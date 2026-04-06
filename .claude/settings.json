@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "pattern": "*.rs",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --all -- --quiet 2>&1 | head -20",
+            "statusMessage": "Running cargo fmt..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "pattern": "*.rs",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --all -- --quiet 2>&1 | head -20",
+            "statusMessage": "Running cargo fmt..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "pattern": "*.rs",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy --workspace -- -D warnings 2>&1 | tail -30",
+            "statusMessage": "Running cargo clippy..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "pattern": "*.rs",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy --workspace -- -D warnings 2>&1 | tail -30",
+            "statusMessage": "Running cargo clippy..."
+          }
+        ]
+      }
+    ]
+  }
+}

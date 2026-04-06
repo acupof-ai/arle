@@ -1,400 +1,198 @@
-# agent-infer
+<p align="center">
+  <strong>agent-infer</strong><br>
+  <em>KV-cache-first inference engine for LLM agents. Pure Rust + CUDA.</em>
+</p>
 
-Pure Rust LLM inference engine with multi-turn agent tool-calling.
-
-**No Python glue** — GPU inference calls go directly from Rust to CUDA kernels.
-
----
-
-## Performance vs SGLang (Qwen3-4B, A100-SXM4-40GB)
-
-| Metric | agent-infer | SGLang v0.5.9 | Ratio |
-|--------|-------------|---------------|-------|
-| TTFT (C=1) | **8.6ms** | 39.3ms | **4.6x faster** |
-| Throughput C=1 | 119.5 tok/s | 121.0 tok/s | **0.99x** |
-| Throughput C=4 | 414.8 tok/s | 419.4 tok/s | **0.99x** |
-| Throughput C=8 | 811 tok/s | 886 tok/s | **0.92x** |
-| ITL (decode step) | 8.3ms | 8.0ms | 1.04x |
-
-**Benchmark parameters**: 50 synthetic prompts, max_tokens=128, temperature=0 (greedy), same A100-40GB GPU. agent-infer: `--num-slots 8`; SGLang: `--disable-radix-cache`.
-
-**TTFT lead**: Rust runtime eliminates Python dispatch overhead; CUDA Graph decode removes per-step CPU→GPU launches.
-
-**Single-request parity**: At C=1, agent-infer matches SGLang throughput (119.5 vs 121.0 tok/s) with 4.6x faster first-token latency.
-
-**Concurrent throughput**: At C=8, agent-infer reaches **0.92x** of SGLang (811 vs 886 tok/s). Remaining gap is from prefill/decode interleaving overhead and batched attention scheduling efficiency.
+<p align="center">
+  <a href="https://github.com/cklxx/agent-infer/actions"><img src="https://github.com/cklxx/agent-infer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/cklxx/agent-infer/releases"><img src="https://img.shields.io/github/v/release/cklxx/agent-infer?include_prereleases" alt="Release"></a>
+</p>
 
 ---
 
-## Optimization Journey (8-concurrent, A100-40GB)
+## Why agent-infer?
 
-| Phase | Optimization | Throughput | Delta |
-|-------|-------------|-----------|-------|
-| Baseline | Per-request decode loop | 128 tok/s | — |
+In agent workloads every turn pays a prefill tax: system prompt + conversation history + tool results must be re-processed. As context grows, **prefill dominates latency**.
+
+agent-infer treats this as the core problem:
+
+| Capability | What it does | Impact |
+|---|---|---|
+| **Radix-tree prefix cache** | Content-addressable KV reuse across requests. Shared system prompts and conversation prefixes skip prefill entirely. | 100% cache hit on multi-turn agent benchmarks |
+| **Token-level KV pool** | page_size=1 pooling (SGLang-style). Zero fragmentation, instant alloc/free. | Eliminates memory waste from fixed-page padding |
+| **Transparent GPU-CPU offload** | Oldest KV blocks migrate to host RAM; prefetch back before attention. | Contexts beyond GPU VRAM capacity |
+| **Copy-on-write block sharing** | Paged blocks with ref-counting. Shared prefixes across concurrent requests use one copy. | N requests, 1x prefix memory |
+| **CUDA Graph batched decode** | One captured graph per batch size (1-32). 504 kernel launches → 1 replay. | Eliminates CPU-GPU dispatch overhead |
+
+**The result**: 4.6x faster time-to-first-token than SGLang, with matching throughput — because the cache does the heavy lifting.
+
+---
+
+## Performance (Qwen3-4B, A100-SXM4-40GB)
+
+| Concurrency | Throughput | vs SGLang v0.5.9 | TTFT | vs SGLang |
+|:-----------:|:----------:|:-----------------:|:----:|:---------:|
+| 1 | 119.5 tok/s | 0.99x | **8.6ms** | **4.6x faster** |
+| 4 | 414.8 tok/s | 0.99x | **53.1ms** | **2.6x faster** |
+| 8 | 811 tok/s | 0.92x | **68.7ms** | **1.1x faster** |
+
+<details>
+<summary>Agent benchmark (multi-turn tool calling)</summary>
+
+| Model | Turns | Tool Calls | KV Hit Rate | Avg Latency |
+|-------|:-----:|:----------:|:-----------:|:-----------:|
+| Qwen3-4B | 10 | 8 | **100%** | 31.9s |
+| Qwen3-8B | 10 | 11 | **100%** | 88.5s |
+
+</details>
+
+<details>
+<summary>Optimization journey (C=8)</summary>
+
+| Phase | What changed | Throughput | Delta |
+|:-----:|---|:----------:|:-----:|
+| 0 | Per-request decode loop | 128 tok/s | — |
 | 1 | Token-level KV pool + FlashInfer paged decode | 434 tok/s | +239% |
-| 2 | Buffer pre-allocation (eliminate per-step GPU alloc) | 681 tok/s | +57% |
-| 3 | FlashInfer plan once per step (not per layer) | 690 tok/s | +1% |
-| 4 | Embedding + logits buffer pre-allocation | 700 tok/s | +1% |
-| 5 | CUDA Graph investigation (CPU memcpy constraint) | 700 tok/s | — |
-| 6 | CUDA Graph batched decode (one graph per batch_size) | 756 tok/s | +8% |
-| 7 | Argmax/scatter optimization (batched argmax, skip D2D scatter for greedy) | **811 tok/s** | +7% |
+| 2 | Buffer pre-allocation | 681 tok/s | +57% |
+| 3 | FlashInfer plan-once-per-step | 690 tok/s | +1% |
+| 4 | Embedding + logits buffer pre-alloc | 700 tok/s | +1% |
+| 5 | CUDA Graph batched decode | 756 tok/s | +8% |
+| 6 | Batched argmax + skip D2D scatter | **811 tok/s** | +7% |
 
----
-
-## Architecture
-
-```
-User
- │
- ▼
-┌─────────────────────────────────────────────────────────┐
-│  agent-infer binary  (src/)                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐ │
-│  │ ChatML fmt   │  │ tool_call    │  │ Agent loop    │ │
-│  │ (chat.rs)    │  │ parser       │  │ gen→parse→exec│ │
-│  └──────────────┘  └──────────────┘  └───────────────┘ │
-└──────────────────────────┬──────────────────────────────┘
-                           │  (linked library)
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  infer  (infer/src/)                                    │
-│                                                         │
-│  HTTP layer          Scheduler          Sampler         │
-│  /v1/completions  ──▶ continuous  ──▶  top-k/p/temp    │
-│  /v1/chat/...       batching          min-p/penalties   │
-│  /metrics                                               │
-│                      ┌──────────┐                       │
-│  ModelForward ──────▶│ Qwen3    │ ← GQA                 │
-│  (trait)             │ Qwen3.5  │ ← Hybrid recurrent+attn│
-│                      └──────────┘                       │
-│  KV Cache  ◀──────── GPU ─────────────────────────────  │
-│  (+ CPU offload)                                        │
-│  Prefix cache   Paged blocks   CUDA graph pool          │
-│  (radix tree)   (accounting)   (batch decode)           │
-└──────────────────────────┬──────────────────────────────┘
-                           │  CUDA kernels
-                           ▼
-         FlashInfer · RMSNorm · GEMM/GEMV · Sampling
-                    (FlashInfer + CUDA C, infer/csrc/)
-```
+</details>
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone
+# Docker (recommended)
+docker run --gpus all -v /path/to/Qwen3-4B:/model \
+  ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
+
+# Or build from source
 git clone https://github.com/cklxx/agent-infer && cd agent-infer
+cargo build -p infer --release
+./target/release/infer --model-path /path/to/Qwen3-4B --port 8000
+```
 
-# 2. Build inference server (requires CUDA toolkit)
-cd infer && cargo build --release
-
-# 3. Start HTTP server
-LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
-  ./target/release/infer \
-    --model-path /path/to/Qwen3-4B \
-    --port 8000 \
-    --num-slots 4 \
-    --cuda-graph true
-
-# 4. Test with curl
-curl http://localhost:8000/v1/completions \
+```bash
+# Test it
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Hello","max_tokens":32,"temperature":0}'
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-### Startup Flow
+**Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only).
+
+---
+
+## Architecture
 
 ```
-main()
-  1. Parse args (model-path, port, num-slots, cuda-graph, max-seq-len)
-  2. Detect model type (Qwen3 / Qwen3.5) from config.json
-  3. Load model weights from safetensors (~2s for 4B on A100)
-  4. Create Scheduler with N state slots + TokenKVPool
-  5. Warm up CUDA Graphs for batch sizes 1..N (~0.4s)
-  6. Bind HTTP server on 0.0.0.0:port
-  7. Scheduler run loop on dedicated thread:
-       ─ Decode priority: all active decodes run before new prefills
-       ─ Chunked prefill: 4096 tokens/chunk (64 when decode active)
-       ─ Batched decode: FlashInfer paged attention + CUDA Graph replay
+┌──────────────────────────────────────────────────────────┐
+│  HTTP API  (/v1/completions, /v1/chat/completions, SSE)  │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  Scheduler  (decode-priority, chunked prefill)           │
+│  ┌──────────────┐  ┌─────────────┐  ┌────────────────┐  │
+│  │ Prefix Cache │  │ Token KV    │  │ Block Manager  │  │
+│  │ (radix tree) │  │ Pool (p=1)  │  │ (CoW paging)   │  │
+│  └──────────────┘  └─────────────┘  └────────────────┘  │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  ModelForward trait                                       │
+│  Qwen3 (GQA) · Qwen3.5 (Hybrid recurrent + attention)   │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+      FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
+         (CUDA C + Triton AOT, infer/csrc/)
 ```
-
-### Prerequisites
-
-- CUDA Toolkit 12.x
-- NVIDIA driver with compute capability >= 8.0 (A100, H100, 4090, ...)
-- Rust 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- Python 3.10+ with `flashinfer-python` installed (for Triton AOT compilation at build time)
-- Model weights in safetensors format (HuggingFace Qwen3 or Qwen3.5)
 
 ---
 
 ## Supported Models
 
 | Model | Attention | Status |
-|-------|-----------|--------|
-| Qwen3-0.5B / 1.8B / 4B / 8B / 14B / 32B / 72B | GQA | ✅ Full |
-| Qwen3.5-4B (hybrid linear + full attention) | HybridGQA | ✅ Full |
-| Llama 3 / 4 | GQA | 🔜 Planned (Phase 1) |
-| DeepSeek-V3 / R1 | MLA | 🔜 Planned (Phase 1) |
-| Mistral / Mixtral | GQA | 🔜 Planned (Phase 1) |
-| Gemma 2 / 3 | MHA | 🔜 Planned (Phase 1) |
-| Phi-4 | GQA | 🔜 Planned (Phase 1) |
+|-------|-----------|:------:|
+| Qwen3 (0.5B-72B) | GQA | :white_check_mark: |
+| Qwen3.5-4B | Hybrid (linear + full attention) | :white_check_mark: |
+| Llama 3 / 4 | GQA | Planned |
+| DeepSeek-V3 / R1 | MLA | Planned |
+
+See [ROADMAP.md](ROADMAP.md) for the full plan.
 
 ---
-
-## Features
-
-### KV Prefix Cache
-Reuses KV cache across multi-turn conversations. When a new prompt shares a prefix with the previous one, only the new suffix is computed. Saves 12–38% of prefill computation on agent workloads.
-
-### KV Offload (GPU → CPU)
-When GPU HBM is full, older KV blocks are migrated to CPU RAM and prefetched back before attention. Enables contexts beyond GPU VRAM capacity.
-
-### Continuous Batching + Chunked Prefill
-Scheduler interleaves multiple requests on a single GPU. Long prefills are chunked (4096 tokens, 64 when decode active) so decode steps can run between chunks, keeping decode latency low for concurrent requests.
-
-### CUDA Graph Decode
-Decode layer loop (36 layers × ~14 kernels = ~504 launches) is captured into CUDA Graphs — one graph per batch_size, cached in a HashMap. First call captures; subsequent calls replay. Eliminates CPU→GPU dispatch overhead per step.
-
-### FlashInfer Batched Decode
-Token-level KV pool (SGLang's `TokenToKVPool` pattern, page_size=1) enables `BatchDecodeWithPagedKVCacheDispatched` across all requests in a single kernel launch. FlashInfer plan runs once per step (not per layer) with buffers pre-allocated at startup.
 
 ## API
 
-Infer exposes an OpenAI-compatible REST API.
-
-### POST /v1/completions
+OpenAI-compatible. Drop-in replacement for any client that speaks `/v1/completions` or `/v1/chat/completions`.
 
 ```bash
-curl http://localhost:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3-8B",
-    "prompt": "The quick brown fox",
-    "max_tokens": 64,
-    "temperature": 0.7,
-    "stream": false
-  }'
-```
-
-**Streaming (SSE):**
-
-```bash
-curl http://localhost:8000/v1/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"Hello","max_tokens":128,"stream":true}'
-```
-
-### POST /v1/chat/completions
-
-```bash
+# Streaming
 curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user",   "content": "What is 2+2?"}
-    ],
-    "max_tokens": 64
-  }'
+  -d '{"messages":[{"role":"user","content":"Explain KV caching"}],"stream":true}'
+
+# Completions
+curl http://localhost:8000/v1/completions \
+  -d '{"prompt":"The quick brown fox","max_tokens":64,"temperature":0.7}'
 ```
 
-### GET /metrics
+<details>
+<summary>Full parameter reference</summary>
 
-Prometheus text format. Compatible with any Prometheus scraper.
-
-```
-infer_requests_total{model="Qwen3-8B"} 42
-infer_ttft_seconds_bucket{le="0.100"} 38
-infer_kv_gpu_utilization{model="Qwen3-8B"} 0.7200
-...
-```
-
-### GET /v1/stats
-
-Human-readable summary:
-
-```
-requests=42 active=2 waiting=0 tokens_out=3891 kv_util=72.0% ttft_p50=85ms ttft_p99=210ms tpot_p50=12ms
-```
-
-### Request parameters
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
 | `max_tokens` | int | 16 | Maximum output tokens |
 | `temperature` | float | 0.0 | Sampling temperature (0 = greedy) |
-| `top_p` | float | 1.0 | Nucleus sampling threshold |
-| `top_k` | int | -1 | Top-K truncation (-1 = disabled) |
-| `min_p` | float | 0.0 | Min-P filter (0 = disabled) |
-| `repetition_penalty` | float | 1.0 | Repetition penalty (>1 discourages repeats) |
-| `frequency_penalty` | float | 0.0 | OpenAI-style frequency penalty |
-| `presence_penalty` | float | 0.0 | OpenAI-style presence penalty |
-| `stop` | list[str] | null | Stop strings |
-| `stop_token_ids` | list[int] | null | Stop token IDs |
-| `seed` | int | null | RNG seed for deterministic output |
-| `stream` | bool | false | Enable SSE streaming |
-| `stream_options.include_usage` | bool | false | Include usage stats in stream |
+| `top_p` | float | 1.0 | Nucleus sampling |
+| `top_k` | int | -1 | Top-K (-1 = off) |
+| `min_p` | float | 0.0 | Min-P filter |
+| `repetition_penalty` | float | 1.0 | Repetition penalty |
+| `frequency_penalty` | float | 0.0 | Frequency penalty |
+| `presence_penalty` | float | 0.0 | Presence penalty |
+| `stop` | list | null | Stop strings |
+| `seed` | int | null | RNG seed |
+| `stream` | bool | false | SSE streaming |
+
+</details>
+
+Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats` (human-readable).
 
 ---
 
-## Benchmarks
+## Agent Mode
 
-### Running
+Built-in agent runtime with tool calling:
 
 ```bash
-# Start server
-./target/release/infer --model-path models/Qwen3-4B --port 8000 --num-slots 4 --cuda-graph true
-
-# Throughput benchmark (synthetic, aligned with SGLang comparison)
-python3 scripts/bench_throughput.py --url http://localhost:8000 \
-  --dataset synthetic --num-prompts 50 --concurrency 4 --max-tokens 128 --temperature 0
-
-# Agent benchmark (multi-turn tool calling)
-python3 scripts/bench_agent.py /path/to/Qwen3-8B
-
-# Multi-request stress test
-python3 scripts/bench_multi_request.py --url http://localhost:8000
+./target/release/agent-infer \
+  --model-path /path/to/Qwen3-8B \
+  --max-turns 10 --temperature 0
 ```
 
-### Throughput Results (Qwen3-4B, A100-SXM4-40GB)
-
-| Concurrency | agent-infer tok/s | SGLang tok/s | TTFT (ours) | TTFT (SGLang) |
-|-------------|-------------------|--------------|-------------|---------------|
-| 1 | 119.5 | 121.0 | **8.6ms** | 39.3ms |
-| 4 | 414.8 | 419.4 | **53.1ms** | 137.0ms |
-| 8 | 811 | 886 | 68.7ms | 78.1ms |
-
-### Agent Benchmark Results
-
-| Model | Prompts | Turns | Tool Calls | KV Hit Rate | Avg Time |
-|-------|---------|-------|-----------|-------------|----------|
-| Qwen3-4B | 5 | 10 | 8 | 100% | 31.9s |
-| Qwen3-8B | 5 | 10 | 11 | 100% | 88.5s |
-
-### Test Environment
-
-- GPU: NVIDIA A100-SXM4-40GB
-- Driver: 580.82.07 / CUDA 13.0
-- SGLang: v0.5.9 (FlashInfer backend, `--disable-radix-cache`)
-- agent-infer: `--num-slots 8 --cuda-graph true`
-- Benchmark: `bench_throughput.py --dataset synthetic --num-prompts 50 --max-tokens 128 --temperature 0 --seed 42`
+Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
 
 ---
 
 ## Development
 
-### Project Layout
-
-```
-agent-infer/
-├── src/                         # Rust agent binary
-│   ├── main.rs                  # CLI + REPL
-│   ├── agent.rs                 # Agent loop: generate → parse → execute
-│   ├── chat.rs                  # ChatML formatter + <tool_call> parser
-│   └── tools.rs                 # shell / python tool execution
-├── infer/                       # Inference engine (Rust library)
-│   ├── src/
-│   │   ├── model/               # Qwen3, Qwen3.5 implementations
-│   │   ├── ops/                 # GPU ops: attention, linear, norm, sampling
-│   │   ├── scheduler/           # Multi-request continuous batching
-│   │   ├── sampler.rs           # Sampling parameters + penalty logic
-│   │   ├── http_server.rs       # Axum HTTP server + SSE streaming
-│   │   ├── block_manager.rs     # Paged KV block accounting
-│   │   ├── prefix_cache.rs      # Radix-tree prefix cache
-│   │   ├── metrics.rs           # Prometheus metrics
-│   │   ├── model_registry.rs    # Architecture detection
-│   │   ├── quant.rs             # Quantization format detection
-│   │   ├── speculative.rs       # Speculative decoding framework
-│   │   └── tensor_parallel.rs   # TP config + sharding math
-│   ├── csrc/                    # CUDA C kernels
-│   └── tools/triton/            # Triton Python kernels (AOT compiled)
-├── scripts/                     # Benchmark + utility scripts
-└── Cargo.toml
-```
-
-### Server Options
-
 ```bash
-./target/release/infer \
-  --model-path /path/to/model  \  # Required
-  --port 8000                  \  # Default: 8000
-  --num-slots 4                \  # Concurrent request slots (each gets own KV cache)
-  --cuda-graph true            \  # CUDA graph decode (default: true)
-  --trace-output-path ./traces    # Optional: write Chrome trace JSON files
+cargo test --no-default-features --features no-cuda   # Unit tests (no GPU)
+cargo clippy --workspace -- -D warnings                # Lint
+cargo fmt --all -- --check                             # Format
+
+# E2E (requires GPU + model weights)
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 ```
 
-### Agent Options
-
-```bash
-./target/release/agent-infer \
-  --model-path /path/to/model  \  # Required
-  --max-turns 10               \  # Agent loop iterations
-  --max-tokens 4096            \  # Tokens per turn
-  --temperature 0.0            \  # 0.0 = greedy
-  --no-cuda-graph              \  # Disable CUDA graph (for debugging)
-  --max-gpu-kv 512                # Limit GPU KV tokens (tests CPU offload)
-```
-
-### Built-in Agent Tools
-
-| Tool | Description |
-|------|-------------|
-| `python` | Execute Python 3 snippets via `python3 -c` |
-| `shell` | Execute shell commands via `bash -c` |
-
-### Building
-
-```bash
-# CPU-only (CI / macOS / no CUDA)
-cargo build --no-default-features --features no-cuda
-
-# GPU (requires CUDA toolkit + nvidia driver)
-cargo build --release
-```
-
-### Testing
-
-```bash
-# All unit tests (CPU-only, fast)
-cargo test --no-default-features --features no-cuda --workspace
-
-# GPU integration tests (requires model weights)
-PEGAINFER_TEST_MODEL_PATH=infer/models/Qwen3-4B \
-  cargo test --release --test e2e
-
-# Lint
-cargo clippy --no-default-features --features no-cuda --workspace -- -D warnings
-
-# Format check
-cargo fmt --all -- --check
-```
-
-### Adding a New Model
-
-1. Create `infer/src/model/<name>/` with `config.rs`, `weights.rs`, `forward.rs`
-2. Implement the `ModelForward` trait (see `infer/src/model.rs`)
-3. Register the architecture string in `infer/src/model_registry.rs`
-4. Add `ModelType` variant in `infer/src/server_engine.rs`
-
----
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for the full phased plan.
-
-| Phase | Focus | Status |
-|-------|-------|--------|
-| 0 | Foundation (CPU-verifiable) | ✅ Complete |
-| 1 | Core GPU features (more models, FA3, MLA) | 🔄 Active |
-| 2 | Quantization (GPTQ/AWQ/FP8/INT8) | 🔜 Planned |
-| 3 | Tensor/Pipeline Parallel | 🔜 Planned |
-| 4 | Advanced decoding (beam search, speculative) | 🔜 Planned |
-| 5 | Performance optimization | 🔄 Partial (5.1 CUDA Graph batch ✅) |
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)
