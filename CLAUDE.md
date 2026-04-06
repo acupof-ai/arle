@@ -4,64 +4,57 @@ Assisting **ckl**. Agent contract below.
 
 ---
 
-## Execution Workflow
+## Project Overview
+
+Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. Supports Qwen3 (4B/8B) and Qwen3.5-4B (hybrid linear + full attention) with continuous batching scheduler. OpenAI-compatible `/v1/completions` + `/v1/chat/completions` API. FlashInfer for both prefill (HD128) and batched decode.
+
+Primary language: **Rust** (inference engine + agent runtime). Secondary: **Python** (tooling, benchmarks, test scripts) + **CUDA C / Triton** (kernels).
+
+---
+
+## Rules
+
+### Execution Workflow
 
 Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
-### Phase 1: Explore
+| Phase | Posture | Key rules |
+|-------|---------|-----------|
+| **Explore** | Cartographer | Trace callers/dependents before reading. Grep for existing implementations before writing new code. Trait change → list all implementors, mark blast radius. Uncertain → surface as open question, don't guess. |
+| **Plan** | Architect (decisions, not options) | "How would this fail?" before "how should this work?". >5 files → question if simpler path exists. Irreversible decision → stop, flag, wait. |
+| **Implement** | Contractor (build to spec) | Check prior art in `infer/src/` and `docs/` first. Outside plan → stop and update plan. Match adjacent code style. |
+| **Verify** | Adversary | `cargo test --workspace`. Each diff line must serve the goal. New `unwrap()` → can this panic? GPU code → CUDA errors, OOM, stream sync? Async → cancel-safe? |
+| **Reflect** | Retrospector | Bug >1 attempt → `docs/experience/errors/YYYY-MM-DD-slug.md`. Win → `docs/experience/wins/`. User corrected → write feedback memory. |
 
-**Posture**: Cartographer.
+**Skip rules**: Trivial → Implement + Verify only. Exploration → Phase 1 only. "Just do it" → Implement + Verify.
 
-- See a relevant file → trace its callers and dependents before reading it
-- Want to write new code → Grep for existing implementations first
-- Involves a trait change → list all implementors, mark blast radius
-- Ready to conclude → stop. List unread related files. Read them first
-- Uncertain → surface as open question, don't guess
+### Editing Rules
 
-### Phase 2: Plan
+- **Preserve by default**: NEVER delete content not explicitly asked to change.
+- **Diff before delete**: Show what's being removed, get confirmation.
+- **Approach-first**: Changes >3 files or architectural decisions → outline approach and wait for approval.
 
-**Posture**: Architect. Output decisions, not options.
+### Behavior Rules
 
-- Start planning → write "how would this fail?" before "how should this work?"
-- Plan touches >5 files → question if there's a simpler path
-- Hit an irreversible decision (public API, serialization format, trait redesign) → stop, flag it, wait for user confirmation
-- Before coding → identify the 3–5 most consequential decisions for THIS task, show choices, wait for approval
-- Plan done → align with user before proceeding
+- **Self-correction**: On ANY user correction → codify a preventive feedback memory before resuming.
+- **GPU/CPU separation**: Mark GPU-only code with `// GPU required` comments. CUDA/Triton kernel stubs use `todo!("GPU required: ...")`.
+- **Opportunistic cleanup**: Spot something inelegant → fix in separate commit.
 
-### Phase 3: Implement
+### Benchmark Rules
 
-**Posture**: Contractor. Build to spec. Spec wrong → fix spec first.
+- **Snapshot before & after** in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
+- **Never overwrite** old snapshots — immutable history.
+- **Standard tool**: `scripts/bench_throughput_sweep.py` with `--label`.
+- **Include environment**: GPU model, CUDA version, model name, num_slots, non-default flags.
+- **Raw data**: Full output table, not summaries. After-snapshot references before-snapshot with delta on key metrics.
 
-- Before writing code → check prior art in `infer/src/` and `docs/` first
-- Want to change something outside the plan → stop. Update plan or note it for later
-- Completed a logical unit → `cargo check` immediately
-- Writing new code → match adjacent code style (error handling, logging, naming)
-- Need a new file → find a similar file for structural reference
-- All changes done → `cargo clippy --workspace -- -D warnings`
+### Git Conventions
 
-### Phase 4: Verify
+Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main`.
 
-**Posture**: Adversary. Assume bugs exist until proven otherwise.
+### Code Conventions
 
-- Code changed → `cargo test --workspace`. Fix before proceeding
-- Each diff line → does this serve the goal? No → remove
-- New `unwrap()` → can this panic? Under what input?
-- GPU-touching code → does it handle CUDA errors, OOM, stream sync?
-- Async code → cancel-safe? Race conditions?
-
-### Phase 5: Reflect
-
-**Posture**: Retrospector. Extract rules, not narratives.
-
-- Bug took >1 attempt → write `docs/experience/errors/YYYY-MM-DD-slug.md`
-- Approach worked well → write `docs/experience/wins/YYYY-MM-DD-slug.md`
-- User corrected you → write feedback memory before resuming
-
-### Skip rules
-
-- **Trivial** (typo, one-liner): Implement + Verify only.
-- **Exploration** ("how does X work?"): Phase 1 only.
-- **"Just do it"**: Implement + Verify. Note skipped exploration.
+Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`.
 
 ---
 
@@ -71,37 +64,7 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
 **On-demand**: `docs/plans/`, full experience entries, `ROADMAP.md`.
 
----
-
-## Editing Rules
-
-- **Preserve by default**: When modifying existing content, NEVER delete content not explicitly asked to change.
-- **Diff before delete**: Before any deletion, show what's being removed and get confirmation.
-- **Approach-first for complex features**: Changes touching >3 files or architectural decisions → outline approach (files to modify, key decision, tradeoffs) and wait for approval before coding.
-
----
-
-## Behavior Rules
-
-- **Self-correction**: On ANY user correction → codify a preventive feedback memory before resuming.
-- **GPU/CPU separation**: Always distinguish between CPU-only logic and GPU-required code. Mark GPU-only code with `// GPU required` comments in placeholder implementations.
-- **Kernel placeholders**: When a CUDA/Triton kernel is needed but not yet implemented, write a clear stub with the expected signature and a `todo!("GPU required: ...")` body.
-- **Opportunistic cleanup**: Reading code and spot something inelegant → fix it in a separate commit, report inline.
-
----
-
-## Benchmark Rules
-
-- **Snapshot before & after**: Every optimization must have a dated baseline snapshot saved *before* coding and a result snapshot saved *after*. Both go in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
-- **Never overwrite**: Old snapshots are immutable history. Always create a new dated file.
-- **Standard tool**: Use `scripts/bench_throughput_sweep.py` for throughput/ITL/TTFT measurements. Include `--label` for traceability.
-- **Include environment**: Every snapshot must record GPU model, CUDA version, model name, num_slots, and any non-default flags.
-- **Raw data**: Include the full output table, not summaries. Numbers are the ground truth.
-- **Comparison**: After-snapshot should reference the before-snapshot and call out delta on key metrics (throughput, ITL p50, TTFT p50).
-
----
-
-## Experience Entries
+### Experience Entry Templates
 
 **Error** (`docs/experience/errors/YYYY-MM-DD-slug.md`):
 ```
@@ -124,53 +87,51 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
 ## Build & Run
 
+**Always use `--release`** — debug builds are extremely slow for GPU/CUDA.
+
 ```bash
-# Build (CPU-only, no CUDA)
+# Build (CPU-only)
 cargo build --release
 
 # Build with CUDA
 CUDA_HOME=/usr/local/cuda cargo build --release
 
-# All tests
-cargo test --workspace
+# Run inference server
+cargo run -p infer --release -- --model-path models/Qwen3.5-4B
 
-# Single test
-cargo test -p infer -- <test_name>
-
-# Lint
+# Lint + format
 cargo clippy --workspace -- -D warnings
-
-# Format check
 cargo fmt --all -- --check
 ```
 
-```bash
-# Run agent REPL (requires model)
-./target/release/agent-infer --model-path /path/to/model
+**Key env vars:**
+- `PEGAINFER_CUDA_SM` — GPU SM target override (e.g. `120` or `120,80`)
+- `PEGAINFER_TRITON_PYTHON` — Python with Triton for AOT kernel generation
+- `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 
-# Run infer HTTP server
-./target/release/infer --model-path /path/to/model --port 8000
-
-# Python agent (HTTP mode, points at running infer)
-python -m agent_infer --url http://localhost:8000
-
-# Benchmark
-python3 scripts/bench_agent.py /path/to/model
-python3 kv_cache_benchmark.py
-```
-
-### Python tests
+### Tests
 
 ```bash
+# Unit tests (~9s)
+cargo test --release
+
+# E2E greedy regression (requires GPU + model weights)
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+cargo test --release --test e2e_qwen35
+
+# Single test
+cargo test -p infer --release -- <test_name>
+
+# Python tests
 pip install -e ".[dev]"
 python -m pytest tests/ -v
 ```
 
+E2E tests compare against JSON baselines in `infer/test_data/`. Regenerate baselines after any change that affects numerical output.
+
 ---
 
 ## Architecture
-
-Primary language: **Rust** (inference engine + agent runtime). Secondary: **Python** (tooling, benchmarks, test scripts) + **CUDA C / Triton** (kernels).
 
 ### Workspace layout
 
@@ -178,7 +139,7 @@ Primary language: **Rust** (inference engine + agent runtime). Secondary: **Pyth
 agent-infer/          ← top-level Cargo workspace
 ├── src/              ← Rust agent binary (ChatML, tool calling, REPL)
 ├── agent_infer/      ← Python agent package (async HTTP client mode)
-├── infer/        ← Inference engine (Rust library + CUDA kernels)
+├── infer/            ← Inference engine (Rust library + CUDA kernels)
 │   ├── src/
 │   │   ├── model/       ← Model implementations (Qwen3, Qwen35, ...)
 │   │   ├── ops/         ← CUDA-backed tensor ops (attention, linear, norm...)
@@ -193,77 +154,36 @@ agent-infer/          ← top-level Cargo workspace
 
 ### Key abstractions
 
-- **`ModelForward` trait** (`infer/src/model.rs`) — single `forward()` entry point per model. Implement for each new architecture.
-- **`GenerationState` trait** — per-request mutable state (KV cache, recurrent state). Separate from weights.
-- **`ServerEngine` trait** — single-request synchronous inference (used by agent binary + tests).
-- **`Scheduler`** (`infer/src/scheduler/`) — multi-request continuous batching over any `ModelForward`.
-- **`SamplingParams`** (`infer/src/sampler.rs`) — sampling config (temperature, top-k, top-p, ...).
+- **`ModelForward` trait** (`infer/src/model.rs`) — `forward(&self, tokens, state)`; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable), per-request state in associated `State` type.
+- **`Scheduler`** (`infer/src/scheduler/`) — multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
+- **`GenericServerEngine`** (`server_engine.rs`) — single-request engine for REPL/agent CLI.
 
 ### Model implementation pattern
 
-Every model lives in `infer/src/model/<name>/`:
-```
-config.rs       ← JSON config parsing
-weights.rs      ← safetensors loading
-decode_buffers.rs   ← GPU buffers for decode step
-prefill_buffers.rs  ← GPU buffers for prefill step (if separate)
-forward.rs      ← ModelForward + GenerationState impl
-```
+Each model in `infer/src/model/<name>/`: `config.rs`, `weights.rs`, `decode_buffers.rs`, `prefill_buffers.rs`, `forward.rs`.
 
 ### CUDA kernel integration
 
-Kernels live in `infer/csrc/` (CUDA C) and `infer/tools/triton/` (Triton).
-FFI bindings are declared in `infer/src/ffi.rs`.
-`build.rs` compiles CUDA C and links against pre-compiled Triton binaries.
+Kernels: `infer/csrc/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/ffi.rs`. `build.rs` compiles CUDA C (auto-detect SM), runs Triton AOT, links FlashInfer.
 
----
-
-## Key References
+### Key references
 
 [ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Roadmap](ROADMAP.md)
 
 ---
 
-## What's Implemented (as of 2026-04-01)
+## Documentation Workflow (PARA)
 
-| Component | Status |
-|-----------|--------|
-| Qwen3 model (GQA) | ✅ |
-| Qwen3.5 model (hybrid recurrent+attn) | ✅ |
-| Qwen3.5 scheduler + batched decode | ✅ |
-| FlashInfer single prefill (HD128) | ✅ |
-| FlashAttention-2 (Triton, HD256 prefill) | ✅ |
-| FlashInfer batched decode attention | ✅ |
-| Merged QKV + gate-up GEMM | ✅ |
-| Batched GEMM decode (multi-request) | ✅ |
-| KV cache with CPU offload | ✅ |
-| Token-level KV pool (SGLang-style) | ✅ |
-| CUDA Graph for batched decode (per batch size 1–32) | ✅ |
-| Continuous batching scheduler | ✅ |
-| Chunked prefill (4096 tok, 64 when decode active) | ✅ |
-| Decode-priority scheduling | ✅ |
-| Prefix-aware slot assignment | ✅ |
-| Request priority + backpressure | ✅ |
-| top-k / top-p / temperature / min-p sampling | ✅ |
-| Repetition / frequency / presence penalties | ✅ |
-| Batched sampling (single sync) | ✅ |
-| OpenAI `/v1/completions` API | ✅ |
-| OpenAI `/v1/chat/completions` API | ✅ |
-| SSE streaming | ✅ |
-| Prometheus `/metrics` endpoint | ✅ |
-| Stats `/v1/stats` endpoint | ✅ |
-| Model architecture registry (9 architectures) | ✅ |
-| Quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF) | ✅ (detection only) |
-| Radix tree prefix cache (data structure) | ✅ (CPU, not yet GPU-wired) |
-| Speculative decoding framework | ✅ (CPU stubs, GPU pending) |
-| Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
-| Rust agent binary (tool calling) | ✅ |
-| Python agent (async HTTP) | ✅ |
-| Benchmark suite (throughput, agent, multi-request) | ✅ |
-| Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
-| FlashAttention-3 | ❌ |
-| MLA attention (DeepSeek) | ❌ |
-| Beam search | ❌ |
-| Quantization GPU kernels (GPTQ/AWQ/FP8/INT8) | ❌ |
-| NCCL all-reduce / all-gather | ❌ |
+```
+docs/
+├── index.md           # Document index
+├── projects/          # Time-bound efforts with clear deliverables
+├── areas/             # Ongoing responsibilities
+├── resources/         # References with potential future value
+└── archives/          # Inactive items
+```
+
+- Docs cover what `--help` and code can't: pitfalls, diagnostic paths, decision context.
+- Refactor over append. Every document points to a next step.
+- At session start, read `index.md` and load relevant docs. At session end, update modified docs and `index.md`.
