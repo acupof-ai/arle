@@ -58,6 +58,7 @@ pub(super) enum MetalModelArch {
     Qwen35(MetalQwen35ArchConfig),
 }
 
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(super) struct MetalModelConfig {
     pub(super) hidden_size: usize,
