@@ -1,8 +1,11 @@
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use log::info;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use infer::chat_protocol::{ParsedAssistantResponse, ToolCall as ProtocolToolCall};
+use infer::chat_protocol::{ChatRole, ParsedAssistantResponse, ToolCall as ProtocolToolCall};
 use infer::sampler::SamplingParams;
 use infer::server_engine::CompleteRequest;
 
@@ -36,6 +39,16 @@ pub struct AgentTurnResult {
     pub max_turns_reached: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionStats {
+    pub conversation_messages: usize,
+    pub user_messages: usize,
+    pub assistant_messages: usize,
+    pub tool_messages: usize,
+    pub tool_calls: usize,
+    pub content_chars: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     messages: Vec<Message>,
@@ -58,6 +71,56 @@ impl AgentSession {
         self.messages.truncate(1);
     }
 
+    pub fn stats(&self) -> AgentSessionStats {
+        let mut stats = AgentSessionStats {
+            conversation_messages: self.messages.len().saturating_sub(1),
+            user_messages: 0,
+            assistant_messages: 0,
+            tool_messages: 0,
+            tool_calls: 0,
+            content_chars: 0,
+        };
+
+        for message in self.messages.iter().skip(1) {
+            stats.content_chars += message.content.len();
+            match &message.role {
+                ChatRole::User => stats.user_messages += 1,
+                ChatRole::Assistant => {
+                    stats.assistant_messages += 1;
+                    stats.tool_calls += message.tool_calls.len();
+                }
+                ChatRole::Tool => stats.tool_messages += 1,
+                _ => {}
+            }
+        }
+
+        stats
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let snapshot = SessionSnapshot::from_messages(&self.messages);
+        let payload = serde_json::to_vec_pretty(&snapshot)?;
+        std::fs::write(path, payload)
+            .with_context(|| format!("failed to write session file {}", path.display()))
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let payload = std::fs::read(path)
+            .with_context(|| format!("failed to read session file {}", path.display()))?;
+        let snapshot: SessionSnapshot = serde_json::from_slice(&payload)
+            .with_context(|| format!("failed to parse session file {}", path.display()))?;
+        Ok(Self {
+            messages: snapshot.into_messages()?,
+        })
+    }
+
+    pub fn replace_from_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        *self = Self::load_from_path(path)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn messages(&self) -> &[Message] {
         &self.messages
@@ -73,6 +136,7 @@ impl AgentSession {
         self.messages.push(Message::user(user_input));
 
         let mut tool_calls_executed = 0usize;
+        let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
 
         for turn in 0..settings.max_turns {
@@ -102,10 +166,8 @@ impl AgentSession {
 
             let mut parsed = parse_tool_calls(&output.text);
             if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
-                if let Some(recovered) =
-                    extract_tool_calls_from_user_request(user_input, tools).or_else(|| {
-                        extract_tool_calls_from_draft(&output.text, tools)
-                    })
+                if let Some(recovered) = extract_tool_calls_from_user_request(user_input, tools)
+                    .or_else(|| extract_tool_calls_from_draft(&output.text, tools))
                 {
                     info!("Recovered tool call(s) via deterministic extraction");
                     parsed = recovered;
@@ -121,6 +183,7 @@ impl AgentSession {
             let content = finalize_response_text(
                 user_input,
                 parsed.content,
+                last_tool_name.as_deref(),
                 last_tool_scalar_result.as_deref(),
                 tool_calls_executed,
             );
@@ -161,8 +224,21 @@ impl AgentSession {
                 println!();
 
                 last_tool_scalar_result = scalar_tool_result(&result);
+                last_tool_name = Some(tool_call.name.clone());
                 self.messages
                     .push(Message::tool_result(&tool_call.name, &result));
+            }
+
+            if let Some(text) = finalize_after_tool_execution(
+                user_input,
+                last_tool_name.as_deref(),
+                last_tool_scalar_result.as_deref(),
+            ) {
+                return Ok(AgentTurnResult {
+                    text,
+                    tool_calls_executed,
+                    max_turns_reached: false,
+                });
             }
         }
 
@@ -171,6 +247,113 @@ impl AgentSession {
             tool_calls_executed,
             max_turns_reached: true,
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionSnapshot {
+    version: u32,
+    messages: Vec<StoredMessage>,
+}
+
+impl SessionSnapshot {
+    const VERSION: u32 = 1;
+
+    fn from_messages(messages: &[Message]) -> Self {
+        Self {
+            version: Self::VERSION,
+            messages: messages.iter().map(StoredMessage::from_message).collect(),
+        }
+    }
+
+    fn into_messages(self) -> Result<Vec<Message>> {
+        if self.version != Self::VERSION {
+            anyhow::bail!(
+                "unsupported session version {} (expected {})",
+                self.version,
+                Self::VERSION
+            );
+        }
+
+        if self.messages.is_empty() {
+            anyhow::bail!("session file does not contain any messages");
+        }
+
+        let messages = self
+            .messages
+            .into_iter()
+            .map(StoredMessage::into_message)
+            .collect::<Result<Vec<_>>>()?;
+
+        if messages[0].role != ChatRole::System {
+            anyhow::bail!("session file must start with a system message");
+        }
+
+        Ok(messages)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredMessage {
+    role: String,
+    content: String,
+    #[serde(default)]
+    tool_calls: Vec<StoredToolCall>,
+}
+
+impl StoredMessage {
+    fn from_message(message: &Message) -> Self {
+        Self {
+            role: message.role.as_str().to_string(),
+            content: message.content.clone(),
+            tool_calls: message
+                .tool_calls
+                .iter()
+                .map(StoredToolCall::from_tool_call)
+                .collect(),
+        }
+    }
+
+    fn into_message(self) -> Result<Message> {
+        let role = ChatRole::from(self.role.as_str());
+        if role == ChatRole::Tool && !self.tool_calls.is_empty() {
+            anyhow::bail!("tool result messages cannot contain tool_calls");
+        }
+
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(StoredToolCall::into_tool_call)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Message {
+            role,
+            content: self.content,
+            tool_calls,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredToolCall {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+impl StoredToolCall {
+    fn from_tool_call(tool_call: &ProtocolToolCall) -> Self {
+        Self {
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+        }
+    }
+
+    fn into_tool_call(self) -> Result<ProtocolToolCall> {
+        if self.name.trim().is_empty() {
+            anyhow::bail!("tool call name cannot be empty");
+        }
+
+        Ok(ProtocolToolCall::new(self.name, self.arguments))
     }
 }
 
@@ -210,20 +393,23 @@ fn extract_tool_calls_from_user_request(
         && mentions_shell_tool(user_input)
         && let Some(command) = extract_shell_command(user_input)
     {
+        return Some(single_tool_response("shell", json!({ "command": command })));
+    }
+
+    if tool_available(tools, "shell") && asks_for_file_listing(user_input) {
         return Some(single_tool_response(
             "shell",
-            json!({ "command": command }),
+            json!({ "command": "pwd && ls -la" }),
         ));
     }
 
     None
 }
 
-fn extract_tool_calls_from_draft(
-    draft: &str,
-    tools: &[Tool],
-) -> Option<ParsedAssistantResponse> {
-    if tool_available(tools, "python") && let Some(code) = extract_python_code(draft) {
+fn extract_tool_calls_from_draft(draft: &str, tools: &[Tool]) -> Option<ParsedAssistantResponse> {
+    if tool_available(tools, "python")
+        && let Some(code) = extract_python_code(draft)
+    {
         return Some(single_tool_response("python", json!({ "code": code })));
     }
 
@@ -231,10 +417,7 @@ fn extract_tool_calls_from_draft(
         && mentions_shell_tool(draft)
         && let Some(command) = extract_shell_command(draft)
     {
-        return Some(single_tool_response(
-            "shell",
-            json!({ "command": command }),
-        ));
+        return Some(single_tool_response("shell", json!({ "command": command })));
     }
 
     None
@@ -243,11 +426,16 @@ fn extract_tool_calls_from_draft(
 fn finalize_response_text(
     user_input: &str,
     content: String,
+    last_tool_name: Option<&str>,
     last_tool_scalar_result: Option<&str>,
     tool_calls_executed: usize,
 ) -> String {
     if tool_calls_executed == 0 {
         return content;
+    }
+
+    if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
+        return "Listed the current directory above.".to_string();
     }
 
     let Some(tool_result) = last_tool_scalar_result else {
@@ -259,6 +447,24 @@ fn finalize_response_text(
     }
 
     content
+}
+
+fn finalize_after_tool_execution(
+    user_input: &str,
+    last_tool_name: Option<&str>,
+    last_tool_scalar_result: Option<&str>,
+) -> Option<String> {
+    if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
+        return Some("Listed the current directory above.".to_string());
+    }
+
+    if asks_for_exact_scalar_output(user_input)
+        && let Some(result) = last_tool_scalar_result
+    {
+        return Some(result.to_string());
+    }
+
+    None
 }
 
 fn single_tool_response(name: &str, arguments: serde_json::Value) -> ParsedAssistantResponse {
@@ -286,6 +492,32 @@ fn mentions_shell_tool(text: &str) -> bool {
         || lower.contains("shell command")
         || lower.contains("use shell")
         || lower.contains("run shell")
+}
+
+fn asks_for_file_listing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "list files",
+        "show files",
+        "what files",
+        "which files",
+        "current directory",
+        "local files",
+        "files here",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "哪些文件",
+            "有哪些文件",
+            "有什么文件",
+            "列出文件",
+            "当前目录",
+            "本地文件",
+            "目录下",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 fn extract_python_code(text: &str) -> Option<String> {
@@ -395,11 +627,7 @@ fn extract_arithmetic_expression(text: &str) -> Option<String> {
         has_operator = false;
     }
 
-    if best.is_empty() {
-        None
-    } else {
-        Some(best)
-    }
+    if best.is_empty() { None } else { Some(best) }
 }
 
 fn asks_for_exact_scalar_output(user_input: &str) -> bool {
@@ -482,8 +710,10 @@ If no tool is needed, output exactly NO_TOOL.",
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     #[cfg(any(feature = "cuda", feature = "metal"))]
     use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
     use serde_json::json;
@@ -551,6 +781,29 @@ mod tests {
         }
     }
 
+    fn shell_tool() -> Tool {
+        Tool {
+            name: "shell".into(),
+            description: "Run shell".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    fn temp_session_path(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "agent-infer-{test_name}-{}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn session_persists_conversation_history_across_turns() {
         let mut session = AgentSession::new();
@@ -611,6 +864,53 @@ mod tests {
     }
 
     #[test]
+    fn stats_report_conversation_shape() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "Checking.\n<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(2 + 2)\"}}\n</tool_call>",
+            "4",
+        ]);
+
+        session
+            .run_turn(
+                &mut engine,
+                "Use the python tool to compute 2 + 2. After the tool returns, answer with just the integer.",
+                &[python_tool()],
+                settings(),
+            )
+            .expect("tool turn");
+
+        let stats = session.stats();
+        assert_eq!(stats.conversation_messages, 3);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+        assert_eq!(stats.tool_messages, 1);
+        assert_eq!(stats.tool_calls, 1);
+        assert!(stats.content_chars > 0);
+    }
+
+    #[test]
+    fn session_can_round_trip_via_disk_snapshot() {
+        let path = temp_session_path("session-roundtrip");
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "Checking.\n<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(2 + 2)\"}}\n</tool_call>",
+            "The answer is 4.",
+        ]);
+
+        session
+            .run_turn(&mut engine, "compute 2+2", &[python_tool()], settings())
+            .expect("tool turn");
+        session.save_to_path(&path).expect("save session");
+
+        let loaded = AgentSession::load_from_path(&path).expect("load session");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.stats(), session.stats());
+    }
+
+    #[test]
     fn maybe_needs_tool_repair_detects_tool_intent() {
         assert!(super::maybe_needs_tool_repair(
             "I should use the python tool to compute this."
@@ -634,8 +934,7 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "56088");
-        assert_eq!(engine.prompts.len(), 2);
-        assert!(engine.prompts[1].contains("56088"));
+        assert_eq!(engine.prompts.len(), 1);
     }
 
     #[test]
@@ -657,6 +956,7 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "56");
+        assert_eq!(engine.prompts.len(), 1);
     }
 
     #[test]
@@ -665,6 +965,23 @@ mod tests {
             super::extract_arithmetic_expression("Use python to compute 123 * 456 right now."),
             Some("123 * 456".to_string())
         );
+    }
+
+    #[test]
+    fn chinese_file_listing_request_is_recovered_with_shell_tool() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "I don't have a tool for listing files.",
+            "I still don't have a suitable tool for this.",
+        ]);
+
+        let result = session
+            .run_turn(&mut engine, "本地有哪些文件", &[shell_tool()], settings())
+            .expect("file listing turn");
+
+        assert_eq!(result.tool_calls_executed, 1);
+        assert_eq!(result.text, "Listed the current directory above.");
+        assert_eq!(engine.prompts.len(), 1);
     }
 
     #[cfg(any(feature = "cuda", feature = "metal"))]

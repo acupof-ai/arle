@@ -684,6 +684,25 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 /// Cargo puts all crate build outputs under the same `{target}/{profile}/build/` tree.
 /// Our OUT_DIR is `{target}/{profile}/build/infer-{hash}/out`, so going up two levels
 /// gives us `{target}/{profile}/build/`, where we scan for `mlx-sys-*/out`.
+fn valid_mlx_include_pair(cpp_hdr: &Path, c_hdr: &Path) -> bool {
+    cpp_hdr.join("mlx/mlx.h").exists()
+        && cpp_hdr.join("mlx/fast.h").exists()
+        && cpp_hdr.join("mlx/transforms.h").exists()
+        && cpp_hdr.join("mlx/ops.h").exists()
+        && c_hdr.join("mlx/c/array.h").exists()
+}
+
+fn candidate_mlx_include_dirs(out: &Path) -> Vec<(PathBuf, PathBuf)> {
+    vec![
+        // mlx-sys 0.2.x installs both the C++ MLX headers and the mlx-c headers
+        // into the same include root.
+        (out.join("build/include"), out.join("build/include")),
+        // Older mlx-sys layouts kept the C++ sources in `_deps/mlx-src` and the
+        // C headers in `build/include`.
+        (out.join("build/_deps/mlx-src"), out.join("build/include")),
+    ]
+}
+
 fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").ok()?);
     // OUT_DIR = …/build/infer-<hash>/out  → parent = …/build/infer-<hash> → parent = …/build
@@ -696,12 +715,10 @@ fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
             continue;
         }
         let out = entry.path().join("out");
-        // C++ MLX source headers: mlx/fast.h, mlx/transforms.h, mlx/ops.h, …
-        let cpp_hdr = out.join("build/_deps/mlx-src");
-        // mlx-c public headers: mlx/c/array.h (mlx_array typedef)
-        let c_hdr = out.join("build/include");
-        if cpp_hdr.exists() && c_hdr.exists() {
-            return Some((cpp_hdr, c_hdr));
+        for (cpp_hdr, c_hdr) in candidate_mlx_include_dirs(&out) {
+            if valid_mlx_include_pair(&cpp_hdr, &c_hdr) {
+                return Some((cpp_hdr, c_hdr));
+            }
         }
     }
     None

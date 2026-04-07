@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 # Enable CUDA (mirrors infer's cuda feature). Default on, like infer.
 default = ["cuda"]
+cli = ["dep:clap", "dep:rustyline"]
 cuda = ["infer/cuda"]
 # Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
 no-cuda = ["infer/no-cuda"]
@@ -17,7 +18,13 @@ infer = { path = "infer", default-features = false }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text"] }
 rand = "0.10"
+rustyline = { version = "15", optional = true }
+
+[[bin]]
+name = "agent-infer"
+path = "src/main.rs"
+required-features = ["cli"]

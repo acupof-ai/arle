@@ -173,18 +173,27 @@ Built-in agent runtime with tool calling:
   --max-turns 10 --temperature 0
 ```
 
+The root CLI binary is behind the `cli` feature. Without `--features cli`, `agent-infer` is not built.
+
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
+On macOS, tool execution now uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
 
 On Apple Silicon, build the same CLI against the Metal backend:
 
 ```bash
-cargo run --release --no-default-features --features metal,no-cuda -- \
+cargo run --release --no-default-features --features metal,no-cuda,cli -- \
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-The CLI keeps conversation history across turns and supports `/reset` to clear it.
+The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
+
+- `/help` for command help
+- `/reset` or `/clear` to clear the current conversation
+- `/tools` to inspect built-in tools
+- `/model` and `/stats` to inspect the loaded runtime
+- `/save <path>` and `/load <path>` to persist or resume a session as JSON
 
 ---
 
@@ -199,7 +208,7 @@ cargo fmt --all -- --check                             # Format
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 
 # Agent CLI live-model E2E on Apple Silicon (auto-detects a local model when available)
-cargo test --release --no-default-features --features metal,no-cuda -- --ignored --nocapture
+cargo test --release --no-default-features --features metal,no-cuda,cli -- --ignored --nocapture
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.
