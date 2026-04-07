@@ -535,6 +535,7 @@ impl MetalBackend {
         self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
     }
 
+    #[allow(unused_mut)]
     fn generate_from_token_ids_with_callback<F>(
         &self,
         input_ids: &[u32],
