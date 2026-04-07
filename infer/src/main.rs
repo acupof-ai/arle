@@ -5,9 +5,9 @@ use clap::Parser;
 use infer::bootstrap::{
     EngineOptions, ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
 };
-use infer::model::kv_cache::KVCacheDtype;
 use infer::http_server::build_app;
 use infer::logging;
+use infer::model::kv_cache::KVCacheDtype;
 use infer::scheduler::SchedulerConfig;
 use infer::trace_reporter::FileReporter;
 use log::info;

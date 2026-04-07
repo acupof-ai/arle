@@ -280,8 +280,6 @@ fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::{
         common_local_roots, has_safetensors_twin, parse_hf_model_id, resolve_local_model_path,
     };

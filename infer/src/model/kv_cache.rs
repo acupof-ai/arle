@@ -242,7 +242,9 @@ impl KVCache {
                     (scale_bytes * 2) as f64 / 1e6,
                     work_bytes as f64 / 1e6,
                     bf16_bytes as f64 / 1e6,
-                    (1.0 - (int8_bytes * 2 + scale_bytes * 2 + work_bytes) as f64 / bf16_bytes as f64) * 100.0,
+                    (1.0 - (int8_bytes * 2 + scale_bytes * 2 + work_bytes) as f64
+                        / bf16_bytes as f64)
+                        * 100.0,
                 );
             }
         }
@@ -296,9 +298,7 @@ impl KVCache {
         layer: usize,
     ) -> Result<(&mut DeviceVec, &mut DeviceVec)> {
         match self.dtype {
-            KVCacheDtype::BF16 => {
-                Ok((&mut self.k_cache[layer], &mut self.v_cache[layer]))
-            }
+            KVCacheDtype::BF16 => Ok((&mut self.k_cache[layer], &mut self.v_cache[layer])),
             KVCacheDtype::INT8 => {
                 // Dequantize existing tokens [0..seq_len) → bf16 working buffers
                 let seq_len = self.seq_len;
@@ -315,13 +315,25 @@ impl KVCache {
                     let v_sc = &self.v_scales[layer];
                     let k_work = self.k_work.as_mut().expect("INT8 k_work not initialized");
                     kv_quant::dequantize_kv(
-                        ctx, k_int8, k_sc, k_work,
-                        num_kv_heads, head_dim, max_seq_len, seq_len,
+                        ctx,
+                        k_int8,
+                        k_sc,
+                        k_work,
+                        num_kv_heads,
+                        head_dim,
+                        max_seq_len,
+                        seq_len,
                     )?;
                     let v_work = self.v_work.as_mut().expect("INT8 v_work not initialized");
                     kv_quant::dequantize_kv(
-                        ctx, v_int8, v_sc, v_work,
-                        num_kv_heads, head_dim, max_seq_len, seq_len,
+                        ctx,
+                        v_int8,
+                        v_sc,
+                        v_work,
+                        num_kv_heads,
+                        head_dim,
+                        max_seq_len,
+                        seq_len,
                     )?;
                 }
 
@@ -362,8 +374,15 @@ impl KVCache {
             let k_int8 = &mut self.k_cache_q[layer];
             let k_sc = &mut self.k_scales[layer];
             kv_quant::quantize_kv(
-                ctx, k_work, k_int8, k_sc,
-                num_kv_heads, head_dim, max_seq_len, start_pos, token_count,
+                ctx,
+                k_work,
+                k_int8,
+                k_sc,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
+                start_pos,
+                token_count,
             )?;
         }
 
@@ -373,8 +392,15 @@ impl KVCache {
             let v_int8 = &mut self.v_cache_q[layer];
             let v_sc = &mut self.v_scales[layer];
             kv_quant::quantize_kv(
-                ctx, v_work, v_int8, v_sc,
-                num_kv_heads, head_dim, max_seq_len, start_pos, token_count,
+                ctx,
+                v_work,
+                v_int8,
+                v_sc,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
+                start_pos,
+                token_count,
             )?;
         }
 
