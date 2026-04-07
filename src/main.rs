@@ -25,9 +25,10 @@ use crate::tools::builtin_tools;
 #[derive(Parser)]
 #[command(name = "agent-infer", about = "Local LLM agent with tool use")]
 struct Args {
-    /// Path to model directory (config.json, tokenizer, safetensors)
+    /// Path to model directory or HuggingFace model ID.
+    /// If omitted, the CLI auto-detects a local model from common directories and HF cache.
     #[arg(long)]
-    model_path: String,
+    model_path: Option<String>,
 
     /// Maximum agent turns (generate-execute cycles) per query
     #[arg(long, default_value_t = 10)]
@@ -140,6 +141,34 @@ fn run_repl(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn resolve_cli_model_source(args: &Args) -> Result<String> {
+    if let Some(model_path) = args.model_path.as_ref()
+        && !model_path.trim().is_empty()
+    {
+        return Ok(model_path.clone());
+    }
+
+    if let Ok(model) = std::env::var("AGENT_INFER_MODEL")
+        && !model.trim().is_empty()
+    {
+        return Ok(model);
+    }
+
+    if let Some((candidate, local_path)) = infer::hf_hub::discover_local_model() {
+        info!(
+            "Auto-detected local model '{}' at {}",
+            candidate,
+            local_path.display()
+        );
+        return Ok(candidate);
+    }
+
+    anyhow::bail!(
+        "No model specified and no local model was auto-detected. Pass --model-path or set AGENT_INFER_MODEL."
+    )
+}
+
 fn main() -> Result<()> {
     infer::logging::init_default();
 
@@ -154,9 +183,10 @@ fn main() -> Result<()> {
     #[cfg(any(feature = "cuda", feature = "metal"))]
     {
         let args = Args::parse();
-        info!("Loading model from: {}", args.model_path);
+        let model_source = resolve_cli_model_source(&args)?;
+        info!("Loading model from: {}", model_source);
         let load_start = Instant::now();
-        let mut engine = LoadedAgentEngine::load(&args.model_path, !args.no_cuda_graph)?;
+        let mut engine = LoadedAgentEngine::load(&model_source, !args.no_cuda_graph)?;
 
         if let Some(max_kv) = args.max_gpu_kv {
             #[cfg(feature = "cuda")]

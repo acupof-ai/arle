@@ -1,4 +1,5 @@
 pub type Message = infer::chat_protocol::ChatMessage;
+#[cfg_attr(not(test), allow(dead_code))]
 pub type ToolCall = infer::chat_protocol::ToolCall;
 
 use infer::chat_protocol::{ParsedAssistantResponse, ToolDefinition as ProtocolToolDefinition};

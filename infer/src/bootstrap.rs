@@ -7,10 +7,10 @@
 #[cfg(feature = "cuda")]
 use std::fmt;
 #[cfg(feature = "cuda")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "cuda")]
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
@@ -87,12 +87,19 @@ pub fn model_id_from_path(model_path: &str) -> String {
 
 #[cfg(feature = "cuda")]
 pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
-    match detect_arch(model_path)? {
+    let resolved = resolve_model_path_for_runtime(model_path)?;
+    match detect_arch(resolved.to_str().unwrap_or(model_path))? {
         ModelArch::Qwen3 => Ok(ModelType::Qwen3),
         ModelArch::Qwen35 => Ok(ModelType::Qwen35),
         ModelArch::GLM4 => Ok(ModelType::GLM4),
         arch => bail!("model architecture {arch:?} is not supported by the runtime yet"),
     }
+}
+
+#[cfg(feature = "cuda")]
+fn resolve_model_path_for_runtime(model_path: &str) -> Result<PathBuf> {
+    crate::hf_hub::resolve_model_path(model_path)
+        .with_context(|| format!("failed to resolve model '{model_path}'"))
 }
 
 #[cfg(feature = "cuda")]
@@ -115,8 +122,10 @@ fn load_model_with<M>(
     options: EngineOptions,
     load_model: impl FnOnce(&str, EngineOptions) -> Result<M>,
 ) -> Result<ModelComponents<M>> {
-    let tokenizer = Tokenizer::from_file(model_path)?;
-    let model = load_model(model_path, options)?;
+    let resolved = resolve_model_path_for_runtime(model_path)?;
+    let resolved_str = resolved.to_str().unwrap_or(model_path);
+    let tokenizer = Tokenizer::from_file(resolved_str)?;
+    let model = load_model(resolved_str, options)?;
     Ok(ModelComponents {
         model_id: model_id_from_path(model_path),
         tokenizer,

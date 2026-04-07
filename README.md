@@ -170,9 +170,10 @@ Built-in agent runtime with tool calling:
 
 ```bash
 ./target/release/agent-infer \
-  --model-path /path/to/Qwen3-8B \
   --max-turns 10 --temperature 0
 ```
+
+If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
 
@@ -197,9 +198,8 @@ cargo fmt --all -- --check                             # Format
 # E2E (requires GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 
-# Agent CLI live-model E2E (root crate; runs ignored tests)
-AGENT_INFER_TEST_MODEL_PATH=/path/to/local/model \
-  cargo test --no-default-features --features metal,no-cuda --bin agent-infer -- --ignored
+# Agent CLI live-model E2E on Apple Silicon (auto-detects a local model when available)
+cargo test --release --no-default-features --features metal,no-cuda -- --ignored --nocapture
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.

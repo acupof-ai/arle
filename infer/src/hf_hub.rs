@@ -22,6 +22,15 @@ use hf_hub::{
     api::sync::{Api, ApiBuilder, ApiRepo},
 };
 
+const DEFAULT_DISCOVERY_CANDIDATES: &[&str] = &[
+    "mlx-community/Qwen3-0.6B-4bit",
+    "mlx-community/Qwen3-0.6B-bf16",
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3.5-4B",
+];
+
 /// Resolve a model source string to a local directory containing model files.
 ///
 /// # Arguments
@@ -30,14 +39,42 @@ use hf_hub::{
 ///
 /// Returns the path to the directory that contains `config.json` and weight files.
 pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
-    let local = Path::new(model_id_or_path);
-    if local.exists() {
+    if let Some(local) = resolve_local_model_path(model_id_or_path) {
         log::info!("Using local model path: {}", local.display());
-        return Ok(local.to_path_buf());
+        return Ok(local);
     }
 
     log::info!("Model not found locally — downloading from HuggingFace: {model_id_or_path}");
     download_from_hub(model_id_or_path)
+}
+
+/// Resolve a model source using local paths and local HuggingFace cache only.
+///
+/// Returns `None` when no local candidate exists.
+pub fn resolve_local_model_path(model_id_or_path: &str) -> Option<PathBuf> {
+    let local = Path::new(model_id_or_path);
+    if local.exists() {
+        return Some(local.to_path_buf());
+    }
+
+    local_model_search_candidates(model_id_or_path)
+        .into_iter()
+        .find(|candidate| is_model_dir(candidate))
+}
+
+/// Discover the best local model from a curated candidate list.
+///
+/// Prefers the explicit candidate order. Returns the candidate label that matched
+/// plus the resolved local path.
+pub fn discover_local_model() -> Option<(String, PathBuf)> {
+    discover_local_model_from(DEFAULT_DISCOVERY_CANDIDATES)
+}
+
+/// Same as [`discover_local_model`] but with a caller-provided priority list.
+pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf)> {
+    candidates.iter().find_map(|candidate| {
+        resolve_local_model_path(candidate).map(|path| ((*candidate).to_string(), path))
+    })
 }
 
 /// Download a model from HuggingFace Hub and return the local cache directory.
@@ -144,6 +181,89 @@ fn build_api() -> Result<Api> {
     builder.build().context("ApiBuilder::build failed")
 }
 
+fn local_model_search_candidates(model_id_or_path: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let model_name = model_id_or_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id_or_path)
+        .trim();
+
+    for base in common_local_roots() {
+        candidates.push(base.join(model_name));
+    }
+
+    if let Some((org, repo)) = parse_hf_model_id(model_id_or_path) {
+        let cache_repo_dir = huggingface_hub_root().join(format!("models--{org}--{repo}"));
+        candidates.extend(snapshot_dirs(&cache_repo_dir));
+        candidates.push(cache_repo_dir.join("snapshots").join("main"));
+    }
+
+    candidates
+}
+
+fn common_local_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("models"));
+        roots.push(cwd.join("infer").join("models"));
+    }
+
+    if let Some(home) = home_dir() {
+        roots.push(home.join("models"));
+        roots.push(home.join("llm"));
+        roots.push(home.join(".cache").join("mlx-models"));
+    }
+
+    roots
+}
+
+fn huggingface_hub_root() -> PathBuf {
+    if let Ok(hf_home) = std::env::var("HF_HOME")
+        && !hf_home.trim().is_empty()
+    {
+        return PathBuf::from(hf_home).join("hub");
+    }
+
+    if let Some(home) = home_dir() {
+        return home.join(".cache").join("huggingface").join("hub");
+    }
+
+    PathBuf::from(".cache/huggingface/hub")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn parse_hf_model_id(model_id_or_path: &str) -> Option<(String, String)> {
+    let (org, repo) = model_id_or_path.split_once('/')?;
+    if org.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((org.to_string(), repo.to_string()))
+}
+
+fn snapshot_dirs(cache_repo_dir: &Path) -> Vec<PathBuf> {
+    let snapshot_root = cache_repo_dir.join("snapshots");
+    let Ok(entries) = std::fs::read_dir(&snapshot_root) else {
+        return Vec::new();
+    };
+
+    let mut snapshots: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    snapshots.sort();
+    snapshots.reverse();
+    snapshots
+}
+
+fn is_model_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("config.json").exists() && path.join("tokenizer.json").exists()
+}
+
 fn fetch_file(repo: &ApiRepo, filename: &str, model_id: &str) -> Result<PathBuf> {
     log::info!("  ↓ {filename}");
     repo.get(filename)
@@ -160,7 +280,11 @@ fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_safetensors_twin;
+    use std::path::PathBuf;
+
+    use super::{
+        common_local_roots, has_safetensors_twin, parse_hf_model_id, resolve_local_model_path,
+    };
 
     #[test]
     fn twin_detection() {
@@ -171,5 +295,34 @@ mod tests {
         ];
         assert!(has_safetensors_twin(&files, "model.bin"));
         assert!(!has_safetensors_twin(&files, "pytorch_model.bin"));
+    }
+
+    #[test]
+    fn parse_hf_model_id_requires_org_and_repo() {
+        assert_eq!(
+            parse_hf_model_id("mlx-community/Qwen3-0.6B-4bit"),
+            Some(("mlx-community".to_string(), "Qwen3-0.6B-4bit".to_string()))
+        );
+        assert_eq!(parse_hf_model_id("Qwen3-0.6B-4bit"), None);
+    }
+
+    #[test]
+    fn resolve_local_model_path_accepts_existing_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("config.json"), "{}").expect("config");
+        std::fs::write(tmp.path().join("tokenizer.json"), "{}").expect("tokenizer");
+
+        assert_eq!(
+            resolve_local_model_path(tmp.path().to_str().expect("utf8")),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn common_local_roots_include_repo_models_dir() {
+        let cwd = std::env::current_dir().expect("current_dir");
+        let roots = common_local_roots();
+        assert!(roots.contains(&cwd.join("models")));
+        assert!(roots.contains(&cwd.join("infer").join("models")));
     }
 }
