@@ -176,6 +176,15 @@ Built-in agent runtime with tool calling:
 
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
 
+On Apple Silicon, build the same CLI against the Metal backend:
+
+```bash
+cargo run --release --no-default-features --features metal,no-cuda -- \
+  --model-path mlx-community/Qwen3-0.6B-4bit
+```
+
+The CLI keeps conversation history across turns and supports `/reset` to clear it.
+
 ---
 
 ## Development
@@ -187,6 +196,10 @@ cargo fmt --all -- --check                             # Format
 
 # E2E (requires GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+
+# Agent CLI live-model E2E (root crate; runs ignored tests)
+AGENT_INFER_TEST_MODEL_PATH=/path/to/local/model \
+  cargo test --no-default-features --features metal,no-cuda --bin agent-infer -- --ignored
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.

@@ -1,21 +1,25 @@
 mod agent;
 mod chat;
+mod engine;
 mod tools;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use std::io::{self, BufRead, Write};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use log::info;
+#[cfg(all(not(feature = "cuda"), feature = "metal"))]
+use log::warn;
 
-#[cfg(feature = "cuda")]
-use infer::server_engine::{EngineOptions, LoadedServerEngine, ServerEngine};
-
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::agent::{AgentSession, AgentSettings};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::engine::{AgentEngine, LoadedAgentEngine};
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::tools::builtin_tools;
 
 #[derive(Parser)]
@@ -47,9 +51,9 @@ struct Args {
     max_gpu_kv: Option<usize>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn run_repl(
-    engine: &mut dyn ServerEngine,
+    engine: &mut dyn AgentEngine,
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
@@ -57,6 +61,7 @@ fn run_repl(
     let tools = builtin_tools();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut session = AgentSession::new();
 
     println!();
     println!("=== agent-infer REPL ===");
@@ -73,7 +78,8 @@ fn run_repl(
         "Max turns: {}, Max tokens: {}, Temperature: {}",
         max_turns, max_tokens, temperature
     );
-    println!("Type your query and press Enter. Type 'quit' or 'exit' to stop.");
+    println!("Type your query and press Enter. Type '/reset' to clear history.");
+    println!("Type 'quit' or 'exit' to stop.");
     println!();
 
     loop {
@@ -92,15 +98,33 @@ fn run_repl(
         if input.is_empty() {
             continue;
         }
+        if input == "/reset" {
+            session.reset();
+            println!("\x1b[2m(conversation reset)\x1b[0m");
+            println!();
+            continue;
+        }
         if input == "quit" || input == "exit" {
             break;
         }
 
         let start = Instant::now();
-        match agent::run_agent(engine, input, &tools, max_turns, max_tokens, temperature) {
-            Ok(response) => {
+        match session.run_turn(
+            engine,
+            input,
+            &tools,
+            AgentSettings {
+                max_turns,
+                max_tokens,
+                temperature,
+            },
+        ) {
+            Ok(result) => {
                 println!();
-                println!("\x1b[1;34m{}\x1b[0m", response);
+                println!("\x1b[1;34m{}\x1b[0m", result.text);
+                if result.max_turns_reached {
+                    println!("\x1b[2m(agent stopped after reaching max turns)\x1b[0m");
+                }
                 println!();
                 let elapsed = start.elapsed();
                 println!("\x1b[2m({:.1}s)\x1b[0m", elapsed.as_secs_f64());
@@ -119,35 +143,37 @@ fn run_repl(
 fn main() -> Result<()> {
     infer::logging::init_default();
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     {
         anyhow::bail!(
-            "agent-infer requires the `cuda` feature. Rebuild without \
-             `--no-default-features`, or use the `infer` crate for CPU-only checks."
+            "agent-infer requires a local inference backend. Rebuild with either \
+             the default `cuda` feature or `--no-default-features --features metal,no-cuda`."
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     {
         let args = Args::parse();
-
-        let options = EngineOptions {
-            enable_cuda_graph: !args.no_cuda_graph,
-        };
-
         info!("Loading model from: {}", args.model_path);
         let load_start = Instant::now();
-        let mut engine = LoadedServerEngine::load_with_options(&args.model_path, 42, options)?;
+        let mut engine = LoadedAgentEngine::load(&args.model_path, !args.no_cuda_graph)?;
 
-        info!("Detected model type: {}", engine.model_type());
         if let Some(max_kv) = args.max_gpu_kv {
+            #[cfg(feature = "cuda")]
             info!(
                 "Setting max GPU KV to {} tokens (offload test mode)",
                 max_kv
             );
+            #[cfg(not(feature = "cuda"))]
+            warn!("Ignoring --max-gpu-kv: only supported by the CUDA backend");
             engine.set_max_gpu_kv(max_kv);
         }
-        info!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
+        info!(
+            "Model loaded in {:.1}s (backend={}, model={})",
+            load_start.elapsed().as_secs_f64(),
+            engine.backend_name(),
+            engine.model_id(),
+        );
         run_repl(
             &mut engine,
             args.max_turns,

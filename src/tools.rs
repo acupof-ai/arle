@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use infer::chat_protocol::{ToolCall as ProtocolToolCall, ToolDefinition};
 
@@ -13,6 +14,7 @@ enum BuiltinToolKind {
     Python,
 }
 
+#[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 impl BuiltinToolKind {
     const ALL: [Self; 2] = [Self::Shell, Self::Python];
 
@@ -109,9 +111,16 @@ impl Default for SandboxConfig {
         Self {
             timeout_secs: 30,
             max_memory_mb: 512,
-            workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+            workdir: default_workdir(),
         }
     }
+}
+
+fn default_workdir() -> String {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Check once whether nsjail is available.
@@ -185,15 +194,22 @@ impl SandboxConfig {
 
     /// Bare fallback when nsjail is unavailable.
     fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("--signal=KILL")
-            .arg(format!("{}s", self.timeout_secs));
-        cmd.arg("bash").arg("-c").arg(user_cmd);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(user_cmd);
         cmd.current_dir(&self.workdir);
         cmd.env_clear();
-        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
-        cmd.env("HOME", &self.workdir);
-        cmd.env("TMPDIR", &self.workdir);
+        cmd.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
+        );
+        cmd.env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
+        );
+        cmd.env(
+            "TMPDIR",
+            std::env::var("TMPDIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
+        );
         cmd.env("LANG", "C.UTF-8");
         cmd
     }
@@ -238,6 +254,7 @@ impl Tool {
 }
 
 /// Return the built-in tool definitions.
+#[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 pub fn builtin_tools() -> Vec<Tool> {
     BuiltinToolKind::ALL
         .into_iter()
@@ -301,16 +318,53 @@ fn collect_output(output: std::process::Output) -> String {
     result
 }
 
+enum TimedCommandResult {
+    Finished(std::process::Output),
+    TimedOut(std::process::Output),
+}
+
+fn run_command_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<TimedCommandResult> {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(TimedCommandResult::Finished);
+        }
+
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return child.wait_with_output().map(TimedCommandResult::TimedOut);
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn execute_shell(command: &str) -> String {
     log::info!("Executing shell (nsjail): {}", command);
     let sandbox = SandboxConfig::default();
     let mut cmd = sandbox.wrap_shell(command);
-    match cmd.output() {
-        Ok(output) => {
+    match run_command_with_timeout(&mut cmd, Duration::from_secs(sandbox.timeout_secs)) {
+        Ok(TimedCommandResult::Finished(output)) => {
             if output.status.code() == Some(137) {
                 return "Error: command killed (timeout or OOM)".to_string();
             }
             collect_output(output)
+        }
+        Ok(TimedCommandResult::TimedOut(output)) => {
+            let partial = collect_output(output);
+            if partial == "(no output)" {
+                "Error: command killed (timeout or OOM)".to_string()
+            } else {
+                format!("{partial}\n[stderr] Error: command killed (timeout or OOM)")
+            }
         }
         Err(e) => format!("Error executing command: {e}"),
     }
@@ -323,13 +377,56 @@ fn execute_python(code: &str) -> String {
         Ok(c) => c,
         Err(e) => return format!("Error preparing python sandbox: {e}"),
     };
-    match cmd.output() {
-        Ok(output) => {
+    match run_command_with_timeout(&mut cmd, Duration::from_secs(sandbox.timeout_secs)) {
+        Ok(TimedCommandResult::Finished(output)) => {
             if output.status.code() == Some(137) {
                 return "Error: python killed (timeout or OOM)".to_string();
             }
             collect_output(output)
         }
+        Ok(TimedCommandResult::TimedOut(output)) => {
+            let partial = collect_output(output);
+            if partial == "(no output)" {
+                "Error: python killed (timeout or OOM)".to_string()
+            } else {
+                format!("{partial}\n[stderr] Error: python killed (timeout or OOM)")
+            }
+        }
         Err(e) => format!("Error executing python: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_workdir, run_command_with_timeout};
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn default_workdir_uses_current_directory() {
+        let expected = std::env::current_dir().expect("current_dir");
+        assert_eq!(default_workdir(), expected.display().to_string());
+    }
+
+    #[test]
+    fn bare_command_runner_collects_stdout() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("printf 'hello'");
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).expect("run");
+        match result {
+            super::TimedCommandResult::Finished(output) => {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+            }
+            super::TimedCommandResult::TimedOut(_) => panic!("command unexpectedly timed out"),
+        }
+    }
+
+    #[test]
+    fn bare_command_runner_times_out_without_external_timeout_binary() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("sleep 2");
+        let result = run_command_with_timeout(&mut cmd, Duration::from_millis(100))
+            .expect("run with timeout");
+        assert!(matches!(result, super::TimedCommandResult::TimedOut(_)));
     }
 }

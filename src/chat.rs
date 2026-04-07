@@ -1,5 +1,4 @@
 pub type Message = infer::chat_protocol::ChatMessage;
-pub type Role = infer::chat_protocol::ChatRole;
 pub type ToolCall = infer::chat_protocol::ToolCall;
 
 use infer::chat_protocol::{ParsedAssistantResponse, ToolDefinition as ProtocolToolDefinition};
