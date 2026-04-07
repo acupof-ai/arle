@@ -50,7 +50,7 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 
 ### Git Conventions
 
-Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main`.
+Commitizen format: `<type>(<scope>): <subject>`.
 
 ### Code Conventions
 
