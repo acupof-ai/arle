@@ -11,3 +11,5 @@ build/
 release/
 .gstack/
 models/
+.DS_Store
+.context/
