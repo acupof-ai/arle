@@ -7,7 +7,7 @@ use infer::bootstrap::{
 };
 use infer::http_server::build_app;
 use infer::logging;
-use infer::model::kv_cache::KVCacheDtype;
+use infer::model::KVCacheDtype;
 use infer::scheduler::SchedulerConfig;
 use infer::trace_reporter::FileReporter;
 use log::info;

@@ -15,6 +15,7 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
+use crate::model::ModelForward;
 use crate::ops;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
