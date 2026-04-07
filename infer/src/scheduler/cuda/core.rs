@@ -78,6 +78,7 @@ impl<M: ModelForward> Scheduler<M> {
         seed: u64,
         config: SchedulerConfig,
         max_seq_len_override: Option<usize>,
+        kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
     ) -> Result<(Self, SchedulerHandle)> {
         config.validate()?;
 
@@ -92,6 +93,7 @@ impl<M: ModelForward> Scheduler<M> {
             if let Some(max_seq) = effective_max_seq_len {
                 state.set_max_seq_len(max_seq);
             }
+            state.set_kv_dtype(kv_cache_dtype);
             states.push(state);
             cached_prompts.push(Vec::new());
             info!("Initialized state slot {}/{}", i + 1, config.max_slots);

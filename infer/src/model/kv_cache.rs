@@ -1,24 +1,65 @@
-//! KV Cache — contiguous buffers for fused attention, with CPU offload support.
+//! KV Cache — contiguous buffers for fused attention, with CPU offload support
+//! and optional INT8 quantization.
 //!
 //! When the sequence length exceeds `max_gpu_seq_len`, the oldest KV blocks are
 //! offloaded to CPU (host) memory. Before attention kernels run, `ensure_on_gpu()`
 //! restores the full sequence to GPU so the kernels see a contiguous `0..seq_len` range.
 //! After attention, `offload_to_host()` moves the prefix back to CPU to free GPU memory.
+//!
+//! ## INT8 Quantization
+//!
+//! When `dtype = KVCacheDtype::INT8`, KV data is stored as INT8 with per-head per-token
+//! f32 scales. A shared bf16 working buffer (one layer's worth) is used for attention:
+//! - `prepare_layer()`: dequantize INT8 → bf16 working buffer
+//! - Attention kernels read/write the bf16 working buffer as usual
+//! - `commit_layer()`: quantize newly written bf16 tokens → INT8 storage
+//!
+//! Memory savings: ~46% (INT8 storage + scales + 1 layer bf16 working vs full bf16).
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::info;
 
+use crate::ops::kv_quant;
 use crate::tensor::{DeviceContext, DeviceVec};
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
 const OFFLOAD_BLOCK_SIZE: usize = 64;
 
+/// KV cache data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KVCacheDtype {
+    /// Full precision bf16 (default).
+    BF16,
+    /// Per-head per-token symmetric INT8 quantization.
+    INT8,
+}
+
+impl Default for KVCacheDtype {
+    fn default() -> Self {
+        Self::BF16
+    }
+}
+
 /// KV Cache — contiguous buffers for fused attention.
 pub(crate) struct KVCache {
+    // ─── BF16 storage (used when dtype=BF16) ───
     // [layer] -> contiguous buffer (num_kv_heads * max_seq * head_dim)
     k_cache: Vec<DeviceVec>,
     v_cache: Vec<DeviceVec>,
+
+    // ─── INT8 storage (used when dtype=INT8) ───
+    k_cache_q: Vec<CudaSlice<i8>>,
+    v_cache_q: Vec<CudaSlice<i8>>,
+    k_scales: Vec<CudaSlice<f32>>,
+    v_scales: Vec<CudaSlice<f32>>,
+    // Shared bf16 working buffers (1 layer, reused across layers)
+    k_work: Option<DeviceVec>,
+    v_work: Option<DeviceVec>,
+
+    // ─── Common fields ───
+    dtype: KVCacheDtype,
     seq_len: usize,
     head_dim: usize,
     num_layers: usize,
@@ -47,6 +88,13 @@ impl KVCache {
         Self {
             k_cache: Vec::new(),
             v_cache: Vec::new(),
+            k_cache_q: Vec::new(),
+            v_cache_q: Vec::new(),
+            k_scales: Vec::new(),
+            v_scales: Vec::new(),
+            k_work: None,
+            v_work: None,
+            dtype: KVCacheDtype::BF16,
             seq_len: 0,
             head_dim: 0,
             num_layers,
@@ -58,6 +106,18 @@ impl KVCache {
             v_host: Vec::new(),
             gpu_has_full_seq: true,
         }
+    }
+
+    /// Set KV cache quantization dtype. Must be called before `init_if_needed()`.
+    pub(crate) fn set_dtype(&mut self, dtype: KVCacheDtype) {
+        self.dtype = dtype;
+        if dtype == KVCacheDtype::INT8 {
+            info!("KV cache: INT8 quantization enabled (per-head per-token symmetric)");
+        }
+    }
+
+    pub(crate) fn dtype(&self) -> KVCacheDtype {
+        self.dtype
     }
 
     /// Set the maximum number of tokens to keep on GPU.
@@ -112,47 +172,218 @@ impl KVCache {
         self.num_kv_heads * self.head_dim
     }
 
-    /// Get mutable references to K/V cache for a layer
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+
+    pub(crate) fn init_if_needed(&mut self, ctx: &DeviceContext, head_dim: usize) -> Result<()> {
+        if self.head_dim != 0 {
+            return Ok(());
+        }
+
+        let cache_size = self.num_kv_heads * self.max_seq_len * head_dim;
+
+        match self.dtype {
+            KVCacheDtype::BF16 => {
+                let mut k_tmp = Vec::with_capacity(self.num_layers);
+                let mut v_tmp = Vec::with_capacity(self.num_layers);
+                for _ in 0..self.num_layers {
+                    k_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
+                    v_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
+                }
+                self.k_cache = k_tmp;
+                self.v_cache = v_tmp;
+            }
+            KVCacheDtype::INT8 => {
+                let scale_size = self.num_kv_heads * self.max_seq_len;
+
+                let mut kq = Vec::with_capacity(self.num_layers);
+                let mut vq = Vec::with_capacity(self.num_layers);
+                let mut ks = Vec::with_capacity(self.num_layers);
+                let mut vs = Vec::with_capacity(self.num_layers);
+                for _ in 0..self.num_layers {
+                    kq.push(
+                        ctx.stream
+                            .alloc_zeros::<i8>(cache_size)
+                            .map_err(|e| anyhow!("INT8 K alloc failed: {e}"))?,
+                    );
+                    vq.push(
+                        ctx.stream
+                            .alloc_zeros::<i8>(cache_size)
+                            .map_err(|e| anyhow!("INT8 V alloc failed: {e}"))?,
+                    );
+                    ks.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(scale_size)
+                            .map_err(|e| anyhow!("K scales alloc failed: {e}"))?,
+                    );
+                    vs.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(scale_size)
+                            .map_err(|e| anyhow!("V scales alloc failed: {e}"))?,
+                    );
+                }
+                self.k_cache_q = kq;
+                self.v_cache_q = vq;
+                self.k_scales = ks;
+                self.v_scales = vs;
+
+                // Shared bf16 working buffers (1 layer's worth)
+                self.k_work = Some(DeviceVec::zeros(ctx, cache_size)?);
+                self.v_work = Some(DeviceVec::zeros(ctx, cache_size)?);
+
+                let int8_bytes = self.num_layers * cache_size; // K+V each
+                let scale_bytes = self.num_layers * scale_size * 4;
+                let work_bytes = cache_size * 2 * 2; // K+V, bf16=2 bytes
+                let bf16_bytes = self.num_layers * cache_size * 2 * 2;
+                info!(
+                    "KV cache INT8: storage={:.1}MB scales={:.1}MB working={:.1}MB (was {:.1}MB bf16, saving {:.0}%)",
+                    (int8_bytes * 2) as f64 / 1e6,
+                    (scale_bytes * 2) as f64 / 1e6,
+                    work_bytes as f64 / 1e6,
+                    bf16_bytes as f64 / 1e6,
+                    (1.0 - (int8_bytes * 2 + scale_bytes * 2 + work_bytes) as f64 / bf16_bytes as f64) * 100.0,
+                );
+            }
+        }
+
+        self.head_dim = head_dim;
+        self.k_host = vec![Vec::new(); self.num_layers];
+        self.v_host = vec![Vec::new(); self.num_layers];
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Layer access: prepare / commit pattern
+    // ========================================================================
+
+    /// Get mutable references to K/V cache for a layer (BF16 mode only).
+    ///
+    /// For INT8 mode, use `prepare_layer()` / `commit_layer()` instead.
     pub(crate) fn get_cache_mut(
         &mut self,
         ctx: &DeviceContext,
         layer: usize,
     ) -> Result<(&mut DeviceVec, &mut DeviceVec)> {
-        // Initialize on first access
-        if self.k_cache.is_empty() {
+        // Initialize on first access (legacy path)
+        if self.head_dim == 0 {
+            // Can't determine head_dim here — caller should call init_if_needed first.
+            let cache_size = self.num_kv_heads * self.max_seq_len * 128; // fallback
             let mut k_tmp = Vec::with_capacity(self.num_layers);
             let mut v_tmp = Vec::with_capacity(self.num_layers);
             for _ in 0..self.num_layers {
-                // Allocate max size upfront
-                let cache_size = self.num_kv_heads * self.max_seq_len * self.head_dim;
                 k_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
                 v_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
             }
             self.k_cache = k_tmp;
             self.v_cache = v_tmp;
+            self.head_dim = 128;
         }
         Ok((&mut self.k_cache[layer], &mut self.v_cache[layer]))
     }
 
-    pub(crate) fn init_if_needed(&mut self, ctx: &DeviceContext, head_dim: usize) -> Result<()> {
-        if self.head_dim == 0 {
-            let mut k_tmp = Vec::with_capacity(self.num_layers);
-            let mut v_tmp = Vec::with_capacity(self.num_layers);
-            for _ in 0..self.num_layers {
-                let cache_size = self.num_kv_heads * self.max_seq_len * head_dim;
-                k_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
-                v_tmp.push(DeviceVec::zeros(ctx, cache_size)?);
+    /// Prepare a layer's KV cache for attention.
+    ///
+    /// - **BF16**: Returns references to the per-layer bf16 buffers (no-op).
+    /// - **INT8**: Dequantizes `[0..seq_len)` from INT8 storage into shared bf16
+    ///   working buffers, then returns references to those working buffers.
+    ///
+    /// After attention completes, call `commit_layer()` to quantize new tokens back.
+    pub(crate) fn prepare_layer(
+        &mut self,
+        ctx: &DeviceContext,
+        layer: usize,
+    ) -> Result<(&mut DeviceVec, &mut DeviceVec)> {
+        match self.dtype {
+            KVCacheDtype::BF16 => {
+                Ok((&mut self.k_cache[layer], &mut self.v_cache[layer]))
             }
-            // All allocations succeeded — commit state atomically.
-            self.k_cache = k_tmp;
-            self.v_cache = v_tmp;
-            self.head_dim = head_dim;
-            // Initialize host buffers (empty initially).
-            self.k_host = vec![Vec::new(); self.num_layers];
-            self.v_host = vec![Vec::new(); self.num_layers];
+            KVCacheDtype::INT8 => {
+                // Dequantize existing tokens [0..seq_len) → bf16 working buffers
+                let seq_len = self.seq_len;
+                let num_kv_heads = self.num_kv_heads;
+                let head_dim = self.head_dim;
+                let max_seq_len = self.max_seq_len;
+
+                if seq_len > 0 {
+                    // Borrow INT8 storage immutably, working buffers mutably
+                    // Need to use raw pointer trick to satisfy borrow checker
+                    let k_int8 = &self.k_cache_q[layer];
+                    let v_int8 = &self.v_cache_q[layer];
+                    let k_sc = &self.k_scales[layer];
+                    let v_sc = &self.v_scales[layer];
+                    let k_work = self.k_work.as_mut().expect("INT8 k_work not initialized");
+                    kv_quant::dequantize_kv(
+                        ctx, k_int8, k_sc, k_work,
+                        num_kv_heads, head_dim, max_seq_len, seq_len,
+                    )?;
+                    let v_work = self.v_work.as_mut().expect("INT8 v_work not initialized");
+                    kv_quant::dequantize_kv(
+                        ctx, v_int8, v_sc, v_work,
+                        num_kv_heads, head_dim, max_seq_len, seq_len,
+                    )?;
+                }
+
+                let k_work = self.k_work.as_mut().expect("INT8 k_work not initialized");
+                let v_work = self.v_work.as_mut().expect("INT8 v_work not initialized");
+                Ok((k_work, v_work))
+            }
         }
+    }
+
+    /// Commit newly written tokens from bf16 working buffer → INT8 storage.
+    ///
+    /// - **BF16**: No-op.
+    /// - **INT8**: Quantizes `[start_pos..start_pos+token_count)` from the bf16
+    ///   working buffer into INT8 storage.
+    ///
+    /// # Arguments
+    /// * `start_pos` — First token position written by the attention kernel.
+    /// * `token_count` — Number of new tokens written.
+    pub(crate) fn commit_layer(
+        &mut self,
+        ctx: &DeviceContext,
+        layer: usize,
+        start_pos: usize,
+        token_count: usize,
+    ) -> Result<()> {
+        if self.dtype != KVCacheDtype::INT8 || token_count == 0 {
+            return Ok(());
+        }
+
+        let num_kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let max_seq_len = self.max_seq_len;
+
+        // Quantize K working → INT8
+        {
+            let k_work = self.k_work.as_ref().expect("INT8 k_work not initialized");
+            let k_int8 = &mut self.k_cache_q[layer];
+            let k_sc = &mut self.k_scales[layer];
+            kv_quant::quantize_kv(
+                ctx, k_work, k_int8, k_sc,
+                num_kv_heads, head_dim, max_seq_len, start_pos, token_count,
+            )?;
+        }
+
+        // Quantize V working → INT8
+        {
+            let v_work = self.v_work.as_ref().expect("INT8 v_work not initialized");
+            let v_int8 = &mut self.v_cache_q[layer];
+            let v_sc = &mut self.v_scales[layer];
+            kv_quant::quantize_kv(
+                ctx, v_work, v_int8, v_sc,
+                num_kv_heads, head_dim, max_seq_len, start_pos, token_count,
+            )?;
+        }
+
         Ok(())
     }
+
+    // ========================================================================
+    // Sequence management
+    // ========================================================================
 
     pub(crate) fn increment_seq_len(&mut self) {
         self.seq_len += 1;
@@ -247,6 +478,10 @@ impl KVCache {
         }
     }
 
+    // ========================================================================
+    // CPU offload (BF16 mode only — INT8 offload is future work)
+    // ========================================================================
+
     /// Offload oldest KV blocks to CPU if GPU seq_len exceeds the budget.
     ///
     /// Call this after `advance_seq_len()` or `increment_seq_len()` when the
@@ -258,6 +493,11 @@ impl KVCache {
     /// - The CUDA kernels will be told `seq_len = gpu_seq_len` until
     ///   `ensure_on_gpu()` is called.
     pub(crate) fn offload_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
+        // INT8 mode: offload not yet supported
+        if self.dtype == KVCacheDtype::INT8 {
+            return Ok(());
+        }
+
         // If the full sequence was restored to GPU by ensure_on_gpu(), we need to
         // first move the prefix back to its CPU-only state before computing what
         // else needs offloading. Otherwise we'd re-offload already-offloaded data.

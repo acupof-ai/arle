@@ -4,6 +4,7 @@ mod attention;
 mod elementwise;
 mod embedding;
 mod kv_ops;
+pub(crate) mod kv_quant;
 mod linear;
 mod norm;
 mod recurrent;
