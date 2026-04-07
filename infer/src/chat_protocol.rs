@@ -171,14 +171,39 @@ impl ToolDefinition {
 
     fn prompt_schema(&self) -> Value {
         json!({
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            }
+            "name": self.name,
+            "description": self.description,
+            "arguments": compact_parameters(&self.parameters),
         })
     }
+}
+
+fn compact_parameters(parameters: &Value) -> Value {
+    let Some(object) = parameters.as_object() else {
+        return parameters.clone();
+    };
+
+    let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+        return parameters.clone();
+    };
+
+    let mut compact = Map::new();
+    for (name, schema) in properties {
+        let ty = schema
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("value")
+            .to_string();
+        compact.insert(name.clone(), Value::String(ty));
+    }
+
+    if let Some(required) = object.get("required").and_then(Value::as_array)
+        && !required.is_empty()
+    {
+        compact.insert("required".to_string(), Value::Array(required.clone()));
+    }
+
+    Value::Object(compact)
 }
 
 /// Structured tool call emitted by the model or embedded in an assistant turn.
@@ -294,9 +319,7 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
         return String::new();
     }
 
-    let mut out = String::from(
-        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
-    );
+    let mut out = String::from("\n<tools>");
 
     for tool in tools {
         out.push('\n');
@@ -305,7 +328,7 @@ pub fn build_tool_block(tools: &[ToolDefinition]) -> String {
         );
     }
 
-    out.push_str("\n</tools>\n\nFor each function call, return a JSON object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+    out.push_str("\n</tools>\nUse <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>.");
     out
 }
 
@@ -380,6 +403,24 @@ mod tests {
         assert!(prompt.contains("<|im_start|>system\n"));
         assert!(prompt.contains("shell"));
         assert!(prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn tool_block_uses_compact_argument_shape() {
+        let block = build_tool_block(&[ToolDefinition::new(
+            "shell",
+            "Run a shell command",
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        )]);
+
+        assert!(block.contains(r#""arguments":{"command":"string","required":["command"]}"#));
+        assert!(!block.contains(r#""type":"function""#));
+        assert!(!block.contains(r#""properties""#));
+        assert!(!block.contains("You may call one or more functions"));
     }
 
     #[test]

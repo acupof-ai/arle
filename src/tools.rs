@@ -37,12 +37,8 @@ impl BuiltinToolKind {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Shell => {
-                "Execute a shell command and return its stdout and stderr. Use this for file operations, system inspection, running programs, etc."
-            }
-            Self::Python => {
-                "Execute a Python 3 code snippet and return its stdout and stderr. Use this for calculations, data processing, or any task best done in Python."
-            }
+            Self::Shell => "Run a shell command.",
+            Self::Python => "Run Python 3 code.",
         }
     }
 
@@ -52,8 +48,7 @@ impl BuiltinToolKind {
                 "type": "object",
                 "properties": {
                     "command": {
-                        "type": "string",
-                        "description": "The shell command to execute"
+                        "type": "string"
                     }
                 },
                 "required": ["command"]
@@ -62,8 +57,7 @@ impl BuiltinToolKind {
                 "type": "object",
                 "properties": {
                     "code": {
-                        "type": "string",
-                        "description": "The Python 3 code to execute"
+                        "type": "string"
                     }
                 },
                 "required": ["code"]

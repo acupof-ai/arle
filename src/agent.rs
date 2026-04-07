@@ -13,17 +13,13 @@ use crate::chat::{Message, format_prompt, parse_tool_calls};
 use crate::engine::AgentEngine;
 use crate::tools::{Tool, execute_tool_call};
 
-const SYSTEM_PROMPT: &str = r#"You are a local CLI assistant with access to tools.
-
-Rules:
-- If the user can be answered directly without tools, answer directly and briefly.
-- If the user asks for an exact format, exact word, or exact integer, output exactly that and nothing else.
-- Only use tools when they are necessary to get information, inspect files, or compute something reliably.
-- If a tool is needed, emit a <tool_call> block immediately. Do not narrate your reasoning before the tool call.
-- After receiving tool results, answer with the final result directly.
-- Do not expose chain-of-thought. Do not explain your internal reasoning unless the user explicitly asks for it.
-- Prefer the python tool for arithmetic and structured computation.
-"#;
+const SYSTEM_PROMPT: &str = r#"You are a local CLI assistant with shell and python tools.
+Answer briefly.
+If a tool is needed, emit a <tool_call> block immediately with no explanation first.
+After tool results, answer directly.
+If the user asks for an exact format, output exactly that.
+Do not expose chain-of-thought.
+Prefer python for arithmetic and structured computation."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -139,6 +135,31 @@ impl AgentSession {
         let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
 
+        if let Some(initial) = extract_tool_calls_from_user_request(user_input, tools) {
+            info!("Recovered tool call(s) from user request before first model turn");
+            self.messages
+                .push(Message::assistant("", initial.tool_calls.clone()));
+            execute_tool_calls(
+                &initial.tool_calls,
+                &mut self.messages,
+                &mut tool_calls_executed,
+                &mut last_tool_name,
+                &mut last_tool_scalar_result,
+            );
+
+            if let Some(text) = finalize_after_tool_execution(
+                user_input,
+                last_tool_name.as_deref(),
+                last_tool_scalar_result.as_deref(),
+            ) {
+                return Ok(AgentTurnResult {
+                    text,
+                    tool_calls_executed,
+                    max_turns_reached: false,
+                });
+            }
+        }
+
         for turn in 0..settings.max_turns {
             let prompt = format_prompt(&self.messages, tools);
             info!(
@@ -204,30 +225,13 @@ impl AgentSession {
                 println!("\x1b[2m{}\x1b[0m", content);
             }
 
-            println!();
-            for tool_call in &tool_calls {
-                tool_calls_executed += 1;
-                println!(
-                    "\x1b[33m[tool: {}]\x1b[0m {}",
-                    tool_call.name,
-                    serde_json::to_string(&tool_call.arguments).unwrap_or_default()
-                );
-
-                let result = execute_tool_call(tool_call);
-                let display_result = if result.len() > 500 {
-                    format!("{}... ({} chars total)", &result[..500], result.len())
-                } else {
-                    result.clone()
-                };
-
-                println!("\x1b[36m{}\x1b[0m", display_result);
-                println!();
-
-                last_tool_scalar_result = scalar_tool_result(&result);
-                last_tool_name = Some(tool_call.name.clone());
-                self.messages
-                    .push(Message::tool_result(&tool_call.name, &result));
-            }
+            execute_tool_calls(
+                &tool_calls,
+                &mut self.messages,
+                &mut tool_calls_executed,
+                &mut last_tool_name,
+                &mut last_tool_scalar_result,
+            );
 
             if let Some(text) = finalize_after_tool_execution(
                 user_input,
@@ -471,6 +475,38 @@ fn single_tool_response(name: &str, arguments: serde_json::Value) -> ParsedAssis
     ParsedAssistantResponse {
         content: String::new(),
         tool_calls: vec![ProtocolToolCall::new(name, arguments)],
+    }
+}
+
+fn execute_tool_calls(
+    tool_calls: &[ProtocolToolCall],
+    messages: &mut Vec<Message>,
+    tool_calls_executed: &mut usize,
+    last_tool_name: &mut Option<String>,
+    last_tool_scalar_result: &mut Option<String>,
+) {
+    println!();
+    for tool_call in tool_calls {
+        *tool_calls_executed += 1;
+        println!(
+            "\x1b[33m[tool: {}]\x1b[0m {}",
+            tool_call.name,
+            serde_json::to_string(&tool_call.arguments).unwrap_or_default()
+        );
+
+        let result = execute_tool_call(tool_call);
+        let display_result = if result.len() > 500 {
+            format!("{}... ({} chars total)", &result[..500], result.len())
+        } else {
+            result.clone()
+        };
+
+        println!("\x1b[36m{}\x1b[0m", display_result);
+        println!();
+
+        *last_tool_scalar_result = scalar_tool_result(&result);
+        *last_tool_name = Some(tool_call.name.clone());
+        messages.push(Message::tool_result(&tool_call.name, &result));
     }
 }
 
@@ -919,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_python_request_is_recovered_without_model_tool_xml() {
+    fn explicit_python_request_can_skip_model_generation() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec!["I'll help with that.", "The result is 56088."]);
 
@@ -934,7 +970,7 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "56088");
-        assert_eq!(engine.prompts.len(), 1);
+        assert_eq!(engine.prompts.len(), 0);
     }
 
     #[test]
@@ -948,7 +984,7 @@ mod tests {
         let result = session
             .run_turn(
                 &mut engine,
-                "Use the python tool to compute 7 * 8. After the tool returns, answer with just the integer.",
+                "What is 7 * 8? After the tool returns, answer with just the integer.",
                 &[python_tool()],
                 settings(),
             )
@@ -981,7 +1017,7 @@ mod tests {
 
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "Listed the current directory above.");
-        assert_eq!(engine.prompts.len(), 1);
+        assert_eq!(engine.prompts.len(), 0);
     }
 
     #[cfg(any(feature = "cuda", feature = "metal"))]
