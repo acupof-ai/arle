@@ -43,10 +43,29 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
-    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+    fn decode_strict(&self, ids: &[u32]) -> Result<String> {
         self.inner
             .decode(ids, true)
             .map_err(|e| anyhow::anyhow!("Decode error: {}", e))
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self.decode_strict(ids) {
+            Ok(text) => Ok(text),
+            Err(err) => {
+                log::warn!(
+                    "Tokenizer decode failed for {} token(s): {:#}. Falling back to lossy incremental decode.",
+                    ids.len(),
+                    err
+                );
+                let lossy = self.decode_lossy(ids);
+                if lossy.is_empty() && !ids.is_empty() {
+                    Err(err)
+                } else {
+                    Ok(lossy)
+                }
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -61,6 +80,33 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
+    }
+
+    fn decode_lossy(&self, ids: &[u32]) -> String {
+        let mut decoder = self.incremental_decoder();
+        let mut out = String::new();
+
+        for &id in ids {
+            match decoder.step(id) {
+                Ok(Some(chunk)) => out.push_str(&chunk),
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!(
+                        "Skipping undecodable token {} during fallback decode: {:#}",
+                        id,
+                        err
+                    );
+                    out.push('\u{fffd}');
+                    decoder = self.incremental_decoder();
+                }
+            }
+        }
+
+        if let Some(tail) = decoder.finish_lossy() {
+            out.push_str(&tail);
+        }
+
+        out
     }
 }
 
@@ -86,7 +132,7 @@ impl IncrementalDecoder<'_> {
     }
 
     pub(crate) fn finish(&mut self) -> Result<Option<String>> {
-        let decoded = self.tokenizer.decode(&self.token_ids)?;
+        let decoded = self.tokenizer.decode_strict(&self.token_ids)?;
         let suffix = decoded.strip_prefix(&self.emitted_text).ok_or_else(|| {
             anyhow!(
                 "Streaming decoder state mismatch: emitted text is not a prefix of final decode"
@@ -98,6 +144,17 @@ impl IncrementalDecoder<'_> {
         } else {
             self.emitted_text.push_str(suffix);
             Ok(Some(suffix.to_string()))
+        }
+    }
+
+    fn finish_lossy(&mut self) -> Option<String> {
+        let decoded = self.tokenizer.decode_strict(&self.token_ids).ok()?;
+        let suffix = decoded.strip_prefix(&self.emitted_text)?;
+        if suffix.is_empty() {
+            None
+        } else {
+            self.emitted_text.push_str(suffix);
+            Some(suffix.to_string())
         }
     }
 }

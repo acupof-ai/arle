@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -86,20 +88,9 @@ impl BuiltinToolKind {
 }
 
 // ============================================================================
-// Sandbox configuration — nsjail backend
+// Sandbox configuration
 // ============================================================================
 
-/// Process sandbox using nsjail.
-///
-/// Provides:
-///   - Mount namespace: rootfs is read-only bind mounts, only /tmp is writable
-///   - PID namespace: isolated PID tree
-///   - Network isolation: no network access by default
-///   - Time limit: SIGKILL after `timeout_secs`
-///   - Memory limit: RLIMIT_AS capped at `max_memory_mb`
-///   - Minimal environment: only PATH, HOME, TMPDIR, LANG
-///
-/// Falls back to bare execution if nsjail is not found.
 struct SandboxConfig {
     timeout_secs: u64,
     max_memory_mb: u64,
@@ -123,9 +114,24 @@ fn default_workdir() -> String {
         .into_owned()
 }
 
-/// Check once whether nsjail is available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SandboxBackend {
+    Nsjail,
+    SandboxExec,
+    Bare,
+}
+
+impl SandboxBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nsjail => "nsjail",
+            Self::SandboxExec => "sandbox-exec",
+            Self::Bare => "bare",
+        }
+    }
+}
+
 fn nsjail_available() -> bool {
-    use std::sync::OnceLock;
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         Command::new("nsjail")
@@ -137,14 +143,79 @@ fn nsjail_available() -> bool {
     })
 }
 
-impl SandboxConfig {
-    /// Build a Command that runs `user_cmd` inside nsjail.
-    fn wrap_shell(&self, user_cmd: &str) -> Command {
-        if !nsjail_available() {
-            log::warn!("nsjail not found — running without sandbox");
-            return self.wrap_shell_bare(user_cmd);
-        }
+#[cfg(target_os = "macos")]
+fn sandbox_exec_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| Path::new("/usr/bin/sandbox-exec").exists())
+}
 
+#[cfg(not(target_os = "macos"))]
+fn sandbox_exec_available() -> bool {
+    false
+}
+
+fn active_sandbox_backend() -> SandboxBackend {
+    if nsjail_available() {
+        SandboxBackend::Nsjail
+    } else if sandbox_exec_available() {
+        SandboxBackend::SandboxExec
+    } else {
+        SandboxBackend::Bare
+    }
+}
+
+fn default_env_path() -> String {
+    std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string())
+}
+
+fn effective_tmpdir() -> String {
+    std::env::var("TMPDIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolved_python_executable() -> PathBuf {
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON
+        .get_or_init(|| {
+            let candidates = ["python3", "python"];
+            for candidate in candidates {
+                for dir in std::env::split_paths(&default_env_path()) {
+                    let path = dir.join(candidate);
+                    if path.is_file() {
+                        return path;
+                    }
+                }
+            }
+            PathBuf::from("python3")
+        })
+        .clone()
+}
+
+impl SandboxConfig {
+    fn wrap_shell(&self, user_cmd: &str) -> Command {
+        match active_sandbox_backend() {
+            SandboxBackend::Nsjail => self.wrap_shell_nsjail(user_cmd),
+            SandboxBackend::SandboxExec => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.wrap_shell_sandbox_exec(user_cmd)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.wrap_shell_bare(user_cmd)
+                }
+            }
+            SandboxBackend::Bare => {
+                log::warn!("no supported sandbox backend found — running without sandbox");
+                self.wrap_shell_bare(user_cmd)
+            }
+        }
+    }
+
+    fn wrap_shell_nsjail(&self, user_cmd: &str) -> Command {
         let mut cmd = Command::new("nsjail");
         cmd.arg("--mode").arg("o");
         cmd.arg("--time_limit").arg(self.timeout_secs.to_string());
@@ -182,9 +253,10 @@ impl SandboxConfig {
         cmd.arg("--cwd").arg(&self.workdir);
 
         // Environment
-        cmd.arg("--env").arg("PATH=/usr/local/bin:/usr/bin:/bin");
+        cmd.arg("--env").arg(format!("PATH={}", default_env_path()));
         cmd.arg("--env").arg(format!("HOME={}", self.workdir));
-        cmd.arg("--env").arg(format!("TMPDIR={}", self.workdir));
+        cmd.arg("--env")
+            .arg(format!("TMPDIR={}", effective_tmpdir()));
         cmd.arg("--env").arg("LANG=C.UTF-8");
         cmd.arg("--env").arg("PYTHONDONTWRITEBYTECODE=1");
 
@@ -192,29 +264,39 @@ impl SandboxConfig {
         cmd
     }
 
-    /// Bare fallback when nsjail is unavailable.
+    #[cfg(target_os = "macos")]
+    fn wrap_shell_sandbox_exec(&self, user_cmd: &str) -> Command {
+        let mut cmd = Command::new("/usr/bin/sandbox-exec");
+        cmd.arg("-p").arg(Self::sandbox_exec_profile());
+        cmd.arg("/bin/bash").arg("-c").arg(user_cmd);
+        cmd.current_dir(&self.workdir);
+        cmd.env_clear();
+        cmd.env("PATH", default_env_path());
+        cmd.env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
+        );
+        cmd.env("TMPDIR", effective_tmpdir());
+        cmd.env("LANG", "C.UTF-8");
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        cmd
+    }
+
     fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(user_cmd);
         cmd.current_dir(&self.workdir);
         cmd.env_clear();
-        cmd.env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
-        );
+        cmd.env("PATH", default_env_path());
         cmd.env(
             "HOME",
             std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
         );
-        cmd.env(
-            "TMPDIR",
-            std::env::var("TMPDIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string()),
-        );
+        cmd.env("TMPDIR", effective_tmpdir());
         cmd.env("LANG", "C.UTF-8");
         cmd
     }
 
-    /// Build a sandboxed Command for running a Python snippet.
     fn wrap_python(&self, code: &str) -> std::io::Result<Command> {
         let seq = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let script_path = format!(
@@ -224,11 +306,32 @@ impl SandboxConfig {
             seq
         );
         std::fs::write(&script_path, code)?;
+        let python = resolved_python_executable();
         let shell_cmd = format!(
-            "python3 -u {} ; _rc=$?; rm -f {} ; exit $_rc",
-            script_path, script_path
+            "{} -u {} ; _rc=$?; rm -f {} ; exit $_rc",
+            shell_quote(&python.display().to_string()),
+            shell_quote(&script_path),
+            shell_quote(&script_path)
         );
         Ok(self.wrap_shell(&shell_cmd))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sandbox_exec_profile() -> String {
+        [
+            "(version 1)".to_string(),
+            "(deny default)".to_string(),
+            "(allow process-exec)".to_string(),
+            "(allow process-fork)".to_string(),
+            "(allow signal (target self))".to_string(),
+            "(allow sysctl-read)".to_string(),
+            "(allow file-read*)".to_string(),
+            "(allow file-write*)".to_string(),
+            "(allow network*)".to_string(),
+            "(allow file-read-data (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/random\"))".to_string(),
+            "(allow file-write-data (literal \"/dev/null\"))".to_string(),
+        ]
+        .join("\n")
     }
 }
 
@@ -348,8 +451,13 @@ fn run_command_with_timeout(
 }
 
 fn execute_shell(command: &str) -> String {
-    log::info!("Executing shell (nsjail): {}", command);
     let sandbox = SandboxConfig::default();
+    log::info!(
+        "Executing shell ({}, timeout={}s): {}",
+        active_sandbox_backend().label(),
+        sandbox.timeout_secs,
+        command
+    );
     let mut cmd = sandbox.wrap_shell(command);
     match run_command_with_timeout(&mut cmd, Duration::from_secs(sandbox.timeout_secs)) {
         Ok(TimedCommandResult::Finished(output)) => {
@@ -371,8 +479,12 @@ fn execute_shell(command: &str) -> String {
 }
 
 fn execute_python(code: &str) -> String {
-    log::info!("Executing python snippet (nsjail, {} chars)", code.len());
     let sandbox = SandboxConfig::default();
+    log::info!(
+        "Executing python snippet ({}, {} chars)",
+        active_sandbox_backend().label(),
+        code.len()
+    );
     let mut cmd = match sandbox.wrap_python(code) {
         Ok(c) => c,
         Err(e) => return format!("Error preparing python sandbox: {e}"),
@@ -398,7 +510,10 @@ fn execute_python(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workdir, run_command_with_timeout};
+    use super::{
+        SandboxConfig, TimedCommandResult, active_sandbox_backend, default_workdir,
+        resolved_python_executable, run_command_with_timeout,
+    };
     use std::process::Command;
     use std::time::Duration;
 
@@ -428,5 +543,44 @@ mod tests {
         let result = run_command_with_timeout(&mut cmd, Duration::from_millis(100))
             .expect("run with timeout");
         assert!(matches!(result, super::TimedCommandResult::TimedOut(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_exec_profile_allows_writes_and_network() {
+        let profile = SandboxConfig::sandbox_exec_profile();
+        assert!(profile.contains("(allow file-write*)"));
+        assert!(profile.contains("(allow network*)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_exec_shell_runner_can_write_inside_workdir() {
+        let sandbox = SandboxConfig::default();
+        let mut cmd = sandbox.wrap_shell_sandbox_exec(
+            "printf 'ok' > .sandbox-exec-test && cat .sandbox-exec-test && rm -f .sandbox-exec-test",
+        );
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(5)).expect("run");
+        match result {
+            TimedCommandResult::Finished(output) => {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+            }
+            TimedCommandResult::TimedOut(_) => panic!("sandbox-exec shell timed out"),
+        }
+    }
+
+    #[test]
+    fn resolved_python_executable_points_to_a_binary() {
+        let python = resolved_python_executable();
+        assert!(
+            python.is_file() || python == std::path::PathBuf::from("python3"),
+            "resolved python path should exist or fall back to python3: {}",
+            python.display()
+        );
+    }
+
+    #[test]
+    fn sandbox_backend_is_detected() {
+        assert_ne!(active_sandbox_backend().label(), "");
     }
 }

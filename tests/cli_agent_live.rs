@@ -1,4 +1,4 @@
-#![cfg(any(feature = "cuda", feature = "metal"))]
+#![cfg(all(feature = "cli", any(feature = "cuda", feature = "metal")))]
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -136,6 +136,40 @@ fn cli_repl_handles_multiple_turns_and_reset() {
     assert!(
         stdout.contains("\u{1b}[1;34m4\u{1b}[0m") && stdout.contains("\u{1b}[1;34m6\u{1b}[0m"),
         "CLI did not produce the expected final answers for both turns\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires a local model auto-detected by the CLI"]
+fn cli_uses_shell_for_file_listing_queries() {
+    let _guard = live_test_guard();
+
+    if !live_model_available() {
+        eprintln!("Skipping live CLI test: no local model available");
+        return;
+    }
+
+    let output = run_cli_session(&["本地有哪些文件"], Duration::from_secs(120));
+
+    assert!(
+        output.status.success(),
+        "CLI exited with failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[tool: shell]"),
+        "CLI did not execute the shell tool\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("/path/to/code/agent-infer"),
+        "CLI shell output did not include the expected working directory\nstdout:\n{}\nstderr:\n{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)
     );
