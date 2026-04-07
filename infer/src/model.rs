@@ -12,11 +12,61 @@ pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
 mod kv_cache;
 
+pub mod glm4;
 pub mod qwen3;
 pub mod qwen35;
 
+pub use glm4::GLM4Model;
+#[cfg(feature = "cuda")]
+pub use glm4::GLM4State;
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
 pub use qwen35::{Qwen35Model, Qwen35State};
+
+// ============================================================================
+// DecodeContextOps trait — scheduler-level operations on decode buffers
+// ============================================================================
+
+/// Operations the scheduler can perform on a model's decode context,
+/// independent of the model architecture.
+///
+/// This decouples scheduler-level work (H2D copies, FlashInfer metadata
+/// management) from model-level computation, so new models don't need to
+/// duplicate this boilerplate in their `decode_batch()` implementations.
+pub trait DecodeContextOps {
+    /// Upload token IDs from host to GPU. Called before `forward_decode_batch`.
+    fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()>;
+
+    /// Update FlashInfer paged KV metadata (positions, indptr, indices,
+    /// last_page_len) for the given slots.
+    ///
+    /// Returns `true` if the kv_indices GPU buffer was reallocated (caller
+    /// should invalidate any CUDA graph that captured the old pointer).
+    fn update_metadata(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot_indices: &[usize],
+    ) -> Result<bool>;
+
+    /// Plan FlashInfer attention for the current batch.
+    /// Must be called once per decode step after `update_metadata()`.
+    fn plan_attention(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<()>;
+
+    /// Set the active batch size on all internal buffers (must be <= max_batch_size).
+    fn set_batch_size(&mut self, bs: usize);
+
+    /// Invalidate the CUDA graph cache entry for the given batch size.
+    /// Called by the scheduler when metadata reallocation invalidates captured pointers.
+    fn invalidate_graph_cache(&mut self, batch_size: usize);
+}
 
 // ============================================================================
 // ModelForward trait — shared by Qwen3 and Qwen3.5
@@ -57,7 +107,10 @@ pub trait ModelForward: Send {
 
     /// Pre-allocated buffers for batched decode, owned by the scheduler.
     /// Replaces `Box<dyn Any + Send>` with compile-time type safety.
-    type DecodeContext: Send;
+    ///
+    /// Must implement `DecodeContextOps` so the scheduler can perform
+    /// model-agnostic pre/post work (H2D copies, FlashInfer metadata).
+    type DecodeContext: DecodeContextOps + Send;
 
     fn create_state(&self) -> Result<Self::State>;
 
@@ -80,6 +133,9 @@ pub trait ModelForward: Send {
 
     /// Head dimension (for paged KV pool sizing).
     fn head_dim(&self) -> usize;
+
+    /// Number of query attention heads (for FlashInfer plan scheduling).
+    fn num_q_heads(&self) -> usize;
 
     /// Prefill: process multiple tokens, populate KV cache and produce logits.
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()>;

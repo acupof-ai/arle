@@ -17,7 +17,7 @@ pub use crate::bootstrap::{
     EngineOptions, ModelType, ServerRuntimeConfig, detect_model_type, model_id_from_path,
 };
 #[cfg(feature = "cuda")]
-use crate::model::{GenerationState, ModelForward, Qwen3Model, Qwen35Model};
+use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
@@ -619,11 +619,14 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
 #[cfg(feature = "cuda")]
 pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
+#[cfg(feature = "cuda")]
+pub type GLM4ServerEngine = GenericServerEngine<GLM4Model>;
 
 #[cfg(feature = "cuda")]
 pub enum LoadedServerEngine {
     Qwen3(RealServerEngine),
     Qwen35(Qwen35ServerEngine),
+    GLM4(GLM4ServerEngine),
 }
 
 #[cfg(feature = "cuda")]
@@ -659,6 +662,22 @@ impl Qwen35ServerEngine {
 }
 
 #[cfg(feature = "cuda")]
+impl GLM4ServerEngine {
+    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
+        Self::load_with_options(model_path, seed, EngineOptions::default())
+    }
+
+    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+        let components = crate::bootstrap::load_glm4_components(model_path, options)?;
+        Self::from_model_components(components, seed)
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.tokenizer.vocab_size()
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl LoadedServerEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
         Self::load_with_options(model_path, seed, EngineOptions::default())
@@ -672,6 +691,9 @@ impl LoadedServerEngine {
             ModelType::Qwen35 => Ok(Self::Qwen35(Qwen35ServerEngine::load_with_options(
                 model_path, seed, options,
             )?)),
+            ModelType::GLM4 => Ok(Self::GLM4(GLM4ServerEngine::load_with_options(
+                model_path, seed, options,
+            )?)),
         }
     }
 
@@ -679,6 +701,7 @@ impl LoadedServerEngine {
         match self {
             Self::Qwen3(_) => ModelType::Qwen3,
             Self::Qwen35(_) => ModelType::Qwen35,
+            Self::GLM4(_) => ModelType::GLM4,
         }
     }
 
@@ -686,6 +709,7 @@ impl LoadedServerEngine {
         match self {
             Self::Qwen3(engine) => engine.set_max_gpu_kv(max_tokens),
             Self::Qwen35(engine) => engine.set_max_gpu_kv(max_tokens),
+            Self::GLM4(engine) => engine.set_max_gpu_kv(max_tokens),
         }
     }
 }
@@ -696,6 +720,7 @@ impl ServerEngine for LoadedServerEngine {
         match self {
             Self::Qwen3(engine) => engine.model_id(),
             Self::Qwen35(engine) => engine.model_id(),
+            Self::GLM4(engine) => engine.model_id(),
         }
     }
 
@@ -703,6 +728,7 @@ impl ServerEngine for LoadedServerEngine {
         match self {
             Self::Qwen3(engine) => engine.complete(req),
             Self::Qwen35(engine) => engine.complete(req),
+            Self::GLM4(engine) => engine.complete(req),
         }
     }
 
@@ -714,6 +740,7 @@ impl ServerEngine for LoadedServerEngine {
         match self {
             Self::Qwen3(engine) => engine.complete_stream(req, tx),
             Self::Qwen35(engine) => engine.complete_stream(req, tx),
+            Self::GLM4(engine) => engine.complete_stream(req, tx),
         }
     }
 }

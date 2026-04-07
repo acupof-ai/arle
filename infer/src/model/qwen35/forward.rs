@@ -148,6 +148,10 @@ impl ModelForward for Qwen35Model {
         self.config.head_dim
     }
 
+    fn num_q_heads(&self) -> usize {
+        self.config.num_attention_heads
+    }
+
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
         // Prefetch offloaded KV before prefill.
         if state.base.kv_cache.has_offloaded() {

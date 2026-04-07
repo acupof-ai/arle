@@ -106,6 +106,37 @@ impl DeviceVec {
         })
     }
 
+    /// Create a tensor filled with bf16 ones (1.0).
+    /// Useful for dummy RMSNorm weights (identity normalization).
+    pub fn ones(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        let host = vec![bf16::ONE; len];
+        Self::from_host(ctx, &host)
+    }
+
+    /// Extract a contiguous sub-range `[start..end)` as a new `DeviceVec`.
+    /// The result is an independent copy on the GPU.
+    pub fn slice_to_vec(
+        ctx: &DeviceContext,
+        src: &DeviceVec,
+        start: usize,
+        end: usize,
+    ) -> Result<Self> {
+        assert!(
+            start < end && end <= src.len,
+            "slice_to_vec: invalid range [{}..{}) for vec of len {}",
+            start,
+            end,
+            src.len,
+        );
+        let len = end - start;
+        let mut out = Self::zeros(ctx, len)?;
+        let src_view = src.data.slice(start..end);
+        ctx.stream
+            .memcpy_dtod(&src_view, &mut out.data)
+            .map_err(|e| anyhow!("slice_to_vec D2D copy failed: {e}"))?;
+        Ok(out)
+    }
+
     /// Attach a debug label describing this tensor's semantic shape/purpose.
     ///
     /// ```ignore
@@ -285,6 +316,38 @@ impl DeviceMatrix {
             data: gpu_data,
             rows,
             cols,
+        })
+    }
+
+    /// Extract a contiguous range of rows `[row_start..row_end)` as a new `DeviceMatrix`.
+    /// The result is an independent copy on the GPU.
+    pub fn slice_rows(
+        ctx: &DeviceContext,
+        src: &DeviceMatrix,
+        row_start: usize,
+        row_end: usize,
+    ) -> Result<Self> {
+        assert!(
+            row_start < row_end && row_end <= src.rows,
+            "slice_rows: invalid range [{}..{}) for matrix with {} rows",
+            row_start,
+            row_end,
+            src.rows,
+        );
+        let out_rows = row_end - row_start;
+        let n = out_rows * src.cols;
+        let offset = row_start * src.cols;
+        let mut dst: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros(n)
+            .map_err(|e| anyhow!("slice_rows alloc failed: {e}"))?;
+        ctx.stream
+            .memcpy_dtod(&src.data.slice(offset..offset + n), &mut dst)
+            .map_err(|e| anyhow!("slice_rows D2D copy failed: {e}"))?;
+        Ok(Self {
+            data: dst,
+            rows: out_rows,
+            cols: src.cols,
         })
     }
 

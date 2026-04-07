@@ -15,7 +15,6 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
-use crate::model::ModelForward;
 use crate::ops;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
@@ -267,12 +266,63 @@ impl BatchDecodeBuffers35 {
         })
     }
 
-    fn set_batch_size(&mut self, bs: usize) {
+    fn set_batch_size_inner(&mut self, bs: usize) {
         debug_assert!(bs <= self.max_batch_size);
         self.common.set_batch_size(bs);
         self.attn.set_batch_size(bs);
         self.recurrent.set_batch_size(bs);
         self.mlp.set_batch_size(bs);
+    }
+}
+
+impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
+    fn upload_token_ids(&mut self, ctx: &DeviceContext, tokens: &[u32]) -> Result<()> {
+        self.token_ids_scratch.clear();
+        self.token_ids_scratch
+            .extend(tokens.iter().map(|&x| x as i32));
+        ctx.stream
+            .memcpy_htod(&self.token_ids_scratch, &mut self.token_ids_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
+        Ok(())
+    }
+
+    fn update_metadata(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &crate::paged_kv::PagedKVPool,
+        slot_indices: &[usize],
+    ) -> Result<bool> {
+        self.metadata.update(ctx, pool, slot_indices)
+    }
+
+    fn plan_attention(
+        &mut self,
+        ctx: &DeviceContext,
+        batch_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        // Qwen3.5 uses HD256 plan for full attention layers.
+        self.metadata.plan_hd256(
+            ctx,
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+            head_dim,
+        )
+    }
+
+    fn set_batch_size(&mut self, bs: usize) {
+        self.set_batch_size_inner(bs);
+    }
+
+    fn invalidate_graph_cache(&mut self, _batch_size: usize) {
+        // Qwen3.5 uses piecewise graph cache (per linear-layer group).
+        // No per-batch-size invalidation needed — reallocation doesn't
+        // happen in the piecewise scheme.
     }
 }
 
@@ -308,37 +358,9 @@ impl Qwen35Model {
         }
         debug_assert!(batch_size <= bufs.max_batch_size);
 
-        let c = &self.config;
-        let num_heads = c.num_attention_heads;
-        let num_kv_heads = c.num_key_value_heads;
-        let head_dim = c.head_dim; // 256
-        let page_size = 1;
-
-        bufs.set_batch_size(batch_size);
-
-        // ── Pre-step: metadata H2D + FlashInfer plan + embedding ──
-
-        bufs.token_ids_scratch.clear();
-        bufs.token_ids_scratch
-            .extend(tokens.iter().map(|&x| x as i32));
-        self.ctx
-            .stream
-            .memcpy_htod(&bufs.token_ids_scratch, &mut bufs.token_ids_gpu)
-            .map_err(|e| anyhow::anyhow!("H2D token_ids: {e}"))?;
-
-        let reallocated = bufs
-            .metadata
-            .update(&self.ctx, paged_kv_pool, slot_indices)?;
-        let _ = reallocated; // No CUDA graph cache to invalidate
-
-        bufs.metadata.plan_hd256(
-            &self.ctx,
-            batch_size,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        // NOTE: set_batch_size, upload_token_ids, update_metadata, and
+        // plan_attention are now called by the scheduler via DecodeContextOps
+        // before this method is invoked.
 
         bufs.common.embedding_out.seq_len = batch_size;
 

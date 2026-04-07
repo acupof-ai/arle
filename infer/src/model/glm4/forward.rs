@@ -3,36 +3,36 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
-use super::weights::Qwen3Model;
+use super::weights::GLM4Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
 use crate::tensor::DeviceVec;
 
-/// Per-request mutable state for Qwen3.
-pub struct Qwen3State {
+/// Per-request mutable state for GLM-4.
+pub struct GLM4State {
     pub(super) ctx: crate::tensor::DeviceContext,
     pub(crate) decode_bufs: DecodeBuffers,
     pub(crate) base: GenerationStateBase,
 }
 
-// SAFETY: `Qwen3State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
+// SAFETY: `GLM4State` contains CUDA resources (`DeviceContext`, `CudaSlice` inside
 // `DecodeBuffers`, `GenerationStateBase` wrapping `KVCache`, `CudaGraphState`,
 // `DeviceVec`) that hold raw CUDA device pointers.  These types are `!Send` by
 // default because CUDA contexts and allocations must be accessed from the thread
 // that created them.
 //
-// Invariant upheld: every `Qwen3State` instance is exclusively owned by its
+// Invariant upheld: every `GLM4State` instance is exclusively owned by its
 // scheduler slot and only ever accessed from the single blocking inference
 // thread that runs `Scheduler::run()`.  No other thread holds a reference to
 // or borrows from this state while the inference thread is running.
 //
 // Violation would mean: concurrent access from multiple threads could cause
 // data races on GPU memory or corrupt the CUDA driver state.
-unsafe impl Send for Qwen3State {}
+unsafe impl Send for GLM4State {}
 
-impl GenerationState for Qwen3State {
+impl GenerationState for GLM4State {
     fn logits(&self) -> &DeviceVec {
         self.base.logits_or(&self.decode_bufs.logits)
     }
@@ -68,17 +68,17 @@ impl GenerationState for Qwen3State {
 }
 
 #[cfg(feature = "cuda")]
-impl ModelForward for Qwen3Model {
-    type State = Qwen3State;
+impl ModelForward for GLM4Model {
+    type State = GLM4State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers;
 
     fn create_state(&self) -> Result<Self::State> {
-        Ok(Qwen3State {
+        Ok(GLM4State {
             ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
             base: GenerationStateBase::new(
-                self.config.num_hidden_layers,
-                self.config.num_key_value_heads,
+                self.config.num_hidden_layers(),
+                self.config.num_key_value_heads(),
             ),
         })
     }
@@ -89,14 +89,15 @@ impl ModelForward for Qwen3Model {
         pool: &crate::paged_kv::PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
+        let num_kv_heads = self.config.num_key_value_heads();
+        let head_dim = self.config.head_dim();
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let inter_dim = self.config.intermediate_size;
+        let inter_dim = self.config.intermediate_size();
         let max_pages = pool.max_total_tokens;
         super::batch_decode::BatchDecodeBuffers::new(
             &self.ctx,
+            &self.config,
             self.config.hidden_size,
             q_dim,
             kv_dim,
@@ -109,26 +110,26 @@ impl ModelForward for Qwen3Model {
 
     fn kv_cache_bytes_per_token(&self) -> usize {
         // 2 (K+V) * num_layers * num_kv_heads * head_dim * 2 (bf16 = 2 bytes)
-        2 * self.config.num_hidden_layers
-            * self.config.num_key_value_heads
-            * self.config.head_dim
+        2 * self.config.num_hidden_layers()
+            * self.config.num_key_value_heads()
+            * self.config.head_dim()
             * 2
     }
 
     fn num_kv_layers(&self) -> usize {
-        self.config.num_hidden_layers
-    }
-
-    fn num_kv_heads(&self) -> usize {
-        self.config.num_key_value_heads
-    }
-
-    fn head_dim(&self) -> usize {
-        self.config.head_dim
+        self.config.num_hidden_layers()
     }
 
     fn num_q_heads(&self) -> usize {
-        self.config.num_attention_heads
+        self.config.num_attention_heads()
+    }
+
+    fn num_kv_heads(&self) -> usize {
+        self.config.num_key_value_heads()
+    }
+
+    fn head_dim(&self) -> usize {
+        self.config.head_dim()
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
@@ -165,18 +166,13 @@ impl ModelForward for Qwen3Model {
         new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         if tokens.len() == 1 {
-            // Single-token: use standard decode path (CUDA Graph).
-            // No pool scatter-write needed — decode path writes to pool via
-            // decode_prep_paged kernel.
             self.forward_decode(tokens[0], state)?;
         } else {
-            // Prefetch offloaded KV before prefill.
             if state.base.kv_cache.has_offloaded() {
                 state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
             }
             let start_pos = state.base.kv_cache.len();
             let hidden = self.get_embeddings_batch(tokens)?;
-            // Dual-write: writes K/V to both contiguous cache AND token pool.
             let hidden = self.process_all_layers_batch_with_pool(
                 hidden,
                 start_pos,
@@ -230,7 +226,6 @@ impl ModelForward for Qwen3Model {
         for i in 0..b {
             let si = slot_indices[i];
             let random_val: f32 = rng.random();
-            // When prefill_logits is set, fall back to the non-cached path
             if states[si].base.prefill_logits.is_some() {
                 let logits = states[si].base.prefill_logits.as_ref().unwrap();
                 crate::ops::gpu_sample_launch(
@@ -308,12 +303,6 @@ impl ModelForward for Qwen3Model {
         if tokens.is_empty() {
             return Ok(());
         }
-        // Always use the FlashInfer paged path when the pool is active, even for
-        // batch_size=1. Routing B=1 through the contiguous/Triton decode path
-        // causes greedy output divergence: (1) K/V is written only to the
-        // contiguous cache, not the pool, so later batches read stale pool data;
-        // (2) Triton and FlashInfer attention produce numerically different bf16
-        // results, making greedy (argmax) output depend on batch composition.
         match paged_kv_pool {
             Some(pool) if !pool.k_buffers.is_empty() => self.decode_batch(
                 tokens,

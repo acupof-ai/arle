@@ -287,6 +287,49 @@ impl<M: ModelForward> Scheduler<M> {
                 .decode_bufs
                 .as_mut()
                 .expect("invariant: decode_bufs initialized in warmup block above");
+
+            // Pre-decode: scheduler-level work via DecodeContextOps.
+            {
+                use crate::model::DecodeContextOps;
+                let ctx = self.model.device_context();
+                decode_ctx.set_batch_size(bs);
+                if let Err(e) = decode_ctx.upload_token_ids(ctx, tokens) {
+                    info!(
+                        "Warmup: upload_token_ids for B={} failed ({}), skipping",
+                        bs, e
+                    );
+                    break;
+                }
+                match decode_ctx.update_metadata(ctx, &self.paged_kv_pool, si) {
+                    Ok(reallocated) => {
+                        if reallocated {
+                            decode_ctx.invalidate_graph_cache(bs);
+                        }
+                    }
+                    Err(e) => {
+                        info!(
+                            "Warmup: update_metadata for B={} failed ({}), skipping",
+                            bs, e
+                        );
+                        break;
+                    }
+                }
+                if let Err(e) = decode_ctx.plan_attention(
+                    ctx,
+                    bs,
+                    self.model.num_q_heads(),
+                    self.model.num_kv_heads(),
+                    1,
+                    self.model.head_dim(),
+                ) {
+                    info!(
+                        "Warmup: plan_attention for B={} failed ({}), skipping",
+                        bs, e
+                    );
+                    break;
+                }
+            }
+
             if let Err(e) = self.model.forward_decode_batch(
                 tokens,
                 &mut self.states,

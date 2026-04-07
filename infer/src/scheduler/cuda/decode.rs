@@ -99,6 +99,50 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let decode_ctx = decode_bufs.as_mut().unwrap();
 
+        // Pre-decode: scheduler handles H2D, metadata, and FlashInfer plan
+        // via DecodeContextOps. This decouples scheduler-level work from
+        // model-level neural computation.
+        {
+            use crate::model::DecodeContextOps;
+            let ctx = model.device_context();
+            decode_ctx.set_batch_size(token_ids.len());
+            if let Err(e) = decode_ctx.upload_token_ids(ctx, &token_ids) {
+                error!("Pre-decode upload_token_ids failed: {}", e);
+                for &i in &decode_indices {
+                    active[i].phase = Phase::Finished;
+                }
+                return;
+            }
+            match decode_ctx.update_metadata(ctx, paged_kv_pool, &slot_indices) {
+                Ok(reallocated) => {
+                    if reallocated {
+                        decode_ctx.invalidate_graph_cache(token_ids.len());
+                    }
+                }
+                Err(e) => {
+                    error!("Pre-decode update_metadata failed: {}", e);
+                    for &i in &decode_indices {
+                        active[i].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+            if let Err(e) = decode_ctx.plan_attention(
+                ctx,
+                token_ids.len(),
+                model.num_q_heads(),
+                model.num_kv_heads(),
+                1, // page_size: token-level pool
+                model.head_dim(),
+            ) {
+                error!("Pre-decode plan_attention failed: {}", e);
+                for &i in &decode_indices {
+                    active[i].phase = Phase::Finished;
+                }
+                return;
+            }
+        }
+
         let forward_result = model.forward_decode_batch(
             &token_ids,
             states,

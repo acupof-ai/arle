@@ -42,6 +42,81 @@ pub(crate) fn add_batch_into(
     Ok(())
 }
 
+/// Element-wise add for 1D vectors: out = a + b (in-place on `a`).
+/// `a` is modified in-place. `b` must have the same length.
+pub(crate) fn vec_add_inplace(ctx: &DeviceContext, a: &mut DeviceVec, b: &DeviceVec) -> Result<()> {
+    assert_eq!(a.len, b.len, "vec_add_inplace: length mismatch");
+    let n = a.len;
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+    // We need to copy `a` to a temp or use a fused add-into kernel.
+    // Use add_cuda with out = a (overwrites a).
+    let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::add_cuda(
+            a_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
+/// Element-wise add for 1D vectors on batched hidden states: out = a + bias
+/// where bias has length `a.hidden_dim` and is broadcast across the batch.
+pub(crate) fn add_bias_batch_into(
+    ctx: &DeviceContext,
+    a: &mut HiddenStates,
+    bias: &DeviceVec,
+) -> Result<()> {
+    assert_eq!(
+        a.hidden_dim, bias.len,
+        "add_bias_batch: hidden_dim {} != bias len {}",
+        a.hidden_dim, bias.len
+    );
+    let n = a.hidden_dim * a.seq_len;
+    let (a_ptr, _ga) = a.data.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _gb) = bias.data.device_ptr(&ctx.stream);
+
+    // For batched broadcast bias add, we need a kernel that adds bias[j] to
+    // a[i * hidden_dim + j] for all i in [0, seq_len). The simple add_cuda
+    // only works when both arrays have the same length.
+    // For batch_size=1 (decode), hidden_dim == n, so add_cuda works.
+    // For batch_size>1 (prefill/batch_decode), we need a broadcast kernel.
+    // For now, only support batch_size=1 (decode path).
+    if a.seq_len == 1 {
+        let result = unsafe {
+            ffi::add_cuda(
+                a_ptr as *const ffi::Half,
+                b_ptr as *const ffi::Half,
+                a_ptr as *mut ffi::Half,
+                n as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    } else {
+        // For batched path: call add_cuda per token (safe, serialized on stream).
+        for i in 0..a.seq_len {
+            let offset = i * a.hidden_dim;
+            let result = unsafe {
+                ffi::add_cuda(
+                    (a_ptr as usize + offset * 2) as *const ffi::Half,
+                    b_ptr as *const ffi::Half,
+                    (a_ptr as usize + offset * 2) as *mut ffi::Half,
+                    a.hidden_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+            };
+            result.result()?;
+        }
+    }
+    Ok(())
+}
+
 /// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
 pub fn silu_mul_batch(
     ctx: &DeviceContext,
