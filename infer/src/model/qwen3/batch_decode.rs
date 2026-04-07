@@ -385,25 +385,31 @@ impl Qwen3Model {
         )?;
 
         // 3. Decode prep: QK-norm + RoPE (in-place on Q) + paged KV write
+        let nrp = ops::NormRopeParams {
+            q_norm: &layer.attention.q_norm,
+            k_norm: &layer.attention.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
+        let paged = ops::PagedKVMeta {
+            kv_pool,
+            layer_idx,
+            kv_indices: &bufs.metadata.kv_indices,
+            kv_indptr: &bufs.metadata.kv_indptr,
+            kv_last_page_len: &bufs.metadata.kv_last_page_len,
+            page_size,
+        };
         ops::decode_prep_paged(
             &self.ctx,
             &mut bufs.q_batch,
             &bufs.k_batch,
             &bufs.v_batch,
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
+            &nrp,
             &bufs.metadata.positions,
-            kv_pool,
-            layer_idx,
-            &bufs.metadata.kv_indices,
-            &bufs.metadata.kv_indptr,
-            &bufs.metadata.kv_last_page_len,
+            &paged,
             num_heads,
             num_kv_heads,
-            page_size,
-            eps,
         )?;
 
         // 4. FlashInfer attention (run only -- plan was called once before loop)

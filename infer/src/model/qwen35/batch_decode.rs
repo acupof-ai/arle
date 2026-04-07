@@ -721,27 +721,33 @@ impl Qwen35Model {
         );
 
         // 3. Decode prep: QK-norm (1+w) + partial RoPE + paged KV write
+        let nrp = ops::NormRopeParams {
+            q_norm: &attn.q_norm,
+            k_norm: &attn.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
+        let paged = ops::PagedKVMeta {
+            kv_pool,
+            layer_idx: full_idx,
+            kv_indices: &bufs.metadata.kv_indices,
+            kv_indptr: &bufs.metadata.kv_indptr,
+            kv_last_page_len: &bufs.metadata.kv_last_page_len,
+            page_size,
+        };
         ops::decode_prep_paged_hd256(
             &self.ctx,
             &bufs.attn.q_full_batch,
             &mut bufs.attn.q_batch,
             &bufs.attn.k_batch,
             &bufs.attn.v_batch,
-            &attn.q_norm,
-            &attn.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
+            &nrp,
             &bufs.metadata.positions,
-            kv_pool,
-            full_idx,
-            &bufs.metadata.kv_indices,
-            &bufs.metadata.kv_indptr,
-            &bufs.metadata.kv_last_page_len,
+            &paged,
             num_heads,
             num_kv_heads,
-            page_size,
             c.rotary_dim,
-            eps,
         )?;
 
         // 4. FlashInfer HD256 attention

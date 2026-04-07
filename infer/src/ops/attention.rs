@@ -5,6 +5,36 @@ use crate::ffi;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
+// ============================================================================
+// Parameter structs — group related config/weight params for high-arity ops.
+// ============================================================================
+
+/// QK normalization weights + RoPE caches, shared across layers.
+pub(crate) struct NormRopeParams<'a> {
+    pub q_norm: &'a DeviceVec,
+    pub k_norm: &'a DeviceVec,
+    pub cos_cache: &'a DeviceVec,
+    pub sin_cache: &'a DeviceVec,
+    pub rms_eps: f32,
+}
+
+/// Head configuration for attention.
+pub(crate) struct HeadConfig {
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+/// Paged KV metadata for batched decode.
+pub(crate) struct PagedKVMeta<'a> {
+    pub kv_pool: &'a PagedKVPool,
+    pub layer_idx: usize,
+    pub kv_indices: &'a CudaSlice<i32>,
+    pub kv_indptr: &'a CudaSlice<i32>,
+    pub kv_last_page_len: &'a CudaSlice<i32>,
+    pub page_size: usize,
+}
+
 /// Batched prefill attention with FlashAttention-2.
 ///
 /// Pipeline:
@@ -13,26 +43,23 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 ///   3. FlashAttention-2 (Triton kernel — fused QK + causal softmax + V)
 ///
 /// No O(n²) scratch buffers needed — FlashAttention uses online softmax.
-#[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_batch(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
     k_batch: &mut HiddenStates,
     v_batch: &HiddenStates,
-    q_norm: &DeviceVec,
-    k_norm: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    nrp: &NormRopeParams,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    heads: &HeadConfig,
     start_pos: usize,
-    rms_eps: f32,
 ) -> Result<()> {
     let seq_len = q_batch.seq_len;
+    let num_q_heads = heads.num_q_heads;
+    let num_kv_heads = heads.num_kv_heads;
+    let head_dim = heads.head_dim;
+    let rms_eps = nrp.rms_eps;
     let q_dim = num_q_heads * head_dim;
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
     let gqa_ratio = num_q_heads / num_kv_heads;
@@ -46,10 +73,10 @@ pub fn prefill_attention_batch(
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
         let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
-        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+        let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&ctx.stream);
+        let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
+        let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
+        let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
         let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
         let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
         let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
@@ -159,16 +186,12 @@ pub(crate) fn flash_attention_prefill_hd256_into(
 }
 
 /// Qwen3.5 full-attention prefill: prep Q/K/cache, run HD256 FlashAttention-2, then apply gate.
-#[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_hd256_batch(
     ctx: &DeviceContext,
     q_full_batch: &HiddenStates,
     k_batch: &HiddenStates,
     v_batch: &HiddenStates,
-    q_norm: &DeviceVec,
-    k_norm: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    nrp: &NormRopeParams,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     output: &mut HiddenStates,
@@ -176,7 +199,6 @@ pub fn prefill_attention_hd256_batch(
     num_kv_heads: usize,
     start_pos: usize,
     rotary_dim: usize,
-    rms_eps: f32,
 ) -> Result<()> {
     let q_dim = num_q_heads * 256;
     let mut q_prepped = HiddenStates::zeros(ctx, q_dim, q_full_batch.seq_len)?;
@@ -190,10 +212,7 @@ pub fn prefill_attention_hd256_batch(
         q_full_batch,
         k_batch,
         v_batch,
-        q_norm,
-        k_norm,
-        cos_cache,
-        sin_cache,
+        nrp,
         k_cache,
         v_cache,
         output,
@@ -202,7 +221,6 @@ pub fn prefill_attention_hd256_batch(
         num_kv_heads,
         &start_pos_buf,
         rotary_dim,
-        rms_eps,
     )
 }
 
@@ -214,10 +232,7 @@ pub fn prefill_attention_hd256_batch_with_scratch(
     q_full_batch: &HiddenStates,
     k_batch: &HiddenStates,
     v_batch: &HiddenStates,
-    q_norm: &DeviceVec,
-    k_norm: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    nrp: &NormRopeParams,
     k_cache: &mut DeviceVec,
     v_cache: &mut DeviceVec,
     output: &mut HiddenStates,
@@ -226,11 +241,11 @@ pub fn prefill_attention_hd256_batch_with_scratch(
     num_kv_heads: usize,
     start_pos_buf: &CudaSlice<i32>,
     rotary_dim: usize,
-    rms_eps: f32,
 ) -> Result<()> {
     let seq_len = q_full_batch.seq_len;
     let q_dim = num_q_heads * 256;
     let kv_dim = num_kv_heads * 256;
+    let rms_eps = nrp.rms_eps;
 
     assert_eq!(q_full_batch.hidden_dim, q_dim * 2);
     assert_eq!(k_batch.hidden_dim, kv_dim);
@@ -249,10 +264,10 @@ pub fn prefill_attention_hd256_batch_with_scratch(
         let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
         let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-        let (qn_ptr, _gqn) = q_norm.data.device_ptr(&ctx.stream);
-        let (kn_ptr, _gkn) = k_norm.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gcos) = cos_cache.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gsin) = sin_cache.data.device_ptr(&ctx.stream);
+        let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&ctx.stream);
+        let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
+        let (cos_ptr, _gcos) = nrp.cos_cache.data.device_ptr(&ctx.stream);
+        let (sin_ptr, _gsin) = nrp.sin_cache.data.device_ptr(&ctx.stream);
         let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
         let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&ctx.stream);
         let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&ctx.stream);
@@ -629,44 +644,36 @@ impl Drop for FlashInferWorkspace {
 /// `page_table_gpu`: flattened page indices on GPU
 /// `page_indptr_gpu`: [B+1] i32 on GPU — cumulative page counts
 /// `last_page_len_gpu`: [B] i32 on GPU — tokens in last page (including the new token)
-#[allow(clippy::too_many_arguments)]
 pub fn decode_prep_paged(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
     k_batch: &HiddenStates,
     v_batch: &HiddenStates,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    nrp: &NormRopeParams,
     positions: &CudaSlice<i32>,
-    kv_pool: &PagedKVPool,
-    layer_idx: usize,
-    page_table_gpu: &CudaSlice<i32>,
-    page_indptr_gpu: &CudaSlice<i32>,
-    last_page_len_gpu: &CudaSlice<i32>,
+    paged: &PagedKVMeta,
     num_qo_heads: usize,
     num_kv_heads: usize,
-    page_size: usize,
-    rms_eps: f32,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let stride_page = kv_pool.kv_dim;
+    let stride_page = paged.kv_pool.kv_dim;
+    let rms_eps = nrp.rms_eps;
+    let page_size = paged.page_size;
 
     let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
     let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
     let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
     let (pos_ptr, _gp) = positions.device_ptr(&ctx.stream);
-    let (pt_ptr, _gpt) = page_table_gpu.device_ptr(&ctx.stream);
-    let (pi_ptr, _gpi) = page_indptr_gpu.device_ptr(&ctx.stream);
-    let (lp_ptr, _glp) = last_page_len_gpu.device_ptr(&ctx.stream);
+    let (pt_ptr, _gpt) = paged.kv_indices.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = paged.kv_indptr.device_ptr(&ctx.stream);
+    let (lp_ptr, _glp) = paged.kv_last_page_len.device_ptr(&ctx.stream);
 
-    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
-    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+    let k_pool_ptr = paged.kv_pool.k_ptr(paged.layer_idx, &ctx.stream);
+    let v_pool_ptr = paged.kv_pool.v_ptr(paged.layer_idx, &ctx.stream);
 
     unsafe {
         ffi::decode_prep_paged_cuda(
@@ -1030,47 +1037,39 @@ pub fn flashinfer_run_layer(
 /// - `q_full_batch` [B, num_q_heads * 256 * 2]: Q with interleaved gate
 /// - `q_out_batch` [B, num_q_heads * 256]: output Q (normed + roped, no gate)
 /// - Writes K (normed + roped) and V (raw) to paged pool.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_prep_paged_hd256(
     ctx: &DeviceContext,
     q_full_batch: &HiddenStates,
     q_out_batch: &mut HiddenStates,
     k_batch: &HiddenStates,
     v_batch: &HiddenStates,
-    q_norm_weight: &DeviceVec,
-    k_norm_weight: &DeviceVec,
-    cos_cache: &DeviceVec,
-    sin_cache: &DeviceVec,
+    nrp: &NormRopeParams,
     positions: &CudaSlice<i32>,
-    kv_pool: &PagedKVPool,
-    layer_idx: usize,
-    page_table_gpu: &CudaSlice<i32>,
-    page_indptr_gpu: &CudaSlice<i32>,
-    last_page_len_gpu: &CudaSlice<i32>,
+    paged: &PagedKVMeta,
     num_qo_heads: usize,
     num_kv_heads: usize,
-    page_size: usize,
     rotary_dim: usize,
-    rms_eps: f32,
 ) -> Result<()> {
     let batch_size = q_full_batch.seq_len;
-    let stride_page = kv_pool.kv_dim;
+    let stride_page = paged.kv_pool.kv_dim;
+    let rms_eps = nrp.rms_eps;
+    let page_size = paged.page_size;
 
     let (qf_ptr, _g0) = q_full_batch.data.device_ptr(&ctx.stream);
     let (qo_ptr, _g1) = q_out_batch.data.device_ptr_mut(&ctx.stream);
     let (k_ptr, _g2) = k_batch.data.device_ptr(&ctx.stream);
     let (v_ptr, _g3) = v_batch.data.device_ptr(&ctx.stream);
-    let (qn_ptr, _g4) = q_norm_weight.data.device_ptr(&ctx.stream);
-    let (kn_ptr, _g5) = k_norm_weight.data.device_ptr(&ctx.stream);
-    let (cos_ptr, _g6) = cos_cache.data.device_ptr(&ctx.stream);
-    let (sin_ptr, _g7) = sin_cache.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _g4) = nrp.q_norm.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _g5) = nrp.k_norm.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _g6) = nrp.cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _g7) = nrp.sin_cache.data.device_ptr(&ctx.stream);
     let (pos_ptr, _g8) = positions.device_ptr(&ctx.stream);
-    let (pt_ptr, _g9) = page_table_gpu.device_ptr(&ctx.stream);
-    let (pi_ptr, _g10) = page_indptr_gpu.device_ptr(&ctx.stream);
-    let (lp_ptr, _g11) = last_page_len_gpu.device_ptr(&ctx.stream);
+    let (pt_ptr, _g9) = paged.kv_indices.device_ptr(&ctx.stream);
+    let (pi_ptr, _g10) = paged.kv_indptr.device_ptr(&ctx.stream);
+    let (lp_ptr, _g11) = paged.kv_last_page_len.device_ptr(&ctx.stream);
 
-    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
-    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+    let k_pool_ptr = paged.kv_pool.k_ptr(paged.layer_idx, &ctx.stream);
+    let v_pool_ptr = paged.kv_pool.v_ptr(paged.layer_idx, &ctx.stream);
 
     unsafe {
         ffi::decode_prep_paged_hd256_cuda(

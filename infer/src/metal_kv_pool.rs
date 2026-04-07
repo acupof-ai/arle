@@ -127,7 +127,10 @@ impl MetalKVPool {
         let mut new_indices = Vec::with_capacity(count);
         for _ in 0..count {
             // SAFETY: we checked len >= count above.
-            let idx = self.free_slots.pop().unwrap();
+            let idx = self
+                .free_slots
+                .pop()
+                .expect("invariant: free_slots.len() >= count checked above");
             new_indices.push(idx);
         }
         self.slot_indices

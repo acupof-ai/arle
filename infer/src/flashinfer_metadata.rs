@@ -130,7 +130,11 @@ impl FlashInferDecodeMetadata {
         // an incremental update (H2D of full index array using scratch buffer).
         // Otherwise, full rebuild of the O(total_tokens) indices array.
         let same_batch = self.prev_slot_indices == slot_indices;
-        let new_total = *self.indptr_h.last().unwrap() as usize;
+        let new_total = *self
+            .indptr_h
+            .last()
+            .expect("invariant: indptr_h from build_indptr() always has at least one element")
+            as usize;
         let mut reallocated = false;
 
         if same_batch && self.prev_total_tokens > 0 && new_total <= self.max_total_pages {
@@ -143,7 +147,12 @@ impl FlashInferDecodeMetadata {
             // With page_size=1, indptr gives cumulative token counts per slot.
             for (i, &slot) in slot_indices.iter().enumerate() {
                 let insert_pos = self.indptr_h[i + 1] as usize - 1; // last token of slot i
-                let last_idx = *pool.token_indices(slot).last().unwrap() as i32;
+                let last_idx = *pool.token_indices(slot).last().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "FlashInfer incremental update: slot {} has no token indices",
+                        slot
+                    )
+                })? as i32;
                 if insert_pos < self.indices_scratch.len() {
                     self.indices_scratch[insert_pos] = last_idx;
                 } else {

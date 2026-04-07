@@ -505,15 +505,19 @@ fn test_prefill_attention_hd256_batch_matches_cpu_reference() -> Result<()> {
         let mut v_cache = DeviceVec::from_host(&ctx, &v_cache_init_bf16)?;
         let mut out = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
 
+        let nrp = NormRopeParams {
+            q_norm: &q_weight,
+            k_norm: &k_weight,
+            cos_cache: &cos_cache,
+            sin_cache: &sin_cache,
+            rms_eps: eps,
+        };
         prefill_attention_hd256_batch(
             &ctx,
             &q_full_batch,
             &k_batch,
             &v_batch,
-            &q_weight,
-            &k_weight,
-            &cos_cache,
-            &sin_cache,
+            &nrp,
             &mut k_cache,
             &mut v_cache,
             &mut out,
@@ -521,7 +525,6 @@ fn test_prefill_attention_hd256_batch_matches_cpu_reference() -> Result<()> {
             num_kvheads,
             start_pos,
             rotary_dim,
-            eps,
         )?;
 
         let out_host_bf16 = ctx.stream.clone_dtoh(&out.data)?;
@@ -689,15 +692,19 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
     let mut k_cache_all = DeviceVec::from_host(&ctx, &zero_cache)?;
     let mut v_cache_all = DeviceVec::from_host(&ctx, &zero_cache)?;
     let mut out_all = HiddenStates::zeros(&ctx, q_dim, total_seq)?;
+    let nrp = NormRopeParams {
+        q_norm: &q_weight,
+        k_norm: &k_weight,
+        cos_cache: &cos_cache,
+        sin_cache: &sin_cache,
+        rms_eps: eps,
+    };
     prefill_attention_hd256_batch(
         &ctx,
         &q_full_all,
         &k_all,
         &v_all,
-        &q_weight,
-        &k_weight,
-        &cos_cache,
-        &sin_cache,
+        &nrp,
         &mut k_cache_all,
         &mut v_cache_all,
         &mut out_all,
@@ -705,7 +712,6 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
         num_kvheads,
         0,
         rotary_dim,
-        eps,
     )?;
 
     let q_full_prefix = HiddenStates {
@@ -737,10 +743,7 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
         &q_full_prefix,
         &k_prefix,
         &v_prefix,
-        &q_weight,
-        &k_weight,
-        &cos_cache,
-        &sin_cache,
+        &nrp,
         &mut k_cache_split,
         &mut v_cache_split,
         &mut out_prefix,
@@ -748,7 +751,6 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
         num_kvheads,
         0,
         rotary_dim,
-        eps,
     )?;
 
     let q_full_next = HiddenStates {
@@ -778,10 +780,7 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
         &q_full_next,
         &k_next,
         &v_next,
-        &q_weight,
-        &k_weight,
-        &cos_cache,
-        &sin_cache,
+        &nrp,
         &mut k_cache_split,
         &mut v_cache_split,
         &mut out_next,
@@ -789,7 +788,6 @@ fn test_prefill_attention_hd256_handoff_matches_single_prefill() -> Result<()> {
         num_kvheads,
         prefix_seq,
         rotary_dim,
-        eps,
     )?;
 
     let out_all_host = ctx.stream.clone_dtoh(&out_all.data)?;

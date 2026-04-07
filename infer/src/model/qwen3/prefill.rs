@@ -224,23 +224,29 @@ impl Qwen3Model {
 
         // 3. FlashAttention-2 (Triton) — also writes to contiguous cache
         let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        let nrp = ops::NormRopeParams {
+            q_norm: &layer.attention.q_norm,
+            k_norm: &layer.attention.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: self.config.rms_norm_eps,
+        };
+        let heads = ops::HeadConfig {
+            num_q_heads: num_heads,
+            num_kv_heads,
+            head_dim,
+        };
         ops::prefill_attention_batch(
             &self.ctx,
             &mut bufs.q_batch,
             &mut bufs.k_batch,
             &bufs.v_batch,
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
+            &nrp,
             k_cache_layer,
             v_cache_layer,
             &mut bufs.attn_output,
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            &heads,
             start_pos,
-            self.config.rms_norm_eps,
         )?;
 
         // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
@@ -345,23 +351,29 @@ impl Qwen3Model {
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
         let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        let nrp = ops::NormRopeParams {
+            q_norm: &layer.attention.q_norm,
+            k_norm: &layer.attention.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: self.config.rms_norm_eps,
+        };
+        let heads = ops::HeadConfig {
+            num_q_heads: num_heads,
+            num_kv_heads,
+            head_dim,
+        };
         ops::prefill_attention_batch(
             &self.ctx,
             &mut bufs.q_batch,
             &mut bufs.k_batch,
             &bufs.v_batch,
-            &layer.attention.q_norm,
-            &layer.attention.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
+            &nrp,
             k_cache_layer,
             v_cache_layer,
             &mut bufs.attn_output,
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            &heads,
             start_pos,
-            self.config.rms_norm_eps,
         )?;
 
         // 4. O projection → bufs.o_buf (as o_batch)

@@ -34,8 +34,8 @@ pub use sampling::{argmax, gpu_sample, gpu_sample_into, gpu_sample_launch, gpu_s
 #[cfg(test)]
 pub(crate) use attention::flash_attention_prefill_hd256_into;
 pub(crate) use attention::{
-    attention_gate_paged_hd256, decode_prep_paged_hd256, flashinfer_plan_hd256,
-    flashinfer_run_layer_hd256,
+    HeadConfig, NormRopeParams, PagedKVMeta, attention_gate_paged_hd256, decode_prep_paged_hd256,
+    flashinfer_plan_hd256, flashinfer_run_layer_hd256,
 };
 pub(crate) use elementwise::{
     add_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into, silu_mul_fused_batch_into,

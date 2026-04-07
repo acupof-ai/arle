@@ -151,15 +151,19 @@ impl Qwen35Model {
 
         let base_pos = kv_cache.len();
         let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, *full_idx)?;
+        let nrp = ops::NormRopeParams {
+            q_norm: &attn.q_norm,
+            k_norm: &attn.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
         ops::prefill_attention_hd256_batch(
             &self.ctx,
             &q_full_batch,
             &k_batch,
             &v_batch,
-            &attn.q_norm,
-            &attn.k_norm,
-            &self.cos_cache,
-            &self.sin_cache,
+            &nrp,
             kc,
             vc,
             &mut attn_out_batch,
@@ -167,7 +171,6 @@ impl Qwen35Model {
             c.num_key_value_heads,
             base_pos,
             c.rotary_dim,
-            eps,
         )?;
 
         *full_idx += 1;
@@ -339,15 +342,19 @@ impl Qwen35Model {
                     ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
 
                     let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, full_idx)?;
+                    let nrp = ops::NormRopeParams {
+                        q_norm: &attn.q_norm,
+                        k_norm: &attn.k_norm,
+                        cos_cache: &self.cos_cache,
+                        sin_cache: &self.sin_cache,
+                        rms_eps: eps,
+                    };
                     ops::prefill_attention_hd256_batch_with_scratch(
                         &self.ctx,
                         &bufs.q_full,
                         &bufs.k_attn,
                         &bufs.v_attn,
-                        &attn.q_norm,
-                        &attn.k_norm,
-                        &self.cos_cache,
-                        &self.sin_cache,
+                        &nrp,
                         kc,
                         vc,
                         &mut bufs.attn_out_full,
@@ -356,7 +363,6 @@ impl Qwen35Model {
                         c.num_key_value_heads,
                         &bufs.start_pos_buf,
                         c.rotary_dim,
-                        eps,
                     )?;
                     full_idx += 1;
 

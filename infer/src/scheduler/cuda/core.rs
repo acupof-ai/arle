@@ -283,7 +283,10 @@ impl<M: ModelForward> Scheduler<M> {
         for &bs in &warmup_sizes {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
-            let decode_ctx = self.decode_bufs.as_mut().unwrap();
+            let decode_ctx = self
+                .decode_bufs
+                .as_mut()
+                .expect("invariant: decode_bufs initialized in warmup block above");
             if let Err(e) = self.model.forward_decode_batch(
                 tokens,
                 &mut self.states,

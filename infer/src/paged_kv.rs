@@ -148,7 +148,10 @@ impl TokenKVPool {
         let mut new_indices = Vec::with_capacity(count);
         for _ in 0..count {
             // SAFETY: we checked len >= count above.
-            let idx = self.free_slots.pop().unwrap();
+            let idx = self
+                .free_slots
+                .pop()
+                .expect("invariant: free_slots.len() >= count checked above");
             new_indices.push(idx);
         }
         self.token_indices[slot].extend_from_slice(&new_indices);
@@ -207,7 +210,9 @@ impl TokenKVPool {
             for &idx in toks {
                 indices.push(idx as i32);
             }
-            let prev = *indptr.last().unwrap();
+            let prev = *indptr
+                .last()
+                .expect("invariant: indptr always has at least one element (initialized with 0)");
             indptr.push(prev + toks.len() as i32);
             // page_size=1 ⇒ last_page_len is always 1 (if seq_len > 0).
             last_page_len.push(if toks.is_empty() { 0 } else { 1 });
@@ -229,7 +234,9 @@ impl TokenKVPool {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
         indptr.push(0);
         for &slot in slots {
-            let last = *indptr.last().unwrap();
+            let last = *indptr
+                .last()
+                .expect("invariant: indptr always has at least one element (initialized with 0)");
             indptr.push(last + self.token_indices[slot].len() as i32);
         }
         indptr
