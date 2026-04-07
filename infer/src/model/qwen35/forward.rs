@@ -60,6 +60,10 @@ impl GenerationState for Qwen35State {
         self.base.set_max_seq_len(max_seq);
     }
 
+    fn set_kv_dtype(&mut self, dtype: crate::model::kv_cache::KVCacheDtype) {
+        self.base.set_kv_dtype(dtype);
+    }
+
     fn offload_kv_if_needed(&mut self) -> Result<()> {
         self.base.offload_kv_if_needed(&self.ctx)
     }

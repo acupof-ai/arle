@@ -10,7 +10,7 @@ use crate::tensor::{DeviceContext, DeviceVec};
 pub(crate) mod common;
 pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
-mod kv_cache;
+pub(crate) mod kv_cache;
 
 pub mod glm4;
 pub mod qwen3;
@@ -83,6 +83,9 @@ pub trait GenerationState {
     /// Set the maximum sequence length (total, GPU + CPU) for the KV cache.
     /// Must be called before the KV cache is first initialized.
     fn set_max_seq_len(&mut self, max_seq: usize);
+    /// Set KV cache quantization dtype (BF16 or INT8).
+    /// Must be called before the KV cache is first initialized.
+    fn set_kv_dtype(&mut self, dtype: kv_cache::KVCacheDtype);
     /// Offload excess KV to CPU if over GPU budget. Called between requests.
     fn offload_kv_if_needed(&mut self) -> Result<()>;
 

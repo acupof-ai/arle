@@ -60,6 +60,10 @@ impl GenerationStateBase {
         self.kv_cache.set_max_seq_len(max_seq);
     }
 
+    pub fn set_kv_dtype(&mut self, dtype: super::kv_cache::KVCacheDtype) {
+        self.kv_cache.set_dtype(dtype);
+    }
+
     pub fn offload_kv_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
         self.kv_cache.offload_if_needed(ctx)
     }

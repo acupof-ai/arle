@@ -5,6 +5,7 @@ use clap::Parser;
 use infer::bootstrap::{
     EngineOptions, ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
 };
+use infer::model::kv_cache::KVCacheDtype;
 use infer::http_server::build_app;
 use infer::logging;
 use infer::scheduler::SchedulerConfig;
@@ -63,6 +64,11 @@ struct Args {
     /// Fallback KV pool budget (MB) when GPU memory query fails.
     #[arg(long, default_value_t = 4096)]
     kv_pool_fallback_mb: usize,
+
+    /// KV cache data type: "bf16" (default) or "int8" for per-head per-token
+    /// symmetric INT8 quantization (~46% KV memory savings).
+    #[arg(long, default_value = "bf16")]
+    kv_cache_dtype: String,
 }
 
 #[tokio::main]
@@ -104,6 +110,12 @@ async fn main() {
         },
     );
 
+    let kv_cache_dtype = match args.kv_cache_dtype.as_str() {
+        "bf16" | "BF16" => KVCacheDtype::BF16,
+        "int8" | "INT8" => KVCacheDtype::INT8,
+        other => panic!("Invalid --kv-cache-dtype '{other}': expected 'bf16' or 'int8'"),
+    };
+
     let runtime = ServerRuntimeConfig {
         engine: EngineOptions {
             enable_cuda_graph: args.cuda_graph,
@@ -118,6 +130,7 @@ async fn main() {
         },
         seed: 42,
         max_seq_len: args.max_seq_len,
+        kv_cache_dtype,
     };
 
     let handle =

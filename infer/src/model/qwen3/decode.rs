@@ -115,7 +115,8 @@ impl Qwen3Model {
             &mut bufs.v,
         )?;
 
-        let (k_cache, v_cache) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        let pos = kv_cache.len();
+        let (k_cache, v_cache) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
         ops::fused_attention_decode_into(
             &self.ctx,
             &bufs.q,
@@ -135,6 +136,8 @@ impl Qwen3Model {
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
         )?;
+        // Quantize the newly written decode token → INT8 (no-op for BF16)
+        kv_cache.commit_layer(&self.ctx, layer_idx, pos, 1)?;
 
         ops::gemv(
             &self.ctx,

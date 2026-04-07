@@ -774,4 +774,32 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── KV cache quantization (INT8) ───
+
+    // Quantize bf16 KV data → INT8 + f32 scales for tokens [start_pos..start_pos+token_count).
+    // HND layout: [num_kv_heads, max_seq_len, head_dim].
+    pub(crate) fn quantize_kv_bf16_to_int8_cuda(
+        kv_bf16: *const Half,
+        kv_int8: *mut i8,
+        scales: *mut f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        max_seq_len: i32,
+        start_pos: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize INT8 KV data → bf16 for tokens [0..token_count).
+    pub(crate) fn dequantize_kv_int8_to_bf16_cuda(
+        kv_int8: *const i8,
+        scales: *const f32,
+        kv_bf16: *mut Half,
+        num_kv_heads: i32,
+        head_dim: i32,
+        max_seq_len: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }

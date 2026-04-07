@@ -6,6 +6,8 @@
 | **Plans** | |
 | [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |
+| **Resources** | |
+| [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics, implementation plan |
 | **Experience — Errors** | |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash: hardcoded MAX_SEQ, GPU plan_info, double alloc |
 | **Experience — Reviews** | |

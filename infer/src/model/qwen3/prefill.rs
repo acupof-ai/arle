@@ -223,7 +223,7 @@ impl Qwen3Model {
         }
 
         // 3. FlashAttention-2 (Triton) — also writes to contiguous cache
-        let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        let (k_cache_layer, v_cache_layer) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
         let nrp = ops::NormRopeParams {
             q_norm: &layer.attention.q_norm,
             k_norm: &layer.attention.k_norm,
@@ -248,6 +248,7 @@ impl Qwen3Model {
             &heads,
             start_pos,
         )?;
+        kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
         // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
         ops::gemm_into(
@@ -350,7 +351,7 @@ impl Qwen3Model {
         );
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
-        let (k_cache_layer, v_cache_layer) = kv_cache.get_cache_mut(&self.ctx, layer_idx)?;
+        let (k_cache_layer, v_cache_layer) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
         let nrp = ops::NormRopeParams {
             q_norm: &layer.attention.q_norm,
             k_norm: &layer.attention.k_norm,
@@ -375,6 +376,8 @@ impl Qwen3Model {
             &heads,
             start_pos,
         )?;
+        // Quantize newly written KV tokens → INT8 storage (no-op for BF16)
+        kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
         // 4. O projection → bufs.o_buf (as o_batch)
         ops::gemm_into(
