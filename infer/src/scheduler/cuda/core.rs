@@ -48,6 +48,7 @@ impl<M: ModelForward> Scheduler<M> {
             seed,
             SchedulerConfig::runtime_defaults(num_slots),
             None,
+            crate::model::kv_cache::KVCacheDtype::BF16,
         )
     }
 
@@ -67,6 +68,7 @@ impl<M: ModelForward> Scheduler<M> {
             seed,
             SchedulerConfig::runtime_defaults(num_slots),
             max_seq_len_override,
+            crate::model::kv_cache::KVCacheDtype::BF16,
         )
     }
 

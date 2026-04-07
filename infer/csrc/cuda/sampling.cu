@@ -254,7 +254,9 @@ __global__ void gpu_sample_kernel(
         if (probs[i] >= mid) local_count++;
       }
       // Reduce count
-      local_count = __reduce_add_sync(0xffffffff, local_count);
+      // Warp-reduce local_count (compatible with sm_75+)
+      for (int offset = 16; offset > 0; offset >>= 1)
+        local_count += __shfl_down_sync(0xffffffff, local_count, offset);
       if (lane_id == 0) warp_vals[warp_id] = (float)local_count;
       __syncthreads();
       int total_count;

@@ -15,6 +15,7 @@ use log::info;
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
+use crate::model::ModelForward;
 use crate::ops;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};

@@ -125,7 +125,7 @@ impl ModelForward for GLM4Model {
     }
 
     fn num_q_heads(&self) -> usize {
-        self.config.num_attention_heads()
+        self.config.num_attention_heads
     }
 
     fn num_kv_heads(&self) -> usize {

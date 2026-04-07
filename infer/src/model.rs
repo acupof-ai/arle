@@ -19,6 +19,7 @@ pub mod qwen35;
 pub use glm4::GLM4Model;
 #[cfg(feature = "cuda")]
 pub use glm4::GLM4State;
+pub use kv_cache::KVCacheDtype;
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
 pub use qwen35::{Qwen35Model, Qwen35State};
 
