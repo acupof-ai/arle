@@ -68,6 +68,23 @@ def quantize_symmetric(weight: torch.Tensor, bits: int, group_size: int = 128):
         scales = scales.to(torch.bfloat16)
         return packed, scales
 
+    elif bits == 2:
+        max_val = 1.0  # range [-2, 1] → 4 levels
+        scales = (absmax / 2.0).squeeze(-1)  # scale so max maps to ±2
+        w_q = torch.clamp(torch.round(w / (absmax / 2.0)), -2, 1).to(torch.int8)
+        w_q = w_q.reshape(N, K)
+        # Pack: 4 int2 values per byte (2 bits each)
+        # Shift signed [-2,1] to unsigned [0,3] by adding 2
+        w_unsigned = (w_q + 2).to(torch.uint8)
+        assert K % 4 == 0
+        v0 = w_unsigned[:, 0::4]
+        v1 = w_unsigned[:, 1::4]
+        v2 = w_unsigned[:, 2::4]
+        v3 = w_unsigned[:, 3::4]
+        packed = v0 | (v1 << 2) | (v2 << 4) | (v3 << 6)
+        scales = scales.to(torch.bfloat16)
+        return packed, scales
+
     else:
         raise ValueError(f"Unsupported bits={bits}")
 
@@ -101,7 +118,7 @@ def dequantize_check(qweight, scales, bits, group_size, original):
 def main():
     parser = argparse.ArgumentParser(description="Quantize model weights")
     parser.add_argument("model_path", help="Path to bf16 model directory")
-    parser.add_argument("--bits", type=int, default=8, choices=[4, 8])
+    parser.add_argument("--bits", type=int, default=8, choices=[2, 4, 8])
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--output", help="Output directory (default: <model>-W<bits>)")
     args = parser.parse_args()

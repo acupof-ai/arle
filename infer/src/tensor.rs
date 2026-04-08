@@ -376,6 +376,44 @@ impl DeviceMatrix {
         })
     }
 
+    /// Create from INT2 packed quantized weight + bf16 scales.
+    /// Weight data is packed: 4 int2 values per byte → [rows, cols/4] bytes.
+    pub fn from_quantized_int2(
+        ctx: &DeviceContext,
+        packed_data: &[u8],
+        scales_data: &[bf16],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        assert_eq!(packed_data.len(), rows * cols / 4);
+        let num_groups = cols / group_size;
+        assert_eq!(scales_data.len(), rows * num_groups);
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int2 failed: {}", e))?;
+        let qs = ctx
+            .stream
+            .clone_htod(scales_data)
+            .map_err(|e| anyhow!("H2D scales failed: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: Some(qw),
+            qscales: Some(qs),
+            group_size,
+            quant_bits: 2,
+        })
+    }
+
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
         self.qweight.is_some()

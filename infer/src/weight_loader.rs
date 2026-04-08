@@ -163,7 +163,22 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             )
         };
 
-        // Detect INT4 vs INT8 from packed shape
+        // Detect bit width from packed shape: INT2 (K/4), INT4 (K/2), INT8 (K)
+        if qw_cols == orig_k / 4 {
+            // INT2 packed: 4 values per byte
+            let packed: &[u8] =
+                unsafe { std::slice::from_raw_parts(qw_tensor.data().as_ptr(), rows * qw_cols) };
+            log::info!(
+                "Loaded quantized {}: [{}x{}] INT2, group_size={}",
+                name,
+                rows,
+                orig_k,
+                group_size
+            );
+            return DeviceMatrix::from_quantized_int2(
+                ctx, packed, sc_data, rows, orig_k, group_size,
+            );
+        }
         if qw_cols == orig_k / 2 {
             // INT4 packed: 2 values per byte
             let packed: &[u8] =
