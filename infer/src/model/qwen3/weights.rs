@@ -6,7 +6,9 @@ use super::config::Config;
 use crate::model::common::{self, MLP};
 use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
-use crate::weight_loader::{load_tensor_1d, load_tensor_2d, precompute_rope};
+use crate::weight_loader::{
+    load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized, precompute_rope,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
@@ -68,6 +70,30 @@ impl Qwen3Model {
         let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
+        // Detect weight quantization (quantize_config.json)
+        let quant_group_size = {
+            let qc_path = std::path::Path::new(model_path).join("quantize_config.json");
+            if qc_path.exists() {
+                let qc: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&qc_path)?)?;
+                let gs = qc["group_size"].as_u64().unwrap_or(128) as usize;
+                let bits = qc["bits"].as_u64().unwrap_or(8);
+                info!("Quantized model detected: W{}A16, group_size={}", bits, gs);
+                gs
+            } else {
+                0 // not quantized
+            }
+        };
+
+        // Helper: load linear weight, quantized if available
+        let load_linear = |name: &str| -> Result<DeviceMatrix> {
+            if quant_group_size > 0 {
+                load_tensor_2d_maybe_quantized(&ctx, &shards, &weight_map, name, quant_group_size)
+            } else {
+                load_tensor_2d(&ctx, &shards, &weight_map, name)
+            }
+        };
+
         let t_gpu = Instant::now();
         debug!("Loading embeddings to GPU");
         let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
@@ -100,36 +126,23 @@ impl Qwen3Model {
                     &format!("{}.input_layernorm.weight", prefix),
                 )?,
                 attention: {
-                    let q_proj = load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.q_proj.weight", prefix),
-                    )?;
-                    let k_proj = load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.k_proj.weight", prefix),
-                    )?;
-                    let v_proj = load_tensor_2d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.v_proj.weight", prefix),
-                    )?;
-                    let qkv_proj = DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?;
+                    let q_proj = load_linear(&format!("{}.self_attn.q_proj.weight", prefix))?;
+                    let k_proj = load_linear(&format!("{}.self_attn.k_proj.weight", prefix))?;
+                    let v_proj = load_linear(&format!("{}.self_attn.v_proj.weight", prefix))?;
+                    let qkv_proj = if q_proj.is_quantized() {
+                        // Can't concat quantized matrices — use q_proj as placeholder.
+                        // Batched decode uses individual Q/K/V projections anyway.
+                        // TODO: merged quantized QKV for prefill
+                        DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?
+                    } else {
+                        DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?
+                    };
                     Attention {
                         q_proj,
                         k_proj,
                         v_proj,
                         qkv_proj,
-                        o_proj: load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.self_attn.o_proj.weight", prefix),
-                        )?,
+                        o_proj: load_linear(&format!("{}.self_attn.o_proj.weight", prefix))?,
                         q_norm: load_tensor_1d(
                             &ctx,
                             &shards,
@@ -150,12 +163,13 @@ impl Qwen3Model {
                     &weight_map,
                     &format!("{}.post_attention_layernorm.weight", prefix),
                 )?,
-                mlp: MLP::load(
+                mlp: MLP::load_with_quant(
                     &ctx,
                     &shards,
                     &weight_map,
                     &format!("{}.mlp", prefix),
                     true, // merge gate+up for batched decode
+                    quant_group_size,
                 )?,
             };
             layers.push(block);

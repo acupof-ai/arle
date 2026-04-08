@@ -13,7 +13,10 @@ use std::collections::HashMap;
 
 use crate::ops;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use crate::weight_loader::{load_shard_info, load_shard_info_fixed, load_tensor_2d, mmap_shards};
+use crate::weight_loader::{
+    load_shard_info, load_shard_info_fixed, load_tensor_2d, load_tensor_2d_maybe_quantized,
+    mmap_shards,
+};
 
 // ─── MLP weights ─────────────────────────────────────────────────────────────
 
@@ -41,29 +44,32 @@ impl MLP {
         prefix: &str,
         merge_gate_up: bool,
     ) -> Result<Self> {
-        let gate_proj = load_tensor_2d(
-            ctx,
-            shards,
-            weight_map,
-            &format!("{}.gate_proj.weight", prefix),
-        )?;
-        let up_proj = load_tensor_2d(
-            ctx,
-            shards,
-            weight_map,
-            &format!("{}.up_proj.weight", prefix),
-        )?;
+        Self::load_with_quant(ctx, shards, weight_map, prefix, merge_gate_up, 0)
+    }
+
+    pub(crate) fn load_with_quant(
+        ctx: &DeviceContext,
+        shards: &[SafeTensors],
+        weight_map: &HashMap<String, usize>,
+        prefix: &str,
+        merge_gate_up: bool,
+        quant_group_size: usize,
+    ) -> Result<Self> {
+        let load_w = |name: &str| -> Result<DeviceMatrix> {
+            if quant_group_size > 0 {
+                load_tensor_2d_maybe_quantized(ctx, shards, weight_map, name, quant_group_size)
+            } else {
+                load_tensor_2d(ctx, shards, weight_map, name)
+            }
+        };
+        let gate_proj = load_w(&format!("{}.gate_proj.weight", prefix))?;
+        let up_proj = load_w(&format!("{}.up_proj.weight", prefix))?;
         let gate_up_proj = if merge_gate_up {
             Some(DeviceMatrix::concat_rows(ctx, &[&gate_proj, &up_proj])?)
         } else {
             None
         };
-        let down_proj = load_tensor_2d(
-            ctx,
-            shards,
-            weight_map,
-            &format!("{}.down_proj.weight", prefix),
-        )?;
+        let down_proj = load_w(&format!("{}.down_proj.weight", prefix))?;
         Ok(Self {
             gate_proj,
             up_proj,

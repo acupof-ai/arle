@@ -123,6 +123,45 @@ pub(crate) fn gemm_into(
         out.seq_len, x.seq_len
     );
 
+    // ── Quantized weight dispatch (W8A16 / W4A16) ──
+    if let (Some(qw), Some(qs)) = (&weight.qweight, &weight.qscales) {
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            if x.seq_len == 1 {
+                ffi::w8a16_gemv_cuda(
+                    qw_ptr as *const i8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w8a16_gemv_cuda failed");
+            } else {
+                ffi::w8a16_gemv_batch_cuda(
+                    qw_ptr as *const i8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w8a16_gemv_batch_cuda failed");
+            }
+        }
+        return;
+    }
+
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);

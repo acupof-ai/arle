@@ -129,6 +129,61 @@ pub(crate) fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
 }
 
+/// Load a 2D tensor, trying quantized (.qweight + .scales) first, then bf16.
+///
+/// If `name` = "model.layers.0.self_attn.q_proj.weight", tries:
+///   1. "model.layers.0.self_attn.q_proj.qweight" + ".scales" → INT8 quantized
+///   2. "model.layers.0.self_attn.q_proj.weight" → bf16
+pub(crate) fn load_tensor_2d_maybe_quantized(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    group_size: usize,
+) -> Result<DeviceMatrix> {
+    // Try quantized path: replace ".weight" with ".qweight"
+    let qweight_name = name.replace(".weight", ".qweight");
+    let scales_name = name.replace(".weight", ".scales");
+
+    if weight_map.contains_key(&qweight_name) && weight_map.contains_key(&scales_name) {
+        let qw_tensor = find_tensor(shards, weight_map, &qweight_name)?;
+        let sc_tensor = find_tensor(shards, weight_map, &scales_name)?;
+
+        let qw_shape = qw_tensor.shape();
+        let sc_shape = sc_tensor.shape();
+        let rows = qw_shape[0];
+        let cols = qw_shape[1];
+
+        // qweight is int8: direct reinterpret
+        let qw_data: &[i8] = unsafe {
+            std::slice::from_raw_parts(qw_tensor.data().as_ptr().cast::<i8>(), rows * cols)
+        };
+
+        // scales are bf16
+        let sc_data: &[half::bf16] = unsafe {
+            std::slice::from_raw_parts(
+                sc_tensor.data().as_ptr().cast::<half::bf16>(),
+                sc_shape[0] * sc_shape[1],
+            )
+        };
+
+        log::info!(
+            "Loaded quantized {}: [{}x{}] INT8, group_size={}, scales=[{}x{}]",
+            name,
+            rows,
+            cols,
+            group_size,
+            sc_shape[0],
+            sc_shape[1]
+        );
+
+        return DeviceMatrix::from_quantized_int8(ctx, qw_data, sc_data, rows, cols, group_size);
+    }
+
+    // Fallback: bf16
+    load_tensor_2d(ctx, shards, weight_map, name)
+}
+
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.
 /// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
 pub(crate) fn precompute_rope(
