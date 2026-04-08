@@ -278,6 +278,8 @@ pub struct DeviceMatrix {
     pub qscales: Option<CudaSlice<bf16>>,
     /// Quantization group size (0 = not quantized).
     pub group_size: usize,
+    /// Quantization bit width (8 or 4). 0 = not quantized.
+    pub quant_bits: usize,
 }
 
 impl DeviceMatrix {
@@ -295,6 +297,7 @@ impl DeviceMatrix {
             qweight: None,
             qscales: None,
             group_size: 0,
+            quant_bits: 0,
         })
     }
 
@@ -331,6 +334,45 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
+            quant_bits: 8,
+        })
+    }
+
+    /// Create from INT4 packed quantized weight + bf16 scales.
+    /// Weight data is packed: 2 int4 values per byte → [rows, cols/2] bytes.
+    pub fn from_quantized_int4(
+        ctx: &DeviceContext,
+        packed_data: &[u8],
+        scales_data: &[bf16],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        assert_eq!(packed_data.len(), rows * cols / 2);
+        let num_groups = cols / group_size;
+        assert_eq!(scales_data.len(), rows * num_groups);
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int4 failed: {}", e))?;
+        let qs = ctx
+            .stream
+            .clone_htod(scales_data)
+            .map_err(|e| anyhow!("H2D scales failed: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: Some(qw),
+            qscales: Some(qs),
+            group_size,
+            quant_bits: 4,
         })
     }
 
@@ -369,6 +411,7 @@ impl DeviceMatrix {
             qweight: None,
             qscales: None,
             group_size: 0,
+            quant_bits: 0,
         })
     }
 
@@ -404,6 +447,7 @@ impl DeviceMatrix {
             qweight: None,
             qscales: None,
             group_size: 0,
+            quant_bits: 0,
         })
     }
 
@@ -440,6 +484,7 @@ impl DeviceMatrix {
             qweight: None,
             qscales: None,
             group_size: 0,
+            quant_bits: 0,
         })
     }
 }
