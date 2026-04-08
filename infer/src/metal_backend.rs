@@ -31,6 +31,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "metal")]
+use crate::backend::StreamingInferenceBackend;
 use crate::{
     backend::{GenerateResult, InferenceBackend},
     hf_hub,
@@ -45,6 +47,8 @@ mod loader;
 mod qwen35;
 
 // ── mlx-rs types (Metal GPU required) ────────────────────────────────────────
+#[cfg(feature = "metal")]
+use crate::metal_kv_pool::MetalKVPool;
 use config::{MetalModelArch, MetalModelConfig, load_metal_config};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
@@ -563,7 +567,15 @@ impl MetalBackend {
                     &mut on_token,
                 )?,
                 MetalWeights::Qwen35(weights) => metal_generate_qwen35(
-                    input_ids,
+                    {
+                        if metal_kv_pool_enabled() {
+                            log::warn!(
+                                "MetalKVPool is currently wired for the Qwen3 fallback path only; \
+                                 Qwen3.5 continues on the existing Metal route"
+                            );
+                        }
+                        input_ids
+                    },
                     weights,
                     config,
                     params,
@@ -734,6 +746,21 @@ impl InferenceBackend for MetalBackend {
     }
 }
 
+#[cfg(feature = "metal")]
+impl StreamingInferenceBackend for MetalBackend {
+    fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        params: &SamplingParams,
+        on_chunk: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        Self::generate_stream(self, prompt, params, on_chunk)
+    }
+}
+
 // ── Metal forward pass (GPU required) ────────────────────────────────────────
 
 /// Autoregressive generation using MLX Metal kernels.
@@ -768,6 +795,8 @@ impl InferenceBackend for MetalBackend {
 // P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
+#[cfg(feature = "metal")]
+const METAL_KV_POOL_REQUEST_ID: usize = 0;
 
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 
@@ -790,6 +819,52 @@ struct MetalGenerateOutput {
     finish_reason: &'static str,
     ttft_ms: f64,
     total_time_ms: f64,
+}
+
+#[cfg(feature = "metal")]
+fn metal_kv_pool_enabled() -> bool {
+    std::env::var("AGENT_INFER_METAL_KV_POOL")
+        .ok()
+        .is_some_and(|value| metal_kv_pool_flag_is_truthy(&value))
+}
+
+#[cfg(feature = "metal")]
+struct MetalKvPoolRequestCleanup {
+    pool: *mut MetalKVPool,
+    request_id: usize,
+}
+
+#[cfg(feature = "metal")]
+impl MetalKvPoolRequestCleanup {
+    fn new(pool: &mut MetalKVPool, request_id: usize) -> Self {
+        Self {
+            pool: pool as *mut MetalKVPool,
+            request_id,
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for MetalKvPoolRequestCleanup {
+    fn drop(&mut self) {
+        if self.pool.is_null() {
+            return;
+        }
+
+        // SAFETY: the guard is created inside `metal_generate` after the pool
+        // and is dropped before the pool goes out of scope.
+        unsafe {
+            (&mut *self.pool).free_request(self.request_id);
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn metal_kv_pool_flag_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 // GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
@@ -821,6 +896,7 @@ fn metal_generate(
     let eps = config.rms_norm_eps as f32;
     let rope_base = config.rope_theta as f32;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let use_kv_pool = metal_kv_pool_enabled();
 
     let fused_mode = if !METAL_FUSED_OPS_AVAILABLE {
         FusedPathMode::Fallback
@@ -842,23 +918,22 @@ fn metal_generate(
         FusedPathMode::Fallback
     };
 
+    let fused_mode = if use_kv_pool {
+        FusedPathMode::Fallback
+    } else {
+        fused_mode
+    };
+
     match fused_mode {
         FusedPathMode::Dense => log::info!("Metal fused path: Dense"),
         FusedPathMode::Quantized => log::info!("Metal fused path: Quantized"),
         FusedPathMode::Fallback => log::info!("Metal fused path: Fallback (Rust)"),
     }
-
-    // TODO: Replace contiguous KV cache with MetalKVPool
-    // Current: slice_update to [1, n_kv_heads, max_seq, head_dim] per layer
-    // Paged: write_kv to pool, gather_kv before attention
-    // This enables multi-sequence support when wired to a scheduler
-    //
-    // Integration sketch:
-    //   let pool = MetalKVPool::new(n_layers, n_kv_heads, head_dim, max_tokens, kv_dtype)?;
-    //   pool.alloc_tokens(request_id, seq_len)?;
-    //   pool.write_kv(layer, request_id, &k_new, &v_new)?;
-    //   let (k_full, v_full) = pool.gather_kv(layer, request_id)?;
-    //   fast::scaled_dot_product_attention(&q, &k_full, &v_full, scale, mask);
+    if use_kv_pool {
+        log::info!(
+            "MetalKVPool enabled via AGENT_INFER_METAL_KV_POOL=1; forcing fallback Rust path"
+        );
+    }
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
     // plus one chunk for initial decode steps.  Grown lazily in KV_CACHE_CHUNK steps.
@@ -876,6 +951,27 @@ fn metal_generate(
         .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("pre-alloc v_caches")?;
+    let mut kv_pool = if use_kv_pool {
+        let pool_tokens = std::cmp::max(
+            initial_cap as usize,
+            input_ids.len().saturating_add(max_new_tokens),
+        );
+        Some(
+            MetalKVPool::new(
+                n_layers,
+                n_kv_heads as usize,
+                head_dim as usize,
+                pool_tokens,
+                kv_dtype,
+            )
+            .context("pre-alloc MetalKVPool")?,
+        )
+    } else {
+        None
+    };
+    let _kv_pool_cleanup = kv_pool
+        .as_mut()
+        .map(|pool| MetalKvPoolRequestCleanup::new(pool, METAL_KV_POOL_REQUEST_ID));
 
     let mut generated: Vec<u32> = Vec::new();
     let mut cache_len: i32 = 0;
@@ -895,6 +991,8 @@ fn metal_generate(
         rope_base,
         eps,
         fused_mode,
+        kv_pool.as_mut(),
+        METAL_KV_POOL_REQUEST_ID,
         params,
     )?;
     // P6: schedule GPU execution without blocking CPU.
@@ -934,7 +1032,7 @@ fn metal_generate(
         }
 
         // P5: grow KV cache in 256-token chunks when capacity is about to overflow.
-        if cache_len + 1 > kv_capacity {
+        if !use_kv_pool && cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
             for li in 0..n_layers {
                 extend_kv_cache(&mut k_caches[li], n_kv_heads, head_dim, new_cap)?;
@@ -962,6 +1060,8 @@ fn metal_generate(
             rope_base,
             eps,
             fused_mode,
+            kv_pool.as_mut(),
+            METAL_KV_POOL_REQUEST_ID,
             params,
         )?;
         cache_len += 1;
@@ -1036,11 +1136,17 @@ fn build_forward_graph(
     rope_base: f32,
     eps: f32,
     fused_mode: FusedPathMode,
+    mut metal_kv_pool: Option<&mut MetalKVPool>,
+    request_id: usize,
     params: &SamplingParams,
 ) -> Result<Array> {
     use mlx_rs::{fast, ops::indexing::take_axis};
 
     let seq = current_ids.len() as i32;
+    if let Some(pool) = metal_kv_pool.as_deref_mut() {
+        pool.alloc_tokens(request_id, seq as usize)
+            .context("alloc MetalKVPool slots")?;
+    }
 
     // ── Embedding lookup ─────────────────────────────────────────────────────
     let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
@@ -1148,8 +1254,21 @@ fn build_forward_graph(
         FusedPathMode::Fallback => {
             for (li, layer) in weights.layers.iter().enumerate() {
                 x = rust_transformer_layer(
-                    x, layer, li, k_caches, v_caches, seq, cache_len, n_heads, n_kv_heads,
-                    head_dim, attn_scale, rope_base, eps,
+                    x,
+                    layer,
+                    li,
+                    k_caches,
+                    v_caches,
+                    seq,
+                    cache_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    attn_scale,
+                    rope_base,
+                    eps,
+                    metal_kv_pool.as_deref_mut(),
+                    request_id,
                 )?;
             }
         }
@@ -1405,6 +1524,8 @@ fn rust_transformer_layer(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
+    mut metal_kv_pool: Option<&mut MetalKVPool>,
+    request_id: usize,
 ) -> Result<Array> {
     use mlx_rs::{
         fast,
@@ -1442,19 +1563,31 @@ fn rust_transformer_layer(
     let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?; // [1, n_kv, seq, d]
 
     // 7. KV cache update
-    let end_pos = cache_len + seq;
-    k_caches[li]
-        .try_index_mut((.., .., cache_len..end_pos, ..), &k)
-        .context("slice_update k_cache")?;
-    v_caches[li]
-        .try_index_mut((.., .., cache_len..end_pos, ..), &v)
-        .context("slice_update v_cache")?;
-    let k_full = k_caches[li]
-        .try_index((.., .., 0i32..end_pos, ..))
-        .context("slice k_cache")?;
-    let v_full = v_caches[li]
-        .try_index((.., .., 0i32..end_pos, ..))
-        .context("slice v_cache")?;
+    let (k_full, v_full) = if let Some(pool) = metal_kv_pool.as_deref_mut() {
+        let k_rows = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k rows")?;
+        let k_rows = reshape(&k_rows, &[seq, n_kv_heads * head_dim]).context("reshape k rows")?;
+        let v_rows = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v rows")?;
+        let v_rows = reshape(&v_rows, &[seq, n_kv_heads * head_dim]).context("reshape v rows")?;
+        pool.write_kv(li, request_id, &k_rows, &v_rows)
+            .context("write MetalKVPool")?;
+        pool.gather_kv(li, request_id)
+            .context("gather MetalKVPool")?
+    } else {
+        let end_pos = cache_len + seq;
+        k_caches[li]
+            .try_index_mut((.., .., cache_len..end_pos, ..), &k)
+            .context("slice_update k_cache")?;
+        v_caches[li]
+            .try_index_mut((.., .., cache_len..end_pos, ..), &v)
+            .context("slice_update v_cache")?;
+        let k_full = k_caches[li]
+            .try_index((.., .., 0i32..end_pos, ..))
+            .context("slice k_cache")?;
+        let v_full = v_caches[li]
+            .try_index((.., .., 0i32..end_pos, ..))
+            .context("slice v_cache")?;
+        (k_full, v_full)
+    };
 
     // 8. Attention
     let use_causal = cache_len == 0 && seq > 1;
@@ -1759,6 +1892,26 @@ mod tests {
     use super::*;
     use crate::backend::InferenceBackend;
     use crate::sampler::SamplingParams;
+
+    #[test]
+    fn kv_pool_flag_parser_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(
+                metal_kv_pool_flag_is_truthy(value),
+                "{value:?} should be truthy"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_pool_flag_parser_rejects_falsey_values() {
+        for value in ["", "0", "false", "off", "no", "maybe"] {
+            assert!(
+                !metal_kv_pool_flag_is_truthy(value),
+                "{value:?} should be falsey"
+            );
+        }
+    }
 
     fn run_bench(model_dir: &std::path::Path, label: &str) {
         if !model_dir.exists() {

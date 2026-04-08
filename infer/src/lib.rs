@@ -18,6 +18,7 @@ pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
 pub mod backend;
+pub mod backend_runtime;
 pub mod block_manager;
 pub mod chat;
 pub mod chat_protocol;
@@ -30,10 +31,13 @@ pub mod memory_planner;
 pub mod metal_backend;
 pub mod metal_gdr;
 pub mod metal_kv_pool;
+pub mod metal_prefix_cache;
+pub mod metal_scheduler;
 pub mod metrics;
 pub mod model_registry;
 pub mod prefix_cache;
 pub mod quant;
+pub mod request_handle;
 pub mod sampler;
 pub mod scheduler;
 pub mod server_engine;

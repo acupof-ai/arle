@@ -108,6 +108,11 @@ name = "metal_request"
 path = "src/bin/metal_request.rs"
 required-features = ["metal"]
 
+[[bin]]
+name = "metal_serve"
+path = "src/bin/metal_serve.rs"
+required-features = ["metal"]
+
 [[bench]]
 name = "tokenizer_bench"
 harness = false
