@@ -65,7 +65,7 @@ impl<M: ModelForward> Scheduler<M> {
             req.prompt_tokens.clone()
         };
 
-        if prefix_len > 0 && !self.paged_kv_pool.k_buffers.is_empty() {
+        if prefix_len > 0 && self.paged_kv_pool.is_active() {
             if let Err(e) = self.paged_kv_pool.alloc_tokens(si, prefix_len) {
                 error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
             } else {
@@ -145,7 +145,7 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        if !paged_kv_pool.k_buffers.is_empty() {
+        if paged_kv_pool.is_active() {
             if let Err(e) = paged_kv_pool.alloc_tokens(slot_idx, total) {
                 error!("Request {}: pool alloc for migration failed: {}", req.id, e);
             } else {

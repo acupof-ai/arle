@@ -197,7 +197,7 @@ impl GLM4Model {
         ops::add_bias_batch_into(&self.ctx, &mut bufs.v_batch, &layer.attention.v_bias)?;
 
         // 2b. Scatter-write K/V to token pool (dual-write path).
-        if !pool.k_buffers.is_empty() {
+        if pool.is_active() {
             ops::scatter_write_kv(
                 &self.ctx,
                 &bufs.k_batch,

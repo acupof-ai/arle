@@ -7,7 +7,7 @@ use infer::bootstrap::{
 };
 use infer::http_server::build_app;
 use infer::logging;
-use infer::model::KVCacheDtype;
+use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
 use infer::trace_reporter::FileReporter;
 use log::info;
@@ -113,7 +113,13 @@ async fn main() {
     let kv_cache_dtype = match args.kv_cache_dtype.as_str() {
         "bf16" | "BF16" => KVCacheDtype::BF16,
         "int8" | "INT8" => KVCacheDtype::INT8,
-        other => panic!("Invalid --kv-cache-dtype '{other}': expected 'bf16' or 'int8'"),
+        "fp8" | "FP8" => KVCacheDtype::BF16, // FP8 pool uses BF16 contiguous (quantize on migration)
+        other => panic!("Invalid --kv-cache-dtype '{other}': expected 'bf16', 'int8', or 'fp8'"),
+    };
+    let kv_pool_format = match args.kv_cache_dtype.as_str() {
+        "fp8" | "FP8" => KVFormat::FP8E4M3,
+        "int8" | "INT8" => KVFormat::INT8,
+        _ => KVFormat::BF16,
     };
 
     let runtime = ServerRuntimeConfig {
@@ -131,6 +137,7 @@ async fn main() {
         seed: 42,
         max_seq_len: args.max_seq_len,
         kv_cache_dtype,
+        kv_pool_format,
     };
 
     let handle =

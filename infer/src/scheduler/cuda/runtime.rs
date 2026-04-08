@@ -115,6 +115,7 @@ impl<M: ModelForward> Scheduler<M> {
                 sent_len: 0,
                 phase: Phase::New,
                 prefix_byte_len: 0,
+                latest_logprob: None,
             });
         }
     }

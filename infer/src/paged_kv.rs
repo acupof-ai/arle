@@ -15,14 +15,34 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
+use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 use crate::tensor::DeviceContext;
 
 /// Token-level KV cache pool — shared across all request slots.
+///
+/// Storage is format-aware via `KVFormat`:
+/// - `BF16`: `k_data`/`v_data` are `CudaSlice<u8>` holding bf16 (2 bytes/elem)
+/// - `FP8E4M3`: `k_data`/`v_data` hold FP8 E4M3 (1 byte/elem), no scales
+/// - `INT8`: `k_data`/`v_data` hold int8 (1 byte/elem), + `k_scales`/`v_scales`
+///
+/// For FP8/INT8, a shared bf16 working buffer (1 layer) is used as the write
+/// target for `decode_prep_paged`, which outputs bf16. After the prep kernel,
+/// new tokens are quantized from the working buffer into the pool.
 pub struct TokenKVPool {
-    /// K buffers per layer: each `[max_total_tokens * kv_dim]` bf16
-    pub(crate) k_buffers: Vec<CudaSlice<u16>>,
-    /// V buffers per layer: each `[max_total_tokens * kv_dim]` bf16
-    v_buffers: Vec<CudaSlice<u16>>,
+    /// K data per layer: raw bytes, layout `[max_total_tokens, kv_dim]` × bytes_per_elem
+    k_data: Vec<CudaSlice<u8>>,
+    /// V data per layer: same layout
+    v_data: Vec<CudaSlice<u8>>,
+    /// Per-head per-token f32 scales (INT8 only). `[max_total_tokens, num_kv_heads]`
+    k_scales: Vec<CudaSlice<f32>>,
+    v_scales: Vec<CudaSlice<f32>>,
+    /// Shared bf16 working buffers (1 layer, for decode_prep write target).
+    /// Only allocated when format != BF16.
+    k_work: Option<CudaSlice<u8>>,
+    v_work: Option<CudaSlice<u8>>,
+    /// Workspace for split-KV fused-dequant attention (INT8 only).
+    pub(crate) int8_attn_workspace: Option<CudaSlice<u8>>,
+    pub(crate) int8_attn_workspace_bytes: usize,
 
     /// Free token slot indices (stack-based allocator, LIFO).
     free_slots: Vec<u32>,
@@ -32,6 +52,9 @@ pub struct TokenKVPool {
     token_indices: Vec<Vec<u32>>,
 
     // Config
+    pub format: KVFormat,
+    /// Legacy compat — maps to format.
+    pub dtype: KVCacheDtype,
     pub num_layers: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -69,60 +92,191 @@ impl TokenKVPool {
         head_dim: usize,
         num_slots: usize,
         budget_bytes: usize,
+        dtype: KVCacheDtype,
+    ) -> Result<Self> {
+        // Map legacy KVCacheDtype to KVFormat.
+        let format = match dtype {
+            KVCacheDtype::BF16 => KVFormat::BF16,
+            KVCacheDtype::INT8 => KVFormat::INT8,
+        };
+        Self::with_format(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_slots,
+            budget_bytes,
+            format,
+        )
+    }
+
+    /// Create a new token-level KV pool with explicit format.
+    pub fn with_format(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        num_slots: usize,
+        budget_bytes: usize,
+        format: KVFormat,
     ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
-        let bytes_per_token_per_layer = kv_dim * 2; // bf16 = 2 bytes
-        let bytes_per_token = bytes_per_token_per_layer * num_layers * 2; // K + V
-        let max_total_tokens = if bytes_per_token > 0 {
-            budget_bytes / bytes_per_token
+        let bpe = format.bytes_per_element();
+
+        // Bytes per token: data (K+V) + optional scales (K+V)
+        let scale_bytes_per_token = if format.has_scales() {
+            num_kv_heads * 4 * 2 // f32 per-head, K+V
         } else {
             0
         };
-        // At least 1 token slot per request slot (may be 0-capacity in stub mode).
+        let data_bytes_per_token = kv_dim * bpe * 2; // K+V
+        let bytes_per_token = (data_bytes_per_token + scale_bytes_per_token) * num_layers;
+
+        // Fixed cost: 1-layer bf16 working buffer for K+V (when format != BF16)
+        let fixed_cost = if format.needs_work_buffer() {
+            kv_dim * 2 * 2 // K+V, bf16=2 bytes, 1 layer
+        } else {
+            0
+        };
+
+        let effective_budget = budget_bytes.saturating_sub(fixed_cost);
+        let max_total_tokens = if bytes_per_token > 0 {
+            effective_budget / bytes_per_token
+        } else {
+            0
+        };
         let max_total_tokens = max_total_tokens.max(num_slots);
 
         info!(
             "TokenKVPool: {} max tokens, {:.1} GB for {} layers \
-             ({} kv_heads x {} head_dim, kv_dim={})",
+             ({} kv_heads x {} head_dim, kv_dim={}, format={:?})",
             max_total_tokens,
-            (max_total_tokens as u64 * bytes_per_token as u64) as f64 / 1e9,
+            (max_total_tokens as u64 * bytes_per_token as u64 + fixed_cost as u64) as f64 / 1e9,
             num_layers,
             num_kv_heads,
             head_dim,
             kv_dim,
+            format,
         );
 
-        // Allocate K and V buffers per layer (skip if budget is 0 — stub mode).
-        let pool_elements = max_total_tokens * kv_dim;
-        let mut k_buffers = Vec::with_capacity(num_layers);
-        let mut v_buffers = Vec::with_capacity(num_layers);
+        let pool_bytes_per_layer = max_total_tokens * kv_dim * bpe;
+        let scale_elements = max_total_tokens * num_kv_heads;
 
-        if pool_elements > 0 {
+        let mut k_data = Vec::new();
+        let mut v_data = Vec::new();
+        let mut k_scales = Vec::new();
+        let mut v_scales = Vec::new();
+        let mut k_work = None;
+        let mut v_work = None;
+
+        if pool_bytes_per_layer > 0 {
+            // Data buffers (all formats)
             for _ in 0..num_layers {
-                let k: CudaSlice<u16> = ctx
-                    .stream
-                    .alloc_zeros(pool_elements)
-                    .map_err(|e| anyhow!("TokenKVPool K alloc failed: {e}"))?;
-                let v: CudaSlice<u16> = ctx
-                    .stream
-                    .alloc_zeros(pool_elements)
-                    .map_err(|e| anyhow!("TokenKVPool V alloc failed: {e}"))?;
-                k_buffers.push(k);
-                v_buffers.push(v);
+                k_data.push(
+                    ctx.stream
+                        .alloc_zeros::<u8>(pool_bytes_per_layer)
+                        .map_err(|e| anyhow!("TokenKVPool K data alloc failed: {e}"))?,
+                );
+                v_data.push(
+                    ctx.stream
+                        .alloc_zeros::<u8>(pool_bytes_per_layer)
+                        .map_err(|e| anyhow!("TokenKVPool V data alloc failed: {e}"))?,
+                );
             }
+
+            // Scale buffers (INT8 only)
+            if format.has_scales() {
+                for _ in 0..num_layers {
+                    k_scales.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(scale_elements)
+                            .map_err(|e| anyhow!("TokenKVPool K scales alloc failed: {e}"))?,
+                    );
+                    v_scales.push(
+                        ctx.stream
+                            .alloc_zeros::<f32>(scale_elements)
+                            .map_err(|e| anyhow!("TokenKVPool V scales alloc failed: {e}"))?,
+                    );
+                }
+            }
+
+            // Working buffer (FP8/INT8: 1-layer bf16 for decode_prep write target)
+            if format.needs_work_buffer() {
+                let work_bytes = max_total_tokens * kv_dim * 2; // bf16 = 2 bytes
+                k_work = Some(
+                    ctx.stream
+                        .alloc_zeros::<u8>(work_bytes)
+                        .map_err(|e| anyhow!("TokenKVPool K work alloc failed: {e}"))?,
+                );
+                v_work = Some(
+                    ctx.stream
+                        .alloc_zeros::<u8>(work_bytes)
+                        .map_err(|e| anyhow!("TokenKVPool V work alloc failed: {e}"))?,
+                );
+            }
+
+            info!(
+                "TokenKVPool {format:?}: data={:.1}MB/layer scales={:.1}MB/layer working={:.1}MB",
+                (pool_bytes_per_layer * 2) as f64 / 1e6,
+                if format.has_scales() {
+                    (scale_elements * 4 * 2) as f64 / 1e6
+                } else {
+                    0.0
+                },
+                if format.needs_work_buffer() {
+                    (max_total_tokens * kv_dim * 2 * 2) as f64 / 1e6
+                } else {
+                    0.0
+                },
+            );
         }
 
-        // Initialize free list: all token slots free, highest indices first (LIFO).
         let free_slots: Vec<u32> = (0..max_total_tokens as u32).rev().collect();
-
-        // Initialize per-slot state.
         let token_indices = vec![Vec::new(); num_slots];
 
+        // INT8 split-KV attention workspace
+        let num_splits = 8;
+        let (int8_attn_workspace, int8_attn_workspace_bytes) = if (format == KVFormat::INT8
+            || format == KVFormat::FP8E4M3)
+            && pool_bytes_per_layer > 0
+        {
+            let ws_bytes = crate::ops::kv_quant::decode_attention_int8_workspace_bytes(
+                num_slots,
+                num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
+                head_dim,
+                num_splits,
+            );
+            // Use a reasonable upper bound: max_batch * max_heads * head_dim * num_splits * 3 floats
+            let ws_bytes_safe = num_splits * num_slots * num_kv_heads * 4 * (head_dim + 2) * 4;
+            let ws_bytes = ws_bytes.max(ws_bytes_safe);
+            let ws = ctx
+                .stream
+                .alloc_zeros::<u8>(ws_bytes)
+                .map_err(|e| anyhow!("INT8 attn workspace alloc failed: {e}"))?;
+            (Some(ws), ws_bytes)
+        } else {
+            (None, 0)
+        };
+
+        // Legacy dtype mapping
+        let dtype = match format {
+            KVFormat::BF16 => KVCacheDtype::BF16,
+            KVFormat::FP8E4M3 | KVFormat::INT8 => KVCacheDtype::INT8,
+        };
+
         Ok(Self {
-            k_buffers,
-            v_buffers,
+            k_data,
+            v_data,
+            k_scales,
+            v_scales,
+            k_work,
+            v_work,
+            int8_attn_workspace,
+            int8_attn_workspace_bytes,
             free_slots,
             token_indices,
+            format,
+            dtype,
             num_layers,
             num_kv_heads,
             head_dim,
@@ -181,15 +335,75 @@ impl TokenKVPool {
         self.free_slots.len()
     }
 
-    /// Get raw K buffer device pointer for a layer (for FFI / kernel launches).
+    /// Whether the pool has allocated buffers.
+    pub fn is_active(&self) -> bool {
+        !self.k_data.is_empty()
+    }
+
+    // ── Pointer accessors ──
+    //
+    // `k_ptr` / `v_ptr` = the "write target" for decode_prep_paged:
+    //   BF16 → per-layer data buffer (also read by FlashInfer)
+    //   FP8/INT8 → shared bf16 working buffer (quantized to pool after write)
+    //
+    // `k_data_ptr` / `v_data_ptr` = the quantized data buffer (read by attention):
+    //   Used by FlashInfer FP8 and fused-dequant INT8 attention.
+
+    /// Write-target pointer for decode_prep_paged (bf16 for all formats).
     pub fn k_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.k_buffers[layer].device_ptr(stream);
+        if self.format.needs_work_buffer() {
+            let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
+            ptr as u64
+        } else {
+            let (ptr, _guard) = self.k_data[layer].device_ptr(stream);
+            ptr as u64
+        }
+    }
+
+    /// Write-target pointer for decode_prep_paged (bf16 for all formats).
+    pub fn v_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        if self.format.needs_work_buffer() {
+            let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
+            ptr as u64
+        } else {
+            let (ptr, _guard) = self.v_data[layer].device_ptr(stream);
+            ptr as u64
+        }
+    }
+
+    /// Quantized K data pointer for a layer (read by attention kernels).
+    pub fn k_data_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.k_data[layer].device_ptr(stream);
         ptr as u64
     }
 
-    /// Get raw V buffer device pointer for a layer (for FFI / kernel launches).
-    pub fn v_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
-        let (ptr, _guard) = self.v_buffers[layer].device_ptr(stream);
+    /// Quantized V data pointer for a layer (read by attention kernels).
+    pub fn v_data_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.v_data[layer].device_ptr(stream);
+        ptr as u64
+    }
+
+    /// K scales device pointer for a layer (INT8 only).
+    pub fn k_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.k_scales[layer].device_ptr(stream);
+        ptr as u64
+    }
+
+    /// V scales device pointer for a layer (INT8 only).
+    pub fn v_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.v_scales[layer].device_ptr(stream);
+        ptr as u64
+    }
+
+    /// K working buffer pointer (bf16, shared across layers).
+    pub fn k_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
+        ptr as u64
+    }
+
+    /// V working buffer pointer (bf16, shared across layers).
+    pub fn v_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
         ptr as u64
     }
 
@@ -294,7 +508,7 @@ impl TokenKVPool {
         use cudarc::driver::DevicePtr;
 
         let seq_len = self.seq_len(slot);
-        if seq_len == 0 || self.k_buffers.is_empty() {
+        if seq_len == 0 || self.k_data.is_empty() {
             return Ok(());
         }
 
@@ -303,9 +517,6 @@ impl TokenKVPool {
             return Ok(());
         }
 
-        // Upload token indices to GPU as the "page table" for the CUDA kernel.
-        // With page_size=1 the existing kv_cache_to_paged_cuda kernel works:
-        // each "page" is one token, stride_page = kv_dim.
         let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
         let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
             .stream
@@ -315,8 +526,8 @@ impl TokenKVPool {
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
-            let (k_dst_ptr, _gkd) = self.k_buffers[layer].device_ptr(&ctx.stream);
-            let (v_dst_ptr, _gvd) = self.v_buffers[layer].device_ptr(&ctx.stream);
+            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
+            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
             let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
 
             unsafe {
@@ -336,6 +547,132 @@ impl TokenKVPool {
                 )
                 .result()?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Migrate INT8 KV data from contiguous per-slot cache into the INT8 token pool.
+    ///
+    /// Copies quantized INT8 data + scales from HND contiguous layout to NHD paged
+    /// layout with scale transposition.
+    pub fn migrate_from_contiguous_int8(
+        &self,
+        ctx: &crate::tensor::DeviceContext,
+        slot: usize,
+        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
+        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
+        max_seq_len_contiguous: usize,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+
+        let seq_len = self.seq_len(slot);
+        if seq_len == 0 || self.k_data.is_empty() {
+            return Ok(());
+        }
+
+        let token_idxs = &self.token_indices[slot];
+        if token_idxs.is_empty() {
+            return Ok(());
+        }
+
+        let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
+        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
+            .stream
+            .memcpy_stod(&page_indices_i32)
+            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
+
+        for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
+            let (k_src_ptr, _gk) = contiguous_k_q[layer].device_ptr(&ctx.stream);
+            let (v_src_ptr, _gv) = contiguous_v_q[layer].device_ptr(&ctx.stream);
+            let (ks_src_ptr, _gks) = contiguous_k_scales[layer].device_ptr(&ctx.stream);
+            let (vs_src_ptr, _gvs) = contiguous_v_scales[layer].device_ptr(&ctx.stream);
+            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
+            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
+            let (ks_dst_ptr, _gksd) = self.k_scales[layer].device_ptr(&ctx.stream);
+            let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
+            let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
+
+            unsafe {
+                crate::ffi::kv_cache_to_paged_int8_cuda(
+                    k_src_ptr as *const i8,
+                    v_src_ptr as *const i8,
+                    ks_src_ptr as *const f32,
+                    vs_src_ptr as *const f32,
+                    k_dst_ptr as *mut i8,
+                    v_dst_ptr as *mut i8,
+                    ks_dst_ptr as *mut f32,
+                    vs_dst_ptr as *mut f32,
+                    pi_ptr as *const i32,
+                    max_seq_len_contiguous as i32,
+                    seq_len as i32,
+                    self.num_kv_heads as i32,
+                    self.head_dim as i32,
+                    self.kv_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migrate BF16 contiguous KV to FP8 paged pool (quantize + scatter).
+    ///
+    /// Reads bf16 from contiguous HND layout, quantizes to FP8 E4M3, and
+    /// scatters to NHD paged layout in a single fused kernel per layer.
+    pub fn migrate_from_contiguous_fp8(
+        &self,
+        ctx: &crate::tensor::DeviceContext,
+        slot: usize,
+        contiguous_k_caches: &[crate::tensor::DeviceVec],
+        contiguous_v_caches: &[crate::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+    ) -> Result<()> {
+        let seq_len = self.seq_len(slot);
+        if seq_len == 0 || self.k_data.is_empty() {
+            return Ok(());
+        }
+
+        let token_idxs = &self.token_indices[slot];
+        if token_idxs.is_empty() {
+            return Ok(());
+        }
+
+        let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
+        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
+            .stream
+            .memcpy_stod(&page_indices_i32)
+            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
+
+        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
+            // K: bf16 contiguous → FP8 paged
+            crate::ops::kv_quant::quantize_scatter_kv_fp8(
+                ctx,
+                &contiguous_k_caches[layer],
+                self.k_data_ptr(layer, &ctx.stream),
+                &page_indices_gpu,
+                max_seq_len_contiguous,
+                seq_len,
+                self.num_kv_heads,
+                self.head_dim,
+                self.kv_dim,
+            )?;
+            // V: bf16 contiguous → FP8 paged
+            crate::ops::kv_quant::quantize_scatter_kv_fp8(
+                ctx,
+                &contiguous_v_caches[layer],
+                self.v_data_ptr(layer, &ctx.stream),
+                &page_indices_gpu,
+                max_seq_len_contiguous,
+                seq_len,
+                self.num_kv_heads,
+                self.head_dim,
+                self.kv_dim,
+            )?;
         }
 
         Ok(())

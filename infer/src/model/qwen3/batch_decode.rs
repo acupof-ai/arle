@@ -16,7 +16,9 @@ use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
 use crate::model::ModelForward;
+use crate::model::kv_cache::KVFormat;
 use crate::ops;
+use crate::ops::kv_quant;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -48,6 +50,10 @@ pub struct BatchDecodeBuffers {
     pub(super) argmax_out: CudaSlice<i32>,
     /// Pre-allocated host buffer for batched argmax readback.
     pub(super) argmax_host: Vec<i32>,
+    /// Pre-allocated batch logprob output [max_batch_size] f32.
+    pub(super) logprobs_gpu: CudaSlice<f32>,
+    /// Host readback for logprobs.
+    pub logprobs_host: Vec<f32>,
 
     /// Pre-allocated token_ids buffer — avoids clone_htod alloc every step.
     token_ids_gpu: CudaSlice<i32>,
@@ -105,6 +111,11 @@ impl BatchDecodeBuffers {
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc argmax_out failed: {e}"))?,
             argmax_host: vec![0i32; max_batch_size],
+            logprobs_gpu: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc logprobs_gpu failed: {e}"))?,
+            logprobs_host: vec![0.0f32; max_batch_size],
 
             token_ids_gpu: ctx
                 .stream
@@ -171,15 +182,21 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
+        kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
-        self.metadata.plan(
-            ctx,
-            batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )
+        // Only BF16 uses FlashInfer plan. FP8/INT8 use our fused-dequant kernel
+        // which doesn't need FlashInfer's work estimation.
+        if kv_format == KVFormat::BF16 {
+            self.metadata.plan(
+                ctx,
+                batch_size,
+                num_q_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        }
+        Ok(())
     }
 
     fn set_batch_size(&mut self, bs: usize) {
@@ -190,6 +207,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         if batch_size >= 1 && batch_size <= self.graph_cache.len() {
             self.graph_cache[batch_size - 1] = None;
         }
+    }
+
+    fn logprobs_host(&self) -> &[f32] {
+        &self.logprobs_host
     }
 }
 
@@ -411,43 +432,130 @@ impl Qwen3Model {
             num_kv_heads,
         )?;
 
-        // 4. FlashInfer attention (run only -- plan was called once before loop)
-        // TC decode (prefill kernel for attention) is available but not faster on A100
-        // for this model size — attention isn't the bottleneck, GEMV is. Keep CUDA graph.
-        let use_tc_decode = false; // Enable with: num_heads / num_kv_heads >= 4
-        if use_tc_decode {
-            ops::flashinfer_tc_run_layer(
-                &self.ctx,
-                &bufs.q_batch,
-                &bufs.metadata.q_indptr,
-                kv_pool,
-                layer_idx,
-                &bufs.metadata.kv_indptr,
-                &bufs.metadata.kv_indices,
-                &bufs.metadata.kv_last_page_len,
-                &mut bufs.attn_output,
-                &mut bufs.metadata.flashinfer_ws,
-                num_heads,
-                num_kv_heads,
-                page_size,
-                head_dim,
-            )?;
-        } else {
-            ops::flashinfer_run_layer(
-                &self.ctx,
-                &bufs.q_batch,
-                kv_pool,
-                layer_idx,
-                &bufs.metadata.kv_indptr,
-                &bufs.metadata.kv_indices,
-                &bufs.metadata.kv_last_page_len,
-                &mut bufs.attn_output,
-                &mut bufs.metadata.flashinfer_ws,
-                num_heads,
-                num_kv_heads,
-                page_size,
-                head_dim,
-            )?;
+        // 4. Attention dispatch — format-aware
+        //
+        // FP8/INT8: quantize new token from bf16 working → pool, then attention
+        //   reads directly from quantized pool (zero full-dequant).
+        // BF16: FlashInfer reads bf16 pool directly (decode_prep already wrote there).
+        {
+            let batch_size = bufs.q_batch.seq_len;
+            let stream = &self.ctx.stream;
+
+            // Quantize new token into pool (FP8/INT8 only — bf16 wrote directly)
+            match kv_pool.format {
+                KVFormat::FP8E4M3 => {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::INT8 => {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::BF16 => {} // decode_prep already wrote bf16 to pool
+            }
+
+            // Attention: read from quantized pool
+            match kv_pool.format {
+                KVFormat::FP8E4M3 => {
+                    // Fused-dequant FP8 — reads FP8 E4M3 from pool, casts in registers
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_fp8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::INT8 => {
+                    // Fused-dequant decode attention — reads INT8+scale from pool directly
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_int8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::BF16 => {
+                    ops::flashinfer_run_layer(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool,
+                        layer_idx,
+                        &bufs.metadata.kv_indptr,
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_last_page_len,
+                        &mut bufs.attn_output,
+                        &mut bufs.metadata.flashinfer_ws,
+                        num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    )?;
+                }
+            }
         }
 
         // 5. Batched O projection → bufs.o_buf [B, hidden_dim]

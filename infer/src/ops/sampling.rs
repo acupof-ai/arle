@@ -63,6 +63,32 @@ pub(crate) fn argmax_batch_launch(
     Ok(())
 }
 
+/// Batched argmax + logprob launch (no sync). Returns token IDs + logprobs.
+pub(crate) fn argmax_batch_logprob_launch(
+    ctx: &DeviceContext,
+    logits: &crate::tensor::HiddenStates,
+    out_ids: &mut CudaSlice<i32>,
+    out_logprobs: &mut CudaSlice<f32>,
+    batch_size: usize,
+) -> Result<()> {
+    let vocab_size = logits.hidden_dim;
+    let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+    let (i_ptr, _gi) = out_ids.device_ptr_mut(&ctx.stream);
+    let (lp_ptr, _glp) = out_logprobs.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::argmax_batch_logprob_cuda(
+            l_ptr as *const ffi::Half,
+            i_ptr as *mut i32,
+            lp_ptr as *mut f32,
+            batch_size as i32,
+            vocab_size as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Read back B argmax results into a pre-allocated host slice. Call after sync.
 pub(crate) fn argmax_batch_readback_into(
     ctx: &DeviceContext,
@@ -107,6 +133,49 @@ pub fn gpu_sample_into(
     random_val: f32,
 ) -> Result<u32> {
     gpu_sample_core(ctx, logits, probs_scratch, out, params, random_val)
+}
+
+/// Greedy argmax + logprob: returns (token_id, log_probability) in a single kernel.
+///
+/// Uses fused argmax+logsoftmax kernel — same cost as argmax alone (one scan
+/// over logits, with an extra sum_exp accumulator). Zero additional memory traffic.
+pub fn argmax_with_logprob(
+    ctx: &DeviceContext,
+    logits: &DeviceVec,
+    out_idx: &mut CudaSlice<i32>,
+    out_logprob: &mut CudaSlice<f32>,
+) -> Result<(u32, f32)> {
+    // Launch kernel
+    {
+        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+        let (i_ptr, _gi) = out_idx.device_ptr_mut(&ctx.stream);
+        let (lp_ptr, _glp) = out_logprob.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            ffi::argmax_logprob_cuda(
+                l_ptr as *const ffi::Half,
+                i_ptr as *mut i32,
+                lp_ptr as *mut f32,
+                logits.len as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    ctx.sync()?;
+
+    // Readback (borrows released from kernel launch scope)
+    let idx = ctx
+        .stream
+        .clone_dtoh(out_idx)
+        .map_err(|e| anyhow!("D2H argmax idx: {}", e))?;
+    let lp = ctx
+        .stream
+        .clone_dtoh(out_logprob)
+        .map_err(|e| anyhow!("D2H logprob: {}", e))?;
+
+    Ok((idx[0] as u32, lp[0]))
 }
 
 fn gpu_sample_core(

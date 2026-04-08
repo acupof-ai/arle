@@ -33,6 +33,8 @@ pub(crate) struct ActiveRequest {
     /// Cached byte length of the decoded prefix (tokens[0..safe_point]).
     /// Avoids O(N) re-decode of prefix in emit_delta.
     pub(crate) prefix_byte_len: usize,
+    /// Latest token's log-probability (greedy only, set by scheduler decode step).
+    pub(crate) latest_logprob: Option<f32>,
 }
 
 impl ActiveRequest {
@@ -87,6 +89,7 @@ impl ActiveRequest {
                             text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
                             finish_reason: None,
                             usage: None,
+                            logprob: self.latest_logprob,
                         });
                     }
                     self.sent_len = stop_pos;
@@ -100,6 +103,7 @@ impl ActiveRequest {
                             text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
                             finish_reason: None,
                             usage: None,
+                            logprob: self.latest_logprob,
                         });
                         self.sent_len = safe_len;
                     }
@@ -113,6 +117,7 @@ impl ActiveRequest {
                     text_delta: self.full_decoded[start..].to_string(),
                     finish_reason: None,
                     usage: None,
+                    logprob: self.latest_logprob,
                 });
             }
             self.sent_len = self.full_decoded.len();
@@ -143,6 +148,7 @@ impl ActiveRequest {
                         text_delta: full_text[start..end].to_string(),
                         finish_reason: None,
                         usage: None,
+                        logprob: None,
                     });
                 }
             }
@@ -160,6 +166,7 @@ impl ActiveRequest {
                 completion_tokens: self.generated_tokens.len(),
                 total_tokens: self.prompt_tokens.len() + self.generated_tokens.len(),
             }),
+            logprob: None,
         });
     }
 }

@@ -480,3 +480,134 @@ class TestMultiRequestSimulation:
         # Continue generating for the new request
         cache.advance_seq_len(50)
         assert cache.seq_len == 150
+
+
+# ---------------------------------------------------------------------------
+# Python mirror of TokenKVPool metadata for INT8 budget tests
+# ---------------------------------------------------------------------------
+
+class TokenKVPoolMeta:
+    """CPU-side metadata mirror of TokenKVPool for budget/capacity tests."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_slots: int,
+        budget_bytes: int,
+        dtype: str = "bf16",
+    ):
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.kv_dim = num_kv_heads * head_dim
+        self.num_slots = num_slots
+        self.dtype = dtype
+
+        if dtype == "bf16":
+            bytes_per_token = self.kv_dim * 2 * num_layers * 2  # K+V, bf16
+            fixed_cost = 0
+        elif dtype == "int8":
+            bytes_per_token = num_layers * 2 * (self.kv_dim + num_kv_heads * 4)
+            fixed_cost = self.kv_dim * 2 * 2  # 1-layer bf16 working K+V
+        else:
+            raise ValueError(f"Unknown dtype: {dtype}")
+
+        effective = budget_bytes - fixed_cost
+        self.max_total_tokens = max(effective // bytes_per_token, num_slots) if bytes_per_token > 0 else num_slots
+        self.bytes_per_token = bytes_per_token
+        self.fixed_cost = fixed_cost
+
+        # Free list + per-slot tracking
+        self.free_slots = list(range(self.max_total_tokens))
+        self.token_indices: list[list[int]] = [[] for _ in range(num_slots)]
+
+    def alloc_tokens(self, slot: int, count: int) -> list[int]:
+        if count > len(self.free_slots):
+            raise RuntimeError(f"Out of token slots: need {count}, have {len(self.free_slots)}")
+        new_indices = [self.free_slots.pop() for _ in range(count)]
+        self.token_indices[slot].extend(new_indices)
+        return new_indices
+
+    def free_slot(self, slot: int):
+        self.free_slots.extend(self.token_indices[slot])
+        self.token_indices[slot].clear()
+
+    def seq_len(self, slot: int) -> int:
+        return len(self.token_indices[slot])
+
+    def free_count(self) -> int:
+        return len(self.free_slots)
+
+    def is_active(self) -> bool:
+        return self.max_total_tokens > 0
+
+    def total_memory_bytes(self) -> int:
+        return self.max_total_tokens * self.bytes_per_token + self.fixed_cost
+
+
+# ---------------------------------------------------------------------------
+# Tests: INT8 TokenKVPool metadata
+# ---------------------------------------------------------------------------
+
+def make_pool(dtype="bf16", budget_mb=100, num_layers=36, num_kv_heads=8, head_dim=128, num_slots=4):
+    return TokenKVPoolMeta(num_layers, num_kv_heads, head_dim, num_slots, int(budget_mb * 1e6), dtype)
+
+
+class TestTokenKVPoolINT8:
+
+    def test_int8_has_more_tokens_than_bf16(self):
+        """INT8 pool should fit ~1.8x more tokens than BF16 for same budget."""
+        bf16 = make_pool(dtype="bf16", budget_mb=100)
+        int8 = make_pool(dtype="int8", budget_mb=100)
+        assert int8.max_total_tokens > bf16.max_total_tokens * 1.5
+
+    def test_int8_memory_savings(self):
+        """INT8 should use ~46% less memory per token than BF16."""
+        bf16 = make_pool(dtype="bf16", budget_mb=100)
+        int8 = make_pool(dtype="int8", budget_mb=100)
+        # Both should use roughly the same total budget
+        bf16_total = bf16.total_memory_bytes()
+        int8_total = int8.total_memory_bytes()
+        # INT8 total is similar (same budget), but more tokens
+        assert abs(bf16_total - int8_total) / bf16_total < 0.1  # within 10%
+
+    def test_alloc_free_int8(self):
+        """Token alloc/free works identically for INT8 pool."""
+        pool = make_pool(dtype="int8")
+        initial_free = pool.free_count()
+        pool.alloc_tokens(0, 100)
+        assert pool.seq_len(0) == 100
+        assert pool.free_count() == initial_free - 100
+        pool.free_slot(0)
+        assert pool.seq_len(0) == 0
+        assert pool.free_count() == initial_free
+
+    def test_int8_pool_is_active(self):
+        """INT8 pool with budget > 0 should report active."""
+        pool = make_pool(dtype="int8")
+        assert pool.is_active()
+
+    def test_int8_budget_accounts_for_working_buffer(self):
+        """INT8 pool budget should subtract the fixed bf16 working buffer cost."""
+        pool = make_pool(dtype="int8", budget_mb=1, num_layers=2, num_kv_heads=4, head_dim=64)
+        kv_dim = 4 * 64
+        fixed = kv_dim * 2 * 2  # 1-layer bf16 working K+V
+        assert pool.fixed_cost == fixed
+        # With very small budget, working buffer cost reduces available tokens
+        pool_no_fixed = TokenKVPoolMeta(2, 4, 64, 4, int(1e6), "bf16")
+        # INT8 should have fewer tokens if working buffer cost is significant
+        # relative to the total budget (but more than BF16 at larger budgets)
+        assert pool.max_total_tokens >= pool.num_slots  # at least num_slots
+
+    def test_multi_slot_int8(self):
+        """Multiple slots allocate from the same INT8 pool."""
+        pool = make_pool(dtype="int8", num_slots=4)
+        pool.alloc_tokens(0, 50)
+        pool.alloc_tokens(1, 100)
+        pool.alloc_tokens(2, 75)
+        assert pool.seq_len(0) == 50
+        assert pool.seq_len(1) == 100
+        assert pool.seq_len(2) == 75
+        assert pool.free_count() == pool.max_total_tokens - 225

@@ -213,6 +213,27 @@ impl ModelForward for Qwen3Model {
         )
     }
 
+    fn select_token_with_logprob(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<(u32, Option<f32>)> {
+        if params.is_greedy() {
+            let logits = state.base.logits_or(&state.decode_bufs.logits);
+            let (token, logprob) = ops::argmax_with_logprob(
+                &self.ctx,
+                logits,
+                &mut state.decode_bufs.sample_out,
+                &mut state.decode_bufs.sample_probs, // reuse as f32 scratch
+            )?;
+            Ok((token, Some(logprob)))
+        } else {
+            let token = self.select_token(state, params, rng)?;
+            Ok((token, None))
+        }
+    }
+
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.config.is_stop_token(token_id)
     }
@@ -284,7 +305,14 @@ impl ModelForward for Qwen3Model {
             _ => return Ok(None),
         };
         let batch_size = slot_indices.len();
-        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut decode_ctx.argmax_out, batch_size)?;
+        // Use logprob variant — computes argmax + logprob in one kernel (negligible overhead)
+        crate::ops::argmax_batch_logprob_launch(
+            &self.ctx,
+            logits,
+            &mut decode_ctx.argmax_out,
+            &mut decode_ctx.logprobs_gpu,
+            batch_size,
+        )?;
         self.ctx.sync()?;
         crate::ops::argmax_batch_readback_into(
             &self.ctx,
@@ -292,6 +320,14 @@ impl ModelForward for Qwen3Model {
             &mut decode_ctx.argmax_host,
             batch_size,
         )?;
+        // Read back logprobs
+        let lp_tmp = self
+            .ctx
+            .stream
+            .clone_dtoh(&decode_ctx.logprobs_gpu)
+            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
+        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
+
         Ok(Some(
             decode_ctx.argmax_host[..batch_size]
                 .iter()
@@ -319,7 +355,7 @@ impl ModelForward for Qwen3Model {
         // (2) Triton and FlashInfer attention produce numerically different bf16
         // results, making greedy (argmax) output depend on batch composition.
         match paged_kv_pool {
-            Some(pool) if !pool.k_buffers.is_empty() => self.decode_batch(
+            Some(pool) if pool.is_active() => self.decode_batch(
                 tokens,
                 states,
                 slot_indices,

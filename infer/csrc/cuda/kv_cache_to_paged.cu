@@ -50,6 +50,79 @@ __global__ void kv_cache_to_paged_kernel(
     v_paged[dst_offset] = v_contiguous[src_offset];
 }
 
+// ============================================================================
+// INT8 variant: copy quantized INT8 data + scales from contiguous (HND)
+// to paged (NHD) layout with scale transposition.
+//
+// Contiguous INT8 data: [num_kv_heads, max_seq_len, head_dim] (HND)
+// Contiguous scales:    [num_kv_heads, max_seq_len]
+// Paged INT8 data:      pool_idx * kv_dim + kv_head * head_dim + d (NHD)
+// Paged scales:         pool_idx * num_kv_heads + kv_head
+//
+// Grid: (num_kv_heads, seq_len)  Threads: head_dim
+// ============================================================================
+__global__ void kv_cache_to_paged_int8_kernel(
+    const int8_t* __restrict__ k_cont,           // [num_kv_heads, max_seq_len, head_dim]
+    const int8_t* __restrict__ v_cont,
+    const float* __restrict__ k_scales_cont,     // [num_kv_heads, max_seq_len]
+    const float* __restrict__ v_scales_cont,
+    int8_t* __restrict__ k_paged,                // paged pool [max_tokens, kv_dim]
+    int8_t* __restrict__ v_paged,
+    float* __restrict__ k_scales_paged,          // [max_tokens, num_kv_heads]
+    float* __restrict__ v_scales_paged,
+    const int32_t* __restrict__ page_indices,    // [seq_len] token pool indices
+    int max_seq_len,
+    int seq_len,
+    int num_kv_heads,
+    int head_dim,
+    int kv_dim)                                  // num_kv_heads * head_dim
+{
+    int kv_head = blockIdx.x;
+    int pos = blockIdx.y;
+    int dim = threadIdx.x;
+
+    if (pos >= seq_len || dim >= head_dim) return;
+
+    int pool_idx = page_indices[pos];
+
+    // Source: HND contiguous
+    int src_data = kv_head * max_seq_len * head_dim + pos * head_dim + dim;
+    // Destination: NHD paged
+    int dst_data = pool_idx * kv_dim + kv_head * head_dim + dim;
+
+    k_paged[dst_data] = k_cont[src_data];
+    v_paged[dst_data] = v_cont[src_data];
+
+    // Copy scales (one thread per (kv_head, pos) pair)
+    if (dim == 0) {
+        int src_scale = kv_head * max_seq_len + pos;
+        int dst_scale = pool_idx * num_kv_heads + kv_head;
+        k_scales_paged[dst_scale] = k_scales_cont[src_scale];
+        v_scales_paged[dst_scale] = v_scales_cont[src_scale];
+    }
+}
+
+extern "C" cudaError_t kv_cache_to_paged_int8_cuda(
+    const int8_t* k_cont, const int8_t* v_cont,
+    const float* k_scales_cont, const float* v_scales_cont,
+    int8_t* k_paged, int8_t* v_paged,
+    float* k_scales_paged, float* v_scales_paged,
+    const int32_t* page_indices,
+    int max_seq_len, int seq_len, int num_kv_heads,
+    int head_dim, int kv_dim,
+    cudaStream_t stream)
+{
+    if (seq_len <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, seq_len);
+    dim3 block(head_dim);
+    kv_cache_to_paged_int8_kernel<<<grid, block, 0, stream>>>(
+        k_cont, v_cont, k_scales_cont, v_scales_cont,
+        k_paged, v_paged, k_scales_paged, v_scales_paged,
+        page_indices, max_seq_len, seq_len, num_kv_heads,
+        head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t kv_cache_to_paged_cuda(
     const __nv_bfloat16* k_contiguous,
     const __nv_bfloat16* v_contiguous,

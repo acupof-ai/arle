@@ -87,6 +87,94 @@ __global__ void argmax_kernel_fast(const __nv_bfloat16 *__restrict__ x,
 }
 
 // ============================================================================
+// Argmax + logprob: find max token AND compute its log-probability.
+// Same scan as argmax but also accumulates sum_exp for log-softmax denominator.
+// logprob(selected) = x_selected - log(Σ exp(x_i))
+//                   = max_val - (max_val + log(Σ exp(x_i - max_val)))
+//                   = -log(Σ exp(x_i - max_val))
+// ============================================================================
+__device__ __forceinline__ float warp_reduce_sum_f(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__global__ void argmax_logprob_kernel(const __nv_bfloat16 *__restrict__ x,
+                                      int *__restrict__ out_idx,
+                                      float *__restrict__ out_logprob,
+                                      int n) {
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    // Pass 1: find max value and its index
+    float local_max = -INFINITY;
+    int local_idx = 0;
+
+    int n_pairs = n / 2;
+    const __nv_bfloat162 *x2 = (const __nv_bfloat162 *)x;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = x2[i];
+        float v0 = __bfloat162float(pair.x);
+        float v1 = __bfloat162float(pair.y);
+        int i0 = i * 2, i1 = i0 + 1;
+        if (v0 > local_max || (v0 == local_max && i0 < local_idx)) { local_max = v0; local_idx = i0; }
+        if (v1 > local_max || (v1 == local_max && i1 < local_idx)) { local_max = v1; local_idx = i1; }
+    }
+    if ((n & 1) && tid == 0) {
+        float v = __bfloat162float(x[n - 1]);
+        if (v > local_max) { local_max = v; local_idx = n - 1; }
+    }
+
+    warp_reduce_argmax(local_max, local_idx);
+
+    __shared__ float warp_vals[ARGMAX_NUM_WARPS];
+    __shared__ int warp_idxs[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) { warp_vals[warp_id] = local_max; warp_idxs[warp_id] = local_idx; }
+    __syncthreads();
+
+    // Broadcast global max to all threads
+    __shared__ float s_max_val;
+    __shared__ int s_max_idx;
+    if (warp_id == 0) {
+        float val = (lane_id < ARGMAX_NUM_WARPS) ? warp_vals[lane_id] : -INFINITY;
+        int idx = (lane_id < ARGMAX_NUM_WARPS) ? warp_idxs[lane_id] : 0;
+        warp_reduce_argmax(val, idx);
+        if (lane_id == 0) { s_max_val = val; s_max_idx = idx; }
+    }
+    __syncthreads();
+
+    float global_max = s_max_val;
+
+    // Pass 2: compute sum_exp = Σ exp(x_i - max_val) for log-softmax denominator
+    float local_sum_exp = 0.0f;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = x2[i];
+        local_sum_exp += expf(__bfloat162float(pair.x) - global_max);
+        local_sum_exp += expf(__bfloat162float(pair.y) - global_max);
+    }
+    if ((n & 1) && tid == 0) {
+        local_sum_exp += expf(__bfloat162float(x[n - 1]) - global_max);
+    }
+
+    // Reduce sum_exp across all threads
+    local_sum_exp = warp_reduce_sum_f(local_sum_exp);
+    __shared__ float warp_sums[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) warp_sums[warp_id] = local_sum_exp;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float s = (lane_id < ARGMAX_NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        s = warp_reduce_sum_f(s);
+        if (lane_id == 0) {
+            out_idx[0] = s_max_idx;
+            out_logprob[0] = -logf(s); // logprob = -log(sum_exp)
+        }
+    }
+}
+
+// ============================================================================
 // Batched argmax: one block per request, processes B logit vectors in one launch
 // ============================================================================
 // Input:  logits [B, vocab_size] contiguous bf16
@@ -155,6 +243,76 @@ __global__ void argmax_batch_kernel(const __nv_bfloat16 *__restrict__ logits,
         if (lane_id == 0) {
             token_ids[bid] = idx;
         }
+    }
+}
+
+// ============================================================================
+// Batched argmax + logprob: B blocks, each computes argmax AND logprob.
+// ============================================================================
+__global__ void argmax_batch_logprob_kernel(
+    const __nv_bfloat16 *__restrict__ logits,
+    int *__restrict__ token_ids,
+    float *__restrict__ logprobs,
+    int vocab_size) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    const __nv_bfloat16 *row = logits + (long long)bid * vocab_size;
+
+    // Pass 1: argmax
+    float local_max = -INFINITY;
+    int local_idx = 0;
+    int n_pairs = vocab_size / 2;
+    const __nv_bfloat162 *row2 = (const __nv_bfloat162 *)row;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = row2[i];
+        float v0 = __bfloat162float(pair.x), v1 = __bfloat162float(pair.y);
+        int i0 = i * 2, i1 = i0 + 1;
+        if (v0 > local_max || (v0 == local_max && i0 < local_idx)) { local_max = v0; local_idx = i0; }
+        if (v1 > local_max || (v1 == local_max && i1 < local_idx)) { local_max = v1; local_idx = i1; }
+    }
+    if ((vocab_size & 1) && tid == 0) {
+        float v = __bfloat162float(row[vocab_size - 1]);
+        if (v > local_max) { local_max = v; local_idx = vocab_size - 1; }
+    }
+    warp_reduce_argmax(local_max, local_idx);
+
+    __shared__ float warp_vals[ARGMAX_NUM_WARPS];
+    __shared__ int warp_idxs[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) { warp_vals[warp_id] = local_max; warp_idxs[warp_id] = local_idx; }
+    __syncthreads();
+
+    __shared__ float s_global_max;
+    if (warp_id == 0) {
+        float val = (lane_id < ARGMAX_NUM_WARPS) ? warp_vals[lane_id] : -INFINITY;
+        int idx = (lane_id < ARGMAX_NUM_WARPS) ? warp_idxs[lane_id] : 0;
+        warp_reduce_argmax(val, idx);
+        if (lane_id == 0) { token_ids[bid] = idx; s_global_max = val; }
+    }
+    __syncthreads();
+    float global_max = s_global_max;
+
+    // Pass 2: sum_exp for logprob
+    float local_sum = 0.0f;
+    for (int i = tid; i < n_pairs; i += ARGMAX_BLOCK) {
+        __nv_bfloat162 pair = row2[i];
+        local_sum += expf(__bfloat162float(pair.x) - global_max);
+        local_sum += expf(__bfloat162float(pair.y) - global_max);
+    }
+    if ((vocab_size & 1) && tid == 0)
+        local_sum += expf(__bfloat162float(row[vocab_size - 1]) - global_max);
+
+    local_sum = warp_reduce_sum_f(local_sum);
+    __shared__ float warp_sums[ARGMAX_NUM_WARPS];
+    if (lane_id == 0) warp_sums[warp_id] = local_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float s = (lane_id < ARGMAX_NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        s = warp_reduce_sum_f(s);
+        if (lane_id == 0) logprobs[bid] = -logf(s);
     }
 }
 
@@ -419,9 +577,23 @@ __global__ void gpu_sample_kernel(
 }
 
 extern "C" {
+cudaError_t argmax_logprob_cuda(const __nv_bfloat16 *x, int *out_idx, float *out_logprob,
+                                int n, cudaStream_t stream) {
+  argmax_logprob_kernel<<<1, ARGMAX_BLOCK, 0, stream>>>(x, out_idx, out_logprob, n);
+  return cudaGetLastError();
+}
+
 cudaError_t argmax_cuda(const __nv_bfloat16 *x, int *out, int n, cudaStream_t stream) {
   argmax_kernel_fast<<<1, ARGMAX_BLOCK, 0, stream>>>(x, out, n);
     return cudaGetLastError();
+}
+
+cudaError_t argmax_batch_logprob_cuda(const __nv_bfloat16 *logits, int *token_ids,
+                                      float *logprobs, int batch_size, int vocab_size,
+                                      cudaStream_t stream) {
+  argmax_batch_logprob_kernel<<<batch_size, ARGMAX_BLOCK, 0, stream>>>(
+      logits, token_ids, logprobs, vocab_size);
+  return cudaGetLastError();
 }
 
 cudaError_t argmax_batch_cuda(const __nv_bfloat16 *logits, int *token_ids,

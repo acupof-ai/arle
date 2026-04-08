@@ -80,6 +80,8 @@ pub struct CompleteRequest {
     pub sampling: SamplingParams,
     /// Stop generation when output ends with any of these strings (OpenAI-compatible).
     pub stop: Option<Vec<String>>,
+    /// Return per-token log-probabilities (greedy sampling only).
+    pub logprobs: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +103,8 @@ pub struct CompleteOutput {
     pub text: String,
     pub finish_reason: FinishReason,
     pub usage: Usage,
+    /// Per-token log-probabilities (greedy only). Empty if logprobs not requested.
+    pub token_logprobs: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +118,21 @@ pub struct StreamDelta {
     pub text_delta: String,
     pub finish_reason: Option<FinishReason>,
     pub usage: Option<Usage>,
+    /// Log-probability of the generated token (greedy only, None otherwise).
+    #[allow(dead_code)]
+    pub logprob: Option<f32>,
+}
+
+impl StreamDelta {
+    /// Create a text delta (no finish, no logprob).
+    pub fn text(s: String) -> Self {
+        Self {
+            text_delta: s,
+            finish_reason: None,
+            usage: None,
+            logprob: None,
+        }
+    }
 }
 
 pub trait ServerEngine: Send {
@@ -216,6 +235,47 @@ fn generate<M: ModelForward>(
     }
 
     Ok(tokens)
+}
+
+/// Same as `generate_tokens_inner` but also returns per-token logprobs (greedy only).
+fn generate_tokens_with_logprobs_inner<M: ModelForward>(
+    model: &M,
+    state: &mut M::State,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    params: &SamplingParams,
+    rng: &mut StdRng,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+
+    let mut tokens = prompt_tokens.to_vec();
+    let mut logprobs = Vec::new();
+
+    model.forward_prefill(prompt_tokens, state)?;
+    let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
+    if let Some(lp) = lp {
+        logprobs.push(lp);
+    }
+
+    if !params.ignore_eos && model.is_stop_token(next_token) {
+        return Ok((tokens, logprobs));
+    }
+    tokens.push(next_token);
+
+    for _i in 1..max_new_tokens {
+        model.forward_decode(*tokens.last().unwrap(), state)?;
+        let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
+        if let Some(lp) = lp {
+            logprobs.push(lp);
+        }
+
+        if !params.ignore_eos && model.is_stop_token(next_token) {
+            break;
+        }
+        tokens.push(next_token);
+    }
+
+    Ok((tokens, logprobs))
 }
 
 #[cfg(feature = "cuda")]
@@ -430,14 +490,26 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
         } else {
             tokens_to_process
         };
-        let output_tokens = generate(
-            &self.model,
-            &mut self.state,
-            &effective,
-            req.max_tokens,
-            &req.sampling,
-            &mut self.rng,
-        )?;
+        let (output_tokens, token_logprobs) = if req.logprobs && req.sampling.is_greedy() {
+            generate_tokens_with_logprobs_inner(
+                &self.model,
+                &mut self.state,
+                &effective,
+                req.max_tokens,
+                &req.sampling,
+                &mut self.rng,
+            )?
+        } else {
+            let tokens = generate(
+                &self.model,
+                &mut self.state,
+                &effective,
+                req.max_tokens,
+                &req.sampling,
+                &mut self.rng,
+            )?;
+            (tokens, vec![])
+        };
         // Update cached prompt and offload excess KV for next request
         self.cached_prompt = prompt_tokens.clone();
         self.state.offload_kv_if_needed()?;
@@ -464,6 +536,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             text,
             finish_reason,
             usage,
+            token_logprobs,
         })
     }
 
@@ -513,6 +586,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                                         text_delta: to_send,
                                         finish_reason: None,
                                         usage: None,
+                                        logprob: None,
                                     })
                                     .is_err()
                             {
@@ -528,6 +602,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                             text_delta: to_send.to_string(),
                             finish_reason: None,
                             usage: None,
+                            logprob: None,
                         })
                         .is_ok()
                     } else {
@@ -535,6 +610,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                             text_delta,
                             finish_reason: None,
                             usage: None,
+                            logprob: None,
                         })
                         .is_ok()
                     }
@@ -566,6 +642,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                             text_delta: to_send,
                             finish_reason: None,
                             usage: None,
+                            logprob: None,
                         });
                     }
                 } else {
@@ -575,6 +652,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                             text_delta: to_send.to_string(),
                             finish_reason: None,
                             usage: None,
+                            logprob: None,
                         });
                     }
                 }
@@ -583,6 +661,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                     text_delta,
                     finish_reason: None,
                     usage: None,
+                    logprob: None,
                 });
             }
         }
@@ -601,6 +680,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                 completion_tokens: stats.emitted_tokens,
                 total_tokens: prompt_tokens.len() + stats.emitted_tokens,
             }),
+            logprob: None,
         });
 
         // Update cached prompt and offload excess KV for next request

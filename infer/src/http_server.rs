@@ -110,6 +110,7 @@ struct BufferedResponse {
     text: String,
     finish_reason: FinishReason,
     usage: Usage,
+    token_logprobs: Vec<f32>,
 }
 
 impl Default for BufferedResponse {
@@ -122,6 +123,7 @@ impl Default for BufferedResponse {
                 completion_tokens: 0,
                 total_tokens: 0,
             },
+            token_logprobs: Vec::new(),
         }
     }
 }
@@ -135,6 +137,9 @@ impl BufferedResponse {
         if let Some(usage) = delta.usage {
             self.usage = usage;
         }
+        if let Some(lp) = delta.logprob {
+            self.token_logprobs.push(lp);
+        }
     }
 
     fn into_output(self) -> CompleteOutput {
@@ -142,6 +147,7 @@ impl BufferedResponse {
             text: self.text,
             finish_reason: self.finish_reason,
             usage: self.usage,
+            token_logprobs: self.token_logprobs,
         }
     }
 }

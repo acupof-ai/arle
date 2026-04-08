@@ -74,12 +74,34 @@ impl GenerationStateBase {
         pool: &crate::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()> {
-        pool.migrate_from_contiguous(
-            ctx,
-            slot,
-            &self.kv_cache.k_caches(),
-            &self.kv_cache.v_caches(),
-            self.kv_cache.max_seq_len(),
-        )
+        use super::kv_cache::KVFormat;
+
+        // Dispatch based on pool format, not contiguous cache dtype.
+        // FP8 pool uses bf16 contiguous (quantizes during migration).
+        match pool.format {
+            KVFormat::BF16 => pool.migrate_from_contiguous(
+                ctx,
+                slot,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+            ),
+            KVFormat::FP8E4M3 => pool.migrate_from_contiguous_fp8(
+                ctx,
+                slot,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+            ),
+            KVFormat::INT8 => pool.migrate_from_contiguous_int8(
+                ctx,
+                slot,
+                self.kv_cache.k_caches_q(),
+                self.kv_cache.v_caches_q(),
+                self.kv_cache.k_scales(),
+                self.kv_cache.v_scales(),
+                self.kv_cache.max_seq_len(),
+            ),
+        }
     }
 }

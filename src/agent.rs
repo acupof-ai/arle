@@ -177,6 +177,7 @@ impl AgentSession {
                     ..SamplingParams::default()
                 },
                 stop: Some(vec!["<|im_end|>".to_string()]),
+                logprobs: false,
             })?;
 
             info!(

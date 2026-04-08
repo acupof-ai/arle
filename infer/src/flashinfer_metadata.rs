@@ -37,6 +37,13 @@ pub(crate) struct FlashInferDecodeMetadata {
     indptr_h: Vec<i32>,
     /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
     qo_indptr_h: Vec<i32>,
+    /// Pool index of the most recently allocated token per request [max_batch_size].
+    /// Used for INT8 quantize-after-write in batched decode.
+    pub last_token_indices: CudaSlice<i32>,
+    /// Host scratch for building last_token_indices.
+    last_token_scratch: Vec<i32>,
+    /// Total tokens across all requests from last update (sum of seq_lens).
+    total_tokens: usize,
     /// Batch size from last successful plan (for plan caching).
     plan_batch_size: usize,
     /// Whether the plan needs to be re-run (batch composition changed).
@@ -88,6 +95,12 @@ impl FlashInferDecodeMetadata {
             indices_scratch: Vec::with_capacity(max_batch_size),
             indptr_h: Vec::with_capacity(max_batch_size + 1),
             qo_indptr_h,
+            last_token_indices: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc last_token_indices failed: {e}"))?,
+            last_token_scratch: Vec::with_capacity(max_batch_size),
+            total_tokens: 0,
             plan_batch_size: 0,
             plan_dirty: true,
         })
@@ -188,6 +201,16 @@ impl FlashInferDecodeMetadata {
                 .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
         }
         self.prev_total_tokens = new_total;
+        self.total_tokens = new_total;
+
+        // Upload last-token pool indices (for INT8 quantize-after-write).
+        self.last_token_scratch.clear();
+        self.last_token_scratch
+            .extend(pool.build_last_indices(slot_indices));
+        ctx.stream
+            .memcpy_htod(&self.last_token_scratch, &mut self.last_token_indices)
+            .map_err(|e| anyhow::anyhow!("H2D last_token_indices: {e}"))?;
+
         // Mark plan dirty if batch composition or size changed.
         if !same_batch || slot_indices.len() != self.plan_batch_size || reallocated {
             self.plan_dirty = true;
@@ -293,5 +316,10 @@ impl FlashInferDecodeMetadata {
         self.plan_batch_size = batch_size;
         self.plan_dirty = false;
         Ok(())
+    }
+
+    /// Total tokens across all requests from the last `update()` call.
+    pub(crate) fn total_tokens(&self) -> usize {
+        self.total_tokens
     }
 }

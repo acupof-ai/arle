@@ -219,7 +219,7 @@ impl ModelForward for Qwen35Model {
             return Ok(());
         }
         match paged_kv_pool {
-            Some(pool) if !pool.k_buffers.is_empty() => self.decode_batch(
+            Some(pool) if pool.is_active() => self.decode_batch(
                 tokens,
                 states,
                 slot_indices,

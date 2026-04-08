@@ -49,6 +49,7 @@ impl<M: ModelForward> Scheduler<M> {
             SchedulerConfig::runtime_defaults(num_slots),
             None,
             crate::model::kv_cache::KVCacheDtype::BF16,
+            crate::model::kv_cache::KVFormat::BF16,
         )
     }
 
@@ -69,6 +70,7 @@ impl<M: ModelForward> Scheduler<M> {
             SchedulerConfig::runtime_defaults(num_slots),
             max_seq_len_override,
             crate::model::kv_cache::KVCacheDtype::BF16,
+            crate::model::kv_cache::KVFormat::BF16,
         )
     }
 
@@ -81,6 +83,7 @@ impl<M: ModelForward> Scheduler<M> {
         config: SchedulerConfig,
         max_seq_len_override: Option<usize>,
         kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
+        kv_pool_format: crate::model::kv_cache::KVFormat,
     ) -> Result<(Self, SchedulerHandle)> {
         config.validate()?;
 
@@ -119,13 +122,14 @@ impl<M: ModelForward> Scheduler<M> {
             );
 
             let ctx = model.device_context();
-            PagedKVPool::new(
+            PagedKVPool::with_format(
                 ctx,
                 model.num_kv_layers(),
                 model.num_kv_heads(),
                 model.head_dim(),
                 config.max_slots,
                 budget_bytes,
+                kv_pool_format,
             )?
         };
 
@@ -246,7 +250,7 @@ impl<M: ModelForward> Scheduler<M> {
     /// counts without capturing every single size.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
-        if num_slots < 2 || self.paged_kv_pool.k_buffers.is_empty() {
+        if num_slots < 2 || !self.paged_kv_pool.is_active() {
             return;
         }
 
@@ -325,6 +329,7 @@ impl<M: ModelForward> Scheduler<M> {
                     self.model.num_kv_heads(),
                     1,
                     self.model.head_dim(),
+                    self.paged_kv_pool.format,
                 ) {
                     info!(
                         "Warmup: plan_attention for B={} failed ({}), skipping",

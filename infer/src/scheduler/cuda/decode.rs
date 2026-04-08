@@ -134,6 +134,7 @@ impl<M: ModelForward> Scheduler<M> {
                 model.num_kv_heads(),
                 1, // page_size: token-level pool
                 model.head_dim(),
+                paged_kv_pool.format,
             ) {
                 error!("Pre-decode plan_attention failed: {}", e);
                 for &i in &decode_indices {
@@ -170,9 +171,16 @@ impl<M: ModelForward> Scheduler<M> {
         };
         match sampled_result {
             Ok(sampled_tokens) => {
+                // Read logprobs from decode context (set by sample_batch_greedy)
+                let logprobs_host: Option<&[f32]> = if all_greedy {
+                    Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx))
+                } else {
+                    None
+                };
                 for (j, &req_idx) in decode_indices.iter().enumerate() {
                     let token = sampled_tokens[j];
                     let req = &mut active[req_idx];
+                    req.latest_logprob = logprobs_host.map(|lps| lps[j]);
                     if !req.sampling.ignore_eos && model.is_stop_token(token) {
                         req.finish(FinishReason::Stop, tokenizer);
                         continue;
