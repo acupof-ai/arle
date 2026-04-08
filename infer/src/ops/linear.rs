@@ -130,7 +130,22 @@ pub(crate) fn gemm_into(
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
         unsafe {
-            if x.seq_len == 1 {
+            if weight.quant_bits == 4 {
+                // W4A16: packed int4 weights
+                ffi::w4a16_gemv_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w4a16_gemv_cuda failed");
+            } else if x.seq_len == 1 {
+                // W8A16 single
                 ffi::w8a16_gemv_cuda(
                     qw_ptr as *const i8,
                     qs_ptr as *const ffi::Half,
@@ -144,6 +159,7 @@ pub(crate) fn gemm_into(
                 .result()
                 .expect("w8a16_gemv_cuda failed");
             } else {
+                // W8A16 batched
                 ffi::w8a16_gemv_batch_cuda(
                     qw_ptr as *const i8,
                     qs_ptr as *const ffi::Half,
