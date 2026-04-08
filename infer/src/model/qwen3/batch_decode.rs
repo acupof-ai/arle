@@ -388,21 +388,43 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // 2. Merged QKV projection: 1 GEMM instead of 3 → [B, q_dim + 2*kv_dim]
-        ops::gemm_into(
-            &self.ctx,
-            &layer.attention.qkv_proj,
-            &bufs.normed,
-            &mut bufs.qkv_batch,
-        );
-        // Split into separate Q/K/V buffers via a single fused kernel (1 launch).
-        ops::split_qkv_batch(
-            &self.ctx,
-            &bufs.qkv_batch,
-            &mut bufs.q_batch,
-            &mut bufs.k_batch,
-            &mut bufs.v_batch,
-        )?;
+        // 2. QKV projection
+        if layer.attention.q_proj.is_quantized() {
+            // Quantized: use 3 separate GEMVs (merged QKV concat doesn't work for quantized)
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.q_proj,
+                &bufs.normed,
+                &mut bufs.q_batch,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.k_proj,
+                &bufs.normed,
+                &mut bufs.k_batch,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.v_proj,
+                &bufs.normed,
+                &mut bufs.v_batch,
+            );
+        } else {
+            // BF16: single merged GEMM + split (3x fewer kernel launches)
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.qkv_proj,
+                &bufs.normed,
+                &mut bufs.qkv_batch,
+            );
+            ops::split_qkv_batch(
+                &self.ctx,
+                &bufs.qkv_batch,
+                &mut bufs.q_batch,
+                &mut bufs.k_batch,
+                &mut bufs.v_batch,
+            )?;
+        }
 
         // 3. Decode prep: QK-norm + RoPE (in-place on Q) + paged KV write
         let nrp = ops::NormRopeParams {
@@ -578,19 +600,36 @@ impl Qwen3Model {
             &mut bufs.normed,
         );
 
-        // 8. Batched MLP: merged gate+up GEMM → fused silu_mul from merged buffer → down
-        ops::gemm_into(
-            &self.ctx,
-            layer
-                .mlp
-                .gate_up_proj
-                .as_ref()
-                .expect("merged gate_up_proj required"),
-            &bufs.normed,
-            &mut bufs.gate_up_out,
-        );
-        // silu_mul directly from merged buffer (gate = first half, up = second half)
-        ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        // 8. Batched MLP: gate + up projections → fused silu_mul → down
+        if layer.mlp.gate_proj.is_quantized() {
+            // Quantized: separate gate + up GEMVs (merged concat doesn't work)
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.gate_proj,
+                &bufs.normed,
+                &mut bufs.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.up_proj,
+                &bufs.normed,
+                &mut bufs.up_out,
+            );
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        } else {
+            // BF16: merged gate+up GEMM + fused silu_mul from merged buffer
+            ops::gemm_into(
+                &self.ctx,
+                layer
+                    .mlp
+                    .gate_up_proj
+                    .as_ref()
+                    .expect("merged gate_up_proj required"),
+                &bufs.normed,
+                &mut bufs.gate_up_out,
+            );
+            ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
+        }
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,
