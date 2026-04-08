@@ -31,6 +31,29 @@ pub trait InferenceBackend: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// Streaming-capable inference backend.
+///
+/// Backends can override this for token/chunk-level streaming. The default
+/// implementation falls back to [`InferenceBackend::generate`] and emits the
+/// full text as a single chunk.
+pub trait StreamingInferenceBackend: InferenceBackend {
+    fn generate_stream<F>(
+        &self,
+        prompt: &str,
+        params: &SamplingParams,
+        mut on_chunk: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let generated = self.generate(prompt, params)?;
+        if !generated.text.is_empty() {
+            on_chunk(&generated.text)?;
+        }
+        Ok(generated)
+    }
+}
+
 /// Output from a single [`InferenceBackend::generate`] call.
 #[derive(Debug, Clone)]
 pub struct GenerateResult {

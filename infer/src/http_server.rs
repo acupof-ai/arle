@@ -22,8 +22,11 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
+use crate::request_handle::RequestHandle;
 use crate::sampler::{SamplingParams, sampling_params_from_request};
-use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
+#[cfg(test)]
+use crate::scheduler::SchedulerHandle;
+use crate::scheduler::{IncomingRequest, RequestPriority};
 use crate::server_engine::StreamDelta;
 use crate::server_engine::{CompleteOutput, FinishReason, Usage};
 use openai_v1::{
@@ -32,7 +35,7 @@ use openai_v1::{
 };
 
 struct AppState {
-    handle: SchedulerHandle,
+    handle: Arc<dyn RequestHandle>,
     metrics: ServerMetrics,
 }
 
@@ -183,7 +186,7 @@ async fn collect_buffered_response(
 }
 
 fn submit_request(
-    handle: &SchedulerHandle,
+    handle: &dyn RequestHandle,
     options: RequestExecutionOptions,
     prompt: String,
 ) -> Result<UnboundedReceiver<StreamDelta>, ApiError> {
@@ -261,7 +264,7 @@ async fn completions(
         stream,
     );
 
-    let delta_rx = submit_request(&state.handle, options, req.prompt)?;
+    let delta_rx = submit_request(state.handle.as_ref(), options, req.prompt)?;
 
     if stream {
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -320,7 +323,7 @@ async fn chat_completions(
         do_stream,
     );
 
-    let delta_rx = submit_request(&state.handle, options, prompt)?;
+    let delta_rx = submit_request(state.handle.as_ref(), options, prompt)?;
 
     if do_stream {
         let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -388,13 +391,22 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 }
 
 /// Build the Axum router with default (empty) metrics.
-pub fn build_app(handle: SchedulerHandle) -> Router {
+pub fn build_app<H>(handle: H) -> Router
+where
+    H: RequestHandle + 'static,
+{
     build_app_with_metrics(handle, ServerMetrics::new(""))
 }
 
 /// Build the Axum router with a pre-configured `ServerMetrics` instance.
-pub fn build_app_with_metrics(handle: SchedulerHandle, metrics: ServerMetrics) -> Router {
-    let state = Arc::new(AppState { handle, metrics });
+pub fn build_app_with_metrics<H>(handle: H, metrics: ServerMetrics) -> Router
+where
+    H: RequestHandle + 'static,
+{
+    let state = Arc::new(AppState {
+        handle: Arc::new(handle),
+        metrics,
+    });
 
     Router::new()
         .route("/v1/completions", post(completions))
