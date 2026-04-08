@@ -272,6 +272,12 @@ pub struct DeviceMatrix {
     pub data: CudaSlice<bf16>,
     pub rows: usize,
     pub cols: usize,
+    /// INT8 quantized weights (if quantized). When set, `data` is unused.
+    pub qweight: Option<CudaSlice<i8>>,
+    /// Per-group bf16 scales for quantized weights. Shape: [rows, cols/group_size].
+    pub qscales: Option<CudaSlice<bf16>>,
+    /// Quantization group size (0 = not quantized).
+    pub group_size: usize,
 }
 
 impl DeviceMatrix {
@@ -286,7 +292,51 @@ impl DeviceMatrix {
             data: gpu_data,
             rows,
             cols,
+            qweight: None,
+            qscales: None,
+            group_size: 0,
         })
+    }
+
+    /// Create from INT8 quantized weight + bf16 scales.
+    pub fn from_quantized_int8(
+        ctx: &DeviceContext,
+        qweight_data: &[i8],
+        scales_data: &[bf16],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> Result<Self> {
+        assert_eq!(qweight_data.len(), rows * cols);
+        let num_groups = cols / group_size;
+        assert_eq!(scales_data.len(), rows * num_groups);
+
+        let qw = ctx
+            .stream
+            .clone_htod(qweight_data)
+            .map_err(|e| anyhow!("H2D qweight failed: {}", e))?;
+        let qs = ctx
+            .stream
+            .clone_htod(scales_data)
+            .map_err(|e| anyhow!("H2D scales failed: {}", e))?;
+        // Allocate dummy bf16 data (1 element, unused)
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: Some(qw),
+            qscales: Some(qs),
+            group_size,
+        })
+    }
+
+    /// Whether this matrix uses quantized weights.
+    pub fn is_quantized(&self) -> bool {
+        self.qweight.is_some()
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -316,6 +366,9 @@ impl DeviceMatrix {
             data: gpu_data,
             rows,
             cols,
+            qweight: None,
+            qscales: None,
+            group_size: 0,
         })
     }
 
@@ -348,6 +401,9 @@ impl DeviceMatrix {
             data: dst,
             rows: out_rows,
             cols: src.cols,
+            qweight: None,
+            qscales: None,
+            group_size: 0,
         })
     }
 
@@ -381,6 +437,9 @@ impl DeviceMatrix {
             data: merged,
             rows: total_rows,
             cols,
+            qweight: None,
+            qscales: None,
+            group_size: 0,
         })
     }
 }
