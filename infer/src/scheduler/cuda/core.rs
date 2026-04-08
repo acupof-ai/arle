@@ -250,7 +250,7 @@ impl<M: ModelForward> Scheduler<M> {
     /// counts without capturing every single size.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
-        if num_slots < 2 || !self.paged_kv_pool.is_active() {
+        if !self.paged_kv_pool.is_active() {
             return;
         }
 
