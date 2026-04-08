@@ -72,6 +72,23 @@ unsafe extern "C" {
 
     pub(crate) fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream) -> CUresult;
 
+    pub(crate) fn argmax_logprob_cuda(
+        x: *const Half,
+        out_idx: *mut i32,
+        out_logprob: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn argmax_batch_logprob_cuda(
+        logits: *const Half,
+        token_ids: *mut i32,
+        logprobs: *mut f32,
+        batch_size: i32,
+        vocab_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub(crate) fn argmax_batch_cuda(
         logits: *const Half,
         token_ids: *mut i32,
@@ -800,6 +817,131 @@ unsafe extern "C" {
         max_seq_len: i32,
         token_count: i32,
         stream: CUstream,
+    ) -> CUresult;
+
+    // ─── KV cache quantization (INT8 paged / NHD layout) ───
+
+    // Dequantize INT8 paged KV → bf16 working buffer for all tokens in the batch.
+    // NHD layout: pool_idx * kv_dim + kv_head * head_dim + d
+    pub(crate) fn dequantize_paged_kv_cuda(
+        kv_int8: *const i8,
+        scales: *const f32,
+        kv_bf16: *mut Half,
+        token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        total_tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Quantize 1 new token per request from bf16 working → INT8 paged pool.
+    pub(crate) fn quantize_paged_kv_single_cuda(
+        kv_bf16: *const Half,
+        kv_int8: *mut i8,
+        scales: *mut f32,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── FP8 E4M3 KV quantization (paged NHD layout) ───
+
+    // Quantize 1 new token per request: bf16 working → FP8 paged pool.
+    pub(crate) fn quantize_paged_kv_fp8_cuda(
+        kv_bf16: *const Half,
+        kv_fp8: *mut u8,
+        new_token_indices: *const i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Quantize + scatter contiguous bf16 KV → FP8 paged pool (for migration).
+    pub(crate) fn quantize_scatter_kv_fp8_cuda(
+        kv_cont: *const Half,
+        kv_fp8: *mut u8,
+        page_indices: *const i32,
+        max_seq_len: i32,
+        seq_len: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── Fused-dequant decode attention (INT8 + FP8) ───
+
+    pub(crate) fn decode_attention_int8_workspace_bytes(
+        batch_size: i32,
+        num_qo_heads: i32,
+        head_dim: i32,
+        num_splits: i32,
+    ) -> usize;
+
+    pub(crate) fn decode_attention_int8_cuda(
+        q: *const Half,
+        k_data: *const i8,
+        v_data: *const i8,
+        k_scales: *const f32,
+        v_scales: *const f32,
+        kv_indices: *const i32,
+        kv_indptr: *const i32,
+        o: *mut Half,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        sm_scale: f32,
+        stream: CUstream,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+    ) -> CUresult;
+
+    // ─── KV cache contiguous → paged migration (INT8) ───
+
+    // Copy INT8 KV data + scales from contiguous HND to paged NHD layout.
+    pub(crate) fn kv_cache_to_paged_int8_cuda(
+        k_cont: *const i8,
+        v_cont: *const i8,
+        k_scales_cont: *const f32,
+        v_scales_cont: *const f32,
+        k_paged: *mut i8,
+        v_paged: *mut i8,
+        k_scales_paged: *mut f32,
+        v_scales_paged: *mut f32,
+        token_indices: *const i32,
+        max_seq_len: i32,
+        seq_len: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // FP8 E4M3 fused-dequant decode attention (no scales).
+    pub(crate) fn decode_attention_fp8_cuda(
+        q: *const Half,
+        k_data: *const u8, // FP8 E4M3
+        v_data: *const u8, // FP8 E4M3
+        kv_indices: *const i32,
+        kv_indptr: *const i32,
+        o: *mut Half,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        sm_scale: f32,
+        stream: CUstream,
+        workspace: *mut u8,
+        workspace_bytes: usize,
     ) -> CUresult;
 
 }

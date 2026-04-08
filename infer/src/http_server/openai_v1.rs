@@ -27,6 +27,8 @@ pub(super) struct CompletionRequest {
     pub(super) stop_token_ids: Option<Vec<u32>>,
     pub(super) ignore_eos: Option<bool>,
     pub(super) seed: Option<u64>,
+    /// Return per-token logprobs. If set to a number > 0, returns logprobs.
+    pub(super) logprobs: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +67,13 @@ pub(super) struct CompletionResponse {
 struct Choice {
     text: String,
     index: usize,
-    logprobs: Option<()>,
+    logprobs: Option<LogprobsResult>,
     finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LogprobsResult {
+    token_logprobs: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +104,13 @@ impl CompletionResponse {
             choices: vec![Choice {
                 text: output.text,
                 index: 0,
-                logprobs: None,
+                logprobs: if output.token_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(LogprobsResult {
+                        token_logprobs: output.token_logprobs,
+                    })
+                },
                 finish_reason: output.finish_reason.as_openai_str().to_string(),
             }],
             usage: output.usage.into(),
@@ -119,7 +132,7 @@ pub(super) struct StreamChunk {
 struct StreamChoice {
     text: String,
     index: usize,
-    logprobs: Option<()>,
+    logprobs: Option<LogprobsResult>,
     finish_reason: Option<String>,
 }
 
@@ -138,7 +151,9 @@ impl StreamChunk {
             choices: vec![StreamChoice {
                 text: delta.text_delta,
                 index: 0,
-                logprobs: None,
+                logprobs: delta.logprob.map(|lp| LogprobsResult {
+                    token_logprobs: vec![lp],
+                }),
                 finish_reason: delta
                     .finish_reason
                     .map(|reason| reason.as_openai_str().to_string()),

@@ -19,7 +19,7 @@ pub mod qwen35;
 pub use glm4::GLM4Model;
 #[cfg(feature = "cuda")]
 pub use glm4::GLM4State;
-pub use kv_cache::KVCacheDtype;
+pub use kv_cache::{KVCacheDtype, KVFormat};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
 pub use qwen35::{Qwen35Model, Qwen35State};
 
@@ -51,6 +51,7 @@ pub trait DecodeContextOps {
 
     /// Plan FlashInfer attention for the current batch.
     /// Must be called once per decode step after `update_metadata()`.
+    /// `kv_format` dispatches between BF16/FP8 FlashInfer plans.
     fn plan_attention(
         &mut self,
         ctx: &DeviceContext,
@@ -59,6 +60,7 @@ pub trait DecodeContextOps {
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
+        kv_format: kv_cache::KVFormat,
     ) -> Result<()>;
 
     /// Set the active batch size on all internal buffers (must be <= max_batch_size).
@@ -67,6 +69,11 @@ pub trait DecodeContextOps {
     /// Invalidate the CUDA graph cache entry for the given batch size.
     /// Called by the scheduler when metadata reallocation invalidates captured pointers.
     fn invalidate_graph_cache(&mut self, batch_size: usize);
+
+    /// Access per-request logprobs computed by the last `sample_batch_greedy` call.
+    fn logprobs_host(&self) -> &[f32] {
+        &[]
+    }
 }
 
 // ============================================================================
@@ -163,6 +170,18 @@ pub trait ModelForward: Send {
         params: &SamplingParams,
         rng: &mut StdRng,
     ) -> Result<u32>;
+
+    /// Select token with logprob. Default: delegates to select_token, returns None logprob.
+    fn select_token_with_logprob(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<(u32, Option<f32>)> {
+        let token = self.select_token(state, params, rng)?;
+        Ok((token, None))
+    }
+
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn device_context(&self) -> &DeviceContext;
 

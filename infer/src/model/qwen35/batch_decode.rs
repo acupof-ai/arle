@@ -16,7 +16,9 @@ use super::weights::{
 };
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
 use crate::model::ModelForward;
+use crate::model::kv_cache::KVFormat;
 use crate::ops;
+use crate::ops::kv_quant;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, HiddenStates};
 
@@ -304,8 +306,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
+        _kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
         // Qwen3.5 uses HD256 plan for full attention layers.
+        // TODO: FP8 HD256 plan when needed.
         self.metadata.plan_hd256(
             ctx,
             batch_size,
@@ -773,22 +777,122 @@ impl Qwen35Model {
             c.rotary_dim,
         )?;
 
-        // 4. FlashInfer HD256 attention
-        ops::flashinfer_run_layer_hd256(
-            &self.ctx,
-            &bufs.attn.q_batch,
-            kv_pool,
-            full_idx,
-            &bufs.metadata.kv_indptr,
-            &bufs.metadata.kv_indices,
-            &bufs.metadata.kv_last_page_len,
-            &mut bufs.attn.attn_output,
-            &mut bufs.metadata.flashinfer_ws,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        // 4. Attention dispatch — format-aware (quantize new token + attention read)
+        {
+            let stream = &self.ctx.stream;
+
+            match kv_pool.format {
+                KVFormat::FP8E4M3 => {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::INT8 => {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        kv_pool.k_scales_ptr(full_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        kv_pool.v_scales_ptr(full_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::BF16 => {}
+            }
+
+            match kv_pool.format {
+                KVFormat::INT8 => {
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_int8(
+                        &self.ctx,
+                        &bufs.attn.q_batch,
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        kv_pool.k_scales_ptr(full_idx, stream),
+                        kv_pool.v_scales_ptr(full_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::FP8E4M3 => {
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_fp8(
+                        &self.ctx,
+                        &bufs.attn.q_batch,
+                        kv_pool.k_data_ptr(full_idx, stream),
+                        kv_pool.v_data_ptr(full_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::BF16 => {
+                    ops::flashinfer_run_layer_hd256(
+                        &self.ctx,
+                        &bufs.attn.q_batch,
+                        kv_pool,
+                        full_idx,
+                        &bufs.metadata.kv_indptr,
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_last_page_len,
+                        &mut bufs.attn.attn_output,
+                        &mut bufs.metadata.flashinfer_ws,
+                        num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    )?;
+                }
+            }
+        }
 
         // 5. Apply sigmoid gate
         ops::attention_gate_paged_hd256(

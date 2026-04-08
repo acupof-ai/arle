@@ -27,13 +27,59 @@ use crate::tensor::{DeviceContext, DeviceVec};
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
 const OFFLOAD_BLOCK_SIZE: usize = 64;
 
-/// KV cache data type.
+/// KV cache data type (contiguous cache).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KVCacheDtype {
     /// Full precision bf16 (default).
     BF16,
     /// Per-head per-token symmetric INT8 quantization.
     INT8,
+}
+
+/// KV pool storage format (paged pool).
+///
+/// Determines how KV data is stored in the TokenKVPool and which attention
+/// kernel is used during batched decode:
+/// - `FP8E4M3` → FlashInfer native (zero dequant overhead)
+/// - `INT8` → self-built fused-dequant decode attention
+/// - `BF16` → FlashInfer native (baseline)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KVFormat {
+    /// Full precision bf16, 2 bytes/element. FlashInfer native.
+    BF16,
+    /// FP8 E4M3, 1 byte/element, no separate scale. FlashInfer native.
+    FP8E4M3,
+    /// INT8 + per-head per-token f32 scale. Fused-dequant attention.
+    INT8,
+}
+
+impl Default for KVFormat {
+    fn default() -> Self {
+        Self::BF16
+    }
+}
+
+impl KVFormat {
+    /// Bytes per element for the data buffer (excluding scales).
+    pub fn bytes_per_element(self) -> usize {
+        match self {
+            Self::BF16 => 2,
+            Self::FP8E4M3 => 1,
+            Self::INT8 => 1,
+        }
+    }
+
+    /// Whether this format uses separate per-head per-token scale buffers.
+    pub fn has_scales(self) -> bool {
+        matches!(self, Self::INT8)
+    }
+
+    /// Whether a bf16 working buffer is needed (for decode_prep_paged write target).
+    /// FP8 and INT8 need a working buffer because decode_prep_paged outputs bf16,
+    /// which then gets quantized into the pool.
+    pub fn needs_work_buffer(self) -> bool {
+        !matches!(self, Self::BF16)
+    }
 }
 
 impl Default for KVCacheDtype {
@@ -423,6 +469,26 @@ impl KVCache {
     /// Access contiguous V caches for migration to paged pool.
     pub(crate) fn v_caches(&self) -> &[DeviceVec] {
         &self.v_cache
+    }
+
+    /// Access contiguous INT8 K caches for migration to paged pool.
+    pub(crate) fn k_caches_q(&self) -> &[CudaSlice<i8>] {
+        &self.k_cache_q
+    }
+
+    /// Access contiguous INT8 V caches for migration to paged pool.
+    pub(crate) fn v_caches_q(&self) -> &[CudaSlice<i8>] {
+        &self.v_cache_q
+    }
+
+    /// Access contiguous K scales for migration to paged pool.
+    pub(crate) fn k_scales(&self) -> &[CudaSlice<f32>] {
+        &self.k_scales
+    }
+
+    /// Access contiguous V scales for migration to paged pool.
+    pub(crate) fn v_scales(&self) -> &[CudaSlice<f32>] {
+        &self.v_scales
     }
 
     /// Maximum sequence length (for contiguous offset calculation).

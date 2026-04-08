@@ -62,9 +62,10 @@ pub struct ServerRuntimeConfig {
     pub scheduler: SchedulerConfig,
     pub seed: u64,
     pub max_seq_len: Option<usize>,
-    /// KV cache quantization dtype. When set to INT8, KV data is stored as
-    /// per-head per-token symmetric INT8, saving ~46% KV memory.
+    /// KV cache quantization dtype for contiguous cache (single-request path).
     pub kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
+    /// KV pool storage format (paged pool). Determines attention dispatch.
+    pub kv_pool_format: crate::model::kv_cache::KVFormat,
 }
 
 #[cfg(feature = "cuda")]
@@ -76,6 +77,7 @@ impl Default for ServerRuntimeConfig {
             seed: 42,
             max_seq_len: None,
             kv_cache_dtype: crate::model::kv_cache::KVCacheDtype::BF16,
+            kv_pool_format: crate::model::kv_cache::KVFormat::BF16,
         }
     }
 }
@@ -227,6 +229,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         seed,
         max_seq_len,
         kv_cache_dtype,
+        kv_pool_format,
         ..
     } = runtime;
 
@@ -238,6 +241,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         scheduler,
         max_seq_len,
         kv_cache_dtype,
+        kv_pool_format,
     )?;
     std::thread::spawn(move || scheduler.run());
     Ok(handle)

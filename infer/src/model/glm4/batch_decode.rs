@@ -17,7 +17,9 @@ use super::forward::GLM4State;
 use super::weights::{GLM4Model, TransformerBlock};
 use crate::flashinfer_metadata::FlashInferDecodeMetadata;
 use crate::model::ModelForward;
+use crate::model::kv_cache::KVFormat;
 use crate::ops;
+use crate::ops::kv_quant;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -163,15 +165,19 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
+        kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
-        self.metadata.plan(
-            ctx,
-            batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )
+        if kv_format == crate::model::kv_cache::KVFormat::BF16 {
+            self.metadata.plan(
+                ctx,
+                batch_size,
+                num_q_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        }
+        Ok(())
     }
 
     fn set_batch_size(&mut self, bs: usize) {
@@ -382,22 +388,123 @@ impl GLM4Model {
             num_kv_heads,
         )?;
 
-        // 4. FlashInfer attention
-        ops::flashinfer_run_layer(
-            &self.ctx,
-            &bufs.q_batch,
-            kv_pool,
-            layer_idx,
-            &bufs.metadata.kv_indptr,
-            &bufs.metadata.kv_indices,
-            &bufs.metadata.kv_last_page_len,
-            &mut bufs.attn_output,
-            &mut bufs.metadata.flashinfer_ws,
-            num_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )?;
+        // 4. Attention dispatch — format-aware
+        {
+            let batch_size = bufs.q_batch.seq_len;
+            let stream = &self.ctx.stream;
+
+            match kv_pool.format {
+                KVFormat::FP8E4M3 => {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::INT8 => {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                }
+                KVFormat::BF16 => {}
+            }
+
+            match kv_pool.format {
+                KVFormat::INT8 => {
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_int8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::FP8E4M3 => {
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_fp8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::BF16 => {
+                    ops::flashinfer_run_layer(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool,
+                        layer_idx,
+                        &bufs.metadata.kv_indptr,
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_last_page_len,
+                        &mut bufs.attn_output,
+                        &mut bufs.metadata.flashinfer_ws,
+                        num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    )?;
+                }
+            }
+        }
 
         // 5. O projection
         ops::gemm_into(

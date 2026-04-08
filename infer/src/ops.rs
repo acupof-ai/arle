@@ -29,7 +29,10 @@ pub use norm::{
     rms_norm_gated_into, rms_norm_into, rms_norm_offset_into,
 };
 pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
-pub use sampling::{argmax, gpu_sample, gpu_sample_into, gpu_sample_launch, gpu_sample_readback};
+pub use sampling::{
+    argmax, argmax_with_logprob, gpu_sample, gpu_sample_into, gpu_sample_launch,
+    gpu_sample_readback,
+};
 
 // pub(crate) re-exports
 #[cfg(test)]
@@ -50,4 +53,7 @@ pub(crate) use recurrent::{
     conv1d_decode_batch_into, conv1d_prefill_batch_into, gated_delta_rule_decode_into,
     gdr_decode_batch_into,
 };
-pub(crate) use sampling::{argmax_batch_launch, argmax_batch_readback_into, gpu_sample_launch_raw};
+pub(crate) use sampling::{
+    argmax_batch_launch, argmax_batch_logprob_launch, argmax_batch_readback_into,
+    gpu_sample_launch_raw,
+};

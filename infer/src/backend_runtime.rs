@@ -148,6 +148,7 @@ where
         text_delta: String::new(),
         finish_reason: Some(finish_reason),
         usage: Some(usage),
+        logprob: None,
     });
 
     Ok(())
@@ -173,6 +174,7 @@ fn send_text_delta(
             text_delta,
             finish_reason: None,
             usage: None,
+            logprob: None,
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
 }
