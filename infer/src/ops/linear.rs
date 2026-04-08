@@ -130,7 +130,21 @@ pub(crate) fn gemm_into(
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
         unsafe {
-            if weight.quant_bits == 4 {
+            if weight.quant_bits == 2 {
+                // W2A16: packed int2 weights (TurboQuant)
+                ffi::w2a16_gemv_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w2a16_gemv_cuda failed");
+            } else if weight.quant_bits == 4 {
                 // W4A16: packed int4 weights
                 ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
