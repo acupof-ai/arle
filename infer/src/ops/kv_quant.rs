@@ -97,6 +97,7 @@ pub(crate) fn dequantize_kv(
 /// Raw pointers (u64) are used because the pool's INT8/scales/work buffers may
 /// be different types (`CudaSlice<i8>`, `CudaSlice<f32>`, `CudaSlice<u16>`).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn dequantize_paged_kv(
     ctx: &DeviceContext,
     kv_int8_ptr: u64,

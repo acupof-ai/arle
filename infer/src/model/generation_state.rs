@@ -21,7 +21,7 @@ pub(crate) struct GenerationStateBase {
 }
 
 impl GenerationStateBase {
-    pub fn new(num_layers: usize, num_kv_heads: usize) -> Self {
+    pub(crate) fn new(num_layers: usize, num_kv_heads: usize) -> Self {
         Self {
             kv_cache: KVCache::new(num_layers, num_kv_heads),
             prefill_logits: None,
@@ -31,12 +31,12 @@ impl GenerationStateBase {
 
     /// Return prefill logits if present, otherwise fall back to the provided
     /// decode-buffer logits.
-    pub fn logits_or<'a>(&'a self, decode_logits: &'a DeviceVec) -> &'a DeviceVec {
+    pub(crate) fn logits_or<'a>(&'a self, decode_logits: &'a DeviceVec) -> &'a DeviceVec {
         self.prefill_logits.as_ref().unwrap_or(decode_logits)
     }
 
     /// Reset KV cache, clear prefill logits, and invalidate CUDA graph.
-    pub fn reset(&mut self) -> Result<()> {
+    pub(crate) fn reset(&mut self) -> Result<()> {
         self.kv_cache.reset();
         self.prefill_logits = None;
         self.graph_state = CudaGraphState::new();
@@ -45,30 +45,30 @@ impl GenerationStateBase {
 
     /// Truncate KV cache to `len` tokens, clear prefill logits, and invalidate
     /// CUDA graph.
-    pub fn truncate_to(&mut self, len: usize) -> Result<()> {
+    pub(crate) fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.kv_cache.truncate_to(len);
         self.prefill_logits = None;
         self.graph_state = CudaGraphState::new();
         Ok(())
     }
 
-    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+    pub(crate) fn set_max_gpu_kv(&mut self, max_tokens: usize) {
         self.kv_cache.set_max_gpu_seq_len(max_tokens);
     }
 
-    pub fn set_max_seq_len(&mut self, max_seq: usize) {
+    pub(crate) fn set_max_seq_len(&mut self, max_seq: usize) {
         self.kv_cache.set_max_seq_len(max_seq);
     }
 
-    pub fn set_kv_dtype(&mut self, dtype: super::kv_cache::KVCacheDtype) {
+    pub(crate) fn set_kv_dtype(&mut self, dtype: super::kv_cache::KVCacheDtype) {
         self.kv_cache.set_dtype(dtype);
     }
 
-    pub fn offload_kv_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
+    pub(crate) fn offload_kv_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
         self.kv_cache.offload_if_needed(ctx)
     }
 
-    pub fn migrate_kv_to_paged(
+    pub(crate) fn migrate_kv_to_paged(
         &self,
         ctx: &DeviceContext,
         pool: &crate::paged_kv::PagedKVPool,

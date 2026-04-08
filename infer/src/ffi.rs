@@ -823,6 +823,7 @@ unsafe extern "C" {
 
     // Dequantize INT8 paged KV → bf16 working buffer for all tokens in the batch.
     // NHD layout: pool_idx * kv_dim + kv_head * head_dim + d
+    #[allow(dead_code)]
     pub(crate) fn dequantize_paged_kv_cuda(
         kv_int8: *const i8,
         scales: *const f32,

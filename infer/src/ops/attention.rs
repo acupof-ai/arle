@@ -60,9 +60,9 @@ pub fn prefill_attention_batch(
     let num_kv_heads = heads.num_kv_heads;
     let head_dim = heads.head_dim;
     let rms_eps = nrp.rms_eps;
-    let q_dim = num_q_heads * head_dim;
+    let _q_dim = num_q_heads * head_dim;
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-    let gqa_ratio = num_q_heads / num_kv_heads;
+    let _gqa_ratio = num_q_heads / num_kv_heads;
 
     // Derive max_seq_len from KV cache buffer size.
     // Buffer layout: [num_kv_heads * max_seq_len * head_dim] u16 elements.
