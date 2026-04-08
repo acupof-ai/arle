@@ -440,8 +440,8 @@ impl Qwen35Model {
     fn decode_batch_body(
         &self,
         bufs: &mut BatchDecodeBuffers35,
-        states: &mut [Qwen35State],
-        slot_indices: &[usize],
+        _states: &mut [Qwen35State],
+        _slot_indices: &[usize],
         kv_pool: &PagedKVPool,
         batch_size: usize,
     ) -> Result<()> {
@@ -923,8 +923,8 @@ impl Qwen35Model {
         attn: &LinearAttentionLayer,
         hidden: &mut HiddenStates,
         bufs: &mut BatchDecodeBuffers35,
-        states: &mut [Qwen35State],
-        slot_indices: &[usize],
+        _states: &mut [Qwen35State],
+        _slot_indices: &[usize],
         linear_idx: usize,
         batch_size: usize,
     ) -> Result<()> {

@@ -520,7 +520,7 @@ impl TokenKVPool {
         let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
         let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
             .stream
-            .memcpy_stod(&page_indices_i32)
+            .clone_htod(&page_indices_i32)
             .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
@@ -581,7 +581,7 @@ impl TokenKVPool {
         let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
         let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
             .stream
-            .memcpy_stod(&page_indices_i32)
+            .clone_htod(&page_indices_i32)
             .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
 
         for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
@@ -645,7 +645,7 @@ impl TokenKVPool {
         let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
         let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
             .stream
-            .memcpy_stod(&page_indices_i32)
+            .clone_htod(&page_indices_i32)
             .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
