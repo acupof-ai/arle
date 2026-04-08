@@ -24,3 +24,6 @@
 | [experience/wins/2026-04-01-long-seq-agent-bench.md](experience/wins/2026-04-01-long-seq-agent-bench.md) | Long-sequence agent benchmark results |
 | [experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md](experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md) | MLX Metal benchmark alignment log: prompt_tps / generation_tps / e2e_tps / TTFT, then 4-bit hot-path optimization |
 | [experience/wins/2026-04-01-qwen35-scheduler-support.md](experience/wins/2026-04-01-qwen35-scheduler-support.md) | Qwen3.5 scheduler + FlashInfer HD256 batched decode; C=1 100tok/s, C=4 290tok/s vs sglang 107/349 |
+| [experience/wins/2026-04-08-kv-quant-fused-dequant.md](experience/wins/2026-04-08-kv-quant-fused-dequant.md) | KV 量化 fused-dequant attention: FP8 2x 容量 +5% long ctx, INT8 同等; 统一 split-KV kernel |
+| [experience/wins/2026-04-08-int8-kv-batched-decode.md](experience/wins/2026-04-08-int8-kv-batched-decode.md) | INT8 KV batched decode 初版 benchmark (已被 fused-dequant 替代) |
+| [experience/wins/2026-04-08-weight-quantization.md](experience/wins/2026-04-08-weight-quantization.md) | 权重量化 W8A16 +72% (53.4 tok/s), W4A16 +39%, W2A16 TurboQuant 框架 |
