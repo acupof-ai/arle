@@ -18,14 +18,179 @@
 //! All GPU-touching types/methods are behind `#[cfg(feature = "metal")]`.
 //! The module itself is always compiled (like `metal_backend`).
 
-#[cfg(feature = "metal")]
 use std::collections::HashMap;
 
-#[cfg(feature = "metal")]
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
 use mlx_rs::Array;
+
+/// Pure Rust token-slot ledger used by the Metal KV pool.
+///
+/// This is the metadata layer only:
+/// - slot allocation / freeing
+/// - request -> slot mappings
+/// - prefix sharing via reference counts
+///
+/// It has no GPU dependency and can be unit-tested on CPU-only builds.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+#[derive(Debug, Clone)]
+struct SlotLedger {
+    max_total_tokens: usize,
+    free_slots: Vec<u32>,
+    slot_refcounts: Vec<u32>,
+    request_slots: HashMap<usize, Vec<u32>>,
+}
+
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+impl SlotLedger {
+    fn new(max_total_tokens: usize) -> Self {
+        let free_slots = (0..max_total_tokens as u32).rev().collect();
+        Self {
+            max_total_tokens,
+            free_slots,
+            slot_refcounts: vec![0; max_total_tokens],
+            request_slots: HashMap::new(),
+        }
+    }
+
+    fn available_tokens(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    fn total_tokens_used(&self) -> usize {
+        self.max_total_tokens - self.free_slots.len()
+    }
+
+    fn token_indices(&self, request_id: usize) -> Option<&[u32]> {
+        self.request_slots.get(&request_id).map(Vec::as_slice)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn slot_refcount(&self, slot: u32) -> Result<u32> {
+        let idx = self.slot_index(slot)?;
+        Ok(self.slot_refcounts[idx])
+    }
+
+    fn alloc_tokens(&mut self, request_id: usize, count: usize) -> Result<Vec<u32>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > self.free_slots.len() {
+            return Err(anyhow!(
+                "MetalKVPool: out of token slots (requested {}, available {})",
+                count,
+                self.free_slots.len()
+            ));
+        }
+
+        let mut new_indices = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx = self
+                .free_slots
+                .pop()
+                .expect("invariant: free_slots.len() >= count checked above");
+            self.bump_refcount(idx)?;
+            new_indices.push(idx);
+        }
+        self.request_slots
+            .entry(request_id)
+            .or_default()
+            .extend_from_slice(&new_indices);
+        Ok(new_indices)
+    }
+
+    fn share_slots(&mut self, request_id: usize, slots: &[u32]) -> Result<Vec<u32>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for &slot in slots {
+            self.bump_refcount(slot)?;
+        }
+
+        let entry = self.request_slots.entry(request_id).or_default();
+        entry.extend_from_slice(slots);
+        Ok(slots.to_vec())
+    }
+
+    fn share_prefix_from(
+        &mut self,
+        request_id: usize,
+        source_request_id: usize,
+        prefix_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        if prefix_tokens == 0 {
+            return Ok(Vec::new());
+        }
+
+        let source_slots = self
+            .request_slots
+            .get(&source_request_id)
+            .ok_or_else(|| anyhow!("MetalKVPool: unknown source request_id {source_request_id}"))?;
+        let prefix = source_slots.get(0..prefix_tokens).ok_or_else(|| {
+            anyhow!(
+                "MetalKVPool: source request {source_request_id} only has {} slots",
+                source_slots.len()
+            )
+        })?;
+        let prefix = prefix.to_vec();
+        self.share_slots(request_id, &prefix)
+    }
+
+    fn free_request(&mut self, request_id: usize) {
+        if let Some(indices) = self.request_slots.remove(&request_id) {
+            for idx in indices {
+                self.release_slot(idx);
+            }
+        }
+    }
+
+    fn max_total_tokens(&self) -> usize {
+        self.max_total_tokens
+    }
+
+    fn slot_index(&self, slot: u32) -> Result<usize> {
+        let idx =
+            usize::try_from(slot).map_err(|_| anyhow!("MetalKVPool: invalid token slot {slot}"))?;
+        if idx >= self.max_total_tokens {
+            return Err(anyhow!(
+                "MetalKVPool: token slot {} out of range (max {})",
+                slot,
+                self.max_total_tokens
+            ));
+        }
+        Ok(idx)
+    }
+
+    fn bump_refcount(&mut self, slot: u32) -> Result<()> {
+        let idx = self.slot_index(slot)?;
+        self.slot_refcounts[idx] = self
+            .slot_refcounts
+            .get(idx)
+            .copied()
+            .ok_or_else(|| anyhow!("MetalKVPool: slot index {slot} missing"))?
+            .saturating_add(1);
+        Ok(())
+    }
+
+    fn release_slot(&mut self, slot: u32) {
+        let Ok(idx) = self.slot_index(slot) else {
+            return;
+        };
+        let Some(count) = self.slot_refcounts.get_mut(idx) else {
+            return;
+        };
+        if *count == 0 {
+            debug_assert!(*count > 0, "MetalKVPool: release_slot saw zero refcount");
+            return;
+        }
+        *count -= 1;
+        if *count == 0 {
+            self.free_slots.push(slot);
+        }
+    }
+}
 
 /// Token-level KV cache pool for the Metal backend.
 ///
@@ -35,17 +200,11 @@ use mlx_rs::Array;
 // GPU required: Array is backed by Metal unified memory.
 #[cfg(feature = "metal")]
 pub struct MetalKVPool {
+    ledger: SlotLedger,
     /// K buffers per layer: each `[max_total_tokens, kv_dim]` bf16/f16.
     k_pool: Vec<Array>,
     /// V buffers per layer: each `[max_total_tokens, kv_dim]` bf16/f16.
     v_pool: Vec<Array>,
-
-    /// Free token slot indices (stack-based allocator, LIFO).
-    free_slots: Vec<u32>,
-
-    /// Per-request token mappings: `slot_indices[request_id][i]` = physical pool
-    /// index for logical position `i` of that request.
-    slot_indices: HashMap<usize, Vec<u32>>,
 
     // ── Config ────────────────────────────────────────────────────────────────
     num_layers: usize,
@@ -53,7 +212,6 @@ pub struct MetalKVPool {
     head_dim: usize,
     /// `num_kv_heads * head_dim` — stride for one token row in the pool buffer.
     kv_dim: usize,
-    max_total_tokens: usize,
 }
 
 #[cfg(feature = "metal")]
@@ -73,6 +231,7 @@ impl MetalKVPool {
 
         let kv_dim = num_kv_heads * head_dim;
         let pool_shape = [max_total_tokens as i32, kv_dim as i32];
+        let ledger = SlotLedger::new(max_total_tokens);
 
         let mut k_pool = Vec::with_capacity(num_layers);
         let mut v_pool = Vec::with_capacity(num_layers);
@@ -86,9 +245,6 @@ impl MetalKVPool {
             v_pool.push(v);
         }
 
-        // Initialize free list: all token slots free, highest indices first (LIFO).
-        let free_slots: Vec<u32> = (0..max_total_tokens as u32).rev().collect();
-
         log::info!(
             "MetalKVPool: {} max tokens, {} layers ({} kv_heads x {} head_dim, kv_dim={})",
             max_total_tokens,
@@ -99,15 +255,13 @@ impl MetalKVPool {
         );
 
         Ok(Self {
+            ledger,
             k_pool,
             v_pool,
-            free_slots,
-            slot_indices: HashMap::new(),
             num_layers,
             num_kv_heads,
             head_dim,
             kv_dim,
-            max_total_tokens,
         })
     }
 
@@ -116,37 +270,31 @@ impl MetalKVPool {
     /// Returns the newly allocated physical pool indices. These are appended
     /// to the request's token list in `slot_indices`.
     pub fn alloc_tokens(&mut self, request_id: usize, count: usize) -> Result<Vec<u32>> {
-        if count > self.free_slots.len() {
-            return Err(anyhow!(
-                "MetalKVPool: out of token slots (requested {}, available {})",
-                count,
-                self.free_slots.len()
-            ));
-        }
+        self.ledger.alloc_tokens(request_id, count)
+    }
 
-        let mut new_indices = Vec::with_capacity(count);
-        for _ in 0..count {
-            // SAFETY: we checked len >= count above.
-            let idx = self
-                .free_slots
-                .pop()
-                .expect("invariant: free_slots.len() >= count checked above");
-            new_indices.push(idx);
-        }
-        self.slot_indices
-            .entry(request_id)
-            .or_default()
-            .extend_from_slice(&new_indices);
-        Ok(new_indices)
+    /// Share an existing token-slot slice with `request_id`.
+    ///
+    /// Each slot in `slots` has its reference count incremented and is appended
+    /// to the request's logical token sequence.
+    pub fn share_slots(&mut self, request_id: usize, slots: &[u32]) -> Result<Vec<u32>> {
+        self.ledger.share_slots(request_id, slots)
+    }
+
+    /// Share a prefix of another request's token slots with `request_id`.
+    pub fn share_prefix_from(
+        &mut self,
+        request_id: usize,
+        source_request_id: usize,
+        prefix_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        self.ledger
+            .share_prefix_from(request_id, source_request_id, prefix_tokens)
     }
 
     /// Free all token slots for a request, returning them to the pool.
     pub fn free_request(&mut self, request_id: usize) {
-        if let Some(indices) = self.slot_indices.remove(&request_id) {
-            for idx in indices {
-                self.free_slots.push(idx);
-            }
-        }
+        self.ledger.free_request(request_id);
     }
 
     /// Scatter-write K/V tensors into the pool at the request's token positions.
@@ -167,8 +315,8 @@ impl MetalKVPool {
         use mlx_rs::ops::indexing::{TryIndexMutOp, take_axis};
 
         let indices = self
-            .slot_indices
-            .get(&request_id)
+            .ledger
+            .token_indices(request_id)
             .ok_or_else(|| anyhow!("MetalKVPool: unknown request_id {request_id}"))?;
 
         let num_tokens = k.shape().first().copied().unwrap_or(0) as usize;
@@ -218,8 +366,8 @@ impl MetalKVPool {
         use mlx_rs::ops::{indexing::take_axis, reshape, transpose_axes};
 
         let indices = self
-            .slot_indices
-            .get(&request_id)
+            .ledger
+            .token_indices(request_id)
             .ok_or_else(|| anyhow!("MetalKVPool: unknown request_id {request_id}"))?;
 
         let seq_len = indices.len() as i32;
@@ -259,17 +407,17 @@ impl MetalKVPool {
 
     /// Number of token slots currently in use across all requests.
     pub fn total_tokens_used(&self) -> usize {
-        self.max_total_tokens - self.free_slots.len()
+        self.ledger.total_tokens_used()
     }
 
     /// Number of free token slots remaining in the pool.
     pub fn available_tokens(&self) -> usize {
-        self.free_slots.len()
+        self.ledger.available_tokens()
     }
 
     /// Get token indices for a request (physical pool indices, in logical order).
     pub fn token_indices(&self, request_id: usize) -> Option<&[u32]> {
-        self.slot_indices.get(&request_id).map(Vec::as_slice)
+        self.ledger.token_indices(request_id)
     }
 
     /// Number of layers in the pool.
@@ -294,7 +442,7 @@ impl MetalKVPool {
 
     /// Maximum total tokens the pool can hold.
     pub fn max_total_tokens(&self) -> usize {
-        self.max_total_tokens
+        self.ledger.max_total_tokens()
     }
 }
 
@@ -307,4 +455,90 @@ impl MetalKVPool {
 #[cfg(not(feature = "metal"))]
 pub struct MetalKVPool {
     _private: (),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlotLedger;
+
+    #[test]
+    fn alloc_and_free_round_trip() {
+        let mut ledger = SlotLedger::new(4);
+        let slots = ledger.alloc_tokens(1, 2).expect("alloc");
+        assert_eq!(slots, vec![0, 1]);
+        assert_eq!(ledger.available_tokens(), 2);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 1);
+
+        ledger.free_request(1);
+        assert_eq!(ledger.available_tokens(), 4);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 0);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 0);
+        assert!(ledger.token_indices(1).is_none());
+    }
+
+    #[test]
+    fn share_prefix_increments_refcounts() {
+        let mut ledger = SlotLedger::new(8);
+        let source = ledger.alloc_tokens(10, 4).expect("source alloc");
+        assert_eq!(source, vec![0, 1, 2, 3]);
+
+        let shared = ledger.share_prefix_from(11, 10, 2).expect("share prefix");
+        assert_eq!(shared, vec![0, 1]);
+        assert_eq!(ledger.token_indices(11).unwrap(), &[0, 1]);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 2);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 2);
+        assert_eq!(ledger.slot_refcount(2).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(3).unwrap(), 1);
+        assert_eq!(ledger.available_tokens(), 4);
+
+        ledger.free_request(10);
+        assert_eq!(ledger.available_tokens(), 6);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(2).unwrap(), 0);
+        assert_eq!(ledger.slot_refcount(3).unwrap(), 0);
+
+        ledger.free_request(11);
+        assert_eq!(ledger.available_tokens(), 8);
+    }
+
+    #[test]
+    fn free_request_is_idempotent() {
+        let mut ledger = SlotLedger::new(2);
+        ledger.alloc_tokens(1, 1).expect("alloc");
+        ledger.free_request(1);
+        let available_after_first_free = ledger.available_tokens();
+        ledger.free_request(1);
+        assert_eq!(ledger.available_tokens(), available_after_first_free);
+    }
+
+    #[test]
+    fn share_prefix_rejects_bad_requests() {
+        let mut ledger = SlotLedger::new(2);
+        assert!(ledger.share_prefix_from(2, 1, 1).is_err());
+
+        ledger.alloc_tokens(1, 1).expect("alloc");
+        assert!(ledger.share_prefix_from(2, 1, 2).is_err());
+        assert!(ledger.token_indices(2).is_none());
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn share_slots_allows_manual_aliasing() {
+        let mut ledger = SlotLedger::new(4);
+        ledger.alloc_tokens(1, 2).expect("alloc");
+        let shared = ledger.share_slots(2, &[1, 0, 1]).expect("share");
+        assert_eq!(shared, vec![1, 0, 1]);
+        assert_eq!(ledger.token_indices(2).unwrap(), &[1, 0, 1]);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 2);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 3);
+
+        ledger.free_request(1);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 2);
+
+        ledger.free_request(2);
+        assert_eq!(ledger.available_tokens(), 4);
+    }
 }
