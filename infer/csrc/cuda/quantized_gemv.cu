@@ -66,21 +66,29 @@ __global__ void w8a16_gemv_kernel(
     int row_offset = row * K;
     int scale_offset = row * num_groups;
 
-    // Each thread processes K / threads_per_row elements, vectorized
+    // Each thread processes K / threads_per_row elements, vectorized.
+    // group_size (128) is always a multiple of VEC_SIZE (16), so one scale per vector.
     for (int k = tid_in_row * W8_VEC_SIZE; k < K; k += threads_per_row * W8_VEC_SIZE) {
+        // Single scale lookup per 16 elements (group-aligned)
+        float scale_f = __bfloat162float(scales[scale_offset + k / group_size]);
+
         // Vectorized 128-bit load: 16 int8 weights
-        const int4* w_ptr = reinterpret_cast<const int4*>(&weight[row_offset + k]);
-        int4 w_packed = *w_ptr;
+        int4 w_packed = *reinterpret_cast<const int4*>(&weight[row_offset + k]);
         const int8_t* w_vals = reinterpret_cast<const int8_t*>(&w_packed);
 
-        // Per-element scale lookup (handles group boundary crossing correctly)
+        // Vectorized 128-bit load: 8 bf16 activations × 2
+        const int4* x_ptr = reinterpret_cast<const int4*>(&input[k]);
+        int4 x_lo = x_ptr[0];  // 8 bf16
+        int4 x_hi = x_ptr[1];  // 8 bf16
+        const __nv_bfloat16* x_vals = reinterpret_cast<const __nv_bfloat16*>(&x_lo);
+        const __nv_bfloat16* x_vals2 = reinterpret_cast<const __nv_bfloat16*>(&x_hi);
+
         #pragma unroll
-        for (int i = 0; i < W8_VEC_SIZE; i++) {
-            float scale_f = __bfloat162float(scales[scale_offset + (k + i) / group_size]);
-            float w_f = static_cast<float>(w_vals[i]) * scale_f;
-            float x_f = __bfloat162float(input[k + i]);
-            sum += w_f * x_f;
-        }
+        for (int i = 0; i < 8; i++)
+            sum += (static_cast<float>(w_vals[i]) * scale_f) * __bfloat162float(x_vals[i]);
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            sum += (static_cast<float>(w_vals[8 + i]) * scale_f) * __bfloat162float(x_vals2[i]);
     }
 
     // Reduce within the threads assigned to this row
@@ -138,26 +146,25 @@ __global__ void w4a16_gemv_kernel(
     int row_offset = row * (K / 2);  // packed: K/2 bytes per row
     int scale_offset = row * num_groups;
 
-    // Each iteration processes 32 int4 values (16 bytes = 128-bit load)
+    // Each iteration processes 32 int4 values (16 bytes = 128-bit load).
+    // group_size (128) is always a multiple of W4_VEC_SIZE (32), so one scale per vector.
     for (int k = tid_in_row * W4_VEC_SIZE; k < K; k += threads_per_row * W4_VEC_SIZE) {
+        float scale_f = __bfloat162float(scales[scale_offset + k / group_size]);
+
         // Load 16 bytes = 32 packed int4 values
-        const int4* w_ptr = reinterpret_cast<const int4*>(&weight[row_offset + k / 2]);
-        int4 w_packed = *w_ptr;
+        int4 w_packed = *reinterpret_cast<const int4*>(&weight[row_offset + k / 2]);
         const uint8_t* w_bytes = reinterpret_cast<const uint8_t*>(&w_packed);
 
-        // Unpack + dequant + FMA for 32 elements (per-element scale for group boundary)
+        // Vectorized activation loads (32 bf16 = 4 × int4)
+        const int4* x_ptr = reinterpret_cast<const int4*>(&input[k]);
+
         #pragma unroll
         for (int i = 0; i < 16; i++) {
             uint8_t byte = w_bytes[i];
             int lo = (byte & 0x0F) - 8;
             int hi = (byte >> 4) - 8;
-
-            int k0 = k + i * 2;
-            int k1 = k0 + 1;
-            float s0 = __bfloat162float(scales[scale_offset + k0 / group_size]);
-            float s1 = __bfloat162float(scales[scale_offset + k1 / group_size]);
-            sum += (static_cast<float>(lo) * s0) * __bfloat162float(input[k0]);
-            sum += (static_cast<float>(hi) * s1) * __bfloat162float(input[k1]);
+            sum += (static_cast<float>(lo) * scale_f) * __bfloat162float(input[k + i * 2]);
+            sum += (static_cast<float>(hi) * scale_f) * __bfloat162float(input[k + i * 2 + 1]);
         }
     }
 
@@ -208,14 +215,12 @@ __global__ void w8a16_gemv_batch_kernel(
     int scale_offset = row * num_groups;
 
     for (int k = tid_in_row * W8_VEC_SIZE; k < K; k += threads_per_row * W8_VEC_SIZE) {
-        const int4* w_ptr = reinterpret_cast<const int4*>(&weight[row_offset + k]);
-        int4 w_packed = *w_ptr;
+        float scale_f = __bfloat162float(scales[scale_offset + k / group_size]);
+        int4 w_packed = *reinterpret_cast<const int4*>(&weight[row_offset + k]);
         const int8_t* w_vals = reinterpret_cast<const int8_t*>(&w_packed);
         #pragma unroll
-        for (int i = 0; i < W8_VEC_SIZE; i++) {
-            float scale_f = __bfloat162float(scales[scale_offset + (k + i) / group_size]);
+        for (int i = 0; i < W8_VEC_SIZE; i++)
             sum += (static_cast<float>(w_vals[i]) * scale_f) * __bfloat162float(x[k + i]);
-        }
     }
 
     sum = warp_reduce_sum(sum);
