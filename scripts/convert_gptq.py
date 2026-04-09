@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 
 
 def unpack_gptq_weight(qweight, qzeros, scales, bits=4, group_size=128):
-    """Unpack GPTQ format to our internal format.
+    """Unpack GPTQ format to our internal format (vectorized, no Python loops).
 
     GPTQ layout:
       qweight: [K // (32//bits), N] int32  — 8 int4 values packed per int32
@@ -32,50 +32,36 @@ def unpack_gptq_weight(qweight, qzeros, scales, bits=4, group_size=128):
       scales_out:    [N, num_groups] bfloat16
     """
     vals_per_int32 = 32 // bits  # 8 for 4-bit
-    K = qweight.shape[0] * vals_per_int32
+    mask = (1 << bits) - 1  # 0xF for 4-bit
+    K_packed = qweight.shape[0]
     N = qweight.shape[1]
+    K = K_packed * vals_per_int32
     num_groups = scales.shape[0]
 
-    # Unpack qweight: [K//8, N] int32 → [K, N] int4 values
-    weight_unpacked = torch.zeros(K, N, dtype=torch.int32)
-    for i in range(vals_per_int32):
-        weight_unpacked[i::vals_per_int32] = (qweight >> (bits * i)) & ((1 << bits) - 1)
+    # Vectorized unpack: [K//8, N] int32 → [K, N] uint4 values
+    # Expand each int32 into 8 int4 values
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32)  # [0,4,8,...,28]
+    # qweight: [K//8, N] → expand → [K//8, 8, N]
+    w_expanded = (qweight.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask  # [K//8, 8, N]
+    weight_unpacked = w_expanded.permute(0, 1, 2).reshape(K, N)  # [K, N]
 
-    # Unpack qzeros: [num_groups, N//8] int32 → [num_groups, N] int4 values
-    zeros_unpacked = torch.zeros(num_groups, N, dtype=torch.int32)
-    for i in range(vals_per_int32):
-        zeros_unpacked[:, i::vals_per_int32] = (qzeros >> (bits * i)) & ((1 << bits) - 1)
+    # Vectorized unpack zeros: [num_groups, N//8] → [num_groups, N]
+    z_expanded = (qzeros.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask  # [G, 8, N//8]
+    zeros_unpacked = z_expanded.permute(0, 1, 2).reshape(num_groups, N)  # [G, N]
 
-    # Dequantize to verify: w_float = (w_int - zero) * scale
-    # For symmetric GPTQ: zero = 2^(bits-1) = 8 for 4-bit
-    # w_float[k, n] = (weight_unpacked[k, n] - zeros_unpacked[g, n]) * scales[g, n]
-    # where g = k // group_size
+    # Apply zero-point: signed_val = unsigned_val - zero_point, clamped to [-8, 7]
+    # Expand zeros to [K, N] by repeating per group
+    zeros_expanded = zeros_unpacked.repeat_interleave(group_size, dim=0)[:K]  # [K, N]
+    weight_signed = torch.clamp(weight_unpacked.int() - zeros_expanded.int(), -8, 7).to(torch.int8)
 
-    # Repack to our format: [N, K//2] uint8, signed symmetric [-8, 7]
-    # Our format: (val + 8) stored as uint8, low nibble first
-    # GPTQ unsigned [0, 15] → our signed: val_signed = val_gptq - zero_point
+    # Transpose: [K, N] → [N, K] (our format is row-major over output channels)
+    weight_signed = weight_signed.T.contiguous()  # [N, K]
 
-    weight_signed = torch.zeros(N, K, dtype=torch.int8)
-    scales_out = torch.zeros(N, num_groups, dtype=torch.bfloat16)
+    # Scales: transpose [num_groups, N] → [N, num_groups]
+    scales_out = scales.T.contiguous().to(torch.bfloat16)
 
-    for g in range(num_groups):
-        k_start = g * group_size
-        k_end = min(k_start + group_size, K)
-        for n in range(N):
-            zp = zeros_unpacked[g, n].item()
-            sc = scales[g, n].item()
-            scales_out[n, g] = sc  # transpose: [num_groups, N] → [N, num_groups]
-            for k in range(k_start, k_end):
-                val = weight_unpacked[k, n].item()
-                # GPTQ: w_float = (val - zp) * scale
-                # Our kernel: w_float = w_signed * scale (symmetric)
-                # So: w_signed = val - zp, clamped to [-8, 7]
-                w_s = max(-8, min(7, val - zp))
-                weight_signed[n, k] = w_s
-
-    # Pack to uint8: 2 int4 per byte (low nibble = even index, high nibble = odd)
+    # Pack to uint8: 2 int4 per byte, low nibble = even, high nibble = odd
     weight_unsigned = (weight_signed + 8).to(torch.uint8)  # [0, 15]
-    packed = torch.zeros(N, K // 2, dtype=torch.uint8)
     packed = weight_unsigned[:, 0::2] | (weight_unsigned[:, 1::2] << 4)
 
     return packed, scales_out

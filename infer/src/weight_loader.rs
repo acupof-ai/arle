@@ -15,7 +15,9 @@ use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
     let single_path = format!("{}/model.safetensors", model_path);
-    if std::path::Path::new(&single_path).exists() {
+    let index_path = format!("{}/model.safetensors.index.json", model_path);
+    if std::path::Path::new(&single_path).exists() && !std::path::Path::new(&index_path).exists() {
+        // Single file, no index — all tensors keyed by name within the file
         return Ok((vec![single_path], HashMap::new()));
     }
 

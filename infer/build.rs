@@ -944,6 +944,14 @@ fn main() {
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
 
+        // Marlin kernel needs C++17 + relaxed constexpr
+        if stem.starts_with("marlin_") {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+            ]);
+        }
+
         // FlashInfer headers for flashinfer_*.cu files
         if stem.starts_with("flashinfer_") {
             let fi_include = find_flashinfer_include();
