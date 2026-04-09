@@ -367,6 +367,131 @@ fn compiled_gdr_step(
     (y, new_state)
 }
 
+// ── Metal GDR kernel ────────────────────────────────────────────────────────
+//
+// Ported from mlx_lm's gated_delta.py: a custom Metal shader that fuses the
+// entire GDR state update into a single GPU dispatch with SIMD reductions.
+// This replaces ~12 MLX ops with 1 kernel dispatch.
+
+#[cfg(feature = "metal")]
+static GDR_METAL_KERNEL: std::sync::LazyLock<crate::mlx::MetalKernel> =
+    std::sync::LazyLock::new(|| {
+        crate::mlx::MetalKernel::new(
+            "gated_delta_step",
+            &["q", "k", "v", "g", "beta", "state_in", "T"],
+            &["y", "state_out"],
+            // Metal shader source — scalar gating, no mask (decode-only).
+            r#"
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        for (int t = 0; t < T; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+                out += state[i] * q_[s_idx];
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        "#,
+        )
+    });
+
+/// Execute the GDR Metal kernel for a single decode step.
+/// inputs: q[B,T,Hk,Dk], k[B,T,Hk,Dk], v[B,T,Hv,Dv], g[B,T,Hv], beta[B,T,Hv], state[B,Hv,Dv,Dk]
+/// outputs: y[B,T,Hv,Dv], state_out[B,Hv,Dv,Dk]
+#[cfg(feature = "metal")]
+fn metal_gdr_kernel_step(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    g: &MlxArray,
+    beta: &MlxArray,
+    state: &MlxArray,
+    config: &MetalGdrConfig,
+) -> (MlxArray, MlxArray) {
+    use crate::mlx::Dtype;
+
+    let b = 1i32; // batch size always 1 for decode
+    let t = 1i32; // single timestep
+    let hk = config.num_key_heads as i32;
+    let hv = config.num_value_heads as i32;
+    let dk = config.key_dim as i32;
+    let dv = config.value_dim as i32;
+
+    let y_shape = [b, t, hv, dv];
+    let state_shape = [b, hv, dv, dk];
+
+    let t_arr = MlxArray::from_slice_i32(&[t], &[1]);
+
+    let results = GDR_METAL_KERNEL.apply(
+        &[q, k, v, g, beta, state, &t_arr],
+        [32, dv, b * hv], // grid
+        [32, 4, 1],       // threadgroup
+        &[&y_shape, &state_shape],
+        &[Dtype::Bfloat16, Dtype::Float32],
+        &[("Dk", dk), ("Dv", dv), ("Hk", hk), ("Hv", hv)],
+        &[("InT", Dtype::Bfloat16), ("StT", Dtype::Float32)],
+    );
+
+    let mut it = results.into_iter();
+    let y = it.next().expect("GDR kernel output y");
+    let new_state = it.next().expect("GDR kernel output state");
+    (y, new_state)
+}
+
 // ── Conv1d single-step ───────────────────────────────────────────────────────
 
 /// Causal depthwise conv1d for a single timestep.
@@ -449,7 +574,7 @@ pub fn metal_gdr_decode_step(
 ) -> MlxArray {
     use crate::mlx::{
         Dtype, add, as_dtype, broadcast_to, exp, expand_dims, multiply, negative, reshape,
-        rms_norm, sigmoid, silu, slice, subtract, sum_axis,
+        rms_norm, sigmoid, silu, slice, subtract, sum_axis, transpose_axes,
     };
 
     let num_key_heads = config.num_key_heads;
@@ -540,60 +665,81 @@ pub fn metal_gdr_decode_step(
     // beta = sigmoid(beta_raw)
     let beta = sigmoid(&beta_1d);
 
-    // ── 5–6. State update (per value head) ───────────────────────────────
-    // State layout: [num_value_heads, key_dim, val_dim] f32
-    //
-    // From CUDA kernel (two-pass algorithm):
-    //   Pass 1: S[j, v] *= exp_g  (decay entire state)
-    //           kv_mem[v] = sum_j S[j, v] * k[j]  (query state with k)
-    //   Pass 2: delta[v] = (v[v] - kv_mem[v]) * beta
-    //           S[j, v] += delta[v] * k[j]  (rank-1 update)
-    //           out[v] = sum_j S[j, v] * q[j]  (query updated state with q)
+    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+        .ok()
+        .is_some_and(|v| v == "1");
 
-    // Reshape q, k per GQA mapping: value heads share key heads
-    // k_norm: [k_dim] = [num_key_heads * key_dim]
-    // Expand k to [num_value_heads, key_dim] by repeating key heads
+    // ── 5–6. State update ─────────────────────────────────────────────
     let heads_per_key = num_value_heads / num_key_heads;
-    // Repeat each key head `heads_per_key` times → [num_value_heads, key_dim]
-    let k_expanded = if heads_per_key > 1 {
-        // [num_key_heads, key_dim] → [num_key_heads, 1, key_dim] → [num_key_heads, heads_per_key, key_dim]
-        let k_unsq = expand_dims(&k_scaled, 1);
-        let k_broadcast = broadcast_to(
-            &k_unsq,
-            &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
+    let hv = num_value_heads as i32;
+    let dk = key_dim as i32;
+    let dv = value_dim as i32;
+
+    let output_heads = if use_metal_kernel {
+        // Metal kernel path — single GPU dispatch for entire GDR step.
+        let b = 1i32;
+        let t = 1i32;
+        let hk = num_key_heads as i32;
+
+        let q_kernel = as_dtype(&reshape(&q_scaled, &[b, t, hk, dk]), Dtype::Bfloat16);
+        let k_kernel = as_dtype(&reshape(&k_scaled, &[b, t, hk, dk]), Dtype::Bfloat16);
+        let v_kernel = as_dtype(&reshape(&v_raw, &[b, t, hv, dv]), Dtype::Bfloat16);
+        let g_kernel = reshape(&exp_g, &[b, t, hv]);
+        let beta_kernel = reshape(&beta, &[b, t, hv]);
+
+        // State: our [Hv, Dk, Dv] → kernel [B=1, Hv, Dv, Dk]
+        let state_kernel = transpose_axes(
+            &reshape(&state.states[layer_idx], &[b, hv, dk, dv]),
+            &[0, 1, 3, 2],
         );
-        reshape(&k_broadcast, &[num_value_heads as i32, key_dim as i32])
-    } else {
-        k_scaled
-    };
 
-    // Same expansion for q
-    let q_expanded = if heads_per_key > 1 {
-        let q_unsq = expand_dims(&q_scaled, 1);
-        let q_broadcast = broadcast_to(
-            &q_unsq,
-            &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
+        let (y_kernel, state_out_kernel) = metal_gdr_kernel_step(
+            &q_kernel,
+            &k_kernel,
+            &v_kernel,
+            &g_kernel,
+            &beta_kernel,
+            &state_kernel,
+            config,
         );
-        reshape(&q_broadcast, &[num_value_heads as i32, key_dim as i32])
+
+        // State back: [B=1, Hv, Dv, Dk] → [Hv, Dk, Dv]
+        state.states[layer_idx] = reshape(
+            &transpose_axes(&state_out_kernel, &[0, 1, 3, 2]),
+            &[hv, dk, dv],
+        );
+        as_dtype(&reshape(&y_kernel, &[hv, dv]), Dtype::Float32)
     } else {
-        q_scaled
+        // Compiled ops fallback.
+        let k_expanded = if heads_per_key > 1 {
+            let k_unsq = expand_dims(&k_scaled, 1);
+            let k_broadcast =
+                broadcast_to(&k_unsq, &[num_key_heads as i32, heads_per_key as i32, dk]);
+            reshape(&k_broadcast, &[hv, dk])
+        } else {
+            k_scaled
+        };
+        let q_expanded = if heads_per_key > 1 {
+            let q_unsq = expand_dims(&q_scaled, 1);
+            let q_broadcast =
+                broadcast_to(&q_unsq, &[num_key_heads as i32, heads_per_key as i32, dk]);
+            reshape(&q_broadcast, &[hv, dk])
+        } else {
+            q_scaled
+        };
+        let v_heads = reshape(&v_raw, &[hv, dv]);
+
+        let (y, s_updated) = compiled_gdr_step(
+            &q_expanded,
+            &k_expanded,
+            &v_heads,
+            &exp_g,
+            &beta,
+            &state.states[layer_idx],
+        );
+        state.states[layer_idx] = s_updated;
+        y
     };
-
-    // v: [v_dim] → [num_value_heads, val_dim]
-    let v_heads = reshape(&v_raw, &[num_value_heads as i32, value_dim as i32]);
-
-    // ── 5-6. Compiled GDR state update ─────────────────────────────────
-    // inputs: q[H,K], k[H,K], v[H,V], g[H], beta[H], state[H,K,V]
-    // outputs: y[H,V], new_state[H,K,V]
-    let (output_heads, s_updated) = compiled_gdr_step(
-        &q_expanded,
-        &k_expanded,
-        &v_heads,
-        &exp_g,
-        &beta,
-        &state.states[layer_idx],
-    );
-    state.states[layer_idx] = s_updated;
 
     // ── 7. Per-head RMSNorm + output gate ────────────────────────────────
     // output_heads: [num_value_heads, val_dim]

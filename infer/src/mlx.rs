@@ -11,7 +11,7 @@
 
 #![allow(unsafe_code)]
 
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 
 use mlx_sys::{
     mlx_array, mlx_dtype, mlx_dtype__MLX_BFLOAT16, mlx_dtype__MLX_FLOAT16, mlx_dtype__MLX_FLOAT32,
@@ -591,6 +591,149 @@ pub fn async_eval(arrays: &[&MlxArray]) -> c_int {
 pub fn compile_clear_cache() {
     unsafe {
         mlx_sys::mlx_detail_compile_clear_cache();
+    }
+}
+
+// ── Metal Kernel ─────────────────────────────────────────────────────────────
+
+/// A custom Metal kernel created via `mx.fast.metal_kernel()`.
+pub struct MetalKernel(mlx_sys::mlx_fast_metal_kernel);
+
+impl Drop for MetalKernel {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_fast_metal_kernel_free(self.0);
+        }
+    }
+}
+unsafe impl Send for MetalKernel {}
+unsafe impl Sync for MetalKernel {}
+
+impl MetalKernel {
+    /// Create a new Metal kernel from source.
+    pub fn new(name: &str, input_names: &[&str], output_names: &[&str], source: &str) -> Self {
+        use std::ffi::CString;
+        let name_c = CString::new(name).unwrap();
+        let source_c = CString::new(source).unwrap();
+        let input_cstrs: Vec<CString> = input_names
+            .iter()
+            .map(|s| CString::new(*s).unwrap())
+            .collect();
+        let input_ptrs: Vec<*const c_char> = input_cstrs.iter().map(|c| c.as_ptr()).collect();
+        let output_cstrs: Vec<CString> = output_names
+            .iter()
+            .map(|s| CString::new(*s).unwrap())
+            .collect();
+        let output_ptrs: Vec<*const c_char> = output_cstrs.iter().map(|c| c.as_ptr()).collect();
+
+        unsafe {
+            let in_vec = mlx_sys::mlx_vector_string_new_data(
+                input_ptrs.as_ptr() as *mut _,
+                input_ptrs.len(),
+            );
+            let out_vec = mlx_sys::mlx_vector_string_new_data(
+                output_ptrs.as_ptr() as *mut _,
+                output_ptrs.len(),
+            );
+            let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+                name_c.as_ptr(),
+                in_vec,
+                out_vec,
+                source_c.as_ptr(),
+                std::ptr::null(), // header
+                true,             // ensure_row_contiguous
+                false,            // atomic_outputs
+            );
+            mlx_sys::mlx_vector_string_free(in_vec);
+            mlx_sys::mlx_vector_string_free(out_vec);
+            Self(kernel)
+        }
+    }
+
+    /// Execute the kernel with given inputs and config.
+    pub fn apply(
+        &self,
+        inputs: &[&MlxArray],
+        grid: [i32; 3],
+        threadgroup: [i32; 3],
+        output_shapes: &[&[i32]],
+        output_dtypes: &[Dtype],
+        template_int_args: &[(&str, i32)],
+        template_dtype_args: &[(&str, Dtype)],
+    ) -> Vec<MlxArray> {
+        use std::ffi::CString;
+
+        let raw_in: Vec<mlx_array> = inputs.iter().map(|a| a.0).collect();
+        let in_vec = unsafe { mlx_sys::mlx_vector_array_new_data(raw_in.as_ptr(), raw_in.len()) };
+
+        let config = unsafe { mlx_sys::mlx_fast_metal_kernel_config_new() };
+        unsafe {
+            mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, grid[0], grid[1], grid[2]);
+            mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(
+                config,
+                threadgroup[0],
+                threadgroup[1],
+                threadgroup[2],
+            );
+
+            for (shape, dtype) in output_shapes.iter().zip(output_dtypes.iter()) {
+                mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+                    config,
+                    shape.as_ptr(),
+                    shape.len(),
+                    dtype.to_raw(),
+                );
+            }
+
+            for (name, val) in template_int_args {
+                let name_c = CString::new(*name).unwrap();
+                mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                    config,
+                    name_c.as_ptr(),
+                    *val,
+                );
+            }
+            for (name, dtype) in template_dtype_args {
+                let name_c = CString::new(*name).unwrap();
+                mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+                    config,
+                    name_c.as_ptr(),
+                    dtype.to_raw(),
+                );
+            }
+        }
+
+        let mut out_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+        let ret = unsafe {
+            mlx_sys::mlx_fast_metal_kernel_apply(
+                &mut out_vec,
+                self.0,
+                in_vec,
+                config,
+                default_stream(),
+            )
+        };
+        if ret != 0 {
+            eprintln!("[MLX] metal_kernel_apply failed with code {ret}");
+        }
+        unsafe {
+            mlx_sys::mlx_vector_array_free(in_vec);
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        }
+
+        let n = unsafe { mlx_sys::mlx_vector_array_size(out_vec) };
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut arr = unsafe { mlx_sys::mlx_array_new() };
+            unsafe {
+                mlx_sys::mlx_vector_array_get(&mut arr, out_vec, i);
+            }
+            results.push(MlxArray(arr));
+        }
+        unsafe {
+            mlx_sys::mlx_vector_array_free(out_vec);
+        }
+        results
     }
 }
 
