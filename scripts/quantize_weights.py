@@ -108,8 +108,20 @@ def dequantize_check(qweight, scales, bits, group_size, original):
         w_q[:, 1::2] = high.float()
         s = scales.float().unsqueeze(-1).expand(-1, -1, group_size).reshape(N, K)
         recon = w_q * s
+    elif bits == 2:
+        v0 = (qweight & 0x03).to(torch.int8) - 2
+        v1 = ((qweight >> 2) & 0x03).to(torch.int8) - 2
+        v2 = ((qweight >> 4) & 0x03).to(torch.int8) - 2
+        v3 = ((qweight >> 6) & 0x03).to(torch.int8) - 2
+        w_q = torch.zeros(N, K, dtype=torch.float32)
+        w_q[:, 0::4] = v0.float()
+        w_q[:, 1::4] = v1.float()
+        w_q[:, 2::4] = v2.float()
+        w_q[:, 3::4] = v3.float()
+        s = scales.float().unsqueeze(-1).expand(-1, -1, group_size).reshape(N, K)
+        recon = w_q * s
     else:
-        raise ValueError
+        raise ValueError(f"Unsupported bits={bits}")
 
     err = (original.float() - recon).abs()
     return err.mean().item(), err.max().item()
