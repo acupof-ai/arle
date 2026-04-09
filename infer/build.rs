@@ -711,7 +711,7 @@ fn find_mlx_include_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     for entry in std::fs::read_dir(build_dir).ok()?.flatten() {
         let name = entry.file_name();
         let name_str = name.to_str().unwrap_or("");
-        if !name_str.starts_with("mlx-sys-") {
+        if !name_str.starts_with("mlx-sys-") && !name_str.starts_with("pmetal-mlx-sys-") {
             continue;
         }
         let out = entry.path().join("out");
@@ -854,7 +854,7 @@ fn main() {
                     }
                     build.compile("metal_fused_ops");
                     println!("cargo:rustc-cfg=metal_fused_ops");
-                    println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
+                    // println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
 
                     // Pure C API fused block (no C++ ABI issues).
                     println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");

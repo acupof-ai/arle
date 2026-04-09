@@ -306,7 +306,7 @@ void metal_quantized_fused_block_cached(
                              group_size, bits);
     // Split into q, k, v along the last axis.
     // split_sections expects cumulative indices: [q_dim, q_dim+k_dim].
-    std::vector<int> qkv_split_at = {q_dim, q_dim + k_dim};
+    Shape qkv_split_at = {q_dim, q_dim + k_dim};
     auto qkv_parts = split(qkv, qkv_split_at, -1);
     array q_raw = qkv_parts[0];  // [seq, q_dim]
     array k_raw = qkv_parts[1];  // [seq, k_dim]
@@ -364,7 +364,7 @@ void metal_quantized_fused_block_cached(
     // Merged gate+up projection, then split.
     array gate_up = quant_linear(xn, gate_up_w, gate_up_scales, gate_up_biases,
                                  group_size, bits);
-    std::vector<int> gu_split_at = {gate_dim};
+    Shape gu_split_at = {gate_dim};
     auto gu_parts = split(gate_up, gu_split_at, -1);
     array gate = gu_parts[0];  // [seq, gate_dim]
     array up   = gu_parts[1];  // [seq, up_dim]
@@ -457,7 +457,7 @@ void metal_qwen35_full_attn_block(
                     arr_ref(q_proj_biases_h), group_size, bits, is_quantized),
         bfloat16);
     q_full = reshape(q_full, {1, 1, n_heads, head_dim * 2});
-    auto q_gate = split(q_full, std::vector<int>{head_dim}, -1);
+    auto q_gate = split(q_full, Shape{head_dim}, -1);
     array q_heads = q_gate[0];
     array gate_heads = q_gate[1];
 
