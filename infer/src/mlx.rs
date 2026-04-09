@@ -61,20 +61,26 @@ impl Dtype {
 
 /// Sync-safe wrapper for `mlx_stream` (contains a raw pointer that Rust
 /// won't auto-impl Send/Sync for, but MLX streams are thread-safe).
-struct SyncStream(mlx_stream);
-unsafe impl Send for SyncStream {}
-unsafe impl Sync for SyncStream {}
+struct SyncStreamAndDevice {
+    stream: mlx_stream,
+    _device: mlx_sys::mlx_device, // keep device alive alongside stream
+}
+unsafe impl Send for SyncStreamAndDevice {}
+unsafe impl Sync for SyncStreamAndDevice {}
 
 /// Return the default GPU stream. Cached on first call.
 fn default_stream() -> mlx_stream {
-    static STREAM: std::sync::LazyLock<SyncStream> = std::sync::LazyLock::new(|| unsafe {
+    static CACHED: std::sync::LazyLock<SyncStreamAndDevice> = std::sync::LazyLock::new(|| unsafe {
         let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
         let mut stream = mlx_sys::mlx_stream_new();
         mlx_sys::mlx_get_default_stream(&mut stream, dev);
-        mlx_sys::mlx_device_free(dev);
-        SyncStream(stream)
+        // Keep device alive — freeing it could invalidate the stream.
+        SyncStreamAndDevice {
+            stream,
+            _device: dev,
+        }
     });
-    STREAM.0
+    CACHED.stream
 }
 
 // ── MlxArray ─────────────────────────────────────────────────────────────────
@@ -518,8 +524,9 @@ pub fn scaled_dot_product_attention(
 ) -> MlxArray {
     use std::ffi::CString;
     let mut res = unsafe { mlx_sys::mlx_array_new() };
-    let mask_cstr = mask.map(|s| CString::new(s).unwrap());
-    let mask_ptr = mask_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // mask_mode must never be NULL — std::string(nullptr) is UB in the C wrapper.
+    let mask_cstr = CString::new(mask.unwrap_or("")).unwrap();
+    let mask_ptr = mask_cstr.as_ptr();
     // Empty mask vector — mask_mode string handles causal masking.
     let empty_mask_vec = unsafe { mlx_sys::mlx_vector_array_new() };
     unsafe {

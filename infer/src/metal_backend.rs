@@ -1083,7 +1083,6 @@ fn metal_generate(
     let mut decode_step: usize = 0;
 
     let finish_reason = loop {
-        // P6: sync — blocks until GPU computation for this token is complete.
         let next_token = pending.item_i32() as u32;
 
         if decode_step == 0 {
@@ -1121,7 +1120,6 @@ fn metal_generate(
             clear_metal_cache();
         }
 
-        // Build next decode step's lazy graph (CPU-only; GPU idle until async_eval).
         let new_pending = build_forward_graph(
             &[next_token],
             weights,
@@ -1164,7 +1162,8 @@ fn metal_generate(
 
 #[cfg(feature = "metal")]
 fn metal_async_eval(arr: &MlxArray) -> Result<()> {
-    crate::mlx::async_eval(&[arr]);
+    // Use sync eval — async_eval may have lifecycle issues with MlxArray handles.
+    crate::mlx::eval(&[arr]);
     Ok(())
 }
 
@@ -1614,7 +1613,6 @@ fn rust_transformer_layer(
     // 1. Input norm + residual
     let residual = x.clone();
     let x = rms_norm(&x, &layer.input_layernorm, eps);
-
     // 2. QKV projections
     let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x);
 
@@ -1647,14 +1645,12 @@ fn rust_transformer_layer(
             .context("gather MetalKVPool")?
     } else {
         let end_pos = cache_len + seq;
-        // slice_update k_cache: write k into cache[.., .., cache_len..end_pos, ..]
         k_caches[li] = slice_update(
             &mut k_caches[li],
             &k,
             &[0, 0, cache_len, 0],
             &[1, n_kv_heads, end_pos, head_dim],
         );
-        // slice_update v_cache: write v into cache[.., .., cache_len..end_pos, ..]
         v_caches[li] = slice_update(
             &mut v_caches[li],
             &v,
