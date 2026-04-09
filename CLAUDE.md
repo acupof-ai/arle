@@ -56,6 +56,47 @@ Commitizen format: `<type>(<scope>): <subject>`.
 
 Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`.
 
+### CUDA Kernel Optimization — Six Principles
+
+Every kernel in `csrc/cuda/` must be evaluated against these. Use `ncu` to validate.
+
+**1. Global Memory Coalescing**
+- Warp of 32 threads → hardware groups addresses by 128B cache line → 1 transaction per line.
+- Optimal: consecutive threads access consecutive addresses (stride = `sizeof(elem)`, aligned).
+- Anti-pattern: `A[tid * N]` → stride N → 32 transactions instead of 1. Fix: transpose layout or tile.
+- Verify: substitute `tid = 0..31` into address expression; adjacent difference should = element size.
+- ncu metric: `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.avg` / requests. Ideal = 4 (128B/32B).
+
+**2. Shared Memory Bank Conflicts**
+- 32 banks, 4B each. Bank = `(byte_addr / 4) % 32`.
+- Same address → broadcast (free). Different addresses, same bank → serial (N-way conflict = N cycles).
+- Classic trigger: `smem[32][32]` column access → all hit bank 0. Fix: pad to `smem[32][33]`.
+- Distinct from coalescing: coalescing saves HBM bandwidth; bank-conflict-free saves smem latency.
+
+**3. Occupancy**
+- Active warps / max warps per SM. Limited by: threads, registers, shared memory, block count.
+- Sweet spot: ≥50%. Below 25% → scheduler starves → compute units idle.
+- Register pressure: >64 regs/thread → spill to local memory (HBM, ~400 cycles). Target 32-64.
+- Trade-off: more smem per block → fewer blocks → lower occupancy. Balance tile size vs. occupancy.
+
+**4. Tiling & Data Reuse**
+- HBM load costs ~400 cycles. Shared memory costs ~5 cycles. Load once, reuse N times.
+- GEMM: tile A and B into smem, each element reused by TILE threads → N/TILE HBM loads.
+- Applies to attention (Q×K reuse), convolution, any overlapping computation.
+- Larger tile = better reuse but more smem → occupancy drops. Profile to find sweet spot.
+
+**5. Warp Divergence**
+- Warp executes one instruction at a time. Branch → serialize both paths (masked execution).
+- `if (tid % 2)` → 2× slowdown. `if (tid / 32 % 2)` → zero cost (different warps, not divergent).
+- Fix: align branches to warp boundaries. Move divergent code outside inner loops.
+- Boundary checks `if (idx < N)` → only last warp affected → usually negligible.
+
+**6. Launch Config & Tail Effect**
+- Grid must be >> SM_count × blocks_per_SM, otherwise last wave underutilizes.
+- 900 blocks on 108 SMs (8 blocks/SM = 864 capacity): last wave = 36 blocks → 5% utilization.
+- Fix: align grid to SM capacity, or use persistent kernels with `atomicAdd` work-stealing.
+- Block size: 256 is default sweet spot. 128 for register-heavy kernels. 512+ only with profiling data.
+
 ---
 
 ## Memory
