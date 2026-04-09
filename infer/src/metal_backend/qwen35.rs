@@ -343,6 +343,70 @@ impl CppQwen35Model {
 
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
+
+    /// Full decode loop in C++ — all intermediates stay alive within the loop.
+    fn generate(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        temperature: f32,
+        stop_token_ids: &[u32],
+        on_token: &mut impl FnMut(u32) -> Result<()>,
+    ) -> Result<Vec<u32>> {
+        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
+        let stop_i32: Vec<i32> = stop_token_ids.iter().map(|&id| id as i32).collect();
+        let mut out_tokens = vec![0i32; max_new_tokens];
+        let mut out_count: i32 = 0;
+
+        // Callback wrapper
+        struct CallbackCtx<'a> {
+            on_token: &'a mut dyn FnMut(u32) -> Result<()>,
+            error: Option<anyhow::Error>,
+        }
+        let mut ctx = CallbackCtx {
+            on_token,
+            error: None,
+        };
+
+        unsafe extern "C" fn token_callback(token_id: i32, ctx_ptr: *mut std::ffi::c_void) -> i32 {
+            let ctx = &mut *(ctx_ptr as *mut CallbackCtx);
+            match (ctx.on_token)(token_id as u32) {
+                Ok(()) => 0,
+                Err(e) => {
+                    ctx.error = Some(e);
+                    -1
+                }
+            }
+        }
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_generate(
+                self.0,
+                prompt_i32.as_ptr(),
+                prompt_i32.len() as i32,
+                max_new_tokens as i32,
+                temperature,
+                out_tokens.as_mut_ptr(),
+                &mut out_count,
+                Some(token_callback),
+                &mut ctx as *mut CallbackCtx as *mut std::ffi::c_void,
+                stop_i32.as_ptr(),
+                stop_i32.len() as i32,
+            )
+        };
+
+        if let Some(e) = ctx.error {
+            return Err(e);
+        }
+        if rc != 0 {
+            return Err(crate::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(out_tokens[..out_count as usize]
+            .iter()
+            .map(|&id| id as u32)
+            .collect())
+    }
 }
 
 /// Extract quantized weight raw pointers. Returns None for Dense weights.
@@ -398,6 +462,44 @@ pub(super) fn metal_generate_qwen35(
     let MetalModelArch::Qwen35(arch) = &config.arch else {
         anyhow::bail!("Qwen3.5 Metal path requires a Qwen3.5 config");
     };
+
+    // C++ full generate path — entire decode loop in C++ for maximum GPU buffer reuse.
+    if let Some(ref cpp_model) = weights.cpp_model {
+        log::info!("Metal forward path: C++ full generate (all in C++)");
+        let mut stop_ids: Vec<u32> = params.stop_token_ids.clone();
+        if !params.ignore_eos {
+            stop_ids.push(config.eos_token_id);
+        }
+
+        let gen_t0 = Instant::now();
+        let tokens = cpp_model.generate(
+            input_ids,
+            max_new_tokens,
+            params.temperature,
+            &stop_ids,
+            on_token,
+        )?;
+
+        let elapsed = gen_t0.elapsed().as_secs_f64();
+        let total_time_ms = elapsed * 1000.0;
+        // Estimate TTFT from total (prefill is included)
+        let decode_elapsed = elapsed.max(1e-9);
+        let tps = tokens.len() as f64 / decode_elapsed;
+        log::info!("  generated {} tokens ({tps:.1} tok/s)", tokens.len());
+
+        let finish_reason = if tokens.last().is_some_and(|t| stop_ids.contains(t)) {
+            "stop"
+        } else {
+            "length"
+        };
+
+        return Ok(super::MetalGenerateOutput {
+            tokens,
+            finish_reason,
+            ttft_ms: 0.0, // TODO: measure prefill separately
+            total_time_ms,
+        });
+    }
 
     log::info!("Metal forward path: Qwen3.5 hybrid (Rust/MLX)");
 

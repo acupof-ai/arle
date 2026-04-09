@@ -343,6 +343,22 @@ unsafe extern "C" {
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
 
+    /// Full decode loop in C++ — all intermediates stay alive within the loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_generate(
+        model: *mut std::ffi::c_void,
+        prompt_ids: *const i32,
+        prompt_len: i32,
+        max_new_tokens: i32,
+        temperature: f32,
+        out_tokens: *mut i32,
+        out_count: *mut i32,
+        on_token: Option<unsafe extern "C" fn(i32, *mut std::ffi::c_void) -> i32>,
+        callback_ctx: *mut std::ffi::c_void,
+        stop_tokens: *const i32,
+        n_stop_tokens: i32,
+    ) -> i32;
+
     // === Fast ops ===
 
     /// RMS normalization. Pass null for weight to use no learnable weight.
