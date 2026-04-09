@@ -215,6 +215,158 @@ fn softplus(x: &MlxArray) -> MlxArray {
     where_(&mask, x, &log1p_exp)
 }
 
+// ── Compiled compute_g ──────────────────────────────────────────────────────
+//
+// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+// Compiled with shapeless=true matching mlx_lm's pattern.
+
+#[cfg(feature = "metal")]
+static COMPILED_COMPUTE_G: std::sync::LazyLock<crate::mlx::CompiledFn> =
+    std::sync::LazyLock::new(|| crate::mlx::compile_simple(compute_g_callback, true));
+
+/// C callback for compute_g: inputs = [A_log, alpha, dt_bias], output = [g].
+#[cfg(feature = "metal")]
+unsafe extern "C" fn compute_g_callback(
+    res: *mut mlx_sys::mlx_vector_array,
+    inputs: mlx_sys::mlx_vector_array,
+) -> std::os::raw::c_int {
+    use crate::mlx::{add, exp, multiply, negative};
+
+    // Extract inputs.
+    let mut a_log_h = mlx_sys::mlx_array_new();
+    let mut alpha_h = mlx_sys::mlx_array_new();
+    let mut dt_bias_h = mlx_sys::mlx_array_new();
+    mlx_sys::mlx_vector_array_get(&mut a_log_h, inputs, 0);
+    mlx_sys::mlx_vector_array_get(&mut alpha_h, inputs, 1);
+    mlx_sys::mlx_vector_array_get(&mut dt_bias_h, inputs, 2);
+
+    let a_log = MlxArray::from_raw(a_log_h);
+    let alpha = MlxArray::from_raw(alpha_h);
+    let dt_bias = MlxArray::from_raw(dt_bias_h);
+
+    // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+    let alpha_plus_bias = add(&alpha, &dt_bias);
+    let sp = softplus(&alpha_plus_bias);
+    let neg_a_exp = negative(&exp(&a_log));
+    let g = exp(&multiply(&neg_a_exp, &sp));
+
+    // Set output.
+    let out = mlx_sys::mlx_vector_array_new_data(&g.as_raw(), 1);
+    mlx_sys::mlx_vector_array_set(res, out);
+    mlx_sys::mlx_vector_array_free(out);
+
+    // Don't free inputs — caller owns them. But we took ownership via from_raw,
+    // so forget them to avoid double-free.
+    std::mem::forget(a_log);
+    std::mem::forget(alpha);
+    std::mem::forget(dt_bias);
+
+    0
+}
+
+/// Compute g using the compiled closure.
+#[cfg(feature = "metal")]
+fn compiled_compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxArray {
+    let results = COMPILED_COMPUTE_G.call(&[a_log, alpha, dt_bias]);
+    results
+        .into_iter()
+        .next()
+        .expect("compute_g should return 1 array")
+}
+
+// ── Compiled GDR state update ───────────────────────────────────────────────
+//
+// Compiled version of the delta-rule state update matching mlx_lm's
+// @mx.compile on _gated_delta_step_ops.
+// inputs = [q, k, v, g, beta, state]  (all properly shaped)
+// outputs = [y, new_state]
+
+#[cfg(feature = "metal")]
+static COMPILED_GDR_STEP: std::sync::LazyLock<crate::mlx::CompiledFn> =
+    std::sync::LazyLock::new(|| crate::mlx::compile_simple(gdr_step_callback, false));
+
+/// C callback for the GDR state update step.
+/// inputs[0] = q [H, K], inputs[1] = k [H, K], inputs[2] = v [H, V],
+/// inputs[3] = g [H], inputs[4] = beta [H], inputs[5] = state [H, K, V]
+/// outputs[0] = y [H, V], outputs[1] = new_state [H, K, V]
+#[cfg(feature = "metal")]
+unsafe extern "C" fn gdr_step_callback(
+    res: *mut mlx_sys::mlx_vector_array,
+    inputs: mlx_sys::mlx_vector_array,
+) -> std::os::raw::c_int {
+    use crate::mlx::{add, multiply, reshape, subtract, sum_axis};
+
+    // Extract 6 inputs.
+    let get = |i: usize| -> MlxArray {
+        let mut h = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut h, inputs, i);
+        MlxArray::from_raw(h)
+    };
+    let q = get(0); // [H, K]
+    let k = get(1); // [H, K]
+    let v = get(2); // [H, V]
+    let g = get(3); // [H]
+    let beta = get(4); // [H]
+    let state = get(5); // [H, K, V]
+
+    let h_dim = state.shape()[0];
+    let k_dim = state.shape()[1];
+    let v_dim = state.shape()[2];
+
+    // Decay: state * g[:, None, None]
+    let g_3d = reshape(&g, &[h_dim, 1, 1]);
+    let s_decayed = multiply(&state, &g_3d);
+
+    // kv_mem = sum_k(S_decayed * k[:, :, None])
+    let k_3d = reshape(&k, &[h_dim, k_dim, 1]);
+    let kv_mem = sum_axis(&multiply(&s_decayed, &k_3d), 1, false); // [H, V]
+
+    // delta = (v - kv_mem) * beta[:, None]
+    let beta_2d = reshape(&beta, &[h_dim, 1]);
+    let delta = multiply(&subtract(&v, &kv_mem), &beta_2d); // [H, V]
+
+    // Rank-1 update: S += delta[:, None, :] * k[:, :, None]
+    let delta_3d = reshape(&delta, &[h_dim, 1, v_dim]);
+    let s_updated = add(&s_decayed, &multiply(&delta_3d, &k_3d)); // [H, K, V]
+
+    // Output: y = sum_k(S_updated * q[:, :, None])
+    let q_3d = reshape(&q, &[h_dim, k_dim, 1]);
+    let y = sum_axis(&multiply(&s_updated, &q_3d), 1, false); // [H, V]
+
+    // Output: [y, s_updated]
+    let out_arrays = [y.as_raw(), s_updated.as_raw()];
+    let out = mlx_sys::mlx_vector_array_new_data(out_arrays.as_ptr(), 2);
+    mlx_sys::mlx_vector_array_set(res, out);
+    mlx_sys::mlx_vector_array_free(out);
+
+    // Forget all inputs (caller owns them via mlx_vector_array_get refcount).
+    std::mem::forget(q);
+    std::mem::forget(k);
+    std::mem::forget(v);
+    std::mem::forget(g);
+    std::mem::forget(beta);
+    std::mem::forget(state);
+
+    0
+}
+
+/// Call the compiled GDR step.
+#[cfg(feature = "metal")]
+fn compiled_gdr_step(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    g: &MlxArray,
+    beta: &MlxArray,
+    state: &MlxArray,
+) -> (MlxArray, MlxArray) {
+    let results = COMPILED_GDR_STEP.call(&[q, k, v, g, beta, state]);
+    let mut it = results.into_iter();
+    let y = it.next().expect("gdr_step output y");
+    let new_state = it.next().expect("gdr_step output state");
+    (y, new_state)
+}
+
 // ── Conv1d single-step ───────────────────────────────────────────────────────
 
 /// Causal depthwise conv1d for a single timestep.
@@ -382,17 +534,8 @@ pub fn metal_gdr_decode_step(
     );
 
     // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
-    // From CUDA kernel:
-    //   float x = a_val + bias;
-    //   float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
-    //   float g = -expf(a_log) * softplus_x;
-    //   s_exp_g = expf(g);
-    let alpha_plus_bias = add(&alpha_1d, &layer_weights.dt_bias);
-    let sp = softplus(&alpha_plus_bias);
-    let a_exp = exp(&layer_weights.a_log);
-    let neg_a_exp = negative(&a_exp);
-    let g_exponent = multiply(&neg_a_exp, &sp);
-    let exp_g = exp(&g_exponent); // per-head decay factor [num_value_heads]
+    // Compiled with shapeless=true matching mlx_lm's pattern.
+    let exp_g = compiled_compute_g(&layer_weights.a_log, &alpha_1d, &layer_weights.dt_bias);
 
     // beta = sigmoid(beta_raw)
     let beta = sigmoid(&beta_1d);
@@ -439,43 +582,18 @@ pub fn metal_gdr_decode_step(
     // v: [v_dim] → [num_value_heads, val_dim]
     let v_heads = reshape(&v_raw, &[num_value_heads as i32, value_dim as i32]);
 
-    // Get current state: [num_value_heads, key_dim, val_dim]
-    let s = &state.states[layer_idx];
-
-    // Pass 1: Decay state
-    // exp_g: [num_value_heads] → [num_value_heads, 1, 1] for broadcasting
-    let exp_g_3d = reshape(&exp_g, &[num_value_heads as i32, 1, 1]);
-    let s_decayed = multiply(s, &exp_g_3d);
-
-    // kv_mem[h, v] = sum_j S_decayed[h, j, v] * k[h, j]
-    // k_expanded: [num_value_heads, key_dim] → [num_value_heads, key_dim, 1]
-    let k_3d = reshape(&k_expanded, &[num_value_heads as i32, key_dim as i32, 1]);
-    // S_decayed: [H, K, V], k_3d: [H, K, 1]
-    // kv_mem = sum over K: S_decayed * k_3d → [H, V]
-    let s_times_k = multiply(&s_decayed, &k_3d);
-    let kv_mem = sum_axis(&s_times_k, 1, false); // [H, V]
-
-    // delta = (v - kv_mem) * beta
-    let v_minus_kv = subtract(&v_heads, &kv_mem);
-    // beta: [H] → [H, 1]
-    let beta_2d = reshape(&beta, &[num_value_heads as i32, 1]);
-    let delta = multiply(&v_minus_kv, &beta_2d); // [H, V]
-
-    // Pass 2: Rank-1 update: S[h, j, v] += delta[h, v] * k[h, j]
-    // delta: [H, V] → [H, 1, V], k_expanded: [H, K] → [H, K, 1]
-    // outer product: [H, K, V]
-    let delta_3d = reshape(&delta, &[num_value_heads as i32, 1, value_dim as i32]);
-    let update = multiply(&delta_3d, &k_3d); // [H, K, V]
-    let s_updated = add(&s_decayed, &update);
-
-    // Store updated state
-    state.states[layer_idx] = s_updated.clone();
-
-    // Output: o[h, v] = sum_j S_updated[h, j, v] * q[h, j]
-    // q_expanded: [H, K] → [H, K, 1]
-    let q_3d = reshape(&q_expanded, &[num_value_heads as i32, key_dim as i32, 1]);
-    let s_times_q = multiply(&s_updated, &q_3d);
-    let output_heads = sum_axis(&s_times_q, 1, false); // [H, V]
+    // ── 5-6. Compiled GDR state update ─────────────────────────────────
+    // inputs: q[H,K], k[H,K], v[H,V], g[H], beta[H], state[H,K,V]
+    // outputs: y[H,V], new_state[H,K,V]
+    let (output_heads, s_updated) = compiled_gdr_step(
+        &q_expanded,
+        &k_expanded,
+        &v_heads,
+        &exp_g,
+        &beta,
+        &state.states[layer_idx],
+    );
+    state.states[layer_idx] = s_updated;
 
     // ── 7. Per-head RMSNorm + output gate ────────────────────────────────
     // output_heads: [num_value_heads, val_dim]
