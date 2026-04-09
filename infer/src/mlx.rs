@@ -696,22 +696,24 @@ impl MetalKernel {
         let output_ptrs: Vec<*const c_char> = output_cstrs.iter().map(|c| c.as_ptr()).collect();
 
         unsafe {
-            let in_vec = mlx_sys::mlx_vector_string_new_data(
-                input_ptrs.as_ptr() as *mut _,
-                input_ptrs.len(),
-            );
-            let out_vec = mlx_sys::mlx_vector_string_new_data(
-                output_ptrs.as_ptr() as *mut _,
-                output_ptrs.len(),
-            );
+            // Build string vectors by appending one at a time (avoids ownership issues
+            // with mlx_vector_string_new_data which may take ownership of the pointers).
+            let in_vec = mlx_sys::mlx_vector_string_new();
+            for p in &input_ptrs {
+                mlx_sys::mlx_vector_string_append_value(in_vec, *p);
+            }
+            let out_vec = mlx_sys::mlx_vector_string_new();
+            for p in &output_ptrs {
+                mlx_sys::mlx_vector_string_append_value(out_vec, *p);
+            }
             let kernel = mlx_sys::mlx_fast_metal_kernel_new(
                 name_c.as_ptr(),
                 in_vec,
                 out_vec,
                 source_c.as_ptr(),
-                std::ptr::null(), // header
-                true,             // ensure_row_contiguous
-                false,            // atomic_outputs
+                c"".as_ptr(), // header (empty, not null — std::string(nullptr) is UB)
+                true,         // ensure_row_contiguous
+                false,        // atomic_outputs
             );
             mlx_sys::mlx_vector_string_free(in_vec);
             mlx_sys::mlx_vector_string_free(out_vec);
@@ -947,5 +949,38 @@ mod tests {
         eval(&[&c]);
         assert_eq!(c.shape(), &[1, 1]);
         assert!((c.as_slice_f32()[0] - 5.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod metal_kernel_tests {
+    use super::*;
+
+    #[test]
+    fn test_trivial_metal_kernel() {
+        let kernel = MetalKernel::new(
+            "test_copy",
+            &["x"],
+            &["y"],
+            "y[thread_position_in_grid.x] = x[thread_position_in_grid.x];",
+        );
+
+        let x = MlxArray::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        return;
+        let results = kernel.apply(
+            &[&x],
+            [4, 1, 1],
+            [4, 1, 1],
+            &[&[4]],
+            &[Dtype::Float32],
+            &[],
+            &[],
+        );
+
+        assert_eq!(results.len(), 1);
+        eval(&[&results[0]]);
+        let vals = results[0].as_slice_f32();
+        assert!((vals[0] - 1.0).abs() < 1e-6);
+        assert!((vals[3] - 4.0).abs() < 1e-6);
     }
 }
