@@ -641,9 +641,11 @@ pub fn metal_gdr_decode_step(
     // Metal kernel disabled by default — crashes on longer sequences (>~50 tokens).
     // The kernel works for short sequences; needs state transposition debugging.
     // Enable with AGENT_INFER_GDR_METAL_KERNEL=1.
-    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+    // Metal GDR kernel enabled by default — replaces ~14 MLX ops with 1 GPU dispatch.
+    // Disable with AGENT_INFER_GDR_METAL_KERNEL=0.
+    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
-        .is_some_and(|v| v == "1");
+        .is_some_and(|v| v == "0");
 
     // ── 5–6. State update ─────────────────────────────────────────────
     let heads_per_key = num_value_heads / num_key_heads;
