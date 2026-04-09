@@ -233,6 +233,14 @@ mlx_binary_op!(subtract, mlx_subtract);
 mlx_binary_op!(multiply, mlx_multiply);
 mlx_binary_op!(matmul, mlx_matmul);
 
+pub fn transpose_axes(a: &MlxArray, axes: &[i32]) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_transpose_axes(&mut res, a.0, axes.as_ptr(), axes.len(), default_stream());
+    }
+    MlxArray(res)
+}
+
 pub fn reshape(a: &MlxArray, shape: &[i32]) -> MlxArray {
     let mut res = unsafe { mlx_sys::mlx_array_new() };
     unsafe {

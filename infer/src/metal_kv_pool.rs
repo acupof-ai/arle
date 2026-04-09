@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
-use mlx_rs::Array;
+use crate::mlx::MlxArray;
 
 /// Pure Rust token-slot ledger used by the Metal KV pool.
 ///
@@ -202,9 +202,9 @@ impl SlotLedger {
 pub struct MetalKVPool {
     ledger: SlotLedger,
     /// K buffers per layer: each `[max_total_tokens, kv_dim]` bf16/f16.
-    k_pool: Vec<Array>,
+    k_pool: Vec<MlxArray>,
     /// V buffers per layer: each `[max_total_tokens, kv_dim]` bf16/f16.
-    v_pool: Vec<Array>,
+    v_pool: Vec<MlxArray>,
 
     // ── Config ────────────────────────────────────────────────────────────────
     num_layers: usize,
@@ -225,9 +225,9 @@ impl MetalKVPool {
         num_kv_heads: usize,
         head_dim: usize,
         max_total_tokens: usize,
-        dtype: mlx_rs::Dtype,
+        dtype: crate::mlx::Dtype,
     ) -> Result<Self> {
-        use mlx_rs::{StreamOrDevice, ops::zeros_dtype_device};
+        use crate::mlx::zeros;
 
         let kv_dim = num_kv_heads * head_dim;
         let pool_shape = [max_total_tokens as i32, kv_dim as i32];
@@ -237,12 +237,8 @@ impl MetalKVPool {
         let mut v_pool = Vec::with_capacity(num_layers);
 
         for _ in 0..num_layers {
-            let k = zeros_dtype_device(&pool_shape, dtype, StreamOrDevice::default())
-                .map_err(|e| anyhow!("MetalKVPool K alloc failed: {e}"))?;
-            let v = zeros_dtype_device(&pool_shape, dtype, StreamOrDevice::default())
-                .map_err(|e| anyhow!("MetalKVPool V alloc failed: {e}"))?;
-            k_pool.push(k);
-            v_pool.push(v);
+            k_pool.push(zeros(&pool_shape, dtype));
+            v_pool.push(zeros(&pool_shape, dtype));
         }
 
         log::info!(
@@ -309,10 +305,10 @@ impl MetalKVPool {
         &mut self,
         layer: usize,
         request_id: usize,
-        k: &Array,
-        v: &Array,
+        k: &MlxArray,
+        v: &MlxArray,
     ) -> Result<()> {
-        use mlx_rs::ops::indexing::{TryIndexMutOp, take_axis};
+        use crate::mlx::{slice_update, take_axis};
 
         let indices = self
             .ledger
@@ -324,8 +320,6 @@ impl MetalKVPool {
             return Ok(());
         }
 
-        // The new tokens correspond to the LAST `num_tokens` entries in the
-        // request's slot_indices (the most recently allocated ones).
         if num_tokens > indices.len() {
             return Err(anyhow!(
                 "MetalKVPool: write_kv got {} tokens but request {request_id} only has {} slots",
@@ -334,27 +328,18 @@ impl MetalKVPool {
             ));
         }
         let write_indices = &indices[indices.len() - num_tokens..];
+        let kv_dim = self.kv_dim as i32;
 
-        let k_pool = &mut self.k_pool[layer];
-
-        // MLX `try_index_mut` supports contiguous slice ranges. We write one row
-        // at a time using `pool[pi..pi+1] = row`. This is correct but not optimal;
-        // a future batched scatter would be faster for large writes.
         for (i, &pool_idx) in write_indices.iter().enumerate() {
-            // take_axis with a 1-element index returns [1, kv_dim] — matches the
-            // slice range pi..pi+1 for try_index_mut.
-            let row_k = take_axis(k, Array::from_slice(&[i as i32], &[1]), 0)
-                .map_err(|e| anyhow!("take k row {i}: {e}"))?;
-            let row_v = take_axis(v, Array::from_slice(&[i as i32], &[1]), 0)
-                .map_err(|e| anyhow!("take v row {i}: {e}"))?;
+            let idx_arr = MlxArray::from_slice_i32(&[i as i32], &[1]);
+            let row_k = take_axis(k, &idx_arr, 0);
+            let row_v = take_axis(v, &idx_arr, 0);
 
             let pi = pool_idx as i32;
-            k_pool
-                .try_index_mut(pi..pi + 1, &row_k)
-                .map_err(|e| anyhow!("scatter k[{pool_idx}]: {e}"))?;
-            self.v_pool[layer]
-                .try_index_mut(pi..pi + 1, &row_v)
-                .map_err(|e| anyhow!("scatter v[{pool_idx}]: {e}"))?;
+            let start = [pi, 0];
+            let stop = [pi + 1, kv_dim];
+            self.k_pool[layer] = slice_update(&mut self.k_pool[layer], &row_k, &start, &stop);
+            self.v_pool[layer] = slice_update(&mut self.v_pool[layer], &row_v, &start, &stop);
         }
 
         Ok(())
@@ -362,8 +347,8 @@ impl MetalKVPool {
 
     /// Gather K/V from the pool for a request, returning contiguous tensors
     /// shaped `[1, n_kv_heads, seq_len, head_dim]` ready for attention.
-    pub fn gather_kv(&self, layer: usize, request_id: usize) -> Result<(Array, Array)> {
-        use mlx_rs::ops::{indexing::take_axis, reshape, transpose_axes};
+    pub fn gather_kv(&self, layer: usize, request_id: usize) -> Result<(MlxArray, MlxArray)> {
+        use crate::mlx::{reshape, take_axis, transpose_axes};
 
         let indices = self
             .ledger
@@ -377,30 +362,19 @@ impl MetalKVPool {
             ));
         }
 
-        // Build index array from the request's token positions.
         let idx_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
-        let idx_arr = Array::from_slice(&idx_i32, &[seq_len]);
+        let idx_arr = MlxArray::from_slice_i32(&idx_i32, &[seq_len]);
 
-        // Gather rows from pool: result is [seq_len, kv_dim].
-        let k_gathered = take_axis(&self.k_pool[layer], &idx_arr, 0)
-            .map_err(|e| anyhow!("gather k layer {layer}: {e}"))?;
-        let v_gathered = take_axis(&self.v_pool[layer], &idx_arr, 0)
-            .map_err(|e| anyhow!("gather v layer {layer}: {e}"))?;
+        let k_gathered = take_axis(&self.k_pool[layer], &idx_arr, 0);
+        let v_gathered = take_axis(&self.v_pool[layer], &idx_arr, 0);
 
-        // Reshape to [1, n_kv_heads, seq_len, head_dim] for attention.
         let n_kv = self.num_kv_heads as i32;
         let hd = self.head_dim as i32;
-        let k_out =
-            reshape(&k_gathered, &[1, seq_len, n_kv, hd]).map_err(|e| anyhow!("reshape k: {e}"))?;
-        let v_out =
-            reshape(&v_gathered, &[1, seq_len, n_kv, hd]).map_err(|e| anyhow!("reshape v: {e}"))?;
+        let k_out = reshape(&k_gathered, &[1, seq_len, n_kv, hd]);
+        let v_out = reshape(&v_gathered, &[1, seq_len, n_kv, hd]);
 
-        // Transpose from [1, seq_len, n_kv_heads, head_dim] to
-        //                 [1, n_kv_heads, seq_len, head_dim].
-        let k_out =
-            transpose_axes(&k_out, &[0, 2, 1, 3]).map_err(|e| anyhow!("transpose k: {e}"))?;
-        let v_out =
-            transpose_axes(&v_out, &[0, 2, 1, 3]).map_err(|e| anyhow!("transpose v: {e}"))?;
+        let k_out = transpose_axes(&k_out, &[0, 2, 1, 3]);
+        let v_out = transpose_axes(&v_out, &[0, 2, 1, 3]);
 
         Ok((k_out, v_out))
     }
