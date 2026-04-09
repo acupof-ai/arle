@@ -46,6 +46,311 @@ pub(super) struct Qwen35MetalWeights {
     pub(super) layers: Vec<MetalQwen35BlockWeights>,
     pub(super) norm: MlxArray,
     pub(super) lm_head: WeightTensor,
+    /// C++ compiled model handle (if available). Eliminates per-op FFI overhead.
+    pub(super) compiled_model: Option<CompiledQwen35>,
+}
+
+/// RAII wrapper for the C++ Qwen35CompiledModel.
+pub(super) struct CompiledQwen35(*mut std::ffi::c_void);
+
+impl Drop for CompiledQwen35 {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::qwen35_compiled_free(self.0) }
+    }
+}
+unsafe impl Send for CompiledQwen35 {}
+unsafe impl Sync for CompiledQwen35 {}
+
+impl CompiledQwen35 {
+    /// Build C++ model from loaded Rust weights. Returns None if weights are not
+    /// all quantized (required for the C++ path).
+    fn build(
+        weights: &Qwen35MetalWeights,
+        config: &MetalModelConfig,
+        arch: &MetalQwen35ArchConfig,
+    ) -> Option<Self> {
+        let model = unsafe { mlx_sys::qwen35_compiled_new() };
+        if model.is_null() {
+            return None;
+        }
+
+        // Config
+        unsafe {
+            mlx_sys::qwen35_compiled_set_config(
+                model,
+                config.rope_theta as f32,
+                config.rms_norm_eps as f32,
+                config.num_attention_heads as i32,
+                config.num_key_value_heads as i32,
+                config.head_dim as i32,
+                arch.rotary_dim as i32,
+                config.hidden_size as i32,
+            );
+        }
+
+        // Embed + norm + lm_head
+        let (lm_w, lm_s, lm_b, lm_gs, lm_bits) = match &weights.lm_head {
+            WeightTensor::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => (
+                w.as_raw(),
+                scales.as_raw(),
+                biases.as_raw(),
+                *group_size,
+                *bits,
+            ),
+            WeightTensor::Dense(_) => {
+                log::warn!("C++ compiled model requires quantized lm_head — falling back to Rust");
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
+            }
+        };
+        unsafe {
+            mlx_sys::qwen35_compiled_set_embed(
+                model,
+                weights.embed_tokens.as_raw(),
+                weights.norm.as_raw(),
+                lm_w,
+                lm_s,
+                lm_b,
+                lm_gs,
+                lm_bits,
+            );
+        }
+
+        // Layers
+        for layer in &weights.layers {
+            let (input_ln, post_ln) = (
+                layer.input_layernorm.as_raw(),
+                layer.post_attention_layernorm.as_raw(),
+            );
+
+            // MLP weights (shared by both attention types)
+            let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) = match &layer.mlp_inputs {
+                MlpInputProjection::MergedQuantized {
+                    gate_up_proj:
+                        WeightTensor::Quantized {
+                            w,
+                            scales,
+                            biases,
+                            group_size,
+                            bits,
+                        },
+                    gate_dim,
+                    ..
+                } => (
+                    w.as_raw(),
+                    scales.as_raw(),
+                    biases.as_raw(),
+                    *group_size,
+                    *bits,
+                    *gate_dim,
+                ),
+                _ => {
+                    log::warn!("C++ compiled model requires quantized MLP — falling back to Rust");
+                    unsafe { mlx_sys::qwen35_compiled_free(model) };
+                    return None;
+                }
+            };
+            let (dw_w, dw_s, dw_b) = match &layer.down_proj {
+                WeightTensor::Quantized {
+                    w, scales, biases, ..
+                } => (w.as_raw(), scales.as_raw(), biases.as_raw()),
+                _ => {
+                    unsafe { mlx_sys::qwen35_compiled_free(model) };
+                    return None;
+                }
+            };
+
+            match &layer.attention {
+                MetalQwen35Attention::Full(attn) => {
+                    let q = extract_qw(&attn.q_proj)?;
+                    let k = extract_qw(&attn.k_proj)?;
+                    let v = extract_qw(&attn.v_proj)?;
+                    let o = extract_qw(&attn.o_proj)?;
+                    unsafe {
+                        mlx_sys::qwen35_compiled_push_full_attn(
+                            model,
+                            input_ln,
+                            post_ln,
+                            q.0,
+                            q.1,
+                            q.2,
+                            q.3,
+                            q.4,
+                            k.0,
+                            k.1,
+                            k.2,
+                            v.0,
+                            v.1,
+                            v.2,
+                            o.0,
+                            o.1,
+                            o.2,
+                            attn.q_norm.as_raw(),
+                            attn.k_norm.as_raw(),
+                            gu_w,
+                            gu_s,
+                            gu_b,
+                            gu_gs,
+                            gu_bits,
+                            gate_dim,
+                            dw_w,
+                            dw_s,
+                            dw_b,
+                        );
+                    }
+                }
+                MetalQwen35Attention::Linear(attn) => {
+                    let qkvz = extract_qw(&attn.in_proj_qkvz)?;
+                    let ba = extract_qw(&attn.in_proj_ba)?;
+                    let out = extract_qw(&attn.out_proj)?;
+                    unsafe {
+                        mlx_sys::qwen35_compiled_push_gdr(
+                            model,
+                            input_ln,
+                            post_ln,
+                            qkvz.0,
+                            qkvz.1,
+                            qkvz.2,
+                            qkvz.3,
+                            qkvz.4,
+                            attn.qkvz_split.0,
+                            attn.qkvz_split.1,
+                            ba.0,
+                            ba.1,
+                            ba.2,
+                            ba.3,
+                            ba.4,
+                            attn.ba_num_heads,
+                            attn.conv1d_weight.as_raw(),
+                            arch.linear.conv_kernel as i32,
+                            attn.a_log.as_raw(),
+                            attn.dt_bias.as_raw(),
+                            attn.norm_weight.as_raw(),
+                            arch.linear.rms_norm_eps,
+                            out.0,
+                            out.1,
+                            out.2,
+                            out.3,
+                            out.4,
+                            arch.linear.num_key_heads as i32,
+                            arch.linear.key_dim as i32,
+                            arch.linear.num_value_heads as i32,
+                            arch.linear.value_dim as i32,
+                            gu_w,
+                            gu_s,
+                            gu_b,
+                            gu_gs,
+                            gu_bits,
+                            gate_dim,
+                            dw_w,
+                            dw_s,
+                            dw_b,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Finalize (compile)
+        let rc = unsafe { mlx_sys::qwen35_compiled_finalize(model) };
+        if rc != 0 {
+            log::warn!("C++ model finalize failed — falling back to Rust");
+            unsafe { mlx_sys::qwen35_compiled_free(model) };
+            return None;
+        }
+
+        log::info!(
+            "  C++ compiled model ready (all {} layers in C++)",
+            weights.layers.len()
+        );
+        Some(Self(model))
+    }
+
+    /// Run one decode step. Returns logits. Updates caches in place.
+    fn step(
+        &self,
+        token: &MlxArray,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray], // [k0, v0, k1, v1, ...] for full-attn layers
+        gdr_states: &mut [MlxArray], // [gdr0, conv0, gdr1, conv1, ...] for GDR layers
+    ) -> Result<MlxArray> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(|a| a.as_raw()).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(|a| a.as_raw()).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step(
+                self.0,
+                token.as_raw(),
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                &mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(crate::mlx::check_mlx_error().unwrap_err());
+        }
+
+        // Update caches in place
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+}
+
+/// Extract quantized weight raw pointers. Returns None for Dense weights.
+fn extract_qw(
+    wt: &WeightTensor,
+) -> Option<(
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    i32,
+    i32,
+)> {
+    match wt {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => Some((
+            w.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            *group_size,
+            *bits,
+        )),
+        WeightTensor::Dense(_) => None,
+    }
 }
 
 pub(super) fn metal_generate_qwen35(
@@ -95,19 +400,69 @@ pub(super) fn metal_generate_qwen35(
 
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
+
+    // Use C++ compiled model if available (1 FFI call per step vs ~1600).
+    let use_cpp = weights.compiled_model.is_some();
+    if use_cpp {
+        log::info!("  using C++ compiled forward (1 FFI call/step)");
+    }
+
+    // Build flat cache arrays for C++ path: [k0, v0, k1, v1, ...] and [gdr0, conv0, ...]
+    let mut kv_flat: Vec<MlxArray> = k_caches
+        .iter()
+        .zip(v_caches.iter())
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    let mut gdr_flat: Vec<MlxArray> = recurrent
+        .states
+        .iter()
+        .zip(recurrent.conv_states.iter())
+        .flat_map(|(s, c)| [s.clone(), c.clone()])
+        .collect();
+
+    // Helper: run one forward step (C++ or Rust path)
+    let forward_step = |token: &MlxArray,
+                        weights: &Qwen35MetalWeights,
+                        k_caches: &mut [MlxArray],
+                        v_caches: &mut [MlxArray],
+                        recurrent: &mut MetalRecurrentState,
+                        kv_flat: &mut [MlxArray],
+                        gdr_flat: &mut [MlxArray],
+                        cache_len: i32|
+     -> Result<MlxArray> {
+        if let Some(cpp_model) = &weights.compiled_model {
+            let logits = cpp_model.step(token, cache_len, kv_flat, gdr_flat)?;
+            // Sync back KV caches from flat to split arrays
+            for (i, chunk) in kv_flat.chunks(2).enumerate() {
+                k_caches[i] = chunk[0].clone();
+                v_caches[i] = chunk[1].clone();
+            }
+            // Sync back GDR state
+            for (i, chunk) in gdr_flat.chunks(2).enumerate() {
+                recurrent.states[i] = chunk[0].clone();
+                recurrent.conv_states[i] = chunk[1].clone();
+            }
+            Ok(logits)
+        } else {
+            Ok(qwen35_forward_step(
+                token, weights, config, arch, k_caches, v_caches, recurrent, cache_len,
+            ))
+        }
+    };
+
     let mut logits = None;
     for &token in input_ids {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        logits = Some(qwen35_forward_step(
+        logits = Some(forward_step(
             &token_arr,
             weights,
-            config,
-            arch,
             &mut k_caches,
             &mut v_caches,
             &mut recurrent,
+            &mut kv_flat,
+            &mut gdr_flat,
             cache_len,
-        ));
+        )?);
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
     }
@@ -117,35 +472,21 @@ pub(super) fn metal_generate_qwen35(
     let mut ttft_ms = 0.0;
 
     // ── mlx_lm-style double-buffered decode loop ────────────────────────
-    //
-    // Pass the LAZY sample token `y` directly to forward_step (not the
-    // materialized u32). This lets CPU build the next graph while GPU
-    // executes the current step, overlapping ~1.5ms of CPU work.
-    //
-    //   y = sample(prefill)     async_eval(y)
-    //   loop:
-    //     next_y = sample(fwd(y))   ← CPU builds graph (y still lazy)
-    //     async_eval(next_y)        ← submit to GPU
-    //     eval(y)                   ← wait for current
-    //     token = y.item()          ← read result
-    //     y = next_y
-
     let mut y = gpu_sample_token(&logits, params)?;
     crate::mlx::async_eval(&[&y]);
 
     let finish_reason = 'decode: loop {
-        // Build NEXT step's graph while GPU computes CURRENT y.
-        // y is lazy — forward_step builds a graph that depends on it.
-        let next_logits = qwen35_forward_step(
+        // Build NEXT graph while GPU computes CURRENT y.
+        let next_logits = forward_step(
             &y,
             weights,
-            config,
-            arch,
             &mut k_caches,
             &mut v_caches,
             &mut recurrent,
+            &mut kv_flat,
+            &mut gdr_flat,
             cache_len,
-        );
+        )?;
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
         let next_y = gpu_sample_token(&next_logits, params)?;
@@ -725,12 +1066,18 @@ pub(super) fn load_qwen35_metal_weights(
         });
     }
 
-    Ok(Qwen35MetalWeights {
+    let mut weights = Qwen35MetalWeights {
         embed_tokens,
         layers,
         norm,
         lm_head,
-    })
+        compiled_model: None,
+    };
+
+    // Try to build the C++ compiled model (all layers in C++, no per-op FFI).
+    weights.compiled_model = CompiledQwen35::build(&weights, config, arch);
+
+    Ok(weights)
 }
 
 fn load_lm_head(
