@@ -171,15 +171,20 @@ struct FullAttnLayerWeights {
 
 struct GdrLayerWeights {
     array input_ln_w = array(0), post_attn_ln_w = array(0);
-    QWeight qkvz_proj, ba_proj, out_proj;
+    // Separate projections (matching mlx_lm — 4 matmul, no slice overhead)
+    QWeight qkv_proj, z_proj, b_proj, a_proj, out_proj;
+    // Legacy fused projections (used if separate not provided)
+    QWeight qkvz_proj, ba_proj;
     int qkv_split = 0, z_split = 0, ba_num_heads = 0;
+    bool use_separate_proj = false;
     array conv1d_w = array(0);
     array a_log = array(0), dt_bias = array(0);
     array norm_w = array(0);
-    QWeight gate_up, down;
+    QWeight gate_proj, up_proj, down;
+    bool use_separate_mlp = false;
+    QWeight gate_up;
     int gate_dim = 0;
     int num_key_heads = 0, key_dim = 0, num_value_heads = 0, value_dim = 0;
-    // Pre-computed scale constants (avoid per-step array(scalar) creation)
     array q_scale_arr = array(0.0f);
     array k_scale_arr = array(0.0f);
     int conv_kernel = 4;
@@ -227,8 +232,9 @@ struct Qwen35CompiledModel {
         float attn_scale = 1.0f / std::sqrt((float)hd);
 
         auto q_full = reshape(lw.q_proj.apply(x), {1, 1, nh, hd * 2});
-        auto q_heads = slice(q_full, {0,0,0,0}, {1,1,nh,hd});
-        auto gate_heads = slice(q_full, {0,0,0,hd}, {1,1,nh,hd*2});
+        auto q_gate = split(q_full, Shape{hd}, -1);  // split at hd along last dim
+        auto& q_heads = q_gate[0];
+        auto& gate_heads = q_gate[1];
 
         auto k_raw = lw.k_proj.apply(x);
         auto v_raw = lw.v_proj.apply(x);
@@ -279,13 +285,23 @@ struct Qwen35CompiledModel {
 
         auto x_3d = reshape(x, {1, 1, hidden_size});
 
-        // Projections
-        auto qkvz = lw.qkvz_proj.apply(x_3d);
-        auto qkv = slice(qkvz, {0,0,0}, {1,1,lw.qkv_split});
-        auto z = slice(qkvz, {0,0,lw.qkv_split}, {1,1,lw.qkv_split+lw.z_split});
-        auto ba = lw.ba_proj.apply(x_3d);
-        auto b_raw = slice(ba, {0,0,0}, {1,1,lw.ba_num_heads});
-        auto a_raw = slice(ba, {0,0,lw.ba_num_heads}, {1,1,lw.ba_num_heads*2});
+        // Projections — separate matmuls matching mlx_lm (4 matmul, no split overhead)
+        array qkv(0), z_raw(0), b_raw(0), a_raw(0);
+        if (lw.use_separate_proj) {
+            qkv = lw.qkv_proj.apply(x_3d);
+            z_raw = lw.z_proj.apply(x_3d);
+            b_raw = lw.b_proj.apply(x_3d);
+            a_raw = lw.a_proj.apply(x_3d);
+        } else {
+            auto qkvz = lw.qkvz_proj.apply(x_3d);
+            auto qkv_z = split(qkvz, Shape{lw.qkv_split}, -1);
+            qkv = qkv_z[0];
+            z_raw = qkv_z[1];
+            auto ba = lw.ba_proj.apply(x_3d);
+            auto ba_parts = split(ba, Shape{lw.ba_num_heads}, -1);
+            b_raw = ba_parts[0];
+            a_raw = ba_parts[1];
+        }
 
         // Conv1d
         auto conv_input = concatenate({conv_state_in, qkv}, 1);
@@ -294,10 +310,11 @@ struct Qwen35CompiledModel {
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
         conv_out = compiled_silu()({conv_out})[0]; // SiLU (compiled)
 
-        // Split + normalize
-        auto q_raw = reshape(slice(conv_out, {0,0,0}, {1,1,q_dim}), {1,1,hk,dk});
-        auto k_raw = reshape(slice(conv_out, {0,0,q_dim}, {1,1,q_dim+k_dim}), {1,1,hk,dk});
-        auto v_raw = reshape(slice(conv_out, {0,0,q_dim+k_dim}, {1,1,q_dim+k_dim+v_dim}), {1,1,hv,dv});
+        // Split conv output: 1 split op instead of 3 separate slices
+        auto qkv_parts = split(conv_out, Shape{q_dim, q_dim + k_dim}, -1);
+        auto q_raw = reshape(qkv_parts[0], {1, 1, hk, dk});
+        auto k_raw = reshape(qkv_parts[1], {1, 1, hk, dk});
+        auto v_raw = reshape(qkv_parts[2], {1, 1, hv, dv});
 
         auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * lw.q_scale_arr;
         auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * lw.k_scale_arr;
@@ -370,7 +387,7 @@ struct Qwen35CompiledModel {
         // Output norm + gate
         auto y_heads = reshape(y, {hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
-        auto z_gated = reshape(z, {hv, dv});
+        auto z_gated = reshape(z_raw, {hv, dv});
         auto out = normed * compiled_silu()({z_gated})[0]; // normed * silu(z) (compiled)
         return lw.out_proj.apply(reshape(out, {1, hv*dv}));
     }
@@ -379,8 +396,9 @@ struct Qwen35CompiledModel {
 
     array mlp(const array& x, const QWeight& gate_up, const QWeight& down, int gate_dim) const {
         auto gu = gate_up.apply(x);
-        auto g = slice(gu, {0, 0}, {1, gate_dim});
-        auto u = slice(gu, {0, gate_dim}, {1, gate_dim * 2});
+        auto gu_parts = split(gu, Shape{gate_dim}, -1);
+        auto& g = gu_parts[0];
+        auto& u = gu_parts[1];
         auto h = compiled_swiglu()({g, u})[0]; // SiLU(gate) * up (compiled)
         return down.apply(h);
     }
