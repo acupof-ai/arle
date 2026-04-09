@@ -264,7 +264,7 @@ struct Qwen35CompiledModel {
         // SDPA + gate
         auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, "");
         attn_out = reshape(transpose(attn_out, {0,2,1,3}), {1, nh*hd});
-        auto gate = reshape(gate_heads, {1, nh*hd});
+        auto gate = reshape(gate_heads, {1, 1, nh*hd});
         gate = sigmoid(astype(gate, float32));
         auto gated = astype(astype(attn_out, float32) * gate, bfloat16);
 
@@ -390,7 +390,7 @@ struct Qwen35CompiledModel {
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
         auto z_gated = reshape(z_raw, {hv, dv});
         auto out = normed * compiled_silu()({z_gated})[0]; // normed * silu(z) (compiled)
-        return lw.out_proj.apply(reshape(out, {1, hv*dv}));
+        return lw.out_proj.apply(reshape(out, {1, 1, hv*dv}));
     }
 
     // ── MLP block ──────────────────────────────────────────────────────
@@ -431,7 +431,11 @@ struct Qwen35CompiledModel {
         int cache_pos = current_cache_pos;
 
         int F = n_full_attn, G = n_gdr;
-        auto x = take(embed_tokens, token_id, 0);
+        // Ensure x is [1, 1, hidden] (3D) matching mlx_lm's tensor layout.
+        // token_id may be [1] (1D) — reshape to [1, 1] so take returns [1, 1, H].
+        auto tid = (token_id.ndim() == 1) ? reshape(token_id, {1, 1}) : token_id;
+        auto x = take(embed_tokens, flatten(tid), 0);
+        x = reshape(x, {1, 1, hidden_size});
 
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
