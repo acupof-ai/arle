@@ -842,7 +842,8 @@ int32_t qwen35_compiled_generate(
 
         int cache_pos = 0;
 
-        // Prefill
+        // Prefill — build the entire graph lazily, eval only once at the end.
+        // Each step chains on the previous step's cache outputs.
         for (int p = 0; p < prompt_len; ++p) {
             m->current_cache_pos = cache_pos;
             std::vector<array> inputs;
@@ -852,7 +853,7 @@ int32_t qwen35_compiled_generate(
 
             auto outputs = m->forward(inputs);
 
-            // Update caches
+            // Update caches (lazy — no eval until end of prefill)
             for (int j = 0; j < (int)kv_caches.size(); ++j)
                 kv_caches[j] = outputs[1 + j];
             for (int j = 0; j < (int)gdr_states.size(); ++j)
@@ -860,12 +861,12 @@ int32_t qwen35_compiled_generate(
 
             cache_pos++;
             if (p == prompt_len - 1) {
-                // Prefill done — record TTFT
+                // Prefill done — eval the entire chained graph at once
                 auto logits = outputs[0];
                 auto y = (temperature <= 1e-6f)
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
-                eval(y);  // force eval to measure prefill time
+                eval(y);  // single eval for all prefill tokens
                 auto t_prefill_end = std::chrono::high_resolution_clock::now();
                 if (out_prefill_ms) {
                     *out_prefill_ms = std::chrono::duration<double, std::milli>(
