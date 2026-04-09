@@ -168,6 +168,83 @@ mod metal_ffi {
             result_out: *mut mlx_array,
         );
 
+        // ── Qwen3.5 fused blocks ───────────────────────────────────────────
+
+        /// Qwen3.5 full-attention layer: norm → q/gate split → QK norm →
+        /// partial RoPE → KV cache → SDPA → sigmoid gating → o_proj.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn metal_qwen35_full_attn_block(
+            x: mlx_array,
+            input_norm_w: mlx_array,
+            q_proj_w: mlx_array,
+            q_proj_scales: mlx_array,
+            q_proj_biases: mlx_array,
+            k_proj_w: mlx_array,
+            k_proj_scales: mlx_array,
+            k_proj_biases: mlx_array,
+            v_proj_w: mlx_array,
+            v_proj_scales: mlx_array,
+            v_proj_biases: mlx_array,
+            o_proj_w: mlx_array,
+            o_proj_scales: mlx_array,
+            o_proj_biases: mlx_array,
+            q_norm_w: mlx_array,
+            k_norm_w: mlx_array,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            attn_scale: f32,
+            rope_base: f32,
+            rotary_dim: i32,
+            norm_eps: f32,
+            group_size: i32,
+            bits: i32,
+            is_quantized: bool,
+            norm_offset: bool,
+            k_cache: *mut mlx_array,
+            v_cache: *mut mlx_array,
+            cache_len: i32,
+            result_out: *mut mlx_array,
+        );
+
+        /// Qwen3.5 GDR linear attention decode step: project → conv1d →
+        /// normalize → gate → state update → output → norm → gate → o_proj.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn metal_qwen35_gdr_block(
+            x: mlx_array,
+            qkv_w: mlx_array,
+            qkv_scales: mlx_array,
+            qkv_biases: mlx_array,
+            z_w: mlx_array,
+            z_scales: mlx_array,
+            z_biases: mlx_array,
+            beta_w: mlx_array,
+            beta_scales: mlx_array,
+            beta_biases: mlx_array,
+            alpha_w: mlx_array,
+            alpha_scales: mlx_array,
+            alpha_biases: mlx_array,
+            out_w: mlx_array,
+            out_scales: mlx_array,
+            out_biases: mlx_array,
+            conv1d_weight: mlx_array,
+            dt_bias: mlx_array,
+            a_log: mlx_array,
+            norm_weight: mlx_array,
+            num_key_heads: i32,
+            key_dim: i32,
+            num_value_heads: i32,
+            value_dim: i32,
+            conv_kernel: i32,
+            hidden_size: i32,
+            rms_norm_eps: f32,
+            group_size: i32,
+            bits: i32,
+            is_quantized: bool,
+            recurrent_state: *mut mlx_array,
+            conv_state: *mut mlx_array,
+            result_out: *mut mlx_array,
+        );
     }
 }
 
