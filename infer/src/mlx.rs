@@ -87,6 +87,12 @@ fn default_stream() -> mlx_stream {
 #[repr(transparent)]
 pub struct MlxArray(mlx_array);
 
+impl std::fmt::Debug for MlxArray {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlxArray({:?}, {:?})", self.shape(), self.dtype())
+    }
+}
+
 impl Drop for MlxArray {
     fn drop(&mut self) {
         unsafe {
@@ -135,29 +141,6 @@ impl MlxArray {
     /// that update the array in-place (e.g. KV cache slice_update).
     pub fn as_raw_mut(&mut self) -> *mut mlx_array {
         &mut self.0 as *mut mlx_array
-    }
-
-    // ── mlx_rs bridge (temporary — removed when mlx_rs is fully dropped) ──
-
-    /// Borrow an `mlx_rs::Array` as `&MlxArray` (zero-cost, both are
-    /// `#[repr(transparent)]` over `mlx_sys::mlx_array`).
-    ///
-    /// This is safe because the two types have identical layout and neither
-    /// is mutated through the shared reference.
-    pub fn borrow_from_mlx_rs(arr: &mlx_rs::Array) -> &MlxArray {
-        // SAFETY: Both Array and MlxArray are #[repr(transparent)] over mlx_array.
-        unsafe { &*(arr as *const mlx_rs::Array as *const MlxArray) }
-    }
-
-    /// Convert an owned `MlxArray` into an `mlx_rs::Array` (zero-cost).
-    ///
-    /// Consumes self without running drop, and wraps the raw handle in
-    /// `mlx_rs::Array` which will take over ownership.
-    pub fn into_mlx_rs(self) -> mlx_rs::Array {
-        let raw = self.into_raw();
-        // SAFETY: Both types are #[repr(transparent)] over mlx_array.
-        // into_raw() prevents double-free; mlx_rs::Array now owns the handle.
-        unsafe { std::mem::transmute::<mlx_array, mlx_rs::Array>(raw) }
     }
 
     // ── Construction ─────────────────────────────────────────────────────

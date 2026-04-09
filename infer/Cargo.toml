@@ -27,8 +27,7 @@ memmap2 = { version = "0.9", optional = true }
 # HuggingFace Hub: auto-download model weights + tokenizer by model ID
 hf-hub = { version = "0.5", features = ["tokio"] }
 # MLX Metal backend (Apple Silicon)
-mlx-rs = { version = "0.25", optional = true }
-# mlx-sys: direct dep so we can use mlx_array in FFI declarations
+# mlx-sys: direct MLX C API bindings (bindgen). No mlx-rs wrapper.
 mlx-sys = { version = "0.2", optional = true }
 # libc: peak RSS via getrusage for metal_bench
 libc = { version = "0.2", optional = true }
@@ -48,7 +47,7 @@ cuda = ["dep:cudarc", "dep:memmap2"]
 # Disable CUDA — allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = []
 # Metal backend via mlx-rs (Apple Silicon). Mutually compatible with no-cuda.
-metal = ["dep:mlx-rs", "dep:mlx-sys", "dep:libc"]
+metal = ["dep:mlx-sys", "dep:libc"]
 default = ["cuda"]
 reference = []
 
