@@ -274,8 +274,14 @@ struct Qwen35CompiledModel {
         auto gate = reshape(gate_heads, {1, 1, nh*hd});
         gate = sigmoid(astype(gate, float32));
         auto gated = astype(astype(attn_out, float32) * gate, bfloat16);
+        auto result = lw.o_proj.apply(gated);
 
-        return lw.o_proj.apply(gated);
+        // Keep intermediates alive for GPU buffer reuse
+        intermediates.push_back(q);
+        intermediates.push_back(k);
+        intermediates.push_back(attn_out);
+        intermediates.push_back(gated);
+        return result;
     }
 
     // ── GDR decode step ────────────────────────────────────────────────
