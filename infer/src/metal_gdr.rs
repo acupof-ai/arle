@@ -85,14 +85,15 @@ impl MetalGdrConfig {
 /// - `out_proj`: output projection
 #[cfg(feature = "metal")]
 pub struct MetalLinearAttnWeights {
-    /// Fused QKV projection: [qkv_dim, hidden_size] (pre-transposed for Dense).
-    pub in_proj_qkv: WeightTensor,
-    /// Z (output gate) projection: [z_dim, hidden_size].
-    pub in_proj_z: WeightTensor,
-    /// Beta (learning rate) projection: [num_value_heads, hidden_size].
-    pub in_proj_beta: WeightTensor,
-    /// Alpha (decay) projection: [num_value_heads, hidden_size].
-    pub in_proj_alpha: WeightTensor,
+    /// Merged QKV+Z projection: [qkv_dim + z_dim, hidden_size].
+    /// Single matmul replaces two separate projections.
+    pub in_proj_qkvz: WeightTensor,
+    /// Merged Beta+Alpha projection: [num_value_heads * 2, hidden_size].
+    pub in_proj_ba: WeightTensor,
+    /// Split dimensions for QKVZ output: qkv_dim, z_dim.
+    pub qkvz_split: (i32, i32),
+    /// Number of value heads (for BA split).
+    pub ba_num_heads: i32,
     /// Depthwise conv1d weight: [qkv_dim, kernel_size] f32.
     pub conv1d_weight: MlxArray,
     /// Per-head dt bias: [num_value_heads] f32.
@@ -496,15 +497,8 @@ fn metal_gdr_kernel_step(
 
 /// Causal depthwise conv1d for a single timestep.
 ///
-/// Updates the rolling buffer in-place and returns the convolved + SiLU output.
-///
-/// # Arguments
-/// - `x`: [qkv_dim] current input (f32)
-/// - `conv_state`: [qkv_dim, kernel-1] rolling buffer (f32), mutated in place
-/// - `kernel`: [qkv_dim, kernel_size] conv weights (f32)
-///
-/// # Returns
-/// - [qkv_dim] convolved output with SiLU activation (f32)
+/// Uses manual concatenate+multiply+sum — faster than mlx_conv1d for
+/// single-token decode because it avoids reshape/transpose overhead.
 #[cfg(feature = "metal")]
 fn conv1d_step(
     x: &MlxArray,
@@ -515,19 +509,11 @@ fn conv1d_step(
 ) -> MlxArray {
     use crate::mlx::{Dtype, as_dtype, concatenate_axis, multiply, reshape, silu, slice, sum_axis};
 
-    // conv_state is [qkv_dim, kernel-1], x is [qkv_dim]
-    // We need to form [qkv_dim, kernel_size] by concatenating [conv_state, x_col]
     let x_col = reshape(x, &[qkv_dim as i32, 1]);
-
-    // full_window = [conv_state | x_col] → [qkv_dim, kernel_size]
     let full_window = concatenate_axis(&[conv_state.clone(), x_col], 1);
-
-    // Element-wise multiply by kernel weights, sum along time axis
     let prod = multiply(&full_window, kernel);
-    let conv_out = sum_axis(&prod, 1, false); // [qkv_dim]
+    let conv_out = sum_axis(&prod, 1, false);
 
-    // Match CUDA: conv sum is truncated to bf16 before SiLU, and the SiLU output
-    // is also stored as bf16 before the next stage consumes it.
     let conv_out = as_dtype(&conv_out, Dtype::Bfloat16);
     let activated = silu(&conv_out);
     let activated = as_dtype(&as_dtype(&activated, Dtype::Bfloat16), Dtype::Float32);
@@ -585,27 +571,23 @@ pub fn metal_gdr_decode_step(
     let k_dim = q_dim;
     let v_dim = num_value_heads * value_dim;
 
-    // ── 1. Projections ───────────────────────────────────────────────────
-    // x: [1, hidden_size] → flat [hidden_size] for projections
+    // ── 1. Merged projections (4 matmuls → 2) ─────────────────────────
+    // Fused QKVZ: single matmul → split into qkv + z
+    // Fused BA: single matmul → split into beta + alpha
     let x_flat = reshape(x, &[1, config.hidden_size as i32]);
 
-    // QKV projection: [1, qkv_dim]
-    let qkv_raw = as_dtype(
-        &linear(&x_flat, &layer_weights.in_proj_qkv),
+    let qkvz = as_dtype(
+        &linear(&x_flat, &layer_weights.in_proj_qkvz),
         Dtype::Bfloat16,
     );
-    // Z projection (output gate): [1, z_dim]
-    let z = as_dtype(&linear(&x_flat, &layer_weights.in_proj_z), Dtype::Bfloat16);
-    // Beta projection (learning rate): [1, num_value_heads]
-    let beta_raw = as_dtype(
-        &linear(&x_flat, &layer_weights.in_proj_beta),
-        Dtype::Bfloat16,
-    );
-    // Alpha projection (decay): [1, num_value_heads]
-    let alpha_raw = as_dtype(
-        &linear(&x_flat, &layer_weights.in_proj_alpha),
-        Dtype::Bfloat16,
-    );
+    let (qkv_split, z_split) = layer_weights.qkvz_split;
+    let qkv_raw = slice(&qkvz, &[0, 0], &[1, qkv_split], &[1, 1]);
+    let z = slice(&qkvz, &[0, qkv_split], &[1, qkv_split + z_split], &[1, 1]);
+
+    let ba = as_dtype(&linear(&x_flat, &layer_weights.in_proj_ba), Dtype::Bfloat16);
+    let nh = layer_weights.ba_num_heads;
+    let beta_raw = slice(&ba, &[0, 0], &[1, nh], &[1, 1]);
+    let alpha_raw = slice(&ba, &[0, nh], &[1, nh * 2], &[1, 1]);
 
     // Flatten to 1D for per-element ops
     let qkv_1d = reshape(&qkv_raw, &[config.qkv_dim() as i32]);
