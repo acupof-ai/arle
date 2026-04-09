@@ -27,6 +27,11 @@ pub struct Scheduler<M: ModelForward> {
     /// Lifetime stats.
     pub(super) total_completed: u64,
     pub(super) total_generated_tokens: u64,
+    /// EMA step timing (microseconds) for /v1/stats profiling.
+    pub(super) step_timing_decode_us: f64,
+    pub(super) step_timing_emit_us: f64,
+    pub(super) step_timing_prefill_us: f64,
+    pub(super) step_timing_total_us: f64,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -161,6 +166,10 @@ impl<M: ModelForward> Scheduler<M> {
             last_served: 0,
             total_completed: 0,
             total_generated_tokens: 0,
+            step_timing_decode_us: 0.0,
+            step_timing_emit_us: 0.0,
+            step_timing_prefill_us: 0.0,
+            step_timing_total_us: 0.0,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(

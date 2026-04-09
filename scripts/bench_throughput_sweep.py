@@ -219,6 +219,7 @@ async def main():
     parser.add_argument("--label", default="infer", help="Label for this server")
     parser.add_argument("--quick", action="store_true", help="Run fewer configs")
     parser.add_argument("--requests", type=int, default=8, help="Requests per config")
+    parser.add_argument("--save", type=str, default=None, help="Save results to JSON snapshot file")
     args = parser.parse_args()
 
     configs = QUICK_CONFIGS if args.quick else SWEEP_CONFIGS
@@ -286,6 +287,32 @@ async def main():
         print(f"  Total tokens:       {total_tok:,}")
         print(f"  Total wall time:    {total_wall:.1f}s")
         print("=" * 100)
+
+        # Save JSON snapshot for regression tracking
+        if args.save:
+            import dataclasses, datetime, platform, subprocess
+            gpu_name = "unknown"
+            try:
+                gpu_name = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    timeout=5
+                ).decode().strip()
+            except Exception:
+                pass
+            snapshot = {
+                "label": args.label,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "gpu": gpu_name,
+                "platform": platform.platform(),
+                "url": args.url,
+                "configs": [dataclasses.asdict(r) for r in results],
+            }
+            import pathlib
+            out_path = pathlib.Path(args.save)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w") as f:
+                json.dump(snapshot, f, indent=2)
+            print(f"\nSnapshot saved: {out_path}")
 
 
 if __name__ == "__main__":
