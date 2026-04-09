@@ -17,6 +17,8 @@ pub(crate) enum Phase {
 pub(crate) struct ActiveRequest {
     pub(crate) id: u64,
     pub(crate) slot_idx: usize,
+    /// Original prompt string (kept for preemption re-queue).
+    pub(crate) prompt: String,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) generated_tokens: Vec<u32>,
     pub(crate) max_tokens: usize,
