@@ -132,6 +132,10 @@ unsafe extern "C" {
         bits: i32,
     ) -> *mut mlx_array;
 
+    // === Contiguous ===
+
+    pub fn mlx_contiguous(a: *mut mlx_array) -> *mut mlx_array;
+
     // === Conv ===
 
     pub fn mlx_conv1d(
@@ -141,6 +145,16 @@ unsafe extern "C" {
         padding: i32,
         dilation: i32,
         groups: i32,
+    ) -> *mut mlx_array;
+
+    // === Fused ops ===
+
+    /// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+    /// Fuses 10 ops into 1 C++ call.
+    pub fn mlx_compute_g(
+        a_log: *mut mlx_array,
+        alpha: *mut mlx_array,
+        dt_bias: *mut mlx_array,
     ) -> *mut mlx_array;
 
     // === Fast ops ===
