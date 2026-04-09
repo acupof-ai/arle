@@ -133,23 +133,27 @@ impl CppQwen35Model {
                 lm_bits,
             );
             // Set quantized embed for as_linear lm_head (avoids 1.2GB dense matmul)
-            if let Some(WeightTensor::Quantized {
-                w,
-                scales,
-                biases,
-                group_size,
-                bits,
-            }) = &weights.embed_quantized
-            {
-                mlx_sys::qwen35_compiled_set_embed_as_linear(
-                    model,
-                    w.as_raw(),
-                    scales.as_raw(),
-                    biases.as_raw(),
-                    *group_size,
-                    *bits,
-                );
-                log::info!("  using quantized lm_head (as_linear) — saves ~7.5ms/step");
+            // Only use embed_as_linear when lm_head is Dense (tied to embed_tokens).
+            // If lm_head is already Quantized (independent), don't override it.
+            if lm_bits == 0 {
+                if let Some(WeightTensor::Quantized {
+                    w,
+                    scales,
+                    biases,
+                    group_size,
+                    bits,
+                }) = &weights.embed_quantized
+                {
+                    mlx_sys::qwen35_compiled_set_embed_as_linear(
+                        model,
+                        w.as_raw(),
+                        scales.as_raw(),
+                        biases.as_raw(),
+                        *group_size,
+                        *bits,
+                    );
+                    log::info!("  using quantized lm_head (as_linear, tied weights)");
+                }
             }
         }
 
