@@ -945,6 +945,36 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
+    // ─── Marlin W4A16 GEMM (near-optimal INT4 kernel) ───
+
+    pub(crate) fn marlin_gemm_cuda(
+        a: *const Half, // [M, K] bf16 activations
+        b: *const u8,   // Marlin-packed int4 weights
+        c: *mut Half,   // [M, N] bf16 output
+        s: *const Half, // [K/group_size, N] fp16 scales
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut i32, // lock buffer
+        groupsize: i32,
+        dev: i32,
+        stream: CUstream,
+        thread_k: i32,
+        thread_n: i32,
+        sms: i32,
+        max_par: i32,
+    ) -> i32;
+
+    pub(crate) fn gptq_marlin_repack_cuda(
+        b_q_weight: *const u32,
+        out: *mut u32,
+        size_k: i32,
+        size_n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn marlin_workspace_size(prob_n: i32, sms: i32) -> usize;
+
     // ─── Quantized GEMV (W8A16 / W4A16) ───
 
     pub(crate) fn w8a16_gemv_cuda(
