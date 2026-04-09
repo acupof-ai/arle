@@ -101,6 +101,21 @@ auto& gated_delta_kernel() {
     return kernel;
 }
 
+// Compiled compute_g: g = exp(-exp(A_log.f32) * softplus(a + dt_bias))
+// Matches mlx_lm's @mx.compile(shapeless=True) — fuses ~10 elementwise ops
+// into a single compiled kernel, saving ~240 kernel launches per step.
+std::vector<array> compute_g_impl(const std::vector<array>& inputs) {
+    auto A_log = astype(inputs[0], float32);
+    auto ab = inputs[1] + inputs[2];
+    auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
+    return {exp(negative(exp(A_log)) * sp)};
+}
+
+auto& compiled_compute_g() {
+    static auto fn = mlx::core::compile(compute_g_impl, true /*shapeless*/);
+    return fn;
+}
+
 } // namespace
 
 // ── Quantized linear helper ────────────────────────────────────────────────
@@ -262,12 +277,9 @@ struct Qwen35CompiledModel {
         auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * array(inv_scale * inv_scale);
         auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * array(inv_scale);
 
-        // Gate computation: g = exp(-exp(A_log) * softplus(a + dt_bias))
+        // Gate computation: compiled (matching mlx_lm's @mx.compile(shapeless=True))
         auto beta = sigmoid(b_raw);
-        auto a = astype(lw.a_log, float32);
-        auto ab = a_raw + lw.dt_bias;
-        auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
-        auto g = exp(negative(exp(a)) * sp);
+        auto g = compiled_compute_g()({lw.a_log, a_raw, lw.dt_bias})[0];
 
         array y(0);
         if (use_gdr_metal_kernel()) {
