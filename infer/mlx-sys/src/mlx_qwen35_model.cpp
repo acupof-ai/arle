@@ -224,7 +224,9 @@ struct Qwen35CompiledModel {
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
     std::vector<array> prev_outputs;
-    std::vector<array> prev_inputs;
+    // Collect ALL intermediate arrays during forward() to keep them alive.
+    // Cleared at start of each step, populated during forward().
+    mutable std::vector<array> intermediates;
 
     // ── Full attention decode step ─────────────────────────────────────
 
@@ -394,8 +396,19 @@ struct Qwen35CompiledModel {
         auto y_heads = reshape(y, {hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
         auto z_gated = reshape(z_raw, {hv, dv});
-        auto out = normed * compiled_silu()({z_gated})[0]; // normed * silu(z) (compiled)
-        return lw.out_proj.apply(reshape(out, {1, 1, hv*dv}));
+        auto out = normed * compiled_silu()({z_gated})[0];
+        auto result = lw.out_proj.apply(reshape(out, {1, 1, hv*dv}));
+
+        // Keep intermediates alive for GPU buffer reuse
+        intermediates.push_back(qkv);
+        intermediates.push_back(conv_out);
+        intermediates.push_back(q);
+        intermediates.push_back(k);
+        intermediates.push_back(g);
+        intermediates.push_back(y);
+        intermediates.push_back(normed);
+        intermediates.push_back(out);
+        return result;
     }
 
     // ── MLP block ──────────────────────────────────────────────────────
@@ -430,9 +443,11 @@ struct Qwen35CompiledModel {
     //   [1+2*F .. 1+2*F+2*G) : new gdr/conv states
 
     std::vector<array> forward(const std::vector<array>& inputs) const {
+        // Clear intermediates from previous step (releases old GPU buffers)
+        intermediates.clear();
+        intermediates.reserve(2048);  // pre-alloc to avoid realloc
+
         auto token_id = inputs[0];
-        // cache_pos is passed as current_cache_pos (set before call),
-        // NOT extracted from inputs — avoids forcing GPU eval mid-graph.
         int cache_pos = current_cache_pos;
 
         int F = n_full_attn, G = n_gdr;
@@ -486,6 +501,13 @@ struct Qwen35CompiledModel {
                 int gd = layer.is_gdr ? layer.gdr.gate_dim : layer.full.gate_dim;
                 x = residual2 + mlp(xn2, gu, dw, gd);
             }
+
+            // Keep key intermediates alive for GPU buffer reuse.
+            // Without this, C++ RAII destroys them immediately, causing MLX
+            // to release GPU buffers that could be reused next step.
+            intermediates.push_back(xn);
+            intermediates.push_back(attn_out);
+            intermediates.push_back(xn2);
         }
 
         // Final norm + lm_head

@@ -89,7 +89,7 @@ pub struct MetalLinearAttnWeights {
     pub in_proj_qkvz: WeightTensor,
     /// Merged Beta+Alpha projection: [num_value_heads * 2, hidden_size].
     pub in_proj_ba: WeightTensor,
-    /// Individual projections (for C++ unfused path — fewer graph nodes).
+    /// Individual projections used by the optional C++ step path.
     pub in_proj_qkv: WeightTensor,
     pub in_proj_z: WeightTensor,
     pub in_proj_b: WeightTensor,
@@ -517,7 +517,7 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
-    // Try C++ fused path — requires all weights to be quantized.
+    // Try the optional C++ step path first; it requires fully quantized weights.
     if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
         return result;
     }

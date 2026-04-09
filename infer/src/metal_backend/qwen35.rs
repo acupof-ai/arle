@@ -39,7 +39,7 @@ pub(super) struct MetalQwen35BlockWeights {
     pub(super) post_attention_layernorm: MlxArray,
     pub(super) mlp_inputs: MlpInputProjection,
     pub(super) down_proj: WeightTensor,
-    /// Individual gate/up projections (for C++ unfused path).
+    /// Individual gate/up projections used by the optional C++ step path.
     pub(super) gate_proj: WeightTensor,
     pub(super) up_proj: WeightTensor,
 }
@@ -956,7 +956,7 @@ pub(super) fn load_qwen35_metal_weights(
                     },
                 };
 
-                // Reload individual projections for C++ unfused path
+                // Reload individual projections for the optional C++ step path.
                 let in_proj_qkv_ind = load_proj(&format!("{attn_prefix}.in_proj_qkv"))?;
                 let in_proj_z_ind = load_proj(&format!("{attn_prefix}.in_proj_z"))?;
                 let in_proj_b_ind = load_proj(&format!("{attn_prefix}.in_proj_b"))?;
@@ -1001,7 +1001,7 @@ pub(super) fn load_qwen35_metal_weights(
                 MlpInputProjection::Split { gate_proj, up_proj }
             };
 
-        // Store individual gate/up for C++ unfused path
+        // Store individual gate/up projections for the optional C++ step path.
         let gate_proj_individual = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
         let up_proj_individual = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
 

@@ -935,7 +935,7 @@ fn build_forward_graph(
     gpu_sample_token(&logits, params)
 }
 
-/// Single transformer layer — used as fallback when fused paths are unavailable.
+/// Single transformer layer for the maintained Rust/MLX Qwen3 path.
 // GPU required
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
