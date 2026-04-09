@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;

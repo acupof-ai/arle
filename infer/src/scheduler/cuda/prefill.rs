@@ -14,18 +14,58 @@ impl<M: ModelForward> Scheduler<M> {
         let cached = &mut self.cached_prompts[si];
         let state = &mut self.states[si];
 
-        // TODO: prefix cache disabled for Qwen3.5 — recurrent state contamination
-        // from previous request's decode tokens causes CUDA_ERROR_ILLEGAL_ADDRESS
-        // during batched decode. Need to properly reset recurrent state on prefix hit.
-        let prefix_len = 0;
+        let raw_prefix_len = cached
+            .iter()
+            .zip(req.prompt_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // Hybrid models (e.g. Qwen3.5) cannot truncate recurrent state to an
+        // arbitrary prefix length. Downgrade partial hits to MISS; only full
+        // hits benefit from snapshot/restore.
+        let prefix_len = if raw_prefix_len > 0
+            && raw_prefix_len < cached.len()
+            && !state.supports_partial_prefix()
+        {
+            0
+        } else {
+            raw_prefix_len
+        };
 
         let effective = if prefix_len > 0 && prefix_len == cached.len() {
-            info!(
-                "Request {}: prefix HIT {}/{} tokens",
-                req.id,
-                prefix_len,
-                req.prompt_tokens.len()
-            );
+            // Full prefix hit — restore recurrent state snapshot to undo
+            // decode-token contamination from the previous request.
+            match state.restore_prefix_snapshot() {
+                Ok(true) => info!(
+                    "Request {}: prefix HIT {}/{} tokens (recurrent state restored)",
+                    req.id,
+                    prefix_len,
+                    req.prompt_tokens.len()
+                ),
+                Ok(false) => info!(
+                    "Request {}: prefix HIT {}/{} tokens",
+                    req.id,
+                    prefix_len,
+                    req.prompt_tokens.len()
+                ),
+                Err(e) => {
+                    warn!(
+                        "Request {}: prefix hit but snapshot restore failed ({}), falling back to MISS",
+                        req.id, e
+                    );
+                    if let Err(e2) = state.reset() {
+                        error!("Request {}: reset failed: {}", req.id, e2);
+                        req.phase = Phase::Finished;
+                        return;
+                    }
+                    cached.clear();
+                    req.phase = Phase::Prefilling {
+                        effective_tokens: req.prompt_tokens.clone(),
+                        progress: 0,
+                    };
+                    return;
+                }
+            }
             let suffix = &req.prompt_tokens[prefix_len..];
             if suffix.is_empty() {
                 let Some(&last_tok) = req.prompt_tokens.last() else {
@@ -154,6 +194,16 @@ impl<M: ModelForward> Scheduler<M> {
                     error!("Request {}: KV migration to pool failed: {}", req.id, e);
                 }
             }
+        }
+
+        // Snapshot auxiliary state (recurrent/SSM) after prefill completes.
+        // On the next full prefix hit for this slot, restore_prefix_snapshot()
+        // reverts to this clean state, avoiding decode-token contamination.
+        if let Err(e) = state.save_prefix_snapshot() {
+            warn!(
+                "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
+                req.id, e
+            );
         }
 
         match model.select_token(state, &req.sampling, rng) {

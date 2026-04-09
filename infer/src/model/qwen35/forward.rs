@@ -48,8 +48,23 @@ impl GenerationState for Qwen35State {
 
     fn truncate_to(&mut self, len: usize) -> Result<()> {
         self.base.truncate_to(len)?;
+        // Recurrent state cannot be partially truncated — reset to zeros.
+        // The scheduler should avoid partial prefix hits for hybrid models
+        // (supports_partial_prefix() returns false).
         self.recurrent_state.reset(&self.ctx)?;
         Ok(())
+    }
+
+    fn supports_partial_prefix(&self) -> bool {
+        false
+    }
+
+    fn save_prefix_snapshot(&mut self) -> Result<()> {
+        self.recurrent_state.save_snapshot(&self.ctx)
+    }
+
+    fn restore_prefix_snapshot(&mut self) -> Result<bool> {
+        self.recurrent_state.restore_snapshot(&self.ctx)
     }
 
     fn set_max_gpu_kv(&mut self, max_tokens: usize) {
