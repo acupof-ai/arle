@@ -179,6 +179,9 @@ struct GdrLayerWeights {
     QWeight gate_up, down;
     int gate_dim = 0;
     int num_key_heads = 0, key_dim = 0, num_value_heads = 0, value_dim = 0;
+    // Pre-computed scale constants (avoid per-step array(scalar) creation)
+    array q_scale_arr = array(0.0f);
+    array k_scale_arr = array(0.0f);
     int conv_kernel = 4;
     float rms_eps = 1e-6f;
 };
@@ -296,9 +299,8 @@ struct Qwen35CompiledModel {
         auto k_raw = reshape(slice(conv_out, {0,0,q_dim}, {1,1,q_dim+k_dim}), {1,1,hk,dk});
         auto v_raw = reshape(slice(conv_out, {0,0,q_dim+k_dim}, {1,1,q_dim+k_dim+v_dim}), {1,1,hv,dv});
 
-        float inv_scale = 1.0f / std::sqrt((float)dk);
-        auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * array(inv_scale * inv_scale);
-        auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * array(inv_scale);
+        auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * lw.q_scale_arr;
+        auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * lw.k_scale_arr;
 
         // Gate computation: compiled (matching mlx_lm's @mx.compile(shapeless=True))
         auto beta = sigmoid(b_raw);
@@ -306,9 +308,11 @@ struct Qwen35CompiledModel {
 
         array y(0);
         if (use_gdr_metal_kernel()) {
-            auto q_bf16 = astype(q, bfloat16);
-            auto k_bf16 = astype(k, bfloat16);
-            auto v_bf16 = astype(v_raw, bfloat16);
+            // q, k are already bf16 (from rms_norm * scalar). v_raw is bf16 from conv.
+            // Skip unnecessary casts — 3 fewer ops per GDR layer × 24 = 72 fewer ops.
+            auto& q_bf16 = q;
+            auto& k_bf16 = k;
+            auto& v_bf16 = v_raw;
             auto g_3d = reshape(g, {1, 1, hv});
             auto beta_3d = reshape(beta, {1, 1, hv});
             auto t_arr = array(1);
@@ -581,6 +585,9 @@ void qwen35_compiled_push_gdr(
     lw.gdr.key_dim = key_dim;
     lw.gdr.num_value_heads = num_value_heads;
     lw.gdr.value_dim = value_dim;
+    float inv = 1.0f / std::sqrt((float)key_dim);
+    lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
+    lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
     lw.gdr.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
     lw.gdr.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
     lw.gdr.gate_dim = gate_dim;
