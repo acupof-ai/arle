@@ -3,7 +3,9 @@ use cudarc::driver::sys::{CUresult, CUstream};
 // Half type (16-bit float) - same layout as CUDA half
 pub(crate) type Half = u16;
 
-// CUDA kernels - all use half precision
+// CUDA kernels — FFI declarations for all compiled kernels.
+// Some are not yet called from Rust (reserved for future paths).
+#[allow(dead_code)]
 unsafe extern "C" {
     pub(crate) fn rms_norm_cuda(
         x: *const Half,

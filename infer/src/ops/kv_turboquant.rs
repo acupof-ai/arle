@@ -101,6 +101,7 @@ pub(crate) fn turboquant_quantize_paged_single(
 /// index position. This allows FlashInfer to read from the working buffer
 /// using its existing page table.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn turboquant_dequantize_inplace(
     ctx: &DeviceContext,
     pool_data: &CudaSlice<u8>,

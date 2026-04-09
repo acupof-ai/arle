@@ -147,6 +147,7 @@ impl TurboQuantRotation {
     }
 
     /// Whether this is Hadamard mode.
+    #[allow(dead_code)]
     pub fn is_hadamard(&self) -> bool {
         matches!(self, Self::Hadamard { .. })
     }
