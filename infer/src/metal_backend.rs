@@ -1264,9 +1264,14 @@ fn load_qwen3_metal_weights(
     let norm = get("model.norm.weight")?;
 
     // lm_head may be weight-tied to embed_tokens; handle both dense and quantized.
+    // When tied, use quantized_matmul on the original packed weights (as_linear pattern)
+    // instead of dense matmul on dequantized bf16 — saves ~7.5ms/step for large vocabs.
     let lm_head =
         if tensors.contains_key("lm_head.weight") || tensors.contains_key("lm_head.scales") {
-            load_proj("lm_head")? // load_proj pre-transposes Dense weights
+            load_proj("lm_head")?
+        } else if config.quantization.is_some() {
+            // Tied + quantized: load original packed embed weights for quantized_matmul
+            load_proj("model.embed_tokens")?
         } else {
             tie_lm_head_from_embed_tokens(&embed_tokens)?
         };
