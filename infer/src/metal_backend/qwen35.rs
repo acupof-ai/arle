@@ -402,12 +402,12 @@ pub(super) fn metal_generate_qwen35(
     let mut cache_len = 0i32;
 
     // Use C++ compiled model if available (1 FFI call per step vs ~1600).
-    let use_cpp = weights.compiled_model.is_some();
-    if use_cpp {
+    if weights.compiled_model.is_some() {
         log::info!("  using C++ compiled forward (1 FFI call/step)");
     }
 
     // Build flat cache arrays for C++ path: [k0, v0, k1, v1, ...] and [gdr0, conv0, ...]
+    // No clone — move into flat layout (C++ path owns these exclusively).
     let mut kv_flat: Vec<MlxArray> = k_caches
         .iter()
         .zip(v_caches.iter())
@@ -420,29 +420,18 @@ pub(super) fn metal_generate_qwen35(
         .flat_map(|(s, c)| [s.clone(), c.clone()])
         .collect();
 
-    // Helper: run one forward step (C++ or Rust path)
-    let forward_step = |token: &MlxArray,
-                        weights: &Qwen35MetalWeights,
-                        k_caches: &mut [MlxArray],
-                        v_caches: &mut [MlxArray],
-                        recurrent: &mut MetalRecurrentState,
-                        kv_flat: &mut [MlxArray],
-                        gdr_flat: &mut [MlxArray],
-                        cache_len: i32|
+    // Helper: run forward step dispatching to C++ or Rust path.
+    let do_step = |token: &MlxArray,
+                   cpp: &Option<CompiledQwen35>,
+                   kv_flat: &mut [MlxArray],
+                   gdr_flat: &mut [MlxArray],
+                   k_caches: &mut [MlxArray],
+                   v_caches: &mut [MlxArray],
+                   recurrent: &mut MetalRecurrentState,
+                   cache_len: i32|
      -> Result<MlxArray> {
-        if let Some(cpp_model) = &weights.compiled_model {
-            let logits = cpp_model.step(token, cache_len, kv_flat, gdr_flat)?;
-            // Sync back KV caches from flat to split arrays
-            for (i, chunk) in kv_flat.chunks(2).enumerate() {
-                k_caches[i] = chunk[0].clone();
-                v_caches[i] = chunk[1].clone();
-            }
-            // Sync back GDR state
-            for (i, chunk) in gdr_flat.chunks(2).enumerate() {
-                recurrent.states[i] = chunk[0].clone();
-                recurrent.conv_states[i] = chunk[1].clone();
-            }
-            Ok(logits)
+        if let Some(m) = cpp {
+            m.step(token, cache_len, kv_flat, gdr_flat)
         } else {
             Ok(qwen35_forward_step(
                 token, weights, config, arch, k_caches, v_caches, recurrent, cache_len,
@@ -453,14 +442,14 @@ pub(super) fn metal_generate_qwen35(
     let mut logits = None;
     for &token in input_ids {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        logits = Some(forward_step(
+        logits = Some(do_step(
             &token_arr,
-            weights,
+            &weights.compiled_model,
+            &mut kv_flat,
+            &mut gdr_flat,
             &mut k_caches,
             &mut v_caches,
             &mut recurrent,
-            &mut kv_flat,
-            &mut gdr_flat,
             cache_len,
         )?);
         cache_len += 1;
@@ -477,14 +466,14 @@ pub(super) fn metal_generate_qwen35(
 
     let finish_reason = 'decode: loop {
         // Build NEXT graph while GPU computes CURRENT y.
-        let next_logits = forward_step(
+        let next_logits = do_step(
             &y,
-            weights,
+            &weights.compiled_model,
+            &mut kv_flat,
+            &mut gdr_flat,
             &mut k_caches,
             &mut v_caches,
             &mut recurrent,
-            &mut kv_flat,
-            &mut gdr_flat,
             cache_len,
         )?;
         cache_len += 1;
