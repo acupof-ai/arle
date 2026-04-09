@@ -1062,4 +1062,107 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── TurboQuant KV cache quantization ───
+
+    // Host-side: compute Lloyd-Max codebook (centroids + boundaries).
+    pub(crate) fn turboquant_lloyd_max(
+        centroids: *mut f32,
+        boundaries: *mut f32,
+        num_levels: i32,
+        head_dim: i32,
+        max_iters: i32,
+    );
+
+    // Host-side: generate deterministic random orthogonal rotation matrix.
+    pub(crate) fn turboquant_generate_rotation(Pi: *mut f32, head_dim: i32, seed: u64);
+
+    // Quantize bf16 KV → TurboQuant packed (contiguous batch).
+    pub(crate) fn turboquant_quantize_kv_cuda(
+        kv_bf16: *const Half,
+        packed_out: *mut u8,
+        norms_out: *mut Half,
+        Pi: *const f32,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TurboQuant packed → bf16 KV (contiguous).
+    pub(crate) fn turboquant_dequantize_kv_cuda(
+        packed_in: *const u8,
+        norms_in: *const Half,
+        kv_bf16: *mut Half,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Quantize 1 new token per request: bf16 working → TQ paged pool.
+    pub(crate) fn turboquant_quantize_single_cuda(
+        kv_bf16: *const Half,
+        pool_data: *mut u8,
+        pool_norms: *mut Half,
+        pool_indices: *const i32,
+        Pi: *const f32,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TQ paged pool → bf16 (scatter-read via token_indices).
+    pub(crate) fn turboquant_dequantize_paged_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        kv_bf16: *mut Half,
+        token_indices: *const i32,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        total_tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TQ pool → bf16 working buffer, preserving NHD paged layout.
+    // Used before FlashInfer attention (Phase 1: separate dequant path).
+    pub(crate) fn turboquant_dequantize_inplace_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        work_bf16: *mut Half,
+        pool_indices: *const i32,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        num_indices: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }

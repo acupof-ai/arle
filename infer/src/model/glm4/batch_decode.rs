@@ -20,6 +20,7 @@ use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
 use crate::ops::kv_quant;
+use crate::ops::kv_turboquant;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -441,6 +442,34 @@ impl GLM4Model {
                     )?;
                 }
                 KVFormat::BF16 => {}
+                KVFormat::TurboQuant { .. } => {
+                    let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_quantize_paged_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_slice(layer_idx),
+                        kv_pool.k_norms_slice(layer_idx),
+                        &bufs.metadata.last_token_indices,
+                        tq_k,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                    )?;
+                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_quantize_paged_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_slice(layer_idx),
+                        kv_pool.v_norms_slice(layer_idx),
+                        &bufs.metadata.last_token_indices,
+                        tq_v,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                    )?;
+                }
             }
 
             match kv_pool.format {
@@ -487,6 +516,49 @@ impl GLM4Model {
                     )?;
                 }
                 KVFormat::BF16 => {
+                    ops::flashinfer_run_layer(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool,
+                        layer_idx,
+                        &bufs.metadata.kv_indptr,
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_last_page_len,
+                        &mut bufs.attn_output,
+                        &mut bufs.metadata.flashinfer_ws,
+                        num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    )?;
+                }
+                KVFormat::TurboQuant { .. } => {
+                    let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_dequantize_inplace(
+                        &self.ctx,
+                        kv_pool.k_data_slice(layer_idx),
+                        kv_pool.k_norms_slice(layer_idx),
+                        kv_pool.k_work_ptr(stream),
+                        &bufs.metadata.kv_indices,
+                        tq_k,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        bufs.metadata.kv_indices.len(),
+                    )?;
+                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_dequantize_inplace(
+                        &self.ctx,
+                        kv_pool.v_data_slice(layer_idx),
+                        kv_pool.v_norms_slice(layer_idx),
+                        kv_pool.v_work_ptr(stream),
+                        &bufs.metadata.kv_indices,
+                        tq_v,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        bufs.metadata.kv_indices.len(),
+                    )?;
                     ops::flashinfer_run_layer(
                         &self.ctx,
                         &bufs.q_batch,

@@ -43,6 +43,7 @@ pub enum KVCacheDtype {
 /// - `FP8E4M3` → FlashInfer native (zero dequant overhead)
 /// - `INT8` → self-built fused-dequant decode attention
 /// - `BF16` → FlashInfer native (baseline)
+/// - `TurboQuant` → rotation-based 2-4 bit (dequant → FlashInfer, Phase 1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KVFormat {
     /// Full precision bf16, 2 bytes/element. FlashInfer native.
@@ -51,6 +52,10 @@ pub enum KVFormat {
     FP8E4M3,
     /// INT8 + per-head per-token f32 scale. Fused-dequant attention.
     INT8,
+    /// TurboQuant: rotation + Lloyd-Max quantization.
+    /// `key_bits` and `val_bits` control compression (2-4 bits each).
+    /// Phase 1: dequantize → bf16 working buffer → FlashInfer.
+    TurboQuant { key_bits: u8, val_bits: u8 },
 }
 
 impl Default for KVFormat {
@@ -60,25 +65,58 @@ impl Default for KVFormat {
 }
 
 impl KVFormat {
-    /// Bytes per element for the data buffer (excluding scales).
+    /// Bytes per element for the data buffer (excluding scales/norms).
+    ///
+    /// For TurboQuant this returns the packed bytes per coordinate (approximate),
+    /// but the actual allocation uses [`Self::pool_bytes_per_token`] for accuracy.
     pub fn bytes_per_element(self) -> usize {
         match self {
             Self::BF16 => 2,
             Self::FP8E4M3 => 1,
             Self::INT8 => 1,
+            // Approximate: ceil(bits / 8) — actual layout is per-head packed.
+            Self::TurboQuant { key_bits, .. } => {
+                let effective = if key_bits == 3 { 4 } else { key_bits as usize };
+                (effective + 7) / 8
+            }
         }
     }
 
-    /// Whether this format uses separate per-head per-token scale buffers.
+    /// Whether this format uses separate per-head per-token scale buffers (f32).
     pub fn has_scales(self) -> bool {
         matches!(self, Self::INT8)
     }
 
+    /// Whether this format uses separate per-head per-token norm buffers (f16).
+    pub fn has_norms(self) -> bool {
+        matches!(self, Self::TurboQuant { .. })
+    }
+
     /// Whether a bf16 working buffer is needed (for decode_prep_paged write target).
-    /// FP8 and INT8 need a working buffer because decode_prep_paged outputs bf16,
-    /// which then gets quantized into the pool.
+    /// FP8, INT8, and TurboQuant need a working buffer because decode_prep_paged
+    /// outputs bf16, which then gets quantized into the pool.
     pub fn needs_work_buffer(self) -> bool {
         !matches!(self, Self::BF16)
+    }
+
+    /// Whether this is a TurboQuant format.
+    pub fn is_turboquant(self) -> bool {
+        matches!(self, Self::TurboQuant { .. })
+    }
+
+    /// Total bytes per token per KV head in the pool (data + norms).
+    /// Used for accurate budget calculation.
+    pub fn pool_bytes_per_kv_head(self, head_dim: usize) -> usize {
+        match self {
+            Self::BF16 => head_dim * 2,
+            Self::FP8E4M3 => head_dim,
+            Self::INT8 => head_dim + 4, // 1 byte/elem + 4 bytes f32 scale
+            Self::TurboQuant { key_bits, .. } => {
+                let packed =
+                    crate::model::turboquant_state::packed_bytes_per_head(head_dim, key_bits);
+                packed + 2 // + 2 bytes f16 norm
+            }
+        }
     }
 }
 
