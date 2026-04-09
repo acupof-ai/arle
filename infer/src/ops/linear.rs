@@ -130,8 +130,7 @@ pub(crate) fn gemm_into(
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
         unsafe {
-            if weight.quant_bits == 2 {
-                // W2A16: packed int2 weights (TurboQuant)
+            if x.seq_len == 1 && weight.quant_bits == 2 {
                 ffi::w2a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
@@ -144,18 +143,7 @@ pub(crate) fn gemm_into(
                 )
                 .result()
                 .expect("w2a16_gemv_cuda failed");
-            } else if weight.quant_bits == 4 {
-                // W4A16: packed int4 weights
-                // Debug: verify qweight size matches expected packed size
-                debug_assert_eq!(
-                    qw.len(),
-                    weight.rows * weight.cols / 2,
-                    "W4 qweight size mismatch: got {}, expected {} (rows={}, cols={})",
-                    qw.len(),
-                    weight.rows * weight.cols / 2,
-                    weight.rows,
-                    weight.cols
-                );
+            } else if x.seq_len == 1 && weight.quant_bits == 4 {
                 ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
