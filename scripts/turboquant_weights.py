@@ -202,18 +202,19 @@ def main():
         print(f"\nProcessing {st_file.name}...")
         output_tensors = {}
 
-        with safe_open(st_file, framework="numpy") as f:
+        with safe_open(st_file, framework="pt") as f:
             for key in f.keys():
-                tensor = f.get_tensor(key)
+                tensor_pt = f.get_tensor(key)
 
                 if any(key.endswith(s) for s in linear_suffixes):
                     # Quantize this linear weight
-                    w = tensor.astype(np.float32)
+                    tensor = tensor_pt.float().numpy()
+                    w = tensor
                     N, K = w.shape
 
                     if K % args.group_size != 0:
                         print(f"  SKIP {key}: K={K} not divisible by group_size={args.group_size}")
-                        output_tensors[key] = torch.from_numpy(tensor)
+                        output_tensors[key] = tensor_pt
                         continue
 
                     # Deterministic seed from tensor name
@@ -239,12 +240,31 @@ def main():
                     output_tensors[f"{base_key}.tq_signs"] = torch.from_numpy(signs)
                 else:
                     # Keep non-linear tensors as-is
-                    output_tensors[key] = torch.from_numpy(tensor)
+                    output_tensors[key] = tensor_pt
 
         # Save quantized safetensors
         out_file = output_path / st_file.name
         save_file(output_tensors, str(out_file))
         print(f"  Saved {out_file.name}")
+
+    # Update safetensors index to reflect TQ tensor names
+    index_path = output_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        new_wm = {}
+        for key, shard in index["weight_map"].items():
+            if any(key.endswith(s) for s in linear_suffixes):
+                base = key.replace(".weight", "")
+                new_wm[f"{base}.tq_packed"] = shard
+                new_wm[f"{base}.tq_scales"] = shard
+                new_wm[f"{base}.tq_signs"] = shard
+            else:
+                new_wm[key] = shard
+        index["weight_map"] = new_wm
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+        print(f"\nUpdated {index_path.name} ({len(new_wm)} entries)")
 
     # Write config
     config = {
