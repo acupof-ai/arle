@@ -97,8 +97,9 @@ pub(super) fn metal_generate_qwen35(
     let mut cache_len = 0i32;
     let mut logits = None;
     for &token in input_ids {
+        let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         logits = Some(qwen35_forward_step(
-            token,
+            &token_arr,
             weights,
             config,
             arch,
@@ -115,13 +116,44 @@ pub(super) fn metal_generate_qwen35(
     let mut generated = Vec::new();
     let mut ttft_ms = 0.0;
 
-    // Double-buffered async_eval: GPU executes step N while CPU builds step N+1.
-    let mut pending = gpu_sample_token(&logits, params)?;
-    crate::mlx::async_eval(&[&pending]);
+    // ── mlx_lm-style double-buffered decode loop ────────────────────────
+    //
+    // Pass the LAZY sample token `y` directly to forward_step (not the
+    // materialized u32). This lets CPU build the next graph while GPU
+    // executes the current step, overlapping ~1.5ms of CPU work.
+    //
+    //   y = sample(prefill)     async_eval(y)
+    //   loop:
+    //     next_y = sample(fwd(y))   ← CPU builds graph (y still lazy)
+    //     async_eval(next_y)        ← submit to GPU
+    //     eval(y)                   ← wait for current
+    //     token = y.item()          ← read result
+    //     y = next_y
 
-    let finish_reason = loop {
-        // Sync previous GPU result (likely done since async_eval).
-        let next_token = pending.item_i32() as u32;
+    let mut y = gpu_sample_token(&logits, params)?;
+    crate::mlx::async_eval(&[&y]);
+
+    let finish_reason = 'decode: loop {
+        // Build NEXT step's graph while GPU computes CURRENT y.
+        // y is lazy — forward_step builds a graph that depends on it.
+        let next_logits = qwen35_forward_step(
+            &y,
+            weights,
+            config,
+            arch,
+            &mut k_caches,
+            &mut v_caches,
+            &mut recurrent,
+            cache_len,
+        );
+        cache_len += 1;
+        recurrent.seq_len = cache_len as usize;
+        let next_y = gpu_sample_token(&next_logits, params)?;
+        crate::mlx::async_eval(&[&next_y]);
+
+        // Now wait for CURRENT y and process the token.
+        crate::mlx::eval(&[&y]);
+        let next_token = y.item_i32() as u32;
 
         if generated.is_empty() {
             ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -137,12 +169,13 @@ pub(super) fn metal_generate_qwen35(
         on_token(next_token)?;
 
         if stop {
-            break "stop";
+            break 'decode "stop";
         }
         if generated.len() >= max_new_tokens {
-            break "length";
+            break 'decode "length";
         }
 
+        // Grow KV cache if needed (rare — only every 256 tokens)
         if cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
             for li in 0..num_full_layers {
@@ -161,27 +194,11 @@ pub(super) fn metal_generate_qwen35(
             }
             kv_capacity = new_cap;
         }
-
         if generated.len().is_multiple_of(256) {
             clear_metal_cache();
         }
 
-        let logits = qwen35_forward_step(
-            next_token,
-            weights,
-            config,
-            arch,
-            &mut k_caches,
-            &mut v_caches,
-            &mut recurrent,
-            cache_len,
-        );
-        cache_len += 1;
-        recurrent.seq_len = cache_len as usize;
-
-        // Build sample token graph and kick off GPU — CPU loops back to sync at top.
-        pending = gpu_sample_token(&logits, params)?;
-        crate::mlx::async_eval(&[&pending]);
+        y = next_y;
     };
 
     let elapsed = t0.elapsed().as_secs_f64();
@@ -200,7 +217,7 @@ pub(super) fn metal_generate_qwen35(
 
 #[allow(clippy::too_many_arguments)]
 fn qwen35_forward_step(
-    token_id: u32,
+    token: &MlxArray,
     weights: &Qwen35MetalWeights,
     config: &MetalModelConfig,
     arch: &MetalQwen35ArchConfig,
@@ -209,8 +226,7 @@ fn qwen35_forward_step(
     recurrent: &mut MetalRecurrentState,
     cache_len: i32,
 ) -> MlxArray {
-    let token_arr = MlxArray::from_slice_i32(&[token_id as i32], &[1]);
-    let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
+    let mut x = take_axis(&weights.embed_tokens, token, 0);
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
 
