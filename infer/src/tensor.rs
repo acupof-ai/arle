@@ -353,22 +353,13 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Unpack INT4 → INT8: each byte holds 2 int4 values
-        let mut unpacked = vec![0i8; rows * cols];
-        for i in 0..packed_data.len() {
-            let byte = packed_data[i];
-            let lo = (byte & 0x0F) as i8 - 8;
-            let hi = (byte >> 4) as i8 - 8;
-            let row = i / (cols / 2);
-            let byte_in_row = i % (cols / 2);
-            unpacked[row * cols + byte_in_row * 2] = lo;
-            unpacked[row * cols + byte_in_row * 2 + 1] = hi;
-        }
-
-        let qw = ctx
+        // Upload packed INT4 data directly — native W4 kernel handles nibble extraction
+        let qw: CudaSlice<i8> = ctx
             .stream
-            .clone_htod(&unpacked)
-            .map_err(|e| anyhow!("H2D qweight int4→int8 failed: {}", e))?;
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int4 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -384,7 +375,7 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8, // INT4→INT8 unpack; uses W8 kernels
+            quant_bits: 4, // Native packed INT4; W4 kernel extracts nibbles
         })
     }
 
