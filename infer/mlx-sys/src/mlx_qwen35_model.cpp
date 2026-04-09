@@ -1,15 +1,15 @@
-//! Full Qwen3.5 compiled forward pass in C++ with mx::compile() JIT.
+//! Qwen3.5 C++ forward model used to collapse per-op Rust/FFI overhead.
 //!
-//! Architecture: weights are captured as constants by compile(). Only dynamic
-//! state (token_id, KV caches, GDR states) flows through the function I/O.
-//! The compiled graph is ~1200 nodes, fused into ~200 kernels.
+//! The implementation currently runs the C++ forward path directly. It does not
+//! call `mx::compile()` because the position-dependent KV cache updates still
+//! force retracing on each decode step.
 //!
 //! API:
 //!   model = qwen35_compiled_new()
 //!   qwen35_compiled_set_config(model, ...)
 //!   qwen35_compiled_push_layer_full_attn(model, ...) // ×8
 //!   qwen35_compiled_push_layer_gdr(model, ...)       // ×24
-//!   qwen35_compiled_finalize(model)                  // triggers mx::compile()
+//!   qwen35_compiled_finalize(model)                  // validates/prepares model
 //!   qwen35_compiled_step(model, token, caches_in, caches_out)
 //!   qwen35_compiled_free(model)
 
@@ -220,6 +220,11 @@ struct Qwen35CompiledModel {
 
     // Runtime state (set before each forward call)
     int current_cache_pos = 0;
+    // Keep previous step's arrays alive to prevent premature GPU buffer release.
+    // This mimics Python's lazy GC behavior where intermediates survive until
+    // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
+    std::vector<array> prev_outputs;
+    std::vector<array> prev_inputs;
 
     // ── Full attention decode step ─────────────────────────────────────
 
@@ -499,10 +504,11 @@ struct Qwen35CompiledModel {
         return outputs;
     }
 
-    void compile_forward() {
+    void prepare_forward() {
         // NOTE: mx::compile() cannot handle position-dependent KV cache slicing
-        // (cache_pos changes each step, forcing re-trace). For now, skip compile
-        // and run the C++ forward directly. This still eliminates FFI overhead.
+        // (cache_pos changes each step, forcing re-trace). For now, skip JIT
+        // compilation and run the C++ forward directly. This still eliminates
+        // most Rust/FFI overhead.
         //
         // Future: compile individual GDR+MLP sublayers (no position deps) while
         // keeping full-attention layers uncompiled.
@@ -515,11 +521,11 @@ struct Qwen35CompiledModel {
 extern "C" {
 
 void* qwen35_compiled_new() {
-    return new Qwen35CompiledModel();
+    MLX_TRY_RETURN(new Qwen35CompiledModel());
 }
 
 void qwen35_compiled_free(void* model) {
-    delete static_cast<Qwen35CompiledModel*>(model);
+    MLX_TRY_VOID(delete static_cast<Qwen35CompiledModel*>(model));
 }
 
 void qwen35_compiled_set_config(
@@ -528,14 +534,16 @@ void qwen35_compiled_set_config(
     int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
     int32_t rotary_dim, int32_t hidden_size
 ) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    m->rope_theta = rope_theta;
-    m->rms_eps = rms_eps;
-    m->n_heads = n_heads;
-    m->n_kv_heads = n_kv_heads;
-    m->head_dim = head_dim;
-    m->rotary_dim = rotary_dim;
-    m->hidden_size = hidden_size;
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->rope_theta = rope_theta;
+        m->rms_eps = rms_eps;
+        m->n_heads = n_heads;
+        m->n_kv_heads = n_kv_heads;
+        m->head_dim = head_dim;
+        m->rotary_dim = rotary_dim;
+        m->hidden_size = hidden_size;
+    });
 }
 
 void qwen35_compiled_set_embed(
@@ -545,15 +553,17 @@ void qwen35_compiled_set_embed(
     mlx_array* lm_head_w, mlx_array* lm_head_s, mlx_array* lm_head_b,
     int32_t lm_gs, int32_t lm_bits
 ) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    m->embed_tokens = *to_arr(embed_tokens);
-    m->final_norm_w = *to_arr(final_norm_w);
-    if (lm_head_s == nullptr || lm_bits == 0) {
-        // Dense lm_head (tied to embed_tokens transpose)
-        m->lm_head = {*to_arr(lm_head_w), array(0), array(0), 0, 0, true};
-    } else {
-        m->lm_head = {*to_arr(lm_head_w), *to_arr(lm_head_s), *to_arr(lm_head_b), lm_gs, lm_bits, false};
-    }
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        m->embed_tokens = *to_arr(embed_tokens);
+        m->final_norm_w = *to_arr(final_norm_w);
+        if (lm_head_s == nullptr || lm_bits == 0) {
+            // Dense lm_head (tied to embed_tokens transpose)
+            m->lm_head = {*to_arr(lm_head_w), array(0), array(0), 0, 0, true};
+        } else {
+            m->lm_head = {*to_arr(lm_head_w), *to_arr(lm_head_s), *to_arr(lm_head_b), lm_gs, lm_bits, false};
+        }
+    });
 }
 
 void qwen35_compiled_push_full_attn(
@@ -567,22 +577,24 @@ void qwen35_compiled_push_full_attn(
     mlx_array* gu_w, mlx_array* gu_s, mlx_array* gu_b, int32_t gu_gs, int32_t gu_bits, int32_t gate_dim,
     mlx_array* dw_w, mlx_array* dw_s, mlx_array* dw_b
 ) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    LayerWeights lw;
-    lw.is_gdr = false;
-    lw.full.input_ln_w = *to_arr(input_ln);
-    lw.full.post_attn_ln_w = *to_arr(post_ln);
-    lw.full.q_proj = {*to_arr(q_w), *to_arr(q_s), *to_arr(q_b), q_gs, q_bits};
-    lw.full.k_proj = {*to_arr(k_w), *to_arr(k_s), *to_arr(k_b), q_gs, q_bits};
-    lw.full.v_proj = {*to_arr(v_w), *to_arr(v_s), *to_arr(v_b), q_gs, q_bits};
-    lw.full.o_proj = {*to_arr(o_w), *to_arr(o_s), *to_arr(o_b), q_gs, q_bits};
-    lw.full.q_norm_w = *to_arr(q_norm);
-    lw.full.k_norm_w = *to_arr(k_norm);
-    lw.full.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
-    lw.full.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
-    lw.full.gate_dim = gate_dim;
-    m->layers.push_back(std::move(lw));
-    m->n_full_attn++;
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        LayerWeights lw;
+        lw.is_gdr = false;
+        lw.full.input_ln_w = *to_arr(input_ln);
+        lw.full.post_attn_ln_w = *to_arr(post_ln);
+        lw.full.q_proj = {*to_arr(q_w), *to_arr(q_s), *to_arr(q_b), q_gs, q_bits};
+        lw.full.k_proj = {*to_arr(k_w), *to_arr(k_s), *to_arr(k_b), q_gs, q_bits};
+        lw.full.v_proj = {*to_arr(v_w), *to_arr(v_s), *to_arr(v_b), q_gs, q_bits};
+        lw.full.o_proj = {*to_arr(o_w), *to_arr(o_s), *to_arr(o_b), q_gs, q_bits};
+        lw.full.q_norm_w = *to_arr(q_norm);
+        lw.full.k_norm_w = *to_arr(k_norm);
+        lw.full.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
+        lw.full.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
+        lw.full.gate_dim = gate_dim;
+        m->layers.push_back(std::move(lw));
+        m->n_full_attn++;
+    });
 }
 
 void qwen35_compiled_push_gdr(
@@ -600,35 +612,37 @@ void qwen35_compiled_push_gdr(
     mlx_array* gu_w, mlx_array* gu_s, mlx_array* gu_b, int32_t gu_gs, int32_t gu_bits, int32_t gate_dim,
     mlx_array* dw_w, mlx_array* dw_s, mlx_array* dw_b
 ) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    LayerWeights lw;
-    lw.is_gdr = true;
-    lw.gdr.input_ln_w = *to_arr(input_ln);
-    lw.gdr.post_attn_ln_w = *to_arr(post_ln);
-    lw.gdr.qkvz_proj = {*to_arr(qkvz_w), *to_arr(qkvz_s), *to_arr(qkvz_b), qkvz_gs, qkvz_bits};
-    lw.gdr.qkv_split = qkv_split;
-    lw.gdr.z_split = z_split;
-    lw.gdr.ba_proj = {*to_arr(ba_w), *to_arr(ba_s), *to_arr(ba_b), ba_gs, ba_bits};
-    lw.gdr.ba_num_heads = ba_num_heads;
-    lw.gdr.conv1d_w = *to_arr(conv1d_w);
-    lw.gdr.conv_kernel = conv_kernel;
-    lw.gdr.a_log = *to_arr(a_log);
-    lw.gdr.dt_bias = *to_arr(dt_bias);
-    lw.gdr.norm_w = *to_arr(norm_w);
-    lw.gdr.rms_eps = gdr_rms_eps;
-    lw.gdr.out_proj = {*to_arr(out_w), *to_arr(out_s), *to_arr(out_b), out_gs, out_bits};
-    lw.gdr.num_key_heads = num_key_heads;
-    lw.gdr.key_dim = key_dim;
-    lw.gdr.num_value_heads = num_value_heads;
-    lw.gdr.value_dim = value_dim;
-    float inv = 1.0f / std::sqrt((float)key_dim);
-    lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
-    lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
-    lw.gdr.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
-    lw.gdr.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
-    lw.gdr.gate_dim = gate_dim;
-    m->layers.push_back(std::move(lw));
-    m->n_gdr++;
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        LayerWeights lw;
+        lw.is_gdr = true;
+        lw.gdr.input_ln_w = *to_arr(input_ln);
+        lw.gdr.post_attn_ln_w = *to_arr(post_ln);
+        lw.gdr.qkvz_proj = {*to_arr(qkvz_w), *to_arr(qkvz_s), *to_arr(qkvz_b), qkvz_gs, qkvz_bits};
+        lw.gdr.qkv_split = qkv_split;
+        lw.gdr.z_split = z_split;
+        lw.gdr.ba_proj = {*to_arr(ba_w), *to_arr(ba_s), *to_arr(ba_b), ba_gs, ba_bits};
+        lw.gdr.ba_num_heads = ba_num_heads;
+        lw.gdr.conv1d_w = *to_arr(conv1d_w);
+        lw.gdr.conv_kernel = conv_kernel;
+        lw.gdr.a_log = *to_arr(a_log);
+        lw.gdr.dt_bias = *to_arr(dt_bias);
+        lw.gdr.norm_w = *to_arr(norm_w);
+        lw.gdr.rms_eps = gdr_rms_eps;
+        lw.gdr.out_proj = {*to_arr(out_w), *to_arr(out_s), *to_arr(out_b), out_gs, out_bits};
+        lw.gdr.num_key_heads = num_key_heads;
+        lw.gdr.key_dim = key_dim;
+        lw.gdr.num_value_heads = num_value_heads;
+        lw.gdr.value_dim = value_dim;
+        float inv = 1.0f / std::sqrt((float)key_dim);
+        lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
+        lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
+        lw.gdr.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
+        lw.gdr.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
+        lw.gdr.gate_dim = gate_dim;
+        m->layers.push_back(std::move(lw));
+        m->n_gdr++;
+    });
 }
 
 // Set individual (unfused) projections for the last-pushed GDR layer.
@@ -643,23 +657,25 @@ void qwen35_compiled_set_separate_proj(
     mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b, int32_t mlp_gs, int32_t mlp_bits,
     mlx_array* up_w, mlx_array* up_s, mlx_array* up_b
 ) {
-    auto* m = static_cast<Qwen35CompiledModel*>(model);
-    auto& lw = m->layers.back().gdr;
-    lw.qkv_proj = {*to_arr(qkv_w), *to_arr(qkv_s), *to_arr(qkv_b), qkv_gs, qkv_bits};
-    lw.z_proj = {*to_arr(z_w), *to_arr(z_s), *to_arr(z_b), qkv_gs, qkv_bits};
-    lw.b_proj = {*to_arr(b_w), *to_arr(b_s), *to_arr(b_b), qkv_gs, qkv_bits};
-    lw.a_proj = {*to_arr(a_w), *to_arr(a_s), *to_arr(a_b), qkv_gs, qkv_bits};
-    lw.use_separate_proj = true;
-    lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
-    lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
-    lw.use_separate_mlp = true;
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        auto& lw = m->layers.back().gdr;
+        lw.qkv_proj = {*to_arr(qkv_w), *to_arr(qkv_s), *to_arr(qkv_b), qkv_gs, qkv_bits};
+        lw.z_proj = {*to_arr(z_w), *to_arr(z_s), *to_arr(z_b), qkv_gs, qkv_bits};
+        lw.b_proj = {*to_arr(b_w), *to_arr(b_s), *to_arr(b_b), qkv_gs, qkv_bits};
+        lw.a_proj = {*to_arr(a_w), *to_arr(a_s), *to_arr(a_b), qkv_gs, qkv_bits};
+        lw.use_separate_proj = true;
+        lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
+        lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
+        lw.use_separate_mlp = true;
+    });
 }
 
 int32_t qwen35_compiled_finalize(void* model) {
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     try {
         mlx_clear_error();
-        m->compile_forward();
+        m->prepare_forward();
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
@@ -695,11 +711,14 @@ int32_t qwen35_compiled_step(
         for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(kv_caches[i]));
         for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(gdr_states[i]));
 
-        // Run forward — returns LAZY arrays. DO NOT eval here!
-        // The Rust caller handles eval via double-buffered async_eval pattern.
-        auto outputs = m->forward(inputs);
+        // Run forward — returns lazy arrays.
+        // IMPORTANT: keep the previous step's intermediate arrays alive by
+        // storing outputs in a member variable. This prevents premature
+        // GPU buffer deallocation when C++ locals are destructed.
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
 
-        // Distribute outputs (still lazy — no GPU work yet)
+        // Distribute outputs to caller (still lazy — no GPU work yet)
         *out_logits = from_arr(std::move(outputs[0]));
         for (int i = 0; i < n_kv; ++i)
             out_kv_caches[i] = from_arr(std::move(outputs[1 + i]));

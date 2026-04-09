@@ -36,21 +36,10 @@ jobs:
           --no-default-features --features metal,no-cuda
           -p infer --lib --bin metal_bench
 
-      - name: Locate libmetal_fused_ops.a
-        id: locate_lib
-        run: |
-          LIB=$(find target/release/build -name "libmetal_fused_ops.a" | head -1)
-          if [ -z "$LIB" ]; then
-            echo "::error::libmetal_fused_ops.a not found under target/release/build"
-            exit 1
-          fi
-          echo "lib_path=$LIB" >> "$GITHUB_OUTPUT"
-
       - name: Package macOS artifacts
         run: |
           mkdir -p dist
           cp target/release/metal_bench dist/
-          cp "${{ steps.locate_lib.outputs.lib_path }}" dist/
           tar -czf agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz -C dist .
 
       - name: Upload macOS artifact

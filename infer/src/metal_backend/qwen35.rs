@@ -49,24 +49,23 @@ pub(super) struct Qwen35MetalWeights {
     pub(super) layers: Vec<MetalQwen35BlockWeights>,
     pub(super) norm: MlxArray,
     pub(super) lm_head: WeightTensor,
-    /// C++ compiled model handle (if available). Eliminates per-op FFI overhead.
-    pub(super) compiled_model: Option<CompiledQwen35>,
+    /// Optional C++ forward model handle. Eliminates most per-op FFI overhead.
+    pub(super) cpp_model: Option<CppQwen35Model>,
 }
 
-/// RAII wrapper for the C++ Qwen35CompiledModel.
-pub(super) struct CompiledQwen35(*mut std::ffi::c_void);
+/// RAII wrapper for the C++ Qwen35 forward model.
+pub(super) struct CppQwen35Model(*mut std::ffi::c_void);
 
-impl Drop for CompiledQwen35 {
+impl Drop for CppQwen35Model {
     fn drop(&mut self) {
         unsafe { mlx_sys::qwen35_compiled_free(self.0) }
     }
 }
-unsafe impl Send for CompiledQwen35 {}
-unsafe impl Sync for CompiledQwen35 {}
+unsafe impl Send for CppQwen35Model {}
 
-impl CompiledQwen35 {
-    /// Build C++ model from loaded Rust weights. Returns None if weights are not
-    /// all quantized (required for the C++ path).
+impl CppQwen35Model {
+    /// Build a C++ step model from loaded Rust weights. Returns None if weights
+    /// are not fully supported by the C++ route.
     fn build(
         weights: &Qwen35MetalWeights,
         config: &MetalModelConfig,
@@ -156,7 +155,7 @@ impl CompiledQwen35 {
                     *gate_dim,
                 ),
                 _ => {
-                    log::warn!("C++ compiled model requires quantized MLP — falling back to Rust");
+                    log::warn!("C++ forward model requires quantized MLP — falling back to Rust");
                     unsafe { mlx_sys::qwen35_compiled_free(model) };
                     return None;
                 }
@@ -281,13 +280,13 @@ impl CompiledQwen35 {
         // Finalize (compile)
         let rc = unsafe { mlx_sys::qwen35_compiled_finalize(model) };
         if rc != 0 {
-            log::warn!("C++ model finalize failed — falling back to Rust");
+            log::warn!("C++ forward model finalize failed — falling back to Rust");
             unsafe { mlx_sys::qwen35_compiled_free(model) };
             return None;
         }
 
         log::info!(
-            "  C++ compiled model ready (all {} layers in C++)",
+            "  C++ forward model ready (all {} layers wired through one step call)",
             weights.layers.len()
         );
         Some(Self(model))
@@ -400,7 +399,7 @@ pub(super) fn metal_generate_qwen35(
         anyhow::bail!("Qwen3.5 Metal path requires a Qwen3.5 config");
     };
 
-    log::info!("Metal fused path: Qwen3.5 Hybrid (Rust/MLX)");
+    log::info!("Metal forward path: Qwen3.5 hybrid (Rust/MLX)");
 
     let num_full_layers = arch.num_full_attention_layers();
     let prefill_len = input_ids.len() as i32;
@@ -422,9 +421,9 @@ pub(super) fn metal_generate_qwen35(
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
 
-    // Use C++ compiled model if available (1 FFI call per step vs ~1600).
-    if weights.compiled_model.is_some() {
-        log::info!("  using C++ compiled forward (1 FFI call/step)");
+    // Use the C++ step model if available (1 FFI call per step vs ~1600).
+    if weights.cpp_model.is_some() {
+        log::info!("  using C++ step model (1 FFI call/step)");
     }
 
     // Build flat cache arrays for C++ path: [k0, v0, k1, v1, ...] and [gdr0, conv0, ...]
@@ -442,7 +441,7 @@ pub(super) fn metal_generate_qwen35(
 
     // Helper: run forward step dispatching to C++ or Rust path.
     let do_step = |token: &MlxArray,
-                   cpp: &Option<CompiledQwen35>,
+                   cpp: &Option<CppQwen35Model>,
                    kv_flat: &mut [MlxArray],
                    gdr_flat: &mut [MlxArray],
                    k_caches: &mut [MlxArray],
@@ -464,7 +463,7 @@ pub(super) fn metal_generate_qwen35(
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let step_logits = do_step(
             &token_arr,
-            &weights.compiled_model,
+            &weights.cpp_model,
             &mut kv_flat,
             &mut gdr_flat,
             &mut k_caches,
@@ -472,7 +471,7 @@ pub(super) fn metal_generate_qwen35(
             &mut recurrent,
             cache_len,
         )?;
-        if weights.compiled_model.is_some() && idx + 1 != input_ids.len() {
+        if weights.cpp_model.is_some() && idx + 1 != input_ids.len() {
             let mut prompt_outputs: Vec<&MlxArray> =
                 Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
             prompt_outputs.push(&step_logits);
@@ -497,7 +496,7 @@ pub(super) fn metal_generate_qwen35(
         // Build NEXT graph while GPU computes CURRENT y.
         let next_logits = do_step(
             &y,
-            &weights.compiled_model,
+            &weights.cpp_model,
             &mut kv_flat,
             &mut gdr_flat,
             &mut k_caches,
@@ -537,7 +536,7 @@ pub(super) fn metal_generate_qwen35(
         // Grow KV cache if needed (rare — only every 256 tokens)
         if cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
-            if weights.compiled_model.is_some() {
+            if weights.cpp_model.is_some() {
                 for li in 0..num_full_layers {
                     extend_kv_cache(
                         &mut kv_flat[2 * li],
@@ -609,7 +608,7 @@ fn qwen35_forward_step(
     for layer in &weights.layers {
         let residual = x.clone();
 
-        // C++ fused blocks do norm internally; Rust fallback needs explicit norm.
+        // Full-attention and GDR steps both operate on the normalized input.
         let attn_out = match &layer.attention {
             MetalQwen35Attention::Full(attn) => {
                 let out = fused_full_attn_step(
@@ -665,106 +664,8 @@ fn qwen35_forward_step(
     linear(&final_norm, &weights.lm_head)
 }
 
-// ── Fused C++ wrappers (dispatch to C++ FFI or Rust fallback) ────────────────
+// ── Qwen3.5 attention wrappers ───────────────────────────────────────────────
 
-/// Helper: extract raw mlx_array + quant params from a WeightTensor.
-/// For Dense: returns (w_t, empty, empty, 0, 0, false).
-/// For Quantized: returns (w, scales, biases, group_size, bits, true).
-#[cfg(metal_qwen35_fused_ops)]
-fn wt_parts(
-    wt: &WeightTensor,
-) -> (
-    mlx_sys::mlx_array,
-    mlx_sys::mlx_array,
-    mlx_sys::mlx_array,
-    i32,
-    i32,
-    bool,
-) {
-    match wt {
-        WeightTensor::Dense(w_t) => {
-            let empty = unsafe { mlx_sys::mlx_array_new() };
-            (w_t.as_raw(), empty, empty, 0, 0, false)
-        }
-        WeightTensor::Quantized {
-            w,
-            scales,
-            biases,
-            group_size,
-            bits,
-        } => (
-            w.as_raw(),
-            scales.as_raw(),
-            biases.as_raw(),
-            *group_size,
-            *bits,
-            true,
-        ),
-    }
-}
-
-#[cfg(metal_qwen35_fused_ops)]
-#[allow(clippy::too_many_arguments)]
-fn fused_full_attn_step(
-    x: &MlxArray,
-    input_norm_w: &MlxArray,
-    attn: &MetalQwen35FullAttentionWeights,
-    config: &MetalModelConfig,
-    arch: &MetalQwen35ArchConfig,
-    k_cache: &mut MlxArray,
-    v_cache: &mut MlxArray,
-    cache_len: i32,
-) -> MlxArray {
-    let (q_w, q_s, q_b, gs, bits, is_q) = wt_parts(&attn.q_proj);
-    let (k_w, k_s, k_b, _, _, _) = wt_parts(&attn.k_proj);
-    let (v_w, v_s, v_b, _, _, _) = wt_parts(&attn.v_proj);
-    let (o_w, o_s, o_b, _, _, _) = wt_parts(&attn.o_proj);
-    let n_heads = config.num_attention_heads as i32;
-    let n_kv = config.num_key_value_heads as i32;
-    let hd = config.head_dim as i32;
-    let attn_scale = 1.0f32 / (hd as f32).sqrt();
-
-    let result_raw: mlx_sys::mlx_array = unsafe {
-        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-        super::metal_ffi::metal_qwen35_full_attn_block(
-            x.as_raw(),
-            input_norm_w.as_raw(),
-            q_w,
-            q_s,
-            q_b,
-            k_w,
-            k_s,
-            k_b,
-            v_w,
-            v_s,
-            v_b,
-            o_w,
-            o_s,
-            o_b,
-            attn.q_norm.as_raw(),
-            attn.k_norm.as_raw(),
-            n_heads,
-            n_kv,
-            hd,
-            attn_scale,
-            config.rope_theta as f32,
-            arch.rotary_dim as i32,
-            config.rms_norm_eps as f32,
-            gs,
-            bits,
-            is_q,
-            config.norm_weight_mode.uses_offset(),
-            k_cache.as_raw_mut(),
-            v_cache.as_raw_mut(),
-            cache_len,
-            r.as_mut_ptr(),
-        );
-        r.assume_init()
-    };
-    unsafe { MlxArray::from_raw(result_raw) }
-}
-
-#[cfg(not(metal_qwen35_fused_ops))]
 #[allow(clippy::too_many_arguments)]
 fn fused_full_attn_step(
     x: &MlxArray,
@@ -805,7 +706,7 @@ fn fused_gdr_step(
     metal_gdr_decode_step(&normed, attn, recurrent, layer_idx, gdr_cfg)
 }
 
-// ── Rust fallback implementations (used when metal_fused_ops not compiled) ───
+// ── Rust/MLX implementations ──────────────────────────────────────────────────
 
 fn qwen35_full_attention_step(
     x: &MlxArray,
@@ -1122,13 +1023,12 @@ pub(super) fn load_qwen35_metal_weights(
         layers,
         norm,
         lm_head,
-        compiled_model: None,
+        cpp_model: None,
     };
 
-    // Try to build the C++ compiled model (all layers in C++, no per-op FFI).
-    // C++ model — gated by env var for A/B testing
+    // Try to build the optional C++ step model.
     if !std::env::var("METAL_NO_CPP").is_ok() {
-        weights.compiled_model = CompiledQwen35::build(&weights, config, arch);
+        weights.cpp_model = CppQwen35Model::build(&weights, config, arch);
     }
 
     Ok(weights)

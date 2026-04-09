@@ -5,7 +5,7 @@
 | [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Complete** — INT4 quantization architecture: LinearWeight dispatch, W4A16 GEMV, Marlin prefill |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文：FP8 native + INT8/INT4 fused-dequant + TurboQuant 3-bit |
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research — XMA / accelerated model architectures future implications |
-| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal: Qwen3/3.5 at 58 tok/s, custom mlx-sys + C++ forward, serial serving |
+| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal: Qwen3/3.5, direct `mlx-sys` bridge, serial serving |
 | **Plans** | |
 | [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity (C=4 exceeded) |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **Near-complete** — prefix cache fixed, batched prefill remaining |

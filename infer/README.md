@@ -88,14 +88,14 @@ xcodebuild -downloadComponent MetalToolchain
 ```
 
 ```bash
-# Download model (Qwen2.5 series recommended for Metal backend)
-huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct --local-dir models/Qwen2.5-0.5B
+# Download model (Qwen3/Qwen3.5 MLX-converted checkpoints)
+huggingface-cli download mlx-community/Qwen3-0.6B-4bit --local-dir models/Qwen3-0.6B-4bit
 
-# Build library (binaries require CUDA; Metal path is library-only today)
+# Build the Metal backend and serial HTTP server
 cargo build --release --no-default-features --features metal,no-cuda --lib
 ```
 
-The Metal backend (`MetalBackend`) implements the same `InferenceBackend` trait as the CUDA path. HTTP server integration pending.
+The Metal backend (`MetalBackend`) implements the same `InferenceBackend` trait as the CUDA path. `metal_serve` is available today, but it still runs as a serial backend runtime rather than the CUDA-style continuous batching scheduler.
 
 <details>
 <summary>Environment variables</summary>
@@ -130,7 +130,7 @@ cargo run --release --bin infer -- --model-path models/Qwen3-4B
 | [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | Full attention (GQA) | 4B | CUDA |
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | CUDA |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attn) | 4B | CUDA |
-| Qwen2.5 series | Full attention | 0.5B–7B | Metal |
+| Qwen3 / Qwen3.5 MLX-converted checkpoints | Full attention / hybrid | 0.6B–4B | Metal |
 
 Model type is auto-detected from `config.json`.
 
@@ -147,7 +147,7 @@ Model type is auto-detected from `config.json`.
 - top-k / top-p / temperature / min-p / repetition / frequency / presence penalties
 - OpenAI `/v1/completions` and `/v1/chat/completions` (SSE streaming)
 - Prometheus `/metrics` and `/v1/stats`
-- Metal backend for Apple Silicon (library, single request)
+- Metal backend for Apple Silicon (serial `metal_serve`, single request at a time)
 
 ## API
 
