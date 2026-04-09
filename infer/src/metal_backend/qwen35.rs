@@ -115,6 +115,10 @@ pub(super) fn metal_generate_qwen35(
     let mut generated = Vec::new();
     let mut ttft_ms = 0.0;
 
+    // Synchronous decode — GDR recurrent state has step-to-step data
+    // dependencies. mlx_lm handles this via Python reference-captured cache
+    // that stays in the lazy graph; our Rust path replaces MlxArray handles
+    // each step, breaking graph continuity.
     let finish_reason = loop {
         let next_token = gpu_sample_token(&logits, params)?.item_i32() as u32;
 
