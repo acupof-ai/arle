@@ -764,4 +764,156 @@ int32_t qwen35_compiled_step(
     }
 }
 
+// ── Full decode loop in C++ ────────────────────────────────────────────────
+// Keeps ALL intermediate arrays alive within the loop body, matching
+// Python's behavior where locals survive until the next loop iteration.
+// This eliminates the GPU buffer release/realloc overhead that caused
+// our per-step time to be 5ms slower than Python.
+
+int32_t qwen35_compiled_generate(
+    void* model,
+    const int32_t* prompt_ids, int32_t prompt_len,
+    int32_t max_new_tokens,
+    float temperature,
+    // Output: generated token ids (caller allocates max_new_tokens ints)
+    int32_t* out_tokens,
+    int32_t* out_count,
+    // Callbacks
+    int32_t (*on_token)(int32_t token_id, void* ctx),
+    void* callback_ctx,
+    // Stop tokens
+    const int32_t* stop_tokens, int32_t n_stop_tokens
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+        int F = m->n_full_attn, G = m->n_gdr;
+
+        // Initialize caches
+        int kv_cap = 256;
+        auto cache_shape = [&](int heads, int dim) {
+            return Shape{1, heads, kv_cap, dim};
+        };
+        std::vector<array> kv_caches;
+        for (int i = 0; i < F; ++i) {
+            kv_caches.push_back(zeros(cache_shape(m->n_kv_heads, m->head_dim), bfloat16));
+            kv_caches.push_back(zeros(cache_shape(m->n_kv_heads, m->head_dim), bfloat16));
+        }
+        std::vector<array> gdr_states;
+        for (int i = 0; i < (int)m->layers.size(); ++i) {
+            if (m->layers[i].is_gdr) {
+                auto& lw = m->layers[i].gdr;
+                int hv = lw.num_value_heads, dv = lw.value_dim, dk = lw.key_dim;
+                gdr_states.push_back(zeros({1, hv, dv, dk}, float32));  // gdr state
+                gdr_states.push_back(zeros({1, (int)lw.conv_kernel-1, lw.num_key_heads*dk*2 + hv*dv}, bfloat16));  // conv state
+            }
+        }
+        eval(kv_caches); eval(gdr_states);
+
+        int cache_pos = 0;
+
+        // Prefill
+        for (int p = 0; p < prompt_len; ++p) {
+            m->current_cache_pos = cache_pos;
+            std::vector<array> inputs;
+            inputs.push_back(array(prompt_ids[p]));
+            for (auto& c : kv_caches) inputs.push_back(c);
+            for (auto& s : gdr_states) inputs.push_back(s);
+
+            auto outputs = m->forward(inputs);
+
+            // Update caches
+            for (int j = 0; j < (int)kv_caches.size(); ++j)
+                kv_caches[j] = outputs[1 + j];
+            for (int j = 0; j < (int)gdr_states.size(); ++j)
+                gdr_states[j] = outputs[1 + (int)kv_caches.size() + j];
+
+            cache_pos++;
+            if (p == prompt_len - 1) {
+                // Get logits from last prefill token
+                auto logits = outputs[0];
+                auto y = (temperature <= 1e-6f)
+                    ? argmax(logits, true)
+                    : random::categorical(logits * array(1.0f / temperature), -1);
+                async_eval(y);
+
+                // ── Decode loop (double-buffered, all in C++) ──
+                int generated = 0;
+                // Keep previous step's locals alive in these vectors
+                std::vector<array> prev_step_arrays;
+
+                while (generated < max_new_tokens) {
+                    // Save current step's key arrays to keep them alive
+                    prev_step_arrays.clear();
+                    prev_step_arrays.reserve(512);
+
+                    // Build NEXT graph with lazy token y
+                    m->current_cache_pos = cache_pos;
+                    std::vector<array> step_inputs;
+                    step_inputs.push_back(y);
+                    for (auto& c : kv_caches) step_inputs.push_back(c);
+                    for (auto& s : gdr_states) step_inputs.push_back(s);
+
+                    auto step_outputs = m->forward(step_inputs);
+
+                    // Update caches (lazy)
+                    for (int j = 0; j < (int)kv_caches.size(); ++j)
+                        kv_caches[j] = step_outputs[1 + j];
+                    for (int j = 0; j < (int)gdr_states.size(); ++j)
+                        gdr_states[j] = step_outputs[1 + (int)kv_caches.size() + j];
+
+                    auto next_logits = step_outputs[0];
+                    auto next_y = (temperature <= 1e-6f)
+                        ? argmax(next_logits, true)
+                        : random::categorical(next_logits * array(1.0f / temperature), -1);
+                    async_eval(next_y);
+
+                    // Wait for CURRENT y
+                    eval(y);
+                    int32_t token_id = y.item<int32_t>();
+
+                    // Check stop
+                    bool stop = false;
+                    for (int s = 0; s < n_stop_tokens; ++s) {
+                        if (token_id == stop_tokens[s]) { stop = true; break; }
+                    }
+                    out_tokens[generated] = token_id;
+                    generated++;
+                    cache_pos++;
+
+                    if (on_token && on_token(token_id, callback_ctx) != 0)
+                        break;
+                    if (stop) break;
+
+                    // Keep step_outputs and step_inputs alive until next iteration
+                    // (they're already in local scope — will survive until next loop clear)
+                    prev_step_arrays = std::move(step_outputs);
+                    for (auto& a : step_inputs) prev_step_arrays.push_back(std::move(a));
+                    // Also keep intermediates from forward()
+                    for (auto& a : m->intermediates) prev_step_arrays.push_back(std::move(a));
+
+                    y = next_y;
+                }
+
+                // Handle last pending token
+                if (generated < max_new_tokens) {
+                    eval(y);
+                    // Already handled above
+                }
+
+                *out_count = generated;
+            }
+        }
+
+        if (prompt_len == 0) {
+            *out_count = 0;
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
 } // extern "C"
