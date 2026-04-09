@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use log::error;
 use tokio::sync::mpsc;
 
-use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+use crate::backend::{GenerateResult, StreamingInferenceBackend};
 #[cfg(feature = "metal")]
 use crate::metal_backend::MetalBackend;
 use crate::request_handle::{RequestHandle, SubmitError};

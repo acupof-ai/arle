@@ -11,7 +11,7 @@
 //! achieving 5x+ memory reduction at quality-neutral levels.
 
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::ffi;
 use crate::model::turboquant_state::{RotationMode, TurboQuantLayerState};
