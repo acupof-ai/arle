@@ -22,6 +22,7 @@ pub(crate) struct FlashInferDecodeMetadata {
     pub kv_indptr: CudaSlice<i32>,
     pub kv_last_page_len: CudaSlice<i32>,
     /// Q indptr for tensor-core decode: [0, 1, 2, ..., B] (1 token per request).
+    #[allow(dead_code)]
     pub q_indptr: CudaSlice<i32>,
     pub flashinfer_ws: FlashInferWorkspace,
     pub max_total_pages: usize,

@@ -1,3 +1,16 @@
+//! Linear projection ops: GEMV (decode) and GEMM (prefill/batch).
+//!
+//! Dispatch priority for `gemv()` (single token, decode path):
+//!   1. Quantized INT2/4/8 → `w{2,4,8}a16_gemv_cuda` (fused dequant)
+//!   2. BF16 → `gemv_cuda` (handwritten BF16×4 vectorized kernel)
+//!
+//! Dispatch priority for `gemm_into()` (batched, prefill path):
+//!   1. Marlin W4 → `marlin_gemm_cuda` (tensor core, 5-25× TTFT speedup)
+//!   2. TurboQuant → bulk dequant + cuBLAS GEMM
+//!   3. Quantized INT → `w{2,4,8}a16_gemv_batch_cuda`
+//!   4. BF16, N=1 → `gemm_graphsafe_cuda` (cuBLAS, CUDA Graph safe)
+//!   5. BF16, N>1 → `gemm_cuda` (cuBLAS with workspace)
+
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;

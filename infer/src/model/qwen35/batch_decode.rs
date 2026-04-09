@@ -1000,6 +1000,7 @@ impl Qwen35Model {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn decode_batch_linear_attn_layer(
         &self,
         layer: &TransformerBlock35,

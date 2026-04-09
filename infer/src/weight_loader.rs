@@ -338,6 +338,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
 ///
 /// Reverse path: unpack → gather centroids → iFFWT → sign flip → scale by norm.
 /// Produces a standard BF16 DeviceMatrix for use with existing GEMM kernels.
+#[allow(dead_code)]
 fn turboquant_dequant_at_load(
     ctx: &DeviceContext,
     packed: &[u8],
@@ -406,6 +407,7 @@ fn turboquant_dequant_at_load(
 
 /// CPU Fast Walsh-Hadamard Transform (in-place, normalized by 1/√n).
 fn fwht_cpu(data: &mut [f32]) {
+    #[allow(dead_code)]
     let n = data.len();
     debug_assert!(n.is_power_of_two());
     let mut h = 1;

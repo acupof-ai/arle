@@ -1,3 +1,12 @@
+//! GPU sampling ops: argmax, top-k, nucleus, temperature, penalties.
+//!
+//! Two sampling paths:
+//!   - **Greedy** (`argmax_batch_launch`): single kernel, batched across requests
+//!   - **Full** (`gpu_sample_launch`): softmax + top-k filter + multinomial via
+//!     parallel prefix sum (Blelloch scan)
+//!
+//! All kernels are CUDA Graph safe (no allocation, fixed pointers).
+
 use anyhow::{Result, anyhow};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
