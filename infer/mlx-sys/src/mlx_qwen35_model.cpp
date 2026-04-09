@@ -116,6 +116,29 @@ auto& compiled_compute_g() {
     return fn;
 }
 
+// Compiled SiLU: x * sigmoid(x) — matches mlx_lm's @mx.compile(shapeless=True)
+// Fuses 2 ops (sigmoid + multiply) into 1 compiled kernel.
+std::vector<array> silu_impl(const std::vector<array>& inputs) {
+    return {inputs[0] * sigmoid(inputs[0])};
+}
+
+auto& compiled_silu() {
+    static auto fn = mlx::core::compile(silu_impl, true /*shapeless*/);
+    return fn;
+}
+
+// Compiled SwiGLU: silu(gate) * up — fuses 3 ops into 1 compiled kernel.
+std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    auto gate = inputs[0];
+    auto up = inputs[1];
+    return {(gate * sigmoid(gate)) * up};
+}
+
+auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, true /*shapeless*/);
+    return fn;
+}
+
 } // namespace
 
 // ── Quantized linear helper ────────────────────────────────────────────────
@@ -266,7 +289,7 @@ struct Qwen35CompiledModel {
         int n_keep = lw.conv_kernel - 1;
         conv_state_out = slice(conv_input, {0,1,0}, {1,n_keep+1,qkv_dim});
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
-        conv_out = conv_out * sigmoid(conv_out); // SiLU
+        conv_out = compiled_silu()({conv_out})[0]; // SiLU (compiled)
 
         // Split + normalize
         auto q_raw = reshape(slice(conv_out, {0,0,0}, {1,1,q_dim}), {1,1,hk,dk});
@@ -344,7 +367,7 @@ struct Qwen35CompiledModel {
         auto y_heads = reshape(y, {hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
         auto z_gated = reshape(z, {hv, dv});
-        auto out = normed * (z_gated * sigmoid(z_gated)); // normed * silu(z)
+        auto out = normed * compiled_silu()({z_gated})[0]; // normed * silu(z) (compiled)
         return lw.out_proj.apply(reshape(out, {1, hv*dv}));
     }
 
@@ -354,7 +377,7 @@ struct Qwen35CompiledModel {
         auto gu = gate_up.apply(x);
         auto g = slice(gu, {0, 0}, {1, gate_dim});
         auto u = slice(gu, {0, gate_dim}, {1, gate_dim * 2});
-        auto h = (g * sigmoid(g)) * u; // SiLU(gate) * up
+        auto h = compiled_swiglu()({g, u})[0]; // SiLU(gate) * up (compiled)
         return down.apply(h);
     }
 
