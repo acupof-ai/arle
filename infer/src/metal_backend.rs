@@ -257,6 +257,10 @@ struct StandardMetalWeights {
     pub norm: MlxArray,
     /// Output projection (lm_head) — dense or quantized.
     pub lm_head: WeightTensor,
+    /// Quantized embed weights for as_linear lm_head.
+    pub embed_quantized: Option<WeightTensor>,
+    /// C++ compiled model (reuses Qwen3.5 model struct with all full-attn layers).
+    pub cpp_model: Option<qwen35::CppQwen35Model>,
 }
 
 #[cfg(feature = "metal")]
@@ -269,18 +273,18 @@ enum MetalWeights {
 // GPU required: all fields are MlxArrays or WeightTensors.
 #[cfg(feature = "metal")]
 struct StandardMetalLayerWeights {
-    // Self-attention input projections (possibly merged for quantized layers).
     pub attention_inputs: AttentionInputProjection,
     pub o_proj: WeightTensor,
-    // MLP input projections (possibly merged for quantized layers).
     pub mlp_inputs: MlpInputProjection,
     pub down_proj: WeightTensor,
-    // Per-head QK norms (always float)
     pub q_norm: MlxArray,
     pub k_norm: MlxArray,
-    // Layer norms (always float)
     pub input_layernorm: MlxArray,
     pub post_attention_layernorm: MlxArray,
+    /// Individual q/k/v projections for C++ model (separate from merged attention_inputs).
+    pub q_proj_individual: Option<WeightTensor>,
+    pub k_proj_individual: Option<WeightTensor>,
+    pub v_proj_individual: Option<WeightTensor>,
 }
 
 impl MetalBackend {
@@ -671,6 +675,34 @@ fn metal_generate(
             finish_reason: "length",
             ttft_ms: 0.0,
             total_time_ms: 0.0,
+        });
+    }
+
+    // C++ full generate path (same as Qwen3.5 — batch prefill + double-buffered decode)
+    if let Some(ref cpp_model) = weights.cpp_model {
+        log::info!("Metal Qwen3: C++ full generate");
+        let mut stop_ids: Vec<u32> = params.stop_token_ids.clone();
+        if !params.ignore_eos {
+            stop_ids.push(config.eos_token_id);
+        }
+        let (tokens, prefill_ms, decode_ms) = cpp_model.generate(
+            input_ids,
+            max_new_tokens,
+            params.temperature,
+            &stop_ids,
+            on_token,
+        )?;
+        let total_time_ms = prefill_ms + decode_ms;
+        let finish_reason = if tokens.last().is_some_and(|t| stop_ids.contains(t)) {
+            "stop"
+        } else {
+            "length"
+        };
+        return Ok(MetalGenerateOutput {
+            tokens,
+            finish_reason,
+            ttft_ms: prefill_ms,
+            total_time_ms,
         });
     }
 
@@ -1318,6 +1350,11 @@ fn load_qwen3_metal_weights(
                 MlpInputProjection::Split { gate_proj, up_proj }
             };
 
+        // Reload individual q/k/v for C++ model (separate from merged)
+        let q_ind = load_proj(&p("self_attn.q_proj")).ok();
+        let k_ind = load_proj(&p("self_attn.k_proj")).ok();
+        let v_ind = load_proj(&p("self_attn.v_proj")).ok();
+
         layers.push(StandardMetalLayerWeights {
             attention_inputs,
             o_proj: load_proj(&p("self_attn.o_proj"))?,
@@ -1327,15 +1364,265 @@ fn load_qwen3_metal_weights(
             k_norm: get(&p("self_attn.k_norm.weight"))?,
             input_layernorm: get(&p("input_layernorm.weight"))?,
             post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
+            q_proj_individual: q_ind,
+            k_proj_individual: k_ind,
+            v_proj_individual: v_ind,
         });
     }
+
+    // Load quantized embed for as_linear lm_head
+    let embed_quantized = if config.quantization.is_some() {
+        load_proj("model.embed_tokens").ok()
+    } else {
+        None
+    };
+
+    // Build C++ model (all full-attn layers — reuses Qwen3.5 model struct)
+    let cpp_model = build_qwen3_cpp_model(
+        &embed_tokens,
+        &norm,
+        &lm_head,
+        embed_quantized.as_ref(),
+        &layers,
+        config,
+    );
 
     Ok(StandardMetalWeights {
         embed_tokens,
         layers,
         norm,
         lm_head,
+        embed_quantized,
+        cpp_model,
     })
+}
+
+/// Build C++ compiled model for Qwen3 (pure transformer, all full-attn layers).
+/// Reuses the Qwen3.5 C++ model struct with zero GDR layers.
+#[cfg(feature = "metal")]
+fn build_qwen3_cpp_model(
+    embed_tokens: &MlxArray,
+    norm: &MlxArray,
+    lm_head: &WeightTensor,
+    embed_quantized: Option<&WeightTensor>,
+    layers: &[StandardMetalLayerWeights],
+    config: &MetalModelConfig,
+) -> Option<qwen35::CppQwen35Model> {
+    use qwen35::CppQwen35Model;
+
+    let model = unsafe { mlx_sys::qwen35_compiled_new() };
+    if model.is_null() {
+        return None;
+    }
+
+    unsafe {
+        mlx_sys::qwen35_compiled_set_config(
+            model,
+            config.rope_theta as f32,
+            config.rms_norm_eps as f32,
+            config.num_attention_heads as i32,
+            config.num_key_value_heads as i32,
+            config.head_dim as i32,
+            config.head_dim as i32, // rotary_dim = head_dim for Qwen3
+            config.hidden_size as i32,
+        );
+    }
+
+    // Embed + norm + lm_head
+    let (lm_w, lm_s, lm_b, lm_gs, lm_bits) = match lm_head {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (
+            w.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            *group_size,
+            *bits,
+        ),
+        WeightTensor::Dense(w_t) => (
+            w_t.as_raw(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            0,
+        ),
+    };
+    unsafe {
+        mlx_sys::qwen35_compiled_set_embed(
+            model,
+            embed_tokens.as_raw(),
+            norm.as_raw(),
+            lm_w,
+            lm_s,
+            lm_b,
+            lm_gs,
+            lm_bits,
+        );
+        if let Some(WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        }) = embed_quantized
+        {
+            mlx_sys::qwen35_compiled_set_embed_as_linear(
+                model,
+                w.as_raw(),
+                scales.as_raw(),
+                biases.as_raw(),
+                *group_size,
+                *bits,
+            );
+        }
+    }
+
+    // All layers are full attention
+    for layer in layers {
+        let extract = |wt: &WeightTensor| -> Option<(
+            *mut mlx_sys::mlx_array,
+            *mut mlx_sys::mlx_array,
+            *mut mlx_sys::mlx_array,
+            i32,
+            i32,
+        )> {
+            match wt {
+                WeightTensor::Quantized {
+                    w,
+                    scales,
+                    biases,
+                    group_size,
+                    bits,
+                } => Some((
+                    w.as_raw(),
+                    scales.as_raw(),
+                    biases.as_raw(),
+                    *group_size,
+                    *bits,
+                )),
+                WeightTensor::Dense(_) => None,
+            }
+        };
+
+        // Extract attention projections from AttentionInputProjection
+        let (q, k, v) = match &layer.attention_inputs {
+            AttentionInputProjection::Split {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => match (extract(q_proj), extract(k_proj), extract(v_proj)) {
+                (Some(q), Some(k), Some(v)) => (q, k, v),
+                _ => {
+                    unsafe { mlx_sys::qwen35_compiled_free(model) };
+                    return None;
+                }
+            },
+            AttentionInputProjection::MergedQuantized { .. } => {
+                // Use individual weights stored alongside merged
+                match (
+                    layer.q_proj_individual.as_ref().and_then(|w| extract(w)),
+                    layer.k_proj_individual.as_ref().and_then(|w| extract(w)),
+                    layer.v_proj_individual.as_ref().and_then(|w| extract(w)),
+                ) {
+                    (Some(q), Some(k), Some(v)) => (q, k, v),
+                    _ => {
+                        unsafe { mlx_sys::qwen35_compiled_free(model) };
+                        return None;
+                    }
+                }
+            }
+        };
+        let o = match extract(&layer.o_proj) {
+            Some(o) => o,
+            None => {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
+            }
+        };
+
+        // MLP
+        let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) = match &layer.mlp_inputs {
+            MlpInputProjection::MergedQuantized {
+                gate_up_proj:
+                    WeightTensor::Quantized {
+                        w,
+                        scales,
+                        biases,
+                        group_size,
+                        bits,
+                    },
+                gate_dim,
+                ..
+            } => (
+                w.as_raw(),
+                scales.as_raw(),
+                biases.as_raw(),
+                *group_size,
+                *bits,
+                *gate_dim,
+            ),
+            _ => {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
+            }
+        };
+        let (dw_w, dw_s, dw_b) = match extract(&layer.down_proj) {
+            Some((w, s, b, _, _)) => (w, s, b),
+            None => {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
+            }
+        };
+
+        unsafe {
+            mlx_sys::qwen35_compiled_push_full_attn(
+                model,
+                layer.input_layernorm.as_raw(),
+                layer.post_attention_layernorm.as_raw(),
+                q.0,
+                q.1,
+                q.2,
+                q.3,
+                q.4,
+                k.0,
+                k.1,
+                k.2,
+                v.0,
+                v.1,
+                v.2,
+                o.0,
+                o.1,
+                o.2,
+                layer.q_norm.as_raw(),
+                layer.k_norm.as_raw(),
+                gu_w,
+                gu_s,
+                gu_b,
+                gu_gs,
+                gu_bits,
+                gate_dim,
+                dw_w,
+                dw_s,
+                dw_b,
+            );
+        }
+    }
+
+    let rc = unsafe { mlx_sys::qwen35_compiled_finalize(model) };
+    if rc != 0 {
+        unsafe { mlx_sys::qwen35_compiled_free(model) };
+        return None;
+    }
+
+    log::info!(
+        "  C++ Qwen3 model ready ({} full-attn layers)",
+        layers.len()
+    );
+    Some(CppQwen35Model::from_raw(model))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

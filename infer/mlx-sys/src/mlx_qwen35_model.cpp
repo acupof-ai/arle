@@ -166,6 +166,7 @@ struct FullAttnLayerWeights {
     QWeight q_proj, k_proj, v_proj, o_proj;
     array q_norm_w = array(0), k_norm_w = array(0);
     QWeight gate_up, down;
+    bool has_qk_gate = true;  // true for Qwen3.5 (q_dim = nh*hd*2), false for Qwen3
     int gate_dim = 0;
 };
 
@@ -243,15 +244,21 @@ struct Qwen35CompiledModel {
         int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
 
-        auto q_full = reshape(lw.q_proj.apply(x), {1, S, nh, hd * 2});
-        auto q_gate = split(q_full, Shape{hd}, -1);
-        auto& q_heads = q_gate[0];
-        auto& gate_heads = q_gate[1];
-
+        auto q_proj_out = lw.q_proj.apply(x);
         auto k_raw = lw.k_proj.apply(x);
         auto v_raw = lw.v_proj.apply(x);
 
-        auto q = fast::rms_norm(q_heads, lw.q_norm_w, rms_eps);
+        array q(0), gate_val(0);
+        if (lw.has_qk_gate) {
+            // Qwen3.5: Q has gate — split at head_dim
+            auto q_full = reshape(q_proj_out, {1, S, nh, hd * 2});
+            auto q_gate = split(q_full, Shape{hd}, -1);
+            q = fast::rms_norm(q_gate[0], lw.q_norm_w, rms_eps);
+            gate_val = q_gate[1];
+        } else {
+            // Qwen3: standard Q, no gate
+            q = fast::rms_norm(reshape(q_proj_out, {1, S, nh, hd}), lw.q_norm_w, rms_eps);
+        }
         q = transpose(q, {0, 2, 1, 3});
         q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
@@ -266,24 +273,27 @@ struct Qwen35CompiledModel {
         int end = cache_pos + S;
         new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {1,nkv,end,hd});
         new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {1,nkv,end,hd});
-
         auto k_full = slice(new_k_cache, {0,0,0,0}, {1,nkv,end,hd});
         auto v_full = slice(new_v_cache, {0,0,0,0}, {1,nkv,end,hd});
 
-        // SDPA: causal mask for prefill (S>1), no mask for decode (S=1)
-        std::string mask = (S > 1) ? "causal" : "";
-        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask);
+        std::string mask_mode = (S > 1) ? "causal" : "";
+        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask_mode);
         attn_out = reshape(transpose(attn_out, {0,2,1,3}), {1, S, nh*hd});
-        auto gate = reshape(gate_heads, {1, S, nh*hd});
-        gate = sigmoid(astype(gate, float32));
-        auto gated = astype(astype(attn_out, float32) * gate, bfloat16);
-        auto result = lw.o_proj.apply(gated);
+
+        array result(0);
+        if (lw.has_qk_gate) {
+            auto gate = reshape(gate_val, {1, S, nh*hd});
+            gate = sigmoid(astype(gate, float32));
+            result = lw.o_proj.apply(astype(astype(attn_out, float32) * gate, bfloat16));
+        } else {
+            result = lw.o_proj.apply(attn_out);
+        }
 
         // Keep intermediates alive for GPU buffer reuse
         intermediates.push_back(q);
         intermediates.push_back(k);
         intermediates.push_back(attn_out);
-        intermediates.push_back(gated);
+        intermediates.push_back(result);
         return result;
     }
 
@@ -547,6 +557,15 @@ struct Qwen35CompiledModel {
     }
 
     void prepare_forward() {
+        // Auto-detect gate mode: Qwen3.5 (has GDR layers) uses gated Q,
+        // Qwen3 (pure attention) does not.
+        bool has_gate = (n_gdr > 0);
+        for (auto& lw : layers) {
+            if (!lw.is_gdr) {
+                lw.full.has_qk_gate = has_gate;
+            }
+        }
+
         // NOTE: mx::compile() cannot handle position-dependent KV cache slicing
         // (cache_pos changes each step, forcing re-trace). For now, skip JIT
         // compilation and run the C++ forward directly. This still eliminates
