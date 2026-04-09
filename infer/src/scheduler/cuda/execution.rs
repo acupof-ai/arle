@@ -7,7 +7,30 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Phase 1: Flush deferred deltas (CPU tokenizer decode)
+        // Phase 1: Batched decode (GPU forward pass + sampling)
+        //
+        // Launched BEFORE emit_delta so that GPU compute overlaps with
+        // CPU tokenizer work in Phase 2. emit_delta only needs tokens
+        // from the PREVIOUS step (already in generated_tokens), so
+        // there's no data dependency with the current forward pass.
+        let has_decode = self
+            .active
+            .iter()
+            .any(|r| matches!(r.phase, Phase::Decoding));
+        let decode_us = if has_decode {
+            let t = std::time::Instant::now();
+            self.step_decode_batch();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+
+        // Phase 2: Flush deferred deltas (CPU tokenizer decode)
+        //
+        // Runs after decode batch returns. When GPU forward is fast
+        // (CUDA Graph replay), emit_delta dominates; when forward is
+        // slow, emit_delta would have overlapped with GPU compute if
+        // we split forward into launch + sync phases (future opt).
         let emit_t = std::time::Instant::now();
         {
             let Self {
@@ -22,19 +45,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
         let emit_us = emit_t.elapsed().as_micros();
-
-        // Phase 2: Batched decode (GPU forward pass)
-        let has_decode = self
-            .active
-            .iter()
-            .any(|r| matches!(r.phase, Phase::Decoding));
-        let decode_us = if has_decode {
-            let t = std::time::Instant::now();
-            self.step_decode_batch();
-            t.elapsed().as_micros()
-        } else {
-            0
-        };
 
         // Phase 3: Accept ALL new requests (prefix cache + start prefill)
         // Process all new requests in one step to avoid multi-iteration admission delay.

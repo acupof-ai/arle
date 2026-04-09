@@ -8,11 +8,20 @@ use std::sync::Arc;
 
 use crate::ffi;
 
-/// CUDA device context holding context and stream.
+/// CUDA device context holding compute stream and optional copy stream.
+///
+/// Two-stream architecture for overlapping H2D/D2H transfers with compute:
+/// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
+/// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
+///
+/// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
+/// which breaks CUDA Graph capture).
 #[derive(Clone)]
 pub struct DeviceContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Separate stream for async H2D/D2H memory copies.
+    pub copy_stream: Arc<CudaStream>,
 }
 
 impl DeviceContext {
@@ -39,12 +48,20 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA stream: {}", e))?;
 
+        let copy_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA copy stream: {}", e))?;
+
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
         }
 
-        Ok(Self { ctx, stream })
+        Ok(Self {
+            ctx,
+            stream,
+            copy_stream,
+        })
     }
 
     /// Query the number of streaming multiprocessors on the GPU.
@@ -61,11 +78,69 @@ impl DeviceContext {
         count.max(1) as usize
     }
 
-    /// Synchronize stream
+    /// Synchronize compute stream.
     pub fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
             .map_err(|e| anyhow!("Sync failed: {}", e))
+    }
+
+    /// Synchronize copy stream.
+    pub fn sync_copy(&self) -> Result<()> {
+        self.copy_stream
+            .synchronize()
+            .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
+    }
+
+    /// Record an event on the compute stream and make the copy stream wait for it.
+    ///
+    /// Use after GPU kernels finish (e.g. sampling) to ensure the copy stream
+    /// sees the results before starting D2H transfer.
+    pub fn copy_waits_for_compute(&self) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let mut event: CUevent = std::ptr::null_mut();
+            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuEventCreate failed: {:?}", r));
+            }
+            let r = cuEventRecord(event, self.stream.cu_stream());
+            if r != CUresult::CUDA_SUCCESS {
+                cuEventDestroy_v2(event);
+                return Err(anyhow!("cuEventRecord failed: {:?}", r));
+            }
+            let r = cuStreamWaitEvent(self.copy_stream.cu_stream(), event, 0);
+            cuEventDestroy_v2(event);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record an event on the copy stream and make the compute stream wait for it.
+    ///
+    /// Use after H2D transfer completes to ensure compute kernels see the uploaded data.
+    pub fn compute_waits_for_copy(&self) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let mut event: CUevent = std::ptr::null_mut();
+            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuEventCreate failed: {:?}", r));
+            }
+            let r = cuEventRecord(event, self.copy_stream.cu_stream());
+            if r != CUresult::CUDA_SUCCESS {
+                cuEventDestroy_v2(event);
+                return Err(anyhow!("cuEventRecord failed: {:?}", r));
+            }
+            let r = cuStreamWaitEvent(self.stream.cu_stream(), event, 0);
+            cuEventDestroy_v2(event);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
+            }
+        }
+        Ok(())
     }
 }
 
