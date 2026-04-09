@@ -137,6 +137,29 @@ impl MlxArray {
         &mut self.0 as *mut mlx_array
     }
 
+    // ── mlx_rs bridge (temporary — removed when mlx_rs is fully dropped) ──
+
+    /// Borrow an `mlx_rs::Array` as `&MlxArray` (zero-cost, both are
+    /// `#[repr(transparent)]` over `mlx_sys::mlx_array`).
+    ///
+    /// This is safe because the two types have identical layout and neither
+    /// is mutated through the shared reference.
+    pub fn borrow_from_mlx_rs(arr: &mlx_rs::Array) -> &MlxArray {
+        // SAFETY: Both Array and MlxArray are #[repr(transparent)] over mlx_array.
+        unsafe { &*(arr as *const mlx_rs::Array as *const MlxArray) }
+    }
+
+    /// Convert an owned `MlxArray` into an `mlx_rs::Array` (zero-cost).
+    ///
+    /// Consumes self without running drop, and wraps the raw handle in
+    /// `mlx_rs::Array` which will take over ownership.
+    pub fn into_mlx_rs(self) -> mlx_rs::Array {
+        let raw = self.into_raw();
+        // SAFETY: Both types are #[repr(transparent)] over mlx_array.
+        // into_raw() prevents double-free; mlx_rs::Array now owns the handle.
+        unsafe { std::mem::transmute::<mlx_array, mlx_rs::Array>(raw) }
+    }
+
     // ── Construction ─────────────────────────────────────────────────────
 
     /// Create an array from a raw data pointer (copies the data).
@@ -232,6 +255,26 @@ mlx_binary_op!(add, mlx_add);
 mlx_binary_op!(subtract, mlx_subtract);
 mlx_binary_op!(multiply, mlx_multiply);
 mlx_binary_op!(matmul, mlx_matmul);
+mlx_binary_op!(greater, mlx_greater);
+
+/// Helper: call a unary mlx op, return result.
+macro_rules! mlx_unary_op {
+    ($name:ident, $cfn:ident) => {
+        pub fn $name(a: &MlxArray) -> MlxArray {
+            let mut res = unsafe { mlx_sys::mlx_array_new() };
+            unsafe {
+                mlx_sys::$cfn(&mut res, a.0, default_stream());
+            }
+            MlxArray(res)
+        }
+    };
+}
+
+mlx_unary_op!(exp, mlx_exp);
+mlx_unary_op!(log1p, mlx_log1p);
+mlx_unary_op!(negative, mlx_negative);
+mlx_unary_op!(sqrt, mlx_sqrt);
+mlx_unary_op!(reciprocal, mlx_reciprocal);
 
 pub fn transpose_axes(a: &MlxArray, axes: &[i32]) -> MlxArray {
     let mut res = unsafe { mlx_sys::mlx_array_new() };
@@ -310,6 +353,56 @@ pub fn sigmoid(a: &MlxArray) -> MlxArray {
     let mut res = unsafe { mlx_sys::mlx_array_new() };
     unsafe {
         mlx_sys::mlx_sigmoid(&mut res, a.0, default_stream());
+    }
+    MlxArray(res)
+}
+
+/// SiLU activation: silu(x) = x * sigmoid(x).
+pub fn silu(a: &MlxArray) -> MlxArray {
+    multiply(a, &sigmoid(a))
+}
+
+pub fn sum_axis(a: &MlxArray, axis: i32, keepdims: bool) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_sum_axis(&mut res, a.0, axis as c_int, keepdims, default_stream());
+    }
+    MlxArray(res)
+}
+
+pub fn expand_dims(a: &MlxArray, axis: i32) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_expand_dims(&mut res, a.0, axis as c_int, default_stream());
+    }
+    MlxArray(res)
+}
+
+/// Element-wise conditional: where(mask, a, b) — selects from `a` where mask is true, else `b`.
+pub fn where_(condition: &MlxArray, a: &MlxArray, b: &MlxArray) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_where(&mut res, condition.0, a.0, b.0, default_stream());
+    }
+    MlxArray(res)
+}
+
+/// Multi-axis slice: `a[start[0]:stop[0]:strides[0], start[1]:stop[1]:strides[1], ...]`.
+/// Pass empty strides for default stride of 1.
+pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_slice(
+            &mut res,
+            a.0,
+            start.as_ptr(),
+            start.len(),
+            stop.as_ptr(),
+            stop.len(),
+            strides.as_ptr(),
+            strides.len(),
+            default_stream(),
+        );
     }
     MlxArray(res)
 }

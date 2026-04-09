@@ -1,7 +1,7 @@
 //! Metal inference backend for Apple Silicon.
 //!
-//! Uses [`mlx-rs`](https://crates.io/crates/mlx-rs) (Rust bindings to Apple's
-//! MLX framework) for Metal-accelerated tensor operations.
+//! Uses `crate::mlx` (thin mlx-sys wrappers) for Metal-accelerated tensor
+//! operations.  No mlx-rs dependency.
 //!
 //! # Architecture
 //!
@@ -46,9 +46,11 @@ mod loader;
 #[cfg(feature = "metal")]
 mod qwen35;
 
-// ── mlx-rs types (Metal GPU required) ────────────────────────────────────────
+// ── mlx types (Metal GPU required) ───────────────────────────────────────────
 #[cfg(feature = "metal")]
 use crate::metal_kv_pool::MetalKVPool;
+#[cfg(feature = "metal")]
+use crate::mlx::{Dtype, MlxArray};
 use config::{MetalModelArch, MetalModelConfig, load_metal_config};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
@@ -58,20 +60,18 @@ use loader::{
     tie_lm_head_from_embed_tokens,
 };
 #[cfg(feature = "metal")]
-use mlx_rs::Array;
-#[cfg(feature = "metal")]
 use qwen35::{Qwen35MetalWeights, load_qwen35_metal_weights, metal_generate_qwen35};
 
 // ── Metal C++ fused-ops FFI (compiled from csrc/metal_fused_ops.cpp) ─────────
 //
-// The C ABI uses `mlx_array` (= `{ ctx: *mut c_void }`) by value.  In mlx-rs,
-// `Array` is `#[repr(transparent)]` over `mlx_sys::mlx_array`, so we can pass
-// `Array` directly across the FFI boundary.
+// The C ABI uses `mlx_array` (= `{ ctx: *mut c_void }`) by value.  `MlxArray`
+// is `#[repr(transparent)]` over `mlx_sys::mlx_array`, so we use `as_raw()` /
+// `from_raw()` to cross the FFI boundary.
 //
 // Ownership rule: input arrays are borrowed (C++ holds no extra reference).
 // Output arrays (`*mut mlx_sys::mlx_array` written by C++) transfer ownership
 // to Rust — they must eventually be freed via `mlx_array_free` (happens
-// automatically when the mlx-rs `Array` wrapper is dropped).
+// automatically when `MlxArray` is dropped).
 #[cfg(all(feature = "metal", metal_fused_ops))]
 mod metal_ffi {
     use mlx_sys::mlx_array;
@@ -203,15 +203,15 @@ pub struct MetalBackend {
 /// `Dense(w_t)` stores the **transposed** weight `w.T` — shape `[in, out]`.
 /// Pre-transposed at load time so `linear()` calls `matmul(x, w_t)` directly,
 /// eliminating one `transpose()` view creation per forward-pass call.
-// GPU required: Array is backed by Metal buffers.
+// GPU required: MlxArray is backed by Metal buffers.
 #[cfg(feature = "metal")]
 pub enum WeightTensor {
     /// Pre-transposed weight: shape [in, out] = w.T. Ready for `x @ w_t`.
-    Dense(Array),
+    Dense(MlxArray),
     Quantized {
-        w: Array,
-        scales: Array,
-        biases: Array,
+        w: MlxArray,
+        scales: MlxArray,
+        biases: MlxArray,
         group_size: i32,
         bits: i32,
     },
@@ -221,7 +221,7 @@ pub enum WeightTensor {
 impl WeightTensor {
     /// Returns the element dtype: for Dense the array dtype; for Quantized the scales dtype
     /// (scales hold the dequantization type, e.g. bfloat16).
-    pub fn dtype(&self) -> mlx_rs::Dtype {
+    pub fn dtype(&self) -> Dtype {
         match self {
             WeightTensor::Dense(a) => a.dtype(),
             WeightTensor::Quantized { scales, .. } => scales.dtype(),
@@ -229,7 +229,7 @@ impl WeightTensor {
     }
 
     /// Returns the quantized weight components, or `None` if this is a dense weight.
-    fn quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32)> {
+    fn quantized_parts(&self) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32)> {
         match self {
             WeightTensor::Quantized {
                 w,
@@ -285,14 +285,14 @@ pub enum AttentionInputProjection {
 
 #[cfg(feature = "metal")]
 impl AttentionInputProjection {
-    fn kv_dtype(&self) -> mlx_rs::Dtype {
+    fn kv_dtype(&self) -> Dtype {
         match self {
             Self::Split { k_proj, .. } => k_proj.dtype(),
             Self::MergedQuantized { qkv_proj, .. } => qkv_proj.dtype(),
         }
     }
 
-    fn fused_dense_parts(&self) -> Option<(&Array, &Array, &Array)> {
+    fn fused_dense_parts(&self) -> Option<(&MlxArray, &MlxArray, &MlxArray)> {
         match self {
             Self::Split {
                 q_proj: WeightTensor::Dense(q_proj_t),
@@ -306,7 +306,9 @@ impl AttentionInputProjection {
     /// Returns the merged quantized QKV weight components plus split dimensions,
     /// or `None` if the projection is not `MergedQuantized`.
     #[allow(clippy::type_complexity)]
-    fn fused_quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32, i32)> {
+    fn fused_quantized_parts(
+        &self,
+    ) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32, i32, i32, i32)> {
         match self {
             Self::MergedQuantized {
                 qkv_proj:
@@ -334,35 +336,32 @@ impl AttentionInputProjection {
         }
     }
 
-    fn project(&self, x: &Array) -> Result<(Array, Array, Array)> {
-        use mlx_rs::ops::split_sections;
+    fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray, MlxArray) {
+        use crate::mlx::slice;
 
         match self {
             Self::Split {
                 q_proj,
                 k_proj,
                 v_proj,
-            } => Ok((
-                linear(x, q_proj).context("q_proj")?,
-                linear(x, k_proj).context("k_proj")?,
-                linear(x, v_proj).context("v_proj")?,
-            )),
+            } => (linear(x, q_proj), linear(x, k_proj), linear(x, v_proj)),
             Self::MergedQuantized {
                 qkv_proj,
                 q_dim,
                 k_dim,
                 v_dim,
             } => {
-                let qkv = linear(x, qkv_proj).context("qkv_proj")?;
-                let split_at = [*q_dim, *q_dim + *k_dim];
-                let parts = split_sections(&qkv, &split_at, -1).context("split qkv")?;
-                let [q_raw, k_raw, v_raw] = <[Array; 3]>::try_from(parts).map_err(|parts| {
-                    anyhow::anyhow!("expected 3 qkv splits, got {}", parts.len())
-                })?;
-                debug_assert_eq!(q_raw.shape()[1], *q_dim);
-                debug_assert_eq!(k_raw.shape()[1], *k_dim);
-                debug_assert_eq!(v_raw.shape()[1], *v_dim);
-                Ok((q_raw, k_raw, v_raw))
+                let qkv = linear(x, qkv_proj);
+                let seq = qkv.shape()[0];
+                let q_raw = slice(&qkv, &[0, 0], &[seq, *q_dim], &[1, 1]);
+                let k_raw = slice(&qkv, &[0, *q_dim], &[seq, *q_dim + *k_dim], &[1, 1]);
+                let v_raw = slice(
+                    &qkv,
+                    &[0, *q_dim + *k_dim],
+                    &[seq, *q_dim + *k_dim + *v_dim],
+                    &[1, 1],
+                );
+                (q_raw, k_raw, v_raw)
             }
         }
     }
@@ -386,7 +385,7 @@ pub enum MlpInputProjection {
 
 #[cfg(feature = "metal")]
 impl MlpInputProjection {
-    fn fused_dense_parts(&self) -> Option<(&Array, &Array)> {
+    fn fused_dense_parts(&self) -> Option<(&MlxArray, &MlxArray)> {
         match self {
             Self::Split {
                 gate_proj: WeightTensor::Dense(gate_proj_t),
@@ -399,7 +398,9 @@ impl MlpInputProjection {
     /// Returns the merged quantized gate+up weight components plus split dimensions,
     /// or `None` if the projection is not `MergedQuantized`.
     #[allow(clippy::type_complexity)]
-    fn fused_quantized_parts(&self) -> Option<(&Array, &Array, &Array, i32, i32, i32, i32)> {
+    fn fused_quantized_parts(
+        &self,
+    ) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32, i32, i32)> {
         match self {
             Self::MergedQuantized {
                 gate_up_proj:
@@ -417,42 +418,41 @@ impl MlpInputProjection {
         }
     }
 
-    fn project(&self, x: &Array) -> Result<(Array, Array)> {
-        use mlx_rs::ops::split_sections;
+    fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray) {
+        use crate::mlx::slice;
 
         match self {
-            Self::Split { gate_proj, up_proj } => Ok((
-                linear(x, gate_proj).context("gate_proj")?,
-                linear(x, up_proj).context("up_proj")?,
-            )),
+            Self::Split { gate_proj, up_proj } => (linear(x, gate_proj), linear(x, up_proj)),
             Self::MergedQuantized {
                 gate_up_proj,
                 gate_dim,
                 up_dim,
             } => {
-                let gate_up = linear(x, gate_up_proj).context("gate_up_proj")?;
-                let parts = split_sections(&gate_up, &[*gate_dim], -1).context("split gate_up")?;
-                let [gate_raw, up_raw] = <[Array; 2]>::try_from(parts).map_err(|parts| {
-                    anyhow::anyhow!("expected 2 gate/up splits, got {}", parts.len())
-                })?;
-                debug_assert_eq!(gate_raw.shape()[1], *gate_dim);
-                debug_assert_eq!(up_raw.shape()[1], *up_dim);
-                Ok((gate_raw, up_raw))
+                let gate_up = linear(x, gate_up_proj);
+                let seq = gate_up.shape()[0];
+                let gate_raw = slice(&gate_up, &[0, 0], &[seq, *gate_dim], &[1, 1]);
+                let up_raw = slice(
+                    &gate_up,
+                    &[0, *gate_dim],
+                    &[seq, *gate_dim + *up_dim],
+                    &[1, 1],
+                );
+                (gate_raw, up_raw)
             }
         }
     }
 }
 
 /// Weight tensors loaded from safetensors shards into Metal unified memory.
-// GPU required: all fields are mlx-rs Arrays backed by Metal buffers.
+// GPU required: all fields are MlxArrays backed by Metal buffers.
 #[cfg(feature = "metal")]
 struct StandardMetalWeights {
     /// Token embedding table — shape [vocab_size, hidden_size] (dequantized to float at load).
-    pub embed_tokens: Array,
+    pub embed_tokens: MlxArray,
     /// Per-layer attention + MLP weights.
     pub layers: Vec<StandardMetalLayerWeights>,
     /// Final layer-norm scale — shape [hidden_size].
-    pub norm: Array,
+    pub norm: MlxArray,
     /// Output projection (lm_head) — dense or quantized.
     pub lm_head: WeightTensor,
 }
@@ -464,7 +464,7 @@ enum MetalWeights {
 }
 
 /// Weights for a single transformer layer.
-// GPU required: all fields are mlx-rs Arrays or WeightTensors.
+// GPU required: all fields are MlxArrays or WeightTensors.
 #[cfg(feature = "metal")]
 struct StandardMetalLayerWeights {
     // Self-attention input projections (possibly merged for quantized layers).
@@ -474,11 +474,11 @@ struct StandardMetalLayerWeights {
     pub mlp_inputs: MlpInputProjection,
     pub down_proj: WeightTensor,
     // Per-head QK norms (always float)
-    pub q_norm: Array,
-    pub k_norm: Array,
+    pub q_norm: MlxArray,
+    pub k_norm: MlxArray,
     // Layer norms (always float)
-    pub input_layernorm: Array,
-    pub post_attention_layernorm: Array,
+    pub input_layernorm: MlxArray,
+    pub post_attention_layernorm: MlxArray,
 }
 
 impl MetalBackend {
@@ -649,7 +649,7 @@ impl Default for MetalBackend {
     }
 }
 
-// mlx_rs::Array wraps a *mut c_void (Metal buffer handle). MLX manages its own
+// MlxArray wraps a *mut c_void (Metal buffer handle). MLX manages its own
 // internal locking, so it is safe to send the backend across threads.
 // SAFETY: MetalBackend is used from a single inference thread at a time (the
 // scheduler ensures exclusive access). No concurrent mutation occurs.
@@ -791,7 +791,7 @@ impl StreamingInferenceBackend for MetalBackend {
 /// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
 /// - **P5**: KV cache grows in 256-token chunks; `metal_clear_cache()` every 256 steps.
 /// - **P7**: Fused path keeps all intermediates in C++ scope; Rust holds only
-///   per-layer input/output `Array` handles.
+///   per-layer input/output `MlxArray` handles.
 // P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -867,7 +867,7 @@ fn metal_kv_pool_flag_is_truthy(value: &str) -> bool {
     )
 }
 
-// GPU required: all tensor operations use mlx-rs Arrays on Metal unified memory.
+// GPU required: all tensor operations use MlxArray on Metal unified memory.
 #[cfg(feature = "metal")]
 fn metal_generate(
     input_ids: &[u32],
@@ -878,7 +878,7 @@ fn metal_generate(
     t0: Instant,
     on_token: &mut impl FnMut(u32) -> Result<()>,
 ) -> Result<MetalGenerateOutput> {
-    use mlx_rs::{StreamOrDevice, ops::zeros_dtype_device};
+    use crate::mlx::zeros;
 
     if max_new_tokens == 0 {
         return Ok(MetalGenerateOutput {
@@ -943,14 +943,12 @@ fn metal_generate(
 
     let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
     let cache_shape = [1i32, n_kv_heads, initial_cap, head_dim];
-    let mut k_caches: Vec<Array> = (0..n_layers)
-        .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("pre-alloc k_caches")?;
-    let mut v_caches: Vec<Array> = (0..n_layers)
-        .map(|_| zeros_dtype_device(&cache_shape, kv_dtype, StreamOrDevice::default()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("pre-alloc v_caches")?;
+    let mut k_caches: Vec<MlxArray> = (0..n_layers)
+        .map(|_| zeros(&cache_shape, kv_dtype))
+        .collect();
+    let mut v_caches: Vec<MlxArray> = (0..n_layers)
+        .map(|_| zeros(&cache_shape, kv_dtype))
+        .collect();
     let mut kv_pool = if use_kv_pool {
         let pool_tokens = std::cmp::max(
             initial_cap as usize,
@@ -1009,7 +1007,7 @@ fn metal_generate(
 
     let finish_reason = loop {
         // P6: sync — blocks until GPU computation for this token is complete.
-        let next_token = pending.item::<i32>() as u32;
+        let next_token = pending.item_i32() as u32;
 
         if decode_step == 0 {
             ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1088,46 +1086,50 @@ fn metal_generate(
 }
 
 #[cfg(feature = "metal")]
-fn metal_async_eval(arr: &Array) -> Result<()> {
-    mlx_rs::transforms::async_eval([arr]).context("mlx async_eval")
+fn metal_async_eval(arr: &MlxArray) -> Result<()> {
+    crate::mlx::async_eval(&[arr]);
+    Ok(())
 }
 
 #[cfg(feature = "metal")]
 fn clear_metal_cache() {
-    mlx_rs::transforms::compile::clear_cache();
+    crate::mlx::compile_clear_cache();
 }
 
 #[cfg(feature = "metal")]
-fn extend_kv_cache(cache: &mut Array, n_kv_heads: i32, head_dim: i32, new_cap: i32) -> Result<()> {
-    use mlx_rs::{StreamOrDevice, ops::concatenate_axis, ops::zeros_dtype_device};
+fn extend_kv_cache(
+    cache: &mut MlxArray,
+    n_kv_heads: i32,
+    head_dim: i32,
+    new_cap: i32,
+) -> Result<()> {
+    use crate::mlx::{concatenate_axis, zeros};
 
     let current_cap = cache.shape().get(2).copied().unwrap_or_default();
     if new_cap <= current_cap {
         return Ok(());
     }
 
-    let extra = zeros_dtype_device(
+    let extra = zeros(
         &[1, n_kv_heads, new_cap - current_cap, head_dim],
         cache.dtype(),
-        StreamOrDevice::default(),
-    )
-    .context("allocate Metal KV extension")?;
-    *cache = concatenate_axis(&[cache.clone(), extra], 2).context("extend Metal KV cache")?;
+    );
+    *cache = concatenate_axis(&[cache.clone(), extra], 2);
     Ok(())
 }
 
 /// Build one forward-pass compute graph (lazy — no GPU work until eval/async_eval).
 ///
-/// Returns an unsynchronised token `Array` (greedy argmax or categorical sample).
-/// The caller must `async_eval` or `eval` then call `.item()` to materialise the token.
+/// Returns an unsynchronised token `MlxArray` (greedy argmax or categorical sample).
+/// The caller must `async_eval` or `eval` then call `.item_i32()` to materialise the token.
 // GPU required: all ops register Metal-backed lazy computation nodes.
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments)]
 fn build_forward_graph(
     current_ids: &[u32],
     weights: &StandardMetalWeights,
-    k_caches: &mut [Array],
-    v_caches: &mut [Array],
+    k_caches: &mut [MlxArray],
+    v_caches: &mut [MlxArray],
     cache_len: i32,
     n_heads: i32,
     n_kv_heads: i32,
@@ -1139,8 +1141,8 @@ fn build_forward_graph(
     mut metal_kv_pool: Option<&mut MetalKVPool>,
     request_id: usize,
     params: &SamplingParams,
-) -> Result<Array> {
-    use mlx_rs::{fast, ops::indexing::take_axis};
+) -> Result<MlxArray> {
+    use crate::mlx::{rms_norm, take_axis};
 
     let seq = current_ids.len() as i32;
     if let Some(pool) = metal_kv_pool.as_deref_mut() {
@@ -1150,8 +1152,8 @@ fn build_forward_graph(
 
     // ── Embedding lookup ─────────────────────────────────────────────────────
     let idx_i32: Vec<i32> = current_ids.iter().map(|&t| t as i32).collect();
-    let idx_arr = Array::from_slice(&idx_i32, &[seq]);
-    let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0).context("embedding take_axis")?;
+    let idx_arr = MlxArray::from_slice_i32(&idx_i32, &[seq]);
+    let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0);
 
     // ── Transformer layers ────────────────────────────────────────────────────
     match fused_mode {
@@ -1275,10 +1277,10 @@ fn build_forward_graph(
     }
 
     // ── Final norm + lm_head ─────────────────────────────────────────────────
-    let last_idx = Array::from_slice(&[seq - 1], &[1]);
-    let last_x = take_axis(&x, &last_idx, 0).context("take last hidden")?;
-    let last_x = fast::rms_norm(&last_x, &weights.norm, eps).context("final norm")?;
-    let logits = linear(&last_x, &weights.lm_head)?; // [1, vocab]
+    let last_idx = MlxArray::from_slice_i32(&[seq - 1], &[1]);
+    let last_x = take_axis(&x, &last_idx, 0);
+    let last_x = rms_norm(&last_x, &weights.norm, eps);
+    let logits = linear(&last_x, &weights.lm_head); // [1, vocab]
 
     // P4: GPU-side sampling — stays on GPU, only scalar crosses on .item() later.
     gpu_sample_token(&logits, params)
@@ -1288,17 +1290,17 @@ fn build_forward_graph(
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
-    x: &Array,
+    x: &MlxArray,
     layer: &StandardMetalLayerWeights,
-    q_proj_t: &Array,
-    k_proj_t: &Array,
-    v_proj_t: &Array,
-    o_proj_t: &Array,
-    gate_proj_t: &Array,
-    up_proj_t: &Array,
-    down_proj_t: &Array,
-    k_cache: &mut Array,
-    v_cache: &mut Array,
+    q_proj_t: &MlxArray,
+    k_proj_t: &MlxArray,
+    v_proj_t: &MlxArray,
+    o_proj_t: &MlxArray,
+    gate_proj_t: &MlxArray,
+    up_proj_t: &MlxArray,
+    down_proj_t: &MlxArray,
+    k_cache: &mut MlxArray,
+    v_cache: &mut MlxArray,
     n_heads: i32,
     n_kv_heads: i32,
     head_dim: i32,
@@ -1307,24 +1309,24 @@ fn fused_transformer_layer(
     eps: f32,
     cache_len: i32,
     seq: i32,
-) -> Result<Array> {
+) -> Result<MlxArray> {
     // SAFETY: metal_fused_block_cached borrows all inputs and writes a fresh array into
     // `result_raw`, which is transferred to Rust ownership below.
     let result_raw: mlx_sys::mlx_array = unsafe {
         let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
         metal_ffi::metal_fused_block_cached(
-            x.as_ptr(),
-            layer.input_layernorm.as_ptr(),
-            layer.post_attention_layernorm.as_ptr(),
-            q_proj_t.as_ptr(),
-            k_proj_t.as_ptr(),
-            v_proj_t.as_ptr(),
-            o_proj_t.as_ptr(),
-            layer.q_norm.as_ptr(),
-            layer.k_norm.as_ptr(),
-            gate_proj_t.as_ptr(),
-            up_proj_t.as_ptr(),
-            down_proj_t.as_ptr(),
+            x.as_raw(),
+            layer.input_layernorm.as_raw(),
+            layer.post_attention_layernorm.as_raw(),
+            q_proj_t.as_raw(),
+            k_proj_t.as_raw(),
+            v_proj_t.as_raw(),
+            o_proj_t.as_raw(),
+            layer.q_norm.as_raw(),
+            layer.k_norm.as_raw(),
+            gate_proj_t.as_raw(),
+            up_proj_t.as_raw(),
+            down_proj_t.as_raw(),
             n_heads,
             n_kv_heads,
             head_dim,
@@ -1332,8 +1334,8 @@ fn fused_transformer_layer(
             rope_base,
             head_dim, // rope_dims = head_dim
             eps,
-            std::ptr::from_mut(k_cache).cast::<mlx_sys::mlx_array>(),
-            std::ptr::from_mut(v_cache).cast::<mlx_sys::mlx_array>(),
+            k_cache.as_raw_mut(),
+            v_cache.as_raw_mut(),
             cache_len,
             seq,
             r.as_mut_ptr(),
@@ -1342,23 +1344,23 @@ fn fused_transformer_layer(
     };
 
     // SAFETY: C++ heap-allocated array transferred to Rust ownership.
-    Ok(unsafe { Array::from_ptr(result_raw) })
+    Ok(unsafe { MlxArray::from_raw(result_raw) })
 }
 
 #[cfg(all(feature = "metal", not(metal_fused_ops)))]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
-    _x: &Array,
+    _x: &MlxArray,
     _layer: &StandardMetalLayerWeights,
-    _q_proj_t: &Array,
-    _k_proj_t: &Array,
-    _v_proj_t: &Array,
-    _o_proj_t: &Array,
-    _gate_proj_t: &Array,
-    _up_proj_t: &Array,
-    _down_proj_t: &Array,
-    _k_cache: &mut Array,
-    _v_cache: &mut Array,
+    _q_proj_t: &MlxArray,
+    _k_proj_t: &MlxArray,
+    _v_proj_t: &MlxArray,
+    _o_proj_t: &MlxArray,
+    _gate_proj_t: &MlxArray,
+    _up_proj_t: &MlxArray,
+    _down_proj_t: &MlxArray,
+    _k_cache: &mut MlxArray,
+    _v_cache: &mut MlxArray,
     _n_heads: i32,
     _n_kv_heads: i32,
     _head_dim: i32,
@@ -1367,7 +1369,7 @@ fn fused_transformer_layer(
     _eps: f32,
     _cache_len: i32,
     _seq: i32,
-) -> Result<Array> {
+) -> Result<MlxArray> {
     unreachable!("fused transformer path requires metal_fused_ops")
 }
 
@@ -1379,24 +1381,24 @@ fn fused_transformer_layer(
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_arguments)]
 fn quantized_fused_transformer_layer(
-    x: &Array,
+    x: &MlxArray,
     layer: &StandardMetalLayerWeights,
     // Quantized QKV projection (merged)
-    qkv_w: &Array,
-    qkv_scales: &Array,
-    qkv_biases: &Array,
+    qkv_w: &MlxArray,
+    qkv_scales: &MlxArray,
+    qkv_biases: &MlxArray,
     // Quantized output projection
-    o_w: &Array,
-    o_scales: &Array,
-    o_biases: &Array,
+    o_w: &MlxArray,
+    o_scales: &MlxArray,
+    o_biases: &MlxArray,
     // Quantized gate+up projection (merged)
-    gate_up_w: &Array,
-    gate_up_scales: &Array,
-    gate_up_biases: &Array,
+    gate_up_w: &MlxArray,
+    gate_up_scales: &MlxArray,
+    gate_up_biases: &MlxArray,
     // Quantized down projection
-    down_w: &Array,
-    down_scales: &Array,
-    down_biases: &Array,
+    down_w: &MlxArray,
+    down_scales: &MlxArray,
+    down_biases: &MlxArray,
     // Quantization parameters
     group_size: i32,
     bits: i32,
@@ -1407,8 +1409,8 @@ fn quantized_fused_transformer_layer(
     gate_dim: i32,
     up_dim: i32,
     // KV cache
-    k_cache: &mut Array,
-    v_cache: &mut Array,
+    k_cache: &mut MlxArray,
+    v_cache: &mut MlxArray,
     // Attention hyper-params
     n_heads: i32,
     n_kv_heads: i32,
@@ -1418,29 +1420,29 @@ fn quantized_fused_transformer_layer(
     eps: f32,
     cache_len: i32,
     seq: i32,
-) -> Result<Array> {
+) -> Result<MlxArray> {
     // SAFETY: metal_quantized_fused_block_cached borrows all inputs and writes a
     // fresh array into `result_raw`, which is transferred to Rust ownership below.
     let result_raw: mlx_sys::mlx_array = unsafe {
         let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
         metal_ffi::metal_quantized_fused_block_cached(
-            x.as_ptr(),
-            layer.input_layernorm.as_ptr(),
-            layer.post_attention_layernorm.as_ptr(),
-            qkv_w.as_ptr(),
-            qkv_scales.as_ptr(),
-            qkv_biases.as_ptr(),
-            o_w.as_ptr(),
-            o_scales.as_ptr(),
-            o_biases.as_ptr(),
-            layer.q_norm.as_ptr(),
-            layer.k_norm.as_ptr(),
-            gate_up_w.as_ptr(),
-            gate_up_scales.as_ptr(),
-            gate_up_biases.as_ptr(),
-            down_w.as_ptr(),
-            down_scales.as_ptr(),
-            down_biases.as_ptr(),
+            x.as_raw(),
+            layer.input_layernorm.as_raw(),
+            layer.post_attention_layernorm.as_raw(),
+            qkv_w.as_raw(),
+            qkv_scales.as_raw(),
+            qkv_biases.as_raw(),
+            o_w.as_raw(),
+            o_scales.as_raw(),
+            o_biases.as_raw(),
+            layer.q_norm.as_raw(),
+            layer.k_norm.as_raw(),
+            gate_up_w.as_raw(),
+            gate_up_scales.as_raw(),
+            gate_up_biases.as_raw(),
+            down_w.as_raw(),
+            down_scales.as_raw(),
+            down_biases.as_raw(),
             group_size,
             bits,
             q_dim,
@@ -1455,8 +1457,8 @@ fn quantized_fused_transformer_layer(
             rope_base,
             head_dim, // rope_dims = head_dim
             eps,
-            std::ptr::from_mut(k_cache).cast::<mlx_sys::mlx_array>(),
-            std::ptr::from_mut(v_cache).cast::<mlx_sys::mlx_array>(),
+            k_cache.as_raw_mut(),
+            v_cache.as_raw_mut(),
             cache_len,
             seq,
             r.as_mut_ptr(),
@@ -1465,26 +1467,26 @@ fn quantized_fused_transformer_layer(
     };
 
     // SAFETY: C++ heap-allocated array transferred to Rust ownership.
-    Ok(unsafe { Array::from_ptr(result_raw) })
+    Ok(unsafe { MlxArray::from_raw(result_raw) })
 }
 
 #[cfg(all(feature = "metal", not(metal_fused_ops)))]
 #[allow(clippy::too_many_arguments)]
 fn quantized_fused_transformer_layer(
-    _x: &Array,
+    _x: &MlxArray,
     _layer: &StandardMetalLayerWeights,
-    _qkv_w: &Array,
-    _qkv_scales: &Array,
-    _qkv_biases: &Array,
-    _o_w: &Array,
-    _o_scales: &Array,
-    _o_biases: &Array,
-    _gate_up_w: &Array,
-    _gate_up_scales: &Array,
-    _gate_up_biases: &Array,
-    _down_w: &Array,
-    _down_scales: &Array,
-    _down_biases: &Array,
+    _qkv_w: &MlxArray,
+    _qkv_scales: &MlxArray,
+    _qkv_biases: &MlxArray,
+    _o_w: &MlxArray,
+    _o_scales: &MlxArray,
+    _o_biases: &MlxArray,
+    _gate_up_w: &MlxArray,
+    _gate_up_scales: &MlxArray,
+    _gate_up_biases: &MlxArray,
+    _down_w: &MlxArray,
+    _down_scales: &MlxArray,
+    _down_biases: &MlxArray,
     _group_size: i32,
     _bits: i32,
     _q_dim: i32,
@@ -1492,8 +1494,8 @@ fn quantized_fused_transformer_layer(
     _v_dim: i32,
     _gate_dim: i32,
     _up_dim: i32,
-    _k_cache: &mut Array,
-    _v_cache: &mut Array,
+    _k_cache: &mut MlxArray,
+    _v_cache: &mut MlxArray,
     _n_heads: i32,
     _n_kv_heads: i32,
     _head_dim: i32,
@@ -1502,7 +1504,7 @@ fn quantized_fused_transformer_layer(
     _eps: f32,
     _cache_len: i32,
     _seq: i32,
-) -> Result<Array> {
+) -> Result<MlxArray> {
     unreachable!("quantized fused transformer path requires metal_fused_ops")
 }
 
@@ -1511,11 +1513,11 @@ fn quantized_fused_transformer_layer(
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn rust_transformer_layer(
-    x: Array,
+    x: MlxArray,
     layer: &StandardMetalLayerWeights,
     li: usize,
-    k_caches: &mut [Array],
-    v_caches: &mut [Array],
+    k_caches: &mut [MlxArray],
+    v_caches: &mut [MlxArray],
     seq: i32,
     cache_len: i32,
     n_heads: i32,
@@ -1526,123 +1528,121 @@ fn rust_transformer_layer(
     eps: f32,
     mut metal_kv_pool: Option<&mut MetalKVPool>,
     request_id: usize,
-) -> Result<Array> {
-    use mlx_rs::{
-        fast,
-        nn::silu,
-        ops::indexing::{TryIndexMutOp, TryIndexOp},
-        ops::{self, reshape, transpose_axes},
+) -> Result<MlxArray> {
+    use crate::mlx::{
+        add, multiply, reshape, rms_norm, rope, scaled_dot_product_attention, silu, slice,
+        slice_update, transpose_axes,
     };
 
     // 1. Input norm + residual
     let residual = x.clone();
-    let x = fast::rms_norm(&x, &layer.input_layernorm, eps).context("input_layernorm")?;
+    let x = rms_norm(&x, &layer.input_layernorm, eps);
 
     // 2. QKV projections
-    let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x)?;
+    let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x);
 
     // 3+4+5+6. Reshape → per-head norm → transpose → RoPE.
     //
-    // fast::rope expects (B, *, T, D) where T is the second-to-last dim (sequence axis).
+    // rope expects (B, *, T, D) where T is the second-to-last dim (sequence axis).
     // Transpose to [1, n_heads, seq, d] BEFORE rope so T = seq (correct positions).
-    // Previous order (rope on [1, seq, n_heads, d]) used T = n_heads — wrong semantics.
-    // This also removes 2 extra reshapes per q/k vs the old apply_head_norm path.
-    let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]).context("reshape q")?;
-    let q = fast::rms_norm(&q, &layer.q_norm, eps).context("q_norm")?;
-    let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?; // [1, n_heads, seq, d]
-    let q =
-        fast::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope q")?;
+    let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]);
+    let q = rms_norm(&q, &layer.q_norm, eps);
+    let q = transpose_axes(&q, &[0, 2, 1, 3]); // [1, n_heads, seq, d]
+    let q = rope(&q, head_dim, false, rope_base, 1.0f32, cache_len);
 
-    let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape k")?;
-    let k = fast::rms_norm(&k, &layer.k_norm, eps).context("k_norm")?;
-    let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?; // [1, n_kv, seq, d]
-    let k =
-        fast::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len, None).context("rope k")?;
+    let k = reshape(&k_raw, &[1, seq, n_kv_heads, head_dim]);
+    let k = rms_norm(&k, &layer.k_norm, eps);
+    let k = transpose_axes(&k, &[0, 2, 1, 3]); // [1, n_kv, seq, d]
+    let k = rope(&k, head_dim, false, rope_base, 1.0f32, cache_len);
 
-    let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]).context("reshape v")?;
-    let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?; // [1, n_kv, seq, d]
+    let v = reshape(&v_raw, &[1, seq, n_kv_heads, head_dim]);
+    let v = transpose_axes(&v, &[0, 2, 1, 3]); // [1, n_kv, seq, d]
 
     // 7. KV cache update
     let (k_full, v_full) = if let Some(pool) = metal_kv_pool.as_deref_mut() {
-        let k_rows = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k rows")?;
-        let k_rows = reshape(&k_rows, &[seq, n_kv_heads * head_dim]).context("reshape k rows")?;
-        let v_rows = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v rows")?;
-        let v_rows = reshape(&v_rows, &[seq, n_kv_heads * head_dim]).context("reshape v rows")?;
+        let k_rows = transpose_axes(&k, &[0, 2, 1, 3]);
+        let k_rows = reshape(&k_rows, &[seq, n_kv_heads * head_dim]);
+        let v_rows = transpose_axes(&v, &[0, 2, 1, 3]);
+        let v_rows = reshape(&v_rows, &[seq, n_kv_heads * head_dim]);
         pool.write_kv(li, request_id, &k_rows, &v_rows)
             .context("write MetalKVPool")?;
         pool.gather_kv(li, request_id)
             .context("gather MetalKVPool")?
     } else {
         let end_pos = cache_len + seq;
-        k_caches[li]
-            .try_index_mut((.., .., cache_len..end_pos, ..), &k)
-            .context("slice_update k_cache")?;
-        v_caches[li]
-            .try_index_mut((.., .., cache_len..end_pos, ..), &v)
-            .context("slice_update v_cache")?;
-        let k_full = k_caches[li]
-            .try_index((.., .., 0i32..end_pos, ..))
-            .context("slice k_cache")?;
-        let v_full = v_caches[li]
-            .try_index((.., .., 0i32..end_pos, ..))
-            .context("slice v_cache")?;
+        // slice_update k_cache: write k into cache[.., .., cache_len..end_pos, ..]
+        k_caches[li] = slice_update(
+            &mut k_caches[li],
+            &k,
+            &[0, 0, cache_len, 0],
+            &[1, n_kv_heads, end_pos, head_dim],
+        );
+        // slice_update v_cache: write v into cache[.., .., cache_len..end_pos, ..]
+        v_caches[li] = slice_update(
+            &mut v_caches[li],
+            &v,
+            &[0, 0, cache_len, 0],
+            &[1, n_kv_heads, end_pos, head_dim],
+        );
+        // Read back the full KV sequence
+        let k_full = slice(
+            &k_caches[li],
+            &[0, 0, 0, 0],
+            &[1, n_kv_heads, end_pos, head_dim],
+            &[1, 1, 1, 1],
+        );
+        let v_full = slice(
+            &v_caches[li],
+            &[0, 0, 0, 0],
+            &[1, n_kv_heads, end_pos, head_dim],
+            &[1, 1, 1, 1],
+        );
         (k_full, v_full)
     };
 
     // 8. Attention
     let use_causal = cache_len == 0 && seq > 1;
-    let mask_arg = if use_causal {
-        Some(fast::ScaledDotProductAttentionMask::Causal)
-    } else {
-        None
-    };
-    let attn_out = fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg)
-        .context("sdpa")?;
+    let mask_arg = if use_causal { Some("causal") } else { None };
+    let attn_out = scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, mask_arg);
 
     // 9. Reshape + output proj + residual
-    let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
-    let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim]).context("reshape attn_out")?;
-    let attn_out = linear(&attn_out, &layer.o_proj)?;
-    let x = ops::add(&residual, &attn_out).context("residual + attn")?;
+    let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
+    let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim]);
+    let attn_out = linear(&attn_out, &layer.o_proj);
+    let x = add(&residual, &attn_out);
 
     // 10. MLP
     let residual2 = x.clone();
-    let xn =
-        fast::rms_norm(&x, &layer.post_attention_layernorm, eps).context("post_attn_layernorm")?;
-    let (gate_raw, up) = layer.mlp_inputs.project(&xn)?;
-    let gate = silu(&gate_raw).context("silu gate")?;
-    let mlp = linear(
-        &ops::multiply(&gate, &up).context("gate*up")?,
-        &layer.down_proj,
-    )?;
-    ops::add(&residual2, &mlp).context("residual + mlp")
+    let xn = rms_norm(&x, &layer.post_attention_layernorm, eps);
+    let (gate_raw, up) = layer.mlp_inputs.project(&xn);
+    let gate = silu(&gate_raw);
+    let mlp = linear(&multiply(&gate, &up), &layer.down_proj);
+    Ok(add(&residual2, &mlp))
 }
 
 /// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
 #[cfg(feature = "metal")]
-fn gpu_sample_token(logits: &Array, params: &SamplingParams) -> Result<Array> {
-    use mlx_rs::ops::multiply;
-
+fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
     let temp = params.temperature;
 
     if temp <= 1e-6 {
-        return greedy_sample_token(logits);
+        return Ok(greedy_sample_token(logits));
     }
 
     // Temperature scaling then GPU categorical sample.
-    let inv_t: Array = (1.0f32 / temp).into();
-    let scaled = multiply(logits, &inv_t).context("temp scale")?;
-    categorical_sample_token(&scaled)
+    let inv_t = MlxArray::scalar_f32(1.0f32 / temp);
+    let scaled = crate::mlx::multiply(logits, &inv_t);
+    Ok(categorical_sample_token(&scaled))
 }
 
 #[cfg(feature = "metal")]
-fn greedy_sample_token(logits: &Array) -> Result<Array> {
-    mlx_rs::ops::indexing::argmax(logits, None).context("mlx argmax")
+fn greedy_sample_token(logits: &MlxArray) -> MlxArray {
+    crate::mlx::argmax(logits)
 }
 
 #[cfg(feature = "metal")]
-fn categorical_sample_token(logits: &Array) -> Result<Array> {
-    mlx_rs::random::categorical(logits, None, None, None::<&Array>).context("mlx categorical")
+fn categorical_sample_token(logits: &MlxArray) -> MlxArray {
+    crate::mlx::categorical(logits)
 }
 
 /// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.
@@ -1651,11 +1651,11 @@ fn categorical_sample_token(logits: &Array) -> Result<Array> {
 /// so this is just `matmul(x, w_t)` without an extra transpose.
 #[cfg(feature = "metal")]
 #[inline]
-fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
+fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
     match weight {
         WeightTensor::Dense(w_t) => {
             // w_t is pre-transposed [in, out]; direct matmul, no per-call transpose.
-            mlx_rs::ops::matmul(x, w_t).context("matmul")
+            crate::mlx::matmul(x, w_t)
         }
         WeightTensor::Quantized {
             w,
@@ -1665,23 +1665,14 @@ fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
             bits,
         } => {
             // w stored as [out, in] packed uint32; transpose=true → x @ w.T
-            mlx_rs::ops::quantized_matmul(
-                x,
-                w,
-                scales,
-                biases,
-                Some(true),
-                Some(*group_size),
-                Some(*bits),
-            )
-            .context("quantized_matmul")
+            crate::mlx::quantized_matmul(x, w, scales, biases, true, *group_size, *bits)
         }
     }
 }
 
 #[cfg(feature = "metal")]
 fn merge_quantized_projection_rows(weights: &[&WeightTensor]) -> Result<Option<WeightTensor>> {
-    use mlx_rs::{ops::concatenate_axis, transforms::eval};
+    use crate::mlx::{concatenate_axis, eval};
 
     if weights.is_empty() {
         return Ok(None);
@@ -1782,10 +1773,10 @@ fn merge_quantized_projection_rows(weights: &[&WeightTensor]) -> Result<Option<W
         biases.push(bias.clone());
     }
 
-    let merged_w = concatenate_axis(&ws, 0).context("concat quantized rows")?;
-    let merged_scales = concatenate_axis(&scales, 0).context("concat quantized scales")?;
-    let merged_biases = concatenate_axis(&biases, 0).context("concat quantized biases")?;
-    eval([&merged_w, &merged_scales, &merged_biases]).context("eval merged quantized rows")?;
+    let merged_w = concatenate_axis(&ws, 0);
+    let merged_scales = concatenate_axis(&scales, 0);
+    let merged_biases = concatenate_axis(&biases, 0);
+    eval(&[&merged_w, &merged_scales, &merged_biases]);
 
     Ok(Some(WeightTensor::Quantized {
         w: merged_w,
@@ -1798,8 +1789,8 @@ fn merge_quantized_projection_rows(weights: &[&WeightTensor]) -> Result<Option<W
 
 // ── Weight loading (Metal GPU required) ───────────────────────────────────────
 
-/// Load safetensors shards into Metal unified memory via mlx-rs.
-// GPU required: Array is backed by Metal buffers.
+/// Load safetensors shards into Metal unified memory.
+// GPU required: MlxArray is backed by Metal buffers.
 #[cfg(feature = "metal")]
 fn load_qwen3_metal_weights(
     model_dir: &Path,

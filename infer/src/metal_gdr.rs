@@ -20,9 +20,7 @@
 //! Gated behind `#[cfg(feature = "metal")]` — only compiled on Metal builds.
 
 #[cfg(feature = "metal")]
-use anyhow::{Context, Result};
-#[cfg(feature = "metal")]
-use mlx_rs::Array;
+use crate::mlx::MlxArray;
 
 #[cfg(feature = "metal")]
 use crate::metal_backend::WeightTensor;
@@ -96,13 +94,13 @@ pub struct MetalLinearAttnWeights {
     /// Alpha (decay) projection: [num_value_heads, hidden_size].
     pub in_proj_alpha: WeightTensor,
     /// Depthwise conv1d weight: [qkv_dim, kernel_size] f32.
-    pub conv1d_weight: Array,
+    pub conv1d_weight: MlxArray,
     /// Per-head dt bias: [num_value_heads] f32.
-    pub dt_bias: Array,
+    pub dt_bias: MlxArray,
     /// Per-head log-decay: [num_value_heads] f32.
-    pub a_log: Array,
+    pub a_log: MlxArray,
     /// RMSNorm weight (per head_dim, broadcast across heads): [value_dim] f32.
-    pub norm_weight: Array,
+    pub norm_weight: MlxArray,
     /// Output projection: [hidden_size, z_dim].
     pub out_proj: WeightTensor,
 }
@@ -117,9 +115,9 @@ pub struct MetalLinearAttnWeights {
 #[cfg(feature = "metal")]
 pub struct MetalRecurrentState {
     /// Per-layer recurrent state: [num_value_heads, key_dim, val_dim] f32.
-    pub states: Vec<Array>,
+    pub states: Vec<MlxArray>,
     /// Per-layer conv1d rolling buffer: [qkv_dim, conv_kernel - 1] f32.
-    pub conv_states: Vec<Array>,
+    pub conv_states: Vec<MlxArray>,
     /// Number of tokens processed so far.
     pub seq_len: usize,
 }
@@ -133,7 +131,7 @@ impl MetalRecurrentState {
 
         for _ in 0..num_linear_layers {
             // Recurrent state: [num_value_heads, key_dim, val_dim] f32
-            states.push(Array::from_slice(
+            states.push(MlxArray::from_slice_f32(
                 &vec![0.0f32; config.num_value_heads * config.key_dim * config.value_dim],
                 &[
                     config.num_value_heads as i32,
@@ -144,7 +142,7 @@ impl MetalRecurrentState {
 
             // Conv state: [qkv_dim, conv_kernel - 1] f32
             let conv_state_width = config.conv_kernel - 1;
-            conv_states.push(Array::from_slice(
+            conv_states.push(MlxArray::from_slice_f32(
                 &vec![0.0f32; config.qkv_dim() * conv_state_width],
                 &[config.qkv_dim() as i32, conv_state_width as i32],
             ));
@@ -170,25 +168,17 @@ impl MetalRecurrentState {
 /// Same as `metal_backend::linear` but avoids cross-module visibility issues.
 #[cfg(feature = "metal")]
 #[inline]
-fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
+fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
+    use crate::mlx::{matmul, quantized_matmul};
     match weight {
-        WeightTensor::Dense(w_t) => mlx_rs::ops::matmul(x, w_t).context("matmul"),
+        WeightTensor::Dense(w_t) => matmul(x, w_t),
         WeightTensor::Quantized {
             w,
             scales,
             biases,
             group_size,
             bits,
-        } => mlx_rs::ops::quantized_matmul(
-            x,
-            w,
-            scales,
-            biases,
-            Some(true),
-            Some(*group_size),
-            Some(*bits),
-        )
-        .context("quantized_matmul"),
+        } => quantized_matmul(x, w, scales, biases, true, *group_size, *bits),
     }
 }
 
@@ -196,24 +186,17 @@ fn linear(x: &Array, weight: &WeightTensor) -> Result<Array> {
 
 /// RMS-normalize along the last axis, matching `mx.fast.rms_norm(x, None, eps)`.
 #[cfg(feature = "metal")]
-fn rms_normalize(x: &Array, eps: f32) -> Result<Array> {
-    let last_dim = x
-        .shape()
-        .last()
-        .copied()
-        .context("rms_normalize missing last dimension")? as f32;
-    let inv_dim = Array::from_slice(&[1.0f32 / last_dim], &[1]);
-    let eps_arr = Array::from_slice(&[eps], &[1]);
-    let sq = mlx_rs::ops::multiply(x, x).context("l2 sq")?;
-    let sum_sq = sq.sum_axis(-1, true).context("l2 sum")?;
-    let mean_sq = mlx_rs::ops::multiply(&sum_sq, &inv_dim).context("rms mean")?;
-    let inv_norm = mlx_rs::ops::add(&mean_sq, &eps_arr)
-        .context("rms add eps")?
-        .sqrt()
-        .context("rms sqrt")?
-        .reciprocal()
-        .context("rms reciprocal")?;
-    mlx_rs::ops::multiply(x, &inv_norm).context("rms mul")
+fn rms_normalize(x: &MlxArray, eps: f32) -> MlxArray {
+    use crate::mlx::{add, multiply, reciprocal, sqrt, sum_axis};
+
+    let last_dim = *x.shape().last().expect("rms_normalize: empty shape") as f32;
+    let inv_dim = MlxArray::from_slice_f32(&[1.0f32 / last_dim], &[1]);
+    let eps_arr = MlxArray::from_slice_f32(&[eps], &[1]);
+    let sq = multiply(x, x);
+    let sum_sq = sum_axis(&sq, -1, true);
+    let mean_sq = multiply(&sum_sq, &inv_dim);
+    let inv_norm = reciprocal(&sqrt(&add(&mean_sq, &eps_arr)));
+    multiply(x, &inv_norm)
 }
 
 // ── Helper: softplus ─────────────────────────────────────────────────────────
@@ -222,12 +205,14 @@ fn rms_normalize(x: &Array, eps: f32) -> Result<Array> {
 /// For large x (> 20), exp(x) overflows — return x directly (the CUDA kernel
 /// uses the same threshold). Implements: where(x > 20, x, log1p(exp(x))).
 #[cfg(feature = "metal")]
-fn softplus(x: &Array) -> Result<Array> {
-    let threshold = Array::from_slice(&[20.0f32], &[1]);
-    let mask = x.gt(&threshold).context("softplus mask")?;
-    let exp_x = x.exp().context("softplus exp")?;
-    let log1p_exp = exp_x.log1p().context("softplus log1p")?;
-    mlx_rs::ops::r#where(&mask, x, &log1p_exp).context("softplus where")
+fn softplus(x: &MlxArray) -> MlxArray {
+    use crate::mlx::{exp, greater, log1p, where_};
+
+    let threshold = MlxArray::from_slice_f32(&[20.0f32], &[1]);
+    let mask = greater(x, &threshold);
+    let exp_x = exp(x);
+    let log1p_exp = log1p(&exp_x);
+    where_(&mask, x, &log1p_exp)
 }
 
 // ── Conv1d single-step ───────────────────────────────────────────────────────
@@ -245,49 +230,45 @@ fn softplus(x: &Array) -> Result<Array> {
 /// - [qkv_dim] convolved output with SiLU activation (f32)
 #[cfg(feature = "metal")]
 fn conv1d_step(
-    x: &Array,
-    conv_state: &mut Array,
-    kernel: &Array,
+    x: &MlxArray,
+    conv_state: &mut MlxArray,
+    kernel: &MlxArray,
     qkv_dim: usize,
     kernel_size: usize,
-) -> Result<Array> {
+) -> MlxArray {
+    use crate::mlx::{Dtype, as_dtype, concatenate_axis, multiply, reshape, silu, slice, sum_axis};
+
     // conv_state is [qkv_dim, kernel-1], x is [qkv_dim]
     // We need to form [qkv_dim, kernel_size] by concatenating [conv_state, x_col]
-    let x_col = x
-        .reshape(&[qkv_dim as i32, 1])
-        .context("conv1d reshape x")?;
+    let x_col = reshape(x, &[qkv_dim as i32, 1]);
 
     // full_window = [conv_state | x_col] → [qkv_dim, kernel_size]
-    let full_window =
-        mlx_rs::ops::concatenate_axis(&[conv_state.clone(), x_col], 1).context("conv1d concat")?;
+    let full_window = concatenate_axis(&[conv_state.clone(), x_col], 1);
 
     // Element-wise multiply by kernel weights, sum along time axis
-    let prod = mlx_rs::ops::multiply(&full_window, kernel).context("conv1d mul")?;
-    let conv_out = prod.sum_axis(1, None).context("conv1d sum")?; // [qkv_dim]
+    let prod = multiply(&full_window, kernel);
+    let conv_out = sum_axis(&prod, 1, false); // [qkv_dim]
 
     // Match CUDA: conv sum is truncated to bf16 before SiLU, and the SiLU output
     // is also stored as bf16 before the next stage consumes it.
-    let conv_out = conv_out
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("conv1d sum to bf16")?;
-    let activated = mlx_rs::nn::silu(&conv_out).context("conv1d silu")?;
-    let activated = activated
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("conv1d silu to bf16")?
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .context("conv1d silu back to f32")?;
+    let conv_out = as_dtype(&conv_out, Dtype::Bfloat16);
+    let activated = silu(&conv_out);
+    let activated = as_dtype(&as_dtype(&activated, Dtype::Bfloat16), Dtype::Float32);
 
     // Update conv_state: shift left, drop oldest column, append x
     // New state = full_window[:, 1:] = columns [1..kernel_size] of full_window
+    // slice(full_window, [0, 1], [qkv_dim, kernel_size], [1, 1])
     let state_width = (kernel_size - 1) as i32;
     if state_width > 0 {
-        use mlx_rs::ops::indexing::TryIndexOp;
-        *conv_state = full_window
-            .try_index((.., 1i32..kernel_size as i32))
-            .context("conv1d state update")?;
+        *conv_state = slice(
+            &full_window,
+            &[0, 1],
+            &[qkv_dim as i32, kernel_size as i32],
+            &[1, 1],
+        );
     }
 
-    Ok(activated)
+    activated
 }
 
 // ── GDR decode step ──────────────────────────────────────────────────────────
@@ -308,13 +289,16 @@ fn conv1d_step(
 /// - [1, hidden_size] output hidden state (after output projection)
 #[cfg(feature = "metal")]
 pub fn metal_gdr_decode_step(
-    x: &Array,
+    x: &MlxArray,
     layer_weights: &MetalLinearAttnWeights,
     state: &mut MetalRecurrentState,
     layer_idx: usize,
     config: &MetalGdrConfig,
-) -> Result<Array> {
-    use mlx_rs::ops;
+) -> MlxArray {
+    use crate::mlx::{
+        Dtype, add, as_dtype, broadcast_to, exp, expand_dims, multiply, negative, reshape,
+        rms_norm, sigmoid, silu, slice, subtract, sum_axis,
+    };
 
     let num_key_heads = config.num_key_heads;
     let key_dim = config.key_dim;
@@ -326,41 +310,32 @@ pub fn metal_gdr_decode_step(
 
     // ── 1. Projections ───────────────────────────────────────────────────
     // x: [1, hidden_size] → flat [hidden_size] for projections
-    let x_flat = x
-        .reshape(&[1, config.hidden_size as i32])
-        .context("reshape x")?;
+    let x_flat = reshape(x, &[1, config.hidden_size as i32]);
 
     // QKV projection: [1, qkv_dim]
-    let qkv_raw = linear(&x_flat, &layer_weights.in_proj_qkv)
-        .context("in_proj_qkv")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("in_proj_qkv to bf16")?;
+    let qkv_raw = as_dtype(
+        &linear(&x_flat, &layer_weights.in_proj_qkv),
+        Dtype::Bfloat16,
+    );
     // Z projection (output gate): [1, z_dim]
-    let z = linear(&x_flat, &layer_weights.in_proj_z)
-        .context("in_proj_z")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("in_proj_z to bf16")?;
+    let z = as_dtype(&linear(&x_flat, &layer_weights.in_proj_z), Dtype::Bfloat16);
     // Beta projection (learning rate): [1, num_value_heads]
-    let beta_raw = linear(&x_flat, &layer_weights.in_proj_beta)
-        .context("in_proj_beta")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("in_proj_beta to bf16")?;
+    let beta_raw = as_dtype(
+        &linear(&x_flat, &layer_weights.in_proj_beta),
+        Dtype::Bfloat16,
+    );
     // Alpha projection (decay): [1, num_value_heads]
-    let alpha_raw = linear(&x_flat, &layer_weights.in_proj_alpha)
-        .context("in_proj_alpha")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("in_proj_alpha to bf16")?;
+    let alpha_raw = as_dtype(
+        &linear(&x_flat, &layer_weights.in_proj_alpha),
+        Dtype::Bfloat16,
+    );
 
     // Flatten to 1D for per-element ops
-    let qkv_1d = qkv_raw
-        .reshape(&[config.qkv_dim() as i32])
-        .context("flatten qkv")?;
+    let qkv_1d = reshape(&qkv_raw, &[config.qkv_dim() as i32]);
 
     // ── 2. Conv1d step ───────────────────────────────────────────────────
     // Cast qkv to f32 for conv1d (state is f32)
-    let qkv_f32 = qkv_1d
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .context("qkv to f32")?;
+    let qkv_f32 = as_dtype(&qkv_1d, Dtype::Float32);
 
     let qkv_conv = conv1d_step(
         &qkv_f32,
@@ -368,52 +343,43 @@ pub fn metal_gdr_decode_step(
         &layer_weights.conv1d_weight,
         config.qkv_dim(),
         config.conv_kernel,
-    )
-    .context("conv1d_step")?;
+    );
 
     // ── 3. Split QKV and RMS-normalize q, k ──────────────────────────────
     // qkv_conv: [qkv_dim] → split into q [q_dim], k [k_dim], v [v_dim]
-    use mlx_rs::ops::indexing::TryIndexOp;
-    let q_raw = qkv_conv.try_index(0i32..q_dim as i32).context("split q")?;
-    let k_raw = qkv_conv
-        .try_index(q_dim as i32..(q_dim + k_dim) as i32)
-        .context("split k")?;
-    let v_raw = qkv_conv
-        .try_index((q_dim + k_dim) as i32..(q_dim + k_dim + v_dim) as i32)
-        .context("split v")?;
+    let q_raw = slice(&qkv_conv, &[0], &[q_dim as i32], &[1]);
+    let k_raw = slice(&qkv_conv, &[q_dim as i32], &[(q_dim + k_dim) as i32], &[1]);
+    let v_raw = slice(
+        &qkv_conv,
+        &[(q_dim + k_dim) as i32],
+        &[(q_dim + k_dim + v_dim) as i32],
+        &[1],
+    );
 
     // MLX normalizes q/k per key head, not across the concatenated q_dim.
-    let q_per_key_head = q_raw
-        .reshape(&[num_key_heads as i32, key_dim as i32])
-        .context("reshape q per key head")?;
-    let k_per_key_head = k_raw
-        .reshape(&[num_key_heads as i32, key_dim as i32])
-        .context("reshape k per key head")?;
-    let q_norm = rms_normalize(&q_per_key_head, 1e-6).context("rms norm q per head")?;
-    let k_norm = rms_normalize(&k_per_key_head, 1e-6).context("rms norm k per head")?;
+    let q_per_key_head = reshape(&q_raw, &[num_key_heads as i32, key_dim as i32]);
+    let k_per_key_head = reshape(&k_raw, &[num_key_heads as i32, key_dim as i32]);
+    let q_norm = rms_normalize(&q_per_key_head, 1e-6);
+    let k_norm = rms_normalize(&k_per_key_head, 1e-6);
 
     // Match mlx_lm:
     //   q = (inv_scale**2) * rms_norm(q, None, 1e-6)
     //   k = inv_scale * rms_norm(k, None, 1e-6)
     let inv_scale = 1.0 / (key_dim as f32).sqrt();
     let q_scale = inv_scale * inv_scale;
-    let q_scaled =
-        ops::multiply(&q_norm, &Array::from_slice(&[q_scale], &[1])).context("scale q")?;
-    let k_scaled =
-        ops::multiply(&k_norm, &Array::from_slice(&[inv_scale], &[1])).context("scale k")?;
+    let q_scaled = multiply(&q_norm, &MlxArray::from_slice_f32(&[q_scale], &[1]));
+    let k_scaled = multiply(&k_norm, &MlxArray::from_slice_f32(&[inv_scale], &[1]));
 
     // ── 4. Compute gate (g) and beta ─────────────────────────────────────
     // Flatten alpha and beta to [num_value_heads]
-    let alpha_1d = alpha_raw
-        .reshape(&[num_value_heads as i32])
-        .context("flatten alpha")?
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .context("alpha to f32")?;
-    let beta_1d = beta_raw
-        .reshape(&[num_value_heads as i32])
-        .context("flatten beta")?
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .context("beta to f32")?;
+    let alpha_1d = as_dtype(
+        &reshape(&alpha_raw, &[num_value_heads as i32]),
+        Dtype::Float32,
+    );
+    let beta_1d = as_dtype(
+        &reshape(&beta_raw, &[num_value_heads as i32]),
+        Dtype::Float32,
+    );
 
     // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
     // From CUDA kernel:
@@ -421,15 +387,15 @@ pub fn metal_gdr_decode_step(
     //   float softplus_x = (x > 20.0f) ? x : logf(1.0f + expf(x));
     //   float g = -expf(a_log) * softplus_x;
     //   s_exp_g = expf(g);
-    let alpha_plus_bias = ops::add(&alpha_1d, &layer_weights.dt_bias).context("alpha + dt_bias")?;
-    let sp = softplus(&alpha_plus_bias).context("softplus")?;
-    let a_exp = layer_weights.a_log.exp().context("exp(A_log)")?;
-    let neg_a_exp = a_exp.negative().context("neg exp(A_log)")?;
-    let g_exponent = ops::multiply(&neg_a_exp, &sp).context("g exponent")?;
-    let exp_g = g_exponent.exp().context("exp(g)")?; // per-head decay factor [num_value_heads]
+    let alpha_plus_bias = add(&alpha_1d, &layer_weights.dt_bias);
+    let sp = softplus(&alpha_plus_bias);
+    let a_exp = exp(&layer_weights.a_log);
+    let neg_a_exp = negative(&a_exp);
+    let g_exponent = multiply(&neg_a_exp, &sp);
+    let exp_g = exp(&g_exponent); // per-head decay factor [num_value_heads]
 
     // beta = sigmoid(beta_raw)
-    let beta = mlx_rs::nn::sigmoid(&beta_1d).context("sigmoid beta")?;
+    let beta = sigmoid(&beta_1d);
 
     // ── 5–6. State update (per value head) ───────────────────────────────
     // State layout: [num_value_heads, key_dim, val_dim] f32
@@ -448,86 +414,68 @@ pub fn metal_gdr_decode_step(
     // Repeat each key head `heads_per_key` times → [num_value_heads, key_dim]
     let k_expanded = if heads_per_key > 1 {
         // [num_key_heads, key_dim] → [num_key_heads, 1, key_dim] → [num_key_heads, heads_per_key, key_dim]
-        let k_unsq = k_scaled.expand_dims(1).context("k expand_dims")?;
-        let k_broadcast = mlx_rs::ops::broadcast_to(
+        let k_unsq = expand_dims(&k_scaled, 1);
+        let k_broadcast = broadcast_to(
             &k_unsq,
             &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
-        )
-        .context("k broadcast")?;
-        k_broadcast
-            .reshape(&[num_value_heads as i32, key_dim as i32])
-            .context("k reshape expanded")?
+        );
+        reshape(&k_broadcast, &[num_value_heads as i32, key_dim as i32])
     } else {
         k_scaled
     };
 
     // Same expansion for q
     let q_expanded = if heads_per_key > 1 {
-        let q_unsq = q_scaled.expand_dims(1).context("q expand_dims")?;
-        let q_broadcast = mlx_rs::ops::broadcast_to(
+        let q_unsq = expand_dims(&q_scaled, 1);
+        let q_broadcast = broadcast_to(
             &q_unsq,
             &[num_key_heads as i32, heads_per_key as i32, key_dim as i32],
-        )
-        .context("q broadcast")?;
-        q_broadcast
-            .reshape(&[num_value_heads as i32, key_dim as i32])
-            .context("q reshape expanded")?
+        );
+        reshape(&q_broadcast, &[num_value_heads as i32, key_dim as i32])
     } else {
         q_scaled
     };
 
     // v: [v_dim] → [num_value_heads, val_dim]
-    let v_heads = v_raw
-        .reshape(&[num_value_heads as i32, value_dim as i32])
-        .context("reshape v")?;
+    let v_heads = reshape(&v_raw, &[num_value_heads as i32, value_dim as i32]);
 
     // Get current state: [num_value_heads, key_dim, val_dim]
     let s = &state.states[layer_idx];
 
     // Pass 1: Decay state
     // exp_g: [num_value_heads] → [num_value_heads, 1, 1] for broadcasting
-    let exp_g_3d = exp_g
-        .reshape(&[num_value_heads as i32, 1, 1])
-        .context("reshape exp_g")?;
-    let s_decayed = ops::multiply(s, &exp_g_3d).context("decay state")?;
+    let exp_g_3d = reshape(&exp_g, &[num_value_heads as i32, 1, 1]);
+    let s_decayed = multiply(s, &exp_g_3d);
 
     // kv_mem[h, v] = sum_j S_decayed[h, j, v] * k[h, j]
     // k_expanded: [num_value_heads, key_dim] → [num_value_heads, key_dim, 1]
-    let k_3d = k_expanded
-        .reshape(&[num_value_heads as i32, key_dim as i32, 1])
-        .context("reshape k 3d")?;
+    let k_3d = reshape(&k_expanded, &[num_value_heads as i32, key_dim as i32, 1]);
     // S_decayed: [H, K, V], k_3d: [H, K, 1]
     // kv_mem = sum over K: S_decayed * k_3d → [H, V]
-    let s_times_k = ops::multiply(&s_decayed, &k_3d).context("s * k")?;
-    let kv_mem = s_times_k.sum_axis(1, None).context("kv_mem sum")?; // [H, V]
+    let s_times_k = multiply(&s_decayed, &k_3d);
+    let kv_mem = sum_axis(&s_times_k, 1, false); // [H, V]
 
     // delta = (v - kv_mem) * beta
-    let v_minus_kv = ops::subtract(&v_heads, &kv_mem).context("v - kv_mem")?;
+    let v_minus_kv = subtract(&v_heads, &kv_mem);
     // beta: [H] → [H, 1]
-    let beta_2d = beta
-        .reshape(&[num_value_heads as i32, 1])
-        .context("reshape beta")?;
-    let delta = ops::multiply(&v_minus_kv, &beta_2d).context("delta")?; // [H, V]
+    let beta_2d = reshape(&beta, &[num_value_heads as i32, 1]);
+    let delta = multiply(&v_minus_kv, &beta_2d); // [H, V]
 
     // Pass 2: Rank-1 update: S[h, j, v] += delta[h, v] * k[h, j]
     // delta: [H, V] → [H, 1, V], k_expanded: [H, K] → [H, K, 1]
     // outer product: [H, K, V]
-    let delta_3d = delta
-        .reshape(&[num_value_heads as i32, 1, value_dim as i32])
-        .context("reshape delta 3d")?;
-    let update = ops::multiply(&delta_3d, &k_3d).context("rank1 update")?; // [H, K, V]
-    let s_updated = ops::add(&s_decayed, &update).context("state + update")?;
+    let delta_3d = reshape(&delta, &[num_value_heads as i32, 1, value_dim as i32]);
+    let update = multiply(&delta_3d, &k_3d); // [H, K, V]
+    let s_updated = add(&s_decayed, &update);
 
     // Store updated state
     state.states[layer_idx] = s_updated.clone();
 
     // Output: o[h, v] = sum_j S_updated[h, j, v] * q[h, j]
     // q_expanded: [H, K] → [H, K, 1]
-    let q_3d = q_expanded
-        .reshape(&[num_value_heads as i32, key_dim as i32, 1])
-        .context("reshape q 3d")?;
-    let s_times_q = ops::multiply(&s_updated, &q_3d).context("s * q")?;
-    let output_heads = s_times_q.sum_axis(1, None).context("output sum")?; // [H, V]
+    let q_3d = reshape(&q_expanded, &[num_value_heads as i32, key_dim as i32, 1]);
+    let s_times_q = multiply(&s_updated, &q_3d);
+    let output_heads = sum_axis(&s_times_q, 1, false); // [H, V]
 
     // ── 7. Per-head RMSNorm + output gate ────────────────────────────────
     // output_heads: [num_value_heads, val_dim]
@@ -535,39 +483,30 @@ pub fn metal_gdr_decode_step(
     // z: [1, z_dim] where z_dim = num_value_heads * val_dim
 
     // RMSNorm per head: for each head h, normalize output_heads[h, :] and scale by norm_weight
-    // mlx_rs::fast::rms_norm operates on the last axis, so with shape [H, V] it norms over V.
-    let output_heads_bf16 = output_heads
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("gdr output to bf16")?;
-    let normed = mlx_rs::fast::rms_norm(
+    // rms_norm operates on the last axis, so with shape [H, V] it norms over V.
+    let output_heads_bf16 = as_dtype(&output_heads, Dtype::Bfloat16);
+    let normed = rms_norm(
         &output_heads_bf16,
         &layer_weights.norm_weight,
         config.rms_norm_eps,
-    )
-    .context("gdr rms_norm")?; // [H, V]
+    ); // [H, V]
 
     // Flatten: [H, V] → [1, z_dim]
-    let normed_flat = normed
-        .reshape(&[1, (num_value_heads * value_dim) as i32])
-        .context("flatten normed")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("normed to bf16")?;
+    let normed_flat = as_dtype(
+        &reshape(&normed, &[1, (num_value_heads * value_dim) as i32]),
+        Dtype::Bfloat16,
+    );
 
     // Output gate: o = normed * silu(z)
-    let z_f32 = z.as_dtype(mlx_rs::Dtype::Float32).context("z to f32")?;
-    let z_silu = mlx_rs::nn::silu(&z_f32).context("silu z")?;
-    let gated = ops::multiply(&normed_flat.as_dtype(mlx_rs::Dtype::Float32)?, &z_silu)
-        .context("output gate")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("output gate to bf16")?;
+    let z_f32 = as_dtype(&z, Dtype::Float32);
+    let z_silu = silu(&z_f32);
+    let gated = as_dtype(
+        &multiply(&as_dtype(&normed_flat, Dtype::Float32), &z_silu),
+        Dtype::Bfloat16,
+    );
 
     // ── 8. Output projection ─────────────────────────────────────────────
-    let output = linear(&gated, &layer_weights.out_proj)
-        .context("out_proj")?
-        .as_dtype(mlx_rs::Dtype::Bfloat16)
-        .context("out_proj to bf16")?;
-
-    Ok(output) // [1, hidden_size]
+    as_dtype(&linear(&gated, &layer_weights.out_proj), Dtype::Bfloat16) // [1, hidden_size]
 }
 
 #[cfg(test)]
@@ -584,17 +523,17 @@ mod tests {
         let kernel_size = 4;
         let state_width = kernel_size - 1;
 
-        let x = Array::from_slice(&vec![1.0f32; qkv_dim], &[qkv_dim as i32]);
-        let mut conv_state = Array::from_slice(
+        let x = MlxArray::from_slice_f32(&vec![1.0f32; qkv_dim], &[qkv_dim as i32]);
+        let mut conv_state = MlxArray::from_slice_f32(
             &vec![0.0f32; qkv_dim * state_width],
             &[qkv_dim as i32, state_width as i32],
         );
-        let kernel = Array::from_slice(
+        let kernel = MlxArray::from_slice_f32(
             &vec![0.25f32; qkv_dim * kernel_size],
             &[qkv_dim as i32, kernel_size as i32],
         );
 
-        let out = conv1d_step(&x, &mut conv_state, &kernel, qkv_dim, kernel_size).unwrap();
+        let out = conv1d_step(&x, &mut conv_state, &kernel, qkv_dim, kernel_size);
 
         assert_eq!(out.shape(), &[qkv_dim as i32]);
     }
@@ -659,16 +598,18 @@ mod tests {
     #[test]
     fn test_softplus_numerical_accuracy() {
         let _guard = metal_test_guard();
+        use crate::mlx::eval;
+
         let values: Vec<f32> = vec![
             -10.0, -1.0, 0.0, 1.0, 5.0, 10.0, 19.0, 20.0, 21.0, 50.0, 100.0,
         ];
-        let input = Array::from_slice(&values, &[values.len() as i32]);
-        let result = softplus(&input).unwrap();
-        mlx_rs::transforms::eval([&result]).unwrap();
+        let input = MlxArray::from_slice_f32(&values, &[values.len() as i32]);
+        let result = softplus(&input);
+        eval(&[&result]);
 
         for (i, &x) in values.iter().enumerate() {
             let expected = ref_softplus(x);
-            let actual = result.as_slice::<f32>()[i];
+            let actual = result.as_slice_f32()[i];
             let tol = expected.abs() * 1e-5 + 1e-6;
             assert!(
                 (actual - expected).abs() < tol,
@@ -681,10 +622,12 @@ mod tests {
     #[test]
     fn test_softplus_no_overflow() {
         let _guard = metal_test_guard();
-        let large = Array::from_slice(&[88.0f32, 200.0, 1000.0], &[3]);
-        let result = softplus(&large).unwrap();
-        mlx_rs::transforms::eval([&result]).unwrap();
-        let vals = result.as_slice::<f32>();
+        use crate::mlx::eval;
+
+        let large = MlxArray::from_slice_f32(&[88.0f32, 200.0, 1000.0], &[3]);
+        let result = softplus(&large);
+        eval(&[&result]);
+        let vals = result.as_slice_f32();
         for &v in vals {
             assert!(v.is_finite(), "softplus overflow: got {v}");
         }
@@ -697,11 +640,13 @@ mod tests {
     #[test]
     fn test_rms_normalize_unit_norm() {
         let _guard = metal_test_guard();
-        let x = Array::from_slice(&[3.0f32, 4.0], &[1, 2]);
-        let normed = rms_normalize(&x, 1e-6).unwrap();
-        mlx_rs::transforms::eval([&normed]).unwrap();
+        use crate::mlx::eval;
 
-        let vals = normed.as_slice::<f32>();
+        let x = MlxArray::from_slice_f32(&[3.0f32, 4.0], &[1, 2]);
+        let normed = rms_normalize(&x, 1e-6);
+        eval(&[&normed]);
+
+        let vals = normed.as_slice_f32();
         // rms = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355
         // normed = [3/3.5355, 4/3.5355] ≈ [0.8485, 1.1314]
         let rms = (3.0f32.powi(2) + 4.0f32.powi(2)) / 2.0;
@@ -715,7 +660,7 @@ mod tests {
     #[test]
     fn test_gate_computation_scalar() {
         let _guard = metal_test_guard();
-        use mlx_rs::ops;
+        use crate::mlx::{add, eval, exp, multiply, negative};
 
         let a_log_val = -1.0f32; // exp(A_log) = exp(-1) ≈ 0.3679
         let alpha_val = 2.0f32;
@@ -724,21 +669,21 @@ mod tests {
         // g_exp = -0.3679 * 3.0486 ≈ -1.1216
         // exp(g) ≈ exp(-1.1216) ≈ 0.3258
 
-        let alpha = Array::from_slice(&[alpha_val], &[1]);
-        let dt_bias = Array::from_slice(&[dt_bias_val], &[1]);
-        let a_log = Array::from_slice(&[a_log_val], &[1]);
+        let alpha = MlxArray::from_slice_f32(&[alpha_val], &[1]);
+        let dt_bias = MlxArray::from_slice_f32(&[dt_bias_val], &[1]);
+        let a_log = MlxArray::from_slice_f32(&[a_log_val], &[1]);
 
-        let alpha_plus_bias = ops::add(&alpha, &dt_bias).unwrap();
-        let sp = softplus(&alpha_plus_bias).unwrap();
-        let a_exp = a_log.exp().unwrap();
-        let neg_a_exp = a_exp.negative().unwrap();
-        let g_exponent = ops::multiply(&neg_a_exp, &sp).unwrap();
-        let exp_g = g_exponent.exp().unwrap();
-        mlx_rs::transforms::eval([&exp_g]).unwrap();
+        let alpha_plus_bias = add(&alpha, &dt_bias);
+        let sp = softplus(&alpha_plus_bias);
+        let a_exp = exp(&a_log);
+        let neg_a_exp = negative(&a_exp);
+        let g_exponent = multiply(&neg_a_exp, &sp);
+        let exp_g = exp(&g_exponent);
+        eval(&[&exp_g]);
 
         let expected_sp = ref_softplus(alpha_val + dt_bias_val);
         let expected_g = (-a_log_val.exp() * expected_sp).exp();
-        let actual = exp_g.as_slice::<f32>()[0];
+        let actual = exp_g.as_slice_f32()[0];
         assert!(
             (actual - expected_g).abs() < 1e-4,
             "gate: expected {expected_g}, got {actual}"

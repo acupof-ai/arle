@@ -1,12 +1,11 @@
 use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result};
-use mlx_rs::{
-    Array, Dtype, StreamOrDevice,
-    ops::{
-        self, indexing::TryIndexMutOp, indexing::TryIndexOp, indexing::take_axis, reshape,
-        split_sections, transpose_axes, zeros_dtype_device,
-    },
+
+use crate::mlx::{
+    self, Dtype, MlxArray, add, as_dtype, multiply, reshape, rms_norm, rope,
+    scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
+    zeros,
 };
 
 use super::{
@@ -25,8 +24,8 @@ pub(super) struct MetalQwen35FullAttentionWeights {
     pub(super) k_proj: WeightTensor,
     pub(super) v_proj: WeightTensor,
     pub(super) o_proj: WeightTensor,
-    pub(super) q_norm: Array,
-    pub(super) k_norm: Array,
+    pub(super) q_norm: MlxArray,
+    pub(super) k_norm: MlxArray,
 }
 
 pub(super) enum MetalQwen35Attention {
@@ -35,17 +34,17 @@ pub(super) enum MetalQwen35Attention {
 }
 
 pub(super) struct MetalQwen35BlockWeights {
-    pub(super) input_layernorm: Array,
+    pub(super) input_layernorm: MlxArray,
     pub(super) attention: MetalQwen35Attention,
-    pub(super) post_attention_layernorm: Array,
+    pub(super) post_attention_layernorm: MlxArray,
     pub(super) mlp_inputs: MlpInputProjection,
     pub(super) down_proj: WeightTensor,
 }
 
 pub(super) struct Qwen35MetalWeights {
-    pub(super) embed_tokens: Array,
+    pub(super) embed_tokens: MlxArray,
     pub(super) layers: Vec<MetalQwen35BlockWeights>,
-    pub(super) norm: Array,
+    pub(super) norm: MlxArray,
     pub(super) lm_head: WeightTensor,
 }
 
@@ -87,14 +86,12 @@ pub(super) fn metal_generate_qwen35(
         config.head_dim as i32,
     ];
     let mut kv_capacity = initial_cap;
-    let mut k_caches: Vec<Array> = (0..num_full_layers)
-        .map(|_| zeros_dtype_device(&cache_shape, Dtype::Bfloat16, StreamOrDevice::default()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("pre-alloc qwen3.5 k_caches")?;
-    let mut v_caches: Vec<Array> = (0..num_full_layers)
-        .map(|_| zeros_dtype_device(&cache_shape, Dtype::Bfloat16, StreamOrDevice::default()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("pre-alloc qwen3.5 v_caches")?;
+    let mut k_caches: Vec<MlxArray> = (0..num_full_layers)
+        .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+        .collect();
+    let mut v_caches: Vec<MlxArray> = (0..num_full_layers)
+        .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+        .collect();
 
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
@@ -109,7 +106,7 @@ pub(super) fn metal_generate_qwen35(
             &mut v_caches,
             &mut recurrent,
             cache_len,
-        )?);
+        ));
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
     }
@@ -119,9 +116,7 @@ pub(super) fn metal_generate_qwen35(
     let mut ttft_ms = 0.0;
 
     let finish_reason = loop {
-        let next_token = gpu_sample_token(&logits, params)
-            .context("sample qwen3.5 token")?
-            .item::<i32>() as u32;
+        let next_token = gpu_sample_token(&logits, params)?.item_i32() as u32;
 
         if generated.is_empty() {
             ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -151,13 +146,13 @@ pub(super) fn metal_generate_qwen35(
                     config.num_key_value_heads as i32,
                     config.head_dim as i32,
                     new_cap,
-                )?;
+                );
                 extend_kv_cache(
                     &mut v_caches[li],
                     config.num_key_value_heads as i32,
                     config.head_dim as i32,
                     new_cap,
-                )?;
+                );
             }
             kv_capacity = new_cap;
         }
@@ -175,7 +170,7 @@ pub(super) fn metal_generate_qwen35(
             &mut v_caches,
             &mut recurrent,
             cache_len,
-        )?;
+        );
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
     };
@@ -200,13 +195,13 @@ fn qwen35_forward_step(
     weights: &Qwen35MetalWeights,
     config: &MetalModelConfig,
     arch: &MetalQwen35ArchConfig,
-    k_caches: &mut [Array],
-    v_caches: &mut [Array],
+    k_caches: &mut [MlxArray],
+    v_caches: &mut [MlxArray],
     recurrent: &mut MetalRecurrentState,
     cache_len: i32,
-) -> Result<Array> {
-    let token_arr = Array::from_slice(&[token_id as i32], &[1]);
-    let mut x = take_axis(&weights.embed_tokens, &token_arr, 0).context("embedding take_axis")?;
+) -> MlxArray {
+    let token_arr = MlxArray::from_slice_i32(&[token_id as i32], &[1]);
+    let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
     let mut full_idx = 0usize;
     let mut linear_idx = 0usize;
 
@@ -217,8 +212,7 @@ fn qwen35_forward_step(
             &layer.input_layernorm,
             config.rms_norm_eps as f32,
             config.norm_weight_mode.uses_offset(),
-        )
-        .context("qwen3.5 input_layernorm")?;
+        );
 
         let attn_out = match &layer.attention {
             MetalQwen35Attention::Full(attn) => {
@@ -230,19 +224,18 @@ fn qwen35_forward_step(
                     &mut k_caches[full_idx],
                     &mut v_caches[full_idx],
                     cache_len,
-                )?;
+                );
                 full_idx += 1;
                 out
             }
             MetalQwen35Attention::Linear(attn) => {
-                let out = metal_gdr_decode_step(&normed, attn, recurrent, linear_idx, &arch.linear)
-                    .context("qwen3.5 linear attention")?;
+                let out = metal_gdr_decode_step(&normed, attn, recurrent, linear_idx, &arch.linear);
                 linear_idx += 1;
                 out
             }
         };
 
-        x = ops::add(&residual, &attn_out).context("qwen3.5 residual + attention")?;
+        x = add(&residual, &attn_out);
 
         let residual2 = x.clone();
         let xn = rms_norm_last_dim(
@@ -250,23 +243,14 @@ fn qwen35_forward_step(
             &layer.post_attention_layernorm,
             config.rms_norm_eps as f32,
             config.norm_weight_mode.uses_offset(),
-        )
-        .context("qwen3.5 post_attention_layernorm")?;
-        let (gate_raw, up) = layer.mlp_inputs.project(&xn).context("qwen3.5 mlp proj")?;
-        let gate_raw = gate_raw
-            .as_dtype(Dtype::Bfloat16)
-            .context("gate_raw to bf16")?;
-        let up = up.as_dtype(Dtype::Bfloat16).context("up to bf16")?;
-        let gate = mlx_rs::nn::silu(&gate_raw).context("qwen3.5 silu gate")?;
-        let fused = ops::multiply(&gate, &up)
-            .context("qwen3.5 gate*up")?
-            .as_dtype(Dtype::Bfloat16)
-            .context("gate*up to bf16")?;
-        let mlp = linear(&fused, &layer.down_proj)
-            .context("qwen3.5 down_proj")?
-            .as_dtype(Dtype::Bfloat16)
-            .context("mlp to bf16")?;
-        x = ops::add(&residual2, &mlp).context("qwen3.5 residual + mlp")?;
+        );
+        let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
+        let gate_raw = as_dtype(&gate_raw, Dtype::Bfloat16);
+        let up = as_dtype(&up, Dtype::Bfloat16);
+        let gate = silu(&gate_raw);
+        let fused = as_dtype(&multiply(&gate, &up), Dtype::Bfloat16);
+        let mlp = as_dtype(&linear(&fused, &layer.down_proj), Dtype::Bfloat16);
+        x = add(&residual2, &mlp);
     }
 
     let final_norm = rms_norm_last_dim(
@@ -274,149 +258,160 @@ fn qwen35_forward_step(
         &weights.norm,
         config.rms_norm_eps as f32,
         config.norm_weight_mode.uses_offset(),
-    )
-    .context("qwen3.5 final norm")?;
-    linear(&final_norm, &weights.lm_head).context("qwen3.5 lm_head")
+    );
+    linear(&final_norm, &weights.lm_head)
 }
 
 fn qwen35_full_attention_step(
-    x: &Array,
+    x: &MlxArray,
     attn: &MetalQwen35FullAttentionWeights,
     config: &MetalModelConfig,
     arch: &MetalQwen35ArchConfig,
-    k_cache: &mut Array,
-    v_cache: &mut Array,
+    k_cache: &mut MlxArray,
+    v_cache: &mut MlxArray,
     cache_len: i32,
-) -> Result<Array> {
-    use mlx_rs::fast;
-
+) -> MlxArray {
     let n_heads = config.num_attention_heads as i32;
     let n_kv_heads = config.num_key_value_heads as i32;
     let head_dim = config.head_dim as i32;
     let q_dim = n_heads * head_dim;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let q_full = linear(x, &attn.q_proj)
-        .context("qwen3.5 q_proj")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("q_full to bf16")?;
-    let q_full = reshape(&q_full, &[1, 1, n_heads, head_dim * 2]).context("reshape q_full")?;
-    let [q_heads, gate_heads] = <[Array; 2]>::try_from(
-        split_sections(&q_full, &[head_dim], -1).context("split q/gate per head")?,
-    )
-    .map_err(|parts| anyhow::anyhow!("expected q+gate split, got {}", parts.len()))?;
-    let k_raw = linear(x, &attn.k_proj)
-        .context("qwen3.5 k_proj")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("k_raw to bf16")?;
-    let v_raw = linear(x, &attn.v_proj)
-        .context("qwen3.5 v_proj")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("v_raw to bf16")?;
+    let q_full = as_dtype(&linear(x, &attn.q_proj), Dtype::Bfloat16);
+    let q_full = reshape(&q_full, &[1, 1, n_heads, head_dim * 2]);
+    // Split q and gate: q_full is [1, 1, n_heads, head_dim*2], split at head_dim on last axis
+    let q_heads = slice(
+        &q_full,
+        &[0, 0, 0, 0],
+        &[1, 1, n_heads, head_dim],
+        &[1, 1, 1, 1],
+    );
+    let gate_heads = slice(
+        &q_full,
+        &[0, 0, 0, head_dim],
+        &[1, 1, n_heads, head_dim * 2],
+        &[1, 1, 1, 1],
+    );
+
+    let k_raw = as_dtype(&linear(x, &attn.k_proj), Dtype::Bfloat16);
+    let v_raw = as_dtype(&linear(x, &attn.v_proj), Dtype::Bfloat16);
 
     let q = rms_norm_last_dim(
         &q_heads,
         &attn.q_norm,
         config.rms_norm_eps as f32,
         config.norm_weight_mode.uses_offset(),
-    )
-    .context("q norm")?;
-    let q = transpose_axes(&q, &[0, 2, 1, 3]).context("transpose q")?;
-    let q = fast::rope(
+    );
+    let q = transpose_axes(&q, &[0, 2, 1, 3]);
+    let q = rope(
         &q,
         arch.rotary_dim as i32,
         false,
         config.rope_theta as f32,
         1.0f32,
         cache_len,
-        None,
-    )
-    .context("rope q")?;
+    );
 
-    let k = reshape(&k_raw, &[1, 1, n_kv_heads, head_dim]).context("reshape k")?;
+    let k = reshape(&k_raw, &[1, 1, n_kv_heads, head_dim]);
     let k = rms_norm_last_dim(
         &k,
         &attn.k_norm,
         config.rms_norm_eps as f32,
         config.norm_weight_mode.uses_offset(),
-    )
-    .context("k norm")?;
-    let k = transpose_axes(&k, &[0, 2, 1, 3]).context("transpose k")?;
-    let k = fast::rope(
+    );
+    let k = transpose_axes(&k, &[0, 2, 1, 3]);
+    let k = rope(
         &k,
         arch.rotary_dim as i32,
         false,
         config.rope_theta as f32,
         1.0f32,
         cache_len,
-        None,
-    )
-    .context("rope k")?;
+    );
 
-    let v = reshape(&v_raw, &[1, 1, n_kv_heads, head_dim]).context("reshape v")?;
-    let v = transpose_axes(&v, &[0, 2, 1, 3]).context("transpose v")?;
+    let v = reshape(&v_raw, &[1, 1, n_kv_heads, head_dim]);
+    let v = transpose_axes(&v, &[0, 2, 1, 3]);
 
+    // KV cache update
     let end_pos = cache_len + 1;
-    k_cache
-        .try_index_mut((.., .., cache_len..end_pos, ..), &k)
-        .context("write qwen3.5 k_cache")?;
-    v_cache
-        .try_index_mut((.., .., cache_len..end_pos, ..), &v)
-        .context("write qwen3.5 v_cache")?;
-    let k_full = k_cache
-        .try_index((.., .., 0i32..end_pos, ..))
-        .context("slice qwen3.5 k_cache")?;
-    let v_full = v_cache
-        .try_index((.., .., 0i32..end_pos, ..))
-        .context("slice qwen3.5 v_cache")?;
+    *k_cache = slice_update(
+        k_cache,
+        &k,
+        &[0, 0, cache_len, 0],
+        &[1, n_kv_heads, end_pos, head_dim],
+    );
+    *v_cache = slice_update(
+        v_cache,
+        &v,
+        &[0, 0, cache_len, 0],
+        &[1, n_kv_heads, end_pos, head_dim],
+    );
+    let k_full = slice(
+        k_cache,
+        &[0, 0, 0, 0],
+        &[1, n_kv_heads, end_pos, head_dim],
+        &[1, 1, 1, 1],
+    );
+    let v_full = slice(
+        v_cache,
+        &[0, 0, 0, 0],
+        &[1, n_kv_heads, end_pos, head_dim],
+        &[1, 1, 1, 1],
+    );
 
-    let attn_out = fast::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None)
-        .context("qwen3.5 sdpa")?;
-    let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]).context("transpose attn_out")?;
-    let attn_out = reshape(&attn_out, &[1, q_dim]).context("reshape attn_out")?;
-    let gate = reshape(&gate_heads, &[1, q_dim]).context("reshape gate")?;
-    let gate = mlx_rs::nn::sigmoid(&gate.as_dtype(Dtype::Float32)?).context("sigmoid gate")?;
-    let gated = ops::multiply(&attn_out.as_dtype(Dtype::Float32)?, &gate)
-        .context("apply full-attn gate")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("gated attn to bf16")?;
-    linear(&gated, &attn.o_proj)
-        .context("qwen3.5 o_proj")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("o_proj to bf16")
+    let attn_out = scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None);
+    let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
+    let attn_out = reshape(&attn_out, &[1, q_dim]);
+    let gate = reshape(&gate_heads, &[1, q_dim]);
+    let gate = sigmoid(&as_dtype(&gate, Dtype::Float32));
+    let gated = as_dtype(
+        &multiply(&as_dtype(&attn_out, Dtype::Float32), &gate),
+        Dtype::Bfloat16,
+    );
+    as_dtype(&linear(&gated, &attn.o_proj), Dtype::Bfloat16)
 }
 
-fn rms_norm_last_dim(x: &Array, weight: &Array, eps: f32, offset: bool) -> Result<Array> {
-    let last_dim = x
-        .shape()
-        .last()
-        .copied()
-        .context("rms_norm_last_dim missing last dimension")? as f32;
-    let x = x.as_dtype(Dtype::Float32).context("x to f32")?;
-    let weight = weight.as_dtype(Dtype::Float32).context("weight to f32")?;
-    let inv_dim = Array::from_slice(&[1.0f32 / last_dim], &[1]);
-    let eps_arr = Array::from_slice(&[eps], &[1]);
-    let one = Array::from_slice(&[1.0f32], &[1]);
+fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) -> MlxArray {
+    use crate::mlx::{reciprocal, sqrt, sum_axis};
 
-    let sq = ops::multiply(&x, &x).context("square x")?;
-    let sum_sq = sq.sum_axis(-1, true).context("sum square")?;
-    let mean_sq = ops::multiply(&sum_sq, &inv_dim).context("mean square")?;
-    let inv_rms = ops::add(&mean_sq, &eps_arr)
-        .context("add eps")?
-        .sqrt()
-        .context("sqrt rms")?
-        .reciprocal()
-        .context("reciprocal rms")?;
-    let normed = ops::multiply(&x, &inv_rms).context("apply rms")?;
-    let scale = if offset {
-        ops::add(&weight, &one).context("offset norm scale")?
-    } else {
-        weight
-    };
-    ops::multiply(&normed, &scale)
-        .context("apply norm scale")?
-        .as_dtype(Dtype::Bfloat16)
-        .context("norm output to bf16")
+    let last_dim = *x.shape().last().expect("rms_norm_last_dim: empty shape") as f32;
+    let x = as_dtype(x, Dtype::Float32);
+    let weight = as_dtype(weight, Dtype::Float32);
+    let inv_dim = MlxArray::from_slice_f32(&[1.0f32 / last_dim], &[1]);
+    let eps_arr = MlxArray::from_slice_f32(&[eps], &[1]);
+    let one = MlxArray::from_slice_f32(&[1.0f32], &[1]);
+
+    let sq = multiply(&x, &x);
+    let sum_sq = sum_axis(&sq, -1, true);
+    let mean_sq = multiply(&sum_sq, &inv_dim);
+    let inv_rms = reciprocal(&sqrt(&add(&mean_sq, &eps_arr)));
+    let normed = multiply(&x, &inv_rms);
+    let scale = if offset { add(&weight, &one) } else { weight };
+    as_dtype(&multiply(&normed, &scale), Dtype::Bfloat16)
+}
+
+/// MLP projection helper — replaces the mlx_rs method on MlpInputProjection.
+fn mlp_project(mlp: &MlpInputProjection, x: &MlxArray) -> (MlxArray, MlxArray) {
+    match mlp {
+        MlpInputProjection::Split { gate_proj, up_proj } => {
+            (linear(x, gate_proj), linear(x, up_proj))
+        }
+        MlpInputProjection::MergedQuantized {
+            gate_up_proj,
+            gate_dim,
+            up_dim,
+        } => {
+            let gate_up = linear(x, gate_up_proj);
+            let gate = slice(&gate_up, &[0, 0], &[1, *gate_dim], &[1, 1]);
+            let up = slice(
+                &gate_up,
+                &[0, *gate_dim],
+                &[1, *gate_dim + *up_dim],
+                &[1, 1],
+            );
+            (gate, up)
+        }
+    }
 }
 
 pub(super) fn load_qwen35_metal_weights(
@@ -478,16 +473,13 @@ pub(super) fn load_qwen35_metal_weights(
                     conv1d_weight: load_conv1d_weight(
                         &get(&format!("{attn_prefix}.conv1d.weight"))?,
                         &arch.linear,
-                    )?,
-                    dt_bias: get(&format!("{attn_prefix}.dt_bias"))?
-                        .as_dtype(Dtype::Float32)
-                        .context("dt_bias to f32")?,
-                    a_log: get(&format!("{attn_prefix}.A_log"))?
-                        .as_dtype(Dtype::Float32)
-                        .context("A_log to f32")?,
-                    norm_weight: get(&format!("{attn_prefix}.norm.weight"))?
-                        .as_dtype(Dtype::Float32)
-                        .context("linear norm.weight to f32")?,
+                    ),
+                    dt_bias: as_dtype(&get(&format!("{attn_prefix}.dt_bias"))?, Dtype::Float32),
+                    a_log: as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
+                    norm_weight: as_dtype(
+                        &get(&format!("{attn_prefix}.norm.weight"))?,
+                        Dtype::Float32,
+                    ),
                     out_proj: load_proj(&format!("{attn_prefix}.out_proj"))?,
                 })
             }
@@ -530,7 +522,7 @@ pub(super) fn load_qwen35_metal_weights(
 fn load_lm_head(
     tensors: &super::TensorMap,
     candidates: &[String],
-    embed_tokens: &Array,
+    embed_tokens: &MlxArray,
     load_proj: &impl Fn(&str) -> Result<WeightTensor>,
 ) -> Result<WeightTensor> {
     for candidate in candidates {
@@ -544,31 +536,34 @@ fn load_lm_head(
     tie_lm_head_from_embed_tokens(embed_tokens)
 }
 
-fn load_conv1d_weight(weight: &Array, linear: &crate::metal_gdr::MetalGdrConfig) -> Result<Array> {
+fn load_conv1d_weight(
+    weight: &MlxArray,
+    linear_cfg: &crate::metal_gdr::MetalGdrConfig,
+) -> MlxArray {
     match weight.shape() {
         [qkv_dim, kernel] => {
-            anyhow::ensure!(
-                *qkv_dim == linear.qkv_dim() as i32 && *kernel == linear.conv_kernel as i32,
+            assert!(
+                *qkv_dim == linear_cfg.qkv_dim() as i32 && *kernel == linear_cfg.conv_kernel as i32,
                 "unexpected conv1d weight shape {:?}, expected [{}, {}]",
                 weight.shape(),
-                linear.qkv_dim(),
-                linear.conv_kernel
+                linear_cfg.qkv_dim(),
+                linear_cfg.conv_kernel
             );
-            weight
-                .as_dtype(Dtype::Float32)
-                .context("conv1d weight to f32")
+            as_dtype(weight, Dtype::Float32)
         }
         [qkv_dim, dim1, dim2]
-            if *qkv_dim == linear.qkv_dim() as i32
-                && ((*dim1 == 1 && *dim2 == linear.conv_kernel as i32)
-                    || (*dim1 == linear.conv_kernel as i32 && *dim2 == 1)) =>
+            if *qkv_dim == linear_cfg.qkv_dim() as i32
+                && ((*dim1 == 1 && *dim2 == linear_cfg.conv_kernel as i32)
+                    || (*dim1 == linear_cfg.conv_kernel as i32 && *dim2 == 1)) =>
         {
-            weight
-                .reshape(&[linear.qkv_dim() as i32, linear.conv_kernel as i32])
-                .context("reshape conv1d weight")?
-                .as_dtype(Dtype::Float32)
-                .context("conv1d weight to f32")
+            as_dtype(
+                &reshape(
+                    weight,
+                    &[linear_cfg.qkv_dim() as i32, linear_cfg.conv_kernel as i32],
+                ),
+                Dtype::Float32,
+            )
         }
-        shape => anyhow::bail!("unsupported conv1d weight shape {:?}", shape),
+        shape => panic!("unsupported conv1d weight shape {:?}", shape),
     }
 }
