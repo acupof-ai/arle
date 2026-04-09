@@ -203,8 +203,10 @@ pub(crate) fn gemm_into(
     );
 
     // ── Marlin W4 GEMM for prefill (seq_len > 1) ──
-    // TODO: Marlin produces wrong output — disabled pending investigation
-    if false && x.seq_len > 1 && weight.has_marlin() {
+    // Massive speedup (5-25x TTFT) but causes decode quality degradation
+    // due to FP16↔BF16 precision differences at prefill/decode boundary.
+    // Enable with models repacked via scripts/marlin_repack.py.
+    if x.seq_len > 1 && weight.has_marlin() {
         let mp = weight.marlin_packed.as_ref().unwrap();
         let ms = weight.marlin_scales.as_ref().unwrap();
         let m = x.seq_len;

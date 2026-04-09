@@ -194,9 +194,40 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             );
             let mut mat =
                 DeviceMatrix::from_quantized_int4(ctx, packed, sc_data, rows, orig_k, group_size)?;
-            // Repack for Marlin prefill GEMM (skips if dimensions not aligned)
-            if let Err(e) = mat.repack_for_marlin(ctx) {
-                log::warn!("Marlin repack failed for {}: {}", name, e);
+            // Load pre-computed Marlin weights if available (from scripts/marlin_repack.py)
+            let marlin_key = qweight_name.replace(".qweight", ".marlin_qweight");
+            let marlin_scales_key = qweight_name.replace(".qweight", ".marlin_scales");
+            if let (Ok(mp), Ok(ms)) = (
+                find_tensor(shards, weight_map, &marlin_key),
+                find_tensor(shards, weight_map, &marlin_scales_key),
+            ) {
+                let mp_data: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        mp.data().as_ptr(),
+                        mp.shape().iter().product::<usize>() * 4, // int32 → bytes
+                    )
+                };
+                let ms_data: &[u16] = unsafe {
+                    std::slice::from_raw_parts(
+                        ms.data().as_ptr().cast::<u16>(),
+                        ms.shape().iter().product::<usize>(),
+                    )
+                };
+                let mp_gpu: cudarc::driver::CudaSlice<u8> = ctx
+                    .stream
+                    .clone_htod(mp_data)
+                    .map_err(|e| anyhow::anyhow!("H2D Marlin packed: {}", e))?;
+                let ms_gpu: cudarc::driver::CudaSlice<u16> = ctx
+                    .stream
+                    .clone_htod(ms_data)
+                    .map_err(|e| anyhow::anyhow!("H2D Marlin scales: {}", e))?;
+                mat.marlin_packed = Some(mp_gpu);
+                mat.marlin_scales = Some(ms_gpu);
+                log::info!(
+                    "  + Marlin repacked: {:?} + scales {:?}",
+                    mp.shape(),
+                    ms.shape()
+                );
             }
             return Ok(mat);
         }
