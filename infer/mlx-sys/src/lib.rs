@@ -362,6 +362,8 @@ unsafe extern "C" {
         temperature: f32,
         out_tokens: *mut i32,
         out_count: *mut i32,
+        out_prefill_ms: *mut f64,
+        out_decode_ms: *mut f64,
         on_token: Option<unsafe extern "C" fn(i32, *mut std::ffi::c_void) -> i32>,
         callback_ctx: *mut std::ffi::c_void,
         stop_tokens: *const i32,

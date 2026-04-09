@@ -374,7 +374,8 @@ impl CppQwen35Model {
         temperature: f32,
         stop_token_ids: &[u32],
         on_token: &mut impl FnMut(u32) -> Result<()>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, f64, f64)> {
+        // Returns (tokens, prefill_ms, decode_ms)
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
         let stop_i32: Vec<i32> = stop_token_ids.iter().map(|&id| id as i32).collect();
         let mut out_tokens = vec![0i32; max_new_tokens];
@@ -401,6 +402,9 @@ impl CppQwen35Model {
             }
         }
 
+        let mut prefill_ms: f64 = 0.0;
+        let mut decode_ms: f64 = 0.0;
+
         let rc = unsafe {
             mlx_sys::qwen35_compiled_generate(
                 self.0,
@@ -410,6 +414,8 @@ impl CppQwen35Model {
                 temperature,
                 out_tokens.as_mut_ptr(),
                 &mut out_count,
+                &mut prefill_ms,
+                &mut decode_ms,
                 Some(token_callback),
                 &mut ctx as *mut CallbackCtx as *mut std::ffi::c_void,
                 stop_i32.as_ptr(),
@@ -424,10 +430,14 @@ impl CppQwen35Model {
             return Err(crate::mlx::check_mlx_error().unwrap_err());
         }
 
-        Ok(out_tokens[..out_count as usize]
-            .iter()
-            .map(|&id| id as u32)
-            .collect())
+        Ok((
+            out_tokens[..out_count as usize]
+                .iter()
+                .map(|&id| id as u32)
+                .collect(),
+            prefill_ms,
+            decode_ms,
+        ))
     }
 }
 
@@ -493,8 +503,7 @@ pub(super) fn metal_generate_qwen35(
             stop_ids.push(config.eos_token_id);
         }
 
-        let gen_t0 = Instant::now();
-        let tokens = cpp_model.generate(
+        let (tokens, prefill_ms, decode_ms) = cpp_model.generate(
             input_ids,
             max_new_tokens,
             params.temperature,
@@ -502,12 +511,22 @@ pub(super) fn metal_generate_qwen35(
             on_token,
         )?;
 
-        let elapsed = gen_t0.elapsed().as_secs_f64();
-        let total_time_ms = elapsed * 1000.0;
-        // Estimate TTFT from total (prefill is included)
-        let decode_elapsed = elapsed.max(1e-9);
-        let tps = tokens.len() as f64 / decode_elapsed;
-        log::info!("  generated {} tokens ({tps:.1} tok/s)", tokens.len());
+        let total_time_ms = prefill_ms + decode_ms;
+        let decode_tps = if decode_ms > 0.0 {
+            tokens.len() as f64 / (decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let prompt_tps = if prefill_ms > 0.0 {
+            input_ids.len() as f64 / (prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
+        log::info!(
+            "  prefill {} tokens ({prompt_tps:.1} tok/s, {prefill_ms:.1}ms) decode {} tokens ({decode_tps:.1} tok/s, {decode_ms:.1}ms)",
+            input_ids.len(),
+            tokens.len(),
+        );
 
         let finish_reason = if tokens.last().is_some_and(|t| stop_ids.contains(t)) {
             "stop"
@@ -518,7 +537,7 @@ pub(super) fn metal_generate_qwen35(
         return Ok(super::MetalGenerateOutput {
             tokens,
             finish_reason,
-            ttft_ms: 0.0, // TODO: measure prefill separately
+            ttft_ms: prefill_ms,
             total_time_ms,
         });
     }

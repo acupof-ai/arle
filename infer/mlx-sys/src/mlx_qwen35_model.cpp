@@ -802,9 +802,11 @@ int32_t qwen35_compiled_generate(
     const int32_t* prompt_ids, int32_t prompt_len,
     int32_t max_new_tokens,
     float temperature,
-    // Output: generated token ids (caller allocates max_new_tokens ints)
+    // Output
     int32_t* out_tokens,
     int32_t* out_count,
+    double* out_prefill_ms,   // prefill time in ms (nullable)
+    double* out_decode_ms,    // decode time in ms (nullable)
     // Callbacks
     int32_t (*on_token)(int32_t token_id, void* ctx),
     void* callback_ctx,
@@ -814,6 +816,7 @@ int32_t qwen35_compiled_generate(
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     try {
         mlx_clear_error();
+        auto t_start = std::chrono::high_resolution_clock::now();
         int F = m->n_full_attn, G = m->n_gdr;
 
         // Initialize caches
@@ -857,14 +860,20 @@ int32_t qwen35_compiled_generate(
 
             cache_pos++;
             if (p == prompt_len - 1) {
-                // Get logits from last prefill token
+                // Prefill done — record TTFT
                 auto logits = outputs[0];
                 auto y = (temperature <= 1e-6f)
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
+                eval(y);  // force eval to measure prefill time
+                auto t_prefill_end = std::chrono::high_resolution_clock::now();
+                if (out_prefill_ms) {
+                    *out_prefill_ms = std::chrono::duration<double, std::milli>(
+                        t_prefill_end - t_start).count();
+                }
                 async_eval(y);
 
-                // ── Decode loop (double-buffered, all in C++) ──
+                // ── Decode loop ──
                 int generated = 0;
                 // Keep previous step's locals alive in these vectors
                 std::vector<array> prev_step_arrays;
@@ -929,6 +938,11 @@ int32_t qwen35_compiled_generate(
                 }
 
                 *out_count = generated;
+                if (out_decode_ms) {
+                    auto t_decode_end = std::chrono::high_resolution_clock::now();
+                    *out_decode_ms = std::chrono::duration<double, std::milli>(
+                        t_decode_end - t_prefill_end).count();
+                }
             }
         }
 
