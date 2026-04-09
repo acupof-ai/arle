@@ -381,4 +381,131 @@ void metal_quantized_fused_block_cached(
     *result_out = arr_own(std::move(output));
 }
 
+// ── Qwen3.5 helpers ─────────────────────────────────────────────────────────
+
+/// Projection that handles both dense and quantized weights.
+static inline mlx::core::array flex_linear(
+    const mlx::core::array& x,
+    const mlx::core::array& w,
+    const mlx::core::array& scales,
+    const mlx::core::array& biases,
+    int group_size, int bits, bool is_quantized)
+{
+    if (is_quantized) {
+        return mlx::core::quantized_matmul(
+            x, w, scales, biases, /*transpose=*/true, group_size, bits);
+    } else {
+        return mlx::core::matmul(x, w);
+    }
+}
+
+/// RMS normalize with optional +1 offset on weight.
+static inline mlx::core::array rms_norm_weighted(
+    const mlx::core::array& x,
+    const mlx::core::array& weight,
+    float eps,
+    bool offset)
+{
+    using namespace mlx::core;
+    namespace fast = mlx::core::fast;
+    if (offset) {
+        array w_f32 = astype(weight, float32);
+        array scale = add(w_f32, array(1.0f));
+        array normed = fast::rms_norm(astype(x, float32), std::nullopt, eps);
+        return astype(multiply(normed, scale), bfloat16);
+    } else {
+        return fast::rms_norm(x, std::optional<array>(weight), eps);
+    }
+}
+
+/// Numerically stable softplus: where(x > 20, x, log1p(exp(x))).
+static inline mlx::core::array softplus(const mlx::core::array& x) {
+    using namespace mlx::core;
+    return where(greater(x, array(20.0f)), x, log1p(exp(x)));
+}
+
+// ── metal_qwen35_full_attn_block ────────────────────────────────────────────
+
+void metal_qwen35_full_attn_block(
+    mlx_array x_h,
+    mlx_array input_norm_w_h,
+    mlx_array q_proj_w_h, mlx_array q_proj_scales_h, mlx_array q_proj_biases_h,
+    mlx_array k_proj_w_h, mlx_array k_proj_scales_h, mlx_array k_proj_biases_h,
+    mlx_array v_proj_w_h, mlx_array v_proj_scales_h, mlx_array v_proj_biases_h,
+    mlx_array o_proj_w_h, mlx_array o_proj_scales_h, mlx_array o_proj_biases_h,
+    mlx_array q_norm_w_h, mlx_array k_norm_w_h,
+    int n_heads, int n_kv_heads, int head_dim, float attn_scale,
+    float rope_base, int rotary_dim, float norm_eps,
+    int group_size, int bits, bool is_quantized, bool norm_offset,
+    mlx_array* k_cache_h, mlx_array* v_cache_h, int cache_len,
+    mlx_array* result_out)
+{
+    using namespace mlx::core;
+    namespace fast = mlx::core::fast;
+
+    const array& x = arr_ref(x_h);
+    array& k_cache = arr_ref(*k_cache_h);
+    array& v_cache = arr_ref(*v_cache_h);
+    int q_dim = n_heads * head_dim;
+
+    // 1. Input norm
+    array normed = rms_norm_weighted(x, arr_ref(input_norm_w_h), norm_eps, norm_offset);
+
+    // 2. Q → [1, n_heads * head_dim * 2], split into q + gate
+    array q_full = astype(
+        flex_linear(normed, arr_ref(q_proj_w_h), arr_ref(q_proj_scales_h),
+                    arr_ref(q_proj_biases_h), group_size, bits, is_quantized),
+        bfloat16);
+    q_full = reshape(q_full, {1, 1, n_heads, head_dim * 2});
+    auto q_gate = split(q_full, {head_dim}, -1);
+    array q_heads = q_gate[0];
+    array gate_heads = q_gate[1];
+
+    // 3. K, V projections
+    array k_raw = astype(
+        flex_linear(normed, arr_ref(k_proj_w_h), arr_ref(k_proj_scales_h),
+                    arr_ref(k_proj_biases_h), group_size, bits, is_quantized),
+        bfloat16);
+    array v_raw = astype(
+        flex_linear(normed, arr_ref(v_proj_w_h), arr_ref(v_proj_scales_h),
+                    arr_ref(v_proj_biases_h), group_size, bits, is_quantized),
+        bfloat16);
+
+    // 4. Per-head QK norm + RoPE
+    array q = rms_norm_weighted(q_heads, arr_ref(q_norm_w_h), norm_eps, norm_offset);
+    q = transpose(q, {0, 2, 1, 3});
+    q = fast::rope(q, rotary_dim, false, std::optional<float>(rope_base), 1.0f, cache_len);
+
+    array k = reshape(k_raw, {1, 1, n_kv_heads, head_dim});
+    k = rms_norm_weighted(k, arr_ref(k_norm_w_h), norm_eps, norm_offset);
+    k = transpose(k, {0, 2, 1, 3});
+    k = fast::rope(k, rotary_dim, false, std::optional<float>(rope_base), 1.0f, cache_len);
+
+    array v = reshape(v_raw, {1, 1, n_kv_heads, head_dim});
+    v = transpose(v, {0, 2, 1, 3});
+
+    // 5. KV cache update
+    int end_pos = cache_len + 1;
+    k_cache = slice_update(k_cache, k, {0,0,cache_len,0}, {1,n_kv_heads,end_pos,head_dim});
+    v_cache = slice_update(v_cache, v, {0,0,cache_len,0}, {1,n_kv_heads,end_pos,head_dim});
+    array k_full = slice(k_cache, {0,0,0,0}, {1,n_kv_heads,end_pos,head_dim});
+    array v_full = slice(v_cache, {0,0,0,0}, {1,n_kv_heads,end_pos,head_dim});
+
+    // 6. SDPA
+    array attn_out = fast::scaled_dot_product_attention(
+        q, k_full, v_full, attn_scale, "");
+
+    // 7. Reshape + sigmoid gating + output projection
+    attn_out = transpose(attn_out, {0, 2, 1, 3});
+    attn_out = reshape(attn_out, {1, q_dim});
+    array gate = reshape(gate_heads, {1, q_dim});
+    gate = sigmoid(astype(gate, float32));
+    array gated = astype(multiply(astype(attn_out, float32), gate), bfloat16);
+
+    *result_out = arr_own(std::move(astype(
+        flex_linear(gated, arr_ref(o_proj_w_h), arr_ref(o_proj_scales_h),
+                    arr_ref(o_proj_biases_h), group_size, bits, is_quantized),
+        bfloat16)));
+}
+
 } // extern "C"

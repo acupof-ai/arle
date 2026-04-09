@@ -853,6 +853,9 @@ fn main() {
                     }
                     build.compile("metal_fused_ops");
                     println!("cargo:rustc-cfg=metal_fused_ops");
+                    // Qwen3.5 fused: only full-attn block is ready; GDR uses Rust path.
+                    // Enable when metal_qwen35_gdr_block is added to C++.
+                    // println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
 
                     // Pure C API fused block (no C++ ABI issues).
                     println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");
