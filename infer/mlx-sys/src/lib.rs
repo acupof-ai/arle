@@ -204,6 +204,119 @@ unsafe extern "C" {
         out_result: *mut *mut mlx_array,
     );
 
+    // === Compiled Qwen3.5 model ===
+
+    pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;
+    pub fn qwen35_compiled_free(model: *mut std::ffi::c_void);
+    pub fn qwen35_compiled_set_config(
+        model: *mut std::ffi::c_void,
+        rope_theta: f32,
+        rms_eps: f32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        hidden_size: i32,
+    );
+    pub fn qwen35_compiled_set_embed(
+        model: *mut std::ffi::c_void,
+        embed_tokens: *mut mlx_array,
+        final_norm_w: *mut mlx_array,
+        lm_head_w: *mut mlx_array,
+        lm_head_s: *mut mlx_array,
+        lm_head_b: *mut mlx_array,
+        lm_gs: i32,
+        lm_bits: i32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_push_full_attn(
+        model: *mut std::ffi::c_void,
+        input_ln: *mut mlx_array,
+        post_ln: *mut mlx_array,
+        q_w: *mut mlx_array,
+        q_s: *mut mlx_array,
+        q_b: *mut mlx_array,
+        q_gs: i32,
+        q_bits: i32,
+        k_w: *mut mlx_array,
+        k_s: *mut mlx_array,
+        k_b: *mut mlx_array,
+        v_w: *mut mlx_array,
+        v_s: *mut mlx_array,
+        v_b: *mut mlx_array,
+        o_w: *mut mlx_array,
+        o_s: *mut mlx_array,
+        o_b: *mut mlx_array,
+        q_norm: *mut mlx_array,
+        k_norm: *mut mlx_array,
+        gu_w: *mut mlx_array,
+        gu_s: *mut mlx_array,
+        gu_b: *mut mlx_array,
+        gu_gs: i32,
+        gu_bits: i32,
+        gate_dim: i32,
+        dw_w: *mut mlx_array,
+        dw_s: *mut mlx_array,
+        dw_b: *mut mlx_array,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_push_gdr(
+        model: *mut std::ffi::c_void,
+        input_ln: *mut mlx_array,
+        post_ln: *mut mlx_array,
+        qkvz_w: *mut mlx_array,
+        qkvz_s: *mut mlx_array,
+        qkvz_b: *mut mlx_array,
+        qkvz_gs: i32,
+        qkvz_bits: i32,
+        qkv_split: i32,
+        z_split: i32,
+        ba_w: *mut mlx_array,
+        ba_s: *mut mlx_array,
+        ba_b: *mut mlx_array,
+        ba_gs: i32,
+        ba_bits: i32,
+        ba_num_heads: i32,
+        conv1d_w: *mut mlx_array,
+        conv_kernel: i32,
+        a_log: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        gdr_rms_eps: f32,
+        out_w: *mut mlx_array,
+        out_s: *mut mlx_array,
+        out_b: *mut mlx_array,
+        out_gs: i32,
+        out_bits: i32,
+        num_key_heads: i32,
+        key_dim: i32,
+        num_value_heads: i32,
+        value_dim: i32,
+        gu_w: *mut mlx_array,
+        gu_s: *mut mlx_array,
+        gu_b: *mut mlx_array,
+        gu_gs: i32,
+        gu_bits: i32,
+        gate_dim: i32,
+        dw_w: *mut mlx_array,
+        dw_s: *mut mlx_array,
+        dw_b: *mut mlx_array,
+    );
+    pub fn qwen35_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_step(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+        out_logits: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+        out_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
+
     // === Fast ops ===
 
     /// RMS normalization. Pass null for weight to use no learnable weight.
