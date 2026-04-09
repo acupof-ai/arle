@@ -33,6 +33,22 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         let effective = if prefix_len > 0 && prefix_len == cached.len() {
+            // Truncate contiguous KV cache to prefix length — removes stale
+            // decode tokens from the previous request. Without this, migration
+            // to paged pool reads invalid memory (CUDA_ERROR_ILLEGAL_ADDRESS).
+            if let Err(e) = state.truncate_to(prefix_len) {
+                error!("Request {}: truncate on prefix hit failed: {}", req.id, e);
+                if let Err(e2) = state.reset() {
+                    error!("Request {}: reset failed: {}", req.id, e2);
+                }
+                cached.clear();
+                req.phase = Phase::Prefilling {
+                    effective_tokens: req.prompt_tokens.clone(),
+                    progress: 0,
+                };
+                return;
+            }
+
             // Full prefix hit — restore recurrent state snapshot to undo
             // decode-token contamination from the previous request.
             match state.restore_prefix_snapshot() {
