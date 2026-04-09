@@ -1392,3 +1392,136 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
 
     Ok(())
 }
+
+/// CPU reference implementation for TurboQuant quantize → dequantize roundtrip.
+/// Used to validate GPU kernel correctness.
+#[test]
+fn turboquant_cpu_reference_roundtrip() {
+    let head_dim = 128usize;
+    let bits = 3u8;
+    let num_levels = 1usize << bits;
+    let effective_bits = 4usize; // bits==3 → 4-bit nibbles
+
+    // 1. Compute codebook
+    let mut centroids = vec![0.0f32; num_levels];
+    let mut boundaries = vec![0.0f32; num_levels + 1];
+    unsafe {
+        crate::ffi::turboquant_lloyd_max(
+            centroids.as_mut_ptr(),
+            boundaries.as_mut_ptr(),
+            num_levels as i32,
+            head_dim as i32,
+            200,
+        );
+    }
+    eprintln!("Centroids: {:?}", centroids);
+    eprintln!("Boundaries: {:?}", boundaries);
+
+    // 2. Generate signs
+    let mut signs = vec![0i8; head_dim];
+    unsafe {
+        crate::ffi::turboquant_generate_signs(signs.as_mut_ptr(), head_dim as i32, 42);
+    }
+
+    // 3. Generate test vector
+    let mut x = vec![0.0f32; head_dim];
+    let mut seed = 12345u64;
+    for v in x.iter_mut() {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *v = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+    }
+
+    // 4. CPU quantize: norm → normalize → sign flip → FWHT → searchsorted → pack
+    let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let inv_norm = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+
+    let mut y: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * inv_norm * signs[i] as f32)
+        .collect();
+
+    // FWHT
+    let n = head_dim;
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = y[j];
+                let b = y[j + h];
+                y[j] = a + b;
+                y[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    for v in y.iter_mut() {
+        *v *= scale;
+    }
+
+    // Searchsorted
+    let mut indices = vec![0u8; head_dim];
+    for (i, &val) in y.iter().enumerate() {
+        let mut idx = 0u8;
+        for k in 1..num_levels {
+            if val >= boundaries[k] {
+                idx = k as u8;
+            }
+        }
+        indices[i] = idx;
+    }
+
+    // 5. CPU dequantize: gather → iFFWT → sign flip → scale
+    let mut y_hat: Vec<f32> = indices.iter().map(|&idx| centroids[idx as usize]).collect();
+
+    // iFFWT (same as FWHT for orthogonal Hadamard)
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = y_hat[j];
+                let b = y_hat[j + h];
+                y_hat[j] = a + b;
+                y_hat[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    for v in y_hat.iter_mut() {
+        *v *= scale;
+    }
+
+    // Sign flip + scale by norm
+    let x_hat: Vec<f32> = y_hat
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * signs[i] as f32 * norm)
+        .collect();
+
+    // 6. Compute error
+    let mut sum_sq_err = 0.0f64;
+    let mut sum_sq_input = 0.0f64;
+    let mut max_err = 0.0f32;
+    for i in 0..head_dim {
+        let err = (x[i] - x_hat[i]).abs();
+        sum_sq_err += (err as f64).powi(2);
+        sum_sq_input += (x[i] as f64).powi(2);
+        max_err = max_err.max(err);
+    }
+    let rmse = (sum_sq_err / head_dim as f64).sqrt();
+    let rms_input = (sum_sq_input / head_dim as f64).sqrt();
+    let relative_rmse = rmse / rms_input;
+
+    eprintln!(
+        "CPU reference 3-bit: RMSE={rmse:.6}, max_err={max_err:.4}, relative_RMSE={relative_rmse:.4}"
+    );
+
+    // CPU reference should give the theoretical bound
+    assert!(
+        relative_rmse < 0.30,
+        "CPU relative RMSE {relative_rmse:.4} too high"
+    );
+}

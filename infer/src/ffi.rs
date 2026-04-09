@@ -1240,4 +1240,39 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── TurboQuant Fused Decode Attention ───
+
+    // Rotate query: sign flip + FWHT. Prepares Q for fused TQ attention.
+    pub(crate) fn tq_rotate_query_cuda(
+        Q: *const Half,
+        Q_rot: *mut Half,
+        signs: *const i8,
+        num_heads_total: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fused TQ decode attention: score from packed K, dequant V in-kernel.
+    pub(crate) fn tq_decode_attention_cuda(
+        Q_rot: *const Half,
+        K_packed: *const u8,
+        K_norms: *const Half,
+        V_packed: *const u8,
+        V_norms: *const Half,
+        kv_indices: *const i32,
+        kv_indptr: *const i32,
+        O: *mut Half,
+        centroids_k: *const f32,
+        centroids_v: *const f32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        sm_scale: f32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }
