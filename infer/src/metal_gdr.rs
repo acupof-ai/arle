@@ -111,13 +111,15 @@ pub struct MetalLinearAttnWeights {
 /// Per-request recurrent state for all linear attention layers on Metal.
 ///
 /// Each linear attention layer maintains:
-/// - Recurrent state matrix: [num_value_heads, key_dim, value_dim] f32
-/// - Conv1d rolling buffer: [qkv_dim, conv_kernel - 1] f32
+/// - Recurrent state matrix: [1, num_value_heads, value_dim, key_dim] f32
+///   (matches Metal kernel layout — no transpose needed)
+/// - Conv1d rolling buffer: [1, conv_kernel - 1, qkv_dim] bf16
+///   (matches mlx nn.Conv1d input layout — no reshape needed)
 #[cfg(feature = "metal")]
 pub struct MetalRecurrentState {
-    /// Per-layer recurrent state: [num_value_heads, key_dim, val_dim] f32.
+    /// Per-layer recurrent state: [1, Hv, Dv, Dk] f32.
     pub states: Vec<MlxArray>,
-    /// Per-layer conv1d rolling buffer: [qkv_dim, conv_kernel - 1] f32.
+    /// Per-layer conv1d rolling buffer: [1, conv_kernel-1, qkv_dim] bf16.
     pub conv_states: Vec<MlxArray>,
     /// Number of tokens processed so far.
     pub seq_len: usize,
@@ -127,25 +129,29 @@ pub struct MetalRecurrentState {
 impl MetalRecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub fn new(num_linear_layers: usize, config: &MetalGdrConfig) -> Self {
+        use crate::mlx::{Dtype, zeros};
+
         let mut states = Vec::with_capacity(num_linear_layers);
         let mut conv_states = Vec::with_capacity(num_linear_layers);
 
         for _ in 0..num_linear_layers {
-            // Recurrent state: [num_value_heads, key_dim, val_dim] f32
-            states.push(MlxArray::from_slice_f32(
-                &vec![0.0f32; config.num_value_heads * config.key_dim * config.value_dim],
+            // Recurrent state: [1, Hv, Dv, Dk] f32 — matches Metal kernel layout
+            states.push(zeros(
                 &[
+                    1,
                     config.num_value_heads as i32,
-                    config.key_dim as i32,
                     config.value_dim as i32,
+                    config.key_dim as i32,
                 ],
+                Dtype::Float32,
             ));
 
-            // Conv state: [qkv_dim, conv_kernel - 1] f32
-            let conv_state_width = config.conv_kernel - 1;
-            conv_states.push(MlxArray::from_slice_f32(
-                &vec![0.0f32; config.qkv_dim() * conv_state_width],
-                &[config.qkv_dim() as i32, conv_state_width as i32],
+            // Conv state: [1, conv_kernel-1, qkv_dim] bf16 — matches nn.Conv1d input
+            let conv_state_width = (config.conv_kernel - 1) as i32;
+            states.len(); // suppress unused
+            conv_states.push(zeros(
+                &[1, conv_state_width, config.qkv_dim() as i32],
+                Dtype::Bfloat16,
             ));
         }
 
@@ -213,153 +219,6 @@ fn softplus(x: &MlxArray) -> MlxArray {
 //
 // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
 // Compiled with shapeless=true matching mlx_lm's pattern.
-
-#[cfg(feature = "metal")]
-static COMPILED_COMPUTE_G: std::sync::LazyLock<crate::mlx::CompiledFn> =
-    std::sync::LazyLock::new(|| crate::mlx::compile_simple(compute_g_callback, true));
-
-/// C callback for compute_g: inputs = [A_log, alpha, dt_bias], output = [g].
-#[cfg(feature = "metal")]
-unsafe extern "C" fn compute_g_callback(
-    res: *mut mlx_sys::mlx_vector_array,
-    inputs: mlx_sys::mlx_vector_array,
-) -> std::os::raw::c_int {
-    use crate::mlx::{add, exp, multiply, negative};
-
-    // Extract inputs.
-    let mut a_log_h = mlx_sys::mlx_array_new();
-    let mut alpha_h = mlx_sys::mlx_array_new();
-    let mut dt_bias_h = mlx_sys::mlx_array_new();
-    mlx_sys::mlx_vector_array_get(&mut a_log_h, inputs, 0);
-    mlx_sys::mlx_vector_array_get(&mut alpha_h, inputs, 1);
-    mlx_sys::mlx_vector_array_get(&mut dt_bias_h, inputs, 2);
-
-    let a_log = MlxArray::from_raw(a_log_h);
-    let alpha = MlxArray::from_raw(alpha_h);
-    let dt_bias = MlxArray::from_raw(dt_bias_h);
-
-    // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
-    let alpha_plus_bias = add(&alpha, &dt_bias);
-    let sp = softplus(&alpha_plus_bias);
-    let neg_a_exp = negative(&exp(&a_log));
-    let g = exp(&multiply(&neg_a_exp, &sp));
-
-    // Set output.
-    let out = mlx_sys::mlx_vector_array_new_data(&g.as_raw(), 1);
-    mlx_sys::mlx_vector_array_set(res, out);
-    mlx_sys::mlx_vector_array_free(out);
-
-    // Don't free inputs — caller owns them. But we took ownership via from_raw,
-    // so forget them to avoid double-free.
-    std::mem::forget(a_log);
-    std::mem::forget(alpha);
-    std::mem::forget(dt_bias);
-
-    0
-}
-
-/// Compute g using the compiled closure.
-#[cfg(feature = "metal")]
-fn compiled_compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxArray {
-    let results = COMPILED_COMPUTE_G.call(&[a_log, alpha, dt_bias]);
-    results
-        .into_iter()
-        .next()
-        .expect("compute_g should return 1 array")
-}
-
-// ── Compiled GDR state update ───────────────────────────────────────────────
-//
-// Compiled version of the delta-rule state update matching mlx_lm's
-// @mx.compile on _gated_delta_step_ops.
-// inputs = [q, k, v, g, beta, state]  (all properly shaped)
-// outputs = [y, new_state]
-
-#[cfg(feature = "metal")]
-static COMPILED_GDR_STEP: std::sync::LazyLock<crate::mlx::CompiledFn> =
-    std::sync::LazyLock::new(|| crate::mlx::compile_simple(gdr_step_callback, false));
-
-/// C callback for the GDR state update step.
-/// inputs[0] = q [H, K], inputs[1] = k [H, K], inputs[2] = v [H, V],
-/// inputs[3] = g [H], inputs[4] = beta [H], inputs[5] = state [H, K, V]
-/// outputs[0] = y [H, V], outputs[1] = new_state [H, K, V]
-#[cfg(feature = "metal")]
-unsafe extern "C" fn gdr_step_callback(
-    res: *mut mlx_sys::mlx_vector_array,
-    inputs: mlx_sys::mlx_vector_array,
-) -> std::os::raw::c_int {
-    use crate::mlx::{add, multiply, reshape, subtract, sum_axis};
-
-    // Extract 6 inputs.
-    let get = |i: usize| -> MlxArray {
-        let mut h = mlx_sys::mlx_array_new();
-        mlx_sys::mlx_vector_array_get(&mut h, inputs, i);
-        MlxArray::from_raw(h)
-    };
-    let q = get(0); // [H, K]
-    let k = get(1); // [H, K]
-    let v = get(2); // [H, V]
-    let g = get(3); // [H]
-    let beta = get(4); // [H]
-    let state = get(5); // [H, K, V]
-
-    let h_dim = state.shape()[0];
-    let k_dim = state.shape()[1];
-    let v_dim = state.shape()[2];
-
-    // Decay: state * g[:, None, None]
-    let g_3d = reshape(&g, &[h_dim, 1, 1]);
-    let s_decayed = multiply(&state, &g_3d);
-
-    // kv_mem = sum_k(S_decayed * k[:, :, None])
-    let k_3d = reshape(&k, &[h_dim, k_dim, 1]);
-    let kv_mem = sum_axis(&multiply(&s_decayed, &k_3d), 1, false); // [H, V]
-
-    // delta = (v - kv_mem) * beta[:, None]
-    let beta_2d = reshape(&beta, &[h_dim, 1]);
-    let delta = multiply(&subtract(&v, &kv_mem), &beta_2d); // [H, V]
-
-    // Rank-1 update: S += delta[:, None, :] * k[:, :, None]
-    let delta_3d = reshape(&delta, &[h_dim, 1, v_dim]);
-    let s_updated = add(&s_decayed, &multiply(&delta_3d, &k_3d)); // [H, K, V]
-
-    // Output: y = sum_k(S_updated * q[:, :, None])
-    let q_3d = reshape(&q, &[h_dim, k_dim, 1]);
-    let y = sum_axis(&multiply(&s_updated, &q_3d), 1, false); // [H, V]
-
-    // Output: [y, s_updated]
-    let out_arrays = [y.as_raw(), s_updated.as_raw()];
-    let out = mlx_sys::mlx_vector_array_new_data(out_arrays.as_ptr(), 2);
-    mlx_sys::mlx_vector_array_set(res, out);
-    mlx_sys::mlx_vector_array_free(out);
-
-    // Forget all inputs (caller owns them via mlx_vector_array_get refcount).
-    std::mem::forget(q);
-    std::mem::forget(k);
-    std::mem::forget(v);
-    std::mem::forget(g);
-    std::mem::forget(beta);
-    std::mem::forget(state);
-
-    0
-}
-
-/// Call the compiled GDR step.
-#[cfg(feature = "metal")]
-fn compiled_gdr_step(
-    q: &MlxArray,
-    k: &MlxArray,
-    v: &MlxArray,
-    g: &MlxArray,
-    beta: &MlxArray,
-    state: &MlxArray,
-) -> (MlxArray, MlxArray) {
-    let results = COMPILED_GDR_STEP.call(&[q, k, v, g, beta, state]);
-    let mut it = results.into_iter();
-    let y = it.next().expect("gdr_step output y");
-    let new_state = it.next().expect("gdr_step output state");
-    (y, new_state)
-}
 
 // ── Metal GDR kernel ────────────────────────────────────────────────────────
 //
@@ -486,45 +345,44 @@ fn metal_gdr_kernel_step(
     (y, new_state)
 }
 
-// ── Conv1d single-step ───────────────────────────────────────────────────────
+// ── Conv1d step ─────────────────────────────────────────────────────────────
 
-/// Causal depthwise conv1d for a single timestep.
+/// Conv1d step matching mlx_lm approach:
+/// 1. Concatenate conv_state and new input along seq axis
+/// 2. Update conv_state (keep last kernel_size-1 timesteps)
+/// 3. Run standard nn.Conv1d (depthwise, no padding)
+/// 4. SiLU activation
 ///
-/// Uses manual concatenate+multiply+sum — faster than mlx_conv1d for
-/// single-token decode because it avoids reshape/transpose overhead.
+/// Input/state shapes match mlx_lm: [B=1, T, qkv_dim] in bf16.
 #[cfg(feature = "metal")]
-fn conv1d_step(
-    x: &MlxArray,
+fn conv1d_step_v2(
+    qkv: &MlxArray,
     conv_state: &mut MlxArray,
     kernel: &MlxArray,
-    qkv_dim: usize,
-    kernel_size: usize,
+    config: &MetalGdrConfig,
 ) -> MlxArray {
-    use crate::mlx::{Dtype, as_dtype, concatenate_axis, multiply, reshape, silu, slice, sum_axis};
+    use crate::mlx::{concatenate_axis, conv1d, silu, slice};
 
-    let x_col = reshape(x, &[qkv_dim as i32, 1]);
-    let full_window = concatenate_axis(&[conv_state.clone(), x_col], 1);
-    let prod = multiply(&full_window, kernel);
-    let conv_out = sum_axis(&prod, 1, false);
+    let qkv_dim = config.qkv_dim() as i32;
+    let n_keep = (config.conv_kernel - 1) as i32;
+    let total_len = n_keep + 1; // conv_state has n_keep timesteps, we add 1
 
-    // Truncate to bf16 before SiLU (matching CUDA precision), keep as f32 for downstream.
-    let conv_bf16 = as_dtype(&conv_out, Dtype::Bfloat16);
-    let activated = as_dtype(&silu(&conv_bf16), Dtype::Float32);
+    // conv_input: [1, conv_kernel, qkv_dim] — concat state [1, n_keep, C] + qkv [1, 1, C]
+    let conv_input = concatenate_axis(&[conv_state.clone(), qkv.clone()], 1);
 
-    // Update conv_state: shift left, drop oldest column, append x
-    // New state = full_window[:, 1:] = columns [1..kernel_size] of full_window
-    // slice(full_window, [0, 1], [qkv_dim, kernel_size], [1, 1])
-    let state_width = (kernel_size - 1) as i32;
-    if state_width > 0 {
-        *conv_state = slice(
-            &full_window,
-            &[0, 1],
-            &[qkv_dim as i32, kernel_size as i32],
-            &[1, 1],
-        );
-    }
+    // Update state: keep last n_keep timesteps
+    *conv_state = slice(
+        &conv_input,
+        &[0, 1, 0],
+        &[1, total_len, qkv_dim],
+        &[1, 1, 1],
+    );
 
-    activated
+    // Depthwise conv1d: [1, conv_kernel, C] → [1, 1, C] (no padding, groups=C)
+    let conv_out = conv1d(&conv_input, kernel, 1, 0, qkv_dim);
+
+    // SiLU activation (works in any dtype)
+    silu(&conv_out)
 }
 
 // ── GDR decode step ──────────────────────────────────────────────────────────
@@ -543,6 +401,13 @@ fn conv1d_step(
 ///
 /// # Returns
 /// - [1, hidden_size] output hidden state (after output projection)
+/// Optimized GDR decode step matching mlx_lm's approach:
+/// - Standard mlx::conv1d instead of manual multiply+sum (saves ~4 ops)
+/// - State stored in [B, Hv, Dv, Dk] — no transposes around Metal kernel (saves 4 ops)
+/// - Work in bf16 throughout — minimal dtype casts (saves ~8 casts)
+/// - 3D/4D tensors — fewer reshapes (saves ~6 reshapes)
+///
+/// Total ops: ~34 (down from ~60), matching mlx_lm.
 #[cfg(feature = "metal")]
 pub fn metal_gdr_decode_step(
     x: &MlxArray,
@@ -552,195 +417,177 @@ pub fn metal_gdr_decode_step(
     config: &MetalGdrConfig,
 ) -> MlxArray {
     use crate::mlx::{
-        Dtype, add, as_dtype, broadcast_to, exp, expand_dims, multiply, negative, reshape,
-        rms_norm, sigmoid, silu, slice, subtract, sum_axis, transpose_axes,
+        Dtype, add, as_dtype, exp, multiply, negative, reshape, rms_norm, sigmoid, silu, slice,
     };
 
-    let num_key_heads = config.num_key_heads;
-    let key_dim = config.key_dim;
-    let num_value_heads = config.num_value_heads;
-    let value_dim = config.value_dim;
-    let q_dim = num_key_heads * key_dim;
-    let k_dim = q_dim;
-    let v_dim = num_value_heads * value_dim;
+    let hk = config.num_key_heads as i32;
+    let dk = config.key_dim as i32;
+    let hv = config.num_value_heads as i32;
+    let dv = config.value_dim as i32;
+    let key_dim_f = config.key_dim as f32;
 
-    // ── 1. Merged projections (4 matmuls → 2) ─────────────────────────
-    // Fused QKVZ: single matmul → split into qkv + z
-    // Fused BA: single matmul → split into beta + alpha
-    let x_flat = reshape(x, &[1, config.hidden_size as i32]);
+    // ── 1. Projections (2 fused matmuls) ─────────────────────────────────
+    let x_flat = reshape(x, &[1, 1, config.hidden_size as i32]);
 
-    // quantized_matmul returns in input dtype (bf16) — no cast needed.
     let qkvz = linear(&x_flat, &layer_weights.in_proj_qkvz);
     let (qkv_split, z_split) = layer_weights.qkvz_split;
-    let qkv_raw = slice(&qkvz, &[0, 0], &[1, qkv_split], &[1, 1]);
-    let z = slice(&qkvz, &[0, qkv_split], &[1, qkv_split + z_split], &[1, 1]);
+    // qkv: [1, 1, qkv_dim], z: [1, 1, z_dim]
+    let qkv = slice(&qkvz, &[0, 0, 0], &[1, 1, qkv_split], &[1, 1, 1]);
+    let z = slice(
+        &qkvz,
+        &[0, 0, qkv_split],
+        &[1, 1, qkv_split + z_split],
+        &[1, 1, 1],
+    );
 
     let ba = linear(&x_flat, &layer_weights.in_proj_ba);
     let nh = layer_weights.ba_num_heads;
-    let beta_raw = slice(&ba, &[0, 0], &[1, nh], &[1, 1]);
-    let alpha_raw = slice(&ba, &[0, nh], &[1, nh * 2], &[1, 1]);
+    let b_raw = slice(&ba, &[0, 0, 0], &[1, 1, nh], &[1, 1, 1]);
+    let a_raw = slice(&ba, &[0, 0, nh], &[1, 1, nh * 2], &[1, 1, 1]);
 
-    // Flatten to 1D for per-element ops
-    let qkv_1d = reshape(&qkv_raw, &[config.qkv_dim() as i32]);
-
-    // ── 2. Conv1d step ───────────────────────────────────────────────────
-    // Cast qkv to f32 for conv1d (state is f32)
-    let qkv_f32 = as_dtype(&qkv_1d, Dtype::Float32);
-
-    let qkv_conv = conv1d_step(
-        &qkv_f32,
+    // ── 2. Conv1d (standard mlx::conv1d, depthwise) ──────────────────────
+    // qkv is [1, 1, qkv_dim] bf16 — same layout as mlx_lm
+    let conv_out = conv1d_step_v2(
+        &qkv,
         &mut state.conv_states[layer_idx],
         &layer_weights.conv1d_weight,
-        config.qkv_dim(),
-        config.conv_kernel,
+        config,
     );
+    // conv_out: [1, 1, qkv_dim] bf16 (already activated with SiLU)
 
     // ── 3. Split QKV and RMS-normalize q, k ──────────────────────────────
-    // qkv_conv: [qkv_dim] → split into q [q_dim], k [k_dim], v [v_dim]
-    let q_raw = slice(&qkv_conv, &[0], &[q_dim as i32], &[1]);
-    let k_raw = slice(&qkv_conv, &[q_dim as i32], &[(q_dim + k_dim) as i32], &[1]);
-    let v_raw = slice(
-        &qkv_conv,
-        &[(q_dim + k_dim) as i32],
-        &[(q_dim + k_dim + v_dim) as i32],
-        &[1],
+    let q_dim = hk * dk;
+    let k_dim = q_dim;
+    let v_dim = hv * dv;
+
+    // Split conv output: [1, 1, qkv_dim] → q, k, v
+    let q_raw = reshape(
+        &slice(&conv_out, &[0, 0, 0], &[1, 1, q_dim], &[1, 1, 1]),
+        &[1, 1, hk, dk],
+    );
+    let k_raw = reshape(
+        &slice(
+            &conv_out,
+            &[0, 0, q_dim],
+            &[1, 1, q_dim + k_dim],
+            &[1, 1, 1],
+        ),
+        &[1, 1, hk, dk],
+    );
+    let v_raw = reshape(
+        &slice(
+            &conv_out,
+            &[0, 0, q_dim + k_dim],
+            &[1, 1, q_dim + k_dim + v_dim],
+            &[1, 1, 1],
+        ),
+        &[1, 1, hv, dv],
     );
 
-    // MLX normalizes q/k per key head, not across the concatenated q_dim.
-    let q_per_key_head = reshape(&q_raw, &[num_key_heads as i32, key_dim as i32]);
-    let k_per_key_head = reshape(&k_raw, &[num_key_heads as i32, key_dim as i32]);
-    let q_norm = rms_normalize(&q_per_key_head, 1e-6);
-    let k_norm = rms_normalize(&k_per_key_head, 1e-6);
-
-    // Match mlx_lm:
-    //   q = (inv_scale**2) * rms_norm(q, None, 1e-6)
-    //   k = inv_scale * rms_norm(k, None, 1e-6)
-    let inv_scale = 1.0 / (key_dim as f32).sqrt();
-    let q_scale = inv_scale * inv_scale;
-    let q_scaled = multiply(&q_norm, &MlxArray::from_slice_f32(&[q_scale], &[1]));
-    let k_scaled = multiply(&k_norm, &MlxArray::from_slice_f32(&[inv_scale], &[1]));
+    // RMS-normalize per head + scale (matching mlx_lm exactly)
+    let inv_scale = 1.0 / key_dim_f.sqrt();
+    let q_scale_val = inv_scale * inv_scale;
+    let q = multiply(
+        &rms_normalize(&q_raw, 1e-6),
+        &MlxArray::scalar_f32(q_scale_val),
+    );
+    let k = multiply(
+        &rms_normalize(&k_raw, 1e-6),
+        &MlxArray::scalar_f32(inv_scale),
+    );
 
     // ── 4. Compute gate (g) and beta ─────────────────────────────────────
-    // Flatten alpha and beta to [num_value_heads]
-    let alpha_1d = as_dtype(
-        &reshape(&alpha_raw, &[num_value_heads as i32]),
-        Dtype::Float32,
-    );
-    let beta_1d = as_dtype(
-        &reshape(&beta_raw, &[num_value_heads as i32]),
-        Dtype::Float32,
-    );
+    // beta = sigmoid(b)
+    let beta = sigmoid(&b_raw);
 
     // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
-    // Compiled with shapeless=true matching mlx_lm's pattern.
-    let exp_g = compiled_compute_g(&layer_weights.a_log, &alpha_1d, &layer_weights.dt_bias);
+    let a_plus_bias = add(&a_raw, &layer_weights.dt_bias);
+    let sp = softplus(&a_plus_bias);
+    let g = exp(&multiply(&negative(&exp(&layer_weights.a_log)), &sp));
 
-    // beta = sigmoid(beta_raw)
-    let beta = sigmoid(&beta_1d);
-
-    // Metal kernel disabled by default — crashes on longer sequences (>~50 tokens).
-    // The kernel works for short sequences; needs state transposition debugging.
-    // Enable with AGENT_INFER_GDR_METAL_KERNEL=1.
-    // Metal GDR kernel enabled by default — replaces ~14 MLX ops with 1 GPU dispatch.
-    // Disable with AGENT_INFER_GDR_METAL_KERNEL=0.
+    // ── 5. Metal kernel GDR state update ─────────────────────────────────
     let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
         .is_some_and(|v| v == "0");
 
-    // ── 5–6. State update ─────────────────────────────────────────────
-    let heads_per_key = num_value_heads / num_key_heads;
-    let hv = num_value_heads as i32;
-    let dk = key_dim as i32;
-    let dv = value_dim as i32;
+    let y = if use_metal_kernel {
+        // Reshape for kernel: q/k [1,1,Hk,Dk]→bf16, v [1,1,Hv,Dv]→bf16
+        // g [1,1,Hv], beta [1,1,Hv]
+        // State already in [1, Hv, Dv, Dk] f32 — no transpose needed!
+        let q_bf16 = as_dtype(&q, Dtype::Bfloat16);
+        let k_bf16 = as_dtype(&k, Dtype::Bfloat16);
+        let v_bf16 = as_dtype(&v_raw, Dtype::Bfloat16);
+        let g_3d = reshape(&g, &[1, 1, hv]);
+        let beta_3d = reshape(&beta, &[1, 1, hv]);
 
-    let output_heads = if use_metal_kernel {
-        // Metal kernel path — single GPU dispatch for entire GDR step.
-        let b = 1i32;
-        let t = 1i32;
-        let hk = num_key_heads as i32;
-
-        let q_kernel = as_dtype(&reshape(&q_scaled, &[b, t, hk, dk]), Dtype::Bfloat16);
-        let k_kernel = as_dtype(&reshape(&k_scaled, &[b, t, hk, dk]), Dtype::Bfloat16);
-        let v_kernel = as_dtype(&reshape(&v_raw, &[b, t, hv, dv]), Dtype::Bfloat16);
-        let g_kernel = reshape(&exp_g, &[b, t, hv]);
-        let beta_kernel = reshape(&beta, &[b, t, hv]);
-
-        // State: our [Hv, Dk, Dv] → kernel [B=1, Hv, Dv, Dk]
-        let state_kernel = transpose_axes(
-            &reshape(&state.states[layer_idx], &[b, hv, dk, dv]),
-            &[0, 1, 3, 2],
-        );
-
-        let (y_kernel, state_out_kernel) = metal_gdr_kernel_step(
-            &q_kernel,
-            &k_kernel,
-            &v_kernel,
-            &g_kernel,
-            &beta_kernel,
-            &state_kernel,
+        let (y_out, new_state) = metal_gdr_kernel_step(
+            &q_bf16,
+            &k_bf16,
+            &v_bf16,
+            &g_3d,
+            &beta_3d,
+            &state.states[layer_idx],
             config,
         );
 
-        // State back: [B=1, Hv, Dv, Dk] → [Hv, Dk, Dv]
-        state.states[layer_idx] = reshape(
-            &transpose_axes(&state_out_kernel, &[0, 1, 3, 2]),
-            &[hv, dk, dv],
-        );
-        as_dtype(&reshape(&y_kernel, &[hv, dv]), Dtype::Float32)
+        state.states[layer_idx] = new_state;
+        // y_out: [1, 1, Hv, Dv] bf16
+        y_out
     } else {
-        // Compiled ops fallback.
-        let k_expanded = if heads_per_key > 1 {
-            let k_unsq = expand_dims(&k_scaled, 1);
-            let k_broadcast =
-                broadcast_to(&k_unsq, &[num_key_heads as i32, heads_per_key as i32, dk]);
-            reshape(&k_broadcast, &[hv, dk])
-        } else {
-            k_scaled
-        };
-        let q_expanded = if heads_per_key > 1 {
-            let q_unsq = expand_dims(&q_scaled, 1);
-            let q_broadcast =
-                broadcast_to(&q_unsq, &[num_key_heads as i32, heads_per_key as i32, dk]);
-            reshape(&q_broadcast, &[hv, dk])
-        } else {
-            q_scaled
-        };
-        let v_heads = reshape(&v_raw, &[hv, dv]);
+        // Ops fallback — use the compiled step ops pattern
+        use crate::mlx::{broadcast_to, expand_dims, subtract, sum_axis};
+        let heads_per_key = config.num_value_heads / config.num_key_heads;
 
-        let (y, s_updated) = compiled_gdr_step(
-            &q_expanded,
-            &k_expanded,
-            &v_heads,
-            &exp_g,
-            &beta,
-            &state.states[layer_idx],
-        );
+        // Expand q/k for GQA
+        let q_exp = if heads_per_key > 1 {
+            let q_unsq = expand_dims(&q, 2);
+            reshape(
+                &broadcast_to(&q_unsq, &[1, 1, hk, heads_per_key as i32, dk]),
+                &[1, hv, dk],
+            )
+        } else {
+            reshape(&q, &[1, hv, dk])
+        };
+        let k_exp = if heads_per_key > 1 {
+            let k_unsq = expand_dims(&k, 2);
+            reshape(
+                &broadcast_to(&k_unsq, &[1, 1, hk, heads_per_key as i32, dk]),
+                &[1, hv, dk],
+            )
+        } else {
+            reshape(&k, &[1, hv, dk])
+        };
+        let v_3d = reshape(&v_raw, &[1, hv, dv]);
+
+        // State: [1, Hv, Dv, Dk] — decay + delta update
+        let g_4d = reshape(&g, &[1, hv, 1, 1]);
+        let s = &state.states[layer_idx];
+        let s_decayed = multiply(s, &g_4d);
+        let k_4d = reshape(&k_exp, &[1, hv, 1, dk]);
+        let kv_mem = sum_axis(&multiply(&s_decayed, &k_4d), -1, false);
+        let beta_3d = reshape(&beta, &[1, hv, 1]);
+        let delta = multiply(&subtract(&v_3d, &kv_mem), &beta_3d);
+        let delta_4d = reshape(&delta, &[1, hv, dv, 1]);
+        let s_updated = add(&s_decayed, &multiply(&delta_4d, &k_4d));
+        let q_4d = reshape(&q_exp, &[1, hv, 1, dk]);
+        let y_raw = sum_axis(&multiply(&s_updated, &q_4d), -1, false);
         state.states[layer_idx] = s_updated;
-        y
+        // y_raw: [1, Hv, Dv] → reshape to [1, 1, Hv, Dv]
+        reshape(&y_raw, &[1, 1, hv, dv])
     };
 
-    // ── 7. Per-head RMSNorm + output gate ────────────────────────────────
-    // output_heads: [num_value_heads, val_dim]
-    // norm_weight: [val_dim] (broadcast across heads)
-    // z: [1, z_dim] where z_dim = num_value_heads * val_dim
+    // ── 6. Per-head RMSNorm + output gate ────────────────────────────────
+    // y: [1, 1, Hv, Dv] → reshape to [Hv, Dv] for per-head norm
+    let y_heads = reshape(&y, &[hv, dv]);
+    let normed = rms_norm(&y_heads, &layer_weights.norm_weight, config.rms_norm_eps);
 
-    // RMSNorm per head + flatten.
-    let normed = rms_norm(
-        &as_dtype(&output_heads, Dtype::Bfloat16),
-        &layer_weights.norm_weight,
-        config.rms_norm_eps,
-    );
-    let normed_flat = reshape(&normed, &[1, (num_value_heads * value_dim) as i32]);
+    // z: [1, 1, z_dim] → reshape [1, 1, Hv, Dv] → silu → multiply with normed
+    let z_gated = reshape(&z, &[hv, dv]);
+    let out = multiply(&normed, &silu(&z_gated));
 
-    // Output gate: o = normed * silu(z).  silu takes f32 input.
-    let z_silu = silu(&as_dtype(&z, Dtype::Float32));
-    let gated = as_dtype(
-        &multiply(&as_dtype(&normed_flat, Dtype::Float32), &z_silu),
-        Dtype::Bfloat16,
-    );
-
-    // Output projection.
-    linear(&gated, &layer_weights.out_proj)
+    // Output projection: flatten to [1, z_dim] → matmul
+    let out_flat = reshape(&out, &[1, hv * dv]);
+    linear(&out_flat, &layer_weights.out_proj)
 }
 
 #[cfg(test)]

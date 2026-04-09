@@ -19,41 +19,6 @@ use crate::{
     sampler::SamplingParams,
 };
 
-// ── Compiled SwiGLU ─────────────────────────────────────────────────────────
-// silu(gate) * up → single compiled Metal kernel. Saves 1 dispatch per layer.
-
-static COMPILED_SWIGLU: std::sync::LazyLock<crate::mlx::CompiledFn> =
-    std::sync::LazyLock::new(|| crate::mlx::compile_simple(swiglu_callback, true));
-
-unsafe extern "C" fn swiglu_callback(
-    res: *mut mlx_sys::mlx_vector_array,
-    inputs: mlx_sys::mlx_vector_array,
-) -> std::os::raw::c_int {
-    let mut gate_h = mlx_sys::mlx_array_new();
-    let mut up_h = mlx_sys::mlx_array_new();
-    mlx_sys::mlx_vector_array_get(&mut gate_h, inputs, 0);
-    mlx_sys::mlx_vector_array_get(&mut up_h, inputs, 1);
-    let gate = MlxArray::from_raw(gate_h);
-    let up = MlxArray::from_raw(up_h);
-
-    let result = multiply(&silu(&gate), &up);
-
-    let out = mlx_sys::mlx_vector_array_new_data(&result.as_raw(), 1);
-    mlx_sys::mlx_vector_array_set(res, out);
-    mlx_sys::mlx_vector_array_free(out);
-    std::mem::forget(gate);
-    std::mem::forget(up);
-    0
-}
-
-fn compiled_swiglu(gate: &MlxArray, up: &MlxArray) -> MlxArray {
-    COMPILED_SWIGLU
-        .call(&[gate, up])
-        .into_iter()
-        .next()
-        .expect("swiglu should return 1 array")
-}
-
 pub(super) struct MetalQwen35FullAttentionWeights {
     pub(super) q_proj: WeightTensor,
     pub(super) k_proj: WeightTensor,
@@ -150,10 +115,13 @@ pub(super) fn metal_generate_qwen35(
     let mut generated = Vec::new();
     let mut ttft_ms = 0.0;
 
-    let mut logits = logits;
+    // Double-buffered async_eval: GPU executes step N while CPU builds step N+1.
+    let mut pending = gpu_sample_token(&logits, params)?;
+    crate::mlx::async_eval(&[&pending]);
 
     let finish_reason = loop {
-        let next_token = gpu_sample_token(&logits, params)?.item_i32() as u32;
+        // Sync previous GPU result (likely done since async_eval).
+        let next_token = pending.item_i32() as u32;
 
         if generated.is_empty() {
             ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -194,11 +162,11 @@ pub(super) fn metal_generate_qwen35(
             kv_capacity = new_cap;
         }
 
-        if !generated.is_empty() && generated.len().is_multiple_of(256) {
+        if generated.len().is_multiple_of(256) {
             clear_metal_cache();
         }
 
-        logits = qwen35_forward_step(
+        let logits = qwen35_forward_step(
             next_token,
             weights,
             config,
@@ -210,6 +178,10 @@ pub(super) fn metal_generate_qwen35(
         );
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
+
+        // Build sample token graph and kick off GPU — CPU loops back to sync at top.
+        pending = gpu_sample_token(&logits, params)?;
+        crate::mlx::async_eval(&[&pending]);
     };
 
     let elapsed = t0.elapsed().as_secs_f64();
@@ -287,7 +259,7 @@ fn qwen35_forward_step(
         );
         let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
         // SwiGLU: silu(gate) * up → compiled kernel. No casts needed.
-        let fused_val = compiled_swiglu(&gate_raw, &up);
+        let fused_val = multiply(&silu(&gate_raw), &up);
         let mlp = linear(&fused_val, &layer.down_proj);
         x = add(&residual2, &mlp);
     }
@@ -306,6 +278,7 @@ fn qwen35_forward_step(
 /// Helper: extract raw mlx_array + quant params from a WeightTensor.
 /// For Dense: returns (w_t, empty, empty, 0, 0, false).
 /// For Quantized: returns (w, scales, biases, group_size, bits, true).
+#[cfg(metal_qwen35_fused_ops)]
 fn wt_parts(
     wt: &WeightTensor,
 ) -> (
@@ -632,6 +605,12 @@ pub(super) fn load_qwen35_metal_weights(
         &load_proj,
     )?;
 
+    log::info!(
+        "  {} layers ({} full attention, {} GDR)",
+        config.num_hidden_layers,
+        arch.num_full_attention_layers(),
+        arch.num_linear_attention_layers(),
+    );
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let layer_prefix = format!("{prefix}.layers.{i}");
@@ -689,12 +668,9 @@ pub(super) fn load_qwen35_metal_weights(
                         &get(&format!("{attn_prefix}.conv1d.weight"))?,
                         &arch.linear,
                     ),
-                    dt_bias: as_dtype(&get(&format!("{attn_prefix}.dt_bias"))?, Dtype::Float32),
+                    dt_bias: get(&format!("{attn_prefix}.dt_bias"))?,
                     a_log: as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
-                    norm_weight: as_dtype(
-                        &get(&format!("{attn_prefix}.norm.weight"))?,
-                        Dtype::Float32,
-                    ),
+                    norm_weight: get(&format!("{attn_prefix}.norm.weight"))?,
                     out_proj: load_proj(&format!("{attn_prefix}.out_proj"))?,
                 })
             }
@@ -751,34 +727,24 @@ fn load_lm_head(
     tie_lm_head_from_embed_tokens(embed_tokens)
 }
 
+/// Load conv1d weight in nn.Conv1d format: [out_channels, kernel_size, in_channels/groups].
+/// For depthwise conv (groups=C), shape is [C, K, 1]. Keep native dtype (bf16).
 fn load_conv1d_weight(
     weight: &MlxArray,
     linear_cfg: &crate::metal_gdr::MetalGdrConfig,
 ) -> MlxArray {
+    let c = linear_cfg.qkv_dim() as i32;
+    let k = linear_cfg.conv_kernel as i32;
     match weight.shape() {
-        [qkv_dim, kernel] => {
-            assert!(
-                *qkv_dim == linear_cfg.qkv_dim() as i32 && *kernel == linear_cfg.conv_kernel as i32,
-                "unexpected conv1d weight shape {:?}, expected [{}, {}]",
-                weight.shape(),
-                linear_cfg.qkv_dim(),
-                linear_cfg.conv_kernel
-            );
-            as_dtype(weight, Dtype::Float32)
-        }
-        [qkv_dim, dim1, dim2]
-            if *qkv_dim == linear_cfg.qkv_dim() as i32
-                && ((*dim1 == 1 && *dim2 == linear_cfg.conv_kernel as i32)
-                    || (*dim1 == linear_cfg.conv_kernel as i32 && *dim2 == 1)) =>
-        {
-            as_dtype(
-                &reshape(
-                    weight,
-                    &[linear_cfg.qkv_dim() as i32, linear_cfg.conv_kernel as i32],
-                ),
-                Dtype::Float32,
-            )
-        }
-        shape => panic!("unsupported conv1d weight shape {:?}", shape),
+        // Already [C, K, 1] — nn.Conv1d format
+        [ch, ks, 1] if *ch == c && *ks == k => weight.clone(),
+        // [C, 1, K] — transpose to [C, K, 1]
+        [ch, 1, ks] if *ch == c && *ks == k => reshape(weight, &[c, k, 1]),
+        // [C, K] — reshape to [C, K, 1]
+        [ch, ks] if *ch == c && *ks == k => reshape(weight, &[c, k, 1]),
+        shape => panic!(
+            "unsupported conv1d weight shape {:?}, expected [{c}, {k}, 1]",
+            shape
+        ),
     }
 }

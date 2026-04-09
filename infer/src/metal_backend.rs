@@ -72,9 +72,8 @@ use qwen35::{Qwen35MetalWeights, load_qwen35_metal_weights, metal_generate_qwen3
 // Output arrays (`*mut mlx_sys::mlx_array` written by C++) transfer ownership
 // to Rust — they must eventually be freed via `mlx_array_free` (happens
 // automatically when `MlxArray` is dropped).
-#[cfg(all(feature = "metal", metal_fused_ops))]
+#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
 mod metal_ffi {
-    use mlx_sys::mlx_array;
 
     unsafe extern "C" {
         /// Full transformer block: norm → QKV → RoPE → KV-cache → GQA →
@@ -249,9 +248,8 @@ mod metal_ffi {
 }
 
 /// Pure C API fused block — no C++ ABI issues.
-#[cfg(all(feature = "metal", metal_capi_fused))]
+#[cfg(all(feature = "metal", metal_capi_fused, not_currently_available))]
 mod metal_capi_ffi {
-    use mlx_sys::mlx_array;
 
     unsafe extern "C" {
         #[allow(clippy::too_many_arguments)]
@@ -285,7 +283,6 @@ mod metal_capi_ffi {
 }
 
 #[cfg(feature = "metal")]
-const METAL_CAPI_FUSED_AVAILABLE: bool = cfg!(metal_capi_fused);
 #[cfg(feature = "metal")]
 const METAL_FUSED_OPS_AVAILABLE: bool = cfg!(metal_fused_ops);
 
@@ -925,7 +922,6 @@ enum FusedPathMode {
     /// quantized fused C++ block.
     Quantized,
     /// Dense weights — use pure C API fused block (no C++ ABI issues).
-    CApiFused,
     /// Mixed or fused ops unavailable — fall back to Rust/MLX per-op path.
     Fallback,
 }
@@ -1031,8 +1027,6 @@ fn metal_generate(
     // Prefer C++ fused > C API fused > quantized fused > Rust fallback.
     let fused_mode = if METAL_FUSED_OPS_AVAILABLE && all_dense {
         FusedPathMode::Dense
-    } else if METAL_CAPI_FUSED_AVAILABLE && all_dense {
-        FusedPathMode::CApiFused
     } else if METAL_FUSED_OPS_AVAILABLE && all_quantized {
         FusedPathMode::Quantized
     } else {
@@ -1046,7 +1040,6 @@ fn metal_generate(
     };
 
     match fused_mode {
-        FusedPathMode::CApiFused => log::info!("Metal fused path: C API Dense"),
         FusedPathMode::Dense => log::info!("Metal fused path: Dense"),
         FusedPathMode::Quantized => log::info!("Metal fused path: Quantized"),
         FusedPathMode::Fallback => log::info!("Metal fused path: Fallback (Rust)"),
@@ -1277,59 +1270,6 @@ fn build_forward_graph(
 
     // ── Transformer layers ────────────────────────────────────────────────────
     match fused_mode {
-        #[cfg(metal_capi_fused)]
-        FusedPathMode::CApiFused => {
-            for (li, layer) in weights.layers.iter().enumerate() {
-                let (q_proj_t, k_proj_t, v_proj_t) = layer
-                    .attention_inputs
-                    .fused_dense_parts()
-                    .expect("CApiFused only when attention inputs are Dense");
-                let (gate_proj_t, up_proj_t) = layer
-                    .mlp_inputs
-                    .fused_dense_parts()
-                    .expect("CApiFused only when mlp inputs are Dense");
-                let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
-                    unreachable!()
-                };
-                let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
-                    unreachable!()
-                };
-
-                let result_raw: mlx_sys::mlx_array = unsafe {
-                    let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-                    metal_capi_ffi::metal_capi_fused_block(
-                        x.as_raw(),
-                        layer.input_layernorm.as_raw(),
-                        layer.post_attention_layernorm.as_raw(),
-                        q_proj_t.as_raw(),
-                        k_proj_t.as_raw(),
-                        v_proj_t.as_raw(),
-                        o_proj_t.as_raw(),
-                        layer.q_norm.as_raw(),
-                        layer.k_norm.as_raw(),
-                        gate_proj_t.as_raw(),
-                        up_proj_t.as_raw(),
-                        down_proj_t.as_raw(),
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        attn_scale,
-                        rope_base,
-                        head_dim, // rope_dims = head_dim
-                        eps,
-                        k_caches[li].as_raw_mut(),
-                        v_caches[li].as_raw_mut(),
-                        cache_len,
-                        seq,
-                        r.as_mut_ptr(),
-                    );
-                    r.assume_init()
-                };
-                x = unsafe { MlxArray::from_raw(result_raw) };
-            }
-        }
-        #[cfg(not(metal_capi_fused))]
-        FusedPathMode::CApiFused => unreachable!(),
         FusedPathMode::Dense => {
             for (li, layer) in weights.layers.iter().enumerate() {
                 let (q_proj_t, k_proj_t, v_proj_t) = layer
@@ -1459,7 +1399,7 @@ fn build_forward_graph(
     gpu_sample_token(&logits, params)
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops))]
+#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
@@ -1550,7 +1490,7 @@ fn fused_transformer_layer(
 ///
 /// Mirrors `fused_transformer_layer` but uses `quantized_matmul` for all
 /// projections.  Requires merged QKV and gate+up projections.
-#[cfg(all(feature = "metal", metal_fused_ops))]
+#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::too_many_arguments)]
 fn quantized_fused_transformer_layer(
