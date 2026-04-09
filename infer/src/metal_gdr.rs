@@ -89,6 +89,11 @@ pub struct MetalLinearAttnWeights {
     pub in_proj_qkvz: WeightTensor,
     /// Merged Beta+Alpha projection: [num_value_heads * 2, hidden_size].
     pub in_proj_ba: WeightTensor,
+    /// Individual projections (for C++ unfused path — fewer graph nodes).
+    pub in_proj_qkv: WeightTensor,
+    pub in_proj_z: WeightTensor,
+    pub in_proj_b: WeightTensor,
+    pub in_proj_a: WeightTensor,
     /// Split dimensions for QKVZ output: qkv_dim, z_dim.
     pub qkvz_split: (i32, i32),
     /// Number of value heads (for BA split).
