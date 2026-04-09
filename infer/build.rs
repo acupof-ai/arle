@@ -823,8 +823,7 @@ fn find_flashinfer_include() -> Option<String> {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(metal_fused_ops)");
-    // Qwen3.5 fused blocks are disabled until mlx-sys ABI mismatch is fixed.
-    // Enable via: println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
+    println!("cargo:rustc-check-cfg=cfg(metal_capi_fused)");
     println!("cargo:rustc-check-cfg=cfg(metal_qwen35_fused_ops)");
 
     // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
@@ -853,11 +852,28 @@ fn main() {
                         build.compiler("clang++");
                     }
                     build.compile("metal_fused_ops");
-                    // C++ fused blocks disabled: mlx-sys 0.2 has SmallVector vs
-                    // vector<int> ABI mismatch in ArrayDesc constructor. Every MLX
-                    // C++ op that creates a result array triggers the undefined symbol.
-                    // Fix: upgrade mlx-sys or vendor with matching headers/library.
+                    // C++ fused blocks disabled due to mlx-sys ABI mismatch.
                     // println!("cargo:rustc-cfg=metal_fused_ops");
+
+                    // Pure C API fused block (no C++ ABI issues).
+                    println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");
+                    let mut cbuild = cc::Build::new();
+                    cbuild
+                        .cpp(true)
+                        .std("c++17")
+                        .warnings(false)
+                        .flag("-O3")
+                        .include(&c_hdr)
+                        .file("csrc/metal/metal_fused_capi.cpp");
+                    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                        cbuild.compiler("clang++");
+                    }
+                    cbuild.compile("metal_fused_capi");
+                    println!("cargo:rustc-cfg=metal_capi_fused");
+                    println!(
+                        "cargo:warning=metal_fused_capi: compiled C API fused block (MLX: {})",
+                        c_hdr.display()
+                    );
                     println!(
                         "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
                         cpp_hdr.display()
