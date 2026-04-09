@@ -457,7 +457,7 @@ void metal_qwen35_full_attn_block(
                     arr_ref(q_proj_biases_h), group_size, bits, is_quantized),
         bfloat16);
     q_full = reshape(q_full, {1, 1, n_heads, head_dim * 2});
-    auto q_gate = split(q_full, {head_dim}, -1);
+    auto q_gate = split(q_full, std::vector<int>{head_dim}, -1);
     array q_heads = q_gate[0];
     array gate_heads = q_gate[1];
 
@@ -624,10 +624,6 @@ void metal_qwen35_gdr_block(
 
     // 7. Per-head RMSNorm + output gate
     array out_bf16 = astype(output_heads, bfloat16);
-    for (auto d : out_bf16.shape()) fprintf(stderr, "%d ", d);
-    fprintf(stderr, "norm_w=");
-    for (auto d : norm_w.shape()) fprintf(stderr, "%d ", d);
-    fprintf(stderr, "\n");
     array normed = fast::rms_norm(out_bf16, std::optional<array>(norm_w), rms_norm_eps);
     array normed_flat = astype(reshape(normed, {1, num_value_heads * value_dim}), bfloat16);
     array z_f32 = astype(z, float32);

@@ -853,9 +853,7 @@ fn main() {
                     }
                     build.compile("metal_fused_ops");
                     println!("cargo:rustc-cfg=metal_fused_ops");
-                    // Qwen3.5 fused path has a shape mismatch in full-attn block
-                    // rms_norm (head_dim=256 vs q_norm shape). Needs debugging.
-                    // println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
+                    println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
 
                     // Pure C API fused block (no C++ ABI issues).
                     println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");
