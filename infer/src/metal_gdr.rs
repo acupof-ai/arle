@@ -507,9 +507,9 @@ fn conv1d_step(
     let prod = multiply(&full_window, kernel);
     let conv_out = sum_axis(&prod, 1, false);
 
-    let conv_out = as_dtype(&conv_out, Dtype::Bfloat16);
-    let activated = silu(&conv_out);
-    let activated = as_dtype(&as_dtype(&activated, Dtype::Bfloat16), Dtype::Float32);
+    // Truncate to bf16 before SiLU (matching CUDA precision), keep as f32 for downstream.
+    let conv_bf16 = as_dtype(&conv_out, Dtype::Bfloat16);
+    let activated = as_dtype(&silu(&conv_bf16), Dtype::Float32);
 
     // Update conv_state: shift left, drop oldest column, append x
     // New state = full_window[:, 1:] = columns [1..kernel_size] of full_window
@@ -569,15 +569,13 @@ pub fn metal_gdr_decode_step(
     // Fused BA: single matmul → split into beta + alpha
     let x_flat = reshape(x, &[1, config.hidden_size as i32]);
 
-    let qkvz = as_dtype(
-        &linear(&x_flat, &layer_weights.in_proj_qkvz),
-        Dtype::Bfloat16,
-    );
+    // quantized_matmul returns in input dtype (bf16) — no cast needed.
+    let qkvz = linear(&x_flat, &layer_weights.in_proj_qkvz);
     let (qkv_split, z_split) = layer_weights.qkvz_split;
     let qkv_raw = slice(&qkvz, &[0, 0], &[1, qkv_split], &[1, 1]);
     let z = slice(&qkvz, &[0, qkv_split], &[1, qkv_split + z_split], &[1, 1]);
 
-    let ba = as_dtype(&linear(&x_flat, &layer_weights.in_proj_ba), Dtype::Bfloat16);
+    let ba = linear(&x_flat, &layer_weights.in_proj_ba);
     let nh = layer_weights.ba_num_heads;
     let beta_raw = slice(&ba, &[0, 0], &[1, nh], &[1, 1]);
     let alpha_raw = slice(&ba, &[0, nh], &[1, nh * 2], &[1, 1]);
@@ -724,31 +722,23 @@ pub fn metal_gdr_decode_step(
     // norm_weight: [val_dim] (broadcast across heads)
     // z: [1, z_dim] where z_dim = num_value_heads * val_dim
 
-    // RMSNorm per head: for each head h, normalize output_heads[h, :] and scale by norm_weight
-    // rms_norm operates on the last axis, so with shape [H, V] it norms over V.
-    let output_heads_bf16 = as_dtype(&output_heads, Dtype::Bfloat16);
+    // RMSNorm per head + flatten.
     let normed = rms_norm(
-        &output_heads_bf16,
+        &as_dtype(&output_heads, Dtype::Bfloat16),
         &layer_weights.norm_weight,
         config.rms_norm_eps,
-    ); // [H, V]
-
-    // Flatten: [H, V] → [1, z_dim]
-    let normed_flat = as_dtype(
-        &reshape(&normed, &[1, (num_value_heads * value_dim) as i32]),
-        Dtype::Bfloat16,
     );
+    let normed_flat = reshape(&normed, &[1, (num_value_heads * value_dim) as i32]);
 
-    // Output gate: o = normed * silu(z)
-    let z_f32 = as_dtype(&z, Dtype::Float32);
-    let z_silu = silu(&z_f32);
+    // Output gate: o = normed * silu(z).  silu takes f32 input.
+    let z_silu = silu(&as_dtype(&z, Dtype::Float32));
     let gated = as_dtype(
         &multiply(&as_dtype(&normed_flat, Dtype::Float32), &z_silu),
         Dtype::Bfloat16,
     );
 
-    // ── 8. Output projection ─────────────────────────────────────────────
-    as_dtype(&linear(&gated, &layer_weights.out_proj), Dtype::Bfloat16) // [1, hidden_size]
+    // Output projection.
+    linear(&gated, &layer_weights.out_proj)
 }
 
 #[cfg(test)]
