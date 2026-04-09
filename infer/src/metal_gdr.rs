@@ -86,7 +86,6 @@ impl MetalGdrConfig {
 #[cfg(feature = "metal")]
 pub struct MetalLinearAttnWeights {
     /// Merged QKV+Z projection: [qkv_dim + z_dim, hidden_size].
-    /// Single matmul replaces two separate projections.
     pub in_proj_qkvz: WeightTensor,
     /// Merged Beta+Alpha projection: [num_value_heads * 2, hidden_size].
     pub in_proj_ba: WeightTensor,
@@ -94,16 +93,20 @@ pub struct MetalLinearAttnWeights {
     pub qkvz_split: (i32, i32),
     /// Number of value heads (for BA split).
     pub ba_num_heads: i32,
-    /// Depthwise conv1d weight: [qkv_dim, kernel_size] f32.
+    /// Depthwise conv1d weight: [qkv_dim, kernel_size, 1] bf16.
     pub conv1d_weight: MlxArray,
-    /// Per-head dt bias: [num_value_heads] f32.
+    /// Per-head dt bias: [num_value_heads] bf16.
     pub dt_bias: MlxArray,
     /// Per-head log-decay: [num_value_heads] f32.
     pub a_log: MlxArray,
-    /// RMSNorm weight (per head_dim, broadcast across heads): [value_dim] f32.
+    /// RMSNorm weight (per head_dim, broadcast across heads): [value_dim] bf16.
     pub norm_weight: MlxArray,
     /// Output projection: [hidden_size, z_dim].
     pub out_proj: WeightTensor,
+    /// Pre-computed q scale: inv_scale² (scalar f32).
+    pub q_scale: MlxArray,
+    /// Pre-computed k scale: inv_scale (scalar f32).
+    pub k_scale: MlxArray,
 }
 
 // ── Recurrent state ──────────────────────────────────────────────────────────
@@ -416,15 +419,12 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
-    use crate::mlx::{
-        Dtype, add, as_dtype, exp, multiply, negative, reshape, rms_norm, sigmoid, silu, slice,
-    };
+    use crate::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
 
     let hk = config.num_key_heads as i32;
     let dk = config.key_dim as i32;
     let hv = config.num_value_heads as i32;
     let dv = config.value_dim as i32;
-    let key_dim_f = config.key_dim as f32;
 
     // ── 1. Projections (2 fused matmuls) ─────────────────────────────────
     let x_flat = reshape(x, &[1, 1, config.hidden_size as i32]);
@@ -485,11 +485,10 @@ pub fn metal_gdr_decode_step(
     );
 
     // RMS-normalize per head + scale (matching mlx_lm exactly)
-    let inv_scale = 1.0 / key_dim_f.sqrt();
-    let q_scale_val = inv_scale * inv_scale;
+    let inv_scale = 1.0 / (config.key_dim as f32).sqrt();
     let q = multiply(
         &rms_normalize(&q_raw, 1e-6),
-        &MlxArray::scalar_f32(q_scale_val),
+        &MlxArray::scalar_f32(inv_scale * inv_scale),
     );
     let k = multiply(
         &rms_normalize(&k_raw, 1e-6),
@@ -497,13 +496,15 @@ pub fn metal_gdr_decode_step(
     );
 
     // ── 4. Compute gate (g) and beta ─────────────────────────────────────
-    // beta = sigmoid(b)
     let beta = sigmoid(&b_raw);
 
     // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
-    let a_plus_bias = add(&a_raw, &layer_weights.dt_bias);
-    let sp = softplus(&a_plus_bias);
-    let g = exp(&multiply(&negative(&exp(&layer_weights.a_log)), &sp));
+    let g = {
+        use crate::mlx::{exp, negative};
+        let a_plus_bias = add(&a_raw, &layer_weights.dt_bias);
+        let sp = softplus(&a_plus_bias);
+        exp(&multiply(&negative(&exp(&layer_weights.a_log)), &sp))
+    };
 
     // ── 5. Metal kernel GDR state update ─────────────────────────────────
     let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")

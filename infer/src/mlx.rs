@@ -242,10 +242,18 @@ pub fn quantized_matmul(
 pub fn dequantize(w: &MlxArray, s: &MlxArray, b: &MlxArray, gs: i32, bits: i32) -> MlxArray {
     MlxArray(unsafe { mlx_sys::mlx_dequantize(w.0, s.0, b.0, gs, bits) })
 }
+pub fn contiguous(a: &MlxArray) -> MlxArray {
+    MlxArray(unsafe { mlx_sys::mlx_contiguous(a.0) })
+}
 pub fn conv1d(inp: &MlxArray, w: &MlxArray, stride: i32, pad: i32, groups: i32) -> MlxArray {
     MlxArray(unsafe {
         mlx_sys::mlx_conv1d(inp.0, w.0, stride, pad, 1 /*dilation*/, groups)
     })
+}
+/// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+/// Fused C++ implementation — replaces 10 individual FFI ops with 1.
+pub fn compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxArray {
+    MlxArray(unsafe { mlx_sys::mlx_compute_g(a_log.0, alpha.0, dt_bias.0) })
 }
 
 pub fn rms_norm(x: &MlxArray, w: &MlxArray, eps: f32) -> MlxArray {

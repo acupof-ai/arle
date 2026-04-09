@@ -297,6 +297,12 @@ void mlx_free_loaded_tensors(const char** names, mlx_array** arrays, int32_t cou
     delete[] arrays;
 }
 
+// === Contiguous ===
+
+mlx_array* mlx_contiguous(mlx_array* a) {
+    return from_arr(contiguous(*to_arr(a)));
+}
+
 // === Conv1d ===
 
 mlx_array* mlx_conv1d(mlx_array* input, mlx_array* weight,
@@ -304,6 +310,17 @@ mlx_array* mlx_conv1d(mlx_array* input, mlx_array* weight,
                       int32_t dilation, int32_t groups) {
     return from_arr(conv1d(*to_arr(input), *to_arr(weight),
                            stride, padding, dilation, groups));
+}
+
+// === Fused compute_g ===
+// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+// Fuses 10 ops into 1 C++ call (no heap allocs for intermediates).
+
+mlx_array* mlx_compute_g(mlx_array* A_log, mlx_array* alpha, mlx_array* dt_bias) {
+    auto a = astype(*to_arr(A_log), float32);
+    auto ab = *to_arr(alpha) + *to_arr(dt_bias);
+    auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
+    return from_arr(exp(negative(exp(a)) * sp));
 }
 
 // === Metal kernel ===

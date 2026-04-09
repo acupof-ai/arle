@@ -659,6 +659,7 @@ pub(super) fn load_qwen35_metal_weights(
                         WeightTensor::Dense(concatenate_axis(&[b_t.clone(), a_t.clone()], 1))
                     });
 
+                let inv_scale = 1.0 / (arch.linear.key_dim as f32).sqrt();
                 MetalQwen35Attention::Linear(MetalLinearAttnWeights {
                     in_proj_qkvz,
                     in_proj_ba,
@@ -672,6 +673,8 @@ pub(super) fn load_qwen35_metal_weights(
                     a_log: as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
                     norm_weight: get(&format!("{attn_prefix}.norm.weight"))?,
                     out_proj: load_proj(&format!("{attn_prefix}.out_proj"))?,
+                    q_scale: MlxArray::scalar_f32(inv_scale * inv_scale),
+                    k_scale: MlxArray::scalar_f32(inv_scale),
                 })
             }
         };
