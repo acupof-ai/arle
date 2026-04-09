@@ -1162,8 +1162,7 @@ fn metal_generate(
 
 #[cfg(feature = "metal")]
 fn metal_async_eval(arr: &MlxArray) -> Result<()> {
-    // Use sync eval — async_eval may have lifecycle issues with MlxArray handles.
-    crate::mlx::eval(&[arr]);
+    crate::mlx::async_eval(&[arr]);
     Ok(())
 }
 
