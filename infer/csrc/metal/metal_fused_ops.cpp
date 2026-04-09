@@ -75,6 +75,17 @@ static inline mlx::core::array vec_sum(
     return mlx::core::sum(a, axes, keepdims, mlx::core::StreamOrDevice{});
 }
 
+// ── Scalar helper (C API to avoid SmallVector ABI mismatch) ─────────────────
+// array(float) triggers ArrayDesc(SmallVector{}, dtype) which doesn't link.
+// Go through mlx_array_new_float32 (C API) instead.
+static inline mlx::core::array scalar(float val) {
+    mlx_array h = mlx_array_new_float32(val);
+    mlx::core::array& ref = *static_cast<mlx::core::array*>(h.ctx);
+    mlx::core::array result(ref); // copy (ref-count bump)
+    mlx_array_free(h);
+    return result;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Borrow: extract a reference to the mlx::core::array stored in an mlx_array handle.
@@ -92,14 +103,23 @@ static inline mlx_array arr_own(mlx::core::array&& a) {
 #include "mlx/c/fast.h"
 
 /// SDPA via C API — returns ownership via mlx_array handle, caller wraps with arr_ref.
+// The C fast.h header may declare a 9-param SDPA (mask_arr + sinks) while
+// the compiled library uses an 8-param version (mask_arrs: mlx_vector_array).
+// We declare the actual library symbol directly.
+extern "C" int mlx_fast_sdpa_vec(
+    mlx_array* res,
+    mlx_array queries, mlx_array keys, mlx_array values,
+    float scale, const char* mask_mode,
+    mlx_vector_array mask_arrs, mlx_stream s)
+    asm("_mlx_fast_scaled_dot_product_attention");
+
 static inline mlx_array c_sdpa(
     const mlx::core::array& q, const mlx::core::array& k,
     const mlx::core::array& v, float scale, const std::string& mask_mode) {
     mlx_array q_h = arr_own(mlx::core::array(q));
     mlx_array k_h = arr_own(mlx::core::array(k));
     mlx_array v_h = arr_own(mlx::core::array(v));
-    mlx_array no_mask = mlx_array_new();
-    mlx_array no_sinks = mlx_array_new();
+    mlx_vector_array empty_masks = mlx_vector_array_new();
     mlx_stream s = mlx_stream_new();
     {
         mlx_device dev = mlx_device_new_type(MLX_GPU, 0);
@@ -107,13 +127,11 @@ static inline mlx_array c_sdpa(
         mlx_device_free(dev);
     }
     mlx_array res;
-    mlx_fast_scaled_dot_product_attention(
-        &res, q_h, k_h, v_h, scale, mask_mode.c_str(), no_mask, no_sinks, s);
+    mlx_fast_sdpa_vec(&res, q_h, k_h, v_h, scale, mask_mode.c_str(), empty_masks, s);
     mlx_array_free(q_h);
     mlx_array_free(k_h);
     mlx_array_free(v_h);
-    mlx_array_free(no_mask);
-    mlx_array_free(no_sinks);
+    mlx_vector_array_free(empty_masks);
     mlx_stream_free(s);
     return res; // caller takes ownership
 }
@@ -491,7 +509,7 @@ static inline mlx::core::array rms_norm_weighted(
     using namespace mlx::core;
     namespace fast = mlx::core::fast;
     if (offset) {
-        array scale = add(astype(weight, float32), array(1.0f));
+        array scale = add(astype(weight, float32), scalar(1.0f));
         array normed = fast::rms_norm(astype(x, float32), std::nullopt, eps);
         return astype(multiply(normed, scale), bfloat16);
     } else {
@@ -502,7 +520,7 @@ static inline mlx::core::array rms_norm_weighted(
 /// softplus(x) = log(1 + exp(x)), numerically stable for large x.
 static inline mlx::core::array softplus(const mlx::core::array& x) {
     using namespace mlx::core;
-    array threshold = array(20.0f);
+    array threshold = scalar(20.0f);
     return where(greater(x, threshold), x, log1p(exp(x)));
 }
 
@@ -724,8 +742,8 @@ void metal_qwen35_gdr_block(
     auto rms_no_weight = [rms_norm_eps](const array& x) -> array {
         int d = x.shape().back();
         array sq = multiply(x, x);
-        array mean_sq = multiply(vec_sum(sq, {-1}, true), array(1.0f / d));
-        return multiply(x, reciprocal(sqrt(add(mean_sq, array(rms_norm_eps)))));
+        array mean_sq = multiply(vec_sum(sq, {-1}, true), scalar(1.0f / d));
+        return multiply(x, reciprocal(sqrt(add(mean_sq, scalar(rms_norm_eps)))));
     };
 
     array q_norm = rms_no_weight(q_per_head);
@@ -733,8 +751,8 @@ void metal_qwen35_gdr_block(
 
     // Scale: q *= inv_scale^2, k *= inv_scale (matching mlx_lm)
     float inv_scale = 1.0f / std::sqrt((float)key_dim);
-    array q_scaled = multiply(q_norm, array(inv_scale * inv_scale));
-    array k_scaled = multiply(k_norm, array(inv_scale));
+    array q_scaled = multiply(q_norm, scalar(inv_scale * inv_scale));
+    array k_scaled = multiply(k_norm, scalar(inv_scale));
 
     // ── 4. Compute gate + beta ──────────────────────────────────────────────
     array alpha_1d = astype(vec_reshape(alpha_raw, {num_value_heads}), float32);

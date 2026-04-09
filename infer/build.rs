@@ -823,6 +823,9 @@ fn find_flashinfer_include() -> Option<String> {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(metal_fused_ops)");
+    // Qwen3.5 fused blocks are disabled until mlx-sys ABI mismatch is fixed.
+    // Enable via: println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
+    println!("cargo:rustc-check-cfg=cfg(metal_qwen35_fused_ops)");
 
     // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
@@ -850,7 +853,10 @@ fn main() {
                         build.compiler("clang++");
                     }
                     build.compile("metal_fused_ops");
-                    println!("cargo:rustc-cfg=metal_fused_ops");
+                    // Disabled: mlx-sys 0.2 has SmallVector/vector ABI mismatch.
+                    // The Rust fallback path (crate::mlx using C API) is used instead.
+                    // Re-enable when mlx-sys is upgraded:
+                    // println!("cargo:rustc-cfg=metal_fused_ops");
                     println!(
                         "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
                         cpp_hdr.display()
@@ -865,7 +871,8 @@ fn main() {
                 }
             }
         } else if let Some(_prebuilt) = try_download_prebuilt(&out_dir) {
-            println!("cargo:rustc-cfg=metal_fused_ops");
+            // Disabled: same ABI mismatch as source build.
+            // println!("cargo:rustc-cfg=metal_fused_ops");
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-lib=static=metal_fused_ops");
         } else {

@@ -399,6 +399,8 @@ pub fn argmax(a: &MlxArray) -> MlxArray {
 }
 
 pub fn slice_update(a: &mut MlxArray, update: &MlxArray, start: &[i32], stop: &[i32]) -> MlxArray {
+    // Default strides: all 1s, matching the number of start/stop indices.
+    let strides: Vec<i32> = vec![1i32; start.len()];
     let mut res = unsafe { mlx_sys::mlx_array_new() };
     unsafe {
         mlx_sys::mlx_slice_update(
@@ -409,8 +411,8 @@ pub fn slice_update(a: &mut MlxArray, update: &MlxArray, start: &[i32], stop: &[
             start.len(),
             stop.as_ptr(),
             stop.len(),
-            std::ptr::null(), // strides
-            0,
+            strides.as_ptr(),
+            strides.len(),
             default_stream(),
         );
     }
