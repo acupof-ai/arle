@@ -323,9 +323,7 @@ mlx_array* mlx_compute_g(mlx_array* A_log, mlx_array* alpha, mlx_array* dt_bias)
     return from_arr(exp(negative(exp(a)) * sp));
 }
 
-// === Metal kernel ===
-
-// Opaque handle wrapping the fast::MetalKernel builder
+// Metal kernel struct (used by both GDR forward and standalone kernel API)
 struct mlx_metal_kernel {
     std::string name;
     std::vector<std::string> input_names;
@@ -333,6 +331,165 @@ struct mlx_metal_kernel {
     std::string source;
     std::string header;
 };
+
+// === Fused GDR layer forward ===
+// Full GDR linear attention decode step in C++ — eliminates ~40 FFI calls per layer.
+// Matches mlx_lm's GatedDeltaNet.__call__ for decode (T=1).
+
+void mlx_gdr_layer_forward(
+    mlx_array* x_in,           // [1, 1, hidden] bf16 input
+    // Projection weights (quantized)
+    mlx_array* qkvz_w, mlx_array* qkvz_s, mlx_array* qkvz_b,
+    int32_t qkvz_gs, int32_t qkvz_bits,
+    int32_t qkv_split, int32_t z_split,
+    mlx_array* ba_w, mlx_array* ba_s, mlx_array* ba_b,
+    int32_t ba_gs, int32_t ba_bits, int32_t ba_num_heads,
+    // Conv1d
+    mlx_array* conv1d_w,       // [C, K, 1] bf16
+    mlx_array** conv_state,    // [1, K-1, C] bf16 — updated in place
+    int32_t conv_kernel,
+    // Gate params
+    mlx_array* a_log,          // [Hv] f32
+    mlx_array* dt_bias,        // [Hv] bf16
+    // Norm + output
+    mlx_array* norm_w,         // [Dv] bf16
+    float rms_eps,
+    mlx_array* out_w, mlx_array* out_s, mlx_array* out_b,
+    int32_t out_gs, int32_t out_bits,
+    // Config
+    int32_t num_key_heads, int32_t key_dim,
+    int32_t num_value_heads, int32_t value_dim,
+    float q_scale, float k_scale,
+    // State
+    mlx_array** gdr_state,     // [1, Hv, Dv, Dk] f32 — updated in place
+    // Metal kernel handle
+    void* metal_kernel, int32_t use_metal_kernel,
+    // Output
+    mlx_array* out_result      // receives the output array
+) {
+    auto x = *to_arr(x_in);
+    int hk = num_key_heads, dk = key_dim;
+    int hv = num_value_heads, dv = value_dim;
+    int q_dim = hk * dk, k_dim_total = q_dim, v_dim = hv * dv;
+    int qkv_dim = q_dim + k_dim_total + v_dim;
+
+    // 1. Projections
+    auto qkvz = quantized_matmul(x, *to_arr(qkvz_w), *to_arr(qkvz_s), *to_arr(qkvz_b),
+                                  true, qkvz_gs, qkvz_bits);
+    auto qkv = slice(qkvz, {0, 0, 0}, {1, 1, qkv_split});
+    auto z = slice(qkvz, {0, 0, qkv_split}, {1, 1, qkv_split + z_split});
+
+    auto ba = quantized_matmul(x, *to_arr(ba_w), *to_arr(ba_s), *to_arr(ba_b),
+                                true, ba_gs, ba_bits);
+    auto b_raw = slice(ba, {0, 0, 0}, {1, 1, ba_num_heads});
+    auto a_raw = slice(ba, {0, 0, ba_num_heads}, {1, 1, ba_num_heads * 2});
+
+    // 2. Conv1d (standard depthwise)
+    auto conv_st = *to_arr(*conv_state);
+    auto conv_input = concatenate({conv_st, qkv}, 1);
+    int n_keep = conv_kernel - 1;
+    auto new_conv_state = slice(conv_input, {0, 1, 0}, {1, n_keep + 1, qkv_dim});
+    // Update conv state
+    delete to_arr(*conv_state);
+    *conv_state = from_arr(std::move(new_conv_state));
+
+    auto conv_out = conv1d(conv_input, *to_arr(conv1d_w), 1, 0, 1, qkv_dim);
+    // SiLU
+    conv_out = conv_out * sigmoid(conv_out);
+
+    // 3. Split QKV + RMS normalize
+    auto q_raw = reshape(slice(conv_out, {0, 0, 0}, {1, 1, q_dim}), {1, 1, hk, dk});
+    auto k_raw = reshape(slice(conv_out, {0, 0, q_dim}, {1, 1, q_dim + k_dim_total}), {1, 1, hk, dk});
+    auto v_raw = reshape(slice(conv_out, {0, 0, q_dim + k_dim_total}, {1, 1, q_dim + k_dim_total + v_dim}), {1, 1, hv, dv});
+
+    auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * array(q_scale);
+    auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * array(k_scale);
+
+    // 4. Gate computation
+    auto beta = sigmoid(b_raw);
+    auto A = *to_arr(a_log);
+    auto ab = a_raw + *to_arr(dt_bias);
+    auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
+    auto g = exp(negative(exp(astype(A, float32))) * sp);
+
+    // 5. Metal kernel state update
+    array y_out({0});
+    if (use_metal_kernel && metal_kernel) {
+        auto q_bf16 = astype(q, bfloat16);
+        auto k_bf16 = astype(k, bfloat16);
+        auto v_bf16 = astype(v_raw, bfloat16);
+        auto g_3d = reshape(g, {1, 1, hv});
+        auto beta_3d = reshape(beta, {1, 1, hv});
+        auto state_in = *to_arr(*gdr_state);
+
+        auto* mk = static_cast<mlx_metal_kernel*>(metal_kernel);
+        auto kernel_fn = fast::metal_kernel(
+            mk->name, mk->input_names, mk->output_names,
+            mk->source, mk->header, true, false);
+
+        auto t_arr = array(1);  // T=1
+        std::vector<array> inputs = {q_bf16, k_bf16, v_bf16, g_3d, beta_3d, state_in, t_arr};
+        std::vector<Shape> out_shapes = {{1, 1, hv, dv}, state_in.shape()};
+        std::vector<Dtype> out_dtypes = {bfloat16, float32};
+        std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+            {"Dk", fast::TemplateArg(dk)}, {"Dv", fast::TemplateArg(dv)},
+            {"Hk", fast::TemplateArg(hk)}, {"Hv", fast::TemplateArg(hv)},
+            {"InT", fast::TemplateArg(bfloat16)}, {"StT", fast::TemplateArg(float32)}
+        };
+
+        auto result = kernel_fn(
+            inputs, out_shapes, out_dtypes,
+            std::make_tuple(32, dv, 1 * hv),
+            std::make_tuple(32, 4, 1),
+            tmpl, std::nullopt, false, {});
+
+        y_out = result[0];
+        // Update GDR state
+        delete to_arr(*gdr_state);
+        *gdr_state = from_arr(std::move(result[1]));
+    } else {
+        // Ops fallback
+        auto g_4d = reshape(g, {1, hv, 1, 1});
+        auto s = *to_arr(*gdr_state);
+        auto s_decayed = s * g_4d;
+        // Expand k for GQA
+        int heads_per_key = hv / hk;
+        array k_exp = (heads_per_key > 1)
+            ? reshape(broadcast_to(expand_dims(k, 2), {1, 1, hk, heads_per_key, dk}), {1, hv, dk})
+            : reshape(k, {1, hv, dk});
+        array q_exp = (heads_per_key > 1)
+            ? reshape(broadcast_to(expand_dims(q, 2), {1, 1, hk, heads_per_key, dk}), {1, hv, dk})
+            : reshape(q, {1, hv, dk});
+        auto v_3d = reshape(v_raw, {1, hv, dv});
+        auto k_4d = reshape(k_exp, {1, hv, 1, dk});
+        auto kv_mem = sum(s_decayed * k_4d, -1, false);
+        auto beta_3d = reshape(beta, {1, hv, 1});
+        auto delta = (v_3d - kv_mem) * beta_3d;
+        auto s_updated = s_decayed + reshape(delta, {1, hv, dv, 1}) * k_4d;
+        auto q_4d = reshape(q_exp, {1, hv, 1, dk});
+        y_out = reshape(sum(s_updated * q_4d, -1, false), {1, 1, hv, dv});
+        delete to_arr(*gdr_state);
+        *gdr_state = from_arr(std::move(s_updated));
+    }
+
+    // 6. Per-head RMSNorm + output gate
+    auto y_heads = reshape(y_out, {hv, dv});
+    auto normed = fast::rms_norm(y_heads, *to_arr(norm_w), rms_eps);
+    auto z_gated = reshape(z, {hv, dv});
+    auto silu_z = z_gated * sigmoid(z_gated);
+    auto gated_out = normed * silu_z;
+
+    // 7. Output projection
+    auto out_flat = reshape(gated_out, {1, hv * dv});
+    auto result = quantized_matmul(out_flat, *to_arr(out_w), *to_arr(out_s), *to_arr(out_b),
+                                    true, out_gs, out_bits);
+
+    // Write output — heap-allocate like from_arr()
+    auto** dst = reinterpret_cast<mlx_array**>(out_result);
+    *dst = from_arr(std::move(result));
+}
+
+// === Metal kernel ===
 
 void* mlx_metal_kernel_new(const char* name,
                            const char** input_names, size_t n_inputs,
