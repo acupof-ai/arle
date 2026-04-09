@@ -4,14 +4,18 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use mlx_rs::Array;
+
+#[cfg(feature = "metal")]
+use crate::mlx::MlxArray;
 
 use super::{QuantConfig, WeightTensor};
 
-pub(super) type TensorMap = HashMap<String, Array>;
+#[cfg(feature = "metal")]
+pub(super) type TensorMap = HashMap<String, MlxArray>;
 
+#[cfg(feature = "metal")]
 pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
-    use mlx_rs::Dtype;
+    use crate::mlx::Dtype;
     use safetensors::{Dtype as SdType, SafeTensors};
 
     let shards = collect_safetensors_shards(model_dir)?;
@@ -50,7 +54,8 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
                 SdType::U32 => Dtype::Uint32,
                 other => anyhow::bail!("unsupported safetensors dtype {other:?} for {name}"),
             };
-            let arr = unsafe { Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
+            let arr =
+                unsafe { MlxArray::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
             tensors.insert(name.to_string(), arr);
         }
     }
@@ -59,19 +64,21 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
     Ok(tensors)
 }
 
-pub(super) fn tensor_get(tensors: &TensorMap, name: &str) -> Result<Array> {
+#[cfg(feature = "metal")]
+pub(super) fn tensor_get(tensors: &TensorMap, name: &str) -> Result<MlxArray> {
     tensors
         .get(name)
         .cloned()
         .with_context(|| format!("missing weight '{name}'"))
 }
 
+#[cfg(feature = "metal")]
 pub(super) fn load_proj_from_tensors(
     tensors: &TensorMap,
     base: &str,
     quantization: Option<QuantConfig>,
 ) -> Result<WeightTensor> {
-    use mlx_rs::{ops::transpose, transforms::eval};
+    use crate::mlx::{eval, transpose_all};
 
     if let Some(qc) = quantization {
         let scales_key = format!("{base}.scales");
@@ -95,16 +102,17 @@ pub(super) fn load_proj_from_tensors(
     }
 
     let w = tensor_get(tensors, &format!("{base}.weight"))?;
-    let w_t = transpose(&w).context("pre-transpose weight")?;
-    eval([&w_t]).context("eval pre-transposed weight")?;
+    let w_t = transpose_all(&w);
+    eval(&[&w_t]);
     Ok(WeightTensor::Dense(w_t))
 }
 
+#[cfg(feature = "metal")]
 pub(super) fn load_embed_tokens_from_tensors(
     tensors: &TensorMap,
     base: &str,
     quantization: Option<QuantConfig>,
-) -> Result<Array> {
+) -> Result<MlxArray> {
     let w = tensor_get(tensors, &format!("{base}.weight"))?;
     if let Some(qc) = quantization {
         if let Some(scales) = tensors.get(&format!("{base}.scales")).cloned() {
@@ -113,24 +121,24 @@ pub(super) fn load_embed_tokens_from_tensors(
                 .cloned()
                 .with_context(|| format!("missing biases '{base}.biases'"))?;
             log::info!("  dequantizing embed_tokens at load time");
-            return mlx_rs::ops::dequantize(
+            return Ok(crate::mlx::dequantize(
                 &w,
                 &scales,
                 &biases,
-                Some(qc.group_size),
-                Some(qc.bits),
-            )
-            .context("dequantize embed_tokens");
+                qc.group_size,
+                qc.bits,
+            ));
         }
     }
     Ok(w)
 }
 
-pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &Array) -> Result<WeightTensor> {
-    use mlx_rs::{ops::transpose, transforms::eval};
+#[cfg(feature = "metal")]
+pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &MlxArray) -> Result<WeightTensor> {
+    use crate::mlx::{eval, transpose_all};
 
-    let w_t = transpose(embed_tokens).context("pre-transpose tied lm_head")?;
-    eval([&w_t]).context("eval tied lm_head")?;
+    let w_t = transpose_all(embed_tokens);
+    eval(&[&w_t]);
     Ok(WeightTensor::Dense(w_t))
 }
 
