@@ -280,16 +280,53 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             )
         };
 
+        // Phase 2: keep weights packed on GPU — dequant happens at runtime
+        // in fused GEMV (decode) or bulk dequant + cuBLAS GEMM (prefill).
+        let bits = 3u8; // TODO: detect from turboquant_config.json
+        let num_levels = 1usize << bits;
+        let mut centroids_host = vec![0.0f32; num_levels];
+        let mut boundaries_host = vec![0.0f32; num_levels + 1];
+        unsafe {
+            crate::ffi::turboquant_lloyd_max(
+                centroids_host.as_mut_ptr(),
+                boundaries_host.as_mut_ptr(),
+                num_levels as i32,
+                group_size as i32,
+                200,
+            );
+        }
+        let centroids_gpu: CudaSlice<f32> = ctx
+            .stream
+            .clone_htod(&centroids_host)
+            .map_err(|e| anyhow::anyhow!("H2D centroids failed: {}", e))?;
+
+        let scales_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                scales.as_ptr().cast::<u8>(),
+                scales.len() * std::mem::size_of::<half::f16>(),
+            )
+        };
+
         log::info!(
-            "Loaded TurboQuant {}: [{}x{}] → dequant at load, group_size={}",
+            "Loaded TurboQuant {}: [{}x{}] packed {}-bit on GPU, group_size={}",
             name,
             rows,
             orig_k,
+            bits,
             group_size
         );
 
-        // Phase 1: dequant at load time on CPU → BF16 DeviceMatrix
-        let mat = turboquant_dequant_at_load(ctx, packed, scales, signs, rows, orig_k, group_size)?;
+        let mat = DeviceMatrix::from_quantized_tq(
+            ctx,
+            packed,
+            scales_bytes,
+            signs,
+            &centroids_gpu,
+            rows,
+            orig_k,
+            group_size,
+            bits,
+        )?;
         return Ok(mat);
     }
 

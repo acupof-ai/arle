@@ -298,6 +298,18 @@ pub struct DeviceMatrix {
     pub marlin_packed: Option<CudaSlice<u8>>,
     /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
     pub marlin_scales: Option<CudaSlice<u16>>,
+    // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
+    /// TQ packed indices [rows, packed_cols] u8.
+    /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
+    pub tq_packed: Option<CudaSlice<u8>>,
+    /// TQ per-group f16 norms [rows, cols/group_size], stored as u16 on device.
+    pub tq_scales: Option<CudaSlice<u16>>,
+    /// TQ Hadamard signs [cols] i8 (+1/-1), shared across rows.
+    pub tq_signs: Option<CudaSlice<i8>>,
+    /// TQ Lloyd-Max centroids [2^bits] f32, shared across all layers.
+    pub tq_centroids: Option<CudaSlice<f32>>,
+    /// TQ bit width (2, 3, or 4). 0 = not TQ.
+    pub tq_bits: u8,
 }
 
 impl DeviceMatrix {
@@ -318,6 +330,11 @@ impl DeviceMatrix {
             quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -357,6 +374,11 @@ impl DeviceMatrix {
             quant_bits: 8,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -400,6 +422,11 @@ impl DeviceMatrix {
             quant_bits: 4, // Native packed INT4; W4 kernel extracts nibbles
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -442,6 +469,11 @@ impl DeviceMatrix {
             quant_bits: 2,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -453,6 +485,67 @@ impl DeviceMatrix {
     /// Whether this matrix has Marlin-repacked weights for fast prefill GEMM.
     pub fn has_marlin(&self) -> bool {
         self.marlin_packed.is_some()
+    }
+
+    /// Whether this matrix uses TurboQuant packed weight storage.
+    pub fn has_tq(&self) -> bool {
+        self.tq_packed.is_some()
+    }
+
+    /// Create from TurboQuant packed weights on GPU.
+    ///
+    /// Weights stay packed at runtime; dequant happens in the fused GEMV kernel
+    /// (decode) or via bulk dequant + cuBLAS GEMM (prefill).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_quantized_tq(
+        ctx: &DeviceContext,
+        packed: &[u8],
+        scales: &[u8], // f16 as raw bytes
+        signs: &[i8],
+        centroids: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        bits: u8,
+    ) -> Result<Self> {
+        let tq_p = ctx
+            .stream
+            .clone_htod(packed)
+            .map_err(|e| anyhow!("H2D tq_packed failed: {}", e))?;
+        let tq_s: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(scales.as_ptr().cast::<u16>(), scales.len() / 2)
+            })
+            .map_err(|e| anyhow!("H2D tq_scales failed: {}", e))?;
+        let tq_sg = ctx
+            .stream
+            .clone_htod(signs)
+            .map_err(|e| anyhow!("H2D tq_signs failed: {}", e))?;
+        let tq_c = ctx
+            .stream
+            .clone_dtod(centroids)
+            .map_err(|e| anyhow!("D2D tq_centroids failed: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: None,
+            qscales: None,
+            group_size,
+            quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: Some(tq_p),
+            tq_scales: Some(tq_s),
+            tq_signs: Some(tq_sg),
+            tq_centroids: Some(tq_c),
+            tq_bits: bits,
+        })
     }
 
     /// Repack W4 weights to Marlin tile layout for fast prefill.
@@ -592,6 +685,11 @@ impl DeviceMatrix {
             quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -630,6 +728,11 @@ impl DeviceMatrix {
             quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -661,6 +764,11 @@ impl DeviceMatrix {
                 quant_bits: 0,
                 marlin_packed: None,
                 marlin_scales: None,
+                tq_packed: None,
+                tq_scales: None,
+                tq_signs: None,
+                tq_centroids: None,
+                tq_bits: 0,
             });
         }
 
@@ -689,6 +797,11 @@ impl DeviceMatrix {
             quant_bits: 0,
             marlin_packed: None,
             marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::bf16;
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
@@ -287,6 +288,91 @@ pub(crate) fn gemm_into(
             }
         }
 
+        return;
+    }
+
+    // ── TurboQuant weight dispatch (fused dequant GEMV / dequant + cuBLAS) ──
+    if weight.has_tq() {
+        let tq_p = weight.tq_packed.as_ref().unwrap();
+        let tq_s = weight.tq_scales.as_ref().unwrap();
+        let tq_sg = weight.tq_signs.as_ref().unwrap();
+        let tq_c = weight.tq_centroids.as_ref().unwrap();
+
+        let n = weight.rows as i32;
+        let k = weight.cols as i32;
+        let gs = weight.group_size as i32;
+        let num_groups = (weight.cols / weight.group_size) as i32;
+        let effective_bits = if weight.tq_bits == 3 {
+            4
+        } else {
+            weight.tq_bits as usize
+        };
+        let packed_cols = ((weight.cols * effective_bits + 7) / 8) as i32;
+        let bits = weight.tq_bits as i32;
+        let stream = ctx.stream.cu_stream();
+
+        let (tp_ptr, _g1) = tq_p.device_ptr(&ctx.stream);
+        let (ts_ptr, _g2) = tq_s.device_ptr(&ctx.stream);
+        let (tsg_ptr, _g3) = tq_sg.device_ptr(&ctx.stream);
+        let (tc_ptr, _g4) = tq_c.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+        if x.seq_len == 1 {
+            // Decode: fused dequant-GEMV (reads packed weights, ~4x less bandwidth)
+            unsafe {
+                ffi::turboquant_weight_gemv_cuda(
+                    tp_ptr as *const u8,
+                    ts_ptr as *const ffi::Half,
+                    tsg_ptr as *const i8,
+                    tc_ptr as *const f32,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    n,
+                    k,
+                    gs,
+                    packed_cols,
+                    num_groups,
+                    bits,
+                    stream,
+                );
+            }
+        } else {
+            // Prefill: bulk dequant to BF16 workspace → cuBLAS GEMM
+            let ws_size = weight.rows * weight.cols;
+            let mut workspace: CudaSlice<bf16> = ctx
+                .stream
+                .alloc_zeros(ws_size)
+                .expect("alloc TQ dequant workspace");
+            let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::turboquant_weight_dequant_cuda(
+                    tp_ptr as *const u8,
+                    ts_ptr as *const ffi::Half,
+                    tsg_ptr as *const i8,
+                    tc_ptr as *const f32,
+                    ws_ptr as *mut ffi::Half,
+                    n,
+                    k,
+                    gs,
+                    packed_cols,
+                    num_groups,
+                    bits,
+                    stream,
+                );
+                ffi::gemm_cuda(
+                    ws_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    n,
+                    x.seq_len as i32,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("TQ dequant+cuBLAS GEMM failed");
+            }
+        }
         return;
     }
 
