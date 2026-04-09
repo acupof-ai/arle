@@ -192,9 +192,13 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
                 orig_k,
                 group_size
             );
-            return DeviceMatrix::from_quantized_int4(
-                ctx, packed, sc_data, rows, orig_k, group_size,
-            );
+            let mut mat =
+                DeviceMatrix::from_quantized_int4(ctx, packed, sc_data, rows, orig_k, group_size)?;
+            // Repack for Marlin prefill GEMM (skips if dimensions not aligned)
+            if let Err(e) = mat.repack_for_marlin(ctx) {
+                log::warn!("Marlin repack failed for {}: {}", name, e);
+            }
+            return Ok(mat);
         }
 
         // INT8
