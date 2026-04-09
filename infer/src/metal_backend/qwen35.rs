@@ -554,21 +554,25 @@ fn qwen35_full_attention_step(
 }
 
 fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) -> MlxArray {
+    if !offset {
+        // Use MLX's fused fast.rms_norm — single op instead of 10 manual ops.
+        // This is the same as mlx_lm's nn.RMSNorm.__call__.
+        return rms_norm(x, weight, eps);
+    }
+    // Offset mode: weight = weight + 1, then manual norm.
     use crate::mlx::{reciprocal, sqrt, sum_axis};
-
     let last_dim = *x.shape().last().expect("rms_norm_last_dim: empty shape") as f32;
     let x = as_dtype(x, Dtype::Float32);
     let weight = as_dtype(weight, Dtype::Float32);
     let inv_dim = MlxArray::from_slice_f32(&[1.0f32 / last_dim], &[1]);
     let eps_arr = MlxArray::from_slice_f32(&[eps], &[1]);
     let one = MlxArray::from_slice_f32(&[1.0f32], &[1]);
-
     let sq = multiply(&x, &x);
     let sum_sq = sum_axis(&sq, -1, true);
     let mean_sq = multiply(&sum_sq, &inv_dim);
     let inv_rms = reciprocal(&sqrt(&add(&mean_sq, &eps_arr)));
     let normed = multiply(&x, &inv_rms);
-    let scale = if offset { add(&weight, &one) } else { weight };
+    let scale = add(&weight, &one);
     as_dtype(&multiply(&normed, &scale), Dtype::Bfloat16)
 }
 

@@ -90,6 +90,16 @@ fn generation_stream() -> mlx_stream {
 }
 
 fn default_stream() -> mlx_stream {
+    // Use the generation stream AND set it as default (matching mlx_lm's pattern).
+    let s = generation_stream();
+    unsafe {
+        mlx_sys::mlx_set_default_stream(s);
+    }
+    s
+}
+
+#[allow(dead_code)]
+fn device_default_stream() -> mlx_stream {
     static CACHED: std::sync::LazyLock<SyncStreamAndDevice> = std::sync::LazyLock::new(|| unsafe {
         let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
         let mut stream = mlx_sys::mlx_stream_new();
@@ -527,6 +537,17 @@ pub fn rms_norm(x: &MlxArray, weight: &MlxArray, eps: f32) -> MlxArray {
     let mut res = unsafe { mlx_sys::mlx_array_new() };
     unsafe {
         mlx_sys::mlx_fast_rms_norm(&mut res, x.0, weight.0, eps, default_stream());
+    }
+    MlxArray(res)
+}
+
+/// RMS norm without learnable weight (used for Q/K normalization).
+pub fn rms_norm_no_weight(x: &MlxArray, eps: f32) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    let no_weight = unsafe { mlx_sys::mlx_array_new() }; // empty = None
+    unsafe {
+        mlx_sys::mlx_fast_rms_norm(&mut res, x.0, no_weight, eps, default_stream());
+        mlx_sys::mlx_array_free(no_weight);
     }
     MlxArray(res)
 }
