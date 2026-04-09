@@ -945,6 +945,22 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
+    // ─── BF16 ↔ FP16 conversion ───
+
+    pub(crate) fn bf16_to_fp16_cuda(
+        input: *const Half,
+        output: *mut u16, // __half is u16
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn fp16_to_bf16_cuda(
+        input: *const u16, // __half
+        output: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ─── Marlin W4A16 GEMM (near-optimal INT4 kernel) ───
 
     pub(crate) fn marlin_gemm_cuda(
