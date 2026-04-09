@@ -1038,4 +1038,28 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn w4a16_gemv_batch_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn w2a16_gemv_batch_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }

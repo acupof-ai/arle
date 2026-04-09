@@ -170,6 +170,36 @@ pub(crate) fn gemm_into(
                 )
                 .result()
                 .expect("w8a16_gemv_cuda failed");
+            } else if weight.quant_bits == 4 {
+                // W4A16 batched (prefill)
+                ffi::w4a16_gemv_batch_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w4a16_gemv_batch_cuda failed");
+            } else if weight.quant_bits == 2 {
+                // W2A16 batched (prefill)
+                ffi::w2a16_gemv_batch_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("w2a16_gemv_batch_cuda failed");
             } else {
                 // W8A16 batched
                 ffi::w8a16_gemv_batch_cuda(

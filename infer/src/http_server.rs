@@ -438,6 +438,7 @@ mod tests {
                     text_delta: String::new(),
                     finish_reason: None,
                     usage: None,
+                    logprob: None,
                 },
                 StreamDelta {
                     text_delta: String::new(),
@@ -447,6 +448,7 @@ mod tests {
                         completion_tokens: 1,
                         total_tokens: 2,
                     }),
+                    logprob: None,
                 },
             ],
             true,
@@ -473,6 +475,7 @@ mod tests {
                         text_delta,
                         finish_reason: delta.finish_reason,
                         usage: delta.usage,
+                        logprob: delta.logprob,
                     });
                 }
             }
@@ -731,6 +734,7 @@ mod tests {
                             .to_string(),
                     finish_reason: None,
                     usage: None,
+                    logprob: None,
                 },
                 StreamDelta {
                     text_delta: String::new(),
@@ -740,6 +744,7 @@ mod tests {
                         completion_tokens: 1,
                         total_tokens: 2,
                     }),
+                    logprob: None,
                 },
             ],
             false,
