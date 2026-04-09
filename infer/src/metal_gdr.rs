@@ -219,15 +219,15 @@ fn rms_normalize(x: &Array, eps: f32) -> Result<Array> {
 // ── Helper: softplus ─────────────────────────────────────────────────────────
 
 /// softplus(x) = log(1 + exp(x)), numerically stable.
-/// For large x (> 20), returns x directly.
-/// MLX doesn't have a native softplus, so we compute: log1p(exp(x)).
+/// For large x (> 20), exp(x) overflows — return x directly (the CUDA kernel
+/// uses the same threshold). Implements: where(x > 20, x, log1p(exp(x))).
 #[cfg(feature = "metal")]
 fn softplus(x: &Array) -> Result<Array> {
-    // softplus(x) = log(1 + exp(x)) = log1p(exp(x))
-    // This is fine for small-to-moderate x. For very large x, exp(x) overflows,
-    // but in practice the alpha + dt_bias values are well-bounded.
+    let threshold = Array::from_slice(&[20.0f32], &[1]);
+    let mask = x.gt(&threshold).context("softplus mask")?;
     let exp_x = x.exp().context("softplus exp")?;
-    exp_x.log1p().context("softplus log1p")
+    let log1p_exp = exp_x.log1p().context("softplus log1p")?;
+    mlx_rs::ops::r#where(&mask, x, &log1p_exp).context("softplus where")
 }
 
 // ── Conv1d single-step ───────────────────────────────────────────────────────
@@ -642,5 +642,98 @@ mod tests {
         assert_eq!(state.conv_states.len(), 24);
         assert_eq!(state.states[0].shape(), &[32, 128, 128]);
         assert_eq!(state.conv_states[0].shape(), &[8192, 3]);
+    }
+
+    // ── Numerical tests ─────────────────────────────────────────────────────
+
+    /// Reference softplus matching the CUDA kernel: x > 20 ? x : log(1 + exp(x))
+    fn ref_softplus(x: f32) -> f32 {
+        if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() }
+    }
+
+    /// softplus must match the CUDA reference for small, moderate, and large values.
+    #[test]
+    fn test_softplus_numerical_accuracy() {
+        let values: Vec<f32> = vec![
+            -10.0, -1.0, 0.0, 1.0, 5.0, 10.0, 19.0, 20.0, 21.0, 50.0, 100.0,
+        ];
+        let input = Array::from_slice(&values, &[values.len() as i32]);
+        let result = softplus(&input).unwrap();
+        mlx_rs::transforms::eval([&result]).unwrap();
+
+        for (i, &x) in values.iter().enumerate() {
+            let expected = ref_softplus(x);
+            let actual = result.as_slice::<f32>()[i];
+            let tol = expected.abs() * 1e-5 + 1e-6;
+            assert!(
+                (actual - expected).abs() < tol,
+                "softplus({x}): expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// softplus must not overflow for large inputs (the original bug).
+    #[test]
+    fn test_softplus_no_overflow() {
+        let large = Array::from_slice(&[88.0f32, 200.0, 1000.0], &[3]);
+        let result = softplus(&large).unwrap();
+        mlx_rs::transforms::eval([&result]).unwrap();
+        let vals = result.as_slice::<f32>();
+        for &v in vals {
+            assert!(v.is_finite(), "softplus overflow: got {v}");
+        }
+        // For x >> 20, softplus(x) ≈ x
+        assert!((vals[0] - 88.0).abs() < 0.01);
+        assert!((vals[1] - 200.0).abs() < 0.01);
+    }
+
+    /// RMS normalize should produce unit-norm output (up to epsilon).
+    #[test]
+    fn test_rms_normalize_unit_norm() {
+        let x = Array::from_slice(&[3.0f32, 4.0], &[1, 2]);
+        let normed = rms_normalize(&x, 1e-6).unwrap();
+        mlx_rs::transforms::eval([&normed]).unwrap();
+
+        let vals = normed.as_slice::<f32>();
+        // rms = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355
+        // normed = [3/3.5355, 4/3.5355] ≈ [0.8485, 1.1314]
+        let rms = (3.0f32.powi(2) + 4.0f32.powi(2)) / 2.0;
+        let rms = rms.sqrt();
+        assert!((vals[0] - 3.0 / rms).abs() < 1e-4);
+        assert!((vals[1] - 4.0 / rms).abs() < 1e-4);
+    }
+
+    /// Gate computation: g = exp(-exp(A_log) * softplus(alpha + dt_bias))
+    /// Verify against scalar reference for a single head.
+    #[test]
+    fn test_gate_computation_scalar() {
+        use mlx_rs::ops;
+
+        let a_log_val = -1.0f32; // exp(A_log) = exp(-1) ≈ 0.3679
+        let alpha_val = 2.0f32;
+        let dt_bias_val = 1.0f32;
+        // softplus(alpha + dt_bias) = softplus(3.0) = log(1 + exp(3)) ≈ 3.0486
+        // g_exp = -0.3679 * 3.0486 ≈ -1.1216
+        // exp(g) ≈ exp(-1.1216) ≈ 0.3258
+
+        let alpha = Array::from_slice(&[alpha_val], &[1]);
+        let dt_bias = Array::from_slice(&[dt_bias_val], &[1]);
+        let a_log = Array::from_slice(&[a_log_val], &[1]);
+
+        let alpha_plus_bias = ops::add(&alpha, &dt_bias).unwrap();
+        let sp = softplus(&alpha_plus_bias).unwrap();
+        let a_exp = a_log.exp().unwrap();
+        let neg_a_exp = a_exp.negative().unwrap();
+        let g_exponent = ops::multiply(&neg_a_exp, &sp).unwrap();
+        let exp_g = g_exponent.exp().unwrap();
+        mlx_rs::transforms::eval([&exp_g]).unwrap();
+
+        let expected_sp = ref_softplus(alpha_val + dt_bias_val);
+        let expected_g = (-a_log_val.exp() * expected_sp).exp();
+        let actual = exp_g.as_slice::<f32>()[0];
+        assert!(
+            (actual - expected_g).abs() < 1e-4,
+            "gate: expected {expected_g}, got {actual}"
+        );
     }
 }

@@ -39,16 +39,33 @@ impl BackendRuntimeHandle {
 
 impl RequestHandle for BackendRuntimeHandle {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        // Atomically increment the waiting count only if below the limit.
+        // A CAS loop prevents concurrent submits from racing past the cap.
         if self.max_waiting > 0 {
-            let current = self.waiting_count.load(Ordering::Relaxed);
-            if current >= self.max_waiting {
-                return Err(SubmitError);
+            loop {
+                let current = self.waiting_count.load(Ordering::Acquire);
+                if current >= self.max_waiting {
+                    return Err(SubmitError);
+                }
+                if self
+                    .waiting_count
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
             }
+        } else {
+            self.waiting_count.fetch_add(1, Ordering::AcqRel);
         }
 
-        self.waiting_count.fetch_add(1, Ordering::Relaxed);
         self.tx.send(req).map_err(|_| {
-            self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+            self.waiting_count.fetch_sub(1, Ordering::AcqRel);
             SubmitError
         })
     }
@@ -79,6 +96,8 @@ pub fn spawn_metal_runtime_handle_from_path(
     model_path: &str,
     max_waiting: usize,
 ) -> Result<BackendRuntimeHandle> {
+    use std::path::Path;
+
     let mut backend = MetalBackend::new();
     backend.load(Path::new(model_path))?;
 
@@ -103,7 +122,7 @@ fn run_backend_runtime<B>(
     B: StreamingInferenceBackend,
 {
     while let Some(req) = rx.blocking_recv() {
-        waiting_count.fetch_sub(1, Ordering::Relaxed);
+        waiting_count.fetch_sub(1, Ordering::AcqRel);
         if let Err(err) = execute_request(&backend, req) {
             error!("backend runtime request failed: {err:#}");
         }
@@ -275,6 +294,8 @@ fn clamp_char_boundary(text: &str, mut idx: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::backend::GenerateResult;
     use crate::request_handle::RequestHandle;
@@ -409,5 +430,102 @@ mod tests {
 
         assert_eq!(text, "hello");
         assert_eq!(finish_reason, Some(FinishReason::Stop));
+    }
+
+    /// A mock backend that blocks for a configurable duration, used to test
+    /// backpressure under concurrent submits.
+    #[derive(Clone)]
+    struct SlowBackend {
+        delay: std::time::Duration,
+    }
+
+    impl InferenceBackend for SlowBackend {
+        fn load(&mut self, _model_path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn generate(&self, _prompt: &str, _params: &SamplingParams) -> Result<GenerateResult> {
+            std::thread::sleep(self.delay);
+            Ok(GenerateResult {
+                text: "ok".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                finish_reason: "stop".into(),
+                ttft_ms: 1.0,
+                prompt_tps: 1.0,
+                generation_tps: 1.0,
+                total_time_ms: 1.0,
+            })
+        }
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+    }
+
+    impl StreamingInferenceBackend for SlowBackend {
+        fn generate_stream<F>(
+            &self,
+            prompt: &str,
+            params: &SamplingParams,
+            _on_chunk: F,
+        ) -> Result<GenerateResult>
+        where
+            F: FnMut(&str) -> Result<()>,
+        {
+            self.generate(prompt, params)
+        }
+    }
+
+    #[tokio::test]
+    async fn backpressure_rejects_when_at_capacity() {
+        let handle = spawn_backend_runtime_handle(
+            SlowBackend {
+                delay: std::time::Duration::from_millis(200),
+            },
+            Arc::<str>::from("slow"),
+            2, // max_waiting = 2
+        );
+
+        // Fill the queue to capacity.
+        let (req1, _rx1) = make_request("a", None);
+        let (req2, _rx2) = make_request("b", None);
+        handle.submit(req1).unwrap();
+        handle.submit(req2).unwrap();
+
+        // Third submit should be rejected (waiting_count == 2 == max_waiting).
+        let (req3, _rx3) = make_request("c", None);
+        assert!(handle.submit(req3).is_err(), "should reject at capacity");
+    }
+
+    #[tokio::test]
+    async fn backpressure_concurrent_submits_respect_limit() {
+        let handle = spawn_backend_runtime_handle(
+            SlowBackend {
+                delay: std::time::Duration::from_millis(500),
+            },
+            Arc::<str>::from("slow"),
+            4, // max_waiting = 4
+        );
+
+        // Spawn 8 concurrent submits — at most 4 should succeed.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let h = handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let (req, _rx) = make_request("x", None);
+                h.submit(req)
+            }));
+        }
+
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(()) => accepted += 1,
+                Err(_) => rejected += 1,
+            }
+        }
+
+        assert!(accepted <= 4, "should accept at most 4, got {accepted}");
+        assert!(rejected >= 4, "should reject at least 4, got {rejected}");
     }
 }

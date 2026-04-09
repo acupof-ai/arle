@@ -91,11 +91,10 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let root = v
         .as_object()
         .context("config.json root must be a JSON object")?;
-    let has_text_config = root.get("text_config").is_some();
-    let model = root
+    let text_config = root
         .get("text_config")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or(root);
+        .and_then(serde_json::Value::as_object);
+    let model = text_config.unwrap_or(root);
 
     let get_usize =
         |obj: &serde_json::Map<String, serde_json::Value>, key: &str, default: usize| -> usize {
@@ -149,11 +148,19 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         );
     }
 
-    let arch = if has_text_config {
+    // Qwen3.5 is identified by `layer_types` containing "full_attention"/"linear_attention"
+    // entries. `text_config` alone is NOT sufficient — many multimodal models wrap their
+    // text config without being Qwen3.5.
+    let has_layer_types = model
+        .get("layer_types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+
+    let arch = if has_layer_types {
         let layer_types = model
             .get("layer_types")
             .and_then(serde_json::Value::as_array)
-            .context("Qwen3.5 text_config.layer_types missing")?
+            .context("Qwen3.5 layer_types missing")?
             .iter()
             .map(|value| match value.as_str() {
                 Some("full_attention") => Ok(MetalQwen35LayerType::FullAttention),
@@ -203,7 +210,7 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .and_then(serde_json::Value::as_f64)
         .unwrap_or_else(|| get_f64(model, "rope_theta", 1_000_000.0));
 
-    let norm_weight_mode = if has_text_config {
+    let norm_weight_mode = if has_layer_types {
         // MLX-converted Qwen3.5 checkpoints already run sanitize(), which shifts
         // the offset-style RMSNorm weights during conversion. The Metal path
         // must consume those weights directly instead of applying a second `+1`.
