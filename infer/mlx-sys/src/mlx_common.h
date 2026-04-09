@@ -7,6 +7,26 @@
 #include <string>
 
 using namespace mlx::core;
+
+// ── Error handling ──────────────────────────────────────────────────────────
+// Thread-local last error string. Functions that can fail set this and return
+// nullptr. Rust checks for nullptr and calls mlx_last_error() to get the message.
+inline thread_local std::string g_mlx_last_error;
+
+static inline void mlx_clear_error() { g_mlx_last_error.clear(); }
+static inline void mlx_set_error(const char* msg) { g_mlx_last_error = msg; }
+static inline void mlx_set_error(const std::string& msg) { g_mlx_last_error = msg; }
+
+// Macro for wrapping functions that return mlx_array* — catches C++ exceptions
+// and returns nullptr + sets thread-local error.
+#define MLX_TRY_RETURN(expr) \
+    try { \
+        mlx_clear_error(); \
+        return (expr); \
+    } catch (const std::exception& e) { \
+        mlx_set_error(e.what()); \
+        return nullptr; \
+    }
 // Shape = mlx::core::Shape (SmallVector<int> in v0.31+)
 
 struct mlx_array;  // opaque

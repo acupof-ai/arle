@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 use std::collections::BTreeSet;
 
 use infer::model::qwen3::Config;

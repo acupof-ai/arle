@@ -13,3 +13,4 @@ release/
 models/
 .DS_Store
 .context/
+vendor/

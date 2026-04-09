@@ -653,27 +653,31 @@ pub(super) fn load_qwen35_metal_weights(
                 let beta_dim = beta_proj.output_dim()?;
 
                 // Merge QKV+Z → single matmul (saves 1 dispatch per layer)
-                let in_proj_qkvz = merge_quantized_projection_rows(&[&qkv_proj, &z_proj])?
-                    .unwrap_or_else(|| {
-                        // Dense fallback: concatenate transposed weights
-                        let (WeightTensor::Dense(qkv_t), WeightTensor::Dense(z_t)) =
-                            (&qkv_proj, &z_proj)
-                        else {
-                            panic!("mixed dense/quantized QKV+Z projections not supported");
-                        };
-                        WeightTensor::Dense(concatenate_axis(&[qkv_t.clone(), z_t.clone()], 1))
-                    });
+                let in_proj_qkvz = match merge_quantized_projection_rows(&[&qkv_proj, &z_proj])? {
+                    Some(merged) => merged,
+                    None => match (&qkv_proj, &z_proj) {
+                        (WeightTensor::Dense(qkv_t), WeightTensor::Dense(z_t)) => {
+                            WeightTensor::Dense(concatenate_axis(&[qkv_t.clone(), z_t.clone()], 1))
+                        }
+                        _ => anyhow::bail!(
+                            "layer {i}: mixed dense/quantized QKV+Z projections not supported"
+                        ),
+                    },
+                };
 
                 // Merge Beta+Alpha → single matmul (saves 1 dispatch per layer)
-                let in_proj_ba = merge_quantized_projection_rows(&[&beta_proj, &alpha_proj])?
-                    .unwrap_or_else(|| {
-                        let (WeightTensor::Dense(b_t), WeightTensor::Dense(a_t)) =
-                            (&beta_proj, &alpha_proj)
-                        else {
-                            panic!("mixed dense/quantized beta+alpha projections not supported");
-                        };
-                        WeightTensor::Dense(concatenate_axis(&[b_t.clone(), a_t.clone()], 1))
-                    });
+                let in_proj_ba = match merge_quantized_projection_rows(&[&beta_proj, &alpha_proj])?
+                {
+                    Some(merged) => merged,
+                    None => match (&beta_proj, &alpha_proj) {
+                        (WeightTensor::Dense(b_t), WeightTensor::Dense(a_t)) => {
+                            WeightTensor::Dense(concatenate_axis(&[b_t.clone(), a_t.clone()], 1))
+                        }
+                        _ => anyhow::bail!(
+                            "layer {i}: mixed dense/quantized beta+alpha projections not supported"
+                        ),
+                    },
+                };
 
                 let inv_scale = 1.0 / (arch.linear.key_dim as f32).sqrt();
                 MetalQwen35Attention::Linear(MetalLinearAttnWeights {
@@ -684,7 +688,7 @@ pub(super) fn load_qwen35_metal_weights(
                     conv1d_weight: load_conv1d_weight(
                         &get(&format!("{attn_prefix}.conv1d.weight"))?,
                         &arch.linear,
-                    ),
+                    )?,
                     dt_bias: get(&format!("{attn_prefix}.dt_bias"))?,
                     a_log: as_dtype(&get(&format!("{attn_prefix}.A_log"))?, Dtype::Float32),
                     norm_weight: get(&format!("{attn_prefix}.norm.weight"))?,
@@ -751,17 +755,17 @@ fn load_lm_head(
 fn load_conv1d_weight(
     weight: &MlxArray,
     linear_cfg: &crate::metal_gdr::MetalGdrConfig,
-) -> MlxArray {
+) -> Result<MlxArray> {
     let c = linear_cfg.qkv_dim() as i32;
     let k = linear_cfg.conv_kernel as i32;
     match weight.shape() {
         // Already [C, K, 1] — nn.Conv1d format
-        [ch, ks, 1] if *ch == c && *ks == k => weight.clone(),
+        [ch, ks, 1] if *ch == c && *ks == k => Ok(weight.clone()),
         // [C, 1, K] — transpose to [C, K, 1]
-        [ch, 1, ks] if *ch == c && *ks == k => reshape(weight, &[c, k, 1]),
+        [ch, 1, ks] if *ch == c && *ks == k => Ok(reshape(weight, &[c, k, 1])),
         // [C, K] — reshape to [C, K, 1]
-        [ch, ks] if *ch == c && *ks == k => reshape(weight, &[c, k, 1]),
-        shape => panic!(
+        [ch, ks] if *ch == c && *ks == k => Ok(reshape(weight, &[c, k, 1])),
+        shape => anyhow::bail!(
             "unsupported conv1d weight shape {:?}, expected [{c}, {k}, 1]",
             shape
         ),

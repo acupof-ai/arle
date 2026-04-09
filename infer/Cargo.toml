@@ -46,10 +46,26 @@ comfy-table = "7.2"
 cuda = ["dep:cudarc", "dep:memmap2"]
 # Disable CUDA — allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = []
-# Metal backend via mlx-rs (Apple Silicon). Mutually compatible with no-cuda.
+# Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
 metal = ["dep:mlx-sys", "dep:libc"]
 default = ["cuda"]
 reference = []
+
+# CUDA-only binaries — skipped under --features metal,no-cuda
+[[bin]]
+name = "infer"
+path = "src/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "triton_silu_smoke"
+path = "src/bin/triton_silu_smoke.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "bench_serving"
+path = "src/bin/bench_serving.rs"
+required-features = ["cuda"]
 
 [build-dependencies]
 cc = "1.0"

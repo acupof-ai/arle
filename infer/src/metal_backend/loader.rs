@@ -27,7 +27,7 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
 
     for shard in &shards {
         let path_str = shard.to_str().context("non-UTF8 path")?;
-        let shard_tensors = crate::mlx::load_safetensors(path_str);
+        let shard_tensors = crate::mlx::load_safetensors(path_str)?;
         for (name, arr) in shard_tensors {
             if tensors.contains_key(&name) {
                 log::warn!(

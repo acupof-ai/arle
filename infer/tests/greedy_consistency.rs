@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 //! Greedy consistency test: verifies that greedy decode output is identical
 //! whether a request runs solo (batch_size=1) or alongside concurrent requests
 //! (batch_size=2+). Regression test for the Triton/FlashInfer divergence bug.

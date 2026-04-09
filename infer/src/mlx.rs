@@ -5,6 +5,20 @@
 
 use std::os::raw::c_void;
 
+/// Check the MLX C++ bridge for a pending error. Returns `Err` if an MLX
+/// exception was caught by a try/catch wrapper, `Ok(())` otherwise.
+pub fn check_mlx_error() -> anyhow::Result<()> {
+    unsafe {
+        let ptr = mlx_sys::mlx_last_error();
+        if ptr.is_null() {
+            Ok(())
+        } else {
+            let msg = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+            Err(anyhow::anyhow!("MLX error: {msg}"))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     Uint8,
@@ -478,11 +492,15 @@ impl MetalKernel {
     }
 }
 
-pub fn load_safetensors(path: &str) -> std::collections::HashMap<String, MlxArray> {
+pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<String, MlxArray>> {
     let pc = std::ffi::CString::new(path).unwrap();
     let mut names: *mut *const i8 = std::ptr::null_mut();
     let mut arrays: *mut *mut mlx_sys::mlx_array = std::ptr::null_mut();
     let count = unsafe { mlx_sys::mlx_load_safetensors(pc.as_ptr(), &mut names, &mut arrays) };
+    if count < 0 {
+        // C++ threw an exception — check the error string
+        return Err(check_mlx_error().unwrap_err());
+    }
     let mut map = std::collections::HashMap::new();
     for i in 0..count as usize {
         let name = unsafe {
@@ -501,7 +519,7 @@ pub fn load_safetensors(path: &str) -> std::collections::HashMap<String, MlxArra
             mlx_sys::mlx_free_loaded_tensors(names as *mut _, arrays, count);
         }
     }
-    map
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -534,6 +552,13 @@ mod tests {
     }
 }
 
-pub fn compile_clear_cache() {
-    // No-op with new mlx-sys — compile cache management not yet ported
+/// Release cached Metal buffers and other allocator caches.
+///
+/// Wraps `mlx::core::clear_cache()` (equivalent to `mx.metal.clear_cache()`
+/// in Python). Call periodically during long generation loops to free
+/// accumulated temporary Metal allocations.
+pub fn clear_cache() {
+    unsafe {
+        mlx_sys::mlx_metal_clear_cache();
+    }
 }

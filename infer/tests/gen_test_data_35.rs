@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 /// Generate greedy reference outputs from our own Qwen3.5 engine.
 /// Run with: cargo test -r --test gen_test_data_35 -- --nocapture
 use infer::sampler::SamplingParams;

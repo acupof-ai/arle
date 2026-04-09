@@ -827,9 +827,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(mlx_engine)");
     println!("cargo:rustc-check-cfg=cfg(metal_qwen35_fused_ops)");
 
-    // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
+    // ── Metal C++ engine (macOS only, requires `metal` feature) ────────────────
     if std::env::var("CARGO_FEATURE_METAL").is_ok() {
-        println!("cargo:rerun-if-changed=csrc/metal/metal_fused_ops.cpp");
+        println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.cpp");
+        println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.h");
         println!("cargo:rerun-if-env-changed=METAL_BUILD_FROM_SOURCE");
         println!("cargo:rerun-if-env-changed=METAL_PREBUILT_URL");
 
@@ -840,41 +841,13 @@ fn main() {
         if can_build {
             match find_mlx_include_dirs_with_retry() {
                 Some((cpp_hdr, c_hdr)) => {
-                    let mut build = cc::Build::new();
-                    build
-                        .cpp(true)
-                        .std("c++17")
-                        .warnings(false)
-                        .flag("-O3")
-                        .include(&cpp_hdr)
-                        .include(&c_hdr)
-                        .file("csrc/metal/metal_fused_ops.cpp");
-                    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-                        build.compiler("clang++");
-                    }
-                    build.compile("metal_fused_ops");
-                    // println!("cargo:rustc-cfg=metal_fused_ops"); // disabled for mlx-sys v0.3 migration
-                    // // disabled
-
-                    // Pure C API fused block (no C++ ABI issues).
-                    println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");
-                    let mut cbuild = cc::Build::new();
-                    cbuild
-                        .cpp(true)
-                        .std("c++17")
-                        .warnings(false)
-                        .flag("-O3")
-                        .include(&c_hdr)
-                        .file("csrc/metal/metal_fused_capi.cpp");
-                    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-                        cbuild.compiler("clang++");
-                    }
-                    cbuild.compile("metal_fused_capi");
-                    println!("cargo:rustc-cfg=metal_capi_fused");
+                    // NOTE: metal_fused_ops.cpp and metal_fused_capi.cpp are no longer
+                    // compiled here. The fused C++ FFI blocks in metal_backend.rs were
+                    // gated on `not_currently_available` (dead since mlx-sys v0.3
+                    // migration) and have been removed. The source files are kept in
+                    // csrc/metal/ for reference if the fused path is revived.
 
                     // C++ MLX engine (full forward pass, zero FFI overhead).
-                    println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.cpp");
-                    println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.h");
                     let mut ebuild = cc::Build::new();
                     ebuild
                         .cpp(true)
@@ -890,32 +863,24 @@ fn main() {
                     ebuild.compile("mlx_engine");
                     println!("cargo:rustc-cfg=mlx_engine");
                     println!("cargo:warning=mlx_engine: compiled C++ engine");
-
-                    println!(
-                        "cargo:warning=metal_fused_capi: compiled C API fused block (MLX: {})",
-                        c_hdr.display()
-                    );
-                    println!(
-                        "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
-                        cpp_hdr.display()
-                    );
                 }
                 None => {
                     println!(
-                        "cargo:warning=metal_fused_ops: mlx-sys headers not available yet; \
-                         building without the optional Metal fused shim and falling back to \
+                        "cargo:warning=mlx_engine: mlx-sys headers not available yet; \
+                         building without the optional Metal C++ engine and falling back to \
                          the Rust/MLX path"
                     );
                 }
             }
         } else if let Some(_prebuilt) = try_download_prebuilt(&out_dir) {
-            // println!("cargo:rustc-cfg=metal_fused_ops"); // disabled for mlx-sys v0.3 migration
+            // TODO: dead code — prebuilt metal_fused_ops download is unused since
+            // the fused C++ FFI was removed. Remove when confirmed unneeded.
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-lib=static=metal_fused_ops");
         } else {
             println!(
-                "cargo:warning=metal_fused_ops: Metal toolchain unavailable and no prebuilt \
-                 library provided; building without the optional fused shim"
+                "cargo:warning=Metal C++ engine: Metal toolchain unavailable and no prebuilt \
+                 library provided; building without the optional Metal C++ engine"
             );
         }
     }
