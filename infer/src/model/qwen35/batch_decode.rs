@@ -55,6 +55,8 @@ pub(crate) struct FullAttnBufs {
     pub(super) k_batch: HiddenStates,
     pub(super) v_batch: HiddenStates,
     pub(super) attn_output: HiddenStates,
+    /// Rotated query buffer for TurboQuant fused attention [max_batch_size, q_dim].
+    pub(super) q_rot: HiddenStates,
 }
 
 // SAFETY: Exclusively accessed from the single scheduler inference thread.
@@ -67,6 +69,7 @@ impl FullAttnBufs {
         self.k_batch.seq_len = bs;
         self.v_batch.seq_len = bs;
         self.attn_output.seq_len = bs;
+        self.q_rot.seq_len = bs;
     }
 }
 
@@ -186,6 +189,7 @@ impl BatchDecodeBuffers35 {
             k_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
+            q_rot: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
         };
 
         // Per-layer pointer arrays enable future CUDA Graph capture by moving
@@ -921,46 +925,53 @@ impl Qwen35Model {
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
+                    // Fused TQ attention: rotate Q once, score from packed K centroids.
                     let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
-                    kv_turboquant::turboquant_dequantize_inplace(
+                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+                    // Step 1: Rotate Q → Q_rot (sign flip + FWHT)
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+                    let q_ptr = {
+                        let (p, _g) = bufs.attn.q_batch.data.device_ptr(stream);
+                        p as u64
+                    };
+                    let q_rot_ptr = {
+                        let (p, _g) = bufs.attn.q_rot.data.device_ptr_mut(stream);
+                        p as u64
+                    };
+                    kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
-                        kv_pool.k_data_slice(full_idx),
-                        kv_pool.k_norms_slice(full_idx),
-                        kv_pool.k_work_ptr(stream),
-                        &bufs.metadata.kv_indices,
+                        q_ptr,
+                        q_rot_ptr,
                         tq_k,
                         full_idx,
-                        num_kv_heads,
+                        batch_size * num_heads,
                         head_dim,
-                        bufs.metadata.kv_indices.len(),
                     )?;
-                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
-                    kv_turboquant::turboquant_dequantize_inplace(
+
+                    // Step 2: Fused attention
+                    let attn_ptr = {
+                        let (p, _g) = bufs.attn.attn_output.data.device_ptr_mut(stream);
+                        p as u64
+                    };
+                    kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,
+                        q_rot_ptr,
+                        kv_pool.k_data_slice(full_idx),
+                        kv_pool.k_norms_slice(full_idx),
                         kv_pool.v_data_slice(full_idx),
                         kv_pool.v_norms_slice(full_idx),
-                        kv_pool.v_work_ptr(stream),
                         &bufs.metadata.kv_indices,
-                        tq_v,
-                        full_idx,
-                        num_kv_heads,
-                        head_dim,
-                        bufs.metadata.kv_indices.len(),
-                    )?;
-                    ops::flashinfer_run_layer_hd256(
-                        &self.ctx,
-                        &bufs.attn.q_batch,
-                        kv_pool,
-                        full_idx,
                         &bufs.metadata.kv_indptr,
-                        &bufs.metadata.kv_indices,
-                        &bufs.metadata.kv_last_page_len,
-                        &mut bufs.attn.attn_output,
-                        &mut bufs.metadata.flashinfer_ws,
+                        attn_ptr,
+                        tq_k,
+                        tq_v,
+                        batch_size,
                         num_heads,
                         num_kv_heads,
-                        page_size,
                         head_dim,
+                        sm_scale,
                     )?;
                 }
             }
