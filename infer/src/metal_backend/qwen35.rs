@@ -392,7 +392,7 @@ impl CppQwen35Model {
         };
 
         unsafe extern "C" fn token_callback(token_id: i32, ctx_ptr: *mut std::ffi::c_void) -> i32 {
-            let ctx = &mut *(ctx_ptr as *mut CallbackCtx);
+            let ctx = unsafe { &mut *(ctx_ptr as *mut CallbackCtx) };
             match (ctx.on_token)(token_id as u32) {
                 Ok(()) => 0,
                 Err(e) => {
