@@ -423,74 +423,7 @@ fn fused_full_attn_step(
     qwen35_full_attention_step(&normed, attn, config, arch, k_cache, v_cache, cache_len)
 }
 
-#[cfg(metal_qwen35_fused_ops)]
-#[allow(clippy::too_many_arguments)]
-fn fused_gdr_step(
-    x: &MlxArray,
-    input_norm_w: &MlxArray,
-    attn: &MetalLinearAttnWeights,
-    recurrent: &mut MetalRecurrentState,
-    layer_idx: usize,
-    gdr_cfg: &crate::metal_gdr::MetalGdrConfig,
-    _config: &MetalModelConfig,
-) -> MlxArray {
-    // C++ GDR block does NOT include input norm — it expects normed input.
-    // Apply norm here, then call C++. (The GDR block is already complex enough.)
-    let normed = rms_norm_last_dim(
-        x,
-        input_norm_w,
-        gdr_cfg.rms_norm_eps,
-        false, // GDR uses direct norm
-    );
-    let (qkv_w, qkv_s, qkv_b, gs, bits, is_q) = wt_parts(&attn.in_proj_qkv);
-    let (z_w, z_s, z_b, _, _, _) = wt_parts(&attn.in_proj_z);
-    let (beta_w, beta_s, beta_b, _, _, _) = wt_parts(&attn.in_proj_beta);
-    let (alpha_w, alpha_s, alpha_b, _, _, _) = wt_parts(&attn.in_proj_alpha);
-    let (out_w, out_s, out_b, _, _, _) = wt_parts(&attn.out_proj);
-
-    let result_raw: mlx_sys::mlx_array = unsafe {
-        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-        super::metal_ffi::metal_qwen35_gdr_block(
-            normed.as_raw(),
-            qkv_w,
-            qkv_s,
-            qkv_b,
-            z_w,
-            z_s,
-            z_b,
-            beta_w,
-            beta_s,
-            beta_b,
-            alpha_w,
-            alpha_s,
-            alpha_b,
-            out_w,
-            out_s,
-            out_b,
-            attn.conv1d_weight.as_raw(),
-            attn.dt_bias.as_raw(),
-            attn.a_log.as_raw(),
-            attn.norm_weight.as_raw(),
-            gdr_cfg.num_key_heads as i32,
-            gdr_cfg.key_dim as i32,
-            gdr_cfg.num_value_heads as i32,
-            gdr_cfg.value_dim as i32,
-            gdr_cfg.conv_kernel as i32,
-            gdr_cfg.hidden_size as i32,
-            gdr_cfg.rms_norm_eps,
-            gs,
-            bits,
-            is_q,
-            recurrent.states[layer_idx].as_raw_mut(),
-            recurrent.conv_states[layer_idx].as_raw_mut(),
-            r.as_mut_ptr(),
-        );
-        r.assume_init()
-    };
-    unsafe { MlxArray::from_raw(result_raw) }
-}
-
-#[cfg(not(metal_qwen35_fused_ops))]
+// GDR step uses the Rust path (compiled ops + Metal kernel).
 #[allow(clippy::too_many_arguments)]
 fn fused_gdr_step(
     x: &MlxArray,
