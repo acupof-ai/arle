@@ -24,11 +24,21 @@ L4 GPU (23GB VRAM), num_slots=1, greedy decode, 100 token generation.
 - INT4/INT2 → INT8 unpack workaround is reliable and correct
 - concat_rows dummy allocation for quantized weights saves ~3.5 GB VRAM
 
+## Update: Native W4 GEMV Enabled (same session)
+
+Root cause found: single-request decode path used BF16-only `ops::gemv` instead of
+quantized-aware dispatch. Native W4 GEMV now works for all paths.
+
+| Format | Speed (tok/s) | vs BF16 | vs W8 |
+|--------|--------------|---------|-------|
+| BF16   | 30.4         | baseline | -     |
+| W8A16  | 51.4         | +69%    | baseline |
+| W4A16 (native, g128) | 72.3 | +138% | +41% |
+
 ## Limitations
 
-- W4/W2 throughput identical to W8 because of INT8 unpack (same kernel)
-- Native W4 GEMV kernel produces wrong output when called from Rust FFI (standalone CUDA test passes)
-- Next step: integrate Marlin kernel for native W4 throughput gain
+- Scheduler's paged attention path produces numerically divergent greedy output vs single-request engine (pre-existing)
+- Marlin kernel integration remains an option for further W4 prefill optimization
 
 ## Rule
 

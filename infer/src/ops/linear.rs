@@ -6,9 +6,60 @@ use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 /// Matrix-vector multiplication: y = A @ x
 /// A: (M, K) row-major, x: (K,), y: (M,)
+/// Supports BF16, W8A16, W4A16, and W2A16 weights.
 pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut DeviceVec) -> Result<()> {
     assert_eq!(a.cols, x.len, "A cols {} != x len {}", a.cols, x.len);
     assert_eq!(a.rows, y.len, "A rows {} != y len {}", a.rows, y.len);
+
+    // ── Quantized weight dispatch (W8A16 / W4A16 / W2A16) ──
+    if let (Some(qw), Some(qs)) = (&a.qweight, &a.qscales) {
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+
+        unsafe {
+            if a.quant_bits == 2 {
+                ffi::w2a16_gemv_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    a.rows as i32,
+                    a.cols as i32,
+                    a.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else if a.quant_bits == 4 {
+                ffi::w4a16_gemv_cuda(
+                    qw_ptr as *const u8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    a.rows as i32,
+                    a.cols as i32,
+                    a.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            } else {
+                // W8A16
+                ffi::w8a16_gemv_cuda(
+                    qw_ptr as *const i8,
+                    qs_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    a.rows as i32,
+                    a.cols as i32,
+                    a.group_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        return Ok(());
+    }
 
     let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
@@ -39,7 +90,8 @@ pub(crate) fn linear(
     Ok(y)
 }
 
-/// Fully fused MLP into pre-allocated output buffer
+/// Fully fused MLP into pre-allocated output buffer.
+/// For quantized weights, falls back to separate gate/up GEMVs + silu_mul + down GEMV.
 pub fn fused_mlp_into(
     ctx: &DeviceContext,
     x: &DeviceVec,
@@ -61,6 +113,33 @@ pub fn fused_mlp_into(
     );
     assert_eq!(down_proj.rows, out.len, "down_proj rows != out len");
     assert_eq!(act.len, gate_proj.rows, "act len != intermediate_size");
+
+    // ── Quantized weights: separate gate/up GEMVs + silu_mul + down GEMV ──
+    if gate_proj.is_quantized() {
+        let intermediate_size = gate_proj.rows;
+        let mut up_out = DeviceVec::zeros(ctx, intermediate_size)?;
+        gemv(ctx, gate_proj, x, act)?;
+        gemv(ctx, up_proj, x, &mut up_out)?;
+        // silu(gate) * up → act (in-place)
+        {
+            let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
+            let (up_ptr, _gu) = up_out.data.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::silu_mul_triton_aot_cuda(
+                    act_ptr as *const ffi::Half,
+                    up_ptr as *const ffi::Half,
+                    act_ptr as *mut ffi::Half,
+                    intermediate_size as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        // down_proj @ act → out
+        let act_ref: &DeviceVec = act;
+        gemv(ctx, down_proj, act_ref, out)?;
+        return Ok(());
+    }
 
     let hidden_size = x.len;
     let intermediate_size = gate_proj.rows;
