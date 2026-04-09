@@ -71,7 +71,22 @@ unsafe impl Sync for SyncStreamAndDevice {}
 /// Return the default GPU stream. Cached on first call.
 /// Expose the cached default stream for internal use (e.g., loader).
 pub(crate) fn default_stream_raw() -> mlx_stream {
-    default_stream()
+    // Use a separate generation stream for better GPU pipelining,
+    // matching mlx_lm's `generation_stream = mx.new_stream(mx.default_device())`.
+    generation_stream()
+}
+
+/// Separate stream for generation — enables GPU pipelining within forward pass.
+fn generation_stream() -> mlx_stream {
+    static CACHED: std::sync::LazyLock<SyncStreamAndDevice> = std::sync::LazyLock::new(|| unsafe {
+        let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
+        let stream = mlx_sys::mlx_stream_new_device(dev);
+        SyncStreamAndDevice {
+            stream,
+            _device: dev,
+        }
+    });
+    CACHED.stream
 }
 
 fn default_stream() -> mlx_stream {
@@ -79,7 +94,6 @@ fn default_stream() -> mlx_stream {
         let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
         let mut stream = mlx_sys::mlx_stream_new();
         mlx_sys::mlx_get_default_stream(&mut stream, dev);
-        // Keep device alive — freeing it could invalidate the stream.
         SyncStreamAndDevice {
             stream,
             _device: dev,
