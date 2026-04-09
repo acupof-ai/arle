@@ -57,7 +57,7 @@ pub(super) struct Qwen35MetalWeights {
 }
 
 /// RAII wrapper for the C++ Qwen35 forward model.
-pub(super) struct CppQwen35Model(*mut std::ffi::c_void);
+pub(crate) struct CppQwen35Model(*mut std::ffi::c_void);
 
 impl Drop for CppQwen35Model {
     fn drop(&mut self) {
@@ -65,8 +65,13 @@ impl Drop for CppQwen35Model {
     }
 }
 unsafe impl Send for CppQwen35Model {}
+unsafe impl Sync for CppQwen35Model {}
 
 impl CppQwen35Model {
+    /// Wrap a raw C++ model pointer (takes ownership).
+    pub(crate) fn from_raw(ptr: *mut std::ffi::c_void) -> Self {
+        Self(ptr)
+    }
     /// Build a C++ step model from loaded Rust weights. Returns None if weights
     /// are not fully supported by the C++ route.
     fn build(
@@ -367,7 +372,7 @@ impl CppQwen35Model {
     }
 
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
-    fn generate(
+    pub(crate) fn generate(
         &self,
         prompt_ids: &[u32],
         max_new_tokens: usize,
