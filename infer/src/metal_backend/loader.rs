@@ -15,8 +15,7 @@ pub(super) type TensorMap = HashMap<String, MlxArray>;
 
 #[cfg(feature = "metal")]
 pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
-    use crate::mlx::Dtype;
-    use safetensors::{Dtype as SdType, SafeTensors};
+    use std::ffi::CString;
 
     let shards = collect_safetensors_shards(model_dir)?;
     anyhow::ensure!(
@@ -26,41 +25,64 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
     );
 
     let mut tensors = TensorMap::new();
-    log::info!("  loading {} shard(s) …", shards.len());
+    log::info!(
+        "  loading {} shard(s) via mlx_load_safetensors (mmap) …",
+        shards.len()
+    );
 
     for shard in &shards {
-        let bytes = std::fs::read(shard).with_context(|| format!("read {}", shard.display()))?;
-        let st = SafeTensors::deserialize(&bytes)
-            .with_context(|| format!("parse {}", shard.display()))?;
+        let path_c = CString::new(shard.to_str().unwrap_or("")).unwrap();
+        // mlx_load_safetensors requires a CPU stream.
+        let cpu_dev = unsafe { mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_CPU, 0) };
+        let mut stream = unsafe { mlx_sys::mlx_stream_new() };
+        unsafe {
+            mlx_sys::mlx_get_default_stream(&mut stream, cpu_dev);
+        }
+        unsafe {
+            mlx_sys::mlx_device_free(cpu_dev);
+        }
+        let mut map = unsafe { mlx_sys::mlx_map_string_to_array_new() };
+        let mut meta = unsafe { mlx_sys::mlx_map_string_to_string_new() };
 
-        for name in st.names() {
-            if tensors.contains_key(name) {
-                anyhow::bail!(
-                    "duplicate tensor '{}' found while loading {}",
-                    name,
-                    shard.display()
-                );
+        let ret =
+            unsafe { mlx_sys::mlx_load_safetensors(&mut map, &mut meta, path_c.as_ptr(), stream) };
+        if ret != 0 {
+            unsafe {
+                mlx_sys::mlx_map_string_to_array_free(map);
+                mlx_sys::mlx_map_string_to_string_free(meta);
             }
-            let view = st
-                .tensor(name)
-                .with_context(|| format!("tensor {name} in {}", shard.display()))?;
-            let shape: Vec<i32> = view.shape().iter().map(|&x| x as i32).collect();
-            let dtype = match view.dtype() {
-                SdType::BF16 => Dtype::Bfloat16,
-                SdType::F16 => Dtype::Float16,
-                SdType::F32 => Dtype::Float32,
-                SdType::U8 => Dtype::Uint8,
-                SdType::I32 => Dtype::Int32,
-                SdType::U32 => Dtype::Uint32,
-                other => anyhow::bail!("unsupported safetensors dtype {other:?} for {name}"),
+            anyhow::bail!("mlx_load_safetensors failed for {}", shard.display());
+        }
+
+        // Iterate over the map to extract tensors.
+        let it = unsafe { mlx_sys::mlx_map_string_to_array_iterator_new(map) };
+        loop {
+            let mut key_ptr: *const std::os::raw::c_char = std::ptr::null();
+            let mut val = unsafe { mlx_sys::mlx_array_new() };
+            let done = unsafe {
+                mlx_sys::mlx_map_string_to_array_iterator_next(&mut key_ptr, &mut val, it)
             };
-            let arr =
-                unsafe { MlxArray::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
-            tensors.insert(name.to_string(), arr);
+            if done != 0 {
+                unsafe {
+                    mlx_sys::mlx_array_free(val);
+                }
+                break;
+            }
+            let name = unsafe {
+                std::ffi::CStr::from_ptr(key_ptr)
+                    .to_string_lossy()
+                    .to_string()
+            };
+            tensors.insert(name, unsafe { MlxArray::from_raw(val) });
+        }
+        unsafe {
+            mlx_sys::mlx_map_string_to_array_iterator_free(it);
+            mlx_sys::mlx_map_string_to_array_free(map);
+            mlx_sys::mlx_map_string_to_string_free(meta);
         }
     }
 
-    log::info!("  parsed {} tensors", tensors.len());
+    log::info!("  loaded {} tensors (memory-mapped)", tensors.len());
     Ok(tensors)
 }
 

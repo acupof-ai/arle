@@ -69,6 +69,11 @@ unsafe impl Send for SyncStreamAndDevice {}
 unsafe impl Sync for SyncStreamAndDevice {}
 
 /// Return the default GPU stream. Cached on first call.
+/// Expose the cached default stream for internal use (e.g., loader).
+pub(crate) fn default_stream_raw() -> mlx_stream {
+    default_stream()
+}
+
 fn default_stream() -> mlx_stream {
     static CACHED: std::sync::LazyLock<SyncStreamAndDevice> = std::sync::LazyLock::new(|| unsafe {
         let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
