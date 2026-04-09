@@ -853,9 +853,10 @@ fn main() {
                         build.compiler("clang++");
                     }
                     build.compile("metal_fused_ops");
-                    // Disabled: mlx-sys 0.2 has SmallVector/vector ABI mismatch.
-                    // The Rust fallback path (crate::mlx using C API) is used instead.
-                    // Re-enable when mlx-sys is upgraded:
+                    // C++ fused blocks disabled: mlx-sys 0.2 has SmallVector vs
+                    // vector<int> ABI mismatch in ArrayDesc constructor. Every MLX
+                    // C++ op that creates a result array triggers the undefined symbol.
+                    // Fix: upgrade mlx-sys or vendor with matching headers/library.
                     // println!("cargo:rustc-cfg=metal_fused_ops");
                     println!(
                         "cargo:warning=metal_fused_ops: compiled from source (MLX: {})",
@@ -871,7 +872,6 @@ fn main() {
                 }
             }
         } else if let Some(_prebuilt) = try_download_prebuilt(&out_dir) {
-            // Disabled: same ABI mismatch as source build.
             // println!("cargo:rustc-cfg=metal_fused_ops");
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-lib=static=metal_fused_ops");
