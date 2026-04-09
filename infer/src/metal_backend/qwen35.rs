@@ -39,6 +39,9 @@ pub(super) struct MetalQwen35BlockWeights {
     pub(super) post_attention_layernorm: MlxArray,
     pub(super) mlp_inputs: MlpInputProjection,
     pub(super) down_proj: WeightTensor,
+    /// Individual gate/up projections (for C++ unfused path).
+    pub(super) gate_proj: WeightTensor,
+    pub(super) up_proj: WeightTensor,
 }
 
 pub(super) struct Qwen35MetalWeights {
@@ -254,6 +257,22 @@ impl CompiledQwen35 {
                             dw_s,
                             dw_b,
                         );
+                    }
+                    // Set unfused projections (fewer graph nodes, matches mlx_lm)
+                    if let (Some(qkv), Some(z), Some(b), Some(a), Some(gp), Some(up)) = (
+                        extract_qw(&attn.in_proj_qkv),
+                        extract_qw(&attn.in_proj_z),
+                        extract_qw(&attn.in_proj_b),
+                        extract_qw(&attn.in_proj_a),
+                        extract_qw(&layer.gate_proj),
+                        extract_qw(&layer.up_proj),
+                    ) {
+                        unsafe {
+                            mlx_sys::qwen35_compiled_set_separate_proj(
+                                model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2, b.0, b.1,
+                                b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4, up.0, up.1, up.2,
+                            );
+                        }
                     }
                 }
             }
@@ -1036,10 +1055,20 @@ pub(super) fn load_qwen35_metal_weights(
                     },
                 };
 
+                // Reload individual projections for C++ unfused path
+                let in_proj_qkv_ind = load_proj(&format!("{attn_prefix}.in_proj_qkv"))?;
+                let in_proj_z_ind = load_proj(&format!("{attn_prefix}.in_proj_z"))?;
+                let in_proj_b_ind = load_proj(&format!("{attn_prefix}.in_proj_b"))?;
+                let in_proj_a_ind = load_proj(&format!("{attn_prefix}.in_proj_a"))?;
+
                 let inv_scale = 1.0 / (arch.linear.key_dim as f32).sqrt();
                 MetalQwen35Attention::Linear(MetalLinearAttnWeights {
                     in_proj_qkvz,
                     in_proj_ba,
+                    in_proj_qkv: in_proj_qkv_ind,
+                    in_proj_z: in_proj_z_ind,
+                    in_proj_b: in_proj_b_ind,
+                    in_proj_a: in_proj_a_ind,
                     qkvz_split: (qkv_dim, z_dim),
                     ba_num_heads: beta_dim,
                     conv1d_weight: load_conv1d_weight(
@@ -1071,6 +1100,10 @@ pub(super) fn load_qwen35_metal_weights(
                 MlpInputProjection::Split { gate_proj, up_proj }
             };
 
+        // Store individual gate/up for C++ unfused path
+        let gate_proj_individual = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
+        let up_proj_individual = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
+
         layers.push(MetalQwen35BlockWeights {
             input_layernorm: get(&format!("{layer_prefix}.input_layernorm.weight"))?,
             attention,
@@ -1078,6 +1111,8 @@ pub(super) fn load_qwen35_metal_weights(
                 "{layer_prefix}.post_attention_layernorm.weight"
             ))?,
             mlp_inputs,
+            gate_proj: gate_proj_individual,
+            up_proj: up_proj_individual,
             down_proj: load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
         });
     }

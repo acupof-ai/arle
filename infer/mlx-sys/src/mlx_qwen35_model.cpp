@@ -288,8 +288,9 @@ struct Qwen35CompiledModel {
         // Projections — separate matmuls matching mlx_lm (4 matmul, no split overhead)
         array qkv(0), z_raw(0), b_raw(0), a_raw(0);
         if (lw.use_separate_proj) {
+            // 4 separate matmuls — no split/slice overhead (matches mlx_lm)
             qkv = lw.qkv_proj.apply(x_3d);
-            z_raw = lw.z_proj.apply(x_3d);
+            z_raw = reshape(lw.z_proj.apply(x_3d), {1, 1, hv, dv}); // reshape like mlx_lm
             b_raw = lw.b_proj.apply(x_3d);
             a_raw = lw.a_proj.apply(x_3d);
         } else {
@@ -394,6 +395,15 @@ struct Qwen35CompiledModel {
 
     // ── MLP block ──────────────────────────────────────────────────────
 
+    // Separate MLP: 2 matmul (matching mlx_lm, no split overhead)
+    array mlp_separate(const array& x, const QWeight& gate, const QWeight& up, const QWeight& down) const {
+        auto g = gate.apply(x);
+        auto u = up.apply(x);
+        auto h = compiled_swiglu()({g, u})[0];
+        return down.apply(h);
+    }
+
+    // Fused MLP: 1 matmul + split
     array mlp(const array& x, const QWeight& gate_up, const QWeight& down, int gate_dim) const {
         auto gu = gate_up.apply(x);
         auto gu_parts = split(gu, Shape{gate_dim}, -1);
@@ -459,10 +469,14 @@ struct Qwen35CompiledModel {
             auto residual2 = x;
             auto post_ln_w = layer.is_gdr ? layer.gdr.post_attn_ln_w : layer.full.post_attn_ln_w;
             auto xn2 = fast::rms_norm(x, post_ln_w, rms_eps);
-            auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
-            auto& dw = layer.is_gdr ? layer.gdr.down : layer.full.down;
-            int gd = layer.is_gdr ? layer.gdr.gate_dim : layer.full.gate_dim;
-            x = residual2 + mlp(xn2, gu, dw, gd);
+            if (layer.is_gdr && layer.gdr.use_separate_mlp) {
+                x = residual2 + mlp_separate(xn2, layer.gdr.gate_proj, layer.gdr.up_proj, layer.gdr.down);
+            } else {
+                auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
+                auto& dw = layer.is_gdr ? layer.gdr.down : layer.full.down;
+                int gd = layer.is_gdr ? layer.gdr.gate_dim : layer.full.gate_dim;
+                x = residual2 + mlp(xn2, gu, dw, gd);
+            }
         }
 
         // Final norm + lm_head
@@ -611,6 +625,30 @@ void qwen35_compiled_push_gdr(
     lw.gdr.gate_dim = gate_dim;
     m->layers.push_back(std::move(lw));
     m->n_gdr++;
+}
+
+// Set individual (unfused) projections for the last-pushed GDR layer.
+// Call AFTER qwen35_compiled_push_gdr. Enables the unfused matmul path
+// which has fewer graph nodes (matches mlx_lm's op pattern).
+void qwen35_compiled_set_separate_proj(
+    void* model,
+    mlx_array* qkv_w, mlx_array* qkv_s, mlx_array* qkv_b, int32_t qkv_gs, int32_t qkv_bits,
+    mlx_array* z_w, mlx_array* z_s, mlx_array* z_b,
+    mlx_array* b_w, mlx_array* b_s, mlx_array* b_b,
+    mlx_array* a_w, mlx_array* a_s, mlx_array* a_b,
+    mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b, int32_t mlp_gs, int32_t mlp_bits,
+    mlx_array* up_w, mlx_array* up_s, mlx_array* up_b
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    auto& lw = m->layers.back().gdr;
+    lw.qkv_proj = {*to_arr(qkv_w), *to_arr(qkv_s), *to_arr(qkv_b), qkv_gs, qkv_bits};
+    lw.z_proj = {*to_arr(z_w), *to_arr(z_s), *to_arr(z_b), qkv_gs, qkv_bits};
+    lw.b_proj = {*to_arr(b_w), *to_arr(b_s), *to_arr(b_b), qkv_gs, qkv_bits};
+    lw.a_proj = {*to_arr(a_w), *to_arr(a_s), *to_arr(a_b), qkv_gs, qkv_bits};
+    lw.use_separate_proj = true;
+    lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
+    lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
+    lw.use_separate_mlp = true;
 }
 
 int32_t qwen35_compiled_finalize(void* model) {
