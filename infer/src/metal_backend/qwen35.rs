@@ -207,17 +207,13 @@ fn qwen35_forward_step(
 
     for layer in &weights.layers {
         let residual = x.clone();
-        let normed = rms_norm_last_dim(
-            &x,
-            &layer.input_layernorm,
-            config.rms_norm_eps as f32,
-            config.norm_weight_mode.uses_offset(),
-        );
 
+        // C++ fused blocks do norm internally; Rust fallback needs explicit norm.
         let attn_out = match &layer.attention {
             MetalQwen35Attention::Full(attn) => {
-                let out = qwen35_full_attention_step(
-                    &normed,
+                let out = fused_full_attn_step(
+                    &x,
+                    &layer.input_layernorm,
                     attn,
                     config,
                     arch,
@@ -229,7 +225,15 @@ fn qwen35_forward_step(
                 out
             }
             MetalQwen35Attention::Linear(attn) => {
-                let out = metal_gdr_decode_step(&normed, attn, recurrent, linear_idx, &arch.linear);
+                let out = fused_gdr_step(
+                    &x,
+                    &layer.input_layernorm,
+                    attn,
+                    recurrent,
+                    linear_idx,
+                    &arch.linear,
+                    config,
+                );
                 linear_idx += 1;
                 out
             }
@@ -248,8 +252,8 @@ fn qwen35_forward_step(
         let gate_raw = as_dtype(&gate_raw, Dtype::Bfloat16);
         let up = as_dtype(&up, Dtype::Bfloat16);
         let gate = silu(&gate_raw);
-        let fused = as_dtype(&multiply(&gate, &up), Dtype::Bfloat16);
-        let mlp = as_dtype(&linear(&fused, &layer.down_proj), Dtype::Bfloat16);
+        let fused_val = as_dtype(&multiply(&gate, &up), Dtype::Bfloat16);
+        let mlp = as_dtype(&linear(&fused_val, &layer.down_proj), Dtype::Bfloat16);
         x = add(&residual2, &mlp);
     }
 
@@ -261,6 +265,214 @@ fn qwen35_forward_step(
     );
     linear(&final_norm, &weights.lm_head)
 }
+
+// ── Fused C++ wrappers (dispatch to C++ FFI or Rust fallback) ────────────────
+
+/// Helper: extract raw mlx_array + quant params from a WeightTensor.
+/// For Dense: returns (w_t, empty, empty, 0, 0, false).
+/// For Quantized: returns (w, scales, biases, group_size, bits, true).
+fn wt_parts(
+    wt: &WeightTensor,
+) -> (
+    mlx_sys::mlx_array,
+    mlx_sys::mlx_array,
+    mlx_sys::mlx_array,
+    i32,
+    i32,
+    bool,
+) {
+    match wt {
+        WeightTensor::Dense(w_t) => {
+            let empty = unsafe { mlx_sys::mlx_array_new() };
+            (w_t.as_raw(), empty, empty, 0, 0, false)
+        }
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (
+            w.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            *group_size,
+            *bits,
+            true,
+        ),
+    }
+}
+
+#[cfg(metal_fused_ops)]
+#[allow(clippy::too_many_arguments)]
+fn fused_full_attn_step(
+    x: &MlxArray,
+    input_norm_w: &MlxArray,
+    attn: &MetalQwen35FullAttentionWeights,
+    config: &MetalModelConfig,
+    arch: &MetalQwen35ArchConfig,
+    k_cache: &mut MlxArray,
+    v_cache: &mut MlxArray,
+    cache_len: i32,
+) -> MlxArray {
+    let (q_w, q_s, q_b, gs, bits, is_q) = wt_parts(&attn.q_proj);
+    let (k_w, k_s, k_b, _, _, _) = wt_parts(&attn.k_proj);
+    let (v_w, v_s, v_b, _, _, _) = wt_parts(&attn.v_proj);
+    let (o_w, o_s, o_b, _, _, _) = wt_parts(&attn.o_proj);
+    let n_heads = config.num_attention_heads as i32;
+    let n_kv = config.num_key_value_heads as i32;
+    let hd = config.head_dim as i32;
+    let attn_scale = 1.0f32 / (hd as f32).sqrt();
+
+    let result_raw: mlx_sys::mlx_array = unsafe {
+        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+        super::metal_ffi::metal_qwen35_full_attn_block(
+            x.as_raw(),
+            input_norm_w.as_raw(),
+            q_w,
+            q_s,
+            q_b,
+            k_w,
+            k_s,
+            k_b,
+            v_w,
+            v_s,
+            v_b,
+            o_w,
+            o_s,
+            o_b,
+            attn.q_norm.as_raw(),
+            attn.k_norm.as_raw(),
+            n_heads,
+            n_kv,
+            hd,
+            attn_scale,
+            config.rope_theta as f32,
+            arch.rotary_dim as i32,
+            config.rms_norm_eps as f32,
+            gs,
+            bits,
+            is_q,
+            config.norm_weight_mode.uses_offset(),
+            k_cache.as_raw_mut(),
+            v_cache.as_raw_mut(),
+            cache_len,
+            r.as_mut_ptr(),
+        );
+        r.assume_init()
+    };
+    unsafe { MlxArray::from_raw(result_raw) }
+}
+
+#[cfg(not(metal_fused_ops))]
+#[allow(clippy::too_many_arguments)]
+fn fused_full_attn_step(
+    x: &MlxArray,
+    input_norm_w: &MlxArray,
+    attn: &MetalQwen35FullAttentionWeights,
+    config: &MetalModelConfig,
+    arch: &MetalQwen35ArchConfig,
+    k_cache: &mut MlxArray,
+    v_cache: &mut MlxArray,
+    cache_len: i32,
+) -> MlxArray {
+    let normed = rms_norm_last_dim(
+        x,
+        input_norm_w,
+        config.rms_norm_eps as f32,
+        config.norm_weight_mode.uses_offset(),
+    );
+    qwen35_full_attention_step(&normed, attn, config, arch, k_cache, v_cache, cache_len)
+}
+
+#[cfg(metal_fused_ops)]
+#[allow(clippy::too_many_arguments)]
+fn fused_gdr_step(
+    x: &MlxArray,
+    input_norm_w: &MlxArray,
+    attn: &MetalLinearAttnWeights,
+    recurrent: &mut MetalRecurrentState,
+    layer_idx: usize,
+    gdr_cfg: &crate::metal_gdr::MetalGdrConfig,
+    _config: &MetalModelConfig,
+) -> MlxArray {
+    // C++ GDR block does NOT include input norm — it expects normed input.
+    // Apply norm here, then call C++. (The GDR block is already complex enough.)
+    let normed = rms_norm_last_dim(
+        x,
+        input_norm_w,
+        gdr_cfg.rms_norm_eps,
+        false, // GDR uses direct norm
+    );
+    let (qkv_w, qkv_s, qkv_b, gs, bits, is_q) = wt_parts(&attn.in_proj_qkv);
+    let (z_w, z_s, z_b, _, _, _) = wt_parts(&attn.in_proj_z);
+    let (beta_w, beta_s, beta_b, _, _, _) = wt_parts(&attn.in_proj_beta);
+    let (alpha_w, alpha_s, alpha_b, _, _, _) = wt_parts(&attn.in_proj_alpha);
+    let (out_w, out_s, out_b, _, _, _) = wt_parts(&attn.out_proj);
+
+    let result_raw: mlx_sys::mlx_array = unsafe {
+        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
+        super::metal_ffi::metal_qwen35_gdr_block(
+            normed.as_raw(),
+            qkv_w,
+            qkv_s,
+            qkv_b,
+            z_w,
+            z_s,
+            z_b,
+            beta_w,
+            beta_s,
+            beta_b,
+            alpha_w,
+            alpha_s,
+            alpha_b,
+            out_w,
+            out_s,
+            out_b,
+            attn.conv1d_weight.as_raw(),
+            attn.dt_bias.as_raw(),
+            attn.a_log.as_raw(),
+            attn.norm_weight.as_raw(),
+            gdr_cfg.num_key_heads as i32,
+            gdr_cfg.key_dim as i32,
+            gdr_cfg.num_value_heads as i32,
+            gdr_cfg.value_dim as i32,
+            gdr_cfg.conv_kernel as i32,
+            gdr_cfg.hidden_size as i32,
+            gdr_cfg.rms_norm_eps,
+            gs,
+            bits,
+            is_q,
+            recurrent.states[layer_idx].as_raw_mut(),
+            recurrent.conv_states[layer_idx].as_raw_mut(),
+            r.as_mut_ptr(),
+        );
+        r.assume_init()
+    };
+    unsafe { MlxArray::from_raw(result_raw) }
+}
+
+#[cfg(not(metal_fused_ops))]
+#[allow(clippy::too_many_arguments)]
+fn fused_gdr_step(
+    x: &MlxArray,
+    input_norm_w: &MlxArray,
+    attn: &MetalLinearAttnWeights,
+    recurrent: &mut MetalRecurrentState,
+    layer_idx: usize,
+    gdr_cfg: &crate::metal_gdr::MetalGdrConfig,
+    config: &MetalModelConfig,
+) -> MlxArray {
+    let normed = rms_norm_last_dim(
+        x,
+        input_norm_w,
+        config.rms_norm_eps as f32,
+        config.norm_weight_mode.uses_offset(),
+    );
+    metal_gdr_decode_step(&normed, attn, recurrent, layer_idx, gdr_cfg)
+}
+
+// ── Rust fallback implementations (used when metal_fused_ops not compiled) ───
 
 fn qwen35_full_attention_step(
     x: &MlxArray,
