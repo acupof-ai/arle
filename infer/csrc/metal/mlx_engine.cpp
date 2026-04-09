@@ -138,7 +138,7 @@ static array full_attn_step(
     // Q → [1, n_heads * hd * 2] → split into q + gate
     auto q_full = astype(attn.q_proj(normed), bfloat16);
     q_full = reshape(q_full, {1, 1, n_heads, hd * 2});
-    auto q_gate = split(q_full, std::vector<int>{hd}, -1);
+    auto q_gate = split(q_full, Shape{hd}, -1);
     auto q_heads = q_gate[0], gate_heads = q_gate[1];
 
     auto k_raw = astype(attn.k_proj(normed), bfloat16);
