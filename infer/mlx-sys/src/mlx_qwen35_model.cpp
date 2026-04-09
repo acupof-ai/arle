@@ -201,9 +201,12 @@ struct LayerWeights {
 
 struct Qwen35CompiledModel {
     // Weights
-    array embed_tokens = array(0);
+    array embed_tokens = array(0);  // dequantized bf16 for take() lookup
     array final_norm_w = array(0);
     QWeight lm_head;
+    // Quantized embed weights for as_linear lm_head (when tied)
+    QWeight embed_as_linear;
+    bool use_embed_as_linear = false;
     std::vector<LayerWeights> layers;
 
     // Config
@@ -529,7 +532,11 @@ struct Qwen35CompiledModel {
 
         // Final norm + lm_head
         auto final_x = fast::rms_norm(x, final_norm_w, rms_eps);
-        auto logits = lm_head.apply(final_x);
+        // Use quantized matmul for tied lm_head (same as mlx_lm's as_linear).
+        // Dense bf16 matmul reads 1.2GB vs quantized reads 0.3GB — 7.5ms difference.
+        auto logits = use_embed_as_linear
+            ? embed_as_linear.apply(final_x)
+            : lm_head.apply(final_x);
 
         // Build output
         std::vector<array> outputs;
@@ -602,7 +609,20 @@ void qwen35_compiled_set_embed(
         } else {
             m->lm_head = {*to_arr(lm_head_w), *to_arr(lm_head_s), *to_arr(lm_head_b), lm_gs, lm_bits, false};
         }
+        m->use_embed_as_linear = false;
     });
+}
+
+// Set quantized embed weights for as_linear lm_head (when tie_word_embeddings=true).
+// This uses quantized_matmul instead of dense matmul, reading 0.3GB vs 1.2GB per step.
+void qwen35_compiled_set_embed_as_linear(
+    void* model,
+    mlx_array* w, mlx_array* s, mlx_array* b,
+    int32_t gs, int32_t bits
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    m->embed_as_linear = {*to_arr(w), *to_arr(s), *to_arr(b), gs, bits, false};
+    m->use_embed_as_linear = true;
 }
 
 void qwen35_compiled_push_full_attn(
