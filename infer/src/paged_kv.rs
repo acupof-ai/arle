@@ -43,6 +43,13 @@ pub struct TokenKVPool {
     /// Workspace for split-KV fused-dequant attention (INT8 only).
     pub(crate) int8_attn_workspace: Option<CudaSlice<u8>>,
     pub(crate) int8_attn_workspace_bytes: usize,
+    /// Per-head per-token f16 norms (TurboQuant only). `[max_total_tokens, num_kv_heads]`
+    pub(crate) k_norms: Vec<CudaSlice<u16>>,
+    pub(crate) v_norms: Vec<CudaSlice<u16>>,
+    /// TurboQuant per-layer state: rotation matrices + codebook (K and V).
+    /// Only populated when format is TurboQuant.
+    pub(crate) tq_k_state: Option<crate::model::turboquant_state::TurboQuantLayerState>,
+    pub(crate) tq_v_state: Option<crate::model::turboquant_state::TurboQuantLayerState>,
 
     /// Free token slot indices (stack-based allocator, LIFO).
     free_slots: Vec<u32>,
@@ -166,6 +173,8 @@ impl TokenKVPool {
         let mut v_data = Vec::new();
         let mut k_scales = Vec::new();
         let mut v_scales = Vec::new();
+        let mut k_norms = Vec::new();
+        let mut v_norms = Vec::new();
         let mut k_work = None;
         let mut v_work = None;
 
@@ -196,6 +205,22 @@ impl TokenKVPool {
                         ctx.stream
                             .alloc_zeros::<f32>(scale_elements)
                             .map_err(|e| anyhow!("TokenKVPool V scales alloc failed: {e}"))?,
+                    );
+                }
+            }
+
+            // Norm buffers (TurboQuant only): f16 per-head per-token
+            if format.has_norms() {
+                for _ in 0..num_layers {
+                    k_norms.push(
+                        ctx.stream
+                            .alloc_zeros::<u16>(scale_elements)
+                            .map_err(|e| anyhow!("TokenKVPool K norms alloc failed: {e}"))?,
+                    );
+                    v_norms.push(
+                        ctx.stream
+                            .alloc_zeros::<u16>(scale_elements)
+                            .map_err(|e| anyhow!("TokenKVPool V norms alloc failed: {e}"))?,
                     );
                 }
             }
@@ -258,10 +283,20 @@ impl TokenKVPool {
             (None, 0)
         };
 
+        // TurboQuant state: rotation matrices + codebook
+        let (tq_k_state, tq_v_state) = if let KVFormat::TurboQuant { key_bits, val_bits } = format {
+            use crate::model::turboquant_state::TurboQuantLayerState;
+            let k_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, key_bits, 42)?;
+            let v_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, val_bits, 137)?;
+            (Some(k_state), Some(v_state))
+        } else {
+            (None, None)
+        };
+
         // Legacy dtype mapping
         let dtype = match format {
             KVFormat::BF16 => KVCacheDtype::BF16,
-            KVFormat::FP8E4M3 | KVFormat::INT8 => KVCacheDtype::INT8,
+            KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::TurboQuant { .. } => KVCacheDtype::INT8,
         };
 
         Ok(Self {
@@ -273,6 +308,10 @@ impl TokenKVPool {
             v_work,
             int8_attn_workspace,
             int8_attn_workspace_bytes,
+            k_norms,
+            v_norms,
+            tq_k_state,
+            tq_v_state,
             free_slots,
             token_indices,
             format,
@@ -393,6 +432,38 @@ impl TokenKVPool {
     pub fn v_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_scales[layer].device_ptr(stream);
         ptr as u64
+    }
+
+    /// K norms device pointer for a layer (TurboQuant only).
+    pub fn k_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.k_norms[layer].device_ptr(stream);
+        ptr as u64
+    }
+
+    /// V norms device pointer for a layer (TurboQuant only).
+    pub fn v_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
+        let (ptr, _guard) = self.v_norms[layer].device_ptr(stream);
+        ptr as u64
+    }
+
+    /// K norms CudaSlice ref for a layer (TurboQuant only).
+    pub fn k_norms_slice(&self, layer: usize) -> &CudaSlice<u16> {
+        &self.k_norms[layer]
+    }
+
+    /// V norms CudaSlice ref for a layer (TurboQuant only).
+    pub fn v_norms_slice(&self, layer: usize) -> &CudaSlice<u16> {
+        &self.v_norms[layer]
+    }
+
+    /// K data CudaSlice ref for a layer.
+    pub fn k_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
+        &self.k_data[layer]
+    }
+
+    /// V data CudaSlice ref for a layer.
+    pub fn v_data_slice(&self, layer: usize) -> &CudaSlice<u8> {
+        &self.v_data[layer]
     }
 
     /// K working buffer pointer (bf16, shared across layers).

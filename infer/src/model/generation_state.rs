@@ -102,6 +102,17 @@ impl GenerationStateBase {
                 self.kv_cache.v_scales(),
                 self.kv_cache.max_seq_len(),
             ),
+            KVFormat::TurboQuant { .. } => {
+                // Phase 1: contiguous cache is BF16. Migrate as BF16 first,
+                // then the pool's quantize path handles TQ conversion per-token.
+                pool.migrate_from_contiguous(
+                    ctx,
+                    slot,
+                    self.kv_cache.k_caches(),
+                    self.kv_cache.v_caches(),
+                    self.kv_cache.max_seq_len(),
+                )
+            }
         }
     }
 }

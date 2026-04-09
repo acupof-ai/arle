@@ -11,6 +11,7 @@ pub(crate) mod common;
 pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
 pub(crate) mod kv_cache;
+pub(crate) mod turboquant_state;
 
 pub mod glm4;
 pub mod qwen3;
