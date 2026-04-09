@@ -118,6 +118,7 @@ fn regen_test_data() {
                 ..Default::default()
             },
             stop: None,
+            logprobs: false,
         };
         let resp = engine.complete(req).expect("complete failed");
         let output = resp.text;
