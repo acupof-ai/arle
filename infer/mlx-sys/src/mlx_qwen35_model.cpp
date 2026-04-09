@@ -223,6 +223,7 @@ struct Qwen35CompiledModel {
 
     // Runtime state (set before each forward call)
     int current_cache_pos = 0;
+    int current_seq_len = 1;  // 1 for decode, >1 for batch prefill
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -239,42 +240,41 @@ struct Qwen35CompiledModel {
         array& new_k_cache, array& new_v_cache
     ) const {
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
+        int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
 
-        auto q_full = reshape(lw.q_proj.apply(x), {1, 1, nh, hd * 2});
-        auto q_gate = split(q_full, Shape{hd}, -1);  // split at hd along last dim
+        auto q_full = reshape(lw.q_proj.apply(x), {1, S, nh, hd * 2});
+        auto q_gate = split(q_full, Shape{hd}, -1);
         auto& q_heads = q_gate[0];
         auto& gate_heads = q_gate[1];
 
         auto k_raw = lw.k_proj.apply(x);
         auto v_raw = lw.v_proj.apply(x);
 
-        // Q norm + RoPE
         auto q = fast::rms_norm(q_heads, lw.q_norm_w, rms_eps);
         q = transpose(q, {0, 2, 1, 3});
         q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
-        // K norm + RoPE
-        auto k = reshape(k_raw, {1, 1, nkv, hd});
+        auto k = reshape(k_raw, {1, S, nkv, hd});
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
         k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
-        auto v = reshape(v_raw, {1, 1, nkv, hd});
+        auto v = reshape(v_raw, {1, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
 
-        // KV cache update
-        int end = cache_pos + 1;
+        int end = cache_pos + S;
         new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {1,nkv,end,hd});
         new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {1,nkv,end,hd});
 
         auto k_full = slice(new_k_cache, {0,0,0,0}, {1,nkv,end,hd});
         auto v_full = slice(new_v_cache, {0,0,0,0}, {1,nkv,end,hd});
 
-        // SDPA + gate
-        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, "");
-        attn_out = reshape(transpose(attn_out, {0,2,1,3}), {1, nh*hd});
-        auto gate = reshape(gate_heads, {1, 1, nh*hd});
+        // SDPA: causal mask for prefill (S>1), no mask for decode (S=1)
+        std::string mask = (S > 1) ? "causal" : "";
+        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask);
+        attn_out = reshape(transpose(attn_out, {0,2,1,3}), {1, S, nh*hd});
+        auto gate = reshape(gate_heads, {1, S, nh*hd});
         gate = sigmoid(astype(gate, float32));
         auto gated = astype(astype(attn_out, float32) * gate, bfloat16);
         auto result = lw.o_proj.apply(gated);
@@ -298,15 +298,15 @@ struct Qwen35CompiledModel {
         int hv = lw.num_value_heads, dv = lw.value_dim;
         int q_dim = hk * dk, k_dim = q_dim, v_dim = hv * dv;
         int qkv_dim = q_dim + k_dim + v_dim;
+        int S = current_seq_len;
 
-        auto x_3d = reshape(x, {1, 1, hidden_size});
+        auto x_3d = reshape(x, {1, S, hidden_size});
 
-        // Projections — separate matmuls matching mlx_lm (4 matmul, no split overhead)
+        // Projections
         array qkv(0), z_raw(0), b_raw(0), a_raw(0);
         if (lw.use_separate_proj) {
-            // 4 separate matmuls — no split/slice overhead (matches mlx_lm)
             qkv = lw.qkv_proj.apply(x_3d);
-            z_raw = reshape(lw.z_proj.apply(x_3d), {1, 1, hv, dv}); // reshape like mlx_lm
+            z_raw = reshape(lw.z_proj.apply(x_3d), {1, S, hv, dv});
             b_raw = lw.b_proj.apply(x_3d);
             a_raw = lw.a_proj.apply(x_3d);
         } else {
@@ -318,48 +318,46 @@ struct Qwen35CompiledModel {
             auto ba_parts = split(ba, Shape{lw.ba_num_heads}, -1);
             b_raw = ba_parts[0];
             a_raw = ba_parts[1];
-            // Retain fused intermediates
             intermediates.push_back(qkvz); intermediates.push_back(ba);
             for (auto& a : qkv_z) intermediates.push_back(a);
             for (auto& a : ba_parts) intermediates.push_back(a);
         }
 
-        // Conv1d
+        // Conv1d (naturally handles S > 1)
         auto conv_input = concatenate({conv_state_in, qkv}, 1);
         int n_keep = lw.conv_kernel - 1;
-        conv_state_out = contiguous(slice(conv_input, {0,1,0}, {1,n_keep+1,qkv_dim}));
+        int conv_total = n_keep + S;
+        conv_state_out = contiguous(slice(conv_input, {0, conv_total - n_keep, 0}, {1, conv_total, qkv_dim}));
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
-        conv_out = compiled_silu()({conv_out})[0]; // SiLU (compiled)
+        conv_out = compiled_silu()({conv_out})[0];
 
         // Split conv output
         auto qkv_parts = split(conv_out, Shape{q_dim, q_dim + k_dim}, -1);
         for (auto& a : qkv_parts) intermediates.push_back(a);
-        auto q_raw = reshape(qkv_parts[0], {1, 1, hk, dk});
-        auto k_raw = reshape(qkv_parts[1], {1, 1, hk, dk});
-        auto v_raw = reshape(qkv_parts[2], {1, 1, hv, dv});
+        auto q_raw = reshape(qkv_parts[0], {1, S, hk, dk});
+        auto k_raw = reshape(qkv_parts[1], {1, S, hk, dk});
+        auto v_raw = reshape(qkv_parts[2], {1, S, hv, dv});
 
         auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * lw.q_scale_arr;
         auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * lw.k_scale_arr;
 
-        // Gate computation: compiled (matching mlx_lm's @mx.compile(shapeless=True))
         auto beta = sigmoid(b_raw);
         auto g = compiled_compute_g()({lw.a_log, a_raw, lw.dt_bias})[0];
 
         array y(0);
         if (use_gdr_metal_kernel()) {
-            // q, k are already bf16 (from rms_norm * scalar). v_raw is bf16 from conv.
-            // Skip unnecessary casts — 3 fewer ops per GDR layer × 24 = 72 fewer ops.
             auto& q_bf16 = q;
             auto& k_bf16 = k;
             auto& v_bf16 = v_raw;
-            auto g_3d = reshape(g, {1, 1, hv});
-            auto beta_3d = reshape(beta, {1, 1, hv});
-            auto t_arr = array(1);
+            // g and beta are [1, S, Hv] — no reshape needed
+            auto& g_3d = g;
+            auto& beta_3d = beta;
+            auto t_arr = array(S);
 
             std::vector<array> inputs = {
                 q_bf16, k_bf16, v_bf16, g_3d, beta_3d, gdr_state_in, t_arr
             };
-            std::vector<Shape> out_shapes = {{1, 1, hv, dv}, gdr_state_in.shape()};
+            std::vector<Shape> out_shapes = {{1, S, hv, dv}, gdr_state_in.shape()};
             std::vector<Dtype> out_dtypes = {bfloat16, float32};
             std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
                 {"Dk", fast::TemplateArg(dk)},
@@ -408,12 +406,12 @@ struct Qwen35CompiledModel {
             y = reshape(sum(gdr_state_out * q_4d, -1, false), {1,1,hv,dv});
         }
 
-        // Output norm + gate
-        auto y_heads = reshape(y, {hv, dv});
+        // Output norm + gate (S-aware)
+        auto y_heads = reshape(y, {S * hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
-        auto z_gated = reshape(z_raw, {hv, dv});
+        auto z_gated = reshape(z_raw, {S * hv, dv});
         auto out = normed * compiled_silu()({z_gated})[0];
-        auto result = lw.out_proj.apply(reshape(out, {1, 1, hv*dv}));
+        auto result = lw.out_proj.apply(reshape(out, {1, S, hv*dv}));
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
         auto& im = intermediates;
@@ -469,13 +467,11 @@ struct Qwen35CompiledModel {
 
         auto token_id = inputs[0];
         int cache_pos = current_cache_pos;
+        int S = current_seq_len;  // 1 for decode, >1 for batch prefill
 
         int F = n_full_attn, G = n_gdr;
-        // Ensure x is [1, 1, hidden] (3D) matching mlx_lm's tensor layout.
-        // token_id may be [1] (1D) — reshape to [1, 1] so take returns [1, 1, H].
-        auto tid = (token_id.ndim() == 1) ? reshape(token_id, {1, 1}) : token_id;
-        auto x = take(embed_tokens, flatten(tid), 0);
-        x = reshape(x, {1, 1, hidden_size});
+        auto x = take(embed_tokens, flatten(token_id), 0);
+        x = reshape(x, {1, S, hidden_size});
 
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
@@ -842,27 +838,33 @@ int32_t qwen35_compiled_generate(
 
         int cache_pos = 0;
 
-        // Prefill — build the entire graph lazily, eval only once at the end.
-        // Each step chains on the previous step's cache outputs.
-        for (int p = 0; p < prompt_len; ++p) {
-            m->current_cache_pos = cache_pos;
+        // Batch prefill — all prompt tokens in one forward pass.
+        {
+            m->current_cache_pos = 0;
+            m->current_seq_len = prompt_len;
+
+            std::vector<int32_t> pv(prompt_ids, prompt_ids + prompt_len);
+            auto tokens = array(pv.data(), {prompt_len}, int32);
+
             std::vector<array> inputs;
-            inputs.push_back(array(prompt_ids[p]));
+            inputs.push_back(tokens);
             for (auto& c : kv_caches) inputs.push_back(c);
             for (auto& s : gdr_states) inputs.push_back(s);
 
             auto outputs = m->forward(inputs);
+            m->current_seq_len = 1;  // back to decode mode
 
-            // Update caches (lazy — no eval until end of prefill)
             for (int j = 0; j < (int)kv_caches.size(); ++j)
                 kv_caches[j] = outputs[1 + j];
             for (int j = 0; j < (int)gdr_states.size(); ++j)
                 gdr_states[j] = outputs[1 + (int)kv_caches.size() + j];
 
-            cache_pos++;
-            if (p == prompt_len - 1) {
-                // Prefill done — eval the entire chained graph at once
-                auto logits = outputs[0];
+            cache_pos = prompt_len;
+
+            {
+                // Take last token's logits: [1, S, vocab] → take row S-1
+                auto all_logits = outputs[0];
+                auto logits = take(all_logits, array(prompt_len - 1), 1);
                 auto y = (temperature <= 1e-6f)
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
