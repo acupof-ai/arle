@@ -68,7 +68,8 @@ token → garbage continuation.
 3. CPU simulation: matches reference
 4. Fix: add `seq_len == 1` guard for W4/W2 dispatch
 
-**Current state:**
-- W4 native kernel: CORRECT for decode (72.9 tok/s, +135% vs BF16)
-- W4 prefill: uses INT4→INT8 unpack + W8 batch kernel (correct)
-- Next: implement W4 batch GEMM for native prefill performance
+**Current state (RESOLVED):**
+- W4 native kernel: decode + prefill both use native packed kernels
+- `from_quantized_int4` stores packed data directly (`quant_bits=4`)
+- `w4a16_gemv_batch_cuda` added for prefill (seq_len > 1)
+- No more INT4→INT8 unpack workaround — full native W4 pipeline
