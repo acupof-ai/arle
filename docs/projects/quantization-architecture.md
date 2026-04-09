@@ -1,7 +1,7 @@
 # Quantization Architecture Design
 
-**Status**: Design Review  
-**Date**: 2026-04-02  
+**Status**: Complete  
+**Date**: 2026-04-02 (design) / 2026-04-09 (implemented)  
 **Goal**: Support GPTQ/AWQ INT4 quantized models, unlocking 4x weight compression with minimal throughput regression
 
 ---

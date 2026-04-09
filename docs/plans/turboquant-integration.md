@@ -1,8 +1,8 @@
 # TurboQuant Integration — Unified Rotation-Based Quantization
 
-**Status**: Design  
+**Status**: Complete (Phases 1-3)  
 **Date**: 2026-04-09  
-**Scope**: KV cache compression (Phase 1) + weight quantization ITQ3_S (Phase 2)
+**Scope**: KV cache compression (Phase 1) + weight quantization ITQ3_S (Phase 2) + fused decode attention (Phase 3)
 
 ---
 
