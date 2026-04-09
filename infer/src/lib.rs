@@ -34,6 +34,8 @@ pub mod metal_kv_pool;
 pub mod metal_prefix_cache;
 pub mod metal_scheduler;
 pub mod metrics;
+#[cfg(feature = "metal")]
+pub mod mlx;
 pub mod model_registry;
 pub mod prefix_cache;
 pub mod quant;
