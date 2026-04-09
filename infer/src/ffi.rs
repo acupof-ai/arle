@@ -1165,4 +1165,79 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── TurboQuant Fast (Hadamard-based, O(D log D)) ───
+
+    // Host-side: generate random signs for Hadamard rotation.
+    pub(crate) fn turboquant_generate_signs(signs: *mut i8, head_dim: i32, seed: u64);
+
+    // Fast quantize: sign flip + FWHT + searchsorted + bitpack.
+    pub(crate) fn turboquant_fast_quantize_kv_cuda(
+        kv_bf16: *const Half,
+        packed_out: *mut u8,
+        norms_out: *mut Half,
+        signs: *const i8,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast dequantize: unpack + centroid gather + iFFWT + sign flip.
+    pub(crate) fn turboquant_fast_dequantize_kv_cuda(
+        packed_in: *const u8,
+        norms_in: *const Half,
+        kv_bf16: *mut Half,
+        signs: *const i8,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast dequant pool → working buffer (in-place NHD layout for FlashInfer).
+    pub(crate) fn turboquant_fast_dequantize_inplace_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        work_bf16: *mut Half,
+        pool_indices: *const i32,
+        signs: *const i8,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        num_indices: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast quantize single token: bf16 working → TQ paged pool.
+    pub(crate) fn turboquant_fast_quantize_single_cuda(
+        kv_bf16: *const Half,
+        pool_data: *mut u8,
+        pool_norms: *mut Half,
+        pool_indices: *const i32,
+        signs: *const i8,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
 }
