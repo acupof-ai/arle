@@ -238,6 +238,7 @@ fn generate<M: ModelForward>(
 }
 
 /// Same as `generate_tokens_inner` but also returns per-token logprobs (greedy only).
+#[cfg(feature = "cuda")]
 fn generate_tokens_with_logprobs_inner<M: ModelForward>(
     model: &M,
     state: &mut M::State,
