@@ -11,52 +11,52 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
     assert_eq!(a.cols, x.len, "A cols {} != x len {}", a.cols, x.len);
     assert_eq!(a.rows, y.len, "A rows {} != y len {}", a.rows, y.len);
 
-    // ── Quantized weight dispatch (W8A16 / W4A16 / W2A16) ──
+    // ── Quantized weight dispatch (W2A16 / W4A16 / W8A16) ──
     if let (Some(qw), Some(qs)) = (&a.qweight, &a.qscales) {
         let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
         let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
 
+        let rows = a.rows as i32;
+        let cols = a.cols as i32;
+        let grp = a.group_size as i32;
+        let stream = ctx.stream.cu_stream();
+
         unsafe {
-            if a.quant_bits == 2 {
-                ffi::w2a16_gemv_cuda(
+            match a.quant_bits {
+                2 => ffi::w2a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    a.rows as i32,
-                    a.cols as i32,
-                    a.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            } else if a.quant_bits == 4 {
-                ffi::w4a16_gemv_cuda(
+                    rows,
+                    cols,
+                    grp,
+                    stream,
+                ),
+                4 => ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    a.rows as i32,
-                    a.cols as i32,
-                    a.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            } else {
-                // W8A16
-                ffi::w8a16_gemv_cuda(
+                    rows,
+                    cols,
+                    grp,
+                    stream,
+                ),
+                _ => ffi::w8a16_gemv_cuda(
                     qw_ptr as *const i8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    a.rows as i32,
-                    a.cols as i32,
-                    a.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+                    rows,
+                    cols,
+                    grp,
+                    stream,
+                ),
             }
+            .result()?;
         }
         return Ok(());
     }
@@ -290,100 +290,86 @@ pub(crate) fn gemm_into(
         return;
     }
 
-    // ── Quantized weight dispatch (W8A16 / W4A16) ──
+    // ── Quantized weight dispatch (W2A16 / W4A16 / W8A16) ──
     if let (Some(qw), Some(qs)) = (&weight.qweight, &weight.qscales) {
         let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
         let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
 
+        let is_decode = x.seq_len == 1;
+        let n = weight.rows as i32;
+        let k = weight.cols as i32;
+        let gs = weight.group_size as i32;
+        let stream = ctx.stream.cu_stream();
+
         unsafe {
-            if x.seq_len == 1 && weight.quant_bits == 2 {
-                ffi::w2a16_gemv_cuda(
+            let res = match (is_decode, weight.quant_bits) {
+                (true, 2) => ffi::w2a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w2a16_gemv_cuda failed");
-            } else if x.seq_len == 1 && weight.quant_bits == 4 {
-                ffi::w4a16_gemv_cuda(
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+                (true, 4) => ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w4a16_gemv_cuda failed");
-            } else if x.seq_len == 1 {
-                // W8A16 single
-                ffi::w8a16_gemv_cuda(
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+                (true, _) => ffi::w8a16_gemv_cuda(
                     qw_ptr as *const i8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w8a16_gemv_cuda failed");
-            } else if weight.quant_bits == 4 {
-                // W4A16 batched (prefill)
-                ffi::w4a16_gemv_batch_cuda(
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+                (false, 2) => ffi::w2a16_gemv_batch_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
                     x.seq_len as i32,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w4a16_gemv_batch_cuda failed");
-            } else if weight.quant_bits == 2 {
-                // W2A16 batched (prefill)
-                ffi::w2a16_gemv_batch_cuda(
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+                (false, 4) => ffi::w4a16_gemv_batch_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
                     x.seq_len as i32,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w2a16_gemv_batch_cuda failed");
-            } else {
-                // W8A16 batched
-                ffi::w8a16_gemv_batch_cuda(
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+                (false, _) => ffi::w8a16_gemv_batch_cuda(
                     qw_ptr as *const i8,
                     qs_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     y_ptr as *mut ffi::Half,
                     x.seq_len as i32,
-                    weight.rows as i32,
-                    weight.cols as i32,
-                    weight.group_size as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()
-                .expect("w8a16_gemv_batch_cuda failed");
-            }
+                    n,
+                    k,
+                    gs,
+                    stream,
+                ),
+            };
+            res.result().expect("quantized GEMV/GEMM failed");
         }
         return;
     }
