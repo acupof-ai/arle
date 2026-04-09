@@ -34,6 +34,7 @@ pub enum QuantFormat {
     Fp8,
     Int8,
     Gguf,
+    TurboQuant,
 }
 
 impl QuantFormat {
@@ -49,6 +50,7 @@ impl QuantFormat {
             Self::Fp8 => "FP8 (E4M3)",
             Self::Int8 => "INT8 (W8A8)",
             Self::Gguf => "GGUF",
+            Self::TurboQuant => "TurboQuant (TQ3)",
         }
     }
 }
@@ -180,6 +182,27 @@ impl Default for Int8Config {
     }
 }
 
+/// TurboQuant weight quantization config (Hadamard rotation + Lloyd-Max).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurboQuantWeightConfig {
+    /// Bit-width (2, 3, or 4).
+    pub bits: u8,
+    /// Group size for per-group quantization.
+    pub group_size: usize,
+    /// Rotation type ("hadamard" or "full").
+    pub rotation: String,
+}
+
+impl Default for TurboQuantWeightConfig {
+    fn default() -> Self {
+        Self {
+            bits: 3,
+            group_size: 128,
+            rotation: "hadamard".to_string(),
+        }
+    }
+}
+
 /// GGUF file info.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GgufConfig {
@@ -202,6 +225,7 @@ pub enum QuantMeta {
     Fp8(Fp8Config),
     Int8(Int8Config),
     Gguf(GgufConfig),
+    TurboQuant(TurboQuantWeightConfig),
 }
 
 impl QuantMeta {
@@ -213,6 +237,7 @@ impl QuantMeta {
             Self::Fp8(_) => QuantFormat::Fp8,
             Self::Int8(_) => QuantFormat::Int8,
             Self::Gguf(_) => QuantFormat::Gguf,
+            Self::TurboQuant(_) => QuantFormat::TurboQuant,
         }
     }
 
@@ -292,7 +317,13 @@ pub fn load_quant_meta(model_path: &str) -> Result<QuantMeta> {
         return Ok(meta);
     }
 
-    // 2. GPTQ: AutoGPTQ writes `quantize_config.json`
+    // 2. TurboQuant: `turboquant_config.json`
+    let tq_path = dir.join("turboquant_config.json");
+    if tq_path.exists() {
+        return load_turboquant_from_file(&tq_path);
+    }
+
+    // 3. GPTQ: AutoGPTQ writes `quantize_config.json`
     let gptq_path = dir.join("quantize_config.json");
     if gptq_path.exists() {
         return load_gptq_from_file(&gptq_path);
@@ -337,6 +368,26 @@ fn try_load_gguf(dir: &Path) -> Option<QuantMeta> {
         }
     }
     None
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawTurboQuantConfig {
+    bits: Option<u8>,
+    group_size: Option<u64>,
+    rotation: Option<String>,
+}
+
+fn load_turboquant_from_file(path: &Path) -> Result<QuantMeta> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw: RawTurboQuantConfig =
+        serde_json::from_str(&content).with_context(|| "parsing turboquant_config.json")?;
+    Ok(QuantMeta::TurboQuant(TurboQuantWeightConfig {
+        bits: raw.bits.unwrap_or(3),
+        group_size: raw.group_size.unwrap_or(128) as usize,
+        rotation: raw.rotation.unwrap_or_else(|| "hadamard".to_string()),
+    }))
 }
 
 fn load_gptq_from_file(path: &Path) -> Result<QuantMeta> {
@@ -410,6 +461,11 @@ fn try_parse_config_json(json: &str) -> Result<Option<QuantMeta>> {
         "int8" | "smoothquant" | "w8a8" => QuantMeta::Int8(Int8Config {
             is_smoothquant: qc.is_smoothquant.unwrap_or(qtype == "smoothquant"),
             per_channel: true,
+        }),
+        "turboquant" | "tq" => QuantMeta::TurboQuant(TurboQuantWeightConfig {
+            bits: qc.bits.unwrap_or(3),
+            group_size: qc.group_size.unwrap_or(128) as usize,
+            rotation: "hadamard".to_string(),
         }),
         _ => return Ok(None),
     };
@@ -564,6 +620,41 @@ mod tests {
 
         let meta = load_quant_meta(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(meta.format(), QuantFormat::Gguf);
+    }
+
+    #[test]
+    fn turboquant_from_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("turboquant_config.json"),
+            r#"{"quant_type":"turboquant","bits":3,"group_size":128,"rotation":"hadamard"}"#,
+        )
+        .unwrap();
+
+        let meta = load_quant_meta(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(meta.format(), QuantFormat::TurboQuant);
+        if let QuantMeta::TurboQuant(c) = meta {
+            assert_eq!(c.bits, 3);
+            assert_eq!(c.group_size, 128);
+            assert_eq!(c.rotation, "hadamard");
+        } else {
+            panic!("expected TurboQuant");
+        }
+    }
+
+    #[test]
+    fn turboquant_from_config_json() {
+        let meta = parse_quant_meta_from_config_json(
+            r#"{"quantization_config":{"quant_type":"turboquant","bits":3,"group_size":64}}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.format(), QuantFormat::TurboQuant);
+        if let QuantMeta::TurboQuant(c) = meta {
+            assert_eq!(c.bits, 3);
+            assert_eq!(c.group_size, 64);
+        } else {
+            panic!("expected TurboQuant");
+        }
     }
 
     #[test]
