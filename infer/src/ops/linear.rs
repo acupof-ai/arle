@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::ffi;
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
@@ -201,6 +201,92 @@ pub(crate) fn gemm_into(
         "out seq_len {} != x seq_len {}",
         out.seq_len, x.seq_len
     );
+
+    // ── Marlin W4 GEMM for prefill (seq_len > 1) ──
+    // TODO: Marlin produces wrong output — disabled pending investigation
+    if false && x.seq_len > 1 && weight.has_marlin() {
+        let mp = weight.marlin_packed.as_ref().unwrap();
+        let ms = weight.marlin_scales.as_ref().unwrap();
+        let m = x.seq_len;
+        let n = weight.rows;
+        let k = weight.cols;
+
+        // BF16→FP16 input conversion
+        let mut x_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * k).expect("alloc x_fp16");
+        {
+            let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+            let (xf_ptr, _gf) = x_fp16.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::bf16_to_fp16_cuda(
+                    x_ptr as *const ffi::Half,
+                    xf_ptr as *mut ffi::Half,
+                    (m * k) as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("bf16_to_fp16 failed");
+            }
+        }
+
+        // FP16 output buffer
+        let mut y_fp16: CudaSlice<u16> = ctx.stream.alloc_zeros(m * n).expect("alloc y_fp16");
+
+        // Marlin workspace (lock buffer)
+        let sms = ctx.sm_count() as i32;
+        let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
+        let ws_elems = (ws_size + 3) / 4; // round up to i32 count
+        let mut workspace: CudaSlice<i32> = ctx
+            .stream
+            .alloc_zeros(ws_elems)
+            .expect("alloc marlin workspace");
+
+        // Run Marlin GEMM
+        {
+            let (xf_ptr, _g1) = x_fp16.device_ptr(&ctx.stream);
+            let (mp_ptr, _g2) = mp.device_ptr(&ctx.stream);
+            let (yf_ptr, _g3) = y_fp16.device_ptr_mut(&ctx.stream);
+            let (ms_ptr, _g4) = ms.device_ptr(&ctx.stream);
+            let (ws_ptr, _g5) = workspace.device_ptr_mut(&ctx.stream);
+            let ret = unsafe {
+                ffi::marlin_gemm_cuda(
+                    xf_ptr as *const ffi::Half,
+                    mp_ptr as *const u8,
+                    yf_ptr as *mut ffi::Half,
+                    ms_ptr as *mut ffi::Half, // scales (fp16)
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    ws_ptr as *mut i32,
+                    weight.group_size as i32,
+                    0, // dev
+                    ctx.stream.cu_stream(),
+                    -1, // thread_k (auto)
+                    -1, // thread_n (auto)
+                    sms,
+                    16, // max_par
+                )
+            };
+            assert_eq!(ret, 0, "marlin_gemm_cuda failed with code {ret}");
+        }
+
+        // FP16→BF16 output conversion
+        {
+            let (yf_ptr, _g1) = y_fp16.device_ptr(&ctx.stream);
+            let (y_ptr, _g2) = out.data.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::fp16_to_bf16_cuda(
+                    yf_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    (m * n) as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .expect("fp16_to_bf16 failed");
+            }
+        }
+
+        return;
+    }
 
     // ── Quantized weight dispatch (W8A16 / W4A16) ──
     if let (Some(qw), Some(qs)) = (&weight.qweight, &weight.qscales) {

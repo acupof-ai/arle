@@ -1,7 +1,7 @@
 //! Device tensor types and CUDA context.
 
 use anyhow::{Result, anyhow};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -45,6 +45,20 @@ impl DeviceContext {
         }
 
         Ok(Self { ctx, stream })
+    }
+
+    /// Query the number of streaming multiprocessors on the GPU.
+    pub fn sm_count(&self) -> usize {
+        use cudarc::driver::sys::*;
+        let mut count: i32 = 0;
+        unsafe {
+            cuDeviceGetAttribute(
+                &mut count,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            );
+        }
+        count.max(1) as usize
     }
 
     /// Synchronize stream
@@ -280,6 +294,10 @@ pub struct DeviceMatrix {
     pub group_size: usize,
     /// Quantization bit width (8 or 4). 0 = not quantized.
     pub quant_bits: usize,
+    /// Marlin-repacked INT4 weights for prefill GEMM (None if not W4 or repack failed).
+    pub marlin_packed: Option<CudaSlice<u8>>,
+    /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
+    pub marlin_scales: Option<CudaSlice<u16>>,
 }
 
 impl DeviceMatrix {
@@ -298,6 +316,8 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
@@ -335,6 +355,8 @@ impl DeviceMatrix {
             qscales: Some(qs),
             group_size,
             quant_bits: 8,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
@@ -376,6 +398,8 @@ impl DeviceMatrix {
             qscales: Some(qs),
             group_size,
             quant_bits: 4, // Native packed INT4; W4 kernel extracts nibbles
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
@@ -416,12 +440,123 @@ impl DeviceMatrix {
             qscales: Some(qs),
             group_size,
             quant_bits: 2,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
         self.qweight.is_some()
+    }
+
+    /// Whether this matrix has Marlin-repacked weights for fast prefill GEMM.
+    pub fn has_marlin(&self) -> bool {
+        self.marlin_packed.is_some()
+    }
+
+    /// Repack W4 weights to Marlin tile layout for fast prefill.
+    /// Our format: [N, K/2] uint8 packed (lo/hi nibble = even/odd elements)
+    /// Marlin format: tiled int32 layout optimized for tensor core MMA.
+    /// Also transposes scales from [N, K/group_size] bf16 → [K/group_size, N] fp16.
+    pub fn repack_for_marlin(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.quant_bits != 4 || self.qweight.is_none() || self.qscales.is_none() {
+            return Ok(()); // Only for W4
+        }
+        let n = self.rows; // output dim
+        let k = self.cols; // input dim
+
+        // Skip if dimensions not Marlin-compatible (need K%16==0, N%64==0)
+        if k % 16 != 0 || n % 64 != 0 {
+            log::warn!("Marlin repack skipped: [{n}x{k}] not tile-aligned (need K%16==0, N%64==0)");
+            return Ok(());
+        }
+
+        // Step 1: Convert our [N, K/2] uint8 → GPTQ [K/8, N] int32 on CPU
+        let qw = self.qweight.as_ref().unwrap();
+        let packed_host: Vec<i8> = ctx
+            .stream
+            .clone_dtoh(qw)
+            .map_err(|e| anyhow!("D2H qweight: {}", e))?;
+        let packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(packed_host.as_ptr().cast::<u8>(), packed_host.len())
+        };
+
+        // GPTQ format: qweight[k/8, n] = 8 nibbles packed into int32
+        // bit position (k%8)*4 holds the 4-bit unsigned value for element (k, n)
+        let gptq_rows = k / 8;
+        let mut gptq = vec![0u32; gptq_rows * n];
+        for row_n in 0..n {
+            for col_k in 0..k {
+                let byte_idx = row_n * (k / 2) + col_k / 2;
+                let nibble = if col_k % 2 == 0 {
+                    packed[byte_idx] & 0x0F
+                } else {
+                    packed[byte_idx] >> 4
+                };
+                let gptq_row = col_k / 8;
+                let bit_pos = (col_k % 8) * 4;
+                gptq[gptq_row * n + row_n] |= (nibble as u32) << bit_pos;
+            }
+        }
+
+        // Upload GPTQ weights as raw bytes
+        let gptq_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(gptq.as_ptr().cast::<u8>(), gptq.len() * 4) };
+        let gptq_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(gptq_bytes)
+            .map_err(|e| anyhow!("H2D GPTQ: {}", e))?;
+
+        // Allocate Marlin output buffer (same byte count as GPTQ: K*N/2 bytes)
+        let marlin_bytes = k * n / 2;
+        let mut marlin_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(marlin_bytes)
+            .map_err(|e| anyhow!("Alloc Marlin: {}", e))?;
+
+        // Step 2: GPTQ → Marlin repack on GPU
+        {
+            let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
+            let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::gptq_marlin_repack_cuda(
+                    gptq_ptr as *const u32,
+                    marlin_ptr as *mut u32,
+                    k as i32,
+                    n as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("Marlin repack failed: {:?}", e))?;
+            }
+        }
+
+        // Step 3: Transpose + convert scales [N, K/gs] bf16 → [K/gs, N] fp16
+        let qs = self.qscales.as_ref().unwrap();
+        let scales_host: Vec<bf16> = ctx
+            .stream
+            .clone_dtoh(qs)
+            .map_err(|e| anyhow!("D2H scales: {}", e))?;
+        let num_groups = k / self.group_size;
+        let mut scales_fp16 = vec![0u16; num_groups * n];
+        for row_n in 0..n {
+            for g in 0..num_groups {
+                let bf = scales_host[row_n * num_groups + g];
+                let f = f32::from(bf);
+                let fp16 = half::f16::from_f32(f);
+                scales_fp16[g * n + row_n] = fp16.to_bits();
+            }
+        }
+        let scales_gpu: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(&scales_fp16)
+            .map_err(|e| anyhow!("H2D Marlin scales: {}", e))?;
+
+        self.marlin_packed = Some(marlin_gpu);
+        self.marlin_scales = Some(scales_gpu);
+
+        Ok(())
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -455,6 +590,8 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
@@ -491,6 +628,8 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 
@@ -520,6 +659,8 @@ impl DeviceMatrix {
                 qscales: None,
                 group_size: 0,
                 quant_bits: 0,
+                marlin_packed: None,
+                marlin_scales: None,
             });
         }
 
@@ -546,6 +687,8 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
         })
     }
 }
