@@ -91,12 +91,28 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let prefill_us = prefill_t.elapsed().as_micros();
 
-        // Log slow steps for profiling
-        let total_us = emit_us + decode_us + new_us + prefill_us;
+        // Step timing — always tracked for /v1/stats and profiling.
+        // EMA (exponential moving average) with α=0.1 smooths noise
+        // while responding quickly to sustained changes.
+        let total_us = decode_us + emit_us + new_us + prefill_us;
+        const ALPHA: f64 = 0.1;
+        let update_ema = |ema: &mut f64, val: u128| {
+            let v = val as f64;
+            if *ema == 0.0 {
+                *ema = v;
+            } else {
+                *ema = ALPHA * v + (1.0 - ALPHA) * *ema;
+            }
+        };
+        update_ema(&mut self.step_timing_decode_us, decode_us);
+        update_ema(&mut self.step_timing_emit_us, emit_us);
+        update_ema(&mut self.step_timing_prefill_us, prefill_us);
+        update_ema(&mut self.step_timing_total_us, total_us);
+
         if total_us > 100_000 {
             info!(
-                "step breakdown: emit={}us decode={}us new={}us prefill={}us total={}us batch={}",
-                emit_us, decode_us, new_us, prefill_us, total_us, num
+                "step breakdown: decode={}us emit={}us new={}us prefill={}us total={}us batch={}",
+                decode_us, emit_us, new_us, prefill_us, total_us, num
             );
         }
     }
