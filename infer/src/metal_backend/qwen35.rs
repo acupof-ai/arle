@@ -286,11 +286,9 @@ fn qwen35_forward_step(
             config.norm_weight_mode.uses_offset(),
         );
         let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
-        let gate_raw = as_dtype(&gate_raw, Dtype::Bfloat16);
-        let up = as_dtype(&up, Dtype::Bfloat16);
-        // Compiled SwiGLU: silu(gate) * up → single compiled kernel dispatch.
-        let fused_val = as_dtype(&compiled_swiglu(&gate_raw, &up), Dtype::Bfloat16);
-        let mlp = as_dtype(&linear(&fused_val, &layer.down_proj), Dtype::Bfloat16);
+        // SwiGLU: silu(gate) * up → compiled kernel. No casts needed.
+        let fused_val = compiled_swiglu(&gate_raw, &up);
+        let mlp = linear(&fused_val, &layer.down_proj);
         x = add(&residual2, &mlp);
     }
 
@@ -459,7 +457,7 @@ fn qwen35_full_attention_step(
     let q_dim = n_heads * head_dim;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let q_full = as_dtype(&linear(x, &attn.q_proj), Dtype::Bfloat16);
+    let q_full = linear(x, &attn.q_proj);
     let q_full = reshape(&q_full, &[1, 1, n_heads, head_dim * 2]);
     // Split q and gate: q_full is [1, 1, n_heads, head_dim*2], split at head_dim on last axis
     let q_heads = slice(
@@ -475,8 +473,8 @@ fn qwen35_full_attention_step(
         &[1, 1, 1, 1],
     );
 
-    let k_raw = as_dtype(&linear(x, &attn.k_proj), Dtype::Bfloat16);
-    let v_raw = as_dtype(&linear(x, &attn.v_proj), Dtype::Bfloat16);
+    let k_raw = linear(x, &attn.k_proj);
+    let v_raw = linear(x, &attn.v_proj);
 
     let q = rms_norm_last_dim(
         &q_heads,
@@ -550,7 +548,7 @@ fn qwen35_full_attention_step(
         &multiply(&as_dtype(&attn_out, Dtype::Float32), &gate),
         Dtype::Bfloat16,
     );
-    as_dtype(&linear(&gated, &attn.o_proj), Dtype::Bfloat16)
+    linear(&gated, &attn.o_proj)
 }
 
 fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) -> MlxArray {
