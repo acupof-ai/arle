@@ -315,6 +315,10 @@ struct Qwen35CompiledModel {
             auto ba_parts = split(ba, Shape{lw.ba_num_heads}, -1);
             b_raw = ba_parts[0];
             a_raw = ba_parts[1];
+            // Retain fused intermediates
+            intermediates.push_back(qkvz); intermediates.push_back(ba);
+            for (auto& a : qkv_z) intermediates.push_back(a);
+            for (auto& a : ba_parts) intermediates.push_back(a);
         }
 
         // Conv1d
@@ -324,8 +328,9 @@ struct Qwen35CompiledModel {
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
         conv_out = compiled_silu()({conv_out})[0]; // SiLU (compiled)
 
-        // Split conv output: 1 split op instead of 3 separate slices
+        // Split conv output
         auto qkv_parts = split(conv_out, Shape{q_dim, q_dim + k_dim}, -1);
+        for (auto& a : qkv_parts) intermediates.push_back(a);
         auto q_raw = reshape(qkv_parts[0], {1, 1, hk, dk});
         auto k_raw = reshape(qkv_parts[1], {1, 1, hk, dk});
         auto v_raw = reshape(qkv_parts[2], {1, 1, hv, dv});
@@ -375,6 +380,8 @@ struct Qwen35CompiledModel {
 
             y = std::move(result[0]);
             gdr_state_out = std::move(result[1]);
+            intermediates.push_back(g_3d);
+            intermediates.push_back(beta_3d);
         } else {
             int heads_per_key = hv / hk;
             auto g_4d = reshape(g, {1, hv, 1, 1});
