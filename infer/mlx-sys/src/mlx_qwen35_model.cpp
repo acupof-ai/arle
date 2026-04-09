@@ -287,7 +287,7 @@ struct Qwen35CompiledModel {
         // Conv1d
         auto conv_input = concatenate({conv_state_in, qkv}, 1);
         int n_keep = lw.conv_kernel - 1;
-        conv_state_out = slice(conv_input, {0,1,0}, {1,n_keep+1,qkv_dim});
+        conv_state_out = contiguous(slice(conv_input, {0,1,0}, {1,n_keep+1,qkv_dim}));
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
         conv_out = compiled_silu()({conv_out})[0]; // SiLU (compiled)
 
