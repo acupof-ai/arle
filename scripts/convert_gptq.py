@@ -39,15 +39,19 @@ def unpack_gptq_weight(qweight, qzeros, scales, bits=4, group_size=128):
     num_groups = scales.shape[0]
 
     # Vectorized unpack: [K//8, N] int32 → [K, N] uint4 values
-    # Expand each int32 into 8 int4 values
     shifts = torch.arange(0, 32, bits, dtype=torch.int32)  # [0,4,8,...,28]
-    # qweight: [K//8, N] → expand → [K//8, 8, N]
+    # qweight [K//8, N] → [K//8, 8, N] → permute to [K//8, N, 8] → reshape [K//8*N, 8]
+    # But simpler: [K//8, 8, N] with correct interleaving:
+    # Element at [pack, shift_idx, n] should map to [pack*8 + shift_idx, n]
     w_expanded = (qweight.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask  # [K//8, 8, N]
-    weight_unpacked = w_expanded.permute(0, 1, 2).reshape(K, N)  # [K, N]
+    # reshape: pack dimension (0) and shift dimension (1) interleave into K
+    # [K//8, 8, N] → want [K, N] where K = pack*8 + shift
+    weight_unpacked = w_expanded.reshape(K, N)  # correct: C-order reshape interleaves pack*8+shift
 
-    # Vectorized unpack zeros: [num_groups, N//8] → [num_groups, N]
-    z_expanded = (qzeros.unsqueeze(1) >> shifts.view(1, -1, 1)) & mask  # [G, 8, N//8]
-    zeros_unpacked = z_expanded.permute(0, 1, 2).reshape(num_groups, N)  # [G, N]
+    # Vectorized unpack zeros: [G, N//8] int32 → [G, N]
+    # Each int32 in qzeros[g, n_pack] holds 8 zero-points for n_pack*8..n_pack*8+7
+    z_expanded = (qzeros.unsqueeze(2) >> shifts.view(1, 1, -1)) & mask  # [G, N//8, 8]
+    zeros_unpacked = z_expanded.reshape(num_groups, N)  # [G, N]
 
     # Apply zero-point: signed_val = unsigned_val - zero_point, clamped to [-8, 7]
     # Expand zeros to [K, N] by repeating per group
