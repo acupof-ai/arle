@@ -45,3 +45,13 @@ pub mod speculative;
 pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trace_reporter;
+
+#[cfg(all(test, feature = "metal"))]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn metal_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+}

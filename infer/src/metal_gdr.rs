@@ -574,10 +574,12 @@ pub fn metal_gdr_decode_step(
 #[cfg(feature = "metal")]
 mod tests {
     use super::*;
+    use crate::test_support::metal_test_guard;
 
     /// Smoke test: verify shapes through the conv1d step.
     #[test]
     fn test_conv1d_step_shapes() {
+        let _guard = metal_test_guard();
         let qkv_dim = 8192; // q=2048 + k=2048 + v=4096
         let kernel_size = 4;
         let state_width = kernel_size - 1;
@@ -600,6 +602,7 @@ mod tests {
     /// Smoke test: verify state allocation shapes for small dimensions.
     #[test]
     fn test_gdr_state_shapes_small() {
+        let _guard = metal_test_guard();
         // Tiny config: 1 key head, 1 value head, dim=2
         let config = MetalGdrConfig {
             num_key_heads: 1,
@@ -623,6 +626,7 @@ mod tests {
     /// Smoke test: verify state shapes for Qwen3.5-4B dimensions.
     #[test]
     fn test_gdr_state_shapes_qwen35() {
+        let _guard = metal_test_guard();
         let config = MetalGdrConfig {
             num_key_heads: 16,
             key_dim: 128,
@@ -654,6 +658,7 @@ mod tests {
     /// softplus must match the CUDA reference for small, moderate, and large values.
     #[test]
     fn test_softplus_numerical_accuracy() {
+        let _guard = metal_test_guard();
         let values: Vec<f32> = vec![
             -10.0, -1.0, 0.0, 1.0, 5.0, 10.0, 19.0, 20.0, 21.0, 50.0, 100.0,
         ];
@@ -675,6 +680,7 @@ mod tests {
     /// softplus must not overflow for large inputs (the original bug).
     #[test]
     fn test_softplus_no_overflow() {
+        let _guard = metal_test_guard();
         let large = Array::from_slice(&[88.0f32, 200.0, 1000.0], &[3]);
         let result = softplus(&large).unwrap();
         mlx_rs::transforms::eval([&result]).unwrap();
@@ -690,6 +696,7 @@ mod tests {
     /// RMS normalize should produce unit-norm output (up to epsilon).
     #[test]
     fn test_rms_normalize_unit_norm() {
+        let _guard = metal_test_guard();
         let x = Array::from_slice(&[3.0f32, 4.0], &[1, 2]);
         let normed = rms_normalize(&x, 1e-6).unwrap();
         mlx_rs::transforms::eval([&normed]).unwrap();
@@ -707,6 +714,7 @@ mod tests {
     /// Verify against scalar reference for a single head.
     #[test]
     fn test_gate_computation_scalar() {
+        let _guard = metal_test_guard();
         use mlx_rs::ops;
 
         let a_log_val = -1.0f32; // exp(A_log) = exp(-1) ≈ 0.3679
