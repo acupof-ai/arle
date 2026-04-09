@@ -106,6 +106,36 @@ pub trait GenerationState {
         pool: &crate::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()>;
+
+    // -- Prefix cache support for hybrid models (recurrent + full attention) --
+
+    /// Whether this model supports partial prefix reuse via `truncate_to()`.
+    ///
+    /// Returns `false` for hybrid models (e.g. Qwen3.5) where accumulated
+    /// recurrent state cannot be truncated to an arbitrary prefix length.
+    /// The scheduler downgrades partial prefix hits to full MISS for such models.
+    fn supports_partial_prefix(&self) -> bool {
+        true
+    }
+
+    /// Save a snapshot of auxiliary state (recurrent/SSM) after prefill.
+    ///
+    /// Called by the scheduler after prefill completes successfully. On a
+    /// subsequent full prefix hit, `restore_prefix_snapshot()` restores this
+    /// clean post-prefill state, avoiding decode-token contamination.
+    ///
+    /// Default: no-op (pure-attention models have no auxiliary state).
+    fn save_prefix_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Restore auxiliary state from a previously saved snapshot.
+    ///
+    /// Returns `true` if a snapshot existed and was restored, `false` otherwise.
+    /// Called on full prefix cache hit before transitioning to decode.
+    fn restore_prefix_snapshot(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Deep module interface: explicit prefill/decode phases with typed decode context.
