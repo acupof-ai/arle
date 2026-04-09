@@ -405,15 +405,19 @@ struct Qwen35CompiledModel {
         auto out = normed * compiled_silu()({z_gated})[0];
         auto result = lw.out_proj.apply(reshape(out, {1, 1, hv*dv}));
 
-        // Keep intermediates alive for GPU buffer reuse
-        intermediates.push_back(qkv);
-        intermediates.push_back(conv_out);
-        intermediates.push_back(q);
-        intermediates.push_back(k);
-        intermediates.push_back(g);
-        intermediates.push_back(y);
-        intermediates.push_back(normed);
-        intermediates.push_back(out);
+        // Keep ALL available intermediates alive for GPU buffer reuse.
+        auto& im = intermediates;
+        im.push_back(x_3d);
+        im.push_back(qkv); im.push_back(z_raw);
+        im.push_back(b_raw); im.push_back(a_raw);
+        im.push_back(conv_input); im.push_back(conv_out);
+        for (auto& a : qkv_parts) im.push_back(a);
+        im.push_back(q_raw); im.push_back(k_raw); im.push_back(v_raw);
+        im.push_back(q); im.push_back(k);
+        im.push_back(beta); im.push_back(g);
+        im.push_back(y);
+        im.push_back(y_heads); im.push_back(normed);
+        im.push_back(z_gated); im.push_back(out);
         return result;
     }
 
