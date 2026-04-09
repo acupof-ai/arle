@@ -1275,4 +1275,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── TurboQuant Weight GEMV/Dequant ───
+
+    // Fused TQ weight dequant + GEMV for decode (single token).
+    // y[N] = dequant(packed[N,K]) @ x[K]
+    pub(crate) fn turboquant_weight_gemv_cuda(
+        packed: *const u8,
+        scales: *const Half, // f16
+        signs: *const i8,
+        centroids: *const f32,
+        x: *const Half, // bf16
+        y: *mut Half,   // bf16
+        N: i32,
+        K: i32,
+        group_size: i32,
+        packed_cols: i32,
+        num_groups: i32,
+        bits: i32,
+        stream: CUstream,
+    );
+
+    // Bulk TQ weight dequant to bf16 workspace (for prefill cuBLAS GEMM).
+    // out[N, K] = dequant(packed[N, packed_cols])
+    pub(crate) fn turboquant_weight_dequant_cuda(
+        packed: *const u8,
+        scales: *const Half,
+        signs: *const i8,
+        centroids: *const f32,
+        out: *mut Half, // bf16
+        N: i32,
+        K: i32,
+        group_size: i32,
+        packed_cols: i32,
+        num_groups: i32,
+        bits: i32,
+        stream: CUstream,
+    );
+
 }
