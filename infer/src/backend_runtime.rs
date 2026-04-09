@@ -279,6 +279,7 @@ mod tests {
     use crate::backend::GenerateResult;
     use crate::request_handle::RequestHandle;
     use crate::sampler::SamplingParams;
+    use std::path::Path;
 
     #[derive(Clone)]
     struct MockStreamingBackend {
