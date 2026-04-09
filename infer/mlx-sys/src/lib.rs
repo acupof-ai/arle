@@ -157,6 +157,47 @@ unsafe extern "C" {
         dt_bias: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    /// Full GDR layer forward in C++ — eliminates ~40 FFI calls per layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_gdr_layer_forward(
+        x: *mut mlx_array,
+        qkvz_w: *mut mlx_array,
+        qkvz_s: *mut mlx_array,
+        qkvz_b: *mut mlx_array,
+        qkvz_gs: i32,
+        qkvz_bits: i32,
+        qkv_split: i32,
+        z_split: i32,
+        ba_w: *mut mlx_array,
+        ba_s: *mut mlx_array,
+        ba_b: *mut mlx_array,
+        ba_gs: i32,
+        ba_bits: i32,
+        ba_num_heads: i32,
+        conv1d_w: *mut mlx_array,
+        conv_state: *mut *mut mlx_array,
+        conv_kernel: i32,
+        a_log: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        rms_eps: f32,
+        out_w: *mut mlx_array,
+        out_s: *mut mlx_array,
+        out_b: *mut mlx_array,
+        out_gs: i32,
+        out_bits: i32,
+        num_key_heads: i32,
+        key_dim: i32,
+        num_value_heads: i32,
+        value_dim: i32,
+        q_scale: f32,
+        k_scale: f32,
+        gdr_state: *mut *mut mlx_array,
+        metal_kernel: *mut std::ffi::c_void,
+        use_metal_kernel: i32,
+        out_result: *mut *mut mlx_array,
+    );
+
     // === Fast ops ===
 
     /// RMS normalization. Pass null for weight to use no learnable weight.

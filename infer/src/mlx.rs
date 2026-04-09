@@ -256,6 +256,90 @@ pub fn compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxA
     MlxArray(unsafe { mlx_sys::mlx_compute_g(a_log.0, alpha.0, dt_bias.0) })
 }
 
+/// Full GDR layer forward in C++ — one FFI call replaces ~40 individual ops.
+/// Returns the output tensor. Updates conv_state and gdr_state in place.
+#[allow(clippy::too_many_arguments)]
+pub fn gdr_layer_forward(
+    x: &MlxArray,
+    qkvz_w: &MlxArray,
+    qkvz_s: &MlxArray,
+    qkvz_b: &MlxArray,
+    qkvz_gs: i32,
+    qkvz_bits: i32,
+    qkv_split: i32,
+    z_split: i32,
+    ba_w: &MlxArray,
+    ba_s: &MlxArray,
+    ba_b: &MlxArray,
+    ba_gs: i32,
+    ba_bits: i32,
+    ba_num_heads: i32,
+    conv1d_w: &MlxArray,
+    conv_state: &mut MlxArray,
+    conv_kernel: i32,
+    a_log: &MlxArray,
+    dt_bias: &MlxArray,
+    norm_w: &MlxArray,
+    rms_eps: f32,
+    out_w: &MlxArray,
+    out_s: &MlxArray,
+    out_b: &MlxArray,
+    out_gs: i32,
+    out_bits: i32,
+    num_key_heads: i32,
+    key_dim: i32,
+    num_value_heads: i32,
+    value_dim: i32,
+    q_scale: f32,
+    k_scale: f32,
+    gdr_state: &mut MlxArray,
+    metal_kernel: *mut std::ffi::c_void,
+    use_metal_kernel: bool,
+) -> MlxArray {
+    unsafe {
+        let mut result: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        mlx_sys::mlx_gdr_layer_forward(
+            x.0,
+            qkvz_w.0,
+            qkvz_s.0,
+            qkvz_b.0,
+            qkvz_gs,
+            qkvz_bits,
+            qkv_split,
+            z_split,
+            ba_w.0,
+            ba_s.0,
+            ba_b.0,
+            ba_gs,
+            ba_bits,
+            ba_num_heads,
+            conv1d_w.0,
+            &mut conv_state.0 as *mut _,
+            conv_kernel,
+            a_log.0,
+            dt_bias.0,
+            norm_w.0,
+            rms_eps,
+            out_w.0,
+            out_s.0,
+            out_b.0,
+            out_gs,
+            out_bits,
+            num_key_heads,
+            key_dim,
+            num_value_heads,
+            value_dim,
+            q_scale,
+            k_scale,
+            &mut gdr_state.0 as *mut _,
+            metal_kernel,
+            use_metal_kernel as i32,
+            &mut result,
+        );
+        MlxArray(result)
+    }
+}
+
 pub fn rms_norm(x: &MlxArray, w: &MlxArray, eps: f32) -> MlxArray {
     MlxArray(unsafe { mlx_sys::mlx_fast_rms_norm(x.0, w.0, eps) })
 }
@@ -298,6 +382,12 @@ impl Drop for MetalKernel {
         unsafe {
             mlx_sys::mlx_metal_kernel_free(self.0);
         }
+    }
+}
+impl MetalKernel {
+    /// Return the raw opaque pointer for passing to C++ functions.
+    pub fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.0
     }
 }
 unsafe impl Send for MetalKernel {}

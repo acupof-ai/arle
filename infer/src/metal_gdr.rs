@@ -390,6 +390,99 @@ fn conv1d_step_v2(
 
 // ── GDR decode step ──────────────────────────────────────────────────────────
 
+/// Try the C++ fused GDR forward path. Returns None if weights are not all quantized.
+#[cfg(feature = "metal")]
+fn try_cpp_gdr_forward(
+    x: &MlxArray,
+    lw: &MetalLinearAttnWeights,
+    state: &mut MetalRecurrentState,
+    layer_idx: usize,
+    config: &MetalGdrConfig,
+) -> Option<MlxArray> {
+    use crate::metal_backend::WeightTensor;
+
+    // Extract quantized weight params. Bail to Rust path if any are Dense.
+    let (qkvz_w, qkvz_s, qkvz_b, qkvz_gs, qkvz_bits) = match &lw.in_proj_qkvz {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (w, scales, biases, *group_size, *bits),
+        WeightTensor::Dense(_) => return None,
+    };
+    let (ba_w, ba_s, ba_b, ba_gs, ba_bits) = match &lw.in_proj_ba {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (w, scales, biases, *group_size, *bits),
+        WeightTensor::Dense(_) => return None,
+    };
+    let (out_w, out_s, out_b, out_gs, out_bits) = match &lw.out_proj {
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (w, scales, biases, *group_size, *bits),
+        WeightTensor::Dense(_) => return None,
+    };
+
+    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+        .ok()
+        .is_some_and(|v| v == "0");
+
+    let inv_scale = 1.0 / (config.key_dim as f32).sqrt();
+
+    // Reshape x from [1, hidden] to [1, 1, hidden] for the C++ function
+    let x_3d = crate::mlx::reshape(x, &[1, 1, config.hidden_size as i32]);
+
+    let result = crate::mlx::gdr_layer_forward(
+        &x_3d,
+        qkvz_w,
+        qkvz_s,
+        qkvz_b,
+        qkvz_gs,
+        qkvz_bits,
+        lw.qkvz_split.0,
+        lw.qkvz_split.1,
+        ba_w,
+        ba_s,
+        ba_b,
+        ba_gs,
+        ba_bits,
+        lw.ba_num_heads,
+        &lw.conv1d_weight,
+        &mut state.conv_states[layer_idx],
+        config.conv_kernel as i32,
+        &lw.a_log,
+        &lw.dt_bias,
+        &lw.norm_weight,
+        config.rms_norm_eps,
+        out_w,
+        out_s,
+        out_b,
+        out_gs,
+        out_bits,
+        config.num_key_heads as i32,
+        config.key_dim as i32,
+        config.num_value_heads as i32,
+        config.value_dim as i32,
+        inv_scale * inv_scale,
+        inv_scale,
+        &mut state.states[layer_idx],
+        GDR_METAL_KERNEL.as_raw(),
+        use_metal_kernel,
+    );
+
+    Some(result)
+}
+
 /// Single-token GDR decode step using MLX ops.
 ///
 /// Implements the full linear attention layer for one token:
@@ -419,6 +512,11 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
+    // Try C++ fused path — requires all weights to be quantized.
+    if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
+        return result;
+    }
+    // Fallback to Rust per-op path for Dense weights.
     use crate::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
 
     let hk = config.num_key_heads as i32;
