@@ -1,76 +1,45 @@
-# 2026-04-10 · Metal MLX Optimization — Final State
+# 2026-04-10 · Metal MLX Optimization — Final
 
 ## Result
-- **Start**: 54.6 tok/s decode
-- **Final**: 81.0 tok/s decode (98.4% of mlx_lm)
-- **Target**: 82.3 tok/s (mlx_lm Python)
-- **Total improvement**: +48.4%
+| Metric | Start | Final | mlx_lm | Ratio |
+|--------|-------|-------|--------|-------|
+| Decode | 54.6 tok/s | 80.6 tok/s | 82.3 tok/s | **98%** |
+| Prompt | 90.5 tok/s | 302 tok/s | 181 tok/s | **167%** |
+| TTFT (20 tok) | 221ms | 66ms | ~66ms | **100%** |
+| Peak RSS | 1.9GB | 2.5GB | 2.5GB | same |
 
-## Performance Comparison
+## Key Optimizations
 
-| Metric | Ours | mlx_lm | Ratio |
-|--------|------|--------|-------|
-| Decode throughput | 81.0 tok/s | 82.3 tok/s | 98.4% |
-| Prompt throughput | 90.5 tok/s | 181.0 tok/s | 50% |
-| TTFT (20 tokens) | 221ms | ~66ms | 3.3x |
+### 1. Quantized lm_head (+25% decode)
+Root cause of the biggest gap. Our `load_embed_tokens_from_tensors` dequantized
+the 248K×2560 embedding at load time. When `tie_word_embeddings=true`, lm_head
+reused this 1.2GB bf16 matrix for dense matmul. mlx_lm's `as_linear()` uses
+quantized_matmul on the 0.3GB packed weights. Saves 7.5ms/step.
 
-Prompt speed gap is from sequential per-token prefill (our C++ forward
-processes one token at a time) vs mlx_lm's batched prefill. This only
-affects TTFT, not decode throughput.
+### 2. Batch prefill (+234% prompt, 3.3x TTFT)
+Process all prompt tokens in one forward() call with S > 1 instead of
+sequential per-token. Changes: reshape dims parameterized by S, full attention
+uses causal mask, GDR Metal kernel T=S, conv1d naturally handles multi-token.
 
-## Key Optimizations (in order of impact)
+### 3. Double-buffered decode (+6%)
+Pass lazy sample token to next forward step. CPU graph build overlaps GPU.
 
-### 1. Quantized lm_head as_linear (+25%, THE root cause)
-Our `load_embed_tokens_from_tensors` dequantized the embedding matrix at
-load time (248K × 2560 bf16 = 1.2GB). When `tie_word_embeddings=true`, the
-lm_head reused this dense tensor for matmul — reading 1.2GB per step.
+### 4. mx::compile() (+2%)
+Fuse compute_g (10→1 op), silu (2→1), swiglu (3→1).
 
-mlx_lm's `QuantizedEmbedding.as_linear()` uses `quantized_matmul` on the
-original 4-bit packed weights (0.3GB read). At 120 GB/s memory bandwidth,
-this saves **7.5ms per step**.
-
-Fix: Store original quantized embed weights and use `quantized_matmul` for
-the lm_head projection.
-
-### 2. Double-buffered async_eval decode loop (+6%)
-Pass the lazy (unevaluated) sample token directly to the next forward step.
-The CPU builds step N+1's graph while the GPU executes step N.
-
-### 3. mx::compile() for elementwise chains (+2%)
-Match mlx_lm's compiled functions:
-- `compute_g`: 10 ops → 1 compiled kernel (24 GDR layers)
-- `silu`: 2 ops → 1 compiled kernel
-- `swiglu`: 3 ops → 1 compiled kernel (32 MLP layers)
-
-### 4. C++ full forward pass + decode loop (+1%)
-All 32 layers in a single FFI call. Entire decode loop in C++.
-
-### 5. Graph optimization: split(), 3D layout, intermediate retention (+1%)
-- `mx::split()` instead of separate `slice()` calls
-- 3D tensor layout `[1,1,H]` matching mlx_lm
-- Retain intermediate arrays across steps for GPU buffer reuse
-
-## What Didn't Help (verified experimentally)
-- **Unfusing matmuls**: Fused (2 matmul + split) vs separate (4 matmul) = same perf
-- **Linking system libmlx.dylib**: Same performance as source-built static lib
-- **Metal stream management**: 0.09ms difference (negligible)
-- **Array destruction overhead**: 0ms per 150 arrays (disproved GC theory)
+### 5. C++ full forward + decode loop
+32 layers in one FFI call. Intermediate retention for GPU buffer reuse.
 
 ## Architecture
-
 ```
-Rust CLI (metal_bench/metal_request/metal_serve)
-  → MetalBackend::generate()
-    → CompiledQwen35::generate()  [Rust RAII wrapper]
-      → qwen35_compiled_generate()  [C++ full decode loop]
-        → forward()  [C++ 32-layer forward, all MLX ops]
-          → quantized_matmul, rms_norm, rope, sdpa, Metal GDR kernel
-          → compiled compute_g, silu, swiglu via mx::compile()
-          → quantized lm_head via embed_as_linear
+Rust → CppQwen35Model::generate()
+  → qwen35_compiled_generate() [C++]
+    → forward(all_prompt_tokens, S=prompt_len)  [batch prefill]
+    → decode loop:
+        forward(lazy_token, S=1) + async_eval    [double-buffered]
 ```
 
 ## Rule
-- **ALWAYS** use `quantized_matmul` for tied lm_head — never dense matmul
-- Profile with `async_eval` timing to separate CPU graph build from GPU eval
-- Check memory bandwidth: `weight_bytes / bandwidth = minimum kernel time`
-- `mx::compile(fn, shapeless=true)` for all elementwise chains
+- ALWAYS use quantized_matmul for tied lm_head
+- Batch prefill: forward() must be S-aware (reshape by S, causal mask, T=S)
+- Check memory bandwidth: weight_bytes / bandwidth = minimum kernel time
