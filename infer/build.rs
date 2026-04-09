@@ -824,6 +824,7 @@ fn find_flashinfer_include() -> Option<String> {
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(metal_fused_ops)");
     println!("cargo:rustc-check-cfg=cfg(metal_capi_fused)");
+    println!("cargo:rustc-check-cfg=cfg(mlx_engine)");
     println!("cargo:rustc-check-cfg=cfg(metal_qwen35_fused_ops)");
 
     // ── Metal C++ fused-ops shim (macOS only, requires `metal` feature) ────────
@@ -870,6 +871,26 @@ fn main() {
                     }
                     cbuild.compile("metal_fused_capi");
                     println!("cargo:rustc-cfg=metal_capi_fused");
+
+                    // C++ MLX engine (full forward pass, zero FFI overhead).
+                    println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.cpp");
+                    println!("cargo:rerun-if-changed=csrc/metal/mlx_engine.h");
+                    let mut ebuild = cc::Build::new();
+                    ebuild
+                        .cpp(true)
+                        .std("c++17")
+                        .warnings(false)
+                        .flag("-O3")
+                        .include(&cpp_hdr)
+                        .include(&c_hdr)
+                        .file("csrc/metal/mlx_engine.cpp");
+                    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                        ebuild.compiler("clang++");
+                    }
+                    ebuild.compile("mlx_engine");
+                    println!("cargo:rustc-cfg=mlx_engine");
+                    println!("cargo:warning=mlx_engine: compiled C++ engine");
+
                     println!(
                         "cargo:warning=metal_fused_capi: compiled C API fused block (MLX: {})",
                         c_hdr.display()
