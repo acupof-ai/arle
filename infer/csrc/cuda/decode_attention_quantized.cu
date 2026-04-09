@@ -121,13 +121,17 @@ __global__ void decode_attention_int8_partial_kernel(
 
         float k_scale = K_scales[scale_off];
 
-        // QK dot product with EPT elements per thread
+        // QK dot product — vectorized INT8 load (4 bytes = 4× INT8 per thread)
         float qk = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            int d = lane_id * EPT + i;
-            float k_val = static_cast<float>(K_data[base + d]) * k_scale;
-            qk += q_reg[i] * k_val;
+        {
+            int d_base = lane_id * EPT;
+            // Load 4 consecutive INT8 values as a single 32-bit word (coalesced)
+            int32_t k_packed = *reinterpret_cast<const int32_t*>(&K_data[base + d_base]);
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                float k_val = static_cast<float>(static_cast<int8_t>((k_packed >> (i * 8)) & 0xFF)) * k_scale;
+                qk += q_reg[i] * k_val;
+            }
         }
         qk = warp_reduce_sum(qk);
 
@@ -137,13 +141,16 @@ __global__ void decode_attention_int8_partial_kernel(
         float exp_qk = __expf(qk - m_new);
         float l_new = l_local * exp_diff + exp_qk;
 
-        // V accumulation
+        // V accumulation — vectorized INT8 load
         float v_scale = V_scales[scale_off];
-        #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            int d = lane_id * EPT + i;
-            float v_val = static_cast<float>(V_data[base + d]) * v_scale;
-            o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+        {
+            int d_base = lane_id * EPT;
+            int32_t v_packed = *reinterpret_cast<const int32_t*>(&V_data[base + d_base]);
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                float v_val = static_cast<float>(static_cast<int8_t>((v_packed >> (i * 8)) & 0xFF)) * v_scale;
+                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+            }
         }
 
         m_local = m_new;

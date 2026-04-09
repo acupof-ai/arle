@@ -542,15 +542,35 @@ __global__ void gpu_sample_kernel(
   partial_sums[tid] = my_sum;
   __syncthreads();
 
-  // Prefix sum on partial_sums (thread 0 does sequential scan — only 256 elements)
-  __shared__ float prefix[SAMPLE_BLOCK];
-  if (tid == 0) {
-    float running = 0.0f;
-    for (int t = 0; t < SAMPLE_BLOCK; t++) {
-      prefix[t] = running;
-      running += partial_sums[t];
+  // Parallel exclusive prefix sum (Blelloch scan) on partial_sums.
+  // 256 elements → 8 rounds of up-sweep + 8 rounds of down-sweep.
+  // All threads participate → ~16 cycles vs ~256 for serial.
+  // Up-sweep (reduce)
+  for (int stride = 1; stride < SAMPLE_BLOCK; stride <<= 1) {
+    int idx = (tid + 1) * (stride << 1) - 1;
+    if (idx < SAMPLE_BLOCK) {
+      partial_sums[idx] += partial_sums[idx - stride];
     }
+    __syncthreads();
   }
+  // Set root to zero (exclusive prefix)
+  if (tid == 0) partial_sums[SAMPLE_BLOCK - 1] = 0.0f;
+  __syncthreads();
+  // Down-sweep
+  for (int stride = SAMPLE_BLOCK >> 1; stride >= 1; stride >>= 1) {
+    int idx = (tid + 1) * (stride << 1) - 1;
+    if (idx < SAMPLE_BLOCK) {
+      float temp = partial_sums[idx - stride];
+      partial_sums[idx - stride] = partial_sums[idx];
+      partial_sums[idx] += temp;
+    }
+    __syncthreads();
+  }
+  // partial_sums now contains exclusive prefix sums
+  __shared__ float prefix[SAMPLE_BLOCK];
+  prefix[tid] = partial_sums[tid];
+  // Restore partial_sums for range calculation (need original per-thread sums)
+  partial_sums[tid] = my_sum;
   __syncthreads();
 
   // Each thread checks if the sample falls in its range

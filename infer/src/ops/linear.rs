@@ -66,6 +66,11 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
 
+    // Handwritten GEMV with BF16×4 vectorized loads.
+    // cuBLAS GEMM(M,1,K) was tested but has higher dispatch overhead
+    // on Ada (L4) for single-vector operations. The handwritten kernel
+    // wins at B=1; cuBLAS wins at B≥2 (handled by gemm_into path).
+    // On A100/H100 with tensor cores, cuBLAS may be faster — profile first.
     unsafe {
         ffi::gemv_cuda(
             a_ptr as *const ffi::Half,

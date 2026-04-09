@@ -76,13 +76,16 @@ __global__ void gemv_handwritten_kernel(
     sums[r] = warp_reduce_sum(sums[r]);
   }
 
-  // Inter-warp reduction via shared memory
-  __shared__ float warp_sums[GEMV_ROWS_PER_BLOCK][GEMV_NUM_WARPS];
+  // Inter-warp reduction via shared memory.
+  // Layout: [WARPS][ROWS+1] — transposed + padded to avoid bank conflicts.
+  // Old layout [ROWS][WARPS]: 8 warps write to same row → 8-way conflict.
+  // New layout [WARPS][ROWS+1]: each warp writes to its own row → zero conflict.
+  __shared__ float warp_sums[GEMV_NUM_WARPS][GEMV_ROWS_PER_BLOCK + 1];
 
   if (lane_id == 0) {
     #pragma unroll
     for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
-      warp_sums[r][warp_id] = sums[r];
+      warp_sums[warp_id][r] = sums[r];
     }
   }
   __syncthreads();
@@ -91,7 +94,7 @@ __global__ void gemv_handwritten_kernel(
   if (warp_id == 0) {
     #pragma unroll
     for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
-      float val = (lane_id < GEMV_NUM_WARPS) ? warp_sums[r][lane_id] : 0.0f;
+      float val = (lane_id < GEMV_NUM_WARPS) ? warp_sums[lane_id][r] : 0.0f;
       val = warp_reduce_sum(val);
       if (lane_id == 0) {
         int row = row_base + r;
