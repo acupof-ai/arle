@@ -339,8 +339,8 @@ impl DeviceMatrix {
     }
 
     /// Create from INT4 packed quantized weight + bf16 scales.
-    /// Stores packed data natively (2 int4 per byte). Native W4 kernels
-    /// handle nibble extraction on the GPU for both decode and prefill.
+    /// Unpacks INT4 → INT8 at load time for the W8 kernel.
+    /// TODO: integrate Marlin kernel for native W4 prefill, AWQ-style GEMV for decode.
     pub fn from_quantized_int4(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -353,13 +353,22 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Upload packed INT4 data directly — GPU kernels handle nibble extraction
-        let qw: CudaSlice<i8> = ctx
+        // Unpack INT4 → INT8: each byte holds 2 int4 values
+        let mut unpacked = vec![0i8; rows * cols];
+        for i in 0..packed_data.len() {
+            let byte = packed_data[i];
+            let lo = (byte & 0x0F) as i8 - 8;
+            let hi = (byte >> 4) as i8 - 8;
+            let row = i / (cols / 2);
+            let byte_in_row = i % (cols / 2);
+            unpacked[row * cols + byte_in_row * 2] = lo;
+            unpacked[row * cols + byte_in_row * 2 + 1] = hi;
+        }
+
+        let qw = ctx
             .stream
-            .clone_htod(unsafe {
-                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
-            })
-            .map_err(|e| anyhow!("H2D qweight int4 failed: {}", e))?;
+            .clone_htod(&unpacked)
+            .map_err(|e| anyhow!("H2D qweight int4→int8 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -375,7 +384,7 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 4,
+            quant_bits: 8, // INT4→INT8 unpack; uses W8 kernels
         })
     }
 
@@ -504,8 +513,26 @@ impl DeviceMatrix {
             assert_eq!(m.cols, cols, "concat_rows: cols mismatch");
         }
         let total_rows: usize = matrices.iter().map(|m| m.rows).sum();
-        let total_elements = total_rows * cols;
 
+        // Quantized weights use separate GEMVs (not merged), so skip the
+        // expensive bf16 concat — just allocate a 1-element dummy.
+        if matrices[0].is_quantized() {
+            let dummy = ctx
+                .stream
+                .alloc_zeros::<bf16>(1)
+                .map_err(|e| anyhow!("concat_rows dummy alloc: {e}"))?;
+            return Ok(Self {
+                data: dummy,
+                rows: total_rows,
+                cols,
+                qweight: None,
+                qscales: None,
+                group_size: 0,
+                quant_bits: 0,
+            });
+        }
+
+        let total_elements = total_rows * cols;
         let mut merged: CudaSlice<bf16> = ctx
             .stream
             .alloc_zeros(total_elements)

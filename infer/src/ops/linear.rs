@@ -129,6 +129,7 @@ pub(crate) fn gemm_into(
         let (qs_ptr, _gqs) = qs.device_ptr(&ctx.stream);
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
         unsafe {
             if x.seq_len == 1 && weight.quant_bits == 2 {
                 ffi::w2a16_gemv_cuda(
