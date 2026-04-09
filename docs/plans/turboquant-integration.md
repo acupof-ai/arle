@@ -345,7 +345,14 @@ The fused attention kernel (§4.3) is key: it avoids the D² dequantization cost
 4. ✅ **Decode GEMV**: `turboquant_weight_gemv.cu` — fused unpack → centroid gather → iFWHT → sign flip → dot
 5. ✅ **Prefill GEMM**: bulk dequant kernel + cuBLAS GEMM (Marlin pattern)
 6. ✅ **Dispatch**: `ops/linear.rs` TQ path before INT quant dispatch
-7. **Future**: Fused Tensor Core MMA kernel for higher prefill throughput
+7. ✅ **Warp-level FWHT**: `__shfl_xor_sync` for stride 1-16, +24% decode throughput
+
+**Weight quantization finding (2026-04-09)**: TQ rotation is mathematically optimal
+(calibrated centroids ≡ analytical), but per-layer NMSE (3-bit: 3.4%, 4-bit: 0.94%)
+causes accumulated quality degradation on small models (4B, 36 layers). TQ weight
+quantization is viable for 70B+ models; for 4B-8B, use GPTQ/AWQ (Hessian-aware
+rounding preserves cross-layer coherence). TQ remains the best choice for **KV cache**
+compression where per-token error doesn't accumulate across layers.
 
 ### Phase 3: Fused Decode Attention ✅
 
