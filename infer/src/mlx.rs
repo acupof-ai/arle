@@ -174,6 +174,11 @@ impl MlxArray {
         Self(unsafe { mlx_sys::mlx_array_new_float32(val) })
     }
 
+    /// Create a scalar i32 array (shape []).
+    pub fn scalar_i32(val: i32) -> Self {
+        Self(unsafe { mlx_sys::mlx_array_new_int(val) })
+    }
+
     // ── Inspection ───────────────────────────────────────────────────────
 
     pub fn ndim(&self) -> usize {
