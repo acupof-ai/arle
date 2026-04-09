@@ -59,12 +59,26 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 4: Prefill chunks — process a limited number of pending prefill
-        // requests to avoid blocking decode for too long. When decode requests
-        // are active, limit to 1 prefill per step (like SGLang). When idle,
-        // process up to 8 to speed up batch admission.
+        // Phase 4: Prefill chunks — adaptive rate based on decode batch size.
+        //
+        // During ramp-up (few decodes), allow more prefills to reduce TTFT.
+        // At high concurrency, limit prefills to protect decode ITL.
+        // SGLang uses a similar adaptive policy.
         let prefill_t = std::time::Instant::now();
-        let max_prefills = if has_decode { 1 } else { 8 };
+        let decode_count = self
+            .active
+            .iter()
+            .filter(|r| matches!(r.phase, Phase::Decoding))
+            .count();
+        let max_prefills = if !has_decode {
+            8 // No decode: drain prefill queue fast
+        } else if decode_count <= 4 {
+            4 // Ramp-up: GPU has headroom, reduce TTFT
+        } else if decode_count <= 16 {
+            2 // Moderate load: balance TTFT vs ITL
+        } else {
+            1 // High concurrency: protect decode latency
+        };
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
             .take(max_prefills)
