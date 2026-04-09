@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 /// Regenerate model-specific golden data in test_data/<model_name>.json using greedy decoding.
 use std::path::{Path, PathBuf};
 

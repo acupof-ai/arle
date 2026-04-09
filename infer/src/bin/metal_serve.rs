@@ -1,3 +1,14 @@
+//! Metal-backed OpenAI-compatible inference server.
+//!
+//! **Limitation:** This server uses a serial runtime (`BackendRuntimeHandle`)
+//! that processes one request at a time. Concurrent requests are queued, not
+//! batched. The scheduler, continuous batching, decode-priority scheduling,
+//! and chunked prefill from the CUDA path are NOT connected here.
+//!
+//! For production multi-request serving, the Metal backend needs a proper
+//! `MetalScheduler` that mirrors the CUDA `Scheduler` design with KV cache
+//! lifecycle management and batch decode support.
+
 #![cfg(feature = "metal")]
 
 use clap::Parser;
@@ -7,7 +18,10 @@ use infer::logging;
 use log::info;
 
 #[derive(Parser)]
-#[command(name = "metal_serve", about = "Metal-backed OpenAI-compatible server")]
+#[command(
+    name = "metal_serve",
+    about = "Metal-backed OpenAI-compatible server (serial runtime, single-request)"
+)]
 struct Args {
     /// Model directory or HuggingFace model ID.
     #[arg(long)]

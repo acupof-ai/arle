@@ -28,6 +28,12 @@ pub const MLX_BFLOAT16: i32 = 12;
 pub const MLX_COMPLEX64: i32 = 13;
 
 unsafe extern "C" {
+    // === Error handling ===
+
+    /// Returns the last error message, or null if no error.
+    /// Thread-local — safe to call from any thread.
+    pub fn mlx_last_error() -> *const std::ffi::c_char;
+
     // === Array lifecycle ===
 
     pub fn mlx_array_new_float32(val: f32) -> *mut mlx_array;
@@ -276,4 +282,10 @@ unsafe extern "C" {
         n_int_templates: usize,
         n_dtype_templates: usize,
     );
+
+    // === Memory management ===
+
+    /// Release cached Metal buffers and other allocator caches.
+    /// Equivalent to `mx.metal.clear_cache()` in Python.
+    pub fn mlx_metal_clear_cache();
 }

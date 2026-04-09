@@ -62,227 +62,11 @@ use loader::{
 #[cfg(feature = "metal")]
 use qwen35::{Qwen35MetalWeights, load_qwen35_metal_weights, metal_generate_qwen35};
 
-// ── Metal C++ fused-ops FFI (compiled from csrc/metal_fused_ops.cpp) ─────────
-//
-// The C ABI uses `mlx_array` (= `{ ctx: *mut c_void }`) by value.  `MlxArray`
-// is `#[repr(transparent)]` over `mlx_sys::mlx_array`, so we use `as_raw()` /
-// `from_raw()` to cross the FFI boundary.
-//
-// Ownership rule: input arrays are borrowed (C++ holds no extra reference).
-// Output arrays (`*mut mlx_sys::mlx_array` written by C++) transfer ownership
-// to Rust — they must eventually be freed via `mlx_array_free` (happens
-// automatically when `MlxArray` is dropped).
-#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
-mod metal_ffi {
+// NOTE: The C++ fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were
+// removed — they were gated on `not_currently_available` and dead since the
+// mlx-sys v0.3 migration.  The C++ source files are kept in csrc/metal/ for
+// reference if the fused path is revived.
 
-    unsafe extern "C" {
-        /// Full transformer block: norm → QKV → RoPE → KV-cache → GQA →
-        /// residual → norm → SwiGLU MLP → residual.
-        ///
-        /// All Dense weights are pre-transposed (`[in, out]`).
-        /// `k_cache_h / v_cache_h` are updated in-place via slice_update.
-        /// Writes a new hidden-state array into `*result_out`.
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn metal_fused_block_cached(
-            x: mlx_array,
-            input_norm_w: mlx_array,
-            post_attn_norm_w: mlx_array,
-            q_proj_t: mlx_array,
-            k_proj_t: mlx_array,
-            v_proj_t: mlx_array,
-            o_proj_t: mlx_array,
-            q_norm_w: mlx_array,
-            k_norm_w: mlx_array,
-            gate_proj_t: mlx_array,
-            up_proj_t: mlx_array,
-            down_proj_t: mlx_array,
-            n_heads: i32,
-            n_kv_heads: i32,
-            head_dim: i32,
-            attn_scale: f32,
-            rope_base: f32,
-            rope_dims: i32,
-            norm_eps: f32,
-            k_cache: *mut mlx_array,
-            v_cache: *mut mlx_array,
-            cache_len: i32,
-            seq: i32,
-            result_out: *mut mlx_array,
-        );
-
-        /// Quantized transformer block: same structure as `metal_fused_block_cached`
-        /// but uses `quantized_matmul` for all projections.
-        ///
-        /// Merged projections: qkv_proj (split by q/k/v dims), gate_up_proj (split
-        /// by gate/up dims).  `group_size` and `bits` are shared across all weights.
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn metal_quantized_fused_block_cached(
-            // input hidden state
-            x: mlx_array,
-            // layer-norm weights
-            input_norm_w: mlx_array,
-            post_attn_norm_w: mlx_array,
-            // quantized QKV projection (merged)
-            qkv_w: mlx_array,
-            qkv_scales: mlx_array,
-            qkv_biases: mlx_array,
-            // quantized output projection
-            o_w: mlx_array,
-            o_scales: mlx_array,
-            o_biases: mlx_array,
-            // per-head QK norms
-            q_norm_w: mlx_array,
-            k_norm_w: mlx_array,
-            // quantized MLP gate+up projection (merged)
-            gate_up_w: mlx_array,
-            gate_up_scales: mlx_array,
-            gate_up_biases: mlx_array,
-            // quantized MLP down projection
-            down_w: mlx_array,
-            down_scales: mlx_array,
-            down_biases: mlx_array,
-            // quantization parameters
-            group_size: i32,
-            bits: i32,
-            // split dimensions
-            q_dim: i32,
-            k_dim: i32,
-            v_dim: i32,
-            gate_dim: i32,
-            up_dim: i32,
-            // attention hyper-params
-            n_heads: i32,
-            n_kv_heads: i32,
-            head_dim: i32,
-            attn_scale: f32,
-            rope_base: f32,
-            rope_dims: i32,
-            norm_eps: f32,
-            // KV cache (in/out)
-            k_cache: *mut mlx_array,
-            v_cache: *mut mlx_array,
-            cache_len: i32,
-            seq: i32,
-            // output
-            result_out: *mut mlx_array,
-        );
-
-        // ── Qwen3.5 fused blocks ───────────────────────────────────────────
-
-        /// Qwen3.5 full-attention layer: norm → q/gate split → QK norm →
-        /// partial RoPE → KV cache → SDPA → sigmoid gating → o_proj.
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn metal_qwen35_full_attn_block(
-            x: mlx_array,
-            input_norm_w: mlx_array,
-            q_proj_w: mlx_array,
-            q_proj_scales: mlx_array,
-            q_proj_biases: mlx_array,
-            k_proj_w: mlx_array,
-            k_proj_scales: mlx_array,
-            k_proj_biases: mlx_array,
-            v_proj_w: mlx_array,
-            v_proj_scales: mlx_array,
-            v_proj_biases: mlx_array,
-            o_proj_w: mlx_array,
-            o_proj_scales: mlx_array,
-            o_proj_biases: mlx_array,
-            q_norm_w: mlx_array,
-            k_norm_w: mlx_array,
-            n_heads: i32,
-            n_kv_heads: i32,
-            head_dim: i32,
-            attn_scale: f32,
-            rope_base: f32,
-            rotary_dim: i32,
-            norm_eps: f32,
-            group_size: i32,
-            bits: i32,
-            is_quantized: bool,
-            norm_offset: bool,
-            k_cache: *mut mlx_array,
-            v_cache: *mut mlx_array,
-            cache_len: i32,
-            result_out: *mut mlx_array,
-        );
-
-        /// Qwen3.5 GDR linear attention decode step: project → conv1d →
-        /// normalize → gate → state update → output → norm → gate → o_proj.
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn metal_qwen35_gdr_block(
-            x: mlx_array,
-            qkv_w: mlx_array,
-            qkv_scales: mlx_array,
-            qkv_biases: mlx_array,
-            z_w: mlx_array,
-            z_scales: mlx_array,
-            z_biases: mlx_array,
-            beta_w: mlx_array,
-            beta_scales: mlx_array,
-            beta_biases: mlx_array,
-            alpha_w: mlx_array,
-            alpha_scales: mlx_array,
-            alpha_biases: mlx_array,
-            out_w: mlx_array,
-            out_scales: mlx_array,
-            out_biases: mlx_array,
-            conv1d_weight: mlx_array,
-            dt_bias: mlx_array,
-            a_log: mlx_array,
-            norm_weight: mlx_array,
-            num_key_heads: i32,
-            key_dim: i32,
-            num_value_heads: i32,
-            value_dim: i32,
-            conv_kernel: i32,
-            hidden_size: i32,
-            rms_norm_eps: f32,
-            group_size: i32,
-            bits: i32,
-            is_quantized: bool,
-            recurrent_state: *mut mlx_array,
-            conv_state: *mut mlx_array,
-            result_out: *mut mlx_array,
-        );
-    }
-}
-
-/// Pure C API fused block — no C++ ABI issues.
-#[cfg(all(feature = "metal", metal_capi_fused, not_currently_available))]
-mod metal_capi_ffi {
-
-    unsafe extern "C" {
-        #[allow(clippy::too_many_arguments)]
-        pub(super) fn metal_capi_fused_block(
-            x: mlx_array,
-            input_norm_w: mlx_array,
-            post_attn_norm_w: mlx_array,
-            q_proj_t: mlx_array,
-            k_proj_t: mlx_array,
-            v_proj_t: mlx_array,
-            o_proj_t: mlx_array,
-            q_norm_w: mlx_array,
-            k_norm_w: mlx_array,
-            gate_proj_t: mlx_array,
-            up_proj_t: mlx_array,
-            down_proj_t: mlx_array,
-            n_heads: i32,
-            n_kv_heads: i32,
-            head_dim: i32,
-            attn_scale: f32,
-            rope_base: f32,
-            rope_dims: i32,
-            norm_eps: f32,
-            k_cache: *mut mlx_array,
-            v_cache: *mut mlx_array,
-            cache_len: i32,
-            seq: i32,
-            result_out: *mut mlx_array,
-        );
-    }
-}
-
-#[cfg(feature = "metal")]
 #[cfg(feature = "metal")]
 const METAL_FUSED_OPS_AVAILABLE: bool = cfg!(metal_fused_ops);
 
@@ -726,7 +510,7 @@ impl MetalBackend {
         #[cfg(not(feature = "metal"))]
         {
             let _ = (tokenizer, config, params, prompt_tokens, on_token);
-            todo!(
+            anyhow::bail!(
                 "Metal GPU required: rebuild with --no-default-features \
                  --features metal,no-cuda to enable Metal inference"
             )
@@ -913,6 +697,12 @@ const METAL_KV_POOL_REQUEST_ID: usize = 0;
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 
 /// Which fused C++ path to use for transformer layers.
+///
+/// TODO: dead code — `Dense` and `Quantized` are unreachable because
+/// `METAL_FUSED_OPS_AVAILABLE` is always `false` (the `metal_fused_ops` cfg
+/// is never emitted since the mlx-sys v0.3 migration). Only `Fallback` is
+/// ever selected. Remove the dead variants and simplify `build_forward_graph`
+/// when confirmed unused.
 #[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 enum FusedPathMode {
@@ -921,7 +711,6 @@ enum FusedPathMode {
     /// All weights are quantized with matching group_size/bits — use the
     /// quantized fused C++ block.
     Quantized,
-    /// Dense weights — use pure C API fused block (no C++ ABI issues).
     /// Mixed or fused ops unavailable — fall back to Rust/MLX per-op path.
     Fallback,
 }
@@ -934,6 +723,10 @@ struct MetalGenerateOutput {
     total_time_ms: f64,
 }
 
+// TODO: dead code for current use cases — MetalKVPool is only activated via
+// the `AGENT_INFER_METAL_KV_POOL=1` env var and only wired into the Qwen3
+// fallback path. Qwen3.5 bypasses it entirely (see the warning at the call
+// site). Consider removing if the KV pool experiment is abandoned.
 #[cfg(feature = "metal")]
 fn metal_kv_pool_enabled() -> bool {
     std::env::var("AGENT_INFER_METAL_KV_POOL")
@@ -1206,7 +999,7 @@ fn metal_async_eval(arr: &MlxArray) -> Result<()> {
 
 #[cfg(feature = "metal")]
 fn clear_metal_cache() {
-    crate::mlx::compile_clear_cache();
+    crate::mlx::clear_cache();
 }
 
 #[cfg(feature = "metal")]
@@ -1399,67 +1192,11 @@ fn build_forward_graph(
     gpu_sample_token(&logits, params)
 }
 
-#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
-#[allow(clippy::unnecessary_wraps)]
-#[allow(clippy::too_many_arguments)]
-fn fused_transformer_layer(
-    x: &MlxArray,
-    layer: &StandardMetalLayerWeights,
-    q_proj_t: &MlxArray,
-    k_proj_t: &MlxArray,
-    v_proj_t: &MlxArray,
-    o_proj_t: &MlxArray,
-    gate_proj_t: &MlxArray,
-    up_proj_t: &MlxArray,
-    down_proj_t: &MlxArray,
-    k_cache: &mut MlxArray,
-    v_cache: &mut MlxArray,
-    n_heads: i32,
-    n_kv_heads: i32,
-    head_dim: i32,
-    attn_scale: f32,
-    rope_base: f32,
-    eps: f32,
-    cache_len: i32,
-    seq: i32,
-) -> Result<MlxArray> {
-    // SAFETY: metal_fused_block_cached borrows all inputs and writes a fresh array into
-    // `result_raw`, which is transferred to Rust ownership below.
-    let result_raw: mlx_sys::mlx_array = unsafe {
-        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-        metal_ffi::metal_fused_block_cached(
-            x.as_raw(),
-            layer.input_layernorm.as_raw(),
-            layer.post_attention_layernorm.as_raw(),
-            q_proj_t.as_raw(),
-            k_proj_t.as_raw(),
-            v_proj_t.as_raw(),
-            o_proj_t.as_raw(),
-            layer.q_norm.as_raw(),
-            layer.k_norm.as_raw(),
-            gate_proj_t.as_raw(),
-            up_proj_t.as_raw(),
-            down_proj_t.as_raw(),
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            attn_scale,
-            rope_base,
-            head_dim, // rope_dims = head_dim
-            eps,
-            k_cache.as_raw_mut(),
-            v_cache.as_raw_mut(),
-            cache_len,
-            seq,
-            r.as_mut_ptr(),
-        );
-        r.assume_init()
-    };
-
-    // SAFETY: C++ heap-allocated array transferred to Rust ownership.
-    Ok(unsafe { MlxArray::from_raw(result_raw) })
-}
-
+// TODO: dead code — fused_transformer_layer is unreachable because
+// metal_fused_ops cfg is never emitted (disabled since mlx-sys v0.3 migration).
+// The real implementation (calling metal_ffi::metal_fused_block_cached) was
+// removed along with the metal_ffi FFI module. Remove this stub and its
+// FusedPathMode::Dense match arm when confirmed unused.
 #[cfg(all(feature = "metal", not(metal_fused_ops)))]
 #[allow(clippy::too_many_arguments)]
 fn fused_transformer_layer(
@@ -1486,103 +1223,11 @@ fn fused_transformer_layer(
     unreachable!("fused transformer path requires metal_fused_ops")
 }
 
-/// Quantized fused transformer layer — single C++ FFI call for quantized models.
-///
-/// Mirrors `fused_transformer_layer` but uses `quantized_matmul` for all
-/// projections.  Requires merged QKV and gate+up projections.
-#[cfg(all(feature = "metal", metal_fused_ops, not_currently_available))]
-#[allow(clippy::unnecessary_wraps)]
-#[allow(clippy::too_many_arguments)]
-fn quantized_fused_transformer_layer(
-    x: &MlxArray,
-    layer: &StandardMetalLayerWeights,
-    // Quantized QKV projection (merged)
-    qkv_w: &MlxArray,
-    qkv_scales: &MlxArray,
-    qkv_biases: &MlxArray,
-    // Quantized output projection
-    o_w: &MlxArray,
-    o_scales: &MlxArray,
-    o_biases: &MlxArray,
-    // Quantized gate+up projection (merged)
-    gate_up_w: &MlxArray,
-    gate_up_scales: &MlxArray,
-    gate_up_biases: &MlxArray,
-    // Quantized down projection
-    down_w: &MlxArray,
-    down_scales: &MlxArray,
-    down_biases: &MlxArray,
-    // Quantization parameters
-    group_size: i32,
-    bits: i32,
-    // Split dimensions
-    q_dim: i32,
-    k_dim: i32,
-    v_dim: i32,
-    gate_dim: i32,
-    up_dim: i32,
-    // KV cache
-    k_cache: &mut MlxArray,
-    v_cache: &mut MlxArray,
-    // Attention hyper-params
-    n_heads: i32,
-    n_kv_heads: i32,
-    head_dim: i32,
-    attn_scale: f32,
-    rope_base: f32,
-    eps: f32,
-    cache_len: i32,
-    seq: i32,
-) -> Result<MlxArray> {
-    // SAFETY: metal_quantized_fused_block_cached borrows all inputs and writes a
-    // fresh array into `result_raw`, which is transferred to Rust ownership below.
-    let result_raw: mlx_sys::mlx_array = unsafe {
-        let mut r = std::mem::MaybeUninit::<mlx_sys::mlx_array>::uninit();
-        metal_ffi::metal_quantized_fused_block_cached(
-            x.as_raw(),
-            layer.input_layernorm.as_raw(),
-            layer.post_attention_layernorm.as_raw(),
-            qkv_w.as_raw(),
-            qkv_scales.as_raw(),
-            qkv_biases.as_raw(),
-            o_w.as_raw(),
-            o_scales.as_raw(),
-            o_biases.as_raw(),
-            layer.q_norm.as_raw(),
-            layer.k_norm.as_raw(),
-            gate_up_w.as_raw(),
-            gate_up_scales.as_raw(),
-            gate_up_biases.as_raw(),
-            down_w.as_raw(),
-            down_scales.as_raw(),
-            down_biases.as_raw(),
-            group_size,
-            bits,
-            q_dim,
-            k_dim,
-            v_dim,
-            gate_dim,
-            up_dim,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            attn_scale,
-            rope_base,
-            head_dim, // rope_dims = head_dim
-            eps,
-            k_cache.as_raw_mut(),
-            v_cache.as_raw_mut(),
-            cache_len,
-            seq,
-            r.as_mut_ptr(),
-        );
-        r.assume_init()
-    };
-
-    // SAFETY: C++ heap-allocated array transferred to Rust ownership.
-    Ok(unsafe { MlxArray::from_raw(result_raw) })
-}
-
+// TODO: dead code — quantized_fused_transformer_layer is unreachable because
+// metal_fused_ops cfg is never emitted (disabled since mlx-sys v0.3 migration).
+// The real implementation (calling metal_ffi::metal_quantized_fused_block_cached)
+// was removed along with the metal_ffi FFI module. Remove this stub and its
+// FusedPathMode::Quantized match arm when confirmed unused.
 #[cfg(all(feature = "metal", not(metal_fused_ops)))]
 #[allow(clippy::too_many_arguments)]
 fn quantized_fused_transformer_layer(
@@ -1733,6 +1378,45 @@ fn rust_transformer_layer(
 /// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
 #[cfg(feature = "metal")]
 fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
+    // Validate: warn about sampling params that Metal doesn't yet support.
+    // This prevents silent semantic drift vs the CUDA path.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if params.top_k > 0
+        || params.top_p < 1.0
+        || params.min_p > 0.0
+        || params.has_penalties()
+        || params.seed.is_some()
+    {
+        WARNED.call_once(|| {
+            let mut unsupported = Vec::new();
+            if params.top_k > 0 {
+                unsupported.push(format!("top_k={}", params.top_k));
+            }
+            if params.top_p < 1.0 {
+                unsupported.push(format!("top_p={}", params.top_p));
+            }
+            if params.min_p > 0.0 {
+                unsupported.push(format!("min_p={}", params.min_p));
+            }
+            if params.repetition_penalty != 1.0 {
+                unsupported.push(format!("repetition_penalty={}", params.repetition_penalty));
+            }
+            if params.frequency_penalty != 0.0 {
+                unsupported.push(format!("frequency_penalty={}", params.frequency_penalty));
+            }
+            if params.presence_penalty != 0.0 {
+                unsupported.push(format!("presence_penalty={}", params.presence_penalty));
+            }
+            if params.seed.is_some() {
+                unsupported.push("seed".to_string());
+            }
+            log::warn!(
+                "Metal sampling ignores: {} (only temperature is supported)",
+                unsupported.join(", ")
+            );
+        });
+    }
+
     let temp = params.temperature;
 
     if temp <= 1e-6 {

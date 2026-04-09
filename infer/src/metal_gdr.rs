@@ -695,27 +695,46 @@ mod tests {
     use super::*;
     use crate::test_support::metal_test_guard;
 
-    /// Smoke test: verify shapes through the conv1d step.
+    /// Smoke test: verify shapes through the conv1d step (v2 — standard conv1d).
     #[test]
     fn test_conv1d_step_shapes() {
         let _guard = metal_test_guard();
-        let qkv_dim = 8192; // q=2048 + k=2048 + v=4096
-        let kernel_size = 4;
-        let state_width = kernel_size - 1;
+        let qkv_dim = 64; // small for test
+        let kernel_size = 4usize;
 
-        let x = MlxArray::from_slice_f32(&vec![1.0f32; qkv_dim], &[qkv_dim as i32]);
-        let mut conv_state = MlxArray::from_slice_f32(
-            &vec![0.0f32; qkv_dim * state_width],
-            &[qkv_dim as i32, state_width as i32],
+        let config = MetalGdrConfig {
+            num_key_heads: 2,
+            key_dim: 16,
+            num_value_heads: 2,
+            value_dim: 16,
+            conv_kernel: kernel_size,
+            hidden_size: 64,
+            rms_norm_eps: 1e-6,
+        };
+
+        // x: [1, 1, qkv_dim] bf16
+        let x = crate::mlx::as_dtype(
+            &MlxArray::from_slice_f32(&vec![1.0f32; qkv_dim], &[1, 1, qkv_dim as i32]),
+            crate::mlx::Dtype::Bfloat16,
         );
-        let kernel = MlxArray::from_slice_f32(
-            &vec![0.25f32; qkv_dim * kernel_size],
-            &[qkv_dim as i32, kernel_size as i32],
+        // conv_state: [1, kernel_size-1, qkv_dim] bf16
+        let mut conv_state = crate::mlx::zeros(
+            &[1, (kernel_size - 1) as i32, qkv_dim as i32],
+            crate::mlx::Dtype::Bfloat16,
+        );
+        // kernel: [qkv_dim, kernel_size, 1] bf16
+        let kernel = crate::mlx::as_dtype(
+            &MlxArray::from_slice_f32(
+                &vec![0.25f32; qkv_dim * kernel_size],
+                &[qkv_dim as i32, kernel_size as i32, 1],
+            ),
+            crate::mlx::Dtype::Bfloat16,
         );
 
-        let out = conv1d_step(&x, &mut conv_state, &kernel, qkv_dim, kernel_size);
+        let out = conv1d_step_v2(&x, &mut conv_state, &kernel, &config);
 
-        assert_eq!(out.shape(), &[qkv_dim as i32]);
+        // Output: [1, 1, qkv_dim]
+        assert_eq!(out.shape(), &[1, 1, qkv_dim as i32]);
     }
 
     /// Smoke test: verify state allocation shapes for small dimensions.

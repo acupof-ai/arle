@@ -2,6 +2,12 @@
 
 extern "C" {
 
+// === Error handling ===
+
+const char* mlx_last_error() {
+    return g_mlx_last_error.empty() ? nullptr : g_mlx_last_error.c_str();
+}
+
 // === Array lifecycle ===
 
 mlx_array* mlx_array_new_float32(float val) {
@@ -240,21 +246,31 @@ mlx_array* mlx_random_categorical(mlx_array* logits, int32_t axis) {
 // === Transforms ===
 
 void mlx_eval(mlx_array** arrays, size_t count) {
-    std::vector<array> arrs;
-    arrs.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        arrs.push_back(*to_arr(arrays[i]));
+    try {
+        mlx_clear_error();
+        std::vector<array> arrs;
+        arrs.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            arrs.push_back(*to_arr(arrays[i]));
+        }
+        eval(arrs);
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
     }
-    eval(arrs);
 }
 
 void mlx_async_eval(mlx_array** arrays, size_t count) {
-    std::vector<array> arrs;
-    arrs.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        arrs.push_back(*to_arr(arrays[i]));
+    try {
+        mlx_clear_error();
+        std::vector<array> arrs;
+        arrs.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            arrs.push_back(*to_arr(arrays[i]));
+        }
+        async_eval(arrs);
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
     }
-    async_eval(arrs);
 }
 
 // === IO ===
@@ -262,8 +278,16 @@ void mlx_async_eval(mlx_array** arrays, size_t count) {
 int32_t mlx_load_safetensors(const char* path,
                              const char*** out_names,
                              mlx_array*** out_arrays) {
-    auto result = load_safetensors(std::string(path));
-    // result is SafetensorsLoad: { .data = unordered_map<string,array>, .metadata = ... }
+    mlx_clear_error();
+    std::pair<std::unordered_map<std::string, array>, std::unordered_map<std::string, std::string>> result;
+    try {
+        result = load_safetensors(std::string(path));
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        *out_names = nullptr;
+        *out_arrays = nullptr;
+        return -1;
+    }
     auto& data = result.first;
     int32_t count = static_cast<int32_t>(data.size());
     if (count == 0) {
@@ -589,6 +613,14 @@ void mlx_metal_kernel_apply(void* kernel,
     for (size_t i = 0; i < result.size() && i < n_outputs; ++i) {
         outputs[i] = from_arr(std::move(result[i]));
     }
+}
+
+// === Memory management ===
+
+/// Release cached Metal buffers and other allocator caches.
+/// Equivalent to `mx.metal.clear_cache()` in Python.
+void mlx_metal_clear_cache() {
+    mlx::core::clear_cache();
 }
 
 } // extern "C"

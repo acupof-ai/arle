@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 //! Prefill benchmark for measuring TTFT at various prompt lengths.
 //!
 //! Usage:
