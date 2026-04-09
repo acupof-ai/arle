@@ -70,15 +70,23 @@ impl Qwen3Model {
         let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
-        // Detect weight quantization (quantize_config.json)
+        // Detect weight quantization (quantize_config.json or turboquant_config.json)
         let quant_group_size = {
             let qc_path = std::path::Path::new(model_path).join("quantize_config.json");
+            let tq_path = std::path::Path::new(model_path).join("turboquant_config.json");
             if qc_path.exists() {
                 let qc: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(&qc_path)?)?;
                 let gs = qc["group_size"].as_u64().unwrap_or(128) as usize;
                 let bits = qc["bits"].as_u64().unwrap_or(8);
                 info!("Quantized model detected: W{}A16, group_size={}", bits, gs);
+                gs
+            } else if tq_path.exists() {
+                let tq: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&tq_path)?)?;
+                let gs = tq["group_size"].as_u64().unwrap_or(128) as usize;
+                let bits = tq["bits"].as_u64().unwrap_or(3);
+                info!("TurboQuant model detected: TQ{}, group_size={}", bits, gs);
                 gs
             } else {
                 0 // not quantized

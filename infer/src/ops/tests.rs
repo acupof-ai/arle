@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use super::*;
@@ -1166,4 +1166,362 @@ fn test_triton_decode_attention_matches_cpu_reference() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// TurboQuant KV roundtrip tests
+// ============================================================================
+
+#[test]
+fn turboquant_lloyd_max_codebook_symmetry() {
+    // Lloyd-Max codebook for symmetric Beta distribution should be symmetric.
+    let head_dim = 128;
+    let bits = 3u8;
+    let num_levels = 1usize << bits;
+
+    let mut centroids = vec![0.0f32; num_levels];
+    let mut boundaries = vec![0.0f32; num_levels + 1];
+
+    unsafe {
+        crate::ffi::turboquant_lloyd_max(
+            centroids.as_mut_ptr(),
+            boundaries.as_mut_ptr(),
+            num_levels as i32,
+            head_dim as i32,
+            200,
+        );
+    }
+
+    // Centroids should be symmetric: c[i] ≈ -c[num_levels-1-i]
+    for i in 0..num_levels / 2 {
+        let diff = (centroids[i] + centroids[num_levels - 1 - i]).abs();
+        assert!(
+            diff < 1e-5,
+            "Codebook not symmetric: c[{}]={}, c[{}]={}",
+            i,
+            centroids[i],
+            num_levels - 1 - i,
+            centroids[num_levels - 1 - i]
+        );
+    }
+
+    // Boundaries should be sorted
+    for i in 1..=num_levels {
+        assert!(
+            boundaries[i] > boundaries[i - 1],
+            "Boundaries not sorted at {i}"
+        );
+    }
+
+    // Endpoints
+    assert_eq!(boundaries[0], -1.0);
+    assert_eq!(boundaries[num_levels], 1.0);
+}
+
+#[test]
+fn turboquant_hadamard_signs_deterministic() {
+    let dim = 128;
+    let seed = 42u64;
+
+    let mut signs1 = vec![0i8; dim];
+    let mut signs2 = vec![0i8; dim];
+
+    unsafe {
+        crate::ffi::turboquant_generate_signs(signs1.as_mut_ptr(), dim as i32, seed);
+        crate::ffi::turboquant_generate_signs(signs2.as_mut_ptr(), dim as i32, seed);
+    }
+
+    assert_eq!(
+        signs1, signs2,
+        "Signs should be deterministic for same seed"
+    );
+
+    // All values should be -1 or +1
+    for &s in &signs1 {
+        assert!(s == -1 || s == 1, "Sign should be -1 or +1, got {s}");
+    }
+
+    // Different seed → different signs
+    let mut signs3 = vec![0i8; dim];
+    unsafe {
+        crate::ffi::turboquant_generate_signs(signs3.as_mut_ptr(), dim as i32, seed + 1);
+    }
+    assert_ne!(
+        signs1, signs3,
+        "Different seeds should produce different signs"
+    );
+}
+
+#[test]
+fn turboquant_kv_roundtrip_gpu() -> Result<()> {
+    // Roundtrip test: BF16 → TQ quantize → TQ dequantize → BF16
+    // Verify reconstruction error is within expected bounds.
+    let ctx = DeviceContext::new()?;
+
+    let head_dim = 128usize;
+    let num_kv_heads = 4usize;
+    let kv_dim = num_kv_heads * head_dim;
+    let batch_size = 8usize;
+    let bits = 3u8;
+
+    use crate::model::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
+
+    // Init TQ state (1 layer, Hadamard mode)
+    let tq_state = TurboQuantLayerState::new(&ctx, 1, head_dim, bits, 42)?;
+    let packed_per_head = packed_bytes_per_head(head_dim, bits);
+
+    // Generate random BF16 input (simulating KV vectors)
+    let mut rng_data = Vec::with_capacity(batch_size * kv_dim);
+    let mut seed = 12345u64;
+    for _ in 0..(batch_size * kv_dim) {
+        // Simple LCG for reproducible random floats in [-1, 1]
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let f = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+        rng_data.push(bf16::from_f32(f));
+    }
+    let input = DeviceVec::from_host(&ctx, &rng_data)?;
+
+    // Allocate packed + norms buffers
+    let packed_total = batch_size * num_kv_heads * packed_per_head;
+    let norms_total = batch_size * num_kv_heads;
+    let mut packed: CudaSlice<u8> = ctx
+        .stream
+        .alloc_zeros(packed_total)
+        .map_err(|e| anyhow!("alloc packed: {e}"))?;
+    let mut norms: CudaSlice<u16> = ctx
+        .stream
+        .alloc_zeros(norms_total)
+        .map_err(|e| anyhow!("alloc norms: {e}"))?;
+
+    // Quantize
+    super::kv_turboquant::turboquant_quantize_paged_single(
+        &ctx,
+        {
+            let (ptr, _g) = input.data.device_ptr(&ctx.stream);
+            ptr as u64
+        },
+        &packed,
+        &norms,
+        // Pool indices: identity mapping [0, 1, 2, ..., batch_size-1]
+        &ctx.stream
+            .clone_htod(&(0..batch_size as i32).collect::<Vec<_>>())
+            .map_err(|e| anyhow!("alloc indices: {e}"))?,
+        &tq_state,
+        0, // layer_idx
+        num_kv_heads,
+        head_dim,
+        batch_size,
+    )?;
+
+    // Allocate output buffer for dequantize
+    let mut output = DeviceVec::zeros(&ctx, batch_size * kv_dim)?;
+
+    // Dequantize (contiguous path)
+    super::kv_turboquant::turboquant_dequantize_inplace(
+        &ctx,
+        &packed,
+        &norms,
+        {
+            let (ptr, _g) = output.data.device_ptr_mut(&ctx.stream);
+            ptr as u64
+        },
+        &ctx.stream
+            .clone_htod(&(0..batch_size as i32).collect::<Vec<_>>())
+            .map_err(|e| anyhow!("alloc indices: {e}"))?,
+        &tq_state,
+        0,
+        num_kv_heads,
+        head_dim,
+        batch_size,
+    )?;
+
+    // Read back and compare
+    ctx.stream.synchronize().map_err(|e| anyhow!("sync: {e}"))?;
+
+    let input_host: Vec<bf16> = ctx
+        .stream
+        .clone_dtoh(&input.data)
+        .map_err(|e| anyhow!("D2H input: {e}"))?;
+    let output_host: Vec<bf16> = ctx
+        .stream
+        .clone_dtoh(&output.data)
+        .map_err(|e| anyhow!("D2H output: {e}"))?;
+
+    // Compute MSE and max error
+    let mut sum_sq_err = 0.0f64;
+    let mut max_err = 0.0f32;
+    let mut sum_sq_input = 0.0f64;
+    let n = input_host.len();
+
+    for i in 0..n {
+        let inp = input_host[i].to_f32();
+        let out = output_host[i].to_f32();
+        let err = (inp - out).abs();
+        sum_sq_err += (err as f64) * (err as f64);
+        sum_sq_input += (inp as f64) * (inp as f64);
+        if err > max_err {
+            max_err = err;
+        }
+    }
+
+    let mse = sum_sq_err / n as f64;
+    let rmse = mse.sqrt();
+    let rms_input = (sum_sq_input / n as f64).sqrt();
+    let relative_rmse = rmse / rms_input;
+
+    eprintln!(
+        "TurboQuant {bits}-bit roundtrip: RMSE={rmse:.6}, max_err={max_err:.4}, \
+         relative_RMSE={relative_rmse:.4} ({n} elements)"
+    );
+
+    // 3-bit Hadamard quantization: expect ~15-25% relative RMSE.
+    // Hadamard rotation is near-optimal but not identical to full QR rotation;
+    // the FWHT butterfly structure introduces slightly higher reconstruction
+    // error compared to a true random orthogonal matrix.
+    // Empirical: 3-bit Hadamard on uniform[-1,1] data → ~19% relative RMSE.
+    assert!(
+        relative_rmse < 0.30,
+        "Relative RMSE {relative_rmse:.4} exceeds threshold 0.30 for {bits}-bit TQ"
+    );
+    assert!(
+        max_err < 2.0,
+        "Max error {max_err:.4} exceeds threshold 2.0"
+    );
+
+    Ok(())
+}
+
+/// CPU reference implementation for TurboQuant quantize → dequantize roundtrip.
+/// Used to validate GPU kernel correctness.
+#[test]
+fn turboquant_cpu_reference_roundtrip() {
+    let head_dim = 128usize;
+    let bits = 3u8;
+    let num_levels = 1usize << bits;
+    let effective_bits = 4usize; // bits==3 → 4-bit nibbles
+
+    // 1. Compute codebook
+    let mut centroids = vec![0.0f32; num_levels];
+    let mut boundaries = vec![0.0f32; num_levels + 1];
+    unsafe {
+        crate::ffi::turboquant_lloyd_max(
+            centroids.as_mut_ptr(),
+            boundaries.as_mut_ptr(),
+            num_levels as i32,
+            head_dim as i32,
+            200,
+        );
+    }
+    eprintln!("Centroids: {:?}", centroids);
+    eprintln!("Boundaries: {:?}", boundaries);
+
+    // 2. Generate signs
+    let mut signs = vec![0i8; head_dim];
+    unsafe {
+        crate::ffi::turboquant_generate_signs(signs.as_mut_ptr(), head_dim as i32, 42);
+    }
+
+    // 3. Generate test vector
+    let mut x = vec![0.0f32; head_dim];
+    let mut seed = 12345u64;
+    for v in x.iter_mut() {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *v = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+    }
+
+    // 4. CPU quantize: norm → normalize → sign flip → FWHT → searchsorted → pack
+    let norm: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let inv_norm = if norm > 1e-10 { 1.0 / norm } else { 0.0 };
+
+    let mut y: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * inv_norm * signs[i] as f32)
+        .collect();
+
+    // FWHT
+    let n = head_dim;
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = y[j];
+                let b = y[j + h];
+                y[j] = a + b;
+                y[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    for v in y.iter_mut() {
+        *v *= scale;
+    }
+
+    // Searchsorted
+    let mut indices = vec![0u8; head_dim];
+    for (i, &val) in y.iter().enumerate() {
+        let mut idx = 0u8;
+        for k in 1..num_levels {
+            if val >= boundaries[k] {
+                idx = k as u8;
+            }
+        }
+        indices[i] = idx;
+    }
+
+    // 5. CPU dequantize: gather → iFFWT → sign flip → scale
+    let mut y_hat: Vec<f32> = indices.iter().map(|&idx| centroids[idx as usize]).collect();
+
+    // iFFWT (same as FWHT for orthogonal Hadamard)
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = y_hat[j];
+                let b = y_hat[j + h];
+                y_hat[j] = a + b;
+                y_hat[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    for v in y_hat.iter_mut() {
+        *v *= scale;
+    }
+
+    // Sign flip + scale by norm
+    let x_hat: Vec<f32> = y_hat
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * signs[i] as f32 * norm)
+        .collect();
+
+    // 6. Compute error
+    let mut sum_sq_err = 0.0f64;
+    let mut sum_sq_input = 0.0f64;
+    let mut max_err = 0.0f32;
+    for i in 0..head_dim {
+        let err = (x[i] - x_hat[i]).abs();
+        sum_sq_err += (err as f64).powi(2);
+        sum_sq_input += (x[i] as f64).powi(2);
+        max_err = max_err.max(err);
+    }
+    let rmse = (sum_sq_err / head_dim as f64).sqrt();
+    let rms_input = (sum_sq_input / head_dim as f64).sqrt();
+    let relative_rmse = rmse / rms_input;
+
+    eprintln!(
+        "CPU reference 3-bit: RMSE={rmse:.6}, max_err={max_err:.4}, relative_RMSE={relative_rmse:.4}"
+    );
+
+    // CPU reference should give the theoretical bound
+    assert!(
+        relative_rmse < 0.30,
+        "CPU relative RMSE {relative_rmse:.4} too high"
+    );
 }

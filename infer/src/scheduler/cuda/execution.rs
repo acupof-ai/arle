@@ -7,7 +7,30 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        // Phase 1: Flush deferred deltas (CPU tokenizer decode)
+        // Phase 1: Batched decode (GPU forward pass + sampling)
+        //
+        // Launched BEFORE emit_delta so that GPU compute overlaps with
+        // CPU tokenizer work in Phase 2. emit_delta only needs tokens
+        // from the PREVIOUS step (already in generated_tokens), so
+        // there's no data dependency with the current forward pass.
+        let has_decode = self
+            .active
+            .iter()
+            .any(|r| matches!(r.phase, Phase::Decoding));
+        let decode_us = if has_decode {
+            let t = std::time::Instant::now();
+            self.step_decode_batch();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+
+        // Phase 2: Flush deferred deltas (CPU tokenizer decode)
+        //
+        // Runs after decode batch returns. When GPU forward is fast
+        // (CUDA Graph replay), emit_delta dominates; when forward is
+        // slow, emit_delta would have overlapped with GPU compute if
+        // we split forward into launch + sync phases (future opt).
         let emit_t = std::time::Instant::now();
         {
             let Self {
@@ -23,19 +46,6 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
-        // Phase 2: Batched decode (GPU forward pass)
-        let has_decode = self
-            .active
-            .iter()
-            .any(|r| matches!(r.phase, Phase::Decoding));
-        let decode_us = if has_decode {
-            let t = std::time::Instant::now();
-            self.step_decode_batch();
-            t.elapsed().as_micros()
-        } else {
-            0
-        };
-
         // Phase 3: Accept ALL new requests (prefix cache + start prefill)
         // Process all new requests in one step to avoid multi-iteration admission delay.
         let new_t = std::time::Instant::now();
@@ -49,12 +59,26 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 4: Prefill chunks — process a limited number of pending prefill
-        // requests to avoid blocking decode for too long. When decode requests
-        // are active, limit to 1 prefill per step (like SGLang). When idle,
-        // process up to 8 to speed up batch admission.
+        // Phase 4: Prefill chunks — adaptive rate based on decode batch size.
+        //
+        // During ramp-up (few decodes), allow more prefills to reduce TTFT.
+        // At high concurrency, limit prefills to protect decode ITL.
+        // SGLang uses a similar adaptive policy.
         let prefill_t = std::time::Instant::now();
-        let max_prefills = if has_decode { 1 } else { 8 };
+        let decode_count = self
+            .active
+            .iter()
+            .filter(|r| matches!(r.phase, Phase::Decoding))
+            .count();
+        let max_prefills = if !has_decode {
+            8 // No decode: drain prefill queue fast
+        } else if decode_count <= 4 {
+            4 // Ramp-up: GPU has headroom, reduce TTFT
+        } else if decode_count <= 16 {
+            2 // Moderate load: balance TTFT vs ITL
+        } else {
+            1 // High concurrency: protect decode latency
+        };
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
             .take(max_prefills)

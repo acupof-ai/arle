@@ -5,6 +5,7 @@ mod elementwise;
 mod embedding;
 mod kv_ops;
 pub(crate) mod kv_quant;
+pub(crate) mod kv_turboquant;
 mod linear;
 mod norm;
 mod recurrent;

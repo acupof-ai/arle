@@ -20,6 +20,7 @@ use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
 use crate::ops::kv_quant;
+use crate::ops::kv_turboquant;
 use crate::paged_kv::PagedKVPool;
 use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -32,6 +33,8 @@ pub struct BatchDecodeBuffers {
     v_batch: HiddenStates,
     qkv_batch: HiddenStates,
     attn_output: HiddenStates,
+    /// Rotated query buffer for TurboQuant fused attention [max_batch_size, q_dim].
+    q_rot: HiddenStates,
     o_buf: HiddenStates,
     gate_out: HiddenStates,
     up_out: HiddenStates,
@@ -83,6 +86,7 @@ impl BatchDecodeBuffers {
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_batch_size)?,
             qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_batch_size)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
+            q_rot: HiddenStates::zeros(ctx, q_dim, max_batch_size)?,
             o_buf: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             gate_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
             up_out: HiddenStates::zeros(ctx, inter_dim, max_batch_size)?,
@@ -129,6 +133,7 @@ impl BatchDecodeBuffers {
         self.v_batch.seq_len = batch_size;
         self.qkv_batch.seq_len = batch_size;
         self.attn_output.seq_len = batch_size;
+        self.q_rot.seq_len = batch_size;
         self.o_buf.seq_len = batch_size;
         self.gate_out.seq_len = batch_size;
         self.up_out.seq_len = batch_size;
@@ -441,6 +446,34 @@ impl GLM4Model {
                     )?;
                 }
                 KVFormat::BF16 => {}
+                KVFormat::TurboQuant { .. } => {
+                    let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_quantize_paged_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_slice(layer_idx),
+                        kv_pool.k_norms_slice(layer_idx),
+                        &bufs.metadata.last_token_indices,
+                        tq_k,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                    )?;
+                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
+                    kv_turboquant::turboquant_quantize_paged_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_slice(layer_idx),
+                        kv_pool.v_norms_slice(layer_idx),
+                        &bufs.metadata.last_token_indices,
+                        tq_v,
+                        layer_idx,
+                        num_kv_heads,
+                        head_dim,
+                        batch_size,
+                    )?;
+                }
             }
 
             match kv_pool.format {
@@ -501,6 +534,56 @@ impl GLM4Model {
                         num_kv_heads,
                         page_size,
                         head_dim,
+                    )?;
+                }
+                KVFormat::TurboQuant { .. } => {
+                    // Fused TQ attention: rotate Q once, score from packed K centroids.
+                    let tq_k = kv_pool.tq_k_state.as_ref().unwrap();
+                    let tq_v = kv_pool.tq_v_state.as_ref().unwrap();
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+                    // Step 1: Rotate Q → Q_rot (sign flip + FWHT)
+                    use cudarc::driver::{DevicePtr, DevicePtrMut};
+                    let q_ptr = {
+                        let (p, _g) = bufs.q_batch.data.device_ptr(stream);
+                        p as u64
+                    };
+                    let q_rot_ptr = {
+                        let (p, _g) = bufs.q_rot.data.device_ptr_mut(stream);
+                        p as u64
+                    };
+                    kv_turboquant::turboquant_rotate_query(
+                        &self.ctx,
+                        q_ptr,
+                        q_rot_ptr,
+                        tq_k,
+                        layer_idx,
+                        batch_size * num_heads,
+                        head_dim,
+                    )?;
+
+                    // Step 2: Fused attention
+                    let attn_ptr = {
+                        let (p, _g) = bufs.attn_output.data.device_ptr_mut(stream);
+                        p as u64
+                    };
+                    kv_turboquant::turboquant_fused_decode_attention(
+                        &self.ctx,
+                        q_rot_ptr,
+                        kv_pool.k_data_slice(layer_idx),
+                        kv_pool.k_norms_slice(layer_idx),
+                        kv_pool.v_data_slice(layer_idx),
+                        kv_pool.v_norms_slice(layer_idx),
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_indptr,
+                        attn_ptr,
+                        tq_k,
+                        tq_v,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        sm_scale,
                     )?;
                 }
             }

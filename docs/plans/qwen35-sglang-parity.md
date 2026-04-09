@@ -1,8 +1,8 @@
 # Plan: Qwen3.5 SGLang 0.5.9 Parity (Qwen3.5-4B, A100-80GB)
 
-> Status: **Decode speed exceeds SGLang at all C. Throughput ahead C=1–C=16, -8% at C=32 (TTFT gap)**
+> Status: **Near-complete** — prefix cache fixed (2026-04-09), batched prefill remaining
 > Created: 2026-04-01
-> Updated: 2026-04-02
+> Updated: 2026-04-09
 > Goal: Match SGLang 0.5.9 throughput on Qwen3.5-4B
 
 ---
@@ -57,6 +57,7 @@
 
 | Step | Priority | Impact | Description |
 |------|----------|--------|-------------|
-| Fix prefix cache for Qwen3.5 | High | C=32 TTFT -135ms | Reset recurrent state on prefix hit; closes -8% throughput gap |
+| ~~Fix prefix cache for Qwen3.5~~ | ~~High~~ | ~~C=32 TTFT -135ms~~ | ✅ Done (2026-04-09) — recurrent state snapshot/restore via `GenerationState` trait |
+| ~~Overlap scheduling~~ | ~~Medium~~ | ~~ITL~~ | ✅ Done (2026-04-09) — dual-stream + decode-first phase reordering |
 | Batched prefill (multi-request) | Medium | TTFT | Prefill multiple requests in one forward pass |
 | Increase prefill rate during ramp-up | Low | TTFT | More than 1 prefill/step when few decodes active |

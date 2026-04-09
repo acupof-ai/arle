@@ -192,9 +192,44 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
                 orig_k,
                 group_size
             );
-            return DeviceMatrix::from_quantized_int4(
-                ctx, packed, sc_data, rows, orig_k, group_size,
-            );
+            let mut mat =
+                DeviceMatrix::from_quantized_int4(ctx, packed, sc_data, rows, orig_k, group_size)?;
+            // Load pre-computed Marlin weights if available (from scripts/marlin_repack.py)
+            let marlin_key = qweight_name.replace(".qweight", ".marlin_qweight");
+            let marlin_scales_key = qweight_name.replace(".qweight", ".marlin_scales");
+            if let (Ok(mp), Ok(ms)) = (
+                find_tensor(shards, weight_map, &marlin_key),
+                find_tensor(shards, weight_map, &marlin_scales_key),
+            ) {
+                let mp_data: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        mp.data().as_ptr(),
+                        mp.shape().iter().product::<usize>() * 4, // int32 → bytes
+                    )
+                };
+                let ms_data: &[u16] = unsafe {
+                    std::slice::from_raw_parts(
+                        ms.data().as_ptr().cast::<u16>(),
+                        ms.shape().iter().product::<usize>(),
+                    )
+                };
+                let mp_gpu: cudarc::driver::CudaSlice<u8> = ctx
+                    .stream
+                    .clone_htod(mp_data)
+                    .map_err(|e| anyhow::anyhow!("H2D Marlin packed: {}", e))?;
+                let ms_gpu: cudarc::driver::CudaSlice<u16> = ctx
+                    .stream
+                    .clone_htod(ms_data)
+                    .map_err(|e| anyhow::anyhow!("H2D Marlin scales: {}", e))?;
+                mat.marlin_packed = Some(mp_gpu);
+                mat.marlin_scales = Some(ms_gpu);
+                log::info!(
+                    "  + Marlin repacked: {:?} + scales {:?}",
+                    mp.shape(),
+                    ms.shape()
+                );
+            }
+            return Ok(mat);
         }
 
         // INT8
@@ -211,8 +246,184 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
         return DeviceMatrix::from_quantized_int8(ctx, qw_data, sc_data, rows, orig_k, group_size);
     }
 
+    // Try TurboQuant path: .tq_packed + .tq_scales + .tq_signs
+    let tq_packed_name = name.replace(".weight", ".tq_packed");
+    let tq_scales_name = name.replace(".weight", ".tq_scales");
+    let tq_signs_name = name.replace(".weight", ".tq_signs");
+
+    if weight_map.contains_key(&tq_packed_name)
+        && weight_map.contains_key(&tq_scales_name)
+        && weight_map.contains_key(&tq_signs_name)
+    {
+        let packed_tensor = find_tensor(shards, weight_map, &tq_packed_name)?;
+        let scales_tensor = find_tensor(shards, weight_map, &tq_scales_name)?;
+        let signs_tensor = find_tensor(shards, weight_map, &tq_signs_name)?;
+
+        let rows = packed_tensor.shape()[0];
+        let packed_cols = packed_tensor.shape()[1];
+        let num_groups = scales_tensor.shape()[1];
+        let orig_k = num_groups * group_size;
+
+        let packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(packed_tensor.data().as_ptr(), rows * packed_cols)
+        };
+        let scales: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(
+                scales_tensor.data().as_ptr().cast::<half::f16>(),
+                rows * num_groups,
+            )
+        };
+        let signs: &[i8] = unsafe {
+            std::slice::from_raw_parts(
+                signs_tensor.data().as_ptr().cast::<i8>(),
+                signs_tensor.shape()[0],
+            )
+        };
+
+        // Phase 2: keep weights packed on GPU — dequant happens at runtime
+        // in fused GEMV (decode) or bulk dequant + cuBLAS GEMM (prefill).
+        let bits = 3u8; // TODO: detect from turboquant_config.json
+        let num_levels = 1usize << bits;
+        let mut centroids_host = vec![0.0f32; num_levels];
+        let mut boundaries_host = vec![0.0f32; num_levels + 1];
+        unsafe {
+            crate::ffi::turboquant_lloyd_max(
+                centroids_host.as_mut_ptr(),
+                boundaries_host.as_mut_ptr(),
+                num_levels as i32,
+                group_size as i32,
+                200,
+            );
+        }
+        let centroids_gpu: CudaSlice<f32> = ctx
+            .stream
+            .clone_htod(&centroids_host)
+            .map_err(|e| anyhow::anyhow!("H2D centroids failed: {}", e))?;
+
+        let scales_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                scales.as_ptr().cast::<u8>(),
+                scales.len() * std::mem::size_of::<half::f16>(),
+            )
+        };
+
+        log::info!(
+            "Loaded TurboQuant {}: [{}x{}] packed {}-bit on GPU, group_size={}",
+            name,
+            rows,
+            orig_k,
+            bits,
+            group_size
+        );
+
+        let mat = DeviceMatrix::from_quantized_tq(
+            ctx,
+            packed,
+            scales_bytes,
+            signs,
+            &centroids_gpu,
+            rows,
+            orig_k,
+            group_size,
+            bits,
+        )?;
+        return Ok(mat);
+    }
+
     // Fallback: bf16
     load_tensor_2d(ctx, shards, weight_map, name)
+}
+
+/// TurboQuant Phase 1: dequantize packed weights at load time on CPU.
+///
+/// Reverse path: unpack → gather centroids → iFFWT → sign flip → scale by norm.
+/// Produces a standard BF16 DeviceMatrix for use with existing GEMM kernels.
+fn turboquant_dequant_at_load(
+    ctx: &DeviceContext,
+    packed: &[u8],
+    scales: &[half::f16],
+    signs: &[i8],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Result<DeviceMatrix> {
+    let num_groups = cols / group_size;
+    let bits = 3u8; // TODO: detect from config
+    let effective_bits = if bits == 3 { 4 } else { bits as usize };
+    let indices_per_byte = 8 / effective_bits;
+
+    // Compute Lloyd-Max centroids on CPU
+    let num_levels = 1usize << bits;
+    let mut centroids = vec![0.0f32; num_levels];
+    let mut boundaries = vec![0.0f32; num_levels + 1];
+    unsafe {
+        crate::ffi::turboquant_lloyd_max(
+            centroids.as_mut_ptr(),
+            boundaries.as_mut_ptr(),
+            num_levels as i32,
+            group_size as i32,
+            200,
+        );
+    }
+
+    // Dequantize each row
+    let mut bf16_data = vec![bf16::ZERO; rows * cols];
+    let packed_cols = packed.len() / rows;
+
+    for row in 0..rows {
+        for g in 0..num_groups {
+            let norm = half::f16::to_f32(scales[row * num_groups + g]);
+            let group_start = g * group_size;
+
+            // Unpack indices → centroids
+            let mut rotated = vec![0.0f32; group_size];
+            for d in 0..group_size {
+                let k = group_start + d;
+                let byte_idx = k / indices_per_byte;
+                let sub_idx = k % indices_per_byte;
+                let packed_byte = packed[row * packed_cols + byte_idx];
+                let idx = ((packed_byte >> (sub_idx * effective_bits))
+                    & ((1 << effective_bits) - 1)) as usize;
+                let idx = idx.min(num_levels - 1);
+                rotated[d] = centroids[idx] * norm;
+            }
+
+            // Inverse FWHT (self-inverse with 1/√n normalization)
+            fwht_cpu(&mut rotated);
+
+            // Inverse sign flip
+            for d in 0..group_size {
+                let k = group_start + d;
+                let sign_idx = k % signs.len();
+                rotated[d] *= signs[sign_idx] as f32;
+                bf16_data[row * cols + k] = bf16::from_f32(rotated[d]);
+            }
+        }
+    }
+
+    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
+}
+
+/// CPU Fast Walsh-Hadamard Transform (in-place, normalized by 1/√n).
+fn fwht_cpu(data: &mut [f32]) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let a = data[j];
+                let b = data[j + h];
+                data[j] = a + b;
+                data[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    for x in data.iter_mut() {
+        *x *= scale;
+    }
 }
 
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.

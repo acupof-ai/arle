@@ -1,18 +1,27 @@
 //! Device tensor types and CUDA context.
 
 use anyhow::{Result, anyhow};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::ffi;
 
-/// CUDA device context holding context and stream.
+/// CUDA device context holding compute stream and optional copy stream.
+///
+/// Two-stream architecture for overlapping H2D/D2H transfers with compute:
+/// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
+/// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
+///
+/// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
+/// which breaks CUDA Graph capture).
 #[derive(Clone)]
 pub struct DeviceContext {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Separate stream for async H2D/D2H memory copies.
+    pub copy_stream: Arc<CudaStream>,
 }
 
 impl DeviceContext {
@@ -39,19 +48,99 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA stream: {}", e))?;
 
+        let copy_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA copy stream: {}", e))?;
+
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
         }
 
-        Ok(Self { ctx, stream })
+        Ok(Self {
+            ctx,
+            stream,
+            copy_stream,
+        })
     }
 
-    /// Synchronize stream
+    /// Query the number of streaming multiprocessors on the GPU.
+    pub fn sm_count(&self) -> usize {
+        use cudarc::driver::sys::*;
+        let mut count: i32 = 0;
+        unsafe {
+            cuDeviceGetAttribute(
+                &mut count,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            );
+        }
+        count.max(1) as usize
+    }
+
+    /// Synchronize compute stream.
     pub fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
             .map_err(|e| anyhow!("Sync failed: {}", e))
+    }
+
+    /// Synchronize copy stream.
+    pub fn sync_copy(&self) -> Result<()> {
+        self.copy_stream
+            .synchronize()
+            .map_err(|e| anyhow!("Copy stream sync failed: {}", e))
+    }
+
+    /// Record an event on the compute stream and make the copy stream wait for it.
+    ///
+    /// Use after GPU kernels finish (e.g. sampling) to ensure the copy stream
+    /// sees the results before starting D2H transfer.
+    pub fn copy_waits_for_compute(&self) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let mut event: CUevent = std::ptr::null_mut();
+            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuEventCreate failed: {:?}", r));
+            }
+            let r = cuEventRecord(event, self.stream.cu_stream());
+            if r != CUresult::CUDA_SUCCESS {
+                cuEventDestroy_v2(event);
+                return Err(anyhow!("cuEventRecord failed: {:?}", r));
+            }
+            let r = cuStreamWaitEvent(self.copy_stream.cu_stream(), event, 0);
+            cuEventDestroy_v2(event);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record an event on the copy stream and make the compute stream wait for it.
+    ///
+    /// Use after H2D transfer completes to ensure compute kernels see the uploaded data.
+    pub fn compute_waits_for_copy(&self) -> Result<()> {
+        use cudarc::driver::sys::*;
+        unsafe {
+            let mut event: CUevent = std::ptr::null_mut();
+            let r = cuEventCreate(&mut event, CUevent_flags::CU_EVENT_DISABLE_TIMING as u32);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuEventCreate failed: {:?}", r));
+            }
+            let r = cuEventRecord(event, self.copy_stream.cu_stream());
+            if r != CUresult::CUDA_SUCCESS {
+                cuEventDestroy_v2(event);
+                return Err(anyhow!("cuEventRecord failed: {:?}", r));
+            }
+            let r = cuStreamWaitEvent(self.stream.cu_stream(), event, 0);
+            cuEventDestroy_v2(event);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuStreamWaitEvent failed: {:?}", r));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +369,22 @@ pub struct DeviceMatrix {
     pub group_size: usize,
     /// Quantization bit width (8 or 4). 0 = not quantized.
     pub quant_bits: usize,
+    /// Marlin-repacked INT4 weights for prefill GEMM (None if not W4 or repack failed).
+    pub marlin_packed: Option<CudaSlice<u8>>,
+    /// FP16 scales in Marlin layout [K/group_size, N] (transposed from qscales).
+    pub marlin_scales: Option<CudaSlice<u16>>,
+    // -- TurboQuant packed weight storage (Phase 2: fused dequant at runtime) --
+    /// TQ packed indices [rows, packed_cols] u8.
+    /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
+    pub tq_packed: Option<CudaSlice<u8>>,
+    /// TQ per-group f16 norms [rows, cols/group_size], stored as u16 on device.
+    pub tq_scales: Option<CudaSlice<u16>>,
+    /// TQ Hadamard signs [cols] i8 (+1/-1), shared across rows.
+    pub tq_signs: Option<CudaSlice<i8>>,
+    /// TQ Lloyd-Max centroids [2^bits] f32, shared across all layers.
+    pub tq_centroids: Option<CudaSlice<f32>>,
+    /// TQ bit width (2, 3, or 4). 0 = not TQ.
+    pub tq_bits: u8,
 }
 
 impl DeviceMatrix {
@@ -298,6 +403,13 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -335,14 +447,19 @@ impl DeviceMatrix {
             qscales: Some(qs),
             group_size,
             quant_bits: 8,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
     /// Create from INT4 packed quantized weight + bf16 scales.
-    ///
-    /// Unpacks INT4 → INT8 at load time and uses the proven W8A16 kernel path.
-    /// This avoids a known GPU correctness issue in the W4 GEMV kernel while
-    /// still getting ~50% of the W4 bandwidth benefit (INT8 = 1 byte vs bf16 = 2 bytes).
+    /// Unpacks INT4 → INT8 at load time for the W8 kernel.
+    /// TODO: integrate Marlin kernel for native W4 prefill, AWQ-style GEMV for decode.
     pub fn from_quantized_int4(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -355,23 +472,13 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Unpack INT4 → INT8 on CPU: each byte holds 2 int4 values
-        let mut unpacked = vec![0i8; rows * cols];
-        for i in 0..packed_data.len() {
-            let byte = packed_data[i];
-            let lo = (byte & 0x0F) as i8 - 8; // signed [-8, 7]
-            let hi = (byte >> 4) as i8 - 8;
-            let row = i / (cols / 2);
-            let byte_in_row = i % (cols / 2);
-            unpacked[row * cols + byte_in_row * 2] = lo;
-            unpacked[row * cols + byte_in_row * 2 + 1] = hi;
-        }
-
-        // Upload as INT8 and use the W8 kernel (quant_bits=8)
-        let qw = ctx
+        // Upload packed INT4 data directly — native W4 kernel handles nibble extraction
+        let qw: CudaSlice<i8> = ctx
             .stream
-            .clone_htod(&unpacked)
-            .map_err(|e| anyhow!("H2D qweight int4→int8 failed: {}", e))?;
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int4 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -387,12 +494,19 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8, // Use W8 kernel (proven correct)
+            quant_bits: 4, // Native packed INT4; W4 kernel extracts nibbles
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
     /// Create from INT2 packed quantized weight + bf16 scales.
-    /// Unpacks INT2 → INT8 at load time and uses W8A16 kernel (same workaround as INT4).
+    /// Weight data is packed: 4 int2 values per byte → [rows, cols/4] bytes.
     pub fn from_quantized_int2(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -405,27 +519,13 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Unpack INT2 → INT8: each byte holds 4 int2 values
-        let mut unpacked = vec![0i8; rows * cols];
-        for i in 0..packed_data.len() {
-            let byte = packed_data[i];
-            let v0 = (byte & 0x03) as i8 - 2;
-            let v1 = ((byte >> 2) & 0x03) as i8 - 2;
-            let v2 = ((byte >> 4) & 0x03) as i8 - 2;
-            let v3 = ((byte >> 6) & 0x03) as i8 - 2;
-            let row = i / (cols / 4);
-            let byte_in_row = i % (cols / 4);
-            let base = row * cols + byte_in_row * 4;
-            unpacked[base] = v0;
-            unpacked[base + 1] = v1;
-            unpacked[base + 2] = v2;
-            unpacked[base + 3] = v3;
-        }
-
-        let qw = ctx
+        // Upload packed data directly (native W2 kernel handles bit extraction)
+        let qw: CudaSlice<i8> = ctx
             .stream
-            .clone_htod(&unpacked)
-            .map_err(|e| anyhow!("H2D qweight int2→int8 failed: {}", e))?;
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int2 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -441,13 +541,190 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8, // Use W8 kernel (proven correct, same workaround as INT4)
+            quant_bits: 2,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
     /// Whether this matrix uses quantized weights.
     pub fn is_quantized(&self) -> bool {
         self.qweight.is_some()
+    }
+
+    /// Whether this matrix has Marlin-repacked weights for fast prefill GEMM.
+    pub fn has_marlin(&self) -> bool {
+        self.marlin_packed.is_some()
+    }
+
+    /// Whether this matrix uses TurboQuant packed weight storage.
+    pub fn has_tq(&self) -> bool {
+        self.tq_packed.is_some()
+    }
+
+    /// Create from TurboQuant packed weights on GPU.
+    ///
+    /// Weights stay packed at runtime; dequant happens in the fused GEMV kernel
+    /// (decode) or via bulk dequant + cuBLAS GEMM (prefill).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_quantized_tq(
+        ctx: &DeviceContext,
+        packed: &[u8],
+        scales: &[u8], // f16 as raw bytes
+        signs: &[i8],
+        centroids: &CudaSlice<f32>,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        bits: u8,
+    ) -> Result<Self> {
+        let tq_p = ctx
+            .stream
+            .clone_htod(packed)
+            .map_err(|e| anyhow!("H2D tq_packed failed: {}", e))?;
+        let tq_s: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(scales.as_ptr().cast::<u16>(), scales.len() / 2)
+            })
+            .map_err(|e| anyhow!("H2D tq_scales failed: {}", e))?;
+        let tq_sg = ctx
+            .stream
+            .clone_htod(signs)
+            .map_err(|e| anyhow!("H2D tq_signs failed: {}", e))?;
+        let tq_c = ctx
+            .stream
+            .clone_dtod(centroids)
+            .map_err(|e| anyhow!("D2D tq_centroids failed: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: None,
+            qscales: None,
+            group_size,
+            quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: Some(tq_p),
+            tq_scales: Some(tq_s),
+            tq_signs: Some(tq_sg),
+            tq_centroids: Some(tq_c),
+            tq_bits: bits,
+        })
+    }
+
+    /// Repack W4 weights to Marlin tile layout for fast prefill.
+    /// Our format: [N, K/2] uint8 packed (lo/hi nibble = even/odd elements)
+    /// Marlin format: tiled int32 layout optimized for tensor core MMA.
+    /// Also transposes scales from [N, K/group_size] bf16 → [K/group_size, N] fp16.
+    pub fn repack_for_marlin(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.quant_bits != 4 || self.qweight.is_none() || self.qscales.is_none() {
+            return Ok(()); // Only for W4
+        }
+        let n = self.rows; // output dim
+        let k = self.cols; // input dim
+
+        // Skip if dimensions not Marlin-compatible (need K%16==0, N%64==0)
+        if k % 16 != 0 || n % 64 != 0 {
+            log::warn!("Marlin repack skipped: [{n}x{k}] not tile-aligned (need K%16==0, N%64==0)");
+            return Ok(());
+        }
+
+        // Step 1: Convert our [N, K/2] uint8 → GPTQ [K/8, N] int32 on CPU
+        let qw = self.qweight.as_ref().unwrap();
+        let packed_host: Vec<i8> = ctx
+            .stream
+            .clone_dtoh(qw)
+            .map_err(|e| anyhow!("D2H qweight: {}", e))?;
+        let packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(packed_host.as_ptr().cast::<u8>(), packed_host.len())
+        };
+
+        // GPTQ format: qweight[k/8, n] = 8 nibbles packed into int32
+        // bit position (k%8)*4 holds the 4-bit unsigned value for element (k, n)
+        let gptq_rows = k / 8;
+        let mut gptq = vec![0u32; gptq_rows * n];
+        for row_n in 0..n {
+            for col_k in 0..k {
+                let byte_idx = row_n * (k / 2) + col_k / 2;
+                let nibble = if col_k % 2 == 0 {
+                    packed[byte_idx] & 0x0F
+                } else {
+                    packed[byte_idx] >> 4
+                };
+                let gptq_row = col_k / 8;
+                let bit_pos = (col_k % 8) * 4;
+                gptq[gptq_row * n + row_n] |= (nibble as u32) << bit_pos;
+            }
+        }
+
+        // Upload GPTQ weights as raw bytes
+        let gptq_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(gptq.as_ptr().cast::<u8>(), gptq.len() * 4) };
+        let gptq_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(gptq_bytes)
+            .map_err(|e| anyhow!("H2D GPTQ: {}", e))?;
+
+        // Allocate Marlin output buffer (same byte count as GPTQ: K*N/2 bytes)
+        let marlin_bytes = k * n / 2;
+        let mut marlin_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(marlin_bytes)
+            .map_err(|e| anyhow!("Alloc Marlin: {}", e))?;
+
+        // Step 2: GPTQ → Marlin repack on GPU
+        {
+            let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
+            let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::gptq_marlin_repack_cuda(
+                    gptq_ptr as *const u32,
+                    marlin_ptr as *mut u32,
+                    k as i32,
+                    n as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("Marlin repack failed: {:?}", e))?;
+            }
+        }
+
+        // Step 3: Transpose + convert scales [N, K/gs] bf16 → [K/gs, N] fp16
+        let qs = self.qscales.as_ref().unwrap();
+        let scales_host: Vec<bf16> = ctx
+            .stream
+            .clone_dtoh(qs)
+            .map_err(|e| anyhow!("D2H scales: {}", e))?;
+        let num_groups = k / self.group_size;
+        let mut scales_fp16 = vec![0u16; num_groups * n];
+        for row_n in 0..n {
+            for g in 0..num_groups {
+                let bf = scales_host[row_n * num_groups + g];
+                let f = f32::from(bf);
+                let fp16 = half::f16::from_f32(f);
+                scales_fp16[g * n + row_n] = fp16.to_bits();
+            }
+        }
+        let scales_gpu: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(&scales_fp16)
+            .map_err(|e| anyhow!("H2D Marlin scales: {}", e))?;
+
+        self.marlin_packed = Some(marlin_gpu);
+        self.marlin_scales = Some(scales_gpu);
+
+        Ok(())
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -481,6 +758,13 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -517,6 +801,13 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 
@@ -530,8 +821,33 @@ impl DeviceMatrix {
             assert_eq!(m.cols, cols, "concat_rows: cols mismatch");
         }
         let total_rows: usize = matrices.iter().map(|m| m.rows).sum();
-        let total_elements = total_rows * cols;
 
+        // Quantized weights use separate GEMVs (not merged), so skip the
+        // expensive bf16 concat — just allocate a 1-element dummy.
+        if matrices[0].is_quantized() {
+            let dummy = ctx
+                .stream
+                .alloc_zeros::<bf16>(1)
+                .map_err(|e| anyhow!("concat_rows dummy alloc: {e}"))?;
+            return Ok(Self {
+                data: dummy,
+                rows: total_rows,
+                cols,
+                qweight: None,
+                qscales: None,
+                group_size: 0,
+                quant_bits: 0,
+                marlin_packed: None,
+                marlin_scales: None,
+                tq_packed: None,
+                tq_scales: None,
+                tq_signs: None,
+                tq_centroids: None,
+                tq_bits: 0,
+            });
+        }
+
+        let total_elements = total_rows * cols;
         let mut merged: CudaSlice<bf16> = ctx
             .stream
             .alloc_zeros(total_elements)
@@ -554,6 +870,13 @@ impl DeviceMatrix {
             qscales: None,
             group_size: 0,
             quant_bits: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
         })
     }
 }

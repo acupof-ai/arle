@@ -1038,4 +1038,278 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn w4a16_gemv_batch_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn w2a16_gemv_batch_cuda(
+        weight: *const u8,
+        scales: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── TurboQuant KV cache quantization ───
+
+    // Host-side: compute Lloyd-Max codebook (centroids + boundaries).
+    pub(crate) fn turboquant_lloyd_max(
+        centroids: *mut f32,
+        boundaries: *mut f32,
+        num_levels: i32,
+        head_dim: i32,
+        max_iters: i32,
+    );
+
+    // Host-side: generate deterministic random orthogonal rotation matrix.
+    pub(crate) fn turboquant_generate_rotation(Pi: *mut f32, head_dim: i32, seed: u64);
+
+    // Quantize bf16 KV → TurboQuant packed (contiguous batch).
+    pub(crate) fn turboquant_quantize_kv_cuda(
+        kv_bf16: *const Half,
+        packed_out: *mut u8,
+        norms_out: *mut Half,
+        Pi: *const f32,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TurboQuant packed → bf16 KV (contiguous).
+    pub(crate) fn turboquant_dequantize_kv_cuda(
+        packed_in: *const u8,
+        norms_in: *const Half,
+        kv_bf16: *mut Half,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Quantize 1 new token per request: bf16 working → TQ paged pool.
+    pub(crate) fn turboquant_quantize_single_cuda(
+        kv_bf16: *const Half,
+        pool_data: *mut u8,
+        pool_norms: *mut Half,
+        pool_indices: *const i32,
+        Pi: *const f32,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TQ paged pool → bf16 (scatter-read via token_indices).
+    pub(crate) fn turboquant_dequantize_paged_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        kv_bf16: *mut Half,
+        token_indices: *const i32,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        total_tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Dequantize TQ pool → bf16 working buffer, preserving NHD paged layout.
+    // Used before FlashInfer attention (Phase 1: separate dequant path).
+    pub(crate) fn turboquant_dequantize_inplace_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        work_bf16: *mut Half,
+        pool_indices: *const i32,
+        Pi: *const f32,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        num_indices: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── TurboQuant Fast (Hadamard-based, O(D log D)) ───
+
+    // Host-side: generate random signs for Hadamard rotation.
+    pub(crate) fn turboquant_generate_signs(signs: *mut i8, head_dim: i32, seed: u64);
+
+    // Fast quantize: sign flip + FWHT + searchsorted + bitpack.
+    pub(crate) fn turboquant_fast_quantize_kv_cuda(
+        kv_bf16: *const Half,
+        packed_out: *mut u8,
+        norms_out: *mut Half,
+        signs: *const i8,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast dequantize: unpack + centroid gather + iFFWT + sign flip.
+    pub(crate) fn turboquant_fast_dequantize_kv_cuda(
+        packed_in: *const u8,
+        norms_in: *const Half,
+        kv_bf16: *mut Half,
+        signs: *const i8,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        token_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast dequant pool → working buffer (in-place NHD layout for FlashInfer).
+    pub(crate) fn turboquant_fast_dequantize_inplace_cuda(
+        pool_data: *const u8,
+        pool_norms: *const Half,
+        work_bf16: *mut Half,
+        pool_indices: *const i32,
+        signs: *const i8,
+        centroids: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        num_indices: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fast quantize single token: bf16 working → TQ paged pool.
+    pub(crate) fn turboquant_fast_quantize_single_cuda(
+        kv_bf16: *const Half,
+        pool_data: *mut u8,
+        pool_norms: *mut Half,
+        pool_indices: *const i32,
+        signs: *const i8,
+        boundaries: *const f32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── TurboQuant Fused Decode Attention ───
+
+    // Rotate query: sign flip + FWHT. Prepares Q for fused TQ attention.
+    pub(crate) fn tq_rotate_query_cuda(
+        Q: *const Half,
+        Q_rot: *mut Half,
+        signs: *const i8,
+        num_heads_total: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // Fused TQ decode attention: score from packed K, dequant V in-kernel.
+    pub(crate) fn tq_decode_attention_cuda(
+        Q_rot: *const Half,
+        K_packed: *const u8,
+        K_norms: *const Half,
+        V_packed: *const u8,
+        V_norms: *const Half,
+        kv_indices: *const i32,
+        kv_indptr: *const i32,
+        O: *mut Half,
+        centroids_k: *const f32,
+        centroids_v: *const f32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        packed_per_head: i32,
+        num_levels: i32,
+        bits: i32,
+        sm_scale: f32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── TurboQuant Weight GEMV/Dequant ───
+
+    // Fused TQ weight dequant + GEMV for decode (single token).
+    // y[N] = dequant(packed[N,K]) @ x[K]
+    pub(crate) fn turboquant_weight_gemv_cuda(
+        packed: *const u8,
+        scales: *const Half, // f16
+        signs: *const i8,
+        centroids: *const f32,
+        x: *const Half, // bf16
+        y: *mut Half,   // bf16
+        N: i32,
+        K: i32,
+        group_size: i32,
+        packed_cols: i32,
+        num_groups: i32,
+        bits: i32,
+        stream: CUstream,
+    );
+
+    // Bulk TQ weight dequant to bf16 workspace (for prefill cuBLAS GEMM).
+    // out[N, K] = dequant(packed[N, packed_cols])
+    pub(crate) fn turboquant_weight_dequant_cuda(
+        packed: *const u8,
+        scales: *const Half,
+        signs: *const i8,
+        centroids: *const f32,
+        out: *mut Half, // bf16
+        N: i32,
+        K: i32,
+        group_size: i32,
+        packed_cols: i32,
+        num_groups: i32,
+        bits: i32,
+        stream: CUstream,
+    );
+
 }

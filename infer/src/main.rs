@@ -119,6 +119,18 @@ async fn main() {
     let kv_pool_format = match args.kv_cache_dtype.as_str() {
         "fp8" | "FP8" => KVFormat::FP8E4M3,
         "int8" | "INT8" => KVFormat::INT8,
+        "tq2" => KVFormat::TurboQuant {
+            key_bits: 2,
+            val_bits: 2,
+        },
+        "tq3" => KVFormat::TurboQuant {
+            key_bits: 3,
+            val_bits: 3,
+        },
+        "tq4" => KVFormat::TurboQuant {
+            key_bits: 4,
+            val_bits: 4,
+        },
         _ => KVFormat::BF16,
     };
 
