@@ -11,6 +11,8 @@ impl<M: ModelForward> Scheduler<M> {
             rng,
             paged_kv_pool,
             decode_bufs,
+            waiting,
+            cached_prompts,
             ..
         } = self;
 
@@ -48,19 +50,74 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
-        let decode_indices = valid_decode_indices;
+        let mut decode_indices = valid_decode_indices;
         if decode_indices.is_empty() {
             return;
         }
-        // Allocate one pool token per decode request. If allocation fails,
-        // finish that request rather than continuing with stale pool state.
+        // Preemption: if pool can't fit all decode requests, preempt the
+        // request with the most generated tokens (highest KV cost, preserves
+        // shorter conversations that are closer to completion).
+        // Recompute mode: preempted request is re-queued and re-prefilled
+        // when GPU memory frees up.
+        while paged_kv_pool.is_active()
+            && paged_kv_pool.free_count() < decode_indices.len()
+            && decode_indices.len() > 1
+        {
+            // Pick victim: most generated tokens = highest KV cost
+            let victim_pos = decode_indices
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, i)| active[**i].generated_tokens.len())
+                .map(|(pos, _)| pos)
+                .unwrap();
+            let victim_idx = decode_indices[victim_pos];
+            let victim = &mut active[victim_idx];
+            warn!(
+                "Request {}: preempting (recompute) — {} generated tokens, pool free={}",
+                victim.id,
+                victim.generated_tokens.len(),
+                paged_kv_pool.free_count()
+            );
+
+            // Free victim's paged pool tokens and reset slot state
+            paged_kv_pool.free_slot(victim.slot_idx);
+            if let Err(e) = states[victim.slot_idx].reset() {
+                error!(
+                    "Request {}: slot reset after preempt failed: {}",
+                    victim.id, e
+                );
+            }
+            cached_prompts[victim.slot_idx].clear();
+
+            // Re-queue as waiting (will be re-prefilled when re-admitted).
+            // NOTE: preempted request loses generated tokens (recompute mode).
+            // The prompt is re-tokenized on re-admission via assign_slots().
+            let requeue = IncomingRequest {
+                prompt: std::mem::take(&mut victim.prompt),
+                max_tokens: victim.max_tokens,
+                sampling: victim.sampling.clone(),
+                stop: victim.stop.take(),
+                priority: RequestPriority::Normal,
+                delta_tx: victim.delta_tx.clone(),
+            };
+            victim.phase = Phase::Finished;
+
+            // Remove from decode batch
+            decode_indices.remove(victim_pos);
+            token_ids.remove(victim_pos);
+
+            // Push to front of waiting queue (priority re-admission)
+            waiting.push_front(requeue);
+        }
+
+        // Allocate one pool token per remaining decode request.
         let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
         let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
         for (j, &i) in decode_indices.iter().enumerate() {
             let slot = active[i].slot_idx;
             if let Err(e) = paged_kv_pool.alloc_tokens(slot, 1) {
                 error!(
-                    "Request {}: KV pool exhausted (slot {}): {} — finishing request",
+                    "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
                     active[i].id, slot, e
                 );
                 active[i].finish(FinishReason::Length, tokenizer);

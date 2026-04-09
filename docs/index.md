@@ -2,28 +2,47 @@
 | --- | --- |
 | **Projects** | |
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
-| [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Design Review** — INT4 quantization architecture: LinearWeight enum, GEMV kernel, risk analysis |
-| [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文解决方案：INT8→FP8→K8V4→自适应混合精度 + 智能驱逐 + 分层 prefix cache |
-| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal 当前状态与后续路线：Qwen3/Qwen3.5 已接通，`metal_serve` 仍是串行 runtime，连续批处理和更多模型覆盖待继续 |
+| [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Complete** — INT4 quantization architecture: LinearWeight dispatch, W4A16 GEMV, Marlin prefill |
+| [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文：FP8 native + INT8/INT4 fused-dequant + TurboQuant 3-bit |
+| [projects/xma-future-research.md](projects/xma-future-research.md) | Research — XMA / accelerated model architectures future implications |
+| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal: Qwen3/3.5 at 58 tok/s, custom mlx-sys + C++ forward, serial serving |
 | **Plans** | |
-| [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
-| [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |
+| [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity (C=4 exceeded) |
+| [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **Near-complete** — prefix cache fixed, batched prefill remaining |
+| [plans/turboquant-integration.md](plans/turboquant-integration.md) | **Complete** — TurboQuant Phases 1-3: KV cache + weight + fused decode attention |
 | **Resources** | |
-| [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics, implementation plan |
+| [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
+| **Reviews** | |
+| [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | 10K star readiness review |
+| [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: optimization gaps in Qwen3.5 batched decode |
 | **Experience — Errors** | |
-| [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash: hardcoded MAX_SEQ, GPU plan_info, double alloc |
-| **Experience — Reviews** | |
-| [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: implemented-but-not-landed optimizations, mainly Qwen3.5 batched decode / recurrent / graph gaps |
+| [experience/errors/2026-04-09-scheduler-greedy-divergence.md](experience/errors/2026-04-09-scheduler-greedy-divergence.md) | Scheduler greedy divergence: Triton vs FlashInfer numerical diff |
+| [experience/errors/2026-04-09-w4-gptq-quality.md](experience/errors/2026-04-09-w4-gptq-quality.md) | W4 GPTQ quality regression investigation |
+| [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | RoPE axis bug in Qwen3.5 |
+| [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — Wins** | |
-| [experience/wins/2026-03-31-batched-decode-throughput.md](experience/wins/2026-03-31-batched-decode-throughput.md) | 128 → 811 tok/s (6.3x) via token pool + FlashInfer + buffer reuse + plan-once + CUDA Graph + argmax/scatter |
-| [experience/wins/2026-03-31-nsys-profiling-decode.md](experience/wins/2026-03-31-nsys-profiling-decode.md) | nsys profiling methodology for decode kernel analysis |
-| [experience/wins/2026-03-31-throughput-profiling.md](experience/wins/2026-03-31-throughput-profiling.md) | Profiling-driven throughput optimization for Qwen3 |
-| [experience/wins/2026-04-01-sglang-parity-steps1-4.md](experience/wins/2026-04-01-sglang-parity-steps1-4.md) | Qwen3-8B scheduler fixes: C=4 exceeds sglang (260 vs 256 tok/s) |
-| [experience/wins/2026-04-01-throughput-vs-sglang.md](experience/wins/2026-04-01-throughput-vs-sglang.md) | Qwen3-8B vs sglang head-to-head: C=1 -8%, C=4 +2%, TTFT 2.5x faster |
-| [experience/wins/2026-04-01-bench-raw-data.md](experience/wins/2026-04-01-bench-raw-data.md) | Raw benchmark data for Qwen3-8B optimization runs |
-| [experience/wins/2026-04-01-long-seq-agent-bench.md](experience/wins/2026-04-01-long-seq-agent-bench.md) | Long-sequence agent benchmark results |
-| [experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md](experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md) | MLX Metal benchmark alignment log: prompt_tps / generation_tps / e2e_tps / TTFT, then 4-bit hot-path optimization |
-| [experience/wins/2026-04-01-qwen35-scheduler-support.md](experience/wins/2026-04-01-qwen35-scheduler-support.md) | Qwen3.5 scheduler + FlashInfer HD256 batched decode; C=1 100tok/s, C=4 290tok/s vs sglang 107/349 |
-| [experience/wins/2026-04-08-kv-quant-fused-dequant.md](experience/wins/2026-04-08-kv-quant-fused-dequant.md) | KV 量化 fused-dequant attention: FP8 2x 容量 +5% long ctx, INT8 同等; 统一 split-KV kernel |
-| [experience/wins/2026-04-08-int8-kv-batched-decode.md](experience/wins/2026-04-08-int8-kv-batched-decode.md) | INT8 KV batched decode 初版 benchmark (已被 fused-dequant 替代) |
-| [experience/wins/2026-04-08-weight-quantization.md](experience/wins/2026-04-08-weight-quantization.md) | 权重量化 W8A16 +72% (53.4 tok/s), W4A16 +39%, W2A16 TurboQuant 框架 |
+| [experience/wins/2026-04-09-marlin-prefill.md](experience/wins/2026-04-09-marlin-prefill.md) | Marlin W4 prefill: 5-25x TTFT speedup for long prompts |
+| [experience/wins/2026-04-09-native-w4-throughput.md](experience/wins/2026-04-09-native-w4-throughput.md) | Native W4 throughput results |
+| [experience/wins/2026-04-09-ppl-weight-quant.md](experience/wins/2026-04-09-ppl-weight-quant.md) | PPL evaluation for weight quantization |
+| [experience/wins/2026-04-09-bench-quant-quality.md](experience/wins/2026-04-09-bench-quant-quality.md) | Quantization quality benchmark results |
+| [experience/wins/2026-04-09-w4-int8kv-combo.md](experience/wins/2026-04-09-w4-int8kv-combo.md) | W4 weight + INT8 KV combo performance |
+| [experience/wins/2026-04-08-kv-quant-fused-dequant.md](experience/wins/2026-04-08-kv-quant-fused-dequant.md) | KV fused-dequant attention: FP8 2x capacity, INT8 parity |
+| [experience/wins/2026-04-08-weight-quantization.md](experience/wins/2026-04-08-weight-quantization.md) | Weight quantization: W8 +72%, W4 +39%, W2 TurboQuant framework |
+| [experience/wins/2026-04-08-int8-kv-batched-decode.md](experience/wins/2026-04-08-int8-kv-batched-decode.md) | INT8 KV batched decode initial benchmark |
+| [experience/wins/2026-04-02-sglang-parity-achieved.md](experience/wins/2026-04-02-sglang-parity-achieved.md) | Qwen3.5 SGLang parity achieved (C=1–C=16 ahead) |
+| [experience/wins/2026-04-02-sglang-parity-final.md](experience/wins/2026-04-02-sglang-parity-final.md) | Final SGLang parity numbers |
+| [experience/wins/2026-04-02-sglang-vs-infer-qwen35.md](experience/wins/2026-04-02-sglang-vs-infer-qwen35.md) | Qwen3.5 head-to-head vs SGLang |
+| [experience/wins/2026-04-02-128slots-high-concurrency.md](experience/wins/2026-04-02-128slots-high-concurrency.md) | 128 slots high concurrency fixes |
+| [experience/wins/2026-04-02-piecewise-cuda-graph.md](experience/wins/2026-04-02-piecewise-cuda-graph.md) | Piecewise CUDA Graph: per-group capture for Qwen3.5 |
+| [experience/wins/2026-04-02-modelforward-trait-redesign.md](experience/wins/2026-04-02-modelforward-trait-redesign.md) | ModelForward trait redesign for multi-model support |
+| [experience/wins/2026-04-02-batched-kernels-results.md](experience/wins/2026-04-02-batched-kernels-results.md) | Batched kernel optimization results |
+| [experience/wins/2026-04-02-qwen35-baseline-8slots.md](experience/wins/2026-04-02-qwen35-baseline-8slots.md) | Qwen3.5 baseline with 8 slots |
+| [experience/wins/2026-04-01-sglang-parity-steps1-4.md](experience/wins/2026-04-01-sglang-parity-steps1-4.md) | Qwen3-8B scheduler fixes: C=4 exceeds sglang |
+| [experience/wins/2026-04-01-throughput-vs-sglang.md](experience/wins/2026-04-01-throughput-vs-sglang.md) | Qwen3-8B vs sglang head-to-head |
+| [experience/wins/2026-04-01-bench-raw-data.md](experience/wins/2026-04-01-bench-raw-data.md) | Raw benchmark data for Qwen3-8B |
+| [experience/wins/2026-04-01-long-seq-agent-bench.md](experience/wins/2026-04-01-long-seq-agent-bench.md) | Long-sequence agent benchmark |
+| [experience/wins/2026-04-01-qwen35-scheduler-support.md](experience/wins/2026-04-01-qwen35-scheduler-support.md) | Qwen3.5 scheduler + FlashInfer HD256 |
+| [experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md](experience/wins/2026-04-01-mlx-metal-alignment-and-optimization.md) | MLX Metal benchmark alignment + 4-bit optimization |
+| [experience/wins/2026-03-31-batched-decode-throughput.md](experience/wins/2026-03-31-batched-decode-throughput.md) | 128 → 811 tok/s (6.3x) via batched decode optimizations |
+| [experience/wins/2026-03-31-nsys-profiling-decode.md](experience/wins/2026-03-31-nsys-profiling-decode.md) | nsys profiling methodology |
+| [experience/wins/2026-03-31-throughput-profiling.md](experience/wins/2026-03-31-throughput-profiling.md) | Profiling-driven throughput optimization |

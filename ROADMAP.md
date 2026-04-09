@@ -8,17 +8,20 @@ Related docs:
 
 ---
 
-## Current State (2026-04-01)
+## Current State (2026-04-09)
 
-Working: Qwen3/Qwen3.5 inference, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, KV cache + CPU offload, token-level KV pool (SGLang-style), continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), quantization format detection (GPTQ/AWQ/FP8/INT8/GGUF parser), throughput benchmark suite (bench_throughput.py, bench_agent.py).
+Working: Qwen3/Qwen3.5/GLM4 inference, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, KV cache + CPU offload, token-level KV pool (SGLang-style), continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, throughput benchmark suite.
 
 **Recent milestones (April 2026)**:
 - Qwen3-8B throughput at SGLang parity: C=1 -8%, C=4 +2%, TTFT 2.5x faster
-- Qwen3.5-4B scheduler + FlashInfer HD256 batched decode: C=1 100 tok/s, C=4 290 tok/s
-- FlashInfer single prefill replaced Triton FA2 for HD128 models
+- Qwen3.5-4B scheduler + FlashInfer HD256 batched decode: C=1 123 tok/s, C=4 428 tok/s (+14% over SGLang)
+- **Qwen3.5 prefix cache enabled** via recurrent state snapshot/restore (was disabled due to state contamination)
+- **TurboQuant complete**: KV cache 3-bit (5x compression), weight 3-bit (fused dequant GEMV), fused decode attention
+- **GPTQ/AWQ INT4 production-ready**: format detection, W4A16 GEMV, Marlin W4 prefill (5-25x TTFT speedup)
+- **FP8 KV cache**: FlashInfer native FP8 E4M3 decode attention, 50% KV memory reduction
 - Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
 
-Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), MLA attention, quantization GPU kernels, tensor parallel communication (NCCL), speculative decoding GPU integration, FlashAttention-3 (H100).
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration, FlashAttention-3 (H100), scheduler preemption with KV swap.
 
 ---
 
@@ -449,7 +452,7 @@ Phase 0 (CPU) ✅ COMPLETE
   0.2 Sampler           ✅
   0.3 Radix Cache       ✅
   0.4 Block Manager     ✅
-  0.5 Scheduler++       ✅ (preemption/swap pending)
+  0.5 Scheduler++       ✅ (preemption: recompute mode done, swap mode deferred)
   0.6 Model Registry    ✅
   0.7 Benchmark Suite   ✅
 
@@ -462,12 +465,12 @@ Phase 1 (GPU) — ACTIVE
   1.7 Gemma             → depends on 0.6 ✅
   1.8 Phi               → depends on 0.6 ✅
 
-Phase 2 (Quantization)
-  2.1 Loader            → depends on 0.6 ✅
-  2.2 GPTQ/AWQ          → depends on 2.1
-  2.3 FP8               → depends on 2.1
-  2.4 INT8              → depends on 2.1
-  2.5 GGUF              → depends on 2.1
+Phase 2 (Quantization) ✅ COMPLETE
+  2.1 Loader            ✅
+  2.2 GPTQ/AWQ          ✅ (W4A16 GEMV + Marlin W4 prefill)
+  2.3 FP8               ✅ (FP8 KV cache + FlashInfer native decode)
+  2.4 INT8              ✅ (W8A16 GEMV/GEMM + INT8 KV fused-dequant)
+  2.5 GGUF              → deferred
 
 Phase 3 (TP/PP/EP)
   3.1 NCCL primitives   → Phase 1 complete
@@ -491,14 +494,16 @@ Phase 5 (Optimization)
 
 ## Immediate Next Steps
 
-Phase 0 is complete. Focus shifts to multi-model support and performance closing:
+Phase 0 complete. Quantization (Phase 2) largely complete. Focus on performance and robustness:
 
-1. **Qwen3.5 SGLang parity** (in progress) — close ITL gap via batched recurrent kernels
-2. **1.4 Llama 3/4 Model** — most requested architecture, unblocks community adoption
-3. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
-4. **1.2 FlashAttention-3** — H100 utilization improvement
-5. **2.1–2.2 Quantization (GPTQ/AWQ)** — most community models are quantized
-6. **Scheduler preemption with KV swap** — remaining 0.5 item for production robustness
+1. ~~**Qwen3.5 SGLang parity**~~ — ✅ prefix cache fixed, ITL/TTFT ahead at C≤16
+2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant all production-ready
+3. ~~**Scheduler preemption with KV swap**~~ — ✅ recompute mode done (swap mode deferred)
+4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
+5. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass
+6. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
+7. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
+8. **1.2 FlashAttention-3** — H100 utilization improvement
 
 ---
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -13,7 +13,7 @@ use crate::paged_kv::PagedKVPool;
 use crate::server_engine::{FinishReason, StreamDelta, Usage};
 use crate::tokenizer::Tokenizer;
 
-use super::{IncomingRequest, SchedulerConfig, SchedulerHandle};
+use super::{IncomingRequest, RequestPriority, SchedulerConfig, SchedulerHandle};
 
 mod core;
 mod decode;

@@ -104,6 +104,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.active.push(ActiveRequest {
                 id,
                 slot_idx,
+                prompt: incoming.prompt,
                 prompt_tokens,
                 generated_tokens: Vec::new(),
                 max_tokens: incoming.max_tokens,

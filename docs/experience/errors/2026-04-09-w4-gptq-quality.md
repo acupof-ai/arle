@@ -52,3 +52,24 @@ Attempting to support GPTQ-Int4 pre-quantized models. Both naive symmetric INT4 
 ## Rule
 
 When debugging quantization quality: always compare against a known-good dequantized BF16 model first. If dequanted BF16 also produces garbage, the conversion is broken, not the quantization kernel.
+
+## Root Cause Found (2026-04-09)
+
+**The W4 GEMV CUDA kernel itself was CORRECT all along.**
+
+The actual bug: `gemm_into` called `w4a16_gemv_cuda` (single-vector GEMV) during
+**prefill** (seq_len > 1). The GEMV kernel only processes input[0..K], ignoring all
+other tokens in the batch. This meant prefill computed wrong logits → wrong first
+token → garbage continuation.
+
+**Evidence:**
+1. Standalone kernel test with known data: 128.0 output ✅
+2. compute-sanitizer: zero memory errors
+3. CPU simulation: matches reference
+4. Fix: add `seq_len == 1` guard for W4/W2 dispatch
+
+**Current state (RESOLVED):**
+- W4 native kernel: decode + prefill both use native packed kernels
+- `from_quantized_int4` stores packed data directly (`quant_bits=4`)
+- `w4a16_gemv_batch_cuda` added for prefill (seq_len > 1)
+- No more INT4→INT8 unpack workaround — full native W4 pipeline
