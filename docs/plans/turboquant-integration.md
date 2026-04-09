@@ -329,27 +329,29 @@ The fused attention kernel (§4.3) is key: it avoids the D² dequantization cost
 
 ## 7. Implementation Phases
 
-### Phase 1: KV Cache TurboQuant (this PR)
+### Phase 1: KV Cache TurboQuant ✅
 
-1. **Core CUDA kernel**: `turboquant.cu` with quantize + dequantize kernels
-2. **Rust bindings**: `kv_turboquant.rs` FFI wrappers + `turboquant_state.rs` init
-3. **Integration**: `KVFormat::TurboQuant` in `kv_cache.rs` + `paged_kv.rs`
-4. **CLI**: `--kv-quant tq3` flag
-5. **Tests**: Unit tests for quantize/dequantize roundtrip, E2E quality regression
+1. ✅ **Core CUDA kernel**: `turboquant.cu` + `turboquant_fast.cu` (full + Hadamard rotation)
+2. ✅ **Rust bindings**: `kv_turboquant.rs` FFI wrappers + `turboquant_state.rs` init
+3. ✅ **Integration**: `KVFormat::TurboQuant` in `kv_cache.rs` + `paged_kv.rs`
+4. ✅ **CLI**: `--kv-quant tq3` flag
+5. ✅ **Tests**: GPU roundtrip + codebook + signs tests
 
-### Phase 2: Weight TurboQuant / ITQ3_S (future PR)
+### Phase 2: Weight TurboQuant / ITQ3_S ✅ (2026-04-09)
 
-1. **Hadamard rotation**: FWHT in CUDA, fused into GEMM shared memory load
-2. **Weight format**: 3-bit packed with DP4A interleaving
-3. **Offline conversion script**: `scripts/turboquant_repack.py`
-4. **GEMM kernel**: Fused IFWHT + dequant + Tensor Core MMA
-5. **Format detection**: `turboquant_config.json` → `QuantMeta::TurboQuant`
+1. ✅ **Format detection**: `turboquant_config.json` → `QuantMeta::TurboQuant`
+2. ✅ **Offline conversion**: `scripts/turboquant_weights.py`
+3. ✅ **GPU-packed storage**: `DeviceMatrix.tq_packed/tq_scales/tq_signs/tq_centroids`
+4. ✅ **Decode GEMV**: `turboquant_weight_gemv.cu` — fused unpack → centroid gather → iFWHT → sign flip → dot
+5. ✅ **Prefill GEMM**: bulk dequant kernel + cuBLAS GEMM (Marlin pattern)
+6. ✅ **Dispatch**: `ops/linear.rs` TQ path before INT quant dispatch
+7. **Future**: Fused Tensor Core MMA kernel for higher prefill throughput
 
-### Phase 3: Fused Decode Attention (optimization PR)
+### Phase 3: Fused Decode Attention ✅
 
-1. **Fused kernel**: `turboquant_fused_decode_attention` (§4.3)
-2. **Q rotation**: Moved to per-layer pre-attention step
-3. **Benchmark**: vs INT8 fused-dequant on long-context workloads
+1. ✅ **Fused kernel**: `tq_decode_attention_cuda` — score from packed K, no dequant
+2. ✅ **Q rotation**: `tq_rotate_query_cuda` — sign flip + FWHT per-layer
+3. ✅ **Wired into all 3 models**: Qwen3, Qwen3.5, GLM4
 
 ---
 
