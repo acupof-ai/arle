@@ -594,6 +594,90 @@ pub fn compile_clear_cache() {
     }
 }
 
+// ── Compile ──────────────────────────────────────────────────────────────────
+
+/// A compiled MLX closure — wraps `mlx_closure` with RAII.
+pub struct CompiledFn(mlx_sys::mlx_closure);
+
+impl Drop for CompiledFn {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_closure_free(self.0);
+        }
+    }
+}
+
+// SAFETY: MLX closures are thread-safe (same as Arrays).
+unsafe impl Send for CompiledFn {}
+unsafe impl Sync for CompiledFn {}
+
+impl CompiledFn {
+    /// Call the compiled function: `inputs → outputs`.
+    pub fn call(&self, inputs: &[&MlxArray]) -> Vec<MlxArray> {
+        let raw_in: Vec<mlx_array> = inputs.iter().map(|a| a.0).collect();
+        let in_vec = unsafe { mlx_sys::mlx_vector_array_new_data(raw_in.as_ptr(), raw_in.len()) };
+        let mut out_vec = unsafe { mlx_sys::mlx_vector_array_new() };
+        unsafe {
+            mlx_sys::mlx_closure_apply(&mut out_vec, self.0, in_vec);
+            mlx_sys::mlx_vector_array_free(in_vec);
+        }
+        // Extract output arrays.
+        let n = unsafe { mlx_sys::mlx_vector_array_size(out_vec) };
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut arr = unsafe { mlx_sys::mlx_array_new() };
+            unsafe {
+                mlx_sys::mlx_vector_array_get(&mut arr, out_vec, i);
+            }
+            results.push(MlxArray(arr));
+        }
+        unsafe {
+            mlx_sys::mlx_vector_array_free(out_vec);
+        }
+        results
+    }
+}
+
+/// Compile a function `fn(vector_array) -> vector_array` with optional shapeless mode.
+///
+/// The callback `f` receives `(result_out, inputs, payload)`. It must populate
+/// `result_out` with the output vector_array and return 0 on success.
+///
+/// `payload` is an opaque pointer passed to every call (e.g. weights).
+/// `dtor` is called when the closure is freed.
+pub fn compile_fn(
+    f: unsafe extern "C" fn(
+        *mut mlx_sys::mlx_vector_array,
+        mlx_sys::mlx_vector_array,
+        *mut std::os::raw::c_void,
+    ) -> c_int,
+    payload: *mut std::os::raw::c_void,
+    dtor: Option<unsafe extern "C" fn(*mut std::os::raw::c_void)>,
+    shapeless: bool,
+) -> CompiledFn {
+    unsafe {
+        let closure = mlx_sys::mlx_closure_new_func_payload(Some(f), payload, dtor);
+        let mut compiled = mlx_sys::mlx_closure_new();
+        mlx_sys::mlx_compile(&mut compiled, closure, shapeless);
+        mlx_sys::mlx_closure_free(closure); // original closure no longer needed
+        CompiledFn(compiled)
+    }
+}
+
+/// Compile a simple function (no payload) with shapeless mode.
+pub fn compile_simple(
+    f: unsafe extern "C" fn(*mut mlx_sys::mlx_vector_array, mlx_sys::mlx_vector_array) -> c_int,
+    shapeless: bool,
+) -> CompiledFn {
+    unsafe {
+        let closure = mlx_sys::mlx_closure_new_func(Some(f));
+        let mut compiled = mlx_sys::mlx_closure_new();
+        mlx_sys::mlx_compile(&mut compiled, closure, shapeless);
+        mlx_sys::mlx_closure_free(closure);
+        CompiledFn(compiled)
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
