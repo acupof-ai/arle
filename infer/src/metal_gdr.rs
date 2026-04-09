@@ -474,7 +474,7 @@ fn metal_gdr_kernel_step(
     let y_shape = [b, t, hv, dv];
     let state_shape = [b, hv, dv, dk];
 
-    let t_arr = MlxArray::from_slice_i32(&[t], &[1]);
+    let t_arr = MlxArray::scalar_i32(t);
 
     let results = GDR_METAL_KERNEL.apply(
         &[q, k, v, g, beta, state, &t_arr],
@@ -665,9 +665,10 @@ pub fn metal_gdr_decode_step(
     // beta = sigmoid(beta_raw)
     let beta = sigmoid(&beta_1d);
 
-    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+    // Metal kernel is the default (matches mlx_lm). Disable with env var = "0".
+    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
-        .is_some_and(|v| v == "1");
+        .is_some_and(|v| v == "0");
 
     // ── 5–6. State update ─────────────────────────────────────────────
     let heads_per_key = num_value_heads / num_key_heads;
