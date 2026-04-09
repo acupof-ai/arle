@@ -3,7 +3,7 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use crate::mlx::{
-    self, Dtype, MlxArray, add, as_dtype, multiply, reshape, rms_norm, rope,
+    self, Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
     zeros,
 };
@@ -18,6 +18,41 @@ use crate::{
     metal_gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step},
     sampler::SamplingParams,
 };
+
+// ── Compiled SwiGLU ─────────────────────────────────────────────────────────
+// silu(gate) * up → single compiled Metal kernel. Saves 1 dispatch per layer.
+
+static COMPILED_SWIGLU: std::sync::LazyLock<crate::mlx::CompiledFn> =
+    std::sync::LazyLock::new(|| crate::mlx::compile_simple(swiglu_callback, true));
+
+unsafe extern "C" fn swiglu_callback(
+    res: *mut mlx_sys::mlx_vector_array,
+    inputs: mlx_sys::mlx_vector_array,
+) -> std::os::raw::c_int {
+    let mut gate_h = mlx_sys::mlx_array_new();
+    let mut up_h = mlx_sys::mlx_array_new();
+    mlx_sys::mlx_vector_array_get(&mut gate_h, inputs, 0);
+    mlx_sys::mlx_vector_array_get(&mut up_h, inputs, 1);
+    let gate = MlxArray::from_raw(gate_h);
+    let up = MlxArray::from_raw(up_h);
+
+    let result = multiply(&silu(&gate), &up);
+
+    let out = mlx_sys::mlx_vector_array_new_data(&result.as_raw(), 1);
+    mlx_sys::mlx_vector_array_set(res, out);
+    mlx_sys::mlx_vector_array_free(out);
+    std::mem::forget(gate);
+    std::mem::forget(up);
+    0
+}
+
+fn compiled_swiglu(gate: &MlxArray, up: &MlxArray) -> MlxArray {
+    COMPILED_SWIGLU
+        .call(&[gate, up])
+        .into_iter()
+        .next()
+        .expect("swiglu should return 1 array")
+}
 
 pub(super) struct MetalQwen35FullAttentionWeights {
     pub(super) q_proj: WeightTensor,
@@ -111,14 +146,13 @@ pub(super) fn metal_generate_qwen35(
         recurrent.seq_len = cache_len as usize;
     }
 
-    let mut logits = logits.context("Qwen3.5 prompt produced no logits")?;
+    let logits = logits.context("Qwen3.5 prompt produced no logits")?;
     let mut generated = Vec::new();
     let mut ttft_ms = 0.0;
 
-    // Synchronous decode — GDR recurrent state has step-to-step data
-    // dependencies. mlx_lm handles this via Python reference-captured cache
-    // that stays in the lazy graph; our Rust path replaces MlxArray handles
-    // each step, breaking graph continuity.
+    let mut logits = logits;
+    let mut generated_count = 0usize;
+
     let finish_reason = loop {
         let next_token = gpu_sample_token(&logits, params)?.item_i32() as u32;
 
@@ -255,8 +289,8 @@ fn qwen35_forward_step(
         let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
         let gate_raw = as_dtype(&gate_raw, Dtype::Bfloat16);
         let up = as_dtype(&up, Dtype::Bfloat16);
-        let gate = silu(&gate_raw);
-        let fused_val = as_dtype(&multiply(&gate, &up), Dtype::Bfloat16);
+        // Compiled SwiGLU: silu(gate) * up → single compiled kernel dispatch.
+        let fused_val = as_dtype(&compiled_swiglu(&gate_raw, &up), Dtype::Bfloat16);
         let mlp = as_dtype(&linear(&fused_val, &layer.down_proj), Dtype::Bfloat16);
         x = add(&residual2, &mlp);
     }
@@ -681,11 +715,42 @@ pub(super) fn load_qwen35_metal_weights(
             }
             MetalQwen35LayerType::LinearAttention => {
                 let attn_prefix = format!("{layer_prefix}.linear_attn");
+                let qkv_proj = load_proj(&format!("{attn_prefix}.in_proj_qkv"))?;
+                let z_proj = load_proj(&format!("{attn_prefix}.in_proj_z"))?;
+                let beta_proj = load_proj(&format!("{attn_prefix}.in_proj_b"))?;
+                let alpha_proj = load_proj(&format!("{attn_prefix}.in_proj_a"))?;
+                let qkv_dim = qkv_proj.output_dim()?;
+                let z_dim = z_proj.output_dim()?;
+                let beta_dim = beta_proj.output_dim()?;
+
+                // Merge QKV+Z → single matmul (saves 1 dispatch per layer)
+                let in_proj_qkvz = merge_quantized_projection_rows(&[&qkv_proj, &z_proj])?
+                    .unwrap_or_else(|| {
+                        // Dense fallback: concatenate transposed weights
+                        let (WeightTensor::Dense(qkv_t), WeightTensor::Dense(z_t)) =
+                            (&qkv_proj, &z_proj)
+                        else {
+                            panic!("mixed dense/quantized QKV+Z projections not supported");
+                        };
+                        WeightTensor::Dense(concatenate_axis(&[qkv_t.clone(), z_t.clone()], 1))
+                    });
+
+                // Merge Beta+Alpha → single matmul (saves 1 dispatch per layer)
+                let in_proj_ba = merge_quantized_projection_rows(&[&beta_proj, &alpha_proj])?
+                    .unwrap_or_else(|| {
+                        let (WeightTensor::Dense(b_t), WeightTensor::Dense(a_t)) =
+                            (&beta_proj, &alpha_proj)
+                        else {
+                            panic!("mixed dense/quantized beta+alpha projections not supported");
+                        };
+                        WeightTensor::Dense(concatenate_axis(&[b_t.clone(), a_t.clone()], 1))
+                    });
+
                 MetalQwen35Attention::Linear(MetalLinearAttnWeights {
-                    in_proj_qkv: load_proj(&format!("{attn_prefix}.in_proj_qkv"))?,
-                    in_proj_z: load_proj(&format!("{attn_prefix}.in_proj_z"))?,
-                    in_proj_beta: load_proj(&format!("{attn_prefix}.in_proj_b"))?,
-                    in_proj_alpha: load_proj(&format!("{attn_prefix}.in_proj_a"))?,
+                    in_proj_qkvz,
+                    in_proj_ba,
+                    qkvz_split: (qkv_dim, z_dim),
+                    ba_num_heads: beta_dim,
                     conv1d_weight: load_conv1d_weight(
                         &get(&format!("{attn_prefix}.conv1d.weight"))?,
                         &arch.linear,

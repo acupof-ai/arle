@@ -478,6 +478,30 @@ pub fn quantized_matmul(
     MlxArray(res)
 }
 
+/// Depthwise conv1d: input[batch, seq, channels], weight[out, kernel, 1] for groups=out.
+pub fn conv1d(
+    input: &MlxArray,
+    weight: &MlxArray,
+    stride: i32,
+    padding: i32,
+    groups: i32,
+) -> MlxArray {
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    unsafe {
+        mlx_sys::mlx_conv1d(
+            &mut res,
+            input.0,
+            weight.0,
+            stride,
+            padding,
+            1, /*dilation*/
+            groups,
+            default_stream(),
+        );
+    }
+    MlxArray(res)
+}
+
 // ── Fast ops ─────────────────────────────────────────────────────────────────
 
 pub fn rms_norm(x: &MlxArray, weight: &MlxArray, eps: f32) -> MlxArray {
