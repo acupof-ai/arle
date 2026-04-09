@@ -228,6 +228,15 @@ unsafe extern "C" {
         lm_gs: i32,
         lm_bits: i32,
     );
+    /// Set quantized embed weights for as_linear lm_head (tie_word_embeddings).
+    pub fn qwen35_compiled_set_embed_as_linear(
+        model: *mut std::ffi::c_void,
+        w: *mut mlx_array,
+        s: *mut mlx_array,
+        b: *mut mlx_array,
+        gs: i32,
+        bits: i32,
+    );
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_push_full_attn(
         model: *mut std::ffi::c_void,

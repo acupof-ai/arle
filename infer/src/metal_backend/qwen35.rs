@@ -49,6 +49,9 @@ pub(super) struct Qwen35MetalWeights {
     pub(super) layers: Vec<MetalQwen35BlockWeights>,
     pub(super) norm: MlxArray,
     pub(super) lm_head: WeightTensor,
+    /// Quantized embed weights for as_linear lm_head (when tied).
+    /// Avoids 1.2GB dense matmul — uses 0.3GB quantized_matmul instead.
+    pub(super) embed_quantized: Option<WeightTensor>,
     /// Optional C++ forward model handle. Eliminates most per-op FFI overhead.
     pub(super) cpp_model: Option<CppQwen35Model>,
 }
@@ -124,6 +127,25 @@ impl CppQwen35Model {
                 lm_gs,
                 lm_bits,
             );
+            // Set quantized embed for as_linear lm_head (avoids 1.2GB dense matmul)
+            if let Some(WeightTensor::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            }) = &weights.embed_quantized
+            {
+                mlx_sys::qwen35_compiled_set_embed_as_linear(
+                    model,
+                    w.as_raw(),
+                    scales.as_raw(),
+                    biases.as_raw(),
+                    *group_size,
+                    *bits,
+                );
+                log::info!("  using quantized lm_head (as_linear) — saves ~7.5ms/step");
+            }
         }
 
         // Layers
@@ -988,6 +1010,12 @@ pub(super) fn load_qwen35_metal_weights(
 
     let embed_base = format!("{prefix}.embed_tokens");
     let embed_tokens = load_embed_tokens_from_tensors(&tensors, &embed_base, config.quantization)?;
+    // Also load quantized embed for as_linear lm_head (avoids 1.2GB dense matmul)
+    let embed_quantized = if config.quantization.is_some() {
+        load_proj_from_tensors(&tensors, &embed_base, config.quantization).ok()
+    } else {
+        None
+    };
     let norm = get(&format!("{prefix}.norm.weight"))?;
     let lm_head = load_lm_head(
         &tensors,
@@ -1125,6 +1153,7 @@ pub(super) fn load_qwen35_metal_weights(
         layers,
         norm,
         lm_head,
+        embed_quantized,
         cpp_model: None,
     };
 
