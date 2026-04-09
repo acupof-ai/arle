@@ -853,7 +853,9 @@ fn main() {
                     }
                     build.compile("metal_fused_ops");
                     println!("cargo:rustc-cfg=metal_fused_ops");
-                    println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
+                    // C++ GDR block is slower than Rust path (36 vs 45 tok/s).
+                    // Needs profiling. Keeping Rust + Metal kernel path.
+                    // println!("cargo:rustc-cfg=metal_qwen35_fused_ops");
 
                     // Pure C API fused block (no C++ ABI issues).
                     println!("cargo:rerun-if-changed=csrc/metal/metal_fused_capi.cpp");

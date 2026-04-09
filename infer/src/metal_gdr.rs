@@ -665,10 +665,12 @@ pub fn metal_gdr_decode_step(
     // beta = sigmoid(beta_raw)
     let beta = sigmoid(&beta_1d);
 
-    // Metal kernel is the default (matches mlx_lm). Disable with env var = "0".
-    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+    // Metal kernel disabled by default — crashes on longer sequences (>~50 tokens).
+    // The kernel works for short sequences; needs state transposition debugging.
+    // Enable with AGENT_INFER_GDR_METAL_KERNEL=1.
+    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
-        .is_some_and(|v| v == "0");
+        .is_some_and(|v| v == "1");
 
     // ── 5–6. State update ─────────────────────────────────────────────
     let heads_per_key = num_value_heads / num_key_heads;
