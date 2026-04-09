@@ -14,7 +14,12 @@ use crate::sampler::SamplingParams;
 /// Implementors load model weights once, then answer repeated `generate` calls.
 /// For multi-request batching use the [`crate::scheduler::Scheduler`] on top
 /// of the CUDA path; the Metal backend currently supports one request at a time.
-pub trait InferenceBackend: Send + Sync {
+///
+/// Backends must be movable across threads (`Send`) because runtimes may hand
+/// ownership to a dedicated worker thread. They are not required to be `Sync`:
+/// concurrency, if any, should be introduced by the runtime on top, not by
+/// sharing one backend instance across threads.
+pub trait InferenceBackend: Send {
     /// Load model weights and tokenizer from `model_path` (a local directory
     /// containing `config.json`, `tokenizer.json`, and `.safetensors` files).
     ///

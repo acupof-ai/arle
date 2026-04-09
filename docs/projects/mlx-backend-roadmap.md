@@ -4,7 +4,7 @@
 
 Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 
-- `MetalBackend` 已接通 Qwen3 / Qwen3.5 的真实加载和生成路径
+- `MetalBackend` 已通过 `mlx-sys` + C++ bridge 接通 Qwen3 / Qwen3.5 的真实加载和生成路径
 - `metal_serve` 可以直接提供 OpenAI 兼容 HTTP 服务
 - `metal_bench` 可以保存/比较 baseline，并做本地性能回归
 

@@ -28,6 +28,7 @@ pub(super) struct CompletionRequest {
     pub(super) ignore_eos: Option<bool>,
     pub(super) seed: Option<u64>,
     /// Return per-token logprobs. If set to a number > 0, returns logprobs.
+    #[allow(dead_code)]
     pub(super) logprobs: Option<u32>,
 }
 

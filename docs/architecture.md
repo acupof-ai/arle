@@ -186,7 +186,7 @@ infer/src/
 │   ├── backend.rs         ← InferenceBackend trait (load/generate)
 │   ├── metal_backend.rs   ← MetalBackend impl (InferenceBackend)
 │   │                          depends on: backend, tokenizer, hf_hub, sampler
-│   │                          [feature=metal]: mlx-rs
+│   │                          [feature=metal]: mlx-sys + C++ bridge
 │   ├── sampler.rs         ← SamplingParams struct (pure Rust)
 │   ├── tokenizer.rs       ← Tokenizer wrapper (tokenizers crate)
 │   ├── chat.rs            ← ChatML message formatting
@@ -305,7 +305,7 @@ Common prefix = [A B C D] (len=4)
     │  Feature: "cuda"   │              │  - tokenizer: Tokenizer    │
     │  Deps: cudarc,     │              │  - config: MetalModelConfig│
     │         memmap2    │              │  - weights: MetalWeights   │
-    │                    │              │    (mlx-rs Arrays in       │
+    │                    │              │    (MlxArray tensors in    │
     │  Supports:         │              │     unified memory)        │
     │  - Multi-request   │              │                            │
     │    Scheduler       │              │  Implements:               │
@@ -341,7 +341,7 @@ pub mod backend;                  // ← Trait definition, always compiled
 
 // In metal_backend.rs:
 #[cfg(feature = "metal")]
-use mlx_rs::Array;                // ← mlx-rs only when feature active
+use crate::mlx::MlxArray;         // ← mlx-sys wrappers only when feature active
 
 pub struct MetalBackend {
     #[cfg(feature = "metal")]
@@ -585,7 +585,7 @@ Every decode step with B active requests:
 | `http_server.rs` | Axum router: OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, SSE |
 | `http_server/openai_v1.rs` | OpenAI API request/response JSON types |
 | `backend.rs` | `InferenceBackend` trait — backend-agnostic single-request interface |
-| `metal_backend.rs` | Apple Silicon Metal backend via mlx-rs; implements `InferenceBackend` and `StreamingInferenceBackend` |
+| `metal_backend.rs` | Apple Silicon Metal backend via `mlx-sys` + C++ bridge; implements `InferenceBackend` and `StreamingInferenceBackend` |
 | `sampler.rs` | `SamplingParams` struct (temperature, top-k/p, min-p, penalties, EOS) |
 | `tokenizer.rs` | Tokenizer wrapper (HuggingFace `tokenizers` crate) with incremental decoding |
 | `chat.rs` | ChatML message formatting and tool definition injection |
@@ -706,7 +706,7 @@ Every decode step with B active requests:
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
-| Metal backend (Apple Silicon, mlx-rs) | ✅ (single-request + serial HTTP runtime) |
+| Metal backend (Apple Silicon, `mlx-sys` bridge) | ✅ (single-request + serial HTTP runtime) |
 | Benchmark suite (throughput, agent, multi-request) | ✅ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |

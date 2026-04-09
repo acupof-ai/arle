@@ -19,13 +19,35 @@ static inline void mlx_set_error(const std::string& msg) { g_mlx_last_error = ms
 
 // Macro for wrapping functions that return mlx_array* — catches C++ exceptions
 // and returns nullptr + sets thread-local error.
-#define MLX_TRY_RETURN(expr) \
+#define MLX_TRY_RETURN(...) \
     try { \
         mlx_clear_error(); \
-        return (expr); \
+        return (__VA_ARGS__); \
     } catch (const std::exception& e) { \
         mlx_set_error(e.what()); \
         return nullptr; \
+    }
+
+// Macro for wrapping functions that return scalars / non-array pointers and
+// should fall back to a sentinel value on failure.
+#define MLX_TRY_RETURN_VALUE(default_value, ...) \
+    try { \
+        mlx_clear_error(); \
+        return (__VA_ARGS__); \
+    } catch (const std::exception& e) { \
+        mlx_set_error(e.what()); \
+        return (default_value); \
+    }
+
+// Macro for wrapping void-returning functions so exceptions never cross the C ABI.
+#define MLX_TRY_VOID(...) \
+    try { \
+        mlx_clear_error(); \
+        __VA_ARGS__; \
+        return; \
+    } catch (const std::exception& e) { \
+        mlx_set_error(e.what()); \
+        return; \
     }
 // Shape = mlx::core::Shape (SmallVector<int> in v0.31+)
 

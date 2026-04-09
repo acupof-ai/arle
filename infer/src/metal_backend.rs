@@ -62,13 +62,10 @@ use loader::{
 #[cfg(feature = "metal")]
 use qwen35::{Qwen35MetalWeights, load_qwen35_metal_weights, metal_generate_qwen35};
 
-// NOTE: The C++ fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were
-// removed — they were gated on `not_currently_available` and dead since the
-// mlx-sys v0.3 migration.  The C++ source files are kept in csrc/metal/ for
-// reference if the fused path is revived.
-
-#[cfg(feature = "metal")]
-const METAL_FUSED_OPS_AVAILABLE: bool = cfg!(metal_fused_ops);
+// NOTE: The legacy fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were
+// removed during the mlx-sys migration. Qwen3 now runs on the maintained
+// Rust/MLX path; Qwen3.5 optionally uses the dedicated C++ step model in
+// `qwen35.rs`.
 
 /// Apple Silicon Metal inference backend.
 ///
@@ -82,7 +79,7 @@ pub struct MetalBackend {
     /// Loaded model configuration.
     config: Option<MetalModelConfig>,
     /// Weight tensors — resident in Metal unified memory.
-    // GPU required: populated in `load()` via mlx-rs.
+    // GPU required: populated in `load()` via mlx-sys-backed MLX tensors.
     #[cfg(feature = "metal")]
     weights: Option<MetalWeights>,
     #[cfg(not(feature = "metal"))]
@@ -124,20 +121,6 @@ impl WeightTensor {
         }
     }
 
-    /// Returns the quantized weight components, or `None` if this is a dense weight.
-    fn quantized_parts(&self) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32)> {
-        match self {
-            WeightTensor::Quantized {
-                w,
-                scales,
-                biases,
-                group_size,
-                bits,
-            } => Some((w, scales, biases, *group_size, *bits)),
-            WeightTensor::Dense(_) => None,
-        }
-    }
-
     /// Logical output width of the projection.
     ///
     /// Dense tensors are stored transposed as `[in, out]`; quantized tensors
@@ -164,7 +147,7 @@ impl WeightTensor {
 /// Attention input projections for one transformer layer.
 #[cfg(feature = "metal")]
 pub enum AttentionInputProjection {
-    /// Dense/non-merged path. Required by the fused C++ block path.
+    /// Dense/non-merged path.
     Split {
         q_proj: WeightTensor,
         k_proj: WeightTensor,
@@ -185,50 +168,6 @@ impl AttentionInputProjection {
         match self {
             Self::Split { k_proj, .. } => k_proj.dtype(),
             Self::MergedQuantized { qkv_proj, .. } => qkv_proj.dtype(),
-        }
-    }
-
-    fn fused_dense_parts(&self) -> Option<(&MlxArray, &MlxArray, &MlxArray)> {
-        match self {
-            Self::Split {
-                q_proj: WeightTensor::Dense(q_proj_t),
-                k_proj: WeightTensor::Dense(k_proj_t),
-                v_proj: WeightTensor::Dense(v_proj_t),
-            } => Some((q_proj_t, k_proj_t, v_proj_t)),
-            _ => None,
-        }
-    }
-
-    /// Returns the merged quantized QKV weight components plus split dimensions,
-    /// or `None` if the projection is not `MergedQuantized`.
-    #[allow(clippy::type_complexity)]
-    fn fused_quantized_parts(
-        &self,
-    ) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32, i32, i32, i32)> {
-        match self {
-            Self::MergedQuantized {
-                qkv_proj:
-                    WeightTensor::Quantized {
-                        w,
-                        scales,
-                        biases,
-                        group_size,
-                        bits,
-                    },
-                q_dim,
-                k_dim,
-                v_dim,
-            } => Some((
-                w,
-                scales,
-                biases,
-                *q_dim,
-                *k_dim,
-                *v_dim,
-                *group_size,
-                *bits,
-            )),
-            _ => None,
         }
     }
 
@@ -266,7 +205,7 @@ impl AttentionInputProjection {
 /// MLP input projections for one transformer layer.
 #[cfg(feature = "metal")]
 pub enum MlpInputProjection {
-    /// Dense/non-merged path, preserving the fused dense block assumptions.
+    /// Dense/non-merged path.
     Split {
         gate_proj: WeightTensor,
         up_proj: WeightTensor,
@@ -281,39 +220,6 @@ pub enum MlpInputProjection {
 
 #[cfg(feature = "metal")]
 impl MlpInputProjection {
-    fn fused_dense_parts(&self) -> Option<(&MlxArray, &MlxArray)> {
-        match self {
-            Self::Split {
-                gate_proj: WeightTensor::Dense(gate_proj_t),
-                up_proj: WeightTensor::Dense(up_proj_t),
-            } => Some((gate_proj_t, up_proj_t)),
-            _ => None,
-        }
-    }
-
-    /// Returns the merged quantized gate+up weight components plus split dimensions,
-    /// or `None` if the projection is not `MergedQuantized`.
-    #[allow(clippy::type_complexity)]
-    fn fused_quantized_parts(
-        &self,
-    ) -> Option<(&MlxArray, &MlxArray, &MlxArray, i32, i32, i32, i32)> {
-        match self {
-            Self::MergedQuantized {
-                gate_up_proj:
-                    WeightTensor::Quantized {
-                        w,
-                        scales,
-                        biases,
-                        group_size,
-                        bits,
-                    },
-                gate_dim,
-                up_dim,
-            } => Some((w, scales, biases, *gate_dim, *up_dim, *group_size, *bits)),
-            _ => None,
-        }
-    }
-
     fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray) {
         use crate::mlx::slice;
 
@@ -551,8 +457,6 @@ impl Default for MetalBackend {
 // scheduler ensures exclusive access). No concurrent mutation occurs.
 #[cfg(feature = "metal")]
 unsafe impl Send for MetalBackend {}
-#[cfg(feature = "metal")]
-unsafe impl Sync for MetalBackend {}
 
 impl InferenceBackend for MetalBackend {
     fn name(&self) -> &'static str {
@@ -678,16 +582,10 @@ impl StreamingInferenceBackend for MetalBackend {
 ///
 /// Optimisations applied:
 /// - **P1**: Dense weights are pre-transposed at load time (no per-step transpose).
-/// - **P2**: Full transformer block is one C++ FFI call (`metal_fused_block_cached`
-///   for dense, `metal_quantized_fused_block_cached` for quantized models),
-///   eliminating ~40 mlx-rs round-trips per layer. Falls back to the Rust
-///   path for mixed dense/quantized models.
 /// - **P3/P6**: async_eval double-buffering: GPU computes step N while CPU processes
 ///   step N-1's token. Graph construction (CPU-only) overlaps GPU execution.
 /// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
 /// - **P5**: KV cache grows in 256-token chunks; `metal_clear_cache()` every 256 steps.
-/// - **P7**: Fused path keeps all intermediates in C++ scope; Rust holds only
-///   per-layer input/output `MlxArray` handles.
 // P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -695,25 +593,6 @@ const KV_CACHE_CHUNK: i32 = 256;
 const METAL_KV_POOL_REQUEST_ID: usize = 0;
 
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
-
-/// Which fused C++ path to use for transformer layers.
-///
-/// TODO: dead code — `Dense` and `Quantized` are unreachable because
-/// `METAL_FUSED_OPS_AVAILABLE` is always `false` (the `metal_fused_ops` cfg
-/// is never emitted since the mlx-sys v0.3 migration). Only `Fallback` is
-/// ever selected. Remove the dead variants and simplify `build_forward_graph`
-/// when confirmed unused.
-#[cfg(feature = "metal")]
-#[derive(Clone, Copy)]
-enum FusedPathMode {
-    /// All weights are dense — use the dense fused C++ block.
-    Dense,
-    /// All weights are quantized with matching group_size/bits — use the
-    /// quantized fused C++ block.
-    Quantized,
-    /// Mixed or fused ops unavailable — fall back to Rust/MLX per-op path.
-    Fallback,
-}
 
 #[cfg(feature = "metal")]
 struct MetalGenerateOutput {
@@ -803,44 +682,11 @@ fn metal_generate(
     let rope_base = config.rope_theta as f32;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
     let use_kv_pool = metal_kv_pool_enabled();
+    validate_metal_sampling_params(params)?;
 
-    let all_dense = weights.layers.iter().all(|layer| {
-        layer.attention_inputs.fused_dense_parts().is_some()
-            && layer.mlp_inputs.fused_dense_parts().is_some()
-            && matches!(&layer.o_proj, WeightTensor::Dense(_))
-            && matches!(&layer.down_proj, WeightTensor::Dense(_))
-    });
-    let all_quantized = weights.layers.iter().all(|layer| {
-        layer.attention_inputs.fused_quantized_parts().is_some()
-            && layer.mlp_inputs.fused_quantized_parts().is_some()
-            && layer.o_proj.quantized_parts().is_some()
-            && layer.down_proj.quantized_parts().is_some()
-    });
-
-    // Prefer C++ fused > C API fused > quantized fused > Rust fallback.
-    let fused_mode = if METAL_FUSED_OPS_AVAILABLE && all_dense {
-        FusedPathMode::Dense
-    } else if METAL_FUSED_OPS_AVAILABLE && all_quantized {
-        FusedPathMode::Quantized
-    } else {
-        FusedPathMode::Fallback
-    };
-
-    let fused_mode = if use_kv_pool {
-        FusedPathMode::Fallback
-    } else {
-        fused_mode
-    };
-
-    match fused_mode {
-        FusedPathMode::Dense => log::info!("Metal fused path: Dense"),
-        FusedPathMode::Quantized => log::info!("Metal fused path: Quantized"),
-        FusedPathMode::Fallback => log::info!("Metal fused path: Fallback (Rust)"),
-    }
+    log::info!("Metal transformer path: Rust/MLX");
     if use_kv_pool {
-        log::info!(
-            "MetalKVPool enabled via AGENT_INFER_METAL_KV_POOL=1; forcing fallback Rust path"
-        );
+        log::info!("MetalKVPool enabled via AGENT_INFER_METAL_KV_POOL=1");
     }
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
@@ -896,7 +742,6 @@ fn metal_generate(
         attn_scale,
         rope_base,
         eps,
-        fused_mode,
         kv_pool.as_mut(),
         METAL_KV_POOL_REQUEST_ID,
         params,
@@ -963,7 +808,6 @@ fn metal_generate(
             attn_scale,
             rope_base,
             eps,
-            fused_mode,
             kv_pool.as_mut(),
             METAL_KV_POOL_REQUEST_ID,
             params,
@@ -1043,7 +887,6 @@ fn build_forward_graph(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
-    fused_mode: FusedPathMode,
     mut metal_kv_pool: Option<&mut MetalKVPool>,
     request_id: usize,
     params: &SamplingParams,
@@ -1062,124 +905,24 @@ fn build_forward_graph(
     let mut x = take_axis(&weights.embed_tokens, &idx_arr, 0);
 
     // ── Transformer layers ────────────────────────────────────────────────────
-    match fused_mode {
-        FusedPathMode::Dense => {
-            for (li, layer) in weights.layers.iter().enumerate() {
-                let (q_proj_t, k_proj_t, v_proj_t) = layer
-                    .attention_inputs
-                    .fused_dense_parts()
-                    .expect("FusedPathMode::Dense only when attention inputs are Dense");
-                let (gate_proj_t, up_proj_t) = layer
-                    .mlp_inputs
-                    .fused_dense_parts()
-                    .expect("FusedPathMode::Dense only when mlp inputs are Dense");
-                let WeightTensor::Dense(o_proj_t) = &layer.o_proj else {
-                    unreachable!("FusedPathMode::Dense only when o_proj is Dense")
-                };
-                let WeightTensor::Dense(down_proj_t) = &layer.down_proj else {
-                    unreachable!("FusedPathMode::Dense only when down_proj is Dense")
-                };
-
-                x = fused_transformer_layer(
-                    &x,
-                    layer,
-                    q_proj_t,
-                    k_proj_t,
-                    v_proj_t,
-                    o_proj_t,
-                    gate_proj_t,
-                    up_proj_t,
-                    down_proj_t,
-                    &mut k_caches[li],
-                    &mut v_caches[li],
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    attn_scale,
-                    rope_base,
-                    eps,
-                    cache_len,
-                    seq,
-                )?;
-            }
-        }
-        FusedPathMode::Quantized => {
-            for (li, layer) in weights.layers.iter().enumerate() {
-                let (qkv_w, qkv_scales, qkv_biases, q_dim, k_dim, v_dim, group_size, bits) =
-                    layer.attention_inputs.fused_quantized_parts().expect(
-                        "FusedPathMode::Quantized only when attention inputs are MergedQuantized",
-                    );
-                let (gate_up_w, gate_up_scales, gate_up_biases, gate_dim, up_dim, gs2, b2) = layer
-                    .mlp_inputs
-                    .fused_quantized_parts()
-                    .expect("FusedPathMode::Quantized only when mlp inputs are MergedQuantized");
-                debug_assert_eq!(group_size, gs2, "group_size mismatch between attn and mlp");
-                debug_assert_eq!(bits, b2, "bits mismatch between attn and mlp");
-                let (o_w, o_scales, o_biases, _, _) = layer
-                    .o_proj
-                    .quantized_parts()
-                    .expect("FusedPathMode::Quantized only when o_proj is Quantized");
-                let (down_w, down_scales, down_biases, _, _) = layer
-                    .down_proj
-                    .quantized_parts()
-                    .expect("FusedPathMode::Quantized only when down_proj is Quantized");
-
-                x = quantized_fused_transformer_layer(
-                    &x,
-                    layer,
-                    qkv_w,
-                    qkv_scales,
-                    qkv_biases,
-                    o_w,
-                    o_scales,
-                    o_biases,
-                    gate_up_w,
-                    gate_up_scales,
-                    gate_up_biases,
-                    down_w,
-                    down_scales,
-                    down_biases,
-                    group_size,
-                    bits,
-                    q_dim,
-                    k_dim,
-                    v_dim,
-                    gate_dim,
-                    up_dim,
-                    &mut k_caches[li],
-                    &mut v_caches[li],
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    attn_scale,
-                    rope_base,
-                    eps,
-                    cache_len,
-                    seq,
-                )?;
-            }
-        }
-        FusedPathMode::Fallback => {
-            for (li, layer) in weights.layers.iter().enumerate() {
-                x = rust_transformer_layer(
-                    x,
-                    layer,
-                    li,
-                    k_caches,
-                    v_caches,
-                    seq,
-                    cache_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    attn_scale,
-                    rope_base,
-                    eps,
-                    metal_kv_pool.as_deref_mut(),
-                    request_id,
-                )?;
-            }
-        }
+    for (li, layer) in weights.layers.iter().enumerate() {
+        x = rust_transformer_layer(
+            x,
+            layer,
+            li,
+            k_caches,
+            v_caches,
+            seq,
+            cache_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            attn_scale,
+            rope_base,
+            eps,
+            metal_kv_pool.as_deref_mut(),
+            request_id,
+        )?;
     }
 
     // ── Final norm + lm_head ─────────────────────────────────────────────────
@@ -1190,80 +933,6 @@ fn build_forward_graph(
 
     // P4: GPU-side sampling — stays on GPU, only scalar crosses on .item() later.
     gpu_sample_token(&logits, params)
-}
-
-// TODO: dead code — fused_transformer_layer is unreachable because
-// metal_fused_ops cfg is never emitted (disabled since mlx-sys v0.3 migration).
-// The real implementation (calling metal_ffi::metal_fused_block_cached) was
-// removed along with the metal_ffi FFI module. Remove this stub and its
-// FusedPathMode::Dense match arm when confirmed unused.
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
-#[allow(clippy::too_many_arguments)]
-fn fused_transformer_layer(
-    _x: &MlxArray,
-    _layer: &StandardMetalLayerWeights,
-    _q_proj_t: &MlxArray,
-    _k_proj_t: &MlxArray,
-    _v_proj_t: &MlxArray,
-    _o_proj_t: &MlxArray,
-    _gate_proj_t: &MlxArray,
-    _up_proj_t: &MlxArray,
-    _down_proj_t: &MlxArray,
-    _k_cache: &mut MlxArray,
-    _v_cache: &mut MlxArray,
-    _n_heads: i32,
-    _n_kv_heads: i32,
-    _head_dim: i32,
-    _attn_scale: f32,
-    _rope_base: f32,
-    _eps: f32,
-    _cache_len: i32,
-    _seq: i32,
-) -> Result<MlxArray> {
-    unreachable!("fused transformer path requires metal_fused_ops")
-}
-
-// TODO: dead code — quantized_fused_transformer_layer is unreachable because
-// metal_fused_ops cfg is never emitted (disabled since mlx-sys v0.3 migration).
-// The real implementation (calling metal_ffi::metal_quantized_fused_block_cached)
-// was removed along with the metal_ffi FFI module. Remove this stub and its
-// FusedPathMode::Quantized match arm when confirmed unused.
-#[cfg(all(feature = "metal", not(metal_fused_ops)))]
-#[allow(clippy::too_many_arguments)]
-fn quantized_fused_transformer_layer(
-    _x: &MlxArray,
-    _layer: &StandardMetalLayerWeights,
-    _qkv_w: &MlxArray,
-    _qkv_scales: &MlxArray,
-    _qkv_biases: &MlxArray,
-    _o_w: &MlxArray,
-    _o_scales: &MlxArray,
-    _o_biases: &MlxArray,
-    _gate_up_w: &MlxArray,
-    _gate_up_scales: &MlxArray,
-    _gate_up_biases: &MlxArray,
-    _down_w: &MlxArray,
-    _down_scales: &MlxArray,
-    _down_biases: &MlxArray,
-    _group_size: i32,
-    _bits: i32,
-    _q_dim: i32,
-    _k_dim: i32,
-    _v_dim: i32,
-    _gate_dim: i32,
-    _up_dim: i32,
-    _k_cache: &mut MlxArray,
-    _v_cache: &mut MlxArray,
-    _n_heads: i32,
-    _n_kv_heads: i32,
-    _head_dim: i32,
-    _attn_scale: f32,
-    _rope_base: f32,
-    _eps: f32,
-    _cache_len: i32,
-    _seq: i32,
-) -> Result<MlxArray> {
-    unreachable!("quantized fused transformer path requires metal_fused_ops")
 }
 
 /// Single transformer layer — used as fallback when fused paths are unavailable.
@@ -1375,56 +1044,50 @@ fn rust_transformer_layer(
     Ok(add(&residual2, &mlp))
 }
 
+#[cfg(feature = "metal")]
+fn validate_metal_sampling_params(params: &SamplingParams) -> Result<()> {
+    let mut unsupported = Vec::new();
+
+    if params.top_k != -1 && params.top_k != 1 {
+        unsupported.push(format!("top_k={}", params.top_k));
+    }
+    if params.top_p < 1.0 {
+        unsupported.push(format!("top_p={}", params.top_p));
+    }
+    if params.min_p > 0.0 {
+        unsupported.push(format!("min_p={}", params.min_p));
+    }
+    if params.repetition_penalty != 1.0 {
+        unsupported.push(format!("repetition_penalty={}", params.repetition_penalty));
+    }
+    if params.frequency_penalty != 0.0 {
+        unsupported.push(format!("frequency_penalty={}", params.frequency_penalty));
+    }
+    if params.presence_penalty != 0.0 {
+        unsupported.push(format!("presence_penalty={}", params.presence_penalty));
+    }
+    if let Some(seed) = params.seed {
+        unsupported.push(format!("seed={seed}"));
+    }
+
+    anyhow::ensure!(
+        unsupported.is_empty(),
+        "Metal backend currently supports only temperature sampling and greedy decoding (top_k=1); unsupported sampling params: {}",
+        unsupported.join(", ")
+    );
+
+    Ok(())
+}
+
 /// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
 #[cfg(feature = "metal")]
 fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
-    // Validate: warn about sampling params that Metal doesn't yet support.
-    // This prevents silent semantic drift vs the CUDA path.
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    if params.top_k > 0
-        || params.top_p < 1.0
-        || params.min_p > 0.0
-        || params.has_penalties()
-        || params.seed.is_some()
-    {
-        WARNED.call_once(|| {
-            let mut unsupported = Vec::new();
-            if params.top_k > 0 {
-                unsupported.push(format!("top_k={}", params.top_k));
-            }
-            if params.top_p < 1.0 {
-                unsupported.push(format!("top_p={}", params.top_p));
-            }
-            if params.min_p > 0.0 {
-                unsupported.push(format!("min_p={}", params.min_p));
-            }
-            if params.repetition_penalty != 1.0 {
-                unsupported.push(format!("repetition_penalty={}", params.repetition_penalty));
-            }
-            if params.frequency_penalty != 0.0 {
-                unsupported.push(format!("frequency_penalty={}", params.frequency_penalty));
-            }
-            if params.presence_penalty != 0.0 {
-                unsupported.push(format!("presence_penalty={}", params.presence_penalty));
-            }
-            if params.seed.is_some() {
-                unsupported.push("seed".to_string());
-            }
-            log::warn!(
-                "Metal sampling ignores: {} (only temperature is supported)",
-                unsupported.join(", ")
-            );
-        });
-    }
-
-    let temp = params.temperature;
-
-    if temp <= 1e-6 {
+    if params.temperature <= 1e-6 || params.top_k == 1 {
         return Ok(greedy_sample_token(logits));
     }
 
     // Temperature scaling then GPU categorical sample.
-    let inv_t = MlxArray::scalar_f32(1.0f32 / temp);
+    let inv_t = MlxArray::scalar_f32(1.0f32 / params.temperature);
     let scaled = crate::mlx::multiply(logits, &inv_t);
     Ok(categorical_sample_token(&scaled))
 }

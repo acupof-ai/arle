@@ -19,6 +19,29 @@ pub fn check_mlx_error() -> anyhow::Result<()> {
     }
 }
 
+fn mlx_error_message() -> Option<String> {
+    unsafe {
+        let ptr = mlx_sys::mlx_last_error();
+        (!ptr.is_null()).then(|| std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+fn panic_if_mlx_error(op: &str) {
+    if let Some(msg) = mlx_error_message() {
+        panic!("{op} failed: {msg}");
+    }
+}
+
+fn mlx_array_from_raw_or_panic(raw: *mut mlx_sys::mlx_array, op: &str) -> MlxArray {
+    if raw.is_null() {
+        match mlx_error_message() {
+            Some(msg) => panic!("{op} returned a null MLX handle: {msg}"),
+            None => panic!("{op} returned a null MLX handle"),
+        }
+    }
+    MlxArray(raw)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     Uint8,
@@ -66,7 +89,10 @@ impl Drop for MlxArray {
 }
 impl Clone for MlxArray {
     fn clone(&self) -> Self {
-        Self(unsafe { mlx_sys::mlx_array_clone(self.0) })
+        mlx_array_from_raw_or_panic(
+            unsafe { mlx_sys::mlx_array_clone(self.0) },
+            "mlx_array_clone",
+        )
     }
 }
 impl std::fmt::Debug for MlxArray {
@@ -75,11 +101,10 @@ impl std::fmt::Debug for MlxArray {
     }
 }
 unsafe impl Send for MlxArray {}
-unsafe impl Sync for MlxArray {}
 
 impl MlxArray {
     pub unsafe fn from_raw(raw: *mut mlx_sys::mlx_array) -> Self {
-        Self(raw)
+        mlx_array_from_raw_or_panic(raw, "MlxArray::from_raw")
     }
     pub fn as_raw(&self) -> *mut mlx_sys::mlx_array {
         self.0
@@ -94,12 +119,17 @@ impl MlxArray {
     }
 
     pub unsafe fn from_raw_data(data: *const c_void, shape: &[i32], dtype: Dtype) -> Self {
-        Self(mlx_sys::mlx_array_from_data(
-            data,
-            shape.as_ptr(),
-            shape.len() as i32,
-            dtype.to_raw(),
-        ))
+        mlx_array_from_raw_or_panic(
+            unsafe {
+                mlx_sys::mlx_array_from_data(
+                    data,
+                    shape.as_ptr(),
+                    shape.len() as i32,
+                    dtype.to_raw(),
+                )
+            },
+            "mlx_array_from_data",
+        )
     }
     pub fn from_slice_i32(data: &[i32], shape: &[i32]) -> Self {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Int32) }
@@ -108,19 +138,32 @@ impl MlxArray {
         unsafe { Self::from_raw_data(data.as_ptr().cast(), shape, Dtype::Float32) }
     }
     pub fn scalar_f32(val: f32) -> Self {
-        Self(unsafe { mlx_sys::mlx_array_new_float32(val) })
+        mlx_array_from_raw_or_panic(
+            unsafe { mlx_sys::mlx_array_new_float32(val) },
+            "mlx_array_new_float32",
+        )
     }
     pub fn scalar_i32(val: i32) -> Self {
-        Self(unsafe { mlx_sys::mlx_array_new_int32(val) })
+        mlx_array_from_raw_or_panic(
+            unsafe { mlx_sys::mlx_array_new_int32(val) },
+            "mlx_array_new_int32",
+        )
     }
 
     pub fn ndim(&self) -> usize {
-        unsafe { mlx_sys::mlx_array_ndim(self.0) as usize }
+        let ndim = unsafe { mlx_sys::mlx_array_ndim(self.0) as usize };
+        panic_if_mlx_error("mlx_array_ndim");
+        ndim
     }
     pub fn shape(&self) -> &[i32] {
         unsafe {
             let ptr = mlx_sys::mlx_array_shape(self.0);
             let n = self.ndim();
+            if ptr.is_null() && n > 0 {
+                panic_if_mlx_error("mlx_array_shape");
+                panic!("mlx_array_shape returned null for non-scalar array");
+            }
+            panic_if_mlx_error("mlx_array_shape");
             if n == 0 || ptr.is_null() {
                 &[]
             } else {
@@ -129,20 +172,31 @@ impl MlxArray {
         }
     }
     pub fn dtype(&self) -> Dtype {
-        Dtype::from_raw(unsafe { mlx_sys::mlx_array_dtype(self.0) }).unwrap_or(Dtype::Float32)
+        let raw = unsafe { mlx_sys::mlx_array_dtype(self.0) };
+        panic_if_mlx_error("mlx_array_dtype");
+        Dtype::from_raw(raw)
+            .unwrap_or_else(|| panic!("mlx_array_dtype returned unknown dtype {raw}"))
     }
     pub fn item_i32(&self) -> i32 {
-        unsafe { mlx_sys::mlx_array_item_int32(self.0) }
+        let value = unsafe { mlx_sys::mlx_array_item_int32(self.0) };
+        panic_if_mlx_error("mlx_array_item_int32");
+        value
     }
     pub fn item_f32(&self) -> f32 {
-        unsafe { mlx_sys::mlx_array_item_float32(self.0) }
+        let value = unsafe { mlx_sys::mlx_array_item_float32(self.0) };
+        panic_if_mlx_error("mlx_array_item_float32");
+        value
     }
     pub fn as_slice_f32(&self) -> &[f32] {
         unsafe {
-            std::slice::from_raw_parts(
-                mlx_sys::mlx_array_data_float32(self.0),
-                mlx_sys::mlx_array_size(self.0),
-            )
+            let ptr = mlx_sys::mlx_array_data_float32(self.0);
+            let len = mlx_sys::mlx_array_size(self.0);
+            if ptr.is_null() && len > 0 {
+                panic_if_mlx_error("mlx_array_data_float32");
+                panic!("mlx_array_data_float32 returned null for non-empty array");
+            }
+            panic_if_mlx_error("mlx_array_data_float32");
+            std::slice::from_raw_parts(ptr, len)
         }
     }
 }
@@ -152,14 +206,14 @@ impl MlxArray {
 macro_rules! binary_op {
     ($name:ident, $cfn:ident) => {
         pub fn $name(a: &MlxArray, b: &MlxArray) -> MlxArray {
-            MlxArray(unsafe { mlx_sys::$cfn(a.0, b.0) })
+            mlx_array_from_raw_or_panic(unsafe { mlx_sys::$cfn(a.0, b.0) }, stringify!($cfn))
         }
     };
 }
 macro_rules! unary_op {
     ($name:ident, $cfn:ident) => {
         pub fn $name(a: &MlxArray) -> MlxArray {
-            MlxArray(unsafe { mlx_sys::$cfn(a.0) })
+            mlx_array_from_raw_or_panic(unsafe { mlx_sys::$cfn(a.0) }, stringify!($cfn))
         }
     };
 }
@@ -181,66 +235,99 @@ pub fn silu(a: &MlxArray) -> MlxArray {
 }
 
 pub fn reshape(a: &MlxArray, s: &[i32]) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_reshape(a.0, s.as_ptr(), s.len()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_reshape(a.0, s.as_ptr(), s.len()) },
+        "mlx_reshape",
+    )
 }
 pub fn transpose_all(a: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_transpose(a.0) })
+    mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_transpose(a.0) }, "mlx_transpose")
 }
 pub fn transpose_axes(a: &MlxArray, ax: &[i32]) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_transpose_axes(a.0, ax.as_ptr(), ax.len()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_transpose_axes(a.0, ax.as_ptr(), ax.len()) },
+        "mlx_transpose_axes",
+    )
 }
 pub fn as_dtype(a: &MlxArray, d: Dtype) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_astype(a.0, d.to_raw()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_astype(a.0, d.to_raw()) },
+        "mlx_astype",
+    )
 }
 pub fn zeros(s: &[i32], d: Dtype) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_zeros(s.as_ptr(), s.len(), d.to_raw()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_zeros(s.as_ptr(), s.len(), d.to_raw()) },
+        "mlx_zeros",
+    )
 }
 pub fn take_axis(a: &MlxArray, idx: &MlxArray, ax: i32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_take_axis(a.0, idx.0, ax) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_take_axis(a.0, idx.0, ax) },
+        "mlx_take_axis",
+    )
 }
 pub fn broadcast_to(a: &MlxArray, s: &[i32]) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_broadcast_to(a.0, s.as_ptr(), s.len()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_broadcast_to(a.0, s.as_ptr(), s.len()) },
+        "mlx_broadcast_to",
+    )
 }
 pub fn expand_dims(a: &MlxArray, ax: i32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_expand_dims(a.0, ax) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_expand_dims(a.0, ax) },
+        "mlx_expand_dims",
+    )
 }
 pub fn sum_axis(a: &MlxArray, ax: i32, kd: bool) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_sum_axis(a.0, ax, kd) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_sum_axis(a.0, ax, kd) },
+        "mlx_sum_axis",
+    )
 }
 pub fn argmax(a: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_argmax(a.0, false) })
+    mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_argmax(a.0, false) }, "mlx_argmax")
 }
 pub fn where_(c: &MlxArray, a: &MlxArray, b: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_where(c.0, a.0, b.0) })
+    mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_where(c.0, a.0, b.0) }, "mlx_where")
 }
 
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
-    MlxArray(unsafe { mlx_sys::mlx_concatenate_axis(p.as_ptr() as *mut _, p.len(), axis) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_concatenate_axis(p.as_ptr() as *mut _, p.len(), axis) },
+        "mlx_concatenate_axis",
+    )
 }
 pub fn slice(a: &MlxArray, start: &[i32], stop: &[i32], strides: &[i32]) -> MlxArray {
-    MlxArray(unsafe {
-        mlx_sys::mlx_slice(
-            a.0,
-            start.as_ptr(),
-            stop.as_ptr(),
-            strides.as_ptr(),
-            start.len(),
-        )
-    })
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_slice(
+                a.0,
+                start.as_ptr(),
+                stop.as_ptr(),
+                strides.as_ptr(),
+                start.len(),
+            )
+        },
+        "mlx_slice",
+    )
 }
 pub fn slice_update(a: &mut MlxArray, upd: &MlxArray, start: &[i32], stop: &[i32]) -> MlxArray {
     let st: Vec<i32> = vec![1; start.len()];
-    MlxArray(unsafe {
-        mlx_sys::mlx_slice_update(
-            a.0,
-            upd.0,
-            start.as_ptr(),
-            stop.as_ptr(),
-            st.as_ptr(),
-            start.len(),
-        )
-    })
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_slice_update(
+                a.0,
+                upd.0,
+                start.as_ptr(),
+                stop.as_ptr(),
+                st.as_ptr(),
+                start.len(),
+            )
+        },
+        "mlx_slice_update",
+    )
 }
 pub fn quantized_matmul(
     x: &MlxArray,
@@ -251,23 +338,35 @@ pub fn quantized_matmul(
     gs: i32,
     bits: i32,
 ) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_quantized_matmul(x.0, w.0, s.0, b.0, tr, gs, bits) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_quantized_matmul(x.0, w.0, s.0, b.0, tr, gs, bits) },
+        "mlx_quantized_matmul",
+    )
 }
 pub fn dequantize(w: &MlxArray, s: &MlxArray, b: &MlxArray, gs: i32, bits: i32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_dequantize(w.0, s.0, b.0, gs, bits) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_dequantize(w.0, s.0, b.0, gs, bits) },
+        "mlx_dequantize",
+    )
 }
 pub fn contiguous(a: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_contiguous(a.0) })
+    mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_contiguous(a.0) }, "mlx_contiguous")
 }
 pub fn conv1d(inp: &MlxArray, w: &MlxArray, stride: i32, pad: i32, groups: i32) -> MlxArray {
-    MlxArray(unsafe {
-        mlx_sys::mlx_conv1d(inp.0, w.0, stride, pad, 1 /*dilation*/, groups)
-    })
+    mlx_array_from_raw_or_panic(
+        unsafe {
+            mlx_sys::mlx_conv1d(inp.0, w.0, stride, pad, 1 /*dilation*/, groups)
+        },
+        "mlx_conv1d",
+    )
 }
 /// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
 /// Fused C++ implementation — replaces 10 individual FFI ops with 1.
 pub fn compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_compute_g(a_log.0, alpha.0, dt_bias.0) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_compute_g(a_log.0, alpha.0, dt_bias.0) },
+        "mlx_compute_g",
+    )
 }
 
 /// Full GDR layer forward in C++ — one FFI call replaces ~40 individual ops.
@@ -350,18 +449,27 @@ pub fn gdr_layer_forward(
             use_metal_kernel as i32,
             &mut result,
         );
-        MlxArray(result)
+        mlx_array_from_raw_or_panic(result, "mlx_gdr_layer_forward")
     }
 }
 
 pub fn rms_norm(x: &MlxArray, w: &MlxArray, eps: f32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_fast_rms_norm(x.0, w.0, eps) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_rms_norm(x.0, w.0, eps) },
+        "mlx_fast_rms_norm",
+    )
 }
 pub fn rms_norm_no_weight(x: &MlxArray, eps: f32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_fast_rms_norm(x.0, std::ptr::null_mut(), eps) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_rms_norm(x.0, std::ptr::null_mut(), eps) },
+        "mlx_fast_rms_norm",
+    )
 }
 pub fn rope(x: &MlxArray, dims: i32, trad: bool, base: f32, scale: f32, off: i32) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_fast_rope(x.0, dims, trad, base, scale, off) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_rope(x.0, dims, trad, base, scale, off) },
+        "mlx_fast_rope",
+    )
 }
 pub fn scaled_dot_product_attention(
     q: &MlxArray,
@@ -371,10 +479,16 @@ pub fn scaled_dot_product_attention(
     mask: Option<&str>,
 ) -> MlxArray {
     let m = std::ffi::CString::new(mask.unwrap_or("")).unwrap();
-    MlxArray(unsafe { mlx_sys::mlx_fast_sdpa(q.0, k.0, v.0, scale, m.as_ptr()) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_sdpa(q.0, k.0, v.0, scale, m.as_ptr()) },
+        "mlx_fast_sdpa",
+    )
 }
 pub fn categorical(logits: &MlxArray) -> MlxArray {
-    MlxArray(unsafe { mlx_sys::mlx_random_categorical(logits.0, -1) })
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_random_categorical(logits.0, -1) },
+        "mlx_random_categorical",
+    )
 }
 
 pub fn eval(arrays: &[&MlxArray]) {
@@ -382,12 +496,14 @@ pub fn eval(arrays: &[&MlxArray]) {
     unsafe {
         mlx_sys::mlx_eval(p.as_ptr() as *mut _, p.len());
     }
+    panic_if_mlx_error("mlx_eval");
 }
 pub fn async_eval(arrays: &[&MlxArray]) {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     unsafe {
         mlx_sys::mlx_async_eval(p.as_ptr() as *mut _, p.len());
     }
+    panic_if_mlx_error("mlx_async_eval");
 }
 
 pub struct MetalKernel(*mut std::ffi::c_void);
@@ -423,7 +539,7 @@ impl MetalKernel {
             .map(|x| CString::new(*x).unwrap())
             .collect();
         let op: Vec<*const i8> = oc.iter().map(|c| c.as_ptr()).collect();
-        Self(unsafe {
+        let raw = unsafe {
             mlx_sys::mlx_metal_kernel_new(
                 n.as_ptr(),
                 ip.as_ptr(),
@@ -433,7 +549,10 @@ impl MetalKernel {
                 s.as_ptr(),
                 h.as_ptr(),
             )
-        })
+        };
+        panic_if_mlx_error("mlx_metal_kernel_new");
+        assert!(!raw.is_null(), "mlx_metal_kernel_new returned null");
+        Self(raw)
     }
 
     pub fn apply(
@@ -488,7 +607,10 @@ impl MetalKernel {
                 dv.len(),
             );
         }
-        op.into_iter().map(|p| MlxArray(p)).collect()
+        panic_if_mlx_error("mlx_metal_kernel_apply");
+        op.into_iter()
+            .map(|p| mlx_array_from_raw_or_panic(p, "mlx_metal_kernel_apply"))
+            .collect()
     }
 }
 
@@ -561,4 +683,5 @@ pub fn clear_cache() {
     unsafe {
         mlx_sys::mlx_metal_clear_cache();
     }
+    panic_if_mlx_error("mlx_metal_clear_cache");
 }
