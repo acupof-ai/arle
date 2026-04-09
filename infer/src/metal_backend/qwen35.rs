@@ -151,7 +151,6 @@ pub(super) fn metal_generate_qwen35(
     let mut ttft_ms = 0.0;
 
     let mut logits = logits;
-    let mut generated_count = 0usize;
 
     let finish_reason = loop {
         let next_token = gpu_sample_token(&logits, params)?.item_i32() as u32;
