@@ -339,7 +339,10 @@ impl DeviceMatrix {
     }
 
     /// Create from INT4 packed quantized weight + bf16 scales.
-    /// Weight data is packed: 2 int4 values per byte → [rows, cols/2] bytes.
+    ///
+    /// Unpacks INT4 → INT8 at load time and uses the proven W8A16 kernel path.
+    /// This avoids a known GPU correctness issue in the W4 GEMV kernel while
+    /// still getting ~50% of the W4 bandwidth benefit (INT8 = 1 byte vs bf16 = 2 bytes).
     pub fn from_quantized_int4(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -351,12 +354,24 @@ impl DeviceMatrix {
         assert_eq!(packed_data.len(), rows * cols / 2);
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
-        let qw: CudaSlice<i8> = ctx
+
+        // Unpack INT4 → INT8 on CPU: each byte holds 2 int4 values
+        let mut unpacked = vec![0i8; rows * cols];
+        for i in 0..packed_data.len() {
+            let byte = packed_data[i];
+            let lo = (byte & 0x0F) as i8 - 8; // signed [-8, 7]
+            let hi = (byte >> 4) as i8 - 8;
+            let row = i / (cols / 2);
+            let byte_in_row = i % (cols / 2);
+            unpacked[row * cols + byte_in_row * 2] = lo;
+            unpacked[row * cols + byte_in_row * 2 + 1] = hi;
+        }
+
+        // Upload as INT8 and use the W8 kernel (quant_bits=8)
+        let qw = ctx
             .stream
-            .clone_htod(unsafe {
-                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
-            })
-            .map_err(|e| anyhow!("H2D qweight int4 failed: {}", e))?;
+            .clone_htod(&unpacked)
+            .map_err(|e| anyhow!("H2D qweight int4→int8 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -372,7 +387,7 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 4,
+            quant_bits: 8, // Use W8 kernel (proven correct)
         })
     }
 

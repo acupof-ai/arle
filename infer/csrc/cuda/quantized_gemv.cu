@@ -146,20 +146,17 @@ __global__ void w4a16_gemv_kernel(
     int row_offset = row * (K / 2);  // packed: K/2 bytes per row
     int scale_offset = row * num_groups;
 
-    // Each iteration processes 32 int4 values (16 bytes = 128-bit load).
-    // group_size (128) is always a multiple of W4_VEC_SIZE (32), so one scale per vector.
-    for (int k = tid_in_row * W4_VEC_SIZE; k < K; k += threads_per_row * W4_VEC_SIZE) {
+    // Process W4: same VEC_SIZE=16 as W8, but read packed bytes through register.
+    // Load 8 bytes via vectorized 64-bit load, unpack nibbles in registers.
+    for (int k = tid_in_row * W8_VEC_SIZE; k < K; k += threads_per_row * W8_VEC_SIZE) {
         float scale_f = __bfloat162float(scales[scale_offset + k / group_size]);
 
-        // Load 16 bytes = 32 packed int4 values
-        int4 w_packed = *reinterpret_cast<const int4*>(&weight[row_offset + k / 2]);
-        const uint8_t* w_bytes = reinterpret_cast<const uint8_t*>(&w_packed);
-
-        // Vectorized activation loads (32 bf16 = 4 × int4)
-        const int4* x_ptr = reinterpret_cast<const int4*>(&input[k]);
+        // Vectorized 64-bit load: 8 bytes = 16 int4 values into register
+        uint2 w_loaded = *reinterpret_cast<const uint2*>(&weight[row_offset + k / 2]);
+        const uint8_t* w_bytes = reinterpret_cast<const uint8_t*>(&w_loaded);
 
         #pragma unroll
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 8; i++) {
             uint8_t byte = w_bytes[i];
             int lo = (byte & 0x0F) - 8;
             int hi = (byte >> 4) - 8;
