@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::model_registry::{ModelArch, detect_arch_from_json};
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QuantConfig {
     pub(super) group_size: i32,
@@ -87,6 +89,8 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
     let path = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
+    let declared_arch = detect_arch_from_json(&raw)
+        .context("Metal backend could not determine model architecture")?;
     let v: serde_json::Value = serde_json::from_str(&raw).context("config.json parse")?;
     let root = v
         .as_object()
@@ -156,51 +160,60 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .and_then(serde_json::Value::as_array)
         .is_some_and(|arr| !arr.is_empty());
 
-    let arch = if has_layer_types {
-        let layer_types = model
-            .get("layer_types")
-            .and_then(serde_json::Value::as_array)
-            .context("Qwen3.5 layer_types missing")?
-            .iter()
-            .map(|value| match value.as_str() {
-                Some("full_attention") => Ok(MetalQwen35LayerType::FullAttention),
-                Some("linear_attention") => Ok(MetalQwen35LayerType::LinearAttention),
-                Some(other) => Err(anyhow::anyhow!("unsupported Qwen3.5 layer type '{other}'")),
-                None => Err(anyhow::anyhow!(
-                    "Qwen3.5 layer_types entries must be strings"
-                )),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!(
-            layer_types.len() == get_usize(model, "num_hidden_layers", layer_types.len()),
-            "Qwen3.5 layer_types length {} != num_hidden_layers {}",
-            layer_types.len(),
-            get_usize(model, "num_hidden_layers", layer_types.len())
-        );
+    let arch = match declared_arch {
+        ModelArch::Qwen35 => {
+            anyhow::ensure!(
+                has_layer_types,
+                "Qwen3.5 Metal config requires non-empty `layer_types`"
+            );
+            let layer_types = model
+                .get("layer_types")
+                .and_then(serde_json::Value::as_array)
+                .context("Qwen3.5 layer_types missing")?
+                .iter()
+                .map(|value| match value.as_str() {
+                    Some("full_attention") => Ok(MetalQwen35LayerType::FullAttention),
+                    Some("linear_attention") => Ok(MetalQwen35LayerType::LinearAttention),
+                    Some(other) => Err(anyhow::anyhow!("unsupported Qwen3.5 layer type '{other}'")),
+                    None => Err(anyhow::anyhow!(
+                        "Qwen3.5 layer_types entries must be strings"
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                layer_types.len() == get_usize(model, "num_hidden_layers", layer_types.len()),
+                "Qwen3.5 layer_types length {} != num_hidden_layers {}",
+                layer_types.len(),
+                get_usize(model, "num_hidden_layers", layer_types.len())
+            );
 
-        let rope_parameters = model
-            .get("rope_parameters")
-            .and_then(serde_json::Value::as_object);
-        let partial_rotary_factor = rope_parameters
-            .and_then(|rope| rope.get("partial_rotary_factor"))
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(1.0);
-        MetalModelArch::Qwen35(MetalQwen35ArchConfig {
-            rotary_dim: (head_dim as f64 * partial_rotary_factor) as usize,
-            layer_types,
-            #[cfg(feature = "metal")]
-            linear: crate::metal_gdr::MetalGdrConfig {
-                num_key_heads: get_usize(model, "linear_num_key_heads", 0),
-                key_dim: get_usize(model, "linear_key_head_dim", 0),
-                num_value_heads: get_usize(model, "linear_num_value_heads", 0),
-                value_dim: get_usize(model, "linear_value_head_dim", 0),
-                conv_kernel: get_usize(model, "linear_conv_kernel_dim", 4),
-                hidden_size,
-                rms_norm_eps: rms_norm_eps as f32,
-            },
-        })
-    } else {
-        MetalModelArch::Qwen3
+            let rope_parameters = model
+                .get("rope_parameters")
+                .and_then(serde_json::Value::as_object);
+            let partial_rotary_factor = rope_parameters
+                .and_then(|rope| rope.get("partial_rotary_factor"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0);
+            MetalModelArch::Qwen35(MetalQwen35ArchConfig {
+                rotary_dim: (head_dim as f64 * partial_rotary_factor) as usize,
+                layer_types,
+                #[cfg(feature = "metal")]
+                linear: crate::metal_gdr::MetalGdrConfig {
+                    num_key_heads: get_usize(model, "linear_num_key_heads", 0),
+                    key_dim: get_usize(model, "linear_key_head_dim", 0),
+                    num_value_heads: get_usize(model, "linear_num_value_heads", 0),
+                    value_dim: get_usize(model, "linear_value_head_dim", 0),
+                    conv_kernel: get_usize(model, "linear_conv_kernel_dim", 4),
+                    hidden_size,
+                    rms_norm_eps: rms_norm_eps as f32,
+                },
+            })
+        }
+        ModelArch::Qwen3 => MetalModelArch::Qwen3,
+        other => anyhow::bail!(
+            "Metal backend currently supports Qwen3/Qwen3.5 only; got {}",
+            other.display_name()
+        ),
     };
 
     let rope_theta = model
@@ -210,13 +223,13 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .and_then(serde_json::Value::as_f64)
         .unwrap_or_else(|| get_f64(model, "rope_theta", 1_000_000.0));
 
-    let norm_weight_mode = if has_layer_types {
+    let norm_weight_mode = match declared_arch {
         // MLX-converted Qwen3.5 checkpoints already run sanitize(), which shifts
         // the offset-style RMSNorm weights during conversion. The Metal path
         // must consume those weights directly instead of applying a second `+1`.
-        MetalNormWeightMode::Direct
-    } else {
-        MetalNormWeightMode::AddUnitOffset
+        ModelArch::Qwen35 => MetalNormWeightMode::Direct,
+        ModelArch::Qwen3 => MetalNormWeightMode::AddUnitOffset,
+        _ => unreachable!("unsupported architectures return earlier"),
     };
 
     Ok(MetalModelConfig {
@@ -269,5 +282,62 @@ fn load_stop_token_ids(model_dir: &Path, fallback_eos_token_id: u32) -> Result<V
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(vec![fallback_eos_token_id]),
         Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{MetalModelArch, MetalNormWeightMode, load_metal_config};
+
+    fn write_config_file(contents: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), contents).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loads_qwen35_config_without_treating_text_config_as_generic_qwen() {
+        let dir = write_config_file(
+            r#"{
+                "architectures": ["Qwen2ForCausalLM"],
+                "text_config": {
+                    "hidden_size": 2560,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 8,
+                    "num_hidden_layers": 2,
+                    "head_dim": 80,
+                    "layer_types": ["full_attention", "linear_attention"]
+                }
+            }"#,
+        );
+
+        let config = load_metal_config(dir.path()).unwrap();
+        assert_eq!(config.norm_weight_mode, MetalNormWeightMode::Direct);
+        match config.arch {
+            MetalModelArch::Qwen35(arch) => {
+                assert_eq!(arch.num_full_attention_layers(), 1);
+                assert_eq!(arch.num_linear_attention_layers(), 1);
+            }
+            other => panic!("expected Qwen3.5 config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_qwen_metal_config_instead_of_silently_falling_back() {
+        let dir = write_config_file(
+            r#"{
+                "architectures": ["ChatGLMModel"],
+                "hidden_size": 4096,
+                "num_attention_heads": 32
+            }"#,
+        );
+
+        let err = load_metal_config(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("supports Qwen3/Qwen3.5 only"), "err={err}");
+        assert!(err.contains("GLM-4"), "err={err}");
     }
 }

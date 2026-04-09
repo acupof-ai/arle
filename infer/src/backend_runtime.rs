@@ -498,6 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_concurrent_submits_respect_limit() {
+        use std::sync::atomic::Ordering;
+
         let handle = spawn_backend_runtime_handle(
             SlowBackend {
                 delay: std::time::Duration::from_millis(500),
@@ -506,7 +508,9 @@ mod tests {
             4, // max_waiting = 4
         );
 
-        // Spawn 8 concurrent submits — at most 4 should succeed.
+        // Spawn 8 concurrent submits. The queue may admit one extra request if
+        // the worker thread has already popped one into the active slot, but
+        // the waiting queue itself must never exceed `max_waiting`.
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let h = handle.clone();
@@ -525,7 +529,12 @@ mod tests {
             }
         }
 
-        assert!(accepted <= 4, "should accept at most 4, got {accepted}");
-        assert!(rejected >= 4, "should reject at least 4, got {rejected}");
+        let waiting = handle.waiting_count.load(Ordering::Acquire);
+        assert!(waiting <= 4, "waiting queue should cap at 4, got {waiting}");
+        assert!(
+            accepted <= 5,
+            "should accept at most 1 active + 4 waiting, got {accepted}"
+        );
+        assert!(rejected >= 3, "should reject at least 3, got {rejected}");
     }
 }

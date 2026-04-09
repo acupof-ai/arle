@@ -4,7 +4,7 @@
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
 | [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Design Review** — INT4 quantization architecture: LinearWeight enum, GEMV kernel, risk analysis |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文解决方案：INT8→FP8→K8V4→自适应混合精度 + 智能驱逐 + 分层 prefix cache |
-| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal 后端演进规划：连续批处理 → 自定义 Metal kernel → 全模型覆盖 → 极致体验 → 多机协同 |
+| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal 当前状态与后续路线：Qwen3/Qwen3.5 已接通，`metal_serve` 仍是串行 runtime，连续批处理和更多模型覆盖待继续 |
 | **Plans** | |
 | [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity plan (C=4 exceeded) |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **In Progress** — Qwen3.5 sglang parity: ITL gap from per-request recurrent ops |

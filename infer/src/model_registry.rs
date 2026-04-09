@@ -9,7 +9,7 @@
 //! | `architectures` value (config.json)   | `ModelArch`              |
 //! |---------------------------------------|--------------------------|
 //! | `Qwen2ForCausalLM`                    | `Qwen3`                  |
-//! | `Qwen2_5_VLForCausalLM` (text_config) | `Qwen35`                 |
+//! | `Qwen2_5_VLForCausalLM` / Qwen text wrapper | `Qwen35`            |
 //! | `LlamaForCausalLM`                    | `Llama`                  |
 //! | `MistralForCausalLM`                  | `Mistral`                |
 //! | `MixtralForCausalLM`                  | `Mixtral`                |
@@ -113,8 +113,8 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         // Qwen
         m.insert("Qwen2ForCausalLM", ModelArch::Qwen3);
         m.insert("Qwen3ForCausalLM", ModelArch::Qwen3);
-        // Qwen3.5 is identified by the presence of text_config (handled below),
-        // but register a direct key too in case future checkpoints use it.
+        // Qwen3.5 often appears as a Qwen text wrapper; keep direct keys for
+        // checkpoints that already declare the dedicated architecture string.
         m.insert("Qwen2_5_VLForCausalLM", ModelArch::Qwen35);
         m.insert("Qwen3_5ForCausalLM", ModelArch::Qwen35);
         // Llama
@@ -129,6 +129,9 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         m.insert("GemmaForCausalLM", ModelArch::Gemma);
         m.insert("Gemma2ForCausalLM", ModelArch::Gemma);
         m.insert("Gemma3ForCausalLM", ModelArch::Gemma);
+        m.insert("Gemma3ForConditionalGeneration", ModelArch::Gemma);
+        m.insert("Gemma4ForCausalLM", ModelArch::Gemma);
+        m.insert("Gemma4ForConditionalGeneration", ModelArch::Gemma);
         // Phi
         m.insert("PhiForCausalLM", ModelArch::Phi);
         m.insert("Phi3ForCausalLM", ModelArch::Phi);
@@ -146,8 +149,8 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
 
 /// Detect the model architecture by reading `<model_path>/config.json`.
 ///
-/// Uses the `architectures` array first; falls back to heuristics for
-/// multi-modal configs that embed a `text_config` sub-object (Qwen3.5).
+/// Uses the `architectures` array first; only falls back to a Qwen3.5-specific
+/// heuristic when the config shape is otherwise ambiguous.
 pub fn detect_arch(model_path: &str) -> Result<ModelArch> {
     let config_path = Path::new(model_path).join("config.json");
     let content = std::fs::read_to_string(&config_path)
@@ -158,11 +161,7 @@ pub fn detect_arch(model_path: &str) -> Result<ModelArch> {
 /// Detect architecture from a `config.json` string (testable without disk I/O).
 pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
     let v: serde_json::Value = serde_json::from_str(json_str).context("parsing config.json")?;
-
-    // Heuristic: Qwen3.5 embeds a `text_config` block at the top level.
-    if v.get("text_config").is_some() {
-        return Ok(ModelArch::Qwen35);
-    }
+    let has_text_config = v.get("text_config").is_some();
 
     // Primary: `architectures` array.
     if let Some(archs) = v.get("architectures").and_then(|a| a.as_array()) {
@@ -170,6 +169,11 @@ pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
         for arch_val in archs {
             if let Some(arch_str) = arch_val.as_str() {
                 if let Some(&arch) = map.get(arch_str) {
+                    // Qwen3.5 checkpoints are frequently wrapped as top-level
+                    // `Qwen2ForCausalLM` plus a nested `text_config`.
+                    if arch == ModelArch::Qwen3 && has_text_config {
+                        return Ok(ModelArch::Qwen35);
+                    }
                     return Ok(arch);
                 }
             }
@@ -177,6 +181,18 @@ pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
         // Found architectures array but none matched.
         let names: Vec<&str> = archs.iter().filter_map(|v| v.as_str()).collect();
         bail!("unknown architectures: {:?}", names);
+    }
+
+    // Legacy fallback for configs without `architectures`: only treat them as
+    // Qwen3.5 if the embedded text config exposes Qwen3.5-specific layer types.
+    let has_qwen35_layer_types = v
+        .get("text_config")
+        .and_then(|tc| tc.get("layer_types"))
+        .or_else(|| v.get("layer_types"))
+        .and_then(|lt| lt.as_array())
+        .is_some_and(|arr| !arr.is_empty());
+    if has_qwen35_layer_types {
+        return Ok(ModelArch::Qwen35);
     }
 
     bail!("config.json has no `architectures` field")
@@ -208,7 +224,7 @@ mod tests {
     }
 
     fn qwen35_config() -> &'static str {
-        r#"{"architectures":["Qwen2ForCausalLM"],"text_config":{"hidden_size":2048}}"#
+        r#"{"architectures":["Qwen2ForCausalLM"],"text_config":{"hidden_size":2048,"layer_types":["full_attention","linear_attention"]}}"#
     }
 
     fn llama_config() -> &'static str {
@@ -221,6 +237,10 @@ mod tests {
 
     fn gemma_config() -> &'static str {
         r#"{"architectures":["Gemma2ForCausalLM"],"hidden_size":3584}"#
+    }
+
+    fn gemma4_multimodal_config() -> &'static str {
+        r#"{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{"hidden_size":3584}}"#
     }
 
     fn phi_config() -> &'static str {
@@ -275,6 +295,14 @@ mod tests {
     fn detects_gemma() {
         assert_eq!(
             detect_arch_from_json(gemma_config()).unwrap(),
+            ModelArch::Gemma
+        );
+    }
+
+    #[test]
+    fn detects_gemma4_multimodal_without_misclassifying_as_qwen35() {
+        assert_eq!(
+            detect_arch_from_json(gemma4_multimodal_config()).unwrap(),
             ModelArch::Gemma
         );
     }

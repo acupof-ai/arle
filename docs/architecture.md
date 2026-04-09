@@ -581,10 +581,11 @@ Every decode step with B active requests:
 | `weight_loader.rs` | Memory-mapped safetensors → GPU tensor loading |
 | `scheduler.rs` | Multi-request scheduler; manages shared `TokenKVPool`; decode-priority; chunked prefill |
 | `server_engine.rs` | `ServerEngine` trait; `GenericServerEngine<M>` (single-request, for REPL/agent) |
+| `backend_runtime.rs` | Serial request queue for `StreamingInferenceBackend`; used by Metal HTTP serving today |
 | `http_server.rs` | Axum router: OpenAI-compatible `/v1/completions`, `/v1/chat/completions`, SSE |
 | `http_server/openai_v1.rs` | OpenAI API request/response JSON types |
 | `backend.rs` | `InferenceBackend` trait — backend-agnostic single-request interface |
-| `metal_backend.rs` | Apple Silicon Metal backend via mlx-rs; implements `InferenceBackend` |
+| `metal_backend.rs` | Apple Silicon Metal backend via mlx-rs; implements `InferenceBackend` and `StreamingInferenceBackend` |
 | `sampler.rs` | `SamplingParams` struct (temperature, top-k/p, min-p, penalties, EOS) |
 | `tokenizer.rs` | Tokenizer wrapper (HuggingFace `tokenizers` crate) with incremental decoding |
 | `chat.rs` | ChatML message formatting and tool definition injection |
@@ -705,7 +706,7 @@ Every decode step with B active requests:
 | Tensor parallel config + sharding math | ✅ (CPU, NCCL stubs) |
 | Rust agent binary (tool calling) | ✅ |
 | Python agent (async HTTP) | ✅ |
-| Metal backend (Apple Silicon, mlx-rs) | ✅ (single-request) |
+| Metal backend (Apple Silicon, mlx-rs) | ✅ (single-request + serial HTTP runtime) |
 | Benchmark suite (throughput, agent, multi-request) | ✅ |
 | Llama / DeepSeek / Mistral / Gemma / Phi models | ❌ |
 | FlashAttention-3 | ❌ |

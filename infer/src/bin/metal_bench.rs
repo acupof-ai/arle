@@ -187,6 +187,39 @@ fn compare_baseline(baseline: &Baseline, current: &BTreeMap<String, MetricStat>)
     all_pass
 }
 
+fn validate_baseline_compatibility(
+    baseline: &Baseline,
+    model: &str,
+    prompt_tokens: usize,
+    generation_tokens: usize,
+) -> Result<()> {
+    if let Some(baseline_model) = &baseline.model {
+        anyhow::ensure!(
+            baseline_model == model,
+            "baseline model mismatch: baseline='{}', current='{}'",
+            baseline_model,
+            model
+        );
+    }
+    if let Some(baseline_prompt) = baseline.prompt_tokens {
+        anyhow::ensure!(
+            baseline_prompt == prompt_tokens,
+            "baseline prompt_tokens mismatch: baseline={}, current={}",
+            baseline_prompt,
+            prompt_tokens
+        );
+    }
+    if let Some(baseline_generation) = baseline.generation_tokens {
+        anyhow::ensure!(
+            baseline_generation == generation_tokens,
+            "baseline generation_tokens mismatch: baseline={}, current={}",
+            baseline_generation,
+            generation_tokens
+        );
+    }
+    Ok(())
+}
+
 fn build_current_metrics(
     mean_prompt_tps: f64,
     mean_generation_tps: f64,
@@ -448,23 +481,12 @@ fn run_bench() -> Result<()> {
         let baseline: Baseline = serde_json::from_str(&data)
             .map_err(|e| anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e))?;
         eprintln!("Comparing against baseline: {}", path.display());
-        // Warn if baseline was recorded with different parameters.
-        if let Some(bp) = baseline.prompt_tokens {
-            if bp != cli.prompt_tokens {
-                eprintln!(
-                    "  WARNING: baseline prompt_tokens={} vs current={}",
-                    bp, cli.prompt_tokens
-                );
-            }
-        }
-        if let Some(bg) = baseline.generation_tokens {
-            if bg != cli.generation_tokens {
-                eprintln!(
-                    "  WARNING: baseline generation_tokens={} vs current={}",
-                    bg, cli.generation_tokens
-                );
-            }
-        }
+        validate_baseline_compatibility(
+            &baseline,
+            &cli.model,
+            cli.prompt_tokens,
+            cli.generation_tokens,
+        )?;
         let passed = compare_baseline(&baseline, &current_metrics);
         if !passed {
             eprintln!("REGRESSION DETECTED — one or more metrics exceeded threshold.");
@@ -487,6 +509,12 @@ fn run_bench() -> Result<()> {
                 anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e)
             })?;
             eprintln!("Checking update eligibility against: {}", path.display());
+            validate_baseline_compatibility(
+                &baseline,
+                &cli.model,
+                cli.prompt_tokens,
+                cli.generation_tokens,
+            )?;
             let passed = compare_baseline(&baseline, &current_metrics);
             if passed {
                 eprintln!("All metrics PASS — updating baseline.");
@@ -520,7 +548,8 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let idx = (p / 100.0 * (sorted.len() - 1) as f64).round() as usize;
+    let rank = ((p.clamp(0.0, 100.0) / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -536,5 +565,85 @@ fn peak_rss_kb() -> u64 {
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Baseline, MetricStat, compare_baseline, percentile, validate_baseline_compatibility,
+    };
+    use std::collections::BTreeMap;
+
+    fn metric(mean: f64) -> MetricStat {
+        MetricStat {
+            mean,
+            p50: None,
+            p99: None,
+        }
+    }
+
+    #[test]
+    fn baseline_compatibility_rejects_model_mismatch() {
+        let baseline = Baseline {
+            model: Some("mlx-community/Qwen3-0.6B-4bit".into()),
+            prompt_tokens: Some(20),
+            generation_tokens: Some(64),
+            metrics: BTreeMap::new(),
+            recorded_at: None,
+            notes: None,
+        };
+        let err =
+            validate_baseline_compatibility(&baseline, "mlx-community/Qwen3.5-4B-MLX-4bit", 20, 64)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("baseline model mismatch"), "err={err}");
+    }
+
+    #[test]
+    fn baseline_compatibility_rejects_token_mismatch() {
+        let baseline = Baseline {
+            model: None,
+            prompt_tokens: Some(20),
+            generation_tokens: Some(64),
+            metrics: BTreeMap::new(),
+            recorded_at: None,
+            notes: None,
+        };
+        let err = validate_baseline_compatibility(&baseline, "model", 32, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("baseline prompt_tokens mismatch"), "err={err}");
+    }
+
+    #[test]
+    fn compare_baseline_fails_regression_beyond_threshold() {
+        let mut baseline_metrics = BTreeMap::new();
+        baseline_metrics.insert("prompt_tps".into(), metric(100.0));
+        baseline_metrics.insert("generation_tps".into(), metric(50.0));
+        baseline_metrics.insert("ttft_ms".into(), metric(10.0));
+
+        let baseline = Baseline {
+            model: None,
+            prompt_tokens: None,
+            generation_tokens: None,
+            metrics: baseline_metrics,
+            recorded_at: None,
+            notes: None,
+        };
+
+        let mut current = BTreeMap::new();
+        current.insert("prompt_tps".into(), metric(95.0));
+        current.insert("generation_tps".into(), metric(40.0));
+        current.insert("ttft_ms".into(), metric(10.5));
+
+        assert!(!compare_baseline(&baseline, &current));
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let sorted = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile(&sorted, 50.0), 2.0);
+        assert_eq!(percentile(&sorted, 99.0), 4.0);
     }
 }

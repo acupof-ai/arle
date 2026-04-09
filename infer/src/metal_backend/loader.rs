@@ -30,6 +30,13 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
             .with_context(|| format!("parse {}", shard.display()))?;
 
         for name in st.names() {
+            if tensors.contains_key(name) {
+                anyhow::bail!(
+                    "duplicate tensor '{}' found while loading {}",
+                    name,
+                    shard.display()
+                );
+            }
             let view = st
                 .tensor(name)
                 .with_context(|| format!("tensor {name} in {}", shard.display()))?;
@@ -44,13 +51,6 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
                 other => anyhow::bail!("unsupported safetensors dtype {other:?} for {name}"),
             };
             let arr = unsafe { Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
-            if tensors.contains_key(name) {
-                log::warn!(
-                    "duplicate tensor '{}' in {} — overwriting previous definition",
-                    name,
-                    shard.display()
-                );
-            }
             tensors.insert(name.to_string(), arr);
         }
     }
@@ -173,4 +173,49 @@ fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     shards.sort();
     Ok(shards)
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::test_support::metal_test_guard;
+    use safetensors::{Dtype, serialize_to_file, tensor::TensorView};
+    use tempfile::tempdir;
+
+    use super::load_tensor_map;
+
+    fn write_safetensor_file(path: &std::path::Path, tensors: &[(&str, &[f32], &[usize])]) {
+        let views = tensors
+            .iter()
+            .map(|(name, data, shape)| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        data.as_ptr().cast::<u8>(),
+                        std::mem::size_of_val(*data),
+                    )
+                };
+                let view = TensorView::new(Dtype::F32, shape.to_vec(), bytes).unwrap();
+                ((*name).to_string(), view)
+            })
+            .collect::<BTreeMap<_, _>>();
+        serialize_to_file(&views, None, path).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names_across_shards() {
+        let _guard = metal_test_guard();
+        let dir = tempdir().unwrap();
+        write_safetensor_file(
+            &dir.path().join("model-00001-of-00002.safetensors"),
+            &[("dup.weight", &[1.0f32], &[1])],
+        );
+        write_safetensor_file(
+            &dir.path().join("model-00002-of-00002.safetensors"),
+            &[("dup.weight", &[2.0f32], &[1])],
+        );
+
+        let err = load_tensor_map(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("duplicate tensor 'dup.weight'"), "err={err}");
+    }
 }
