@@ -339,10 +339,7 @@ impl DeviceMatrix {
     }
 
     /// Create from INT4 packed quantized weight + bf16 scales.
-    ///
-    /// Unpacks INT4 → INT8 at load time and uses the proven W8A16 kernel path.
-    /// This avoids a known GPU correctness issue in the W4 GEMV kernel while
-    /// still getting ~50% of the W4 bandwidth benefit (INT8 = 1 byte vs bf16 = 2 bytes).
+    /// Unpacks INT4 → INT8 at load time for the W8 kernel (W4 native kernel has GPU bug).
     pub fn from_quantized_int4(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -355,11 +352,11 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Unpack INT4 → INT8 on CPU: each byte holds 2 int4 values
+        // Unpack INT4 → INT8: each byte holds 2 int4 values
         let mut unpacked = vec![0i8; rows * cols];
         for i in 0..packed_data.len() {
             let byte = packed_data[i];
-            let lo = (byte & 0x0F) as i8 - 8; // signed [-8, 7]
+            let lo = (byte & 0x0F) as i8 - 8;
             let hi = (byte >> 4) as i8 - 8;
             let row = i / (cols / 2);
             let byte_in_row = i % (cols / 2);
@@ -367,7 +364,6 @@ impl DeviceMatrix {
             unpacked[row * cols + byte_in_row * 2 + 1] = hi;
         }
 
-        // Upload as INT8 and use the W8 kernel (quant_bits=8)
         let qw = ctx
             .stream
             .clone_htod(&unpacked)
@@ -387,12 +383,12 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8, // Use W8 kernel (proven correct)
+            quant_bits: 8, // INT4→INT8 unpack workaround
         })
     }
 
     /// Create from INT2 packed quantized weight + bf16 scales.
-    /// Unpacks INT2 → INT8 at load time and uses W8A16 kernel (same workaround as INT4).
+    /// Weight data is packed: 4 int2 values per byte → [rows, cols/4] bytes.
     pub fn from_quantized_int2(
         ctx: &DeviceContext,
         packed_data: &[u8],
@@ -405,27 +401,13 @@ impl DeviceMatrix {
         let num_groups = cols / group_size;
         assert_eq!(scales_data.len(), rows * num_groups);
 
-        // Unpack INT2 → INT8: each byte holds 4 int2 values
-        let mut unpacked = vec![0i8; rows * cols];
-        for i in 0..packed_data.len() {
-            let byte = packed_data[i];
-            let v0 = (byte & 0x03) as i8 - 2;
-            let v1 = ((byte >> 2) & 0x03) as i8 - 2;
-            let v2 = ((byte >> 4) & 0x03) as i8 - 2;
-            let v3 = ((byte >> 6) & 0x03) as i8 - 2;
-            let row = i / (cols / 4);
-            let byte_in_row = i % (cols / 4);
-            let base = row * cols + byte_in_row * 4;
-            unpacked[base] = v0;
-            unpacked[base + 1] = v1;
-            unpacked[base + 2] = v2;
-            unpacked[base + 3] = v3;
-        }
-
-        let qw = ctx
+        // Upload packed data directly (native W2 kernel handles bit extraction)
+        let qw: CudaSlice<i8> = ctx
             .stream
-            .clone_htod(&unpacked)
-            .map_err(|e| anyhow!("H2D qweight int2→int8 failed: {}", e))?;
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
+            })
+            .map_err(|e| anyhow!("H2D qweight int2 failed: {}", e))?;
         let qs = ctx
             .stream
             .clone_htod(scales_data)
@@ -441,7 +423,7 @@ impl DeviceMatrix {
             qweight: Some(qw),
             qscales: Some(qs),
             group_size,
-            quant_bits: 8, // Use W8 kernel (proven correct, same workaround as INT4)
+            quant_bits: 2,
         })
     }
 

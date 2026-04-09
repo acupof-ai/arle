@@ -146,6 +146,16 @@ pub(crate) fn gemm_into(
                 .expect("w2a16_gemv_cuda failed");
             } else if weight.quant_bits == 4 {
                 // W4A16: packed int4 weights
+                // Debug: verify qweight size matches expected packed size
+                debug_assert_eq!(
+                    qw.len(),
+                    weight.rows * weight.cols / 2,
+                    "W4 qweight size mismatch: got {}, expected {} (rows={}, cols={})",
+                    qw.len(),
+                    weight.rows * weight.cols / 2,
+                    weight.rows,
+                    weight.cols
+                );
                 ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
                     qs_ptr as *const ffi::Half,
