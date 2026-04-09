@@ -187,17 +187,10 @@ fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
 
 /// RMS-normalize along the last axis, matching `mx.fast.rms_norm(x, None, eps)`.
 #[cfg(feature = "metal")]
+/// RMS-normalize along the last axis without learnable weight.
+/// Uses MLX's fused fast.rms_norm — single op instead of 7 manual ops.
 fn rms_normalize(x: &MlxArray, eps: f32) -> MlxArray {
-    use crate::mlx::{add, multiply, reciprocal, sqrt, sum_axis};
-
-    let last_dim = *x.shape().last().expect("rms_normalize: empty shape") as f32;
-    let inv_dim = MlxArray::from_slice_f32(&[1.0f32 / last_dim], &[1]);
-    let eps_arr = MlxArray::from_slice_f32(&[eps], &[1]);
-    let sq = multiply(x, x);
-    let sum_sq = sum_axis(&sq, -1, true);
-    let mean_sq = multiply(&sum_sq, &inv_dim);
-    let inv_norm = reciprocal(&sqrt(&add(&mean_sq, &eps_arr)));
-    multiply(x, &inv_norm)
+    crate::mlx::rms_norm_no_weight(x, eps)
 }
 
 // ── Helper: softplus ─────────────────────────────────────────────────────────
