@@ -452,7 +452,7 @@ Phase 0 (CPU) ✅ COMPLETE
   0.2 Sampler           ✅
   0.3 Radix Cache       ✅
   0.4 Block Manager     ✅
-  0.5 Scheduler++       ✅ (preemption/swap pending)
+  0.5 Scheduler++       ✅ (preemption: recompute mode done, swap mode deferred)
   0.6 Model Registry    ✅
   0.7 Benchmark Suite   ✅
 
@@ -498,8 +498,8 @@ Phase 0 complete. Quantization (Phase 2) largely complete. Focus on performance 
 
 1. ~~**Qwen3.5 SGLang parity**~~ — ✅ prefix cache fixed, ITL/TTFT ahead at C≤16
 2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant all production-ready
-3. **Scheduler preemption with KV swap** — remaining 0.5 item for production robustness
-4. **Overlap scheduling (H2D/D2H with compute)** — ~2-5% ITL at high concurrency
+3. ~~**Scheduler preemption with KV swap**~~ — ✅ recompute mode done (swap mode deferred)
+4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
 5. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass
 6. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
 7. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
