@@ -508,4 +508,137 @@ void metal_qwen35_full_attn_block(
         bfloat16)));
 }
 
+// ── metal_qwen35_gdr_block ──────────────────────────────────────────────────
+//
+// Gated Delta Rule linear attention — single C++ call for the entire
+// GDR decode step.
+
+void metal_qwen35_gdr_block(
+    mlx_array x_h,
+    // projections (dense or quantized)
+    mlx_array qkv_w_h, mlx_array qkv_scales_h, mlx_array qkv_biases_h,
+    mlx_array z_w_h, mlx_array z_scales_h, mlx_array z_biases_h,
+    mlx_array beta_w_h, mlx_array beta_scales_h, mlx_array beta_biases_h,
+    mlx_array alpha_w_h, mlx_array alpha_scales_h, mlx_array alpha_biases_h,
+    mlx_array out_w_h, mlx_array out_scales_h, mlx_array out_biases_h,
+    // fixed params
+    mlx_array conv1d_weight_h, mlx_array dt_bias_h, mlx_array a_log_h, mlx_array norm_weight_h,
+    // config
+    int num_key_heads, int key_dim, int num_value_heads, int value_dim,
+    int conv_kernel, int hidden_size, float rms_norm_eps,
+    int group_size, int bits, bool is_quantized,
+    // mutable state
+    mlx_array* recurrent_state_h,  // [num_value_heads, key_dim, value_dim]
+    mlx_array* conv_state_h,       // [qkv_dim, conv_kernel-1]
+    mlx_array* result_out)
+{
+    using namespace mlx::core;
+    namespace fast = mlx::core::fast;
+
+    const array& x = arr_ref(x_h);
+    array& state = arr_ref(*recurrent_state_h);
+    array& conv_state = arr_ref(*conv_state_h);
+    const array& conv_weight = arr_ref(conv1d_weight_h);
+    const array& dt_bias = arr_ref(dt_bias_h);
+    const array& a_log = arr_ref(a_log_h);
+    const array& norm_w = arr_ref(norm_weight_h);
+
+    int q_dim = num_key_heads * key_dim;
+    int k_dim = q_dim;
+    int v_dim = num_value_heads * value_dim;
+    int qkv_dim = q_dim + k_dim + v_dim;
+    int heads_per_key = num_value_heads / num_key_heads;
+
+    // 1. Projections
+    array x_flat = reshape(x, {1, hidden_size});
+    array qkv_raw = astype(flex_linear(x_flat, arr_ref(qkv_w_h), arr_ref(qkv_scales_h),
+        arr_ref(qkv_biases_h), group_size, bits, is_quantized), bfloat16);
+    array z = astype(flex_linear(x_flat, arr_ref(z_w_h), arr_ref(z_scales_h),
+        arr_ref(z_biases_h), group_size, bits, is_quantized), bfloat16);
+    array beta_raw = astype(flex_linear(x_flat, arr_ref(beta_w_h), arr_ref(beta_scales_h),
+        arr_ref(beta_biases_h), group_size, bits, is_quantized), bfloat16);
+    array alpha_raw = astype(flex_linear(x_flat, arr_ref(alpha_w_h), arr_ref(alpha_scales_h),
+        arr_ref(alpha_biases_h), group_size, bits, is_quantized), bfloat16);
+
+    // 2. Conv1d step
+    array qkv_1d = reshape(qkv_raw, {qkv_dim});
+    array qkv_f32 = astype(qkv_1d, float32);
+    array x_col = reshape(qkv_f32, {qkv_dim, 1});
+    array full_window = concatenate({conv_state, x_col}, 1);
+    array conv_out = astype(sum(multiply(full_window, conv_weight), {1}), bfloat16);
+    array activated = astype(multiply(conv_out, sigmoid(conv_out)), bfloat16); // SiLU
+    activated = astype(activated, float32);
+    // Update conv state
+    if (conv_kernel > 1) {
+        conv_state = slice(full_window, {0, 1}, {qkv_dim, conv_kernel});
+    }
+
+    // 3. Split QKV + RMS normalize
+    array q_raw = slice(activated, {0}, {q_dim});
+    array k_raw = slice(activated, {q_dim}, {q_dim + k_dim});
+    array v_raw = slice(activated, {q_dim + k_dim}, {qkv_dim});
+
+    // Per-key-head RMS normalize (no weight)
+    auto rms_no_w = [rms_norm_eps](const array& x) -> array {
+        int d = x.shape().back();
+        array sq = multiply(x, x);
+        array mean_sq = multiply(sum(sq, {-1}, true), array(1.0f / d));
+        return multiply(x, reciprocal(sqrt(add(mean_sq, array(rms_norm_eps)))));
+    };
+
+    array q_norm = rms_no_w(reshape(q_raw, {num_key_heads, key_dim}));
+    array k_norm = rms_no_w(reshape(k_raw, {num_key_heads, key_dim}));
+
+    float inv_scale = 1.0f / std::sqrt((float)key_dim);
+    array q_scaled = multiply(q_norm, array(inv_scale * inv_scale));
+    array k_scaled = multiply(k_norm, array(inv_scale));
+
+    // 4. Gate + beta
+    array alpha_1d = astype(reshape(alpha_raw, {num_value_heads}), float32);
+    array beta_1d = astype(reshape(beta_raw, {num_value_heads}), float32);
+    array sp = softplus(add(alpha_1d, dt_bias));
+    array exp_g = exp(multiply(negative(exp(a_log)), sp));
+    array beta = sigmoid(beta_1d);
+
+    // 5. Expand q/k for GQA
+    array k_exp = k_scaled, q_exp = q_scaled;
+    if (heads_per_key > 1) {
+        k_exp = reshape(broadcast_to(expand_dims(k_scaled, 1),
+            {num_key_heads, heads_per_key, key_dim}), {num_value_heads, key_dim});
+        q_exp = reshape(broadcast_to(expand_dims(q_scaled, 1),
+            {num_key_heads, heads_per_key, key_dim}), {num_value_heads, key_dim});
+    }
+    array v_heads = reshape(v_raw, {num_value_heads, value_dim});
+
+    // 6. State update (delta rule)
+    array exp_g_3d = reshape(exp_g, {num_value_heads, 1, 1});
+    array s_decayed = multiply(state, exp_g_3d);
+    array k_3d = reshape(k_exp, {num_value_heads, key_dim, 1});
+    array kv_mem = sum(multiply(s_decayed, k_3d), {1});
+    array beta_2d = reshape(beta, {num_value_heads, 1});
+    array delta = multiply(subtract(v_heads, kv_mem), beta_2d);
+    array delta_3d = reshape(delta, {num_value_heads, 1, value_dim});
+    state = add(s_decayed, multiply(delta_3d, k_3d));
+    array q_3d = reshape(q_exp, {num_value_heads, key_dim, 1});
+    array output_heads = sum(multiply(state, q_3d), {1}); // [H, V]
+
+    // 7. Per-head RMSNorm + output gate
+    array out_bf16 = astype(output_heads, bfloat16);
+    for (auto d : out_bf16.shape()) fprintf(stderr, "%d ", d);
+    fprintf(stderr, "norm_w=");
+    for (auto d : norm_w.shape()) fprintf(stderr, "%d ", d);
+    fprintf(stderr, "\n");
+    array normed = fast::rms_norm(out_bf16, std::optional<array>(norm_w), rms_norm_eps);
+    array normed_flat = astype(reshape(normed, {1, num_value_heads * value_dim}), bfloat16);
+    array z_f32 = astype(z, float32);
+    array z_silu = multiply(z_f32, sigmoid(z_f32));
+    array gated = astype(multiply(astype(normed_flat, float32), z_silu), bfloat16);
+
+    // 8. Output projection
+    *result_out = arr_own(std::move(astype(
+        flex_linear(gated, arr_ref(out_w_h), arr_ref(out_scales_h),
+                    arr_ref(out_biases_h), group_size, bits, is_quantized),
+        bfloat16)));
+}
+
 } // extern "C"
