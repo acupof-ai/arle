@@ -3,7 +3,7 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use crate::mlx::{
-    self, Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
+    Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
     zeros,
 };
@@ -88,7 +88,7 @@ impl CompiledQwen35 {
             );
         }
 
-        // Embed + norm + lm_head
+        // Embed + norm + lm_head (supports both Dense and Quantized)
         let (lm_w, lm_s, lm_b, lm_gs, lm_bits) = match &weights.lm_head {
             WeightTensor::Quantized {
                 w,
@@ -103,11 +103,13 @@ impl CompiledQwen35 {
                 *group_size,
                 *bits,
             ),
-            WeightTensor::Dense(_) => {
-                log::warn!("C++ compiled model requires quantized lm_head — falling back to Rust");
-                unsafe { mlx_sys::qwen35_compiled_free(model) };
-                return None;
-            }
+            WeightTensor::Dense(w_t) => (
+                w_t.as_raw(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0, // bits=0 signals Dense to C++
+            ),
         };
         unsafe {
             mlx_sys::qwen35_compiled_set_embed(
@@ -407,7 +409,6 @@ pub(super) fn metal_generate_qwen35(
     }
 
     // Build flat cache arrays for C++ path: [k0, v0, k1, v1, ...] and [gdr0, conv0, ...]
-    // No clone — move into flat layout (C++ path owns these exclusively).
     let mut kv_flat: Vec<MlxArray> = k_caches
         .iter()
         .zip(v_caches.iter())
@@ -440,9 +441,9 @@ pub(super) fn metal_generate_qwen35(
     };
 
     let mut logits = None;
-    for &token in input_ids {
+    for (idx, &token) in input_ids.iter().enumerate() {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        logits = Some(do_step(
+        let step_logits = do_step(
             &token_arr,
             &weights.compiled_model,
             &mut kv_flat,
@@ -451,7 +452,16 @@ pub(super) fn metal_generate_qwen35(
             &mut v_caches,
             &mut recurrent,
             cache_len,
-        )?);
+        )?;
+        if weights.compiled_model.is_some() && idx + 1 != input_ids.len() {
+            let mut prompt_outputs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            prompt_outputs.push(&step_logits);
+            prompt_outputs.extend(kv_flat.iter());
+            prompt_outputs.extend(gdr_flat.iter());
+            crate::mlx::eval(&prompt_outputs);
+        }
+        logits = Some(step_logits);
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
     }
@@ -508,19 +518,36 @@ pub(super) fn metal_generate_qwen35(
         // Grow KV cache if needed (rare — only every 256 tokens)
         if cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
-            for li in 0..num_full_layers {
-                extend_kv_cache(
-                    &mut k_caches[li],
-                    config.num_key_value_heads as i32,
-                    config.head_dim as i32,
-                    new_cap,
-                );
-                extend_kv_cache(
-                    &mut v_caches[li],
-                    config.num_key_value_heads as i32,
-                    config.head_dim as i32,
-                    new_cap,
-                );
+            if weights.compiled_model.is_some() {
+                for li in 0..num_full_layers {
+                    extend_kv_cache(
+                        &mut kv_flat[2 * li],
+                        config.num_key_value_heads as i32,
+                        config.head_dim as i32,
+                        new_cap,
+                    )?;
+                    extend_kv_cache(
+                        &mut kv_flat[2 * li + 1],
+                        config.num_key_value_heads as i32,
+                        config.head_dim as i32,
+                        new_cap,
+                    )?;
+                }
+            } else {
+                for li in 0..num_full_layers {
+                    extend_kv_cache(
+                        &mut k_caches[li],
+                        config.num_key_value_heads as i32,
+                        config.head_dim as i32,
+                        new_cap,
+                    )?;
+                    extend_kv_cache(
+                        &mut v_caches[li],
+                        config.num_key_value_heads as i32,
+                        config.head_dim as i32,
+                        new_cap,
+                    )?;
+                }
             }
             kv_capacity = new_cap;
         }
@@ -1064,7 +1091,10 @@ pub(super) fn load_qwen35_metal_weights(
     };
 
     // Try to build the C++ compiled model (all layers in C++, no per-op FFI).
-    weights.compiled_model = CompiledQwen35::build(&weights, config, arch);
+    // C++ model — gated by env var for A/B testing
+    if !std::env::var("METAL_NO_CPP").is_ok() {
+        weights.compiled_model = CompiledQwen35::build(&weights, config, arch);
+    }
 
     Ok(weights)
 }

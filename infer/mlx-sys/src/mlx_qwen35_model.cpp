@@ -14,8 +14,94 @@
 //!   qwen35_compiled_free(model)
 
 #include "mlx_common.h"
+#include <cstdlib>
 
 using namespace mlx::core;
+
+namespace {
+
+bool use_gdr_metal_kernel() {
+    const char* env = std::getenv("AGENT_INFER_GDR_METAL_KERNEL");
+    return !(env && std::string(env) == "0");
+}
+
+auto& gated_delta_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gated_delta_step",
+        {"q", "k", "v", "g", "beta", "state_in", "T"},
+        {"y", "state_out"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        for (int t = 0; t < T; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+                out += state[i] * q_[s_idx];
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
+} // namespace
 
 // ── Quantized linear helper ────────────────────────────────────────────────
 
@@ -25,8 +111,12 @@ struct QWeight {
     array biases = array(0);
     int group_size = 64;
     int bits = 4;
+    bool is_dense = false;  // if true, w is already transposed, use matmul directly
 
     array apply(const array& x) const {
+        if (is_dense) {
+            return matmul(x, w);  // w is already transposed at load time
+        }
         return quantized_matmul(x, w, scales, biases, true, group_size, bits);
     }
 };
@@ -82,6 +172,9 @@ struct Qwen35CompiledModel {
     std::function<std::vector<array>(const std::vector<array>&)> compiled_fn;
     bool is_compiled = false;
 
+    // Runtime state (set before each forward call)
+    int current_cache_pos = 0;
+
     // ── Full attention decode step ─────────────────────────────────────
 
     array full_attn_step(
@@ -131,7 +224,7 @@ struct Qwen35CompiledModel {
         return lw.o_proj.apply(gated);
     }
 
-    // ── GDR decode step (without Metal kernel — ops only for compile) ──
+    // ── GDR decode step ────────────────────────────────────────────────
 
     array gdr_step(
         const array& x, const GdrLayerWeights& lw,
@@ -176,26 +269,64 @@ struct Qwen35CompiledModel {
         auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
         auto g = exp(negative(exp(a)) * sp);
 
-        // State update (ops — compile will fuse elementwise)
-        int heads_per_key = hv / hk;
-        auto g_4d = reshape(g, {1, hv, 1, 1});
-        auto s_decayed = gdr_state_in * g_4d;
+        array y(0);
+        if (use_gdr_metal_kernel()) {
+            auto q_bf16 = astype(q, bfloat16);
+            auto k_bf16 = astype(k, bfloat16);
+            auto v_bf16 = astype(v_raw, bfloat16);
+            auto g_3d = reshape(g, {1, 1, hv});
+            auto beta_3d = reshape(beta, {1, 1, hv});
+            auto t_arr = array(1);
 
-        array k_exp = (heads_per_key > 1)
-            ? reshape(broadcast_to(expand_dims(k, 2), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
-            : reshape(k, {1,hv,dk});
-        array q_exp = (heads_per_key > 1)
-            ? reshape(broadcast_to(expand_dims(q, 2), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
-            : reshape(q, {1,hv,dk});
+            std::vector<array> inputs = {
+                q_bf16, k_bf16, v_bf16, g_3d, beta_3d, gdr_state_in, t_arr
+            };
+            std::vector<Shape> out_shapes = {{1, 1, hv, dv}, gdr_state_in.shape()};
+            std::vector<Dtype> out_dtypes = {bfloat16, float32};
+            std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+                {"Dk", fast::TemplateArg(dk)},
+                {"Dv", fast::TemplateArg(dv)},
+                {"Hk", fast::TemplateArg(hk)},
+                {"Hv", fast::TemplateArg(hv)},
+                {"InT", fast::TemplateArg(bfloat16)},
+                {"StT", fast::TemplateArg(float32)},
+            };
 
-        auto v_3d = reshape(v_raw, {1, hv, dv});
-        auto k_4d = reshape(k_exp, {1, hv, 1, dk});
-        auto kv_mem = sum(s_decayed * k_4d, -1, false);
-        auto beta_3d = reshape(beta, {1, hv, 1});
-        auto delta = (v_3d - kv_mem) * beta_3d;
-        gdr_state_out = s_decayed + reshape(delta, {1,hv,dv,1}) * k_4d;
-        auto q_4d = reshape(q_exp, {1, hv, 1, dk});
-        auto y = reshape(sum(gdr_state_out * q_4d, -1, false), {1,1,hv,dv});
+            auto result = gated_delta_kernel()(
+                inputs,
+                out_shapes,
+                out_dtypes,
+                std::make_tuple(32, dv, hv),
+                std::make_tuple(32, 4, 1),
+                tmpl,
+                std::nullopt,
+                false,
+                {});
+
+            y = std::move(result[0]);
+            gdr_state_out = std::move(result[1]);
+        } else {
+            int heads_per_key = hv / hk;
+            auto g_4d = reshape(g, {1, hv, 1, 1});
+            auto s_decayed = gdr_state_in * g_4d;
+
+            // GQA: repeat k/q from [1,1,Hk,Dk] to [1,Hv,Dk] by inserting + broadcasting
+            array k_exp = (heads_per_key > 1)
+                ? reshape(broadcast_to(expand_dims(k, 3), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
+                : reshape(k, {1,hv,dk});
+            array q_exp = (heads_per_key > 1)
+                ? reshape(broadcast_to(expand_dims(q, 3), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
+                : reshape(q, {1,hv,dk});
+
+            auto v_3d = reshape(v_raw, {1, hv, dv});
+            auto k_4d = reshape(k_exp, {1, hv, 1, dk});
+            auto kv_mem = sum(s_decayed * k_4d, -1, false);
+            auto beta_3d = reshape(beta, {1, hv, 1});
+            auto delta = (v_3d - kv_mem) * beta_3d;
+            gdr_state_out = s_decayed + reshape(delta, {1,hv,dv,1}) * k_4d;
+            auto q_4d = reshape(q_exp, {1, hv, 1, dk});
+            y = reshape(sum(gdr_state_out * q_4d, -1, false), {1,1,hv,dv});
+        }
 
         // Output norm + gate
         auto y_heads = reshape(y, {hv, dv});
@@ -228,10 +359,9 @@ struct Qwen35CompiledModel {
 
     std::vector<array> forward(const std::vector<array>& inputs) const {
         auto token_id = inputs[0];
-        auto cache_pos_arr = inputs[1];
-        // NOTE: cache_pos must be a concrete int for slice indices.
-        // With compile, it's traced as a symbolic value — slice_update
-        // uses it symbolically, which is fine.
+        // cache_pos is passed as current_cache_pos (set before call),
+        // NOT extracted from inputs — avoids forcing GPU eval mid-graph.
+        int cache_pos = current_cache_pos;
 
         int F = n_full_attn, G = n_gdr;
         auto x = take(embed_tokens, token_id, 0);
@@ -252,18 +382,16 @@ struct Qwen35CompiledModel {
             // Attention
             array attn_out(0);
             if (layer.is_gdr) {
-                int si = 2 + 2*F + 2*gdr_idx;
+                int si = 1 + 2*F + 2*gdr_idx;
                 attn_out = gdr_step(xn, layer.gdr,
                     inputs[si], inputs[si+1],
                     new_gdr_states[gdr_idx], new_conv_states[gdr_idx]);
                 gdr_idx++;
             } else {
-                int si = 2 + 2*full_idx;
-                // cache_pos is symbolic — extract as int for slice indices
-                // This works with compile because MLX traces slice ops symbolically
+                int si = 1 + 2*full_idx;
                 attn_out = full_attn_step(xn, layer.full,
                     inputs[si], inputs[si+1],
-                    cache_pos_arr.item<int32_t>(),
+                    cache_pos,
                     new_kv_caches[2*full_idx], new_kv_caches[2*full_idx+1]);
                 full_idx++;
             }
@@ -345,7 +473,12 @@ void qwen35_compiled_set_embed(
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     m->embed_tokens = *to_arr(embed_tokens);
     m->final_norm_w = *to_arr(final_norm_w);
-    m->lm_head = {*to_arr(lm_head_w), *to_arr(lm_head_s), *to_arr(lm_head_b), lm_gs, lm_bits};
+    if (lm_head_s == nullptr || lm_bits == 0) {
+        // Dense lm_head (tied to embed_tokens transpose)
+        m->lm_head = {*to_arr(lm_head_w), array(0), array(0), 0, 0, true};
+    } else {
+        m->lm_head = {*to_arr(lm_head_w), *to_arr(lm_head_s), *to_arr(lm_head_b), lm_gs, lm_bits, false};
+    }
 }
 
 void qwen35_compiled_push_full_attn(
@@ -451,20 +584,20 @@ int32_t qwen35_compiled_step(
     try {
         mlx_clear_error();
 
+        m->current_cache_pos = cache_pos;
+
         // Build inputs vector
         std::vector<array> inputs;
-        inputs.reserve(2 + n_kv + n_gdr);
+        inputs.reserve(1 + n_kv + n_gdr);
         inputs.push_back(*to_arr(token_id));
-        inputs.push_back(array(cache_pos));
         for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(kv_caches[i]));
         for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(gdr_states[i]));
 
-        // Run compiled forward
-        auto outputs = m->is_compiled
-            ? m->compiled_fn(inputs)
-            : m->forward(inputs);
+        // Run forward — returns LAZY arrays. DO NOT eval here!
+        // The Rust caller handles eval via double-buffered async_eval pattern.
+        auto outputs = m->forward(inputs);
 
-        // Distribute outputs
+        // Distribute outputs (still lazy — no GPU work yet)
         *out_logits = from_arr(std::move(outputs[0]));
         for (int i = 0; i < n_kv; ++i)
             out_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
