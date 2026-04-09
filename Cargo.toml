@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "infer"]
+members = [".", "infer", "infer/mlx-sys"]
 
 [package]
 name = "agent-infer"
