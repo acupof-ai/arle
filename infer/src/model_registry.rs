@@ -117,6 +117,7 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         // checkpoints that already declare the dedicated architecture string.
         m.insert("Qwen2_5_VLForCausalLM", ModelArch::Qwen35);
         m.insert("Qwen3_5ForCausalLM", ModelArch::Qwen35);
+        m.insert("Qwen3_5ForConditionalGeneration", ModelArch::Qwen35);
         // Llama
         m.insert("LlamaForCausalLM", ModelArch::Llama);
         m.insert("Llama3ForCausalLM", ModelArch::Llama);

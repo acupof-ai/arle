@@ -303,7 +303,7 @@ fn wt_parts(
     }
 }
 
-#[cfg(metal_fused_ops)]
+#[cfg(metal_qwen35_fused_ops)]
 #[allow(clippy::too_many_arguments)]
 fn fused_full_attn_step(
     x: &MlxArray,
@@ -364,7 +364,7 @@ fn fused_full_attn_step(
     unsafe { MlxArray::from_raw(result_raw) }
 }
 
-#[cfg(not(metal_fused_ops))]
+#[cfg(not(metal_qwen35_fused_ops))]
 #[allow(clippy::too_many_arguments)]
 fn fused_full_attn_step(
     x: &MlxArray,
@@ -385,7 +385,7 @@ fn fused_full_attn_step(
     qwen35_full_attention_step(&normed, attn, config, arch, k_cache, v_cache, cache_len)
 }
 
-#[cfg(metal_fused_ops)]
+#[cfg(metal_qwen35_fused_ops)]
 #[allow(clippy::too_many_arguments)]
 fn fused_gdr_step(
     x: &MlxArray,
@@ -452,7 +452,7 @@ fn fused_gdr_step(
     unsafe { MlxArray::from_raw(result_raw) }
 }
 
-#[cfg(not(metal_fused_ops))]
+#[cfg(not(metal_qwen35_fused_ops))]
 #[allow(clippy::too_many_arguments)]
 fn fused_gdr_step(
     x: &MlxArray,
