@@ -24,8 +24,8 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
     let mut tensors = TensorMap::new();
     log::info!("  loading {} shard(s) …", shards.len());
 
-    for shard in shards {
-        let bytes = std::fs::read(&shard).with_context(|| format!("read {}", shard.display()))?;
+    for shard in &shards {
+        let bytes = std::fs::read(shard).with_context(|| format!("read {}", shard.display()))?;
         let st = SafeTensors::deserialize(&bytes)
             .with_context(|| format!("parse {}", shard.display()))?;
 
@@ -44,6 +44,13 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
                 other => anyhow::bail!("unsupported safetensors dtype {other:?} for {name}"),
             };
             let arr = unsafe { Array::from_raw_data(view.data().as_ptr().cast(), &shape, dtype) };
+            if tensors.contains_key(name) {
+                log::warn!(
+                    "duplicate tensor '{}' in {} — overwriting previous definition",
+                    name,
+                    shard.display()
+                );
+            }
             tensors.insert(name.to_string(), arr);
         }
     }
@@ -127,7 +134,33 @@ pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &Array) -> Result<Weig
     Ok(WeightTensor::Dense(w_t))
 }
 
+/// Collect safetensors shard paths. Prefers `model.safetensors.index.json` when
+/// present — this avoids loading stray `.safetensors` files that happen to exist
+/// in the directory (e.g. leftover shards from a different conversion).
 fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    // Try the index file first.
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if let Ok(raw) = std::fs::read_to_string(&index_path) {
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", index_path.display()))?;
+        if let Some(map) = v.get("weight_map").and_then(serde_json::Value::as_object) {
+            let mut files: Vec<String> = map
+                .values()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            files.sort();
+            files.dedup();
+            let shards: Vec<PathBuf> = files.iter().map(|f| model_dir.join(f)).collect();
+            log::info!(
+                "  using index: {} shards from {}",
+                shards.len(),
+                index_path.display()
+            );
+            return Ok(shards);
+        }
+    }
+
+    // Fallback: glob all .safetensors files, sorted by name.
     let mut shards: Vec<PathBuf> = std::fs::read_dir(model_dir)
         .with_context(|| format!("read_dir {}", model_dir.display()))?
         .filter_map(std::result::Result::ok)

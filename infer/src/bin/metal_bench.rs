@@ -129,11 +129,13 @@ fn compare_baseline(baseline: &Baseline, current: &BTreeMap<String, MetricStat>)
     let mut all_pass = true;
     let mut rows: Vec<(String, f64, f64, f64, bool)> = Vec::new();
 
+    // Only compare metrics that have regression thresholds. `total_time_ms` is
+    // intentionally excluded — it's a derived quantity (prompt + decode) and the
+    // individual components already have their own thresholds.
     for (metric, threshold_info) in [
         ("prompt_tps", regression_threshold("prompt_tps")),
         ("generation_tps", regression_threshold("generation_tps")),
         ("ttft_ms", regression_threshold("ttft_ms")),
-        ("total_time_ms", regression_threshold("total_time_ms")),
     ] {
         let base_val = match baseline.metrics.get(metric) {
             Some(s) => s.mean,
@@ -446,6 +448,23 @@ fn run_bench() -> Result<()> {
         let baseline: Baseline = serde_json::from_str(&data)
             .map_err(|e| anyhow::anyhow!("failed to parse baseline {}: {}", path.display(), e))?;
         eprintln!("Comparing against baseline: {}", path.display());
+        // Warn if baseline was recorded with different parameters.
+        if let Some(bp) = baseline.prompt_tokens {
+            if bp != cli.prompt_tokens {
+                eprintln!(
+                    "  WARNING: baseline prompt_tokens={} vs current={}",
+                    bp, cli.prompt_tokens
+                );
+            }
+        }
+        if let Some(bg) = baseline.generation_tokens {
+            if bg != cli.generation_tokens {
+                eprintln!(
+                    "  WARNING: baseline generation_tokens={} vs current={}",
+                    bg, cli.generation_tokens
+                );
+            }
+        }
         let passed = compare_baseline(&baseline, &current_metrics);
         if !passed {
             eprintln!("REGRESSION DETECTED — one or more metrics exceeded threshold.");
@@ -496,7 +515,7 @@ fn run_bench() -> Result<()> {
     Ok(())
 }
 
-/// Linear-interpolation percentile over a *sorted* slice.
+/// Nearest-rank percentile over a *sorted* slice.
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
