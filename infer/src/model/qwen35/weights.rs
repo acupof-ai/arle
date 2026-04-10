@@ -433,10 +433,18 @@ impl Qwen35Model {
         enable_cuda_graph: bool,
     ) -> Result<Self> {
         use crate::weight_loader::{
-            load_tensor_1d_gguf, load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_reinterleave,
-            load_tensor_2d_gguf, load_tensor_2d_gguf_reinterleave,
-            load_tensor_2d_gguf_reinterleave_rows, precompute_rope, reinterleave_1d_f32,
+            load_tensor_1d_gguf, load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder,
+            load_tensor_2d_gguf, load_tensor_2d_gguf_v_reorder_cols,
+            load_tensor_2d_gguf_v_reorder_rows, precompute_rope, reverse_v_reorder_f32,
+            reverse_v_reorder_rows,
         };
+
+        // SSM V-head reorder config (from llama.cpp _reorder_v_heads)
+        let num_k = config.linear_num_key_heads;
+        let num_v = config.linear_num_value_heads;
+        let vpk = num_v / num_k; // num_v_per_k
+        let hd_k = config.linear_key_head_dim;
+        let hd_v = config.linear_value_head_dim;
         // GGUF stores norm weights with +1 offset baked in (e.g., w_gguf = 1 + w_hf).
         // Use load_tensor_1d_gguf_offset_norm for all RMSNorm/QK-norm weights.
         let load_norm =
@@ -477,18 +485,12 @@ impl Qwen35Model {
                 LayerType::LinearAttention => {
                     let ap = format!("{p}.linear_attn");
                     LayerKind::LinearAttention(LinearAttentionLayer {
-                        // QKV: 8192 rows = Q(2048) + K(2048) + V(4096)
-                        // Q/K have num_key_heads(16) heads, V has num_value_heads(32) heads
-                        // All sections deinterleaved separately by llama.cpp
+                        // QKV: only V rows are reordered (Q/K stay in place)
+                        // Ref: llama.cpp _LinearAttentionVReorderBase.modify_tensors
                         in_proj_qkv: {
-                            let num_key_heads = config.linear_num_key_heads;
-                            let num_val_heads = config.linear_num_value_heads;
-                            let key_dim = config.linear_key_head_dim;
-                            let val_dim = config.linear_value_head_dim;
-                            let q_rows = num_key_heads * key_dim;
-                            let k_rows = num_key_heads * key_dim;
-                            let v_rows = num_val_heads * val_dim;
-
+                            let q_rows = num_k * hd_k;
+                            let k_rows = num_k * hd_k;
+                            let v_rows = num_v * hd_v;
                             let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
                                 gguf,
                                 &format!("{ap}.in_proj_qkv.weight"),
@@ -496,62 +498,77 @@ impl Qwen35Model {
                             let info = &gguf.tensors[&gguf_name];
                             let mut data = gguf.read_tensor_bf16(&gguf_name)?;
                             let cols = info.shape[0] as usize;
-
-                            // Re-interleave Q section (rows 0..q_rows, num_key_heads heads)
-                            crate::weight_loader::reinterleave_rows_by_head(
-                                &mut data[..q_rows * cols],
-                                q_rows,
-                                cols,
-                                num_key_heads,
-                            );
-                            // Re-interleave K section
-                            let k_start = q_rows * cols;
-                            crate::weight_loader::reinterleave_rows_by_head(
-                                &mut data[k_start..k_start + k_rows * cols],
-                                k_rows,
-                                cols,
-                                num_key_heads,
-                            );
-                            // Re-interleave V section
+                            // Reorder only V rows
                             let v_start = (q_rows + k_rows) * cols;
-                            crate::weight_loader::reinterleave_rows_by_head(
+                            reverse_v_reorder_rows(
                                 &mut data[v_start..v_start + v_rows * cols],
                                 v_rows,
                                 cols,
-                                num_val_heads,
+                                num_k,
+                                vpk,
+                                hd_v,
                             );
-
                             let rows = q_rows + k_rows + v_rows;
                             DeviceMatrix::from_host(ctx, &data, rows, cols)?
                         },
-                        // in_proj_z: 4096 rows = 32 value_heads × 128
-                        in_proj_z: load_tensor_2d_gguf_reinterleave(
+                        // in_proj_z: V-reorder rows (head_dim = hd_v)
+                        in_proj_z: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
                             gguf,
                             &format!("{ap}.in_proj_z.weight"),
-                            config.linear_num_value_heads,
+                            num_k,
+                            vpk,
+                            hd_v,
                         )?,
-                        // in_proj_a/b have num_value_heads (32) rows — deinterleaved by llama.cpp
-                        in_proj_b: load_tensor_2d_gguf_reinterleave_rows(
+                        // in_proj_a/b: V-reorder rows (head_dim = 1)
+                        in_proj_b: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
                             gguf,
                             &format!("{ap}.in_proj_b.weight"),
+                            num_k,
+                            vpk,
+                            1,
                         )?,
-                        in_proj_a: load_tensor_2d_gguf_reinterleave_rows(
+                        in_proj_a: load_tensor_2d_gguf_v_reorder_rows(
                             ctx,
                             gguf,
                             &format!("{ap}.in_proj_a.weight"),
+                            num_k,
+                            vpk,
+                            1,
                         )?,
-                        conv1d_weight: load_tensor_1d_gguf(
-                            ctx,
-                            gguf,
-                            &format!("{ap}.conv1d.weight"),
-                        )?,
-                        // dt_bias has num_value_heads (32) elements — deinterleaved
-                        dt_bias: load_tensor_1d_gguf_reinterleave(
+                        // conv1d: [qkv_channels=8192, kernel=4], reorder only V rows.
+                        // Each channel has kernel_dim consecutive weights.
+                        conv1d_weight: {
+                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
+                                gguf,
+                                &format!("{ap}.conv1d.weight"),
+                            )?;
+                            let mut data = gguf.read_tensor_bf16(&gguf_name)?;
+                            let kernel_dim = config.linear_conv_kernel_dim;
+                            let qk_channels = hd_k * num_k * 2;
+                            let v_channels = num_v * hd_v;
+                            assert_eq!(data.len(), (qk_channels + v_channels) * kernel_dim);
+                            // Reorder only V portion: treat as [v_channels, kernel] matrix
+                            let v_start = qk_channels * kernel_dim;
+                            let v_size = v_channels * kernel_dim;
+                            reverse_v_reorder_rows(
+                                &mut data[v_start..v_start + v_size],
+                                v_channels,
+                                kernel_dim,
+                                num_k,
+                                vpk,
+                                hd_v,
+                            );
+                            DeviceVec::from_host(ctx, &data)?
+                        },
+                        // dt_bias: 1D V-reorder (head_dim = 1)
+                        dt_bias: load_tensor_1d_gguf_v_reorder(
                             ctx,
                             gguf,
                             &format!("{ap}.dt_bias"),
+                            num_k,
+                            vpk,
                         )?,
                         a_log: {
                             // GGUF ssm_a stores A = -exp(A_log), not A_log itself.
@@ -584,8 +601,8 @@ impl Qwen35Model {
                                     -(abs_a.ln())
                                 })
                                 .collect();
-                            // Re-interleave: llama.cpp deinterleaves num_value_heads dim
-                            reinterleave_1d_f32(&mut a_log);
+                            // Reverse llama.cpp V-head reorder (head_dim = 1 for A_log)
+                            reverse_v_reorder_f32(&mut a_log, num_k, vpk, 1);
                             ctx.stream.clone_htod(&a_log)?
                         },
                         norm_weight: {
@@ -614,7 +631,15 @@ impl Qwen35Model {
                             // Only RMSNorm layer norms have the offset.
                             ctx.stream.clone_htod(&f32s)?
                         },
-                        out_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.out_proj.weight"))?,
+                        // out_proj: V-reorder columns (input dim = num_v × hd_v)
+                        out_proj: load_tensor_2d_gguf_v_reorder_cols(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.out_proj.weight"),
+                            num_k,
+                            vpk,
+                            hd_v,
+                        )?,
                     })
                 }
             };
