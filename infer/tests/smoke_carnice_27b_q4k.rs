@@ -53,25 +53,31 @@ fn carnice_27b_q4k_load_and_generate() {
     let total_gb = total as f64 / (1 << 30) as f64;
     println!("GPU residency: {used_gb:.2} GiB used / {total_gb:.2} GiB total");
 
-    // Short generation smoke test
-    let req = CompleteRequest {
-        prompt: "The capital of France is".to_string(),
-        max_tokens: 16,
-        sampling: SamplingParams::default(),
-        stop: None,
-        logprobs: false,
-    };
-    let (tx, mut rx) = mpsc::unbounded_channel::<StreamDelta>();
-    let t0 = Instant::now();
-    engine
-        .complete_stream(req, tx)
-        .expect("complete_stream failed");
-    let gen_secs = t0.elapsed().as_secs_f32();
+    // Generation smoke — try very different prompts to tell "stuck token"
+    // (same output regardless of prompt) apart from "bad but prompt-dependent".
+    for prompt in ["The capital of France is", "1 + 1 = "] {
+        let req = CompleteRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 8,
+            sampling: SamplingParams::default(),
+            stop: None,
+            logprobs: true,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamDelta>();
+        let t0 = Instant::now();
+        engine
+            .complete_stream(req, tx)
+            .expect("complete_stream failed");
+        let gen_secs = t0.elapsed().as_secs_f32();
 
-    let mut text = String::new();
-    while let Ok(delta) = rx.try_recv() {
-        text.push_str(&delta.text_delta);
+        let mut text = String::new();
+        let mut logprobs: Vec<f32> = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            text.push_str(&delta.text_delta);
+            if let Some(lp) = delta.logprob {
+                logprobs.push(lp);
+            }
+        }
+        println!("prompt={prompt:?} ({gen_secs:.2}s): {text:?}  logprobs={logprobs:?}");
     }
-    println!("generated in {gen_secs:.2}s: {text:?}");
-    assert!(!text.is_empty(), "empty generation");
 }

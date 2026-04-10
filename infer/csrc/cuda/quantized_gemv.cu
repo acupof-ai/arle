@@ -818,6 +818,11 @@ __device__ __forceinline__ void q4k_decode_scales(
     }
 }
 
+// Element layout for Q4_K — MUST match llama.cpp `dequantize_row_q4_K`:
+//   for iter in 0..4:
+//     for l in 0..32:  y[iter*64 + l    ] = sc[2*iter+0] * (qs[iter*32+l] & 0x0F) - mn[2*iter+0]
+//     for l in 0..32:  y[iter*64 + l+32] = sc[2*iter+1] * (qs[iter*32+l] >>  4) - mn[2*iter+1]
+// NOT the naive "2 elements per ql byte" interpretation!
 __global__ void q4k_gemv_kernel(
     const uint8_t* __restrict__ weight,        // [N, (K/256) * 144]
     const __nv_bfloat16* __restrict__ input,   // [K]
@@ -838,36 +843,40 @@ __global__ void q4k_gemv_kernel(
     for (int sb = 0; sb < num_sb; ++sb) {
         const uint8_t* sb_p = row_p + sb * Q4K_SB_BYTES;
 
-        // Decode (d, dmin) once per superblock (fp16 LE bytes).
         const unsigned short d_u16    = ((const unsigned short*)sb_p)[0];
         const unsigned short dmin_u16 = ((const unsigned short*)sb_p)[1];
         const float d     = __half2float(*reinterpret_cast<const __half*>(&d_u16));
         const float dmin  = __half2float(*reinterpret_cast<const __half*>(&dmin_u16));
 
-        // Decode 8 sub-scales and 8 sub-mins into registers.
         uint8_t sc[8], mn[8];
         q4k_decode_scales(sb_p + 4, sc, mn);
 
-        const uint8_t* qs = sb_p + 16;  // 128 bytes of packed nibbles
+        const uint8_t* qs = sb_p + 16;  // 128 bytes
         const int k_base  = sb * Q4K_SB_SIZE;
 
-        // 8 sub-blocks × 32 elements, one per lane per iteration.
+        // 4 outer iterations of 64 elements, 2 sub-blocks each.
+        // Each lane processes 2 elements per iter (one lo nibble + one hi nibble
+        // of the SAME ql byte) — so 8 elements/superblock/lane, 256/superblock total.
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float sub_scale = d * (float)sc[j];
-            const float sub_min   = dmin * (float)mn[j];
-
-            // Lane l reads byte (j*16 + l/2), low nibble if l even else high.
-            const uint8_t byte = qs[j * 16 + (lane >> 1)];
-            const int q = (lane & 1) ? (byte >> 4) : (byte & 0x0F);
-            const float w = (float)q * sub_scale - sub_min;
-
-            const int k_idx = k_base + j * 32 + lane;
-            sum += w * __bfloat162float(input[k_idx]);
+        for (int iter = 0; iter < 4; ++iter) {
+            const int j_lo = iter * 2;
+            const int j_hi = j_lo + 1;
+            const float d1 = d * (float)sc[j_lo];
+            const float m1 = dmin * (float)mn[j_lo];
+            const float d2 = d * (float)sc[j_hi];
+            const float m2 = dmin * (float)mn[j_hi];
+            const uint8_t byte = qs[iter * 32 + lane];
+            const float q_lo = (float)(byte & 0x0F);
+            const float q_hi = (float)(byte >> 4);
+            const float w_lo = q_lo * d1 - m1;
+            const float w_hi = q_hi * d2 - m2;
+            const int k_lo = k_base + j_lo * 32 + lane;
+            const int k_hi = k_base + j_hi * 32 + lane;
+            sum += w_lo * __bfloat162float(input[k_lo]);
+            sum += w_hi * __bfloat162float(input[k_hi]);
         }
     }
 
-    // Warp reduce (1 warp per row → direct write, no cross-warp smem).
     sum = warp_reduce_sum(sum);
     if (lane == 0) output[row] = __float2bfloat16(sum);
 }
@@ -907,14 +916,18 @@ __global__ void q4k_gemv_batch_kernel(
         const int k_base  = sb * Q4K_SB_SIZE;
 
         #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float sub_scale = d * (float)sc[j];
-            const float sub_min   = dmin * (float)mn[j];
-            const uint8_t byte = qs[j * 16 + (lane >> 1)];
-            const int q = (lane & 1) ? (byte >> 4) : (byte & 0x0F);
-            const float w = (float)q * sub_scale - sub_min;
-            const int k_idx = k_base + j * 32 + lane;
-            sum += w * __bfloat162float(x[k_idx]);
+        for (int iter = 0; iter < 4; ++iter) {
+            const int j_lo = iter * 2;
+            const int j_hi = j_lo + 1;
+            const float d1 = d * (float)sc[j_lo];
+            const float m1 = dmin * (float)mn[j_lo];
+            const float d2 = d * (float)sc[j_hi];
+            const float m2 = dmin * (float)mn[j_hi];
+            const uint8_t byte = qs[iter * 32 + lane];
+            const float q_lo = (float)(byte & 0x0F);
+            const float q_hi = (float)(byte >> 4);
+            sum += (q_lo * d1 - m1) * __bfloat162float(x[k_base + j_lo * 32 + lane]);
+            sum += (q_hi * d2 - m2) * __bfloat162float(x[k_base + j_hi * 32 + lane]);
         }
     }
 
@@ -923,11 +936,11 @@ __global__ void q4k_gemv_batch_kernel(
 }
 
 // Dequantize a K-dim chunk [k_start..k_start+k_len) of a Q4_K weight matrix into BF16.
-// k_start and k_len must be multiples of 256.
-// Output layout: [N, k_len] row-major BF16.
-//
-// Grid:  (N, k_len / 256)       — one block per (row, superblock in chunk)
-// Block: 256 threads            — one thread per element in the superblock
+// Grid:  (N, k_len / 256), Block: 256 threads — but element-to-thread mapping follows
+// llama.cpp's canonical iter/half/l layout, NOT the naive "tid is element index"
+// interpretation. 256 threads cover one superblock:
+//   thread t → iter = (t >> 6) & 3, half = (t >> 5) & 1, l = t & 31
+//   writes y[iter*64 + half*32 + l]
 __global__ void q4k_dequant_chunk_kernel(
     const uint8_t* __restrict__ weight,
     __nv_bfloat16* __restrict__ out,
@@ -943,7 +956,6 @@ __global__ void q4k_dequant_chunk_kernel(
     const int row_bytes    = num_sb_total * Q4K_SB_BYTES;
     const uint8_t* sb_p    = weight + row * row_bytes + sb_global * Q4K_SB_BYTES;
 
-    // Shared scratch: decode (d, dmin, sc[8], mn[8]) once per block.
     __shared__ float s_d;
     __shared__ float s_dmin;
     __shared__ uint8_t s_sc[8];
@@ -959,16 +971,15 @@ __global__ void q4k_dequant_chunk_kernel(
     __syncthreads();
 
     const uint8_t* qs = sb_p + 16;
-    // tid 0..255 → sub-block j = tid/32, in-sub offset i = tid%32.
-    const int j = tid >> 5;
-    const int i = tid & 31;
-    const uint8_t byte = qs[j * 16 + (i >> 1)];
-    const int q = (i & 1) ? (byte >> 4) : (byte & 0x0F);
-    const float sub_scale = s_d    * (float)s_sc[j];
-    const float sub_min   = s_dmin * (float)s_mn[j];
-    const float w = (float)q * sub_scale - sub_min;
+    const int iter = (tid >> 6) & 3;  // 0..4
+    const int half = (tid >> 5) & 1;  // 0..2
+    const int l    = tid & 31;
+    const int sub  = iter * 2 + half;  // 0..8
+    const uint8_t byte = qs[iter * 32 + l];
+    const int q = half ? (byte >> 4) : (byte & 0x0F);
+    const float w = (float)q * (s_d * (float)s_sc[sub]) - (s_dmin * (float)s_mn[sub]);
 
-    const int out_k = sb_in_chunk * Q4K_SB_SIZE + j * 32 + i;
+    const int out_k = sb_in_chunk * Q4K_SB_SIZE + sub * 32 + l;
     out[row * k_len + out_k] = __float2bfloat16(w);
 }
 

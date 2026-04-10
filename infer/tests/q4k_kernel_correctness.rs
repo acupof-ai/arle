@@ -14,6 +14,10 @@ use infer::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Assemble a single Q4_K superblock (144 bytes) with chosen scales and nibbles.
 /// Layout: d(f16) | dmin(f16) | scales_packed(12) | qs(128).
+///
+/// Element → qs byte layout follows llama.cpp: each outer iter holds 32 qs
+/// bytes; the first 32 elements of the iter are the LOW nibbles of those
+/// bytes, the next 32 are the HIGH nibbles.
 fn make_superblock(
     d: f32,
     dmin: f32,
@@ -25,28 +29,28 @@ fn make_superblock(
     out[0..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
     out[2..4].copy_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
 
-    // scales_packed: mirror of gguf.rs::dequant_q4_k / llama.cpp get_scale_min_k4.
-    //   bytes 0..4 : sc[0..4]  low-6-bits | sc[4..8]  top-2-bits in >>6
-    //   bytes 4..8 : mn[0..4]  low-6-bits | mn[4..8]  top-2-bits in >>6
-    //   bytes 8..12: sc[4..8] upper-4-bits in low nibble | mn[4..8] upper-4-bits in high nibble
+    // scales_packed (same as Q5_K's get_scale_min_k4).
     for i in 0..4 {
         out[4 + i] = (sub_scales[i] & 0x3F) | ((sub_scales[4 + i] & 0x03) << 6);
         out[8 + i] = (sub_mins[i] & 0x3F) | ((sub_mins[4 + i] & 0x03) << 6);
         out[12 + i] = ((sub_scales[4 + i] >> 2) & 0x0F) | (((sub_mins[4 + i] >> 2) & 0x0F) << 4);
     }
 
-    // qs: 128 bytes, packed (lo | hi<<4) per pair of elements.
-    for j in 0..8 {
-        for i in 0..16 {
-            let lo = nibbles[j * 32 + i * 2] & 0x0F;
-            let hi = nibbles[j * 32 + i * 2 + 1] & 0x0F;
-            out[16 + j * 16 + i] = lo | (hi << 4);
+    // qs: 4 outer iterations of 32 bytes each. For each iter, byte l carries
+    // element (2*iter+0)*32 + l in its LOW nibble and element (2*iter+1)*32 + l
+    // in its HIGH nibble.
+    for iter in 0..4 {
+        for l in 0..32 {
+            let lo = nibbles[(iter * 2) * 32 + l] & 0x0F;
+            let hi = nibbles[(iter * 2 + 1) * 32 + l] & 0x0F;
+            out[16 + iter * 32 + l] = lo | (hi << 4);
         }
     }
     out
 }
 
-/// Reference CPU dequant of one superblock — exact clone of gguf.rs::dequant_q4_k.
+/// Reference CPU dequant of one superblock — mirrors llama.cpp
+/// `dequantize_row_q4_K` exactly.
 fn dequant_superblock_cpu(sb: &[u8; 144]) -> [f32; 256] {
     let d = half::f16::from_le_bytes([sb[0], sb[1]]).to_f32();
     let dmin = half::f16::from_le_bytes([sb[2], sb[3]]).to_f32();
@@ -65,15 +69,19 @@ fn dequant_superblock_cpu(sb: &[u8; 144]) -> [f32; 256] {
     }
 
     let mut out = [0f32; 256];
-    for j in 0..8 {
-        let sub_scale = d * sc[j] as f32;
-        let sub_min = dmin * mn[j] as f32;
-        for i in 0..16 {
-            let byte = qs[j * 16 + i];
+    for iter in 0..4 {
+        let j_lo = iter * 2;
+        let j_hi = j_lo + 1;
+        let d1 = d * sc[j_lo] as f32;
+        let m1 = dmin * mn[j_lo] as f32;
+        let d2 = d * sc[j_hi] as f32;
+        let m2 = dmin * mn[j_hi] as f32;
+        for l in 0..32 {
+            let byte = qs[iter * 32 + l];
             let lo = (byte & 0x0F) as f32;
-            let hi = ((byte >> 4) & 0x0F) as f32;
-            out[j * 32 + i * 2] = lo * sub_scale - sub_min;
-            out[j * 32 + i * 2 + 1] = hi * sub_scale - sub_min;
+            let hi = (byte >> 4) as f32;
+            out[j_lo * 32 + l] = lo * d1 - m1;
+            out[j_hi * 32 + l] = hi * d2 - m2;
         }
     }
     out

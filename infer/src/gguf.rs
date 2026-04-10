@@ -628,16 +628,21 @@ fn dequant_q4_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
     Ok(out)
 }
 
-/// Q4_K (Q4_K_M/Q4_K_S): 256 elements per superblock.
+/// Q4_K (Q4_K_M/Q4_K_S): 256 elements per superblock (144 bytes). Mirrors
+/// llama.cpp's `dequantize_row_q4_K` exactly.
 ///
-/// Layout per superblock (144 bytes):
-///   - d: f16 (2 bytes) — super-block scale
-///   - dmin: f16 (2 bytes) — super-block minimum
-///   - scales: 12 bytes — packed 6-bit scale/min for 8 sub-blocks
-///   - qs: 128 bytes — 256 × 4-bit quantized values (2 per byte)
+/// Element layout — NOT the naive "2 elements per ql byte" interpretation!
+/// The superblock is 4 outer iterations of 64 elements. Each iteration reads
+/// 32 contiguous ql bytes and splits them into two 32-element halves:
+///   - first half  uses `ql[l].low  nibble` with scale `sc[2*iter + 0]`
+///   - second half uses `ql[l].high nibble` with scale `sc[2*iter + 1]`
+///   Then ql advances by 32 bytes → next outer iteration.
+///
+/// Block layout:
+///   d(f16) | dmin(f16) | scales(12B) | qs(128B)
 fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
     const QK_K: usize = 256;
-    const BLOCK_BYTES: usize = 144; // 2+2+12+128
+    const BLOCK_BYTES: usize = 144;
     let num_blocks = numel / QK_K;
     if raw.len() < num_blocks * BLOCK_BYTES {
         bail!(
@@ -648,42 +653,44 @@ fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
         );
     }
 
-    let mut out = Vec::with_capacity(numel);
+    let mut out = vec![bf16::ZERO; numel];
 
     for b in 0..num_blocks {
         let base = b * BLOCK_BYTES;
         let d = f16::from_le_bytes([raw[base], raw[base + 1]]).to_f32();
         let dmin = f16::from_le_bytes([raw[base + 2], raw[base + 3]]).to_f32();
-        let scales_raw = &raw[base + 4..base + 16]; // 12 bytes of packed scales
-        let qs = &raw[base + 16..base + 144]; // 128 bytes of packed nibbles
+        let scales_raw = &raw[base + 4..base + 16];
+        let qs = &raw[base + 16..base + 144];
 
-        // Decode 6-bit scales: 8 sub-block scales + 8 sub-block mins from 12 bytes
+        // Decode 8 sub-block scales + 8 sub-block mins (6-bit each, packed
+        // across 12 bytes — the same get_scale_min_k4 layout used by Q5_K).
         let mut sc = [0u8; 8];
         let mut mn = [0u8; 8];
-        // First 4 sub-blocks: scales in lower 6 bits of bytes 0-3, mins in bytes 4-7
         for i in 0..4 {
-            sc[i] = scales_raw[i] & 63;
-            mn[i] = scales_raw[i + 4] & 63;
+            sc[i] = scales_raw[i] & 0x3F;
+            mn[i] = scales_raw[i + 4] & 0x3F;
         }
-        // Last 4 sub-blocks: upper 4 bits split across bytes 8-11.
-        // Lower 2 bits from scales_raw[i] >> 6, upper 4 bits from bytes 8-11.
-        // llama.cpp: sc[4+i] = (scales_raw[i] >> 6) | ((scales_raw[8+i] & 0x0F) << 2)
         for i in 0..4 {
             sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
             mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
         }
 
-        // Dequantize 8 sub-blocks of 32 elements each
-        for j in 0..8 {
-            let sub_scale = d * sc[j] as f32;
-            let sub_min = dmin * mn[j] as f32;
-            let qs_offset = j * 16; // 32 nibbles = 16 bytes
-            for i in 0..16 {
-                let byte = qs[qs_offset + i];
+        let out_base = b * QK_K;
+        // 4 outer iterations of 64 elements (2 sub-blocks each).
+        for iter in 0..4 {
+            let j_lo = iter * 2;
+            let j_hi = j_lo + 1;
+            let d1 = d * sc[j_lo] as f32;
+            let m1 = dmin * mn[j_lo] as f32;
+            let d2 = d * sc[j_hi] as f32;
+            let m2 = dmin * mn[j_hi] as f32;
+            let ql_slice = &qs[iter * 32..iter * 32 + 32];
+            for l in 0..32 {
+                let byte = ql_slice[l];
                 let lo = (byte & 0x0F) as f32;
-                let hi = ((byte >> 4) & 0x0F) as f32;
-                out.push(bf16::from_f32(lo * sub_scale - sub_min));
-                out.push(bf16::from_f32(hi * sub_scale - sub_min));
+                let hi = (byte >> 4) as f32;
+                out[out_base + j_lo * 32 + l] = bf16::from_f32(lo * d1 - m1);
+                out[out_base + j_hi * 32 + l] = bf16::from_f32(hi * d2 - m2);
             }
         }
     }
@@ -759,9 +766,14 @@ fn dequant_q3_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
     Ok(out)
 }
 
-/// Q5_K: 256 elements per superblock (176 bytes).
+/// Q5_K: 256 elements per superblock (176 bytes). Mirrors llama.cpp's
+/// `dequantize_row_q5_K` — the 8 sub-blocks of 32 elements are laid out in 4
+/// outer iterations of 64 elements, where each iteration:
+///   - shares one `ql[iter*32 + l]` byte for the low 4 bits of BOTH its halves
+///   - the FIRST half (sub-block `iter*2`) takes the low nibble + `qh[l]` bit `iter*2`
+///   - the SECOND half (sub-block `iter*2+1`) takes the high nibble + `qh[l]` bit `iter*2+1`
 ///
-/// Layout: d(f16) + dmin(f16) + scales(12B) + qh(32B, high bits) + qs(128B, low 4 bits)
+/// Layout: d(f16) | dmin(f16) | scales(12B) | qh(32B, high bits) | qs(128B, low 4 bits)
 fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
     const QK_K: usize = 256;
     const BLOCK_BYTES: usize = 176;
@@ -774,7 +786,7 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
         );
     }
 
-    let mut out = Vec::with_capacity(numel);
+    let mut out = vec![bf16::ZERO; numel];
     for b in 0..num_blocks {
         let base = b * BLOCK_BYTES;
         let d = f16::from_le_bytes([raw[base], raw[base + 1]]).to_f32();
@@ -783,34 +795,40 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
         let qh = &raw[base + 16..base + 48];
         let qs = &raw[base + 48..base + 176];
 
-        // Decode scales (same format as Q4_K)
+        // Decode scales (same 6-bit packing as Q4_K's get_scale_min_k4).
         let mut sc = [0u8; 8];
         let mut mn = [0u8; 8];
         for i in 0..4 {
-            sc[i] = scales_raw[i] & 63;
-            mn[i] = scales_raw[i + 4] & 63;
+            sc[i] = scales_raw[i] & 0x3F;
+            mn[i] = scales_raw[i + 4] & 0x3F;
         }
         for i in 0..4 {
             sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
             mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
         }
 
-        for j in 0..8 {
-            let sub_scale = d * sc[j] as f32;
-            let sub_min = dmin * mn[j] as f32;
-            for i in 0..32 {
-                let idx = j * 32 + i;
-                // Low 4 bits from qs
-                let qs_byte = qs[idx / 2];
-                let lo = if idx % 2 == 0 {
-                    qs_byte & 0x0F
-                } else {
-                    qs_byte >> 4
-                };
-                // High bit from qh
-                let hbit = ((qh[idx / 8] >> (idx % 8)) & 1) as u8;
-                let q5 = lo | (hbit << 4);
-                out.push(bf16::from_f32(q5 as f32 * sub_scale - sub_min));
+        let out_base = b * QK_K;
+        // 4 outer iterations of 64 elements, 2 sub-blocks each.
+        for iter in 0..4 {
+            let j_lo = iter * 2;
+            let j_hi = j_lo + 1;
+            let d1 = d * sc[j_lo] as f32;
+            let m1 = dmin * mn[j_lo] as f32;
+            let d2 = d * sc[j_hi] as f32;
+            let m2 = dmin * mn[j_hi] as f32;
+            let ql_slice = &qs[iter * 32..iter * 32 + 32];
+            for l in 0..32 {
+                let ql_byte = ql_slice[l];
+                // First half: low nibble + qh[l] bit (2*iter + 0)
+                let lo_nib = ql_byte & 0x0F;
+                let hbit_lo = ((qh[l] >> j_lo) & 1) as u8;
+                let q5_lo = lo_nib | (hbit_lo << 4);
+                out[out_base + j_lo * 32 + l] = bf16::from_f32(q5_lo as f32 * d1 - m1);
+                // Second half: high nibble + qh[l] bit (2*iter + 1)
+                let hi_nib = ql_byte >> 4;
+                let hbit_hi = ((qh[l] >> j_hi) & 1) as u8;
+                let q5_hi = hi_nib | (hbit_hi << 4);
+                out[out_base + j_hi * 32 + l] = bf16::from_f32(q5_hi as f32 * d2 - m2);
             }
         }
     }
