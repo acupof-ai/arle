@@ -556,12 +556,12 @@ fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             sc[i] = scales_raw[i] & 63;
             mn[i] = scales_raw[i + 4] & 63;
         }
-        // Last 4 sub-blocks: scales/mins split across bytes 8-11
+        // Last 4 sub-blocks: upper 4 bits split across bytes 8-11.
+        // Lower 2 bits from scales_raw[i] >> 6, upper 4 bits from bytes 8-11.
+        // llama.cpp: sc[4+i] = (scales_raw[i] >> 6) | ((scales_raw[8+i] & 0x0F) << 2)
         for i in 0..4 {
-            let upper_sc = (scales_raw[8 + i] & 0x0F) << 4;
-            let upper_mn = (scales_raw[8 + i] >> 4) << 4;
-            sc[4 + i] = (scales_raw[i] >> 6) | upper_sc;
-            mn[4 + i] = (scales_raw[i + 4] >> 6) | upper_mn;
+            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
+            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
         }
 
         // Dequantize 8 sub-blocks of 32 elements each
@@ -664,8 +664,8 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             mn[i] = scales_raw[i + 4] & 63;
         }
         for i in 0..4 {
-            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 4);
-            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 4);
+            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 2);
+            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 2);
         }
 
         for j in 0..8 {
