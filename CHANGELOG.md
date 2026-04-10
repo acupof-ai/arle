@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+This changelog should record more than feature additions. It should also record:
+
+- breaking changes
+- deprecated surfaces
+- support-matrix changes
+- migration notes when user action is required
+
+Related governance docs:
+
+- [docs/stability-policy.md](docs/stability-policy.md)
+- [docs/support-matrix.md](docs/support-matrix.md)
+- [docs/compatibility.md](docs/compatibility.md)
+
 ## [Unreleased]
+
+### Governance
+- Added a formal stability policy
+- Added a support matrix document
+- Added a compatibility and deprecation policy
+- Added performance and correctness gate guidance
 
 ### Added
 - Radix-tree prefix cache for cross-request KV reuse

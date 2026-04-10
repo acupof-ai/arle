@@ -12,6 +12,12 @@
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | **Complete** — TurboQuant Phases 1-3: KV cache + weight + fused decode attention |
 | **Resources** | |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
+| [stability-policy.md](stability-policy.md) | Governance draft: stable/beta/experimental/internal surface classification |
+| [support-matrix.md](support-matrix.md) | Governance draft: current backend / platform / model / quantization support levels |
+| [compatibility.md](compatibility.md) | Governance draft: breaking-change, deprecation, and migration policy |
+| [perf-and-correctness-gates.md](perf-and-correctness-gates.md) | Governance draft: minimum validation expectations for correctness and performance-sensitive changes |
+| [release-checklist.md](release-checklist.md) | Governance draft: repeatable release checklist for docs, validation, artifacts, and compatibility review |
+| [environment.md](environment.md) | Environment variable reference for CLI, build, tests, integration, and setup workflows |
 | **Reviews** | |
 | [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | 10K star readiness review |
 | [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: optimization gaps in Qwen3.5 batched decode |
