@@ -87,19 +87,29 @@ impl GgmlType {
             Self::F32 => 4,
             Self::F16 | Self::BF16 | Self::I16 => 2,
             Self::I8 => 1,
-            Self::Q8_0 => 2 + 32, // f16 scale + 32 × i8
-            Self::Q4_0 => 2 + 16, // f16 scale + 32 nibbles in 16 bytes
-            Self::Q4_K_M => 144,  // complex: 256 elements per superblock
-            _ => 0,               // unsupported — caught at dequant time
+            Self::Q8_0 => 2 + 32, // f16 scale + 32 × i8 = 34
+            Self::Q4_0 => 2 + 16, // f16 scale + 16 bytes = 18
+            Self::Q3_K_S | Self::Q3_K_M | Self::Q3_K_L => 110, // hmask(32)+qs(64)+scales(12)+d(2)
+            Self::Q4_K_S | Self::Q4_K_M => 144, // d(2)+dmin(2)+scales(12)+qs(128)
+            Self::Q5_K_S | Self::Q5_K_M => 176, // d(2)+dmin(2)+scales(12)+qh(32)+qs(128)
+            Self::Q6_K => 210,    // ql(128)+qh(64)+scales(16)+d(2)
+            _ => 0,
         }
     }
 
     /// Elements per block.
     fn block_size(&self) -> usize {
         match self {
-            Self::F32 | Self::F16 | Self::BF16 => 1,
+            Self::F32 | Self::F16 | Self::BF16 | Self::I8 | Self::I16 => 1,
             Self::Q8_0 | Self::Q4_0 => 32,
-            Self::Q4_K_M | Self::Q4_K_S => 256,
+            Self::Q3_K_S
+            | Self::Q3_K_M
+            | Self::Q3_K_L
+            | Self::Q4_K_S
+            | Self::Q4_K_M
+            | Self::Q5_K_S
+            | Self::Q5_K_M
+            | Self::Q6_K => 256,
             _ => 1,
         }
     }
@@ -460,12 +470,11 @@ fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16
         }
         GgmlType::Q8_0 => dequant_q8_0(raw, numel),
         GgmlType::Q4_0 => dequant_q4_0(raw, numel),
+        GgmlType::Q3_K_S | GgmlType::Q3_K_M | GgmlType::Q3_K_L => dequant_q3_k(raw, numel),
         GgmlType::Q4_K_M | GgmlType::Q4_K_S => dequant_q4_k(raw, numel),
+        GgmlType::Q5_K_S | GgmlType::Q5_K_M => dequant_q5_k(raw, numel),
         GgmlType::Q6_K => dequant_q6_k(raw, numel),
-        _ => bail!(
-            "Dequant not yet implemented for {:?}. Supported: F32, F16, BF16, I8, Q8_0, Q4_0, Q4_K_M/S, Q6_K",
-            dtype
-        ),
+        _ => bail!("Dequant not yet implemented for {:?}", dtype),
     }
 }
 
@@ -572,6 +581,115 @@ fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
     Ok(out)
 }
 
+/// Q3_K: 256 elements per superblock (110 bytes).
+///
+/// Layout: hmask(32B) + qs(64B, 2-bit packed) + scales(12B, 6-bit packed) + d(f16, 2B)
+fn dequant_q3_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+    let num_blocks = numel / QK_K;
+    if raw.len() < num_blocks * BLOCK_BYTES {
+        bail!(
+            "Q3_K: expected {} bytes, got {}",
+            num_blocks * BLOCK_BYTES,
+            raw.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(numel);
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES;
+        let hmask = &raw[base..base + 32];
+        let qs = &raw[base + 32..base + 96];
+        let scales_raw = &raw[base + 96..base + 108];
+        let d = f16::from_le_bytes([raw[base + 108], raw[base + 109]]).to_f32();
+
+        // Decode 6-bit scales for 16 sub-blocks (each 16 elements)
+        let mut scales = [0i8; 16];
+        for i in 0..8 {
+            scales[i] = (scales_raw[i] & 0x0F) as i8 - 8;
+            scales[i + 8] = ((scales_raw[i] >> 4) & 0x0F) as i8 - 8;
+        }
+        // Upper bits from last 4 bytes
+        for i in 0..4 {
+            scales[i] |= ((scales_raw[8 + i] & 0x03) as i8) << 4;
+            scales[i + 4] |= (((scales_raw[8 + i] >> 2) & 0x03) as i8) << 4;
+            scales[i + 8] |= (((scales_raw[8 + i] >> 4) & 0x03) as i8) << 4;
+            scales[i + 12] |= (((scales_raw[8 + i] >> 6) & 0x03) as i8) << 4;
+        }
+
+        for j in 0..QK_K {
+            // 2-bit value from qs (4 per byte)
+            let q2 = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            // High bit from hmask
+            let hbit = ((hmask[j / 8] >> (j % 8)) & 1) as u8;
+            // 3-bit value
+            let q3 = q2 | (hbit << 2);
+            let sc = scales[j / 16] as f32;
+            out.push(bf16::from_f32(d * sc * (q3 as f32 - 4.0)));
+        }
+    }
+    Ok(out)
+}
+
+/// Q5_K: 256 elements per superblock (176 bytes).
+///
+/// Layout: d(f16) + dmin(f16) + scales(12B) + qh(32B, high bits) + qs(128B, low 4 bits)
+fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+    let num_blocks = numel / QK_K;
+    if raw.len() < num_blocks * BLOCK_BYTES {
+        bail!(
+            "Q5_K: expected {} bytes, got {}",
+            num_blocks * BLOCK_BYTES,
+            raw.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(numel);
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES;
+        let d = f16::from_le_bytes([raw[base], raw[base + 1]]).to_f32();
+        let dmin = f16::from_le_bytes([raw[base + 2], raw[base + 3]]).to_f32();
+        let scales_raw = &raw[base + 4..base + 16];
+        let qh = &raw[base + 16..base + 48];
+        let qs = &raw[base + 48..base + 176];
+
+        // Decode scales (same format as Q4_K)
+        let mut sc = [0u8; 8];
+        let mut mn = [0u8; 8];
+        for i in 0..4 {
+            sc[i] = scales_raw[i] & 63;
+            mn[i] = scales_raw[i + 4] & 63;
+        }
+        for i in 0..4 {
+            sc[4 + i] = (scales_raw[i] >> 6) | ((scales_raw[8 + i] & 0x0F) << 4);
+            mn[4 + i] = (scales_raw[i + 4] >> 6) | ((scales_raw[8 + i] >> 4) << 4);
+        }
+
+        for j in 0..8 {
+            let sub_scale = d * sc[j] as f32;
+            let sub_min = dmin * mn[j] as f32;
+            for i in 0..32 {
+                let idx = j * 32 + i;
+                // Low 4 bits from qs
+                let qs_byte = qs[idx / 2];
+                let lo = if idx % 2 == 0 {
+                    qs_byte & 0x0F
+                } else {
+                    qs_byte >> 4
+                };
+                // High bit from qh
+                let hbit = ((qh[idx / 8] >> (idx % 8)) & 1) as u8;
+                let q5 = lo | (hbit << 4);
+                out.push(bf16::from_f32(q5 as f32 * sub_scale - sub_min));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Q6_K: 256 elements per superblock.
 ///
 /// Layout per superblock (210 bytes):
@@ -632,25 +750,28 @@ fn dequant_q6_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
 /// - `blk.0.ffn_gate.weight` → `model.layers.0.mlp.gate_proj.weight`
 /// - `output_norm.weight` → `model.norm.weight`
 /// - `output.weight` → `lm_head.weight`
-pub fn map_gguf_name(gguf_name: &str) -> String {
+/// Map GGUF tensor name to HuggingFace name with a configurable prefix.
+///
+/// `prefix` is typically `"model"` for Qwen3/Llama or `"model.language_model"` for Qwen3.5.
+pub fn map_gguf_name_with_prefix(gguf_name: &str, prefix: &str) -> String {
     // Token embeddings
     if gguf_name == "token_embd.weight" {
-        return "model.embed_tokens.weight".to_string();
+        return format!("{prefix}.embed_tokens.weight");
     }
     // Output norm
     if gguf_name == "output_norm.weight" {
-        return "model.norm.weight".to_string();
+        return format!("{prefix}.norm.weight");
     }
     // LM head
     if gguf_name == "output.weight" {
         return "lm_head.weight".to_string();
     }
 
-    // Layer tensors: blk.N.<suffix>.weight
+    // Layer tensors: blk.N.<suffix>
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
         if let Some((layer_str, suffix)) = rest.split_once('.') {
             let hf_suffix = match suffix {
-                // Attention
+                // Full attention (Qwen3, Llama, Gemma)
                 "attn_q.weight" => "self_attn.q_proj.weight",
                 "attn_k.weight" => "self_attn.k_proj.weight",
                 "attn_v.weight" => "self_attn.v_proj.weight",
@@ -658,22 +779,36 @@ pub fn map_gguf_name(gguf_name: &str) -> String {
                 "attn_norm.weight" => "input_layernorm.weight",
                 "attn_q_norm.weight" => "self_attn.q_norm.weight",
                 "attn_k_norm.weight" => "self_attn.k_norm.weight",
+                // Qwen3.5 linear attention (SSM/GDR)
+                "attn_qkv.weight" => "linear_attn.in_proj_qkv.weight",
+                "attn_gate.weight" => "linear_attn.in_proj_z.weight",
+                "ssm_alpha.weight" => "linear_attn.in_proj_b.weight",
+                "ssm_beta.weight" => "linear_attn.in_proj_a.weight",
+                "ssm_conv1d.weight" => "linear_attn.conv1d.weight",
+                "ssm_out.weight" => "linear_attn.out_proj.weight",
+                "ssm_dt.bias" => "linear_attn.dt_bias",
+                "ssm_a" => "linear_attn.a_log",
+                "ssm_norm.weight" => "linear_attn.norm.weight",
                 // MLP
                 "ffn_gate.weight" => "mlp.gate_proj.weight",
                 "ffn_up.weight" => "mlp.up_proj.weight",
                 "ffn_down.weight" => "mlp.down_proj.weight",
                 "ffn_norm.weight" => "post_attention_layernorm.weight",
-                // Gemma post-attention norm
                 "post_attention_norm.weight" => "post_attention_layernorm.weight",
                 // Fallthrough
                 other => other,
             };
-            return format!("model.layers.{layer_str}.{hf_suffix}");
+            return format!("{prefix}.layers.{layer_str}.{hf_suffix}");
         }
     }
 
     // Fallback: return as-is
     gguf_name.to_string()
+}
+
+/// Map GGUF tensor name to HuggingFace name (default prefix "model").
+pub fn map_gguf_name(gguf_name: &str) -> String {
+    map_gguf_name_with_prefix(gguf_name, "model")
 }
 
 // ── Binary Readers ──

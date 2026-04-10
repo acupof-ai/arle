@@ -640,18 +640,27 @@ fn find_gguf_tensor_name(gguf: &GgufFile, hf_name: &str) -> Result<String> {
         return Ok(hf_name.to_string());
     }
 
-    // Reverse mapping: try all GGUF names, map to HF, check match
+    // Reverse mapping: try multiple prefixes (Qwen3 uses "model", Qwen3.5 uses "model.language_model")
+    let prefixes = ["model", "model.language_model"];
     for gguf_name in gguf.tensors.keys() {
-        if gguf::map_gguf_name(gguf_name) == hf_name {
-            return Ok(gguf_name.clone());
+        for prefix in &prefixes {
+            if gguf::map_gguf_name_with_prefix(gguf_name, prefix) == hf_name {
+                return Ok(gguf_name.clone());
+            }
         }
     }
 
     anyhow::bail!(
-        "Tensor '{}' not found in GGUF (tried {} tensor names)",
+        "Tensor '{}' not found in GGUF (tried {} tensor names with prefixes {:?})",
         hf_name,
-        gguf.tensors.len()
+        gguf.tensors.len(),
+        prefixes
     )
+}
+
+/// Public version of find_gguf_tensor_name for use by model-specific loaders.
+pub(crate) fn find_gguf_tensor_name_pub(gguf: &GgufFile, hf_name: &str) -> Result<String> {
+    find_gguf_tensor_name(gguf, hf_name)
 }
 
 /// Detect if a model path contains a GGUF file and return the GgufFile handle.
