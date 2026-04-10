@@ -569,42 +569,34 @@ pub(crate) fn load_tensor_2d_gguf(
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
 
-    // Q8_0: keep packed — use existing W8A16 GEMV for on-the-fly dequant
+    // Q8_0: keep packed — use existing W8A16 GEMV for on-the-fly dequant.
+    // GGUF column-major: [ne0, ne1] stores data column-by-column.
+    // Reading as row-major gives [ne1, ne0] = [out_dim, in_dim] — no transpose.
+    // Q8_0 blocks are stored per-column (32 elements each), so the natural
+    // column-major → row-major reinterpretation preserves block alignment.
     if info.dtype == gguf::GgmlType::Q8_0 && info.shape.len() == 2 {
         let (qweight, scales, group_size) = gguf.read_tensor_q8_packed(&gguf_name)?;
-        let s0 = info.shape[0] as usize; // in_dim (GGUF is transposed)
-        let s1 = info.shape[1] as usize; // out_dim
-        let (rows, cols) = (s1, s0); // engine: [out_dim, in_dim]
-
-        // Transpose qweight: [in_dim, out_dim] → [out_dim, in_dim]
-        let mut qw_t = vec![0i8; rows * cols];
-        for r in 0..s0 {
-            for c in 0..s1 {
-                qw_t[c * s0 + r] = qweight[r * s1 + c];
-            }
-        }
-        // Transpose scales: [in_dim/gs, out_dim] → [out_dim, in_dim/gs]
-        let num_groups_src = s0 / group_size;
-        let mut sc_t = vec![bf16::ZERO; rows * (cols / group_size)];
-        for r in 0..num_groups_src {
-            for c in 0..s1 {
-                sc_t[c * num_groups_src + r] = scales[r * s1 + c];
-            }
-        }
-        return DeviceMatrix::from_quantized_int8(ctx, &qw_t, &sc_t, rows, cols, group_size);
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        let (rows, cols) = (ne1, ne0); // Column-major → row-major: [ne1, ne0]
+        return DeviceMatrix::from_quantized_int8(ctx, &qweight, &scales, rows, cols, group_size);
     }
 
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
 
-    // GGUF stores 2D weights as [in_dim, out_dim] (transposed vs HuggingFace [out_dim, in_dim]).
-    // Transpose during load to match the engine's row-major [out_dim, in_dim] layout.
-    let (rows, cols, needs_transpose) = if info.shape.len() == 2 {
-        let s0 = info.shape[0] as usize;
-        let s1 = info.shape[1] as usize;
-        // GGUF: shape[0]=in_dim, shape[1]=out_dim → we need [out_dim, in_dim]
-        (s1, s0, true)
+    // GGUF 2D layout verified empirically: GGUF stores ne1 "rows" of ne0 elements
+    // each in row-major order. data[i * ne0 + j] = element at (row=i, col=j).
+    //
+    // For weight matrices: ne0=in_dim, ne1=out_dim.
+    // HuggingFace: [out_dim, in_dim] row-major = [ne1, ne0].
+    // Since GGUF data[i * ne0 + j] directly maps to HF[i][j] with
+    // rows=ne1, cols=ne0 — NO transpose needed.
+    //
+    // Verified: GGUF attn_q data[0] = HF q_proj[0,0], data[1] = HF q_proj[0,1].
+    let (rows, cols) = if info.shape.len() == 2 {
+        (info.shape[1] as usize, info.shape[0] as usize) // [ne1, ne0]
     } else if info.shape.len() == 1 {
-        (1, info.shape[0] as usize, false)
+        (1, info.shape[0] as usize)
     } else {
         anyhow::bail!(
             "Expected 1D or 2D tensor for '{}', got {}D",
@@ -613,22 +605,7 @@ pub(crate) fn load_tensor_2d_gguf(
         );
     };
 
-    let final_data = if needs_transpose && rows > 1 && cols > 1 {
-        // CPU transpose: GGUF [in_dim, out_dim] → engine [out_dim, in_dim]
-        let src_rows = cols; // GGUF dim0 = in_dim = our cols
-        let src_cols = rows; // GGUF dim1 = out_dim = our rows
-        let mut transposed = vec![bf16::ZERO; rows * cols];
-        for r in 0..src_rows {
-            for c in 0..src_cols {
-                transposed[c * src_rows + r] = bf16_data[r * src_cols + c];
-            }
-        }
-        transposed
-    } else {
-        bf16_data
-    };
-
-    DeviceMatrix::from_host(ctx, &final_data, rows, cols)
+    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
 }
 
 /// Find a tensor in the GGUF file by HuggingFace name.
