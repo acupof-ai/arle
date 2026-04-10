@@ -6,9 +6,9 @@ Assisting **ckl**. Agent contract below.
 
 ## Project Overview
 
-Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. Supports Qwen3 (4B/8B) and Qwen3.5-4B (hybrid linear + full attention) with continuous batching scheduler. OpenAI-compatible `/v1/completions` + `/v1/chat/completions` API. FlashInfer for both prefill (HD128) and batched decode.
+Pure Rust LLM inference engine with dual GPU backends: **CUDA** (Linux/NVIDIA, via `cudarc` + FlashInfer + Triton AOT) and **Metal** (Apple Silicon, via `mlx-sys` bindgen bridge). No PyTorch, no frameworks. Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4. Continuous batching scheduler, OpenAI-compatible `/v1/completions` + `/v1/chat/completions` API. FlashInfer drives CUDA prefill (HD128) and batched decode.
 
-Primary language: **Rust** (inference engine + agent runtime). Secondary: **Python** (tooling, benchmarks, test scripts) + **CUDA C / Triton** (kernels).
+Primary language: **Rust** (inference engine + agent runtime). Secondary: **Python** (tooling, benchmarks, test scripts) + **CUDA C / Triton / Metal / C++** (kernels and bridges).
 
 ---
 
@@ -23,7 +23,7 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 | **Explore** | Cartographer | Trace callers/dependents before reading. Grep for existing implementations before writing new code. Trait change → list all implementors, mark blast radius. Uncertain → surface as open question, don't guess. |
 | **Plan** | Architect (decisions, not options) | "How would this fail?" before "how should this work?". >5 files → question if simpler path exists. Irreversible decision → stop, flag, wait. |
 | **Implement** | Contractor (build to spec) | Check prior art in `infer/src/` and `docs/` first. Outside plan → stop and update plan. Match adjacent code style. |
-| **Verify** | Adversary | `cargo test --workspace`. Each diff line must serve the goal. New `unwrap()` → can this panic? GPU code → CUDA errors, OOM, stream sync? Async → cancel-safe? |
+| **Verify** | Adversary | `cargo test --workspace`. Each diff line must serve the goal. New `unwrap()` → can this panic? GPU code → CUDA/Metal errors, OOM, stream/command-buffer sync? Async → cancel-safe? |
 | **Reflect** | Retrospector | Bug >1 attempt → `docs/experience/errors/YYYY-MM-DD-slug.md`. Win → `docs/experience/wins/`. User corrected → write feedback memory. |
 
 **Skip rules**: Trivial → Implement + Verify only. Exploration → Phase 1 only. "Just do it" → Implement + Verify.
@@ -37,7 +37,8 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 ### Behavior Rules
 
 - **Self-correction**: On ANY user correction → codify a preventive feedback memory before resuming.
-- **GPU/CPU separation**: Mark GPU-only code with `// GPU required` comments. CUDA/Triton kernel stubs use `todo!("GPU required: ...")`.
+- **GPU/CPU separation**: Mark GPU-only code with `// GPU required` comments. CUDA/Triton/Metal kernel stubs use `todo!("GPU required: ...")`.
+- **Backend isolation**: CUDA-only code gated behind `#[cfg(feature = "cuda")]`; Metal-only behind `#[cfg(feature = "metal")]`. Never `cfg`-leak backend types into cross-backend modules — route through `backend.rs`.
 - **Opportunistic cleanup**: Spot something inelegant → fix in separate commit.
 
 ### Benchmark Rules
@@ -45,20 +46,20 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 - **Snapshot before & after** in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
 - **Never overwrite** old snapshots — immutable history.
 - **Standard tool**: `scripts/bench_throughput_sweep.py` with `--label`.
-- **Include environment**: GPU model, CUDA version, model name, num_slots, non-default flags.
+- **Include environment**: GPU model (e.g. A100 / M3 Max), CUDA or Metal version, model name, num_slots, non-default flags, feature set.
 - **Raw data**: Full output table, not summaries. After-snapshot references before-snapshot with delta on key metrics.
 
 ### Git Conventions
 
-Commitizen format: `<type>(<scope>): <subject>`.
+Commitizen format: `<type>(<scope>): <subject>`. Scope examples: `metal`, `cuda`, `scheduler`, `qwen3`, `glm4`, `http`.
 
 ### Code Conventions
 
-Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`.
+Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`. Models follow the same pattern: `model/qwen3.rs` + `model/qwen3/`.
 
-### CUDA Kernel Optimization — Six Principles
+### GPU Kernel Optimization — Six Principles
 
-Every kernel in `csrc/cuda/` must be evaluated against these. Use `ncu` to validate.
+Every kernel in `csrc/cuda/` (CUDA) and `csrc/metal/` (Metal) must be evaluated against these. Use `ncu` for CUDA and Xcode Metal GPU capture / MLX instruments for Metal. The principles are universal; terminology translates (CUDA warp ↔ Metal SIMD-group, shared memory ↔ threadgroup memory, SM ↔ GPU core).
 
 **1. Global Memory Coalescing**
 - Warp of 32 threads → hardware groups addresses by 128B cache line → 1 transaction per line.
@@ -128,16 +129,19 @@ Every kernel in `csrc/cuda/` must be evaluated against these. Use `ncu` to valid
 
 ## Build & Run
 
-**Always use `--release`** — debug builds are extremely slow for GPU/CUDA.
+**Always use `--release`** — debug builds are extremely slow for GPU.
 
 ```bash
-# Build (CPU-only)
-cargo build --release
-
-# Build with CUDA
+# CUDA build (Linux, default feature set = ["cuda"])
 CUDA_HOME=/usr/local/cuda cargo build --release
 
-# Run inference server
+# Metal build (Apple Silicon) — disables CUDA
+cargo build --release --no-default-features --features metal
+
+# No-GPU build — compiles on CI/macOS without any GPU backend (ops panic at runtime)
+cargo build --release --no-default-features --features no-cuda
+
+# Run inference server (CUDA)
 cargo run -p infer --release -- --model-path models/Qwen3.5-4B
 
 # Lint + format
@@ -146,7 +150,7 @@ cargo fmt --all -- --check
 ```
 
 **Key env vars:**
-- `PEGAINFER_CUDA_SM` — GPU SM target override (e.g. `120` or `120,80`)
+- `PEGAINFER_CUDA_SM` — CUDA SM target override (e.g. `120` or `120,80`)
 - `PEGAINFER_TRITON_PYTHON` — Python with Triton for AOT kernel generation
 - `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 
@@ -162,6 +166,9 @@ cargo test --release --test e2e_qwen35
 
 # Single test
 cargo test -p infer --release -- <test_name>
+
+# Metal test suite (Apple Silicon)
+cargo test --release --no-default-features --features metal
 
 # Python tests
 pip install -e ".[dev]"
@@ -180,37 +187,47 @@ E2E tests compare against JSON baselines in `infer/test_data/`. Regenerate basel
 agent-infer/          ← top-level Cargo workspace
 ├── src/              ← Rust agent binary (ChatML, tool calling, REPL)
 ├── agent_infer/      ← Python agent package (async HTTP client mode)
-├── infer/            ← Inference engine (Rust library + CUDA kernels)
+├── infer/            ← Inference engine (Rust library + GPU kernels)
 │   ├── src/
-│   │   ├── model/       ← Model implementations (Qwen3, Qwen35, ...)
-│   │   ├── ops/         ← CUDA-backed tensor ops (attention, linear, norm...)
-│   │   ├── scheduler/   ← Multi-request continuous batching scheduler
-│   │   ├── sampler.rs   ← Sampling strategies
-│   │   ├── http_server/ ← OpenAI-compatible HTTP API
-│   │   └── server_engine.rs ← Single-request inference façade
-│   ├── csrc/            ← CUDA C kernels
-│   └── tools/triton/    ← Triton Python kernels (AOT compiled)
+│   │   ├── model/              ← Model impls: qwen3/, qwen35/, glm4/
+│   │   ├── ops/                ← Tensor ops (attention, linear, norm, …)
+│   │   ├── scheduler/          ← CUDA multi-request continuous batching
+│   │   ├── metal_backend/      ← Metal backend module (Apple Silicon)
+│   │   ├── metal_*.rs          ← Metal scheduler, KV pool, prefix cache, GDR
+│   │   ├── backend.rs          ← Backend abstraction (CUDA vs. Metal)
+│   │   ├── backend_runtime.rs  ← Runtime dispatch over backends
+│   │   ├── model_registry.rs   ← Model ID → builder map
+│   │   ├── sampler.rs          ← Sampling strategies
+│   │   ├── http_server/        ← OpenAI-compatible HTTP API
+│   │   └── server_engine.rs    ← Single-request inference façade
+│   ├── csrc/cuda/              ← CUDA C kernels
+│   ├── csrc/metal/             ← Metal .metal shaders
+│   ├── mlx-sys/                ← Bindgen bridge to MLX C++ API
+│   └── tools/triton/           ← Triton Python kernels (AOT compiled)
 └── scripts/          ← Benchmark + utility scripts
 ```
 
 ### Key abstractions
 
 - **`ModelForward` trait** (`infer/src/model.rs`) — `forward(&self, tokens, state)`; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable), per-request state in associated `State` type.
-- **`Scheduler`** (`infer/src/scheduler/`) — multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
+- **`Backend` trait** (`infer/src/backend.rs`) — abstracts CUDA vs. Metal execution; selected at compile time via `--features cuda|metal`. `backend_runtime.rs` dispatches at runtime.
+- **`Scheduler`** (`infer/src/scheduler/`) — CUDA multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
+- **`MetalScheduler`** (`infer/src/metal_scheduler.rs`) — Metal counterpart with its own KV pool (`metal_kv_pool.rs`) and prefix cache (`metal_prefix_cache.rs`).
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
 - **`GenericServerEngine`** (`server_engine.rs`) — single-request engine for REPL/agent CLI.
 
 ### Model implementation pattern
 
-Each model in `infer/src/model/<name>/`: `config.rs`, `weights.rs`, `decode_buffers.rs`, `prefill_buffers.rs`, `forward.rs`.
+Each model is a flat module: `infer/src/model/<name>.rs` + `infer/src/model/<name>/`. Typical files: `config.rs`, `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `batch_decode.rs`, `decode_buffers.rs`. Hybrid models (qwen35) add `recurrent_state.rs`, `prefill_buffers.rs`, `single_token_buffers.rs`.
 
-### CUDA kernel integration
+### GPU kernel integration
 
-Kernels: `infer/csrc/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/ffi.rs`. `build.rs` compiles CUDA C (auto-detect SM), runs Triton AOT, links FlashInfer.
+- **CUDA**: `infer/csrc/cuda/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/ffi.rs`. `build.rs` compiles CUDA C (auto-detects SM), runs Triton AOT, links FlashInfer.
+- **Metal**: `infer/csrc/metal/` (.metal shaders) + `infer/mlx-sys/` (bindgen bridge to MLX C++ API). Enabled via `--features metal`; `libc` pulled in for `getrusage`-based RSS reporting.
 
 ### Key references
 
-[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Roadmap](ROADMAP.md)
+[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Backend trait](infer/src/backend.rs) · [Metal backend](infer/src/metal_backend.rs) · [Roadmap](ROADMAP.md)
 
 ---
 
@@ -220,7 +237,9 @@ Kernels: `infer/csrc/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/
 docs/
 ├── index.md           # Document index
 ├── projects/          # Time-bound efforts with clear deliverables
-├── areas/             # Ongoing responsibilities
+├── plans/             # Design plans for in-flight work
+├── experience/        # errors/ + wins/ + reviews/ — postmortems & playbooks
+├── reviews/           # Standalone code/architecture reviews
 ├── resources/         # References with potential future value
 └── archives/          # Inactive items
 ```
