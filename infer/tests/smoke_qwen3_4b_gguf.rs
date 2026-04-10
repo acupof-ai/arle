@@ -40,10 +40,19 @@ fn qwen3_4b_gguf_generate() {
         engine.model_type()
     );
 
-    for prompt in ["The capital of France is", "1 + 1 = "] {
+    // Build a long prompt (~1.5k tokens) to stress-test long-context prefill.
+    let long_body = "The quick brown fox jumps over the lazy dog. ".repeat(256);
+    let long_prompt =
+        format!("{long_body}\nBased on the passage above, the animal that jumps is the");
+    let prompts: Vec<String> = vec![
+        "The capital of France is".to_string(),
+        "1 + 1 = ".to_string(),
+        long_prompt,
+    ];
+    for prompt in &prompts {
         let req = infer::server_engine::CompleteRequest {
-            prompt: prompt.to_string(),
-            max_tokens: 8,
+            prompt: prompt.clone(),
+            max_tokens: 16,
             sampling: SamplingParams::default(),
             stop: None,
             logprobs: false,
@@ -54,7 +63,8 @@ fn qwen3_4b_gguf_generate() {
             LoadedServerEngine::Qwen35(e) => e.complete(req).unwrap(),
             LoadedServerEngine::GLM4(e) => e.complete(req).unwrap(),
         };
-        println!("prompt={prompt:?}");
+        let shown: String = prompt.chars().take(60).collect();
+        println!("prompt_len={} prompt_head={shown:?}", prompt.len());
         println!("  text={:?}", out.text);
         println!("  finish={:?}", out.finish_reason);
     }
