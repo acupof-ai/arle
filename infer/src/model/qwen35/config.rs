@@ -35,8 +35,21 @@ struct TextConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawConfig {
-    text_config: TextConfig,
+#[serde(untagged)]
+enum RawConfig {
+    /// Multi-modal config with nested text_config (Qwen3.5-4B, Qwen3.5-MoE)
+    Nested { text_config: TextConfig },
+    /// Flat text-only config (Carnice-27b uses Qwen3_5ForCausalLM directly)
+    Flat(TextConfig),
+}
+
+impl RawConfig {
+    fn into_text(self) -> TextConfig {
+        match self {
+            Self::Nested { text_config } => text_config,
+            Self::Flat(t) => t,
+        }
+    }
 }
 
 /// Qwen3.5 model configuration (text-only).
@@ -77,7 +90,7 @@ impl Config35 {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
-        let t = raw.text_config;
+        let t = raw.into_text();
 
         let layer_types: Vec<LayerType> = t
             .layer_types
