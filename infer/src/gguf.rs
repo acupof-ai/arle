@@ -335,6 +335,48 @@ impl GgufFile {
         Ok((qweight, scales, BLOCK_SIZE))
     }
 
+    /// Read a Q4_K_M / Q4_K_S tensor in packed form (raw 144-byte superblock layout).
+    ///
+    /// Unlike `read_tensor_bf16`, this returns the GGUF bytes verbatim so they can be
+    /// uploaded directly to the GPU without a BF16 intermediate. Used by the native
+    /// Q4_K GEMV kernel. Validates dtype and element/block count.
+    ///
+    /// Returned layout, per row `[N, K]`:
+    ///   - `K/256` superblocks per row, 144 bytes each
+    ///   - Superblock: `d:f16(2) | dmin:f16(2) | scales_packed(12) | qs(128)`
+    ///
+    /// Callers that need the K-dim contiguous-per-row reinterpretation (same trick
+    /// as `read_tensor_q8_packed`) should treat the output as `[ne1 * ne0/256 * 144]`.
+    pub fn read_tensor_q4k_packed(&self, name: &str) -> Result<Vec<u8>> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("Tensor '{}' not found in GGUF", name))?;
+        if !matches!(info.dtype, GgmlType::Q4_K_M | GgmlType::Q4_K_S) {
+            bail!("Expected Q4_K_M/Q4_K_S, got {:?}", info.dtype);
+        }
+        let numel = info.numel();
+        if numel % 256 != 0 {
+            bail!(
+                "Q4_K tensor '{}' numel {} is not a multiple of 256",
+                name,
+                numel
+            );
+        }
+        let expected = (numel / 256) * 144;
+        let raw = self.read_tensor_raw(name)?;
+        if raw.len() != expected {
+            bail!(
+                "Q4_K tensor '{}': expected {} bytes ({} superblocks), got {}",
+                name,
+                expected,
+                numel / 256,
+                raw.len()
+            );
+        }
+        Ok(raw)
+    }
+
     /// Read and dequantize a tensor to BF16.
     pub fn read_tensor_bf16(&self, name: &str) -> Result<Vec<bf16>> {
         let info = self

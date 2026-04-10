@@ -700,6 +700,10 @@ pub(crate) fn load_tensor_1d_gguf_v_reorder(
 }
 
 /// Load 2D GGUF tensor with V-head row reorder reversal (in_proj_z, in_proj_a/b).
+///
+/// For Q4_K_M / Q4_K_S, the permutation happens on packed superblock bytes at
+/// row granularity — each row's `(cols/256) * 144` bytes move as one unit,
+/// preserving superblock integrity. No BF16 intermediate is materialised.
 pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     ctx: &DeviceContext,
     gguf: &GgufFile,
@@ -710,12 +714,40 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
 ) -> Result<DeviceMatrix> {
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
-    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     let (rows, cols) = if info.shape.len() == 2 {
         (info.shape[1] as usize, info.shape[0] as usize)
     } else {
         (1, info.shape[0] as usize)
     };
+
+    // Q4_K packed: byte-level row permutation.
+    if matches!(info.dtype, gguf::GgmlType::Q4_K_M | gguf::GgmlType::Q4_K_S)
+        && info.shape.len() == 2
+        && cols % 256 == 0
+    {
+        let src = gguf.read_tensor_q4k_packed(&gguf_name)?;
+        let row_bytes = cols * 9 / 16; // (cols/256) * 144
+        assert_eq!(src.len(), rows * row_bytes);
+        if num_v_per_k <= 1 {
+            return DeviceMatrix::from_quantized_q4k(ctx, &src, rows, cols);
+        }
+        let mut dst = vec![0u8; src.len()];
+        for k in 0..num_k_heads {
+            for v in 0..num_v_per_k {
+                let gguf_head = v * num_k_heads + k;
+                let hf_head = k * num_v_per_k + v;
+                let src_start = gguf_head * head_dim * row_bytes;
+                let dst_start = hf_head * head_dim * row_bytes;
+                let size = head_dim * row_bytes;
+                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
+            }
+        }
+        drop(src);
+        return DeviceMatrix::from_quantized_q4k(ctx, &dst, rows, cols);
+    }
+
+    // BF16 fallback (existing path).
+    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
     reverse_v_reorder_rows(
         &mut bf16_data,
         rows,
@@ -778,6 +810,20 @@ pub(crate) fn load_tensor_2d_gguf(
         let ne1 = info.shape[1] as usize;
         let (rows, cols) = (ne1, ne0); // Column-major → row-major: [ne1, ne0]
         return DeviceMatrix::from_quantized_int8(ctx, &qweight, &scales, rows, cols, group_size);
+    }
+
+    // Q4_K_M / Q4_K_S: keep packed — native q4k_gemv kernel.
+    // Same column-major → row-major trick as Q8_0: superblocks of 256 live along
+    // ne0 (the innermost dimension), so reinterpreting as [ne1, ne0] row-major
+    // preserves superblock integrity.
+    if matches!(info.dtype, gguf::GgmlType::Q4_K_M | gguf::GgmlType::Q4_K_S)
+        && info.shape.len() == 2
+    {
+        let packed = gguf.read_tensor_q4k_packed(&gguf_name)?;
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        let (rows, cols) = (ne1, ne0);
+        return DeviceMatrix::from_quantized_q4k(ctx, &packed, rows, cols);
     }
 
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;

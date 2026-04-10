@@ -1064,6 +1064,44 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── Q4_K (GGUF Q4_K_M / Q4_K_S) native packed GEMV / dequant ───
+    //
+    // Weights are uploaded verbatim as 144-byte superblocks; no BF16 intermediate.
+    // Layout per row: `(K/256) * 144` bytes. `group_size` is fixed at 256 and not
+    // used by the kernel — accepted for signature parity with w4a16 variants.
+
+    pub(crate) fn q4k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q4k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Dequantize a K-dimension chunk of a Q4_K weight matrix into a BF16 tile.
+    /// `k_start` and `k_len` must be multiples of 256 (superblock size).
+    /// Output layout: `[n, k_len]` row-major BF16.
+    pub(crate) fn q4k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ─── TurboQuant KV cache quantization ───
 
     // Host-side: compute Lloyd-Max codebook (centroids + boundaries).

@@ -25,6 +25,29 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
     assert_eq!(a.cols, x.len, "A cols {} != x len {}", a.cols, x.len);
     assert_eq!(a.rows, y.len, "A rows {} != y len {}", a.rows, y.len);
 
+    // ── Q4_K native GEMV (packed superblocks, no BF16 intermediate) ──
+    if a.quant_bits == 44 {
+        let qw = a
+            .qweight
+            .as_ref()
+            .expect("Q4_K DeviceMatrix missing qweight");
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::q4k_gemv_cuda(
+                qw_ptr as *const u8,
+                x_ptr as *const ffi::Half,
+                y_ptr as *mut ffi::Half,
+                a.rows as i32,
+                a.cols as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        return Ok(());
+    }
+
     // ── Quantized weight dispatch (W2A16 / W4A16 / W8A16) ──
     if let (Some(qw), Some(qs)) = (&a.qweight, &a.qscales) {
         let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
@@ -389,6 +412,87 @@ pub(crate) fn gemm_into(
                 )
                 .result()
                 .expect("TQ dequant+cuBLAS GEMM failed");
+            }
+        }
+        return;
+    }
+
+    // ── Q4_K native packed dispatch ──
+    // Decode (seq_len == 1): q4k_gemv_batch_cuda with B=1 (equivalent to q4k_gemv_cuda).
+    // Prefill (seq_len > 1): chunked dequant-to-BF16 tile + cuBLAS GEMM to reuse tensor cores.
+    if weight.quant_bits == 44 {
+        let qw = weight
+            .qweight
+            .as_ref()
+            .expect("Q4_K DeviceMatrix missing qweight");
+        let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+        let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+        let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+        let n = weight.rows as i32;
+        let k = weight.cols as i32;
+        let stream = ctx.stream.cu_stream();
+
+        if x.seq_len == 1 {
+            unsafe {
+                ffi::q4k_gemv_cuda(
+                    qw_ptr as *const u8,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    n,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("q4k_gemv_cuda failed");
+            }
+        } else if x.seq_len <= 8 {
+            // Small batch — batched GEMV is cheaper than allocating a bf16 tile.
+            unsafe {
+                ffi::q4k_gemv_batch_cuda(
+                    qw_ptr as *const u8,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    n,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("q4k_gemv_batch_cuda failed");
+            }
+        } else {
+            // Prefill path: dequant the whole weight into a BF16 workspace then cuBLAS GEMM.
+            // Workspace is [n, k] bf16 — sized per-call, freed on scope exit.
+            // Future optimisation: chunk over K to cap workspace to [n, chunk] and loop.
+            let ws_elems = (weight.rows * weight.cols) as usize;
+            let mut workspace: CudaSlice<bf16> = ctx
+                .stream
+                .alloc_zeros(ws_elems)
+                .expect("alloc Q4_K dequant workspace");
+            let (ws_ptr, _gws) = workspace.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::q4k_dequant_chunk_cuda(
+                    qw_ptr as *const u8,
+                    ws_ptr as *mut ffi::Half,
+                    n,
+                    k,
+                    0,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("q4k_dequant_chunk_cuda failed");
+                ffi::gemm_cuda(
+                    ws_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    y_ptr as *mut ffi::Half,
+                    n,
+                    x.seq_len as i32,
+                    k,
+                    stream,
+                )
+                .result()
+                .expect("Q4_K prefill cuBLAS GEMM failed");
             }
         }
         return;
