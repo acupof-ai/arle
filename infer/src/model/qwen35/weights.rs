@@ -571,8 +571,18 @@ impl Qwen35Model {
                             vpk,
                         )?,
                         a_log: {
-                            // GGUF ssm_a stores A = -exp(A_log), not A_log itself.
-                            // Convert back: A_log = -log(|A|) (negative because A < 0).
+                            // GGUF `ssm_a` stores the raw (negative) A parameter per V-head,
+                            // following llama.cpp's `A = -exp(A_log)` convention — so
+                            //   |A| = exp(A_log)   ⇒   A_log = log(|A|).
+                            // Values we see in Carnice-27b are A ≈ -0.04..-0.3 → A_log ≈ -3..−1.
+                            //
+                            // The GDR kernel (`gated_delta_rule.cu`) computes
+                            //   g = -exp(a_log) * softplus(a_proj + dt_bias)
+                            // so a_log must carry the log-magnitude with the correct sign.
+                            // Earlier code used `-log(|A|)` which flipped the sign and made
+                            // every forward step produce garbage generation on any model
+                            // that exercises this GGUF path (Qwen3.5-4B passed the e2e test
+                            // only because it loads via safetensors, not via this branch).
                             let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
                                 gguf,
                                 &format!("{ap}.a_log"),
@@ -593,12 +603,12 @@ impl Qwen35Model {
                                     .map(|v| v.to_f32())
                                     .collect()
                             };
-                            // Convert: A → A_log = -log(|A|)
+                            // A → A_log = log(|A|)  (matches llama.cpp convention)
                             let mut a_log: Vec<f32> = raw_f32
                                 .iter()
                                 .map(|&a| {
                                     let abs_a = a.abs().max(1e-10);
-                                    -(abs_a.ln())
+                                    abs_a.ln()
                                 })
                                 .collect();
                             // Reverse llama.cpp V-head reorder (head_dim = 1 for A_log)
