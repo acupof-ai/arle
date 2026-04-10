@@ -14,6 +14,7 @@
 //!   qwen35_compiled_free(model)
 
 #include "mlx_common.h"
+#include <algorithm>
 #include <cstdlib>
 
 using namespace mlx::core;
@@ -832,10 +833,13 @@ int32_t qwen35_compiled_generate(
     try {
         mlx_clear_error();
         auto t_start = std::chrono::high_resolution_clock::now();
-        int F = m->n_full_attn, G = m->n_gdr;
+        int F = m->n_full_attn;
 
         // Initialize caches
-        int kv_cap = 256;
+        constexpr int KV_CACHE_CHUNK = 256;
+        const int total_tokens_needed = std::max(1, prompt_len + max_new_tokens);
+        const int kv_cap =
+            ((total_tokens_needed + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK;
         auto cache_shape = [&](int heads, int dim) {
             return Shape{1, heads, kv_cap, dim};
         };

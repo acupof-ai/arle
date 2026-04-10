@@ -17,7 +17,12 @@ on:
       - 'infer/csrc/metal/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
-      - 'infer/Cargo.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'scripts/start_agent.sh'
+      - 'Makefile'
+      - 'README.md'
       - 'infer/src/bin/metal_bench.rs'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
@@ -37,7 +42,12 @@ on:
       - 'infer/csrc/metal/**'
       - 'infer/build.rs'
       - 'infer/Cargo.toml'
-      - 'infer/Cargo.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'scripts/start_agent.sh'
+      - 'Makefile'
+      - 'README.md'
       - 'infer/src/bin/metal_bench.rs'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
@@ -63,24 +73,29 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            infer/target
-          key: ${{ runner.os }}-metal-${{ hashFiles('infer/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-metal-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-metal-
 
       # Verify Metal C++ shim compiles and Rust type-checks cleanly.
-      - name: cargo check (metal + no-cuda)
+      - name: cargo check (metal + no-cuda infer lib)
         working-directory: infer
         run: cargo check --no-default-features --features metal,no-cuda --lib --release
 
-      # Run unit tests serially; skip the unstable metal_gdr shape tests and GPU-only cases.
-      - name: cargo test (metal + no-cuda, non-GPU)
+      - name: cargo check (metal + no-cuda CLI)
+        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release
+
+      - name: cargo test (metal + no-cuda)
         working-directory: infer
         run: >
           cargo test
           --no-default-features --features metal,no-cuda
           --lib --release
-          -- --test-threads 1 --skip metal_gdr::tests::
+          -- --test-threads 1
+
+      - name: cargo test (metal + no-cuda CLI unit tests)
+        run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer --release
 
       # Compile metal_bench binary to verify it links correctly.
       - name: cargo build metal_bench
@@ -101,7 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: metal_bench-macos-arm64
-          path: infer/target/release/metal_bench
+          path: target/release/metal_bench
           if-no-files-found: error
 
   # On tagged releases: attach metal_bench to the GitHub Release.
@@ -127,4 +142,4 @@ jobs:
       - name: Attach metal_bench to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: infer/target/release/metal_bench
+          files: target/release/metal_bench

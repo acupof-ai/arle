@@ -730,6 +730,7 @@ If no tool is needed, output exactly NO_TOOL.",
             ..SamplingParams::default()
         },
         stop: Some(vec!["<|im_end|>".to_string()]),
+        logprobs: false,
     })?;
 
     let repaired = parse_tool_calls(&repair_output.text);
@@ -794,6 +795,7 @@ mod tests {
                 },
                 text,
                 finish_reason: FinishReason::Stop,
+                token_logprobs: Vec::new(),
             })
         }
     }

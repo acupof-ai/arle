@@ -31,9 +31,15 @@ jobs:
           key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
-      - name: cargo check (Metal, no-cuda)
+      - name: cargo check (Metal infer lib)
         working-directory: infer
         run: cargo check --no-default-features --features metal,no-cuda --lib
+
+      - name: cargo check (Metal CLI surface)
+        run: cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer
+
+      - name: cargo test (Metal CLI unit tests)
+        run: cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer
 
   # ── Linux: CPU-only (no CUDA, no Metal) ─────────────────────────────────────
   check:

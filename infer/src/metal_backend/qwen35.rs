@@ -65,7 +65,6 @@ impl Drop for CppQwen35Model {
     }
 }
 unsafe impl Send for CppQwen35Model {}
-unsafe impl Sync for CppQwen35Model {}
 
 impl CppQwen35Model {
     /// Wrap a raw C++ model pointer (takes ownership).

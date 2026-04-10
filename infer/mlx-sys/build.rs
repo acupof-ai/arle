@@ -34,6 +34,7 @@ fn main() {
         .include("src")
         .include(&mlx_fetch_src)
         .include(&mlx_fetch_build) // for generated headers
+        .flag("-Wno-deprecated-copy")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-sign-compare")
         .compile("mlx_ffi");

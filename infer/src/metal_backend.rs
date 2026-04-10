@@ -5,11 +5,11 @@
 //!
 //! # Architecture
 //!
-//! Implements a full Qwen2.5 transformer forward pass:
+//! Implements a full Qwen3/Qwen3.5 transformer forward pass:
 //! - safetensors weight loading into MLX unified memory
 //! - RMSNorm, RoPE, GQA attention, SwiGLU MLP
 //! - Simple append-based KV cache (one buffer per generate call)
-//! - Greedy / temperature + top-p sampling
+//! - Greedy / temperature sampling with `top_k=1`
 //!
 //! # Feature flag
 //!
@@ -22,13 +22,17 @@
 //! use std::path::Path;
 //!
 //! let mut backend = MetalBackend::new();
-//! backend.load(Path::new("Qwen/Qwen2.5-0.5B-Instruct")).unwrap();
+//! backend.load(Path::new("mlx-community/Qwen3-0.6B-4bit")).unwrap();
 //! ```
 
+#[cfg(feature = "metal")]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "metal")]
 use std::time::Instant;
 
+#[cfg(feature = "metal")]
+use anyhow::anyhow;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "metal")]
@@ -257,8 +261,6 @@ struct StandardMetalWeights {
     pub norm: MlxArray,
     /// Output projection (lm_head) — dense or quantized.
     pub lm_head: WeightTensor,
-    /// Quantized embed weights for as_linear lm_head.
-    pub embed_quantized: Option<WeightTensor>,
     /// C++ compiled model (reuses Qwen3.5 model struct with all full-attn layers).
     pub cpp_model: Option<qwen35::CppQwen35Model>,
 }
@@ -309,26 +311,28 @@ impl MetalBackend {
     where
         F: FnMut(&str) -> Result<()>,
     {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .context("model not loaded — call load() first")?;
-        let input_ids = tokenizer.encode(prompt)?;
-        let mut decoder = tokenizer.incremental_decoder();
+        run_with_metal_panic_boundary("stream generation", || {
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .context("model not loaded — call load() first")?;
+            let input_ids = tokenizer.encode(prompt)?;
+            let mut decoder = tokenizer.incremental_decoder();
 
-        let result =
-            self.generate_from_token_ids_with_callback(&input_ids, params, |token_id| {
-                if let Some(chunk) = decoder.step(token_id)? {
-                    on_chunk(&chunk)?;
-                }
-                Ok(())
-            })?;
+            let result =
+                self.generate_from_token_ids_with_callback(&input_ids, params, |token_id| {
+                    if let Some(chunk) = decoder.step(token_id)? {
+                        on_chunk(&chunk)?;
+                    }
+                    Ok(())
+                })?;
 
-        if let Some(tail) = decoder.finish()? {
-            on_chunk(&tail)?;
-        }
+            if let Some(tail) = decoder.finish()? {
+                on_chunk(&tail)?;
+            }
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     pub fn generate_from_token_ids(
@@ -336,7 +340,9 @@ impl MetalBackend {
         input_ids: &[u32],
         params: &SamplingParams,
     ) -> Result<GenerateResult> {
-        self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
+        run_with_metal_panic_boundary("token-id generation", || {
+            self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
+        })
     }
 
     #[allow(unused_mut)]
@@ -449,6 +455,32 @@ impl MetalBackend {
     }
 }
 
+#[cfg(feature = "metal")]
+fn run_with_metal_panic_boundary<T>(op: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|panic| {
+        anyhow!(
+            "metal backend panicked during {op}: {}",
+            panic_message(panic)
+        )
+    })?
+}
+
+#[cfg(feature = "metal")]
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+fn run_with_metal_panic_boundary<T>(_op: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    f()
+}
+
 impl Default for MetalBackend {
     fn default() -> Self {
         Self::new()
@@ -470,8 +502,8 @@ impl InferenceBackend for MetalBackend {
     /// Load model from `model_path`.
     ///
     /// `model_path` may be:
-    /// - An existing local directory (e.g. `/path/to/Qwen2.5-0.5B-Instruct`)
-    /// - A HuggingFace model ID (e.g. `"Qwen/Qwen2.5-0.5B-Instruct"`)
+    /// - An existing local directory (e.g. `/path/to/Qwen3-0.6B-4bit`)
+    /// - A HuggingFace model ID (e.g. `"mlx-community/Qwen3-0.6B-4bit"`)
     fn load(&mut self, model_path: &Path) -> Result<()> {
         // ── 1. Resolve model path ────────────────────────────────────────────
         let path_str = model_path.to_string_lossy();
@@ -574,7 +606,7 @@ impl StreamingInferenceBackend for MetalBackend {
 /// input_ids → embed → [transformer layer × N] → norm → lm_head → logits → sample
 /// ```
 ///
-/// Transformer layer (Qwen2.5):
+/// Transformer layer (Qwen3 / Qwen3.5):
 /// 1. `residual = x`
 /// 2. `x = rms_norm(x, input_layernorm)`
 /// 3. `q = rms_norm(x @ q_proj.T, q_norm)`, `k = rms_norm(x @ k_proj.T, k_norm)`
@@ -1392,7 +1424,6 @@ fn load_qwen3_metal_weights(
         layers,
         norm,
         lm_head,
-        embed_quantized,
         cpp_model,
     })
 }

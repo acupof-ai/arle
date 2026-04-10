@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5,7 +6,9 @@ use anyhow::{Result, anyhow};
 use log::error;
 use tokio::sync::mpsc;
 
-use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+#[cfg(feature = "metal")]
+use crate::backend::InferenceBackend;
+use crate::backend::{GenerateResult, StreamingInferenceBackend};
 #[cfg(feature = "metal")]
 use crate::metal_backend::MetalBackend;
 use crate::request_handle::{RequestHandle, SubmitError};
@@ -123,9 +126,27 @@ fn run_backend_runtime<B>(
 {
     while let Some(req) = rx.blocking_recv() {
         waiting_count.fetch_sub(1, Ordering::AcqRel);
-        if let Err(err) = execute_request(&backend, req) {
+        let result = catch_unwind(AssertUnwindSafe(|| execute_request(&backend, req)));
+        let outcome = match result {
+            Ok(result) => result,
+            Err(panic) => Err(anyhow!(
+                "backend runtime panicked: {}",
+                panic_message(panic)
+            )),
+        };
+        if let Err(err) = outcome {
             error!("backend runtime request failed: {err:#}");
         }
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
     }
 }
 
@@ -297,7 +318,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::backend::GenerateResult;
+    use crate::backend::{GenerateResult, InferenceBackend};
     use crate::request_handle::RequestHandle;
     use crate::sampler::SamplingParams;
 

@@ -3,7 +3,7 @@
 # agent-infer — reproducible dev environment setup
 #
 # Usage:
-#   ./setup.sh              # Full setup: toolchain + venv + build + model
+#   ./setup.sh              # Full setup: Linux/CUDA toolchain + venv + build + model
 #   ./setup.sh --deps-only  # Toolchain + venv only, no build/model
 #   ./setup.sh --build-only # Build only (assumes venv exists)
 #   ./setup.sh --model-only # Download model only
@@ -17,6 +17,7 @@
 #   SKIP_MODEL    — Set to 1 to skip model download
 #   PYTHON        — Python interpreter     (default: python3)
 #
+# This script is CUDA/Linux oriented. Use the Makefile targets for Metal/macOS.
 # All Python deps are installed into .venv/ — never pollutes system packages.
 # Activate manually:  source .venv/bin/activate
 # ============================================================================
@@ -159,11 +160,17 @@ do_check() {
         warn "nsjail not found — tool execution will run without sandbox"
     fi
 
-    # Binary
+    # Binaries
     if [ -x target/release/agent-infer ]; then
         ok "target/release/agent-infer built"
     else
         fail "agent-infer binary not found — run ./setup.sh --build-only"
+        errors=$((errors + 1))
+    fi
+    if [ -x target/release/infer ]; then
+        ok "target/release/infer built"
+    else
+        fail "infer server binary not found — run ./setup.sh --build-only"
         errors=$((errors + 1))
     fi
 
@@ -311,7 +318,7 @@ do_deps() {
 # BUILD — compile Rust + CUDA kernels
 # ============================================================================
 do_build() {
-    step "Building agent-infer (release, CUDA)"
+    step "Building agent-infer CLI + infer server (release, CUDA)"
     activate_venv
 
     # Ensure cargo is on PATH
@@ -331,7 +338,14 @@ do_build() {
     local start
     start=$(date +%s)
 
-    cargo build --release 2>&1 | while IFS= read -r line; do
+    cargo build --release --features cli -p agent-infer 2>&1 | while IFS= read -r line; do
+        case "$line" in
+            *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
+                echo "  $line" ;;
+        esac
+    done
+
+    cargo build --release --features cuda -p infer 2>&1 | while IFS= read -r line; do
         case "$line" in
             *warning:*|*error:*|*Compiling*infer*|*Compiling*agent*)
                 echo "  $line" ;;
@@ -343,6 +357,9 @@ do_build() {
 
     if [ -x target/release/agent-infer ]; then
         info "Binary: target/release/agent-infer ($(du -h target/release/agent-infer | awk '{print $1}'))"
+    fi
+    if [ -x target/release/infer ]; then
+        info "Binary: target/release/infer ($(du -h target/release/infer | awk '{print $1}'))"
     fi
 }
 
