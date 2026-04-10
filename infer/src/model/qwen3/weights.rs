@@ -67,6 +67,12 @@ impl Qwen3Model {
 
         let config = Config::from_file(model_path)?;
 
+        // Try GGUF first — if found, use dequant-at-load path
+        if let Some(gguf) = crate::weight_loader::try_open_gguf(model_path) {
+            info!("Loading from GGUF: {} tensors", gguf.tensors.len());
+            return Self::from_gguf(&ctx, &config, &gguf, runtime);
+        }
+
         let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
@@ -289,5 +295,118 @@ impl Qwen3Model {
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         common::output_projection(&self.lm_head, &self.embed_tokens)
+    }
+
+    /// Load from a GGUF file — dequantizes all tensors to BF16 at load time.
+    fn from_gguf(
+        ctx: &DeviceContext,
+        config: &Config,
+        gguf: &crate::gguf::GgufFile,
+        runtime: ModelRuntimeConfig,
+    ) -> Result<Self> {
+        use crate::weight_loader::{load_tensor_1d_gguf, load_tensor_2d_gguf, precompute_rope};
+
+        let t_gpu = std::time::Instant::now();
+
+        let embed_tokens = load_tensor_2d_gguf(ctx, gguf, "model.embed_tokens.weight")?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(load_tensor_2d_gguf(
+                ctx,
+                gguf,
+                config.lm_head_tensor_name(),
+            )?)
+        };
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let p = format!("model.layers.{}", i);
+
+            let q_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.q_proj.weight"))?;
+            let k_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.k_proj.weight"))?;
+            let v_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.v_proj.weight"))?;
+            let qkv_proj = DeviceMatrix::concat_rows(ctx, &[&q_proj, &k_proj, &v_proj])?;
+
+            layers.push(TransformerBlock {
+                input_layernorm: load_tensor_1d_gguf(
+                    ctx,
+                    gguf,
+                    &format!("{p}.input_layernorm.weight"),
+                )?,
+                attention: Attention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    qkv_proj,
+                    o_proj: load_tensor_2d_gguf(
+                        ctx,
+                        gguf,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                    )?,
+                    q_norm: load_tensor_1d_gguf(
+                        ctx,
+                        gguf,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                    )?,
+                    k_norm: load_tensor_1d_gguf(
+                        ctx,
+                        gguf,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                    )?,
+                },
+                post_attention_layernorm: load_tensor_1d_gguf(
+                    ctx,
+                    gguf,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                )?,
+                mlp: {
+                    let gate =
+                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.gate_proj.weight"))?;
+                    let up = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.up_proj.weight"))?;
+                    let down =
+                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.down_proj.weight"))?;
+                    let gate_up = DeviceMatrix::concat_rows(ctx, &[&gate, &up])?;
+                    MLP {
+                        gate_proj: gate,
+                        up_proj: up,
+                        down_proj: down,
+                        gate_up_proj: Some(gate_up),
+                    }
+                },
+            });
+
+            if (i + 1) % 10 == 0 || i + 1 == config.num_hidden_layers {
+                info!("GGUF: loaded layer {}/{}", i + 1, config.num_hidden_layers);
+            }
+        }
+
+        let norm = load_tensor_1d_gguf(ctx, gguf, "model.norm.weight")?;
+        let (cos_cache, sin_cache) =
+            precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
+
+        ctx.sync()?;
+        info!(
+            "GGUF model loaded in {:.0}ms ({} layers)",
+            t_gpu.elapsed().as_secs_f64() * 1e3,
+            config.num_hidden_layers
+        );
+
+        let model = Self {
+            ctx: ctx.clone(),
+            config: config.clone(),
+            embed_tokens,
+            lm_head,
+            layers,
+            norm,
+            cos_cache,
+            sin_cache,
+            enable_cuda_graph: runtime.enable_cuda_graph,
+        };
+
+        if model.enable_cuda_graph {
+            model.preload_decode_triton_kernels()?;
+        }
+        Ok(model)
     }
 }

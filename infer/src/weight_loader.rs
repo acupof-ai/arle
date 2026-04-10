@@ -569,12 +569,15 @@ pub(crate) fn load_tensor_2d_gguf(
     let info = &gguf.tensors[&gguf_name];
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
 
-    // GGUF stores weights as [out_dim, in_dim] (row-major), same as safetensors
-    let (rows, cols) = if info.shape.len() == 2 {
-        (info.shape[0] as usize, info.shape[1] as usize)
+    // GGUF stores 2D weights as [in_dim, out_dim] (transposed vs HuggingFace [out_dim, in_dim]).
+    // Transpose during load to match the engine's row-major [out_dim, in_dim] layout.
+    let (rows, cols, needs_transpose) = if info.shape.len() == 2 {
+        let s0 = info.shape[0] as usize;
+        let s1 = info.shape[1] as usize;
+        // GGUF: shape[0]=in_dim, shape[1]=out_dim → we need [out_dim, in_dim]
+        (s1, s0, true)
     } else if info.shape.len() == 1 {
-        // 1D tensor treated as [1, N] for embedding lookup
-        (1, info.shape[0] as usize)
+        (1, info.shape[0] as usize, false)
     } else {
         anyhow::bail!(
             "Expected 1D or 2D tensor for '{}', got {}D",
@@ -583,7 +586,22 @@ pub(crate) fn load_tensor_2d_gguf(
         );
     };
 
-    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
+    let final_data = if needs_transpose && rows > 1 && cols > 1 {
+        // CPU transpose: GGUF [in_dim, out_dim] → engine [out_dim, in_dim]
+        let src_rows = cols; // GGUF dim0 = in_dim = our cols
+        let src_cols = rows; // GGUF dim1 = out_dim = our rows
+        let mut transposed = vec![bf16::ZERO; rows * cols];
+        for r in 0..src_rows {
+            for c in 0..src_cols {
+                transposed[c * src_rows + r] = bf16_data[r * src_cols + c];
+            }
+        }
+        transposed
+    } else {
+        bf16_data
+    };
+
+    DeviceMatrix::from_host(ctx, &final_data, rows, cols)
 }
 
 /// Find a tensor in the GGUF file by HuggingFace name.
