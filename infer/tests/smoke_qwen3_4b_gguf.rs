@@ -41,23 +41,21 @@ fn qwen3_4b_gguf_generate() {
     );
 
     for prompt in ["The capital of France is", "1 + 1 = "] {
-        let req = CompleteRequest {
+        let req = infer::server_engine::CompleteRequest {
             prompt: prompt.to_string(),
             max_tokens: 8,
             sampling: SamplingParams::default(),
             stop: None,
             logprobs: false,
         };
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamDelta>();
-        match &mut engine {
-            LoadedServerEngine::Qwen3(e) => e.complete_stream(req, tx).unwrap(),
-            LoadedServerEngine::Qwen35(e) => e.complete_stream(req, tx).unwrap(),
-            LoadedServerEngine::GLM4(e) => e.complete_stream(req, tx).unwrap(),
-        }
-        let mut text = String::new();
-        while let Ok(delta) = rx.try_recv() {
-            text.push_str(&delta.text_delta);
-        }
-        println!("prompt={prompt:?}: {text:?}");
+        // Use the sync complete() so we can see the token_ids directly.
+        let out = match &mut engine {
+            LoadedServerEngine::Qwen3(e) => e.complete(req).unwrap(),
+            LoadedServerEngine::Qwen35(e) => e.complete(req).unwrap(),
+            LoadedServerEngine::GLM4(e) => e.complete(req).unwrap(),
+        };
+        println!("prompt={prompt:?}");
+        println!("  text={:?}", out.text);
+        println!("  finish={:?}", out.finish_reason);
     }
 }
