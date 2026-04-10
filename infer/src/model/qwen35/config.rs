@@ -40,7 +40,7 @@ struct RawConfig {
 }
 
 /// Qwen3.5 model configuration (text-only).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Config35 {
     // Common
     pub(crate) hidden_size: usize,

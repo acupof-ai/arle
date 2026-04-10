@@ -95,6 +95,12 @@ impl Qwen35Model {
             config.num_hidden_layers - config.num_full_attention_layers()
         );
 
+        // Try GGUF first
+        if let Some(gguf) = crate::weight_loader::try_open_gguf(model_path) {
+            info!("Loading Qwen3.5 from GGUF: {} tensors", gguf.tensors.len());
+            return Self::from_gguf(&ctx, &config, &gguf, enable_cuda_graph);
+        }
+
         let (mmaps, weight_map) = common::load_safetensors(model_path, true)?;
         let shards = common::deserialize_shards(&mmaps)?;
 
@@ -417,6 +423,185 @@ impl Qwen35Model {
 
         info!("All weight shapes verified successfully");
         Ok(())
+    }
+
+    /// Load Qwen3.5 from GGUF — dequant all tensors to BF16 at load time.
+    fn from_gguf(
+        ctx: &DeviceContext,
+        config: &Config35,
+        gguf: &crate::gguf::GgufFile,
+        enable_cuda_graph: bool,
+    ) -> Result<Self> {
+        use crate::weight_loader::{load_tensor_1d_gguf, load_tensor_2d_gguf, precompute_rope};
+
+        // Qwen3.5 GGUF uses standard blk.N prefix — map_gguf_name handles
+        // SSM tensors (ssm_a, ssm_conv1d, etc.) → linear_attn.* HF names.
+        // The weight_loader's find_gguf_tensor_name does reverse lookup.
+        //
+        // Note: Qwen3.5 HF uses "model.language_model" prefix, but GGUF
+        // uses flat "blk.N" — the reverse mapping in find_gguf_tensor_name
+        // handles this by trying map_gguf_name_with_prefix for both prefixes.
+
+        let t_gpu = std::time::Instant::now();
+        let wp = "model.language_model";
+
+        let embed_tokens = load_tensor_2d_gguf(ctx, gguf, &format!("{wp}.embed_tokens.weight"))?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let p = format!("{wp}.layers.{i}");
+            let layer_type = config.layer_types[i];
+
+            let attn = match layer_type {
+                LayerType::FullAttention => {
+                    let ap = format!("{p}.self_attn");
+                    LayerKind::FullAttention(FullAttentionLayer {
+                        q_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.q_proj.weight"))?,
+                        k_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.k_proj.weight"))?,
+                        v_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.v_proj.weight"))?,
+                        o_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.o_proj.weight"))?,
+                        q_norm: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.q_norm.weight"))?,
+                        k_norm: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.k_norm.weight"))?,
+                    })
+                }
+                LayerType::LinearAttention => {
+                    let ap = format!("{p}.linear_attn");
+                    LayerKind::LinearAttention(LinearAttentionLayer {
+                        in_proj_qkv: load_tensor_2d_gguf(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.in_proj_qkv.weight"),
+                        )?,
+                        in_proj_z: load_tensor_2d_gguf(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.in_proj_z.weight"),
+                        )?,
+                        in_proj_b: load_tensor_2d_gguf(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.in_proj_b.weight"),
+                        )?,
+                        in_proj_a: load_tensor_2d_gguf(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.in_proj_a.weight"),
+                        )?,
+                        conv1d_weight: load_tensor_1d_gguf(
+                            ctx,
+                            gguf,
+                            &format!("{ap}.conv1d.weight"),
+                        )?,
+                        dt_bias: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.dt_bias"))?,
+                        a_log: {
+                            // a_log is stored as f32 in GGUF
+                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
+                                gguf,
+                                &format!("{ap}.a_log"),
+                            )?;
+                            let raw = gguf.read_tensor_raw(&gguf_name)?;
+                            let info = &gguf.tensors[&gguf_name];
+                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
+                                unsafe {
+                                    std::slice::from_raw_parts(
+                                        raw.as_ptr().cast::<f32>(),
+                                        info.numel(),
+                                    )
+                                }
+                                .to_vec()
+                            } else {
+                                // Dequant to bf16, then to f32
+                                gguf.read_tensor_bf16(&gguf_name)?
+                                    .iter()
+                                    .map(|v| v.to_f32())
+                                    .collect()
+                            };
+                            let gpu: cudarc::driver::CudaSlice<f32> =
+                                ctx.stream.clone_htod(&f32s)?;
+                            gpu
+                        },
+                        norm_weight: {
+                            let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
+                                gguf,
+                                &format!("{ap}.norm.weight"),
+                            )?;
+                            let raw = gguf.read_tensor_raw(&gguf_name)?;
+                            let info = &gguf.tensors[&gguf_name];
+                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
+                                unsafe {
+                                    std::slice::from_raw_parts(
+                                        raw.as_ptr().cast::<f32>(),
+                                        info.numel(),
+                                    )
+                                }
+                                .to_vec()
+                            } else {
+                                gguf.read_tensor_bf16(&gguf_name)?
+                                    .iter()
+                                    .map(|v| v.to_f32())
+                                    .collect()
+                            };
+                            ctx.stream.clone_htod(&f32s)?
+                        },
+                        out_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.out_proj.weight"))?,
+                    })
+                }
+            };
+
+            layers.push(TransformerBlock35 {
+                input_layernorm: load_tensor_1d_gguf(
+                    ctx,
+                    gguf,
+                    &format!("{p}.input_layernorm.weight"),
+                )?,
+                attn,
+                post_attention_layernorm: load_tensor_1d_gguf(
+                    ctx,
+                    gguf,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                )?,
+                mlp: {
+                    let gate =
+                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.gate_proj.weight"))?;
+                    let up = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.up_proj.weight"))?;
+                    let down =
+                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.down_proj.weight"))?;
+                    let gate_up = DeviceMatrix::concat_rows(ctx, &[&gate, &up])?;
+                    common::MLP {
+                        gate_proj: gate,
+                        up_proj: up,
+                        down_proj: down,
+                        gate_up_proj: Some(gate_up),
+                    }
+                },
+            });
+
+            if (i + 1) % 8 == 0 || i + 1 == config.num_hidden_layers {
+                info!("GGUF: loaded layer {}/{}", i + 1, config.num_hidden_layers);
+            }
+        }
+
+        let norm = load_tensor_1d_gguf(ctx, gguf, &format!("{wp}.norm.weight"))?;
+        let (cos_cache, sin_cache) =
+            precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
+
+        ctx.sync()?;
+        info!(
+            "Qwen3.5 GGUF loaded in {:.0}ms ({} layers)",
+            t_gpu.elapsed().as_secs_f64() * 1e3,
+            config.num_hidden_layers
+        );
+
+        Ok(Self {
+            ctx: ctx.clone(),
+            config: config.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            cos_cache,
+            sin_cache,
+            enable_cuda_graph,
+        })
     }
 }
 
