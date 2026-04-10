@@ -559,7 +559,8 @@ pub(crate) fn load_tensor_1d_gguf(
 
 /// Load a 2D tensor (e.g., linear weight) from a GGUF file.
 ///
-/// Dequantizes to BF16, uploads to GPU as DeviceMatrix.
+/// For Q8_0: keeps weights packed as INT8 + bf16 scales (uses W8A16 GEMV at runtime).
+/// For other formats: dequantizes to BF16 at load time.
 pub(crate) fn load_tensor_2d_gguf(
     ctx: &DeviceContext,
     gguf: &GgufFile,
@@ -567,6 +568,32 @@ pub(crate) fn load_tensor_2d_gguf(
 ) -> Result<DeviceMatrix> {
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
+
+    // Q8_0: keep packed — use existing W8A16 GEMV for on-the-fly dequant
+    if info.dtype == gguf::GgmlType::Q8_0 && info.shape.len() == 2 {
+        let (qweight, scales, group_size) = gguf.read_tensor_q8_packed(&gguf_name)?;
+        let s0 = info.shape[0] as usize; // in_dim (GGUF is transposed)
+        let s1 = info.shape[1] as usize; // out_dim
+        let (rows, cols) = (s1, s0); // engine: [out_dim, in_dim]
+
+        // Transpose qweight: [in_dim, out_dim] → [out_dim, in_dim]
+        let mut qw_t = vec![0i8; rows * cols];
+        for r in 0..s0 {
+            for c in 0..s1 {
+                qw_t[c * s0 + r] = qweight[r * s1 + c];
+            }
+        }
+        // Transpose scales: [in_dim/gs, out_dim] → [out_dim, in_dim/gs]
+        let num_groups_src = s0 / group_size;
+        let mut sc_t = vec![bf16::ZERO; rows * (cols / group_size)];
+        for r in 0..num_groups_src {
+            for c in 0..s1 {
+                sc_t[c * num_groups_src + r] = scales[r * s1 + c];
+            }
+        }
+        return DeviceMatrix::from_quantized_int8(ctx, &qw_t, &sc_t, rows, cols, group_size);
+    }
+
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
 
     // GGUF stores 2D weights as [in_dim, out_dim] (transposed vs HuggingFace [out_dim, in_dim]).

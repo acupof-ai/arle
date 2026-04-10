@@ -65,13 +65,36 @@ impl Qwen3Model {
         debug!("Initializing GPU");
         let ctx = DeviceContext::new()?;
 
-        let config = Config::from_file(model_path)?;
-
         // Try GGUF first — if found, use dequant-at-load path
         if let Some(gguf) = crate::weight_loader::try_open_gguf(model_path) {
             info!("Loading from GGUF: {} tensors", gguf.tensors.len());
+            // Config: prefer config.json, fallback to GGUF metadata
+            let config = Config::from_file(model_path).or_else(|_| -> Result<Config> {
+                let gc = gguf.extract_model_config()?;
+                info!(
+                    "Config from GGUF metadata: {}×{}, {} layers",
+                    gc.hidden_size, gc.intermediate_size, gc.num_hidden_layers
+                );
+                Ok(Config {
+                    hidden_size: gc.hidden_size,
+                    intermediate_size: gc.intermediate_size,
+                    num_hidden_layers: gc.num_hidden_layers,
+                    num_attention_heads: gc.num_attention_heads,
+                    num_key_value_heads: gc.num_key_value_heads,
+                    head_dim: gc.head_dim,
+                    vocab_size: gc.vocab_size,
+                    rms_norm_eps: gc.rms_norm_eps,
+                    rope_theta: gc.rope_theta,
+                    bos_token_id: 0,
+                    eos_token_id: 0,
+                    tie_word_embeddings: true,
+                    stop_token_ids: vec![],
+                })
+            })?;
             return Self::from_gguf(&ctx, &config, &gguf, runtime);
         }
+
+        let config = Config::from_file(model_path)?;
 
         let (mmaps, weight_map) = common::load_safetensors(model_path, false)?;
         let shards = common::deserialize_shards(&mmaps)?;
