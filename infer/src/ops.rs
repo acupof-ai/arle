@@ -48,7 +48,8 @@ pub(crate) use elementwise::{
 };
 pub(crate) use linear::{gemm_into, linear};
 pub(crate) use norm::{
-    fused_add_rms_norm_batch_into, rms_norm, rms_norm_batch_into, rms_norm_gated_batch_into,
+    add_bf16_into_f32, cast_bf16_to_f32, cast_f32_to_bf16, fused_add_rms_norm_batch_into, rms_norm,
+    rms_norm_batch_f32_in_into, rms_norm_batch_into, rms_norm_gated_batch_into,
 };
 pub(crate) use recurrent::{
     conv1d_decode_batch_into, conv1d_prefill_batch_into, gated_delta_rule_decode_into,

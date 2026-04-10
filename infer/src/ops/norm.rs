@@ -109,6 +109,101 @@ pub(crate) fn fused_add_rms_norm_batch_into(
 }
 
 /// Batched RMSNorm into pre-allocated output buffer (zero allocation).
+/// fp32-residual-shadow variant of batched RMSNorm.
+/// Reads from a raw fp32 device buffer (shape `[seq_len, hidden_dim]`) and
+/// writes bf16 `out` suitable for feeding downstream GEMMs. Used by Qwen3
+/// prefill when the residual stream is maintained in fp32.
+pub(crate) fn rms_norm_batch_f32_in_into(
+    ctx: &DeviceContext,
+    x_f32: &CudaSlice<f32>,
+    weight: &DeviceVec,
+    out: &mut HiddenStates,
+    seq_len: usize,
+    eps: f32,
+) -> Result<()> {
+    assert_eq!(x_f32.len(), out.hidden_dim * seq_len);
+    let (x_ptr, _gx) = x_f32.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::rms_norm_batched_f32_in_cuda(
+            x_ptr as *const f32,
+            w_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            out.hidden_dim as i32,
+            seq_len as i32,
+            eps,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Accumulate `b` (bf16) into `a` (fp32): `a[i] += f32(b[i])`.
+pub(crate) fn add_bf16_into_f32(
+    ctx: &DeviceContext,
+    a_f32: &mut CudaSlice<f32>,
+    b_bf16: &HiddenStates,
+) -> Result<()> {
+    let n = b_bf16.hidden_dim * b_bf16.seq_len;
+    assert!(a_f32.len() >= n);
+    let (a_ptr, _ga) = a_f32.device_ptr_mut(&ctx.stream);
+    let (b_ptr, _gb) = b_bf16.data.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::add_bf16_into_f32_cuda(
+            a_ptr as *mut f32,
+            b_ptr as *const ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cast_bf16_to_f32(
+    ctx: &DeviceContext,
+    src: &HiddenStates,
+    dst: &mut CudaSlice<f32>,
+) -> Result<()> {
+    let n = src.hidden_dim * src.seq_len;
+    assert!(dst.len() >= n);
+    let (s_ptr, _gs) = src.data.device_ptr(&ctx.stream);
+    let (d_ptr, _gd) = dst.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::cast_bf16_to_f32_cuda(
+            s_ptr as *const ffi::Half,
+            d_ptr as *mut f32,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cast_f32_to_bf16(
+    ctx: &DeviceContext,
+    src: &CudaSlice<f32>,
+    dst: &mut HiddenStates,
+) -> Result<()> {
+    let n = dst.hidden_dim * dst.seq_len;
+    assert!(src.len() >= n);
+    let (s_ptr, _gs) = src.device_ptr(&ctx.stream);
+    let (d_ptr, _gd) = dst.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::cast_f32_to_bf16_cuda(
+            s_ptr as *const f32,
+            d_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rms_norm_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
