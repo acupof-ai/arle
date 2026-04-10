@@ -237,7 +237,7 @@ impl<M: ModelForward> Scheduler<M> {
                 for (j, &req_idx) in decode_indices.iter().enumerate() {
                     let token = sampled_tokens[j];
                     let req = &mut active[req_idx];
-                    req.latest_logprob = logprobs_host.map(|lps| lps[j]);
+                    req.latest_logprob = logprobs_host.and_then(|lps| lps.get(j).copied());
                     if !req.sampling.ignore_eos && model.is_stop_token(token) {
                         req.finish(FinishReason::Stop, tokenizer);
                         continue;
