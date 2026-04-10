@@ -434,7 +434,7 @@ impl Qwen35Model {
     ) -> Result<Self> {
         use crate::weight_loader::{
             load_tensor_1d_gguf, load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder,
-            load_tensor_2d_gguf, load_tensor_2d_gguf_v_reorder_cols,
+            load_tensor_2d_gguf, load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
             load_tensor_2d_gguf_v_reorder_rows, precompute_rope, reverse_v_reorder_f32,
             reverse_v_reorder_rows,
         };
@@ -463,7 +463,11 @@ impl Qwen35Model {
         let t_gpu = std::time::Instant::now();
         let wp = "model.language_model";
 
-        let embed_tokens = load_tensor_2d_gguf(ctx, gguf, &format!("{wp}.embed_tokens.weight"))?;
+        // embed_tokens is read directly via embedding_decode_cuda, which is
+        // NOT quant-aware — it would read from the 1-element dummy `.data`
+        // buffer of a packed matrix and produce garbage. Force BF16 load.
+        let embed_tokens =
+            load_tensor_2d_gguf_bf16(ctx, gguf, &format!("{wp}.embed_tokens.weight"))?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
