@@ -285,6 +285,46 @@ impl GgufFile {
         Ok(buf)
     }
 
+    /// Check if a tensor is quantized (not F32/F16/BF16).
+    pub fn is_quantized(&self, name: &str) -> bool {
+        self.tensors
+            .get(name)
+            .map(|t| !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
+            .unwrap_or(false)
+    }
+
+    /// Read Q8_0 tensor in packed format: split into (qweight: Vec<i8>, scales: Vec<bf16>).
+    ///
+    /// Returns data suitable for `DeviceMatrix::from_quantized_int8`:
+    ///   - qweight: `[numel]` i8 values (one per element)
+    ///   - scales: `[rows × num_groups]` bf16 (one per 32-element block)
+    pub fn read_tensor_q8_packed(&self, name: &str) -> Result<(Vec<i8>, Vec<bf16>, usize)> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("Tensor '{}' not found in GGUF", name))?;
+        if info.dtype != GgmlType::Q8_0 {
+            bail!("Expected Q8_0, got {:?}", info.dtype);
+        }
+        let raw = self.read_tensor_raw(name)?;
+        let numel = info.numel();
+        const BLOCK_SIZE: usize = 32;
+        let num_blocks = numel / BLOCK_SIZE;
+
+        let mut qweight = Vec::with_capacity(numel);
+        let mut scales = Vec::with_capacity(num_blocks);
+
+        for b in 0..num_blocks {
+            let base = b * (2 + BLOCK_SIZE); // f16 scale + 32 × i8
+            let scale = f16::from_le_bytes([raw[base], raw[base + 1]]).to_f32();
+            scales.push(bf16::from_f32(scale));
+            for i in 0..BLOCK_SIZE {
+                qweight.push(raw[base + 2 + i] as i8);
+            }
+        }
+        Ok((qweight, scales, BLOCK_SIZE))
+    }
+
     /// Read and dequantize a tensor to BF16.
     pub fn read_tensor_bf16(&self, name: &str) -> Result<Vec<bf16>> {
         let info = self
@@ -310,6 +350,79 @@ impl GgufFile {
     pub fn meta_str(&self, key: &str) -> Option<&str> {
         self.metadata.get(key)?.as_str()
     }
+
+    /// Get a f32 metadata value.
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        match self.metadata.get(key)? {
+            GgufValue::F32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Extract model config from GGUF metadata.
+    ///
+    /// Returns a generic config struct that can be used by any model.
+    /// Field names follow GGUF convention: `{arch}.{field}` where arch
+    /// is from `general.architecture` (e.g., "qwen3", "llama", "gemma").
+    pub fn extract_model_config(&self) -> Result<GgufModelConfig> {
+        let arch = self
+            .architecture()
+            .ok_or_else(|| anyhow!("GGUF missing general.architecture"))?
+            .to_string();
+        let p = |field: &str| format!("{arch}.{field}");
+
+        Ok(GgufModelConfig {
+            architecture: arch.clone(),
+            vocab_size: self.meta_u32(&p("vocab_size")).unwrap_or(0) as usize,
+            hidden_size: self
+                .meta_u32(&p("embedding_length"))
+                .ok_or_else(|| anyhow!("GGUF missing {}.embedding_length", arch))?
+                as usize,
+            num_hidden_layers: self
+                .meta_u32(&p("block_count"))
+                .ok_or_else(|| anyhow!("GGUF missing {}.block_count", arch))?
+                as usize,
+            num_attention_heads: self
+                .meta_u32(&p("attention.head_count"))
+                .ok_or_else(|| anyhow!("GGUF missing {}.attention.head_count", arch))?
+                as usize,
+            num_key_value_heads: self.meta_u32(&p("attention.head_count_kv")).unwrap_or(0) as usize,
+            head_dim: self.meta_u32(&p("attention.key_length")).unwrap_or(128) as usize,
+            intermediate_size: self.meta_u32(&p("feed_forward_length")).unwrap_or(0) as usize,
+            rms_norm_eps: self
+                .meta_f32(&p("attention.layer_norm_rms_epsilon"))
+                .unwrap_or(1e-6),
+            rope_theta: self.meta_f32(&p("rope.freq_base")).unwrap_or(1_000_000.0),
+            context_length: self.meta_u32(&p("context_length")).unwrap_or(4096) as usize,
+        })
+    }
+
+    /// Check if this GGUF embeds a HuggingFace tokenizer JSON blob.
+    pub fn has_embedded_tokenizer(&self) -> bool {
+        self.metadata.contains_key("tokenizer.huggingface.json")
+            || self.metadata.contains_key("tokenizer.ggml.tokens")
+    }
+
+    /// Extract embedded HuggingFace tokenizer JSON, if present.
+    pub fn extract_tokenizer_json(&self) -> Option<&str> {
+        self.meta_str("tokenizer.huggingface.json")
+    }
+}
+
+/// Generic model config extracted from GGUF metadata.
+#[derive(Debug, Clone)]
+pub struct GgufModelConfig {
+    pub architecture: String,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub context_length: usize,
 }
 
 // ── Dequantization ──
@@ -347,8 +460,10 @@ fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16
         }
         GgmlType::Q8_0 => dequant_q8_0(raw, numel),
         GgmlType::Q4_0 => dequant_q4_0(raw, numel),
+        GgmlType::Q4_K_M | GgmlType::Q4_K_S => dequant_q4_k(raw, numel),
+        GgmlType::Q6_K => dequant_q6_k(raw, numel),
         _ => bail!(
-            "Dequant not yet implemented for {:?}. Supported: F32, F16, BF16, Q8_0, Q4_0",
+            "Dequant not yet implemented for {:?}. Supported: F32, F16, BF16, I8, Q8_0, Q4_0, Q4_K_M/S, Q6_K",
             dtype
         ),
     }
@@ -390,6 +505,118 @@ fn dequant_q4_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             let hi = ((byte >> 4) & 0x0F) as i8 - 8;
             out.push(bf16::from_f32(lo as f32 * scale));
             out.push(bf16::from_f32(hi as f32 * scale));
+        }
+    }
+    Ok(out)
+}
+
+/// Q4_K (Q4_K_M/Q4_K_S): 256 elements per superblock.
+///
+/// Layout per superblock (144 bytes):
+///   - d: f16 (2 bytes) — super-block scale
+///   - dmin: f16 (2 bytes) — super-block minimum
+///   - scales: 12 bytes — packed 6-bit scale/min for 8 sub-blocks
+///   - qs: 128 bytes — 256 × 4-bit quantized values (2 per byte)
+fn dequant_q4_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 144; // 2+2+12+128
+    let num_blocks = numel / QK_K;
+    if raw.len() < num_blocks * BLOCK_BYTES {
+        bail!(
+            "Q4_K: expected {} bytes for {} elements, got {}",
+            num_blocks * BLOCK_BYTES,
+            numel,
+            raw.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(numel);
+
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES;
+        let d = f16::from_le_bytes([raw[base], raw[base + 1]]).to_f32();
+        let dmin = f16::from_le_bytes([raw[base + 2], raw[base + 3]]).to_f32();
+        let scales_raw = &raw[base + 4..base + 16]; // 12 bytes of packed scales
+        let qs = &raw[base + 16..base + 144]; // 128 bytes of packed nibbles
+
+        // Decode 6-bit scales: 8 sub-block scales + 8 sub-block mins from 12 bytes
+        let mut sc = [0u8; 8];
+        let mut mn = [0u8; 8];
+        // First 4 sub-blocks: scales in lower 6 bits of bytes 0-3, mins in bytes 4-7
+        for i in 0..4 {
+            sc[i] = scales_raw[i] & 63;
+            mn[i] = scales_raw[i + 4] & 63;
+        }
+        // Last 4 sub-blocks: scales/mins split across bytes 8-11
+        for i in 0..4 {
+            let upper_sc = (scales_raw[8 + i] & 0x0F) << 4;
+            let upper_mn = (scales_raw[8 + i] >> 4) << 4;
+            sc[4 + i] = (scales_raw[i] >> 6) | upper_sc;
+            mn[4 + i] = (scales_raw[i + 4] >> 6) | upper_mn;
+        }
+
+        // Dequantize 8 sub-blocks of 32 elements each
+        for j in 0..8 {
+            let sub_scale = d * sc[j] as f32;
+            let sub_min = dmin * mn[j] as f32;
+            let qs_offset = j * 16; // 32 nibbles = 16 bytes
+            for i in 0..16 {
+                let byte = qs[qs_offset + i];
+                let lo = (byte & 0x0F) as f32;
+                let hi = ((byte >> 4) & 0x0F) as f32;
+                out.push(bf16::from_f32(lo * sub_scale - sub_min));
+                out.push(bf16::from_f32(hi * sub_scale - sub_min));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Q6_K: 256 elements per superblock.
+///
+/// Layout per superblock (210 bytes):
+///   - ql: 128 bytes (lower 4 bits of 6-bit values, packed as nibbles)
+///   - qh: 64 bytes (upper 2 bits of 6-bit values, packed 4 per byte)
+///   - scales: 16 bytes (i8 per 16-element sub-block)
+///   - d: f16 (2 bytes) — super-block scale
+fn dequant_q6_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 210; // 128+64+16+2
+    let num_blocks = numel / QK_K;
+    if raw.len() < num_blocks * BLOCK_BYTES {
+        bail!(
+            "Q6_K: expected {} bytes, got {}",
+            num_blocks * BLOCK_BYTES,
+            raw.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(numel);
+
+    for b in 0..num_blocks {
+        let base = b * BLOCK_BYTES;
+        let ql = &raw[base..base + 128];
+        let qh = &raw[base + 128..base + 192];
+        let scales = &raw[base + 192..base + 208];
+        let d = f16::from_le_bytes([raw[base + 208], raw[base + 209]]).to_f32();
+
+        for j in 0..QK_K {
+            // Lower 4 bits from ql
+            let ql_byte = ql[j / 2];
+            let ql_val = if j % 2 == 0 {
+                ql_byte & 0x0F
+            } else {
+                ql_byte >> 4
+            };
+            // Upper 2 bits from qh
+            let qh_byte = qh[j / 4];
+            let qh_shift = (j % 4) * 2;
+            let qh_val = (qh_byte >> qh_shift) & 0x03;
+            // 6-bit value
+            let q = ((qh_val << 4) | ql_val) as i8 - 32; // offset by 32 for signed
+            // Scale from sub-block (16 elements per scale)
+            let sc = scales[j / 16] as i8;
+            out.push(bf16::from_f32(d * sc as f32 * q as f32));
         }
     }
     Ok(out)

@@ -130,7 +130,18 @@ fn load_model_with<M>(
 ) -> Result<ModelComponents<M>> {
     let resolved = resolve_model_path_for_runtime(model_path)?;
     let resolved_str = resolved.to_str().unwrap_or(model_path);
-    let tokenizer = Tokenizer::from_file(resolved_str)?;
+    let tokenizer = Tokenizer::from_file(resolved_str).or_else(|e| {
+        // Fallback: extract tokenizer from GGUF metadata if tokenizer.json missing
+        if let Some(gguf) = crate::weight_loader::try_open_gguf(resolved_str) {
+            if let Some(json_str) = gguf.extract_tokenizer_json() {
+                log::info!("Extracting tokenizer from GGUF metadata");
+                let tok_path = resolved.join("_gguf_tokenizer.json");
+                std::fs::write(&tok_path, json_str)?;
+                return Tokenizer::from_file(tok_path.to_str().unwrap_or(resolved_str));
+            }
+        }
+        Err(e)
+    })?;
     let model = load_model(resolved_str, options)?;
     Ok(ModelComponents {
         model_id: model_id_from_path(model_path),
