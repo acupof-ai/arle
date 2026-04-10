@@ -721,10 +721,7 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     };
 
     // Q4_K packed: byte-level row permutation.
-    if matches!(info.dtype, gguf::GgmlType::Q4_K_M | gguf::GgmlType::Q4_K_S)
-        && info.shape.len() == 2
-        && cols % 256 == 0
-    {
+    if info.dtype == gguf::GgmlType::Q4_K && info.shape.len() == 2 && cols % 256 == 0 {
         let src = gguf.read_tensor_q4k_packed(&gguf_name)?;
         let row_bytes = cols * 9 / 16; // (cols/256) * 144
         assert_eq!(src.len(), rows * row_bytes);
@@ -744,6 +741,52 @@ pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
         }
         drop(src);
         return DeviceMatrix::from_quantized_q4k(ctx, &dst, rows, cols);
+    }
+
+    // Q3_K packed: same byte-level row permutation at 110-byte stride.
+    if info.dtype == gguf::GgmlType::Q3_K && info.shape.len() == 2 && cols % 256 == 0 {
+        let src = gguf.read_tensor_q3k_packed(&gguf_name)?;
+        let row_bytes = cols * 55 / 128; // (cols/256) * 110
+        assert_eq!(src.len(), rows * row_bytes);
+        if num_v_per_k <= 1 {
+            return DeviceMatrix::from_quantized_q3k(ctx, &src, rows, cols);
+        }
+        let mut dst = vec![0u8; src.len()];
+        for k in 0..num_k_heads {
+            for v in 0..num_v_per_k {
+                let gguf_head = v * num_k_heads + k;
+                let hf_head = k * num_v_per_k + v;
+                let src_start = gguf_head * head_dim * row_bytes;
+                let dst_start = hf_head * head_dim * row_bytes;
+                let size = head_dim * row_bytes;
+                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
+            }
+        }
+        drop(src);
+        return DeviceMatrix::from_quantized_q3k(ctx, &dst, rows, cols);
+    }
+
+    // Q6_K packed: same byte-level row permutation at 210-byte stride.
+    if info.dtype == gguf::GgmlType::Q6_K && info.shape.len() == 2 && cols % 256 == 0 {
+        let src = gguf.read_tensor_q6k_packed(&gguf_name)?;
+        let row_bytes = cols * 210 / 256;
+        assert_eq!(src.len(), rows * row_bytes);
+        if num_v_per_k <= 1 {
+            return DeviceMatrix::from_quantized_q6k(ctx, &src, rows, cols);
+        }
+        let mut dst = vec![0u8; src.len()];
+        for k in 0..num_k_heads {
+            for v in 0..num_v_per_k {
+                let gguf_head = v * num_k_heads + k;
+                let hf_head = k * num_v_per_k + v;
+                let src_start = gguf_head * head_dim * row_bytes;
+                let dst_start = hf_head * head_dim * row_bytes;
+                let size = head_dim * row_bytes;
+                dst[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
+            }
+        }
+        drop(src);
+        return DeviceMatrix::from_quantized_q6k(ctx, &dst, rows, cols);
     }
 
     // BF16 fallback (existing path).
@@ -816,14 +859,30 @@ pub(crate) fn load_tensor_2d_gguf(
     // Same column-major → row-major trick as Q8_0: superblocks of 256 live along
     // ne0 (the innermost dimension), so reinterpreting as [ne1, ne0] row-major
     // preserves superblock integrity.
-    if matches!(info.dtype, gguf::GgmlType::Q4_K_M | gguf::GgmlType::Q4_K_S)
-        && info.shape.len() == 2
-    {
+    if info.dtype == gguf::GgmlType::Q4_K && info.shape.len() == 2 {
         let packed = gguf.read_tensor_q4k_packed(&gguf_name)?;
         let ne0 = info.shape[0] as usize;
         let ne1 = info.shape[1] as usize;
         let (rows, cols) = (ne1, ne0);
         return DeviceMatrix::from_quantized_q4k(ctx, &packed, rows, cols);
+    }
+
+    // Q3_K: keep packed — native q3k_gemv kernel.
+    if info.dtype == gguf::GgmlType::Q3_K && info.shape.len() == 2 {
+        let packed = gguf.read_tensor_q3k_packed(&gguf_name)?;
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        let (rows, cols) = (ne1, ne0);
+        return DeviceMatrix::from_quantized_q3k(ctx, &packed, rows, cols);
+    }
+
+    // Q6_K: keep packed — native q6k_gemv kernel.
+    if info.dtype == gguf::GgmlType::Q6_K && info.shape.len() == 2 {
+        let packed = gguf.read_tensor_q6k_packed(&gguf_name)?;
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        let (rows, cols) = (ne1, ne0);
+        return DeviceMatrix::from_quantized_q6k(ctx, &packed, rows, cols);
     }
 
     let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;

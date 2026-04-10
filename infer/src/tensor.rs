@@ -505,6 +505,116 @@ impl DeviceMatrix {
         })
     }
 
+    /// Create from Q6_K packed GGUF superblocks.
+    ///
+    /// Each 256-element superblock is 210 bytes: ql(128)|qh(64)|scales(16×i8)|d(f16).
+    /// Per-row byte stride = `(cols/256) * 210`.
+    /// `quant_bits = 66` is the Q6_K discriminator in `ops::linear` dispatch.
+    pub fn from_quantized_q6k(
+        ctx: &DeviceContext,
+        packed_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        assert!(cols % 256 == 0, "Q6_K requires cols % 256 == 0, got {cols}");
+        let expected = rows * cols * 210 / 256;
+        assert_eq!(
+            packed_bytes.len(),
+            expected,
+            "Q6_K packed size {} != expected {} for rows={} cols={}",
+            packed_bytes.len(),
+            expected,
+            rows,
+            cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D Q6_K packed upload failed: {}", e))?;
+        let dummy_scales: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc Q6_K dummy scales: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: Some(qw),
+            qscales: Some(dummy_scales),
+            group_size: 256,
+            quant_bits: 66, // sentinel for Q6_K
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
+    /// Create from Q3_K packed GGUF superblocks.
+    ///
+    /// Each 256-element superblock is 110 bytes: hmask(32)|qs(64)|scales(12)|d(f16).
+    /// Per-row byte stride = `(cols/256) * 110 = cols * 55/128`.
+    /// `quant_bits = 33` is the Q3_K discriminator in `ops::linear` dispatch.
+    pub fn from_quantized_q3k(
+        ctx: &DeviceContext,
+        packed_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        assert!(cols % 256 == 0, "Q3_K requires cols % 256 == 0, got {cols}");
+        let expected = rows * cols * 55 / 128; // (cols/256) * 110 per row
+        assert_eq!(
+            packed_bytes.len(),
+            expected,
+            "Q3_K packed size {} != expected {} for rows={} cols={}",
+            packed_bytes.len(),
+            expected,
+            rows,
+            cols
+        );
+
+        let qw: CudaSlice<i8> = ctx
+            .stream
+            .clone_htod(unsafe {
+                std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
+            })
+            .map_err(|e| anyhow!("H2D Q3_K packed upload failed: {}", e))?;
+        let dummy_scales: CudaSlice<bf16> = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc Q3_K dummy scales: {}", e))?;
+        let dummy = ctx
+            .stream
+            .alloc_zeros::<bf16>(1)
+            .map_err(|e| anyhow!("Alloc dummy: {}", e))?;
+        Ok(Self {
+            data: dummy,
+            rows,
+            cols,
+            qweight: Some(qw),
+            qscales: Some(dummy_scales),
+            group_size: 256,
+            quant_bits: 33, // sentinel for Q3_K
+            marlin_packed: None,
+            marlin_scales: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        })
+    }
+
     /// Create from Q4_K_M/Q4_K_S packed GGUF superblocks.
     ///
     /// Uploads the raw 144-byte superblock bytes verbatim to the GPU — no BF16

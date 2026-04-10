@@ -1064,6 +1064,72 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // ─── Q6_K (GGUF) native packed GEMV / dequant ───
+
+    pub(crate) fn q6k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q6k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q6k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── Q3_K (GGUF) native packed GEMV / dequant ───
+    //
+    // Weights stored verbatim as 110-byte superblocks. Layout:
+    // hmask(32) | qs(64, 2-bit) | scales(12, 6-bit signed, -8..55) | d:f16(2).
+    // Per-row byte stride = `(K / 256) * 110`.
+
+    pub(crate) fn q3k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q3k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q3k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ─── Q4_K (GGUF Q4_K_M / Q4_K_S) native packed GEMV / dequant ───
     //
     // Weights are uploaded verbatim as 144-byte superblocks; no BF16 intermediate.

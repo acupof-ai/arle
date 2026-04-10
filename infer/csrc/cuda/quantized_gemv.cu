@@ -367,6 +367,414 @@ __global__ void w2a16_gemv_batch_kernel(
 }
 
 // ============================================================================
+// Q6_K (GGUF) native packed GEMV + dequant.
+//
+// One superblock = 256 K-dim elements = 210 bytes:
+//   ql:[128]  | qh:[64]  | scales:[16 × i8]  | d:f16(2)
+//
+// Element layout mirrors llama.cpp `dequantize_row_q6_K`. Each half of 128
+// elements interleaves four 32-element quadrants drawn from:
+//   q0 at y[l+  0] = (ql[l+ 0] & 0xF) | ((qh[l]>>0 & 3)<<4)
+//   q1 at y[l+ 32] = (ql[l+32] & 0xF) | ((qh[l]>>2 & 3)<<4)
+//   q2 at y[l+ 64] = (ql[l+ 0] >> 4)  | ((qh[l]>>4 & 3)<<4)
+//   q3 at y[l+ 96] = (ql[l+32] >> 4)  | ((qh[l]>>6 & 3)<<4)
+// Signed weight = (6bit - 32). Scale: scales[is + quadrant*2], is = l/16.
+// Second half uses ql+=64, qh+=32, sc+=8.
+// ============================================================================
+#define Q6K_SB_SIZE 256
+#define Q6K_SB_BYTES 210
+#define Q6K_GEMV_ROWS 8
+#define Q6K_GEMV_THREADS 256  // = Q6K_GEMV_ROWS * 32
+
+__global__ void q6k_gemv_kernel(
+    const uint8_t* __restrict__ weight,       // [N, (K/256) * 210]
+    const __nv_bfloat16* __restrict__ input,  // [K]
+    __nv_bfloat16* __restrict__ output,       // [N]
+    int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q6K_GEMV_ROWS + warp_id;
+    if (row >= N) return;
+
+    const int num_sb    = K / Q6K_SB_SIZE;
+    const int row_bytes = num_sb * Q6K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q6K_SB_BYTES;
+        const uint8_t* ql_all = sb_p + 0;    // 128 bytes
+        const uint8_t* qh_all = sb_p + 128;  // 64 bytes
+        const int8_t*  sc_all = (const int8_t*)(sb_p + 192); // 16 bytes signed
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 208))[0];
+        const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+
+        const int k_base = sb * Q6K_SB_SIZE;
+        const int l = lane;           // 0..32 — position within a 32-element quadrant
+        const int is = l / 16;        // 0 or 1
+
+        // Process both halves × four quadrants per lane = 8 elements/superblock.
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t* ql = ql_all + half * 64;
+            const uint8_t* qh = qh_all + half * 32;
+            const int8_t*  sc = sc_all + half * 8;
+            const int k_half_base = k_base + half * 128;
+            const uint8_t qh_l = qh[l];
+            const uint8_t ql_0 = ql[l];
+            const uint8_t ql_1 = ql[l + 32];
+
+            // Quadrant 0: y[l+0]
+            {
+                const int low4 = ql_0 & 0x0F;
+                const int high2 = (qh_l >> 0) & 0x03;
+                const int q = (low4 | (high2 << 4)) - 32;
+                const float w = d * (float)sc[is + 0] * (float)q;
+                sum += w * __bfloat162float(input[k_half_base + l + 0]);
+            }
+            // Quadrant 1: y[l+32]
+            {
+                const int low4 = ql_1 & 0x0F;
+                const int high2 = (qh_l >> 2) & 0x03;
+                const int q = (low4 | (high2 << 4)) - 32;
+                const float w = d * (float)sc[is + 2] * (float)q;
+                sum += w * __bfloat162float(input[k_half_base + l + 32]);
+            }
+            // Quadrant 2: y[l+64]
+            {
+                const int low4 = ql_0 >> 4;
+                const int high2 = (qh_l >> 4) & 0x03;
+                const int q = (low4 | (high2 << 4)) - 32;
+                const float w = d * (float)sc[is + 4] * (float)q;
+                sum += w * __bfloat162float(input[k_half_base + l + 64]);
+            }
+            // Quadrant 3: y[l+96]
+            {
+                const int low4 = ql_1 >> 4;
+                const int high2 = (qh_l >> 6) & 0x03;
+                const int q = (low4 | (high2 << 4)) - 32;
+                const float w = d * (float)sc[is + 6] * (float)q;
+                sum += w * __bfloat162float(input[k_half_base + l + 96]);
+            }
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[row] = __float2bfloat16(sum);
+}
+
+__global__ void q6k_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q6K_GEMV_ROWS + warp_id;
+    const int batch   = blockIdx.y;
+    if (row >= N || batch >= B) return;
+
+    const int num_sb    = K / Q6K_SB_SIZE;
+    const int row_bytes = num_sb * Q6K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+    const __nv_bfloat16* x = input + batch * K;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q6K_SB_BYTES;
+        const uint8_t* ql_all = sb_p + 0;
+        const uint8_t* qh_all = sb_p + 128;
+        const int8_t*  sc_all = (const int8_t*)(sb_p + 192);
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 208))[0];
+        const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+
+        const int k_base = sb * Q6K_SB_SIZE;
+        const int l = lane;
+        const int is = l / 16;
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t* ql = ql_all + half * 64;
+            const uint8_t* qh = qh_all + half * 32;
+            const int8_t*  sc = sc_all + half * 8;
+            const int k_half_base = k_base + half * 128;
+            const uint8_t qh_l = qh[l];
+            const uint8_t ql_0 = ql[l];
+            const uint8_t ql_1 = ql[l + 32];
+
+            {
+                const int q = ((ql_0 & 0x0F) | (((qh_l >> 0) & 0x03) << 4)) - 32;
+                sum += d * (float)sc[is + 0] * (float)q
+                       * __bfloat162float(x[k_half_base + l + 0]);
+            }
+            {
+                const int q = ((ql_1 & 0x0F) | (((qh_l >> 2) & 0x03) << 4)) - 32;
+                sum += d * (float)sc[is + 2] * (float)q
+                       * __bfloat162float(x[k_half_base + l + 32]);
+            }
+            {
+                const int q = ((ql_0 >> 4) | (((qh_l >> 4) & 0x03) << 4)) - 32;
+                sum += d * (float)sc[is + 4] * (float)q
+                       * __bfloat162float(x[k_half_base + l + 64]);
+            }
+            {
+                const int q = ((ql_1 >> 4) | (((qh_l >> 6) & 0x03) << 4)) - 32;
+                sum += d * (float)sc[is + 6] * (float)q
+                       * __bfloat162float(x[k_half_base + l + 96]);
+            }
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[batch * N + row] = __float2bfloat16(sum);
+}
+
+// Dequantize chunk kernel: each block handles ONE (row, superblock) and 256
+// threads write the 256 dequanted elements of that superblock to the BF16 tile.
+__global__ void q6k_dequant_chunk_kernel(
+    const uint8_t* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K, int k_start, int k_len)
+{
+    const int row = blockIdx.x;
+    const int sb_in_chunk = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const int num_sb_total = K / Q6K_SB_SIZE;
+    const int sb_global    = (k_start / Q6K_SB_SIZE) + sb_in_chunk;
+    const int row_bytes    = num_sb_total * Q6K_SB_BYTES;
+    const uint8_t* sb_p    = weight + row * row_bytes + sb_global * Q6K_SB_BYTES;
+
+    __shared__ float s_d;
+    __shared__ int8_t s_scales[16];
+
+    if (tid == 0) {
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 208))[0];
+        s_d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+    }
+    if (tid < 16) {
+        s_scales[tid] = ((const int8_t*)(sb_p + 192))[tid];
+    }
+    __syncthreads();
+
+    // tid 0..255 → half, quadrant, l
+    const int half = tid / 128;          // 0,1
+    const int j_local = tid % 128;
+    const int quad = j_local / 32;       // 0..4
+    const int l = j_local % 32;
+    const int is = l / 16;
+
+    const uint8_t* ql = sb_p + half * 64;                  // ql[half*64..(half+1)*64]
+    const uint8_t* qh = sb_p + 128 + half * 32;
+    const int sc_base = half * 8;
+
+    uint8_t low4, high2;
+    switch (quad) {
+        case 0: low4 = ql[l] & 0x0F;        high2 = (qh[l] >> 0) & 0x03; break;
+        case 1: low4 = ql[l + 32] & 0x0F;   high2 = (qh[l] >> 2) & 0x03; break;
+        case 2: low4 = ql[l] >> 4;          high2 = (qh[l] >> 4) & 0x03; break;
+        default: low4 = ql[l + 32] >> 4;    high2 = (qh[l] >> 6) & 0x03; break;
+    }
+    const int q = (int)(low4 | (high2 << 4)) - 32;
+    const int8_t sc = s_scales[sc_base + is + quad * 2];
+    const float w = s_d * (float)sc * (float)q;
+
+    const int out_k = sb_in_chunk * Q6K_SB_SIZE + half * 128 + quad * 32 + l;
+    out[row * k_len + out_k] = __float2bfloat16(w);
+}
+
+// ============================================================================
+// Q3_K (GGUF) native packed GEMV + dequant.
+//
+// One superblock = 256 K-dim elements = 110 bytes:
+//   hmask:[32]  | qs:[64, 2-bit]  | scales:[12, 6-bit signed]  | d:f16(2)
+//
+// Element dequant:
+//   q2  = (qs[k/4]    >> ((k%4)*2)) & 0x3
+//   hbit= (hmask[k/8] >> (k%8))     & 0x1
+//   q3  = q2 | (hbit << 2)
+//   scale[i=k/16] = (scales_lo[i] | scales_hi[i] << 4) - 8 (signed, -8..55)
+//   w   = d * scale * (q3 - 4)
+//
+// Scales decode (12 bytes → 16 sub-block scales, signed i8, one per 16 elements).
+//
+// Each scale is a 6-bit UNSIGNED value in 0..63. Low 4 bits come from the
+// low/high nibble of scales_raw[0..8] (i<8 → low nibble of raw[i], i≥8 →
+// high nibble of raw[i-8]). High 2 bits come from scales_raw[8+(i&3)] shifted
+// right 2*(i/4) then masked with 0x3.
+//
+// Signed scale = unsigned6 - 32. Range: -32..31.
+//
+// NOTE: must combine the 6 bits BEFORE subtracting 32. Subtracting first and
+// then OR'ing bit 4 into a negative i8 loses the bit to sign extension.
+// (matches dequant_q3_k in gguf.rs after fix for the same bug.)
+// ============================================================================
+#define Q3K_SB_SIZE 256
+#define Q3K_SB_BYTES 110
+#define Q3K_GEMV_ROWS 8
+#define Q3K_GEMV_THREADS 256  // = Q3K_GEMV_ROWS * 32
+
+__device__ __forceinline__ void q3k_decode_scales(
+    const uint8_t* __restrict__ scales_raw,  // 12 bytes
+    int8_t scales[16])
+{
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t low4 = (i < 8)
+            ? (scales_raw[i] & 0x0F)
+            : ((scales_raw[i - 8] >> 4) & 0x0F);
+        const uint8_t high2 = (scales_raw[8 + (i & 3)] >> (2 * (i / 4))) & 0x03;
+        const uint8_t u6 = low4 | (high2 << 4);
+        scales[i] = (int8_t)((int)u6 - 32);
+    }
+}
+
+__global__ void q3k_gemv_kernel(
+    const uint8_t* __restrict__ weight,       // [N, (K/256) * 110]
+    const __nv_bfloat16* __restrict__ input,  // [K]
+    __nv_bfloat16* __restrict__ output,       // [N]
+    int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q3K_GEMV_ROWS + warp_id;
+    if (row >= N) return;
+
+    const int num_sb    = K / Q3K_SB_SIZE;
+    const int row_bytes = num_sb * Q3K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q3K_SB_BYTES;
+        const uint8_t* hmask = sb_p + 0;
+        const uint8_t* qs    = sb_p + 32;
+        const uint8_t* sc_raw = sb_p + 96;
+
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 108))[0];
+        const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+
+        int8_t scales[16];
+        q3k_decode_scales(sc_raw, scales);
+
+        const int k_base = sb * Q3K_SB_SIZE;
+
+        // Each lane handles 8 elements per superblock, stride 32 → adjacent lanes
+        // touch adjacent K indices → coalesced input loads.
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int k_local = i * 32 + lane;  // 0..255
+            const int q2 = (qs[k_local >> 2] >> ((k_local & 3) << 1)) & 0x3;
+            const int hbit = (hmask[k_local >> 3] >> (k_local & 7)) & 0x1;
+            const int q3 = q2 | (hbit << 2);
+            const int sub_idx = k_local >> 4;  // /16
+            const float scale = d * (float)scales[sub_idx];
+            const float w = scale * ((float)q3 - 4.0f);
+            sum += w * __bfloat162float(input[k_base + k_local]);
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[row] = __float2bfloat16(sum);
+}
+
+__global__ void q3k_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K)
+{
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane    = threadIdx.x % WARP_SIZE;
+    const int row     = blockIdx.x * Q3K_GEMV_ROWS + warp_id;
+    const int batch   = blockIdx.y;
+    if (row >= N || batch >= B) return;
+
+    const int num_sb    = K / Q3K_SB_SIZE;
+    const int row_bytes = num_sb * Q3K_SB_BYTES;
+    const uint8_t* row_p = weight + row * row_bytes;
+    const __nv_bfloat16* x = input + batch * K;
+
+    float sum = 0.0f;
+
+    for (int sb = 0; sb < num_sb; ++sb) {
+        const uint8_t* sb_p = row_p + sb * Q3K_SB_BYTES;
+        const uint8_t* hmask = sb_p + 0;
+        const uint8_t* qs    = sb_p + 32;
+        const uint8_t* sc_raw = sb_p + 96;
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 108))[0];
+        const float d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+
+        int8_t scales[16];
+        q3k_decode_scales(sc_raw, scales);
+        const int k_base = sb * Q3K_SB_SIZE;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int k_local = i * 32 + lane;
+            const int q2 = (qs[k_local >> 2] >> ((k_local & 3) << 1)) & 0x3;
+            const int hbit = (hmask[k_local >> 3] >> (k_local & 7)) & 0x1;
+            const int q3 = q2 | (hbit << 2);
+            const int sub_idx = k_local >> 4;
+            const float scale = d * (float)scales[sub_idx];
+            const float w = scale * ((float)q3 - 4.0f);
+            sum += w * __bfloat162float(x[k_base + k_local]);
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) output[batch * N + row] = __float2bfloat16(sum);
+}
+
+// Dequant chunk kernel: writes a BF16 tile [N, k_len] starting at k_start.
+// Grid: (N, k_len / 256).  Block: 256 threads — one per element in the superblock.
+__global__ void q3k_dequant_chunk_kernel(
+    const uint8_t* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int N, int K, int k_start, int k_len)
+{
+    const int row = blockIdx.x;
+    const int sb_in_chunk = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const int num_sb_total = K / Q3K_SB_SIZE;
+    const int sb_global    = (k_start / Q3K_SB_SIZE) + sb_in_chunk;
+    const int row_bytes    = num_sb_total * Q3K_SB_BYTES;
+    const uint8_t* sb_p    = weight + row * row_bytes + sb_global * Q3K_SB_BYTES;
+
+    __shared__ float s_d;
+    __shared__ int8_t s_scales[16];
+
+    if (tid == 0) {
+        const unsigned short d_u16 = ((const unsigned short*)(sb_p + 108))[0];
+        s_d = __half2float(*reinterpret_cast<const __half*>(&d_u16));
+        q3k_decode_scales(sb_p + 96, s_scales);
+    }
+    __syncthreads();
+
+    const uint8_t* hmask = sb_p + 0;
+    const uint8_t* qs    = sb_p + 32;
+
+    const int k_local = tid;
+    const int q2 = (qs[k_local >> 2] >> ((k_local & 3) << 1)) & 0x3;
+    const int hbit = (hmask[k_local >> 3] >> (k_local & 7)) & 0x1;
+    const int q3 = q2 | (hbit << 2);
+    const int sub_idx = k_local >> 4;
+    const float scale = s_d * (float)s_scales[sub_idx];
+    const float w = scale * ((float)q3 - 4.0f);
+
+    const int out_k = sb_in_chunk * Q3K_SB_SIZE + k_local;
+    out[row * k_len + out_k] = __float2bfloat16(w);
+}
+
+// ============================================================================
 // Q4_K (GGUF Q4_K_M / Q4_K_S) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 144 bytes:
@@ -638,6 +1046,82 @@ cudaError_t w2a16_gemv_batch_cuda(
     dim3 block(GEMV_THREADS);
     w2a16_gemv_batch_kernel<<<grid, block, 0, stream>>>(
         weight, scales, input, output, B, N, K, group_size);
+    return cudaGetLastError();
+}
+
+// ── Q6_K (GGUF) native packed ──
+
+cudaError_t q6k_gemv_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q6K_GEMV_ROWS - 1) / Q6K_GEMV_ROWS);
+    dim3 block(Q6K_GEMV_THREADS);
+    q6k_gemv_kernel<<<grid, block, 0, stream>>>(weight, input, output, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q6k_gemv_batch_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q6K_GEMV_ROWS - 1) / Q6K_GEMV_ROWS, B);
+    dim3 block(Q6K_GEMV_THREADS);
+    q6k_gemv_batch_kernel<<<grid, block, 0, stream>>>(weight, input, output, B, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q6k_dequant_chunk_cuda(
+    const uint8_t* weight, __nv_bfloat16* out,
+    int N, int K, int k_start, int k_len, cudaStream_t stream)
+{
+    if ((k_start % Q6K_SB_SIZE) != 0 || (k_len % Q6K_SB_SIZE) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(N, k_len / Q6K_SB_SIZE);
+    dim3 block(Q6K_SB_SIZE);
+    q6k_dequant_chunk_kernel<<<grid, block, 0, stream>>>(
+        weight, out, N, K, k_start, k_len);
+    return cudaGetLastError();
+}
+
+// ── Q3_K (GGUF) native packed ──
+
+cudaError_t q3k_gemv_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q3K_GEMV_ROWS - 1) / Q3K_GEMV_ROWS);
+    dim3 block(Q3K_GEMV_THREADS);
+    q3k_gemv_kernel<<<grid, block, 0, stream>>>(weight, input, output, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q3k_gemv_batch_cuda(
+    const uint8_t* weight,
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int B, int N, int K, cudaStream_t stream)
+{
+    dim3 grid((N + Q3K_GEMV_ROWS - 1) / Q3K_GEMV_ROWS, B);
+    dim3 block(Q3K_GEMV_THREADS);
+    q3k_gemv_batch_kernel<<<grid, block, 0, stream>>>(weight, input, output, B, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t q3k_dequant_chunk_cuda(
+    const uint8_t* weight, __nv_bfloat16* out,
+    int N, int K, int k_start, int k_len, cudaStream_t stream)
+{
+    if ((k_start % Q3K_SB_SIZE) != 0 || (k_len % Q3K_SB_SIZE) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(N, k_len / Q3K_SB_SIZE);
+    dim3 block(Q3K_SB_SIZE);
+    q3k_dequant_chunk_kernel<<<grid, block, 0, stream>>>(
+        weight, out, N, K, k_start, k_len);
     return cudaGetLastError();
 }
 
