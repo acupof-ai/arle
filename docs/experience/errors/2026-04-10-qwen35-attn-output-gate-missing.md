@@ -1,3 +1,44 @@
+# 2026-04-10 · Qwen3.5 GGUF partial-RoPE cos cache stride bug
+
+> **Update — the real bug.** The initial root-cause below (`attn_output_gate`
+> missing) turned out to be wrong: the gate was already wired correctly in
+> both the prefill and batch-decode paths via the fused
+> `prefill_attention_hd256_prep_cuda` +  `attention_gate_batch_hd256_cuda`
+> kernels. The actual bug was a one-line discrepancy in `precompute_rope`
+> arguments between the safetensors and GGUF loaders:
+>
+> ```rust
+> // safetensors (correct)
+> precompute_rope(&ctx, config.rotary_dim, 4096, config.rope_theta)?;
+> // GGUF (broken — was head_dim, stride=256)
+> precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
+> ```
+>
+> The CUDA kernel indexes `cos_cache[pos * rotary_dim + d]` (stride=64),
+> but the GGUF path built the cache with stride=256. For every position > 0,
+> the kernel read values from position 0's latter half — which is
+> `cos(0 * inv_freq[i]) = 1.0` for all i — so every rotated Q/K element
+> got cos=1, sin=0. That's effectively **zero position encoding across the
+> entire sequence**, which collapses attention to a position-independent
+> average and produces the prompt-independent degenerate output we observed.
+>
+> Fix: change one argument to `config.rotary_dim` in `qwen35/weights.rs:692`.
+>
+> **Validation**: Qwen3.5-4B Q6_K now generates coherent text:
+> `"The capital of France is"` → `" Paris.\nA. True\nB. False..."`.
+> Previously it produced the same repeating-token garbage as Carnice-27b.
+>
+> **Remaining bugs** found during this investigation (separate fixes):
+> - Qwen3.5-4B Q4_K_M still fails (BF16 fallback also fails → bug in
+>   `dequantize_row_q4_K` in `gguf.rs`, not in the native GEMV kernel).
+> - Carnice-27b Q6_K still fails — Carnice has `num_v_per_k = 48/16 = 3`
+>   while Qwen3.5-4B has `vpk = 2`, and our `reverse_v_reorder_rows` may be
+>   wrong for `vpk = 3`.
+
+---
+
+## Original (incorrect) root cause below — kept for audit trail
+
 # 2026-04-10 · Qwen3.5 full-attention output gate dropped on the floor
 
 ## Context

@@ -158,6 +158,9 @@ impl Qwen35Model {
             sin_cache: &self.sin_cache,
             rms_eps: eps,
         };
+        // `prefill_attention_hd256_batch` takes q_full_batch with per-head
+        // concat layout [q|g|q|g|...], extracts Q internally, runs attention,
+        // and applies sigmoid(gate) — all in fused kernels.
         ops::prefill_attention_hd256_batch(
             &self.ctx,
             &q_full_batch,
@@ -349,6 +352,9 @@ impl Qwen35Model {
                         sin_cache: &self.sin_cache,
                         rms_eps: eps,
                     };
+                    // `prefill_attention_hd256_batch_with_scratch` takes q_full
+                    // (per-head concat layout), handles Q extraction + q_norm +
+                    // RoPE + attention + sigmoid(gate) internally.
                     ops::prefill_attention_hd256_batch_with_scratch(
                         &self.ctx,
                         &bufs.q_full,
@@ -364,6 +370,7 @@ impl Qwen35Model {
                         &bufs.start_pos_buf,
                         c.rotary_dim,
                     )?;
+
                     full_idx += 1;
 
                     // O projection → attn_results

@@ -688,8 +688,14 @@ impl Qwen35Model {
         }
 
         let norm = load_norm(ctx, gguf, &format!("{wp}.norm.weight"))?;
+        // Qwen3.5 uses partial RoPE: only the first `rotary_dim` elements of
+        // each head are rotated. The safetensors loader passes `rotary_dim`
+        // here; the GGUF loader used to pass the full `head_dim`, which made
+        // cos_cache have stride=256 while the CUDA kernel indexes with
+        // stride=rotary_dim=64 → every position > 0 read garbage trig values,
+        // collapsing attention to prompt-independent degenerate output.
         let (cos_cache, sin_cache) =
-            precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
+            precompute_rope(ctx, config.rotary_dim, 4096, config.rope_theta)?;
 
         ctx.sync()?;
         info!(
