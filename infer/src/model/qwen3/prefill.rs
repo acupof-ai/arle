@@ -385,6 +385,24 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v_batch,
         );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.q_batch,
+            &format!("L{layer_idx} q_proj_out (pre-norm-rope)"),
+            bufs.q_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.k_batch,
+            &format!("L{layer_idx} k_proj_out (pre-norm-rope)"),
+            bufs.k_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.v_batch,
+            &format!("L{layer_idx} v_proj_out"),
+            bufs.v_batch.hidden_dim,
+        );
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
         let (k_cache_layer, v_cache_layer) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
@@ -412,6 +430,18 @@ impl Qwen3Model {
             &heads,
             start_pos,
         )?;
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.q_batch,
+            &format!("L{layer_idx} q (post-norm-rope)"),
+            bufs.q_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.attn_output,
+            &format!("L{layer_idx} attn_output (pre-o-proj)"),
+            bufs.attn_output.hidden_dim,
+        );
         // Quantize newly written KV tokens → INT8 storage (no-op for BF16)
         kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
@@ -421,6 +451,12 @@ impl Qwen3Model {
             &layer.attention.o_proj,
             &bufs.attn_output,
             &mut bufs.o_buf,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.o_buf,
+            &format!("L{layer_idx} o_proj_out"),
+            bufs.o_buf.hidden_dim,
         );
 
         // 5. Residual add: hidden_in + o_batch → bufs.hidden_out
