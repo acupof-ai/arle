@@ -576,126 +576,137 @@ pub(crate) fn load_tensor_1d_gguf_offset_norm(
     DeviceVec::from_host(ctx, &bf16_data)
 }
 
-/// Re-interleave a 1D vector: llama.cpp deinterleaves SSM state dims
-/// [even..., odd...] → [0,1,2,3,...]. Call this on any 1D tensor with
-/// num_value_heads elements (a_log, dt_bias).
-pub(crate) fn reinterleave_1d(data: &mut [bf16]) {
-    let n = data.len();
-    if n < 2 {
-        return;
-    }
-    let half = n / 2;
-    let src = data.to_vec();
-    for i in 0..half {
-        data[i * 2] = src[i];
-        data[i * 2 + 1] = src[half + i];
-    }
-}
-
-/// Re-interleave f32 vector (same pattern as bf16 variant).
-pub(crate) fn reinterleave_1d_f32(data: &mut [f32]) {
-    let n = data.len();
-    if n < 2 {
-        return;
-    }
-    let half = n / 2;
-    let src = data.to_vec();
-    for i in 0..half {
-        data[i * 2] = src[i];
-        data[i * 2 + 1] = src[half + i];
-    }
-}
-
-/// Re-interleave rows of a 2D BF16 tensor by head groups.
+/// Reverse llama.cpp's `_reorder_v_heads` permutation for 1D data.
 ///
-/// llama.cpp deinterleaves by splitting heads into even/odd halves.
-/// For `num_heads` heads each with `head_dim` rows:
-///   GGUF: [head0, head2, head4, ..., head1, head3, head5, ...]
-///   HF:   [head0, head1, head2, head3, ...]
+/// llama.cpp reorders V heads from grouped (by K head) to tiled:
+///   HF:   [G0_v0, G0_v1, G1_v0, G1_v1, ...]  (grouped by K head)
+///   GGUF: [G0_v0, G1_v0, G0_v1, G1_v1, ...]  (tiled for ggml broadcast)
 ///
-/// Each head occupies `head_dim` consecutive rows (= rows / num_heads).
-pub(crate) fn reinterleave_rows_by_head(
+/// This reverses: reshape [num_v_per_k, num_k_heads, head_dim] → transpose → flatten.
+/// For 1D tensors (A_log, dt_bias): head_dim=1.
+pub(crate) fn reverse_v_reorder(
     data: &mut [bf16],
-    rows: usize,
-    cols: usize,
-    num_heads: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
 ) {
-    if num_heads < 2 {
+    if num_v_per_k <= 1 {
         return;
     }
-    let head_dim = rows / num_heads;
-    let half_heads = num_heads / 2;
     let src = data.to_vec();
-    for h in 0..half_heads {
-        // Even head h → output head 2*h
-        let src_start = h * head_dim * cols;
-        let dst_start = (h * 2) * head_dim * cols;
-        let size = head_dim * cols;
-        data[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
-        // Odd head (half_heads + h) → output head 2*h+1
-        let src_start2 = (half_heads + h) * head_dim * cols;
-        let dst_start2 = (h * 2 + 1) * head_dim * cols;
-        data[dst_start2..dst_start2 + size].copy_from_slice(&src[src_start2..src_start2 + size]);
-    }
-}
-
-/// Re-interleave rows of a 2D tensor (shortcut: 1 row per head).
-pub(crate) fn reinterleave_rows(data: &mut [bf16], rows: usize, cols: usize) {
-    reinterleave_rows_by_head(data, rows, cols, rows);
-}
-
-/// Re-interleave COLUMNS of a 2D BF16 tensor by head groups.
-/// Same deinterleave pattern as rows but applied to the column dimension.
-/// Used for out_proj where cols = num_value_heads × value_head_dim.
-pub(crate) fn reinterleave_cols_by_head(
-    data: &mut [bf16],
-    rows: usize,
-    cols: usize,
-    num_heads: usize,
-) {
-    if num_heads < 2 {
-        return;
-    }
-    let head_dim = cols / num_heads;
-    let half_heads = num_heads / 2;
-    let src = data.to_vec();
-    for r in 0..rows {
-        for h in 0..half_heads {
+    // GGUF order: [vpk, nk, hd] flattened. Reverse to [nk, vpk, hd].
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
             for d in 0..head_dim {
-                let src_col = h * head_dim + d;
-                let dst_col = (h * 2) * head_dim + d;
-                data[r * cols + dst_col] = src[r * cols + src_col];
-            }
-            for d in 0..head_dim {
-                let src_col = (half_heads + h) * head_dim + d;
-                let dst_col = (h * 2 + 1) * head_dim + d;
-                data[r * cols + dst_col] = src[r * cols + src_col];
+                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
+                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
+                data[hf_idx] = src[gguf_idx];
             }
         }
     }
 }
 
-/// Load a 1D GGUF tensor with re-interleave (for SSM state-dim tensors).
-pub(crate) fn load_tensor_1d_gguf_reinterleave(
+/// Same as reverse_v_reorder but for f32 data.
+pub(crate) fn reverse_v_reorder_f32(
+    data: &mut [f32],
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            for d in 0..head_dim {
+                let gguf_idx = (v * num_k_heads + k) * head_dim + d;
+                let hf_idx = (k * num_v_per_k + v) * head_dim + d;
+                data[hf_idx] = src[gguf_idx];
+            }
+        }
+    }
+}
+
+/// Reverse llama.cpp's `_reorder_v_heads` for 2D tensor rows.
+///
+/// Rows are grouped as [num_v_per_k, num_k_heads, head_dim, cols] in GGUF.
+/// Reverse to [num_k_heads, num_v_per_k, head_dim, cols] (HF grouped order).
+pub(crate) fn reverse_v_reorder_rows(
+    data: &mut [bf16],
+    rows: usize,
+    cols: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    let _ = rows; // used for assertion only
+    for k in 0..num_k_heads {
+        for v in 0..num_v_per_k {
+            let gguf_head = v * num_k_heads + k;
+            let hf_head = k * num_v_per_k + v;
+            let src_start = gguf_head * head_dim * cols;
+            let dst_start = hf_head * head_dim * cols;
+            let size = head_dim * cols;
+            data[dst_start..dst_start + size].copy_from_slice(&src[src_start..src_start + size]);
+        }
+    }
+}
+
+/// Reverse llama.cpp's `_reorder_v_heads` for 2D tensor columns.
+/// Used for out_proj where cols = num_v_heads × value_head_dim.
+pub(crate) fn reverse_v_reorder_cols(
+    data: &mut [bf16],
+    rows: usize,
+    cols: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
+) {
+    if num_v_per_k <= 1 {
+        return;
+    }
+    let src = data.to_vec();
+    for r in 0..rows {
+        for k in 0..num_k_heads {
+            for v in 0..num_v_per_k {
+                let gguf_head = v * num_k_heads + k;
+                let hf_head = k * num_v_per_k + v;
+                for d in 0..head_dim {
+                    data[r * cols + hf_head * head_dim + d] =
+                        src[r * cols + gguf_head * head_dim + d];
+                }
+            }
+        }
+    }
+}
+
+/// Load 1D GGUF tensor with V-head reorder reversal (a_log, dt_bias).
+pub(crate) fn load_tensor_1d_gguf_v_reorder(
     ctx: &DeviceContext,
     gguf: &GgufFile,
     hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
 ) -> Result<DeviceVec> {
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
-    reinterleave_1d(&mut bf16_data);
+    reverse_v_reorder(&mut bf16_data, num_k_heads, num_v_per_k, 1);
     DeviceVec::from_host(ctx, &bf16_data)
 }
 
-/// Load a 2D GGUF tensor with head-based row re-interleave.
-///
-/// `num_heads`: number of heads that were deinterleaved by llama.cpp.
-/// Each head has `rows / num_heads` consecutive rows.
-pub(crate) fn load_tensor_2d_gguf_reinterleave(
+/// Load 2D GGUF tensor with V-head row reorder reversal (in_proj_z, in_proj_a/b).
+pub(crate) fn load_tensor_2d_gguf_v_reorder_rows(
     ctx: &DeviceContext,
     gguf: &GgufFile,
     hf_name: &str,
-    num_heads: usize,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
 ) -> Result<DeviceMatrix> {
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
@@ -705,24 +716,43 @@ pub(crate) fn load_tensor_2d_gguf_reinterleave(
     } else {
         (1, info.shape[0] as usize)
     };
-    reinterleave_rows_by_head(&mut bf16_data, rows, cols, num_heads);
+    reverse_v_reorder_rows(
+        &mut bf16_data,
+        rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        head_dim,
+    );
     DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
 }
 
-/// Shortcut: re-interleave with 1 row per head (e.g., in_proj_a with 32 rows = 32 heads).
-pub(crate) fn load_tensor_2d_gguf_reinterleave_rows(
+/// Load 2D GGUF tensor with V-head column reorder reversal (out_proj).
+pub(crate) fn load_tensor_2d_gguf_v_reorder_cols(
     ctx: &DeviceContext,
     gguf: &GgufFile,
     hf_name: &str,
+    num_k_heads: usize,
+    num_v_per_k: usize,
+    head_dim: usize,
 ) -> Result<DeviceMatrix> {
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
-    let rows = if info.shape.len() == 2 {
-        info.shape[1] as usize
+    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
+    let (rows, cols) = if info.shape.len() == 2 {
+        (info.shape[1] as usize, info.shape[0] as usize)
     } else {
-        1
+        (1, info.shape[0] as usize)
     };
-    load_tensor_2d_gguf_reinterleave(ctx, gguf, hf_name, rows)
+    reverse_v_reorder_cols(
+        &mut bf16_data,
+        rows,
+        cols,
+        num_k_heads,
+        num_v_per_k,
+        head_dim,
+    );
+    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
 }
 
 /// Load a 2D tensor (e.g., linear weight) from a GGUF file.
