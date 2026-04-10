@@ -48,6 +48,41 @@ bug is exclusively in the GGUF load path.
 7. **Linear attention is not the cause.** Qwen3-4B (pure dense
    transformer, no linear attention) also breaks under GGUF load.
 
+## Update (2026-04-10 evening)
+
+One more real bug found and fixed: **`embed_tokens` was being uploaded
+as a packed-quantized `DeviceMatrix` with a 1-element dummy `.data`
+buffer**, but `embedding_decode_cuda` reads from `embed.data` directly
+(not quant-aware). Every forward pass started by reading garbage
+device memory through the embedding lookup. Fixed by adding
+`load_tensor_2d_gguf_bf16` that forces BF16 dequant, and using it for
+`embed_tokens` in both Qwen3 and Qwen3.5 GGUF loaders.
+
+Differential: Qwen3-4B GGUF output changed from `"!!!!!!!!"` (reading
+dummy memory) to prompt-dependent tokens like `"零食零食零食..."` —
+the model is now processing input through its embedding correctly,
+but still stuck in repetitive loops.
+
+Additional verification completed:
+- `blk.0.input_layernorm.weight[0..8]` matches exactly between
+  safetensors (BF16) and GGUF (F32 → BF16).
+- `model.norm.weight[0..8]` (final norm) also matches exactly.
+- `blk.0.attn_q.weight[row 0, 0..8]` and `[row 1, 0..8]` both match
+  safetensors within Q4_K quantization noise (~5-15%). Row stride is
+  correct.
+- Existing safetensors-only e2e test on Qwen3-4B produces COHERENT
+  English generation (just slight baseline drift from the hard-coded
+  expected string). The forward pass with safetensors weights works.
+
+So the weight data on device is numerically correct vs safetensors,
+and the forward pass is correct with safetensors weights, yet the
+forward pass with GGUF weights (same numerical values within quant
+noise) produces stuck tokens. This strongly suggests a subtle issue
+that is NOT in weight loading or kernel math but rather in some
+shape / DeviceMatrix metadata set-up that differs between the two
+load paths (e.g., a stride, an alignment, or a `rows`/`cols` field
+accessed by a later op).
+
 ## What's left to investigate
 
 The bug lives somewhere in the shared Qwen3/Qwen3.5 **GGUF loader**
