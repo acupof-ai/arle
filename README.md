@@ -88,6 +88,35 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
+## Stability and Support
+
+`agent-infer` uses explicit stability and support rules.
+
+- **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`),
+  `GET /metrics`, `GET /v1/stats`, and the main documented build/test workflows.
+- **Beta**: CLI agent behavior, Metal serving path, GGUF loading, benchmark tooling.
+- **Experimental**: fast-moving quantization paths, speculative decoding,
+  tensor-parallel scaffolding, and undocumented flags or environment variables.
+
+Current support should be read conservatively:
+
+- **CUDA on Linux** is the primary supported serving path.
+- **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
+  scheduler runtime.
+- **CPU-only / `no-cuda`** is a development and testing path, not a production
+  inference target.
+
+Governance references:
+
+- [docs/stability-policy.md](docs/stability-policy.md)
+- [docs/support-matrix.md](docs/support-matrix.md)
+- [docs/compatibility.md](docs/compatibility.md)
+- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
+- [docs/release-checklist.md](docs/release-checklist.md)
+- [docs/environment.md](docs/environment.md)
+
+---
+
 ## Architecture
 
 ```
@@ -220,7 +249,20 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --no-default-features --features metal,no-cuda,cli -- --ignored --nocapture
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.
+Before opening a PR, read:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and contribution rules
+- [docs/support-matrix.md](docs/support-matrix.md) for what is currently supported
+- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md) for
+  minimum verification expectations
+- [docs/compatibility.md](docs/compatibility.md) if your change affects CLI,
+  API, documented env vars, or migration-sensitive behavior
+- [docs/environment.md](docs/environment.md) for the current environment-variable
+  reference
+
+For release work, also use [docs/release-checklist.md](docs/release-checklist.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 
 ---
 

@@ -1,6 +1,17 @@
 # Contributing to agent-infer
 
-Thanks for your interest in contributing! This document covers the essentials.
+Thanks for your interest in contributing! This document is the main entry point
+for contribution workflow.
+
+If your change is user-visible, compatibility-sensitive, performance-sensitive,
+or release-related, also read:
+
+- [docs/stability-policy.md](docs/stability-policy.md)
+- [docs/support-matrix.md](docs/support-matrix.md)
+- [docs/compatibility.md](docs/compatibility.md)
+- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
+- [docs/release-checklist.md](docs/release-checklist.md)
+- [docs/environment.md](docs/environment.md)
 
 ## Getting Started
 
@@ -40,6 +51,29 @@ cargo fmt --all -- --check
    - Types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore`
 3. Ensure CI passes: `cargo test`, `cargo clippy`, `cargo fmt --check`
 4. One logical change per PR. Keep diffs focused.
+5. If the change affects a documented API, CLI behavior, environment variable,
+   benchmark claim, or migration-sensitive workflow, include the relevant docs
+   updates in the same PR.
+
+## PR Readiness Checklist
+
+Before opening a PR, make sure you can answer these clearly:
+
+1. **What surface changed?**
+   - internal implementation
+   - documented API / CLI
+   - backend/runtime path
+   - benchmark / tooling / docs
+2. **What stability level does it belong to?**
+   - stable, beta, experimental, or internal
+3. **What validation did you run?**
+   - unit / contract / integration / e2e / benchmark / profiling
+4. **Does it change support expectations or compatibility?**
+   - if yes, update the relevant docs and changelog
+5. **Does it claim a performance win?**
+   - if yes, include before/after evidence and command context
+
+If you cannot answer those questions yet, the PR is not ready.
 
 ## Code Conventions
 
@@ -47,6 +81,51 @@ cargo fmt --all -- --check
 - **GPU/CPU separation**: GPU-only code behind `#[cfg(feature = "cuda")]`
 - **Error handling**: `anyhow::Result` for internal, structured `ApiError` for HTTP
 - **Always `--release`**: Debug builds are unusably slow for GPU work
+
+## Compatibility and Support Rules
+
+- Treat documented HTTP APIs, documented CLI behavior, and documented
+  environment variables as compatibility-sensitive.
+- Do not treat internal modules as public extension points unless the docs say
+  they are stable.
+- If support status changes for a backend, model family, quantization path, or
+  platform combination, update `README.md`, `docs/support-matrix.md`, and
+  `CHANGELOG.md` together.
+- If you deprecate or replace a documented surface, include migration guidance.
+
+See [docs/compatibility.md](docs/compatibility.md) for the full policy.
+
+## Validation Expectations
+
+Use the lightest meaningful validation first, then broaden based on risk.
+
+- **CPU-side logic / pure Rust helpers**: run targeted tests plus the CPU-only
+  test path.
+- **HTTP / protocol / CLI behavior**: run targeted tests and update docs when
+  behavior changes.
+- **CUDA / Metal / scheduler runtime / quantization changes**: run targeted
+  correctness checks and include benchmark evidence when claiming a performance
+  improvement.
+
+See [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
+for the detailed matrix.
+
+## Environment Variables
+
+Use [docs/environment.md](docs/environment.md) as the source of truth for:
+
+- CLI runtime variables
+- build/toolchain variables
+- test and integration variables
+- setup-related variables
+
+If you add, rename, or deprecate an environment variable, update that document
+in the same PR.
+
+## Release Work
+
+If you are preparing a release, use
+[docs/release-checklist.md](docs/release-checklist.md).
 
 ## Architecture
 
@@ -67,6 +146,10 @@ Key entry points:
 ## Reporting Issues
 
 Use the [issue templates](.github/ISSUE_TEMPLATE/) for bug reports and feature requests.
+
+If reporting a performance regression, include hardware, model, command, before
+result, after result, and whether the regression is correctness-related or only
+throughput/latency-related.
 
 ## License
 
