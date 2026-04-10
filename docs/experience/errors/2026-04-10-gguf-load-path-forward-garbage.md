@@ -48,6 +48,57 @@ bug is exclusively in the GGUF load path.
 7. **Linear attention is not the cause.** Qwen3-4B (pure dense
    transformer, no linear attention) also breaks under GGUF load.
 
+## Update (2026-04-10 night) — layer-by-layer instrumentation
+
+Added `debug_dump_hidden()` in `model::common` (gated by
+`PEGAINFER_DEBUG_DUMP=1`) and wired it through the Qwen3 prefill loop to
+dump head[0..8], tail[N-4..N], min/max/rms at four checkpoints per layer.
+Side-by-side run of Qwen3-4B safetensors vs Q4_K_M GGUF on the prompt
+"The capital of France is" yields:
+
+| Layer | safetensors rms | GGUF rms (bf16-forced) |
+|------:|----------------:|-----------------------:|
+|  L0   | 0.151           | 0.120                  |
+|  L1   | 0.189           | 0.154                  |
+|  L2   | 0.224           | 0.177                  |
+|  L3   | 0.285           | 0.217                  |
+|  L4   | 0.383           | **0.420** (first cross-over) |
+|  L5   | 0.501           | **16.06** ← 32× explosion in ONE layer |
+|  L6   | 0.560           | 21.30                  |
+|  L11  | 0.843           | 223.9                  |
+
+L0..L4 drift is 22-30% per layer — exactly what 20% per-tensor RMS
+quantization noise would compound to. L5 explodes 38× in a single
+layer, then cascades.
+
+Cross-validations done:
+- `llama-cpp-python` on the SAME GGUF file produces correct text
+  (" Paris. The capital of Germany is Berlin. The capital of"). The
+  weights are fine; our forward pass is what's broken.
+- `blk.5.input_layernorm.weight` matches BIT-EXACT between safetensors
+  and GGUF (both F32 → BF16 in the loader; GGUF stores F32 verbatim).
+- `blk.5.attn_q.weight` row 0 / row 1 dequant matches safetensors
+  within Q4_K precision (5-15% per element).
+- The 20% systematic per-tensor RMS inflation is REAL Q4_K
+  quantization behavior — Python ground-truth dequant matches our
+  Rust dequant matches llama.cpp's `dequantize_row_q4_K` byte-for-byte.
+
+Per-layer dtype audit shows the Q4_K_M recipe interleaves Q6_K and Q4_K
+for `attn_v` / `ffn_down`: blk.{0,1,2,3,6,9,12,15,18,21,24,27,30..35} use
+Q6_K, the rest use Q4_K. Layer 5 uses Q4_K — and is exactly where
+explosion starts. But layer 4 ALSO uses Q4_K and only drifts ~10%, so
+"Q4_K vs Q6_K" alone doesn't explain it.
+
+So the bug is now definitively in **the Qwen3 forward pass code path**,
+specifically: it tolerates 20% per-tensor RMS quant noise much worse
+than llama.cpp does. Likely candidates:
+- A specific kernel using bf16 storage between fp32 stages where
+  llama.cpp keeps fp32 (silu_mul fixed already as a real-but-not-the-bug
+  issue, found while reading the kernel).
+- Attention softmax overflow / stability — flashinfer should be stable
+  but worth verifying it max-subtracts before exp.
+- Accumulator dtype in attention or RoPE.
+
 ## Update (2026-04-10 evening)
 
 One more real bug found and fixed: **`embed_tokens` was being uploaded
