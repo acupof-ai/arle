@@ -782,8 +782,8 @@ pub fn map_gguf_name_with_prefix(gguf_name: &str, prefix: &str) -> String {
                 // Qwen3.5 linear attention (SSM/GDR)
                 "attn_qkv.weight" => "linear_attn.in_proj_qkv.weight",
                 "attn_gate.weight" => "linear_attn.in_proj_z.weight",
-                "ssm_alpha.weight" => "linear_attn.in_proj_b.weight",
-                "ssm_beta.weight" => "linear_attn.in_proj_a.weight",
+                "ssm_alpha.weight" => "linear_attn.in_proj_a.weight",
+                "ssm_beta.weight" => "linear_attn.in_proj_b.weight",
                 "ssm_conv1d.weight" => "linear_attn.conv1d.weight",
                 "ssm_out.weight" => "linear_attn.out_proj.weight",
                 "ssm_dt.bias" => "linear_attn.dt_bias",
