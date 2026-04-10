@@ -309,7 +309,7 @@ Common prefix = [A B C D] (len=4)
     │  Supports:         │              │     unified memory)        │
     │  - Multi-request   │              │                            │
     │    Scheduler       │              │  Implements:               │
-    │  - Continuous      │              │  - Full Qwen2.5 forward    │
+    │  - Continuous      │              │  - Full Qwen3/Qwen3.5      │
     │    batching        │              │  - RMSNorm, RoPE, GQA attn │
     │  - FlashInfer      │              │  - SwiGLU MLP              │
     │    paged decode    │              │  - Append-based KV cache   │

@@ -1,6 +1,10 @@
+#[cfg(feature = "metal")]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use anyhow::Result;
+#[cfg(feature = "metal")]
+use anyhow::anyhow;
 
 use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason};
 
@@ -17,6 +21,17 @@ use infer::metal_backend::MetalBackend;
 use infer::sampler::SamplingParams;
 #[cfg(feature = "metal")]
 use infer::server_engine::Usage;
+
+#[cfg(feature = "metal")]
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
 
 #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 pub trait AgentEngine {
@@ -63,7 +78,15 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
         let mut sampling: SamplingParams = req.sampling.clone();
         sampling.max_new_tokens = Some(req.max_tokens);
 
-        let generated = self.backend.generate(&req.prompt, &sampling)?;
+        let generated = catch_unwind(AssertUnwindSafe(|| {
+            self.backend.generate(&req.prompt, &sampling)
+        }))
+        .map_err(|panic| {
+            anyhow!(
+                "metal backend panicked during completion: {}",
+                panic_message(panic)
+            )
+        })??;
         let mut text = generated.text;
         let mut finish_reason = parse_finish_reason(&generated.finish_reason);
 
@@ -82,6 +105,7 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
                 completion_tokens: generated.completion_tokens,
                 total_tokens: generated.prompt_tokens + generated.completion_tokens,
             },
+            token_logprobs: Vec::new(),
         })
     }
 }

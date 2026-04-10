@@ -704,7 +704,6 @@ mod tests {
     #[test]
     fn test_conv1d_step_shapes() {
         let _guard = metal_test_guard();
-        let qkv_dim = 64; // small for test
         let kernel_size = 4usize;
 
         let config = MetalGdrConfig {
@@ -716,6 +715,7 @@ mod tests {
             hidden_size: 64,
             rms_norm_eps: 1e-6,
         };
+        let qkv_dim = config.qkv_dim();
 
         // x: [1, 1, qkv_dim] bf16
         let x = crate::mlx::as_dtype(
@@ -762,8 +762,8 @@ mod tests {
         assert_eq!(config.z_dim(), 2);
 
         let state = MetalRecurrentState::new(1, &config);
-        assert_eq!(state.states[0].shape(), &[1, 2, 2]);
-        assert_eq!(state.conv_states[0].shape(), &[6, 3]); // [qkv_dim, kernel-1]
+        assert_eq!(state.states[0].shape(), &[1, 1, 2, 2]);
+        assert_eq!(state.conv_states[0].shape(), &[1, 3, 6]);
     }
 
     /// Smoke test: verify state shapes for Qwen3.5-4B dimensions.
@@ -787,8 +787,8 @@ mod tests {
         let state = MetalRecurrentState::new(24, &config);
         assert_eq!(state.states.len(), 24);
         assert_eq!(state.conv_states.len(), 24);
-        assert_eq!(state.states[0].shape(), &[32, 128, 128]);
-        assert_eq!(state.conv_states[0].shape(), &[8192, 3]);
+        assert_eq!(state.states[0].shape(), &[1, 32, 128, 128]);
+        assert_eq!(state.conv_states[0].shape(), &[1, 3, 8192]);
     }
 
     // ── Numerical tests ─────────────────────────────────────────────────────

@@ -194,7 +194,7 @@ cargo run --release -p infer --no-default-features --features metal,no-cuda --bi
   --model-path mlx-community/Qwen3-0.6B-4bit --port 8000
 ```
 
-Current status: `metal_serve` is wired and production-testable for Qwen3/Qwen3.5, but it still runs through a serial backend runtime rather than the CUDA-style continuous batching scheduler.
+Current status: `metal_serve` is usable for single-request validation on Qwen3/Qwen3.5, but it still runs through a serial backend runtime rather than the CUDA-style continuous batching scheduler.
 
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
 

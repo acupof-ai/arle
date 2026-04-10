@@ -11,8 +11,22 @@ use infer::logging;
 use infer::metal_backend::MetalBackend;
 use infer::sampler::SamplingParams;
 
+fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
+    let parsed: i32 = raw
+        .parse()
+        .map_err(|_| format!("invalid integer for --top-k: {raw}"))?;
+    if parsed == -1 || parsed == 1 {
+        Ok(parsed)
+    } else {
+        Err("metal_request only supports --top-k -1 or --top-k 1".to_string())
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "metal_request", about = "Single MLX/Metal inference request")]
+#[command(
+    name = "metal_request",
+    about = "Single MLX/Metal inference request (greedy or temperature sampling)"
+)]
 struct Args {
     /// Model path (local directory) or HuggingFace repo ID.
     #[arg(long, short)]
@@ -50,25 +64,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     temperature: f32,
 
-    /// Top-K sampling. `-1` disables it.
-    #[arg(long, default_value_t = -1)]
+    /// Top-K sampling. Metal currently supports only `-1` or `1`.
+    #[arg(long, default_value_t = -1, value_parser = parse_metal_top_k)]
     top_k: i32,
-
-    /// Top-P sampling.
-    #[arg(long, default_value_t = 1.0)]
-    top_p: f32,
-
-    /// Min-P sampling.
-    #[arg(long, default_value_t = 0.0)]
-    min_p: f32,
 
     /// Ignore EOS and continue generating until `max_new_tokens`.
     #[arg(long, default_value_t = false)]
     ignore_eos: bool,
-
-    /// Optional RNG seed for non-greedy sampling.
-    #[arg(long)]
-    seed: Option<u64>,
 }
 
 fn load_prompt(args: &Args) -> Result<String> {
@@ -150,10 +152,7 @@ fn main() -> Result<()> {
         let params = SamplingParams {
             temperature: args.temperature,
             top_k: args.top_k,
-            top_p: args.top_p,
-            min_p: args.min_p,
             ignore_eos: args.ignore_eos,
-            seed: args.seed,
             max_new_tokens: Some(args.max_new_tokens),
             ..Default::default()
         };

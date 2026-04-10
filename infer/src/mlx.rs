@@ -521,6 +521,10 @@ impl MetalKernel {
     }
 }
 unsafe impl Send for MetalKernel {}
+// SAFETY: `MetalKernel` is an immutable handle to a compiled MLX Metal kernel.
+// We construct it once, store it in a process-wide `LazyLock`, and only call
+// methods that treat the handle as read-only. Per-dispatch mutable state lives
+// in the input/output arrays passed to MLX, not in this wrapper.
 unsafe impl Sync for MetalKernel {}
 
 impl MetalKernel {
