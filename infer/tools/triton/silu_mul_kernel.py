@@ -10,6 +10,8 @@ def silu_mul_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.conste
 
     gate = tl.load(gate_ptr + offsets, mask=mask, other=0).to(tl.float32)
     up = tl.load(up_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    # Keep silu*up in fp32 — rounding silu to bf16 BEFORE the multiply
+    # loses ~3 decimal digits of precision and amplifies upstream noise.
     silu = gate * tl.sigmoid(gate)
-    out = silu.to(tl.bfloat16) * up
+    out = (silu * up).to(tl.bfloat16)
     tl.store(out_ptr + offsets, out, mask=mask)
