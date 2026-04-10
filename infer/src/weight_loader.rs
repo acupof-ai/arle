@@ -842,6 +842,17 @@ pub(crate) fn load_tensor_2d_gguf(
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
 
+    // `PEGAINFER_FORCE_BF16_QUANT=1` skips all packed fast paths and forces the
+    // BF16 dequant fallback. Kept behind an env var as a bisection tool for
+    // "bug in native GPU kernel" vs "bug in downstream forward pass".
+    let force_bf16 = std::env::var("PEGAINFER_FORCE_BF16_QUANT").is_ok();
+    if force_bf16 && info.shape.len() == 2 {
+        let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
+        let ne0 = info.shape[0] as usize;
+        let ne1 = info.shape[1] as usize;
+        return DeviceMatrix::from_host(ctx, &bf16_data, ne1, ne0);
+    }
+
     // Q8_0: keep packed — use existing W8A16 GEMV for on-the-fly dequant.
     // GGUF column-major: [ne0, ne1] stores data column-by-column.
     // Reading as row-major gives [ne1, ne0] = [out_dim, in_dim] — no transpose.
