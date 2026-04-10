@@ -557,6 +557,25 @@ pub(crate) fn load_tensor_1d_gguf(
     DeviceVec::from_host(ctx, &bf16_data)
 }
 
+/// Load a 1D norm weight from GGUF, subtracting 1.0 (offset RMSNorm correction).
+///
+/// GGUF stores norm weights with the +1 offset baked in: `w_gguf = 1 + w_hf`.
+/// Our engine's offset RMSNorm computes `x * (1 + w)`, so we need `w = w_gguf - 1`
+/// to avoid double-offset `x * (1 + w_gguf) = x * (2 + w_hf)`.
+pub(crate) fn load_tensor_1d_gguf_offset_norm(
+    ctx: &DeviceContext,
+    gguf: &GgufFile,
+    hf_name: &str,
+) -> Result<DeviceVec> {
+    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let mut bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
+    // Subtract 1.0 to convert from GGUF convention (1+w) to HF convention (w)
+    for v in &mut bf16_data {
+        *v = bf16::from_f32(v.to_f32() - 1.0);
+    }
+    DeviceVec::from_host(ctx, &bf16_data)
+}
+
 /// Load a 2D tensor (e.g., linear weight) from a GGUF file.
 ///
 /// For Q8_0: keeps weights packed as INT8 + bf16 scales (uses W8A16 GEMV at runtime).

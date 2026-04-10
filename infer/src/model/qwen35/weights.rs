@@ -432,7 +432,16 @@ impl Qwen35Model {
         gguf: &crate::gguf::GgufFile,
         enable_cuda_graph: bool,
     ) -> Result<Self> {
-        use crate::weight_loader::{load_tensor_1d_gguf, load_tensor_2d_gguf, precompute_rope};
+        use crate::weight_loader::{
+            load_tensor_1d_gguf, load_tensor_1d_gguf_offset_norm, load_tensor_2d_gguf,
+            precompute_rope,
+        };
+        // GGUF stores norm weights with +1 offset baked in (e.g., w_gguf = 1 + w_hf).
+        // Use load_tensor_1d_gguf_offset_norm for all RMSNorm/QK-norm weights.
+        let load_norm =
+            |ctx: &DeviceContext, gguf: &crate::gguf::GgufFile, name: &str| -> Result<DeviceVec> {
+                load_tensor_1d_gguf_offset_norm(ctx, gguf, name)
+            };
 
         // Qwen3.5 GGUF uses standard blk.N prefix — map_gguf_name handles
         // SSM tensors (ssm_a, ssm_conv1d, etc.) → linear_attn.* HF names.
@@ -460,8 +469,8 @@ impl Qwen35Model {
                         k_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.k_proj.weight"))?,
                         v_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.v_proj.weight"))?,
                         o_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.o_proj.weight"))?,
-                        q_norm: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.q_norm.weight"))?,
-                        k_norm: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.k_norm.weight"))?,
+                        q_norm: load_norm(ctx, gguf, &format!("{ap}.q_norm.weight"))?,
+                        k_norm: load_norm(ctx, gguf, &format!("{ap}.k_norm.weight"))?,
                     })
                 }
                 LayerType::LinearAttention => {
@@ -494,14 +503,15 @@ impl Qwen35Model {
                         )?,
                         dt_bias: load_tensor_1d_gguf(ctx, gguf, &format!("{ap}.dt_bias"))?,
                         a_log: {
-                            // a_log is stored as f32 in GGUF
+                            // GGUF ssm_a stores A = -exp(A_log), not A_log itself.
+                            // Convert back: A_log = -log(|A|) (negative because A < 0).
                             let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
                                 gguf,
                                 &format!("{ap}.a_log"),
                             )?;
                             let raw = gguf.read_tensor_raw(&gguf_name)?;
                             let info = &gguf.tensors[&gguf_name];
-                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
+                            let raw_f32: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
                                 unsafe {
                                     std::slice::from_raw_parts(
                                         raw.as_ptr().cast::<f32>(),
@@ -510,15 +520,20 @@ impl Qwen35Model {
                                 }
                                 .to_vec()
                             } else {
-                                // Dequant to bf16, then to f32
                                 gguf.read_tensor_bf16(&gguf_name)?
                                     .iter()
                                     .map(|v| v.to_f32())
                                     .collect()
                             };
-                            let gpu: cudarc::driver::CudaSlice<f32> =
-                                ctx.stream.clone_htod(&f32s)?;
-                            gpu
+                            // Convert: A → A_log = log(|A|) with sign preserved
+                            let a_log: Vec<f32> = raw_f32
+                                .iter()
+                                .map(|&a| {
+                                    let abs_a = a.abs().max(1e-10);
+                                    -(abs_a.ln()) // A_log is negative (A = -exp(A_log))
+                                })
+                                .collect();
+                            ctx.stream.clone_htod(&a_log)?
                         },
                         norm_weight: {
                             let gguf_name = crate::weight_loader::find_gguf_tensor_name_pub(
@@ -527,7 +542,7 @@ impl Qwen35Model {
                             )?;
                             let raw = gguf.read_tensor_raw(&gguf_name)?;
                             let info = &gguf.tensors[&gguf_name];
-                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
+                            let mut f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
                                 unsafe {
                                     std::slice::from_raw_parts(
                                         raw.as_ptr().cast::<f32>(),
@@ -541,6 +556,10 @@ impl Qwen35Model {
                                     .map(|v| v.to_f32())
                                     .collect()
                             };
+                            // GGUF norm offset: subtract 1.0 (same as other norms)
+                            for v in &mut f32s {
+                                *v -= 1.0;
+                            }
                             ctx.stream.clone_htod(&f32s)?
                         },
                         out_proj: load_tensor_2d_gguf(ctx, gguf, &format!("{ap}.out_proj.weight"))?,
@@ -549,13 +568,9 @@ impl Qwen35Model {
             };
 
             layers.push(TransformerBlock35 {
-                input_layernorm: load_tensor_1d_gguf(
-                    ctx,
-                    gguf,
-                    &format!("{p}.input_layernorm.weight"),
-                )?,
+                input_layernorm: load_norm(ctx, gguf, &format!("{p}.input_layernorm.weight"))?,
                 attn,
-                post_attention_layernorm: load_tensor_1d_gguf(
+                post_attention_layernorm: load_norm(
                     ctx,
                     gguf,
                     &format!("{p}.post_attention_layernorm.weight"),
@@ -581,7 +596,7 @@ impl Qwen35Model {
             }
         }
 
-        let norm = load_tensor_1d_gguf(ctx, gguf, &format!("{wp}.norm.weight"))?;
+        let norm = load_norm(ctx, gguf, &format!("{wp}.norm.weight"))?;
         let (cos_cache, sin_cache) =
             precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
 
