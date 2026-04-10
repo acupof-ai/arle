@@ -1,4 +1,8 @@
-//! Safetensors weight loading and RoPE precomputation.
+//! Safetensors and GGUF weight loading + RoPE precomputation.
+//!
+//! Two loading paths:
+//! - **Safetensors** (default): `load_tensor_1d`, `load_tensor_2d`, `load_tensor_2d_maybe_quantized`
+//! - **GGUF**: `load_tensor_1d_gguf`, `load_tensor_2d_gguf` — dequant to BF16 at load time
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -10,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
+use crate::gguf::{self, GgufFile};
 use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
@@ -532,6 +537,100 @@ pub(crate) fn load_shard_info_fixed(
     }
 
     Ok((shard_files, weight_map))
+}
+
+// ============================================================================
+// GGUF loading — dequantize to BF16 at load, reuse existing GEMV/GEMM kernels
+// ============================================================================
+
+/// Load a 1D tensor (e.g., norm weight) from a GGUF file.
+///
+/// Looks up the HuggingFace name in the GGUF tensor directory (after
+/// reverse name mapping), dequantizes to BF16, uploads to GPU.
+pub(crate) fn load_tensor_1d_gguf(
+    ctx: &DeviceContext,
+    gguf: &GgufFile,
+    hf_name: &str,
+) -> Result<DeviceVec> {
+    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
+    DeviceVec::from_host(ctx, &bf16_data)
+}
+
+/// Load a 2D tensor (e.g., linear weight) from a GGUF file.
+///
+/// Dequantizes to BF16, uploads to GPU as DeviceMatrix.
+pub(crate) fn load_tensor_2d_gguf(
+    ctx: &DeviceContext,
+    gguf: &GgufFile,
+    hf_name: &str,
+) -> Result<DeviceMatrix> {
+    let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
+    let info = &gguf.tensors[&gguf_name];
+    let bf16_data = gguf.read_tensor_bf16(&gguf_name)?;
+
+    // GGUF stores weights as [out_dim, in_dim] (row-major), same as safetensors
+    let (rows, cols) = if info.shape.len() == 2 {
+        (info.shape[0] as usize, info.shape[1] as usize)
+    } else if info.shape.len() == 1 {
+        // 1D tensor treated as [1, N] for embedding lookup
+        (1, info.shape[0] as usize)
+    } else {
+        anyhow::bail!(
+            "Expected 1D or 2D tensor for '{}', got {}D",
+            hf_name,
+            info.shape.len()
+        );
+    };
+
+    DeviceMatrix::from_host(ctx, &bf16_data, rows, cols)
+}
+
+/// Find a tensor in the GGUF file by HuggingFace name.
+///
+/// Tries: direct lookup → reverse name mapping → prefix stripping.
+fn find_gguf_tensor_name(gguf: &GgufFile, hf_name: &str) -> Result<String> {
+    // Direct match (some GGUF files use HF naming)
+    if gguf.tensors.contains_key(hf_name) {
+        return Ok(hf_name.to_string());
+    }
+
+    // Reverse mapping: try all GGUF names, map to HF, check match
+    for gguf_name in gguf.tensors.keys() {
+        if gguf::map_gguf_name(gguf_name) == hf_name {
+            return Ok(gguf_name.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "Tensor '{}' not found in GGUF (tried {} tensor names)",
+        hf_name,
+        gguf.tensors.len()
+    )
+}
+
+/// Detect if a model path contains a GGUF file and return the GgufFile handle.
+///
+/// Scans for `.gguf` files in the directory. Returns the first one found.
+pub(crate) fn try_open_gguf(model_path: &str) -> Option<GgufFile> {
+    let dir = std::path::Path::new(model_path);
+    if !dir.is_dir() {
+        return None;
+    }
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".gguf") {
+            let path = entry.path();
+            match GgufFile::open(path.to_str()?) {
+                Ok(gguf) => return Some(gguf),
+                Err(e) => {
+                    log::warn!("Failed to parse GGUF {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
