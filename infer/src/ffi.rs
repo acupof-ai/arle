@@ -830,29 +830,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // Qwen3.5 (Qwen3-Next) gated attention output.
-    // De-interleave q_full [B, 2*H*D] (per-head concat [q_h|g_h|...]) into
-    // q [B, H*D] and gate [B, H*D].
-    pub(crate) fn split_q_gate_batch_cuda(
-        q_full: *const Half,
-        q: *mut Half,
-        gate: *mut Half,
-        batch_size: i32,
-        num_heads: i32,
-        head_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // In-place: attn_out[i] *= sigmoid(gate[i]).
-    pub(crate) fn sigmoid_gate_mul_batch_cuda(
-        attn_out: *mut Half,
-        gate: *const Half,
-        batch_size: i32,
-        num_heads: i32,
-        head_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     // ─── KV cache quantization (INT8) ───
 
     // Quantize bf16 KV data → INT8 + f32 scales for tokens [start_pos..start_pos+token_count).

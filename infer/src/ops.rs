@@ -43,9 +43,8 @@ pub(crate) use attention::{
     flashinfer_plan_hd256, flashinfer_run_layer_hd256,
 };
 pub(crate) use elementwise::{
-    add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, sigmoid_gate_mul_batch,
-    silu_mul_batch_into, silu_mul_fused_batch_into, split_q_gate_batch, split_qkv_batch,
-    vec_add_inplace,
+    add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into,
+    silu_mul_fused_batch_into, split_qkv_batch, vec_add_inplace,
 };
 pub(crate) use linear::{gemm_into, linear};
 pub(crate) use norm::{
