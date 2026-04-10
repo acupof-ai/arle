@@ -98,7 +98,52 @@ pub(crate) fn get_embeddings_batch(
         .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
     let mut out = HiddenStates::zeros(ctx, hidden_dim, seq_len)?;
     ops::embedding_batch(ctx, embed_tokens, &token_ids_gpu, &mut out)?;
+    debug_dump_hidden(ctx, &out, "after embedding", hidden_dim);
     Ok(out)
+}
+
+/// Print first 8 and last 4 elements of a hidden-state buffer to stderr,
+/// gated by `PEGAINFER_DEBUG_DUMP=1`. Used to bisect forward-pass divergence
+/// between safetensors and GGUF load paths.
+pub(crate) fn debug_dump_hidden(
+    ctx: &DeviceContext,
+    hidden: &HiddenStates,
+    label: &str,
+    hidden_dim: usize,
+) {
+    if std::env::var("PEGAINFER_DEBUG_DUMP").is_err() {
+        return;
+    }
+    use half::bf16;
+    let last_idx = hidden.seq_len.saturating_sub(1);
+    let view = hidden
+        .data
+        .slice(last_idx * hidden_dim..last_idx * hidden_dim + hidden_dim);
+    let buf: Vec<bf16> = match ctx.stream.memcpy_dtov(&view) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[debug-dump] {label}: copy failed: {e}");
+            return;
+        }
+    };
+    let _ = ctx.sync();
+    let f32s: Vec<f32> = buf.iter().map(|v| v.to_f32()).collect();
+    let head: Vec<String> = f32s.iter().take(8).map(|v| format!("{v:+.5}")).collect();
+    let tail_start = hidden_dim.saturating_sub(4);
+    let tail: Vec<String> = f32s
+        .iter()
+        .skip(tail_start)
+        .map(|v| format!("{v:+.5}"))
+        .collect();
+    let max = f32s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min = f32s.iter().cloned().fold(f32::INFINITY, f32::min);
+    let nan = f32s.iter().any(|v| v.is_nan());
+    let inf = f32s.iter().any(|v| v.is_infinite());
+    let rms = (f32s.iter().map(|v| v * v).sum::<f32>() / hidden_dim as f32).sqrt();
+    eprintln!(
+        "[debug-dump] {label}: head={:?} tail={:?} min={min:.4} max={max:.4} rms={rms:.4} nan={nan} inf={inf}",
+        head, tail
+    );
 }
 
 // ─── Logits ──────────────────────────────────────────────────────────────────

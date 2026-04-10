@@ -178,6 +178,12 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} pre-norm hidden"),
+            self.config.hidden_size,
+        );
         // 1. RMSNorm
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -185,6 +191,12 @@ impl Qwen3Model {
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.normed,
+            &format!("L{layer_idx} after-input-norm"),
+            self.config.hidden_size,
         );
 
         // 2. QKV projections
@@ -260,6 +272,12 @@ impl Qwen3Model {
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} after-attn+residual"),
+            self.config.hidden_size,
+        );
 
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -291,6 +309,12 @@ impl Qwen3Model {
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} layer-end"),
+            self.config.hidden_size,
+        );
 
         Ok(())
     }
@@ -321,6 +345,12 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} pre-norm hidden"),
+            self.config.hidden_size,
+        );
         // 1. RMSNorm → bufs.normed
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -328,6 +358,12 @@ impl Qwen3Model {
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.normed,
+            &format!("L{layer_idx} after-input-norm"),
+            self.config.hidden_size,
         );
 
         // 2. QKV projections → bufs.q_batch, bufs.k_batch, bufs.v_batch
@@ -391,6 +427,12 @@ impl Qwen3Model {
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         // Swap: hidden = attn_residual, bufs.hidden_out = old hidden_in (now free)
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} after-attn+residual"),
+            self.config.hidden_size,
+        );
 
         // 6. MLP RMSNorm → bufs.normed (reused for normed2; steps 1-4 are done)
         ops::rms_norm_batch_into(
@@ -426,6 +468,12 @@ impl Qwen3Model {
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         // Swap: hidden = layer output, bufs.hidden_out = attn_residual (free next layer)
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} layer-end"),
+            self.config.hidden_size,
+        );
 
         Ok(())
     }
