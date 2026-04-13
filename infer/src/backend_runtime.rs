@@ -6,9 +6,11 @@ use anyhow::{Result, anyhow};
 use log::error;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
+#[cfg(feature = "cpu")]
+use crate::cpu_backend::CpuBackend;
 #[cfg(feature = "metal")]
 use crate::metal_backend::MetalBackend;
 use crate::request_handle::{RequestHandle, SubmitError};
@@ -102,6 +104,29 @@ pub fn spawn_metal_runtime_handle_from_path(
     use std::path::Path;
 
     let mut backend = MetalBackend::new();
+    backend.load(Path::new(model_path))?;
+
+    let model_id = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path)
+        .to_string();
+
+    Ok(spawn_backend_runtime_handle(
+        backend,
+        Arc::<str>::from(model_id),
+        max_waiting,
+    ))
+}
+
+#[cfg(feature = "cpu")]
+pub fn spawn_cpu_runtime_handle_from_path(
+    model_path: &str,
+    max_waiting: usize,
+) -> Result<BackendRuntimeHandle> {
+    use std::path::Path;
+
+    let mut backend = CpuBackend::new();
     backend.load(Path::new(model_path))?;
 
     let model_id = Path::new(model_path)
@@ -557,5 +582,37 @@ mod tests {
             "should accept at most 1 active + 4 waiting, got {accepted}"
         );
         assert!(rejected >= 3, "should reject at least 3, got {rejected}");
+    }
+
+    #[cfg(feature = "cpu")]
+    #[tokio::test]
+    async fn cpu_runtime_handle_loads_and_streams() {
+        let model_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            model_dir.path().join("config.json"),
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        )
+        .expect("config");
+
+        let handle =
+            spawn_cpu_runtime_handle_from_path(model_dir.path().to_str().expect("utf8"), 8)
+                .expect("cpu runtime");
+
+        let (mut req, mut delta_rx) = make_request("smoke request", None);
+        req.max_tokens = 64;
+        handle.submit(req).expect("submit");
+
+        let mut text = String::new();
+        let mut finish_reason = None;
+        while let Some(delta) = delta_rx.recv().await {
+            text.push_str(&delta.text_delta);
+            if delta.finish_reason.is_some() {
+                finish_reason = delta.finish_reason;
+                break;
+            }
+        }
+
+        assert!(text.contains("CPU backend development response"));
+        assert_eq!(finish_reason, Some(FinishReason::Stop));
     }
 }

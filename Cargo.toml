@@ -13,6 +13,8 @@ cli = ["dep:clap", "dep:rustyline"]
 cuda = ["infer/cuda"]
 # Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
 no-cuda = ["infer/no-cuda"]
+# Development-oriented CPU backend. Use with --no-default-features --features cpu,no-cuda.
+cpu = ["infer/cpu"]
 # Metal backend via mlx-rs (Apple Silicon). Use with --no-default-features --features metal,no-cuda.
 metal = ["infer/metal"]
 

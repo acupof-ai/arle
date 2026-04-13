@@ -1,6 +1,6 @@
 # infer
 
-Pure Rust LLM inference engine. No PyTorch, no frameworks — CUDA and Metal backends, OpenAI-compatible API.
+Pure Rust LLM inference engine. No PyTorch, no frameworks — CUDA serving, Metal serial serving, and a development-oriented CPU backend with an OpenAI-compatible API.
 
 ## Performance vs SGLang
 
@@ -97,6 +97,23 @@ cargo build --release --no-default-features --features metal,no-cuda --lib
 
 The Metal backend (`MetalBackend`) implements the same `InferenceBackend` trait as the CUDA path. `metal_serve` is available today, but it still runs as a serial backend runtime rather than the CUDA-style continuous batching scheduler.
 
+### CPU backend (development smoke path)
+
+The CPU backend is intended for local request-path validation on machines without
+CUDA or Metal. It exercises the same backend/runtime/HTTP/CLI surfaces, but it
+does not claim production-grade CPU inference throughput.
+
+```bash
+# Reuse a public Hugging Face repo ID. The CPU backend only downloads runtime
+# assets such as config/tokenizer for smoke validation.
+cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
+  --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
+
+# Or run the serial HTTP server variant directly.
+cargo run -p infer --no-default-features --features cpu,no-cuda --bin cpu_serve -- \
+  --model-path Qwen/Qwen3-0.6B
+```
+
 <details>
 <summary>Environment variables</summary>
 
@@ -131,6 +148,7 @@ cargo run --release --bin infer -- --model-path models/Qwen3-4B
 | [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) | Full attention (GQA) | 8B | CUDA |
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Hybrid (24 linear + 8 full attn) | 4B | CUDA |
 | Qwen3 / Qwen3.5 MLX-converted checkpoints | Full attention / hybrid | 0.6B–4B | Metal |
+| Hugging Face repos with `config.json` and tokenizer assets | Request-path validation only | n/a | CPU backend |
 
 Model type is auto-detected from `config.json`.
 
@@ -148,6 +166,7 @@ Model type is auto-detected from `config.json`.
 - OpenAI `/v1/completions` and `/v1/chat/completions` (SSE streaming)
 - Prometheus `/metrics` and `/v1/stats`
 - Metal backend for Apple Silicon (serial `metal_serve`, single request at a time)
+- Development-oriented CPU backend for non-GPU smoke tests (`cpu_serve`, CPU CLI)
 
 ## API
 

@@ -3,29 +3,29 @@ mod chat;
 mod engine;
 mod tools;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::{self, BufRead, IsTerminal, Write};
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::path::PathBuf;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use log::info;
-#[cfg(all(not(feature = "cuda"), feature = "metal"))]
+#[cfg(all(not(feature = "cuda"), any(feature = "metal", feature = "cpu")))]
 use log::warn;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::error::ReadlineError;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::agent::{AgentSession, AgentSessionStats, AgentSettings};
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::engine::{AgentEngine, LoadedAgentEngine};
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::tools::builtin_tools;
 
 #[derive(Parser)]
@@ -58,7 +58,7 @@ struct Args {
     max_gpu_kv: Option<usize>,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplCommand {
     Help,
@@ -72,7 +72,7 @@ enum ReplCommand {
     Unknown(String),
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_repl(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
@@ -87,7 +87,7 @@ fn run_repl(
     run_piped_repl(engine, backend_name, max_turns, max_tokens, temperature)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_banner(
     engine: &dyn AgentEngine,
     backend_name: &str,
@@ -117,13 +117,13 @@ fn print_repl_banner(
     println!();
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".agent-infer-history"))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_interactive_repl(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
@@ -195,7 +195,7 @@ fn run_interactive_repl(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_piped_repl(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
@@ -250,7 +250,7 @@ fn run_piped_repl(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_repl_input(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
@@ -308,7 +308,7 @@ fn handle_repl_input(
     Ok(true)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn parse_repl_command(input: &str) -> Option<ReplCommand> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
@@ -333,7 +333,7 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn execute_repl_command(
     command: ReplCommand,
     engine: &mut dyn AgentEngine,
@@ -423,7 +423,7 @@ fn execute_repl_command(
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_help() {
     println!("Commands:");
     println!("  /help            Show this help");
@@ -436,7 +436,7 @@ fn print_repl_help() {
     println!("  /quit, /exit     Leave the REPL");
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_tools_help(tools: &[crate::tools::Tool]) {
     println!("Tools:");
     for tool in tools {
@@ -444,7 +444,7 @@ fn print_tools_help(tools: &[crate::tools::Tool]) {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_session_stats(
     stats: AgentSessionStats,
     max_turns: usize,
@@ -466,7 +466,7 @@ fn print_session_stats(
     println!("  temperature: {}", temperature);
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn resolve_cli_model_source(args: &Args) -> Result<String> {
     if let Some(model_path) = args.model_path.as_ref()
         && !model_path.trim().is_empty()
@@ -497,15 +497,16 @@ fn resolve_cli_model_source(args: &Args) -> Result<String> {
 fn main() -> Result<()> {
     infer::logging::init_default();
 
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
             "agent-infer requires a local inference backend. Rebuild with either \
-             the default `cuda` feature or `--no-default-features --features metal,no-cuda`."
+             the default `cuda` feature, `--no-default-features --features metal,no-cuda`, \
+             or `--no-default-features --features cpu,no-cuda`."
         );
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     {
         let args = Args::parse();
         let model_source = resolve_cli_model_source(&args)?;

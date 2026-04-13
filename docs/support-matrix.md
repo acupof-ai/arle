@@ -6,7 +6,7 @@ limited, and what validation exists for each area.
 If something is not listed as supported here, do not assume it is supported
 just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-10.
+State reflected here is based on repository evidence as of 2026-04-12.
 
 ---
 
@@ -16,7 +16,7 @@ State reflected here is based on repository evidence as of 2026-04-10.
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
 | Metal | Beta | Usable for local validation and serial serving, but not yet equivalent to CUDA serving runtime. |
-| no-cuda / CPU-only | Development-only | Build and test path for non-GPU logic. Not a production inference target. |
+| no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
 ---
 
@@ -26,7 +26,7 @@ State reflected here is based on repository evidence as of 2026-04-10.
 | --- | --- | --- | --- |
 | Linux x86_64 + NVIDIA GPU | CUDA | Supported | Release workflow builds CUDA artifacts; primary target. |
 | macOS Apple Silicon | Metal | Beta | CI checks and tests Metal/no-cuda surfaces. |
-| Linux/macOS without GPU | no-cuda | Development-only | Unit-test and compile-check path only. |
+| Linux/macOS without GPU | no-cuda | Development-oriented CPU backend | Unit tests, compile checks, and CPU backend smoke validation. |
 
 Notes:
 

@@ -47,8 +47,10 @@ infer-observability = { path = "../crates/infer-observability" }
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
 cuda = ["dep:cudarc", "dep:memmap2"]
-# Disable CUDA — allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
+# Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
 no-cuda = []
+# Development-oriented CPU backend for serial smoke tests and local validation.
+cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
 metal = ["dep:mlx-sys", "dep:libc"]
 default = ["cuda"]
@@ -130,6 +132,11 @@ required-features = ["metal"]
 name = "metal_serve"
 path = "src/bin/metal_serve.rs"
 required-features = ["metal"]
+
+[[bin]]
+name = "cpu_serve"
+path = "src/bin/cpu_serve.rs"
+required-features = ["cpu"]
 
 [[bench]]
 name = "tokenizer_bench"
