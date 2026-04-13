@@ -8,11 +8,11 @@ use tokio::sync::mpsc;
 
 #[cfg(feature = "cpu")]
 use super::cpu::CpuBackend;
+#[cfg(feature = "metal")]
+use super::metal::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
-#[cfg(feature = "metal")]
-use crate::metal_backend::MetalBackend;
 use crate::request_handle::{RequestHandle, SubmitError};
 use crate::scheduler::IncomingRequest;
 use crate::server_engine::{FinishReason, StreamDelta, Usage};

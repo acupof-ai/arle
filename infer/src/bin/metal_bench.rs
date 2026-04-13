@@ -279,7 +279,7 @@ fn main() -> Result<()> {
 #[cfg(feature = "metal")]
 fn run_bench() -> Result<()> {
     use infer::backend::InferenceBackend;
-    use infer::metal_backend::MetalBackend;
+    use infer::backend::metal::MetalBackend;
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();

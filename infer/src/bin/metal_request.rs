@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
+use infer::backend::metal::MetalBackend;
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
-use infer::metal_backend::MetalBackend;
 use infer::sampler::SamplingParams;
 use infer_chat::{ChatMessage, messages_to_prompt};
 

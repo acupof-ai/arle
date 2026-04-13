@@ -21,7 +21,7 @@ use infer::backend::InferenceBackend;
 #[cfg(feature = "cpu")]
 use infer::backend::cpu::CpuBackend;
 #[cfg(feature = "metal")]
-use infer::metal_backend::MetalBackend;
+use infer::backend::metal::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::sampler::SamplingParams;
 

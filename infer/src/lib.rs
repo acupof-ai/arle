@@ -27,7 +27,6 @@ pub mod http_server;
 pub mod kv_tier;
 pub mod logging;
 pub mod memory_planner;
-pub mod metal_backend;
 pub mod metrics;
 pub mod model_registry;
 pub mod prefix_cache;

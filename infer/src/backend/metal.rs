@@ -17,7 +17,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use infer::metal_backend::MetalBackend;
+//! use infer::backend::metal::MetalBackend;
 //! use infer::backend::InferenceBackend;
 //! use std::path::Path;
 //!
