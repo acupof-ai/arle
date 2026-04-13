@@ -142,6 +142,7 @@ pub fn spawn_cpu_runtime_handle_from_path(
     ))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_backend_runtime<B>(
     backend: B,
     mut rx: mpsc::UnboundedReceiver<IncomingRequest>,

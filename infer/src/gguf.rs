@@ -28,7 +28,7 @@ use half::{bf16, f16};
 
 // ── GGUF Constants ──
 
-const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" as little-endian u32 (bytes: 47 47 55 46)
+const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" as little-endian u32 (bytes: 47 47 55 46)
 
 /// GGUF tensor element types. Values match llama.cpp `enum ggml_type` exactly
 /// — see `ggml.h`. S / M / L in names like "Q4_K_M" are *file-level recipe
@@ -85,7 +85,7 @@ impl GgmlType {
     }
 
     /// Bytes per block for this type. Each block contains `block_size()` elements.
-    fn block_bytes(&self) -> usize {
+    fn block_bytes(self) -> usize {
         match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::BF16 | Self::I16 => 2,
@@ -106,7 +106,7 @@ impl GgmlType {
     }
 
     /// Elements per block.
-    fn block_size(&self) -> usize {
+    fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 | Self::I8 | Self::I16 | Self::I32 => 1,
             Self::Q8_0 | Self::Q8_1 | Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 => 32,
@@ -188,7 +188,7 @@ impl GgufTensorInfo {
     pub fn size_bytes(&self) -> usize {
         let n = self.numel();
         let bs = self.dtype.block_size();
-        let num_blocks = (n + bs - 1) / bs;
+        let num_blocks = n.div_ceil(bs);
         num_blocks * self.dtype.block_bytes()
     }
 }
@@ -222,7 +222,7 @@ impl GgufFile {
             );
         }
         let version = read_u32(&mut f)?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             bail!("Unsupported GGUF version: {version} (expected 2 or 3)");
         }
         let tensor_count = read_u64(&mut f)?;
@@ -299,8 +299,7 @@ impl GgufFile {
     pub fn is_quantized(&self, name: &str) -> bool {
         self.tensors
             .get(name)
-            .map(|t| !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
-            .unwrap_or(false)
+            .is_some_and(|t| !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
     }
 
     /// Read Q8_0 tensor in packed format: split into (qweight: Vec<i8>, scales: Vec<bf16>).
@@ -309,6 +308,7 @@ impl GgufFile {
     ///   - qweight: `[numel]` i8 values (one per element)
     ///   - scales: `[rows × num_groups]` bf16 (one per 32-element block)
     pub fn read_tensor_q8_packed(&self, name: &str) -> Result<(Vec<i8>, Vec<bf16>, usize)> {
+        const BLOCK_SIZE: usize = 32;
         let info = self
             .tensors
             .get(name)
@@ -318,7 +318,6 @@ impl GgufFile {
         }
         let raw = self.read_tensor_raw(name)?;
         let numel = info.numel();
-        const BLOCK_SIZE: usize = 32;
         let num_blocks = numel / BLOCK_SIZE;
 
         let mut qweight = Vec::with_capacity(numel);
@@ -550,15 +549,19 @@ pub struct GgufModelConfig {
 fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16>> {
     match dtype {
         GgmlType::BF16 => {
-            // Direct reinterpret
             assert_eq!(raw.len(), numel * 2);
-            let slice = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<bf16>(), numel) };
-            Ok(slice.to_vec())
+            Ok(raw
+                .chunks_exact(2)
+                .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect())
         }
         GgmlType::F16 => {
             assert_eq!(raw.len(), numel * 2);
-            let f16s = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<f16>(), numel) };
-            Ok(f16s.iter().map(|v| bf16::from_f32(v.to_f32())).collect())
+            Ok(raw
+                .chunks_exact(2)
+                .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]))
+                .map(|v| bf16::from_f32(v.to_f32()))
+                .collect())
         }
         GgmlType::I8 => {
             assert_eq!(raw.len(), numel);
@@ -569,16 +572,22 @@ fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16
         }
         GgmlType::I16 => {
             assert_eq!(raw.len(), numel * 2);
-            let i16s = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<i16>(), numel) };
-            Ok(i16s.iter().map(|&v| bf16::from_f32(v as f32)).collect())
+            Ok(raw
+                .chunks_exact(2)
+                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                .map(|v| bf16::from_f32(v as f32))
+                .collect())
         }
         GgmlType::F32 => {
             assert_eq!(raw.len(), numel * 4);
-            let f32s = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<f32>(), numel) };
-            Ok(f32s.iter().map(|v| bf16::from_f32(*v)).collect())
+            Ok(raw
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .map(bf16::from_f32)
+                .collect())
         }
-        GgmlType::Q8_0 => dequant_q8_0(raw, numel),
-        GgmlType::Q4_0 => dequant_q4_0(raw, numel),
+        GgmlType::Q8_0 => Ok(dequant_q8_0(raw, numel)),
+        GgmlType::Q4_0 => Ok(dequant_q4_0(raw, numel)),
         GgmlType::Q3_K => dequant_q3_k(raw, numel),
         GgmlType::Q4_K => dequant_q4_k(raw, numel),
         GgmlType::Q5_K => dequant_q5_k(raw, numel),
@@ -588,7 +597,7 @@ fn dequant_to_bf16(raw: &[u8], dtype: GgmlType, numel: usize) -> Result<Vec<bf16
 }
 
 /// Q8_0: 32 elements per block. Layout: f16 scale + 32× i8.
-fn dequant_q8_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+fn dequant_q8_0(raw: &[u8], numel: usize) -> Vec<bf16> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 2 + BLOCK_SIZE; // f16 + 32 × i8
     let num_blocks = numel / BLOCK_SIZE;
@@ -603,11 +612,11 @@ fn dequant_q8_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             out.push(bf16::from_f32(val as f32 * scale));
         }
     }
-    Ok(out)
+    out
 }
 
 /// Q4_0: 32 elements per block. Layout: f16 scale + 16 bytes (2 nibbles each).
-fn dequant_q4_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
+fn dequant_q4_0(raw: &[u8], numel: usize) -> Vec<bf16> {
     const BLOCK_SIZE: usize = 32;
     const BLOCK_BYTES: usize = 2 + 16; // f16 + 16 bytes packed nibbles
     let num_blocks = numel / BLOCK_SIZE;
@@ -625,18 +634,20 @@ fn dequant_q4_0(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             out.push(bf16::from_f32(hi as f32 * scale));
         }
     }
-    Ok(out)
+    out
 }
 
 /// Q4_K (Q4_K_M/Q4_K_S): 256 elements per superblock (144 bytes). Mirrors
 /// llama.cpp's `dequantize_row_q4_K` exactly.
 ///
-/// Element layout — NOT the naive "2 elements per ql byte" interpretation!
+/// Element layout:
+///
+/// NOT the naive "2 elements per ql byte" interpretation!
 /// The superblock is 4 outer iterations of 64 elements. Each iteration reads
 /// 32 contiguous ql bytes and splits them into two 32-element halves:
 ///   - first half  uses `ql[l].low  nibble` with scale `sc[2*iter + 0]`
 ///   - second half uses `ql[l].high nibble` with scale `sc[2*iter + 1]`
-///   Then ql advances by 32 bytes → next outer iteration.
+///     Then ql advances by 32 bytes → next outer iteration.
 ///
 /// Block layout:
 ///   d(f16) | dmin(f16) | scales(12B) | qs(128B)
@@ -747,16 +758,16 @@ fn dequant_q3_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
             let shift = 2 * (i / 4);
             (scales_raw[byte] >> shift) & 0x03
         };
-        for i in 0..16 {
+        for (i, scale) in scales.iter_mut().enumerate() {
             let u6: u8 = low_nibble(i) | (high_bits(i) << 4);
-            scales[i] = (u6 as i32 - 32) as i8;
+            *scale = (u6 as i32 - 32) as i8;
         }
 
         for j in 0..QK_K {
             // 2-bit value from qs (4 per byte)
             let q2 = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
             // High bit from hmask
-            let hbit = ((hmask[j / 8] >> (j % 8)) & 1) as u8;
+            let hbit = (hmask[j / 8] >> (j % 8)) & 1;
             // 3-bit value
             let q3 = q2 | (hbit << 2);
             let sc = scales[j / 16] as f32;
@@ -821,12 +832,12 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
                 let ql_byte = ql_slice[l];
                 // First half: low nibble + qh[l] bit (2*iter + 0)
                 let lo_nib = ql_byte & 0x0F;
-                let hbit_lo = ((qh[l] >> j_lo) & 1) as u8;
+                let hbit_lo = (qh[l] >> j_lo) & 1;
                 let q5_lo = lo_nib | (hbit_lo << 4);
                 out[out_base + j_lo * 32 + l] = bf16::from_f32(q5_lo as f32 * d1 - m1);
                 // Second half: high nibble + qh[l] bit (2*iter + 1)
                 let hi_nib = ql_byte >> 4;
-                let hbit_hi = ((qh[l] >> j_hi) & 1) as u8;
+                let hbit_hi = (qh[l] >> j_hi) & 1;
                 let q5_hi = hi_nib | (hbit_hi << 4);
                 out[out_base + j_hi * 32 + l] = bf16::from_f32(q5_hi as f32 * d2 - m2);
             }
@@ -842,11 +853,13 @@ fn dequant_q5_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
 ///   - qh: 64 bytes (upper 2 bits of 6-bit values, packed 4 per byte)
 ///   - scales: 16 bytes (i8 per 16-element sub-block)
 ///   - d: f16 (2 bytes) — super-block scale
+///
 /// Q6_K: 256 elements per superblock (210 bytes). Mirrors llama.cpp's
-/// `dequantize_row_q6_K` exactly — the layout is NOT the naive "low nibble then
-/// high nibble of each ql byte". Each half of 128 elements interleaves across
-/// four 32-element quadrants drawn from `ql[l]`/`ql[l+32]` low/high nibbles and
-/// `qh[l]` bit pairs.
+/// `dequantize_row_q6_K` exactly.
+///
+/// The layout is NOT the naive "low nibble then high nibble of each ql byte".
+/// Each half of 128 elements interleaves across four 32-element quadrants drawn
+/// from `ql[l]`/`ql[l+32]` low/high nibbles and `qh[l]` bit pairs.
 ///
 /// Block layout:
 ///   ql:      128 bytes (lower 4 bits of each weight, 2 per byte)
@@ -884,7 +897,7 @@ fn dequant_q6_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
 
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = (((ql[l] & 0x0F) | (((qh[l] >> 0) & 0x03) << 4)) as i32 - 32) as i8;
+                let q1 = (((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32 - 32) as i8;
                 let q2 = (((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32 - 32) as i8;
                 let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32 - 32) as i8;
                 let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i32 - 32) as i8;
@@ -908,6 +921,7 @@ fn dequant_q6_k(raw: &[u8], numel: usize) -> Result<Vec<bf16>> {
 /// - `blk.0.ffn_gate.weight` → `model.layers.0.mlp.gate_proj.weight`
 /// - `output_norm.weight` → `model.norm.weight`
 /// - `output.weight` → `lm_head.weight`
+///
 /// Map GGUF tensor name to HuggingFace name with a configurable prefix.
 ///
 /// `prefix` is typically `"model"` for Qwen3/Llama or `"model.language_model"` for Qwen3.5.
@@ -951,8 +965,9 @@ pub fn map_gguf_name_with_prefix(gguf_name: &str, prefix: &str) -> String {
                 "ffn_gate.weight" => "mlp.gate_proj.weight",
                 "ffn_up.weight" => "mlp.up_proj.weight",
                 "ffn_down.weight" => "mlp.down_proj.weight",
-                "ffn_norm.weight" => "post_attention_layernorm.weight",
-                "post_attention_norm.weight" => "post_attention_layernorm.weight",
+                "ffn_norm.weight" | "post_attention_norm.weight" => {
+                    "post_attention_layernorm.weight"
+                }
                 // Fallthrough
                 other => other,
             };
@@ -1122,7 +1137,7 @@ mod tests {
             block.push(i);
         }
 
-        let result = dequant_q8_0(&block, 32).unwrap();
+        let result = dequant_q8_0(&block, 32);
         assert_eq!(result.len(), 32);
         // First element: 0 * 0.5 = 0.0
         assert_eq!(result[0], bf16::from_f32(0.0));
@@ -1142,7 +1157,7 @@ mod tests {
             block.push(0x98); // hi=9, lo=8
         }
 
-        let result = dequant_q4_0(&block, 32).unwrap();
+        let result = dequant_q4_0(&block, 32);
         assert_eq!(result.len(), 32);
         // lo = (8 - 8) * 1.0 = 0.0
         assert_eq!(result[0], bf16::from_f32(0.0));
