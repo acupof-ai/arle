@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -547,8 +547,8 @@ fn execute_python(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_sandbox_backend, default_workdir, resolved_python_executable,
-        run_command_with_timeout,
+        SandboxConfig, TimedCommandResult, active_sandbox_backend, default_workdir,
+        resolved_python_executable, run_command_with_timeout,
     };
     use std::process::Command;
     use std::time::Duration;
@@ -581,10 +581,10 @@ mod tests {
         let mut cmd = bare_shell_command("printf 'hello'");
         let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).expect("run");
         match result {
-            super::TimedCommandResult::Finished(output) => {
+            TimedCommandResult::Finished(output) => {
                 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
             }
-            super::TimedCommandResult::TimedOut(_) => panic!("command unexpectedly timed out"),
+            TimedCommandResult::TimedOut(_) => panic!("command unexpectedly timed out"),
         }
     }
 
@@ -596,7 +596,7 @@ mod tests {
         let mut cmd = bare_shell_command("sleep 2");
         let result = run_command_with_timeout(&mut cmd, Duration::from_millis(100))
             .expect("run with timeout");
-        assert!(matches!(result, super::TimedCommandResult::TimedOut(_)));
+        assert!(matches!(result, TimedCommandResult::TimedOut(_)));
     }
 
     #[cfg(target_os = "macos")]

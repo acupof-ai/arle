@@ -139,6 +139,11 @@ name = "cpu_serve"
 path = "src/bin/cpu_serve.rs"
 required-features = ["cpu"]
 
+[[example]]
+name = "regenerate_test_data"
+path = "examples/regenerate_test_data.rs"
+required-features = ["cuda"]
+
 [[bench]]
 name = "tokenizer_bench"
 harness = false

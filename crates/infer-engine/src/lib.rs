@@ -14,6 +14,8 @@ use infer_agent::{
 #[cfg(feature = "cuda")]
 use infer::bootstrap::EngineOptions;
 #[cfg(feature = "cuda")]
+use infer::server_engine::CompleteRequest;
+#[cfg(feature = "cuda")]
 use infer::server_engine::LoadedServerEngine;
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
