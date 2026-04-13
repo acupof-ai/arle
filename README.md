@@ -125,12 +125,14 @@ Workspace split summary:
 - `agent-infer` is now a thin binary wrapper.
 - `infer-cli` owns the REPL/CLI flow.
 - `infer-engine` owns model discovery, logging init, backend loading, and the
-  adapter layer exposed to `infer-agent`.
+  runtime adapter boundary; it should not depend on `infer-agent` internals.
 - `infer` continues to own the HTTP server, scheduler, runtime, and backend
   implementations.
 
 See [docs/architecture.md](docs/architecture.md) and [crates/README.md](crates/README.md)
-for the current package boundaries.
+for the current package boundaries. This is still an interim Phase 1 split:
+the control-plane crates are separated, but the lower-level scheduler/runtime
+atomization is still pending.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -221,9 +223,11 @@ Current package boundary for agent mode:
 
 - `agent-infer` -> thin binary wrapper
 - `infer-cli` -> REPL and slash commands
-- `infer-engine` -> backend loading and model auto-discovery
+- `infer-engine` -> backend loading and model auto-discovery, with no control-plane dependency back edge
 - `infer-agent` -> conversation loop and tool-call recovery
-- `infer-tools` / `infer-chat` -> tool execution and shared protocol
+- `infer-tools` / `infer-chat` -> shared tool definitions, execution helpers, and protocol types
+
+The remaining Phase 1 work is now below the control-plane boundary: tightening scheduler/runtime extraction, keeping observability semantics stable, and deferring deeper policy/KV atomization to later phases.
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 

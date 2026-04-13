@@ -1,12 +1,12 @@
 //! Shared observability schema across engine components.
 
-use infer_core::{InferenceMode, RequestId, RequestPhase};
+use infer_core::{InferenceMode, RequestEventKind, RequestId};
 
 /// Minimal event model for request lifecycle tracing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineEvent {
     pub request_id: RequestId,
-    pub phase: RequestPhase,
+    pub kind: RequestEventKind,
     pub mode: Option<InferenceMode>,
 }
 
@@ -44,7 +44,7 @@ mod tests {
         let sink = VecSink::default();
         let event = EngineEvent {
             request_id: RequestId(1),
-            phase: RequestPhase::Prefill,
+            kind: RequestEventKind::PrefillStarted,
             mode: Some(InferenceMode::Prefill),
         };
         sink.emit(&event);

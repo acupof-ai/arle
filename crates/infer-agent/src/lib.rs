@@ -5,68 +5,75 @@ use infer_chat::{
     ChatRole, ParsedAssistantResponse, ProtocolChatMessage, ProtocolToolCall,
     ProtocolToolDefinition,
 };
+use infer_engine::{AgentCompleteRequest, AgentEngine};
 use log::info;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-
-use infer_tools::{Tool, execute_tool_call};
+use serde_json::Value;
 
 pub type Message = ProtocolChatMessage;
 #[cfg_attr(not(test), allow(dead_code))]
 pub type ToolCall = infer_chat::ToolCall;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentCompleteRequest {
-    pub prompt: String,
-    pub max_tokens: usize,
-    pub temperature: f32,
-    pub stop: Option<Vec<String>>,
-    pub logprobs: bool,
+pub trait ToolExecutor {
+    fn execute(&self, tool_call: &ProtocolToolCall) -> String;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AgentFinishReason {
-    Length,
-    Stop,
+pub trait ToolPolicy {
+    fn recover_tool_calls_from_user_request(
+        &self,
+        _user_input: &str,
+        _tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        None
+    }
+
+    fn recover_tool_calls_from_draft(
+        &self,
+        _draft: &str,
+        _tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        None
+    }
+
+    fn should_repair_tool_calls(&self, _text: &str) -> bool {
+        false
+    }
+
+    fn finalize_response_text(
+        &self,
+        _user_input: &str,
+        content: String,
+        _last_tool_name: Option<&str>,
+        _last_tool_scalar_result: Option<&str>,
+        _tool_calls_executed: usize,
+    ) -> String {
+        content
+    }
+
+    fn finalize_after_tool_execution(
+        &self,
+        _user_input: &str,
+        _last_tool_name: Option<&str>,
+        _last_tool_scalar_result: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AgentUsage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentCompleteOutput {
-    pub text: String,
-    pub finish_reason: AgentFinishReason,
-    pub usage: AgentUsage,
-    pub token_logprobs: Vec<f32>,
-}
-
-pub trait AgentEngine {
-    fn model_id(&self) -> &str;
-    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput>;
-}
-
-fn format_prompt(messages: &[Message], tools: &[Tool]) -> String {
-    let protocol_tools: Vec<ProtocolToolDefinition> =
-        tools.iter().map(Tool::to_definition).collect();
-    infer_chat::protocol_messages_to_prompt(messages, &protocol_tools)
+fn format_prompt(messages: &[Message], tools: &[ProtocolToolDefinition]) -> String {
+    infer_chat::protocol_messages_to_prompt(messages, tools)
 }
 
 fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
     infer_chat::parse_protocol_tool_calls(text)
 }
 
-const SYSTEM_PROMPT: &str = r#"You are a local CLI assistant with shell and python tools.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a local CLI assistant.
 Answer briefly.
 If a tool is needed, emit a <tool_call> block immediately with no explanation first.
 After tool results, answer directly.
 If the user asks for an exact format, output exactly that.
-Do not expose chain-of-thought.
-Prefer python for arithmetic and structured computation."#;
+Do not expose chain-of-thought."#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -75,11 +82,22 @@ pub struct AgentSettings {
     pub temperature: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentTraceEvent {
+    AssistantNote(String),
+    ToolCall {
+        name: String,
+        arguments: Value,
+        result: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentTurnResult {
     pub text: String,
     pub tool_calls_executed: usize,
     pub max_turns_reached: bool,
+    pub trace_events: Vec<AgentTraceEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +123,13 @@ impl Default for AgentSession {
 
 impl AgentSession {
     pub fn new() -> Self {
+        Self::with_system_prompt(DEFAULT_SYSTEM_PROMPT)
+    }
+
+    pub fn with_system_prompt(system_prompt: impl Into<String>) -> Self {
+        let system_prompt = system_prompt.into();
         Self {
-            messages: vec![Message::system(SYSTEM_PROMPT)],
+            messages: vec![Message::system(&system_prompt)],
         }
     }
 
@@ -169,11 +192,13 @@ impl AgentSession {
         &self.messages
     }
 
-    pub fn run_turn<E: AgentEngine + ?Sized>(
+    pub fn run_turn<E: AgentEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
         &mut self,
         engine: &mut E,
         user_input: &str,
-        tools: &[Tool],
+        tools: &[ProtocolToolDefinition],
+        tool_executor: &X,
+        tool_policy: &P,
         settings: AgentSettings,
     ) -> Result<AgentTurnResult> {
         self.messages.push(Message::user(user_input));
@@ -181,20 +206,23 @@ impl AgentSession {
         let mut tool_calls_executed = 0usize;
         let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
+        let mut trace_events = Vec::new();
 
-        if let Some(initial) = extract_tool_calls_from_user_request(user_input, tools) {
+        if let Some(initial) = tool_policy.recover_tool_calls_from_user_request(user_input, tools) {
             info!("Recovered tool call(s) from user request before first model turn");
             self.messages
                 .push(Message::assistant("", initial.tool_calls.clone()));
             execute_tool_calls(
                 &initial.tool_calls,
+                tool_executor,
                 &mut self.messages,
                 &mut tool_calls_executed,
                 &mut last_tool_name,
                 &mut last_tool_scalar_result,
+                &mut trace_events,
             );
 
-            if let Some(text) = finalize_after_tool_execution(
+            if let Some(text) = tool_policy.finalize_after_tool_execution(
                 user_input,
                 last_tool_name.as_deref(),
                 last_tool_scalar_result.as_deref(),
@@ -203,6 +231,7 @@ impl AgentSession {
                     text,
                     tool_calls_executed,
                     max_turns_reached: false,
+                    trace_events,
                 });
             }
         }
@@ -232,12 +261,13 @@ impl AgentSession {
 
             let mut parsed = parse_tool_calls(&output.text);
             if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
-                if let Some(recovered) = extract_tool_calls_from_user_request(user_input, tools)
-                    .or_else(|| extract_tool_calls_from_draft(&output.text, tools))
+                if let Some(recovered) = tool_policy
+                    .recover_tool_calls_from_user_request(user_input, tools)
+                    .or_else(|| tool_policy.recover_tool_calls_from_draft(&output.text, tools))
                 {
                     info!("Recovered tool call(s) via deterministic extraction");
                     parsed = recovered;
-                } else if maybe_needs_tool_repair(&parsed.content)
+                } else if tool_policy.should_repair_tool_calls(&parsed.content)
                     && let Some(repaired) =
                         repair_tool_calls(engine, &self.messages, tools, settings, &output.text)?
                 {
@@ -246,7 +276,7 @@ impl AgentSession {
                 }
             }
 
-            let content = finalize_response_text(
+            let content = tool_policy.finalize_response_text(
                 user_input,
                 parsed.content,
                 last_tool_name.as_deref(),
@@ -263,22 +293,25 @@ impl AgentSession {
                     text: content,
                     tool_calls_executed,
                     max_turns_reached: false,
+                    trace_events,
                 });
             }
 
             if !content.is_empty() {
-                println!("\x1b[2m{}\x1b[0m", content);
+                trace_events.push(AgentTraceEvent::AssistantNote(content));
             }
 
             execute_tool_calls(
                 &tool_calls,
+                tool_executor,
                 &mut self.messages,
                 &mut tool_calls_executed,
                 &mut last_tool_name,
                 &mut last_tool_scalar_result,
+                &mut trace_events,
             );
 
-            if let Some(text) = finalize_after_tool_execution(
+            if let Some(text) = tool_policy.finalize_after_tool_execution(
                 user_input,
                 last_tool_name.as_deref(),
                 last_tool_scalar_result.as_deref(),
@@ -287,6 +320,7 @@ impl AgentSession {
                     text,
                     tool_calls_executed,
                     max_turns_reached: false,
+                    trace_events,
                 });
             }
         }
@@ -295,6 +329,7 @@ impl AgentSession {
             text: "(max turns reached - agent stopped)".to_string(),
             tool_calls_executed,
             max_turns_reached: true,
+            trace_events,
         })
     }
 }
@@ -406,335 +441,28 @@ impl StoredToolCall {
     }
 }
 
-fn maybe_needs_tool_repair(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "tool",
-        "function",
-        "python",
-        "shell",
-        "execute",
-        "run the code",
-        "call the",
-        "use the",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn extract_tool_calls_from_user_request(
-    user_input: &str,
-    tools: &[Tool],
-) -> Option<ParsedAssistantResponse> {
-    if tool_available(tools, "python") && mentions_python_tool(user_input) {
-        if let Some(code) = extract_python_code(user_input) {
-            return Some(single_tool_response("python", json!({ "code": code })));
-        }
-        if let Some(expr) = extract_arithmetic_expression(user_input) {
-            return Some(single_tool_response(
-                "python",
-                json!({ "code": format!("print({expr})") }),
-            ));
-        }
-    }
-
-    if tool_available(tools, "shell")
-        && mentions_shell_tool(user_input)
-        && let Some(command) = extract_shell_command(user_input)
-    {
-        return Some(single_tool_response("shell", json!({ "command": command })));
-    }
-
-    if tool_available(tools, "shell") && asks_for_file_listing(user_input) {
-        return Some(single_tool_response(
-            "shell",
-            json!({ "command": default_directory_listing_command() }),
-        ));
-    }
-
-    None
-}
-
-fn extract_tool_calls_from_draft(draft: &str, tools: &[Tool]) -> Option<ParsedAssistantResponse> {
-    if tool_available(tools, "python")
-        && let Some(code) = extract_python_code(draft)
-    {
-        return Some(single_tool_response("python", json!({ "code": code })));
-    }
-
-    if tool_available(tools, "shell")
-        && mentions_shell_tool(draft)
-        && let Some(command) = extract_shell_command(draft)
-    {
-        return Some(single_tool_response("shell", json!({ "command": command })));
-    }
-
-    None
-}
-
-fn finalize_response_text(
-    user_input: &str,
-    content: String,
-    last_tool_name: Option<&str>,
-    last_tool_scalar_result: Option<&str>,
-    tool_calls_executed: usize,
-) -> String {
-    if tool_calls_executed == 0 {
-        return content;
-    }
-
-    if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
-        return "Listed the current directory above.".to_string();
-    }
-
-    let Some(tool_result) = last_tool_scalar_result else {
-        return content;
-    };
-
-    if content.trim().is_empty() || asks_for_exact_scalar_output(user_input) {
-        return tool_result.to_string();
-    }
-
-    content
-}
-
-fn finalize_after_tool_execution(
-    user_input: &str,
-    last_tool_name: Option<&str>,
-    last_tool_scalar_result: Option<&str>,
-) -> Option<String> {
-    if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
-        return Some("Listed the current directory above.".to_string());
-    }
-
-    if asks_for_exact_scalar_output(user_input)
-        && let Some(result) = last_tool_scalar_result
-    {
-        return Some(result.to_string());
-    }
-
-    None
-}
-
-fn single_tool_response(name: &str, arguments: serde_json::Value) -> ParsedAssistantResponse {
-    ParsedAssistantResponse {
-        content: String::new(),
-        tool_calls: vec![ProtocolToolCall::new(name, arguments)],
-    }
-}
-
 fn execute_tool_calls(
     tool_calls: &[ProtocolToolCall],
+    tool_executor: &dyn ToolExecutor,
     messages: &mut Vec<Message>,
     tool_calls_executed: &mut usize,
     last_tool_name: &mut Option<String>,
     last_tool_scalar_result: &mut Option<String>,
+    trace_events: &mut Vec<AgentTraceEvent>,
 ) {
-    println!();
     for tool_call in tool_calls {
         *tool_calls_executed += 1;
-        println!(
-            "\x1b[33m[tool: {}]\x1b[0m {}",
-            tool_call.name,
-            serde_json::to_string(&tool_call.arguments).unwrap_or_default()
-        );
-
-        let result = execute_tool_call(tool_call);
-        let display_result = if result.len() > 500 {
-            format!("{}... ({} chars total)", &result[..500], result.len())
-        } else {
-            result.clone()
-        };
-
-        println!("\x1b[36m{}\x1b[0m", display_result);
-        println!();
+        let result = tool_executor.execute(tool_call);
 
         *last_tool_scalar_result = scalar_tool_result(&result);
         *last_tool_name = Some(tool_call.name.clone());
+        trace_events.push(AgentTraceEvent::ToolCall {
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+            result: result.clone(),
+        });
         messages.push(Message::tool_result(&tool_call.name, &result));
     }
-}
-
-fn tool_available(tools: &[Tool], name: &str) -> bool {
-    tools.iter().any(|tool| tool.name == name)
-}
-
-fn mentions_python_tool(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("python tool")
-        || lower.contains("python function")
-        || lower.contains("use python")
-        || lower.contains("run python")
-}
-
-fn mentions_shell_tool(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("shell tool")
-        || lower.contains("shell command")
-        || lower.contains("use shell")
-        || lower.contains("run shell")
-}
-
-fn asks_for_file_listing(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "list files",
-        "show files",
-        "what files",
-        "which files",
-        "current directory",
-        "local files",
-        "files here",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-        || [
-            "哪些文件",
-            "有哪些文件",
-            "有什么文件",
-            "列出文件",
-            "当前目录",
-            "本地文件",
-            "目录下",
-        ]
-        .iter()
-        .any(|needle| text.contains(needle))
-}
-
-#[cfg(target_os = "windows")]
-fn default_directory_listing_command() -> &'static str {
-    "cd && dir /a"
-}
-
-#[cfg(not(target_os = "windows"))]
-fn default_directory_listing_command() -> &'static str {
-    "pwd && ls -la"
-}
-
-fn extract_python_code(text: &str) -> Option<String> {
-    extract_fenced_code_block(text, &["python", "py"])
-        .or_else(|| extract_balanced_call(text, "print("))
-}
-
-fn extract_shell_command(text: &str) -> Option<String> {
-    extract_fenced_code_block(text, &["bash", "sh", "shell"]).or_else(|| {
-        extract_backticked_snippet(text).and_then(|snippet| {
-            if snippet.contains('\n') || snippet.trim().is_empty() {
-                None
-            } else {
-                Some(snippet)
-            }
-        })
-    })
-}
-
-fn extract_fenced_code_block(text: &str, languages: &[&str]) -> Option<String> {
-    let mut remaining = text;
-    while let Some(start) = remaining.find("```") {
-        remaining = &remaining[start + 3..];
-        let Some(end) = remaining.find("```") else {
-            break;
-        };
-
-        let block = &remaining[..end];
-        let (first_line, rest) = block.split_once('\n').unwrap_or((block, ""));
-        let language = first_line.trim().to_ascii_lowercase();
-        if languages.iter().any(|candidate| language == *candidate) {
-            let code = rest.trim();
-            if !code.is_empty() {
-                return Some(code.to_string());
-            }
-        }
-
-        remaining = &remaining[end + 3..];
-    }
-
-    None
-}
-
-fn extract_backticked_snippet(text: &str) -> Option<String> {
-    let start = text.find('`')?;
-    let rest = &text[start + 1..];
-    let end = rest.find('`')?;
-    let snippet = rest[..end].trim();
-    if snippet.is_empty() {
-        None
-    } else {
-        Some(snippet.to_string())
-    }
-}
-
-fn extract_balanced_call(text: &str, start_pattern: &str) -> Option<String> {
-    let start = text.find(start_pattern)?;
-    let mut depth = 1usize;
-
-    for (offset, ch) in text[start + start_pattern.len()..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let end = start + start_pattern.len() + offset + ch.len_utf8();
-                    let snippet = text[start..end]
-                        .trim_matches(|c| matches!(c, '`' | '"' | '\''))
-                        .trim();
-                    if !snippet.is_empty() {
-                        return Some(snippet.to_string());
-                    }
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn extract_arithmetic_expression(text: &str) -> Option<String> {
-    let mut best = String::new();
-    let mut current = String::new();
-    let mut has_digit = false;
-    let mut has_operator = false;
-
-    for ch in text.chars().chain(std::iter::once('\n')) {
-        let allowed = ch.is_ascii_digit()
-            || ch.is_ascii_whitespace()
-            || matches!(ch, '+' | '-' | '*' | '/' | '%' | '(' | ')');
-        if allowed {
-            current.push(ch);
-            has_digit |= ch.is_ascii_digit();
-            has_operator |= matches!(ch, '+' | '-' | '*' | '/' | '%');
-            continue;
-        }
-
-        let candidate = current.trim();
-        if has_digit && has_operator && candidate.len() > best.len() {
-            best = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
-        }
-
-        current.clear();
-        has_digit = false;
-        has_operator = false;
-    }
-
-    if best.is_empty() { None } else { Some(best) }
-}
-
-fn asks_for_exact_scalar_output(user_input: &str) -> bool {
-    let lower = user_input.to_ascii_lowercase();
-    [
-        "answer with just",
-        "reply with just",
-        "nothing else",
-        "the token only",
-        "the word only",
-        "just the integer",
-        "integer only",
-        "number only",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn scalar_tool_result(result: &str) -> Option<String> {
@@ -763,7 +491,7 @@ fn scalar_tool_result(result: &str) -> Option<String> {
 fn repair_tool_calls<E: AgentEngine + ?Sized>(
     engine: &mut E,
     messages: &[Message],
-    tools: &[Tool],
+    tools: &[ProtocolToolDefinition],
     settings: AgentSettings,
     assistant_draft: &str,
 ) -> Result<Option<ParsedAssistantResponse>> {
@@ -803,13 +531,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
-    use infer_tools::Tool;
+    use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
+    use infer_engine::{
+        AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentUsage,
+    };
+    use infer_tools::BuiltinToolPolicyHooks;
     use serde_json::json;
 
-    use super::{
-        AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentSession,
-        AgentSettings, AgentUsage, Message, ToolCall,
-    };
+    use super::{AgentSession, AgentSettings, Message, ToolCall, ToolExecutor, ToolPolicy};
 
     struct FakeEngine {
         outputs: VecDeque<String>,
@@ -857,16 +586,86 @@ mod tests {
         }
     }
 
-    fn python_tool() -> Tool {
-        Tool {
-            name: "python".into(),
-            description: "Run Python".into(),
-            parameters: json!({
+    struct TestToolExecutor;
+
+    impl ToolExecutor for TestToolExecutor {
+        fn execute(&self, tool_call: &ProtocolToolCall) -> String {
+            infer_tools::execute_tool_call(tool_call)
+        }
+    }
+
+    fn tool_executor() -> TestToolExecutor {
+        TestToolExecutor
+    }
+
+    struct TestToolPolicy;
+
+    impl ToolPolicy for TestToolPolicy {
+        fn recover_tool_calls_from_user_request(
+            &self,
+            user_input: &str,
+            tools: &[ProtocolToolDefinition],
+        ) -> Option<ParsedAssistantResponse> {
+            BuiltinToolPolicyHooks.recover_tool_calls_from_user_request(user_input, tools)
+        }
+
+        fn recover_tool_calls_from_draft(
+            &self,
+            draft: &str,
+            tools: &[ProtocolToolDefinition],
+        ) -> Option<ParsedAssistantResponse> {
+            BuiltinToolPolicyHooks.recover_tool_calls_from_draft(draft, tools)
+        }
+
+        fn should_repair_tool_calls(&self, text: &str) -> bool {
+            BuiltinToolPolicyHooks.should_repair_tool_calls(text)
+        }
+
+        fn finalize_response_text(
+            &self,
+            user_input: &str,
+            content: String,
+            last_tool_name: Option<&str>,
+            last_tool_scalar_result: Option<&str>,
+            tool_calls_executed: usize,
+        ) -> String {
+            BuiltinToolPolicyHooks.finalize_response_text(
+                user_input,
+                content,
+                last_tool_name,
+                last_tool_scalar_result,
+                tool_calls_executed,
+            )
+        }
+
+        fn finalize_after_tool_execution(
+            &self,
+            user_input: &str,
+            last_tool_name: Option<&str>,
+            last_tool_scalar_result: Option<&str>,
+        ) -> Option<String> {
+            BuiltinToolPolicyHooks.finalize_after_tool_execution(
+                user_input,
+                last_tool_name,
+                last_tool_scalar_result,
+            )
+        }
+    }
+
+    fn tool_policy() -> TestToolPolicy {
+        TestToolPolicy
+    }
+
+    fn python_tool() -> ProtocolToolDefinition {
+        ProtocolToolDefinition::new(
+            "python",
+            "Run Python",
+            json!({
                 "type": "object",
                 "properties": { "code": { "type": "string" } },
                 "required": ["code"]
             }),
-        }
+        )
     }
 
     fn python_tool_available() -> bool {
@@ -875,16 +674,16 @@ mod tests {
             .eq("1")
     }
 
-    fn shell_tool() -> Tool {
-        Tool {
-            name: "shell".into(),
-            description: "Run shell".into(),
-            parameters: json!({
+    fn shell_tool() -> ProtocolToolDefinition {
+        ProtocolToolDefinition::new(
+            "shell",
+            "Run shell",
+            json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
                 "required": ["command"]
             }),
-        }
+        )
     }
 
     fn temp_session_path(test_name: &str) -> PathBuf {
@@ -920,11 +719,11 @@ mod tests {
                     vec![ToolCall::new("shell", json!({ "command": "pwd" }))],
                 ),
             ],
-            &[Tool {
-                name: "shell".into(),
-                description: "Run a shell command".into(),
-                parameters: json!({}),
-            }],
+            &[ProtocolToolDefinition::new(
+                "shell",
+                "Run a shell command",
+                json!({}),
+            )],
         );
 
         assert!(prompt.contains("<tools>"));
@@ -938,12 +737,26 @@ mod tests {
         let mut engine = FakeEngine::new(vec!["alpha", "beta"]);
 
         let first = session
-            .run_turn(&mut engine, "remember alpha", &[], settings())
+            .run_turn(
+                &mut engine,
+                "remember alpha",
+                &[],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("first turn");
         assert_eq!(first.text, "alpha");
 
         let second = session
-            .run_turn(&mut engine, "what did I say before?", &[], settings())
+            .run_turn(
+                &mut engine,
+                "what did I say before?",
+                &[],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("second turn");
         assert_eq!(second.text, "beta");
 
@@ -967,7 +780,14 @@ mod tests {
         let tools = vec![python_tool()];
 
         let result = session
-            .run_turn(&mut engine, "compute 2+2", &tools, settings())
+            .run_turn(
+                &mut engine,
+                "compute 2+2",
+                &tools,
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("tool turn");
 
         assert_eq!(result.text, "The answer is 4.");
@@ -985,7 +805,14 @@ mod tests {
         let mut engine = FakeEngine::new(vec!["hello"]);
 
         session
-            .run_turn(&mut engine, "hi", &[], settings())
+            .run_turn(
+                &mut engine,
+                "hi",
+                &[],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("turn");
         session.reset();
 
@@ -1011,6 +838,8 @@ mod tests {
                 &mut engine,
                 "Use the python tool to compute 2 + 2. After the tool returns, answer with just the integer.",
                 &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
                 settings(),
             )
             .expect("tool turn");
@@ -1034,7 +863,14 @@ mod tests {
         ]);
 
         session
-            .run_turn(&mut engine, "compute 2+2", &[python_tool()], settings())
+            .run_turn(
+                &mut engine,
+                "compute 2+2",
+                &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("tool turn");
         session.save_to_path(&path).expect("save session");
 
@@ -1047,10 +883,11 @@ mod tests {
 
     #[test]
     fn maybe_needs_tool_repair_detects_tool_intent() {
-        assert!(super::maybe_needs_tool_repair(
-            "I should use the python tool to compute this."
-        ));
-        assert!(!super::maybe_needs_tool_repair("RIVER"));
+        assert!(
+            BuiltinToolPolicyHooks
+                .should_repair_tool_calls("I should use the python tool to compute this.")
+        );
+        assert!(!BuiltinToolPolicyHooks.should_repair_tool_calls("RIVER"));
     }
 
     #[test]
@@ -1068,6 +905,8 @@ mod tests {
                 &mut engine,
                 "Use the python tool to compute 123 * 456. Do not do the math mentally. After the tool returns, answer with just the integer.",
                 &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
                 settings(),
             )
             .expect("tool recovery turn");
@@ -1095,6 +934,8 @@ mod tests {
                 &mut engine,
                 "What is 7 * 8? After the tool returns, answer with just the integer.",
                 &[python_tool()],
+                &tool_executor(),
+                &tool_policy(),
                 settings(),
             )
             .expect("draft recovery turn");
@@ -1106,10 +947,15 @@ mod tests {
 
     #[test]
     fn extract_arithmetic_expression_finds_inline_math() {
-        assert_eq!(
-            super::extract_arithmetic_expression("Use python to compute 123 * 456 right now."),
-            Some("123 * 456".to_string())
-        );
+        let parsed = BuiltinToolPolicyHooks
+            .recover_tool_calls_from_user_request(
+                "Use python to compute 123 * 456 right now.",
+                &[python_tool()],
+            )
+            .expect("recover tool call");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "python");
+        assert_eq!(parsed.tool_calls[0].arguments["code"], "print(123 * 456)");
     }
 
     #[test]
@@ -1121,7 +967,14 @@ mod tests {
         ]);
 
         let result = session
-            .run_turn(&mut engine, "本地有哪些文件", &[shell_tool()], settings())
+            .run_turn(
+                &mut engine,
+                "本地有哪些文件",
+                &[shell_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
             .expect("file listing turn");
 
         assert_eq!(result.tool_calls_executed, 1);

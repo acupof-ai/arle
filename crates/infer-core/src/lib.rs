@@ -11,12 +11,18 @@ pub enum InferenceMode {
     Decode,
 }
 
-/// Lifecycle state for an inference request in scheduler-like components.
+/// Lifecycle action emitted by scheduler-like components.
+///
+/// These events are intentionally action-oriented instead of state-oriented so
+/// consumers can distinguish initial admission from preemption/requeue, and
+/// lifecycle transitions from chunked work units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestPhase {
-    Queued,
-    Prefill,
-    Decode,
+pub enum RequestEventKind {
+    Enqueued,
+    Requeued,
+    PrefillStarted,
+    DecodeStep,
+    Evicted,
     Completed,
     Cancelled,
 }
@@ -33,13 +39,16 @@ mod tests {
     }
 
     #[test]
-    fn request_phase_progression_example() {
-        let phases = [
-            RequestPhase::Queued,
-            RequestPhase::Prefill,
-            RequestPhase::Decode,
-            RequestPhase::Completed,
+    fn request_event_kind_progression_example() {
+        let events = [
+            RequestEventKind::Enqueued,
+            RequestEventKind::Requeued,
+            RequestEventKind::PrefillStarted,
+            RequestEventKind::DecodeStep,
+            RequestEventKind::Evicted,
+            RequestEventKind::Completed,
+            RequestEventKind::Cancelled,
         ];
-        assert_eq!(phases.len(), 4);
+        assert_eq!(events.len(), 7);
     }
 }

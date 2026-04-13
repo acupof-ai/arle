@@ -8,11 +8,15 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_agent::{AgentEngine, AgentSession, AgentSessionStats, AgentSettings};
+use infer_agent::{
+    AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, ToolExecutor, ToolPolicy,
+};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_engine::{LoadedAgentEngine, init_default_logging, resolve_model_source};
+use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_tools::{Tool, builtin_tools};
+use infer_engine::{AgentEngine, LoadedAgentEngine, init_default_logging, resolve_model_source};
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer_tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
 #[cfg(all(not(feature = "cuda"), any(feature = "metal", feature = "cpu")))]
 use log::warn;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -65,6 +69,72 @@ enum ReplCommand {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+struct BuiltinToolExecutor;
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+struct BuiltinToolPolicy;
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl ToolExecutor for BuiltinToolExecutor {
+    fn execute(&self, tool_call: &ProtocolToolCall) -> String {
+        execute_tool_call(tool_call)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl ToolPolicy for BuiltinToolPolicy {
+    fn recover_tool_calls_from_user_request(
+        &self,
+        user_input: &str,
+        tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        BuiltinToolPolicyHooks.recover_tool_calls_from_user_request(user_input, tools)
+    }
+
+    fn recover_tool_calls_from_draft(
+        &self,
+        draft: &str,
+        tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        BuiltinToolPolicyHooks.recover_tool_calls_from_draft(draft, tools)
+    }
+
+    fn should_repair_tool_calls(&self, text: &str) -> bool {
+        BuiltinToolPolicyHooks.should_repair_tool_calls(text)
+    }
+
+    fn finalize_response_text(
+        &self,
+        user_input: &str,
+        content: String,
+        last_tool_name: Option<&str>,
+        last_tool_scalar_result: Option<&str>,
+        tool_calls_executed: usize,
+    ) -> String {
+        BuiltinToolPolicyHooks.finalize_response_text(
+            user_input,
+            content,
+            last_tool_name,
+            last_tool_scalar_result,
+            tool_calls_executed,
+        )
+    }
+
+    fn finalize_after_tool_execution(
+        &self,
+        user_input: &str,
+        last_tool_name: Option<&str>,
+        last_tool_scalar_result: Option<&str>,
+    ) -> Option<String> {
+        BuiltinToolPolicyHooks.finalize_after_tool_execution(
+            user_input,
+            last_tool_name,
+            last_tool_scalar_result,
+        )
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_repl(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
@@ -83,7 +153,7 @@ fn run_repl(
 fn print_repl_banner(
     engine: &dyn AgentEngine,
     backend_name: &str,
-    tools: &[Tool],
+    tools: &[ProtocolToolDefinition],
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
@@ -123,7 +193,10 @@ fn run_interactive_repl(
     max_tokens: usize,
     temperature: f32,
 ) -> Result<()> {
-    let tools = builtin_tools();
+    let tools = builtin_tools()
+        .into_iter()
+        .map(|tool| tool.to_definition())
+        .collect::<Vec<_>>();
     let mut session = AgentSession::new();
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
@@ -195,7 +268,10 @@ fn run_piped_repl(
     max_tokens: usize,
     temperature: f32,
 ) -> Result<()> {
-    let tools = builtin_tools();
+    let tools = builtin_tools()
+        .into_iter()
+        .map(|tool| tool.to_definition())
+        .collect::<Vec<_>>();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut session = AgentSession::new();
@@ -246,7 +322,7 @@ fn run_piped_repl(
 fn handle_repl_input(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
-    tools: &[Tool],
+    tools: &[ProtocolToolDefinition],
     session: &mut AgentSession,
     input: &str,
     max_turns: usize,
@@ -274,6 +350,8 @@ fn handle_repl_input(
         engine,
         input,
         tools,
+        &BuiltinToolExecutor,
+        &BuiltinToolPolicy,
         AgentSettings {
             max_turns,
             max_tokens,
@@ -281,6 +359,7 @@ fn handle_repl_input(
         },
     ) {
         Ok(result) => {
+            print_trace_events(&result.trace_events);
             println!();
             println!("\x1b[1;34m{}\x1b[0m", result.text);
             if result.max_turns_reached {
@@ -330,7 +409,7 @@ fn execute_repl_command(
     command: ReplCommand,
     engine: &mut dyn AgentEngine,
     backend_name: &str,
-    tools: &[Tool],
+    tools: &[ProtocolToolDefinition],
     session: &mut AgentSession,
     max_turns: usize,
     max_tokens: usize,
@@ -429,10 +508,40 @@ fn print_repl_help() {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn print_tools_help(tools: &[Tool]) {
+fn print_tools_help(tools: &[ProtocolToolDefinition]) {
     println!("Tools:");
     for tool in tools {
         println!("  {}: {}", tool.name, tool.description);
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn print_trace_events(events: &[AgentTraceEvent]) {
+    for event in events {
+        match event {
+            AgentTraceEvent::AssistantNote(content) => {
+                println!("\x1b[2m{}\x1b[0m", content);
+            }
+            AgentTraceEvent::ToolCall {
+                name,
+                arguments,
+                result,
+            } => {
+                println!();
+                println!(
+                    "\x1b[33m[tool: {}]\x1b[0m {}",
+                    name,
+                    serde_json::to_string(arguments).unwrap_or_default()
+                );
+                let display_result = if result.len() > 500 {
+                    format!("{}... ({} chars total)", &result[..500], result.len())
+                } else {
+                    result.clone()
+                };
+                println!("\x1b[36m{}\x1b[0m", display_result);
+                println!();
+            }
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use infer_chat::{ProtocolToolCall, ProtocolToolDefinition};
+use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -402,6 +402,321 @@ pub fn builtin_tools() -> Vec<Tool> {
 }
 
 // ============================================================================
+// Builtin tool policy hooks
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuiltinToolPolicyHooks;
+
+impl BuiltinToolPolicyHooks {
+    pub fn recover_tool_calls_from_user_request(
+        &self,
+        user_input: &str,
+        tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        if tool_available(tools, "python") && mentions_python_tool(user_input) {
+            if let Some(code) = extract_python_code(user_input) {
+                return Some(single_tool_response("python", json!({ "code": code })));
+            }
+            if let Some(expr) = extract_arithmetic_expression(user_input) {
+                return Some(single_tool_response(
+                    "python",
+                    json!({ "code": format!("print({expr})") }),
+                ));
+            }
+        }
+
+        if tool_available(tools, "shell")
+            && mentions_shell_tool(user_input)
+            && let Some(command) = extract_shell_command(user_input)
+        {
+            return Some(single_tool_response("shell", json!({ "command": command })));
+        }
+
+        if tool_available(tools, "shell") && asks_for_file_listing(user_input) {
+            return Some(single_tool_response(
+                "shell",
+                json!({ "command": default_directory_listing_command() }),
+            ));
+        }
+
+        None
+    }
+
+    pub fn recover_tool_calls_from_draft(
+        &self,
+        draft: &str,
+        tools: &[ProtocolToolDefinition],
+    ) -> Option<ParsedAssistantResponse> {
+        if tool_available(tools, "python")
+            && let Some(code) = extract_python_code(draft)
+        {
+            return Some(single_tool_response("python", json!({ "code": code })));
+        }
+
+        if tool_available(tools, "shell")
+            && mentions_shell_tool(draft)
+            && let Some(command) = extract_shell_command(draft)
+        {
+            return Some(single_tool_response("shell", json!({ "command": command })));
+        }
+
+        None
+    }
+
+    pub fn should_repair_tool_calls(&self, text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        [
+            "tool",
+            "function",
+            "python",
+            "shell",
+            "execute",
+            "run the code",
+            "call the",
+            "use the",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    pub fn finalize_response_text(
+        &self,
+        user_input: &str,
+        content: String,
+        last_tool_name: Option<&str>,
+        last_tool_scalar_result: Option<&str>,
+        tool_calls_executed: usize,
+    ) -> String {
+        if tool_calls_executed == 0 {
+            return content;
+        }
+
+        if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
+            return "Listed the current directory above.".to_string();
+        }
+
+        let Some(tool_result) = last_tool_scalar_result else {
+            return content;
+        };
+
+        if content.trim().is_empty() || asks_for_exact_scalar_output(user_input) {
+            return tool_result.to_string();
+        }
+
+        content
+    }
+
+    pub fn finalize_after_tool_execution(
+        &self,
+        user_input: &str,
+        last_tool_name: Option<&str>,
+        last_tool_scalar_result: Option<&str>,
+    ) -> Option<String> {
+        if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
+            return Some("Listed the current directory above.".to_string());
+        }
+
+        if asks_for_exact_scalar_output(user_input)
+            && let Some(result) = last_tool_scalar_result
+        {
+            return Some(result.to_string());
+        }
+
+        None
+    }
+}
+
+fn single_tool_response(name: &str, arguments: serde_json::Value) -> ParsedAssistantResponse {
+    ParsedAssistantResponse {
+        content: String::new(),
+        tool_calls: vec![ProtocolToolCall::new(name, arguments)],
+    }
+}
+
+fn tool_available(tools: &[ProtocolToolDefinition], name: &str) -> bool {
+    tools.iter().any(|tool| tool.name == name)
+}
+
+fn mentions_python_tool(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("python tool")
+        || lower.contains("python function")
+        || lower.contains("use python")
+        || lower.contains("run python")
+}
+
+fn mentions_shell_tool(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("shell tool")
+        || lower.contains("shell command")
+        || lower.contains("use shell")
+        || lower.contains("run shell")
+}
+
+fn asks_for_file_listing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "list files",
+        "show files",
+        "what files",
+        "which files",
+        "current directory",
+        "local files",
+        "files here",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "哪些文件",
+            "有哪些文件",
+            "有什么文件",
+            "列出文件",
+            "当前目录",
+            "本地文件",
+            "目录下",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+#[cfg(target_os = "windows")]
+fn default_directory_listing_command() -> &'static str {
+    "cd && dir /a"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_directory_listing_command() -> &'static str {
+    "pwd && ls -la"
+}
+
+fn extract_python_code(text: &str) -> Option<String> {
+    extract_fenced_code_block(text, &["python", "py"])
+        .or_else(|| extract_balanced_call(text, "print("))
+}
+
+fn extract_shell_command(text: &str) -> Option<String> {
+    extract_fenced_code_block(text, &["bash", "sh", "shell"]).or_else(|| {
+        extract_backticked_snippet(text).and_then(|snippet| {
+            if snippet.contains('\n') || snippet.trim().is_empty() {
+                None
+            } else {
+                Some(snippet)
+            }
+        })
+    })
+}
+
+fn extract_fenced_code_block(text: &str, languages: &[&str]) -> Option<String> {
+    let mut remaining = text;
+    while let Some(start) = remaining.find("```") {
+        remaining = &remaining[start + 3..];
+        let Some(end) = remaining.find("```") else {
+            break;
+        };
+
+        let block = &remaining[..end];
+        let (first_line, rest) = block.split_once('\n').unwrap_or((block, ""));
+        let language = first_line.trim().to_ascii_lowercase();
+        if languages.iter().any(|candidate| language == *candidate) {
+            let code = rest.trim();
+            if !code.is_empty() {
+                return Some(code.to_string());
+            }
+        }
+
+        remaining = &remaining[end + 3..];
+    }
+
+    None
+}
+
+fn extract_backticked_snippet(text: &str) -> Option<String> {
+    let start = text.find('`')?;
+    let rest = &text[start + 1..];
+    let end = rest.find('`')?;
+    let snippet = rest[..end].trim();
+    if snippet.is_empty() {
+        None
+    } else {
+        Some(snippet.to_string())
+    }
+}
+
+fn extract_balanced_call(text: &str, start_pattern: &str) -> Option<String> {
+    let start = text.find(start_pattern)?;
+    let mut depth = 1usize;
+
+    for (offset, ch) in text[start + start_pattern.len()..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + start_pattern.len() + offset + ch.len_utf8();
+                    let snippet = text[start..end]
+                        .trim_matches(|c| matches!(c, '`' | '"' | '\''))
+                        .trim();
+                    if !snippet.is_empty() {
+                        return Some(snippet.to_string());
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn extract_arithmetic_expression(text: &str) -> Option<String> {
+    let mut best = String::new();
+    let mut current = String::new();
+    let mut has_digit = false;
+    let mut has_operator = false;
+
+    for ch in text.chars().chain(std::iter::once('\n')) {
+        let allowed = ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(ch, '+' | '-' | '*' | '/' | '%' | '(' | ')');
+        if allowed {
+            current.push(ch);
+            has_digit |= ch.is_ascii_digit();
+            has_operator |= matches!(ch, '+' | '-' | '*' | '/' | '%');
+            continue;
+        }
+
+        let candidate = current.trim();
+        if has_digit && has_operator && candidate.len() > best.len() {
+            best = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+
+        current.clear();
+        has_digit = false;
+        has_operator = false;
+    }
+
+    if best.is_empty() { None } else { Some(best) }
+}
+
+fn asks_for_exact_scalar_output(user_input: &str) -> bool {
+    let lower = user_input.to_ascii_lowercase();
+    [
+        "answer with just",
+        "reply with just",
+        "nothing else",
+        "the token only",
+        "the word only",
+        "just the integer",
+        "integer only",
+        "number only",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+// ============================================================================
 // Tool execution
 // ============================================================================
 
@@ -547,9 +862,10 @@ fn execute_python(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SandboxConfig, TimedCommandResult, active_sandbox_backend, default_workdir,
-        resolved_python_executable, run_command_with_timeout,
+        BuiltinToolPolicyHooks, SandboxConfig, TimedCommandResult, active_sandbox_backend,
+        builtin_tools, default_workdir, resolved_python_executable, run_command_with_timeout,
     };
+    use serde_json::json;
     use std::process::Command;
     use std::time::Duration;
 
@@ -638,5 +954,60 @@ mod tests {
     #[test]
     fn sandbox_backend_is_detected() {
         assert_ne!(active_sandbox_backend().label(), "");
+    }
+
+    #[test]
+    fn builtin_policy_recovers_python_arithmetic_request() {
+        let tools = builtin_tools()
+            .into_iter()
+            .map(|tool| tool.to_definition())
+            .collect::<Vec<_>>();
+
+        let parsed = BuiltinToolPolicyHooks
+            .recover_tool_calls_from_user_request(
+                "Use python to compute 123 * 456 right now.",
+                &tools,
+            )
+            .expect("recover tool call");
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "python");
+        assert_eq!(parsed.tool_calls[0].arguments["code"], "print(123 * 456)");
+    }
+
+    #[test]
+    fn builtin_policy_finalizes_exact_scalar_output() {
+        let result = BuiltinToolPolicyHooks.finalize_response_text(
+            "After the tool returns, answer with just the integer.",
+            String::new(),
+            Some("python"),
+            Some("56088"),
+            1,
+        );
+        assert_eq!(result, "56088");
+
+        let shell_result = BuiltinToolPolicyHooks.finalize_after_tool_execution(
+            "本地有哪些文件",
+            Some("shell"),
+            Some("ignored"),
+        );
+        assert_eq!(
+            shell_result,
+            Some("Listed the current directory above.".to_string())
+        );
+
+        let tool_call = BuiltinToolPolicyHooks
+            .recover_tool_calls_from_draft(
+                "I should use the Python tool here. I can run print(7 * 8).",
+                &builtin_tools()
+                    .into_iter()
+                    .map(|tool| tool.to_definition())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("recover draft tool call");
+        assert_eq!(
+            tool_call.tool_calls[0].arguments,
+            json!({ "code": "print(7 * 8)" })
+        );
     }
 }
