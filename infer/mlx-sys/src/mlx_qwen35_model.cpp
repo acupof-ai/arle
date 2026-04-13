@@ -52,6 +52,16 @@ bool use_qwen35_cpp_separate_mlp() {
     return true;
 }
 
+bool use_qwen35_cpp_prefill_gbeta_helper() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER");
+    return !(env && std::string(env) == "0");
+}
+
+bool use_qwen35_cpp_qk_norm_helper() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
+    return !(env && std::string(env) == "0");
+}
+
 auto& gated_delta_kernel() {
     static auto kernel = fast::metal_kernel(
         "gated_delta_step",
@@ -449,12 +459,18 @@ struct Qwen35CompiledModel {
         auto k_raw = reshape(qkv_parts[1], {1, S, hk, dk});
         auto v_raw = reshape(qkv_parts[2], {1, S, hv, dv});
 
-        auto qk = compiled_qk_norm_scale()({q_raw, k_raw, lw.q_scale_arr, lw.k_scale_arr});
-        auto q = qk[0];
-        auto k = qk[1];
+        array q(0), k(0);
+        if (use_qwen35_cpp_qk_norm_helper()) {
+            auto qk = compiled_qk_norm_scale()({q_raw, k_raw, lw.q_scale_arr, lw.k_scale_arr});
+            q = qk[0];
+            k = qk[1];
+        } else {
+            q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * lw.q_scale_arr;
+            k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * lw.k_scale_arr;
+        }
 
         array g(0), beta(0);
-        if (S > 1) {
+        if (S > 1 && use_qwen35_cpp_prefill_gbeta_helper()) {
             auto gb = compiled_compute_g_beta()({lw.a_log, a_raw, lw.dt_bias, b_raw});
             g = gb[0];
             beta = gb[1];
