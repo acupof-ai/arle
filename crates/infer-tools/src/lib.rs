@@ -944,8 +944,8 @@ mod tests {
         let python = resolved_python_executable();
         assert!(
             python.is_file()
-                || python == std::path::PathBuf::from("python3")
-                || python == std::path::PathBuf::from("py"),
+                || python == std::path::Path::new("python3")
+                || python == std::path::Path::new("py"),
             "resolved python path should exist or fall back to python3: {}",
             python.display()
         );

@@ -19,17 +19,12 @@ use infer_policy::{
 use std::sync::Arc;
 
 /// Request priority used by the Metal scheduler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub enum MetalRequestPriority {
     Low,
+    #[default]
     Normal,
     High,
-}
-
-impl Default for MetalRequestPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// Scheduler configuration.
@@ -415,7 +410,7 @@ impl MetalScheduler {
             .values()
             .filter(|state| state.phase == MetalRequestPhase::Decoding)
             .collect();
-        states.sort_by(compare_decode_order);
+        states.sort_by(|a, b| compare_decode_order(a, b));
 
         let req_ids = states.iter().map(|state| state.req_id).collect();
         let input_tokens = states
@@ -489,7 +484,7 @@ impl MetalScheduler {
         self.requests
             .values()
             .filter(|state| state.phase == MetalRequestPhase::Prefilling)
-            .min_by(compare_prefill_order)
+            .min_by(|a, b| compare_prefill_order(a, b))
             .map(|state| state.req_id)
     }
 
@@ -526,14 +521,14 @@ fn compare_priority_waiting(a: &MetalRequestState, b: &MetalRequestState) -> Ord
     }
 }
 
-fn compare_prefill_order(a: &&MetalRequestState, b: &&MetalRequestState) -> Ordering {
+fn compare_prefill_order(a: &MetalRequestState, b: &MetalRequestState) -> Ordering {
     match a.arrival_order.cmp(&b.arrival_order) {
         Ordering::Equal => a.req_id.cmp(&b.req_id),
         other => other,
     }
 }
 
-fn compare_decode_order(a: &&MetalRequestState, b: &&MetalRequestState) -> Ordering {
+fn compare_decode_order(a: &MetalRequestState, b: &MetalRequestState) -> Ordering {
     match a.priority.cmp(&b.priority).reverse() {
         Ordering::Equal => match a.arrival_order.cmp(&b.arrival_order) {
             Ordering::Equal => a.req_id.cmp(&b.req_id),
