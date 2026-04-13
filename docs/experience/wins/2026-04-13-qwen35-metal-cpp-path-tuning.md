@@ -341,6 +341,37 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
   - **global separate MLP**
 - 原因不是审美，而是更长 runs 下它在 mixed workload 上小幅更优，在 decode-heavy / prefill-heavy 上也没有可测的负收益
 
+### Kept: helper-level cleanup inside GDR hot path
+
+在把默认 MLP 重新简化回 `global separate` 之后，又继续回到真正的 GDR 热区，做了两刀更小但更扎实的 helper-level 优化：
+
+- `prefill (S>1)` 时，把
+  - `beta = sigmoid(b_raw)`
+  - `g = exp(neg_exp_a * softplus(a_raw + dt_bias))`
+  收进一个 compiled helper，减少每层一个 elementwise launch 和一个临时张量
+- 把 `q/k rms_norm + scale` 收进一个 compiled helper，让两次 GDR q/k 归一化不再从 host 侧分开调度
+- `gdr` Metal kernel 用到的 `T` 标量改成每次 `forward()` 只创建一次，不再每层重建
+
+这里刻意没有再去碰 `decode` 的数学路径：`g/beta` fused helper 只在 `prefill` 启用，`decode (S=1)` 保持旧算式，避免为了追 prompt 去拖慢 decode。
+
+对比上一版默认（`39d95dc`）：
+
+- `128 / 128 / warmup 1 / runs 5`
+  - before: `prompt 683.70 tok/s`, `generation 74.32 tok/s`, `repo_e2e 67.03 tok/s`, `TTFT 187.22 ms`
+  - after:  `prompt 686.64 tok/s`, `generation 74.67 tok/s`, `repo_e2e 67.35 tok/s`, `TTFT 186.42 ms`
+- `1 / 128 / warmup 1 / runs 5`
+  - before: `generation 74.35 tok/s`, `repo_e2e 73.37 tok/s`, `TTFT 23.07 ms`
+  - after:  `generation 75.17 tok/s`, `repo_e2e 74.16 tok/s`, `TTFT 23.20 ms`
+- `2048 / 1 / warmup 1 / runs 3`
+  - before: `prompt 721.19 tok/s`, `TTFT 2840.43 ms`, `repo_e2e 0.3472 tok/s`
+  - after:  `prompt 724.97 tok/s`, `TTFT 2824.94 ms`, `repo_e2e 0.3484 tok/s`
+
+结论：
+
+- 这不是“大跃进”式优化，但三类 workload 都是正方向
+- 收益来自真正的高频层内 helper，而不是尾部一次性算子
+- 因此可以保留为默认路径
+
 ### Control check on newer HEAD
 
 在 `37a8a82` 之后，仓库主线合入了 `prefix_cache / kv_tier` 相关提交。为了确认它们没有把 `metal_bench` 的 direct Metal path 弄慢，做了同机对照：
