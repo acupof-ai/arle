@@ -40,21 +40,20 @@ pub enum KVCacheDtype {
 ///
 /// Determines how KV data is stored in the TokenKVPool and which attention
 /// kernel is used during batched decode:
-/// - `FP8E4M3` → FlashInfer native (zero dequant overhead)
-/// - `INT8` → self-built fused-dequant decode attention
-/// - `BF16` → FlashInfer native (baseline)
-/// - `TurboQuant` → rotation-based 2-4 bit (dequant → FlashInfer, Phase 1)
+/// - `BF16` → FlashInfer native decode (baseline)
+/// - `FP8E4M3` → custom split-KV decode with fused FP8 cast
+/// - `INT8` → custom split-KV decode with fused INT8 dequant
+/// - `TurboQuant` → rotation-based 2-4 bit fused decode attention
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KVFormat {
-    /// Full precision bf16, 2 bytes/element. FlashInfer native.
+    /// Full precision bf16, 2 bytes/element. FlashInfer native decode.
     BF16,
-    /// FP8 E4M3, 1 byte/element, no separate scale. FlashInfer native.
+    /// FP8 E4M3, 1 byte/element, no separate scale. Custom fused decode kernel.
     FP8E4M3,
-    /// INT8 + per-head per-token f32 scale. Fused-dequant attention.
+    /// INT8 + per-head per-token f32 scale. Custom fused-dequant decode kernel.
     INT8,
-    /// TurboQuant: rotation + Lloyd-Max quantization.
+    /// TurboQuant: rotation + Lloyd-Max quantization with fused decode attention.
     /// `key_bits` and `val_bits` control compression (2-4 bits each).
-    /// Phase 1: dequantize → bf16 working buffer → FlashInfer.
     TurboQuant { key_bits: u8, val_bits: u8 },
 }
 

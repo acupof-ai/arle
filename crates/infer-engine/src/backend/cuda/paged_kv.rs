@@ -295,29 +295,28 @@ impl TokenKVPool {
         let token_indices = vec![Vec::new(); num_slots];
         let slot_epochs = vec![0; num_slots];
 
-        // INT8 split-KV attention workspace
+        // Quantized split-KV attention workspace.
+        // FP8 reuses the same two-phase reduction scratch layout as INT8.
         let num_splits = 8;
-        let (int8_attn_workspace, int8_attn_workspace_bytes) = if (format == KVFormat::INT8
-            || format == KVFormat::FP8E4M3)
-            && pool_bytes_per_layer > 0
-        {
-            let ws_bytes = crate::ops::kv_quant::decode_attention_int8_workspace_bytes(
-                num_slots,
-                num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
-                head_dim,
-                num_splits,
-            );
-            // Use a reasonable upper bound: max_batch * max_heads * head_dim * num_splits * 3 floats
-            let ws_bytes_safe = num_splits * num_slots * num_kv_heads * 4 * (head_dim + 2) * 4;
-            let ws_bytes = ws_bytes.max(ws_bytes_safe);
-            let ws = ctx
-                .stream
-                .alloc_zeros::<u8>(ws_bytes)
-                .map_err(|e| anyhow!("INT8 attn workspace alloc failed: {e}"))?;
-            (Some(ws), ws_bytes)
-        } else {
-            (None, 0)
-        };
+        let (int8_attn_workspace, int8_attn_workspace_bytes) =
+            if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
+                let ws_bytes = crate::ops::kv_quant::decode_attention_int8_workspace_bytes(
+                    num_slots,
+                    num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
+                    head_dim,
+                    num_splits,
+                );
+                // Use a reasonable upper bound: max_batch * max_heads * head_dim * num_splits * 3 floats
+                let ws_bytes_safe = num_splits * num_slots * num_kv_heads * 4 * (head_dim + 2) * 4;
+                let ws_bytes = ws_bytes.max(ws_bytes_safe);
+                let ws = ctx
+                    .stream
+                    .alloc_zeros::<u8>(ws_bytes)
+                    .map_err(|e| anyhow!("Quantized attn workspace alloc failed: {e}"))?;
+                (Some(ws), ws_bytes)
+            } else {
+                (None, 0)
+            };
 
         // TurboQuant state: rotation matrices + codebook
         let (tq_k_state, tq_v_state) = if let KVFormat::TurboQuant { key_bits, val_bits } = format {

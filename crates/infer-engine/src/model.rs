@@ -242,12 +242,15 @@ pub trait ModelForward: Send {
         Ok(tokens)
     }
 
-    /// Prefill forward pass that also scatter-writes K/V to the token pool.
+    /// Optional future prefill fast path that scatter-writes K/V to the token pool.
     ///
-    /// Called by the scheduler instead of `forward_prefill()` when a paged KV pool is
-    /// active. The default implementation just calls `forward_prefill()` (no pool write).
-    /// Override in model implementations that support scatter-writing K/V to the
-    /// pool during prefill (e.g., Qwen3).
+    /// The current CUDA scheduler still calls `forward_prefill()` and then migrates
+    /// contiguous KV into the paged pool via `GenerationStateBase::migrate_kv_to_paged()`.
+    /// That migration path is the active production path for FP8/INT8/TurboQuant.
+    ///
+    /// The default implementation just calls `forward_prefill()` (no pool write).
+    /// Override in model implementations that support a direct dual-write path if that
+    /// path is later wired into the scheduler.
     ///
     /// `new_token_indices` are the physical pool indices (on GPU) allocated for
     /// this chunk's tokens. The slice has length `tokens.len()`.

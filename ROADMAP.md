@@ -18,7 +18,7 @@ Working: Qwen3/Qwen3.5/GLM4 inference, FlashInfer single prefill (HD128) + Trito
 - **Qwen3.5 prefix cache enabled** via recurrent state snapshot/restore (was disabled due to state contamination)
 - **TurboQuant complete**: KV cache 3-bit (5x compression), weight 3-bit (fused dequant GEMV), fused decode attention
 - **GPTQ/AWQ INT4 production-ready**: format detection, W4A16 GEMV, Marlin W4 prefill (5-25x TTFT speedup)
-- **FP8 KV cache**: FlashInfer native FP8 E4M3 decode attention, 50% KV memory reduction
+- **FP8 KV cache**: custom fused FP8 E4M3 decode attention, 50% KV memory reduction
 - Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
 
 Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration, FlashAttention-3 (H100), scheduler preemption with KV swap.
@@ -468,7 +468,7 @@ Phase 1 (GPU) — ACTIVE
 Phase 2 (Quantization) ✅ COMPLETE
   2.1 Loader            ✅
   2.2 GPTQ/AWQ          ✅ (W4A16 GEMV + Marlin W4 prefill)
-  2.3 FP8               ✅ (FP8 KV cache + FlashInfer native decode)
+  2.3 FP8               ✅ (FP8 KV cache + custom fused decode)
   2.4 INT8              ✅ (W8A16 GEMV/GEMM + INT8 KV fused-dequant)
   2.5 GGUF              → deferred
 
