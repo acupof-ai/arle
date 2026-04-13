@@ -15,8 +15,8 @@
 #![cfg(feature = "cuda")]
 
 use half::bf16;
-use infer::gguf::GgufFile;
 use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use infer::gguf::GgufFile;
 
 fn model_path() -> String {
     std::env::var("PEGAINFER_CARNICE_PATH")

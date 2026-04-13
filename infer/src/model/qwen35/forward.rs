@@ -6,11 +6,11 @@ use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 pub struct Qwen35State {
     pub(super) ctx: DeviceContext,

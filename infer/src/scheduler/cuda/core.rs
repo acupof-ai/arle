@@ -116,7 +116,8 @@ impl<M: ModelForward> Scheduler<M> {
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * contiguous_max * bytes_per_token;
             let headroom = config.kv_pool_headroom_bytes;
-            let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info() {
+            let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
+            {
                 Ok((free, _)) => free.saturating_sub(contiguous_cost.saturating_add(headroom)),
                 Err(_) => config.kv_pool_fallback_bytes,
             };

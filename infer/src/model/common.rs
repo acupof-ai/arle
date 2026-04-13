@@ -11,8 +11,8 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 
-use crate::ops;
 use crate::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use crate::ops;
 use crate::weight_loader::{
     load_shard_info, load_shard_info_fixed, load_tensor_2d, load_tensor_2d_maybe_quantized,
     mmap_shards,

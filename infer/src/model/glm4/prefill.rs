@@ -2,10 +2,10 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::weights::{GLM4Model, TransformerBlock};
-use crate::model::kv_cache::KVCache;
-use crate::ops;
 use crate::backend::cuda::paged_kv::TokenKVPool;
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::model::kv_cache::KVCache;
+use crate::ops;
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 struct PrefillBuffers {

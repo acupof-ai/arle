@@ -717,7 +717,8 @@ impl RealServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::backend::cuda::bootstrap::load_qwen3_components(model_path, options)?;
+        let components =
+            crate::backend::cuda::bootstrap::load_qwen3_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 
@@ -733,7 +734,8 @@ impl Qwen35ServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
+        let components =
+            crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 
@@ -749,7 +751,8 @@ impl GLM4ServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::backend::cuda::bootstrap::load_glm4_components(model_path, options)?;
+        let components =
+            crate::backend::cuda::bootstrap::load_glm4_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 

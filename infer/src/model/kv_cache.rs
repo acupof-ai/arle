@@ -21,8 +21,8 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::info;
 
-use crate::ops::kv_quant;
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
+use crate::ops::kv_quant;
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
 const OFFLOAD_BLOCK_SIZE: usize = 64;

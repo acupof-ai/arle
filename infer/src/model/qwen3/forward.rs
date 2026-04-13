@@ -4,11 +4,11 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::Qwen3Model;
+use crate::backend::cuda::tensor::DeviceVec;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use crate::backend::cuda::tensor::DeviceVec;
 
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {

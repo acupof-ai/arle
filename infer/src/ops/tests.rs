@@ -1244,7 +1244,11 @@ fn turboquant_hadamard_signs_deterministic() {
     // Different seed → different signs
     let mut signs3 = vec![0i8; dim];
     unsafe {
-        crate::backend::cuda::ffi::turboquant_generate_signs(signs3.as_mut_ptr(), dim as i32, seed + 1);
+        crate::backend::cuda::ffi::turboquant_generate_signs(
+            signs3.as_mut_ptr(),
+            dim as i32,
+            seed + 1,
+        );
     }
     assert_ne!(
         signs1, signs3,
@@ -1420,7 +1424,11 @@ fn turboquant_cpu_reference_roundtrip() {
     // 2. Generate signs
     let mut signs = vec![0i8; head_dim];
     unsafe {
-        crate::backend::cuda::ffi::turboquant_generate_signs(signs.as_mut_ptr(), head_dim as i32, 42);
+        crate::backend::cuda::ffi::turboquant_generate_signs(
+            signs.as_mut_ptr(),
+            head_dim as i32,
+            42,
+        );
     }
 
     // 3. Generate test vector
