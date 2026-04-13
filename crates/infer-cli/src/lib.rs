@@ -6,7 +6,9 @@ mod repl;
 use std::time::Instant;
 
 use anyhow::Result;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use args::Args;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_engine::{AgentEngine, LoadedAgentEngine, init_default_logging, resolve_model_source};
@@ -14,8 +16,6 @@ use infer_engine::{AgentEngine, LoadedAgentEngine, init_default_logging, resolve
 use log::warn;
 
 pub fn run() -> Result<()> {
-    init_default_logging();
-
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
@@ -27,6 +27,7 @@ pub fn run() -> Result<()> {
 
     #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     {
+        init_default_logging();
         let args = Args::parse();
         let model_source = resolve_model_source(args.model_path.as_deref())?;
         log::info!("Loading model from: {}", model_source);
