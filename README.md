@@ -120,6 +120,18 @@ Governance references:
 
 ## Architecture
 
+Workspace split summary:
+
+- `agent-infer` is now a thin binary wrapper.
+- `infer-cli` owns the REPL/CLI flow.
+- `infer-engine` owns model discovery, logging init, backend loading, and the
+  adapter layer exposed to `infer-agent`.
+- `infer` continues to own the HTTP server, scheduler, runtime, and backend
+  implementations.
+
+See [docs/architecture.md](docs/architecture.md) and [crates/README.md](crates/README.md)
+for the current package boundaries.
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  HTTP API  (/v1/completions, /v1/chat/completions, SSE)  │
@@ -204,6 +216,14 @@ Built-in agent runtime with tool calling:
 ```
 
 The root CLI binary is behind the `cli` feature. Without `--features cli`, `agent-infer` is not built.
+
+Current package boundary for agent mode:
+
+- `agent-infer` -> thin binary wrapper
+- `infer-cli` -> REPL and slash commands
+- `infer-engine` -> backend loading and model auto-discovery
+- `infer-agent` -> conversation loop and tool-call recovery
+- `infer-tools` / `infer-chat` -> tool execution and shared protocol
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 

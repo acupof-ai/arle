@@ -48,8 +48,6 @@ pub mod speculative;
 pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trace_reporter;
-
-pub use infer_chat as chat_types;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};

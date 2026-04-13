@@ -1,0 +1,20 @@
+[package]
+name = "infer-cli"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cuda"]
+cuda = ["infer-engine/cuda"]
+no-cuda = ["infer-engine/no-cuda"]
+cpu = ["infer-engine/cpu"]
+metal = ["infer-engine/metal"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+infer-agent = { path = "../infer-agent" }
+infer-engine = { path = "../infer-engine", default-features = false }
+infer-tools = { path = "../infer-tools" }
+log = "0.4"
+rustyline = "15"

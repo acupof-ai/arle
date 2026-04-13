@@ -6,10 +6,10 @@ use std::time::Instant;
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use infer::backend::{GenerateResult, InferenceBackend};
-use infer::chat::{ChatMessage, messages_to_prompt};
 use infer::logging;
 use infer::metal_backend::MetalBackend;
 use infer::sampler::SamplingParams;
+use infer_chat::{ChatMessage, messages_to_prompt};
 
 fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     let parsed: i32 = raw

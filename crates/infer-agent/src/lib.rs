@@ -9,17 +9,45 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use infer::sampler::SamplingParams;
-use infer::server_engine::{CompleteOutput, CompleteRequest};
 use infer_tools::{Tool, execute_tool_call};
 
 pub type Message = ProtocolChatMessage;
 #[cfg_attr(not(test), allow(dead_code))]
 pub type ToolCall = infer_chat::ToolCall;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCompleteRequest {
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub stop: Option<Vec<String>>,
+    pub logprobs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentFinishReason {
+    Length,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCompleteOutput {
+    pub text: String,
+    pub finish_reason: AgentFinishReason,
+    pub usage: AgentUsage,
+    pub token_logprobs: Vec<f32>,
+}
+
 pub trait AgentEngine {
     fn model_id(&self) -> &str;
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput>;
 }
 
 fn format_prompt(messages: &[Message], tools: &[Tool]) -> String {
@@ -188,13 +216,10 @@ impl AgentSession {
                 prompt.len()
             );
 
-            let output = engine.complete(CompleteRequest {
+            let output = engine.complete(AgentCompleteRequest {
                 prompt,
                 max_tokens: settings.max_tokens,
-                sampling: SamplingParams {
-                    temperature: settings.temperature,
-                    ..SamplingParams::default()
-                },
+                temperature: settings.temperature,
                 stop: Some(vec!["<|im_end|>".to_string()]),
                 logprobs: false,
             })?;
@@ -751,13 +776,10 @@ If no tool is needed, output exactly NO_TOOL.",
     ));
 
     let repair_prompt = format_prompt(&repair_messages, tools);
-    let repair_output = engine.complete(CompleteRequest {
+    let repair_output = engine.complete(AgentCompleteRequest {
         prompt: repair_prompt,
         max_tokens: settings.max_tokens.min(128),
-        sampling: SamplingParams {
-            temperature: 0.0,
-            ..SamplingParams::default()
-        },
+        temperature: 0.0,
         stop: Some(vec!["<|im_end|>".to_string()]),
         logprobs: false,
     })?;
@@ -784,9 +806,10 @@ mod tests {
     use infer_tools::Tool;
     use serde_json::json;
 
-    use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason, Usage};
-
-    use super::{AgentEngine, AgentSession, AgentSettings, Message, ToolCall};
+    use super::{
+        AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentSession,
+        AgentSettings, AgentUsage, Message, ToolCall,
+    };
 
     struct FakeEngine {
         outputs: VecDeque<String>,
@@ -807,20 +830,20 @@ mod tests {
             "fake"
         }
 
-        fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+        fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
             self.prompts.push(req.prompt);
             let text = self
                 .outputs
                 .pop_front()
                 .ok_or_else(|| anyhow!("fake engine exhausted"))?;
-            Ok(CompleteOutput {
-                usage: Usage {
+            Ok(AgentCompleteOutput {
+                usage: AgentUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
                 },
                 text,
-                finish_reason: FinishReason::Stop,
+                finish_reason: AgentFinishReason::Stop,
                 token_logprobs: Vec::new(),
             })
         }

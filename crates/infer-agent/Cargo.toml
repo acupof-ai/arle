@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-infer = { path = "../../infer", default-features = false }
 infer-chat = { path = "../infer-chat" }
 infer-tools = { path = "../infer-tools" }
 log = "0.4"
