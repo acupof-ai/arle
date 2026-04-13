@@ -41,6 +41,17 @@ bool use_qwen35_cpp_prefill_last_logits_only() {
     return !(env && std::string(env) == "0");
 }
 
+bool use_qwen35_cpp_separate_mlp_for_seq_len(int seq_len) {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
+    if (env) {
+        return std::string(env) != "0";
+    }
+    // Default to a phase-specific split:
+    // - decode (S=1): separate gate/up matmuls win
+    // - prefill (S>1): merged gate_up matmul wins
+    return seq_len == 1;
+}
+
 auto& gated_delta_kernel() {
     static auto kernel = fast::metal_kernel(
         "gated_delta_step",
@@ -222,7 +233,7 @@ struct GdrLayerWeights {
     array a_log = array(0), dt_bias = array(0);
     array norm_w = array(0);
     QWeight gate_proj, up_proj, down;
-    bool use_separate_mlp = false;
+    bool has_separate_mlp = false;
     QWeight gate_up;
     int gate_dim = 0;
     int num_key_heads = 0, key_dim = 0, num_value_heads = 0, value_dim = 0;
@@ -276,6 +287,10 @@ struct Qwen35CompiledModel {
 
     bool keep_step_intermediates() const {
         return current_seq_len == 1 || keep_prefill_intermediates();
+    }
+
+    bool use_separate_mlp_for_current_step(const GdrLayerWeights& lw) const {
+        return lw.has_separate_mlp && use_qwen35_cpp_separate_mlp_for_seq_len(current_seq_len);
     }
 
     // ── Full attention decode step ─────────────────────────────────────
@@ -576,7 +591,7 @@ struct Qwen35CompiledModel {
             auto residual2 = x;
             auto post_ln_w = layer.is_gdr ? layer.gdr.post_attn_ln_w : layer.full.post_attn_ln_w;
             auto xn2 = fast::rms_norm(x, post_ln_w, rms_eps);
-            if (layer.is_gdr && layer.gdr.use_separate_mlp) {
+            if (layer.is_gdr && use_separate_mlp_for_current_step(layer.gdr)) {
                 x = residual2 + mlp_separate(xn2, layer.gdr.gate_proj, layer.gdr.up_proj, layer.gdr.down);
             } else {
                 auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
@@ -804,6 +819,9 @@ void qwen35_compiled_set_separate_proj(
         lw.z_proj = {*to_arr(z_w), *to_arr(z_s), *to_arr(z_b), qkv_gs, qkv_bits};
         lw.b_proj = {*to_arr(b_w), *to_arr(b_s), *to_arr(b_b), qkv_gs, qkv_bits};
         lw.a_proj = {*to_arr(a_w), *to_arr(a_s), *to_arr(a_b), qkv_gs, qkv_bits};
+        lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
+        lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
+        lw.has_separate_mlp = true;
         lw.use_separate_proj = true;
     });
 }
@@ -818,7 +836,7 @@ void qwen35_compiled_set_separate_mlp(
         auto& lw = m->layers.back().gdr;
         lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
         lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
-        lw.use_separate_mlp = true;
+        lw.has_separate_mlp = true;
     });
 }
 

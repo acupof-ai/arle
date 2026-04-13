@@ -282,6 +282,46 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
 - 在当前 MLX / Metal 图优化行为下，提前切片反而让整体表现更差
 - 因此最终保留 `norm-then-slice`，不把 `slice-before-final-rms_norm` 留在默认路径里
 
+### Kept: phase-specific GDR MLP selection
+
+继续沿着 `separate / merged` 方向往下挖时，发现真正该分开的不是 `final norm` 这类尾巴，而是 GDR block 里的 MLP 形式。
+
+同一份 build，直接拆两个极端 workload 看：
+
+- `decode-heavy (1 / 128)`：
+  - `sep_proj + merged_mlp`: `generation 73.53 tok/s`, `repo_e2e 72.54 tok/s`
+  - `sep_proj + sep_mlp`: `generation 74.63 tok/s`, `repo_e2e 73.62 tok/s`  ← 最优
+  - `merged_proj + merged_mlp`: `generation 72.19 tok/s`, `repo_e2e 71.23 tok/s`
+  - `merged_proj + sep_mlp`: `generation 71.10 tok/s`, `repo_e2e 70.12 tok/s`
+- `prefill-heavy (2048 / 1)`：
+  - `sep_proj + merged_mlp`: `TTFT 2869.14 ms`, `prompt 713.81 tok/s`  ← 最优
+  - `sep_proj + sep_mlp`: `TTFT 2926.01 ms`, `prompt 699.97 tok/s`
+  - `merged_proj + merged_mlp`: `TTFT 2976.49 ms`, `prompt 688.06 tok/s`
+  - `merged_proj + sep_mlp`: `TTFT 2981.24 ms`, `prompt 686.96 tok/s`
+
+结论很直接：
+
+- `projection` 两个阶段都继续保持 `separate`
+- 真正分裂的是 GDR `MLP`
+  - `decode (S=1)` 更适合 `separate gate/up`
+  - `prefill (S>1)` 更适合 merged `gate_up`
+
+现在的默认路径改成：
+
+- `projection`: 继续 `separate`
+- `MLP`: 默认按 phase 切换
+  - `decode (S=1)` → `separate`
+  - `prefill (S>1)` → merged
+- 如果显式设置 `AGENT_INFER_QWEN35_CPP_SEPARATE_MLP=0/1`，则继续按环境变量强制全局模式
+
+对 `128 / 128 / warmup 1 / runs 3` 的综合 workload，三种模式对照如下：
+
+- phase-specific default: `prompt 679.93 tok/s`, `generation 74.89 tok/s`, `repo_e2e 67.46 tok/s`, `TTFT 188.28 ms`
+- force merged: `prompt 684.70 tok/s`, `generation 74.51 tok/s`, `repo_e2e 67.20 tok/s`, `TTFT 186.95 ms`
+- force separate: `prompt 689.16 tok/s`, `generation 75.39 tok/s`, `repo_e2e 67.95 tok/s`, `TTFT 185.74 ms`
+
+这说明 phase-specific 默认不是单一 workload 的“绝对冠军”，但它把两个极端 workload 的最优点分开拿了，而且在常见 `128 / 128` 综合 workload 上没有明显回退，可以保留。
+
 ### Control check on newer HEAD
 
 在 `37a8a82` 之后，仓库主线合入了 `prefix_cache / kv_tier` 相关提交。为了确认它们没有把 `metal_bench` 的 direct Metal path 弄慢，做了同机对照：
