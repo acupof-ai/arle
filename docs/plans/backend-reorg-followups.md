@@ -4,7 +4,7 @@ Round 2 (April 2026) collapsed the `infer/src/` root from 39 top-level `.rs` fil
 
 | # | Item | Owner | Status | Plan |
 |---|---|---|---|---|
-| F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **in progress** | [`backend-metal-split.md`](backend-metal-split.md) |
+| F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** (`19a433d`) | [`backend-metal-split.md`](backend-metal-split.md) |
 | F2 | Audit `backend/cuda/graph_pool.rs` — deliberate scaffold or dead code? | ckl (decision), remote CUDA host (if wire-in) | **awaiting decision** | §F2 below |
 | F3 | Document `--features cuda,no-cuda` type-check invocation | me | **done** (commit `4b493c8`) | — |
 | Round 3 | Extract `backend`/`ops`/`model`/`scheduler` into `crates/infer-engine` | remote Linux CUDA host | **queued** (starts after F1 lands) | [`cuda-crate-extraction.md`](cuda-crate-extraction.md) |
@@ -34,6 +34,34 @@ Round 3 (remote CUDA) ←──┘
 Owner: codex on local Mac.
 Plan doc: [`backend-metal-split.md`](backend-metal-split.md) (self-contained, codex-executable).
 Prerequisite: commit `7a876e1` or later (Round 2 housekeeping).
+
+Status: done on 2026-04-13.
+Final style checkpoint: `19a433d` (`style(metal): rustfmt post-split + line count verification`).
+
+Final layout:
+
+```
+infer/src/backend/metal.rs
+infer/src/backend/metal/weights.rs
+infer/src/backend/metal/generate.rs
+infer/src/backend/metal/forward.rs
+infer/src/backend/metal/ops.rs
+infer/src/backend/metal/sampling.rs
+```
+
+Final line counts:
+- `metal.rs`: 505
+- `weights.rs`: 679
+- `generate.rs`: 307
+- `forward.rs`: 182
+- `ops.rs`: 62
+- `sampling.rs`: 62
+
+Local Metal regression benchmark against a pre-split baseline on `mlx-community/Qwen3.5-4B-MLX-4bit`
+(`prompt=128`, `generation=128`, `warmup=1`, `runs=2`) passed:
+- `prompt_tps`: `705.6 -> 726.3`
+- `generation_tps`: `77.0 -> 80.1`
+- `ttft_ms`: `181.4 -> 176.3`
 
 **What it does (summary).** Takes the 1766-line `infer/src/backend/metal.rs` and breaks it into five topical submodules: `weights.rs` (~780 lines, weight types + loading), `generate.rs` (~320, generation loop + KV pool guard), `forward.rs` (~185, per-step graph builders), `ops.rs` (~75, linear / eval / extend_kv_cache), `sampling.rs` (~80, sampling helpers). `metal.rs` shrinks to ~440 lines and becomes a thin facade holding only the struct, the `impl InferenceBackend`/`impl StreamingInferenceBackend` trait blocks, and submodule declarations.
 
