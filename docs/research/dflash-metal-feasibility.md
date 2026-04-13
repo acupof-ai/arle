@@ -15,9 +15,9 @@ Key properties:
 
 ## DFlash-MLX: Apple Silicon Implementation
 
-A native MLX port exists supporting Qwen3-4B and Qwen3.5-4B:
+GitHub: https://github.com/Aryagm/dflash-mlx — active project, directly relevant.
 
-**Key implementation details found:**
+**Key implementation details:**
 - Uses **hidden-state extraction**: intermediate activations from target model layers feed draft model
 - Does **not require a separate KV cache** for the draft model (uses target's cached states)
 - **Per-layer cache rollback**: handles Qwen3.5's hybrid attention/recurrent layers correctly
@@ -27,8 +27,22 @@ A native MLX port exists supporting Qwen3-4B and Qwen3.5-4B:
 
 **Supported models:**
 - Qwen3-4B BF16 (primary target + DFlash draft)
-- Qwen3.5-4B MLX BF16 (functional)
+- Qwen3.5-4B MLX BF16 (functional, with hybrid attention rollback)
 - Additional: Llama 3.1, Qwen3 Coder (upstream checkpoints)
+
+## Alternative Apple Silicon Approaches
+
+| Approach | Repo | Speedup | Notes |
+|----------|------|---------|-------|
+| **mlx-lm `--draft-model`** | ml-explore/mlx-examples (merged Jan 2025) | 1.5–1.8x | No batching; prompt cache conflicts |
+| **mlx-community/speculative-decoding** (Swift) | mlx-community/speculative-decoding | 2–3x | Mamba drafters 86 tok/s experimental |
+| **dflash-mlx** | Aryagm/dflash-mlx | TBD | Block diffusion; Qwen3/Qwen3.5; per-layer rollback |
+| **Apple ReDrafter** | machinelearning.apple.com/research | 2.3x | RNN drafter; requires distillation training |
+| **EAGLE-3 on MLX** | Not ported | N/A | Python/CUDA only |
+
+**Key insight**: mlx-lm's built-in `--draft-model` is the easiest integration point
+but has no batch support. For agent-infer's use case (single request, Metal backend),
+it's a viable first step.
 
 ## Feasibility for agent-infer Metal Backend
 
