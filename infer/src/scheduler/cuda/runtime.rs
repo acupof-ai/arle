@@ -1,5 +1,41 @@
 use super::*;
 
+fn raw_prefix_len(cached: &[u32], prompt_tokens: &[u32]) -> usize {
+    cached
+        .iter()
+        .zip(prompt_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn effective_prefix_reuse_len(cached: &[u32], prompt_tokens: &[u32]) -> usize {
+    let prefix_len = raw_prefix_len(cached, prompt_tokens);
+    if prefix_len > 0 && prefix_len == prompt_tokens.len() && prefix_len < cached.len() {
+        0
+    } else {
+        prefix_len
+    }
+}
+
+fn best_prefix_slot_for_cached_prompts(
+    cached_prompts: &[Vec<u32>],
+    free_slots: &[usize],
+    prompt_tokens: &[u32],
+) -> usize {
+    let mut best_slot = free_slots[0];
+    let mut best_match = 0usize;
+
+    for &slot in free_slots {
+        let match_len = effective_prefix_reuse_len(&cached_prompts[slot], prompt_tokens);
+        if match_len > best_match {
+            best_match = match_len;
+            best_slot = slot;
+        }
+    }
+
+    best_slot
+}
+
 impl<M: ModelForward> Scheduler<M> {
     /// Run the scheduler loop. Blocks until all handles are dropped.
     pub fn run(mut self) {
@@ -77,11 +113,8 @@ impl<M: ModelForward> Scheduler<M> {
             let id = self.next_id;
             self.next_id += 1;
 
-            let prefix_len = self.cached_prompts[slot_idx]
-                .iter()
-                .zip(prompt_tokens.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
+            let prefix_len =
+                effective_prefix_reuse_len(&self.cached_prompts[slot_idx], &prompt_tokens);
             if prefix_len > 0 {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, prefix_reuse={}, queue={})",
@@ -116,6 +149,7 @@ impl<M: ModelForward> Scheduler<M> {
                 decoded_token_count: 0,
                 sent_len: 0,
                 phase: Phase::New,
+                cacheable_prompt_len: 0,
                 prefix_byte_len: 0,
                 latest_logprob: None,
             });
@@ -133,22 +167,7 @@ impl<M: ModelForward> Scheduler<M> {
     /// Pick the free slot whose cached prompt best matches the given tokens.
     /// Falls back to the first free slot if no prefix matches.
     fn best_prefix_slot(&self, free_slots: &[usize], prompt_tokens: &[u32]) -> usize {
-        let mut best_slot = free_slots[0];
-        let mut best_match = 0usize;
-
-        for &slot in free_slots {
-            let cached = &self.cached_prompts[slot];
-            let match_len = cached
-                .iter()
-                .zip(prompt_tokens.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
-            if match_len > best_match {
-                best_match = match_len;
-                best_slot = slot;
-            }
-        }
-        best_slot
+        best_prefix_slot_for_cached_prompts(&self.cached_prompts, free_slots, prompt_tokens)
     }
 
     fn cleanup(&mut self) {
@@ -159,7 +178,11 @@ impl<M: ModelForward> Scheduler<M> {
                 let gen_tokens = req.generated_tokens.len() as u64;
 
                 self.paged_kv_pool.free_slot(req.slot_idx);
-                self.cached_prompts[req.slot_idx] = req.prompt_tokens;
+                if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
+                    self.cached_prompts[req.slot_idx] = prompt_tokens.to_vec();
+                } else {
+                    self.cached_prompts[req.slot_idx].clear();
+                }
                 let _ = self.states[req.slot_idx].offload_kv_if_needed();
 
                 self.total_completed += 1;
@@ -190,5 +213,37 @@ impl<M: ModelForward> Scheduler<M> {
                 i += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{best_prefix_slot_for_cached_prompts, effective_prefix_reuse_len, raw_prefix_len};
+
+    #[test]
+    fn effective_prefix_reuse_ignores_prompt_that_is_prefix_of_longer_cache() {
+        let cached = vec![1, 2, 3, 4];
+        let prompt = vec![1, 2, 3];
+        assert_eq!(raw_prefix_len(&cached, &prompt), 3);
+        assert_eq!(effective_prefix_reuse_len(&cached, &prompt), 0);
+    }
+
+    #[test]
+    fn effective_prefix_reuse_keeps_exact_and_extendable_hits() {
+        assert_eq!(effective_prefix_reuse_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(effective_prefix_reuse_len(&[1, 2, 3], &[1, 2, 3, 4]), 3);
+        assert_eq!(effective_prefix_reuse_len(&[1, 9, 3], &[1, 2, 3, 4]), 1);
+    }
+
+    #[test]
+    fn best_prefix_slot_prefers_effectively_reusable_prefixes() {
+        let cached_prompts = vec![vec![1, 2, 3, 4], vec![1, 2], vec![1]];
+        let free_slots = vec![0, 1, 2];
+        let prompt = vec![1, 2, 3];
+
+        assert_eq!(
+            best_prefix_slot_for_cached_prompts(&cached_prompts, &free_slots, &prompt),
+            1
+        );
     }
 }

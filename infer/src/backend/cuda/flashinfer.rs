@@ -26,16 +26,16 @@ pub(crate) struct FlashInferDecodeMetadata {
     pub q_indptr: CudaSlice<i32>,
     pub flashinfer_ws: FlashInferWorkspace,
     pub max_total_pages: usize,
-    /// Total tokens in kv_indices from previous step (for incremental update).
-    prev_total_tokens: usize,
-    /// Previous batch slot indices (for detecting batch composition changes).
-    prev_slot_indices: Vec<usize>,
     /// Scratch buffer for building positions on the host side.
     positions_scratch: Vec<i32>,
-    /// Scratch buffer for incremental index H2D (avoids alloc).
+    /// Scratch buffer for KV index H2D.
     indices_scratch: Vec<i32>,
     /// Cached host-side indptr from last `update()`, reused by `plan()`.
     indptr_h: Vec<i32>,
+    /// Previous slot indices that produced `indices_scratch`.
+    prev_slot_indices: Vec<usize>,
+    /// Previous slot epochs; changes when a slot is recycled for a new request.
+    prev_slot_epochs: Vec<u64>,
     /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
     qo_indptr_h: Vec<i32>,
     /// Pool index of the most recently allocated token per request [max_batch_size].
@@ -90,11 +90,11 @@ impl FlashInferDecodeMetadata {
             q_indptr,
             flashinfer_ws: FlashInferWorkspace::new(ctx, max_batch_size, num_qheads)?,
             max_total_pages,
-            prev_total_tokens: 0,
-            prev_slot_indices: Vec::new(),
             positions_scratch: Vec::with_capacity(max_batch_size),
-            indices_scratch: Vec::with_capacity(max_batch_size),
+            indices_scratch: Vec::with_capacity(max_total_pages.max(1)),
             indptr_h: Vec::with_capacity(max_batch_size + 1),
+            prev_slot_indices: Vec::with_capacity(max_batch_size),
+            prev_slot_epochs: Vec::with_capacity(max_batch_size),
             qo_indptr_h,
             last_token_indices: ctx
                 .stream
@@ -109,10 +109,6 @@ impl FlashInferDecodeMetadata {
 
     /// Upload metadata (positions, indptr, last_page_len, KV indices) to GPU.
     ///
-    /// Uses incremental index updates when the batch composition is unchanged
-    /// (same slot indices as previous step), falling back to a full rebuild
-    /// when the batch changes or on the first call.
-    ///
     /// Returns `true` if the kv_indices GPU buffer was reallocated (caller
     /// should invalidate any CUDA graph that captured the old pointer).
     pub(crate) fn update(
@@ -121,13 +117,26 @@ impl FlashInferDecodeMetadata {
         pool: &PagedKVPool,
         slot_indices: &[usize],
     ) -> Result<bool> {
-        self.indptr_h = pool.build_indptr(slot_indices);
+        let slot_epochs: Vec<u64> = slot_indices
+            .iter()
+            .map(|&slot| pool.slot_epoch(slot))
+            .collect();
+        let next_indptr_h = pool.build_indptr(slot_indices);
+        let same_batch_identity =
+            self.prev_slot_indices == slot_indices && self.prev_slot_epochs == slot_epochs;
+        let can_incremental_update = same_batch_identity
+            && can_append_decode_step(&self.indptr_h, &next_indptr_h)
+            && self.indices_scratch.len() == self.total_tokens;
+        let reuse_plan = same_batch_identity
+            && self.plan_batch_size == slot_indices.len()
+            && can_reuse_decode_plan(&self.indptr_h, &next_indptr_h);
         let last_page_lens_h = pool.build_last_page_lens(slot_indices);
 
         // Build positions (each request's current sequence position).
         self.positions_scratch.clear();
         self.positions_scratch
             .extend(slot_indices.iter().map(|&si| (pool.seq_len(si) - 1) as i32));
+        let prev_indptr_h = std::mem::replace(&mut self.indptr_h, next_indptr_h);
 
         // H2D copies -- positions, indptr, last_page_len (small, fixed size).
         ctx.stream
@@ -140,10 +149,6 @@ impl FlashInferDecodeMetadata {
             .memcpy_htod(&last_page_lens_h, &mut self.kv_last_page_len)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
 
-        // KV indices update: if same batch composition as last step, only do
-        // an incremental update (H2D of full index array using scratch buffer).
-        // Otherwise, full rebuild of the O(total_tokens) indices array.
-        let same_batch = self.prev_slot_indices == slot_indices;
         let new_total = *self
             .indptr_h
             .last()
@@ -151,73 +156,50 @@ impl FlashInferDecodeMetadata {
             as usize;
         let mut reallocated = false;
 
-        if same_batch && self.prev_total_tokens > 0 && new_total <= self.max_total_pages {
-            // Truly incremental: each slot grew by exactly 1 token since last step.
-            // Append only the new token indices to the existing scratch buffer,
-            // then H2D the entire array. This avoids O(total_tokens) iteration.
-            //
-            // We must insert each slot's new token at the correct offset within
-            // the flat indices array (after all that slot's existing tokens).
-            // With page_size=1, indptr gives cumulative token counts per slot.
-            for (i, &slot) in slot_indices.iter().enumerate() {
-                let insert_pos = self.indptr_h[i + 1] as usize - 1; // last token of slot i
-                let last_idx = *pool.token_indices(slot).last().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "FlashInfer incremental update: slot {} has no token indices",
-                        slot
-                    )
-                })? as i32;
-                if insert_pos < self.indices_scratch.len() {
-                    self.indices_scratch[insert_pos] = last_idx;
-                } else {
-                    // Grow scratch to fit
-                    self.indices_scratch.resize(insert_pos + 1, 0);
-                    self.indices_scratch[insert_pos] = last_idx;
-                }
-            }
-            // Truncate to exact size
-            self.indices_scratch.truncate(new_total);
-            ctx.stream
-                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
-                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
-        } else {
-            // Full rebuild (first call, or batch composition changed).
-            // Populate indices_scratch so next incremental step can build on it.
-            self.indices_scratch.clear();
-            for &slot in slot_indices.iter() {
-                for &idx in pool.token_indices(slot) {
-                    self.indices_scratch.push(idx as i32);
-                }
-            }
-            if self.indices_scratch.len() > self.max_total_pages {
-                self.kv_indices = ctx
-                    .stream
-                    .alloc_zeros(self.indices_scratch.len())
-                    .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
-                self.max_total_pages = self.indices_scratch.len();
-                reallocated = true;
-            }
-            ctx.stream
-                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
-                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
-        }
-        self.prev_total_tokens = new_total;
-        self.total_tokens = new_total;
-
-        // Upload last-token pool indices (for INT8 quantize-after-write).
         self.last_token_scratch.clear();
         self.last_token_scratch
             .extend(pool.build_last_indices(slot_indices));
+
+        if can_incremental_update {
+            append_last_token_indices_in_place(
+                &mut self.indices_scratch,
+                &prev_indptr_h,
+                &self.indptr_h,
+                &self.last_token_scratch,
+            );
+        } else {
+            self.indices_scratch.clear();
+            self.indices_scratch.extend(flatten_token_indices(
+                slot_indices.iter().map(|&slot| pool.token_indices(slot)),
+            ));
+        }
+        if self.indices_scratch.len() > self.max_total_pages {
+            self.kv_indices = ctx
+                .stream
+                .alloc_zeros(self.indices_scratch.len())
+                .map_err(|e| anyhow::anyhow!("Realloc kv_indices: {e}"))?;
+            self.max_total_pages = self.indices_scratch.len();
+            reallocated = true;
+        }
+        ctx.stream
+            .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+            .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        self.total_tokens = new_total;
+
+        // Upload last-token pool indices (for INT8 quantize-after-write).
         ctx.stream
             .memcpy_htod(&self.last_token_scratch, &mut self.last_token_indices)
             .map_err(|e| anyhow::anyhow!("H2D last_token_indices: {e}"))?;
 
-        // Mark plan dirty if batch composition or size changed.
-        if !same_batch || slot_indices.len() != self.plan_batch_size || reallocated {
+        // Re-plan when the batch size changed, lengths did not follow the
+        // steady-state decode progression, or kv_indices had to move.
+        if reallocated || !reuse_plan {
             self.plan_dirty = true;
         }
         self.prev_slot_indices.clear();
         self.prev_slot_indices.extend_from_slice(slot_indices);
+        self.prev_slot_epochs.clear();
+        self.prev_slot_epochs.extend_from_slice(&slot_epochs);
 
         Ok(reallocated)
     }
@@ -322,5 +304,102 @@ impl FlashInferDecodeMetadata {
     /// Total tokens across all requests from the last `update()` call.
     pub(crate) fn total_tokens(&self) -> usize {
         self.total_tokens
+    }
+}
+
+fn flatten_token_indices<'a>(token_groups: impl IntoIterator<Item = &'a [u32]>) -> Vec<i32> {
+    let mut flat = Vec::new();
+    for group in token_groups {
+        flat.extend(group.iter().map(|&idx| idx as i32));
+    }
+    flat
+}
+
+fn can_append_decode_step(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
+    if prev_indptr.len() != next_indptr.len() || prev_indptr.len() < 2 {
+        return false;
+    }
+
+    prev_indptr
+        .windows(2)
+        .zip(next_indptr.windows(2))
+        .all(|(prev, next)| (next[1] - next[0]) == (prev[1] - prev[0]) + 1)
+}
+
+fn append_last_token_indices_in_place(
+    indices_scratch: &mut Vec<i32>,
+    prev_indptr: &[i32],
+    next_indptr: &[i32],
+    last_token_indices: &[i32],
+) {
+    if next_indptr.is_empty() {
+        indices_scratch.clear();
+        return;
+    }
+
+    let new_total = *next_indptr
+        .last()
+        .expect("invariant: next_indptr always has at least one element")
+        as usize;
+    indices_scratch.resize(new_total, 0);
+
+    for i in (0..last_token_indices.len()).rev() {
+        let old_start = prev_indptr[i] as usize;
+        let old_end = prev_indptr[i + 1] as usize;
+        let new_start = next_indptr[i] as usize;
+        let new_end = next_indptr[i + 1] as usize;
+        indices_scratch.copy_within(old_start..old_end, new_start);
+        indices_scratch[new_end - 1] = last_token_indices[i];
+    }
+}
+
+fn can_reuse_decode_plan(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
+    can_append_decode_step(prev_indptr, next_indptr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_last_token_indices_in_place, can_append_decode_step, can_reuse_decode_plan,
+        flatten_token_indices,
+    };
+
+    #[test]
+    fn flatten_token_indices_preserves_per_slot_segments() {
+        let flat =
+            flatten_token_indices([&[10_u32, 11, 12][..], &[20_u32, 21, 22][..], &[30_u32][..]]);
+        assert_eq!(flat, vec![10, 11, 12, 20, 21, 22, 30]);
+    }
+
+    #[test]
+    fn decode_plan_reuse_allows_steady_state_growth() {
+        assert!(can_reuse_decode_plan(&[0, 3, 7], &[0, 4, 9]));
+    }
+
+    #[test]
+    fn decode_plan_reuse_rejects_batch_shape_changes() {
+        assert!(!can_reuse_decode_plan(&[0, 3, 7], &[0, 3, 7]));
+        assert!(!can_reuse_decode_plan(&[0, 3, 7], &[0, 5, 8]));
+        assert!(!can_reuse_decode_plan(&[0, 3, 7], &[0, 3]));
+        assert!(!can_reuse_decode_plan(&[0, 3, 7], &[0, 2, 4]));
+    }
+
+    #[test]
+    fn incremental_append_updates_each_slot_segment_without_corruption() {
+        let mut scratch = vec![10, 11, 20, 21, 22, 30];
+        append_last_token_indices_in_place(
+            &mut scratch,
+            &[0, 2, 5, 6],
+            &[0, 3, 7, 9],
+            &[12, 23, 31],
+        );
+        assert_eq!(scratch, vec![10, 11, 12, 20, 21, 22, 23, 30, 31]);
+    }
+
+    #[test]
+    fn append_decode_step_requires_every_slot_to_grow_by_one() {
+        assert!(can_append_decode_step(&[0, 2, 5], &[0, 3, 7]));
+        assert!(!can_append_decode_step(&[0, 2, 5], &[0, 2, 6]));
+        assert!(!can_append_decode_step(&[0, 2, 5], &[0, 4, 6]));
     }
 }

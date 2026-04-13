@@ -36,6 +36,9 @@ pub(crate) struct ActiveRequest {
     /// Number of characters already sent to the client.
     pub(crate) sent_len: usize,
     pub(crate) phase: Phase,
+    /// Prompt length that is known to be fully materialized in this slot's state.
+    /// Zero means the slot must not publish a cached prefix on cleanup.
+    pub(crate) cacheable_prompt_len: usize,
     /// Cached byte length of the decoded prefix (tokens[0..safe_point]).
     /// Avoids O(N) re-decode of prefix in emit_delta.
     pub(crate) prefix_byte_len: usize,
@@ -44,6 +47,18 @@ pub(crate) struct ActiveRequest {
 }
 
 impl ActiveRequest {
+    pub(crate) fn mark_prompt_cacheable(&mut self) {
+        self.cacheable_prompt_len = self.prompt_tokens.len();
+    }
+
+    pub(crate) fn cached_prompt_to_publish(&self) -> Option<&[u32]> {
+        if self.cacheable_prompt_len == self.prompt_tokens.len() && !self.prompt.is_empty() {
+            Some(&self.prompt_tokens)
+        } else {
+            None
+        }
+    }
+
     /// Decode newly generated tokens and emit text deltas to the client.
     ///
     /// Uses incremental decode: only re-decodes a small suffix (4 tokens)
@@ -206,4 +221,52 @@ pub(crate) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckRes
     // Snap to a char boundary so slicing never panics on multi-byte chars.
     let safe_len = text.floor_char_boundary(raw_safe);
     StopCheckResult::NoStop { safe_len }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampler::SamplingParams;
+    use tokio::sync::mpsc;
+
+    fn test_request(prompt: &str, prompt_tokens: Vec<u32>) -> ActiveRequest {
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+        ActiveRequest {
+            id: 1,
+            slot_idx: 0,
+            prompt: prompt.to_string(),
+            prompt_tokens,
+            generated_tokens: Vec::new(),
+            max_tokens: 16,
+            sampling: SamplingParams::default(),
+            stop: None,
+            session_id: None,
+            delta_tx,
+            full_decoded: String::new(),
+            decoded_token_count: 0,
+            sent_len: 0,
+            phase: Phase::New,
+            cacheable_prompt_len: 0,
+            prefix_byte_len: 0,
+            latest_logprob: None,
+        }
+    }
+
+    #[test]
+    fn publishes_cached_prompt_only_after_explicit_mark() {
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        assert_eq!(req.cached_prompt_to_publish(), None);
+
+        req.mark_prompt_cacheable();
+        assert_eq!(req.cached_prompt_to_publish(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn does_not_publish_cached_prompt_for_preempted_request() {
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.mark_prompt_cacheable();
+        req.prompt.clear();
+
+        assert_eq!(req.cached_prompt_to_publish(), None);
+    }
 }

@@ -1,5 +1,17 @@
 use super::*;
 
+fn is_full_prompt_reuse_hit(prompt_len: usize, prefix_len: usize) -> bool {
+    prefix_len > 0 && prefix_len == prompt_len
+}
+
+fn is_exact_full_prefix_hit(prompt_len: usize, cached_len: usize, prefix_len: usize) -> bool {
+    is_full_prompt_reuse_hit(prompt_len, prefix_len) && prefix_len == cached_len
+}
+
+fn is_prompt_prefix_of_cached_hit(prompt_len: usize, cached_len: usize, prefix_len: usize) -> bool {
+    is_full_prompt_reuse_hit(prompt_len, prefix_len) && prefix_len < cached_len
+}
+
 impl<M: ModelForward> Scheduler<M> {
     /// Compute prefix cache for a new request and begin chunked prefill.
     pub(super) fn step_new(&mut self, idx: usize) {
@@ -31,8 +43,68 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             raw_prefix_len
         };
+        let exact_full_prefix_hit =
+            is_exact_full_prefix_hit(req.prompt_tokens.len(), cached.len(), prefix_len);
+        let prompt_prefix_of_cached_hit =
+            is_prompt_prefix_of_cached_hit(req.prompt_tokens.len(), cached.len(), prefix_len);
+        let mut pool_prefix_len = prefix_len;
 
-        let effective = if prefix_len > 0 && prefix_len == cached.len() {
+        let effective = if exact_full_prefix_hit {
+            if state.supports_partial_prefix() {
+                // An exact prompt match can safely keep the prefix up to N-1
+                // tokens and replay only the final prompt token. This refreshes
+                // the next-token logits without duplicating it in KV.
+                let replay_from = prefix_len.saturating_sub(1);
+                info!(
+                    "Request {}: prefix HIT {}/{} tokens (exact full match, replaying final token with {} reused)",
+                    req.id,
+                    prefix_len,
+                    req.prompt_tokens.len(),
+                    replay_from
+                );
+                if let Err(e) = state.truncate_to(replay_from) {
+                    error!(
+                        "Request {}: truncate on full prompt reuse hit failed: {}",
+                        req.id, e
+                    );
+                    req.phase = Phase::Finished;
+                    return;
+                }
+                cached.truncate(replay_from);
+                pool_prefix_len = replay_from;
+                req.prompt_tokens[replay_from..].to_vec()
+            } else {
+                info!(
+                    "Request {}: prefix HIT {}/{} tokens (exact full match, recomputing prompt to refresh logits)",
+                    req.id,
+                    prefix_len,
+                    req.prompt_tokens.len()
+                );
+                if let Err(e) = state.reset() {
+                    error!("Request {}: reset failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                    return;
+                }
+                cached.clear();
+                pool_prefix_len = 0;
+                req.prompt_tokens.clone()
+            }
+        } else if prompt_prefix_of_cached_hit {
+            info!(
+                "Request {}: prefix HIT {}/{} tokens (cached prompt had extra suffix, recomputing prompt for correctness)",
+                req.id,
+                prefix_len,
+                req.prompt_tokens.len()
+            );
+            if let Err(e) = state.reset() {
+                error!("Request {}: reset failed: {}", req.id, e);
+                req.phase = Phase::Finished;
+                return;
+            }
+            cached.clear();
+            pool_prefix_len = 0;
+            req.prompt_tokens.clone()
+        } else if prefix_len > 0 && prefix_len == cached.len() {
             // Truncate contiguous KV cache to prefix length — removes stale
             // decode tokens from the previous request. Without this, migration
             // to paged pool reads invalid memory (CUDA_ERROR_ILLEGAL_ADDRESS).
@@ -82,20 +154,7 @@ impl<M: ModelForward> Scheduler<M> {
                     return;
                 }
             }
-            let suffix = &req.prompt_tokens[prefix_len..];
-            if suffix.is_empty() {
-                let Some(&last_tok) = req.prompt_tokens.last() else {
-                    error!(
-                        "Request {}: prompt_tokens empty on full prefix hit - dropping",
-                        req.id
-                    );
-                    req.phase = Phase::Finished;
-                    return;
-                };
-                vec![last_tok]
-            } else {
-                suffix.to_vec()
-            }
+            req.prompt_tokens[prefix_len..].to_vec()
         } else if prefix_len > 0 {
             info!(
                 "Request {}: prefix PARTIAL {}/{} tokens",
@@ -121,8 +180,8 @@ impl<M: ModelForward> Scheduler<M> {
             req.prompt_tokens.clone()
         };
 
-        if prefix_len > 0 && self.paged_kv_pool.is_active() {
-            if let Err(e) = self.paged_kv_pool.alloc_tokens(si, prefix_len) {
+        if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
+            if let Err(e) = self.paged_kv_pool.alloc_tokens(si, pool_prefix_len) {
                 error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
             } else {
                 let ctx = self.model.device_context();
@@ -220,6 +279,8 @@ impl<M: ModelForward> Scheduler<M> {
                 "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
                 req.id, e
             );
+        } else {
+            req.mark_prompt_cacheable();
         }
 
         match model.select_token(state, &req.sampling, rng) {
@@ -245,5 +306,36 @@ impl<M: ModelForward> Scheduler<M> {
                 req.phase = Phase::Finished;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_exact_full_prefix_hit, is_full_prompt_reuse_hit, is_prompt_prefix_of_cached_hit,
+    };
+
+    #[test]
+    fn exact_full_prefix_hit_detects_only_true_exact_matches() {
+        assert!(is_exact_full_prefix_hit(4, 4, 4));
+        assert!(!is_exact_full_prefix_hit(5, 4, 4));
+        assert!(!is_exact_full_prefix_hit(4, 5, 4));
+        assert!(!is_exact_full_prefix_hit(4, 4, 3));
+    }
+
+    #[test]
+    fn full_prompt_reuse_hit_detects_exact_and_prefix_of_cached_cases() {
+        assert!(is_full_prompt_reuse_hit(4, 4));
+        assert!(is_full_prompt_reuse_hit(4, 4));
+        assert!(!is_full_prompt_reuse_hit(4, 3));
+        assert!(!is_full_prompt_reuse_hit(4, 0));
+    }
+
+    #[test]
+    fn prompt_prefix_of_cached_hit_detects_only_shorter_prompt_case() {
+        assert!(is_prompt_prefix_of_cached_hit(4, 6, 4));
+        assert!(!is_prompt_prefix_of_cached_hit(4, 4, 4));
+        assert!(!is_prompt_prefix_of_cached_hit(4, 6, 3));
+        assert!(!is_prompt_prefix_of_cached_hit(4, 3, 3));
     }
 }
