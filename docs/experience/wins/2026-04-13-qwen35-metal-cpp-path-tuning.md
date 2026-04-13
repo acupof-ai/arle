@@ -433,3 +433,105 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
 1. 继续 profile Qwen3.5 GDR prefill，但只接受 clean-build 之后的 trace / benchmark
 2. 优先沿着 `mlx_lm` 的思路继续做 helper-level compile / fuse，不优先做 whole-sublayer compile
 3. 如果 prompt gap 仍明显存在，再评估更激进的 sequence-level GDR prefill kernel 设计
+
+## Follow-up Sweep (same day)
+
+这轮继续往下挖时，刻意把“看起来可能有用”的方向都做成小而可证伪的实验，不再直接改默认。
+
+### Rejected: fuse q/k RMSNorm into the prefill GDR kernel
+
+尝试过一条更激进的路：在 `prefill (S>1)` 时把 `q/k rms_norm + scale` 直接塞进 `gated_delta` Metal kernel，本意是少一次 `q/k` 物化。
+
+结果是负收益：
+
+- `2048 / 1 / warmup 1 / runs 3`
+  - baseline: `TTFT 2824.94 ms`, `prompt 724.97 tok/s`, `repo_e2e 0.3484`
+  - fused qk in kernel: `TTFT 2887.05 ms`, `prompt 709.38 tok/s`, `repo_e2e 0.3408`
+- `128 / 128 / warmup 1 / runs 5`
+  - baseline: `prompt 683~686 tok/s`, `repo_e2e 67.0~67.4`
+  - fused qk in kernel: `prompt 662.65 tok/s`, `repo_e2e 67.24`, `TTFT 193.17 ms`
+
+判断：
+
+- 这条不是“把 helper 再往 kernel 里塞就会更快”的问题
+- 额外的 kernel 内 `rms_norm` 计算把寄存器压力和每步算量一起抬高，抵消了省下来的 `q/k` 物化
+- 所以它被明确记为 rejected experiment，不进入默认路径
+
+### GDR launch-shape sweep
+
+为了确认当前瓶颈是不是单纯的 occupancy / threadgroup 选择问题，这轮把 `gated_delta_kernel` 的 `threadgroup.y` 暴露成了调参开关：
+
+- `AGENT_INFER_QWEN35_CPP_GDR_TG_Y`
+- `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y`
+- `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y`
+
+先扫了 `128 / 128 / warmup 1 / runs 3`：
+
+- `TG_Y=1`: `prompt 684.22`, `generation 73.48`, `repo_e2e 66.36`
+- `TG_Y=2`: `prompt 688.45`, `generation 75.03`, `repo_e2e 67.66`
+- `TG_Y=4`: `prompt 683.25`, `generation 75.17`, `repo_e2e 67.72`
+- `TG_Y=8`: `prompt 682.95`, `generation 74.21`, `repo_e2e 66.93`
+
+然后把候选的 `2` 和 `4` 拿到极端 workload 上复测：
+
+- `1 / 128 / warmup 1 / runs 5`
+  - `TG_Y=2`: `generation 75.00`, `repo_e2e 73.99`
+  - `TG_Y=4`: `generation 75.16`, `repo_e2e 74.15`
+- `2048 / 1 / warmup 1 / runs 3`
+  - `TG_Y=2`: `TTFT 2914.30 ms`, `prompt 702.91`, `repo_e2e 0.3384`
+  - `TG_Y=4`: `TTFT 2982.00 ms`, `prompt 686.79`, `repo_e2e 0.3310`
+
+这组数据本身带有 machine-state 噪音，但可以读出两个稳定事实：
+
+- `TG_Y=8` 没戏，可以排除
+- `TG_Y=2` 并没有形成“全局更优”的稳定结论，尤其在更长 prefill 上没有证明自己是下一个默认值
+
+所以这轮没有翻默认 launch shape，只保留调参开关，继续把主要注意力放回 kernel 本体。
+
+### Isolate the q/k norm helper
+
+前面只做了 “两个 helper 一起开/关” 的总开关，这轮把 `q/k norm helper` 单独拉出来看。
+
+结果是它不能简单地被当成 decode-side 负资产：
+
+- `128 / 128 / warmup 1 / runs 5`
+  - qk helper on: `prompt 682.22`, `generation 74.86`, `repo_e2e 67.46`, `TTFT 187.63 ms`
+  - qk helper off: `prompt 682.95`, `generation 74.09`, `repo_e2e 66.84`, `TTFT 187.43 ms`
+- `1 / 128 / warmup 1 / runs 5`
+  - qk helper on: `generation 74.96`, `repo_e2e 73.93`, `TTFT 23.69 ms`
+  - qk helper off: `generation 74.38`, `repo_e2e 73.41`, `TTFT 22.85 ms`
+- `2048 / 1 / warmup 1 / runs 3`
+  - qk helper on: `TTFT 2811.82 ms`, `prompt 728.36`, `repo_e2e 0.3503`
+  - qk helper off: `TTFT 3015.27 ms`, `prompt 684.12`, `repo_e2e 0.3146`
+
+结论：
+
+- qk helper 不是“decode 慢一点点，所以关掉就好”
+- 它对 mixed 和长 prefill 都是硬收益，尤其长 prefill 上差距已经大到足够压过 decode 侧那点 TTFT 摆动
+- 因此继续保留为默认路径
+
+### Re-check projection choice on the newer baseline
+
+早期文档里得出的结论是 `projection: separate`。但那是更早的基线，这轮在当前 helper/last-logits/clear-cache 都已经稳定后的状态下又重新测了一次。
+
+顺序 A/B 里一度看到了：
+
+- `128 / 128 / warmup 1 / runs 5`
+  - force separate: `prompt 685.16`, `generation 74.71`, `repo_e2e 67.36`
+  - force merged: `prompt 675.52`, `generation 74.55`, `repo_e2e 67.14`
+
+也尝试过把 projection 做成 runtime phase split：
+
+- 默认 `decode -> separate`
+- 默认 `prefill -> merged`
+
+但完整跑完之后，这条策略没有稳定赢过当前的全局 `separate` 默认：
+
+- phase-specific default: `prompt 677.64`, `generation 74.33`, `repo_e2e 66.98`, `TTFT 188.90 ms`
+- force separate: `prompt 685.16`, `generation 74.71`, `repo_e2e 67.36`, `TTFT 186.82 ms`
+
+结论：
+
+- 旧结论“projection 一定 separate”并不是永远真理，需要随着基线更新重新验证
+- 但这轮重验还不够支持翻默认
+- 因此当前代码里仍保留全局 `separate projection` 作为默认，phase-specific projection 只作为 rejected attempt 记录，不进主线
