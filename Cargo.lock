@@ -13,13 +13,8 @@ name = "agent-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
  "infer",
- "infer-agent",
- "infer-tools",
- "log",
- "logforth",
- "rustyline",
+ "infer-cli",
 ]
 
 [[package]]
@@ -1435,7 +1430,6 @@ name = "infer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "infer",
  "infer-chat",
  "infer-tools",
  "log",
@@ -1452,10 +1446,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "infer-agent",
+ "infer-engine",
+ "infer-tools",
+ "log",
+ "rustyline",
+]
+
+[[package]]
 name = "infer-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "infer-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "infer",
+ "infer-agent",
+ "log",
 ]
 
 [[package]]

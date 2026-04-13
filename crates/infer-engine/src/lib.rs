@@ -5,9 +5,11 @@ use std::path::Path;
 use anyhow::Result;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use anyhow::anyhow;
-use infer_agent::AgentEngine;
-
-use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason};
+#[cfg(feature = "cuda")]
+use infer::server_engine::FinishReason;
+use infer_agent::{
+    AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentUsage,
+};
 
 #[cfg(feature = "cuda")]
 use infer::bootstrap::EngineOptions;
@@ -22,8 +24,6 @@ use infer::cpu_backend::CpuBackend;
 use infer::metal_backend::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::sampler::SamplingParams;
-#[cfg(any(feature = "metal", feature = "cpu"))]
-use infer::server_engine::Usage;
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -42,8 +42,30 @@ impl AgentEngine for LoadedServerEngine {
         infer::server_engine::ServerEngine::model_id(self)
     }
 
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
-        infer::server_engine::ServerEngine::complete(self, req)
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
+        let output = infer::server_engine::ServerEngine::complete(
+            self,
+            CompleteRequest {
+                prompt: req.prompt,
+                max_tokens: req.max_tokens,
+                sampling: infer::sampler::SamplingParams {
+                    temperature: req.temperature,
+                    ..infer::sampler::SamplingParams::default()
+                },
+                stop: req.stop,
+                logprobs: req.logprobs,
+            },
+        )?;
+        Ok(AgentCompleteOutput {
+            text: output.text,
+            finish_reason: finish_reason_from_infer(output.finish_reason),
+            usage: AgentUsage {
+                prompt_tokens: output.usage.prompt_tokens,
+                completion_tokens: output.usage.completion_tokens,
+                total_tokens: output.usage.total_tokens,
+            },
+            token_logprobs: output.token_logprobs,
+        })
     }
 }
 
@@ -83,8 +105,11 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
         &self.model_id
     }
 
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
-        let mut sampling: SamplingParams = req.sampling.clone();
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
+        let mut sampling = SamplingParams {
+            temperature: req.temperature,
+            ..SamplingParams::default()
+        };
         sampling.max_new_tokens = Some(req.max_tokens);
 
         let generated = catch_unwind(AssertUnwindSafe(|| {
@@ -104,13 +129,13 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
             && let Some(truncated) = truncate_at_first_stop(&text, &stops)
         {
             text = truncated;
-            finish_reason = FinishReason::Stop;
+            finish_reason = AgentFinishReason::Stop;
         }
 
-        Ok(CompleteOutput {
+        Ok(AgentCompleteOutput {
             text,
             finish_reason,
-            usage: Usage {
+            usage: AgentUsage {
                 prompt_tokens: generated.prompt_tokens,
                 completion_tokens: generated.completion_tokens,
                 total_tokens: generated.prompt_tokens + generated.completion_tokens,
@@ -197,7 +222,7 @@ impl AgentEngine for LoadedAgentEngine {
         }
     }
 
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
         match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(engine) => engine.complete(req),
@@ -217,10 +242,10 @@ fn model_id_from_path(model_path: &str) -> String {
         .to_string()
 }
 
-fn parse_finish_reason(finish_reason: &str) -> FinishReason {
+fn parse_finish_reason(finish_reason: &str) -> AgentFinishReason {
     match finish_reason {
-        "length" => FinishReason::Length,
-        _ => FinishReason::Stop,
+        "length" => AgentFinishReason::Length,
+        _ => AgentFinishReason::Stop,
     }
 }
 
@@ -241,11 +266,49 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     earliest.map(|pos| text[..pos].to_string())
 }
 
+#[cfg(feature = "cuda")]
+fn finish_reason_from_infer(reason: FinishReason) -> AgentFinishReason {
+    match reason {
+        FinishReason::Length => AgentFinishReason::Length,
+        FinishReason::Stop => AgentFinishReason::Stop,
+    }
+}
+
+pub fn init_default_logging() {
+    infer::logging::init_default();
+}
+
+pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String> {
+    if let Some(model_path) = explicit_model_path
+        && !model_path.trim().is_empty()
+    {
+        return Ok(model_path.to_string());
+    }
+
+    if let Ok(model) = std::env::var("AGENT_INFER_MODEL")
+        && !model.trim().is_empty()
+    {
+        return Ok(model);
+    }
+
+    if let Some((candidate, local_path)) = infer::hf_hub::discover_local_model() {
+        log::info!(
+            "Auto-detected local model '{}' at {}",
+            candidate,
+            local_path.display()
+        );
+        return Ok(candidate);
+    }
+
+    anyhow::bail!(
+        "No model specified and no local model was auto-detected. Pass --model-path or set AGENT_INFER_MODEL."
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use infer::server_engine::FinishReason;
-
     use super::{model_id_from_path, parse_finish_reason, truncate_at_first_stop};
+    use infer_agent::AgentFinishReason;
 
     #[test]
     fn model_id_uses_final_path_segment() {
@@ -258,9 +321,9 @@ mod tests {
 
     #[test]
     fn parse_finish_reason_defaults_to_stop() {
-        assert_eq!(parse_finish_reason("length"), FinishReason::Length);
-        assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
-        assert_eq!(parse_finish_reason("tool_calls"), FinishReason::Stop);
+        assert_eq!(parse_finish_reason("length"), AgentFinishReason::Length);
+        assert_eq!(parse_finish_reason("stop"), AgentFinishReason::Stop);
+        assert_eq!(parse_finish_reason("tool_calls"), AgentFinishReason::Stop);
     }
 
     #[test]
