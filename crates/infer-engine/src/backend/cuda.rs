@@ -10,13 +10,19 @@
 //! model-specific CUDA decode paths.
 
 #[cfg(feature = "cuda")]
+#[path = "cuda/bootstrap.rs"]
 pub mod bootstrap;
 #[cfg(feature = "cuda")]
+#[path = "cuda/ffi.rs"]
 pub(crate) mod ffi;
 #[cfg(feature = "cuda")]
+#[path = "cuda/flashinfer.rs"]
 pub(crate) mod flashinfer;
+#[path = "cuda/graph_pool.rs"]
 pub(crate) mod graph_pool;
 #[cfg(feature = "cuda")]
+#[path = "cuda/paged_kv.rs"]
 pub mod paged_kv;
 #[cfg(feature = "cuda")]
+#[path = "cuda/tensor.rs"]
 pub mod tensor;

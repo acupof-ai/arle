@@ -10,10 +10,13 @@ pub mod ops;
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
+#[path = "../../crates/infer-engine/src/backend.rs"]
 pub mod backend;
 pub mod block_manager;
+#[path = "../../crates/infer-engine/src/error.rs"]
 pub mod error;
 pub mod gguf;
+#[path = "../../crates/infer-engine/src/hf_hub.rs"]
 pub mod hf_hub;
 pub mod http_server;
 pub mod kv_tier;
@@ -23,12 +26,15 @@ pub mod metrics;
 pub mod model_registry;
 pub mod prefix_cache;
 pub mod quant;
+#[path = "../../crates/infer-engine/src/request_handle.rs"]
 pub mod request_handle;
+#[path = "../../crates/infer-engine/src/sampler.rs"]
 pub mod sampler;
 pub mod scheduler;
 pub mod server_engine;
 pub mod speculative;
 pub mod tensor_parallel;
+#[path = "../../crates/infer-engine/src/tokenizer.rs"]
 pub mod tokenizer;
 pub mod trace_reporter;
 #[cfg(all(test, feature = "metal"))]

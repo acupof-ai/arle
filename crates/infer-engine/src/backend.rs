@@ -11,9 +11,13 @@
 //!   and CPU paths.
 
 #[cfg(feature = "cpu")]
+#[path = "backend/cpu.rs"]
 pub mod cpu;
+#[path = "backend/cuda.rs"]
 pub mod cuda;
+#[path = "backend/metal.rs"]
 pub mod metal;
+#[path = "backend/runtime.rs"]
 pub mod runtime;
 
 use std::path::Path;

@@ -44,30 +44,43 @@ use crate::{
     tokenizer::Tokenizer,
 };
 
+#[path = "metal/config.rs"]
 mod config;
 #[cfg(feature = "metal")]
+#[path = "metal/forward.rs"]
 pub mod forward;
 #[cfg(feature = "metal")]
+#[path = "metal/generate.rs"]
 pub mod generate;
 #[cfg(feature = "metal")]
+#[path = "metal/loader.rs"]
 mod loader;
 #[cfg(feature = "metal")]
+#[path = "metal/ops.rs"]
 pub mod ops;
 #[cfg(feature = "metal")]
+#[path = "metal/qwen35.rs"]
 mod qwen35;
 #[cfg(feature = "metal")]
+#[path = "metal/sampling.rs"]
 pub mod sampling;
 #[cfg(feature = "metal")]
+#[path = "metal/weights.rs"]
 pub mod weights;
 
 // Submodules that used to live at the crate root as `metal_*.rs` — moved
 // under `metal_backend/` so that all Metal-specific code lives in one place
 // (see `docs/plans/` for the reorganisation plan).
+#[path = "metal/gdr.rs"]
 pub mod gdr;
+#[path = "metal/kv_pool.rs"]
 pub mod kv_pool;
 #[cfg(feature = "metal")]
+#[path = "metal/mlx.rs"]
 pub mod mlx;
+#[path = "metal/prefix_cache.rs"]
 pub mod prefix_cache;
+#[path = "metal/scheduler.rs"]
 pub mod scheduler;
 
 // ── mlx types (Metal GPU required) ───────────────────────────────────────────
