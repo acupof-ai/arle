@@ -315,7 +315,7 @@ mod tests {
         dir.insert(desc).expect("insert");
         let out = dir.resolve(BlockId(55)).expect("resolve");
         assert_eq!(
-            out.session_id.as_ref().map(|s| s.as_str()),
+            out.session_id.as_ref().map(SessionId::as_str),
             Some("agent-session-xyz")
         );
     }
