@@ -104,7 +104,7 @@ Every kernel in `csrc/cuda/` (CUDA) and `csrc/metal/` (Metal) must be evaluated 
 
 **Always-load**: auto memory + latest 3 from `docs/experience/errors/` and `docs/experience/wins/`.
 
-**On-demand**: `docs/plans/`, full experience entries, `ROADMAP.md`.
+**On-demand**: `docs/plans/`, `docs/research/`, full experience entries, `ROADMAP.md`.
 
 ### Experience Entry Templates
 
