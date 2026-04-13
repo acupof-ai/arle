@@ -2,22 +2,20 @@ use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result};
 
-use crate::mlx::{
+use super::mlx::{
     Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
     zeros,
 };
 
+use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
 use super::{
     KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
     MlpInputProjection, WeightTensor, clear_metal_cache, extend_kv_cache, gpu_sample_token, linear,
     load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
     merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
 };
-use crate::{
-    metal_gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step},
-    sampler::SamplingParams,
-};
+use crate::sampler::SamplingParams;
 
 pub(super) struct MetalQwen35FullAttentionWeights {
     pub(super) q_proj: WeightTensor,
@@ -305,9 +303,9 @@ impl CppQwen35Model {
                         if separate_proj {
                             unsafe {
                                 mlx_sys::qwen35_compiled_set_separate_proj(
-                                    model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2,
-                                    b.0, b.1, b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4,
-                                    up.0, up.1, up.2,
+                                    model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2, b.0,
+                                    b.1, b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4, up.0,
+                                    up.1, up.2,
                                 );
                             }
                         }
@@ -372,7 +370,7 @@ impl CppQwen35Model {
         };
 
         if rc != 0 {
-            return Err(crate::mlx::check_mlx_error().unwrap_err());
+            return Err(super::mlx::check_mlx_error().unwrap_err());
         }
 
         // Update caches in place
@@ -449,7 +447,7 @@ impl CppQwen35Model {
             return Err(e);
         }
         if rc != 0 {
-            return Err(crate::mlx::check_mlx_error().unwrap_err());
+            return Err(super::mlx::check_mlx_error().unwrap_err());
         }
 
         Ok((
@@ -642,7 +640,7 @@ pub(super) fn metal_generate_qwen35(
             prompt_outputs.push(&step_logits);
             prompt_outputs.extend(kv_flat.iter());
             prompt_outputs.extend(gdr_flat.iter());
-            crate::mlx::eval(&prompt_outputs);
+            super::mlx::eval(&prompt_outputs);
         }
         logits = Some(step_logits);
         cache_len += 1;
@@ -655,7 +653,7 @@ pub(super) fn metal_generate_qwen35(
 
     // ── mlx_lm-style double-buffered decode loop ────────────────────────
     let mut y = gpu_sample_token(&logits, params)?;
-    crate::mlx::async_eval(&[&y]);
+    super::mlx::async_eval(&[&y]);
 
     let finish_reason = 'decode: loop {
         // Build NEXT graph while GPU computes CURRENT y.
@@ -672,10 +670,10 @@ pub(super) fn metal_generate_qwen35(
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
         let next_y = gpu_sample_token(&next_logits, params)?;
-        crate::mlx::async_eval(&[&next_y]);
+        super::mlx::async_eval(&[&next_y]);
 
         // Now wait for CURRENT y and process the token.
-        crate::mlx::eval(&[&y]);
+        super::mlx::eval(&[&y]);
         let next_token = y.item_i32() as u32;
 
         if generated.is_empty() {
@@ -859,7 +857,7 @@ fn fused_gdr_step(
     attn: &MetalLinearAttnWeights,
     recurrent: &mut MetalRecurrentState,
     layer_idx: usize,
-    gdr_cfg: &crate::metal_gdr::MetalGdrConfig,
+    gdr_cfg: &super::gdr::MetalGdrConfig,
     config: &MetalModelConfig,
 ) -> MlxArray {
     let normed = rms_norm_last_dim(
@@ -989,7 +987,7 @@ fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) ->
         return rms_norm(x, weight, eps);
     }
     // Offset mode: weight = weight + 1, then manual norm.
-    use crate::mlx::{reciprocal, sqrt, sum_axis};
+    use super::mlx::{reciprocal, sqrt, sum_axis};
     let last_dim = *x.shape().last().expect("rms_norm_last_dim: empty shape") as f32;
     let x = as_dtype(x, Dtype::Float32);
     let weight = as_dtype(weight, Dtype::Float32);
@@ -1227,7 +1225,7 @@ fn load_lm_head(
 /// For depthwise conv (groups=C), shape is [C, K, 1]. Keep native dtype (bf16).
 fn load_conv1d_weight(
     weight: &MlxArray,
-    linear_cfg: &crate::metal_gdr::MetalGdrConfig,
+    linear_cfg: &super::gdr::MetalGdrConfig,
 ) -> Result<MlxArray> {
     let c = linear_cfg.qkv_dim() as i32;
     let k = linear_cfg.conv_kernel as i32;

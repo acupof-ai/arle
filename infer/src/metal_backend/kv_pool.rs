@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
-use crate::mlx::MlxArray;
+use super::mlx::MlxArray;
 
 /// Pure Rust token-slot ledger used by the Metal KV pool.
 ///
@@ -225,9 +225,9 @@ impl MetalKVPool {
         num_kv_heads: usize,
         head_dim: usize,
         max_total_tokens: usize,
-        dtype: crate::mlx::Dtype,
+        dtype: super::mlx::Dtype,
     ) -> Result<Self> {
-        use crate::mlx::zeros;
+        use super::mlx::zeros;
 
         let kv_dim = num_kv_heads * head_dim;
         let pool_shape = [max_total_tokens as i32, kv_dim as i32];
@@ -308,7 +308,7 @@ impl MetalKVPool {
         k: &MlxArray,
         v: &MlxArray,
     ) -> Result<()> {
-        use crate::mlx::{slice_update, take_axis};
+        use super::mlx::{slice_update, take_axis};
 
         let indices = self
             .ledger
@@ -348,7 +348,7 @@ impl MetalKVPool {
     /// Gather K/V from the pool for a request, returning contiguous tensors
     /// shaped `[1, n_kv_heads, seq_len, head_dim]` ready for attention.
     pub fn gather_kv(&self, layer: usize, request_id: usize) -> Result<(MlxArray, MlxArray)> {
-        use crate::mlx::{reshape, take_axis, transpose_axes};
+        use super::mlx::{reshape, take_axis, transpose_axes};
 
         let indices = self
             .ledger

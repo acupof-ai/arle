@@ -35,7 +35,7 @@ pub(super) struct MetalQwen35ArchConfig {
     pub(super) layer_types: Vec<MetalQwen35LayerType>,
     pub(super) rotary_dim: usize,
     #[cfg(feature = "metal")]
-    pub(super) linear: crate::metal_gdr::MetalGdrConfig,
+    pub(super) linear: super::gdr::MetalGdrConfig,
 }
 
 impl MetalQwen35ArchConfig {
@@ -198,7 +198,7 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 rotary_dim: (head_dim as f64 * partial_rotary_factor) as usize,
                 layer_types,
                 #[cfg(feature = "metal")]
-                linear: crate::metal_gdr::MetalGdrConfig {
+                linear: super::gdr::MetalGdrConfig {
                     num_key_heads: get_usize(model, "linear_num_key_heads", 0),
                     key_dim: get_usize(model, "linear_key_head_dim", 0),
                     num_value_heads: get_usize(model, "linear_num_value_heads", 0),

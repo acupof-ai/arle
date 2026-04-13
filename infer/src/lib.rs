@@ -31,13 +31,7 @@ pub mod kv_tier;
 pub mod logging;
 pub mod memory_planner;
 pub mod metal_backend;
-pub mod metal_gdr;
-pub mod metal_kv_pool;
-pub mod metal_prefix_cache;
-pub mod metal_scheduler;
 pub mod metrics;
-#[cfg(feature = "metal")]
-pub mod mlx;
 pub mod model_registry;
 pub mod prefix_cache;
 pub mod quant;

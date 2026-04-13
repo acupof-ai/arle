@@ -4,14 +4,9 @@ on:
   push:
     branches: [ main, master ]
     paths:
-      - 'infer/src/mlx.rs'
       - 'infer/src/backend_runtime.rs'
       - 'infer/src/metal_backend.rs'
       - 'infer/src/metal_backend/**'
-      - 'infer/src/metal_gdr.rs'
-      - 'infer/src/metal_kv_pool.rs'
-      - 'infer/src/metal_prefix_cache.rs'
-      - 'infer/src/metal_scheduler.rs'
       - 'infer/src/bin/metal_serve.rs'
       - 'infer/mlx-sys/**'
       - 'infer/csrc/metal/**'
@@ -29,14 +24,9 @@ on:
   pull_request:
     branches: [ main, master ]
     paths:
-      - 'infer/src/mlx.rs'
       - 'infer/src/backend_runtime.rs'
       - 'infer/src/metal_backend.rs'
       - 'infer/src/metal_backend/**'
-      - 'infer/src/metal_gdr.rs'
-      - 'infer/src/metal_kv_pool.rs'
-      - 'infer/src/metal_prefix_cache.rs'
-      - 'infer/src/metal_scheduler.rs'
       - 'infer/src/bin/metal_serve.rs'
       - 'infer/mlx-sys/**'
       - 'infer/csrc/metal/**'
