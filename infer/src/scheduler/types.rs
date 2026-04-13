@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use infer_core::SessionId;
 use infer_policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use tokio::sync::mpsc;
 
@@ -116,6 +117,14 @@ pub struct IncomingRequest {
     pub stop: Option<Vec<String>>,
     /// Scheduling priority. Higher-priority requests are served first.
     pub priority: RequestPriority,
+    /// Optional client-supplied session identifier used for sticky routing.
+    ///
+    /// When present, the scheduler will (once A1's RadixCache integration
+    /// lands) prefer to route successive turns of the same session to the
+    /// slot or radix subtree that already holds their KV prefix. `None`
+    /// preserves the legacy slot-affinity behaviour. See
+    /// `docs/projects/agent-first-architecture.md::A2`.
+    pub session_id: Option<SessionId>,
     /// Channel to send streaming deltas back to the HTTP handler.
     pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
 }
@@ -152,10 +161,7 @@ impl SchedulerHandle {
         QueueBoundAdmission {
             max_queued_requests: self.max_waiting,
         }
-        .allow(SchedulerSignals {
-            queued_requests,
-            active_decodes: 0,
-        })
+        .allow(SchedulerSignals::queue_state(queued_requests, 0))
     }
 
     /// Create a handle from raw parts (useful for testing).

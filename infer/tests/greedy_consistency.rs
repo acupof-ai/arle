@@ -54,6 +54,7 @@ fn make_request(
         sampling: SamplingParams::default(), // greedy (temperature=0)
         stop: None,
         priority: RequestPriority::default(),
+        session_id: None,
         delta_tx: tx,
     };
     (req, rx)
