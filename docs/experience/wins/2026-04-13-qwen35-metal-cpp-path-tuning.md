@@ -320,7 +320,26 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
 - force merged: `prompt 684.70 tok/s`, `generation 74.51 tok/s`, `repo_e2e 67.20 tok/s`, `TTFT 186.95 ms`
 - force separate: `prompt 689.16 tok/s`, `generation 75.39 tok/s`, `repo_e2e 67.95 tok/s`, `TTFT 185.74 ms`
 
-这说明 phase-specific 默认不是单一 workload 的“绝对冠军”，但它把两个极端 workload 的最优点分开拿了，而且在常见 `128 / 128` 综合 workload 上没有明显回退，可以保留。
+后续又用更长的 runs 重做了一轮 clean-build 复测，结论反而更简单：
+
+- `128 / 128 / warmup 1 / runs 5`
+  - merged: `prompt 681.31 tok/s`, `generation 74.09 tok/s`, `repo_e2e 66.82 tok/s`, `TTFT 187.91 ms`
+  - separate: `prompt 686.32 tok/s`, `generation 74.67 tok/s`, `repo_e2e 67.35 tok/s`, `TTFT 186.51 ms`
+- `1 / 128 / warmup 1 / runs 5`
+  - merged: `generation 73.71 tok/s`, `repo_e2e 72.71 tok/s`
+  - separate: `generation 73.72 tok/s`, `repo_e2e 72.72 tok/s`
+- `2048 / 1 / warmup 1 / runs 3`
+  - merged: `prompt 691.12 tok/s`, `TTFT 2963.30 ms`, `repo_e2e 0.3323 tok/s`
+  - separate: `prompt 690.44 tok/s`, `TTFT 2966.22 ms`, `repo_e2e 0.3320 tok/s`
+
+这说明先前看到的 “prefill 长序列更偏向 merged MLP” 并不够稳定，至少在当前代码和机器态下，不足以支撑更复杂的默认策略。
+
+最终结论：
+
+- 继续保留环境变量 `AGENT_INFER_QWEN35_CPP_SEPARATE_MLP=0/1` 作为强制开关
+- 但默认策略从 “phase-specific” 再次简化为：
+  - **global separate MLP**
+- 原因不是审美，而是更长 runs 下它在 mixed workload 上小幅更优，在 decode-heavy / prefill-heavy 上也没有可测的负收益
 
 ### Control check on newer HEAD
 

@@ -41,15 +41,15 @@ bool use_qwen35_cpp_prefill_last_logits_only() {
     return !(env && std::string(env) == "0");
 }
 
-bool use_qwen35_cpp_separate_mlp_for_seq_len(int seq_len) {
+bool use_qwen35_cpp_separate_mlp() {
     const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP");
     if (env) {
         return std::string(env) != "0";
     }
-    // Default to a phase-specific split:
-    // - decode (S=1): separate gate/up matmuls win
-    // - prefill (S>1): merged gate_up matmul wins
-    return seq_len == 1;
+    // Revalidation with longer runs shows separate gate/up matmuls are
+    // equal-or-better across mixed, decode-heavy, and prefill-heavy
+    // workloads, so keep the default simple.
+    return true;
 }
 
 auto& gated_delta_kernel() {
@@ -290,7 +290,7 @@ struct Qwen35CompiledModel {
     }
 
     bool use_separate_mlp_for_current_step(const GdrLayerWeights& lw) const {
-        return lw.has_separate_mlp && use_qwen35_cpp_separate_mlp_for_seq_len(current_seq_len);
+        return lw.has_separate_mlp && use_qwen35_cpp_separate_mlp();
     }
 
     // ── Full attention decode step ─────────────────────────────────────
