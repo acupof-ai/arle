@@ -18,10 +18,7 @@ pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
 pub mod backend;
-pub mod backend_runtime;
 pub mod block_manager;
-#[cfg(feature = "cpu")]
-pub mod cpu_backend;
 pub mod cuda_graph_pool;
 pub mod error;
 pub mod gguf;

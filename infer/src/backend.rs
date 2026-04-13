@@ -2,6 +2,18 @@
 //!
 //! Both the CUDA path and the Metal (MLX) path implement [`InferenceBackend`],
 //! allowing the scheduler and HTTP server to be backend-agnostic.
+//!
+//! Concrete backend implementations live under this module:
+//! - [`cpu`]   — development-only CPU backend (feature `cpu`).
+//! - [`runtime`] — cross-backend serial runtime handle used by the Metal
+//!   and CPU paths.
+//!
+//! CUDA and Metal submodules are added as they migrate into the
+//! `backend::*` namespace during the ongoing reorganisation.
+
+#[cfg(feature = "cpu")]
+pub mod cpu;
+pub mod runtime;
 
 use std::path::Path;
 
