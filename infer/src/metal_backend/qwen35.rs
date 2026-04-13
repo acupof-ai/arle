@@ -66,6 +66,18 @@ impl Drop for CppQwen35Model {
 }
 unsafe impl Send for CppQwen35Model {}
 
+fn use_qwen35_cpp_separate_proj() -> bool {
+    std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn use_qwen35_cpp_separate_mlp() -> bool {
+    std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE_MLP")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
+
 impl CppQwen35Model {
     /// Wrap a raw C++ model pointer (takes ownership).
     pub(crate) fn from_raw(ptr: *mut std::ffi::c_void) -> Self {
@@ -287,20 +299,33 @@ impl CppQwen35Model {
                             dw_b,
                         );
                     }
-                    // Set unfused projections (fewer graph nodes, matches mlx_lm)
-                    if let (Some(qkv), Some(z), Some(b), Some(a), Some(gp), Some(up)) = (
-                        extract_qw(&attn.in_proj_qkv),
-                        extract_qw(&attn.in_proj_z),
-                        extract_qw(&attn.in_proj_b),
-                        extract_qw(&attn.in_proj_a),
-                        extract_qw(&layer.gate_proj),
-                        extract_qw(&layer.up_proj),
-                    ) {
-                        unsafe {
-                            mlx_sys::qwen35_compiled_set_separate_proj(
-                                model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2, b.0, b.1,
-                                b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4, up.0, up.1, up.2,
-                            );
+                    let separate_proj = use_qwen35_cpp_separate_proj();
+                    let separate_mlp = use_qwen35_cpp_separate_mlp();
+                    if separate_proj || separate_mlp {
+                        if let (Some(qkv), Some(z), Some(b), Some(a), Some(gp), Some(up)) = (
+                            extract_qw(&attn.in_proj_qkv),
+                            extract_qw(&attn.in_proj_z),
+                            extract_qw(&attn.in_proj_b),
+                            extract_qw(&attn.in_proj_a),
+                            extract_qw(&layer.gate_proj),
+                            extract_qw(&layer.up_proj),
+                        ) {
+                            if separate_proj {
+                                unsafe {
+                                    mlx_sys::qwen35_compiled_set_separate_proj(
+                                        model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2,
+                                        b.0, b.1, b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4,
+                                        up.0, up.1, up.2,
+                                    );
+                                }
+                            }
+                            if separate_mlp {
+                                unsafe {
+                                    mlx_sys::qwen35_compiled_set_separate_mlp(
+                                        model, gp.0, gp.1, gp.2, gp.3, gp.4, up.0, up.1, up.2,
+                                    );
+                                }
+                            }
                         }
                     }
                 }

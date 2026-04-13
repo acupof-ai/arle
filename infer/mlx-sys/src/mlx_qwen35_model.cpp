@@ -102,14 +102,14 @@ auto& gated_delta_kernel() {
     return kernel;
 }
 
-// Compiled compute_g: g = exp(-exp(A_log.f32) * softplus(a + dt_bias))
-// Matches mlx_lm's @mx.compile(shapeless=True) — fuses ~10 elementwise ops
-// into a single compiled kernel, saving ~240 kernel launches per step.
+// Compiled compute_g: g = exp(neg_exp_a * softplus(a + dt_bias))
+// `neg_exp_a = -exp(A_log.f32)` is precomputed once at load time.
+// Matches mlx_lm's runtime math while saving one per-step exp per layer.
 std::vector<array> compute_g_impl(const std::vector<array>& inputs) {
-    auto A_log = astype(inputs[0], float32);
+    auto neg_exp_a = inputs[0];
     auto ab = inputs[1] + inputs[2];
     auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
-    return {exp(negative(exp(A_log)) * sp)};
+    return {exp(neg_exp_a * sp)};
 }
 
 auto& compiled_compute_g() {
@@ -137,6 +137,30 @@ std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
 
 auto& compiled_swiglu() {
     static auto fn = mlx::core::compile(swiglu_impl, true /*shapeless*/);
+    return fn;
+}
+
+// Compiled precise SiLU-mul: silu(gate.f32) * x.f32 -> x.dtype
+std::vector<array> precise_silu_mul_impl(const std::vector<array>& inputs) {
+    auto gate = astype(inputs[0], float32);
+    auto x = astype(inputs[1], float32);
+    return {astype(gate * sigmoid(gate) * x, inputs[1].dtype())};
+}
+
+auto& compiled_precise_silu_mul() {
+    static auto fn = mlx::core::compile(precise_silu_mul_impl, true /*shapeless*/);
+    return fn;
+}
+
+// Compiled precise sigmoid-mul: sigmoid(gate.f32) * x.f32 -> x.dtype
+std::vector<array> precise_sigmoid_mul_impl(const std::vector<array>& inputs) {
+    auto gate = sigmoid(astype(inputs[0], float32));
+    auto x = astype(inputs[1], float32);
+    return {astype(gate * x, inputs[1].dtype())};
+}
+
+auto& compiled_precise_sigmoid_mul() {
+    static auto fn = mlx::core::compile(precise_sigmoid_mul_impl, true /*shapeless*/);
     return fn;
 }
 
@@ -284,8 +308,7 @@ struct Qwen35CompiledModel {
         array result(0);
         if (lw.has_qk_gate) {
             auto gate = reshape(gate_val, {1, S, nh*hd});
-            gate = sigmoid(astype(gate, float32));
-            result = lw.o_proj.apply(astype(astype(attn_out, float32) * gate, bfloat16));
+            result = lw.o_proj.apply(compiled_precise_sigmoid_mul()({gate, attn_out})[0]);
         } else {
             result = lw.o_proj.apply(attn_out);
         }
@@ -421,7 +444,7 @@ struct Qwen35CompiledModel {
         auto y_heads = reshape(y, {S * hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
         auto z_gated = reshape(z_raw, {S * hv, dv});
-        auto out = normed * compiled_silu()({z_gated})[0];
+        auto out = compiled_precise_silu_mul()({z_gated, normed})[0];
         auto result = lw.out_proj.apply(reshape(out, {1, S, hv*dv}));
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
@@ -700,7 +723,7 @@ void qwen35_compiled_push_gdr(
         lw.gdr.ba_num_heads = ba_num_heads;
         lw.gdr.conv1d_w = *to_arr(conv1d_w);
         lw.gdr.conv_kernel = conv_kernel;
-        lw.gdr.a_log = *to_arr(a_log);
+        lw.gdr.a_log = negative(exp(astype(*to_arr(a_log), float32)));
         lw.gdr.dt_bias = *to_arr(dt_bias);
         lw.gdr.norm_w = *to_arr(norm_w);
         lw.gdr.rms_eps = gdr_rms_eps;
@@ -722,7 +745,7 @@ void qwen35_compiled_push_gdr(
 
 // Set individual (unfused) projections for the last-pushed GDR layer.
 // Call AFTER qwen35_compiled_push_gdr. Enables the unfused matmul path
-// which has fewer graph nodes (matches mlx_lm's op pattern).
+// for the attention-side projections.
 void qwen35_compiled_set_separate_proj(
     void* model,
     mlx_array* qkv_w, mlx_array* qkv_s, mlx_array* qkv_b, int32_t qkv_gs, int32_t qkv_bits,
@@ -740,6 +763,17 @@ void qwen35_compiled_set_separate_proj(
         lw.b_proj = {*to_arr(b_w), *to_arr(b_s), *to_arr(b_b), qkv_gs, qkv_bits};
         lw.a_proj = {*to_arr(a_w), *to_arr(a_s), *to_arr(a_b), qkv_gs, qkv_bits};
         lw.use_separate_proj = true;
+    });
+}
+
+void qwen35_compiled_set_separate_mlp(
+    void* model,
+    mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b, int32_t mlp_gs, int32_t mlp_bits,
+    mlx_array* up_w, mlx_array* up_s, mlx_array* up_b
+) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        auto& lw = m->layers.back().gdr;
         lw.gate_proj = {*to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), mlp_gs, mlp_bits};
         lw.up_proj = {*to_arr(up_w), *to_arr(up_s), *to_arr(up_b), mlp_gs, mlp_bits};
         lw.use_separate_mlp = true;
