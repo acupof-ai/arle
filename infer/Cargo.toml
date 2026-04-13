@@ -28,7 +28,7 @@ memmap2 = { version = "0.9", optional = true }
 hf-hub = { version = "0.5", features = ["tokio"] }
 # MLX Metal backend (Apple Silicon)
 # mlx-sys: direct MLX C API bindings (bindgen). No mlx-rs wrapper.
-mlx-sys = { path = "mlx-sys", optional = true }
+mlx-sys = { path = "../crates/mlx-sys", optional = true }
 # libc: peak RSS via getrusage for metal_bench
 libc = { version = "0.2", optional = true }
 # NIXL (NVIDIA Inference Transfer Library) — optional dep for the Tiered KV
