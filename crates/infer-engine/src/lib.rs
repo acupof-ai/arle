@@ -1,5 +1,6 @@
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(any(feature = "metal", feature = "cpu", test))]
 use std::path::Path;
 
 use anyhow::Result;
@@ -7,9 +8,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 #[cfg(feature = "cuda")]
 use infer::server_engine::FinishReason;
-use infer_agent::{
-    AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentUsage,
-};
 
 #[cfg(feature = "cuda")]
 use infer::bootstrap::EngineOptions;
@@ -26,6 +24,41 @@ use infer::cpu_backend::CpuBackend;
 use infer::metal_backend::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::sampler::SamplingParams;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCompleteRequest {
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub stop: Option<Vec<String>>,
+    pub logprobs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentFinishReason {
+    Length,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCompleteOutput {
+    pub text: String,
+    pub finish_reason: AgentFinishReason,
+    pub usage: AgentUsage,
+    pub token_logprobs: Vec<f32>,
+}
+
+pub trait AgentEngine {
+    fn model_id(&self) -> &str;
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput>;
+}
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -236,6 +269,7 @@ impl AgentEngine for LoadedAgentEngine {
     }
 }
 
+#[cfg(any(feature = "metal", feature = "cpu", test))]
 fn model_id_from_path(model_path: &str) -> String {
     Path::new(model_path)
         .file_name()
@@ -244,6 +278,7 @@ fn model_id_from_path(model_path: &str) -> String {
         .to_string()
 }
 
+#[cfg(any(feature = "metal", feature = "cpu", test))]
 fn parse_finish_reason(finish_reason: &str) -> AgentFinishReason {
     match finish_reason {
         "length" => AgentFinishReason::Length,
@@ -251,6 +286,7 @@ fn parse_finish_reason(finish_reason: &str) -> AgentFinishReason {
     }
 }
 
+#[cfg(any(feature = "metal", feature = "cpu", test))]
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let mut earliest = None::<usize>;
     for stop in stops {
@@ -309,8 +345,8 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
 
 #[cfg(test)]
 mod tests {
+    use super::AgentFinishReason;
     use super::{model_id_from_path, parse_finish_reason, truncate_at_first_stop};
-    use infer_agent::AgentFinishReason;
 
     #[test]
     fn model_id_uses_final_path_segment() {

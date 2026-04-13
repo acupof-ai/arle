@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use infer_core::{InferenceMode, RequestId, RequestPhase};
+use infer_core::{InferenceMode, RequestEventKind, RequestId};
 use infer_observability::{EngineEvent, EventSink, NoopEventSink};
 use infer_policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
 
@@ -142,10 +142,15 @@ impl BatchScheduler {
         }
     }
 
-    fn emit_event(&self, request_id: RequestId, phase: RequestPhase, mode: Option<InferenceMode>) {
+    fn emit_event(
+        &self,
+        request_id: RequestId,
+        kind: RequestEventKind,
+        mode: Option<InferenceMode>,
+    ) {
         self.event_sink.emit(&EngineEvent {
             request_id,
-            phase,
+            kind,
             mode,
         });
     }
@@ -167,7 +172,7 @@ impl BatchScheduler {
             prefill_progress: 0,
             allocated_blocks: Vec::new(),
         });
-        self.emit_event(req_id, RequestPhase::Queued, None);
+        self.emit_event(req_id, RequestEventKind::Enqueued, None);
         req_id
     }
 
@@ -189,6 +194,11 @@ impl BatchScheduler {
                 Err(_) => return false,
             }
         }
+        self.emit_event(
+            req_id,
+            RequestEventKind::DecodeStep,
+            Some(InferenceMode::Decode),
+        );
         true
     }
 
@@ -196,7 +206,11 @@ impl BatchScheduler {
     pub fn finish_request(&mut self, req_id: RequestId) {
         if let Some(req) = self.running.remove(&req_id) {
             self.block_manager.free(&req.blocks);
-            self.emit_event(req_id, RequestPhase::Completed, Some(InferenceMode::Decode));
+            self.emit_event(
+                req_id,
+                RequestEventKind::Completed,
+                Some(InferenceMode::Decode),
+            );
         }
         self.waiting.retain(|r| r.req_id != req_id);
     }
@@ -286,6 +300,12 @@ impl BatchScheduler {
             self.block_manager.free(&req.blocks);
             preempted = true;
 
+            self.emit_event(
+                preempt_id,
+                RequestEventKind::Evicted,
+                Some(InferenceMode::Decode),
+            );
+
             self.waiting.push_front(PendingRequest {
                 req_id: preempt_id,
                 prompt_tokens: req.prompt_tokens,
@@ -294,7 +314,7 @@ impl BatchScheduler {
                 prefill_progress: 0,
                 allocated_blocks: Vec::new(),
             });
-            self.emit_event(preempt_id, RequestPhase::Queued, None);
+            self.emit_event(preempt_id, RequestEventKind::Requeued, None);
         }
         preempted
     }
@@ -349,11 +369,20 @@ impl BatchScheduler {
             return None;
         }
 
-        let (chunk, block_table, req_id, seq_len, is_last_chunk, total_tokens) = {
+        let (
+            chunk,
+            block_table,
+            req_id,
+            seq_len,
+            is_last_chunk,
+            total_tokens,
+            emit_prefill_started,
+        ) = {
             let pending = self.waiting.front_mut()?;
 
             let total_tokens = pending.prompt_tokens.len();
             let progress = pending.prefill_progress;
+            let is_first_chunk = progress == 0;
             let remaining = total_tokens.saturating_sub(progress);
             let chunk_tokens = remaining.min(policy_chunk_budget).min(token_budget);
             if chunk_tokens == 0 {
@@ -388,9 +417,18 @@ impl BatchScheduler {
                 seq_len,
                 is_last_chunk,
                 total_tokens,
+                is_first_chunk,
             )
         };
-        self.emit_event(req_id, RequestPhase::Prefill, Some(InferenceMode::Prefill));
+
+        if emit_prefill_started {
+            // Lifecycle signal, not a per-chunk notification.
+            self.emit_event(
+                req_id,
+                RequestEventKind::PrefillStarted,
+                Some(InferenceMode::Prefill),
+            );
+        }
 
         if is_last_chunk {
             let done = self.waiting.pop_front().expect("checked above");
@@ -405,7 +443,6 @@ impl BatchScheduler {
                     kv_tokens: total_tokens,
                 },
             );
-            self.emit_event(req_id, RequestPhase::Decode, Some(InferenceMode::Decode));
         }
 
         Some(PrefillBatch {

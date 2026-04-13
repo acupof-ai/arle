@@ -1431,6 +1431,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "infer-chat",
+ "infer-engine",
  "infer-tools",
  "log",
  "serde",
@@ -1452,10 +1453,12 @@ dependencies = [
  "anyhow",
  "clap",
  "infer-agent",
+ "infer-chat",
  "infer-engine",
  "infer-tools",
  "log",
  "rustyline",
+ "serde_json",
 ]
 
 [[package]]
@@ -1471,7 +1474,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "infer",
- "infer-agent",
  "log",
 ]
 

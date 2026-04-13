@@ -7,9 +7,11 @@
 - 训练语义与推理语义一致（mixed attention / state transition 可验证）。
 - 新模型/新后端接入成本线性，不因代码复制导致熵增。
 
+当前仓库实际处在 **Phase 1 的收尾/稳定阶段**：控制面 crate 已经开始拆出，但 scheduler / KV / runtime 的原子化还没有进入主拆分。下面的目录树仍然是最终目标拓扑，不是当前已完成状态。
+
 ---
 
-## 一、建议的工作区组织（Atomic Crates）
+## 一、目标态工作区组织（Future Atomic Crates）
 
 > 设计原则：**核心语义最小化**、**后端细节外置**、**策略可插拔**、**接口向内收敛**。
 
@@ -32,9 +34,11 @@ agent-infer/
 └── infer/                          # 兼容层（过渡期）：re-export + legacy glue
 ```
 
+这里描述的是 **Phase 2/3 之后的目标拓扑**，不是当前仓库已经存在的 crate 列表。当前实际 workspace 仍以 `infer` + 已拆出的控制面 crate 为主。
+
 ---
 
-## 二、依赖方向（必须单向）
+## 二、目标态依赖方向（必须单向）
 
 ```text
 infer-core
@@ -57,7 +61,7 @@ infer-model-api      infer-backend-api      infer-observability
 1. `runtime-*` 不能反向依赖 `http`、`cli`、`scheduler-core` 的实现细节。
 2. `scheduler-core` 不允许出现 CUDA/Metal 私有类型。
 3. `model-api` 不感知网络协议与后端执行细节。
-4. `infer-engine` 是唯一“装配点”；其他 crate 不做跨层偷连。
+4. `infer-engine` 应保持为唯一“装配点”；任何指回 `infer-agent` / `infer-cli` 的依赖都只能算过渡实现，必须在 Phase 1 收尾中清掉。
 
 ---
 
@@ -105,7 +109,9 @@ infer-model-api      infer-backend-api      infer-observability
 
 ---
 
-## 四、训推一致如何嵌入到分层中
+## 四、后续阶段：训推一致如何嵌入到分层中
+
+> 这一节描述的是后续阶段希望落地的能力，不代表当前 Phase 1 已经具备 `infer-model-api`、`consistency_mode` 或 Golden Trace 管线。
 
 - `infer-model-api` 定义一致性探针接口：层级摘要、token 级摘要。
 - `infer-observability` 承载 Golden Trace 事件与 first-diff 报告 schema。
@@ -118,12 +124,17 @@ infer-model-api      infer-backend-api      infer-observability
 
 ## 五、落地迁移顺序（避免大爆炸）
 
-### Phase 1（先拆 API，不搬重逻辑）
-1. 抽出 `infer-core` / `infer-model-api` / `infer-backend-api`。
-2. 在现有 `infer` 中通过 re-export 保持外部接口不破坏。
-3. 建立 crate 级 CI（每个 crate 至少有 compile + unit）。
+### Phase 1（当前实际范围：控制面拆分与边界收敛）
+1. 保持已拆出的控制面 crate 可编译、可测试、可回退：`infer-agent`、`infer-cli`、`infer-chat`、`infer-tools`、`infer-core`、`infer-engine`、`infer-observability`、`infer-policy`。
+2. 让 `infer-engine` 只保留运行时装配与后端适配边界，不再反向依赖控制面实现。
+3. 维持 `infer` 的兼容层职责，先不把 scheduler / KV / runtime 的主逻辑继续拆散。
+4. 把 observability、policy 先收敛成稳定边界，后续再接入更深的 runtime 语义。
 
-**完成标准**：编译通过、外部调用零破坏、依赖方向满足单向规则。
+**当前未完成**：
+- `infer-model-api` / `infer-backend-api` 还没有真正落地。
+- scheduler、KV、runtime-* 的原子化仍在后续阶段。
+- observability 目前已经收敛为 action-oriented 事件边界，但更深的 trace / consistency 语义还没继续下沉。
+- policy API 已经包含 admission + chunking 边界，但 runtime 目前实际只消费 chunking；更深的 admission / eviction wiring 仍在后续阶段。
 
 ### Phase 2（拆调度与策略）
 1. 把 scheduler 状态机迁到 `infer-scheduler-core`。

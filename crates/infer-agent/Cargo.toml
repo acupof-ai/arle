@@ -6,7 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 infer-chat = { path = "../infer-chat" }
-infer-tools = { path = "../infer-tools" }
+infer-engine = { path = "../infer-engine", default-features = false }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+infer-tools = { path = "../infer-tools" }

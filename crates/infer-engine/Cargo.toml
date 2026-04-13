@@ -13,5 +13,4 @@ metal = ["infer/metal"]
 [dependencies]
 anyhow = "1.0"
 infer = { path = "../../infer", default-features = false }
-infer-agent = { path = "../infer-agent" }
 log = "0.4"
