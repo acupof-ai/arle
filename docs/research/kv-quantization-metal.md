@@ -28,9 +28,10 @@ MLX_INT8 = 5, MLX_INT16 = 6, MLX_INT32 = 7, MLX_INT64 = 8
 MLX_FLOAT16 = 9, MLX_FLOAT32 = 10, MLX_BFLOAT16 = 12, MLX_COMPLEX64 = 13
 ```
 
-**FP8 (E4M3/E5M2) is NOT in MLX's Dtype enum.** As of MLX 0.26 (April 2026), MLX
-does not support FP8 operations. Apple Silicon hardware (M3/M4) does not have
-native FP8 tensor cores — FP8 would be emulated in software with no performance benefit.
+**FP8 (E4M3/E5M2) is NOT in MLX's Dtype enum.** MLX v0.30.3 (January 2025) added
+`nvfp4` and `mxfp8` quantize/dequantize ops — but these are **weight quantization formats**,
+not native tensor dtypes. There is no built-in `--kv-cache-dtype fp8` equivalent.
+Apple Silicon (M3/M4) has no native FP8 tensor cores; FP8 KV cache would provide no speedup.
 
 ## Feasibility Assessment
 
@@ -55,17 +56,36 @@ To quantize KV on Metal, we would need to:
 On M3 Max (400 GB/s unified memory bandwidth), the KV cache rarely dominates
 at typical inference concurrency (C=1–4). BFloat16 KV is generally fine.
 
+## TurboQuant / PolarQuant on MLX (Community)
+
+No first-party MLX KV cache quantization. Community implementations exist:
+
+| Repo | Algorithm | Compression | Qwen3-4B cosine sim |
+|------|-----------|-------------|---------------------|
+| [rachittshah/mlx-turboquant](https://github.com/rachittshah/mlx-turboquant) | PolarQuant (data-oblivious) | 4.6x (4-bit) | 0.995 |
+| [helgklaizar/turboquant_mlx](https://github.com/helgklaizar/turboquant_mlx) | TurboQuant + PolarQuant | 4.6x (4-bit) | 0.995 |
+| [lingengyuan/qjl-mlx](https://github.com/lingengyuan/qjl-mlx) | QJL + TurboQuant | up to 5x | - |
+
+**Algorithm**: Normalize KV vectors → rotate with Hadamard matrix → quantize
+Gaussian-distributed coordinates with Lloyd-Max codebooks → bit-pack to 2/3/4-bit.
+
+**Key result**: GPT-OSS-120B fits its full 131K context in 50 GB on a 64 GB MacBook
+with combined weight + KV cache compression (via `turboquant-mlx-full` PyPI package).
+
+Note: agent-infer already implements TurboQuant on CUDA (3-bit, 5x compression).
+Metal KV quantization would need a Rust/MLX integration of PolarQuant.
+
 ## Recommendation
 
 **FP8 KV on Metal: Not feasible** — hardware and MLX framework don't support it.
 
-**INT8 KV on Metal: Low priority** — M3 Max has 400 GB/s bandwidth; KV memory
-pressure only matters at C≥8 with long contexts. Current 52 tok/s baseline
-is memory-bandwidth-limited at the weight GEMM level, not KV read.
+**TurboQuant/PolarQuant INT4 on Metal: Feasible but medium priority** — 4.6x compression,
+0.995 cosine similarity. Worthwhile at C≥4 with context > 8K tokens. Implementation
+would hook into `backend/metal/kv_pool.rs`: quantize on insert, dequantize before MLX attention.
 
 **Defer Metal KV quantization** until:
-1. MLX adds FP8 support, OR
-2. Concurrency target exceeds C=8 with context > 8K tokens
+1. Concurrency target exceeds C=4 with long contexts, OR
+2. User requests GPU-OSS-120B or similarly large models on Apple Silicon
 
-**Alternative**: Use model weight quantization (INT4 via MLX quantize) to reduce
-total memory footprint, freeing more bandwidth for unquantized KV.
+**Immediate alternative**: Use INT4 weight quantization (MLX quantize) to shrink
+model weights, freeing more unified memory bandwidth for unquantized KV.

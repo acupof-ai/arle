@@ -515,13 +515,14 @@ Phase 0 complete. Quantization (Phase 2) largely complete. Focus on performance 
   offer 2.5–3× speedup on Qwen3 without a separate model (uses target hidden states as draft input).
   See [docs/research/speculative-decoding-feasibility.md](docs/research/speculative-decoding-feasibility.md)
 
-- **KV quantization on Metal**: MLX has no FP8 type. Metal FP8 KV is not feasible.
-  INT8 KV possible but low-priority (M3 Max bandwidth not bottlenecked by KV at C≤4).
+- **KV quantization on Metal**: FP8 KV not feasible (MLX has no FP8 dtype; M3 hardware lacks FP8 cores).
+  TurboQuant/PolarQuant INT4 KV is feasible (4.6x compression, 0.995 cosine sim on Qwen3-4B) via
+  community MLX implementations. Medium priority — worthwhile at C≥4 long-context.
   See [docs/research/kv-quantization-metal.md](docs/research/kv-quantization-metal.md)
 
-- **DFlash on Metal**: DFlash-MLX project exists, supports Qwen3-4B and Qwen3.5-4B natively.
-  Per-layer KV rollback for hybrid models already solved in upstream. Medium priority —
-  implement CUDA speculative decoding first, then port DFlash to Metal.
+- **DFlash on Metal**: DFlash-MLX (github.com/Aryagm/dflash-mlx) supports Qwen3-4B and Qwen3.5-4B.
+  Per-layer KV rollback for hybrid models already solved. mlx-lm built-in `--draft-model` (merged Jan 2025)
+  is the easiest 1.5–1.8x speedup path. EAGLE-3 is CUDA-only. Medium priority.
   See [docs/research/dflash-metal-feasibility.md](docs/research/dflash-metal-feasibility.md)
 
 ---
