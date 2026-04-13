@@ -9,7 +9,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
 use crate::model::{GenerationState, ModelForward};
-use crate::paged_kv::PagedKVPool;
+use crate::backend::cuda::paged_kv::PagedKVPool;
 use crate::server_engine::{FinishReason, StreamDelta, Usage};
 use crate::tokenizer::Tokenizer;
 

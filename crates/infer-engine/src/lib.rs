@@ -10,7 +10,7 @@ use anyhow::anyhow;
 use infer::server_engine::FinishReason;
 
 #[cfg(feature = "cuda")]
-use infer::bootstrap::EngineOptions;
+use infer::backend::cuda::bootstrap::EngineOptions;
 #[cfg(feature = "cuda")]
 use infer::server_engine::CompleteRequest;
 #[cfg(feature = "cuda")]

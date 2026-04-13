@@ -16,7 +16,7 @@
 
 use half::bf16;
 use infer::gguf::GgufFile;
-use infer::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 
 fn model_path() -> String {
     std::env::var("PEGAINFER_CARNICE_PATH")

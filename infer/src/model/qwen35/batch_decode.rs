@@ -14,14 +14,14 @@ use super::forward::Qwen35State;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
-use crate::flashinfer_metadata::FlashInferDecodeMetadata;
+use crate::backend::cuda::flashinfer::FlashInferDecodeMetadata;
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
 use crate::ops::kv_quant;
 use crate::ops::kv_turboquant;
-use crate::paged_kv::PagedKVPool;
-use crate::tensor::{DeviceContext, HiddenStates};
+use crate::backend::cuda::paged_kv::PagedKVPool;
+use crate::backend::cuda::tensor::{DeviceContext, HiddenStates};
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 
@@ -297,7 +297,7 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
     fn update_metadata(
         &mut self,
         ctx: &DeviceContext,
-        pool: &crate::paged_kv::PagedKVPool,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
         slot_indices: &[usize],
     ) -> Result<bool> {
         self.metadata.update(ctx, pool, slot_indices)

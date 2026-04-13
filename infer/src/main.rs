@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use infer::bootstrap::{
+use infer::backend::cuda::bootstrap::{
     EngineOptions, ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
 };
 use infer::http_server::build_app;
@@ -198,7 +198,7 @@ async fn shutdown_signal() {
 /// memory, divide remaining by per-slot cost (KV cache + recurrent state at target
 /// sequence length). Clamp to [4, 128].
 fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
-    use infer::tensor::DeviceContext;
+    use infer::backend::cuda::tensor::DeviceContext;
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;

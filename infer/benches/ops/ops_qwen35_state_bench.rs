@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use infer::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use infer::ops;
-use infer::tensor::{DeviceContext, DeviceVec};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
     EPS, MAX_SEQ_LEN, QWEN35_4B_HEAD_DIM, QWEN35_4B_KV_HEADS, QWEN35_4B_LINEAR_K_DIM,
@@ -41,7 +41,7 @@ pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
                     QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_K_DIM * QWEN35_4B_LINEAR_V_DIM,
                 )
                 .expect("failed to allocate recurrent state");
-                let mut recurrent_out = infer::tensor::HiddenStates::zeros(
+                let mut recurrent_out = infer::backend::cuda::tensor::HiddenStates::zeros(
                     &ctx,
                     QWEN35_4B_LINEAR_V_HEADS * QWEN35_4B_LINEAR_V_DIM,
                     seq_len,
@@ -111,7 +111,7 @@ pub(crate) fn bench_qwen35_prefill_attn_ops(c: &mut Criterion) {
             let mut k_cache = DeviceVec::zeros(&ctx, cache_len).expect("k_cache");
             let mut v_cache = DeviceVec::zeros(&ctx, cache_len).expect("v_cache");
             let mut attn_out =
-                infer::tensor::HiddenStates::zeros(&ctx, q_dim, seq_len).expect("attn_out");
+                infer::backend::cuda::tensor::HiddenStates::zeros(&ctx, q_dim, seq_len).expect("attn_out");
 
             iter_sync(b, &ctx, || {
                 ops::prefill_attention_hd256_batch(

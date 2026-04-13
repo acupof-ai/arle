@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::cuda_graph::CudaGraphState;
 use super::kv_cache::KVCache;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 /// Common generation-state fields shared across all model implementations.
 ///
@@ -71,7 +71,7 @@ impl GenerationStateBase {
     pub(crate) fn migrate_kv_to_paged(
         &self,
         ctx: &DeviceContext,
-        pool: &crate::paged_kv::PagedKVPool,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()> {
         use super::kv_cache::KVFormat;

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use infer::ops;
-use infer::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use super::common::{
     ATTN_SEQ_LEN, EPS, HEAD_DIM_128, KV_HEADS_128, MAX_SEQ_LEN, Q_HEADS_128, ROPE_THETA_QWEN3,

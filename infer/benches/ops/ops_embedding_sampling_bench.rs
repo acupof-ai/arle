@@ -4,7 +4,7 @@ use std::hint::black_box;
 use cudarc::driver::CudaSlice;
 use infer::ops;
 use infer::sampler::SamplingParams;
-use infer::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use super::common::{
     BATCH_SEQ_LEN, VECTOR_DIM, VOCAB_SIZE, configure_group, decode_meta, embedding_matrix,

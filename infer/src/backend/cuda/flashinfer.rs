@@ -9,8 +9,8 @@ use cudarc::driver::CudaSlice;
 
 use crate::ops;
 use crate::ops::FlashInferWorkspace;
-use crate::paged_kv::PagedKVPool;
-use crate::tensor::DeviceContext;
+use super::paged_kv::PagedKVPool;
+use super::tensor::DeviceContext;
 
 /// GPU-side metadata buffers for FlashInfer batched decode attention.
 ///

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 /// RMSNorm into pre-allocated output buffer
 pub fn rms_norm_into(

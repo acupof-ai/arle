@@ -16,7 +16,7 @@ use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
 use crate::model::kv_cache::{KVCacheDtype, KVFormat};
-use crate::tensor::DeviceContext;
+use super::tensor::DeviceContext;
 
 /// Token-level KV cache pool — shared across all request slots.
 ///
@@ -570,10 +570,10 @@ impl TokenKVPool {
     /// The contiguous cache layout is `[max_seq_len_contiguous, kv_dim]` per layer.
     pub fn migrate_from_contiguous(
         &self,
-        ctx: &crate::tensor::DeviceContext,
+        ctx: &super::tensor::DeviceContext,
         slot: usize,
-        contiguous_k_caches: &[crate::tensor::DeviceVec],
-        contiguous_v_caches: &[crate::tensor::DeviceVec],
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
         use cudarc::driver::DevicePtr;
@@ -602,11 +602,11 @@ impl TokenKVPool {
             let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
 
             unsafe {
-                crate::ffi::kv_cache_to_paged_cuda(
-                    k_src_ptr as *const crate::ffi::Half,
-                    v_src_ptr as *const crate::ffi::Half,
-                    k_dst_ptr as *mut crate::ffi::Half,
-                    v_dst_ptr as *mut crate::ffi::Half,
+                super::ffi::kv_cache_to_paged_cuda(
+                    k_src_ptr as *const super::ffi::Half,
+                    v_src_ptr as *const super::ffi::Half,
+                    k_dst_ptr as *mut super::ffi::Half,
+                    v_dst_ptr as *mut super::ffi::Half,
                     pi_ptr as *const i32,
                     max_seq_len_contiguous as i32,
                     seq_len as i32,
@@ -629,7 +629,7 @@ impl TokenKVPool {
     /// layout with scale transposition.
     pub fn migrate_from_contiguous_int8(
         &self,
-        ctx: &crate::tensor::DeviceContext,
+        ctx: &super::tensor::DeviceContext,
         slot: usize,
         contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
         contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
@@ -667,7 +667,7 @@ impl TokenKVPool {
             let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
 
             unsafe {
-                crate::ffi::kv_cache_to_paged_int8_cuda(
+                super::ffi::kv_cache_to_paged_int8_cuda(
                     k_src_ptr as *const i8,
                     v_src_ptr as *const i8,
                     ks_src_ptr as *const f32,
@@ -697,10 +697,10 @@ impl TokenKVPool {
     /// scatters to NHD paged layout in a single fused kernel per layer.
     pub fn migrate_from_contiguous_fp8(
         &self,
-        ctx: &crate::tensor::DeviceContext,
+        ctx: &super::tensor::DeviceContext,
         slot: usize,
-        contiguous_k_caches: &[crate::tensor::DeviceVec],
-        contiguous_v_caches: &[crate::tensor::DeviceVec],
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
         let seq_len = self.seq_len(slot);

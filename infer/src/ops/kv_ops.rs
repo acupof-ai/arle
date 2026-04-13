@@ -1,8 +1,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr};
 
-use crate::ffi;
-use crate::tensor::{DeviceContext, HiddenStates};
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::tensor::{DeviceContext, HiddenStates};
 
 /// Scatter-write prefill K/V from contiguous GEMM output to a token-level KV pool.
 ///
