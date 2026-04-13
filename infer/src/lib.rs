@@ -27,6 +27,7 @@ pub mod error;
 pub mod gguf;
 pub mod hf_hub;
 pub mod http_server;
+pub mod kv_tier;
 pub mod logging;
 pub mod memory_planner;
 pub mod metal_backend;
