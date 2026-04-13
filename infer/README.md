@@ -217,35 +217,36 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 src/
 ├── main.rs                # CLI entry point + HTTP server (axum)
 ├── server_engine.rs       # Model detection, single-request engine
-├── http_server/           # /v1/completions, /v1/chat/completions, SSE
-├── scheduler/             # Continuous batching scheduler (mod, batch, types)
-├── model.rs               # ModelForward + GenerationState traits
-├── model/
-│   ├── cuda_graph.rs      # CUDA Graph capture/replay (per batch size)
-│   ├── kv_cache.rs        # KV cache + CPU offload
-│   ├── qwen3/             # Qwen3: weights, forward, prefill, decode
-│   └── qwen35/            # Qwen3.5: weights, forward, recurrent_state
-├── metal_backend.rs       # Metal/MLX backend (Apple Silicon)
-├── ops.rs                 # GPU operator dispatch
-├── ops/
-│   ├── attention.rs       # GQA attention, FlashInfer paged decode
-│   ├── linear.rs          # GEMV, cuBLAS GEMM, batched GEMM
-│   ├── norm.rs            # RMSNorm, fused Add+RMSNorm
-│   ├── recurrent.rs       # Conv1d, Gated Delta Rule (Qwen3.5)
-│   └── sampling.rs        # GPU argmax, top-k/top-p, batched sampling
-├── tensor.rs              # DeviceVec, DeviceMatrix, HiddenStates
-├── ffi.rs                 # FFI to CUDA/Triton kernels
-├── sampler.rs             # Sampling params + CPU sampler
-└── tokenizer.rs           # HuggingFace tokenizers wrapper
+├── http_server/              # /v1/completions, /v1/chat/completions, SSE
+├── scheduler.rs + scheduler/ # Continuous batching scheduler (batch, types, cuda/)
+├── model.rs + model/         # ModelForward + GenerationState + model impls
+│   ├── cuda_graph.rs         # CUDA Graph capture/replay (per batch size)
+│   ├── kv_cache.rs           # KV cache + CPU offload
+│   ├── qwen3/                # Qwen3: weights, forward, prefill, decode
+│   ├── qwen35/               # Qwen3.5: weights, forward, recurrent_state
+│   └── glm4/                 # GLM4
+├── backend.rs + backend/     # InferenceBackend trait + submodules
+│   ├── cuda.rs + cuda/       # CUDA plumbing: ffi, tensor, paged_kv,
+│   │                           graph_pool, flashinfer, bootstrap
+│   ├── metal.rs + metal/     # Metal/MLX backend: mlx bridge, gdr,
+│   │                           kv_pool, prefix_cache, scheduler, qwen35
+│   ├── cpu.rs                # Development CPU backend (feature `cpu`)
+│   └── runtime.rs            # Serial runtime handle for CPU/Metal
+├── ops.rs + ops/             # GPU operator dispatch
+│   ├── attention.rs          # GQA attention, FlashInfer paged decode
+│   ├── linear.rs             # GEMV, cuBLAS GEMM, batched GEMM
+│   ├── norm.rs               # RMSNorm, fused Add+RMSNorm
+│   ├── recurrent.rs          # Conv1d, Gated Delta Rule (Qwen3.5)
+│   └── sampling.rs           # GPU argmax, top-k/top-p, batched sampling
+├── sampler.rs                # Sampling params + CPU sampler
+└── tokenizer.rs              # HuggingFace tokenizers wrapper
 
-csrc/                      # CUDA C kernels
-├── gemv.cu                # BF16×2 vectorized GEMV
-├── fused_attention.cu     # GQA decode attention (head_dim=128)
-├── fused_mlp.cu           # Fused SwiGLU (gate+up→SiLU→down)
-├── gated_delta_rule.cu    # GDR decode recurrence (Qwen3.5)
-├── norm.cu                # RMSNorm + fused Add+RMSNorm
-├── pos_enc.cu             # RoPE
-└── sampling.cu            # GPU argmax, top-k/top-p
+csrc/cuda/                    # CUDA C kernels, grouped by domain
+├── attention/                # flashinfer_*, fused_attention, prefill_attention, ...
+├── gemm/                     # gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
+├── kv/                       # kv_cache_to_paged, paged_kv_append, kv_quant, scatter_kv
+├── quant/                    # turboquant, turboquant_fast, dtype_convert
+└── misc/                     # norm, sampling, pos_enc, conv1d, gdr, fused_mlp, ...
 
 tools/triton/              # Triton AOT kernels (compiled at build time)
 ├── flash_attention_prefill_kernel.py

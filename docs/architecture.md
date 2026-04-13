@@ -43,7 +43,7 @@ agent-infer (root binary)
 infer binary / metal_serve / cpu_serve
   -> axum handlers
   -> request parsing + sampling params
-  -> scheduler or backend_runtime
+  -> scheduler or backend::runtime
   -> model forward path
   -> backend-specific kernels/runtime
 ```
