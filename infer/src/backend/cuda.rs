@@ -15,7 +15,7 @@ pub mod bootstrap;
 pub(crate) mod ffi;
 #[cfg(feature = "cuda")]
 pub(crate) mod flashinfer;
-pub mod graph_pool;
+pub(crate) mod graph_pool;
 #[cfg(feature = "cuda")]
 pub mod paged_kv;
 #[cfg(feature = "cuda")]
