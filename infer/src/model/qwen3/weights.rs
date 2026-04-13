@@ -327,11 +327,16 @@ impl Qwen3Model {
         gguf: &crate::gguf::GgufFile,
         runtime: ModelRuntimeConfig,
     ) -> Result<Self> {
-        use crate::weight_loader::{load_tensor_1d_gguf, load_tensor_2d_gguf, precompute_rope};
+        use crate::weight_loader::{
+            load_tensor_1d_gguf, load_tensor_2d_gguf, load_tensor_2d_gguf_bf16, precompute_rope,
+        };
 
         let t_gpu = std::time::Instant::now();
 
-        let embed_tokens = load_tensor_2d_gguf(ctx, gguf, "model.embed_tokens.weight")?;
+        // embed_tokens is read directly via embedding_decode_cuda, which is
+        // NOT quant-aware — it would read from the 1-element dummy `.data`
+        // buffer of a packed matrix and produce garbage. Force BF16 load.
+        let embed_tokens = load_tensor_2d_gguf_bf16(ctx, gguf, "model.embed_tokens.weight")?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {

@@ -271,6 +271,11 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
   uint2 *out_vec = reinterpret_cast<uint2 *>(out_row);
 
+  // Keep `x * inv_rms * weight` in fp32 throughout — round to bf16 once at
+  // the final store. ggml/llama.cpp's `ggml_rms_norm` fuses the weight
+  // multiply and stays in fp32 internally; our earlier "round to bf16 between
+  // scale and weight" pattern loses ~0.4% per layer and compounds into
+  // catastrophic drift by layer 5 when fed noisy (Q4_K) weights.
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 xv = x_vec[i];
     uint2 wv = w_vec[i];
@@ -279,25 +284,120 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
     __nv_bfloat162 w_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv.x);
     __nv_bfloat162 w_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv.y);
 
-    __nv_bfloat16 n0 = __float2bfloat16(__bfloat162float(x_lo.x) * inv_rms);
-    __nv_bfloat16 n1 = __float2bfloat16(__bfloat162float(x_lo.y) * inv_rms);
-    __nv_bfloat16 n2 = __float2bfloat16(__bfloat162float(x_hi.x) * inv_rms);
-    __nv_bfloat16 n3 = __float2bfloat16(__bfloat162float(x_hi.y) * inv_rms);
+    float n0 = __bfloat162float(x_lo.x) * inv_rms * __bfloat162float(w_lo.x);
+    float n1 = __bfloat162float(x_lo.y) * inv_rms * __bfloat162float(w_lo.y);
+    float n2 = __bfloat162float(x_hi.x) * inv_rms * __bfloat162float(w_hi.x);
+    float n3 = __bfloat162float(x_hi.y) * inv_rms * __bfloat162float(w_hi.y);
 
     uint2 result;
     __nv_bfloat162 r_lo, r_hi;
-    r_lo.x = __float2bfloat16(__bfloat162float(n0) * __bfloat162float(w_lo.x));
-    r_lo.y = __float2bfloat16(__bfloat162float(n1) * __bfloat162float(w_lo.y));
-    r_hi.x = __float2bfloat16(__bfloat162float(n2) * __bfloat162float(w_hi.x));
-    r_hi.y = __float2bfloat16(__bfloat162float(n3) * __bfloat162float(w_hi.y));
+    r_lo.x = __float2bfloat16(n0);
+    r_lo.y = __float2bfloat16(n1);
+    r_hi.x = __float2bfloat16(n2);
+    r_hi.y = __float2bfloat16(n3);
     result.x = *reinterpret_cast<unsigned int *>(&r_lo);
     result.y = *reinterpret_cast<unsigned int *>(&r_hi);
     out_vec[i] = result;
   }
   for (int i = n4 * 4 + tid; i < hidden_dim; i += NORM_BLOCK) {
-    __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(x_row[i]) * inv_rms);
-    out_row[i] = __float2bfloat16(__bfloat162float(normed) * __bfloat162float(weight[i]));
+    float n = __bfloat162float(x_row[i]) * inv_rms * __bfloat162float(weight[i]);
+    out_row[i] = __float2bfloat16(n);
   }
+}
+
+// ============================================================================
+// Batched RMSNorm with fp32 input, bf16 output.
+//
+// Used to let the residual stream stay in fp32 across layers while still
+// feeding bf16 downstream GEMMs. Reading fp32 here avoids the bf16 rounding
+// that compounds Q4_K-level weight noise through 36 layers on Qwen3-4B.
+// Precision chain: fp32 -> fp32 rsqrt -> fp32 * fp32 weight -> bf16 store.
+// ============================================================================
+__global__ void rms_norm_batched_f32_in_kernel(
+    const float *__restrict__ x,                     // [seq_len, hidden_dim] fp32
+    const __nv_bfloat16 *__restrict__ weight,        // [hidden_dim] bf16
+    __nv_bfloat16 *__restrict__ out,                 // [seq_len, hidden_dim] bf16
+    int hidden_dim, float eps) {
+  const float *x_row = x + blockIdx.x * hidden_dim;
+  __nv_bfloat16 *out_row = out + blockIdx.x * hidden_dim;
+
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+
+  // Pass 1: sum of squares (fp32)
+  float local_sum = 0.0f;
+  for (int i = tid; i < hidden_dim; i += NORM_BLOCK) {
+    float v = x_row[i];
+    local_sum += v * v;
+  }
+  local_sum = warp_reduce_sum(local_sum);
+
+  __shared__ float warp_sums[NORM_NUM_WARPS];
+  if (lane_id == 0) warp_sums[warp_id] = local_sum;
+  __syncthreads();
+
+  float total = 0.0f;
+  if (warp_id == 0) {
+    float val = (lane_id < NORM_NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+    total = warp_reduce_sum(val);
+  }
+
+  __shared__ float s_inv_rms;
+  if (tid == 0) {
+    s_inv_rms = 1.0f / sqrtf(total / hidden_dim + eps);
+  }
+  __syncthreads();
+  float inv_rms = s_inv_rms;
+
+  // Pass 2: normalize × weight, store bf16
+  for (int i = tid; i < hidden_dim; i += NORM_BLOCK) {
+    float n = x_row[i] * inv_rms * __bfloat162float(weight[i]);
+    out_row[i] = __float2bfloat16(n);
+  }
+}
+
+// ============================================================================
+// fp32 += bf16 accumulator. Used to maintain an fp32 residual shadow that
+// absorbs bf16-produced layer outputs without losing precision across
+// 36 layers of compounding.
+// ============================================================================
+__global__ void add_bf16_into_f32_kernel(
+    float *__restrict__ out,                       // fp32 in/out
+    const __nv_bfloat16 *__restrict__ in,          // bf16 read-only
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] += __bfloat162float(in[i]);
+}
+
+// ============================================================================
+// bf16 → fp32 cast, used once per prefill to seed the fp32 residual shadow
+// from the bf16 embedding output.
+// ============================================================================
+__global__ void cast_bf16_to_f32_kernel(
+    const __nv_bfloat16 *__restrict__ in,
+    float *__restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __bfloat162float(in[i]);
+}
+
+// ============================================================================
+// fp32 → bf16 cast, used at the end of prefill to hand back a bf16 hidden
+// state for the final norm + LM head projection that still consume bf16.
+// ============================================================================
+__global__ void cast_f32_to_bf16_kernel(
+    const float *__restrict__ in,
+    __nv_bfloat16 *__restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2bfloat16(in[i]);
 }
 
 // ============================================================================
@@ -451,6 +551,43 @@ cudaError_t rms_norm_batched_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *w
                             float eps, cudaStream_t stream) {
   rms_norm_batched_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
       x, weight, out, hidden_dim, eps);
+    return cudaGetLastError();
+}
+
+cudaError_t rms_norm_batched_f32_in_cuda(
+    const float *x, const __nv_bfloat16 *weight,
+    __nv_bfloat16 *out, int hidden_dim, int seq_len,
+    float eps, cudaStream_t stream
+) {
+    rms_norm_batched_f32_in_kernel<<<seq_len, NORM_BLOCK, 0, stream>>>(
+        x, weight, out, hidden_dim, eps);
+    return cudaGetLastError();
+}
+
+cudaError_t add_bf16_into_f32_cuda(
+    float *out, const __nv_bfloat16 *in, int n, cudaStream_t stream
+) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    add_bf16_into_f32_kernel<<<grid, block, 0, stream>>>(out, in, n);
+    return cudaGetLastError();
+}
+
+cudaError_t cast_bf16_to_f32_cuda(
+    const __nv_bfloat16 *in, float *out, int n, cudaStream_t stream
+) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    cast_bf16_to_f32_kernel<<<grid, block, 0, stream>>>(in, out, n);
+    return cudaGetLastError();
+}
+
+cudaError_t cast_f32_to_bf16_cuda(
+    const float *in, __nv_bfloat16 *out, int n, cudaStream_t stream
+) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    cast_f32_to_bf16_kernel<<<grid, block, 0, stream>>>(in, out, n);
     return cudaGetLastError();
 }
 
