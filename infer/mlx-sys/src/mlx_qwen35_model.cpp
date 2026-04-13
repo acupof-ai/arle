@@ -143,6 +143,38 @@ auto& compiled_compute_g() {
     return fn;
 }
 
+// Compiled compute_g + beta: both are per-token elementwise transforms used by
+// every GDR layer during prefill/decode. Keeping them in one helper reduces one
+// extra elementwise kernel launch and one temporary array per layer.
+std::vector<array> compute_g_beta_impl(const std::vector<array>& inputs) {
+    auto neg_exp_a = inputs[0];
+    auto a_raw = inputs[1];
+    auto dt_bias = inputs[2];
+    auto b_raw = inputs[3];
+    auto ab = a_raw + dt_bias;
+    auto sp = where(greater(ab, array(20.0f)), ab, log1p(exp(ab)));
+    return {exp(neg_exp_a * sp), sigmoid(b_raw)};
+}
+
+auto& compiled_compute_g_beta() {
+    static auto fn = mlx::core::compile(compute_g_beta_impl, true /*shapeless*/);
+    return fn;
+}
+
+// Compiled Q/K norm + scale for GDR. This keeps the two per-layer RMSNorm calls
+// together so MLX can optimize them as one helper-level graph instead of two
+// separate launches from host code.
+std::vector<array> qk_norm_scale_impl(const std::vector<array>& inputs) {
+    auto q = fast::rms_norm(inputs[0], std::nullopt, 1e-6f) * inputs[2];
+    auto k = fast::rms_norm(inputs[1], std::nullopt, 1e-6f) * inputs[3];
+    return {q, k};
+}
+
+auto& compiled_qk_norm_scale() {
+    static auto fn = mlx::core::compile(qk_norm_scale_impl, true /*shapeless*/);
+    return fn;
+}
+
 // Compiled SiLU: x * sigmoid(x) — matches mlx_lm's @mx.compile(shapeless=True)
 // Fuses 2 ops (sigmoid + multiply) into 1 compiled kernel.
 std::vector<array> silu_impl(const std::vector<array>& inputs) {
@@ -277,6 +309,7 @@ struct Qwen35CompiledModel {
     int current_cache_pos = 0;
     int current_seq_len = 1;  // 1 for decode, >1 for batch prefill
     bool current_last_logits_only = false;
+    mutable array current_gdr_t_arr = array(1);
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -364,7 +397,8 @@ struct Qwen35CompiledModel {
     array gdr_step(
         const array& x, const GdrLayerWeights& lw,
         const array& gdr_state_in, const array& conv_state_in,
-        array& gdr_state_out, array& conv_state_out
+        array& gdr_state_out, array& conv_state_out,
+        const array& gdr_t_arr
     ) const {
         int hk = lw.num_key_heads, dk = lw.key_dim;
         int hv = lw.num_value_heads, dv = lw.value_dim;
@@ -415,11 +449,19 @@ struct Qwen35CompiledModel {
         auto k_raw = reshape(qkv_parts[1], {1, S, hk, dk});
         auto v_raw = reshape(qkv_parts[2], {1, S, hv, dv});
 
-        auto q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * lw.q_scale_arr;
-        auto k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * lw.k_scale_arr;
+        auto qk = compiled_qk_norm_scale()({q_raw, k_raw, lw.q_scale_arr, lw.k_scale_arr});
+        auto q = qk[0];
+        auto k = qk[1];
 
-        auto beta = sigmoid(b_raw);
-        auto g = compiled_compute_g()({lw.a_log, a_raw, lw.dt_bias})[0];
+        array g(0), beta(0);
+        if (S > 1) {
+            auto gb = compiled_compute_g_beta()({lw.a_log, a_raw, lw.dt_bias, b_raw});
+            g = gb[0];
+            beta = gb[1];
+        } else {
+            beta = sigmoid(b_raw);
+            g = compiled_compute_g()({lw.a_log, a_raw, lw.dt_bias})[0];
+        }
 
         array y(0);
         if (use_gdr_metal_kernel()) {
@@ -429,10 +471,8 @@ struct Qwen35CompiledModel {
             // g and beta are [1, S, Hv] — no reshape needed
             auto& g_3d = g;
             auto& beta_3d = beta;
-            auto t_arr = array(S);
-
             std::vector<array> inputs = {
-                q_bf16, k_bf16, v_bf16, g_3d, beta_3d, gdr_state_in, t_arr
+                q_bf16, k_bf16, v_bf16, g_3d, beta_3d, gdr_state_in, gdr_t_arr
             };
             std::vector<Shape> out_shapes = {{1, S, hv, dv}, gdr_state_in.shape()};
             std::vector<Dtype> out_dtypes = {bfloat16, float32};
@@ -554,6 +594,7 @@ struct Qwen35CompiledModel {
         auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {1, S, hidden_size});
         bool keep_intermediates = keep_step_intermediates();
+        current_gdr_t_arr = array(S);
 
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
@@ -574,7 +615,7 @@ struct Qwen35CompiledModel {
                 int si = 1 + 2*F + 2*gdr_idx;
                 attn_out = gdr_step(xn, layer.gdr,
                     inputs[si], inputs[si+1],
-                    new_gdr_states[gdr_idx], new_conv_states[gdr_idx]);
+                    new_gdr_states[gdr_idx], new_conv_states[gdr_idx], current_gdr_t_arr);
                 gdr_idx++;
             } else {
                 int si = 1 + 2*full_idx;
