@@ -1,17 +1,28 @@
 //! GPU operations on device tensors.
 
+#[path = "ops/attention.rs"]
 mod attention;
+#[path = "ops/elementwise.rs"]
 mod elementwise;
+#[path = "ops/embedding.rs"]
 mod embedding;
+#[path = "ops/kv_ops.rs"]
 mod kv_ops;
+#[path = "ops/kv_quant.rs"]
 pub(crate) mod kv_quant;
+#[path = "ops/kv_turboquant.rs"]
 pub(crate) mod kv_turboquant;
+#[path = "ops/linear.rs"]
 mod linear;
+#[path = "ops/norm.rs"]
 mod norm;
+#[path = "ops/recurrent.rs"]
 mod recurrent;
+#[path = "ops/sampling.rs"]
 mod sampling;
 
 #[cfg(test)]
+#[path = "ops/tests.rs"]
 mod tests;
 
 // pub re-exports
