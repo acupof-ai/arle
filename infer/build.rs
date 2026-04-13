@@ -767,21 +767,34 @@ fn main() {
     let replaced_cuda_files = BTreeSet::from(["activation.cu", "elementwise.cu", "embedding.cu"]);
 
     let csrc_dir = Path::new("csrc/cuda");
-    let cu_files: Vec<_> = std::fs::read_dir(csrc_dir)
-        .expect("Failed to read csrc/cuda/ directory")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
+    // Recursively collect every `.cu` file under `csrc/cuda/` so domain subdirs
+    // (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
+    // Exclusion is by basename so the legacy-retired list keeps working.
+    fn collect_cu_files(dir: &Path, replaced: &BTreeSet<&'static str>, out: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
-            let file_name = path.file_name()?.to_str()?;
-            if path.extension().and_then(|e| e.to_str()) == Some("cu")
-                && !replaced_cuda_files.contains(file_name)
-            {
-                Some(path)
-            } else {
-                None
+            if path.is_dir() {
+                collect_cu_files(&path, replaced, out);
+                continue;
             }
-        })
-        .collect();
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) == Some("cu")
+                && !replaced.contains(file_name)
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut cu_files: Vec<PathBuf> = Vec::new();
+    collect_cu_files(csrc_dir, &replaced_cuda_files, &mut cu_files);
+    // Keep a stable compile order independent of filesystem iteration order.
+    cu_files.sort();
 
     println!(
         "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
@@ -806,6 +819,9 @@ fn main() {
         ];
         nvcc_args.extend(arch_args.clone());
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
+        // Ensure `#include "common.cuh"` resolves from any domain subdir
+        // (attention/, gemm/, kv/, quant/, misc/).
+        nvcc_args.push("-Icsrc/cuda".to_string());
 
         // Marlin kernel needs C++17 + relaxed constexpr
         if stem.starts_with("marlin_") {

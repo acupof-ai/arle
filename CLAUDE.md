@@ -201,7 +201,7 @@ agent-infer/          ← top-level Cargo workspace
 │   │   ├── http_server/        ← OpenAI-compatible HTTP API
 │   │   └── server_engine.rs    ← Single-request inference façade
 │   ├── csrc/cuda/              ← CUDA C kernels
-│   ├── csrc/metal/             ← Metal .metal shaders
+│   ├── csrc/metal/             ← C++ bridge glue for the Metal backend (metal_fused_ops.cpp, metal_fused_capi.cpp) — actual Metal kernels ship via MLX through mlx-sys
 │   ├── mlx-sys/                ← Bindgen bridge to MLX C++ API
 │   └── tools/triton/           ← Triton Python kernels (AOT compiled)
 └── scripts/          ← Benchmark + utility scripts
@@ -223,7 +223,7 @@ Each model is a flat module: `infer/src/model/<name>.rs` + `infer/src/model/<nam
 ### GPU kernel integration
 
 - **CUDA**: `infer/csrc/cuda/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/ffi.rs`. `build.rs` compiles CUDA C (auto-detects SM), runs Triton AOT, links FlashInfer.
-- **Metal**: `infer/csrc/metal/` (.metal shaders) + `infer/mlx-sys/` (bindgen bridge to MLX C++ API). Enabled via `--features metal`; `libc` pulled in for `getrusage`-based RSS reporting.
+- **Metal**: `infer/csrc/metal/` holds C++ bridge code (`metal_fused_ops.cpp`, `metal_fused_capi.cpp`) that calls into MLX — there are no `.metal` shader files here. The actual Metal kernels live inside the MLX library and are reached through `infer/mlx-sys/` (bindgen bridge to the MLX C++ API). Enabled via `--features metal`; `libc` pulled in for `getrusage`-based RSS reporting.
 
 ### Key references
 
