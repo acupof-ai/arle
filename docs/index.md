@@ -9,6 +9,7 @@
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research — XMA / accelerated model architectures future implications |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal: Qwen3/3.5, direct `mlx-sys` bridge, serial serving |
 | **Plans** | |
+| [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | **Active** — Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes per phase |
 | [plans/sglang-parity.md](plans/sglang-parity.md) | **Done** — Qwen3-8B sglang parity (C=4 exceeded) |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | **Near-complete** — prefix cache fixed, batched prefill remaining |
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | **Complete** — TurboQuant Phases 1-3: KV cache + weight + fused decode attention |
