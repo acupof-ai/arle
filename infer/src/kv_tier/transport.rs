@@ -7,6 +7,16 @@
 //! own completion model.
 //!
 //! See `crate::kv_tier` for the module-level design notes.
+//!
+//! # Backend submodules
+//!
+//! - [`disk`] — [`DiskStore`], the T3 NVMe / SSD backend. Pure `std::fs`;
+//!   cross-platform (macOS tests run on `tokio::fs`-free paths). The
+//!   Phase-3 follow-up PR will wrap it in a real `KVTransport` impl.
+
+pub mod disk;
+
+pub use disk::DiskStore;
 
 use std::task::Poll;
 

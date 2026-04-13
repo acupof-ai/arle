@@ -26,6 +26,21 @@ bool use_gdr_metal_kernel() {
     return !(env && std::string(env) == "0");
 }
 
+bool keep_prefill_intermediates() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES");
+    return env && std::string(env) != "0";
+}
+
+bool use_qwen35_cpp_clear_cache() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_CLEAR_CACHE");
+    return !(env && std::string(env) == "0");
+}
+
+bool use_qwen35_cpp_prefill_last_logits_only() {
+    const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY");
+    return !(env && std::string(env) == "0");
+}
+
 auto& gated_delta_kernel() {
     static auto kernel = fast::metal_kernel(
         "gated_delta_step",
@@ -250,6 +265,7 @@ struct Qwen35CompiledModel {
     // Runtime state (set before each forward call)
     int current_cache_pos = 0;
     int current_seq_len = 1;  // 1 for decode, >1 for batch prefill
+    bool current_last_logits_only = false;
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -257,6 +273,10 @@ struct Qwen35CompiledModel {
     // Collect ALL intermediate arrays during forward() to keep them alive.
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
+
+    bool keep_step_intermediates() const {
+        return current_seq_len == 1 || keep_prefill_intermediates();
+    }
 
     // ── Full attention decode step ─────────────────────────────────────
 
@@ -268,6 +288,7 @@ struct Qwen35CompiledModel {
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
         int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
+        bool keep_intermediates = keep_step_intermediates();
 
         auto q_proj_out = lw.q_proj.apply(x);
         auto k_raw = lw.k_proj.apply(x);
@@ -314,10 +335,12 @@ struct Qwen35CompiledModel {
         }
 
         // Keep intermediates alive for GPU buffer reuse
-        intermediates.push_back(q);
-        intermediates.push_back(k);
-        intermediates.push_back(attn_out);
-        intermediates.push_back(result);
+        if (keep_intermediates) {
+            intermediates.push_back(q);
+            intermediates.push_back(k);
+            intermediates.push_back(attn_out);
+            intermediates.push_back(result);
+        }
         return result;
     }
 
@@ -333,6 +356,7 @@ struct Qwen35CompiledModel {
         int q_dim = hk * dk, k_dim = q_dim, v_dim = hv * dv;
         int qkv_dim = q_dim + k_dim + v_dim;
         int S = current_seq_len;
+        bool keep_intermediates = keep_step_intermediates();
 
         auto x_3d = reshape(x, {1, S, hidden_size});
 
@@ -352,9 +376,11 @@ struct Qwen35CompiledModel {
             auto ba_parts = split(ba, Shape{lw.ba_num_heads}, -1);
             b_raw = ba_parts[0];
             a_raw = ba_parts[1];
-            intermediates.push_back(qkvz); intermediates.push_back(ba);
-            for (auto& a : qkv_z) intermediates.push_back(a);
-            for (auto& a : ba_parts) intermediates.push_back(a);
+            if (keep_intermediates) {
+                intermediates.push_back(qkvz); intermediates.push_back(ba);
+                for (auto& a : qkv_z) intermediates.push_back(a);
+                for (auto& a : ba_parts) intermediates.push_back(a);
+            }
         }
 
         // Conv1d (naturally handles S > 1)
@@ -367,7 +393,9 @@ struct Qwen35CompiledModel {
 
         // Split conv output
         auto qkv_parts = split(conv_out, Shape{q_dim, q_dim + k_dim}, -1);
-        for (auto& a : qkv_parts) intermediates.push_back(a);
+        if (keep_intermediates) {
+            for (auto& a : qkv_parts) intermediates.push_back(a);
+        }
         auto q_raw = reshape(qkv_parts[0], {1, S, hk, dk});
         auto k_raw = reshape(qkv_parts[1], {1, S, hk, dk});
         auto v_raw = reshape(qkv_parts[2], {1, S, hv, dv});
@@ -415,8 +443,10 @@ struct Qwen35CompiledModel {
 
             y = std::move(result[0]);
             gdr_state_out = std::move(result[1]);
-            intermediates.push_back(g_3d);
-            intermediates.push_back(beta_3d);
+            if (keep_intermediates) {
+                intermediates.push_back(g_3d);
+                intermediates.push_back(beta_3d);
+            }
         } else {
             int heads_per_key = hv / hk;
             auto g_4d = reshape(g, {1, hv, 1, 1});
@@ -448,18 +478,20 @@ struct Qwen35CompiledModel {
         auto result = lw.out_proj.apply(reshape(out, {1, S, hv*dv}));
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
-        auto& im = intermediates;
-        im.push_back(x_3d);
-        im.push_back(qkv); im.push_back(z_raw);
-        im.push_back(b_raw); im.push_back(a_raw);
-        im.push_back(conv_input); im.push_back(conv_out);
-        for (auto& a : qkv_parts) im.push_back(a);
-        im.push_back(q_raw); im.push_back(k_raw); im.push_back(v_raw);
-        im.push_back(q); im.push_back(k);
-        im.push_back(beta); im.push_back(g);
-        im.push_back(y);
-        im.push_back(y_heads); im.push_back(normed);
-        im.push_back(z_gated); im.push_back(out);
+        if (keep_intermediates) {
+            auto& im = intermediates;
+            im.push_back(x_3d);
+            im.push_back(qkv); im.push_back(z_raw);
+            im.push_back(b_raw); im.push_back(a_raw);
+            im.push_back(conv_input); im.push_back(conv_out);
+            for (auto& a : qkv_parts) im.push_back(a);
+            im.push_back(q_raw); im.push_back(k_raw); im.push_back(v_raw);
+            im.push_back(q); im.push_back(k);
+            im.push_back(beta); im.push_back(g);
+            im.push_back(y);
+            im.push_back(y_heads); im.push_back(normed);
+            im.push_back(z_gated); im.push_back(out);
+        }
         return result;
     }
 
@@ -497,7 +529,7 @@ struct Qwen35CompiledModel {
     std::vector<array> forward(const std::vector<array>& inputs) const {
         // Clear intermediates from previous step (releases old GPU buffers)
         intermediates.clear();
-        intermediates.reserve(2048);  // pre-alloc to avoid realloc
+        intermediates.reserve(current_seq_len == 1 ? 2048 : 128);
 
         auto token_id = inputs[0];
         int cache_pos = current_cache_pos;
@@ -506,6 +538,7 @@ struct Qwen35CompiledModel {
         int F = n_full_attn, G = n_gdr;
         auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {1, S, hidden_size});
+        bool keep_intermediates = keep_step_intermediates();
 
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
@@ -555,13 +588,22 @@ struct Qwen35CompiledModel {
             // Keep key intermediates alive for GPU buffer reuse.
             // Without this, C++ RAII destroys them immediately, causing MLX
             // to release GPU buffers that could be reused next step.
-            intermediates.push_back(xn);
-            intermediates.push_back(attn_out);
-            intermediates.push_back(xn2);
+            if (keep_intermediates) {
+                intermediates.push_back(xn);
+                intermediates.push_back(attn_out);
+                intermediates.push_back(xn2);
+            }
         }
 
         // Final norm + lm_head
         auto final_x = fast::rms_norm(x, final_norm_w, rms_eps);
+        if (current_last_logits_only && current_seq_len > 1) {
+            final_x = slice(
+                final_x,
+                {0, current_seq_len - 1, 0},
+                {1, current_seq_len, hidden_size}
+            );
+        }
         // Use quantized matmul for tied lm_head (same as mlx_lm's as_linear).
         // Dense bf16 matmul reads 1.2GB vs quantized reads 0.3GB — 7.5ms difference.
         auto logits = use_embed_as_linear
@@ -899,6 +941,7 @@ int32_t qwen35_compiled_generate(
         {
             m->current_cache_pos = 0;
             m->current_seq_len = prompt_len;
+            m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
 
             std::vector<int32_t> pv(prompt_ids, prompt_ids + prompt_len);
             auto tokens = array(pv.data(), {prompt_len}, int32);
@@ -910,6 +953,7 @@ int32_t qwen35_compiled_generate(
 
             auto outputs = m->forward(inputs);
             m->current_seq_len = 1;  // back to decode mode
+            m->current_last_logits_only = false;
 
             for (int j = 0; j < (int)kv_caches.size(); ++j)
                 kv_caches[j] = outputs[1 + j];
@@ -919,9 +963,10 @@ int32_t qwen35_compiled_generate(
             cache_pos = prompt_len;
 
             {
-                // Take last token's logits: [1, S, vocab] → take row S-1
                 auto all_logits = outputs[0];
-                auto logits = take(all_logits, array(prompt_len - 1), 1);
+                auto logits = (all_logits.shape(1) == 1)
+                    ? all_logits
+                    : take(all_logits, array(prompt_len - 1), 1);
                 auto y = (temperature <= 1e-6f)
                     ? argmax(logits, true)
                     : random::categorical(logits * array(1.0f / temperature), -1);
@@ -930,6 +975,9 @@ int32_t qwen35_compiled_generate(
                 if (out_prefill_ms) {
                     *out_prefill_ms = std::chrono::duration<double, std::milli>(
                         t_prefill_end - t_start).count();
+                }
+                if (use_qwen35_cpp_clear_cache()) {
+                    mlx::core::clear_cache();
                 }
                 async_eval(y);
 
@@ -980,6 +1028,10 @@ int32_t qwen35_compiled_generate(
                     if (on_token && on_token(token_id, callback_ctx) != 0)
                         break;
                     if (stop) break;
+
+                    if (use_qwen35_cpp_clear_cache() && generated % 256 == 0) {
+                        mlx::core::clear_cache();
+                    }
 
                     // Keep step_outputs and step_inputs alive until next iteration
                     // (they're already in local scope — will survive until next loop clear)
