@@ -13,14 +13,8 @@ name = "agent-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
  "infer",
- "log",
- "logforth",
- "rand 0.10.0",
- "rustyline",
- "serde",
- "serde_json",
+ "infer-cli",
 ]
 
 [[package]]
@@ -1408,6 +1402,10 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "infer-chat",
+ "infer-core",
+ "infer-observability",
+ "infer-policy",
  "libc",
  "log",
  "logforth",
@@ -1425,6 +1423,82 @@ dependencies = [
  "tokio-stream",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "infer-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "infer-chat",
+ "infer-engine",
+ "infer-tools",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "infer-chat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "infer-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "infer-agent",
+ "infer-chat",
+ "infer-engine",
+ "infer-tools",
+ "log",
+ "rustyline",
+ "serde_json",
+]
+
+[[package]]
+name = "infer-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "infer-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "infer",
+ "log",
+]
+
+[[package]]
+name = "infer-observability"
+version = "0.1.0"
+dependencies = [
+ "infer-core",
+]
+
+[[package]]
+name = "infer-policy"
+version = "0.1.0"
+dependencies = [
+ "infer-core",
+]
+
+[[package]]
+name = "infer-tools"
+version = "0.1.0"
+dependencies = [
+ "infer-chat",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

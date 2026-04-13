@@ -1,0 +1,16 @@
+[package]
+name = "infer-engine"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cuda"]
+cuda = ["infer/cuda"]
+no-cuda = ["infer/no-cuda"]
+cpu = ["infer/cpu"]
+metal = ["infer/metal"]
+
+[dependencies]
+anyhow = "1.0"
+infer = { path = "../../infer", default-features = false }
+log = "0.4"

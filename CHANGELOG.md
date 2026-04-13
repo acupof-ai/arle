@@ -25,6 +25,7 @@ Related governance docs:
 - Added a support matrix document
 - Added a compatibility and deprecation policy
 - Added performance and correctness gate guidance
+- Documented the CPU backend as a development-oriented smoke and validation path
 
 ### Added
 - Radix-tree prefix cache for cross-request KV reuse
@@ -39,6 +40,7 @@ Related governance docs:
 - Built-in agent runtime with tool calling (shell, python)
 - Benchmark suite (throughput, agent, multi-request)
 - macOS Metal backend (experimental)
+- Development-oriented CPU backend path for non-GPU request validation
 
 ### Performance
 - TTFT 4.6x faster than SGLang v0.5.9 (8.6ms vs 39.3ms at C=1)

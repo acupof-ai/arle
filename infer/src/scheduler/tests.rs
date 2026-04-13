@@ -1,6 +1,9 @@
 use super::*;
 use crate::sampler::SamplingParams;
 use crate::server_engine::StreamDelta;
+use infer_core::{InferenceMode, RequestEventKind, RequestId};
+use infer_observability::{EngineEvent, EventSink};
+use std::sync::{Arc, Mutex};
 
 fn make_request() -> IncomingRequest {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
@@ -10,6 +13,7 @@ fn make_request() -> IncomingRequest {
         sampling: SamplingParams::default(),
         stop: None,
         priority: RequestPriority::Normal,
+        session_id: None,
         delta_tx: tx,
     }
 }
@@ -94,6 +98,36 @@ async fn unlimited_queue_never_rejects() {
     assert_eq!(handle.waiting_count(), 100);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_submit_does_not_oversubscribe_waiting_capacity() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = SchedulerHandle::with_max_waiting(tx, "test", 2);
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let mut tasks = Vec::new();
+
+    for _ in 0..16 {
+        let handle = handle.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            handle.submit(make_request()).is_ok()
+        }));
+    }
+
+    barrier.wait().await;
+
+    let mut successes = 0usize;
+    for task in tasks {
+        if task.await.expect("task join") {
+            successes += 1;
+        }
+    }
+
+    assert_eq!(successes, 2);
+    assert_eq!(handle.waiting_count(), 2);
+    assert!(handle.is_full());
+}
+
 #[test]
 fn preemption_mode_default_is_recompute() {
     assert_eq!(PreemptionMode::default(), PreemptionMode::Recompute);
@@ -104,13 +138,28 @@ fn make_batch_scheduler(
     block_size: usize,
     chunk_size: usize,
 ) -> BatchScheduler {
+    make_batch_scheduler_with_event_sink(
+        num_gpu_blocks,
+        block_size,
+        chunk_size,
+        Arc::new(RecordingEventSink::default()),
+    )
+}
+
+fn make_batch_scheduler_with_event_sink(
+    num_gpu_blocks: usize,
+    block_size: usize,
+    chunk_size: usize,
+    event_sink: Arc<dyn EventSink>,
+) -> BatchScheduler {
     let config = BatchSchedulerConfig {
         max_tokens_per_step: 4096,
         prefill_chunk_size: chunk_size,
         preemption_mode: PreemptionMode::Recompute,
+        ..Default::default()
     };
     let bm = crate::block_manager::BlockManager::new(num_gpu_blocks, 0, block_size);
-    BatchScheduler::new(config, bm)
+    BatchScheduler::with_event_sink(config, bm, event_sink)
 }
 
 /// Run one simulated step: process the ScheduleDecision without a real model.
@@ -120,7 +169,7 @@ fn sim_step(sched: &mut BatchScheduler) -> (usize, usize) {
         ScheduleDecision::Idle => (0, 0),
         ScheduleDecision::PrefillBatch(p) => (p.req_ids.len(), 0),
         ScheduleDecision::DecodeBatch(d) => {
-            let to_finish: Vec<u64> = d.req_ids.clone();
+            let to_finish = d.req_ids;
             for id in &to_finish {
                 sched.advance_decode(*id);
             }
@@ -128,7 +177,7 @@ fn sim_step(sched: &mut BatchScheduler) -> (usize, usize) {
         }
         ScheduleDecision::Mixed { decode, prefill } => {
             let n_prefill = prefill.req_ids.len();
-            let to_finish: Vec<u64> = decode.req_ids.clone();
+            let to_finish = decode.req_ids;
             for id in &to_finish {
                 sched.advance_decode(*id);
             }
@@ -175,7 +224,7 @@ fn test_continuous_batching() {
 
     for _ in 0..20 {
         sim_step(&mut sched);
-        let running_ids: Vec<u64> = sched.running.keys().copied().collect();
+        let running_ids: Vec<RequestId> = sched.running.keys().copied().collect();
         for id in running_ids {
             sched.finish_request(id);
         }
@@ -230,8 +279,7 @@ fn test_preemption() {
         ScheduleDecision::Mixed { decode, .. } => {
             assert!(!decode.req_ids.contains(&id2));
         }
-        ScheduleDecision::Idle => {}
-        _ => {}
+        ScheduleDecision::Idle | ScheduleDecision::PrefillBatch(_) => {}
     }
 
     assert!(
@@ -297,4 +345,285 @@ fn test_chunked_prefill() {
     assert!(sched.is_running(id));
     assert_eq!(sched.waiting_len(), 0);
     assert_eq!(sched.free_gpu_blocks(), 8 - 5);
+}
+
+#[test]
+fn batch_scheduler_emits_prefill_started_once_for_chunked_request() {
+    let sink = Arc::new(RecordingEventSink::default());
+    let mut sched = make_batch_scheduler_with_event_sink(8, 4, 8, sink.clone());
+    let id = sched.add_request((1u32..=20).collect(), 4, RequestPriority::Normal);
+
+    match sched.schedule_step() {
+        ScheduleDecision::PrefillBatch(p) => {
+            assert_eq!(p.req_ids, vec![id]);
+            assert_eq!(p.input_ids.len(), 8);
+        }
+        other => panic!(
+            "expected first prefill chunk, got Idle={}",
+            matches!(other, ScheduleDecision::Idle)
+        ),
+    }
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+        ]
+    );
+
+    match sched.schedule_step() {
+        ScheduleDecision::PrefillBatch(p) => {
+            assert_eq!(p.req_ids, vec![id]);
+            assert_eq!(p.input_ids.len(), 8);
+        }
+        other => panic!(
+            "expected second prefill chunk, got Idle={}",
+            matches!(other, ScheduleDecision::Idle)
+        ),
+    }
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+        ]
+    );
+
+    match sched.schedule_step() {
+        ScheduleDecision::PrefillBatch(p) => {
+            assert_eq!(p.req_ids, vec![id]);
+            assert_eq!(p.input_ids.len(), 4);
+        }
+        other => panic!(
+            "expected final prefill chunk, got Idle={}",
+            matches!(other, ScheduleDecision::Idle)
+        ),
+    }
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+        ]
+    );
+
+    match sched.schedule_step() {
+        ScheduleDecision::DecodeBatch(decode) => {
+            assert_eq!(decode.req_ids, vec![id]);
+        }
+        other => panic!(
+            "expected decode batch after final prefill, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+    assert!(sched.advance_decode(id));
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+            EngineEvent {
+                request_id: id,
+                kind: RequestEventKind::DecodeStep,
+                mode: Some(InferenceMode::Decode),
+            },
+        ]
+    );
+}
+
+#[test]
+fn batch_scheduler_uses_decode_aware_chunking_policy() {
+    let mut sched = make_batch_scheduler(512, 4, 512);
+    let req0 = sched.add_request((1..=32).collect(), 8, RequestPriority::Normal);
+    let _req1 = sched.add_request((33..=512).collect(), 8, RequestPriority::Normal);
+
+    // Step 1: prefill req0, it becomes running for decode.
+    let _ = sched.schedule_step();
+
+    // Step 2: mixed step, prefill chunk should be decode-capped by policy (64).
+    match sched.schedule_step() {
+        ScheduleDecision::Mixed { prefill, .. } => {
+            assert_eq!(prefill.req_ids, vec![RequestId(req0.0 + 1)]);
+            assert_eq!(prefill.input_ids.len(), 64);
+        }
+        other => panic!(
+            "expected Mixed schedule decision, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+#[derive(Default)]
+struct RecordingEventSink {
+    events: Mutex<Vec<EngineEvent>>,
+}
+
+impl EventSink for RecordingEventSink {
+    fn emit(&self, event: &EngineEvent) {
+        self.events.lock().expect("poisoned").push(event.clone());
+    }
+}
+
+fn recorded_events(sink: &RecordingEventSink) -> Vec<EngineEvent> {
+    sink.events.lock().expect("poisoned").clone()
+}
+
+#[test]
+fn batch_scheduler_emits_lifecycle_events_for_successful_request() {
+    let sink = Arc::new(RecordingEventSink::default());
+    let mut sched = make_batch_scheduler_with_event_sink(8, 4, 8, sink.clone());
+    let req = sched.add_request(vec![1, 2, 3, 4], 8, RequestPriority::Normal);
+
+    match sched.schedule_step() {
+        ScheduleDecision::PrefillBatch(prefill) => {
+            assert_eq!(prefill.req_ids, vec![req]);
+            assert_eq!(prefill.input_ids, vec![1, 2, 3, 4]);
+        }
+        other => panic!(
+            "expected PrefillBatch, got Idle={}",
+            matches!(other, ScheduleDecision::Idle)
+        ),
+    }
+
+    match sched.schedule_step() {
+        ScheduleDecision::DecodeBatch(decode) => {
+            assert_eq!(decode.req_ids, vec![req]);
+        }
+        other => panic!(
+            "expected DecodeBatch, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+    assert!(sched.advance_decode(req));
+    sched.finish_request(req);
+
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![
+            EngineEvent {
+                request_id: req,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: req,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+            EngineEvent {
+                request_id: req,
+                kind: RequestEventKind::DecodeStep,
+                mode: Some(InferenceMode::Decode),
+            },
+            EngineEvent {
+                request_id: req,
+                kind: RequestEventKind::Completed,
+                mode: Some(InferenceMode::Decode),
+            },
+        ]
+    );
+}
+
+#[test]
+fn batch_scheduler_does_not_emit_prefill_event_when_admission_fails() {
+    let sink = Arc::new(RecordingEventSink::default());
+    let mut sched = make_batch_scheduler_with_event_sink(0, 4, 8, sink.clone());
+    let req = sched.add_request(vec![1, 2, 3, 4], 8, RequestPriority::Normal);
+
+    assert!(matches!(sched.schedule_step(), ScheduleDecision::Idle));
+    assert_eq!(
+        recorded_events(sink.as_ref()),
+        vec![EngineEvent {
+            request_id: req,
+            kind: RequestEventKind::Enqueued,
+            mode: None,
+        }]
+    );
+}
+
+#[test]
+fn batch_scheduler_emits_evicted_and_requeued_when_request_is_preempted() {
+    let sink = Arc::new(RecordingEventSink::default());
+    let mut sched = make_batch_scheduler_with_event_sink(5, 4, 16, sink.clone());
+
+    let id0 = sched.add_request(vec![1, 2, 3, 4], 16, RequestPriority::Normal);
+    let _id1 = sched.add_request(vec![5, 6, 7, 8], 16, RequestPriority::Normal);
+    let id2 = sched.add_request(vec![9, 10, 11, 12], 16, RequestPriority::Normal);
+
+    let _ = sched.schedule_step();
+    match sched.schedule_step() {
+        ScheduleDecision::Mixed { decode, .. } => {
+            assert_eq!(decode.req_ids, vec![id0]);
+            sched.advance_decode(id0);
+        }
+        other => panic!(
+            "expected Mixed schedule decision, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+    let _ = sched.schedule_step();
+    let _ = sched.schedule_step();
+
+    let events_for_preempted: Vec<EngineEvent> = recorded_events(sink.as_ref())
+        .into_iter()
+        .filter(|event| event.request_id == id2)
+        .collect();
+
+    assert_eq!(
+        events_for_preempted,
+        vec![
+            EngineEvent {
+                request_id: id2,
+                kind: RequestEventKind::Enqueued,
+                mode: None,
+            },
+            EngineEvent {
+                request_id: id2,
+                kind: RequestEventKind::PrefillStarted,
+                mode: Some(InferenceMode::Prefill),
+            },
+            EngineEvent {
+                request_id: id2,
+                kind: RequestEventKind::Evicted,
+                mode: Some(InferenceMode::Decode),
+            },
+            EngineEvent {
+                request_id: id2,
+                kind: RequestEventKind::Requeued,
+                mode: None,
+            },
+        ]
+    );
 }

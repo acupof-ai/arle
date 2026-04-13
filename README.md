@@ -1,6 +1,6 @@
 <p align="center">
   <strong>agent-infer</strong><br>
-  <em>KV-cache-first inference engine for LLM agents. Pure Rust + CUDA.</em>
+  <em>KV-cache-first inference engine for LLM agents. Pure Rust, with CUDA as the primary serving path.</em>
 </p>
 
 <p align="center">
@@ -103,8 +103,9 @@ Current support should be read conservatively:
 - **CUDA on Linux** is the primary supported serving path.
 - **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
   scheduler runtime.
-- **CPU-only / `no-cuda`** is a development and testing path, not a production
-  inference target.
+- **CPU-only / `no-cuda`** now includes a development-oriented CPU backend for
+  local smoke tests and request-path validation, but it is still not a
+  production inference target.
 
 Governance references:
 
@@ -118,6 +119,21 @@ Governance references:
 ---
 
 ## Architecture
+
+Workspace split summary:
+
+- `agent-infer` is now a thin binary wrapper.
+- `infer-cli` owns the REPL/CLI flow.
+- `infer-engine` owns model discovery, logging init, backend loading, and the
+  runtime adapter boundary; it should not depend on `infer-agent` internals.
+- `infer` continues to own the HTTP server, scheduler, runtime, and backend
+  implementations.
+
+See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
+for the current package boundaries. This is still an interim Phase 1 split:
+the control-plane crates are separated, but the lower-level scheduler/runtime
+atomization is still pending; enqueue admission and decode-aware chunking now
+share stable policy contracts across the batch/CUDA/Metal paths.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -204,6 +220,16 @@ Built-in agent runtime with tool calling:
 
 The root CLI binary is behind the `cli` feature. Without `--features cli`, `agent-infer` is not built.
 
+Current package boundary for agent mode:
+
+- `agent-infer` -> thin binary wrapper
+- `infer-cli` -> REPL and slash commands
+- `infer-engine` -> backend loading and model auto-discovery, with no control-plane dependency back edge
+- `infer-agent` -> conversation loop and tool-call recovery
+- `infer-tools` / `infer-chat` -> shared tool definitions, execution helpers, and protocol types
+
+The remaining Phase 1 work is now below the control-plane boundary: tightening deeper scheduler/KV extraction, keeping observability semantics stable, and deferring fuller eviction/KV policy atomization to later phases.
+
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
@@ -241,6 +267,10 @@ The CLI keeps conversation history across turns, stores line history in `~/.agen
 cargo test --no-default-features --features no-cuda   # Unit tests (no GPU)
 cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # Format
+
+# CPU backend smoke path (downloads runtime assets like config/tokenizer, not full weights)
+cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
+  --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E (requires GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e

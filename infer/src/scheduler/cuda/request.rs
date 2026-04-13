@@ -24,6 +24,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) max_tokens: usize,
     pub(crate) sampling: crate::sampler::SamplingParams,
     pub(crate) stop: Option<Vec<String>>,
+    /// Optional client session identifier forwarded from `IncomingRequest`.
+    /// Preserved across preemption so requeued work stays session-sticky.
+    /// Consumed by slot-admission once A1 lands; currently informational.
+    pub(crate) session_id: Option<infer_core::SessionId>,
     pub(crate) delta_tx: mpsc::UnboundedSender<StreamDelta>,
     /// Full decoded text, maintained incrementally.
     pub(crate) full_decoded: String,

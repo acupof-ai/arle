@@ -98,6 +98,7 @@ impl<M: ModelForward> Scheduler<M> {
                 sampling: victim.sampling.clone(),
                 stop: victim.stop.take(),
                 priority: RequestPriority::Normal,
+                session_id: victim.session_id.clone(),
                 delta_tx: victim.delta_tx.clone(),
             };
             victim.phase = Phase::Finished;
