@@ -305,15 +305,21 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   `cpu_runtime_handle_loads_and_streams` smoke test with genuine output.
 
 #### C6. Agent workload benchmark script
-- **What**: `scripts/bench_agent.py` — replays a multi-turn tool-calling
-  trace against a running server, reports TTFT per turn, KV hit rate per
-  turn, total wall clock. The script that produces the README's
-  "Agent benchmark (multi-turn tool calling)" numbers must exist in the
-  repo.
+> **Implementation spec**: shipped as `scripts/bench_agent_trace.py` +
+> `scripts/data/agent_trace_default.jsonl` (renamed from the originally
+> proposed `bench_agent.py` because that file already exists as a
+> binary-subprocess benchmark; the two measure different things and
+> cohabit). Landed 2026-04-13 under the Tiered KV Cache task split
+> (`docs/plans/tiered-kv-cache-tasks.md` §7.1).
+
+- **What**: `scripts/bench_agent_trace.py` — replays a multi-turn
+  tool-calling trace against a running server, reports TTFT per turn,
+  inter-token latency, wall time, and optional JSON snapshot output.
+  Matches `bench_throughput_sweep.py` CLI conventions.
 - **Why**: The README publishes agent numbers without a reproducible
   script. That is non-falsifiable and blocks honest iteration on A1–A4.
 - **Where**:
-  - New: `scripts/bench_agent.py` and an input trace under
+  - `scripts/bench_agent_trace.py` and an input trace under
     `scripts/data/agent_trace_default.jsonl`.
   - `docs/experience/wins/` — update the template for agent bench
     snapshots.

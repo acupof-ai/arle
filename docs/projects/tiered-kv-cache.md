@@ -403,8 +403,10 @@ the scheduler queries the radix, receives `Vec<BlockId>`, and the
 1. `grep -r cached_prompts infer/src/` returns empty.
 2. `grep -r RadixCache infer/src/scheduler/` returns non-empty (the
    regression gate called out in `agent-first-architecture.md §5`).
-3. A cross-session concurrent benchmark (to be added in the same PR pair as
-   `scripts/bench_agent.py`; item C6 is folded into this phase's scoreboard)
+3. A cross-session concurrent benchmark replayed by
+   `scripts/bench_agent_trace.py` (renamed from the C6 proposal's
+   `bench_agent.py` to avoid colliding with the existing binary-subprocess
+   benchmark of that name; item C6 is folded into this phase's scoreboard)
    shows ≥70% prefix hit rate on a 2-session alternating trace.
 4. README's "radix-tree prefix cache" claim is now substantiated and the
    diagram updated.

@@ -150,7 +150,7 @@ Every phase below has three subsections:
 - [ ] `[R]` `cargo build --release` green
 - [ ] `[R]` Full e2e + greedy_consistency
 - [ ] `[R]` **Regression gates** (from `agent-first-architecture.md` §5): `grep -r cached_prompts infer/src/` returns empty; `grep -r RadixCache infer/src/scheduler/` returns non-empty
-- [ ] `[R]` Cross-session benchmark on `scripts/bench_agent.py` (built in §7.1): 2-session alternating trace, prefix hit rate ≥70%
+- [ ] `[R]` Cross-session benchmark on `scripts/bench_agent_trace.py` (built in §7.1): 2-session alternating trace, prefix hit rate ≥70%
 - [ ] `[R]` Bench markdown in `docs/experience/wins/`
 
 ### 2.2 Industry references
@@ -611,7 +611,7 @@ These should already be running by the time P0 edits land:
 - [ ] `[R]` **Baseline collection**: `scripts/bench_throughput_sweep.py --label baseline-main-2026-04-13` — every model + slot config we ship. Becomes regression gate from P0 onwards. Save to `docs/experience/wins/2026-04-13-bench-baseline.md`.
 - [ ] `[R]` **Long-context agent baseline**: 32k+ token agent trace, num_slots=4, current main. Numbers we compare against in P2's "must run to completion" gate.
 - [ ] `[R]` **Greedy regression sample**: full `e2e + e2e_qwen35 + greedy_consistency` on current main, capture pass/fail counts as post-merge baseline.
-- [ ] `[L+R]` **`scripts/bench_agent.py`** (item C6 from `agent-first-architecture.md`): build the multi-turn tool-calling replayer + input trace under `scripts/data/agent_trace_default.jsonl`. Mostly local Python; GPU validation only. **P1 needs this as a scoreboard.**
+- [x] `[L+R]` **`scripts/bench_agent_trace.py`** (item C6 from `agent-first-architecture.md`, renamed from `bench_agent.py` to avoid collision with the existing binary-subprocess benchmark of that name): multi-turn tool-calling replayer + input trace under `scripts/data/agent_trace_default.jsonl`. Mostly local Python; GPU validation only. **P1 needs this as a scoreboard.** Landed 2026-04-13.
 
 ### 7.2 — Medium value, parallel tracks
 
