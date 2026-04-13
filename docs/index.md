@@ -1,6 +1,7 @@
 | Path | TL;DR |
 | --- | --- |
 | **Projects** | |
+| [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | **Active** — Priority ledger for turning agent-infer into the strongest engine for agent sequences: radix cache wiring, session routing, constrained decoding, speculative decoding |
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
 | [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Complete** — INT4 quantization architecture: LinearWeight dispatch, W4A16 GEMV, Marlin prefill |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文：FP8 native + INT8/INT4 fused-dequant + TurboQuant 3-bit |
