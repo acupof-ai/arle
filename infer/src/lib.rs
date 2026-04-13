@@ -49,6 +49,11 @@ pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trace_reporter;
 
+// Atomic workspace crates (phase-1 extraction).
+pub use infer_core as core_types;
+pub use infer_observability as observability;
+pub use infer_policy as policy;
+
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
