@@ -197,14 +197,13 @@ impl MetalScheduler {
         QueueBoundAdmission {
             max_queued_requests: self.config.max_waiting_requests,
         }
-        .allow(SchedulerSignals {
+        .allow(SchedulerSignals::queue_state(
             queued_requests,
-            active_decodes: self
-                .requests
+            self.requests
                 .values()
                 .filter(|req| req.phase == MetalRequestPhase::Decoding)
                 .count(),
-        })
+        ))
     }
 
     fn prefill_chunk_budget(&self) -> usize {
@@ -214,10 +213,7 @@ impl MetalScheduler {
         }
         .next_chunk_size(
             InferenceMode::Prefill,
-            SchedulerSignals {
-                queued_requests: self.waiting.len(),
-                active_decodes: self.decoding_len(),
-            },
+            SchedulerSignals::queue_state(self.waiting.len(), self.decoding_len()),
         )
         .max(1)
         .min(self.config.prefill_chunk_size)
