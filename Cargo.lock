@@ -15,12 +15,11 @@ dependencies = [
  "anyhow",
  "clap",
  "infer",
+ "infer-agent",
+ "infer-tools",
  "log",
  "logforth",
- "rand 0.10.0",
  "rustyline",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1408,6 +1407,7 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "infer-chat",
  "infer-core",
  "infer-observability",
  "infer-policy",
@@ -1431,6 +1431,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "infer-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "infer",
+ "infer-chat",
+ "infer-tools",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "infer-chat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "infer-core"
 version = "0.1.0"
 dependencies = [
@@ -1449,6 +1470,16 @@ name = "infer-policy"
 version = "0.1.0"
 dependencies = [
  "infer-core",
+]
+
+[[package]]
+name = "infer-tools"
+version = "0.1.0"
+dependencies = [
+ "infer-chat",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

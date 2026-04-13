@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
+use infer_chat::messages_to_prompt as chat_messages_to_prompt;
 use log::{error, info, warn};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -319,7 +320,7 @@ async fn chat_completions(
     let model_id = state.handle.model_id().to_string();
 
     // Convert messages → ChatML prompt.
-    let prompt = crate::chat::messages_to_prompt(&req.messages, &req.tools);
+    let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
 
     info!(
         "chat/completions: messages={}, prompt_len={}, max_tokens={}, stream={}",

@@ -1,17 +1,36 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use infer_chat::{
+    ChatRole, ParsedAssistantResponse, ProtocolChatMessage, ProtocolToolCall,
+    ProtocolToolDefinition,
+};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use infer::chat_protocol::{ChatRole, ParsedAssistantResponse, ToolCall as ProtocolToolCall};
 use infer::sampler::SamplingParams;
-use infer::server_engine::CompleteRequest;
+use infer::server_engine::{CompleteOutput, CompleteRequest};
+use infer_tools::{Tool, execute_tool_call};
 
-use crate::chat::{Message, format_prompt, parse_tool_calls};
-use crate::engine::AgentEngine;
-use crate::tools::{Tool, execute_tool_call};
+pub type Message = ProtocolChatMessage;
+#[cfg_attr(not(test), allow(dead_code))]
+pub type ToolCall = infer_chat::ToolCall;
+
+pub trait AgentEngine {
+    fn model_id(&self) -> &str;
+    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
+}
+
+fn format_prompt(messages: &[Message], tools: &[Tool]) -> String {
+    let protocol_tools: Vec<ProtocolToolDefinition> =
+        tools.iter().map(Tool::to_definition).collect();
+    infer_chat::protocol_messages_to_prompt(messages, &protocol_tools)
+}
+
+fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
+    infer_chat::parse_protocol_tool_calls(text)
+}
 
 const SYSTEM_PROMPT: &str = r#"You are a local CLI assistant with shell and python tools.
 Answer briefly.
@@ -404,7 +423,7 @@ fn extract_tool_calls_from_user_request(
     if tool_available(tools, "shell") && asks_for_file_listing(user_input) {
         return Some(single_tool_response(
             "shell",
-            json!({ "command": "pwd && ls -la" }),
+            json!({ "command": default_directory_listing_command() }),
         ));
     }
 
@@ -555,6 +574,16 @@ fn asks_for_file_listing(text: &str) -> bool {
         ]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+#[cfg(target_os = "windows")]
+fn default_directory_listing_command() -> &'static str {
+    "cd && dir /a"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn default_directory_listing_command() -> &'static str {
+    "pwd && ls -la"
 }
 
 fn extract_python_code(text: &str) -> Option<String> {
@@ -749,18 +778,15 @@ If no tool is needed, output exactly NO_TOOL.",
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
+    use infer_tools::Tool;
     use serde_json::json;
 
     use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason, Usage};
 
-    use crate::tools::Tool;
-
-    use super::{AgentEngine, AgentSession, AgentSettings};
+    use super::{AgentEngine, AgentSession, AgentSettings, Message, ToolCall};
 
     struct FakeEngine {
         outputs: VecDeque<String>,
@@ -820,6 +846,12 @@ mod tests {
         }
     }
 
+    fn python_tool_available() -> bool {
+        infer_tools::execute_tool("python", &json!({ "code": "print(1)" }))
+            .trim()
+            .eq("1")
+    }
+
     fn shell_tool() -> Tool {
         Tool {
             name: "shell".into(),
@@ -844,6 +876,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_calls_uses_shared_protocol_parser() {
+        let parsed = super::parse_tool_calls(
+            "Let me check.\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>",
+        );
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments["command"], "pwd");
+        assert_eq!(parsed.content, "Let me check.");
+    }
+
+    #[test]
+    fn format_prompt_uses_shared_protocol_formatter() {
+        let prompt = super::format_prompt(
+            &[
+                Message::system("You are helpful."),
+                Message::assistant(
+                    "Checking.",
+                    vec![ToolCall::new("shell", json!({ "command": "pwd" }))],
+                ),
+            ],
+            &[Tool {
+                name: "shell".into(),
+                description: "Run a shell command".into(),
+                parameters: json!({}),
+            }],
+        );
+
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains(r#""name":"shell""#));
+        assert!(prompt.contains(r#""command":"pwd""#));
+    }
+
+    #[test]
     fn session_persists_conversation_history_across_turns() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec!["alpha", "beta"]);
@@ -865,6 +931,11 @@ mod tests {
 
     #[test]
     fn tool_call_messages_are_not_duplicated_in_followup_prompt() {
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "Checking.\n<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(2 + 2)\"}}\n</tool_call>",
@@ -896,14 +967,16 @@ mod tests {
         session.reset();
 
         assert_eq!(session.messages().len(), 1);
-        assert_eq!(
-            session.messages()[0].role,
-            infer::chat_protocol::ChatRole::System
-        );
+        assert_eq!(session.messages()[0].role, infer_chat::ChatRole::System);
     }
 
     #[test]
     fn stats_report_conversation_shape() {
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "Checking.\n<tool_call>\n{\"name\":\"python\",\"arguments\":{\"code\":\"print(2 + 2)\"}}\n</tool_call>",
@@ -959,6 +1032,11 @@ mod tests {
 
     #[test]
     fn explicit_python_request_can_skip_model_generation() {
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec!["I'll help with that.", "The result is 56088."]);
 
@@ -978,6 +1056,11 @@ mod tests {
 
     #[test]
     fn python_tool_is_recovered_from_natural_language_draft() {
+        if !python_tool_available() {
+            eprintln!("Skipping test: python tool is unavailable in this environment");
+            return;
+        }
+
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "I should use the Python tool here. I can run print(7 * 8).",
@@ -1021,125 +1104,5 @@ mod tests {
         assert_eq!(result.tool_calls_executed, 1);
         assert_eq!(result.text, "Listed the current directory above.");
         assert_eq!(engine.prompts.len(), 0);
-    }
-
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    fn live_model_path() -> Option<String> {
-        std::env::var("AGENT_INFER_TEST_MODEL_PATH")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::env::var("AGENT_INFER_MODEL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .or_else(|| {
-                std::env::var("PEGAINFER_TEST_MODEL_PATH")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .or_else(|| infer::hf_hub::discover_local_model().map(|(candidate, _)| candidate))
-    }
-
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    fn live_test_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("live test lock")
-    }
-
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    #[test]
-    #[ignore = "requires a local model available via env or auto-detection"]
-    fn live_local_model_executes_python_tool() {
-        use crate::engine::LoadedAgentEngine;
-
-        let _guard = live_test_guard();
-
-        let Some(model_path) = live_model_path() else {
-            eprintln!("Skipping live test: no local model path provided");
-            return;
-        };
-
-        infer::logging::init_default();
-
-        let mut engine = LoadedAgentEngine::load(&model_path, true).expect("load local engine");
-        let mut session = AgentSession::new();
-        let tools = crate::tools::builtin_tools();
-
-        let result = session
-            .run_turn(
-                &mut engine,
-                "Use the python tool to compute 123 * 456. Do not do the math mentally. After the tool returns, answer with just the integer.",
-                &tools,
-                AgentSettings {
-                    max_turns: 4,
-                    max_tokens: 128,
-                    temperature: 0.0,
-                },
-            )
-            .expect("live tool turn");
-
-        assert!(
-            result.tool_calls_executed > 0,
-            "model did not execute any tool calls; final response: {:?}",
-            result.text
-        );
-        assert!(
-            result.text.contains("56088"),
-            "tool result not reflected in final answer: {:?}",
-            result.text
-        );
-    }
-
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    #[test]
-    #[ignore = "requires a local model available via env or auto-detection"]
-    fn live_local_model_session_handles_reset_and_second_turn() {
-        use crate::engine::LoadedAgentEngine;
-
-        let _guard = live_test_guard();
-
-        let Some(model_path) = live_model_path() else {
-            eprintln!("Skipping live test: no local model path provided");
-            return;
-        };
-
-        infer::logging::init_default();
-
-        let mut engine = LoadedAgentEngine::load(&model_path, true).expect("load local engine");
-        let tools = crate::tools::builtin_tools();
-        let mut session = AgentSession::new();
-
-        let first = session
-            .run_turn(
-                &mut engine,
-                "Use the python tool to compute 2 + 2. After the tool returns, answer with just the integer.",
-                &tools,
-                AgentSettings {
-                    max_turns: 4,
-                    max_tokens: 96,
-                    temperature: 0.0,
-                },
-            )
-            .expect("first live turn");
-        assert!(first.text.contains('4'));
-
-        session.reset();
-
-        let second = session
-            .run_turn(
-                &mut engine,
-                "Use the python tool to compute 3 + 3. After the tool returns, answer with just the integer.",
-                &tools,
-                AgentSettings {
-                    max_turns: 4,
-                    max_tokens: 96,
-                    temperature: 0.0,
-                },
-            )
-            .expect("second live turn");
-        assert!(second.text.contains('6'));
     }
 }

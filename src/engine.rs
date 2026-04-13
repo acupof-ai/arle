@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use anyhow::anyhow;
+use infer_agent::AgentEngine;
 
 use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason};
 
@@ -33,12 +34,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
             Err(_) => "unknown panic payload".to_string(),
         },
     }
-}
-
-#[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
-pub trait AgentEngine {
-    fn model_id(&self) -> &str;
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
 }
 
 #[cfg(feature = "cuda")]

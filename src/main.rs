@@ -1,8 +1,4 @@
-mod agent;
-mod chat;
 mod engine;
-mod tools;
-
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -13,6 +9,10 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer_agent::{AgentEngine, AgentSession, AgentSessionStats, AgentSettings};
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer_tools::{Tool, builtin_tools};
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use log::info;
 #[cfg(all(not(feature = "cuda"), any(feature = "metal", feature = "cpu")))]
 use log::warn;
@@ -22,11 +22,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use crate::agent::{AgentSession, AgentSessionStats, AgentSettings};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use crate::engine::{AgentEngine, LoadedAgentEngine};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use crate::tools::builtin_tools;
+use crate::engine::LoadedAgentEngine;
 
 #[derive(Parser)]
 #[command(name = "agent-infer", about = "Local LLM agent with tool use")]
@@ -91,7 +87,7 @@ fn run_repl(
 fn print_repl_banner(
     engine: &dyn AgentEngine,
     backend_name: &str,
-    tools: &[crate::tools::Tool],
+    tools: &[Tool],
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
@@ -254,7 +250,7 @@ fn run_piped_repl(
 fn handle_repl_input(
     engine: &mut dyn AgentEngine,
     backend_name: &str,
-    tools: &[crate::tools::Tool],
+    tools: &[Tool],
     session: &mut AgentSession,
     input: &str,
     max_turns: usize,
@@ -338,7 +334,7 @@ fn execute_repl_command(
     command: ReplCommand,
     engine: &mut dyn AgentEngine,
     backend_name: &str,
-    tools: &[crate::tools::Tool],
+    tools: &[Tool],
     session: &mut AgentSession,
     max_turns: usize,
     max_tokens: usize,
@@ -437,7 +433,7 @@ fn print_repl_help() {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn print_tools_help(tools: &[crate::tools::Tool]) {
+fn print_tools_help(tools: &[Tool]) {
     println!("Tools:");
     for tool in tools {
         println!("  {}: {}", tool.name, tool.description);

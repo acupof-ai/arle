@@ -20,8 +20,6 @@ pub mod weight_loader;
 pub mod backend;
 pub mod backend_runtime;
 pub mod block_manager;
-pub mod chat;
-pub mod chat_protocol;
 #[cfg(feature = "cpu")]
 pub mod cpu_backend;
 pub mod cuda_graph_pool;
@@ -51,11 +49,7 @@ pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trace_reporter;
 
-// Atomic workspace crates (phase-1 extraction).
-pub use infer_core as core_types;
-pub use infer_observability as observability;
-pub use infer_policy as policy;
-
+pub use infer_chat as chat_types;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
