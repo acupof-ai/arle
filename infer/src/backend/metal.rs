@@ -81,10 +81,9 @@ use self::sampling::gpu_sample_token;
 use self::weights::{
     MetalWeights, MlpInputProjection, WeightTensor, merge_quantized_projection_rows,
 };
-use config::{
-    MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig,
-    load_metal_config,
-};
+use config::{MetalModelArch, MetalModelConfig, load_metal_config};
+#[cfg(feature = "metal")]
+use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
 #[cfg(feature = "metal")]
 use loader::{
     TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
@@ -425,33 +424,6 @@ impl StreamingInferenceBackend for MetalBackend {
     }
 }
 
-// ── Metal forward pass (GPU required) ────────────────────────────────────────
-
-/// Autoregressive generation using MLX Metal kernels.
-///
-/// Forward pass per step:
-/// ```text
-/// input_ids → embed → [transformer layer × N] → norm → lm_head → logits → sample
-/// ```
-///
-/// Transformer layer (Qwen3 / Qwen3.5):
-/// 1. `residual = x`
-/// 2. `x = rms_norm(x, input_layernorm)`
-/// 3. `q = rms_norm(x @ q_proj.T, q_norm)`, `k = rms_norm(x @ k_proj.T, k_norm)`
-/// 4. `v = x @ v_proj.T`
-/// 5. Reshape, apply RoPE to q/k, append to KV cache
-/// 6. GQA via `fast::scaled_dot_product_attention`
-/// 7. `x = residual + attn_out @ o_proj.T`
-/// 8. `x = x + silu(x_norm @ gate.T) * (x_norm @ up.T) @ down.T`
-///
-/// Optimisations applied:
-/// - **P1**: Dense weights are pre-transposed at load time (no per-step transpose).
-/// - **P3/P6**: async_eval double-buffering: GPU computes step N while CPU processes
-///   step N-1's token. Graph construction (CPU-only) overlaps GPU execution.
-/// - **P4**: argmax / categorical sampling stays on GPU (no 152 K float transfer).
-/// - **P5**: KV cache grows in 256-token chunks; `metal_clear_cache()` every 256 steps.
-// P5: KV cache grows in this many token increments (aligned with mlx-lm convention).
-#[cfg(feature = "metal")]
 const BENCHMARK_PROMPT_CHUNK: &str = " benchmark throughput";
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
