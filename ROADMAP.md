@@ -8,7 +8,7 @@ Related docs:
 
 ---
 
-## Current State (2026-04-09)
+## Current State (2026-04-14)
 
 Working: Qwen3/Qwen3.5/GLM4 inference, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, KV cache + CPU offload, token-level KV pool (SGLang-style), continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, throughput benchmark suite.
 
@@ -500,10 +500,29 @@ Phase 0 complete. Quantization (Phase 2) largely complete. Focus on performance 
 2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant all production-ready
 3. ~~**Scheduler preemption with KV swap**~~ — ✅ recompute mode done (swap mode deferred)
 4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
-5. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass
-6. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
-7. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
-8. **1.2 FlashAttention-3** — H100 utilization improvement
+5. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass (CUDA)
+6. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
+   need: DraftEngine, KV rollback in PagedKvPool, SpeculativeScheduler, CUDA Graph 2-phase.
+   Research: standard draft model (Qwen3-0.5B) first; EAGLE2 / DFlash-MLX as phase 2.
+   See [docs/research/speculative-decoding-feasibility.md](docs/research/speculative-decoding-feasibility.md)
+7. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
+8. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
+9. **1.2 FlashAttention-3** — H100 utilization improvement
+
+### Research Notes (2026-04-14)
+
+- **Speculative decoding**: `speculative.rs` framework production-ready (CPU). EAGLE2/EAGLE3
+  offer 2.5–3× speedup on Qwen3 without a separate model (uses target hidden states as draft input).
+  See [docs/research/speculative-decoding-feasibility.md](docs/research/speculative-decoding-feasibility.md)
+
+- **KV quantization on Metal**: MLX has no FP8 type. Metal FP8 KV is not feasible.
+  INT8 KV possible but low-priority (M3 Max bandwidth not bottlenecked by KV at C≤4).
+  See [docs/research/kv-quantization-metal.md](docs/research/kv-quantization-metal.md)
+
+- **DFlash on Metal**: DFlash-MLX project exists, supports Qwen3-4B and Qwen3.5-4B natively.
+  Per-layer KV rollback for hybrid models already solved in upstream. Medium priority —
+  implement CUDA speculative decoding first, then port DFlash to Metal.
+  See [docs/research/dflash-metal-feasibility.md](docs/research/dflash-metal-feasibility.md)
 
 ---
 
