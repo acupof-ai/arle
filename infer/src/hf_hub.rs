@@ -82,6 +82,18 @@ pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf
 /// Files are stored under `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<sha>/`.
 /// Subsequent calls with the same model ID are served from cache (no re-download).
 pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
+    download_repo_assets_from_hub(model_id, true)
+}
+
+/// Download config + tokenizer assets without model weights.
+///
+/// Used by lightweight development backends that need prompt/tokenizer metadata
+/// but do not execute the full neural model.
+pub fn download_runtime_assets_from_hub(model_id: &str) -> Result<PathBuf> {
+    download_repo_assets_from_hub(model_id, false)
+}
+
+fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Result<PathBuf> {
     let api = build_api().context("failed to initialise HuggingFace API")?;
     let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
 
@@ -123,26 +135,28 @@ pub fn download_from_hub(model_id: &str) -> Result<PathBuf> {
     }
 
     // ── weight shards (safetensors preferred, no pickle) ──────────────────
-    let weight_files: Vec<&str> = filenames
-        .iter()
-        .filter(|f| {
-            let p = std::path::Path::new(f.as_str());
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            (ext == "safetensors" || ext == "bin")
-                // Skip adapter / lora weight files
-                && !f.contains("adapter")
-                // Prefer safetensors; skip .bin when a .safetensors twin exists
-                && !(ext == "bin" && has_safetensors_twin(&filenames, f))
-        })
-        .map(String::as_str)
-        .collect();
+    if include_weights {
+        let weight_files: Vec<&str> = filenames
+            .iter()
+            .filter(|f| {
+                let p = std::path::Path::new(f.as_str());
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                (ext == "safetensors" || ext == "bin")
+                    // Skip adapter / lora weight files
+                    && !f.contains("adapter")
+                    // Prefer safetensors; skip .bin when a .safetensors twin exists
+                    && !(ext == "bin" && has_safetensors_twin(&filenames, f))
+            })
+            .map(String::as_str)
+            .collect();
 
-    if weight_files.is_empty() {
-        anyhow::bail!("no weight files (.safetensors or .bin) found in HF repo '{model_id}'");
-    }
+        if weight_files.is_empty() {
+            anyhow::bail!("no weight files (.safetensors or .bin) found in HF repo '{model_id}'");
+        }
 
-    for name in &weight_files {
-        fetch_file(&repo, name, model_id)?;
+        for name in &weight_files {
+            fetch_file(&repo, name, model_id)?;
+        }
     }
 
     // ── derive local cache dir from the first downloaded file ─────────────

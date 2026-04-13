@@ -1,4 +1,6 @@
 use super::*;
+use infer_core::InferenceMode;
+use infer_policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
 
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -242,14 +244,21 @@ impl<M: ModelForward> Scheduler<M> {
         Some(effective)
     }
 
-    pub(super) fn prefill_chunk_size(&self, decode_active: bool) -> usize {
-        if decode_active {
-            self.config
-                .prefill_chunk_size
-                .min(self.config.decode_active_prefill_cap)
-        } else {
-            self.config.prefill_chunk_size
+    pub(super) fn prefill_chunk_size(&self) -> usize {
+        let signals = SchedulerSignals::queue_state(
+            self.waiting.len(),
+            self.active
+                .iter()
+                .filter(|req| matches!(req.phase, Phase::Decoding))
+                .count(),
+        );
+        DecodeAwareChunking {
+            decode_active_chunk: self.config.decode_active_prefill_cap,
+            idle_chunk: self.config.prefill_chunk_size,
         }
+        .next_chunk_size(InferenceMode::Prefill, signals)
+        .max(1)
+        .min(self.config.prefill_chunk_size)
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.

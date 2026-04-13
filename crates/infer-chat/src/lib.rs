@@ -1,14 +1,17 @@
 //! OpenAI-compatible chat request/response types layered on top of the shared
-//! chat/tool-call protocol helpers in [`crate::chat_protocol`].
+//! chat/tool-call protocol helpers in [`crate::protocol`].
+
+pub mod protocol;
+
+pub use protocol::{
+    ChatMessage as ProtocolChatMessage, ChatRole, ParsedAssistantResponse, ToolCall,
+    ToolCall as ProtocolToolCall, ToolDefinition as ProtocolToolDefinition, build_tool_block,
+    messages_to_prompt as protocol_messages_to_prompt,
+    parse_tool_calls as parse_protocol_tool_calls,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use crate::chat_protocol::{
-    ChatMessage as ProtocolChatMessage, ChatRole, ParsedAssistantResponse, ToolCall,
-    ToolDefinition as ProtocolToolDefinition, messages_to_prompt as protocol_messages_to_prompt,
-    parse_tool_calls as parse_protocol_tool_calls,
-};
 
 /// A single message in a chat conversation.
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -1,9 +1,20 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::chat::{ChatMessage, ToolDefinition};
-use crate::chat_protocol::ToolCall as ProtocolToolCall;
 use crate::server_engine::{CompleteOutput, StreamDelta};
+use infer_chat::{ChatMessage, ProtocolToolCall, ToolDefinition, parse_tool_calls};
+use infer_core::SessionId;
+
+/// Normalize a raw string session hint from a client request. Empty / whitespace
+/// ids are dropped so that "" and `null` behave identically.
+fn normalize_session_id(raw: Option<&str>) -> Option<SessionId> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(SessionId::new(trimmed.to_string()))
+    }
+}
 
 // OpenAI-compatible /v1/completions request
 #[derive(Debug, Deserialize)]
@@ -30,6 +41,16 @@ pub(super) struct CompletionRequest {
     /// Return per-token logprobs. If set to a number > 0, returns logprobs.
     #[allow(dead_code)]
     pub(super) logprobs: Option<u32>,
+    /// Optional client-supplied session/conversation identifier.
+    ///
+    /// When present, the scheduler uses it for sticky routing of subsequent
+    /// turns of the same agent session to the slot that already holds their
+    /// KV prefix (see
+    /// `docs/projects/agent-first-architecture.md::A2`). Accepted as
+    /// `session_id` with an `user` alias to match OpenAI's existing "client
+    /// supplies a stable per-user token" field.
+    #[serde(default, alias = "user")]
+    pub(super) session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +72,10 @@ impl CompletionRequest {
             .as_ref()
             .and_then(|options| options.include_usage)
             .unwrap_or(false)
+    }
+
+    pub(super) fn session_id_parsed(&self) -> Option<SessionId> {
+        normalize_session_id(self.session_id.as_deref())
     }
 }
 
@@ -215,6 +240,11 @@ pub(super) struct ChatCompletionRequest {
     /// Tool definitions (OpenAI format).
     #[serde(default)]
     pub(super) tools: Vec<ToolDefinition>,
+    /// Optional client-supplied session/conversation identifier.
+    ///
+    /// See [`CompletionRequest::session_id`] for the routing contract.
+    #[serde(default, alias = "user")]
+    pub(super) session_id: Option<String>,
 }
 
 impl ChatCompletionRequest {
@@ -231,6 +261,10 @@ impl ChatCompletionRequest {
             .as_ref()
             .and_then(|o| o.include_usage)
             .unwrap_or(false)
+    }
+
+    pub(super) fn session_id_parsed(&self) -> Option<SessionId> {
+        normalize_session_id(self.session_id.as_deref())
     }
 }
 
@@ -294,7 +328,7 @@ impl From<&ProtocolToolCall> for ChatToolCall {
 
 impl ChatCompletionResponse {
     pub(super) fn from_output(model: String, created: u64, output: &CompleteOutput) -> Self {
-        let (content, parsed_calls) = crate::chat::parse_tool_calls(&output.text);
+        let (content, parsed_calls) = parse_tool_calls(&output.text);
         let tool_calls: Vec<ChatToolCall> = parsed_calls.iter().map(ChatToolCall::from).collect();
 
         let message = AssistantMessage {
@@ -428,5 +462,52 @@ impl ChatStreamUsageChunk {
             model: model.to_string(),
             usage: usage.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_request_accepts_session_id() {
+        let raw = r#"{"prompt":"hi","session_id":"agent-42"}"#;
+        let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.session_id_parsed().unwrap().as_str(), "agent-42");
+    }
+
+    #[test]
+    fn completion_request_missing_session_id_is_none() {
+        let raw = r#"{"prompt":"hi"}"#;
+        let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+        assert!(req.session_id_parsed().is_none());
+    }
+
+    #[test]
+    fn completion_request_empty_and_whitespace_session_id_is_none() {
+        let empty: CompletionRequest =
+            serde_json::from_str(r#"{"prompt":"hi","session_id":""}"#).unwrap();
+        assert!(empty.session_id_parsed().is_none());
+
+        let whitespace: CompletionRequest =
+            serde_json::from_str(r#"{"prompt":"hi","session_id":"   "}"#).unwrap();
+        assert!(whitespace.session_id_parsed().is_none());
+    }
+
+    #[test]
+    fn completion_request_accepts_user_alias() {
+        // OpenAI's canonical "user" field is the standard per-user identifier;
+        // we accept it as an alias so existing clients opt into sticky routing
+        // without changing their payloads.
+        let raw = r#"{"prompt":"hi","user":"client-9"}"#;
+        let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.session_id_parsed().unwrap().as_str(), "client-9");
+    }
+
+    #[test]
+    fn chat_completion_request_accepts_session_id_and_trims() {
+        let raw = r#"{"messages":[{"role":"user","content":"hi"}],"session_id":"  sess-1  "}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.session_id_parsed().unwrap().as_str(), "sess-1");
     }
 }

@@ -1,6 +1,7 @@
 | Path | TL;DR |
 | --- | --- |
 | **Projects** | |
+| [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | **Active** — Priority ledger for turning agent-infer into the strongest engine for agent sequences: radix cache wiring, session routing, constrained decoding, speculative decoding |
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | **Done** — Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration |
 | [projects/quantization-architecture.md](projects/quantization-architecture.md) | **Complete** — INT4 quantization architecture: LinearWeight dispatch, W4A16 GEMV, Marlin prefill |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Active** — KV 量化存储 + Agent 长上下文：FP8 native + INT8/INT4 fused-dequant + TurboQuant 3-bit |
@@ -12,12 +13,15 @@
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | **Complete** — TurboQuant Phases 1-3: KV cache + weight + fused decode attention |
 | **Resources** | |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
+| [architecture.md](architecture.md) | Current workspace/package topology and runtime split |
+| [codebase-map.md](codebase-map.md) | Current code map: runtime, crates, docs, tests, and entrypoints |
 | [stability-policy.md](stability-policy.md) | Governance draft: stable/beta/experimental/internal surface classification |
 | [support-matrix.md](support-matrix.md) | Governance draft: current backend / platform / model / quantization support levels |
 | [compatibility.md](compatibility.md) | Governance draft: breaking-change, deprecation, and migration policy |
 | [perf-and-correctness-gates.md](perf-and-correctness-gates.md) | Governance draft: minimum validation expectations for correctness and performance-sensitive changes |
 | [release-checklist.md](release-checklist.md) | Governance draft: repeatable release checklist for docs, validation, artifacts, and compatibility review |
 | [environment.md](environment.md) | Environment variable reference for CLI, build, tests, integration, and setup workflows |
+| [../crates/README.md](../crates/README.md) | Workspace crate ownership and dependency boundaries |
 | **Reviews** | |
 | [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | 10K star readiness review |
 | [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: optimization gaps in Qwen3.5 batched decode |

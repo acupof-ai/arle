@@ -651,8 +651,11 @@ pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::metal_test_guard;
+
     #[test]
     fn lifecycle() {
+        let _guard = metal_test_guard();
         let a = MlxArray::from_slice_f32(&[1.0, 2.0, 3.0], &[3]);
         assert_eq!(a.ndim(), 1);
         assert_eq!(a.shape(), &[3]);
@@ -660,6 +663,7 @@ mod tests {
     }
     #[test]
     fn add_basic() {
+        let _guard = metal_test_guard();
         let c = add(
             &MlxArray::from_slice_f32(&[1.0, 2.0], &[2]),
             &MlxArray::from_slice_f32(&[3.0, 4.0], &[2]),
@@ -669,6 +673,7 @@ mod tests {
     }
     #[test]
     fn matmul_basic() {
+        let _guard = metal_test_guard();
         let c = matmul(
             &MlxArray::from_slice_f32(&[1.0, 2.0], &[1, 2]),
             &MlxArray::from_slice_f32(&[1.0, 2.0], &[2, 1]),

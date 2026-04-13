@@ -1,4 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
+
+use infer_core::{InferenceMode, RequestEventKind, RequestId};
+use infer_observability::{EngineEvent, EventSink, NoopEventSink};
+use infer_policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
 
 use crate::block_manager::{BlockId, BlockManager};
 
@@ -6,7 +13,7 @@ use super::{PreemptionMode, RequestPriority};
 
 /// A request waiting to begin (or resume) prefill.
 pub struct PendingRequest {
-    pub req_id: u64,
+    pub req_id: RequestId,
     /// Tokenized prompt. Caller must tokenize before calling `add_request`.
     pub prompt_tokens: Vec<u32>,
     pub max_tokens: usize,
@@ -19,7 +26,7 @@ pub struct PendingRequest {
 
 /// A request that finished prefill and is now in the decode (generation) phase.
 pub struct RunningRequest {
-    pub req_id: u64,
+    pub req_id: RequestId,
     /// Kept for recompute-mode preemption (re-queue without re-tokenizing).
     pub prompt_tokens: Vec<u32>,
     pub generated_tokens: usize,
@@ -38,7 +45,7 @@ impl RunningRequest {
 
 /// Decode-only sub-batch.
 pub struct DecodeBatch {
-    pub req_ids: Vec<u64>,
+    pub req_ids: Vec<RequestId>,
     /// Last generated token ID per request (caller fills from its own state).
     pub input_ids: Vec<u32>,
     /// KV block table per request.
@@ -47,7 +54,7 @@ pub struct DecodeBatch {
 
 /// Prefill sub-batch (may be a chunk of a larger prompt).
 pub struct PrefillBatch {
-    pub req_ids: Vec<u64>,
+    pub req_ids: Vec<RequestId>,
     /// Token IDs to process (the chunk).
     pub input_ids: Vec<u32>,
     /// Full sequence length after this chunk (prefix + chunk).
@@ -75,6 +82,8 @@ pub struct BatchSchedulerConfig {
     pub max_tokens_per_step: usize,
     /// Maximum tokens in a single prefill chunk.
     pub prefill_chunk_size: usize,
+    /// Policy for adapting prefill chunk size under decode pressure.
+    pub chunking_policy: DecodeAwareChunking,
     /// Preemption strategy when GPU KV cache is exhausted.
     pub preemption_mode: PreemptionMode,
 }
@@ -84,6 +93,10 @@ impl Default for BatchSchedulerConfig {
         Self {
             max_tokens_per_step: 2048,
             prefill_chunk_size: 512,
+            chunking_policy: DecodeAwareChunking {
+                decode_active_chunk: 64,
+                idle_chunk: 512,
+            },
             preemption_mode: PreemptionMode::Recompute,
         }
     }
@@ -103,20 +116,43 @@ pub struct BatchScheduler {
     /// Requests waiting to be prefilled, ordered by arrival (FCFS).
     waiting: VecDeque<PendingRequest>,
     /// Requests currently in the decode phase.
-    pub(crate) running: HashMap<u64, RunningRequest>,
+    pub(crate) running: HashMap<RequestId, RunningRequest>,
     block_manager: BlockManager,
     next_req_id: u64,
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl BatchScheduler {
     pub fn new(config: BatchSchedulerConfig, block_manager: BlockManager) -> Self {
+        Self::with_event_sink(config, block_manager, Arc::new(NoopEventSink))
+    }
+
+    pub fn with_event_sink(
+        config: BatchSchedulerConfig,
+        block_manager: BlockManager,
+        event_sink: Arc<dyn EventSink>,
+    ) -> Self {
         Self {
             config,
             waiting: VecDeque::new(),
             running: HashMap::new(),
             block_manager,
             next_req_id: 0,
+            event_sink,
         }
+    }
+
+    fn emit_event(
+        &self,
+        request_id: RequestId,
+        kind: RequestEventKind,
+        mode: Option<InferenceMode>,
+    ) {
+        self.event_sink.emit(&EngineEvent {
+            request_id,
+            kind,
+            mode,
+        });
     }
 
     /// Submit a new request. Returns its assigned `req_id`.
@@ -125,8 +161,8 @@ impl BatchScheduler {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
         priority: RequestPriority,
-    ) -> u64 {
-        let req_id = self.next_req_id;
+    ) -> RequestId {
+        let req_id = RequestId(self.next_req_id);
         self.next_req_id += 1;
         self.waiting.push_back(PendingRequest {
             req_id,
@@ -136,12 +172,13 @@ impl BatchScheduler {
             prefill_progress: 0,
             allocated_blocks: Vec::new(),
         });
+        self.emit_event(req_id, RequestEventKind::Enqueued, None);
         req_id
     }
 
     /// Call after the model generates one more token for a decode request.
     /// Allocates additional KV blocks if the sequence has grown into a new block.
-    pub fn advance_decode(&mut self, req_id: u64) -> bool {
+    pub fn advance_decode(&mut self, req_id: RequestId) -> bool {
         let Some(req) = self.running.get_mut(&req_id) else {
             return false;
         };
@@ -157,13 +194,23 @@ impl BatchScheduler {
                 Err(_) => return false,
             }
         }
+        self.emit_event(
+            req_id,
+            RequestEventKind::DecodeStep,
+            Some(InferenceMode::Decode),
+        );
         true
     }
 
     /// Mark a request as finished and free its KV blocks.
-    pub fn finish_request(&mut self, req_id: u64) {
+    pub fn finish_request(&mut self, req_id: RequestId) {
         if let Some(req) = self.running.remove(&req_id) {
             self.block_manager.free(&req.blocks);
+            self.emit_event(
+                req_id,
+                RequestEventKind::Completed,
+                Some(InferenceMode::Decode),
+            );
         }
         self.waiting.retain(|r| r.req_id != req_id);
     }
@@ -214,11 +261,11 @@ impl BatchScheduler {
         self.block_manager.free_gpu_blocks()
     }
 
-    pub fn is_running(&self, req_id: u64) -> bool {
+    pub fn is_running(&self, req_id: RequestId) -> bool {
         self.running.contains_key(&req_id)
     }
 
-    pub fn is_waiting(&self, req_id: u64) -> bool {
+    pub fn is_waiting(&self, req_id: RequestId) -> bool {
         self.waiting.iter().any(|r| r.req_id == req_id)
     }
 
@@ -253,6 +300,12 @@ impl BatchScheduler {
             self.block_manager.free(&req.blocks);
             preempted = true;
 
+            self.emit_event(
+                preempt_id,
+                RequestEventKind::Evicted,
+                Some(InferenceMode::Decode),
+            );
+
             self.waiting.push_front(PendingRequest {
                 req_id: preempt_id,
                 prompt_tokens: req.prompt_tokens,
@@ -261,6 +314,7 @@ impl BatchScheduler {
                 prefill_progress: 0,
                 allocated_blocks: Vec::new(),
             });
+            self.emit_event(preempt_id, RequestEventKind::Requeued, None);
         }
         preempted
     }
@@ -271,7 +325,7 @@ impl BatchScheduler {
         let mut input_ids = Vec::with_capacity(n);
         let mut block_tables = Vec::with_capacity(n);
 
-        let mut ids: Vec<u64> = self.running.keys().copied().collect();
+        let mut ids: Vec<RequestId> = self.running.keys().copied().collect();
         ids.sort_unstable();
 
         for id in ids {
@@ -288,45 +342,90 @@ impl BatchScheduler {
         }
     }
 
+    fn prefill_chunk_budget(&self) -> usize {
+        let signals = SchedulerSignals::queue_state(self.waiting.len(), self.running.len());
+        self.config
+            .chunking_policy
+            .next_chunk_size(InferenceMode::Prefill, signals)
+            .max(1)
+            .min(self.config.prefill_chunk_size)
+    }
+
     /// Attempt to emit one prefill chunk for the head of `waiting`.
     ///
     /// Allocates new KV blocks for the chunk. Returns `None` if the queue is
     /// empty or KV memory is too full to admit even one token.
     fn try_admit_prefill_chunk(&mut self, token_budget: usize) -> Option<PrefillBatch> {
-        let pending = self.waiting.front_mut()?;
-
-        let total_tokens = pending.prompt_tokens.len();
-        let progress = pending.prefill_progress;
-        let remaining = total_tokens.saturating_sub(progress);
-        if remaining == 0 {
+        let policy_chunk_budget = self.prefill_chunk_budget();
+        let should_drop_empty = self
+            .waiting
+            .front()
+            .is_some_and(|pending| pending.prefill_progress >= pending.prompt_tokens.len());
+        if should_drop_empty {
             self.waiting.pop_front();
             return None;
         }
 
-        let chunk_tokens = remaining
-            .min(self.config.prefill_chunk_size)
-            .min(token_budget);
-        if chunk_tokens == 0 {
-            return None;
-        }
+        let (
+            chunk,
+            block_table,
+            req_id,
+            seq_len,
+            is_last_chunk,
+            total_tokens,
+            emit_prefill_started,
+        ) = {
+            let pending = self.waiting.front_mut()?;
 
-        let chunk_end = progress + chunk_tokens;
-        let blocks_needed = self.block_manager.blocks_for_tokens(chunk_end);
-        let have = pending.allocated_blocks.len();
-        let extra_needed = blocks_needed.saturating_sub(have);
-
-        if extra_needed > 0 {
-            match self.block_manager.allocate_gpu(extra_needed) {
-                Ok(new_blocks) => pending.allocated_blocks.extend(new_blocks),
-                Err(_) => return None,
+            let total_tokens = pending.prompt_tokens.len();
+            let progress = pending.prefill_progress;
+            let is_first_chunk = progress == 0;
+            let remaining = total_tokens.saturating_sub(progress);
+            let chunk_tokens = remaining.min(policy_chunk_budget).min(token_budget);
+            if chunk_tokens == 0 {
+                return None;
             }
-        }
+            let chunk_end = progress + chunk_tokens;
+            let blocks_needed = self.block_manager.blocks_for_tokens(chunk_end);
+            let have = pending.allocated_blocks.len();
+            let extra_needed = blocks_needed.saturating_sub(have);
 
-        let chunk = pending.prompt_tokens[progress..chunk_end].to_vec();
-        let block_table = pending.allocated_blocks.clone();
-        let req_id = pending.req_id;
-        let seq_len = chunk_end;
-        let is_last_chunk = chunk_end >= total_tokens;
+            if extra_needed > 0 {
+                match self.block_manager.allocate_gpu(extra_needed) {
+                    Ok(new_blocks) => pending.allocated_blocks.extend(new_blocks),
+                    Err(_) => return None,
+                }
+            }
+
+            let chunk = pending.prompt_tokens[progress..chunk_end].to_vec();
+            let block_table = pending.allocated_blocks.clone();
+            let req_id = pending.req_id;
+            let seq_len = chunk_end;
+            let is_last_chunk = chunk_end >= total_tokens;
+
+            if !is_last_chunk {
+                pending.prefill_progress = chunk_end;
+            }
+
+            (
+                chunk,
+                block_table,
+                req_id,
+                seq_len,
+                is_last_chunk,
+                total_tokens,
+                is_first_chunk,
+            )
+        };
+
+        if emit_prefill_started {
+            // Lifecycle signal, not a per-chunk notification.
+            self.emit_event(
+                req_id,
+                RequestEventKind::PrefillStarted,
+                Some(InferenceMode::Prefill),
+            );
+        }
 
         if is_last_chunk {
             let done = self.waiting.pop_front().expect("checked above");
@@ -341,8 +440,6 @@ impl BatchScheduler {
                     kv_tokens: total_tokens,
                 },
             );
-        } else {
-            pending.prefill_progress = chunk_end;
         }
 
         Some(PrefillBatch {

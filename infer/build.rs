@@ -733,6 +733,12 @@ fn main() {
         println!("cargo:warning=metal feature active: relying on mlx-sys bridge only.");
     }
 
+    if std::env::var("CARGO_FEATURE_CUDA").is_err() {
+        println!("cargo:warning=cuda feature inactive: skipping CUDA/Triton kernel compilation.");
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
+        return;
+    }
+
     // When the `no-cuda` feature is active (e.g. macOS dev machines without a GPU),
     // skip all CUDA/Triton compilation. GPU ops will panic at runtime.
     if std::env::var("CARGO_FEATURE_NO_CUDA").is_ok() {

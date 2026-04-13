@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
+use infer_chat::messages_to_prompt as chat_messages_to_prompt;
 use log::{error, info, warn};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -45,6 +46,7 @@ struct RequestExecutionOptions {
     include_usage: bool,
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
+    session_id: Option<infer_core::SessionId>,
 }
 
 impl RequestExecutionOptions {
@@ -66,6 +68,7 @@ impl RequestExecutionOptions {
                 req.stop_token_ids.clone(),
             ),
             stop: req.stop.clone(),
+            session_id: req.session_id_parsed(),
         }
     }
 
@@ -87,6 +90,7 @@ impl RequestExecutionOptions {
                 req.stop_token_ids.clone(),
             ),
             stop: req.stop.clone(),
+            session_id: req.session_id_parsed(),
         }
     }
 
@@ -101,6 +105,7 @@ impl RequestExecutionOptions {
             sampling: self.sampling,
             stop: self.stop,
             priority: RequestPriority::default(),
+            session_id: self.session_id,
             delta_tx,
         }
     }
@@ -319,7 +324,7 @@ async fn chat_completions(
     let model_id = state.handle.model_id().to_string();
 
     // Convert messages → ChatML prompt.
-    let prompt = crate::chat::messages_to_prompt(&req.messages, &req.tools);
+    let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
 
     info!(
         "chat/completions: messages={}, prompt_len={}, max_tokens={}, stream={}",
