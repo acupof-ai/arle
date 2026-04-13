@@ -523,13 +523,9 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_rejects_when_at_capacity() {
-        let handle = spawn_backend_runtime_handle(
-            SlowBackend {
-                delay: std::time::Duration::from_millis(200),
-            },
-            Arc::<str>::from("slow"),
-            2, // max_waiting = 2
-        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let waiting_count = Arc::new(AtomicUsize::new(0));
+        let handle = BackendRuntimeHandle::new(tx, Arc::<str>::from("slow"), waiting_count, 2);
 
         // Fill the queue to capacity.
         let (req1, _rx1) = make_request("a", None);
