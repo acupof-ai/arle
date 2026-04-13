@@ -89,6 +89,11 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 ### Tier A — defines whether we are agent-grade at all
 
 #### A1. Wire `RadixCache` into the CUDA scheduler (blocker for A2, A3, A4)
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P1.
+> A1 is folded into the Tiered KV Cache project — it ships as the first
+> behavior phase there. When P1 lands, move A1 to the Done section with a
+> pointer to the merged PRs.
+
 - **What**: Replace `scheduler/cuda/runtime.rs::best_prefix_slot`'s
   `num_slots`-entry linear compare with a `RadixCache` lookup backed by
   block-refcounted `BlockManager` allocations. Cross-request CoW sharing.
@@ -157,6 +162,12 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 ### Tier B — defines whether we are professional
 
 #### B1. Session KV snapshot persistence (needs A1)
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P3.
+> B1 is folded into the Tiered KV Cache project. The proposed
+> `infer/src/session_store.rs` does not land as a standalone module; its
+> functionality ships as `kv_tier::transport::disk` (T3 tier) plus the HTTP
+> save/load handlers. Radix `serde` lands in P1 as a P3 precondition.
+
 - **What**: `POST /v1/sessions/{id}/save` serializes radix nodes + their
   KV blocks to local storage. `POST /v1/sessions/{id}/load` re-attaches.
   Pair with a graceful shutdown hook to persist on SIGTERM.
@@ -184,6 +195,11 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   arguments; no mid-stream content↔tool_call rewrites.
 
 #### B3. Policy signals for prefix / session awareness
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P2.
+> The signal extension itself has already shipped (commit `3e1d35f`); the
+> remaining `EvictionPolicy` trait + `SessionBiasedLru` default lands as the
+> Tiered KV Cache P2 structural PR. When P2 ships, move B3 to Done.
+
 - **What**: Extend `infer_policy::SchedulerSignals` with
   `prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`. Add a built-in
   `PrefixAwareAdmission` that deprioritizes cold requests when warm ones
@@ -364,6 +380,9 @@ A4 is on the critical path for the stated goal.
 
 ## 6 · Related docs
 
+- [`tiered-kv-cache.md`](tiered-kv-cache.md) — Hierarchical KV cache project.
+  Owns the implementation shape for A1, B1, and B3. Any contract change
+  affecting those three items lands there first and propagates here.
 - `infer/docs/projects/art-grade-architecture-for-long-agent-infer.md` —
   workspace crate topology and Phase-1 PR discipline (this doc operates
   under those rules).
