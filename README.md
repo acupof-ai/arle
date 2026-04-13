@@ -132,7 +132,8 @@ Workspace split summary:
 See [docs/architecture.md](docs/architecture.md) and [crates/README.md](crates/README.md)
 for the current package boundaries. This is still an interim Phase 1 split:
 the control-plane crates are separated, but the lower-level scheduler/runtime
-atomization is still pending.
+atomization is still pending; enqueue admission and decode-aware chunking now
+share stable policy contracts across the batch/CUDA/Metal paths.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -227,7 +228,7 @@ Current package boundary for agent mode:
 - `infer-agent` -> conversation loop and tool-call recovery
 - `infer-tools` / `infer-chat` -> shared tool definitions, execution helpers, and protocol types
 
-The remaining Phase 1 work is now below the control-plane boundary: tightening scheduler/runtime extraction, keeping observability semantics stable, and deferring deeper policy/KV atomization to later phases.
+The remaining Phase 1 work is now below the control-plane boundary: tightening deeper scheduler/KV extraction, keeping observability semantics stable, and deferring fuller eviction/KV policy atomization to later phases.
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 

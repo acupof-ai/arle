@@ -11,6 +11,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
+use infer_core::{InferenceMode, RequestEventKind};
+use infer_observability::{EngineEvent, EventSink, NoopEventSink};
+use infer_policy::{
+    AdmissionPolicy, ChunkingPolicy, DecodeAwareChunking, QueueBoundAdmission, SchedulerSignals,
+};
+use std::sync::Arc;
+
 /// Request priority used by the Metal scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum MetalRequestPriority {
@@ -175,11 +182,62 @@ pub struct MetalScheduler {
     next_arrival_order: u64,
     waiting: Vec<u64>,
     requests: HashMap<u64, MetalRequestState>,
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl MetalScheduler {
+    fn emit_event(&self, req_id: u64, kind: RequestEventKind, mode: Option<InferenceMode>) {
+        self.event_sink.emit(&EngineEvent {
+            request_id: infer_core::RequestId(req_id),
+            kind,
+            mode,
+        });
+    }
+
+    fn admission_allows(&self, queued_requests: usize) -> bool {
+        if self.config.max_waiting_requests == 0 {
+            return true;
+        }
+
+        QueueBoundAdmission {
+            max_queued_requests: self.config.max_waiting_requests,
+        }
+        .allow(SchedulerSignals {
+            queued_requests,
+            active_decodes: self
+                .requests
+                .values()
+                .filter(|req| req.phase == MetalRequestPhase::Decoding)
+                .count(),
+        })
+    }
+
+    fn prefill_chunk_budget(&self) -> usize {
+        DecodeAwareChunking {
+            decode_active_chunk: self.config.decode_active_prefill_cap,
+            idle_chunk: self.config.prefill_chunk_size,
+        }
+        .next_chunk_size(
+            InferenceMode::Prefill,
+            SchedulerSignals {
+                queued_requests: self.waiting.len(),
+                active_decodes: self.decoding_len(),
+            },
+        )
+        .max(1)
+        .min(self.config.prefill_chunk_size)
+    }
+
     /// Create a new scheduler with the provided config.
     pub fn new(config: MetalSchedulerConfig) -> Result<Self, MetalSchedulerError> {
+        Self::with_event_sink(config, Arc::new(NoopEventSink))
+    }
+
+    /// Create a new scheduler with an explicit observability sink.
+    pub fn with_event_sink(
+        config: MetalSchedulerConfig,
+        event_sink: Arc<dyn EventSink>,
+    ) -> Result<Self, MetalSchedulerError> {
         config.validate()?;
         Ok(Self {
             config,
@@ -187,6 +245,7 @@ impl MetalScheduler {
             next_arrival_order: 0,
             waiting: Vec::new(),
             requests: HashMap::new(),
+            event_sink,
         })
     }
 
@@ -205,7 +264,7 @@ impl MetalScheduler {
                 "max_tokens must be >= 1".to_string(),
             ));
         }
-        if self.waiting.len() >= self.config.max_waiting_requests {
+        if !self.admission_allows(self.waiting.len()) {
             return Err(MetalSchedulerError::QueueFull);
         }
 
@@ -229,6 +288,7 @@ impl MetalScheduler {
             },
         );
         self.waiting.push(req_id);
+        self.emit_event(req_id, RequestEventKind::Enqueued, None);
         Ok(req_id)
     }
 
@@ -261,24 +321,33 @@ impl MetalScheduler {
         req_id: u64,
         sampled_token: u32,
     ) -> Result<bool, MetalSchedulerError> {
-        let state = self
-            .requests
-            .get_mut(&req_id)
-            .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
+        let should_finish = {
+            let state = self
+                .requests
+                .get_mut(&req_id)
+                .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
 
-        if state.phase != MetalRequestPhase::Decoding {
-            return Err(MetalSchedulerError::WrongPhase {
-                req_id,
-                expected: MetalRequestPhase::Decoding,
-                actual: state.phase,
-            });
-        }
+            if state.phase != MetalRequestPhase::Decoding {
+                return Err(MetalSchedulerError::WrongPhase {
+                    req_id,
+                    expected: MetalRequestPhase::Decoding,
+                    actual: state.phase,
+                });
+            }
 
-        state.last_token = Some(sampled_token);
-        state.generated_tokens += 1;
+            state.last_token = Some(sampled_token);
+            state.generated_tokens += 1;
+            state.generated_tokens >= state.max_tokens
+        };
 
-        if state.generated_tokens >= state.max_tokens {
-            self.remove_request(req_id);
+        self.emit_event(
+            req_id,
+            RequestEventKind::DecodeStep,
+            Some(InferenceMode::Decode),
+        );
+
+        if should_finish {
+            self.finish_request(req_id);
             return Ok(true);
         }
 
@@ -287,7 +356,18 @@ impl MetalScheduler {
 
     /// Explicitly finish a request, releasing all scheduler bookkeeping.
     pub fn finish_request(&mut self, req_id: u64) -> bool {
-        self.remove_request(req_id)
+        let removed = self.remove_request(req_id);
+        if let Some(state) = removed {
+            let mode = match state.phase {
+                MetalRequestPhase::Waiting => None,
+                MetalRequestPhase::Prefilling => Some(InferenceMode::Prefill),
+                MetalRequestPhase::Decoding => Some(InferenceMode::Decode),
+            };
+            self.emit_event(req_id, RequestEventKind::Completed, mode);
+            true
+        } else {
+            false
+        }
     }
 
     /// Get the current phase of a request.
@@ -358,31 +438,42 @@ impl MetalScheduler {
             return None;
         };
 
-        let has_decode_work = self.decoding_len() > 0;
-        let chunk_cap = if has_decode_work {
-            self.config
-                .prefill_chunk_size
-                .min(self.config.decode_active_prefill_cap)
-        } else {
-            self.config.prefill_chunk_size
+        let chunk_cap = self.prefill_chunk_budget();
+
+        let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
+            let state = self.requests.get_mut(&req_id)?;
+            if state.phase == MetalRequestPhase::Waiting {
+                state.phase = MetalRequestPhase::Prefilling;
+            }
+
+            let prompt_len = state.prompt_len();
+            let prompt_start = state.prefill_progress;
+            let prompt_end = (prompt_start + chunk_cap).min(prompt_len);
+            let input_tokens = state.prompt_tokens[prompt_start..prompt_end].to_vec();
+            state.prefill_progress = prompt_end;
+
+            if state.prefill_progress >= prompt_len {
+                state.phase = MetalRequestPhase::Decoding;
+                state.last_token = state.prompt_tokens.last().copied();
+            } else {
+                state.phase = MetalRequestPhase::Prefilling;
+            }
+
+            (
+                prompt_len,
+                prompt_start,
+                prompt_end,
+                input_tokens,
+                prompt_start == 0,
+            )
         };
 
-        let state = self.requests.get_mut(&req_id)?;
-        if state.phase == MetalRequestPhase::Waiting {
-            state.phase = MetalRequestPhase::Prefilling;
-        }
-
-        let prompt_len = state.prompt_len();
-        let prompt_start = state.prefill_progress;
-        let prompt_end = (prompt_start + chunk_cap).min(prompt_len);
-        let input_tokens = state.prompt_tokens[prompt_start..prompt_end].to_vec();
-        state.prefill_progress = prompt_end;
-
-        if state.prefill_progress >= prompt_len {
-            state.phase = MetalRequestPhase::Decoding;
-            state.last_token = state.prompt_tokens.last().copied();
-        } else {
-            state.phase = MetalRequestPhase::Prefilling;
+        if emit_prefill_started {
+            self.emit_event(
+                req_id,
+                RequestEventKind::PrefillStarted,
+                Some(InferenceMode::Prefill),
+            );
         }
 
         Some(MetalPrefillChunk {
@@ -417,9 +508,9 @@ impl MetalScheduler {
         Some(req_id)
     }
 
-    fn remove_request(&mut self, req_id: u64) -> bool {
-        let removed = self.requests.remove(&req_id).is_some();
-        if removed {
+    fn remove_request(&mut self, req_id: u64) -> Option<MetalRequestState> {
+        let removed = self.requests.remove(&req_id);
+        if removed.is_some() {
             if let Some(pos) = self.waiting.iter().position(|id| *id == req_id) {
                 self.waiting.remove(pos);
             }
@@ -455,6 +546,22 @@ fn compare_decode_order(a: &&MetalRequestState, b: &&MetalRequestState) -> Order
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<EngineEvent>>,
+    }
+
+    impl EventSink for RecordingEventSink {
+        fn emit(&self, event: &EngineEvent) {
+            self.events.lock().expect("poisoned").push(event.clone());
+        }
+    }
+
+    fn recorded_events(sink: &RecordingEventSink) -> Vec<EngineEvent> {
+        sink.events.lock().expect("poisoned").clone()
+    }
 
     fn make_scheduler(
         max_active_requests: usize,
@@ -467,6 +574,24 @@ mod tests {
             decode_active_prefill_cap: decode_cap,
             max_waiting_requests: 16,
         })
+        .expect("config should be valid")
+    }
+
+    fn make_scheduler_with_event_sink(
+        max_active_requests: usize,
+        chunk: usize,
+        decode_cap: usize,
+        event_sink: Arc<dyn EventSink>,
+    ) -> MetalScheduler {
+        MetalScheduler::with_event_sink(
+            MetalSchedulerConfig {
+                max_active_requests,
+                prefill_chunk_size: chunk,
+                decode_active_prefill_cap: decode_cap,
+                max_waiting_requests: 16,
+            },
+            event_sink,
+        )
         .expect("config should be valid")
     }
 
@@ -600,6 +725,94 @@ mod tests {
         assert_eq!(
             sched.submit(vec![5, 6, 7, 8], 1, MetalRequestPriority::Normal),
             Err(MetalSchedulerError::QueueFull)
+        );
+    }
+
+    #[test]
+    fn metal_scheduler_emits_lifecycle_events_for_successful_request() {
+        let sink = Arc::new(RecordingEventSink::default());
+        let mut sched = make_scheduler_with_event_sink(1, 4, 4, sink.clone());
+        let req = sched
+            .submit(vec![1, 2, 3, 4], 1, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        match sched.step() {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![1, 2, 3, 4]);
+            }
+            other => panic!("expected initial prefill, got {other:?}"),
+        }
+
+        assert!(
+            sched
+                .advance_decode(req, 99)
+                .expect("request should finish")
+        );
+
+        assert_eq!(
+            recorded_events(sink.as_ref()),
+            vec![
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::Enqueued,
+                    mode: None,
+                },
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::PrefillStarted,
+                    mode: Some(InferenceMode::Prefill),
+                },
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::DecodeStep,
+                    mode: Some(InferenceMode::Decode),
+                },
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::Completed,
+                    mode: Some(InferenceMode::Decode),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn metal_scheduler_emits_prefill_started_once_for_chunked_request() {
+        let sink = Arc::new(RecordingEventSink::default());
+        let mut sched = make_scheduler_with_event_sink(1, 3, 3, sink.clone());
+        let req = sched
+            .submit(
+                vec![10, 11, 12, 13, 14, 15, 16, 17],
+                4,
+                MetalRequestPriority::Normal,
+            )
+            .expect("submit");
+
+        for expected_chunk in [vec![10, 11, 12], vec![13, 14, 15], vec![16, 17]] {
+            match sched.step() {
+                MetalScheduleDecision::PrefillChunk(prefill) => {
+                    assert_eq!(prefill.req_id, req);
+                    assert_eq!(prefill.input_tokens, expected_chunk);
+                }
+                other => panic!("expected prefill chunk, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            recorded_events(sink.as_ref()),
+            vec![
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::Enqueued,
+                    mode: None,
+                },
+                EngineEvent {
+                    request_id: infer_core::RequestId(req),
+                    kind: RequestEventKind::PrefillStarted,
+                    mode: Some(InferenceMode::Prefill),
+                },
+            ]
         );
     }
 }

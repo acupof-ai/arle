@@ -86,7 +86,7 @@ impl<M: ModelForward> Scheduler<M> {
         for idx in prefill_indices {
             // Re-check phase since step_prefill_chunk may transition to Decoding/Finished
             if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                self.step_prefill_chunk(idx, has_decode);
+                self.step_prefill_chunk(idx);
             }
         }
         let prefill_us = prefill_t.elapsed().as_micros();
