@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use infer::chat_protocol::{ToolCall as ProtocolToolCall, ToolDefinition};
+use infer_chat::{ProtocolToolCall, ProtocolToolDefinition};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -16,7 +16,6 @@ enum BuiltinToolKind {
     Python,
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 impl BuiltinToolKind {
     const ALL: [Self; 2] = [Self::Shell, Self::Python];
 
@@ -166,14 +165,30 @@ fn effective_tmpdir() -> String {
     std::env::var("TMPDIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(target_os = "windows")]
+fn shell_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 fn resolved_python_executable() -> PathBuf {
     static PYTHON: OnceLock<PathBuf> = OnceLock::new();
     PYTHON
         .get_or_init(|| {
+            #[cfg(target_os = "windows")]
+            let candidates = [
+                "py.exe",
+                "python.exe",
+                "python3.exe",
+                "py",
+                "python3",
+                "python",
+            ];
+            #[cfg(not(target_os = "windows"))]
             let candidates = ["python3", "python"];
             for candidate in candidates {
                 for dir in std::env::split_paths(&default_env_path()) {
@@ -183,7 +198,14 @@ fn resolved_python_executable() -> PathBuf {
                     }
                 }
             }
-            PathBuf::from("python3")
+            #[cfg(target_os = "windows")]
+            {
+                PathBuf::from("py")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                PathBuf::from("python3")
+            }
         })
         .clone()
 }
@@ -276,6 +298,7 @@ impl SandboxConfig {
         cmd
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(user_cmd);
@@ -291,21 +314,41 @@ impl SandboxConfig {
         cmd
     }
 
+    #[cfg(target_os = "windows")]
+    fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/d").arg("/c").arg(user_cmd);
+        cmd.current_dir(&self.workdir);
+        cmd.env_clear();
+        cmd.env("PATH", default_env_path());
+        cmd.env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
+        );
+        cmd.env("TMPDIR", effective_tmpdir());
+        cmd.env("LANG", "C.UTF-8");
+        cmd
+    }
+
     fn wrap_python(&self, code: &str) -> std::io::Result<Command> {
         let seq = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let script_path = format!(
-            "{}/sandbox_py_{}_{}.py",
-            self.workdir,
-            std::process::id(),
-            seq
-        );
+        let script_path =
+            std::env::temp_dir().join(format!("sandbox_py_{}_{}.py", std::process::id(), seq));
         std::fs::write(&script_path, code)?;
         let python = resolved_python_executable();
+        #[cfg(not(target_os = "windows"))]
         let shell_cmd = format!(
             "{} -u {} ; _rc=$?; rm -f {} ; exit $_rc",
             shell_quote(&python.display().to_string()),
-            shell_quote(&script_path),
-            shell_quote(&script_path)
+            shell_quote(&script_path.display().to_string()),
+            shell_quote(&script_path.display().to_string())
+        );
+        #[cfg(target_os = "windows")]
+        let shell_cmd = format!(
+            "{} -u {} & set _rc=%ERRORLEVEL% & del /f /q {} >nul 2>nul & exit /b %_rc%",
+            shell_quote(&python.display().to_string()),
+            shell_quote(&script_path.display().to_string()),
+            shell_quote(&script_path.display().to_string())
         );
         Ok(self.wrap_shell(&shell_cmd))
     }
@@ -341,8 +384,8 @@ pub struct Tool {
 }
 
 impl Tool {
-    pub fn to_definition(&self) -> ToolDefinition {
-        ToolDefinition::new(
+    pub fn to_definition(&self) -> ProtocolToolDefinition {
+        ProtocolToolDefinition::new(
             self.name.clone(),
             self.description.clone(),
             self.parameters.clone(),
@@ -351,7 +394,6 @@ impl Tool {
 }
 
 /// Return the built-in tool definitions.
-#[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
 pub fn builtin_tools() -> Vec<Tool> {
     BuiltinToolKind::ALL
         .into_iter()
@@ -505,11 +547,25 @@ fn execute_python(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SandboxConfig, TimedCommandResult, active_sandbox_backend, default_workdir,
-        resolved_python_executable, run_command_with_timeout,
+        active_sandbox_backend, default_workdir, resolved_python_executable,
+        run_command_with_timeout,
     };
     use std::process::Command;
     use std::time::Duration;
+
+    #[cfg(target_os = "windows")]
+    fn bare_shell_command(command: &str) -> Command {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/d").arg("/c").arg(command);
+        cmd
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn bare_shell_command(command: &str) -> Command {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
 
     #[test]
     fn default_workdir_uses_current_directory() {
@@ -519,12 +575,14 @@ mod tests {
 
     #[test]
     fn bare_command_runner_collects_stdout() {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg("printf 'hello'");
+        #[cfg(target_os = "windows")]
+        let mut cmd = bare_shell_command("@echo hello");
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = bare_shell_command("printf 'hello'");
         let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).expect("run");
         match result {
             super::TimedCommandResult::Finished(output) => {
-                assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
             }
             super::TimedCommandResult::TimedOut(_) => panic!("command unexpectedly timed out"),
         }
@@ -532,8 +590,10 @@ mod tests {
 
     #[test]
     fn bare_command_runner_times_out_without_external_timeout_binary() {
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg("sleep 2");
+        #[cfg(target_os = "windows")]
+        let mut cmd = bare_shell_command("ping -n 3 127.0.0.1 >nul");
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = bare_shell_command("sleep 2");
         let result = run_command_with_timeout(&mut cmd, Duration::from_millis(100))
             .expect("run with timeout");
         assert!(matches!(result, super::TimedCommandResult::TimedOut(_)));
@@ -567,7 +627,9 @@ mod tests {
     fn resolved_python_executable_points_to_a_binary() {
         let python = resolved_python_executable();
         assert!(
-            python.is_file() || python == std::path::PathBuf::from("python3"),
+            python.is_file()
+                || python == std::path::PathBuf::from("python3")
+                || python == std::path::PathBuf::from("py"),
             "resolved python path should exist or fall back to python3: {}",
             python.display()
         );

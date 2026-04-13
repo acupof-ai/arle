@@ -40,6 +40,7 @@ rand = "0.10"
 tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
+infer-chat = { path = "../crates/infer-chat" }
 infer-core = { path = "../crates/infer-core" }
 infer-policy = { path = "../crates/infer-policy" }
 infer-observability = { path = "../crates/infer-observability" }
