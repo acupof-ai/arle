@@ -7,61 +7,80 @@
 - 训练语义与推理语义一致（mixed attention / state transition 可验证）。
 - 新模型/新后端接入成本线性，不因代码复制导致熵增。
 
-当前仓库实际处在 **Phase 1 的收尾/稳定阶段**：控制面 crate 已经开始拆出，但 scheduler / KV / runtime 的原子化还没有进入主拆分。下面的目录树仍然是最终目标拓扑，不是当前已完成状态。
+当前仓库实际处在 **Phase 1 的收尾/稳定阶段**：控制面 crate 已经开始拆出，但 scheduler / KV / runtime 的原子化还没有进入主拆分。
+
+在重新对照 Tokio、Tracing、Serde、rust-analyzer、Cargo、Bevy 这些顶级 Rust 工作区之后，方案需要一个重要纠偏：
+
+- 不按“抽象名词”预建 crate，而按 **稳定边界、复用证明、发布/测试面、进程边界** 拆。
+- `core` / `api` crate 只有在 **至少两个直接消费者** 需要更强稳定承诺时才成立；这更接近 `tracing` / `tracing-core`，而不是先把所有层都拆空。
+- 像 rust-analyzer 那样的大量内部 crate，只在 **架构不变量已经非常清晰** 时才值得引入；否则会先引入维护成本，再引入边界收益。
+- 像 Tokio、Serde、Cargo 那样，workspace 里的 crate 更多是 **可独立使用/发布/测试** 的单元，而不是每个内部概念都独立成包。
+- 像 Bevy 一样，很多“组合能力”优先通过 **feature/profile** 收拢，再决定哪些边界最终沉淀成独立 crate。
+
+因此，下面不再把“未来所有可能存在的 crate”当作默认终局，而是把 **当前推荐拓扑** 和 **后续候选拆分** 分开描述。
 
 ---
 
-## 一、目标态工作区组织（Future Atomic Crates）
+## 一、当前推荐工作区组织（Near-term Workspace）
 
-> 设计原则：**核心语义最小化**、**后端细节外置**、**策略可插拔**、**接口向内收敛**。
+> 设计原则：**先拆稳定边界，再拆内部层；先证明复用，再沉淀 API**。
 
 ```text
 agent-infer/
-├── Cargo.toml                      # workspace root
+├── Cargo.toml                      # workspace root / shared metadata
+├── infer/                          # 运行时兼容层与当前数据面主体
+│   ├── scheduler / kv / backend / http / bootstrap
+│   └── feature-gated CUDA / Metal / CPU paths
 ├── crates/
-│   ├── infer-core/                 # 纯领域层：请求、token、step、错误模型、共享 trait
-│   ├── infer-model-api/            # ModelForward / State trait + model capability 描述
-│   ├── infer-backend-api/          # Backend trait（设备、stream、buffer、kernel capability）
-│   ├── infer-scheduler-core/       # 与后端无关的调度状态机（slot/request lifecycle）
-│   ├── infer-policy/               # admission/chunking/eviction/prefix 策略接口与默认实现
-│   ├── infer-kv/                   # paged KV 抽象、地址空间、回收与压缩协议
-│   ├── infer-observability/        # metrics/event/trace schema（统一事件模型）
-│   ├── infer-runtime-cuda/         # CUDA adapter（实现 backend-api）
-│   ├── infer-runtime-metal/        # Metal adapter（实现 backend-api）
-│   ├── infer-http/                 # OpenAI-compatible API 层（只依赖 façade）
-│   ├── infer-engine/               # 组合层：把 model+scheduler+backend 组装为可运行引擎
-│   └── infer-cli/                  # CLI/bench 入口
-└── infer/                          # 兼容层（过渡期）：re-export + legacy glue
+│   ├── infer-core/                 # 小而稳定的共享领域类型
+│   ├── infer-policy/               # scheduler/runtime 可复用的策略接口
+│   ├── infer-observability/        # 统一事件 schema + sink trait
+│   ├── infer-chat/                 # 协议类型
+│   ├── infer-tools/                # builtin tools + shared tool policy hooks
+│   ├── infer-agent/                # agent loop（不拥有 UI / runtime 私有细节）
+│   ├── infer-cli/                  # CLI / REPL / slash commands
+│   └── infer-engine/               # 运行时装配边界 / model discovery / backend loading
+└── xtask/ or tools/                # 可选；放 Rust 自动化而不是 shell glue
 ```
 
-这里描述的是 **Phase 2/3 之后的目标拓扑**，不是当前仓库已经存在的 crate 列表。当前实际 workspace 仍以 `infer` + 已拆出的控制面 crate 为主。
+这个布局更接近 Tokio / Cargo / Serde 的拆法：只有那些已经形成稳定消费面的部分才单独成 crate；真正仍在高速迭代的 runtime 内核先留在 `infer/`。
+
+### 候选后续 crate（满足条件才拆）
+
+- `infer-scheduler-core`
+  - 只有当 CUDA / Metal / CPU 至少两条路径共享同一套状态机、并且 golden tests 可以跨后端复用时再拆。
+- `infer-kv`
+  - 只有当 paged KV 协议被多个 runtime/backend 共享，而不只是当前 `infer/` 内部细节时再拆。
+- `infer-runtime-api`
+  - 只有当 “runtime trait + state trait + capability 描述” 已经被多个具体 backend 和至少一个上层装配点稳定消费时再拆。
+- `infer-runtime-cuda` / `infer-runtime-metal`
+  - 只有当 backend 适配层已经从 `infer/` 中自然长出来，而不是为了“看起来分层”硬切时再拆。
+- `infer-http`
+  - 只有当 HTTP server 需要被独立复用/发布/测试，而不是当前 `infer/` 的一部分时再拆。
 
 ---
 
-## 二、目标态依赖方向（必须单向）
+## 二、当前推荐依赖方向（必须单向）
 
 ```text
-infer-core
-  ↑
-infer-model-api      infer-backend-api      infer-observability
-  ↑         \\         ↑                   ↑
-  └─────── infer-scheduler-core ─────── infer-policy
-                  ↑            \
-               infer-kv         \
-                    ↑            \
-          infer-runtime-cuda   infer-runtime-metal
-                    \            /
-                     \          /
-                      infer-engine
+infer-core      infer-policy      infer-observability      infer-chat
+    ↑                ↑                    ↑                   ↑
+    └──── infer-tools / infer-agent / infer-engine ───────────┘
                            ↑
-                   infer-http / infer-cli
+                        infer-cli
+                           ↑
+                      agent-infer
+
+infer/  <---- 当前仍然承载 scheduler / kv / backend / http / bootstrap
+  ↑
+infer-engine  只依赖 infer 的运行时装配边界，不反向依赖控制面
 ```
 
 约束：
-1. `runtime-*` 不能反向依赖 `http`、`cli`、`scheduler-core` 的实现细节。
-2. `scheduler-core` 不允许出现 CUDA/Metal 私有类型。
-3. `model-api` 不感知网络协议与后端执行细节。
-4. `infer-engine` 应保持为唯一“装配点”；任何指回 `infer-agent` / `infer-cli` 的依赖都只能算过渡实现，必须在 Phase 1 收尾中清掉。
+1. `infer-engine` 不得反向依赖 `infer-agent` / `infer-cli`。
+2. `infer-agent` 不得拥有 UI 输出，也不直接拥有 runtime/backend 私有细节。
+3. `infer-tools` / `infer-chat` 提供共享协议与默认语义，但不反向感知 CLI。
+4. 只有当 runtime 内部边界被两个以上实现共同消费时，才允许从 `infer/` 中拆出新 crate。
 
 ---
 
@@ -71,52 +90,36 @@ infer-model-api      infer-backend-api      infer-observability
 **Do**：通用 ID、请求上下文、生命周期枚举、通用错误码、共享 Result。  
 **Don’t**：任何 GPU、HTTP、模型权重加载逻辑。
 
-### 2) infer-model-api
-**Do**：`ModelForward`、`ModelState`、`ModelCaps`（如 max_seq, supports_sliding_window）。  
-**Don’t**：调度策略、batch 拼装。
-
-### 3) infer-backend-api
-**Do**：设备能力抽象（stream、graph、alloc、kernel dispatch）。  
-**Don’t**：具体 CUDA/Metal 调用。
-
-### 4) infer-scheduler-core
-**Do**：request/slot 状态机、prefill/decode 编排、公平性与 deadline 框架。  
-**Don’t**：显存分配细节、内核 launch 细节。
-
-### 5) infer-policy
+### 2) infer-policy
 **Do**：策略 trait + 默认策略（admission/chunking/eviction/prefix）。  
 **Don’t**：直接修改 scheduler 内部字段（仅通过策略输入/输出）。
 
-### 6) infer-kv
-**Do**：paged KV 的逻辑页管理、映射、碎片控制、回收协议。  
-**Don’t**：绑定具体后端 alloc 接口（通过 backend-api 注入）。
-
-### 7) infer-observability
+### 3) infer-observability
 **Do**：统一事件协议（`enqueued`, `prefill_started`, `decode_step`, `evicted`）。  
 **Don’t**：业务逻辑分支。
 
-### 8) infer-runtime-cuda / infer-runtime-metal
-**Do**：实现 backend-api + 性能特化（graph capture、kernel tuning）。  
-**Don’t**：调度主循环决策。
-
-### 9) infer-engine
+### 4) infer-engine
 **Do**：统一 façade（submit/poll/cancel），组装 model+scheduler+backend。  
 **Don’t**：暴露底层后端私有类型给上层。
 
-### 10) infer-http / infer-cli
-**Do**：协议转换、参数校验、服务化入口。  
-**Don’t**：直接操控 KV、直接调用 runtime 私有接口。
+### 5) infer-agent / infer-cli
+**Do**：控制面回合循环、协议转换、参数校验、服务化/交互入口。
+**Don’t**：直接操控 scheduler / KV / backend 私有实现。
+
+### 6) infer（当前 runtime 主体）
+**Do**：继续承载 scheduler、KV、backend、http、bootstrap 的主逻辑，直到共享不变量被证明。
+**Don’t**：继续向控制面反向长依赖。
 
 ---
 
 ## 四、后续阶段：训推一致如何嵌入到分层中
 
-> 这一节描述的是后续阶段希望落地的能力，不代表当前 Phase 1 已经具备 `infer-model-api`、`consistency_mode` 或 Golden Trace 管线。
+> 这一节描述的是后续阶段希望落地的能力，不代表当前 Phase 1 已经具备独立的一致性接口 crate、`consistency_mode` 或 Golden Trace 管线。
 
-- `infer-model-api` 定义一致性探针接口：层级摘要、token 级摘要。
+- 如后续确实需要训练/推理一致性探针，再抽一个更窄的 model-facing probe boundary，负责层级摘要、token 级摘要。
 - `infer-observability` 承载 Golden Trace 事件与 first-diff 报告 schema。
 - `infer-engine` 提供 `consistency_mode`（线上关闭、CI/nightly 开启）。
-- `runtime-*` 只提供执行，不拥有一致性判定逻辑。
+- 具体 runtime/backend 只提供执行，不拥有一致性判定逻辑。
 
 这样可保证：一致性机制是**平台能力**，不是散落在模型实现中的临时代码。
 
@@ -131,24 +134,28 @@ infer-model-api      infer-backend-api      infer-observability
 4. 把 observability、policy 先收敛成稳定边界，后续再接入更深的 runtime 语义。
 
 **当前未完成**：
-- `infer-model-api` / `infer-backend-api` 还没有真正落地。
+- 训练/推理一致性探针边界还没有收敛到足够稳定，因此还不该单独成 crate。
 - scheduler、KV、runtime-* 的原子化仍在后续阶段。
-- observability 目前已经收敛为 action-oriented 事件边界，但更深的 trace / consistency 语义还没继续下沉。
-- policy API 已经包含 admission + chunking 边界，但 runtime 目前实际只消费 chunking；更深的 admission / eviction wiring 仍在后续阶段。
+- observability 目前已经在 batch/Metal 路径收敛为 action-oriented 事件边界；CUDA runtime 的同级事件 sink 仍在后续阶段，更深的 trace / consistency 语义也还没继续下沉。
+- policy API 已经包含 admission + chunking 边界，且当前 batch/CUDA/Metal 路径已经消费 enqueue admission 与 decode-aware chunking；更深的 eviction / KV wiring 仍在后续阶段。
 
-### Phase 2（拆调度与策略）
-1. 把 scheduler 状态机迁到 `infer-scheduler-core`。
-2. 把 admission/chunking/eviction 迁到 `infer-policy`。
-3. prefix cache / paged KV 协议迁到 `infer-kv`。
+### Phase 2（证明运行时内部共享不变量）
+1. 先让 CUDA / Metal / CPU 的 chunking、admission、event 语义尽量收敛到同一套 policy/observability contract。
+2. 为 scheduler / KV / backend 边界补跨实现 golden tests，而不是先新建 crate。
+3. 只有当共享状态机被证明稳定时，再考虑抽 `infer-scheduler-core`。
 
-**完成标准**：新增策略无需改 scheduler 主循环。
+**完成标准**：新增/修改策略主要改 policy 层与测试，而不是到处散改 runtime 主循环。
 
-### Phase 3（拆后端与装配层）
-1. CUDA/Metal 分别进入 `infer-runtime-cuda` / `infer-runtime-metal`。
-2. `infer-engine` 成为唯一装配层。
-3. `infer-http` / `infer-cli` 只依赖 façade。
+### Phase 3（按复用证明继续拆 runtime）
+1. 当 scheduler 状态机跨 backend 共享时，再抽 `infer-scheduler-core`。
+2. 当 paged KV 协议被多个 runtime/backend 共同消费时，再抽 `infer-kv`。
+3. 当 backend trait 真正稳定时，再决定是否抽 `infer-runtime-api` 与 `infer-runtime-*`。
 
-**完成标准**：新增后端时不改 scheduler-core 与 http。
+**完成标准**：新增 backend/变体时，主要新增 adapter 或 feature，不需要回改控制面与共享 contract。
+
+### Phase 4（可选：独立 HTTP / 发布面）
+1. 只有当 HTTP server 需要独立发布或独立复用时，才从 `infer/` 中抽 `infer-http`。
+2. 只有当外部消费者真的需要更稳定的 runtime API 时，才进一步压缩并公开这些边界。
 
 ---
 

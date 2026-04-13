@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use infer_policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use tokio::sync::mpsc;
 
 use crate::sampler::SamplingParams;
@@ -143,6 +144,20 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    fn admission_allows(&self, queued_requests: usize) -> bool {
+        if self.max_waiting == 0 {
+            return true;
+        }
+
+        QueueBoundAdmission {
+            max_queued_requests: self.max_waiting,
+        }
+        .allow(SchedulerSignals {
+            queued_requests,
+            active_decodes: 0,
+        })
+    }
+
     /// Create a handle from raw parts (useful for testing).
     pub fn from_parts(tx: mpsc::UnboundedSender<IncomingRequest>, model_id: &str) -> Self {
         Self {
@@ -188,13 +203,20 @@ impl SchedulerHandle {
     /// Returns `Err(SchedulerFull)` if the waiting queue is at capacity.
     /// Returns `Err(SchedulerFull)` if the scheduler has shut down.
     pub fn submit(&self, req: IncomingRequest) -> std::result::Result<(), SchedulerFull> {
-        if self.max_waiting > 0 {
+        loop {
             let current = self.waiting_count.load(Ordering::Relaxed);
-            if current >= self.max_waiting {
+            if !self.admission_allows(current) {
                 return Err(SchedulerFull);
             }
+            if self
+                .waiting_count
+                .compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
-        self.waiting_count.fetch_add(1, Ordering::Relaxed);
+
         self.tx.send(req).map_err(|_| {
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
             SchedulerFull
@@ -218,6 +240,6 @@ impl SchedulerHandle {
 
     /// Whether the queue is currently full.
     pub fn is_full(&self) -> bool {
-        self.max_waiting > 0 && self.waiting_count() >= self.max_waiting
+        !self.admission_allows(self.waiting_count())
     }
 }

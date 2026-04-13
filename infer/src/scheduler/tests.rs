@@ -97,6 +97,36 @@ async fn unlimited_queue_never_rejects() {
     assert_eq!(handle.waiting_count(), 100);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_submit_does_not_oversubscribe_waiting_capacity() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = SchedulerHandle::with_max_waiting(tx, "test", 2);
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let mut tasks = Vec::new();
+
+    for _ in 0..16 {
+        let handle = handle.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            handle.submit(make_request()).is_ok()
+        }));
+    }
+
+    barrier.wait().await;
+
+    let mut successes = 0usize;
+    for task in tasks {
+        if task.await.expect("task join") {
+            successes += 1;
+        }
+    }
+
+    assert_eq!(successes, 2);
+    assert_eq!(handle.waiting_count(), 2);
+    assert!(handle.is_full());
+}
+
 #[test]
 fn preemption_mode_default_is_recompute() {
     assert_eq!(PreemptionMode::default(), PreemptionMode::Recompute);
