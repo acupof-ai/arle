@@ -13,6 +13,7 @@ use infer::trace_reporter::FileReporter;
 use log::info;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
+const VALID_KV_CACHE_MODES: &str = "'bf16', 'fp8', 'int8', 'tq2', 'tq3', or 'tq4'";
 
 #[derive(Parser)]
 #[command(name = "infer", about = "Qwen3/3.5 GPU inference server")]
@@ -65,8 +66,9 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     kv_pool_fallback_mb: usize,
 
-    /// KV cache data type: "bf16" (default) or "int8" for per-head per-token
-    /// symmetric INT8 quantization (~46% KV memory savings).
+    /// KV cache mode: "bf16" (default), "fp8", "int8", or TurboQuant pool
+    /// modes "tq2"/"tq3"/"tq4". FP8 and TurboQuant keep the contiguous prefill
+    /// cache in BF16 and quantize when migrating into the paged token pool.
     #[arg(long, default_value = "bf16")]
     kv_cache_dtype: String,
 }
@@ -99,7 +101,7 @@ async fn main() {
         .unwrap_or_else(|| auto_num_slots(model_path, args.max_seq_len));
 
     info!(
-        "Config: model_path={}, cuda_graph={}, num_slots={} ({})",
+        "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={}",
         args.model_path.display(),
         args.cuda_graph,
         num_slots,
@@ -108,31 +110,12 @@ async fn main() {
         } else {
             "auto"
         },
+        args.kv_cache_dtype,
     );
 
-    let kv_cache_dtype = match args.kv_cache_dtype.as_str() {
-        "bf16" | "BF16" => KVCacheDtype::BF16,
-        "int8" | "INT8" => KVCacheDtype::INT8,
-        "fp8" | "FP8" => KVCacheDtype::BF16, // FP8 pool uses BF16 contiguous (quantize on migration)
-        other => panic!("Invalid --kv-cache-dtype '{other}': expected 'bf16', 'int8', or 'fp8'"),
-    };
-    let kv_pool_format = match args.kv_cache_dtype.as_str() {
-        "fp8" | "FP8" => KVFormat::FP8E4M3,
-        "int8" | "INT8" => KVFormat::INT8,
-        "tq2" => KVFormat::TurboQuant {
-            key_bits: 2,
-            val_bits: 2,
-        },
-        "tq3" => KVFormat::TurboQuant {
-            key_bits: 3,
-            val_bits: 3,
-        },
-        "tq4" => KVFormat::TurboQuant {
-            key_bits: 4,
-            val_bits: 4,
-        },
-        _ => KVFormat::BF16,
-    };
+    let (kv_cache_dtype, kv_pool_format) =
+        parse_kv_cache_mode(&args.kv_cache_dtype).unwrap_or_else(|err| panic!("{err}"));
+    info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
 
     let runtime = ServerRuntimeConfig {
         engine: EngineOptions {
@@ -190,6 +173,39 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install CTRL+C handler");
     info!("Shutdown signal received");
+}
+
+fn parse_kv_cache_mode(mode: &str) -> std::result::Result<(KVCacheDtype, KVFormat), String> {
+    let normalized = mode.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "bf16" => Ok((KVCacheDtype::BF16, KVFormat::BF16)),
+        "fp8" => Ok((KVCacheDtype::BF16, KVFormat::FP8E4M3)),
+        "int8" => Ok((KVCacheDtype::INT8, KVFormat::INT8)),
+        "tq2" => Ok((
+            KVCacheDtype::BF16,
+            KVFormat::TurboQuant {
+                key_bits: 2,
+                val_bits: 2,
+            },
+        )),
+        "tq3" => Ok((
+            KVCacheDtype::BF16,
+            KVFormat::TurboQuant {
+                key_bits: 3,
+                val_bits: 3,
+            },
+        )),
+        "tq4" => Ok((
+            KVCacheDtype::BF16,
+            KVFormat::TurboQuant {
+                key_bits: 4,
+                val_bits: 4,
+            },
+        )),
+        _ => Err(format!(
+            "Invalid --kv-cache-dtype '{mode}': expected {VALID_KV_CACHE_MODES}"
+        )),
+    }
 }
 
 /// Auto-calculate num_slots from GPU memory and model config.
@@ -311,4 +327,74 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
         num_linear_layers * linear_val_heads * linear_key_dim * linear_val_dim * 4; // f32
 
     kv_bytes + recurrent_bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_kv_cache_mode_supports_all_quantized_pool_modes() {
+        assert_eq!(
+            parse_kv_cache_mode("bf16").unwrap(),
+            (KVCacheDtype::BF16, KVFormat::BF16)
+        );
+        assert_eq!(
+            parse_kv_cache_mode("fp8").unwrap(),
+            (KVCacheDtype::BF16, KVFormat::FP8E4M3)
+        );
+        assert_eq!(
+            parse_kv_cache_mode("int8").unwrap(),
+            (KVCacheDtype::INT8, KVFormat::INT8)
+        );
+        assert_eq!(
+            parse_kv_cache_mode("tq2").unwrap(),
+            (
+                KVCacheDtype::BF16,
+                KVFormat::TurboQuant {
+                    key_bits: 2,
+                    val_bits: 2
+                }
+            )
+        );
+        assert_eq!(
+            parse_kv_cache_mode("tq3").unwrap(),
+            (
+                KVCacheDtype::BF16,
+                KVFormat::TurboQuant {
+                    key_bits: 3,
+                    val_bits: 3
+                }
+            )
+        );
+        assert_eq!(
+            parse_kv_cache_mode("tq4").unwrap(),
+            (
+                KVCacheDtype::BF16,
+                KVFormat::TurboQuant {
+                    key_bits: 4,
+                    val_bits: 4
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn parse_kv_cache_mode_is_case_insensitive() {
+        assert_eq!(
+            parse_kv_cache_mode("FP8").unwrap(),
+            (KVCacheDtype::BF16, KVFormat::FP8E4M3)
+        );
+        assert_eq!(
+            parse_kv_cache_mode("INT8").unwrap(),
+            (KVCacheDtype::INT8, KVFormat::INT8)
+        );
+    }
+
+    #[test]
+    fn parse_kv_cache_mode_rejects_unknown_values() {
+        let err = parse_kv_cache_mode("fp4").unwrap_err();
+        assert!(err.contains("fp4"));
+        assert!(err.contains(VALID_KV_CACHE_MODES));
+    }
 }

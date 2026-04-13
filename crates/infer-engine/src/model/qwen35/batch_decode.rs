@@ -1,7 +1,9 @@
 //! Batched decode for Qwen3.5: process multiple requests in one forward pass.
 //!
-//! Hybrid architecture: 8 full attention layers use FlashInfer HD256 paged decode,
-//! 24 linear attention layers use batched recurrent kernels (conv1d + GDR) via pointer arrays.
+//! Hybrid architecture: 8 full attention layers use HD256 paged decode
+//! (FlashInfer for BF16 pools, custom quantized kernels otherwise), and
+//! 24 linear attention layers use batched recurrent kernels (conv1d + GDR)
+//! via pointer arrays.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -318,18 +320,21 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
-        _kv_format: crate::model::kv_cache::KVFormat,
+        kv_format: crate::model::kv_cache::KVFormat,
     ) -> Result<()> {
-        // Qwen3.5 uses HD256 plan for full attention layers.
-        // TODO: FP8 HD256 plan when needed.
-        self.metadata.plan_hd256(
-            ctx,
-            batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-            head_dim,
-        )
+        // Only BF16 full-attention layers run through FlashInfer HD256.
+        // FP8/INT8/TurboQuant decode uses our quantized kernels instead.
+        if kv_format == KVFormat::BF16 {
+            self.metadata.plan_hd256(
+                ctx,
+                batch_size,
+                num_q_heads,
+                num_kv_heads,
+                page_size,
+                head_dim,
+            )?;
+        }
+        Ok(())
     }
 
     fn set_batch_size(&mut self, bs: usize) {
