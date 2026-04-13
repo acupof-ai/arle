@@ -5,7 +5,7 @@ Round 2 (April 2026) collapsed the `infer/src/` root from 39 top-level `.rs` fil
 | # | Item | Owner | Status | Plan |
 |---|---|---|---|---|
 | F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** (`19a433d`) | [`backend-metal-split.md`](backend-metal-split.md) |
-| F2 | Audit `backend/cuda/graph_pool.rs` — deliberate scaffold or dead code? | ckl (decision), remote CUDA host (if wire-in) | **awaiting decision** | §F2 below |
+| F2 | Audit `backend/cuda/graph_pool.rs` — deliberate scaffold or dead code? | ckl (decision), remote CUDA host (if wire-in) | **parked** (`Option B`) | §F2 below |
 | F3 | Document `--features cuda,no-cuda` type-check invocation | me | **done** (commit `4b493c8`) | — |
 | Round 3 | Extract `backend`/`ops`/`model`/`scheduler` into `crates/infer-engine` | remote Linux CUDA host | **queued** (starts after F1 lands) | [`cuda-crate-extraction.md`](cuda-crate-extraction.md) |
 
@@ -82,6 +82,9 @@ When F1 lands, update the status row in the table above with the final commit SH
 
 Owner: ckl must make the call; execution depends on the call.
 Location: `infer/src/backend/cuda/graph_pool.rs` (441 lines).
+
+Status: parked via Option B. `graph_pool.rs` remains in-tree as an internal scaffold,
+explicitly marked hibernating until scheduler work resumes.
 
 ### Evidence
 
