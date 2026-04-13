@@ -138,6 +138,8 @@ pub struct BatchDecodeBuffers35 {
     pub(super) logits_batch: Option<HiddenStates>,
     pub(super) argmax_out: CudaSlice<i32>,
     pub(super) argmax_host: Vec<i32>,
+    pub(super) logprobs_gpu: CudaSlice<f32>,
+    pub(super) logprobs_host: Vec<f32>,
 
     // ── Token IDs ──
     token_ids_gpu: CudaSlice<i32>,
@@ -241,6 +243,11 @@ impl BatchDecodeBuffers35 {
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc argmax_out: {e}"))?,
             argmax_host: vec![0i32; max_batch_size],
+            logprobs_gpu: ctx
+                .stream
+                .alloc_zeros(max_batch_size)
+                .map_err(|e| anyhow::anyhow!("Alloc logprobs_gpu: {e}"))?,
+            logprobs_host: vec![0.0f32; max_batch_size],
 
             token_ids_gpu: ctx
                 .stream
@@ -333,6 +340,10 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers35 {
         // Qwen3.5 uses piecewise graph cache (per linear-layer group).
         // No per-batch-size invalidation needed — reallocation doesn't
         // happen in the piecewise scheme.
+    }
+
+    fn logprobs_host(&self) -> &[f32] {
+        &self.logprobs_host
     }
 }
 
@@ -435,6 +446,7 @@ impl Qwen35Model {
                     b,
                     &mut states[si].decode_bufs.logits_scratch,
                 )?;
+                states[si].decode_bufs.bind_logits_scratch(&self.ctx);
                 states[si].base.prefill_logits = None;
             }
         }

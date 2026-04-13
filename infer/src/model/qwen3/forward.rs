@@ -336,6 +336,25 @@ impl ModelForward for Qwen3Model {
         ))
     }
 
+    fn prepare_batch_sampling_fallback(
+        &self,
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<()> {
+        let logits = match decode_ctx.logits_batch.as_ref() {
+            Some(logits) if logits.seq_len >= slot_indices.len() => logits,
+            _ => return Ok(()),
+        };
+
+        for (b, &si) in slot_indices.iter().enumerate() {
+            ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
+            states[si].base.prefill_logits = None;
+        }
+
+        Ok(())
+    }
+
     fn forward_decode_batch(
         &self,
         tokens: &[u32],

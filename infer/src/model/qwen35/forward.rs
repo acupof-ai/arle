@@ -37,7 +37,10 @@ unsafe impl Send for Qwen35State {}
 
 impl GenerationState for Qwen35State {
     fn logits(&self) -> &DeviceVec {
-        self.base.logits_or(&self.single_token_bufs.logits)
+        self.base.prefill_logits.as_ref().unwrap_or_else(|| {
+            self.decode_bufs
+                .current_logits(&self.single_token_bufs.logits)
+        })
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -191,6 +194,9 @@ impl ModelForward for Qwen35Model {
             &mut state.single_token_bufs,
             &mut state.base.graph_state,
         )?;
+        state
+            .decode_bufs
+            .bind_single_token_logits(&self.ctx, &state.single_token_bufs.logits);
         state.base.prefill_logits = None;
         Ok(())
     }
@@ -202,15 +208,55 @@ impl ModelForward for Qwen35Model {
         rng: &mut StdRng,
     ) -> Result<u32> {
         let random_val: f32 = rng.random();
-        let logits = state.base.logits_or(&state.single_token_bufs.logits);
-        ops::gpu_sample_into(
-            &self.ctx,
-            logits,
-            &mut state.decode_bufs.sample_probs,
-            &mut state.decode_bufs.sample_out,
-            params,
-            random_val,
-        )
+        if let Some(logits) = state.base.prefill_logits.as_ref() {
+            ops::gpu_sample_into(
+                &self.ctx,
+                logits,
+                &mut state.decode_bufs.sample_probs,
+                &mut state.decode_bufs.sample_out,
+                params,
+                random_val,
+            )
+        } else {
+            let (logits, sample_probs, sample_out) = state
+                .decode_bufs
+                .current_logits_and_sampling_bufs(&state.single_token_bufs.logits);
+            ops::gpu_sample_into(
+                &self.ctx,
+                logits,
+                sample_probs,
+                sample_out,
+                params,
+                random_val,
+            )
+        }
+    }
+
+    fn select_token_with_logprob(
+        &self,
+        state: &mut Self::State,
+        params: &SamplingParams,
+        rng: &mut StdRng,
+    ) -> Result<(u32, Option<f32>)> {
+        if params.is_greedy() {
+            let (token, logprob) = if let Some(logits) = state.base.prefill_logits.as_ref() {
+                ops::argmax_with_logprob(
+                    &self.ctx,
+                    logits,
+                    &mut state.decode_bufs.sample_out,
+                    &mut state.decode_bufs.sample_probs,
+                )?
+            } else {
+                let (logits, sample_probs, sample_out) = state
+                    .decode_bufs
+                    .current_logits_and_sampling_bufs(&state.single_token_bufs.logits);
+                ops::argmax_with_logprob(&self.ctx, logits, sample_out, sample_probs)?
+            };
+            Ok((token, Some(logprob)))
+        } else {
+            let token = self.select_token(state, params, rng)?;
+            Ok((token, None))
+        }
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -256,7 +302,13 @@ impl ModelForward for Qwen35Model {
             _ => return Ok(None),
         };
         let batch_size = slot_indices.len();
-        crate::ops::argmax_batch_launch(&self.ctx, logits, &mut decode_ctx.argmax_out, batch_size)?;
+        crate::ops::argmax_batch_logprob_launch(
+            &self.ctx,
+            logits,
+            &mut decode_ctx.argmax_out,
+            &mut decode_ctx.logprobs_gpu,
+            batch_size,
+        )?;
         self.ctx.sync()?;
         crate::ops::argmax_batch_readback_into(
             &self.ctx,
@@ -264,12 +316,43 @@ impl ModelForward for Qwen35Model {
             &mut decode_ctx.argmax_host,
             batch_size,
         )?;
+        let lp_tmp = self
+            .ctx
+            .stream
+            .clone_dtoh(&decode_ctx.logprobs_gpu)
+            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
+        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
         Ok(Some(
             decode_ctx.argmax_host[..batch_size]
                 .iter()
                 .map(|&x| x as u32)
                 .collect(),
         ))
+    }
+
+    fn prepare_batch_sampling_fallback(
+        &self,
+        states: &mut [Self::State],
+        slot_indices: &[usize],
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<()> {
+        let logits = match decode_ctx.logits_batch.as_ref() {
+            Some(logits) if logits.seq_len >= slot_indices.len() => logits,
+            _ => return Ok(()),
+        };
+
+        for (b, &si) in slot_indices.iter().enumerate() {
+            ops::extract_vec_into(
+                &self.ctx,
+                logits,
+                b,
+                &mut states[si].decode_bufs.logits_scratch,
+            )?;
+            states[si].decode_bufs.bind_logits_scratch(&self.ctx);
+            states[si].base.prefill_logits = None;
+        }
+
+        Ok(())
     }
 
     fn select_tokens_batch(
