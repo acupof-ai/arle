@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-use infer_core::{InferenceMode, RequestEventKind};
+use infer_core::{InferenceMode, RequestEventKind, RequestId};
 use infer_observability::{EngineEvent, EventSink, NoopEventSink};
 use infer_policy::{
     AdmissionPolicy, ChunkingPolicy, DecodeAwareChunking, QueueBoundAdmission, SchedulerSignals,
@@ -92,9 +92,9 @@ pub enum MetalSchedulerError {
     InvalidConfig(String),
     QueueFull,
     EmptyPrompt,
-    UnknownRequest(u64),
+    UnknownRequest(RequestId),
     WrongPhase {
-        req_id: u64,
+        req_id: RequestId,
         expected: MetalRequestPhase,
         actual: MetalRequestPhase,
     },
@@ -106,14 +106,14 @@ impl fmt::Display for MetalSchedulerError {
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
             Self::QueueFull => write!(f, "waiting queue is full"),
             Self::EmptyPrompt => write!(f, "prompt_tokens must not be empty"),
-            Self::UnknownRequest(req_id) => write!(f, "unknown request {req_id}"),
+            Self::UnknownRequest(req_id) => write!(f, "unknown request {req_id:?}"),
             Self::WrongPhase {
                 req_id,
                 expected,
                 actual,
             } => write!(
                 f,
-                "request {req_id} is in phase {:?}, expected {:?}",
+                "request {req_id:?} is in phase {:?}, expected {:?}",
                 actual, expected
             ),
         }
@@ -124,7 +124,7 @@ impl std::error::Error for MetalSchedulerError {}
 
 #[derive(Clone, Debug)]
 struct MetalRequestState {
-    req_id: u64,
+    req_id: RequestId,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     priority: MetalRequestPriority,
@@ -149,14 +149,14 @@ impl MetalRequestState {
 /// Decode batch emitted by the scheduler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalDecodeBatch {
-    pub req_ids: Vec<u64>,
+    pub req_ids: Vec<RequestId>,
     pub input_tokens: Vec<u32>,
 }
 
 /// Prefill chunk emitted by the scheduler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalPrefillChunk {
-    pub req_id: u64,
+    pub req_id: RequestId,
     pub input_tokens: Vec<u32>,
     pub prompt_start: usize,
     pub prompt_end: usize,
@@ -180,15 +180,15 @@ pub struct MetalScheduler {
     config: MetalSchedulerConfig,
     next_req_id: u64,
     next_arrival_order: u64,
-    waiting: Vec<u64>,
-    requests: HashMap<u64, MetalRequestState>,
+    waiting: Vec<RequestId>,
+    requests: HashMap<RequestId, MetalRequestState>,
     event_sink: Arc<dyn EventSink>,
 }
 
 impl MetalScheduler {
-    fn emit_event(&self, req_id: u64, kind: RequestEventKind, mode: Option<InferenceMode>) {
+    fn emit_event(&self, req_id: RequestId, kind: RequestEventKind, mode: Option<InferenceMode>) {
         self.event_sink.emit(&EngineEvent {
-            request_id: infer_core::RequestId(req_id),
+            request_id: req_id,
             kind,
             mode,
         });
@@ -255,7 +255,7 @@ impl MetalScheduler {
         prompt_tokens: Vec<u32>,
         max_tokens: usize,
         priority: MetalRequestPriority,
-    ) -> Result<u64, MetalSchedulerError> {
+    ) -> Result<RequestId, MetalSchedulerError> {
         if prompt_tokens.is_empty() {
             return Err(MetalSchedulerError::EmptyPrompt);
         }
@@ -268,7 +268,7 @@ impl MetalScheduler {
             return Err(MetalSchedulerError::QueueFull);
         }
 
-        let req_id = self.next_req_id;
+        let req_id = RequestId(self.next_req_id);
         self.next_req_id += 1;
         let arrival_order = self.next_arrival_order;
         self.next_arrival_order += 1;
@@ -318,7 +318,7 @@ impl MetalScheduler {
     /// removed from the scheduler.
     pub fn advance_decode(
         &mut self,
-        req_id: u64,
+        req_id: RequestId,
         sampled_token: u32,
     ) -> Result<bool, MetalSchedulerError> {
         let should_finish = {
@@ -355,7 +355,7 @@ impl MetalScheduler {
     }
 
     /// Explicitly finish a request, releasing all scheduler bookkeeping.
-    pub fn finish_request(&mut self, req_id: u64) -> bool {
+    pub fn finish_request(&mut self, req_id: RequestId) -> bool {
         let removed = self.remove_request(req_id);
         if let Some(state) = removed {
             let mode = match state.phase {
@@ -371,7 +371,7 @@ impl MetalScheduler {
     }
 
     /// Get the current phase of a request.
-    pub fn request_phase(&self, req_id: u64) -> Option<MetalRequestPhase> {
+    pub fn request_phase(&self, req_id: RequestId) -> Option<MetalRequestPhase> {
         self.requests.get(&req_id).map(|state| state.phase)
     }
 
@@ -485,7 +485,7 @@ impl MetalScheduler {
         })
     }
 
-    fn find_prefilling_request(&self) -> Option<u64> {
+    fn find_prefilling_request(&self) -> Option<RequestId> {
         self.requests
             .values()
             .filter(|state| state.phase == MetalRequestPhase::Prefilling)
@@ -493,7 +493,7 @@ impl MetalScheduler {
             .map(|state| state.req_id)
     }
 
-    fn admit_next_waiting_request(&mut self) -> Option<u64> {
+    fn admit_next_waiting_request(&mut self) -> Option<RequestId> {
         let best_idx = self
             .waiting
             .iter()
@@ -508,7 +508,7 @@ impl MetalScheduler {
         Some(req_id)
     }
 
-    fn remove_request(&mut self, req_id: u64) -> Option<MetalRequestState> {
+    fn remove_request(&mut self, req_id: RequestId) -> Option<MetalRequestState> {
         let removed = self.requests.remove(&req_id);
         if removed.is_some() {
             if let Some(pos) = self.waiting.iter().position(|id| *id == req_id) {
@@ -754,22 +754,22 @@ mod tests {
             recorded_events(sink.as_ref()),
             vec![
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::Enqueued,
                     mode: None,
                 },
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::PrefillStarted,
                     mode: Some(InferenceMode::Prefill),
                 },
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::DecodeStep,
                     mode: Some(InferenceMode::Decode),
                 },
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::Completed,
                     mode: Some(InferenceMode::Decode),
                 },
@@ -803,12 +803,12 @@ mod tests {
             recorded_events(sink.as_ref()),
             vec![
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::Enqueued,
                     mode: None,
                 },
                 EngineEvent {
-                    request_id: infer_core::RequestId(req),
+                    request_id: req,
                     kind: RequestEventKind::PrefillStarted,
                     mode: Some(InferenceMode::Prefill),
                 },

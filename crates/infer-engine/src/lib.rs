@@ -72,14 +72,32 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(feature = "cuda")]
-impl AgentEngine for LoadedServerEngine {
+struct CudaAgentEngine {
+    inner: LoadedServerEngine,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaAgentEngine {
+    fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
+        Ok(Self {
+            inner: LoadedServerEngine::load_with_options(
+                model_path,
+                42,
+                EngineOptions { enable_cuda_graph },
+            )?,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl AgentEngine for CudaAgentEngine {
     fn model_id(&self) -> &str {
-        infer::server_engine::ServerEngine::model_id(self)
+        infer::server_engine::ServerEngine::model_id(&self.inner)
     }
 
     fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
         let output = infer::server_engine::ServerEngine::complete(
-            self,
+            &mut self.inner,
             CompleteRequest {
                 prompt: req.prompt,
                 max_tokens: req.max_tokens,
@@ -105,7 +123,7 @@ impl AgentEngine for LoadedServerEngine {
 }
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
-pub struct BackendAgentEngine<B: InferenceBackend> {
+struct BackendAgentEngine<B: InferenceBackend> {
     model_id: String,
     backend: B,
 }
@@ -181,9 +199,9 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-pub enum LoadedAgentEngine {
+enum LoadedAgentEngineInner {
     #[cfg(feature = "cuda")]
-    Cuda(LoadedServerEngine),
+    Cuda(CudaAgentEngine),
     #[cfg(feature = "metal")]
     Metal(BackendAgentEngine<MetalBackend>),
     #[cfg(feature = "cpu")]
@@ -191,33 +209,32 @@ pub enum LoadedAgentEngine {
 }
 
 #[cfg(feature = "cuda")]
-impl LoadedAgentEngine {
-    pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
-        Ok(Self::Cuda(LoadedServerEngine::load_with_options(
+impl LoadedAgentEngineInner {
+    fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
+        Ok(Self::Cuda(CudaAgentEngine::load(
             model_path,
-            42,
-            EngineOptions { enable_cuda_graph },
+            enable_cuda_graph,
         )?))
     }
 }
 
 #[cfg(all(not(feature = "cuda"), feature = "metal"))]
-impl LoadedAgentEngine {
-    pub fn load(model_path: &str, _enable_cuda_graph: bool) -> Result<Self> {
+impl LoadedAgentEngineInner {
+    fn load(model_path: &str, _enable_cuda_graph: bool) -> Result<Self> {
         Ok(Self::Metal(BackendAgentEngine::load(model_path)?))
     }
 }
 
 #[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "cpu"))]
-impl LoadedAgentEngine {
-    pub fn load(model_path: &str, _enable_cuda_graph: bool) -> Result<Self> {
+impl LoadedAgentEngineInner {
+    fn load(model_path: &str, _enable_cuda_graph: bool) -> Result<Self> {
         Ok(Self::Cpu(BackendAgentEngine::load(model_path)?))
     }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-impl LoadedAgentEngine {
-    pub fn backend_name(&self) -> &'static str {
+impl LoadedAgentEngineInner {
+    fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(_) => "cuda",
@@ -228,7 +245,7 @@ impl LoadedAgentEngine {
         }
     }
 
-    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
         match self {
             #[cfg(feature = "cuda")]
             Self::Cuda(engine) => engine.set_max_gpu_kv(max_tokens),
@@ -245,7 +262,7 @@ impl LoadedAgentEngine {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-impl AgentEngine for LoadedAgentEngine {
+impl AgentEngine for LoadedAgentEngineInner {
     fn model_id(&self) -> &str {
         match self {
             #[cfg(feature = "cuda")]
@@ -266,6 +283,39 @@ impl AgentEngine for LoadedAgentEngine {
             #[cfg(feature = "cpu")]
             Self::Cpu(engine) => engine.complete(req),
         }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub struct LoadedAgentEngine {
+    inner: LoadedAgentEngineInner,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl LoadedAgentEngine {
+    pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
+        Ok(Self {
+            inner: LoadedAgentEngineInner::load(model_path, enable_cuda_graph)?,
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        self.inner.set_max_gpu_kv(max_tokens);
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl AgentEngine for LoadedAgentEngine {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
+        self.inner.complete(req)
     }
 }
 
