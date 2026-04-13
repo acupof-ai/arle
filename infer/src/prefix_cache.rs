@@ -38,16 +38,19 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 // ============================================================================
 // Types
 // ============================================================================
 
 /// Opaque GPU KV cache block identifier. Assigned by the block allocator
 /// (see `block_manager.rs`) and stored in the cache node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
 /// A node in the radix tree.
+#[derive(Serialize, Deserialize)]
 struct Node {
     /// Token sequence stored on this edge (from parent to this node).
     tokens: Vec<u32>,
@@ -79,6 +82,15 @@ impl Node {
 // ============================================================================
 
 /// Radix tree for content-addressable KV prefix caching.
+///
+/// The `Serialize` / `Deserialize` derives exist so the full cache state
+/// can be snapshotted to disk for session persistence (Tiered KV Cache
+/// §P3). The format is a straightforward serde representation of the
+/// private fields; callers are expected to pair every deserialize with
+/// a separate reconciliation pass if block IDs need to be mapped onto a
+/// fresh allocator (the canonical use case is restoring a snapshot on a
+/// new process where the KV pool layout has changed).
+#[derive(Serialize, Deserialize)]
 pub struct RadixCache {
     /// All nodes, indexed by stable integer IDs.
     nodes: Vec<Node>,
@@ -725,5 +737,63 @@ mod tests {
             "only the unlocked deepest leaf should be evicted"
         );
         assert_eq!(cache.cached_block_count(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Serde round-trip — Tiered KV Cache §P3 session persistence gate.
+    // The on-disk format is a straightforward serde representation; this
+    // test pins the expectation that a full insert → lookup state can be
+    // JSON-roundtripped without loss and that lookups on the restored
+    // cache still find every previously-cached block.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn radix_cache_serde_roundtrip_preserves_lookups() {
+        let mut cache = RadixCache::new(4);
+
+        // Populate with three sequences sharing a common prefix so the
+        // tree has a non-trivial shape with a split.
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        cache.insert(&[1, 2, 3, 4, 9, 10, 11, 12], &bids(&[10, 30]));
+
+        let before_node_count = cache.node_count();
+        let before_cached = cache.cached_block_count();
+
+        let json = serde_json::to_string(&cache).expect("serialize RadixCache");
+        // Exercise pretty-print too — the disk format is allowed to use
+        // either shape.
+        let pretty = serde_json::to_string_pretty(&cache).expect("serialize RadixCache (pretty)");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&pretty).unwrap(),
+            "compact + pretty JSON must decode to the same value tree",
+        );
+
+        let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+
+        assert_eq!(restored.node_count(), before_node_count);
+        assert_eq!(restored.cached_block_count(), before_cached);
+
+        // Every prefix the original cache had should still resolve after
+        // the round trip. Note: `lookup` bumps ref_count — that is
+        // expected, the restored cache is a clean slate.
+        let (len_a, blocks_a) = restored.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let (len_b, blocks_b) = restored.lookup(&[1, 2, 3, 4, 9, 10, 11, 12]);
+        assert_eq!(len_a, 8);
+        assert_eq!(blocks_a, bids(&[10, 20]));
+        assert_eq!(len_b, 8);
+        assert_eq!(blocks_b, bids(&[10, 30]));
+    }
+
+    #[test]
+    fn block_id_serde_roundtrip() {
+        // BlockId is serialized as a newtype around u32 — keep this
+        // explicit so the wire format is stable.
+        let id = BlockId(42);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "42", "BlockId(N) must serialize as the bare N");
+        let back: BlockId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
     }
 }
