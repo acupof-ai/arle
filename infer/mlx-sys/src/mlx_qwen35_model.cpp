@@ -15,11 +15,27 @@
 
 #include "mlx_common.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 
 using namespace mlx::core;
 
 namespace {
+
+int parse_env_int(const char* name, int fallback) {
+    const char* env = std::getenv(name);
+    if (!env || *env == '\0') {
+        return fallback;
+    }
+    int value = fallback;
+    auto first = env;
+    auto last = env + std::char_traits<char>::length(env);
+    auto [ptr, ec] = std::from_chars(first, last, value);
+    if (ec != std::errc() || ptr != last || value <= 0) {
+        return fallback;
+    }
+    return value;
+}
 
 bool use_gdr_metal_kernel() {
     const char* env = std::getenv("AGENT_INFER_GDR_METAL_KERNEL");
@@ -60,6 +76,14 @@ bool use_qwen35_cpp_prefill_gbeta_helper() {
 bool use_qwen35_cpp_qk_norm_helper() {
     const char* env = std::getenv("AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER");
     return !(env && std::string(env) == "0");
+}
+
+int qwen35_cpp_gdr_threadgroup_y(int seq_len) {
+    int fallback = parse_env_int("AGENT_INFER_QWEN35_CPP_GDR_TG_Y", 4);
+    if (seq_len > 1) {
+        return parse_env_int("AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y", fallback);
+    }
+    return parse_env_int("AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y", fallback);
 }
 
 auto& gated_delta_kernel() {
@@ -481,14 +505,13 @@ struct Qwen35CompiledModel {
 
         array y(0);
         if (use_gdr_metal_kernel()) {
-            auto& q_bf16 = q;
-            auto& k_bf16 = k;
             auto& v_bf16 = v_raw;
             // g and beta are [1, S, Hv] — no reshape needed
             auto& g_3d = g;
             auto& beta_3d = beta;
+            int threadgroup_y = qwen35_cpp_gdr_threadgroup_y(S);
             std::vector<array> inputs = {
-                q_bf16, k_bf16, v_bf16, g_3d, beta_3d, gdr_state_in, gdr_t_arr
+                q, k, v_bf16, g_3d, beta_3d, gdr_state_in, gdr_t_arr
             };
             std::vector<Shape> out_shapes = {{1, S, hv, dv}, gdr_state_in.shape()};
             std::vector<Dtype> out_dtypes = {bfloat16, float32};
@@ -506,7 +529,7 @@ struct Qwen35CompiledModel {
                 out_shapes,
                 out_dtypes,
                 std::make_tuple(32, dv, hv),
-                std::make_tuple(32, 4, 1),
+                std::make_tuple(32, threadgroup_y, 1),
                 tmpl,
                 std::nullopt,
                 false,
