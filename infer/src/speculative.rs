@@ -31,6 +31,12 @@
 use anyhow::{Result, bail};
 use rand::RngExt;
 
+#[cfg(feature = "cuda")]
+mod cuda;
+
+#[cfg(feature = "cuda")]
+pub use cuda::{DEFAULT_QWEN3_DRAFT_MODEL_ID, DraftEngine, DraftEngineConfig};
+
 // ============================================================================
 // SpecConfig
 // ============================================================================
