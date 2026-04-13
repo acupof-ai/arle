@@ -718,22 +718,22 @@ mod tests {
         let qkv_dim = config.qkv_dim();
 
         // x: [1, 1, qkv_dim] bf16
-        let x = super::mlx::as_dtype(
+        let x = crate::backend::metal::mlx::as_dtype(
             &MlxArray::from_slice_f32(&vec![1.0f32; qkv_dim], &[1, 1, qkv_dim as i32]),
-            super::mlx::Dtype::Bfloat16,
+            crate::backend::metal::mlx::Dtype::Bfloat16,
         );
         // conv_state: [1, kernel_size-1, qkv_dim] bf16
-        let mut conv_state = super::mlx::zeros(
+        let mut conv_state = crate::backend::metal::mlx::zeros(
             &[1, (kernel_size - 1) as i32, qkv_dim as i32],
-            super::mlx::Dtype::Bfloat16,
+            crate::backend::metal::mlx::Dtype::Bfloat16,
         );
         // kernel: [qkv_dim, kernel_size, 1] bf16
-        let kernel = super::mlx::as_dtype(
+        let kernel = crate::backend::metal::mlx::as_dtype(
             &MlxArray::from_slice_f32(
                 &vec![0.25f32; qkv_dim * kernel_size],
                 &[qkv_dim as i32, kernel_size as i32, 1],
             ),
-            super::mlx::Dtype::Bfloat16,
+            crate::backend::metal::mlx::Dtype::Bfloat16,
         );
 
         let out = conv1d_step_v2(&x, &mut conv_state, &kernel, &config);
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn test_softplus_numerical_accuracy() {
         let _guard = metal_test_guard();
-        use super::mlx::eval;
+        use crate::backend::metal::mlx::eval;
 
         let values: Vec<f32> = vec![
             -10.0, -1.0, 0.0, 1.0, 5.0, 10.0, 19.0, 20.0, 21.0, 50.0, 100.0,
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn test_softplus_no_overflow() {
         let _guard = metal_test_guard();
-        use super::mlx::eval;
+        use crate::backend::metal::mlx::eval;
 
         let large = MlxArray::from_slice_f32(&[88.0f32, 200.0, 1000.0], &[3]);
         let result = softplus(&large);
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn test_rms_normalize_unit_norm() {
         let _guard = metal_test_guard();
-        use super::mlx::eval;
+        use crate::backend::metal::mlx::eval;
 
         let x = MlxArray::from_slice_f32(&[3.0f32, 4.0], &[1, 2]);
         let normed = rms_normalize(&x, 1e-6);
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn test_gate_computation_scalar() {
         let _guard = metal_test_guard();
-        use super::mlx::{add, eval, exp, multiply, negative};
+        use crate::backend::metal::mlx::{add, eval, exp, multiply, negative};
 
         let a_log_val = -1.0f32; // exp(A_log) = exp(-1) ≈ 0.3679
         let alpha_val = 2.0f32;
