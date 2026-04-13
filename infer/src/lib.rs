@@ -5,6 +5,7 @@
 #[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
+#[path = "../../crates/infer-engine/src/ops.rs"]
 pub mod ops;
 #[cfg(feature = "cuda")]
 pub mod weight_loader;
