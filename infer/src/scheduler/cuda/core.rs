@@ -245,14 +245,13 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn prefill_chunk_size(&self) -> usize {
-        let signals = SchedulerSignals {
-            queued_requests: self.waiting.len(),
-            active_decodes: self
-                .active
+        let signals = SchedulerSignals::queue_state(
+            self.waiting.len(),
+            self.active
                 .iter()
                 .filter(|req| matches!(req.phase, Phase::Decoding))
                 .count(),
-        };
+        );
         DecodeAwareChunking {
             decode_active_chunk: self.config.decode_active_prefill_cap,
             idle_chunk: self.config.prefill_chunk_size,

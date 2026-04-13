@@ -343,10 +343,7 @@ impl BatchScheduler {
     }
 
     fn prefill_chunk_budget(&self) -> usize {
-        let signals = SchedulerSignals {
-            queued_requests: self.waiting.len(),
-            active_decodes: self.running.len(),
-        };
+        let signals = SchedulerSignals::queue_state(self.waiting.len(), self.running.len());
         self.config
             .chunking_policy
             .next_chunk_size(InferenceMode::Prefill, signals)
