@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "infer", "infer/mlx-sys", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-core", "crates/infer-engine", "crates/infer-observability", "crates/infer-policy", "crates/infer-tools"]
+members = [".", "infer", "crates/mlx-sys", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-core", "crates/infer-engine", "crates/infer-observability", "crates/infer-policy", "crates/infer-tools"]
 
 [package]
 name = "agent-infer"

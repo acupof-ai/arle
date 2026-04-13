@@ -7,14 +7,22 @@ use crate::backend::cuda::paged_kv::{PagedKVPool, TokenKVPool};
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 use crate::sampler::SamplingParams;
 
+#[path = "model/common.rs"]
 pub(crate) mod common;
+#[path = "model/cuda_graph.rs"]
 pub(crate) mod cuda_graph;
+#[path = "model/generation_state.rs"]
 pub(crate) mod generation_state;
+#[path = "model/kv_cache.rs"]
 pub(crate) mod kv_cache;
+#[path = "model/turboquant_state.rs"]
 pub(crate) mod turboquant_state;
 
+#[path = "model/glm4.rs"]
 pub mod glm4;
+#[path = "model/qwen3.rs"]
 pub mod qwen3;
+#[path = "model/qwen35.rs"]
 pub mod qwen35;
 
 pub use glm4::GLM4Model;

@@ -3,11 +3,13 @@
 // have all moved to `backend::cuda::*`. Model and ops remain here
 // until a follow-up round sorts their cross-backend status.
 #[cfg(feature = "cuda")]
+#[path = "../../crates/infer-engine/src/model.rs"]
 pub mod model;
 #[cfg(feature = "cuda")]
 #[path = "../../crates/infer-engine/src/ops.rs"]
 pub mod ops;
 #[cfg(feature = "cuda")]
+#[path = "../../crates/infer-engine/src/weight_loader.rs"]
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
@@ -16,6 +18,7 @@ pub mod backend;
 pub mod block_manager;
 #[path = "../../crates/infer-engine/src/error.rs"]
 pub mod error;
+#[path = "../../crates/infer-engine/src/gguf.rs"]
 pub mod gguf;
 #[path = "../../crates/infer-engine/src/hf_hub.rs"]
 pub mod hf_hub;
@@ -24,8 +27,10 @@ pub mod kv_tier;
 pub mod logging;
 pub mod memory_planner;
 pub mod metrics;
+#[path = "../../crates/infer-engine/src/model_registry.rs"]
 pub mod model_registry;
 pub mod prefix_cache;
+#[path = "../../crates/infer-engine/src/quant.rs"]
 pub mod quant;
 #[path = "../../crates/infer-engine/src/request_handle.rs"]
 pub mod request_handle;
