@@ -13,10 +13,18 @@
 //! - [`disk`] — [`DiskStore`], the T3 NVMe / SSD backend. Pure `std::fs`;
 //!   cross-platform (macOS tests run on `tokio::fs`-free paths). The
 //!   Phase-3 follow-up PR will wrap it in a real `KVTransport` impl.
+//! - [`nixl`] — [`nixl::NixlTransport`] stub for the T4 remote tier.
+//!   Only compiled under `#[cfg(feature = "rdma-nixl")]`; references
+//!   `nixl-sys` types so a `cargo check --features rdma-nixl` on macOS
+//!   proves the trait shape is forward-compatible with real NIXL.
 
 pub mod disk;
+#[cfg(feature = "rdma-nixl")]
+pub mod nixl;
 
 pub use disk::DiskStore;
+#[cfg(feature = "rdma-nixl")]
+pub use nixl::NixlTransport;
 
 use std::task::Poll;
 
