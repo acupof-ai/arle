@@ -1559,8 +1559,12 @@ name = "infer-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cudarc",
  "infer",
+ "libc",
  "log",
+ "memmap2",
+ "mlx-sys",
 ]
 
 [[package]]
