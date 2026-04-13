@@ -202,7 +202,9 @@ pub trait ModelForward: Send {
         rng: &mut StdRng,
     ) -> Result<u32>;
 
-    /// Select token with logprob. Default: delegates to select_token, returns None logprob.
+    /// Select token with logprob. Greedy-capable backends should override this
+    /// to return the chosen token's log-probability without forcing callers to
+    /// special-case batched vs. non-batched decode.
     fn select_token_with_logprob(
         &self,
         state: &mut Self::State,
@@ -254,6 +256,10 @@ pub trait ModelForward: Send {
     }
 
     /// Fast-path batched greedy sampling on internal contiguous logits.
+    ///
+    /// Implementations that return `Some(tokens)` should also populate
+    /// `DecodeContextOps::logprobs_host()` for the same batch order so the
+    /// scheduler/API can surface per-token logprobs without a second pass.
     /// Returns None if fast path unavailable (non-greedy, or model doesn't support it).
     fn sample_batch_greedy(
         &self,
@@ -261,6 +267,20 @@ pub trait ModelForward: Send {
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
+    }
+
+    /// Prepare per-request sampling buffers when batched greedy sampling needs
+    /// to fall back to `select_tokens_batch()`.
+    ///
+    /// Models that skip per-slot logits scatter on the fast greedy path should
+    /// override this to materialize per-request logits before fallback.
+    fn prepare_batch_sampling_fallback(
+        &self,
+        _states: &mut [Self::State],
+        _slot_indices: &[usize],
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Batched decode: process B tokens from B requests in one forward pass.

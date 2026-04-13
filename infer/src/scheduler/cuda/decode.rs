@@ -221,7 +221,15 @@ impl<M: ModelForward> Scheduler<M> {
         let sampled_result = if all_greedy {
             match model.sample_batch_greedy(&slot_indices, decode_ctx) {
                 Ok(Some(tokens)) => Ok(tokens),
-                Ok(None) => model.select_tokens_batch(states, &slot_indices, &sampling_params, rng),
+                Ok(None) => {
+                    if let Err(e) =
+                        model.prepare_batch_sampling_fallback(states, &slot_indices, decode_ctx)
+                    {
+                        Err(e)
+                    } else {
+                        model.select_tokens_batch(states, &slot_indices, &sampling_params, rng)
+                    }
+                }
                 Err(e) => Err(e),
             }
         } else {

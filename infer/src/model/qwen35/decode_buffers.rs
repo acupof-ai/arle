@@ -25,6 +25,8 @@ pub(crate) struct DecodeBuffers35 {
     pub(crate) ptrs: DecodeBufferPtrs35,
     /// Per-slot logits buffer for batched decode logit scatter.
     pub(crate) logits_scratch: DeviceVec,
+    /// Tracks whether the latest decode logits live in `logits_scratch`.
+    using_logits_scratch: bool,
 }
 
 impl DecodeBuffers35 {
@@ -52,6 +54,56 @@ impl DecodeBuffers35 {
             sample_out,
             ptrs,
             logits_scratch,
+            using_logits_scratch: false,
         })
+    }
+
+    /// Point raw sampling kernels at the state's single-token logits buffer.
+    pub(crate) fn bind_single_token_logits(&mut self, ctx: &DeviceContext, logits: &DeviceVec) {
+        self.ptrs.logits_ptr = crate::backend::cuda::tensor::cache_ptr(&logits.data, ctx);
+        self.ptrs.logits_len = logits.len;
+        self.using_logits_scratch = false;
+    }
+
+    /// Point raw sampling kernels at the per-request batched decode logits copy.
+    pub(crate) fn bind_logits_scratch(&mut self, ctx: &DeviceContext) {
+        self.ptrs.logits_ptr =
+            crate::backend::cuda::tensor::cache_ptr(&self.logits_scratch.data, ctx);
+        self.ptrs.logits_len = self.logits_scratch.len;
+        self.using_logits_scratch = true;
+    }
+
+    pub(crate) fn current_logits<'a>(
+        &'a self,
+        single_token_logits: &'a DeviceVec,
+    ) -> &'a DeviceVec {
+        if self.using_logits_scratch {
+            &self.logits_scratch
+        } else {
+            single_token_logits
+        }
+    }
+
+    pub(crate) fn current_logits_and_sampling_bufs<'a>(
+        &'a mut self,
+        single_token_logits: &'a DeviceVec,
+    ) -> (
+        &'a DeviceVec,
+        &'a mut CudaSlice<f32>,
+        &'a mut CudaSlice<i32>,
+    ) {
+        let Self {
+            sample_probs,
+            sample_out,
+            logits_scratch,
+            using_logits_scratch,
+            ..
+        } = self;
+        let logits = if *using_logits_scratch {
+            &*logits_scratch
+        } else {
+            single_token_logits
+        };
+        (logits, sample_probs, sample_out)
     }
 }
