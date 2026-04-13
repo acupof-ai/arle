@@ -50,11 +50,21 @@ mod loader;
 #[cfg(feature = "metal")]
 mod qwen35;
 
+// Submodules that used to live at the crate root as `metal_*.rs` — moved
+// under `metal_backend/` so that all Metal-specific code lives in one place
+// (see `docs/plans/` for the reorganisation plan).
+pub mod gdr;
+pub mod kv_pool;
+#[cfg(feature = "metal")]
+pub mod mlx;
+pub mod prefix_cache;
+pub mod scheduler;
+
 // ── mlx types (Metal GPU required) ───────────────────────────────────────────
 #[cfg(feature = "metal")]
-use crate::metal_kv_pool::MetalKVPool;
+use self::kv_pool::MetalKVPool;
 #[cfg(feature = "metal")]
-use crate::mlx::{Dtype, MlxArray};
+use self::mlx::{Dtype, MlxArray};
 use config::{MetalModelArch, MetalModelConfig, load_metal_config};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
@@ -176,7 +186,7 @@ impl AttentionInputProjection {
     }
 
     fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray, MlxArray) {
-        use crate::mlx::slice;
+        use self::mlx::slice;
 
         match self {
             Self::Split {
@@ -225,7 +235,7 @@ pub enum MlpInputProjection {
 #[cfg(feature = "metal")]
 impl MlpInputProjection {
     fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray) {
-        use crate::mlx::slice;
+        use self::mlx::slice;
 
         match self {
             Self::Split { gate_proj, up_proj } => (linear(x, gate_proj), linear(x, up_proj)),
@@ -699,7 +709,7 @@ fn metal_generate(
     t0: Instant,
     on_token: &mut impl FnMut(u32) -> Result<()>,
 ) -> Result<MetalGenerateOutput> {
-    use crate::mlx::zeros;
+    use self::mlx::zeros;
 
     if max_new_tokens == 0 {
         return Ok(MetalGenerateOutput {
@@ -901,13 +911,13 @@ fn metal_generate(
 
 #[cfg(feature = "metal")]
 fn metal_async_eval(arr: &MlxArray) -> Result<()> {
-    crate::mlx::async_eval(&[arr]);
+    self::mlx::async_eval(&[arr]);
     Ok(())
 }
 
 #[cfg(feature = "metal")]
 fn clear_metal_cache() {
-    crate::mlx::clear_cache();
+    self::mlx::clear_cache();
 }
 
 #[cfg(feature = "metal")]
@@ -917,7 +927,7 @@ fn extend_kv_cache(
     head_dim: i32,
     new_cap: i32,
 ) -> Result<()> {
-    use crate::mlx::{concatenate_axis, zeros};
+    use self::mlx::{concatenate_axis, zeros};
 
     let current_cap = cache.shape().get(2).copied().unwrap_or_default();
     if new_cap <= current_cap {
@@ -955,7 +965,7 @@ fn build_forward_graph(
     request_id: usize,
     params: &SamplingParams,
 ) -> Result<MlxArray> {
-    use crate::mlx::{rms_norm, take_axis};
+    use self::mlx::{rms_norm, take_axis};
 
     let seq = current_ids.len() as i32;
     if let Some(pool) = metal_kv_pool.as_deref_mut() {
@@ -1020,7 +1030,7 @@ fn rust_transformer_layer(
     mut metal_kv_pool: Option<&mut MetalKVPool>,
     request_id: usize,
 ) -> Result<MlxArray> {
-    use crate::mlx::{
+    use self::mlx::{
         add, multiply, reshape, rms_norm, rope, scaled_dot_product_attention, silu, slice,
         slice_update, transpose_axes,
     };
@@ -1152,18 +1162,18 @@ fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArr
 
     // Temperature scaling then GPU categorical sample.
     let inv_t = MlxArray::scalar_f32(1.0f32 / params.temperature);
-    let scaled = crate::mlx::multiply(logits, &inv_t);
+    let scaled = self::mlx::multiply(logits, &inv_t);
     Ok(categorical_sample_token(&scaled))
 }
 
 #[cfg(feature = "metal")]
 fn greedy_sample_token(logits: &MlxArray) -> MlxArray {
-    crate::mlx::argmax(logits)
+    self::mlx::argmax(logits)
 }
 
 #[cfg(feature = "metal")]
 fn categorical_sample_token(logits: &MlxArray) -> MlxArray {
-    crate::mlx::categorical(logits)
+    self::mlx::categorical(logits)
 }
 
 /// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.
@@ -1176,7 +1186,7 @@ fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
     match weight {
         WeightTensor::Dense(w_t) => {
             // w_t is pre-transposed [in, out]; direct matmul, no per-call transpose.
-            crate::mlx::matmul(x, w_t)
+            self::mlx::matmul(x, w_t)
         }
         WeightTensor::Quantized {
             w,
@@ -1186,14 +1196,14 @@ fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
             bits,
         } => {
             // w stored as [out, in] packed uint32; transpose=true → x @ w.T
-            crate::mlx::quantized_matmul(x, w, scales, biases, true, *group_size, *bits)
+            self::mlx::quantized_matmul(x, w, scales, biases, true, *group_size, *bits)
         }
     }
 }
 
 #[cfg(feature = "metal")]
 fn merge_quantized_projection_rows(weights: &[&WeightTensor]) -> Result<Option<WeightTensor>> {
-    use crate::mlx::{concatenate_axis, eval};
+    use self::mlx::{concatenate_axis, eval};
 
     if weights.is_empty() {
         return Ok(None);

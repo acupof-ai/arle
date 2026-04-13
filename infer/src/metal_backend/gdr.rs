@@ -20,10 +20,10 @@
 //! Gated behind `#[cfg(feature = "metal")]` — only compiled on Metal builds.
 
 #[cfg(feature = "metal")]
-use crate::mlx::MlxArray;
+use super::mlx::MlxArray;
 
 #[cfg(feature = "metal")]
-use crate::metal_backend::WeightTensor;
+use super::WeightTensor;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ pub struct MetalRecurrentState {
 impl MetalRecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub fn new(num_linear_layers: usize, config: &MetalGdrConfig) -> Self {
-        use crate::mlx::{Dtype, zeros};
+        use super::mlx::{Dtype, zeros};
 
         let mut states = Vec::with_capacity(num_linear_layers);
         let mut conv_states = Vec::with_capacity(num_linear_layers);
@@ -184,7 +184,7 @@ impl MetalRecurrentState {
 #[cfg(feature = "metal")]
 #[inline]
 fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
-    use crate::mlx::{matmul, quantized_matmul};
+    use super::mlx::{matmul, quantized_matmul};
     match weight {
         WeightTensor::Dense(w_t) => matmul(x, w_t),
         WeightTensor::Quantized {
@@ -204,7 +204,7 @@ fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
 /// RMS-normalize along the last axis without learnable weight.
 /// Uses MLX's fused fast.rms_norm — single op instead of 7 manual ops.
 fn rms_normalize(x: &MlxArray, eps: f32) -> MlxArray {
-    crate::mlx::rms_norm_no_weight(x, eps)
+    super::mlx::rms_norm_no_weight(x, eps)
 }
 
 // ── Helper: softplus ─────────────────────────────────────────────────────────
@@ -214,7 +214,7 @@ fn rms_normalize(x: &MlxArray, eps: f32) -> MlxArray {
 /// uses the same threshold). Implements: where(x > 20, x, log1p(exp(x))).
 #[cfg(feature = "metal")]
 fn softplus(x: &MlxArray) -> MlxArray {
-    use crate::mlx::{exp, greater, log1p, where_};
+    use super::mlx::{exp, greater, log1p, where_};
 
     let threshold = MlxArray::from_slice_f32(&[20.0f32], &[1]);
     let mask = greater(x, &threshold);
@@ -235,9 +235,9 @@ fn softplus(x: &MlxArray) -> MlxArray {
 // This replaces ~12 MLX ops with 1 kernel dispatch.
 
 #[cfg(feature = "metal")]
-static GDR_METAL_KERNEL: std::sync::LazyLock<crate::mlx::MetalKernel> =
+static GDR_METAL_KERNEL: std::sync::LazyLock<super::mlx::MetalKernel> =
     std::sync::LazyLock::new(|| {
-        crate::mlx::MetalKernel::new(
+        super::mlx::MetalKernel::new(
             "gated_delta_step",
             &["q", "k", "v", "g", "beta", "state_in", "T"],
             &["y", "state_out"],
@@ -323,7 +323,7 @@ fn metal_gdr_kernel_step(
     state: &MlxArray,
     config: &MetalGdrConfig,
 ) -> (MlxArray, MlxArray) {
-    use crate::mlx::Dtype;
+    use super::mlx::Dtype;
 
     let b = 1i32; // batch size always 1 for decode
     let t = 1i32; // single timestep
@@ -369,7 +369,7 @@ fn conv1d_step_v2(
     kernel: &MlxArray,
     config: &MetalGdrConfig,
 ) -> MlxArray {
-    use crate::mlx::{concatenate_axis, conv1d, silu, slice};
+    use super::mlx::{concatenate_axis, conv1d, silu, slice};
 
     let qkv_dim = config.qkv_dim() as i32;
     let n_keep = (config.conv_kernel - 1) as i32;
@@ -404,7 +404,7 @@ fn try_cpp_gdr_forward(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> Option<MlxArray> {
-    use crate::metal_backend::WeightTensor;
+    use super::WeightTensor;
 
     // Extract quantized weight params. Bail to Rust path if any are Dense.
     let (qkvz_w, qkvz_s, qkvz_b, qkvz_gs, qkvz_bits) = match &lw.in_proj_qkvz {
@@ -445,9 +445,9 @@ fn try_cpp_gdr_forward(
     let inv_scale = 1.0 / (config.key_dim as f32).sqrt();
 
     // Reshape x from [1, hidden] to [1, 1, hidden] for the C++ function
-    let x_3d = crate::mlx::reshape(x, &[1, 1, config.hidden_size as i32]);
+    let x_3d = super::mlx::reshape(x, &[1, 1, config.hidden_size as i32]);
 
-    let result = crate::mlx::gdr_layer_forward(
+    let result = super::mlx::gdr_layer_forward(
         &x_3d,
         qkvz_w,
         qkvz_s,
@@ -522,7 +522,7 @@ pub fn metal_gdr_decode_step(
         return result;
     }
     // Fallback to Rust per-op path for Dense weights.
-    use crate::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
+    use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
 
     let hk = config.num_key_heads as i32;
     let dk = config.key_dim as i32;
@@ -603,7 +603,7 @@ pub fn metal_gdr_decode_step(
 
     // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
     let g = {
-        use crate::mlx::{exp, negative};
+        use super::mlx::{exp, negative};
         let a_plus_bias = add(&a_raw, &layer_weights.dt_bias);
         let sp = softplus(&a_plus_bias);
         exp(&multiply(&negative(&exp(&layer_weights.a_log)), &sp))
@@ -639,7 +639,7 @@ pub fn metal_gdr_decode_step(
         y_out
     } else {
         // Ops fallback — use the compiled step ops pattern
-        use crate::mlx::{broadcast_to, expand_dims, subtract, sum_axis};
+        use super::mlx::{broadcast_to, expand_dims, subtract, sum_axis};
         let heads_per_key = config.num_value_heads / config.num_key_heads;
 
         // Expand q/k for GQA
@@ -718,22 +718,22 @@ mod tests {
         let qkv_dim = config.qkv_dim();
 
         // x: [1, 1, qkv_dim] bf16
-        let x = crate::mlx::as_dtype(
+        let x = super::mlx::as_dtype(
             &MlxArray::from_slice_f32(&vec![1.0f32; qkv_dim], &[1, 1, qkv_dim as i32]),
-            crate::mlx::Dtype::Bfloat16,
+            super::mlx::Dtype::Bfloat16,
         );
         // conv_state: [1, kernel_size-1, qkv_dim] bf16
-        let mut conv_state = crate::mlx::zeros(
+        let mut conv_state = super::mlx::zeros(
             &[1, (kernel_size - 1) as i32, qkv_dim as i32],
-            crate::mlx::Dtype::Bfloat16,
+            super::mlx::Dtype::Bfloat16,
         );
         // kernel: [qkv_dim, kernel_size, 1] bf16
-        let kernel = crate::mlx::as_dtype(
+        let kernel = super::mlx::as_dtype(
             &MlxArray::from_slice_f32(
                 &vec![0.25f32; qkv_dim * kernel_size],
                 &[qkv_dim as i32, kernel_size as i32, 1],
             ),
-            crate::mlx::Dtype::Bfloat16,
+            super::mlx::Dtype::Bfloat16,
         );
 
         let out = conv1d_step_v2(&x, &mut conv_state, &kernel, &config);
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn test_softplus_numerical_accuracy() {
         let _guard = metal_test_guard();
-        use crate::mlx::eval;
+        use super::mlx::eval;
 
         let values: Vec<f32> = vec![
             -10.0, -1.0, 0.0, 1.0, 5.0, 10.0, 19.0, 20.0, 21.0, 50.0, 100.0,
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn test_softplus_no_overflow() {
         let _guard = metal_test_guard();
-        use crate::mlx::eval;
+        use super::mlx::eval;
 
         let large = MlxArray::from_slice_f32(&[88.0f32, 200.0, 1000.0], &[3]);
         let result = softplus(&large);
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn test_rms_normalize_unit_norm() {
         let _guard = metal_test_guard();
-        use crate::mlx::eval;
+        use super::mlx::eval;
 
         let x = MlxArray::from_slice_f32(&[3.0f32, 4.0], &[1, 2]);
         let normed = rms_normalize(&x, 1e-6);
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn test_gate_computation_scalar() {
         let _guard = metal_test_guard();
-        use crate::mlx::{add, eval, exp, multiply, negative};
+        use super::mlx::{add, eval, exp, multiply, negative};
 
         let a_log_val = -1.0f32; // exp(A_log) = exp(-1) ≈ 0.3679
         let alpha_val = 2.0f32;

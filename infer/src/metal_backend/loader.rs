@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 
 #[cfg(feature = "metal")]
-use crate::mlx::MlxArray;
+use super::mlx::MlxArray;
 
 use super::{QuantConfig, WeightTensor};
 
@@ -27,7 +27,7 @@ pub(super) fn load_tensor_map(model_dir: &Path) -> Result<TensorMap> {
 
     for shard in &shards {
         let path_str = shard.to_str().context("non-UTF8 path")?;
-        let shard_tensors = crate::mlx::load_safetensors(path_str)?;
+        let shard_tensors = super::mlx::load_safetensors(path_str)?;
         for (name, arr) in shard_tensors {
             if tensors.contains_key(&name) {
                 log::warn!(
@@ -58,7 +58,7 @@ pub(super) fn load_proj_from_tensors(
     base: &str,
     quantization: Option<QuantConfig>,
 ) -> Result<WeightTensor> {
-    use crate::mlx::{eval, transpose_all};
+    use super::mlx::{eval, transpose_all};
     if let Some(qc) = quantization {
         if let Some(scales) = tensors.get(&format!("{base}.scales")).cloned() {
             let w = tensors
@@ -98,7 +98,7 @@ pub(super) fn load_embed_tokens_from_tensors(
                 .cloned()
                 .with_context(|| format!("missing biases '{base}.biases'"))?;
             log::info!("  dequantizing embed_tokens at load time");
-            return Ok(crate::mlx::dequantize(
+            return Ok(super::mlx::dequantize(
                 &w,
                 &scales,
                 &biases,
@@ -112,7 +112,7 @@ pub(super) fn load_embed_tokens_from_tensors(
 
 #[cfg(feature = "metal")]
 pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &MlxArray) -> Result<WeightTensor> {
-    use crate::mlx::{eval, transpose_all};
+    use super::mlx::{eval, transpose_all};
     let w_t = transpose_all(embed_tokens);
     eval(&[&w_t]);
     Ok(WeightTensor::Dense(w_t))
