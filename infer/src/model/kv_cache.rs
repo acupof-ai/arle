@@ -22,7 +22,7 @@ use half::bf16;
 use log::info;
 
 use crate::ops::kv_quant;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
 const OFFLOAD_BLOCK_SIZE: usize = 64;

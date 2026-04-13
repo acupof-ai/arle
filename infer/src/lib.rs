@@ -1,25 +1,17 @@
 // CUDA-only modules — excluded when `no-cuda` feature is active.
-#[cfg(feature = "cuda")]
-pub mod bootstrap;
-#[cfg(feature = "cuda")]
-mod ffi;
-#[cfg(feature = "cuda")]
-pub(crate) mod flashinfer_metadata;
+// bootstrap, ffi, flashinfer_metadata, paged_kv, tensor, cuda_graph_pool
+// have all moved to `backend::cuda::*`. Model and ops remain here
+// until a follow-up round sorts their cross-backend status.
 #[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
 pub mod ops;
-#[cfg(feature = "cuda")]
-pub mod paged_kv;
-#[cfg(feature = "cuda")]
-pub mod tensor;
 #[cfg(feature = "cuda")]
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
 pub mod backend;
 pub mod block_manager;
-pub mod cuda_graph_pool;
 pub mod error;
 pub mod gguf;
 pub mod hf_hub;

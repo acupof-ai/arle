@@ -6,8 +6,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 /// Quantize bf16 KV data → INT8 + f32 scales for tokens `[start_pos..start_pos+token_count)`.
 ///
@@ -230,14 +230,14 @@ pub(crate) fn decode_attention_int8_workspace_bytes(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_attention_int8(
     ctx: &DeviceContext,
-    q: &crate::tensor::HiddenStates,
+    q: &crate::backend::cuda::tensor::HiddenStates,
     k_data_ptr: u64,
     v_data_ptr: u64,
     k_scales_ptr: u64,
     v_scales_ptr: u64,
     kv_indices: &CudaSlice<i32>,
     kv_indptr: &CudaSlice<i32>,
-    o: &mut crate::tensor::HiddenStates,
+    o: &mut crate::backend::cuda::tensor::HiddenStates,
     batch_size: usize,
     num_qo_heads: usize,
     num_kv_heads: usize,
@@ -286,12 +286,12 @@ pub(crate) fn decode_attention_int8(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_attention_fp8(
     ctx: &DeviceContext,
-    q: &crate::tensor::HiddenStates,
+    q: &crate::backend::cuda::tensor::HiddenStates,
     k_data_ptr: u64,
     v_data_ptr: u64,
     kv_indices: &CudaSlice<i32>,
     kv_indptr: &CudaSlice<i32>,
-    o: &mut crate::tensor::HiddenStates,
+    o: &mut crate::backend::cuda::tensor::HiddenStates,
     batch_size: usize,
     num_qo_heads: usize,
     num_kv_heads: usize,

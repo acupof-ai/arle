@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use criterion::{Bencher, BenchmarkGroup, measurement::WallTime};
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use infer::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 pub(crate) const VECTOR_DIM: usize = 1024;
 pub(crate) const OUT_DIM: usize = 1024;

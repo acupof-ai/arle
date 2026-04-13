@@ -5,7 +5,7 @@ use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 
-use crate::tensor::DeviceContext;
+use crate::backend::cuda::tensor::DeviceContext;
 
 /// CUDA Graph state for decode path.
 /// First decode call captures the graph; subsequent calls replay it.

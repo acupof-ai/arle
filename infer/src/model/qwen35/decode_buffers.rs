@@ -5,7 +5,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::tensor::{DeviceContext, DeviceVec, RawDevicePtr};
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, RawDevicePtr};
 
 /// Cached raw pointers for hot-path sampling ops (avoids cudarc device_ptr overhead).
 pub(crate) struct DecodeBufferPtrs35 {
@@ -39,10 +39,10 @@ impl DecodeBuffers35 {
             .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?;
 
         let ptrs = DecodeBufferPtrs35 {
-            logits_ptr: crate::tensor::cache_ptr(&logits.data, ctx),
+            logits_ptr: crate::backend::cuda::tensor::cache_ptr(&logits.data, ctx),
             logits_len: config.vocab_size,
-            sample_probs_ptr: crate::tensor::cache_ptr(&sample_probs, ctx),
-            sample_out_ptr: crate::tensor::cache_ptr(&sample_out, ctx),
+            sample_probs_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_probs, ctx),
+            sample_out_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_out, ctx),
         };
 
         let logits_scratch = DeviceVec::zeros(ctx, config.vocab_size)?;

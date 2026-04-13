@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use infer::ops;
-use infer::tensor::DeviceContext;
+use infer::backend::cuda::tensor::DeviceContext;
 
 use super::common::{
     BATCH_SEQ_LEN, OUT_DIM, VECTOR_DIM, configure_group, device_matrix, hidden_states, iter_sync,

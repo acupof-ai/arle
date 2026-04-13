@@ -6,7 +6,7 @@ use half::bf16;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::ffi;
+use super::ffi;
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///

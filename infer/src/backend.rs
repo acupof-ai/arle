@@ -5,14 +5,14 @@
 //!
 //! Concrete backend implementations live under this module:
 //! - [`cpu`]   — development-only CPU backend (feature `cpu`).
+//! - [`cuda`]  — NVIDIA/cudarc backend (feature `cuda`).
 //! - [`metal`] — Apple Silicon MLX-backed backend (feature `metal`).
 //! - [`runtime`] — cross-backend serial runtime handle used by the Metal
 //!   and CPU paths.
-//!
-//! CUDA submodules migrate into `backend::cuda::*` in a follow-up commit.
 
 #[cfg(feature = "cpu")]
 pub mod cpu;
+pub mod cuda;
 pub mod metal;
 pub mod runtime;
 

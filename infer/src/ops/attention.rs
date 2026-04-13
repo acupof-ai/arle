@@ -15,9 +15,9 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::ffi;
-use crate::paged_kv::PagedKVPool;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::paged_kv::PagedKVPool;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 // ============================================================================
 // Parameter structs — group related config/weight params for high-arity ops.

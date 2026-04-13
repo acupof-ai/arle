@@ -1,8 +1,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 /// Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
 pub fn embedding_decode_into(

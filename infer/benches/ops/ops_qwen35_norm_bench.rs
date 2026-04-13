@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput};
 use infer::ops;
-use infer::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
 use super::common::{
     EPS, QWEN35_4B_HIDDEN, QWEN35_4B_LINEAR_V_DIM, QWEN35_4B_LINEAR_V_HEADS, configure_group,

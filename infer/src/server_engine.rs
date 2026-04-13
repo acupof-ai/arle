@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(feature = "cuda")]
-pub use crate::bootstrap::{
+pub use crate::backend::cuda::bootstrap::{
     EngineOptions, ModelType, ServerRuntimeConfig, detect_model_type, model_id_from_path,
 };
 #[cfg(feature = "cuda")]
@@ -397,10 +397,10 @@ pub struct GenericServerEngine<M: ModelForward> {
 #[cfg(feature = "cuda")]
 impl<M: ModelForward> GenericServerEngine<M> {
     fn from_model_components(
-        components: crate::bootstrap::ModelComponents<M>,
+        components: crate::backend::cuda::bootstrap::ModelComponents<M>,
         seed: u64,
     ) -> Result<Self> {
-        let crate::bootstrap::ModelComponents {
+        let crate::backend::cuda::bootstrap::ModelComponents {
             model_id,
             tokenizer,
             model,
@@ -717,7 +717,7 @@ impl RealServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::bootstrap::load_qwen3_components(model_path, options)?;
+        let components = crate::backend::cuda::bootstrap::load_qwen3_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 
@@ -733,7 +733,7 @@ impl Qwen35ServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::bootstrap::load_qwen35_components(model_path, options)?;
+        let components = crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 
@@ -749,7 +749,7 @@ impl GLM4ServerEngine {
     }
 
     pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
-        let components = crate::bootstrap::load_glm4_components(model_path, options)?;
+        let components = crate::backend::cuda::bootstrap::load_glm4_components(model_path, options)?;
         Self::from_model_components(components, seed)
     }
 

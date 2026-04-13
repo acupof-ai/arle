@@ -10,7 +10,7 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 pub struct Qwen35State {
     pub(super) ctx: DeviceContext,
@@ -85,8 +85,8 @@ impl GenerationState for Qwen35State {
 
     fn migrate_kv_to_paged(
         &mut self,
-        ctx: &crate::tensor::DeviceContext,
-        pool: &crate::paged_kv::PagedKVPool,
+        ctx: &crate::backend::cuda::tensor::DeviceContext,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()> {
         self.base.migrate_kv_to_paged(ctx, pool, slot)
@@ -116,7 +116,7 @@ impl ModelForward for Qwen35Model {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
-        pool: &crate::paged_kv::PagedKVPool,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         use super::batch_decode::BatchDecodeBuffers35;
         let c = &self.config;
@@ -217,7 +217,7 @@ impl ModelForward for Qwen35Model {
         self.config.is_stop_token(token_id)
     }
 
-    fn device_context(&self) -> &crate::tensor::DeviceContext {
+    fn device_context(&self) -> &crate::backend::cuda::tensor::DeviceContext {
         &self.ctx
     }
 
@@ -226,7 +226,7 @@ impl ModelForward for Qwen35Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
-        paged_kv_pool: Option<&mut crate::paged_kv::PagedKVPool>,
+        paged_kv_pool: Option<&mut crate::backend::cuda::paged_kv::PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
         skip_logit_scatter: bool,
     ) -> Result<()> {

@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use super::*;
-use crate::tensor::*;
+use crate::backend::cuda::tensor::*;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
@@ -1183,7 +1183,7 @@ fn turboquant_lloyd_max_codebook_symmetry() {
     let mut boundaries = vec![0.0f32; num_levels + 1];
 
     unsafe {
-        crate::ffi::turboquant_lloyd_max(
+        crate::backend::cuda::ffi::turboquant_lloyd_max(
             centroids.as_mut_ptr(),
             boundaries.as_mut_ptr(),
             num_levels as i32,
@@ -1227,8 +1227,8 @@ fn turboquant_hadamard_signs_deterministic() {
     let mut signs2 = vec![0i8; dim];
 
     unsafe {
-        crate::ffi::turboquant_generate_signs(signs1.as_mut_ptr(), dim as i32, seed);
-        crate::ffi::turboquant_generate_signs(signs2.as_mut_ptr(), dim as i32, seed);
+        crate::backend::cuda::ffi::turboquant_generate_signs(signs1.as_mut_ptr(), dim as i32, seed);
+        crate::backend::cuda::ffi::turboquant_generate_signs(signs2.as_mut_ptr(), dim as i32, seed);
     }
 
     assert_eq!(
@@ -1244,7 +1244,7 @@ fn turboquant_hadamard_signs_deterministic() {
     // Different seed → different signs
     let mut signs3 = vec![0i8; dim];
     unsafe {
-        crate::ffi::turboquant_generate_signs(signs3.as_mut_ptr(), dim as i32, seed + 1);
+        crate::backend::cuda::ffi::turboquant_generate_signs(signs3.as_mut_ptr(), dim as i32, seed + 1);
     }
     assert_ne!(
         signs1, signs3,
@@ -1406,7 +1406,7 @@ fn turboquant_cpu_reference_roundtrip() {
     let mut centroids = vec![0.0f32; num_levels];
     let mut boundaries = vec![0.0f32; num_levels + 1];
     unsafe {
-        crate::ffi::turboquant_lloyd_max(
+        crate::backend::cuda::ffi::turboquant_lloyd_max(
             centroids.as_mut_ptr(),
             boundaries.as_mut_ptr(),
             num_levels as i32,
@@ -1420,7 +1420,7 @@ fn turboquant_cpu_reference_roundtrip() {
     // 2. Generate signs
     let mut signs = vec![0i8; head_dim];
     unsafe {
-        crate::ffi::turboquant_generate_signs(signs.as_mut_ptr(), head_dim as i32, 42);
+        crate::backend::cuda::ffi::turboquant_generate_signs(signs.as_mut_ptr(), head_dim as i32, 42);
     }
 
     // 3. Generate test vector

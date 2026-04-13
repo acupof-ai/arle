@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use infer::ops;
-use infer::tensor::{DeviceContext, DeviceVec};
+use infer::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 use super::common::{
     EPS, INTERMEDIATE_DIM, OUT_DIM, QWEN35_4B_HIDDEN, QWEN35_4B_INTERMEDIATE, QWEN35_4B_VOCAB,

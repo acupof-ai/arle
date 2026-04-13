@@ -3,9 +3,9 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::paged_kv::{PagedKVPool, TokenKVPool};
+use crate::backend::cuda::paged_kv::{PagedKVPool, TokenKVPool};
 use crate::sampler::SamplingParams;
-use crate::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
 
 pub(crate) mod common;
 pub(crate) mod cuda_graph;
@@ -103,7 +103,7 @@ pub trait GenerationState {
     fn migrate_kv_to_paged(
         &mut self,
         ctx: &DeviceContext,
-        pool: &crate::paged_kv::PagedKVPool,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
         slot: usize,
     ) -> Result<()>;
 

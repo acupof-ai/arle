@@ -14,8 +14,8 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::CudaSlice;
 
-use crate::ffi;
-use crate::tensor::DeviceContext;
+use crate::backend::cuda::ffi;
+use crate::backend::cuda::tensor::DeviceContext;
 
 /// Packed bytes per head for a given head_dim and bit width.
 pub fn packed_bytes_per_head(head_dim: usize, bits: u8) -> usize {
