@@ -72,10 +72,6 @@ impl Node {
             children: HashMap::new(),
         }
     }
-
-    fn is_leaf(&self) -> bool {
-        self.children.is_empty()
-    }
 }
 
 // ============================================================================
@@ -244,12 +240,24 @@ impl RadixCache {
                     let split_point = match_len;
                     let old_suffix = child_tokens[split_point..].to_vec();
                     let old_block = self.nodes[child_idx].block_id;
+                    let old_ref_count = self.nodes[child_idx].ref_count;
                     let old_children: HashMap<u32, usize> =
                         std::mem::take(&mut self.nodes[child_idx].children);
 
                     // Create an intermediate node for the shared prefix.
+                    //
+                    // Inherit the splitting child's `ref_count`. SGLang does
+                    // the same in `_split_node` (see `radix_cache.py`,
+                    // `new_node.lock_ref = child.lock_ref`): a request that
+                    // was holding a lock on the deeper node is, by the
+                    // path-lock invariant, also locking every ancestor on
+                    // its matched path. Without this inheritance, a future
+                    // garbage-collection pass that prunes orphaned non-block
+                    // intermediates could remove a shared parent that is
+                    // structurally part of an in-flight request.
                     let shared_tokens = child_tokens[..split_point].to_vec();
-                    let shared_node = Node::new(shared_tokens, None, now);
+                    let mut shared_node = Node::new(shared_tokens, None, now);
+                    shared_node.ref_count = old_ref_count;
                     let shared_idx = self.nodes.len();
                     self.nodes.push(shared_node);
 
@@ -329,42 +337,68 @@ impl RadixCache {
     /// Evict up to `n` least-recently-used leaf nodes with `ref_count == 0`.
     ///
     /// Returns the freed `BlockId`s so the block allocator can reclaim them.
+    ///
+    /// Evictions cascade through orphaned parents in a single call: when the
+    /// LRU leaf is freed, its parent may become an active leaf itself (all
+    /// its children are now virtually evicted). The loop picks the next LRU
+    /// candidate from the updated structure until it has freed `n` blocks or
+    /// run out of evictable candidates. Matches the shape of SGLang's
+    /// iterative `evict()` (`radix_cache.py`: after `_delete_leaf`, re-push
+    /// the now-childless parent onto the candidate heap).
+    ///
+    /// Intermediate non-block nodes (shared prefixes left behind by a split)
+    /// still block cascading at their own level because the candidate filter
+    /// requires `block_id.is_some()`. That leaves a structural residue but
+    /// no correctness issue; a dedicated GC pass can prune them later.
     pub fn evict(&mut self, n: usize) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
         }
 
-        // Collect evictable leaf nodes: leaves with ref_count == 0 and a block_id.
-        let mut candidates: Vec<(u64, usize)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(idx, node)| {
-                *idx != Self::root()
-                    && node.is_leaf()
-                    && node.ref_count == 0
-                    && node.block_id.is_some()
-            })
-            .map(|(idx, node)| (node.last_access, idx))
-            .collect();
+        let mut freed: Vec<BlockId> = Vec::with_capacity(n);
+        let mut evicted_set: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(n);
 
-        // Sort ascending by last_access (LRU first).
-        candidates.sort_unstable();
+        while freed.len() < n {
+            // Scan for the LRU evictable candidate: not root, not already
+            // evicted, has a block_id, ref_count == 0, and is currently an
+            // active leaf (all of its children are in `evicted_set`).
+            let mut best: Option<(u64, usize)> = None;
+            for (idx, node) in self.nodes.iter().enumerate() {
+                if idx == Self::root() || evicted_set.contains(&idx) {
+                    continue;
+                }
+                if node.ref_count != 0 || node.block_id.is_none() {
+                    continue;
+                }
+                let active_leaf = node
+                    .children
+                    .iter()
+                    .all(|(_, child_idx)| evicted_set.contains(child_idx));
+                if !active_leaf {
+                    continue;
+                }
+                match best {
+                    Some((best_access, _)) if best_access <= node.last_access => {}
+                    _ => best = Some((node.last_access, idx)),
+                }
+            }
 
-        let to_evict: Vec<usize> = candidates.into_iter().take(n).map(|(_, idx)| idx).collect();
+            let Some((_, victim_idx)) = best else {
+                break;
+            };
 
-        let mut freed = Vec::with_capacity(to_evict.len());
-        for node_idx in &to_evict {
-            if let Some(bid) = self.nodes[*node_idx].block_id {
+            evicted_set.insert(victim_idx);
+            if let Some(bid) = self.nodes[victim_idx].block_id.take() {
                 freed.push(bid);
-                self.nodes[*node_idx].block_id = None;
             }
         }
 
-        // Remove evicted leaf nodes from their parents.
-        // We do this by scanning all nodes for children pointing to evicted nodes.
-        let evicted_set: std::collections::HashSet<usize> = to_evict.iter().copied().collect();
-
+        // Physically remove evicted children from their parents' child maps.
+        // Unreachable nodes stay in `self.nodes` — their indices remain stable
+        // for any in-flight lookup that may still reference them, and the
+        // next eviction pass will not see them again because their children
+        // have been rewired away.
         for node in &mut self.nodes {
             node.children
                 .retain(|_, child_idx| !evicted_set.contains(child_idx));
@@ -547,6 +581,149 @@ mod tests {
         assert_eq!(cache.cached_block_count(), 1);
 
         cache.insert(&[5, 6, 7, 8], &bids(&[20]));
+        assert_eq!(cache.cached_block_count(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Regression tests for SGLang-parity fixes (2026-04-13):
+    //   - Bug 1: split must inherit ref_count from the old child
+    //   - Bug 3: evict() must cascade through orphaned parents in one call
+    //   - Sanity: lookup() already path-bumps every block-bearing node on
+    //     the matched path (this is NOT the B1-research "Bug 2" — the
+    //     current code already handles this correctly; document it so a
+    //     future refactor does not regress).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a 3-deep block chain `[100, 200, 300]` covering tokens
+    /// `[1..=12]` at `block_size=4`. Each node holds one block.
+    fn chain_tree() -> RadixCache {
+        let mut cache = RadixCache::new(4);
+        cache.insert(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            &bids(&[100, 200, 300]),
+        );
+        cache
+    }
+
+    #[test]
+    fn lookup_bumps_every_block_bearing_node_on_path() {
+        // Sanity test documenting that `lookup()` bumps ref_count on ALL
+        // block-bearing nodes along the matched path (not only the leaf).
+        // This was the behavior before the 2026-04-13 fix series; keep a
+        // test so it stays that way.
+        let mut cache = chain_tree();
+        let (_, blocks) = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(blocks, bids(&[100, 200, 300]));
+
+        // Find each block-bearing node and check ref_count == 1.
+        let ref_counts: Vec<u32> = cache
+            .nodes
+            .iter()
+            .filter(|n| n.block_id.is_some())
+            .map(|n| n.ref_count)
+            .collect();
+        assert_eq!(ref_counts.len(), 3, "expected 3 block-bearing nodes");
+        for (i, rc) in ref_counts.iter().enumerate() {
+            assert_eq!(*rc, 1, "node {i} ref_count should be 1 after lookup");
+        }
+    }
+
+    #[test]
+    fn split_node_inherits_ref_count_from_child() {
+        // Build a single-prefix tree, lock it with a lookup, then trigger
+        // a split by inserting a diverging suffix. The shared intermediate
+        // node (block_id=None) must inherit the old child's ref_count so a
+        // future GC pass cannot prune it out from under the in-flight lock.
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+
+        // Lock the deep child by looking it up.
+        let (_, blocks) = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(blocks, bids(&[10, 20]));
+
+        // After lookup: the [5,6,7,8] leaf has ref_count == 1.
+        // Insert a diverging suffix that forces a split at token 4.
+        // Before the split the existing [1..=8] edge is already a chain of
+        // two full-block nodes: [1,2,3,4] (block 10) and [5,6,7,8] (block
+        // 20). So inserting [1,2,3,4,5,6,9,10] matches the first block
+        // fully and splits the SECOND node at its 3rd token (5,6 shared,
+        // then diverges 7,8 vs 9,10).
+        cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
+
+        // Walk the tree from the root to the shared intermediate node and
+        // verify it inherited `ref_count == 1`. Structurally: root → [1..4]
+        // (block 10, ref 1) → shared [5,6] (no block, ref 1 via inherit)
+        // → [7,8] (block 20, ref 1) and → [9,10] (block 99, ref 0).
+        let root_child = *cache.nodes[0].children.values().next().unwrap();
+        let first_block_node = &cache.nodes[root_child];
+        assert_eq!(first_block_node.block_id, Some(BlockId(10)));
+        assert_eq!(first_block_node.ref_count, 1);
+
+        // Descend to the shared split node.
+        let shared_idx = *first_block_node.children.values().next().unwrap();
+        let shared_node = &cache.nodes[shared_idx];
+        assert!(
+            shared_node.block_id.is_none(),
+            "shared split node should not carry a block_id"
+        );
+        assert_eq!(
+            shared_node.ref_count, 1,
+            "shared split node must inherit ref_count from the locked child"
+        );
+    }
+
+    #[test]
+    fn evict_cascades_through_orphaned_parent_chain() {
+        // Insert a 3-deep chain with no branches. Evict all three blocks in
+        // ONE call — the prior implementation would stop after evicting the
+        // deepest leaf because the parents were not re-examined.
+        let mut cache = chain_tree();
+        assert_eq!(cache.cached_block_count(), 3);
+
+        let freed = cache.evict(3);
+        assert_eq!(
+            freed.len(),
+            3,
+            "evict(3) on a 3-deep chain must cascade through parents in one call"
+        );
+        assert_eq!(cache.cached_block_count(), 0);
+
+        // The freed blocks arrive in LRU order: 300 (deepest, oldest by tie)
+        // then 200 then 100. The exact ordering depends on `last_access`
+        // bookkeeping — just make sure the set matches.
+        let mut freed_sorted: Vec<u32> = freed.iter().map(|b| b.0).collect();
+        freed_sorted.sort_unstable();
+        assert_eq!(freed_sorted, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn evict_cascade_respects_limit_n() {
+        // Same chain, but only evict 2 — the oldest leaf and the
+        // newly-orphaned middle node.
+        let mut cache = chain_tree();
+        let freed = cache.evict(2);
+        assert_eq!(freed.len(), 2);
+        assert_eq!(cache.cached_block_count(), 1, "one block should remain");
+    }
+
+    #[test]
+    fn evict_cascade_respects_ref_count() {
+        // Chain with a locked middle node: evict should stop when it
+        // reaches a node with ref_count > 0.
+        let mut cache = chain_tree();
+
+        // Lookup the middle prefix to bump [1..4] and [5..8]. The deepest
+        // node [9..12] is NOT in the lookup range → ref_count = 0.
+        let _ = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let freed = cache.evict(3);
+        // Only the deepest leaf (block 300) can be evicted; the middle
+        // (200) and top (100) are pinned by the outstanding lookup.
+        assert_eq!(
+            freed,
+            bids(&[300]),
+            "only the unlocked deepest leaf should be evicted"
+        );
         assert_eq!(cache.cached_block_count(), 2);
     }
 }
