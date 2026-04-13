@@ -1408,6 +1408,9 @@ dependencies = [
  "futures-util",
  "half",
  "hf-hub",
+ "infer-core",
+ "infer-observability",
+ "infer-policy",
  "libc",
  "log",
  "logforth",
@@ -1425,6 +1428,27 @@ dependencies = [
  "tokio-stream",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "infer-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "infer-observability"
+version = "0.1.0"
+dependencies = [
+ "infer-core",
+]
+
+[[package]]
+name = "infer-policy"
+version = "0.1.0"
+dependencies = [
+ "infer-core",
 ]
 
 [[package]]
