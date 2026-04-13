@@ -1,6 +1,6 @@
 <p align="center">
   <strong>agent-infer</strong><br>
-  <em>KV-cache-first inference engine for LLM agents. Pure Rust + CUDA.</em>
+  <em>KV-cache-first inference engine for LLM agents. Pure Rust, with CUDA as the primary serving path.</em>
 </p>
 
 <p align="center">
@@ -103,8 +103,9 @@ Current support should be read conservatively:
 - **CUDA on Linux** is the primary supported serving path.
 - **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
   scheduler runtime.
-- **CPU-only / `no-cuda`** is a development and testing path, not a production
-  inference target.
+- **CPU-only / `no-cuda`** now includes a development-oriented CPU backend for
+  local smoke tests and request-path validation, but it is still not a
+  production inference target.
 
 Governance references:
 
@@ -241,6 +242,10 @@ The CLI keeps conversation history across turns, stores line history in `~/.agen
 cargo test --no-default-features --features no-cuda   # Unit tests (no GPU)
 cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # Format
+
+# CPU backend smoke path (downloads runtime assets like config/tokenizer, not full weights)
+cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
+  --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E (requires GPU + model weights)
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e

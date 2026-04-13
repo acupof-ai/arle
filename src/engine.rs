@@ -1,9 +1,9 @@
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use anyhow::Result;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use anyhow::anyhow;
 
 use infer::server_engine::{CompleteOutput, CompleteRequest, FinishReason};
@@ -13,16 +13,18 @@ use infer::bootstrap::EngineOptions;
 #[cfg(feature = "cuda")]
 use infer::server_engine::LoadedServerEngine;
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::backend::InferenceBackend;
+#[cfg(feature = "cpu")]
+use infer::cpu_backend::CpuBackend;
 #[cfg(feature = "metal")]
 use infer::metal_backend::MetalBackend;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::sampler::SamplingParams;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::server_engine::Usage;
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(msg) => *msg,
@@ -50,7 +52,7 @@ impl AgentEngine for LoadedServerEngine {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cpu"))]
 pub struct BackendAgentEngine<B: InferenceBackend> {
     model_id: String,
     backend: B,
@@ -68,7 +70,19 @@ impl BackendAgentEngine<MetalBackend> {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(feature = "cpu")]
+impl BackendAgentEngine<CpuBackend> {
+    pub fn load(model_path: &str) -> Result<Self> {
+        let mut backend = CpuBackend::new();
+        backend.load(Path::new(model_path))?;
+        Ok(Self {
+            model_id: model_id_from_path(model_path),
+            backend,
+        })
+    }
+}
+
+#[cfg(any(feature = "metal", feature = "cpu"))]
 impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
     fn model_id(&self) -> &str {
         &self.model_id
@@ -83,7 +97,8 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
         }))
         .map_err(|panic| {
             anyhow!(
-                "metal backend panicked during completion: {}",
+                "{} backend panicked during completion: {}",
+                self.backend.name(),
                 panic_message(panic)
             )
         })??;
@@ -110,12 +125,14 @@ impl<B: InferenceBackend> AgentEngine for BackendAgentEngine<B> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub enum LoadedAgentEngine {
     #[cfg(feature = "cuda")]
     Cuda(LoadedServerEngine),
     #[cfg(feature = "metal")]
     Metal(BackendAgentEngine<MetalBackend>),
+    #[cfg(feature = "cpu")]
+    Cpu(BackendAgentEngine<CpuBackend>),
 }
 
 #[cfg(feature = "cuda")]
@@ -136,7 +153,14 @@ impl LoadedAgentEngine {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "cpu"))]
+impl LoadedAgentEngine {
+    pub fn load(model_path: &str, _enable_cuda_graph: bool) -> Result<Self> {
+        Ok(Self::Cpu(BackendAgentEngine::load(model_path)?))
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl LoadedAgentEngine {
     pub fn backend_name(&self) -> &'static str {
         match self {
@@ -144,6 +168,8 @@ impl LoadedAgentEngine {
             Self::Cuda(_) => "cuda",
             #[cfg(feature = "metal")]
             Self::Metal(_) => "metal",
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => "cpu",
         }
     }
 
@@ -155,11 +181,15 @@ impl LoadedAgentEngine {
             Self::Metal(_) => {
                 let _ = max_tokens;
             }
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => {
+                let _ = max_tokens;
+            }
         }
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl AgentEngine for LoadedAgentEngine {
     fn model_id(&self) -> &str {
         match self {
@@ -167,6 +197,8 @@ impl AgentEngine for LoadedAgentEngine {
             Self::Cuda(engine) => engine.model_id(),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.model_id(),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.model_id(),
         }
     }
 
@@ -176,6 +208,8 @@ impl AgentEngine for LoadedAgentEngine {
             Self::Cuda(engine) => engine.complete(req),
             #[cfg(feature = "metal")]
             Self::Metal(engine) => engine.complete(req),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.complete(req),
         }
     }
 }
