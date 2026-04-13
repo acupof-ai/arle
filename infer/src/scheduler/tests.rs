@@ -13,6 +13,7 @@ fn make_request() -> IncomingRequest {
         sampling: SamplingParams::default(),
         stop: None,
         priority: RequestPriority::Normal,
+        session_id: None,
         delta_tx: tx,
     }
 }

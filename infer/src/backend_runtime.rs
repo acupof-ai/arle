@@ -406,6 +406,7 @@ mod tests {
                 sampling: SamplingParams::default(),
                 stop,
                 priority: crate::scheduler::RequestPriority::default(),
+                session_id: None,
                 delta_tx,
             },
             delta_rx,

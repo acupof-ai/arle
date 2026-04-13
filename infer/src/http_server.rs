@@ -46,6 +46,7 @@ struct RequestExecutionOptions {
     include_usage: bool,
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
+    session_id: Option<infer_core::SessionId>,
 }
 
 impl RequestExecutionOptions {
@@ -67,6 +68,7 @@ impl RequestExecutionOptions {
                 req.stop_token_ids.clone(),
             ),
             stop: req.stop.clone(),
+            session_id: req.session_id_parsed(),
         }
     }
 
@@ -88,6 +90,7 @@ impl RequestExecutionOptions {
                 req.stop_token_ids.clone(),
             ),
             stop: req.stop.clone(),
+            session_id: req.session_id_parsed(),
         }
     }
 
@@ -102,6 +105,7 @@ impl RequestExecutionOptions {
             sampling: self.sampling,
             stop: self.stop,
             priority: RequestPriority::default(),
+            session_id: self.session_id,
             delta_tx,
         }
     }

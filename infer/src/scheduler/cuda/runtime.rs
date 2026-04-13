@@ -110,6 +110,7 @@ impl<M: ModelForward> Scheduler<M> {
                 max_tokens: incoming.max_tokens,
                 sampling: incoming.sampling,
                 stop: incoming.stop,
+                session_id: incoming.session_id,
                 delta_tx: incoming.delta_tx,
                 full_decoded: String::new(),
                 decoded_token_count: 0,
