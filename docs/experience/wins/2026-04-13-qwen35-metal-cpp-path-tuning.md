@@ -372,6 +372,47 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
 - 收益来自真正的高频层内 helper，而不是尾部一次性算子
 - 因此可以保留为默认路径
 
+### Systematic readout: why the gain is still small
+
+为了避免再被单次 benchmark 的顺序噪音误导，这轮额外加了两个消融开关：
+
+- `AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER=0`
+- `AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER=0`
+
+然后用交错顺序做了 A/B，不再只看单次直跑。
+
+得到的结论是：
+
+1. 这两刀 helper 不是“全局大头”，只能动到 GDR 层里很窄的一段。
+   - 它们优化的是 `sigmoid/softplus/exp` 这类 elementwise 和 `q/k rms_norm` 这类小 helper。
+   - 但长 prefill 的主成本仍然是更重的部分：量化 matmul、`gated_delta_kernel` 本体、以及后续投影。
+   - 所以它们天然不可能带来大幅 TTFT 改写。
+
+2. 长 prefill 上，这两刀已经接近噪音底。
+   - `2048 / 1` 交错 A/B 的中位数几乎不分胜负：
+     - helpers on: `TTFT 2714.83 ms`, `prompt 754.38 tok/s`
+     - helpers off: `TTFT 2710.29 ms`, `prompt 755.64 tok/s`
+   - 这说明对真正的长上下文 prefill 来说，helper-level cleanup 不是下一层级的主战场。
+
+3. `decode-heavy` 上，helper 甚至略有副作用。
+   - `1 / 128` 交错 A/B 中位数：
+     - helpers on: `generation 80.26 tok/s`, `repo_e2e 79.08 tok/s`
+     - helpers off: `generation 80.43 tok/s`, `repo_e2e 79.32 tok/s`
+   - 差距不大，但方向上说明这些 helper 并不是 decode 的核心优化点。
+
+4. 因此常见 `128 / 128` workload 上看到的收益只会是“小幅改善”，不会是数量级变化。
+   - helper on 的 mixed workload 中位数优于 helper off，但原因更像是短到中等 prompt 段里减少了部分 host-side helper 调度成本
+   - 一旦 prompt 再长，真正主导时间的还是大 matmul 和 `gated_delta_kernel`
+
+最终判断：
+
+- 这些 helper 值得保留，因为方向正确、回归风险低、而且短中 prompt 确实能吃到一点收益
+- 但它们已经接近“榨干小头”的阶段了
+- 下一层级的收益如果想明显再上一个台阶，必须转去更重的结构性热点：
+  - `gated_delta_kernel` 本体
+  - GDR prefill 的 projection / state-update 组合
+  - 更大粒度的 sequence-level / chunk-level fuse
+
 ### Control check on newer HEAD
 
 在 `37a8a82` 之后，仓库主线合入了 `prefix_cache / kv_tier` 相关提交。为了确认它们没有把 `metal_bench` 的 direct Metal path 弄慢，做了同机对照：
