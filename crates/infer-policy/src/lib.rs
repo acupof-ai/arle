@@ -151,6 +151,192 @@ impl ChunkingPolicy for DecodeAwareChunking {
     }
 }
 
+/// Snapshot of one eviction candidate as the coordinator sees it. Pure data —
+/// the coordinator builds these from its own bookkeeping and hands them to
+/// [`EvictionPolicy::score`], which only scores. Sibling shape to
+/// [`SchedulerSignals`]: small, [`Copy`], no allocations.
+///
+/// Field semantics:
+/// - `slot`: coordinator-assigned slot index. Useful for [`SessionBiasedLru`]
+///   (bonus when matching `signals.session_affinity_slot`) and for
+///   deterministic tie-breaking.
+/// - `tokens`: number of tokens this candidate represents (one block, one
+///   slot, one radix node — depends on the granularity of the caller).
+/// - `last_access_step`: monotonic scheduler tick. Higher = more recent. The
+///   coordinator picks the unit (per-step counter, per-decode counter, etc.).
+/// - `hit_count`: how many requests reused this candidate. Used by
+///   [`HitCountLru`] to protect "warm" prefixes from immediate eviction.
+/// - `prefix_depth`: radix-tree depth. Reserved for future policies that
+///   prefer to keep deep shared prefixes; current default impls do not read
+///   it but it costs nothing to surface.
+/// - `pinned`: `true` ⇒ a request is currently using this candidate's KV
+///   (refcount > 0 in the coordinator's bookkeeping). All shipped policies
+///   return [`f32::INFINITY`] when this is set, so pinned candidates are
+///   never selected for eviction. Maps to SGLang's `lock_ref > 0` and
+///   vLLM's `KVCacheBlock::ref_cnt > 0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvictionCandidate {
+    pub slot: u32,
+    pub tokens: u32,
+    pub last_access_step: u64,
+    pub hit_count: u32,
+    pub prefix_depth: u32,
+    pub pinned: bool,
+}
+
+impl EvictionCandidate {
+    /// Convenience constructor for tests and policy-only call sites that do
+    /// not need every field. Defaults: `pinned = false`, everything else `0`.
+    pub fn new(slot: u32, last_access_step: u64) -> Self {
+        Self {
+            slot,
+            tokens: 0,
+            last_access_step,
+            hit_count: 0,
+            prefix_depth: 0,
+            pinned: false,
+        }
+    }
+}
+
+/// A policy that ranks eviction candidates. The coordinator scores every
+/// candidate it owns and evicts in ascending score order: **lower = evict
+/// first**, [`f32::INFINITY`] = pinned (never evict).
+///
+/// This trait is a sibling of [`AdmissionPolicy`] and [`ChunkingPolicy`]:
+/// pure scoring, `Send + Sync`, no IO, no mutable state in the hot path.
+/// Stateful policies (e.g. the future `ReuseDistancePolicy` from KVFlow-lite)
+/// keep their state inside the impl struct via `Mutex` / `RwLock` and still
+/// expose this stateless interface.
+pub trait EvictionPolicy: Send + Sync {
+    /// Score a single candidate against the current scheduler signals.
+    ///
+    /// Lower scores are evicted first. Return [`f32::INFINITY`] for pinned
+    /// candidates (refcount > 0, in-flight requests). Return values are
+    /// finite floats elsewhere; policies should avoid NaN.
+    fn score(&self, candidate: EvictionCandidate, signals: SchedulerSignals) -> f32;
+}
+
+/// Plain LRU: oldest `last_access_step` evicts first. Pinned candidates are
+/// protected. Mirrors vLLM's `FreeKVCacheBlockQueue` recency-only ordering
+/// (cached blocks tail-pushed at release; popped from the head). The
+/// closest analogue in SGLang is the fallback path inside
+/// `radix_cache.RadixCache.evict()` when no priority strategy is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LruEviction;
+
+impl EvictionPolicy for LruEviction {
+    fn score(&self, candidate: EvictionCandidate, _signals: SchedulerSignals) -> f32 {
+        if candidate.pinned {
+            return f32::INFINITY;
+        }
+        // Lower last_access_step ⇒ older ⇒ smaller score ⇒ evict first.
+        candidate.last_access_step as f32
+    }
+}
+
+/// LRU biased by reuse count: blocks that were hit often survive longer
+/// even when they are slightly older. Lifts vLLM's recency-only baseline
+/// with KVFlow-style temporal-locality × hit-count weighting (KVFlow §3,
+/// arXiv:2507.07400).
+///
+/// `recency_weight` and `hit_weight` are taste knobs. The default
+/// `Default` impl uses `(1.0, 8.0)`: a hit is worth eight steps of recency.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReuseBiasedLru {
+    pub recency_weight: f32,
+    pub hit_weight: f32,
+}
+
+impl Default for ReuseBiasedLru {
+    fn default() -> Self {
+        Self {
+            recency_weight: 1.0,
+            hit_weight: 8.0,
+        }
+    }
+}
+
+impl EvictionPolicy for ReuseBiasedLru {
+    fn score(&self, candidate: EvictionCandidate, _signals: SchedulerSignals) -> f32 {
+        if candidate.pinned {
+            return f32::INFINITY;
+        }
+        let recency = candidate.last_access_step as f32 * self.recency_weight;
+        let reuse = candidate.hit_count as f32 * self.hit_weight;
+        recency + reuse
+    }
+}
+
+/// Two-tier eviction: candidates with `hit_count >= hit_threshold` are
+/// pinned (never evicted by this policy). Below the threshold, falls back
+/// to plain LRU. Mirrors SGLang's `write_through_selective` heuristic
+/// (`hiradix_cache.py`, `write_through_threshold` default = 2): only blocks
+/// with at least two hits are considered "warm" and worth protecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitCountLru {
+    pub hit_threshold: u32,
+}
+
+impl Default for HitCountLru {
+    fn default() -> Self {
+        Self { hit_threshold: 2 }
+    }
+}
+
+impl EvictionPolicy for HitCountLru {
+    fn score(&self, candidate: EvictionCandidate, _signals: SchedulerSignals) -> f32 {
+        if candidate.pinned {
+            return f32::INFINITY;
+        }
+        if candidate.hit_count >= self.hit_threshold {
+            return f32::INFINITY;
+        }
+        candidate.last_access_step as f32
+    }
+}
+
+/// LRU with a session-affinity bonus: when the coordinator is scoring
+/// candidates on behalf of an incoming request whose
+/// [`SchedulerSignals::session_affinity_slot`] is `Some(slot)`, candidates
+/// living in that slot get `affinity_bonus` added to their score so they
+/// outrank cold candidates and survive eviction.
+///
+/// This is the default policy that ships with the Tiered KV Cache project
+/// (P2): it satisfies `agent-first-architecture.md::B3`'s "warm
+/// (session-continuation) requests do not get starved" requirement while
+/// remaining a pure scoring function.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionBiasedLru {
+    pub affinity_bonus: f32,
+}
+
+impl Default for SessionBiasedLru {
+    fn default() -> Self {
+        // Empirically: should be larger than the largest realistic
+        // last_access_step delta within a single decode burst (~10 ks) so a
+        // matching slot wins regardless of how stale its access timestamp is.
+        Self {
+            affinity_bonus: 1.0e6,
+        }
+    }
+}
+
+impl EvictionPolicy for SessionBiasedLru {
+    fn score(&self, candidate: EvictionCandidate, signals: SchedulerSignals) -> f32 {
+        if candidate.pinned {
+            return f32::INFINITY;
+        }
+        let mut score = candidate.last_access_step as f32;
+        if let Some(affinity_slot) = signals.session_affinity_slot
+            && candidate.slot as usize == affinity_slot
+        {
+            score += self.affinity_bonus;
+        }
+        score
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +504,160 @@ mod tests {
             prefix_hit_tokens: 1,
             ..SchedulerSignals::default()
         }));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // EvictionPolicy
+    // ──────────────────────────────────────────────────────────────────
+
+    fn cold_signals() -> SchedulerSignals {
+        SchedulerSignals::default()
+    }
+
+    fn warm_signals(slot: usize) -> SchedulerSignals {
+        SchedulerSignals {
+            session_affinity_slot: Some(slot),
+            ..SchedulerSignals::default()
+        }
+    }
+
+    #[test]
+    fn eviction_candidate_new_defaults() {
+        let c = EvictionCandidate::new(7, 42);
+        assert_eq!(c.slot, 7);
+        assert_eq!(c.last_access_step, 42);
+        assert_eq!(c.tokens, 0);
+        assert_eq!(c.hit_count, 0);
+        assert_eq!(c.prefix_depth, 0);
+        assert!(!c.pinned);
+    }
+
+    #[test]
+    fn lru_eviction_orders_by_recency() {
+        // Three candidates: oldest first should evict first.
+        let policy = LruEviction;
+        let oldest = EvictionCandidate::new(0, 10);
+        let middle = EvictionCandidate::new(1, 30);
+        let newest = EvictionCandidate::new(2, 50);
+
+        let s_old = policy.score(oldest, cold_signals());
+        let s_mid = policy.score(middle, cold_signals());
+        let s_new = policy.score(newest, cold_signals());
+
+        assert!(s_old < s_mid);
+        assert!(s_mid < s_new);
+    }
+
+    #[test]
+    fn lru_eviction_pins_in_use_candidates() {
+        // pinned == true → INFINITY → never evicted.
+        let policy = LruEviction;
+        let pinned = EvictionCandidate {
+            pinned: true,
+            ..EvictionCandidate::new(0, 0)
+        };
+        assert_eq!(policy.score(pinned, cold_signals()), f32::INFINITY);
+    }
+
+    #[test]
+    fn all_default_policies_pin_in_use_candidates() {
+        // Every shipped policy must honor the pinned invariant.
+        let pinned = EvictionCandidate {
+            pinned: true,
+            slot: 0,
+            tokens: 16,
+            last_access_step: 0,
+            hit_count: 0,
+            prefix_depth: 0,
+        };
+        let signals = cold_signals();
+
+        assert_eq!(LruEviction.score(pinned, signals), f32::INFINITY);
+        assert_eq!(
+            ReuseBiasedLru::default().score(pinned, signals),
+            f32::INFINITY
+        );
+        assert_eq!(HitCountLru::default().score(pinned, signals), f32::INFINITY);
+        assert_eq!(
+            SessionBiasedLru::default().score(pinned, signals),
+            f32::INFINITY
+        );
+    }
+
+    #[test]
+    fn reuse_biased_lru_protects_hot_blocks() {
+        // Two candidates: one is older but hit many times; should outscore
+        // the slightly newer cold one.
+        let policy = ReuseBiasedLru::default(); // recency=1, hit=8
+        let hot_old = EvictionCandidate {
+            hit_count: 5, // adds 40 to score
+            ..EvictionCandidate::new(0, 100)
+        };
+        let cold_new = EvictionCandidate::new(1, 120); // score = 120
+
+        let s_hot = policy.score(hot_old, cold_signals());
+        let s_cold = policy.score(cold_new, cold_signals());
+
+        // hot_old: 100 + 40 = 140; cold_new: 120 + 0 = 120
+        assert!(s_hot > s_cold, "hot {s_hot} should outscore cold {s_cold}");
+    }
+
+    #[test]
+    fn hit_count_lru_pins_above_threshold() {
+        // hit_count >= threshold → INFINITY (warm pin).
+        // hit_count < threshold → falls back to LRU.
+        let policy = HitCountLru { hit_threshold: 2 };
+        let warm = EvictionCandidate {
+            hit_count: 2,
+            ..EvictionCandidate::new(0, 100)
+        };
+        let single_hit = EvictionCandidate {
+            hit_count: 1,
+            ..EvictionCandidate::new(1, 50)
+        };
+        let no_hits = EvictionCandidate::new(2, 30);
+
+        assert_eq!(policy.score(warm, cold_signals()), f32::INFINITY);
+
+        // Both below-threshold candidates fall back to LRU; older = lower.
+        let s_hit = policy.score(single_hit, cold_signals());
+        let s_none = policy.score(no_hits, cold_signals());
+        assert!(s_none < s_hit);
+        assert!(s_hit.is_finite());
+        assert!(s_none.is_finite());
+    }
+
+    #[test]
+    fn session_biased_lru_protects_affinity_slot() {
+        // When signals.session_affinity_slot points at slot 3, candidates in
+        // slot 3 get the affinity bonus and outscore older non-affinity ones.
+        let policy = SessionBiasedLru::default();
+
+        // Newer cold candidate in slot 7.
+        let cold_new = EvictionCandidate::new(7, 1_000);
+        // Older candidate in the affinity slot (3).
+        let warm_old = EvictionCandidate::new(3, 100);
+
+        let signals = warm_signals(3);
+        let s_cold = policy.score(cold_new, signals);
+        let s_warm = policy.score(warm_old, signals);
+
+        // warm_old gets affinity_bonus (1e6) added → outscores cold_new.
+        assert!(
+            s_warm > s_cold,
+            "session-biased warm {s_warm} should outscore cold {s_cold}"
+        );
+    }
+
+    #[test]
+    fn session_biased_lru_falls_back_to_lru_without_affinity() {
+        // When signals.session_affinity_slot is None, this is just LRU.
+        let policy = SessionBiasedLru::default();
+        let older = EvictionCandidate::new(0, 10);
+        let newer = EvictionCandidate::new(1, 50);
+
+        let s_old = policy.score(older, cold_signals());
+        let s_new = policy.score(newer, cold_signals());
+        assert!(s_old < s_new);
     }
 }
