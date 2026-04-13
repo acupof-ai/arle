@@ -69,7 +69,7 @@ infer/src/main.rs
 Key files:
 
 - `infer/src/main.rs`: CUDA server binary
-- `infer/src/bootstrap.rs`: model loading, runtime config, scheduler bring-up
+- `infer/src/backend/cuda/bootstrap.rs`: model loading, runtime config, scheduler bring-up
 - `infer/src/http_server.rs` and `infer/src/http_server/openai_v1.rs`: HTTP API
 - `infer/src/server_engine.rs`: synchronous/streaming server-engine façade and generation loop
 - `infer/src/scheduler/cuda/`: production CUDA scheduler implementation
@@ -80,16 +80,16 @@ The non-CUDA runtime path uses a serial request loop:
 
 ```text
 cpu_serve / metal_serve
-  -> backend_runtime.rs
+  -> backend/runtime.rs
   -> CpuBackend or MetalBackend
   -> request streaming through StopChunkProcessor
 ```
 
 Key files:
 
-- `infer/src/backend_runtime.rs`: serial runtime handle for backends without the CUDA scheduler
-- `infer/src/cpu_backend.rs`: development-oriented CPU backend
-- `infer/src/metal_backend.rs`: Apple Silicon backend via `mlx-sys`
+- `infer/src/backend/runtime.rs`: serial runtime handle for backends without the CUDA scheduler
+- `infer/src/backend/cpu.rs`: development-oriented CPU backend
+- `infer/src/backend/metal.rs`: Apple Silicon backend via `mlx-sys`
 - `infer/src/bin/cpu_serve.rs`
 - `infer/src/bin/metal_serve.rs`
 
@@ -99,9 +99,9 @@ Key files:
 
 These files sit near the top of the runtime stack:
 
-- `infer/src/bootstrap.rs`: builds CUDA engines, loads tokenizer/model, and applies runtime config
+- `infer/src/backend/cuda/bootstrap.rs`: builds CUDA engines, loads tokenizer/model, and applies runtime config
 - `infer/src/server_engine.rs`: shared request contract (`CompleteRequest`, `CompleteOutput`, streaming deltas) and CUDA generation loop
-- `infer/src/backend_runtime.rs`: serial backend runtime for CPU/Metal request handling
+- `infer/src/backend/runtime.rs`: serial backend runtime for CPU/Metal request handling
 - `infer/src/http_server.rs`: axum wiring for serving
 - `infer/src/request_handle.rs`: generic request submission interface
 - `infer/src/logging.rs`: default logging init
@@ -128,26 +128,26 @@ The CUDA scheduler is internally split by behavior:
 
 Metal has a separate planning/accounting scheduler in:
 
-- `infer/src/metal_scheduler.rs`
+- `infer/src/backend/metal/scheduler.rs`
 
-This Metal scheduler is currently useful as a policy/accounting layer and test target; the actual Metal serving path still goes through `backend_runtime.rs`.
+This Metal scheduler is currently useful as a policy/accounting layer and test target; the actual Metal serving path still goes through `backend/runtime.rs`.
 
 ### 3.3 Memory, KV, caching, and batching support
 
 The runtime’s memory/caching pieces live here:
 
 - `infer/src/block_manager.rs`: GPU/CPU KV block accounting for the batch scheduler
-- `infer/src/paged_kv.rs`: token-level KV pool for CUDA paged attention
+- `infer/src/backend/cuda/paged_kv.rs`: token-level KV pool for CUDA paged attention
 - `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse
 - `infer/src/memory_planner.rs`: memory planning helpers
-- `infer/src/cuda_graph_pool.rs`: CUDA graph capture/reuse support
-- `infer/src/flashinfer_metadata.rs`: paged-KV metadata staging for FlashInfer
+- `infer/src/backend/cuda/graph_pool.rs`: CUDA graph capture/reuse support
+- `infer/src/backend/cuda/flashinfer.rs`: paged-KV metadata staging for FlashInfer
 
 Metal-specific cache/state helpers are separate:
 
-- `infer/src/metal_kv_pool.rs`
-- `infer/src/metal_prefix_cache.rs`
-- `infer/src/metal_gdr.rs`
+- `infer/src/backend/metal/kv_pool.rs`
+- `infer/src/backend/metal/prefix_cache.rs`
+- `infer/src/backend/metal/gdr.rs`
 
 ### 3.4 Models, kernels, and numerics
 
@@ -177,7 +177,7 @@ The operator layer lives in:
 
 Lower-level runtime support:
 
-- `infer/src/tensor.rs`: CUDA tensor/device abstractions
+- `infer/src/backend/cuda/tensor.rs`: CUDA tensor/device abstractions
 - `infer/src/weight_loader.rs`: weight loading
 - `infer/src/gguf.rs`: GGUF parsing
 - `infer/src/quant.rs`: quantization metadata + dispatch
@@ -190,8 +190,8 @@ Lower-level runtime support:
 Backend interfaces:
 
 - `infer/src/backend.rs`: backend traits and shared generate result types
-- `infer/src/cpu_backend.rs`
-- `infer/src/metal_backend.rs`
+- `infer/src/backend/cpu.rs`
+- `infer/src/backend/metal.rs`
 
 Runtime/benchmark binaries:
 
@@ -206,7 +206,7 @@ Runtime/benchmark binaries:
 
 - `infer/src/trace_reporter.rs`: file-based fastrace reporter
 - `infer/src/error.rs`: runtime error helpers
-- `infer/src/ffi.rs`: CUDA-only FFI bindings
+- `infer/src/backend/cuda/ffi.rs`: CUDA-only FFI bindings
 
 ## 4. Extracted crate map
 
@@ -301,9 +301,9 @@ Runtime- and model-focused implementation notes:
 
 - Agent/CLI behavior: start at `crates/infer-cli/src/lib.rs`, `crates/infer-cli/src/repl.rs`, `crates/infer-agent/src/lib.rs`
 - Tool behavior: start at `crates/infer-tools/src/lib.rs`
-- Backend loading / model discovery: start at `crates/infer-engine/src/lib.rs`, then `infer/src/hf_hub.rs` and `infer/src/bootstrap.rs`
+- Backend loading / model discovery: start at `crates/infer-engine/src/lib.rs`, then `infer/src/hf_hub.rs` and `infer/src/backend/cuda/bootstrap.rs`
 - CUDA serving scheduler: start at `infer/src/scheduler/mod.rs`, then `infer/src/scheduler/cuda/`
-- Metal serving path: start at `infer/src/metal_backend.rs`, `infer/src/backend_runtime.rs`, and `infer/src/metal_scheduler.rs`
+- Metal serving path: start at `infer/src/backend/metal.rs`, `infer/src/backend/runtime.rs`, and `infer/src/backend/metal/scheduler.rs`
 - GGUF / quantization / kernels: start at `infer/src/gguf.rs`, `infer/src/quant.rs`, `infer/src/ops/`, and `infer/csrc/`
 - HTTP API behavior: start at `infer/src/http_server.rs` and `infer/src/server_engine.rs`
 

@@ -170,6 +170,13 @@ cargo test -p infer --release -- <test_name>
 # Metal test suite (Apple Silicon)
 cargo test --release --no-default-features --features metal
 
+# Type-check CUDA-gated Rust on non-CUDA hosts (Darwin, CI without nvcc).
+# The `no-cuda` feature makes build.rs skip nvcc; the `cuda` feature still
+# enables `#[cfg(feature = "cuda")]` so rustc processes every CUDA-gated
+# module. Use this to validate refactors that touch CUDA-only code paths
+# before shipping to a CUDA host.
+cargo check -p infer --no-default-features --features cuda,no-cuda
+
 # Python tests
 pip install -e ".[dev]"
 python -m pytest tests/ -v
@@ -189,30 +196,36 @@ agent-infer/          ← top-level Cargo workspace
 ├── agent_infer/      ← Python agent package (async HTTP client mode)
 ├── infer/            ← Inference engine (Rust library + GPU kernels)
 │   ├── src/
-│   │   ├── model/              ← Model impls: qwen3/, qwen35/, glm4/
-│   │   ├── ops/                ← Tensor ops (attention, linear, norm, …)
-│   │   ├── scheduler/          ← CUDA multi-request continuous batching
-│   │   ├── metal_backend/      ← Metal backend module (Apple Silicon)
-│   │   ├── metal_*.rs          ← Metal scheduler, KV pool, prefix cache, GDR
-│   │   ├── backend.rs          ← Backend abstraction (CUDA vs. Metal)
-│   │   ├── backend_runtime.rs  ← Runtime dispatch over backends
-│   │   ├── model_registry.rs   ← Model ID → builder map
-│   │   ├── sampler.rs          ← Sampling strategies
-│   │   ├── http_server/        ← OpenAI-compatible HTTP API
-│   │   └── server_engine.rs    ← Single-request inference façade
-│   ├── csrc/cuda/              ← CUDA C kernels
-│   ├── csrc/metal/             ← C++ bridge glue for the Metal backend (metal_fused_ops.cpp, metal_fused_capi.cpp) — actual Metal kernels ship via MLX through mlx-sys
-│   ├── mlx-sys/                ← Bindgen bridge to MLX C++ API
-│   └── tools/triton/           ← Triton Python kernels (AOT compiled)
+│   │   ├── backend.rs           ← `InferenceBackend` trait + submodule declarations
+│   │   ├── backend/
+│   │   │   ├── cuda.rs + cuda/  ← CUDA plumbing: ffi, tensor, paged_kv,
+│   │   │   │                      graph_pool, flashinfer, bootstrap
+│   │   │   ├── metal.rs + metal/ ← Metal/MLX backend + its scheduler,
+│   │   │   │                       KV pool, prefix cache, GDR, mlx bridge
+│   │   │   ├── cpu.rs            ← Development CPU backend (feature `cpu`)
+│   │   │   └── runtime.rs        ← Serial runtime handle shared by CPU/Metal
+│   │   ├── model/               ← Model impls: qwen3/, qwen35/, glm4/
+│   │   ├── ops/                 ← Tensor ops (attention, linear, norm, …)
+│   │   ├── scheduler/           ← CUDA multi-request continuous batching
+│   │   ├── model_registry.rs    ← Model ID → builder map
+│   │   ├── sampler.rs           ← Sampling strategies
+│   │   ├── http_server/         ← OpenAI-compatible HTTP API
+│   │   └── server_engine.rs     ← Single-request inference façade
+│   ├── csrc/cuda/{attention,gemm,kv,quant,misc}/  ← CUDA C kernels, grouped
+│   ├── csrc/metal/              ← C++ bridge glue (metal_fused_ops.cpp,
+│   │                              metal_fused_capi.cpp) — real Metal
+│   │                              kernels ship via MLX through mlx-sys
+│   ├── mlx-sys/                 ← Bindgen bridge to MLX C++ API
+│   └── tools/triton/            ← Triton Python kernels (AOT compiled)
 └── scripts/          ← Benchmark + utility scripts
 ```
 
 ### Key abstractions
 
 - **`ModelForward` trait** (`infer/src/model.rs`) — `forward(&self, tokens, state)`; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable), per-request state in associated `State` type.
-- **`Backend` trait** (`infer/src/backend.rs`) — abstracts CUDA vs. Metal execution; selected at compile time via `--features cuda|metal`. `backend_runtime.rs` dispatches at runtime.
+- **`InferenceBackend` trait** (`infer/src/backend.rs`) — abstracts CUDA vs. Metal vs. CPU execution; selected at compile time via `--features cuda|metal|cpu`. `backend::runtime` dispatches at runtime for the serial backends (Metal/CPU).
 - **`Scheduler`** (`infer/src/scheduler/`) — CUDA multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
-- **`MetalScheduler`** (`infer/src/metal_scheduler.rs`) — Metal counterpart with its own KV pool (`metal_kv_pool.rs`) and prefix cache (`metal_prefix_cache.rs`).
+- **Metal scheduler** (`infer/src/backend/metal/scheduler.rs`) — Metal counterpart with its own KV pool (`backend/metal/kv_pool.rs`) and prefix cache (`backend/metal/prefix_cache.rs`).
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
 - **`GenericServerEngine`** (`server_engine.rs`) — single-request engine for REPL/agent CLI.
 
@@ -222,12 +235,12 @@ Each model is a flat module: `infer/src/model/<name>.rs` + `infer/src/model/<nam
 
 ### GPU kernel integration
 
-- **CUDA**: `infer/csrc/cuda/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/ffi.rs`. `build.rs` compiles CUDA C (auto-detects SM), runs Triton AOT, links FlashInfer.
+- **CUDA**: `infer/csrc/cuda/{attention,gemm,kv,quant,misc}/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/backend/cuda/ffi.rs`. `build.rs` recursively collects every `.cu` under `csrc/cuda/`, passes `-I csrc/cuda/` to nvcc so `common.cuh` resolves from any subdir, auto-detects SM, runs Triton AOT, links FlashInfer.
 - **Metal**: `infer/csrc/metal/` holds C++ bridge code (`metal_fused_ops.cpp`, `metal_fused_capi.cpp`) that calls into MLX — there are no `.metal` shader files here. The actual Metal kernels live inside the MLX library and are reached through `infer/mlx-sys/` (bindgen bridge to the MLX C++ API). Enabled via `--features metal`; `libc` pulled in for `getrusage`-based RSS reporting.
 
 ### Key references
 
-[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Backend trait](infer/src/backend.rs) · [Metal backend](infer/src/metal_backend.rs) · [Roadmap](ROADMAP.md)
+[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Backend trait](infer/src/backend.rs) · [Metal backend](infer/src/backend/metal.rs) · [CUDA backend](infer/src/backend/cuda.rs) · [Roadmap](ROADMAP.md)
 
 ---
 
