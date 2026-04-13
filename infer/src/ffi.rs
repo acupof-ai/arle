@@ -26,6 +26,43 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// RMSNorm that reads an fp32 input and writes bf16 output. Used by the
+    /// fp32 residual shadow in Qwen3 prefill to feed the GEMMs bf16 without
+    /// first rounding the residual accumulator through bf16.
+    pub(crate) fn rms_norm_batched_f32_in_cuda(
+        x: *const f32,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// fp32 += bf16 element-wise accumulator (for residual shadow).
+    pub(crate) fn add_bf16_into_f32_cuda(
+        out: *mut f32,
+        r#in: *const Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// bf16 → fp32 cast (initialise residual shadow from embedding output).
+    pub(crate) fn cast_bf16_to_f32_cuda(
+        r#in: *const Half,
+        out: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// fp32 → bf16 cast (hand back bf16 hidden at end of prefill).
+    pub(crate) fn cast_f32_to_bf16_cuda(
+        r#in: *const f32,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub(crate) fn add_cuda(
         a: *const Half,
         b: *const Half,
@@ -1061,6 +1098,72 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── Q6_K (GGUF) native packed GEMV / dequant ───
+
+    pub(crate) fn q6k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q6k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q6k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // ─── Q3_K (GGUF) native packed GEMV / dequant ───
+    //
+    // Weights stored verbatim as 110-byte superblocks. Layout:
+    // hmask(32) | qs(64, 2-bit) | scales(12, 6-bit signed, -8..55) | d:f16(2).
+    // Per-row byte stride = `(K / 256) * 110`.
+
+    pub(crate) fn q3k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q3k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn q3k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
         stream: CUstream,
     ) -> CUresult;
 

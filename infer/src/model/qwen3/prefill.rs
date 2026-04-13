@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use half::bf16;
 
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
@@ -17,6 +18,12 @@ use crate::tensor::{DeviceContext, DeviceVec, HiddenStates};
 struct PrefillBuffers {
     /// Output ping-pong: layer writes result here; caller swaps with the incoming hidden.
     hidden_out: HiddenStates, // hidden_dim × seq_len
+    /// fp32 shadow of the residual stream. Maintained across layers so that
+    /// per-layer bf16 outputs accumulate into fp32 without compounding
+    /// ~0.4% bf16 rounding noise at each residual add. Norm reads from here
+    /// directly to avoid a further bf16 round-trip on the hidden state.
+    /// `None` unless `PEGAINFER_QWEN3_FP32_RESIDUAL=1` is set.
+    residual_f32: Option<CudaSlice<f32>>,
     normed: HiddenStates,      // hidden_dim × seq_len (reused for normed2)
     q_batch: HiddenStates,     // q_dim × seq_len
     k_batch: HiddenStates,     // kv_dim × seq_len
@@ -37,8 +44,18 @@ impl PrefillBuffers {
         inter_dim: usize,
         seq_len: usize,
     ) -> Result<Self> {
+        let residual_f32 = if std::env::var("PEGAINFER_QWEN3_FP32_RESIDUAL").is_ok() {
+            Some(
+                ctx.stream
+                    .alloc_zeros::<f32>(hidden_dim * seq_len)
+                    .map_err(|e| anyhow::anyhow!("alloc residual_f32: {e}"))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             hidden_out: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
+            residual_f32,
             normed: HiddenStates::zeros(ctx, hidden_dim, seq_len)?,
             q_batch: HiddenStates::zeros(ctx, q_dim, seq_len)?,
             k_batch: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
@@ -88,6 +105,11 @@ impl Qwen3Model {
             seq_len,
         )?;
 
+        // If fp32 residual shadow is enabled, seed it from the bf16 embedding.
+        if let Some(ref mut r) = bufs.residual_f32 {
+            ops::cast_bf16_to_f32(&self.ctx, &hidden, r)?;
+        }
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_layer_batch(
                 layer_idx,
@@ -97,6 +119,12 @@ impl Qwen3Model {
                 kv_cache,
                 &mut bufs,
             )?;
+        }
+
+        // If fp32 residual shadow was active, convert back to bf16 for the
+        // final norm + LM head which still consume bf16.
+        if let Some(ref r) = bufs.residual_f32 {
+            ops::cast_f32_to_bf16(&self.ctx, r, &mut hidden)?;
         }
 
         // Increment sequence length AFTER all layers processed
@@ -178,6 +206,12 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} pre-norm hidden"),
+            self.config.hidden_size,
+        );
         // 1. RMSNorm
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -185,6 +219,12 @@ impl Qwen3Model {
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.normed,
+            &format!("L{layer_idx} after-input-norm"),
+            self.config.hidden_size,
         );
 
         // 2. QKV projections
@@ -260,6 +300,12 @@ impl Qwen3Model {
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} after-attn+residual"),
+            self.config.hidden_size,
+        );
 
         ops::rms_norm_batch_into(
             &self.ctx,
@@ -291,6 +337,12 @@ impl Qwen3Model {
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} layer-end"),
+            self.config.hidden_size,
+        );
 
         Ok(())
     }
@@ -321,13 +373,37 @@ impl Qwen3Model {
 
         kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
-        // 1. RMSNorm → bufs.normed
-        ops::rms_norm_batch_into(
+        crate::model::common::debug_dump_hidden(
             &self.ctx,
             hidden,
-            &layer.input_layernorm,
-            self.config.rms_norm_eps,
-            &mut bufs.normed,
+            &format!("L{layer_idx} pre-norm hidden"),
+            self.config.hidden_size,
+        );
+        // 1. RMSNorm → bufs.normed. When the fp32 residual shadow is active,
+        //    read from it directly — skipping the bf16 rounding in `hidden`.
+        if let Some(ref r) = bufs.residual_f32 {
+            ops::rms_norm_batch_f32_in_into(
+                &self.ctx,
+                r,
+                &layer.input_layernorm,
+                &mut bufs.normed,
+                hidden.seq_len,
+                self.config.rms_norm_eps,
+            )?;
+        } else {
+            ops::rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &layer.input_layernorm,
+                self.config.rms_norm_eps,
+                &mut bufs.normed,
+            );
+        }
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.normed,
+            &format!("L{layer_idx} after-input-norm"),
+            self.config.hidden_size,
         );
 
         // 2. QKV projections → bufs.q_batch, bufs.k_batch, bufs.v_batch
@@ -348,6 +424,24 @@ impl Qwen3Model {
             &layer.attention.v_proj,
             &bufs.normed,
             &mut bufs.v_batch,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.q_batch,
+            &format!("L{layer_idx} q_proj_out (pre-norm-rope)"),
+            bufs.q_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.k_batch,
+            &format!("L{layer_idx} k_proj_out (pre-norm-rope)"),
+            bufs.k_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.v_batch,
+            &format!("L{layer_idx} v_proj_out"),
+            bufs.v_batch.hidden_dim,
         );
 
         // 3. FlashAttention-2 (Triton) → bufs.attn_output
@@ -376,6 +470,18 @@ impl Qwen3Model {
             &heads,
             start_pos,
         )?;
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.q_batch,
+            &format!("L{layer_idx} q (post-norm-rope)"),
+            bufs.q_batch.hidden_dim,
+        );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.attn_output,
+            &format!("L{layer_idx} attn_output (pre-o-proj)"),
+            bufs.attn_output.hidden_dim,
+        );
         // Quantize newly written KV tokens → INT8 storage (no-op for BF16)
         kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
@@ -386,20 +492,50 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            &bufs.o_buf,
+            &format!("L{layer_idx} o_proj_out"),
+            bufs.o_buf.hidden_dim,
+        );
 
-        // 5. Residual add: hidden_in + o_batch → bufs.hidden_out
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
-        // Swap: hidden = attn_residual, bufs.hidden_out = old hidden_in (now free)
-        std::mem::swap(hidden, &mut bufs.hidden_out);
-
-        // 6. MLP RMSNorm → bufs.normed (reused for normed2; steps 1-4 are done)
-        ops::rms_norm_batch_into(
+        // 5. Residual add: hidden + o_buf.
+        //    With fp32 shadow: accumulate into residual_f32 (fp32 precision),
+        //    then sync hidden for downstream bf16 consumers / debug dumps.
+        //    Without shadow: use the classic bf16 add + swap path.
+        if let Some(ref mut r) = bufs.residual_f32 {
+            ops::add_bf16_into_f32(&self.ctx, r, &bufs.o_buf)?;
+            ops::cast_f32_to_bf16(&self.ctx, r, hidden)?;
+        } else {
+            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            std::mem::swap(hidden, &mut bufs.hidden_out);
+        }
+        crate::model::common::debug_dump_hidden(
             &self.ctx,
             hidden,
-            &layer.post_attention_layernorm,
-            self.config.rms_norm_eps,
-            &mut bufs.normed,
+            &format!("L{layer_idx} after-attn+residual"),
+            self.config.hidden_size,
         );
+
+        // 6. MLP RMSNorm → bufs.normed.
+        if let Some(ref r) = bufs.residual_f32 {
+            ops::rms_norm_batch_f32_in_into(
+                &self.ctx,
+                r,
+                &layer.post_attention_layernorm,
+                &mut bufs.normed,
+                hidden.seq_len,
+                self.config.rms_norm_eps,
+            )?;
+        } else {
+            ops::rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &layer.post_attention_layernorm,
+                self.config.rms_norm_eps,
+                &mut bufs.normed,
+            );
+        }
 
         // 7. MLP: gate + up → act → down → bufs.o_buf (reused for mlp_out; step 5 is done)
         ops::gemm_into(
@@ -422,10 +558,20 @@ impl Qwen3Model {
             &mut bufs.o_buf,
         );
 
-        // 8. Residual add: attn_residual + mlp_out → bufs.hidden_out (old hidden_in, free to overwrite)
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
-        // Swap: hidden = layer output, bufs.hidden_out = attn_residual (free next layer)
-        std::mem::swap(hidden, &mut bufs.hidden_out);
+        // 8. Residual add: attn_residual + mlp_out.
+        if let Some(ref mut r) = bufs.residual_f32 {
+            ops::add_bf16_into_f32(&self.ctx, r, &bufs.o_buf)?;
+            ops::cast_f32_to_bf16(&self.ctx, r, hidden)?;
+        } else {
+            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            std::mem::swap(hidden, &mut bufs.hidden_out);
+        }
+        crate::model::common::debug_dump_hidden(
+            &self.ctx,
+            hidden,
+            &format!("L{layer_idx} layer-end"),
+            self.config.hidden_size,
+        );
 
         Ok(())
     }

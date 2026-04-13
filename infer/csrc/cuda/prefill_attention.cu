@@ -50,13 +50,16 @@ __global__ void prefill_qk_norm_rope_kernel(
     }
     __syncthreads();
 
-    // Match HF precision: round to bf16 after norm, then multiply weight
-    __nv_bfloat16 normed = __float2bfloat16(val * s_inv_rms);
-    float normed_f = __bfloat162float(normed) * __bfloat162float(norm_w[d]);
+    // Keep everything in fp32 between rsqrt and RoPE output — ggml/llama.cpp
+    // does `x * inv_rms * weight` without bf16 rounding in the middle, and
+    // our previous "round to bf16 then multiply weight" pattern compounds
+    // noise layer-by-layer. Drop ~2 bf16 rounding points per head per token.
+    float normed_f = val * s_inv_rms * __bfloat162float(norm_w[d]);
 
-    // RoPE via shared memory exchange
-    __shared__ __nv_bfloat16 smem[HEAD_DIM];
-    smem[d] = __float2bfloat16(normed_f);
+    // RoPE via shared memory exchange — use fp32 smem so the pair lookup
+    // doesn't lose precision either.
+    __shared__ float smem[HEAD_DIM];
+    smem[d] = normed_f;
     __syncthreads();
 
     int half = head_dim / 2;
@@ -64,15 +67,15 @@ __global__ void prefill_qk_norm_rope_kernel(
 
     __nv_bfloat16 result;
     if (d < half) {
-        float lo = __bfloat162float(smem[d]);
-        float hi = __bfloat162float(smem[d + half]);
+        float lo = smem[d];
+        float hi = smem[d + half];
         float c = __bfloat162float(cos_cache[pos * head_dim + d]);
         float s = __bfloat162float(sin_cache[pos * head_dim + d]);
         result = __float2bfloat16(lo * c - hi * s);
     } else {
         int pair_d = d - half;
-        float lo = __bfloat162float(smem[pair_d]);
-        float hi = __bfloat162float(smem[d]);
+        float lo = smem[pair_d];
+        float hi = smem[d];
         float c = __bfloat162float(cos_cache[pos * head_dim + pair_d]);
         float s = __bfloat162float(sin_cache[pos * head_dim + pair_d]);
         result = __float2bfloat16(lo * s + hi * c);
