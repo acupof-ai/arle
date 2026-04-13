@@ -13,6 +13,7 @@
 | **Resources** | |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
 | [architecture.md](architecture.md) | Current workspace/package topology and runtime split |
+| [codebase-map.md](codebase-map.md) | Current code map: runtime, crates, docs, tests, and entrypoints |
 | [stability-policy.md](stability-policy.md) | Governance draft: stable/beta/experimental/internal surface classification |
 | [support-matrix.md](support-matrix.md) | Governance draft: current backend / platform / model / quantization support levels |
 | [compatibility.md](compatibility.md) | Governance draft: breaking-change, deprecation, and migration policy |
