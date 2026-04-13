@@ -48,7 +48,11 @@ mod config;
 #[cfg(feature = "metal")]
 mod loader;
 #[cfg(feature = "metal")]
+pub mod ops;
+#[cfg(feature = "metal")]
 mod qwen35;
+#[cfg(feature = "metal")]
+pub mod sampling;
 #[cfg(feature = "metal")]
 pub mod weights;
 
@@ -67,6 +71,10 @@ pub mod scheduler;
 use self::kv_pool::MetalKVPool;
 #[cfg(feature = "metal")]
 use self::mlx::MlxArray;
+#[cfg(feature = "metal")]
+use self::ops::{clear_metal_cache, extend_kv_cache, linear};
+#[cfg(feature = "metal")]
+use self::sampling::gpu_sample_token;
 #[cfg(feature = "metal")]
 use self::weights::{
     MetalWeights, MlpInputProjection, StandardMetalLayerWeights, StandardMetalWeights,
@@ -565,7 +573,7 @@ fn metal_generate(
     let rope_base = config.rope_theta as f32;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
     let use_kv_pool = metal_kv_pool_enabled();
-    validate_metal_sampling_params(params)?;
+    self::sampling::validate_metal_sampling_params(params)?;
 
     log::info!("Metal transformer path: Rust/MLX");
     if use_kv_pool {
@@ -630,7 +638,7 @@ fn metal_generate(
         params,
     )?;
     // P6: schedule GPU execution without blocking CPU.
-    metal_async_eval(&prefill_token)?;
+    self::ops::metal_async_eval(&prefill_token)?;
     cache_len += prefill_len;
 
     // ── Phase 2: Decode loop (double-buffered — P3/P6) ────────────────────────
@@ -668,15 +676,15 @@ fn metal_generate(
         if !use_kv_pool && cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
             for li in 0..n_layers {
-                extend_kv_cache(&mut k_caches[li], n_kv_heads, head_dim, new_cap)?;
-                extend_kv_cache(&mut v_caches[li], n_kv_heads, head_dim, new_cap)?;
+                self::ops::extend_kv_cache(&mut k_caches[li], n_kv_heads, head_dim, new_cap)?;
+                self::ops::extend_kv_cache(&mut v_caches[li], n_kv_heads, head_dim, new_cap)?;
             }
             kv_capacity = new_cap;
         }
 
         // P5: release accumulated temporary Metal allocations every 256 steps.
         if decode_step > 0 && decode_step.is_multiple_of(256) {
-            clear_metal_cache();
+            self::ops::clear_metal_cache();
         }
 
         let new_pending = build_forward_graph(
@@ -699,7 +707,7 @@ fn metal_generate(
         decode_step += 1;
 
         // P6: kick off GPU — CPU syncs at top of next iteration via item().
-        metal_async_eval(&new_pending)?;
+        self::ops::metal_async_eval(&new_pending)?;
 
         pending = new_pending;
     };
@@ -716,39 +724,6 @@ fn metal_generate(
         ttft_ms,
         total_time_ms,
     })
-}
-
-#[cfg(feature = "metal")]
-fn metal_async_eval(arr: &MlxArray) -> Result<()> {
-    self::mlx::async_eval(&[arr]);
-    Ok(())
-}
-
-#[cfg(feature = "metal")]
-fn clear_metal_cache() {
-    self::mlx::clear_cache();
-}
-
-#[cfg(feature = "metal")]
-fn extend_kv_cache(
-    cache: &mut MlxArray,
-    n_kv_heads: i32,
-    head_dim: i32,
-    new_cap: i32,
-) -> Result<()> {
-    use self::mlx::{concatenate_axis, zeros};
-
-    let current_cap = cache.shape().get(2).copied().unwrap_or_default();
-    if new_cap <= current_cap {
-        return Ok(());
-    }
-
-    let extra = zeros(
-        &[1, n_kv_heads, new_cap - current_cap, head_dim],
-        cache.dtype(),
-    );
-    *cache = concatenate_axis(&[cache.clone(), extra], 2);
-    Ok(())
 }
 
 /// Build one forward-pass compute graph (lazy — no GPU work until eval/async_eval).
@@ -812,10 +787,10 @@ fn build_forward_graph(
     let last_idx = MlxArray::from_slice_i32(&[seq - 1], &[1]);
     let last_x = take_axis(&x, &last_idx, 0);
     let last_x = rms_norm(&last_x, &weights.norm, eps);
-    let logits = linear(&last_x, &weights.lm_head); // [1, vocab]
+    let logits = self::ops::linear(&last_x, &weights.lm_head); // [1, vocab]
 
     // P4: GPU-side sampling — stays on GPU, only scalar crosses on .item() later.
-    gpu_sample_token(&logits, params)
+    self::sampling::gpu_sample_token(&logits, params)
 }
 
 /// Single transformer layer for the maintained Rust/MLX Qwen3 path.
@@ -915,7 +890,7 @@ fn rust_transformer_layer(
     // 9. Reshape + output proj + residual
     let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
     let attn_out = reshape(&attn_out, &[seq, n_heads * head_dim]);
-    let attn_out = linear(&attn_out, &layer.o_proj);
+    let attn_out = self::ops::linear(&attn_out, &layer.o_proj);
     let x = add(&residual, &attn_out);
 
     // 10. MLP
@@ -923,91 +898,8 @@ fn rust_transformer_layer(
     let xn = rms_norm(&x, &layer.post_attention_layernorm, eps);
     let (gate_raw, up) = layer.mlp_inputs.project(&xn);
     let gate = silu(&gate_raw);
-    let mlp = linear(&multiply(&gate, &up), &layer.down_proj);
+    let mlp = self::ops::linear(&multiply(&gate, &up), &layer.down_proj);
     Ok(add(&residual2, &mlp))
-}
-
-#[cfg(feature = "metal")]
-fn validate_metal_sampling_params(params: &SamplingParams) -> Result<()> {
-    let mut unsupported = Vec::new();
-
-    if params.top_k != -1 && params.top_k != 1 {
-        unsupported.push(format!("top_k={}", params.top_k));
-    }
-    if params.top_p < 1.0 {
-        unsupported.push(format!("top_p={}", params.top_p));
-    }
-    if params.min_p > 0.0 {
-        unsupported.push(format!("min_p={}", params.min_p));
-    }
-    if params.repetition_penalty != 1.0 {
-        unsupported.push(format!("repetition_penalty={}", params.repetition_penalty));
-    }
-    if params.frequency_penalty != 0.0 {
-        unsupported.push(format!("frequency_penalty={}", params.frequency_penalty));
-    }
-    if params.presence_penalty != 0.0 {
-        unsupported.push(format!("presence_penalty={}", params.presence_penalty));
-    }
-    if let Some(seed) = params.seed {
-        unsupported.push(format!("seed={seed}"));
-    }
-
-    anyhow::ensure!(
-        unsupported.is_empty(),
-        "Metal backend currently supports only temperature sampling and greedy decoding (top_k=1); unsupported sampling params: {}",
-        unsupported.join(", ")
-    );
-
-    Ok(())
-}
-
-/// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
-#[cfg(feature = "metal")]
-fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
-    if params.temperature <= 1e-6 || params.top_k == 1 {
-        return Ok(greedy_sample_token(logits));
-    }
-
-    // Temperature scaling then GPU categorical sample.
-    let inv_t = MlxArray::scalar_f32(1.0f32 / params.temperature);
-    let scaled = self::mlx::multiply(logits, &inv_t);
-    Ok(categorical_sample_token(&scaled))
-}
-
-#[cfg(feature = "metal")]
-fn greedy_sample_token(logits: &MlxArray) -> MlxArray {
-    self::mlx::argmax(logits)
-}
-
-#[cfg(feature = "metal")]
-fn categorical_sample_token(logits: &MlxArray) -> MlxArray {
-    self::mlx::categorical(logits)
-}
-
-/// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.
-///
-/// For `Dense(w_t)`, `w_t` is already transposed at load time (shape `[in, out]`),
-/// so this is just `matmul(x, w_t)` without an extra transpose.
-#[cfg(feature = "metal")]
-#[inline]
-fn linear(x: &MlxArray, weight: &WeightTensor) -> MlxArray {
-    match weight {
-        WeightTensor::Dense(w_t) => {
-            // w_t is pre-transposed [in, out]; direct matmul, no per-call transpose.
-            self::mlx::matmul(x, w_t)
-        }
-        WeightTensor::Quantized {
-            w,
-            scales,
-            biases,
-            group_size,
-            bits,
-        } => {
-            // w stored as [out, in] packed uint32; transpose=true → x @ w.T
-            self::mlx::quantized_matmul(x, w, scales, biases, true, *group_size, *bits)
-        }
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
