@@ -57,6 +57,9 @@ pub struct TokenKVPool {
     /// Per-request token mappings: `token_indices[slot][i]` = physical pool index
     /// for logical position `i` of the request occupying that slot.
     token_indices: Vec<Vec<u32>>,
+    /// Monotonic slot epoch bumped whenever a slot is released.
+    /// Lets decode metadata distinguish "same slot index, different request".
+    slot_epochs: Vec<u64>,
 
     // Config
     pub format: KVFormat,
@@ -84,6 +87,57 @@ pub struct FlashInferMeta {
     pub indices: Vec<i32>,
     /// All 1s — each page holds exactly 1 token.
     pub last_page_len: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BudgetBreakdown {
+    storage_bytes_per_token: usize,
+    work_bytes_per_token: usize,
+    total_bytes_per_token: usize,
+    max_total_tokens: usize,
+}
+
+fn compute_budget_breakdown(
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    num_slots: usize,
+    budget_bytes: usize,
+    format: KVFormat,
+) -> BudgetBreakdown {
+    let kv_dim = num_kv_heads * head_dim;
+    let bpe = format.bytes_per_element();
+    let scale_bytes_per_token = if format.has_scales() {
+        num_kv_heads * 4 * 2 // f32 per-head, K+V
+    } else {
+        0
+    };
+    let norm_bytes_per_token = if format.has_norms() {
+        num_kv_heads * 2 * 2 // f16 per-head, K+V
+    } else {
+        0
+    };
+    let data_bytes_per_token = kv_dim * bpe * 2; // K+V
+    let storage_bytes_per_token =
+        (data_bytes_per_token + scale_bytes_per_token + norm_bytes_per_token) * num_layers;
+    let work_bytes_per_token = if format.needs_work_buffer() {
+        kv_dim * 2 * 2 // K+V bf16 working buffers for one layer
+    } else {
+        0
+    };
+    let total_bytes_per_token = storage_bytes_per_token + work_bytes_per_token;
+    let max_total_tokens = if total_bytes_per_token > 0 {
+        (budget_bytes / total_bytes_per_token).max(num_slots)
+    } else {
+        0
+    };
+
+    BudgetBreakdown {
+        storage_bytes_per_token,
+        work_bytes_per_token,
+        total_bytes_per_token,
+        max_total_tokens,
+    }
 }
 
 impl TokenKVPool {
@@ -129,36 +183,21 @@ impl TokenKVPool {
     ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
         let bpe = format.bytes_per_element();
-
-        // Bytes per token: data (K+V) + optional scales (K+V)
-        let scale_bytes_per_token = if format.has_scales() {
-            num_kv_heads * 4 * 2 // f32 per-head, K+V
-        } else {
-            0
-        };
-        let data_bytes_per_token = kv_dim * bpe * 2; // K+V
-        let bytes_per_token = (data_bytes_per_token + scale_bytes_per_token) * num_layers;
-
-        // Fixed cost: 1-layer bf16 working buffer for K+V (when format != BF16)
-        let fixed_cost = if format.needs_work_buffer() {
-            kv_dim * 2 * 2 // K+V, bf16=2 bytes, 1 layer
-        } else {
-            0
-        };
-
-        let effective_budget = budget_bytes.saturating_sub(fixed_cost);
-        let max_total_tokens = if bytes_per_token > 0 {
-            effective_budget / bytes_per_token
-        } else {
-            0
-        };
-        let max_total_tokens = max_total_tokens.max(num_slots);
+        let budget = compute_budget_breakdown(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            num_slots,
+            budget_bytes,
+            format,
+        );
+        let max_total_tokens = budget.max_total_tokens;
 
         info!(
             "TokenKVPool: {} max tokens, {:.1} GB for {} layers \
              ({} kv_heads x {} head_dim, kv_dim={}, format={:?})",
             max_total_tokens,
-            (max_total_tokens as u64 * bytes_per_token as u64 + fixed_cost as u64) as f64 / 1e9,
+            (max_total_tokens as u64 * budget.total_bytes_per_token as u64) as f64 / 1e9,
             num_layers,
             num_kv_heads,
             head_dim,
@@ -248,16 +287,13 @@ impl TokenKVPool {
                 } else {
                     0.0
                 },
-                if format.needs_work_buffer() {
-                    (max_total_tokens * kv_dim * 2 * 2) as f64 / 1e6
-                } else {
-                    0.0
-                },
+                (max_total_tokens * budget.work_bytes_per_token) as f64 / 1e6,
             );
         }
 
         let free_slots: Vec<u32> = (0..max_total_tokens as u32).rev().collect();
         let token_indices = vec![Vec::new(); num_slots];
+        let slot_epochs = vec![0; num_slots];
 
         // INT8 split-KV attention workspace
         let num_splits = 8;
@@ -314,6 +350,7 @@ impl TokenKVPool {
             tq_v_state,
             free_slots,
             token_indices,
+            slot_epochs,
             format,
             dtype,
             num_layers,
@@ -353,6 +390,9 @@ impl TokenKVPool {
 
     /// Free all token slots for a request, returning them to the pool.
     pub fn free_slot(&mut self, slot: usize) {
+        if !self.token_indices[slot].is_empty() {
+            self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
+        }
         for &idx in &self.token_indices[slot] {
             self.free_slots.push(idx);
         }
@@ -367,6 +407,11 @@ impl TokenKVPool {
     /// Get the sequence length for a request (number of tokens allocated).
     pub fn seq_len(&self, slot: usize) -> usize {
         self.token_indices[slot].len()
+    }
+
+    /// Monotonic identifier for the current logical occupant of `slot`.
+    pub fn slot_epoch(&self, slot: usize) -> u64 {
+        self.slot_epochs[slot]
     }
 
     /// Number of free token slots remaining in the pool.
@@ -758,3 +803,61 @@ pub type PagedKVPool = TokenKVPool;
 /// Page size is 1 for token-level pool (used by callers that pass `page_size`
 /// to FlashInfer / CUDA kernels).
 pub const DEFAULT_PAGE_SIZE: usize = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetBreakdown, compute_budget_breakdown};
+    use crate::model::kv_cache::KVFormat;
+
+    #[test]
+    fn bf16_budget_has_no_work_buffer_component() {
+        let budget = compute_budget_breakdown(2, 8, 16, 4, 16_384, KVFormat::BF16);
+        assert_eq!(
+            budget,
+            BudgetBreakdown {
+                storage_bytes_per_token: 1024,
+                work_bytes_per_token: 0,
+                total_bytes_per_token: 1024,
+                max_total_tokens: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn int8_budget_counts_work_buffer_per_token() {
+        let budget = compute_budget_breakdown(2, 8, 16, 4, 16_384, KVFormat::INT8);
+        assert_eq!(budget.storage_bytes_per_token, 640);
+        assert_eq!(budget.work_bytes_per_token, 512);
+        assert_eq!(budget.total_bytes_per_token, 1152);
+        assert_eq!(budget.max_total_tokens, 14);
+    }
+
+    #[test]
+    fn budget_respects_slot_floor_when_budget_is_tiny() {
+        let budget = compute_budget_breakdown(2, 8, 16, 32, 1, KVFormat::FP8E4M3);
+        assert_eq!(budget.max_total_tokens, 32);
+    }
+
+    #[test]
+    fn slot_epoch_advances_only_when_a_live_slot_is_released() {
+        let mut epochs = vec![0_u64, 0_u64];
+        let mut token_indices = vec![vec![10_u32, 11_u32], Vec::<u32>::new()];
+        let mut free_slots = Vec::<u32>::new();
+
+        if !token_indices[0].is_empty() {
+            epochs[0] = epochs[0].saturating_add(1);
+        }
+        for &idx in &token_indices[0] {
+            free_slots.push(idx);
+        }
+        token_indices[0].clear();
+
+        if !token_indices[1].is_empty() {
+            epochs[1] = epochs[1].saturating_add(1);
+        }
+
+        assert_eq!(epochs, vec![1, 0]);
+        assert_eq!(free_slots, vec![10, 11]);
+        assert!(token_indices[0].is_empty());
+    }
+}

@@ -13,8 +13,9 @@
 //!
 //! # GPU stubs
 //!
-//! - Actual CUDA graph capture / replay lives behind `#[cfg(feature = "cuda")]`
-//!   with `todo!("GPU required: ...")` bodies.
+//! - Actual CUDA graph capture / replay is model-specific today. This module
+//!   intentionally does not expose a generic capture entry that pretends to be
+//!   implemented when it is not.
 
 use std::collections::HashMap;
 
@@ -262,19 +263,13 @@ pub fn warmup_schedule(max_batch: usize) -> Vec<usize> {
 // GPU capture stub
 // ============================================================================
 
-/// Capture a CUDA graph for a single decode step at the given batch size.
+/// Generic graph-pool capture is intentionally unavailable.
 ///
-/// **GPU required** — this function panics in CPU builds.
-///
-/// In the GPU implementation:
-/// 1. Pad the input tensors to `batch_size` with dummy tokens.
-/// 2. Begin CUDA stream capture.
-/// 3. Run one forward pass (attention + FFN + sampling).
-/// 4. End capture → store the `CudaGraph` in the pool.
-///
-/// `kernels` is a closure that runs the actual forward pass.
+/// The live CUDA decode path captures graphs in model-specific code where the
+/// tensor layout and replay invariants are known. Callers should use that path
+/// instead of treating [`GraphPool`] as a complete capture implementation.
 #[allow(unused_variables)]
-pub fn capture_decode_graph<F>(
+pub(crate) fn capture_decode_graph<F>(
     pool: &mut GraphPool,
     batch_size: usize,
     kernels: F,
@@ -282,8 +277,10 @@ pub fn capture_decode_graph<F>(
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
-    // GPU required: CUDA graph capture for batched decode
-    todo!("GPU required: CUDA graph capture for batch_size={batch_size}")
+    anyhow::bail!(
+        "generic CUDA graph capture is unavailable for batch_size={batch_size}; \
+         use the model-specific capture path"
+    )
 }
 
 // ============================================================================
@@ -437,5 +434,15 @@ mod tests {
         pool.mark_failed(32);
         assert_eq!(pool.state(32), Some(GraphCaptureState::Failed));
         assert!(!pool.is_ready(32));
+    }
+
+    #[test]
+    fn capture_decode_graph_returns_error_instead_of_panicking() {
+        let mut pool = GraphPool::new();
+        let err = capture_decode_graph(&mut pool, 8, || Ok(())).expect_err("capture should fail");
+        assert!(
+            err.to_string()
+                .contains("generic CUDA graph capture is unavailable")
+        );
     }
 }

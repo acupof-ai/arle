@@ -442,8 +442,44 @@ impl<M: ModelForward> GenericServerEngine<M> {
             .take_while(|(a, b)| a == b)
             .count();
 
-        if prefix_len > 0 && prefix_len == self.cached_prompt.len() {
-            // Full prefix hit — reuse all cached KV.
+        if prefix_len > 0
+            && prefix_len == prompt_tokens.len()
+            && prefix_len == self.cached_prompt.len()
+        {
+            if self.state.supports_partial_prefix() {
+                // Exact prompt match: rewind to N-1 tokens and replay only the
+                // final prompt token so logits reflect the current prompt
+                // without duplicating it in KV.
+                let replay_from = prefix_len.saturating_sub(1);
+                info!(
+                    "KV prefix cache FULL HIT: exact match, replaying final token with {}/{} tokens reused",
+                    replay_from,
+                    prompt_tokens.len()
+                );
+                self.state.truncate_to(replay_from)?;
+                self.cached_prompt.truncate(replay_from);
+                Ok((prompt_tokens[replay_from..].to_vec(), replay_from))
+            } else {
+                // Hybrid/recurrent models cannot safely rewind to N-1 tokens from a
+                // post-prefill snapshot, so prefer correctness over reuse here.
+                info!(
+                    "KV prefix cache FULL HIT: non-truncatable state, falling back to full prefill"
+                );
+                self.state.reset()?;
+                self.cached_prompt.clear();
+                Ok((prompt_tokens.to_vec(), 0))
+            }
+        } else if prefix_len > 0 && prefix_len == prompt_tokens.len() {
+            // The new prompt is a strict prefix of a longer cached prompt.
+            // Replaying just the final token here can leave the state/KV in a
+            // configuration that diverges from a clean prefill, so recompute.
+            info!(
+                "KV prefix cache FULL HIT: cached prompt has extra suffix, recomputing prompt for correctness"
+            );
+            self.state.reset()?;
+            self.cached_prompt.clear();
+            Ok((prompt_tokens.to_vec(), 0))
+        } else if prefix_len > 0 && prefix_len == self.cached_prompt.len() {
             let suffix = prompt_tokens[prefix_len..].to_vec();
             info!(
                 "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
@@ -483,14 +519,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 
     fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
-        let (tokens_to_process, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
-        // tokens_to_process is the suffix that still needs prefill.
-        // If empty (full cache hit), use just the last token to get logits.
-        let effective = if tokens_to_process.is_empty() {
-            vec![*prompt_tokens.last().unwrap()]
-        } else {
-            tokens_to_process
-        };
+        let (effective, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
         let (output_tokens, token_logprobs) = if req.logprobs && req.sampling.is_greedy() {
             generate_tokens_with_logprobs_inner(
                 &self.model,
