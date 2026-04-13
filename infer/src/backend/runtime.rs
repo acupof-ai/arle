@@ -6,11 +6,11 @@ use anyhow::{Result, anyhow};
 use log::error;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "cpu")]
+use super::cpu::CpuBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
-#[cfg(feature = "cpu")]
-use crate::cpu_backend::CpuBackend;
 #[cfg(feature = "metal")]
 use crate::metal_backend::MetalBackend;
 use crate::request_handle::{RequestHandle, SubmitError};

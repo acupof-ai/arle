@@ -12,7 +12,7 @@
 #![cfg(feature = "metal")]
 
 use clap::Parser;
-use infer::backend_runtime::spawn_metal_runtime_handle_from_path;
+use infer::backend::runtime::spawn_metal_runtime_handle_from_path;
 use infer::http_server::build_app;
 use infer::logging;
 use log::info;

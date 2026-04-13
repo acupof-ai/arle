@@ -19,7 +19,7 @@ use infer::server_engine::LoadedServerEngine;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use infer::backend::InferenceBackend;
 #[cfg(feature = "cpu")]
-use infer::cpu_backend::CpuBackend;
+use infer::backend::cpu::CpuBackend;
 #[cfg(feature = "metal")]
 use infer::metal_backend::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
