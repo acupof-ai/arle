@@ -123,6 +123,45 @@ class TurnResult:
 
 
 @dataclass
+class ServerStats:
+    """Parsed snapshot of the server's `/v1/stats` plain-text response.
+
+    The infer server (see `infer/src/http_server.rs:393-409`) emits a
+    single-line key=value blob like::
+
+        requests=0 active=0 waiting=0 tokens_out=0 kv_util=0.0% \
+            ttft_p50=— ttft_p99=— tpot_p50=—
+
+    All fields are optional on the client side because different
+    servers may expose different subsets. Unknown keys are dropped.
+    """
+
+    raw: str
+    fields: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def parse(cls, text: str) -> "ServerStats":
+        fields: dict[str, str] = {}
+        for tok in text.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                fields[k] = v
+        return cls(raw=text.strip(), fields=fields)
+
+    def int_field(self, name: str) -> int | None:
+        v = self.fields.get(name)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"raw": self.raw, "fields": self.fields}
+
+
+@dataclass
 class RunStats:
     label: str
     server: str
@@ -130,6 +169,10 @@ class RunStats:
     num_concurrent: int
     timestamp: str
     turns: list[TurnResult] = field(default_factory=list)
+    # Optional server-side probes taken before/after the run. `None`
+    # means the server did not expose `/v1/stats` or the probe failed.
+    stats_before: ServerStats | None = None
+    stats_after: ServerStats | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -139,12 +182,53 @@ class RunStats:
             "num_concurrent": self.num_concurrent,
             "timestamp": self.timestamp,
             "turns": [t.to_dict() for t in self.turns],
+            "stats_before": self.stats_before.to_dict()
+            if self.stats_before is not None
+            else None,
+            "stats_after": self.stats_after.to_dict()
+            if self.stats_after is not None
+            else None,
         }
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Trace loading
 # ─────────────────────────────────────────────────────────────────────
+
+
+async def fetch_server_stats(
+    client: httpx.AsyncClient, server: str
+) -> ServerStats | None:
+    """Fetch `/v1/stats` as a plain-text blob and parse it.
+
+    Returns `None` if the endpoint is missing, unreachable, or returns
+    a non-200 — the benchmark still runs, we just do not annotate the
+    report with server-side deltas.
+
+    TODO (P3+ server-side): the infer server's `/v1/stats` today
+    exposes `requests`, `active`, `waiting`, `tokens_out`, `kv_util`,
+    `ttft_p50/p99`, `tpot_p50`. It does NOT expose `prefix_hits` or
+    `prefix_hit_tokens` yet — the scheduler has no counters wired in.
+    Until those land, cross-session prefix hit rate is NOT directly
+    observable from this probe; we report the delta of `tokens_out`
+    and the final `kv_util` / `ttft_*` gauges as the best proxy. The
+    add-the-counters change is ~30–50 LOC in `infer/src/metrics.rs`
+    plus a hook in the scheduler's prefix-cache lookup site. See the
+    I1 research report in
+    `docs/plans/tiered-kv-cache-tasks.md` §N.Addendum (or scroll to
+    the bottom of the file for the consolidated remote-validation
+    checklist).
+    """
+    try:
+        resp = await client.get(
+            f"{server.rstrip('/')}/v1/stats",
+            timeout=httpx.Timeout(5.0, connect=5.0),
+        )
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    return ServerStats.parse(resp.text)
 
 
 def load_trace(path: Path) -> list[Session]:
@@ -339,6 +423,18 @@ async def run_benchmark(args: argparse.Namespace) -> RunStats:
 
     semaphore = asyncio.Semaphore(args.num_concurrent)
     async with httpx.AsyncClient(http2=False) as client:
+        # Probe server-side /v1/stats before the run so the reporter can
+        # compute deltas afterwards. Silent on failure — the client-side
+        # metrics are always the primary view.
+        if args.probe_stats:
+            stats.stats_before = await fetch_server_stats(client, args.server)
+            if stats.stats_before is None:
+                print(
+                    "[bench_agent_trace] /v1/stats probe before run returned "
+                    "no data (endpoint missing or unreachable)",
+                    file=sys.stderr,
+                )
+
         session_tasks = [
             _drive_session(client, args.server, sess, args.max_tokens, semaphore)
             for sess in sessions
@@ -346,6 +442,9 @@ async def run_benchmark(args: argparse.Namespace) -> RunStats:
         # as_completed would interleave prints; gather is cleaner for a
         # small benchmark. For large traces add a progress bar later.
         all_results = await asyncio.gather(*session_tasks, return_exceptions=False)
+
+        if args.probe_stats:
+            stats.stats_after = await fetch_server_stats(client, args.server)
 
     for session_results in all_results:
         stats.turns.extend(session_results)
@@ -396,6 +495,7 @@ def _print_aggregate(stats: RunStats) -> None:
     ok_turns = [t for t in stats.turns if t.error is None and t.tokens_out > 0]
     if not ok_turns:
         print("\nno successful turns — check server logs")
+        _print_server_probe(stats)
         return
     ttfts = [t.ttft_ms for t in ok_turns if t.ttft_ms is not None]
     itls = [t.itl_ms for t in ok_turns if t.itl_ms is not None]
@@ -414,12 +514,56 @@ def _print_aggregate(stats: RunStats) -> None:
     print(f"tokens total:    {tokens_total}")
     print(f"wall total (s):  {wall_total / 1000:.2f}")
     if ttfts:
-        print(
-            f"TTFT p50/p99:    {pct(ttfts, 50):.1f} / {pct(ttfts, 99):.1f} ms"
-        )
+        print(f"TTFT p50/p99:    {pct(ttfts, 50):.1f} / {pct(ttfts, 99):.1f} ms")
     if itls:
+        print(f"ITL  p50/p99:    {pct(itls, 50):.1f} / {pct(itls, 99):.1f} ms")
+
+    _print_server_probe(stats)
+
+
+def _print_server_probe(stats: RunStats) -> None:
+    """Report the delta between before/after snapshots of /v1/stats.
+
+    Monotonic counters (`requests`, `tokens_out`) get a computed delta;
+    gauges (`active`, `waiting`, `kv_util`, `ttft_p*`, `tpot_p50`) are
+    shown as their post-run value because delta doesn't make sense for
+    them. If either snapshot is missing, this is a no-op.
+    """
+    before, after = stats.stats_before, stats.stats_after
+    if before is None and after is None:
+        return
+    print()
+    print("server /v1/stats:")
+    if before is None:
+        print("  before: (unavailable)")
+    else:
+        print(f"  before: {before.raw}")
+    if after is None:
+        print("  after:  (unavailable)")
+        return
+    print(f"  after:  {after.raw}")
+
+    # Delta for cumulative counters.
+    if before is not None:
+        counter_deltas: list[tuple[str, int]] = []
+        for name in ("requests", "tokens_out"):
+            b, a = before.int_field(name), after.int_field(name)
+            if b is not None and a is not None:
+                counter_deltas.append((name, a - b))
+        if counter_deltas:
+            pretty = " ".join(f"{name}=+{delta}" for name, delta in counter_deltas)
+            print(f"  delta:  {pretty}")
+
+    # Inform the operator that prefix-hit rate is not yet in /v1/stats.
+    # The I1 research explicitly flagged this: scheduler has no prefix
+    # hit counters today, so cross-session prefix hit rate cannot be
+    # derived from this probe. The P1 exit gate will need a server-side
+    # addition. See TODO in fetch_server_stats().
+    if "prefix_hit_rate" not in after.fields and "prefix_hits" not in after.fields:
         print(
-            f"ITL  p50/p99:    {pct(itls, 50):.1f} / {pct(itls, 99):.1f} ms"
+            "  note:   prefix_hit_rate not exposed by /v1/stats yet; "
+            "server-side counter addition pending (see I1 research in "
+            "docs/plans/tiered-kv-cache-tasks.md)"
         )
 
 
@@ -470,6 +614,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         default=None,
         help="Optional JSON snapshot output path",
+    )
+    p.add_argument(
+        "--probe-stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Poll GET /v1/stats before and after the run; report deltas "
+            "in the aggregate section. Turn off with --no-probe-stats "
+            "when running against servers that do not expose /v1/stats."
+        ),
     )
     return p.parse_args(argv)
 
