@@ -9,8 +9,8 @@
 #![cfg(feature = "cuda")]
 
 use half::bf16;
-use infer::ops;
 use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use infer::ops;
 
 /// Assemble a single Q4_K superblock (144 bytes) with chosen scales and nibbles.
 /// Layout: d(f16) | dmin(f16) | scales_packed(12) | qs(128).

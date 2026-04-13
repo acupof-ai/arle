@@ -14,8 +14,8 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr};
 
 use crate::backend::cuda::ffi;
-use crate::model::turboquant_state::{RotationMode, TurboQuantLayerState};
 use crate::backend::cuda::tensor::DeviceContext;
+use crate::model::turboquant_state::{RotationMode, TurboQuantLayerState};
 
 /// Quantize 1 new token per request from bf16 working buffer → TQ paged pool.
 ///

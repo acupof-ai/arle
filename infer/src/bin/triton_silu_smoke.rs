@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use half::bf16;
-use infer::ops;
 use infer::backend::cuda::tensor::{DeviceContext, HiddenStates};
+use infer::ops;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]

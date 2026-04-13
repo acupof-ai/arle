@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
-use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 use super::tensor::DeviceContext;
+use crate::model::kv_cache::{KVCacheDtype, KVFormat};
 
 /// Token-level KV cache pool — shared across all request slots.
 ///

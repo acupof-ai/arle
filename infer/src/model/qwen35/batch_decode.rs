@@ -15,13 +15,13 @@ use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
 use crate::backend::cuda::flashinfer::FlashInferDecodeMetadata;
+use crate::backend::cuda::paged_kv::PagedKVPool;
+use crate::backend::cuda::tensor::{DeviceContext, HiddenStates};
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
 use crate::ops::kv_quant;
 use crate::ops::kv_turboquant;
-use crate::backend::cuda::paged_kv::PagedKVPool;
-use crate::backend::cuda::tensor::{DeviceContext, HiddenStates};
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 

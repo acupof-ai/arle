@@ -2,8 +2,8 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::backend::cuda::ffi;
-use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 
 /// Gated delta rule recurrent decode (single step, seq_len=1).
 /// Fused CUDA kernel: L2-norm q/k, compute g/beta, decay + rank-1 state update, output.

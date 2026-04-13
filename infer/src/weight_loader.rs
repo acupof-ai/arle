@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-use crate::gguf::{self, GgufFile};
 use crate::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::gguf::{self, GgufFile};
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
