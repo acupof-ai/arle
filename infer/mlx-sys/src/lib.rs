@@ -337,6 +337,18 @@ unsafe extern "C" {
         up_s: *mut mlx_array,
         up_b: *mut mlx_array,
     );
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_set_separate_mlp(
+        model: *mut std::ffi::c_void,
+        gate_w: *mut mlx_array,
+        gate_s: *mut mlx_array,
+        gate_b: *mut mlx_array,
+        mlp_gs: i32,
+        mlp_bits: i32,
+        up_w: *mut mlx_array,
+        up_s: *mut mlx_array,
+        up_b: *mut mlx_array,
+    );
     pub fn qwen35_compiled_finalize(model: *mut std::ffi::c_void) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_step(
