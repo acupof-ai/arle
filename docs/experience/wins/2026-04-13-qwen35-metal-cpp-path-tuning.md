@@ -535,3 +535,34 @@ cargo build --release -p infer --no-default-features --features metal,no-cuda --
 - 旧结论“projection 一定 separate”并不是永远真理，需要随着基线更新重新验证
 - 但这轮重验还不够支持翻默认
 - 因此当前代码里仍保留全局 `separate projection` 作为默认，phase-specific projection 只作为 rejected attempt 记录，不进主线
+
+### Rejected: stage q/k once per timestep inside `gated_delta_kernel`
+
+又试了一条更保守的 kernel 内优化：不改数学，也不把 RMSNorm 塞进去，只是在每个 timestep 里先把 `q/k` 读到局部数组，再复用两次，顺手把 `g_t / beta_t / v_t` 都提前拉成标量。
+
+这条路的预期是减少：
+
+- `k` 的两次全局读取
+- `g_[hv_idx] / beta_[hv_idx]` 的重复访问
+
+但实测没有跑赢，说明这条 kernel 现在更受寄存器压力和 occupancy 约束，而不是单纯受这几次重复读取约束。
+
+串行 A/B：
+
+- `128 / 128 / warmup 1 / runs 3`
+  - cached-qk on: `prompt 677.87`, `generation 73.68`, `repo_e2e 66.46`, `TTFT 188.83 ms`
+  - cached-qk off: `prompt 678.40`, `generation 73.97`, `repo_e2e 66.70`, `TTFT 188.68 ms`
+- `1 / 128 / warmup 1 / runs 5`
+  - cached-qk on: `generation 68.50`, `repo_e2e 67.56`, `TTFT 26.18 ms`
+  - cached-qk off: `generation 72.72`, `repo_e2e 71.74`, `TTFT 24.02 ms`
+- `2048 / 1 / warmup 1 / runs 3`
+  - cached-qk on: `TTFT 3036.50 ms`, `prompt 674.46`, `repo_e2e 0.3253`
+  - cached-qk off: `TTFT 3020.33 ms`, `prompt 678.08`, `repo_e2e 0.3266`
+
+结论：
+
+- 这条实验在 mixed 上基本不成立
+- 在 decode 上是明显负收益
+- 在 long prefill 上也没有赢
+
+因此实现已完全撤掉，不进入主线；只保留实验记录，避免以后重复踩坑。
