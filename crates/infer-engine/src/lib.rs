@@ -87,6 +87,10 @@ impl CudaAgentEngine {
             )?,
         })
     }
+
+    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
+        self.inner.set_max_gpu_kv(max_tokens);
+    }
 }
 
 #[cfg(feature = "cuda")]
