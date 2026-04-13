@@ -129,7 +129,7 @@ Workspace split summary:
 - `infer` continues to own the HTTP server, scheduler, runtime, and backend
   implementations.
 
-See [docs/architecture.md](docs/architecture.md) and [crates/README.md](crates/README.md)
+See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
 for the current package boundaries. This is still an interim Phase 1 split:
 the control-plane crates are separated, but the lower-level scheduler/runtime
 atomization is still pending; enqueue admission and decode-aware chunking now
