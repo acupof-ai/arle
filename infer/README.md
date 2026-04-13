@@ -189,8 +189,8 @@ Also supports `/v1/chat/completions` with `messages` array (ChatML format).
 # Throughput benchmark (matches SGLang bench_serving.py interface)
 python3 scripts/bench_agent.py /path/to/model
 
-# KV cache benchmark
-python3 kv_cache_benchmark.py
+# KV cache prefix benchmark
+python3 scripts/bench_kv_cache_prefix.py
 
 # Latency benchmark (single request, TTFT + TPOT)
 cargo run --release --bin bench_serving
