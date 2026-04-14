@@ -102,17 +102,61 @@ impl GenerationStateBase {
                 self.kv_cache.v_scales(),
                 self.kv_cache.max_seq_len(),
             ),
-            KVFormat::TurboQuant { .. } => {
-                // Phase 1: contiguous cache is BF16. Migrate as BF16 first,
-                // then the pool's quantize path handles TQ conversion per-token.
-                pool.migrate_from_contiguous(
-                    ctx,
-                    slot,
-                    self.kv_cache.k_caches(),
-                    self.kv_cache.v_caches(),
-                    self.kv_cache.max_seq_len(),
-                )
-            }
+            KVFormat::TurboQuant { .. } => pool.migrate_from_contiguous_turboquant_range(
+                ctx,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+                0,
+                pool.token_indices(slot),
+            ),
+        }
+    }
+
+    pub(crate) fn migrate_kv_range_to_paged(
+        &self,
+        ctx: &DeviceContext,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        use super::kv_cache::KVFormat;
+
+        match pool.format {
+            KVFormat::BF16 => pool.migrate_from_contiguous_range(
+                ctx,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+                start_pos,
+                new_token_indices,
+            ),
+            KVFormat::FP8E4M3 => pool.migrate_from_contiguous_fp8_range(
+                ctx,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+                start_pos,
+                new_token_indices,
+            ),
+            KVFormat::INT8 => pool.migrate_from_contiguous_int8_range(
+                ctx,
+                self.kv_cache.k_caches_q(),
+                self.kv_cache.v_caches_q(),
+                self.kv_cache.k_scales(),
+                self.kv_cache.v_scales(),
+                self.kv_cache.max_seq_len(),
+                start_pos,
+                new_token_indices,
+            ),
+            KVFormat::TurboQuant { .. } => pool.migrate_from_contiguous_turboquant_range(
+                ctx,
+                self.kv_cache.k_caches(),
+                self.kv_cache.v_caches(),
+                self.kv_cache.max_seq_len(),
+                start_pos,
+                new_token_indices,
+            ),
         }
     }
 }

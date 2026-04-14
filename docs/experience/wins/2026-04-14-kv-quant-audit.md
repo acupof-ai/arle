@@ -12,21 +12,26 @@
 
 ### Prefill
 
-The production CUDA scheduler does **not** use the `forward_prefill_with_pool()` dual-write hook today. The active path is:
+The production CUDA scheduler still does **not** use the `forward_prefill_with_pool()` dual-write hook today. The active path is now:
 
-1. `model.forward_prefill()` writes contiguous BF16 KV
-2. scheduler allocates paged token indices
-3. `GenerationStateBase::migrate_kv_to_paged()` quantizes and scatters into the paged pool
+1. `model.forward_prefill()` writes contiguous KV
+2. scheduler allocates paged token indices only for the range being materialized
+3. `GenerationStateBase::migrate_kv_range_to_paged()` copies or quantizes only that range into the paged pool
 
-For FP8 this means prefill is already:
+Two important consequences:
+
+- prefix-hit requests no longer re-migrate the already committed prefix
+- prefill migration APIs now work on `start_pos + new_token_indices`, not only on the full `[0..seq_len)` prefix
+
+For FP8 this means prefill migration is:
 
 ```text
-BF16 contiguous KV -> migrate_from_contiguous_fp8()
-                   -> quantize_scatter_kv_fp8()
-                   -> FP8 paged token pool
+BF16 contiguous KV[start_pos..] -> migrate_from_contiguous_fp8_range()
+                                -> quantize_scatter_kv_fp8_range()
+                                -> FP8 paged token pool
 ```
 
-TurboQuant follows the same pattern: contiguous BF16 prefill first, quantize on migration into the paged pool.
+For TurboQuant the migrated contiguous range is first copied into the shared NHD work buffer at the new pool slots, then quantized into packed TurboQuant storage. This fixes the old gap where TurboQuant prefill migration still followed the BF16 copy helper.
 
 ### Decode
 
@@ -70,14 +75,21 @@ The important detail is that FP8 and TurboQuant are **paged-pool formats**, not 
 1. `qwen35` decode planning now skips FlashInfer HD256 planning for non-BF16 KV formats.
 2. `infer --kv-cache-dtype` help text and parsing now expose all supported quantized modes consistently.
 3. Comments in `kv_cache.rs`, `paged_kv.rs`, and `ROADMAP.md` were updated to match the actual FP8/INT8/TurboQuant decode architecture.
-4. `ModelForward::forward_prefill_with_pool()` documentation now reflects that migration-from-contiguous is the active scheduler path.
+4. `ModelForward::forward_prefill_with_pool()` documentation now reflects that incremental range migration is the active scheduler path.
+5. Scheduler prefill now migrates only newly materialized KV ranges into the pool, instead of re-copying the whole prefix+suffix window on prefix hits.
+6. TurboQuant prefill migration now quantizes into packed paged storage instead of falling through the BF16 helper.
 
 ## Takeaway
 
 The CUDA KV quant stack is complete on the production path:
 
-- prefill quantization happens during contiguous -> paged migration
+- prefill quantization happens during contiguous -> paged range migration
 - decode attention is wired for FP8 / INT8 / TurboQuant
 - FP8 and INT8 workspace allocation is already correct
 
-The main issue found in the audit was drift between implementation and documentation, plus one `qwen35` planner path that still behaved as if all decode formats used BF16 FlashInfer planning.
+The main issues found in the audit were:
+
+- drift between implementation and documentation
+- one `qwen35` planner path that still behaved as if all decode formats used BF16 FlashInfer planning
+- prefill migration doing full-window copies instead of suffix-only copies on prefix hits
+- TurboQuant prefill migration missing a real packed-quantized path

@@ -612,117 +612,49 @@ impl TokenKVPool {
     /// in the pool.
     ///
     /// The contiguous cache layout is `[max_seq_len_contiguous, kv_dim]` per layer.
-    pub fn migrate_from_contiguous(
+    fn upload_token_indices(
         &self,
         ctx: &super::tensor::DeviceContext,
-        slot: usize,
+        token_indices: &[u32],
+    ) -> Result<cudarc::driver::CudaSlice<i32>> {
+        let token_indices_i32: Vec<i32> = token_indices.iter().map(|&p| p as i32).collect();
+        ctx.stream
+            .clone_htod(&token_indices_i32)
+            .map_err(|e| anyhow!("H2D token_indices failed: {e}"))
+    }
+
+    fn migrate_from_contiguous_range_bf16(
+        &self,
+        ctx: &super::tensor::DeviceContext,
         contiguous_k_caches: &[super::tensor::DeviceVec],
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
+        start_pos: usize,
+        new_token_indices: &[u32],
+        k_dst_ptr: impl Fn(usize) -> u64,
+        v_dst_ptr: impl Fn(usize) -> u64,
     ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
-
-        let seq_len = self.seq_len(slot);
-        if seq_len == 0 || self.k_data.is_empty() {
+        let token_count = new_token_indices.len();
+        if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
         }
 
-        let token_idxs = &self.token_indices[slot];
-        if token_idxs.is_empty() {
-            return Ok(());
-        }
-
-        let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
-        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&page_indices_i32)
-            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
+        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
-            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
-            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
-            let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
-
             unsafe {
-                super::ffi::kv_cache_to_paged_cuda(
+                super::ffi::kv_cache_to_paged_range_cuda(
                     k_src_ptr as *const super::ffi::Half,
                     v_src_ptr as *const super::ffi::Half,
-                    k_dst_ptr as *mut super::ffi::Half,
-                    v_dst_ptr as *mut super::ffi::Half,
-                    pi_ptr as *const i32,
+                    k_dst_ptr(layer) as *mut super::ffi::Half,
+                    v_dst_ptr(layer) as *mut super::ffi::Half,
+                    ti_ptr as *const i32,
+                    start_pos as i32,
                     max_seq_len_contiguous as i32,
-                    seq_len as i32,
-                    self.num_kv_heads as i32,
-                    1, // page_size = 1
-                    self.head_dim as i32,
-                    self.kv_dim as i32, // stride_page = kv_dim (one token row)
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Migrate INT8 KV data from contiguous per-slot cache into the INT8 token pool.
-    ///
-    /// Copies quantized INT8 data + scales from HND contiguous layout to NHD paged
-    /// layout with scale transposition.
-    pub fn migrate_from_contiguous_int8(
-        &self,
-        ctx: &super::tensor::DeviceContext,
-        slot: usize,
-        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
-        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
-        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
-        max_seq_len_contiguous: usize,
-    ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
-
-        let seq_len = self.seq_len(slot);
-        if seq_len == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
-        let token_idxs = &self.token_indices[slot];
-        if token_idxs.is_empty() {
-            return Ok(());
-        }
-
-        let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
-        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&page_indices_i32)
-            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
-
-        for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
-            let (k_src_ptr, _gk) = contiguous_k_q[layer].device_ptr(&ctx.stream);
-            let (v_src_ptr, _gv) = contiguous_v_q[layer].device_ptr(&ctx.stream);
-            let (ks_src_ptr, _gks) = contiguous_k_scales[layer].device_ptr(&ctx.stream);
-            let (vs_src_ptr, _gvs) = contiguous_v_scales[layer].device_ptr(&ctx.stream);
-            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
-            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
-            let (ks_dst_ptr, _gksd) = self.k_scales[layer].device_ptr(&ctx.stream);
-            let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
-            let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
-
-            unsafe {
-                super::ffi::kv_cache_to_paged_int8_cuda(
-                    k_src_ptr as *const i8,
-                    v_src_ptr as *const i8,
-                    ks_src_ptr as *const f32,
-                    vs_src_ptr as *const f32,
-                    k_dst_ptr as *mut i8,
-                    v_dst_ptr as *mut i8,
-                    ks_dst_ptr as *mut f32,
-                    vs_dst_ptr as *mut f32,
-                    pi_ptr as *const i32,
-                    max_seq_len_contiguous as i32,
-                    seq_len as i32,
+                    token_count as i32,
                     self.num_kv_heads as i32,
                     self.head_dim as i32,
                     self.kv_dim as i32,
@@ -735,10 +667,177 @@ impl TokenKVPool {
         Ok(())
     }
 
+    pub fn migrate_from_contiguous_range(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        self.migrate_from_contiguous_range_bf16(
+            ctx,
+            contiguous_k_caches,
+            contiguous_v_caches,
+            max_seq_len_contiguous,
+            start_pos,
+            new_token_indices,
+            |layer| self.k_data_ptr(layer, &ctx.stream),
+            |layer| self.v_data_ptr(layer, &ctx.stream),
+        )
+    }
+
+    pub fn migrate_from_contiguous(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        slot: usize,
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+    ) -> Result<()> {
+        let token_idxs = &self.token_indices[slot];
+        self.migrate_from_contiguous_range(
+            ctx,
+            contiguous_k_caches,
+            contiguous_v_caches,
+            max_seq_len_contiguous,
+            0,
+            token_idxs,
+        )
+    }
+
+    /// Migrate INT8 KV data from contiguous per-slot cache into the INT8 token pool.
+    ///
+    /// Copies quantized INT8 data + scales from HND contiguous layout to NHD paged
+    /// layout with scale transposition.
+    pub fn migrate_from_contiguous_int8_range(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
+        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
+        max_seq_len_contiguous: usize,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        let token_count = new_token_indices.len();
+        if token_count == 0 || self.k_data.is_empty() {
+            return Ok(());
+        }
+
+        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
+
+        for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
+            let (k_src_ptr, _gk) = contiguous_k_q[layer].device_ptr(&ctx.stream);
+            let (v_src_ptr, _gv) = contiguous_v_q[layer].device_ptr(&ctx.stream);
+            let (ks_src_ptr, _gks) = contiguous_k_scales[layer].device_ptr(&ctx.stream);
+            let (vs_src_ptr, _gvs) = contiguous_v_scales[layer].device_ptr(&ctx.stream);
+            let (k_dst_ptr, _gkd) = self.k_data[layer].device_ptr(&ctx.stream);
+            let (v_dst_ptr, _gvd) = self.v_data[layer].device_ptr(&ctx.stream);
+            let (ks_dst_ptr, _gksd) = self.k_scales[layer].device_ptr(&ctx.stream);
+            let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
+
+            unsafe {
+                super::ffi::kv_cache_to_paged_int8_range_cuda(
+                    k_src_ptr as *const i8,
+                    v_src_ptr as *const i8,
+                    ks_src_ptr as *const f32,
+                    vs_src_ptr as *const f32,
+                    k_dst_ptr as *mut i8,
+                    v_dst_ptr as *mut i8,
+                    ks_dst_ptr as *mut f32,
+                    vs_dst_ptr as *mut f32,
+                    ti_ptr as *const i32,
+                    start_pos as i32,
+                    max_seq_len_contiguous as i32,
+                    token_count as i32,
+                    self.num_kv_heads as i32,
+                    self.head_dim as i32,
+                    self.kv_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn migrate_from_contiguous_int8(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        slot: usize,
+        contiguous_k_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_v_q: &[cudarc::driver::CudaSlice<i8>],
+        contiguous_k_scales: &[cudarc::driver::CudaSlice<f32>],
+        contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
+        max_seq_len_contiguous: usize,
+    ) -> Result<()> {
+        let token_idxs = &self.token_indices[slot];
+        self.migrate_from_contiguous_int8_range(
+            ctx,
+            contiguous_k_q,
+            contiguous_v_q,
+            contiguous_k_scales,
+            contiguous_v_scales,
+            max_seq_len_contiguous,
+            0,
+            token_idxs,
+        )
+    }
+
     /// Migrate BF16 contiguous KV to FP8 paged pool (quantize + scatter).
     ///
     /// Reads bf16 from contiguous HND layout, quantizes to FP8 E4M3, and
     /// scatters to NHD paged layout in a single fused kernel per layer.
+    pub fn migrate_from_contiguous_fp8_range(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        let token_count = new_token_indices.len();
+        if token_count == 0 || self.k_data.is_empty() {
+            return Ok(());
+        }
+
+        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
+            crate::ops::kv_quant::quantize_scatter_kv_fp8_range(
+                ctx,
+                &contiguous_k_caches[layer],
+                self.k_data_ptr(layer, &ctx.stream),
+                &token_indices_gpu,
+                start_pos,
+                max_seq_len_contiguous,
+                token_count,
+                self.num_kv_heads,
+                self.head_dim,
+                self.kv_dim,
+            )?;
+            crate::ops::kv_quant::quantize_scatter_kv_fp8_range(
+                ctx,
+                &contiguous_v_caches[layer],
+                self.v_data_ptr(layer, &ctx.stream),
+                &token_indices_gpu,
+                start_pos,
+                max_seq_len_contiguous,
+                token_count,
+                self.num_kv_heads,
+                self.head_dim,
+                self.kv_dim,
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn migrate_from_contiguous_fp8(
         &self,
         ctx: &super::tensor::DeviceContext,
@@ -747,46 +846,76 @@ impl TokenKVPool {
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
-        let seq_len = self.seq_len(slot);
-        if seq_len == 0 || self.k_data.is_empty() {
-            return Ok(());
-        }
-
         let token_idxs = &self.token_indices[slot];
-        if token_idxs.is_empty() {
+        self.migrate_from_contiguous_fp8_range(
+            ctx,
+            contiguous_k_caches,
+            contiguous_v_caches,
+            max_seq_len_contiguous,
+            0,
+            token_idxs,
+        )
+    }
+
+    pub fn migrate_from_contiguous_turboquant_range(
+        &self,
+        ctx: &super::tensor::DeviceContext,
+        contiguous_k_caches: &[super::tensor::DeviceVec],
+        contiguous_v_caches: &[super::tensor::DeviceVec],
+        max_seq_len_contiguous: usize,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        let token_count = new_token_indices.len();
+        if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
         }
 
-        let page_indices_i32: Vec<i32> = token_idxs.iter().map(|&p| p as i32).collect();
-        let page_indices_gpu: cudarc::driver::CudaSlice<i32> = ctx
-            .stream
-            .clone_htod(&page_indices_i32)
-            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))?;
+        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let k_state = self
+            .tq_k_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("TurboQuant K state missing"))?;
+        let v_state = self
+            .tq_v_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("TurboQuant V state missing"))?;
+
+        self.migrate_from_contiguous_range_bf16(
+            ctx,
+            contiguous_k_caches,
+            contiguous_v_caches,
+            max_seq_len_contiguous,
+            start_pos,
+            new_token_indices,
+            |_| self.k_work_ptr(&ctx.stream),
+            |_| self.v_work_ptr(&ctx.stream),
+        )?;
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            // K: bf16 contiguous → FP8 paged
-            crate::ops::kv_quant::quantize_scatter_kv_fp8(
+            crate::ops::kv_turboquant::turboquant_quantize_paged_single(
                 ctx,
-                &contiguous_k_caches[layer],
-                self.k_data_ptr(layer, &ctx.stream),
-                &page_indices_gpu,
-                max_seq_len_contiguous,
-                seq_len,
+                self.k_work_ptr(&ctx.stream),
+                self.k_data_slice(layer),
+                self.k_norms_slice(layer),
+                &token_indices_gpu,
+                k_state,
+                layer,
                 self.num_kv_heads,
                 self.head_dim,
-                self.kv_dim,
+                token_count,
             )?;
-            // V: bf16 contiguous → FP8 paged
-            crate::ops::kv_quant::quantize_scatter_kv_fp8(
+            crate::ops::kv_turboquant::turboquant_quantize_paged_single(
                 ctx,
-                &contiguous_v_caches[layer],
-                self.v_data_ptr(layer, &ctx.stream),
-                &page_indices_gpu,
-                max_seq_len_contiguous,
-                seq_len,
+                self.v_work_ptr(&ctx.stream),
+                self.v_data_slice(layer),
+                self.v_norms_slice(layer),
+                &token_indices_gpu,
+                v_state,
+                layer,
                 self.num_kv_heads,
                 self.head_dim,
-                self.kv_dim,
+                token_count,
             )?;
         }
 

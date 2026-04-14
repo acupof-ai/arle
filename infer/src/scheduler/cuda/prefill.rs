@@ -181,15 +181,20 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
-            if let Err(e) = self.paged_kv_pool.alloc_tokens(si, pool_prefix_len) {
-                error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
-            } else {
-                let ctx = self.model.device_context();
-                if let Err(e) = state.migrate_kv_to_paged(ctx, &self.paged_kv_pool, si) {
-                    error!(
-                        "Request {}: prefix KV migration to pool failed: {}",
-                        req.id, e
-                    );
+            match self.paged_kv_pool.alloc_tokens(si, pool_prefix_len) {
+                Err(e) => {
+                    error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
+                }
+                Ok(new_indices) => {
+                    let ctx = self.model.device_context();
+                    if let Err(e) =
+                        state.migrate_kv_range_to_paged(ctx, &self.paged_kv_pool, 0, &new_indices)
+                    {
+                        error!(
+                            "Request {}: prefix KV migration to pool failed: {}",
+                            req.id, e
+                        );
+                    }
                 }
             }
         }
@@ -261,12 +266,21 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         if paged_kv_pool.is_active() {
-            if let Err(e) = paged_kv_pool.alloc_tokens(slot_idx, total) {
-                error!("Request {}: pool alloc for migration failed: {}", req.id, e);
-            } else {
-                let ctx = model.device_context();
-                if let Err(e) = state.migrate_kv_to_paged(ctx, paged_kv_pool, slot_idx) {
-                    error!("Request {}: KV migration to pool failed: {}", req.id, e);
+            let pool_start = paged_kv_pool.seq_len(slot_idx);
+            match paged_kv_pool.alloc_tokens(slot_idx, total) {
+                Err(e) => {
+                    error!("Request {}: pool alloc for migration failed: {}", req.id, e);
+                }
+                Ok(new_indices) => {
+                    let ctx = model.device_context();
+                    if let Err(e) = state.migrate_kv_range_to_paged(
+                        ctx,
+                        paged_kv_pool,
+                        pool_start,
+                        &new_indices,
+                    ) {
+                        error!("Request {}: KV migration to pool failed: {}", req.id, e);
+                    }
                 }
             }
         }

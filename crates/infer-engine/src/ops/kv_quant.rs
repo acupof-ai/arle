@@ -203,6 +203,43 @@ pub(crate) fn quantize_scatter_kv_fp8(
     Ok(())
 }
 
+/// Quantize + scatter a contiguous bf16 KV range `[start_pos, start_pos + token_count)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_scatter_kv_fp8_range(
+    ctx: &DeviceContext,
+    kv_cont: &DeviceVec,
+    kv_fp8_ptr: u64,
+    page_indices_gpu: &CudaSlice<i32>,
+    start_pos: usize,
+    max_seq_len: usize,
+    token_count: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+) -> Result<()> {
+    if token_count == 0 {
+        return Ok(());
+    }
+    let (cont_ptr, _g1) = kv_cont.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _g2) = page_indices_gpu.device_ptr(&ctx.stream);
+    unsafe {
+        ffi::quantize_scatter_kv_fp8_range_cuda(
+            cont_ptr as *const ffi::Half,
+            kv_fp8_ptr as *mut u8,
+            pi_ptr as *const i32,
+            start_pos as i32,
+            max_seq_len as i32,
+            token_count as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            kv_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 // ─── Fused-dequant decode attention (INT8+scale) ───
 
 /// Workspace size for split-KV fused INT8 decode attention.

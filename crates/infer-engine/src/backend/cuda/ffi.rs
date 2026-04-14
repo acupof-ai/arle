@@ -624,6 +624,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn kv_cache_to_paged_range_cuda(
+        k_contiguous: *const Half,
+        v_contiguous: *const Half,
+        k_paged: *mut Half,
+        v_paged: *mut Half,
+        token_indices: *const i32,
+        start_pos: i32,
+        max_seq_len: i32,
+        token_count: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ─── Paged KV cache append ───
 
     pub(crate) fn paged_kv_append_cuda(
@@ -915,6 +930,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub(crate) fn quantize_scatter_kv_fp8_range_cuda(
+        kv_cont: *const Half,
+        kv_fp8: *mut u8,
+        page_indices: *const i32,
+        start_pos: i32,
+        max_seq_len: i32,
+        token_count: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // ─── Fused-dequant decode attention (INT8 + FP8) ───
 
     pub(crate) fn decode_attention_int8_workspace_bytes(
@@ -959,6 +987,25 @@ unsafe extern "C" {
         token_indices: *const i32,
         max_seq_len: i32,
         seq_len: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        kv_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub(crate) fn kv_cache_to_paged_int8_range_cuda(
+        k_cont: *const i8,
+        v_cont: *const i8,
+        k_scales_cont: *const f32,
+        v_scales_cont: *const f32,
+        k_paged: *mut i8,
+        v_paged: *mut i8,
+        k_scales_paged: *mut f32,
+        v_scales_paged: *mut f32,
+        token_indices: *const i32,
+        start_pos: i32,
+        max_seq_len: i32,
+        token_count: i32,
         num_kv_heads: i32,
         head_dim: i32,
         kv_dim: i32,
