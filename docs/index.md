@@ -29,6 +29,7 @@
 | [../crates/README.md](../crates/README.md) | Workspace crate ownership and dependency boundaries |
 | **Reviews** | |
 | [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | 10K star readiness review |
+| [reviews/2026-04-14-cuda-kernel-six-principles-review.md](reviews/2026-04-14-cuda-kernel-six-principles-review.md) | CUDA kernel 六要素审计：全仓分级 + 第一波 decode 热路径优化 |
 | [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: optimization gaps in Qwen3.5 batched decode |
 | **Experience — Errors** | |
 | [experience/errors/2026-04-14-p0-page16-blocker.md](experience/errors/2026-04-14-p0-page16-blocker.md) | P0 page_size=16 blocker: BF16 prefill→pool migration kernel is NHD-only; FlashInfer reads HND |
