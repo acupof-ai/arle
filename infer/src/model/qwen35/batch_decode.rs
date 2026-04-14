@@ -16,14 +16,14 @@ use super::forward::Qwen35State;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
+use crate::model::ModelForward;
+use crate::model::kv_cache::KVFormat;
+use crate::ops;
 use infer_cuda_kernels::kv_quant;
 use infer_cuda_kernels::kv_turboquant;
 use infer_cuda_kernels::prelude::{
     DeviceContext, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
-use crate::model::ModelForward;
-use crate::model::kv_cache::KVFormat;
-use crate::ops;
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 

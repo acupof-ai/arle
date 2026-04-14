@@ -26,7 +26,7 @@
 //! ```
 
 #[cfg(feature = "metal")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "metal")]
 use std::time::Instant;
@@ -90,24 +90,24 @@ pub mod scheduler;
 
 // ── mlx types (Metal GPU required) ───────────────────────────────────────────
 #[cfg(feature = "metal")]
-use self::generate::{MetalGenerateOutput, KV_CACHE_CHUNK};
+use self::generate::{KV_CACHE_CHUNK, MetalGenerateOutput};
 #[cfg(feature = "metal")]
 use self::ops::{clear_metal_cache, extend_kv_cache, linear};
 #[cfg(feature = "metal")]
 use self::sampling::gpu_sample_token;
 #[cfg(feature = "metal")]
 use self::weights::{
-    merge_quantized_projection_rows, MetalWeights, MlpInputProjection, WeightTensor,
+    MetalWeights, MlpInputProjection, WeightTensor, merge_quantized_projection_rows,
 };
-use config::{load_metal_config, MetalModelArch, MetalModelConfig};
+use config::{MetalModelArch, MetalModelConfig, load_metal_config};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
 #[cfg(feature = "metal")]
 pub use dflash::MetalDflashOptions;
 #[cfg(feature = "metal")]
 use loader::{
-    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
-    tie_lm_head_from_embed_tokens, TensorMap,
+    TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
+    tie_lm_head_from_embed_tokens,
 };
 #[cfg(feature = "metal")]
 use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};

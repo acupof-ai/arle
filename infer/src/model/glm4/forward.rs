@@ -4,12 +4,12 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::GLM4Model;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
-use infer_cuda_kernels::TokenKVPool;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
+use infer_cuda_kernels::TokenKVPool;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Per-request mutable state for GLM-4.
 pub struct GLM4State {

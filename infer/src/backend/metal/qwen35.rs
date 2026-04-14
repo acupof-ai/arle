@@ -3,17 +3,17 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use super::mlx::{
-    add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
+    Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
-    zeros, Dtype, MlxArray,
+    zeros,
 };
 
-use super::gdr::{metal_gdr_decode_step, MetalLinearAttnWeights, MetalRecurrentState};
+use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
 use super::{
-    clear_metal_cache, extend_kv_cache, gpu_sample_token, linear, load_embed_tokens_from_tensors,
-    load_proj_from_tensors, load_tensor_map, merge_quantized_projection_rows, tensor_get,
-    tie_lm_head_from_embed_tokens, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig,
-    MetalQwen35LayerType, MlpInputProjection, WeightTensor, KV_CACHE_CHUNK,
+    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
+    MlpInputProjection, WeightTensor, clear_metal_cache, extend_kv_cache, gpu_sample_token, linear,
+    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
+    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
 };
 use crate::sampler::SamplingParams;
 

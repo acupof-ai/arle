@@ -1,5 +1,5 @@
 use super::mlx::{
-    async_eval, clear_cache, concatenate_axis, matmul, quantized_matmul, zeros, MlxArray,
+    MlxArray, async_eval, clear_cache, concatenate_axis, matmul, quantized_matmul, zeros,
 };
 use super::weights::WeightTensor;
 

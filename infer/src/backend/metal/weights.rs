@@ -7,7 +7,7 @@ use super::loader::{
     load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
     tie_lm_head_from_embed_tokens,
 };
-use super::mlx::{concatenate_axis, eval, Dtype, MlxArray};
+use super::mlx::{Dtype, MlxArray, concatenate_axis, eval};
 use super::qwen35;
 
 /// A weight matrix that is either full-precision BF16 or MLX affine 4-bit quantized.

@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
 use super::mlx::MlxArray;
