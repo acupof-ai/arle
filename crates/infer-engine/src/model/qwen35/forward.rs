@@ -94,6 +94,17 @@ impl GenerationState for Qwen35State {
     ) -> Result<()> {
         self.base.migrate_kv_to_paged(ctx, pool, slot)
     }
+
+    fn migrate_kv_range_to_paged(
+        &mut self,
+        ctx: &crate::backend::cuda::tensor::DeviceContext,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()> {
+        self.base
+            .migrate_kv_range_to_paged(ctx, pool, start_pos, new_token_indices)
+    }
 }
 
 #[cfg(feature = "cuda")]

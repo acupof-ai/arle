@@ -194,17 +194,19 @@ __global__ void quantize_scatter_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_cont,    // [num_kv_heads, max_seq_len, head_dim] HND
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // [max_total_tokens, kv_dim] NHD
     const int32_t* __restrict__ page_indices,     // [seq_len] pool indices
+    int start_pos,
     int max_seq_len,
     int num_kv_heads,
     int head_dim,
     int kv_dim)
 {
     int kv_head = blockIdx.x;
-    int pos = blockIdx.y;
+    int rel_pos = blockIdx.y;
     int d = threadIdx.x;
     if (d >= head_dim) return;
 
-    int pool_idx = page_indices[pos];
+    int pos = start_pos + rel_pos;
+    int pool_idx = page_indices[rel_pos];
     // Source: HND
     int src = kv_head * max_seq_len * head_dim + pos * head_dim + d;
     // Dest: NHD
@@ -245,7 +247,24 @@ cudaError_t quantize_scatter_kv_fp8_cuda(
     dim3 block(head_dim);
     quantize_scatter_kv_fp8_kernel<<<grid, block, 0, stream>>>(
         kv_cont, kv_fp8, page_indices,
-        max_seq_len, num_kv_heads, head_dim, kv_dim);
+        0, max_seq_len, num_kv_heads, head_dim, kv_dim);
+    return cudaGetLastError();
+}
+
+cudaError_t quantize_scatter_kv_fp8_range_cuda(
+    const __nv_bfloat16* kv_cont,
+    __nv_fp8_e4m3* kv_fp8,
+    const int32_t* page_indices,
+    int start_pos, int max_seq_len, int token_count,
+    int num_kv_heads, int head_dim, int kv_dim,
+    cudaStream_t stream)
+{
+    if (token_count <= 0) return cudaSuccess;
+    dim3 grid(num_kv_heads, token_count);
+    dim3 block(head_dim);
+    quantize_scatter_kv_fp8_kernel<<<grid, block, 0, stream>>>(
+        kv_cont, kv_fp8, page_indices,
+        start_pos, max_seq_len, num_kv_heads, head_dim, kv_dim);
     return cudaGetLastError();
 }
 

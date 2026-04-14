@@ -115,6 +115,15 @@ pub trait GenerationState {
         slot: usize,
     ) -> Result<()>;
 
+    /// Migrate only the newly appended contiguous KV range into the paged pool.
+    fn migrate_kv_range_to_paged(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        start_pos: usize,
+        new_token_indices: &[u32],
+    ) -> Result<()>;
+
     // -- Prefix cache support for hybrid models (recurrent + full attention) --
 
     /// Whether this model supports partial prefix reuse via `truncate_to()`.
@@ -245,8 +254,9 @@ pub trait ModelForward: Send {
     /// Optional future prefill fast path that scatter-writes K/V to the token pool.
     ///
     /// The current CUDA scheduler still calls `forward_prefill()` and then migrates
-    /// contiguous KV into the paged pool via `GenerationStateBase::migrate_kv_to_paged()`.
-    /// That migration path is the active production path for FP8/INT8/TurboQuant.
+    /// contiguous KV into the paged pool via `GenerationStateBase::migrate_kv_range_to_paged()`.
+    /// That incremental migration path is the active production path for
+    /// BF16/FP8/INT8/TurboQuant prefill.
     ///
     /// The default implementation just calls `forward_prefill()` (no pool write).
     /// Override in model implementations that support a direct dual-write path if that
