@@ -31,6 +31,7 @@
 | [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | 10K star readiness review |
 | [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | CUDA path review: optimization gaps in Qwen3.5 batched decode |
 | **Experience — Errors** | |
+| [experience/errors/2026-04-14-p0-page16-blocker.md](experience/errors/2026-04-14-p0-page16-blocker.md) | P0 page_size=16 blocker: BF16 prefill→pool migration kernel is NHD-only; FlashInfer reads HND |
 | [experience/errors/2026-04-09-scheduler-greedy-divergence.md](experience/errors/2026-04-09-scheduler-greedy-divergence.md) | Scheduler greedy divergence: Triton vs FlashInfer numerical diff |
 | [experience/errors/2026-04-09-w4-gptq-quality.md](experience/errors/2026-04-09-w4-gptq-quality.md) | W4 GPTQ quality regression investigation |
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | RoPE axis bug in Qwen3.5 |
