@@ -1,9 +1,10 @@
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 
 use super::mlx::MlxArray;
 use crate::sampler::SamplingParams;
 
 #[cfg(feature = "metal")]
+#[allow(clippy::float_cmp)]
 pub(super) fn validate_metal_sampling_params(params: &SamplingParams) -> Result<()> {
     let mut unsupported = Vec::new();
 
@@ -40,15 +41,15 @@ pub(super) fn validate_metal_sampling_params(params: &SamplingParams) -> Result<
 
 /// P4 — GPU-side sampling: argmax or categorical, stays on GPU until `.item()`.
 #[cfg(feature = "metal")]
-pub(super) fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
+pub(super) fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> MlxArray {
     if params.temperature <= 1e-6 || params.top_k == 1 {
-        return Ok(greedy_sample_token(logits));
+        return greedy_sample_token(logits);
     }
 
     // Temperature scaling then GPU categorical sample.
     let inv_t = MlxArray::scalar_f32(1.0f32 / params.temperature);
     let scaled = super::mlx::multiply(logits, &inv_t);
-    Ok(categorical_sample_token(&scaled))
+    categorical_sample_token(&scaled)
 }
 
 #[cfg(feature = "metal")]

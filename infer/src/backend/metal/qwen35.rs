@@ -3,17 +3,17 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use super::mlx::{
-    Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
+    add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
-    zeros,
+    zeros, Dtype, MlxArray,
 };
 
-use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
+use super::gdr::{metal_gdr_decode_step, MetalLinearAttnWeights, MetalRecurrentState};
 use super::{
-    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
-    MlpInputProjection, WeightTensor, clear_metal_cache, extend_kv_cache, gpu_sample_token, linear,
-    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
-    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
+    clear_metal_cache, extend_kv_cache, gpu_sample_token, linear, load_embed_tokens_from_tensors,
+    load_proj_from_tensors, load_tensor_map, merge_quantized_projection_rows, tensor_get,
+    tie_lm_head_from_embed_tokens, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig,
+    MetalQwen35LayerType, MlpInputProjection, WeightTensor, KV_CACHE_CHUNK,
 };
 use crate::sampler::SamplingParams;
 
@@ -168,8 +168,8 @@ impl CppQwen35Model {
             );
 
             // MLP weights (shared by both attention types)
-            let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) = match &layer.mlp_inputs {
-                MlpInputProjection::MergedQuantized {
+            let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) =
+                if let MlpInputProjection::MergedQuantized {
                     gate_up_proj:
                         WeightTensor::Quantized {
                             w,
@@ -180,28 +180,29 @@ impl CppQwen35Model {
                         },
                     gate_dim,
                     ..
-                } => (
-                    w.as_raw(),
-                    scales.as_raw(),
-                    biases.as_raw(),
-                    *group_size,
-                    *bits,
-                    *gate_dim,
-                ),
-                _ => {
+                } = &layer.mlp_inputs
+                {
+                    (
+                        w.as_raw(),
+                        scales.as_raw(),
+                        biases.as_raw(),
+                        *group_size,
+                        *bits,
+                        *gate_dim,
+                    )
+                } else {
                     log::warn!("C++ forward model requires quantized MLP — falling back to Rust");
                     unsafe { mlx_sys::qwen35_compiled_free(model) };
                     return None;
-                }
-            };
-            let (dw_w, dw_s, dw_b) = match &layer.down_proj {
-                WeightTensor::Quantized {
-                    w, scales, biases, ..
-                } => (w.as_raw(), scales.as_raw(), biases.as_raw()),
-                _ => {
-                    unsafe { mlx_sys::qwen35_compiled_free(model) };
-                    return None;
-                }
+                };
+            let (dw_w, dw_s, dw_b) = if let WeightTensor::Quantized {
+                w, scales, biases, ..
+            } = &layer.down_proj
+            {
+                (w.as_raw(), scales.as_raw(), biases.as_raw())
+            } else {
+                unsafe { mlx_sys::qwen35_compiled_free(model) };
+                return None;
             };
 
             match &layer.attention {
@@ -346,9 +347,9 @@ impl CppQwen35Model {
         let n_gdr = gdr_states.len() as i32;
 
         let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            kv_caches.iter().map(|a| a.as_raw()).collect();
+            kv_caches.iter().map(MlxArray::as_raw).collect();
         let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            gdr_states.iter().map(|a| a.as_raw()).collect();
+            gdr_states.iter().map(MlxArray::as_raw).collect();
 
         let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
@@ -363,7 +364,7 @@ impl CppQwen35Model {
                 n_kv,
                 gdr_ptrs.as_mut_ptr(),
                 n_gdr,
-                &mut out_logits,
+                &raw mut out_logits,
                 out_kv.as_mut_ptr(),
                 out_gdr.as_mut_ptr(),
             )
@@ -387,6 +388,7 @@ impl CppQwen35Model {
     }
 
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
+    #[allow(clippy::items_after_statements)]
     pub(crate) fn generate(
         &self,
         prompt_ids: &[u32],
@@ -412,7 +414,7 @@ impl CppQwen35Model {
         };
 
         unsafe extern "C" fn token_callback(token_id: i32, ctx_ptr: *mut std::ffi::c_void) -> i32 {
-            let ctx = unsafe { &mut *(ctx_ptr as *mut CallbackCtx) };
+            let ctx = unsafe { &mut *ctx_ptr.cast::<CallbackCtx<'_>>() };
             match (ctx.on_token)(token_id as u32) {
                 Ok(()) => 0,
                 Err(e) => {
@@ -433,11 +435,11 @@ impl CppQwen35Model {
                 max_new_tokens as i32,
                 temperature,
                 out_tokens.as_mut_ptr(),
-                &mut out_count,
-                &mut prefill_ms,
-                &mut decode_ms,
+                &raw mut out_count,
+                &raw mut prefill_ms,
+                &raw mut decode_ms,
                 Some(token_callback),
-                &mut ctx as *mut CallbackCtx as *mut std::ffi::c_void,
+                (&raw mut ctx).cast::<std::ffi::c_void>(),
                 stop_i32.as_ptr(),
                 stop_i32.len() as i32,
             )
@@ -652,7 +654,7 @@ pub(super) fn metal_generate_qwen35(
     let mut ttft_ms = 0.0;
 
     // ── mlx_lm-style double-buffered decode loop ────────────────────────
-    let mut y = gpu_sample_token(&logits, params)?;
+    let mut y = gpu_sample_token(&logits, params);
     super::mlx::async_eval(&[&y]);
 
     let finish_reason = 'decode: loop {
@@ -669,7 +671,7 @@ pub(super) fn metal_generate_qwen35(
         )?;
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
-        let next_y = gpu_sample_token(&next_logits, params)?;
+        let next_y = gpu_sample_token(&next_logits, params);
         super::mlx::async_eval(&[&next_y]);
 
         // Now wait for CURRENT y and process the token.
@@ -706,13 +708,13 @@ pub(super) fn metal_generate_qwen35(
                         config.num_key_value_heads as i32,
                         config.head_dim as i32,
                         new_cap,
-                    )?;
+                    );
                     extend_kv_cache(
                         &mut kv_flat[2 * li + 1],
                         config.num_key_value_heads as i32,
                         config.head_dim as i32,
                         new_cap,
-                    )?;
+                    );
                 }
             } else {
                 for li in 0..num_full_layers {
@@ -721,13 +723,13 @@ pub(super) fn metal_generate_qwen35(
                         config.num_key_value_heads as i32,
                         config.head_dim as i32,
                         new_cap,
-                    )?;
+                    );
                     extend_kv_cache(
                         &mut v_caches[li],
                         config.num_key_value_heads as i32,
                         config.head_dim as i32,
                         new_cap,
-                    )?;
+                    );
                 }
             }
             kv_capacity = new_cap;
@@ -981,13 +983,14 @@ fn qwen35_full_attention_step(
 }
 
 fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) -> MlxArray {
+    use super::mlx::{reciprocal, sqrt, sum_axis};
+
     if !offset {
         // Use MLX's fused fast.rms_norm — single op instead of 10 manual ops.
         // This is the same as mlx_lm's nn.RMSNorm.__call__.
         return rms_norm(x, weight, eps);
     }
     // Offset mode: weight = weight + 1, then manual norm.
-    use super::mlx::{reciprocal, sqrt, sum_axis};
     let last_dim = *x.shape().last().expect("rms_norm_last_dim: empty shape") as f32;
     let x = as_dtype(x, Dtype::Float32);
     let weight = as_dtype(weight, Dtype::Float32);
@@ -1197,7 +1200,7 @@ pub(super) fn load_qwen35_metal_weights(
     };
 
     // Try to build the optional C++ step model.
-    if !std::env::var("METAL_NO_CPP").is_ok() {
+    if std::env::var("METAL_NO_CPP").is_err() {
         weights.cpp_model = CppQwen35Model::build(&weights, config, arch);
     }
 
@@ -1218,7 +1221,7 @@ fn load_lm_head(
         }
     }
 
-    tie_lm_head_from_embed_tokens(embed_tokens)
+    Ok(tie_lm_head_from_embed_tokens(embed_tokens))
 }
 
 /// Load conv1d weight in nn.Conv1d format: [out_channels, kernel_size, in_channels/groups].

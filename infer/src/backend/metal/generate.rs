@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use super::config::MetalModelConfig;
 use super::forward::build_forward_graph;
 use super::kv_pool::MetalKVPool;
-use super::mlx::{MlxArray, zeros};
+use super::mlx::{zeros, MlxArray};
 use super::weights::StandardMetalWeights;
 use crate::sampler::SamplingParams;
 
@@ -43,7 +43,7 @@ struct MetalKvPoolRequestCleanup {
 impl MetalKvPoolRequestCleanup {
     fn new(pool: &mut MetalKVPool, request_id: usize) -> Self {
         Self {
-            pool: pool as *mut MetalKVPool,
+            pool: std::ptr::from_mut(pool),
             request_id,
         }
     }
@@ -193,7 +193,7 @@ pub(super) fn metal_generate(
         params,
     )?;
     // P6: schedule GPU execution without blocking CPU.
-    super::ops::metal_async_eval(&prefill_token)?;
+    super::ops::metal_async_eval(&prefill_token);
     cache_len += prefill_len;
 
     // ── Phase 2: Decode loop (double-buffered — P3/P6) ────────────────────────
@@ -231,8 +231,8 @@ pub(super) fn metal_generate(
         if !use_kv_pool && cache_len + 1 > kv_capacity {
             let new_cap = kv_capacity + KV_CACHE_CHUNK;
             for li in 0..n_layers {
-                super::ops::extend_kv_cache(&mut k_caches[li], n_kv_heads, head_dim, new_cap)?;
-                super::ops::extend_kv_cache(&mut v_caches[li], n_kv_heads, head_dim, new_cap)?;
+                super::ops::extend_kv_cache(&mut k_caches[li], n_kv_heads, head_dim, new_cap);
+                super::ops::extend_kv_cache(&mut v_caches[li], n_kv_heads, head_dim, new_cap);
             }
             kv_capacity = new_cap;
         }
@@ -262,7 +262,7 @@ pub(super) fn metal_generate(
         decode_step += 1;
 
         // P6: kick off GPU — CPU syncs at top of next iteration via item().
-        super::ops::metal_async_eval(&new_pending)?;
+        super::ops::metal_async_eval(&new_pending);
 
         pending = new_pending;
     };

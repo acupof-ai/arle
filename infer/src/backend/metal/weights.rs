@@ -7,7 +7,7 @@ use super::loader::{
     load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
     tie_lm_head_from_embed_tokens,
 };
-use super::mlx::{Dtype, MlxArray, concatenate_axis, eval};
+use super::mlx::{concatenate_axis, eval, Dtype, MlxArray};
 use super::qwen35;
 
 /// A weight matrix that is either full-precision BF16 or MLX affine 4-bit quantized.
@@ -359,7 +359,7 @@ pub(super) fn load_qwen3_metal_weights(
             // Tied + quantized: load original packed embed weights for quantized_matmul
             load_proj("model.embed_tokens")?
         } else {
-            tie_lm_head_from_embed_tokens(&embed_tokens)?
+            tie_lm_head_from_embed_tokens(&embed_tokens)
         };
 
     let n = config.num_hidden_layers;

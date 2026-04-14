@@ -735,11 +735,9 @@ mod tests {
             other => panic!("expected initial prefill, got {other:?}"),
         }
 
-        assert!(
-            sched
-                .advance_decode(req, 99)
-                .expect("request should finish")
-        );
+        assert!(sched
+            .advance_decode(req, 99)
+            .expect("request should finish"));
 
         assert_eq!(
             recorded_events(sink.as_ref()),
