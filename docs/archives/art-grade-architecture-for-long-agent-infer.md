@@ -1,3 +1,21 @@
+> **ARCHIVED 2026-04-15 — Superseded by Route-A refactor.** This document
+> proposed an 8-crate atomic split with `infer-core` / `infer-engine` /
+> `infer-observability` / `infer-policy` as standalone Rust crates plus a
+> longer-term Phase 2/3/4 path toward `infer-scheduler-core` / `infer-kv` /
+> `infer-runtime-api`. The Phase-1 part of that plan was partially executed
+> but the four shell crates never achieved real independence — every file in
+> them used `use crate::…` against `infer` and was only "owned" by the new
+> crates via `#[path]` redirects in `infer/src/lib.rs`. Route-A folded all
+> four crates back into `infer` on 2026-04-15 and collapsed the duplicate
+> `agent_engine` facade into `server_engine`. The current canonical source of
+> truth for workspace organisation is `docs/architecture.md` and
+> `docs/codebase-map.md`. This file is retained for history only — its
+> governance principles in §六 and acceptance criteria in §七 still informed
+> the Route-A revert, but the concrete crate topology proposed in §一 / 二 /
+> 三 is dead.
+
+---
+
 # infer 原子 Rust 库拆分方案（面向超长 Agent 序列）
 
 ## 目标

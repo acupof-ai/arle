@@ -201,7 +201,8 @@ unsafe extern "C" {
     pub(crate) fn cublas_init();
 
     // Prefill attention preparation: QK norm + RoPE + KV cache write (steps 1-2).
-    // Step 3 (attention) is handled by flash_attention_prefill_cuda (Triton).
+    // Step 3 (attention) is handled by `flashinfer_single_prefill` below for
+    // HEAD_DIM=128. The Qwen3.5 HD256 path uses `flash_attention_prefill_hd256_cuda`.
     pub(crate) fn prefill_attention_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
@@ -222,24 +223,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    // FlashAttention-2 prefill (Triton AOT): fused QK + softmax + V for all query tokens.
-    // Q/Output are col-major [q_dim, seq_len]. K/V cache are per-head [max_seq, HEAD_DIM].
-    pub(crate) fn flash_attention_prefill_cuda(
-        Q: *const Half,
-        K_cache: *const Half,
-        V_cache: *const Half,
-        Output: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        gqa_ratio: i32,
-        seq_len: i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        q_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    // FlashInfer single-request prefill: replaces Triton FA2 for HEAD_DIM=128.
+    // FlashInfer single-request prefill: HEAD_DIM=128.
     // Q/Output: [seq_len, num_q_heads * head_dim] NHD interleaved row-major.
     // K/V cache: [num_kv_heads, max_seq_len, head_dim] HND layout.
     pub(crate) fn flashinfer_single_prefill(

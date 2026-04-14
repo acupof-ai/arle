@@ -14,15 +14,6 @@ def add_kernel(a_ptr, b_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.jit
-def embedding_kernel(embed_ptr, token_id, out_ptr, hidden_size, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < hidden_size
-    values = tl.load(embed_ptr + token_id * hidden_size + offsets, mask=mask, other=0)
-    tl.store(out_ptr + offsets, values, mask=mask)
-
-
-@triton.jit
 def embedding_decode_kernel(
     embed_ptr, decode_meta_ptr, out_ptr, hidden_size, BLOCK_SIZE: tl.constexpr
 ):
