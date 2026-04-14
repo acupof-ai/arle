@@ -1266,7 +1266,7 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     let batch_size = 8usize;
     let bits = 3u8;
 
-    use crate::model::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
+    use infer_cuda_kernels::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
 
     // Init TQ state (1 layer, Hadamard mode)
     let tq_state = TurboQuantLayerState::new(&ctx, 1, head_dim, bits, 42)?;
