@@ -103,6 +103,8 @@ impl std::fmt::Debug for MlxArray {
 unsafe impl Send for MlxArray {}
 
 impl MlxArray {
+    /// # Safety
+    /// `raw` must be a valid owned MLX array handle returned by the bridge.
     pub unsafe fn from_raw(raw: *mut mlx_sys::mlx_array) -> Self {
         mlx_array_from_raw_or_panic(raw, "MlxArray::from_raw")
     }
@@ -110,7 +112,7 @@ impl MlxArray {
         self.0
     }
     pub fn as_raw_mut(&mut self) -> *mut *mut mlx_sys::mlx_array {
-        &mut self.0
+        std::ptr::addr_of_mut!(self.0)
     }
     pub fn into_raw(self) -> *mut mlx_sys::mlx_array {
         let r = self.0;
@@ -118,6 +120,8 @@ impl MlxArray {
         r
     }
 
+    /// # Safety
+    /// `data` must remain valid for MLX to read for the duration required by the bridge.
     pub unsafe fn from_raw_data(data: *const c_void, shape: &[i32], dtype: Dtype) -> Self {
         mlx_array_from_raw_or_panic(
             unsafe {
@@ -295,7 +299,7 @@ pub fn where_(c: &MlxArray, a: &MlxArray, b: &MlxArray) -> MlxArray {
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(
-        unsafe { mlx_sys::mlx_concatenate_axis(p.as_ptr() as *mut _, p.len(), axis) },
+        unsafe { mlx_sys::mlx_concatenate_axis(p.as_ptr().cast_mut(), p.len(), axis) },
         "mlx_concatenate_axis",
     )
 }
@@ -431,7 +435,7 @@ pub fn gdr_layer_forward(
             ba_bits,
             ba_num_heads,
             conv1d_w.0,
-            &mut conv_state.0 as *mut _,
+            std::ptr::addr_of_mut!(conv_state.0),
             conv_kernel,
             a_log.0,
             dt_bias.0,
@@ -448,10 +452,10 @@ pub fn gdr_layer_forward(
             value_dim,
             q_scale,
             k_scale,
-            &mut gdr_state.0 as *mut _,
+            std::ptr::addr_of_mut!(gdr_state.0),
             metal_kernel,
             use_metal_kernel as i32,
-            &mut result,
+            std::ptr::addr_of_mut!(result),
         );
         mlx_array_from_raw_or_panic(result, "mlx_gdr_layer_forward")
     }
@@ -498,14 +502,14 @@ pub fn categorical(logits: &MlxArray) -> MlxArray {
 pub fn eval(arrays: &[&MlxArray]) {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     unsafe {
-        mlx_sys::mlx_eval(p.as_ptr() as *mut _, p.len());
+        mlx_sys::mlx_eval(p.as_ptr().cast_mut(), p.len());
     }
     panic_if_mlx_error("mlx_eval");
 }
 pub fn async_eval(arrays: &[&MlxArray]) {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     unsafe {
-        mlx_sys::mlx_async_eval(p.as_ptr() as *mut _, p.len());
+        mlx_sys::mlx_async_eval(p.as_ptr().cast_mut(), p.len());
     }
     panic_if_mlx_error("mlx_async_eval");
 }
@@ -599,7 +603,7 @@ impl MetalKernel {
         unsafe {
             mlx_sys::mlx_metal_kernel_apply(
                 self.0,
-                ip.as_ptr() as *mut _,
+                ip.as_ptr().cast_mut(),
                 ip.len(),
                 op.as_mut_ptr(),
                 no,
@@ -626,7 +630,13 @@ pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<
     let pc = std::ffi::CString::new(path).unwrap();
     let mut names: *mut *const i8 = std::ptr::null_mut();
     let mut arrays: *mut *mut mlx_sys::mlx_array = std::ptr::null_mut();
-    let count = unsafe { mlx_sys::mlx_load_safetensors(pc.as_ptr(), &mut names, &mut arrays) };
+    let count = unsafe {
+        mlx_sys::mlx_load_safetensors(
+            pc.as_ptr(),
+            std::ptr::addr_of_mut!(names),
+            std::ptr::addr_of_mut!(arrays),
+        )
+    };
     if count < 0 {
         // C++ threw an exception — check the error string
         return Err(check_mlx_error().unwrap_err());
@@ -646,7 +656,7 @@ pub fn load_safetensors(path: &str) -> anyhow::Result<std::collections::HashMap<
         // Free C++ allocations: name strings, name array, array objects, array container.
         // Our cloned arrays survive because they hold their own shared_ptr reference.
         unsafe {
-            mlx_sys::mlx_free_loaded_tensors(names as *mut _, arrays, count);
+            mlx_sys::mlx_free_loaded_tensors(names, arrays, count);
         }
     }
     Ok(map)

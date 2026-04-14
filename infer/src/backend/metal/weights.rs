@@ -453,6 +453,8 @@ pub(super) fn load_qwen3_metal_weights(
 /// Build C++ compiled model for Qwen3 (pure transformer, all full-attn layers).
 /// Reuses the Qwen3.5 C++ model struct with zero GDR layers.
 #[cfg(feature = "metal")]
+// reason: q/k/v/o and packed weight tuples mirror attention/FFI terminology.
+#[allow(clippy::many_single_char_names)]
 fn build_qwen3_cpp_model(
     embed_tokens: &MlxArray,
     norm: &MlxArray,
@@ -567,39 +569,36 @@ fn build_qwen3_cpp_model(
                 q_proj,
                 k_proj,
                 v_proj,
-            } => match (extract(q_proj), extract(k_proj), extract(v_proj)) {
-                (Some(q), Some(k), Some(v)) => (q, k, v),
-                _ => {
+            } => {
+                let (Some(q), Some(k), Some(v)) =
+                    (extract(q_proj), extract(k_proj), extract(v_proj))
+                else {
                     unsafe { mlx_sys::qwen35_compiled_free(model) };
                     return None;
-                }
-            },
+                };
+                (q, k, v)
+            }
             AttentionInputProjection::MergedQuantized { .. } => {
                 // Use individual weights stored alongside merged
-                match (
+                let (Some(q), Some(k), Some(v)) = (
                     layer.q_proj_individual.as_ref().and_then(extract),
                     layer.k_proj_individual.as_ref().and_then(extract),
                     layer.v_proj_individual.as_ref().and_then(extract),
-                ) {
-                    (Some(q), Some(k), Some(v)) => (q, k, v),
-                    _ => {
-                        unsafe { mlx_sys::qwen35_compiled_free(model) };
-                        return None;
-                    }
-                }
+                ) else {
+                    unsafe { mlx_sys::qwen35_compiled_free(model) };
+                    return None;
+                };
+                (q, k, v)
             }
         };
-        let o = match extract(&layer.o_proj) {
-            Some(o) => o,
-            None => {
-                unsafe { mlx_sys::qwen35_compiled_free(model) };
-                return None;
-            }
+        let Some(o) = extract(&layer.o_proj) else {
+            unsafe { mlx_sys::qwen35_compiled_free(model) };
+            return None;
         };
 
         // MLP
-        let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) = match &layer.mlp_inputs {
-            MlpInputProjection::MergedQuantized {
+        let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) =
+            if let MlpInputProjection::MergedQuantized {
                 gate_up_proj:
                     WeightTensor::Quantized {
                         w,
@@ -610,25 +609,23 @@ fn build_qwen3_cpp_model(
                     },
                 gate_dim,
                 ..
-            } => (
-                w.as_raw(),
-                scales.as_raw(),
-                biases.as_raw(),
-                *group_size,
-                *bits,
-                *gate_dim,
-            ),
-            _ => {
+            } = &layer.mlp_inputs
+            {
+                (
+                    w.as_raw(),
+                    scales.as_raw(),
+                    biases.as_raw(),
+                    *group_size,
+                    *bits,
+                    *gate_dim,
+                )
+            } else {
                 unsafe { mlx_sys::qwen35_compiled_free(model) };
                 return None;
-            }
-        };
-        let (dw_w, dw_s, dw_b) = match extract(&layer.down_proj) {
-            Some((w, s, b, _, _)) => (w, s, b),
-            None => {
-                unsafe { mlx_sys::qwen35_compiled_free(model) };
-                return None;
-            }
+            };
+        let Some((dw_w, dw_s, dw_b, _, _)) = extract(&layer.down_proj) else {
+            unsafe { mlx_sys::qwen35_compiled_free(model) };
+            return None;
         };
 
         unsafe {
