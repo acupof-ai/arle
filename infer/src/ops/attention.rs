@@ -547,7 +547,7 @@ pub(crate) fn decode_prep_paged(
     num_kv_heads: usize,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let stride_page = paged.kv_pool.kv_dim;
+    let stride_page = paged.kv_pool.kv_dim * paged.page_size;
     let rms_eps = nrp.rms_eps;
     let page_size = paged.page_size;
 
@@ -681,7 +681,7 @@ pub(crate) fn decode_prep_paged_hd256(
     rotary_dim: usize,
 ) -> Result<()> {
     let batch_size = q_full_batch.seq_len;
-    let stride_page = paged.kv_pool.kv_dim;
+    let stride_page = paged.kv_pool.kv_dim * paged.page_size;
     let rms_eps = nrp.rms_eps;
     let page_size = paged.page_size;
 

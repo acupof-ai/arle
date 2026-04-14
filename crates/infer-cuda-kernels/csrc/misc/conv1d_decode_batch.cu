@@ -19,50 +19,71 @@
 
 #define CONV1D_BATCH_BLOCK 256
 
+template <int KERNEL_SIZE>
 __global__ void conv1d_decode_batch_kernel(
     const __nv_bfloat16* __restrict__ x_batch,        // [B, num_channels]
     const __nv_bfloat16* __restrict__ conv_weight,     // [num_channels, kernel_size]
     __nv_bfloat16** __restrict__ conv_state_ptrs,      // [B] → [num_channels, K-1]
     __nv_bfloat16* __restrict__ out_batch,             // [B, num_channels]
-    int num_channels,
-    int kernel_size
+    int num_channels
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
     if (c >= num_channels) return;
 
-    // Note: register unrolling below assumes kernel_size <= 4.
-    // For kernel_size > 4, a generic loop would be needed.
-    int sw = kernel_size - 1;  // state_width (3 for K=4)
+    constexpr int sw = KERNEL_SIZE - 1;
     __nv_bfloat16* my_state = conv_state_ptrs[b] + c * sw;
-    const __nv_bfloat16* my_weight = conv_weight + c * kernel_size;
+    const __nv_bfloat16* my_weight = conv_weight + c * KERNEL_SIZE;
 
-    // Load conv weights into registers (K=4 → 4 floats, negligible register pressure)
-    float w[4];
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        w[k] = (k < kernel_size) ? __bfloat162float(my_weight[k]) : 0.0f;
+    // Load weights and state once into registers. Decode always uses small
+    // kernels (2..4), so template specialization removes the hot-path branches.
+    float w0 = __bfloat162float(my_weight[0]);
+    float w1 = __bfloat162float(my_weight[1]);
+    float w2 = 0.0f;
+    float w3 = 0.0f;
+    if constexpr (KERNEL_SIZE > 2) {
+        w2 = __bfloat162float(my_weight[2]);
+    }
+    if constexpr (KERNEL_SIZE > 3) {
+        w3 = __bfloat162float(my_weight[3]);
     }
 
-    // Load state into registers (avoid repeated global reads during shift)
     float s0 = __bfloat162float(my_state[0]);
-    float s1 = (sw > 1) ? __bfloat162float(my_state[1]) : 0.0f;
-    float s2 = (sw > 2) ? __bfloat162float(my_state[2]) : 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    if constexpr (KERNEL_SIZE > 2) {
+        s1 = __bfloat162float(my_state[1]);
+    }
+    if constexpr (KERNEL_SIZE > 3) {
+        s2 = __bfloat162float(my_state[2]);
+    }
     float x_val = __bfloat162float(x_batch[b * num_channels + c]);
 
-    // Causal conv1d dot product: state[0..sw-1] * w[0..sw-1] + x * w[sw]
-    float sum = s0 * w[0] + s1 * w[1] + s2 * w[2] + x_val * w[3];
+    float sum;
+    if constexpr (KERNEL_SIZE == 2) {
+        sum = s0 * w0 + x_val * w1;
+    } else if constexpr (KERNEL_SIZE == 3) {
+        sum = s0 * w0 + s1 * w1 + x_val * w2;
+    } else {
+        sum = s0 * w0 + s1 * w1 + s2 * w2 + x_val * w3;
+    }
 
     // SiLU activation (bf16 truncation for numerical parity with prefill kernel)
     float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
     float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_batch[b * num_channels + c] = __float2bfloat16(silu_out);
 
-    // Update state: shift left by 1, insert x at tail
-    // Uses register values — no global read dependency, no shift loop
-    my_state[0] = __float2bfloat16(s1);
-    if (sw > 2) my_state[1] = __float2bfloat16(s2);
-    my_state[sw - 1] = __float2bfloat16(x_val);
+    // Update state: shift left by 1, insert x at tail.
+    if constexpr (KERNEL_SIZE == 2) {
+        my_state[0] = __float2bfloat16(x_val);
+    } else if constexpr (KERNEL_SIZE == 3) {
+        my_state[0] = __float2bfloat16(s1);
+        my_state[1] = __float2bfloat16(x_val);
+    } else {
+        my_state[0] = __float2bfloat16(s1);
+        my_state[1] = __float2bfloat16(s2);
+        my_state[2] = __float2bfloat16(x_val);
+    }
 }
 
 extern "C" {
@@ -82,10 +103,25 @@ cudaError_t conv1d_decode_batch_cuda(
     }
 
     dim3 grid((num_channels + CONV1D_BATCH_BLOCK - 1) / CONV1D_BATCH_BLOCK, batch_size);
-    conv1d_decode_batch_kernel<<<grid, CONV1D_BATCH_BLOCK, 0, stream>>>(
-        x_batch, conv_weight, conv_state_ptrs, out_batch,
-        num_channels, kernel_size
-    );
+    switch (kernel_size) {
+        case 2:
+            conv1d_decode_batch_kernel<2><<<grid, CONV1D_BATCH_BLOCK, 0, stream>>>(
+                x_batch, conv_weight, conv_state_ptrs, out_batch, num_channels
+            );
+            break;
+        case 3:
+            conv1d_decode_batch_kernel<3><<<grid, CONV1D_BATCH_BLOCK, 0, stream>>>(
+                x_batch, conv_weight, conv_state_ptrs, out_batch, num_channels
+            );
+            break;
+        case 4:
+            conv1d_decode_batch_kernel<4><<<grid, CONV1D_BATCH_BLOCK, 0, stream>>>(
+                x_batch, conv_weight, conv_state_ptrs, out_batch, num_channels
+            );
+            break;
+        default:
+            return cudaErrorInvalidValue;
+    }
     return cudaGetLastError();
 }
 

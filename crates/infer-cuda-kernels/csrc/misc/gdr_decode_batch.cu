@@ -13,6 +13,7 @@
 //   2. Per-request state via pointer array (no gather/scatter overhead)
 //   3. QKV/b/a read from contiguous [B, dim] batch buffers
 //   4. Output written to contiguous [B, num_value_heads * val_dim]
+//   5. Q/K/V are loaded once per val_idx and reused across all j-slices
 //
 // Grid:  (num_value_heads, B)
 // Block: 512 threads (128 val × 4 j_slices)
@@ -51,6 +52,7 @@ __global__ void gdr_decode_batch_kernel(
 
     __shared__ float smem_q[GDR_B_KEY_DIM];
     __shared__ float smem_k[GDR_B_KEY_DIM];
+    __shared__ float smem_v[GDR_B_VAL_DIM];
     __shared__ float smem_norm[2];
     __shared__ float warp_norms[GDR_B_BLOCK_DIM / WARP_SIZE];  // 16
     __shared__ float s_exp_g;
@@ -58,11 +60,17 @@ __global__ void gdr_decode_batch_kernel(
     __shared__ float smem_kv_partial[GDR_B_J_SLICES][GDR_B_VAL_DIM];
     __shared__ float smem_out_partial[GDR_B_J_SLICES][GDR_B_VAL_DIM];
 
-    // Read this request's QKV
+    // Read this request's Q/K/V once per val_idx. j_slice>0 reuses the
+    // shared-memory copies written by j_slice=0.
     const __nv_bfloat16* my_qkv = qkv_batch + b * qkv_stride;
-    float q_val = __bfloat162float(my_qkv[k_head * key_dim + val_idx]);
-    float k_val = __bfloat162float(my_qkv[q_dim_total + k_head * key_dim + val_idx]);
-    float v_val = __bfloat162float(my_qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+    float q_val = 0.0f;
+    float k_val = 0.0f;
+    if (j_slice == 0) {
+        q_val = __bfloat162float(my_qkv[k_head * key_dim + val_idx]);
+        k_val = __bfloat162float(my_qkv[q_dim_total + k_head * key_dim + val_idx]);
+        smem_v[val_idx] =
+            __bfloat162float(my_qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+    }
 
     // ====================================================================
     // L2 normalize q and k — only j_slice=0 contributes
@@ -141,7 +149,7 @@ __global__ void gdr_decode_batch_kernel(
     float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
                  + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
 
-    float my_delta = (v_val - kv_mem) * beta;
+    float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
     // ====================================================================
     // Pass 2: Rank-1 update + partial output

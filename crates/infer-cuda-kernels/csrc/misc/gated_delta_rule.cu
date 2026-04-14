@@ -56,10 +56,17 @@ __global__ void gated_delta_rule_decode_kernel(
     __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_VAL_DIM];
     __shared__ float smem_out_partial[GDR_J_SLICES][GDR_VAL_DIM];
 
-    // All j_slices load the same q/k/v (duplicated but cheap)
-    float q_val = __bfloat162float(qkv[k_head * key_dim + val_idx]);
-    float k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + val_idx]);
-    float v_val = __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+    // Only the first j-slice touches Q/K/V inputs. The other slices reuse
+    // shared-memory copies, avoiding 4x duplicated global loads per value dim.
+    __shared__ float smem_v[GDR_VAL_DIM];
+    float q_val = 0.0f;
+    float k_val = 0.0f;
+    if (j_slice == 0) {
+        q_val = __bfloat162float(qkv[k_head * key_dim + val_idx]);
+        k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + val_idx]);
+        smem_v[val_idx] =
+            __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+    }
 
     // ========================================================================
     // L2 normalize q and k — only j_slice=0 contributes to avoid 4× counting
@@ -141,7 +148,7 @@ __global__ void gated_delta_rule_decode_kernel(
     float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
                  + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
 
-    float my_delta = (v_val - kv_mem) * beta;
+    float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
     // ========================================================================
     // Pass 2: Rank-1 update + partial output
