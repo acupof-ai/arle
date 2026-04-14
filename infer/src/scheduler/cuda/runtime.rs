@@ -110,6 +110,27 @@ impl<M: ModelForward> Scheduler<M> {
             // Pick the free slot with the best prefix match to maximize KV reuse.
             let slot_idx = self.best_prefix_slot(&free_slots, &prompt_tokens);
 
+            // M1 shadow observer: ask the global RadixCache what the best
+            // achievable prefix hit length would be across ALL previously
+            // completed requests, not just the per-slot cached_prompts
+            // entries. This is logging only — the actual slot selection
+            // still goes through `best_prefix_slot` above because the
+            // radix does not own paged-pool page references yet (M2).
+            //
+            // The lookup bumps `ref_count` on matched nodes internally;
+            // release immediately so we do not leak refs into the eviction
+            // barrier while the radix is still observational.
+            let (radix_hit_len, radix_blocks) = self.prefix_cache.lookup(&prompt_tokens);
+            if radix_hit_len > 0 {
+                info!(
+                    "radix shadow: best cross-slot prefix hit = {}/{} tokens ({} blocks, slot selection unchanged)",
+                    radix_hit_len,
+                    prompt_tokens.len(),
+                    radix_blocks.len(),
+                );
+            }
+            self.prefix_cache.release(&radix_blocks);
+
             let id = self.next_id;
             self.next_id += 1;
 
@@ -179,7 +200,16 @@ impl<M: ModelForward> Scheduler<M> {
 
                 self.paged_kv_pool.free_slot(req.slot_idx);
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
+                    // Per-slot cached prompt stays as the authoritative
+                    // backing for the actual KV state in slot_idx's
+                    // contiguous buffer.
                     self.cached_prompts[req.slot_idx] = prompt_tokens.to_vec();
+                    // Global prefix observer: fold the completed prompt
+                    // into the radix. The synthetic block ids come from
+                    // `next_prefix_block_id`; they are opaque here but
+                    // let the radix insert / lookup / release paths
+                    // exercise their full happy path during M1.
+                    self.publish_to_prefix_cache(prompt_tokens);
                 } else {
                     self.cached_prompts[req.slot_idx].clear();
                 }
