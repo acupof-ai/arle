@@ -3,7 +3,7 @@ use log::{debug, info};
 use std::time::Instant;
 
 use super::config::Config;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::model::common::{self, MLP};
 use crate::ops;
 use crate::weight_loader::{load_tensor_1d, load_tensor_2d, precompute_rope};

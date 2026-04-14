@@ -15,9 +15,9 @@ use log::info;
 use super::config::Config;
 use super::forward::GLM4State;
 use super::weights::{GLM4Model, TransformerBlock};
-use crate::backend::cuda::flashinfer::FlashInferDecodeMetadata;
-use crate::backend::cuda::paged_kv::PagedKVPool;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::backend::cuda::prelude::{
+    DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
+};
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;

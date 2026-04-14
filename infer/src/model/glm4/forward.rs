@@ -4,7 +4,7 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::GLM4Model;
-use crate::backend::cuda::tensor::DeviceVec;
+use crate::backend::cuda::prelude::DeviceVec;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;

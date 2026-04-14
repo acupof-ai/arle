@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::cuda_graph::CudaGraphState;
 use super::kv_cache::KVCache;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
 
 /// Common generation-state fields shared across all model implementations.
 ///

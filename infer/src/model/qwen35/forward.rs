@@ -6,7 +6,7 @@ use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;

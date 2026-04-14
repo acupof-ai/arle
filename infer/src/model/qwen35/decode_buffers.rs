@@ -5,7 +5,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, RawDevicePtr};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, RawDevicePtr};
 
 /// Cached raw pointers for hot-path sampling ops (avoids cudarc device_ptr overhead).
 pub(crate) struct DecodeBufferPtrs35 {

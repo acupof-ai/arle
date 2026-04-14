@@ -567,11 +567,17 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
     println!(
         "cargo:warning=Using Triton AOT as the default path for silu_mul, add, embedding, Qwen3 decode attention, and Qwen3.5 prefill GDR; extract/write vector copies now use cudarc device memcpy"
     );
-    println!("cargo:rerun-if-changed=tools/triton/flash_attention_prefill_hd256_kernel.py");
-    println!("cargo:rerun-if-changed=tools/triton/gated_delta_rule_chunkwise_kernels.py");
-    println!("cargo:rerun-if-changed=tools/triton/basic_kernels.py");
-    println!("cargo:rerun-if-changed=tools/triton/gen_triton_aot.py");
-    println!("cargo:rerun-if-changed=tools/triton/silu_mul_kernel.py");
+    // Triton kernel sources: invalidate AOT cache if any kernel .py changes.
+    for entry in std::fs::read_dir("tools/triton")
+        .expect("tools/triton directory must exist")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!("cargo:rerun-if-changed=tools/triton");
     println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
 }
 

@@ -6,7 +6,7 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
-use crate::backend::cuda::tensor::{DeviceVec, HiddenStates};
+use crate::backend::cuda::prelude::{DeviceVec, HiddenStates};
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;

@@ -3,8 +3,7 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::backend::cuda::paged_kv::{PagedKVPool, TokenKVPool};
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, PagedKVPool, TokenKVPool};
 use crate::sampler::SamplingParams;
 
 #[path = "model/common.rs"]

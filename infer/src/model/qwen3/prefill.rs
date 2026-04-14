@@ -3,8 +3,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::backend::cuda::paged_kv::TokenKVPool;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates, TokenKVPool};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
 
