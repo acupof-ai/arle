@@ -12,7 +12,7 @@ use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::backend::cuda::ffi;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
 
 /// Argmax — returns the index of the maximum element.
 ///

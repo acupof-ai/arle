@@ -24,5 +24,8 @@ pub(crate) mod graph_pool;
 #[path = "cuda/paged_kv.rs"]
 pub mod paged_kv;
 #[cfg(feature = "cuda")]
+#[path = "cuda/prelude.rs"]
+pub(crate) mod prelude;
+#[cfg(feature = "cuda")]
 #[path = "cuda/tensor.rs"]
 pub mod tensor;

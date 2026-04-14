@@ -2,7 +2,7 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::backend::cuda::ffi;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
+use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates};
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 
 /// Gated delta rule recurrent decode (single step, seq_len=1).

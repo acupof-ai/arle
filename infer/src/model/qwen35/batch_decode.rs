@@ -16,9 +16,9 @@ use super::forward::Qwen35State;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
-use crate::backend::cuda::flashinfer::FlashInferDecodeMetadata;
-use crate::backend::cuda::paged_kv::PagedKVPool;
-use crate::backend::cuda::tensor::{DeviceContext, HiddenStates};
+use crate::backend::cuda::prelude::{
+    DeviceContext, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
+};
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
