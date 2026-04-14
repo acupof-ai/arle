@@ -190,7 +190,7 @@ impl Default for TierDirectory {
 mod tests {
     use super::*;
 
-    fn sample_desc(id: u64, tier: Tier, location: BlockLocation) -> BlockDescriptor {
+    fn sample_desc(id: u32, tier: Tier, location: BlockLocation) -> BlockDescriptor {
         BlockDescriptor {
             id: BlockId(id),
             tier,

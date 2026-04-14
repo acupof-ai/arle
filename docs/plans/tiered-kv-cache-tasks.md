@@ -705,23 +705,23 @@ These should already be running by the time P0 edits land:
 
 ## 8 · Concrete next action (revised 2026-04-15)
 
-**Two things can start immediately in parallel** (both are pure-local,
-both are independent of the in-flight `infer-cuda-kernels` crate
-extraction, both have zero benchmark risk):
+**Status update (2026-04-15 revision + execution)**:
 
-1. **M0.1 · `BlockId` unification**. Create `infer/src/types.rs` with the
-   canonical `BlockId(u32)` and `BlockFingerprint([u8; 16])`. Delete
-   `infer/src/kv_tier/id.rs`. Update `prefix_cache::BlockId` to re-export.
-   Delete `block_manager::BlockId`. Mechanical rename + `use` path
-   updates; no algorithmic change. Exit gate: `grep -rn 'pub struct BlockId' infer/src/`
-   returns exactly one hit, and all three feature combos
-   (`cpu,no-cuda` / `metal` / `cuda,no-cuda`) compile clean.
-2. **M0.2 · three `prefix_cache.rs` bug fixes**. Touches only
-   `infer/src/prefix_cache.rs`. Adds three unit tests (one per bug). Pure
-   correctness — no scheduler wiring, no behaviour change outside the
-   unit tests. Full details in §2.1 below (the list of 3 bugs is
-   unchanged from the 2026-04-13 research, only the milestone label
-   changes).
+1. **M0.1 · `BlockId` unification** — **done**, shipped in the same
+   commit as this revision. `infer/src/types.rs` now holds the canonical
+   `BlockId(u32)` and `BlockFingerprint([u8; 16])`.
+   `infer/src/kv_tier/id.rs` is a re-export stub;
+   `prefix_cache::BlockId` and `block_manager::BlockId` also re-export.
+   `BlockHashCtx` deleted. Exactly one `pub struct BlockId` in the tree.
+   All three feature combos compile (CUDA-gated check clean; Metal
+   check has pre-existing unrelated Codex mid-edit errors outside M0.1
+   scope).
+2. **M0.2 · three `prefix_cache.rs` bug fixes** — **no-op, already done
+   in commit `5da8b67 fix(prefix_cache): split must inherit ref_count +
+   evict must cascade`**. The 2026-04-13 research flagged these as open;
+   they were fixed in the same 2026-04-13 work batch that wrote the
+   research. 22 prefix_cache unit tests green. See project doc §8 items
+   10–12 for the code locations.
 
 **M0.3 · `page_size = 1 → 16` with per-format dispatch** blocks on the
 in-flight `infer-cuda-kernels` extraction (kernel files move from

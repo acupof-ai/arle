@@ -46,8 +46,11 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque GPU KV cache block identifier. Assigned by the block allocator
 /// (see `block_manager.rs`) and stored in the cache node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct BlockId(pub u32);
+///
+/// Re-exported from [`crate::types::BlockId`] — the canonical single
+/// `u32` type after the 2026-04-15 tiered-kv-cache revision. See
+/// `docs/projects/tiered-kv-cache.md` §5.1 for the rationale.
+pub use crate::types::BlockId;
 
 /// A node in the radix tree.
 #[derive(Serialize, Deserialize)]

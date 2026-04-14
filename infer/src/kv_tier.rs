@@ -71,6 +71,6 @@ pub mod tier;
 pub mod transport;
 
 pub use directory::{BlockDescriptor, DirectoryError, TierDirectory};
-pub use id::{BlockHashCtx, BlockId};
+pub use id::BlockId;
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};

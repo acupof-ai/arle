@@ -519,25 +519,26 @@ rename + `use` path update, no algorithmic change.
 match (in `types.rs`). `cargo check` passes under `cuda,no-cuda`,
 `cpu,no-cuda`, `metal`.
 
-#### M0.2 · Fix the three `prefix_cache.rs` correctness bugs
+#### M0.2 · Fix the three `prefix_cache.rs` correctness bugs — **already done**
 
-**What**: Port the SGLang RadixAttention fix patterns for the three bugs
-listed in §8 (items 10–12). Each bug gets one unit test.
+**Status (2026-04-15)**: no-op. All three bugs listed in §8 (items 10–12)
+were already fixed by commit `5da8b67 fix(prefix_cache): split must
+inherit ref_count + evict must cascade` on the 2026-04-13 work batch.
+The 2026-04-15 survey agent's report was stale on this point. Evidence:
 
-**Why first**: the scheduler wire-up in M1 will exercise code paths that
-trip these bugs. Fixing them under unit tests is cheap; finding them
-during M1 benchmark regressions is expensive.
+```
+$ cargo test -p infer --no-default-features --features cpu,no-cuda --release \
+    --lib prefix_cache
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 207 filtered out
+```
 
-**Files**:
-- `infer/src/prefix_cache.rs::_split_node` — new node inherits child's
-  `ref_count` (SGLang `new_node.lock_ref = child.lock_ref`)
-- `infer/src/prefix_cache.rs::lookup` — ref_inc walks ancestor chain
-  from leaf to root
-- `infer/src/prefix_cache.rs::evict` — iterative, re-add orphan parent
-  to eviction heap after leaf removal
+The 22 tests include `split_node_inherits_ref_count_from_child`,
+`lookup_bumps_every_block_bearing_node_on_path`, and three
+`evict_cascade_*` tests covering orphan-parent iteration. See §8 items
+10–12 for the fix locations in the current code.
 
-**Exit**: three new unit tests, each reproducing the bug pre-fix and
-passing post-fix.
+No M0.2 PR is needed. M1 can proceed on M0.1 alone (plus M0.3 when the
+extraction prereq is met).
 
 #### M0.3 · `page_size = 1 → 16` (per-format dispatch)
 
@@ -814,25 +815,47 @@ here so that M0.2's test suite references them by number.
    misleading; it is the Qwen3.5 Gated Delta Rule linear-attention
    decoder. Do not reuse that module for transport work.
 
-### 2026-04-15 bugs flagged by the internal survey
+### 2026-04-15 bugs flagged by the internal survey — **all three already fixed**
 
-10. **`_split_node` does not inherit child's `ref_count`.** When the radix
-    tree splits a node on insertion, the new parent-like node is created
-    with `ref_count = 0` even if its child had `ref_count > 0`. SGLang's
-    reference implementation sets `new_node.lock_ref = child.lock_ref`.
-    Without it, a split while a request is mid-decode can free a block
-    that is still in use. **Fix in M0.2.**
+When the 2026-04-15 survey agent read the task doc it found three
+`prefix_cache.rs` correctness bugs flagged in the 2026-04-13 research
+(§3.2) and assumed they were still open. Actual git log:
 
-11. **`lookup` does not walk the ancestor chain.** Current code bumps
-    only the matched leaf's `ref_count`; ancestors are unprotected.
-    Scheduler that holds an intermediate radix node while decoding a
-    continuation can see that node evicted from under it. **Fix in M0.2.**
+```text
+5da8b67 fix(prefix_cache): split must inherit ref_count + evict must cascade
+```
 
-12. **`evict()` does not iterate orphan parents.** When a leaf is
-    evicted, its parent may become childless and eligible for eviction
-    too, but the current code only considers the original leaf set.
-    SGLang re-pushes orphaned parents onto the eviction heap in the
-    same pass. **Fix in M0.2.**
+That commit landed before the 2026-04-15 revision and resolves all
+three items. `cargo test -p infer --lib prefix_cache` runs 22 tests
+green, including:
+
+- `split_node_inherits_ref_count_from_child`
+- `lookup_bumps_every_block_bearing_node_on_path`
+- `evict_cascades_through_orphaned_parent_chain`
+- `evict_cascade_respects_limit_n`
+- `evict_cascade_respects_ref_count`
+
+The items are preserved in the list below with their original
+descriptions for history, but **M0.2 is a no-op** — its scope is
+already shipped, and M1 can proceed on M0.1 alone.
+
+10. **~~`_split_node` does not inherit child's `ref_count`.~~** *Fixed
+    in `5da8b67`*. When the radix tree splits a node on insertion,
+    the new parent-like node inherits the splitting child's
+    `ref_count` — matches SGLang's `new_node.lock_ref = child.lock_ref`
+    pattern. See `infer/src/prefix_cache.rs:258-275`.
+
+11. **~~`lookup` does not walk the ancestor chain.~~** *Fixed in
+    `5da8b67`*. Lookup walks root → leaf and increments `ref_count`
+    on every node on the matched path, not just the leaf. See
+    `infer/src/prefix_cache.rs:146-200`.
+
+12. **~~`evict()` does not iterate orphan parents.~~** *Fixed in
+    `5da8b67`*. Eviction runs an iterative outer loop (`while
+    freed.len() < n`) and re-scans for active-leaf candidates each
+    pass; a parent becomes an active leaf the moment its last
+    non-evicted child joins `evicted_set`. See
+    `infer/src/prefix_cache.rs:368-423`.
 
 ---
 
@@ -1106,19 +1129,26 @@ revision supersedes all three of those as documented above.
 
 ## 14 · Next PR
 
-**M0.1 — `BlockId` unification.** It is the only milestone that is both
-(a) safe to start immediately and (b) unblocks every subsequent milestone.
-It does not conflict with the in-flight `infer-cuda-kernels` crate
-extraction (which touches `infer/src/backend/cuda/*` and `infer/csrc/cuda/*`,
-not `infer/src/prefix_cache.rs` / `infer/src/types.rs` / `infer/src/kv_tier/id.rs`).
+**M0.1 · `BlockId` unification** — executed. Shipped in the same commit
+as this revision. `types::BlockId(u32)` is now the canonical type;
+`prefix_cache::BlockId`, `block_manager::BlockId`, and `kv_tier::BlockId`
+all re-export from `types`. `BlockHashCtx` deleted (its
+content-hash role moves to `types::BlockFingerprint`).
 
-M0.2 (three prefix_cache bug fixes) can also start in parallel with M0.1
-because it only touches `infer/src/prefix_cache.rs`.
+**M0.2 · three `prefix_cache.rs` bug fixes** — no-op. Already fixed in
+commit `5da8b67`. See §6 M0.2 and §8 items 10–12.
 
-M0.3 (`page_size` lift) **blocks on** the in-flight extraction's `.cu`
-moves landing first.
+**M0.3 · `page_size = 1 → 16` per-format dispatch** — can now proceed.
+The in-flight `infer-cuda-kernels` crate extraction has landed (see
+commits `a4e12f5` / `081cf32` / `0ab2cd1`); kernel files are at
+`crates/infer-cuda-kernels/src/paged_kv.rs`,
+`crates/infer-cuda-kernels/csrc/kv/{kv_cache_to_paged, kv_quant,
+scatter_kv}.cu`. Execute §6 M0.3 with those paths. M0.3 is a prereq
+for M3, not for M1.
 
-M1 blocks on all three of M0.1 / M0.2 / M0.3.
+**M1 · wire `RadixCache` into the scheduler + delete
+`kv_tier/directory.rs`** — ready to start whenever M0.1 is committed.
+Does not depend on M0.3.
 
 ---
 
