@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::prefix_cache::{BlockId, RadixCache};
 use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
@@ -8,6 +10,21 @@ use crate::types::InferenceMode;
 /// M2 dual residency wires the radix directly onto the pool, the block
 /// boundaries already agree.
 pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
+
+/// High-water mark for pool pages held by the radix cache, as a
+/// fraction of `max_total_tokens`. When `retained_count / total`
+/// exceeds this, `cleanup()` triggers LRU eviction down to
+/// [`PREFIX_CACHE_EVICT_LOW_WATER`].
+///
+/// Rationale: at 75% retained the next fresh admission is likely to
+/// hit pool OOM on `alloc_tokens`. Keeping headroom above the free
+/// list avoids having to retry alloc with eviction in the hot path.
+pub(super) const PREFIX_CACHE_HIGH_WATER: f64 = 0.75;
+
+/// Low-water mark for the same eviction loop: evict down to this
+/// fraction of `max_total_tokens`. The gap between high and low
+/// prevents thrash (evict-then-re-insert on every cleanup).
+pub(super) const PREFIX_CACHE_LOW_WATER: f64 = 0.50;
 
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -23,22 +40,32 @@ pub struct Scheduler<M: ModelForward> {
     /// is a shadow observer that accumulates cross-slot prefix stats
     /// and will take over slot selection once pool pages gain refcounts.
     pub(super) cached_prompts: Vec<Vec<u32>>,
-    /// Global cross-slot prefix observer. Owned by the single-writer
-    /// scheduler thread, no lock needed. Populated on `cleanup()` with
-    /// each completed request's prompt and queried on `assign_slots()`
-    /// to surface the best achievable prefix hit length in the logs.
+    /// Global cross-slot prefix observer and (as of M2a) the authority
+    /// on which pool pages must survive a slot's `free_slot` call.
+    /// Owned by the single-writer scheduler thread, no lock needed.
     ///
-    /// M1 scope: infrastructure only, behavior unchanged. The
-    /// `BlockId`s stored under each node are **synthetic** — one fresh
-    /// id per `PREFIX_CACHE_BLOCK_SIZE`-token block, minted by
-    /// `next_prefix_block_id`. They do not correspond to any
-    /// paged-pool index yet; the mapping onto pool pages is M2.
+    /// As of M2a (2026-04-14), the `BlockId`s stored under each node
+    /// are **real physical pool page indices** pulled from
+    /// `paged_kv_pool.token_indices(slot_idx)` at publish time. The
+    /// pool's `page_ref_count` tracks how many radix nodes reference
+    /// each page, and `free_slot` now leaves pinned pages in limbo
+    /// instead of returning them to the free list. This sets up the
+    /// M2b "admission bypasses prefill for matched pages" step while
+    /// keeping current slot-selection behavior unchanged.
     pub(super) prefix_cache: RadixCache,
-    /// Monotonic counter for synthetic `BlockId`s inserted into
-    /// `prefix_cache`. Wraps on u32 overflow, which at 16 tokens per
-    /// block and ~10 M blocks per overflow cycle is not a concern for
-    /// any realistic deployment lifetime.
-    pub(super) next_prefix_block_id: u32,
+    /// Side map from `BlockId` → full contiguous page span for that
+    /// block. The radix stores just the first page of each block
+    /// (block id = `slot_pages[i * block_size]`), but the actual
+    /// `block_size` pages belonging to that block can be arbitrary
+    /// pool indices because the LIFO `free_slots` allocator produces
+    /// non-contiguous ranges after a few alloc/free cycles. This map
+    /// keeps the full span so eviction can release the right pages.
+    ///
+    /// Invariant: every `BlockId` inserted into `prefix_cache` has
+    /// an entry here with exactly `prefix_cache.block_size()` pages,
+    /// and every page in the value appears in `page_ref_count > 0`.
+    /// Entries are removed when eviction releases the block.
+    pub(super) block_to_pages: HashMap<BlockId, Vec<u32>>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -186,7 +213,7 @@ impl<M: ModelForward> Scheduler<M> {
             states,
             cached_prompts,
             prefix_cache: RadixCache::new(PREFIX_CACHE_BLOCK_SIZE),
-            next_prefix_block_id: 0,
+            block_to_pages: HashMap::new(),
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
@@ -274,46 +301,169 @@ impl<M: ModelForward> Scheduler<M> {
         Some(effective)
     }
 
-    /// Insert a completed request's prompt into the global
-    /// [`RadixCache`] prefix observer.
+    /// Fold a completed request's prompt into the global
+    /// [`RadixCache`] prefix observer and pin the corresponding pool
+    /// pages so they survive the subsequent `free_slot` call.
     ///
-    /// Each block-sized chunk of `prompt_tokens` gets a fresh synthetic
-    /// [`BlockId`] minted from `next_prefix_block_id`. Trailing partial
-    /// blocks are dropped per `RadixCache::insert` semantics. The ref
-    /// counts for all newly-inserted blocks start at zero so the next
-    /// lookup will be the only holder, and the scheduler's lookup path
-    /// releases immediately — no permanent ref accumulates.
+    /// M2a wiring: the [`BlockId`]s stored in the radix are **real
+    /// physical pool page indices** pulled from
+    /// `paged_kv_pool.token_indices(slot_idx)`. For a prompt of
+    /// `L` tokens and the radix's `block_size = B`, the first
+    /// `num_blocks = L / B` full blocks are inserted under the page
+    /// ids covering positions `[0, num_blocks * B)` — i.e. exactly the
+    /// contiguous pool pages that hold those tokens' KV state. The
+    /// trailing `L % B` tokens are dropped per `RadixCache::insert`
+    /// semantics (partial blocks are never cached).
     ///
-    /// Called from `cleanup()` whenever a finished request has a
-    /// publishable cached prompt. M1 does not wire any eviction; the
-    /// radix grows monotonically for the life of the process. M2 will
-    /// attach eviction to paged-pool free events.
-    pub(super) fn publish_to_prefix_cache(&mut self, prompt_tokens: &[u32]) {
+    /// After inserting, `paged_kv_pool.retain_pages` bumps the
+    /// refcount on each page. Because the scheduler's `cleanup()`
+    /// calls this method **before** `free_slot`, the pool's
+    /// refcount-aware `free_slot` will leave these pages in limbo
+    /// (out of any slot, out of the free list, still physically
+    /// alive in HBM) instead of recycling them. This is the
+    /// dual-residency data model on which M2b will build cross-slot
+    /// KV reuse.
+    ///
+    /// Caller contract: `slot_idx` must currently own the pages in
+    /// `paged_kv_pool.token_indices(slot_idx)` and the slot must not
+    /// have been `free_slot`ed yet. `prompt_tokens.len()` must equal
+    /// the number of tokens currently allocated to the slot (i.e.
+    /// `paged_kv_pool.seq_len(slot_idx)`). Both are true at the
+    /// `cleanup()` call site where this is invoked.
+    pub(super) fn publish_to_prefix_cache(&mut self, slot_idx: usize, prompt_tokens: &[u32]) {
         let block_size = self.prefix_cache.block_size();
         let num_blocks = prompt_tokens.len() / block_size;
         if num_blocks == 0 {
             return;
         }
-        let mut blocks: Vec<BlockId> = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            blocks.push(BlockId(self.next_prefix_block_id));
-            self.next_prefix_block_id = self.next_prefix_block_id.wrapping_add(1);
-        }
+
+        // Snapshot the slot's pool pages into an owned `Vec` so the
+        // immutable borrow on `self.paged_kv_pool` ends before we
+        // reach the `retain_pages` call below (which needs `&mut
+        // self.paged_kv_pool`). The clone is `num_blocks * 16` `u32`s
+        // — cheap compared to the work happening on the CUDA side.
+        let required_pages = num_blocks * block_size;
+        let slot_pages: Vec<u32> = {
+            let all_pages = self.paged_kv_pool.token_indices(slot_idx);
+            if all_pages.len() < required_pages {
+                warn!(
+                    "publish_to_prefix_cache: slot {} has {} pages but prompt needs {} \
+                     ({} full blocks × block_size={}). Skipping publish to preserve invariants.",
+                    slot_idx,
+                    all_pages.len(),
+                    required_pages,
+                    num_blocks,
+                    block_size,
+                );
+                return;
+            }
+            all_pages[..required_pages].to_vec()
+        };
+
+        // `BlockId`s are the first page of each `block_size`-wide
+        // chunk within `slot_pages`. M2b will resurrect a matched
+        // block by copying the block's full page span out of the
+        // pool; the side map `block_to_pages` below carries that
+        // span so eviction can release the exact same pages even
+        // when `token_indices[slot]` is a non-contiguous permutation
+        // of pool ids (always the case after a few alloc/free
+        // cycles).
+        let blocks: Vec<BlockId> = (0..num_blocks)
+            .map(|i| BlockId(slot_pages[i * block_size]))
+            .collect();
+
         let inserted = self.prefix_cache.insert(prompt_tokens, &blocks);
-        if inserted != num_blocks * block_size {
-            // `insert` returns the number of tokens actually stored; a
-            // mismatch here would only happen if `blocks.len()` is
-            // smaller than `num_blocks`, which we just constructed, so
-            // this is a hard invariant violation. Log at warn so the
-            // scheduler loop does not panic.
+        if inserted != required_pages {
             warn!(
-                "prefix_cache.insert: expected {} tokens, got {} (num_blocks={}, tokens={})",
-                num_blocks * block_size,
+                "prefix_cache.insert: expected {} tokens, got {} (slot={}, num_blocks={}, prompt={})",
+                required_pages,
                 inserted,
+                slot_idx,
                 num_blocks,
                 prompt_tokens.len(),
             );
+            return;
         }
+
+        // Pin every physical page that backs the inserted blocks.
+        // The radix refs a "block" as a unit, and the *entire*
+        // `block_size`-wide span must survive free_slot so the
+        // M2b-era resurrection path can read the full KV state back
+        // out.
+        self.paged_kv_pool.retain_pages(&slot_pages);
+        for (block_i, &bid) in blocks.iter().enumerate() {
+            let start = block_i * block_size;
+            let pages_for_block: Vec<u32> = slot_pages[start..start + block_size].to_vec();
+            // If a prior publish already registered this BlockId
+            // (same pool page as first-of-block), the existing entry
+            // is authoritative — don't clobber it. The `retain_pages`
+            // call above bumped the refcount a second time, so the
+            // first `release_pages` will leave the entry with
+            // refcount > 0 and the eviction path will correctly
+            // short-circuit on the second release.
+            self.block_to_pages
+                .entry(bid)
+                .or_insert_with(|| pages_for_block);
+        }
+    }
+
+    /// Release radix-held pool pages back to the free list once the
+    /// pool's retained fraction exceeds the high-water mark.
+    ///
+    /// Policy: when `retained / total > PREFIX_CACHE_HIGH_WATER`,
+    /// evict LRU radix blocks until `retained / total ≤
+    /// PREFIX_CACHE_LOW_WATER`. The gap between high and low marks
+    /// prevents thrash where every completed request immediately
+    /// evicts the block it just inserted.
+    ///
+    /// Each evicted `BlockId` is looked up in `block_to_pages` and
+    /// the full per-block page span is released via
+    /// `paged_kv_pool.release_pages`. If the refcount hits zero the
+    /// pages rejoin the pool's primary free list immediately; if
+    /// another radix block also references them the refcount just
+    /// decrements and the pages stay in limbo.
+    ///
+    /// Returns the number of pool pages actually reclaimed (0 when
+    /// not under pressure). Called at the end of `cleanup()` so the
+    /// eviction cost is amortised over request completions, not the
+    /// admission hot path.
+    pub(super) fn evict_prefix_cache_if_pressured(&mut self) -> usize {
+        let total = self.paged_kv_pool.max_total_tokens;
+        if total == 0 {
+            return 0;
+        }
+        let retained = self.paged_kv_pool.retained_count();
+        let high = (total as f64 * PREFIX_CACHE_HIGH_WATER) as usize;
+        if retained <= high {
+            return 0;
+        }
+        let target = (total as f64 * PREFIX_CACHE_LOW_WATER) as usize;
+        let want_free = retained.saturating_sub(target);
+        let block_size = self.prefix_cache.block_size();
+        // Round up: each evicted block releases at most `block_size`
+        // pages (fewer if some pages are multi-referenced).
+        let blocks_to_evict = want_free.div_ceil(block_size);
+        if blocks_to_evict == 0 {
+            return 0;
+        }
+        let evicted = self.prefix_cache.evict(blocks_to_evict);
+        let mut reclaimed_pages: usize = 0;
+        for bid in evicted {
+            if let Some(pages) = self.block_to_pages.remove(&bid) {
+                let freed_now = self.paged_kv_pool.release_pages(&pages);
+                reclaimed_pages += freed_now.len();
+            }
+        }
+        if reclaimed_pages > 0 {
+            info!(
+                "prefix cache eviction: released {} pool pages back to free list \
+                 ({} evicted blocks; retained now {})",
+                reclaimed_pages,
+                blocks_to_evict,
+                self.paged_kv_pool.retained_count(),
+            );
+        }
+        reclaimed_pages
     }
 
     pub(super) fn prefill_chunk_size(&self) -> usize {
