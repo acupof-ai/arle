@@ -1,4 +1,4 @@
-//! [`NixlTransport`] — P5 stub impl of [`KVTransport`] over NVIDIA NIXL.
+//! [`NixlTransport`] — M5 stub impl of [`KVTransport`] over NVIDIA NIXL.
 //!
 //! Compiled only under `#[cfg(feature = "rdma-nixl")]`. The `rdma-nixl`
 //! feature transitively enables `nixl-sys`'s `stub-api` feature, so
@@ -8,15 +8,33 @@
 //! hosts with the real library, enable the sibling `rdma-nixl-real`
 //! feature instead (it pulls the same dep without `stub-api`).
 //!
+//! # Status — M5 stub only
+//!
+//! This file ships the **stub half** of the tiered-kv-cache M5
+//! milestone (formerly P5 in the 2026-04-13 plan; renamed in the
+//! 2026-04-15 revision — see `docs/projects/tiered-kv-cache.md` §6 M5).
+//! The "real RDMA" half of M5 is **trigger-gated** per project doc §6:
+//! it executes only when one of these fires:
+//!
+//! - prefill / decode disaggregation requires KV migration between
+//!   worker pools
+//! - cluster-wide session roaming asks KV to follow a session across
+//!   nodes
+//! - a second consumer of the kernel layer needs functional remote
+//!   tier I/O to integrate
+//!
+//! In the absence of any trigger, the real impl stays unwritten and
+//! the stub stays as a compile gate.
+//!
 //! # What this skeleton proves
 //!
 //! - `nixl-sys` compiles into the infer workspace (types are in scope,
 //!   the build.rs does not hard-fail when the native library is
 //!   absent).
 //! - Our [`KVTransport`] trait shape survives contact with NIXL's
-//!   polling-completion model (the P5 research specifically locked in
-//!   `type Op` + explicit `poll` / `abort` because NIXL has no native
-//!   `Future`; this file is where that shape gets validated).
+//!   polling-completion model. The 2026-04-13 research specifically
+//!   locked in `type Op` + explicit `poll` / `abort` because NIXL has
+//!   no native `Future`; this file is where that shape gets validated.
 //! - The feature-gate and cargo feature glue work end-to-end: default
 //!   builds do not pay the `nixl-sys` build cost, `rdma-nixl` adds it,
 //!   and the always-on `kv_tier` module still compiles on every
@@ -25,35 +43,36 @@
 //! # What it does NOT do
 //!
 //! - No runtime behavior. Every [`KVTransport`] method returns
-//!   [`TransportError::Other`] with a "P6 stub" diagnostic. The P6
-//!   implementation (follow-up project) will actually call
-//!   [`nixl_sys::Agent::register_memory`] and friends.
+//!   [`TransportError::Other`] with an "M5 stub" diagnostic. The real
+//!   M5 impl (deferred per the trigger discipline above) will actually
+//!   call [`nixl_sys::Agent::register_memory`] and friends.
 //! - No actual transfer. NIXL's `Agent::new` can succeed on Mac with
 //!   `stub-api` (it just records the name), but `create_backend` /
 //!   `register_memory` / `post_xfer_req` will `dlopen` at runtime and
 //!   fail because the real library is absent — so this skeleton
 //!   specifically avoids calling them.
 //!
-//! See `docs/plans/tiered-kv-cache-tasks.md` §6 for the research, and
-//! `docs/projects/tiered-kv-cache.md` §P5/§P6 for the phase split.
+//! See `docs/projects/tiered-kv-cache.md` §6 M5 for the trigger
+//! discipline and the migration shape from stub to real impl.
 
 use std::task::Poll;
 
 use super::super::tier::MemKind;
 use super::{KVTransport, TransferOp, TransportError};
 
-/// Phase-5 stub transport. Holds no state; the real implementation in
-/// P6 will own a `nixl_sys::Agent` and a set of registered regions.
+/// M5-stub transport. Holds no state; the real implementation will own
+/// a `nixl_sys::Agent` and a set of registered regions when one of the
+/// project doc §6 M5 triggers fires.
 #[derive(Debug, Default)]
 pub struct NixlTransport {
-    /// Logical agent name that a future P6 impl will pass to
+    /// Logical agent name that a future real impl will pass to
     /// [`nixl_sys::Agent::new`]. Kept as an owned String so callers can
     /// configure their node identity today and not have to revisit
     /// call sites when the real impl lands.
     name: String,
 }
 
-/// Opaque registered-region handle. The real P6 impl will replace the
+/// Opaque registered-region handle. The real impl will replace the
 /// `()` payload with a `nixl_sys::RegistrationHandle`; keeping the
 /// wrapper type lets call sites avoid importing `nixl-sys` directly.
 #[derive(Debug)]
@@ -66,7 +85,7 @@ pub struct NixlRegion {
 unsafe impl Send for NixlRegion {}
 unsafe impl Sync for NixlRegion {}
 
-/// Opaque in-flight operation handle. The real P6 impl will replace
+/// Opaque in-flight operation handle. The real impl will replace
 /// `()` with a `nixl_sys::XferRequest`.
 #[derive(Debug)]
 pub struct NixlOp {
@@ -80,14 +99,14 @@ unsafe impl Send for NixlOp {}
 
 impl NixlTransport {
     /// Construct a stub transport. Does not touch `nixl_sys` yet —
-    /// constructing a real [`nixl_sys::Agent`] is deferred to the P6
-    /// impl so the skeleton compiles uniformly on every platform.
+    /// constructing a real [`nixl_sys::Agent`] is deferred to the real
+    /// M5 impl so the skeleton compiles uniformly on every platform.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
 
-    /// The agent name this transport was configured with. P6 will pass
-    /// it to `nixl_sys::Agent::new`.
+    /// The agent name this transport was configured with. The real
+    /// impl will pass it to `nixl_sys::Agent::new`.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -96,8 +115,9 @@ impl NixlTransport {
 /// Compile-time proof that `nixl-sys` is a reachable dependency under
 /// the `rdma-nixl` feature. This function is never called; its body
 /// only exists so the compiler instantiates the type and verifies the
-/// feature glue is wired correctly. When P6 arrives and wants to call
-/// `Agent::new`, it can delete this fn and use the type directly.
+/// feature glue is wired correctly. When the real M5 impl arrives and
+/// wants to call `Agent::new`, it can delete this fn and use the type
+/// directly.
 #[allow(dead_code)]
 fn _assert_nixl_sys_types_resolve() {
     // Referencing the type is enough — the skeleton never actually
@@ -122,26 +142,25 @@ impl KVTransport for NixlTransport {
         _kind: MemKind,
     ) -> Result<Self::Region, TransportError> {
         Err(TransportError::Other(
-            "NixlTransport::register is a P5 stub; real impl lands in P6 via nixl_sys::Agent::register_memory".into(),
+            "NixlTransport::register is an M5 stub; real impl calls nixl_sys::Agent::register_memory".into(),
         ))
     }
 
     fn put_batch(&self, _ops: &[TransferOp]) -> Result<Self::Op, TransportError> {
         Err(TransportError::Other(
-            "NixlTransport::put_batch is a P5 stub; real impl lands in P6 via Agent::post_xfer_req(XferOp::Write)".into(),
+            "NixlTransport::put_batch is an M5 stub; real impl calls Agent::post_xfer_req(XferOp::Write)".into(),
         ))
     }
 
     fn get_batch(&self, _ops: &[TransferOp]) -> Result<Self::Op, TransportError> {
         Err(TransportError::Other(
-            "NixlTransport::get_batch is a P5 stub; real impl lands in P6 via Agent::post_xfer_req(XferOp::Read)".into(),
+            "NixlTransport::get_batch is an M5 stub; real impl calls Agent::post_xfer_req(XferOp::Read)".into(),
         ))
     }
 
     fn poll(&self, _op: &mut Self::Op) -> Poll<Result<(), TransportError>> {
         Poll::Ready(Err(TransportError::Other(
-            "NixlTransport::poll is a P5 stub; real impl lands in P6 via Agent::get_xfer_status"
-                .into(),
+            "NixlTransport::poll is an M5 stub; real impl calls Agent::get_xfer_status".into(),
         )))
     }
 
@@ -162,15 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn stub_put_and_get_return_p5_stub_error() {
+    fn stub_put_and_get_return_m5_stub_error() {
         let t = NixlTransport::new("infer-agent-0");
         let err = t
             .put_batch(&[])
             .expect_err("put_batch should be a stub error");
         match err {
             TransportError::Other(msg) => assert!(
-                msg.contains("P5 stub"),
-                "expected P5 stub marker, got: {msg}"
+                msg.contains("M5 stub"),
+                "expected M5 stub marker, got: {msg}"
             ),
             other => panic!("expected Other, got {other:?}"),
         }
@@ -181,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn stub_register_returns_p5_stub_error() {
+    fn stub_register_returns_m5_stub_error() {
         let t = NixlTransport::new("infer-agent-0");
         let mut dummy = [0u8; 16];
         // Safety: pointer is valid for the duration of the unsafe call;
@@ -197,7 +216,7 @@ mod tests {
         let mut op = NixlOp { _stub: () };
         match t.poll(&mut op) {
             Poll::Ready(Err(TransportError::Other(msg))) => {
-                assert!(msg.contains("P5 stub"));
+                assert!(msg.contains("M5 stub"));
             }
             other => panic!("expected Ready(Err(Other)), got {other:?}"),
         }
