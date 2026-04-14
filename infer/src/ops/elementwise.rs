@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-use crate::backend::cuda::ffi;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use infer_cuda_kernels::ffi;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Batched element-wise add: out = a + b (same shape HiddenStates)
 pub fn add_batch(ctx: &DeviceContext, a: &HiddenStates, b: &HiddenStates) -> Result<HiddenStates> {

@@ -7,7 +7,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// All HiddenStates(seq_len=1) buffers needed for one prefill step.
 /// Allocated once, reused every decode step. Eliminates ~500 alloc/free pairs per token.

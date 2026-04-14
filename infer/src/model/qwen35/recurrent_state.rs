@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 
 use super::config::Config35;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
 
 /// Per-layer recurrent state for a single linear attention layer.
 pub(crate) struct LayerRecurrentState {

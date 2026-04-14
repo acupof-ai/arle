@@ -5,7 +5,8 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config35;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, RawDevicePtr};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, RawDevicePtr};
+use infer_cuda_kernels::tensor::cache_ptr;
 
 /// Cached raw pointers for hot-path sampling ops (avoids cudarc device_ptr overhead).
 pub(crate) struct DecodeBufferPtrs35 {
@@ -41,10 +42,10 @@ impl DecodeBuffers35 {
             .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?;
 
         let ptrs = DecodeBufferPtrs35 {
-            logits_ptr: crate::backend::cuda::tensor::cache_ptr(&logits.data, ctx),
+            logits_ptr: cache_ptr(&logits.data, ctx),
             logits_len: config.vocab_size,
-            sample_probs_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_probs, ctx),
-            sample_out_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_out, ctx),
+            sample_probs_ptr: cache_ptr(&sample_probs, ctx),
+            sample_out_ptr: cache_ptr(&sample_out, ctx),
         };
 
         let logits_scratch = DeviceVec::zeros(ctx, config.vocab_size)?;
@@ -60,15 +61,14 @@ impl DecodeBuffers35 {
 
     /// Point raw sampling kernels at the state's single-token logits buffer.
     pub(crate) fn bind_single_token_logits(&mut self, ctx: &DeviceContext, logits: &DeviceVec) {
-        self.ptrs.logits_ptr = crate::backend::cuda::tensor::cache_ptr(&logits.data, ctx);
+        self.ptrs.logits_ptr = cache_ptr(&logits.data, ctx);
         self.ptrs.logits_len = logits.len;
         self.using_logits_scratch = false;
     }
 
     /// Point raw sampling kernels at the per-request batched decode logits copy.
     pub(crate) fn bind_logits_scratch(&mut self, ctx: &DeviceContext) {
-        self.ptrs.logits_ptr =
-            crate::backend::cuda::tensor::cache_ptr(&self.logits_scratch.data, ctx);
+        self.ptrs.logits_ptr = cache_ptr(&self.logits_scratch.data, ctx);
         self.ptrs.logits_len = self.logits_scratch.len;
         self.using_logits_scratch = true;
     }

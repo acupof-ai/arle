@@ -15,8 +15,9 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::backend::cuda::ffi;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
+use infer_cuda_kernels::ffi;
+use infer_cuda_kernels::flashinfer::FlashInferWorkspace;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 
 // ============================================================================
 // Parameter structs — group related config/weight params for high-arity ops.
@@ -56,7 +57,7 @@ pub(crate) struct PagedKVMeta<'a> {
 ///   3. FlashAttention-2 (Triton kernel — fused QK + causal softmax + V)
 ///
 /// No O(n²) scratch buffers needed — FlashAttention uses online softmax.
-pub fn prefill_attention_batch(
+pub(crate) fn prefill_attention_batch(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
     k_batch: &mut HiddenStates,
@@ -199,7 +200,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
 }
 
 /// Qwen3.5 full-attention prefill: prep Q/K/cache, run HD256 FlashAttention-2, then apply gate.
-pub fn prefill_attention_hd256_batch(
+pub(crate) fn prefill_attention_hd256_batch(
     ctx: &DeviceContext,
     q_full_batch: &HiddenStates,
     k_batch: &HiddenStates,
@@ -240,7 +241,7 @@ pub fn prefill_attention_hd256_batch(
 /// Same as `prefill_attention_hd256_batch` but uses pre-allocated scratch buffers.
 /// `start_pos_buf` is a GPU-resident `i32` for CUDA Graph safety.
 #[allow(clippy::too_many_arguments)]
-pub fn prefill_attention_hd256_batch_with_scratch(
+pub(crate) fn prefill_attention_hd256_batch_with_scratch(
     ctx: &DeviceContext,
     q_full_batch: &HiddenStates,
     k_batch: &HiddenStates,
@@ -524,12 +525,6 @@ pub fn fused_attention_decode_into(
     Ok(())
 }
 
-// ============================================================================
-// FlashInfer batch decode with paged KV cache
-// ============================================================================
-
-pub use infer_cuda_kernels::flashinfer::FlashInferWorkspace;
-
 /// Batched decode prep for paged KV cache: QK-norm + RoPE (in-place on Q) + paged KV write.
 ///
 /// After this call:
@@ -540,7 +535,7 @@ pub use infer_cuda_kernels::flashinfer::FlashInferWorkspace;
 /// `page_table_gpu`: flattened page indices on GPU
 /// `page_indptr_gpu`: [B+1] i32 on GPU — cumulative page counts
 /// `last_page_len_gpu`: [B] i32 on GPU — tokens in last page (including the new token)
-pub fn decode_prep_paged(
+pub(crate) fn decode_prep_paged(
     ctx: &DeviceContext,
     q_batch: &mut HiddenStates,
     k_batch: &HiddenStates,
@@ -597,214 +592,6 @@ pub fn decode_prep_paged(
         .result()?;
     }
 
-    Ok(())
-}
-
-/// FlashInfer batch decode attention with paged KV cache.
-///
-/// Calls `flashinfer_batch_decode_plan` (CPU-side scheduling) then
-/// `flashinfer_batch_decode_run` (GPU kernel launch).
-///
-/// Q must already have RMSNorm + RoPE applied, layout: [B, num_qo_heads * head_dim]
-/// (treated as [B, num_qo_heads, head_dim] by FlashInfer).
-/// K/V must already be in the paged cache with RoPE applied to K.
-///
-/// `indptr_h`: host-side [B+1] page indptr (needed by plan)
-/// `kv_indptr_gpu`, `kv_indices_gpu`, `kv_last_page_len_gpu`: GPU arrays
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_batch_decode(
-    ctx: &DeviceContext,
-    q_batch: &HiddenStates,
-    kv_pool: &PagedKVPool,
-    layer_idx: usize,
-    indptr_h: &[i32],
-    kv_indptr_gpu: &CudaSlice<i32>,
-    kv_indices_gpu: &CudaSlice<i32>,
-    kv_last_page_len_gpu: &CudaSlice<i32>,
-    output: &mut HiddenStates,
-    workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
-
-    infer_cuda_kernels::flashinfer::flashinfer_plan(
-        ctx,
-        indptr_h,
-        workspace,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        page_size,
-        head_dim,
-    )?;
-
-    // Step 2: Run (GPU kernel)
-    {
-        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-        let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-        let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
-        let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
-        let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
-        let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
-
-        let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
-        let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
-
-        let ret = unsafe {
-            ffi::flashinfer_batch_decode_run(
-                fw_ptr as *mut u8,
-                iw_ptr as *mut u8,
-                workspace.plan_info as *const u8, // host pointer — FlashInfer uses CPU memcpy
-                q_ptr as *const ffi::Half,
-                k_pool_ptr as *const ffi::Half,
-                v_pool_ptr as *const ffi::Half,
-                ind_ptr as *const i32,
-                idx_ptr as *const i32,
-                lp_ptr as *const i32,
-                o_ptr as *mut ffi::Half,
-                lse_ptr as *mut f32,
-                batch_size as i32,
-                num_qo_heads as i32,
-                num_kv_heads as i32,
-                page_size as i32,
-                head_dim as i32,
-                sm_scale,
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow!(
-                "flashinfer_batch_decode_run failed with CUDA error {}",
-                ret
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// FlashInfer plan step only (CPU-side scheduling). Call once per decode step,
-/// not per layer — the plan result works for all layers since KV layout is the same.
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_plan(
-    ctx: &DeviceContext,
-    indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    infer_cuda_kernels::flashinfer::flashinfer_plan(
-        ctx,
-        indptr_h,
-        workspace,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        page_size,
-        head_dim,
-    )
-}
-
-/// FlashInfer tensor-core decode plan (uses prefill kernel for flat ITL).
-///
-/// Uses `PrefillPlan` instead of `DecodePlan`. For decode, each request has
-/// `qo_len=1`, so `qo_indptr = [0, 1, 2, ..., B]`.
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_tc_plan(
-    ctx: &DeviceContext,
-    qo_indptr_h: &[i32],
-    kv_indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    infer_cuda_kernels::flashinfer::flashinfer_tc_plan(
-        ctx,
-        qo_indptr_h,
-        kv_indptr_h,
-        workspace,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        page_size,
-        head_dim,
-    )
-}
-
-/// FlashInfer tensor-core decode run (GPU kernel). Uses prefill kernel.
-#[allow(clippy::too_many_arguments)]
-pub fn flashinfer_tc_run_layer(
-    ctx: &DeviceContext,
-    q_batch: &HiddenStates,
-    q_indptr_gpu: &CudaSlice<i32>,
-    kv_pool: &PagedKVPool,
-    layer_idx: usize,
-    kv_indptr_gpu: &CudaSlice<i32>,
-    kv_indices_gpu: &CudaSlice<i32>,
-    kv_last_page_len_gpu: &CudaSlice<i32>,
-    output: &mut HiddenStates,
-    workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
-
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
-    let (qi_ptr, _gqi) = q_indptr_gpu.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
-    let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
-    let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
-    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
-
-    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
-    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_tc_decode_run(
-            fw_ptr as *mut u8,
-            iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
-            q_ptr as *const ffi::Half,
-            qi_ptr as *const i32,
-            k_pool_ptr as *const ffi::Half,
-            v_pool_ptr as *const ffi::Half,
-            ind_ptr as *const i32,
-            idx_ptr as *const i32,
-            lp_ptr as *const i32,
-            o_ptr as *mut ffi::Half,
-            lse_ptr as *mut f32,
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            sm_scale,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_tc_decode_run failed with CUDA error {}",
-            ret
-        ));
-    }
     Ok(())
 }
 
@@ -968,30 +755,6 @@ pub(crate) fn attention_gate_paged_hd256(
         .result()
         .expect("attention_gate_paged_hd256_cuda failed");
     }
-}
-
-/// FlashInfer plan for HD256 decode (Qwen3.5 full attention).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn flashinfer_plan_hd256(
-    ctx: &DeviceContext,
-    indptr_h: &[i32],
-    workspace: &mut FlashInferWorkspace,
-    batch_size: usize,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
-) -> Result<()> {
-    infer_cuda_kernels::flashinfer::flashinfer_plan_hd256(
-        ctx,
-        indptr_h,
-        workspace,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        page_size,
-        head_dim,
-    )
 }
 
 /// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.

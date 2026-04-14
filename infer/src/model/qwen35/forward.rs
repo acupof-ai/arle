@@ -6,7 +6,7 @@ use super::decode_buffers::DecodeBuffers35;
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
@@ -88,8 +88,8 @@ impl GenerationState for Qwen35State {
 
     fn migrate_kv_to_paged(
         &mut self,
-        ctx: &crate::backend::cuda::tensor::DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
         slot: usize,
     ) -> Result<()> {
         self.base.migrate_kv_to_paged(ctx, pool, slot)
@@ -97,8 +97,8 @@ impl GenerationState for Qwen35State {
 
     fn migrate_kv_range_to_paged(
         &mut self,
-        ctx: &crate::backend::cuda::tensor::DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {
@@ -130,7 +130,7 @@ impl ModelForward for Qwen35Model {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         use super::batch_decode::BatchDecodeBuffers35;
         let c = &self.config;
@@ -274,7 +274,7 @@ impl ModelForward for Qwen35Model {
         self.config.is_stop_token(token_id)
     }
 
-    fn device_context(&self) -> &crate::backend::cuda::tensor::DeviceContext {
+    fn device_context(&self) -> &DeviceContext {
         &self.ctx
     }
 
@@ -283,7 +283,7 @@ impl ModelForward for Qwen35Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
-        paged_kv_pool: Option<&mut crate::backend::cuda::paged_kv::PagedKVPool>,
+        paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
         skip_logit_scatter: bool,
     ) -> Result<()> {

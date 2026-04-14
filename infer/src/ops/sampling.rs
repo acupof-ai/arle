@@ -11,8 +11,8 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use crate::backend::cuda::ffi;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
+use infer_cuda_kernels::ffi;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, RawDevicePtr};
 
 /// Argmax — returns the index of the maximum element.
 ///
@@ -52,7 +52,7 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
 /// Launch batched argmax on a HiddenStates [B, vocab] buffer. No sync, no readback.
 pub(crate) fn argmax_batch_launch(
     ctx: &DeviceContext,
-    logits: &crate::backend::cuda::tensor::HiddenStates,
+    logits: &HiddenStates,
     out: &mut CudaSlice<i32>,
     batch_size: usize,
 ) -> Result<()> {
@@ -75,7 +75,7 @@ pub(crate) fn argmax_batch_launch(
 /// Batched argmax + logprob launch (no sync). Returns token IDs + logprobs.
 pub(crate) fn argmax_batch_logprob_launch(
     ctx: &DeviceContext,
-    logits: &crate::backend::cuda::tensor::HiddenStates,
+    logits: &HiddenStates,
     out_ids: &mut CudaSlice<i32>,
     out_logprobs: &mut CudaSlice<f32>,
     batch_size: usize,
@@ -276,10 +276,10 @@ pub fn gpu_sample_launch(
 /// Eliminates device_ptr() overhead on every call.
 pub(crate) fn gpu_sample_launch_raw(
     ctx: &DeviceContext,
-    logits_ptr: crate::backend::cuda::tensor::RawDevicePtr<half::bf16>,
+    logits_ptr: RawDevicePtr<half::bf16>,
     logits_len: usize,
-    probs_ptr: crate::backend::cuda::tensor::RawDevicePtr<f32>,
-    out_ptr: crate::backend::cuda::tensor::RawDevicePtr<i32>,
+    probs_ptr: RawDevicePtr<f32>,
+    out_ptr: RawDevicePtr<i32>,
     params: &crate::sampler::SamplingParams,
     random_val: f32,
 ) -> Result<()> {

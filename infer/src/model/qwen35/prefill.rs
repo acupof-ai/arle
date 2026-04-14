@@ -6,10 +6,10 @@ use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::{
     FullAttentionLayer, LayerKind, LinearAttentionLayer, Qwen35Model, TransformerBlock35,
 };
-use crate::backend::cuda::prelude::{DeviceVec, HiddenStates};
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;
+use infer_cuda_kernels::prelude::{DeviceVec, HiddenStates};
 
 impl Qwen35Model {
     pub(super) fn prefill_forward(

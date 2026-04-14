@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::cuda_graph::CudaGraphState;
 use super::kv_cache::KVCache;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Common generation-state fields shared across all model implementations.
 ///
@@ -71,7 +71,7 @@ impl GenerationStateBase {
     pub(crate) fn migrate_kv_to_paged(
         &self,
         ctx: &DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
         slot: usize,
     ) -> Result<()> {
         use super::kv_cache::KVFormat;
@@ -116,7 +116,7 @@ impl GenerationStateBase {
     pub(crate) fn migrate_kv_range_to_paged(
         &self,
         ctx: &DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {

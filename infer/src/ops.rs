@@ -8,10 +8,6 @@ mod elementwise;
 mod embedding;
 #[path = "ops/kv_ops.rs"]
 mod kv_ops;
-#[path = "ops/kv_quant.rs"]
-pub(crate) mod kv_quant;
-#[path = "ops/kv_turboquant.rs"]
-pub(crate) mod kv_turboquant;
 #[path = "ops/linear.rs"]
 mod linear;
 #[path = "ops/norm.rs"]
@@ -26,11 +22,12 @@ mod sampling;
 mod tests;
 
 // pub re-exports
+pub(crate) use attention::{
+    decode_prep_paged, prefill_attention_batch, prefill_attention_hd256_batch,
+    prefill_attention_hd256_batch_with_scratch,
+};
 pub use attention::{
-    FlashInferWorkspace, decode_prep_paged, flashinfer_batch_decode, flashinfer_plan,
-    flashinfer_run_layer, flashinfer_tc_plan, flashinfer_tc_run_layer,
-    fused_attention_decode_batched_into, fused_attention_decode_into, prefill_attention_batch,
-    prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
+    flashinfer_run_layer, fused_attention_decode_batched_into, fused_attention_decode_into,
 };
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};

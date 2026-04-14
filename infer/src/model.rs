@@ -3,9 +3,9 @@
 use anyhow::Result;
 use rand::rngs::StdRng;
 
-use crate::backend::cuda::paged_kv::TokenKVPool;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 use crate::sampler::SamplingParams;
+use infer_cuda_kernels::TokenKVPool;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 #[path = "model/common.rs"]
 pub(crate) mod common;
@@ -15,8 +15,6 @@ pub(crate) mod cuda_graph;
 pub(crate) mod generation_state;
 #[path = "model/kv_cache.rs"]
 pub(crate) mod kv_cache;
-#[path = "model/turboquant_state.rs"]
-pub(crate) mod turboquant_state;
 
 #[path = "model/glm4.rs"]
 pub mod glm4;
@@ -111,7 +109,7 @@ pub trait GenerationState {
     fn migrate_kv_to_paged(
         &mut self,
         ctx: &DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
         slot: usize,
     ) -> Result<()>;
 
@@ -119,7 +117,7 @@ pub trait GenerationState {
     fn migrate_kv_range_to_paged(
         &mut self,
         ctx: &DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()>;
