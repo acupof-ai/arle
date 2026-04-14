@@ -105,11 +105,28 @@ impl MetalDflashRuntime {
                     draft_model_dir.display()
                 )
             })?;
+        let default_block_size = draft_config.block_size.max(1);
         let requested_block_size = options
             .speculative_tokens
-            .unwrap_or(draft_config.block_size)
+            .unwrap_or(default_block_size)
             .max(1);
-        let block_size = requested_block_size.min(draft_config.block_size.max(1));
+        if let Some(requested) = options.speculative_tokens {
+            if requested < default_block_size {
+                log::warn!(
+                    "Metal DFlash speculative block override {} is below the draft default {}; this can reduce acceptance and throughput",
+                    requested,
+                    default_block_size
+                );
+            } else if requested > default_block_size {
+                log::warn!(
+                    "Metal DFlash speculative block override {} exceeds the draft default {}; clamping to {}",
+                    requested,
+                    default_block_size,
+                    default_block_size
+                );
+            }
+        }
+        let block_size = requested_block_size.min(default_block_size);
 
         log::info!(
             "Metal DFlash enabled: draft='{}', block_size={}, target_layers={:?}",

@@ -76,6 +76,7 @@ struct Cli {
     dflash_draft_model: Option<String>,
 
     /// Override the DFlash speculative block size.
+    /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
     speculative_tokens: Option<usize>,
 }
