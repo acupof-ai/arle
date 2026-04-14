@@ -20,7 +20,7 @@ _Date: 2026-04-14_
 
 ## MLX Dtype Support Analysis
 
-From `infer/mlx-sys/src/lib.rs` Dtype constants:
+From `crates/mlx-sys/src/lib.rs` Dtype constants:
 
 ```
 MLX_BOOL = 0, MLX_UINT8 = 1, MLX_UINT16 = 2, MLX_UINT32 = 3
