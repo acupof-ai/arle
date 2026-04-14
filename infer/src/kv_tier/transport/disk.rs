@@ -46,11 +46,11 @@
 //!
 //! # Non-scope (deferred)
 //!
-//! - `KVTransport` trait impl over this store — lands in P3 behavior PR
+//! - `KVTransport` trait impl over this store — lands in M4 behavior PR
 //!   once the coordinator owns a registered host buffer to copy
 //!   to/from.
-//! - Content-addressable filenames (blake3 hash of bytes) — P3 behavior
-//!   PR, adds a `blake3` dep.
+//! - Content-addressable filenames (blake3 hash of bytes via
+//!   `crate::types::BlockFingerprint`) — M4 behavior PR.
 //! - `O_DIRECT` / `F_NOCACHE` — optional optimization, only matters
 //!   when the store is large enough that page-cache pollution hurts.
 //! - `tokio::fs` async path — only useful once the coordinator drives
@@ -59,7 +59,7 @@
 //! - Rebuilding `next_file_id` by scanning the directory on startup —
 //!   every new [`DiskStore`] instance starts at `file_id = 0`, which
 //!   works for the skeleton but will collide with an existing directory
-//!   containing `0.blk`. P3 behavior PR adds a `rescan()` that walks
+//!   containing `0.blk`. M4 behavior PR adds a `rescan()` that walks
 //!   the root and bumps the counter past the highest observed id.
 
 use std::fs;
