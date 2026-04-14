@@ -323,21 +323,25 @@ __global__ void turboquant_fast_quantize_single_kernel(
     int idx = 0;
     for (int k = 1; k < num_levels; k++) idx += (y >= boundaries[k]) ? 1 : 0;
 
-    // Bitpack via shared memory
+    // Bitpack without shared-memory atomics: one thread writes one packed byte.
     int effective_bits = (bits == 3) ? 4 : bits;
     int indices_per_byte = 8 / effective_bits;
-    int byte_idx = d / indices_per_byte;
-    int sub_idx = d % indices_per_byte;
-
-    uint8_t my_val = (uint8_t)(idx & ((1 << effective_bits) - 1)) << (sub_idx * effective_bits);
-    uint8_t* s_packed = (uint8_t*)&smem[0];
-    if (sub_idx == 0) s_packed[byte_idx] = 0;
-    __syncthreads();
-    atomicOr((unsigned int*)(s_packed + (byte_idx & ~3)), (unsigned int)my_val << (8 * (byte_idx & 3)));
+    uint8_t* s_quant = reinterpret_cast<uint8_t*>(&smem[0]);
+    s_quant[d] = (uint8_t)(idx & ((1 << effective_bits) - 1));
     __syncthreads();
 
     int dst = pool_idx * (num_kv_heads * packed_per_head) + kv_head * packed_per_head;
-    if (d < packed_per_head) pool_data[dst + d] = s_packed[d];
+    if (d < packed_per_head) {
+        uint8_t packed = 0;
+        int src_base = d * indices_per_byte;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            if (k < indices_per_byte) {
+                packed |= (uint8_t)(s_quant[src_base + k] << (k * effective_bits));
+            }
+        }
+        pool_data[dst + d] = packed;
+    }
 }
 
 // ============================================================================

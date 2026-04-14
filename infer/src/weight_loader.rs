@@ -435,6 +435,20 @@ fn fwht_cpu(data: &mut [f32]) {
 
 /// Precompute RoPE cos/sin cache as contiguous GPU buffers.
 /// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
+pub(crate) const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
+
+pub(crate) fn resolve_rope_cache_len(config_hint: Option<usize>) -> usize {
+    let env_override = std::env::var("PEGAINFER_ROPE_CACHE_LEN")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&len| len > 0);
+
+    env_override
+        .or(config_hint)
+        .unwrap_or(DEFAULT_ROPE_CACHE_LEN)
+        .max(DEFAULT_ROPE_CACHE_LEN)
+}
+
 pub(crate) fn precompute_rope(
     ctx: &DeviceContext,
     head_dim: usize,

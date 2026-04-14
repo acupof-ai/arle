@@ -297,7 +297,7 @@ impl TokenKVPool {
 
         // Quantized split-KV attention workspace.
         // FP8 reuses the same two-phase reduction scratch layout as INT8.
-        let num_splits = 8;
+        let num_splits = 32;
         let (int8_attn_workspace, int8_attn_workspace_bytes) =
             if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
                 let ws_bytes = crate::ops::kv_quant::decode_attention_int8_workspace_bytes(

@@ -80,7 +80,7 @@ extern "C" int flashinfer_batch_decode_plan(
             int_workspace, page_locked_workspace, int_workspace_bytes,                         \
             plan_info, indptr_h, (uint32_t)batch_size,                                         \
             (uint32_t)num_qo_heads, (uint32_t)page_size,                                       \
-            /*enable_cuda_graph=*/false, stream, work_est_gs);                                 \
+            /*enable_cuda_graph=*/true, stream, work_est_gs);                                  \
     } while (0)
 
     switch (gqa_group) {

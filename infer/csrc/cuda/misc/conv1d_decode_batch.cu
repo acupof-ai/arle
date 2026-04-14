@@ -77,6 +77,10 @@ cudaError_t conv1d_decode_batch_cuda(
     int batch_size,
     cudaStream_t stream
 ) {
+    if (kernel_size <= 0 || kernel_size > 4) {
+        return cudaErrorInvalidValue;
+    }
+
     dim3 grid((num_channels + CONV1D_BATCH_BLOCK - 1) / CONV1D_BATCH_BLOCK, batch_size);
     conv1d_decode_batch_kernel<<<grid, CONV1D_BATCH_BLOCK, 0, stream>>>(
         x_batch, conv_weight, conv_state_ptrs, out_batch,

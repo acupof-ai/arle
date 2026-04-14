@@ -32,6 +32,12 @@ struct TextConfig {
     linear_value_head_dim: usize,
     rope_parameters: RopeParameters,
     eos_token_id: u32,
+    #[serde(default)]
+    max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    context_length: Option<usize>,
+    #[serde(default)]
+    seq_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +86,7 @@ pub(crate) struct Config35 {
     // RoPE
     pub(crate) rope_theta: f32,
     pub(crate) rotary_dim: usize,
+    pub(crate) rope_cache_len_hint: Option<usize>,
 
     // Layer layout
     pub(crate) layer_types: Vec<LayerType>,
@@ -130,6 +137,10 @@ impl Config35 {
             linear_conv_kernel_dim: t.linear_conv_kernel_dim,
             rope_theta: t.rope_parameters.rope_theta as f32,
             rotary_dim,
+            rope_cache_len_hint: t
+                .max_position_embeddings
+                .or(t.context_length)
+                .or(t.seq_length),
             layer_types,
         })
     }
@@ -180,6 +191,10 @@ impl Config35 {
             .iter()
             .filter(|&&t| t == LayerType::FullAttention)
             .count()
+    }
+
+    pub(crate) fn rope_cache_len_hint(&self) -> Option<usize> {
+        self.rope_cache_len_hint
     }
 
     /// Total Q dimension for full attention (includes gate).

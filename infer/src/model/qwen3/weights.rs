@@ -8,6 +8,7 @@ use crate::model::common::{self, MLP};
 use crate::ops;
 use crate::weight_loader::{
     load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized, precompute_rope,
+    resolve_rope_cache_len,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +89,8 @@ impl Qwen3Model {
                     bos_token_id: 0,
                     eos_token_id: 0,
                     tie_word_embeddings: true,
+                    max_position_embeddings: Some(gc.context_length),
+                    context_length: Some(gc.context_length),
                     stop_token_ids: vec![],
                 })
             })?;
@@ -215,8 +218,9 @@ impl Qwen3Model {
         let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
 
         debug!("Precomputing RoPE cache on GPU");
+        let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.head_dim, 4096, config.rope_theta)?;
+            precompute_rope(&ctx, config.head_dim, rope_cache_len, config.rope_theta)?;
 
         ctx.sync()?;
         info!(
@@ -410,8 +414,9 @@ impl Qwen3Model {
         }
 
         let norm = load_tensor_1d_gguf(ctx, gguf, "model.norm.weight")?;
+        let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
-            precompute_rope(ctx, config.head_dim, 4096, config.rope_theta)?;
+            precompute_rope(ctx, config.head_dim, rope_cache_len, config.rope_theta)?;
 
         ctx.sync()?;
         info!(

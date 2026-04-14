@@ -1,14 +1,13 @@
-// Fused-dequant decode attention — Split-KV + async pipeline + vectorized loads.
+// Fused-dequant decode attention — Split-KV + vectorized loads.
 //
 // FlashDecoding-style: multiple blocks per query head, each processing a chunk
 // of KV tokens. Phase 1 computes partials, Phase 2 merges via log-sum-exp.
 //
 // Optimizations:
 // 1. Split-KV: N blocks per head → saturate GPU at low batch sizes
-// 2. cp.async double-buffered shared memory pipeline
-// 3. 128-bit vectorized int8 loads (int4 = 16 bytes = 16 INT8 values)
-// 4. Warp-level QK reduction via shuffle (no __syncthreads per token)
-// 5. Cross-warp merge only once at end of block
+// 2. Vectorized packed-value loads for K/V bytes
+// 3. Warp-level QK reduction via shuffle (no __syncthreads per token)
+// 4. Cross-warp merge only once at end of block
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -414,6 +413,42 @@ size_t decode_attention_int8_workspace_bytes(
     return out_bytes + m_bytes + l_bytes;
 }
 
+static int choose_decode_num_splits(
+    int batch_size,
+    int num_qo_heads,
+    int head_dim,
+    int total_q_heads,
+    size_t workspace_bytes)
+{
+    if (total_q_heads <= 0 || workspace_bytes == 0) return 1;
+
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return 1;
+
+    cudaDeviceProp props;
+    err = cudaGetDeviceProperties(&props, device);
+    if (err != cudaSuccess || props.multiProcessorCount <= 0) return 1;
+
+    constexpr int kTargetBlocksPerSm = 4;
+    constexpr int kMaxSplits = 32;
+
+    int target_blocks = props.multiProcessorCount * kTargetBlocksPerSm;
+    int desired_splits = (target_blocks + total_q_heads - 1) / total_q_heads;
+    if (desired_splits < 1) desired_splits = 1;
+    if (desired_splits > kMaxSplits) desired_splits = kMaxSplits;
+
+    size_t bytes_per_split = decode_attention_int8_workspace_bytes(
+        batch_size, num_qo_heads, head_dim, 1);
+    if (bytes_per_split == 0) return 1;
+
+    int max_splits_by_workspace = (int)(workspace_bytes / bytes_per_split);
+    if (max_splits_by_workspace < 1) return 1;
+    if (max_splits_by_workspace > kMaxSplits) max_splits_by_workspace = kMaxSplits;
+
+    return (desired_splits < max_splits_by_workspace) ? desired_splits : max_splits_by_workspace;
+}
+
 cudaError_t decode_attention_int8_cuda(
     const __nv_bfloat16* Q,
     const int8_t* K_data,
@@ -436,55 +471,11 @@ cudaError_t decode_attention_int8_cuda(
     if (batch_size <= 0) return cudaSuccess;
 
     int total_q_heads = batch_size * num_qo_heads;
-
-    // Determine num_splits: aim for enough blocks to saturate the GPU.
-    // Simple heuristic: target ~512 blocks minimum.
-    int num_splits = 1;
-    // Read the first indptr entry to get approximate seq_len
-    // For simplicity, always use splits if workspace is provided
-    if (workspace != nullptr && workspace_bytes > 0) {
-        // Use at most 32 splits, at least 1
-        // Each split should have at least 64 tokens to be worthwhile
-        num_splits = 8;  // reasonable default for most configs
-        // Clamp to avoid too many empty splits
-        if (num_splits > 32) num_splits = 32;
-    }
-
+    int num_splits = choose_decode_num_splits(
+        batch_size, num_qo_heads, head_dim, total_q_heads, workspace_bytes);
     size_t needed = decode_attention_int8_workspace_bytes(
         batch_size, num_qo_heads, head_dim, num_splits);
-
-    // Fall back to single-block (no split) if workspace too small
     if (workspace == nullptr || workspace_bytes < needed) {
-        num_splits = 1;
-    }
-
-    if (num_splits == 1) {
-        // No split-KV: single block per head (Phase 1 only, output directly)
-        // Use the partial kernel but with num_splits=1, then merge writes bf16
-        // Actually, for num_splits=1 we can skip the merge by writing bf16 directly
-        // But for simplicity, use the two-phase path with num_splits=1
-        // Allocate workspace on stack if possible — but we can't, so fall back to
-        // the simpler non-split kernel for this case.
-        dim3 grid(total_q_heads);
-        dim3 block(BLOCK_SIZE);
-
-        // Direct output path (no workspace needed)
-        if (head_dim == 128) {
-            decode_attention_int8_partial_kernel<128><<<grid, block, 0, stream>>>(
-                Q, K_data, V_data, K_scales, V_scales,
-                kv_indices, kv_indptr,
-                nullptr, nullptr, nullptr,  // unused for num_splits=1
-                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, 1);
-        } else if (head_dim == 256) {
-            decode_attention_int8_partial_kernel<256><<<grid, block, 0, stream>>>(
-                Q, K_data, V_data, K_scales, V_scales,
-                kv_indices, kv_indptr,
-                nullptr, nullptr, nullptr,
-                batch_size, num_qo_heads, num_kv_heads, kv_dim, sm_scale, 1);
-        }
-        // Hmm, partial kernel writes to partial_out which is nullptr...
-        // Need a different path for num_splits=1. Let me just always use splits.
-        // Actually let me just require workspace.
         return cudaErrorInvalidValue;
     }
 
@@ -553,12 +544,8 @@ cudaError_t decode_attention_fp8_cuda(
     if (batch_size <= 0) return cudaSuccess;
 
     int total_q_heads = batch_size * num_qo_heads;
-    int num_splits = 1;
-    if (workspace != nullptr && workspace_bytes > 0) {
-        num_splits = 8;
-        if (num_splits > 32) num_splits = 32;
-    }
-
+    int num_splits = choose_decode_num_splits(
+        batch_size, num_qo_heads, head_dim, total_q_heads, workspace_bytes);
     size_t needed = decode_attention_int8_workspace_bytes(
         batch_size, num_qo_heads, head_dim, num_splits);
     if (workspace == nullptr || workspace_bytes < needed) {
