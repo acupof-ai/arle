@@ -689,7 +689,7 @@ fn main() {
             .join(",")
     );
 
-    let csrc_dir = Path::new("csrc/cuda");
+    let csrc_dir = Path::new("csrc");
     let mut cu_files: Vec<PathBuf> = Vec::new();
     collect_cu_files(csrc_dir, &mut cu_files);
     // Keep a stable compile order independent of filesystem iteration order.
@@ -711,7 +711,7 @@ fn main() {
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         // Ensure `#include "common.cuh"` resolves from any domain subdir
         // (attention/, gemm/, kv/, quant/, misc/).
-        nvcc_args.push("-Icsrc/cuda".to_string());
+        nvcc_args.push("-Icsrc".to_string());
 
         // Marlin kernel needs C++17 + relaxed constexpr
         if stem.starts_with("marlin_") {
