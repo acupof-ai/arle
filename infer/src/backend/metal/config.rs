@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::model_registry::{detect_arch_from_json, ModelArch};
+use crate::model_registry::{ModelArch, detect_arch_from_json};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QuantConfig {
@@ -291,7 +291,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{load_metal_config, MetalModelArch, MetalNormWeightMode};
+    use super::{MetalModelArch, MetalNormWeightMode, load_metal_config};
 
     fn write_config_file(contents: &str) -> tempfile::TempDir {
         let dir = tempdir().unwrap();

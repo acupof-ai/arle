@@ -286,8 +286,8 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "metal")]
 fn run_bench() -> Result<()> {
-    use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
     use infer::backend::InferenceBackend;
+    use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();
@@ -587,7 +587,7 @@ fn peak_rss_kb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_baseline, percentile, validate_baseline_compatibility, Baseline, MetricStat,
+        Baseline, MetricStat, compare_baseline, percentile, validate_baseline_compatibility,
     };
     use std::collections::BTreeMap;
 

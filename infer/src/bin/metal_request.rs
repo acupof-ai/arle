@@ -3,13 +3,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
 use infer::sampler::SamplingParams;
-use infer_chat::{openai_messages_to_prompt, OpenAiChatMessage};
+use infer_chat::{OpenAiChatMessage, openai_messages_to_prompt};
 
 fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     let parsed: i32 = raw

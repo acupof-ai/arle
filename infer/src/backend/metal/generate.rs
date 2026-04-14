@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use super::config::MetalModelConfig;
 use super::forward::build_forward_graph;
 use super::kv_pool::MetalKVPool;
-use super::mlx::{zeros, MlxArray};
+use super::mlx::{MlxArray, zeros};
 use super::weights::StandardMetalWeights;
 use crate::sampler::SamplingParams;
 

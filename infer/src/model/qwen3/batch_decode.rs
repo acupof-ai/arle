@@ -14,14 +14,14 @@ use log::info;
 
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
+use crate::model::ModelForward;
+use crate::model::kv_cache::KVFormat;
+use crate::ops;
 use infer_cuda_kernels::kv_quant;
 use infer_cuda_kernels::kv_turboquant;
 use infer_cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
-use crate::model::ModelForward;
-use crate::model::kv_cache::KVFormat;
-use crate::ops;
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
