@@ -70,6 +70,14 @@ struct Cli {
     /// (or if no baseline file exists yet).
     #[arg(long, value_name = "PATH")]
     update_baseline: Option<PathBuf>,
+
+    /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
+    #[arg(long, value_name = "PATH_OR_REPO")]
+    dflash_draft_model: Option<String>,
+
+    /// Override the DFlash speculative block size.
+    #[arg(long)]
+    speculative_tokens: Option<usize>,
 }
 
 struct Run {
@@ -171,8 +179,8 @@ fn compare_baseline(baseline: &Baseline, current: &BTreeMap<String, MetricStat>)
     // Print comparison table
     eprintln!();
     eprintln!(
-        "  {:<20} {:>12} {:>12} {:>10}   {}",
-        "Metric", "Baseline", "Current", "Delta", "Status"
+        "  {:<20} {:>12} {:>12} {:>10}   Status",
+        "Metric", "Baseline", "Current", "Delta"
     );
     eprintln!("  {}", "-".repeat(72));
     for (metric, base_val, cur_val, delta_pct, pass) in &rows {
@@ -278,8 +286,8 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "metal")]
 fn run_bench() -> Result<()> {
+    use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
     use infer::backend::InferenceBackend;
-    use infer::backend::metal::MetalBackend;
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();
@@ -293,7 +301,15 @@ fn run_bench() -> Result<()> {
 
     // ── Load ─────────────────────────────────────────────────────────────────
     let t_load = Instant::now();
-    let mut backend = MetalBackend::new();
+    let mut backend = MetalBackend::with_options(MetalBackendOptions {
+        dflash: cli
+            .dflash_draft_model
+            .as_ref()
+            .map(|draft_model| MetalDflashOptions {
+                draft_model: draft_model.clone(),
+                speculative_tokens: cli.speculative_tokens,
+            }),
+    });
     backend.load(std::path::Path::new(&cli.model))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
@@ -488,10 +504,10 @@ fn run_bench() -> Result<()> {
             cli.generation_tokens,
         )?;
         let passed = compare_baseline(&baseline, &current_metrics);
-        if !passed {
-            eprintln!("REGRESSION DETECTED — one or more metrics exceeded threshold.");
-        } else {
+        if passed {
             eprintln!("All metrics within threshold.");
+        } else {
+            eprintln!("REGRESSION DETECTED — one or more metrics exceeded threshold.");
         }
         Some(passed)
     } else {
@@ -537,7 +553,7 @@ fn run_bench() -> Result<()> {
 
     // Exit with code 1 if comparison failed
     if comparison_passed == Some(false) {
-        std::process::exit(1);
+        anyhow::bail!("benchmark regression detected");
     }
 
     Ok(())
@@ -571,7 +587,7 @@ fn peak_rss_kb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Baseline, MetricStat, compare_baseline, percentile, validate_baseline_compatibility,
+        compare_baseline, percentile, validate_baseline_compatibility, Baseline, MetricStat,
     };
     use std::collections::BTreeMap;
 

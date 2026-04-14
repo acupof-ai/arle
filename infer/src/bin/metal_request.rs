@@ -3,13 +3,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use infer::backend::metal::MetalBackend;
+use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
 use infer::sampler::SamplingParams;
-use infer_chat::{OpenAiChatMessage, openai_messages_to_prompt};
+use infer_chat::{openai_messages_to_prompt, OpenAiChatMessage};
 
 fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     let parsed: i32 = raw
@@ -71,6 +71,14 @@ struct Args {
     /// Ignore EOS and continue generating until `max_new_tokens`.
     #[arg(long, default_value_t = false)]
     ignore_eos: bool,
+
+    /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
+    #[arg(long, value_name = "PATH_OR_REPO")]
+    dflash_draft_model: Option<String>,
+
+    /// Override the DFlash speculative block size.
+    #[arg(long)]
+    speculative_tokens: Option<usize>,
 }
 
 fn load_prompt(args: &Args) -> Result<String> {
@@ -157,7 +165,15 @@ fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let mut backend = MetalBackend::new();
+        let mut backend = MetalBackend::with_options(MetalBackendOptions {
+            dflash: args
+                .dflash_draft_model
+                .as_ref()
+                .map(|draft_model| MetalDflashOptions {
+                    draft_model: draft_model.clone(),
+                    speculative_tokens: args.speculative_tokens,
+                }),
+        });
         let load_start = Instant::now();
         backend
             .load(Path::new(&args.model))
