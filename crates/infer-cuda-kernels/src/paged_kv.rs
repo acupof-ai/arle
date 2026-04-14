@@ -15,8 +15,12 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr};
 use log::info;
 
+use super::ffi;
 use super::tensor::DeviceContext;
-use crate::model::kv_cache::{KVCacheDtype, KVFormat};
+use crate::kv_quant::{decode_attention_int8_workspace_bytes, quantize_scatter_kv_fp8_range};
+use crate::kv_turboquant::turboquant_quantize_paged_single;
+use crate::kv_types::{KVCacheDtype, KVFormat};
+use crate::turboquant_state::TurboQuantLayerState;
 
 /// Token-level KV cache pool — shared across all request slots.
 ///
@@ -41,15 +45,15 @@ pub struct TokenKVPool {
     k_work: Option<CudaSlice<u8>>,
     v_work: Option<CudaSlice<u8>>,
     /// Workspace for split-KV fused-dequant attention (INT8 only).
-    pub(crate) int8_attn_workspace: Option<CudaSlice<u8>>,
-    pub(crate) int8_attn_workspace_bytes: usize,
+    pub int8_attn_workspace: Option<CudaSlice<u8>>,
+    pub int8_attn_workspace_bytes: usize,
     /// Per-head per-token f16 norms (TurboQuant only). `[max_total_tokens, num_kv_heads]`
-    pub(crate) k_norms: Vec<CudaSlice<u16>>,
-    pub(crate) v_norms: Vec<CudaSlice<u16>>,
+    pub k_norms: Vec<CudaSlice<u16>>,
+    pub v_norms: Vec<CudaSlice<u16>>,
     /// TurboQuant per-layer state: rotation matrices + codebook (K and V).
     /// Only populated when format is TurboQuant.
-    pub(crate) tq_k_state: Option<crate::model::turboquant_state::TurboQuantLayerState>,
-    pub(crate) tq_v_state: Option<crate::model::turboquant_state::TurboQuantLayerState>,
+    pub tq_k_state: Option<TurboQuantLayerState>,
+    pub tq_v_state: Option<TurboQuantLayerState>,
 
     /// Free token slot indices (stack-based allocator, LIFO).
     free_slots: Vec<u32>,
@@ -300,7 +304,7 @@ impl TokenKVPool {
         let num_splits = 32;
         let (int8_attn_workspace, int8_attn_workspace_bytes) =
             if matches!(format, KVFormat::INT8 | KVFormat::FP8E4M3) && pool_bytes_per_layer > 0 {
-                let ws_bytes = crate::ops::kv_quant::decode_attention_int8_workspace_bytes(
+                let ws_bytes = decode_attention_int8_workspace_bytes(
                     num_slots,
                     num_kv_heads * (head_dim / 128).max(1) * 4, // approximate max q_heads
                     head_dim,
@@ -320,7 +324,6 @@ impl TokenKVPool {
 
         // TurboQuant state: rotation matrices + codebook
         let (tq_k_state, tq_v_state) = if let KVFormat::TurboQuant { key_bits, val_bits } = format {
-            use crate::model::turboquant_state::TurboQuantLayerState;
             let k_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, key_bits, 42)?;
             let v_state = TurboQuantLayerState::new(ctx, num_layers, head_dim, val_bits, 137)?;
             (Some(k_state), Some(v_state))
@@ -646,11 +649,11 @@ impl TokenKVPool {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
             unsafe {
-                super::ffi::kv_cache_to_paged_range_cuda(
-                    k_src_ptr as *const super::ffi::Half,
-                    v_src_ptr as *const super::ffi::Half,
-                    k_dst_ptr(layer) as *mut super::ffi::Half,
-                    v_dst_ptr(layer) as *mut super::ffi::Half,
+                ffi::kv_cache_to_paged_range_cuda(
+                    k_src_ptr as *const ffi::Half,
+                    v_src_ptr as *const ffi::Half,
+                    k_dst_ptr(layer) as *mut ffi::Half,
+                    v_dst_ptr(layer) as *mut ffi::Half,
                     ti_ptr as *const i32,
                     start_pos as i32,
                     max_seq_len_contiguous as i32,
@@ -741,7 +744,7 @@ impl TokenKVPool {
             let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
 
             unsafe {
-                super::ffi::kv_cache_to_paged_int8_range_cuda(
+                ffi::kv_cache_to_paged_int8_range_cuda(
                     k_src_ptr as *const i8,
                     v_src_ptr as *const i8,
                     ks_src_ptr as *const f32,
@@ -809,7 +812,7 @@ impl TokenKVPool {
 
         let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            crate::ops::kv_quant::quantize_scatter_kv_fp8_range(
+            quantize_scatter_kv_fp8_range(
                 ctx,
                 &contiguous_k_caches[layer],
                 self.k_data_ptr(layer, &ctx.stream),
@@ -821,7 +824,7 @@ impl TokenKVPool {
                 self.head_dim,
                 self.kv_dim,
             )?;
-            crate::ops::kv_quant::quantize_scatter_kv_fp8_range(
+            quantize_scatter_kv_fp8_range(
                 ctx,
                 &contiguous_v_caches[layer],
                 self.v_data_ptr(layer, &ctx.stream),
@@ -893,7 +896,7 @@ impl TokenKVPool {
         )?;
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
-            crate::ops::kv_turboquant::turboquant_quantize_paged_single(
+            turboquant_quantize_paged_single(
                 ctx,
                 self.k_work_ptr(&ctx.stream),
                 self.k_data_slice(layer),
@@ -905,7 +908,7 @@ impl TokenKVPool {
                 self.head_dim,
                 token_count,
             )?;
-            crate::ops::kv_turboquant::turboquant_quantize_paged_single(
+            turboquant_quantize_paged_single(
                 ctx,
                 self.v_work_ptr(&ctx.stream),
                 self.v_data_slice(layer),
@@ -935,7 +938,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 1;
 #[cfg(test)]
 mod tests {
     use super::{BudgetBreakdown, compute_budget_breakdown};
-    use crate::model::kv_cache::KVFormat;
+    use crate::KVFormat;
 
     #[test]
     fn bf16_budget_has_no_work_buffer_component() {

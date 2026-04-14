@@ -2,7 +2,7 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub(crate) fn gemv_cuda(
+    pub fn gemv_cuda(
         A: *const Half,
         x: *const Half,
         y: *mut Half,
@@ -11,7 +11,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gemm_cuda(
+    pub fn gemm_cuda(
         W: *const Half,
         X: *const Half,
         Y: *mut Half,
@@ -21,7 +21,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gemm_graphsafe_cuda(
+    pub fn gemm_graphsafe_cuda(
         W: *const Half,
         X: *const Half,
         Y: *mut Half,
@@ -31,7 +31,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn fused_mlp_cuda(
+    pub fn fused_mlp_cuda(
         x: *const Half,
         gate_proj: *const Half,
         up_proj: *const Half,
@@ -43,7 +43,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn marlin_gemm_cuda(
+    pub fn marlin_gemm_cuda(
         a: *const Half, // [M, K] bf16 activations
         b: *const u8,   // Marlin-packed int4 weights
         c: *mut Half,   // [M, N] bf16 output
@@ -61,7 +61,7 @@ unsafe extern "C" {
         max_par: i32,
     ) -> i32;
 
-    pub(crate) fn gptq_marlin_repack_cuda(
+    pub fn gptq_marlin_repack_cuda(
         b_q_weight: *const u32,
         out: *mut u32,
         size_k: i32,
@@ -69,9 +69,9 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn marlin_workspace_size(prob_n: i32, sms: i32) -> usize;
+    pub fn marlin_workspace_size(prob_n: i32, sms: i32) -> usize;
 
-    pub(crate) fn w8a16_gemv_cuda(
+    pub fn w8a16_gemv_cuda(
         weight: *const i8,
         scales: *const Half,
         input: *const Half,
@@ -82,7 +82,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn w4a16_gemv_cuda(
+    pub fn w4a16_gemv_cuda(
         weight: *const u8,
         scales: *const Half,
         input: *const Half,
@@ -93,7 +93,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn w2a16_gemv_cuda(
+    pub fn w2a16_gemv_cuda(
         weight: *const u8,
         scales: *const Half,
         input: *const Half,
@@ -104,7 +104,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn w8a16_gemv_batch_cuda(
+    pub fn w8a16_gemv_batch_cuda(
         weight: *const i8,
         scales: *const Half,
         input: *const Half,
@@ -116,7 +116,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn w4a16_gemv_batch_cuda(
+    pub fn w4a16_gemv_batch_cuda(
         weight: *const u8,
         scales: *const Half,
         input: *const Half,
@@ -128,7 +128,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn w2a16_gemv_batch_cuda(
+    pub fn w2a16_gemv_batch_cuda(
         weight: *const u8,
         scales: *const Half,
         input: *const Half,
@@ -140,7 +140,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q6k_gemv_cuda(
+    pub fn q6k_gemv_cuda(
         weight: *const u8,
         input: *const Half,
         output: *mut Half,
@@ -149,36 +149,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q6k_gemv_batch_cuda(
-        weight: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        batch_size: i32,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub(crate) fn q6k_dequant_chunk_cuda(
-        weight: *const u8,
-        out_bf16: *mut Half,
-        n: i32,
-        k: i32,
-        k_start: i32,
-        k_len: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub(crate) fn q3k_gemv_cuda(
-        weight: *const u8,
-        input: *const Half,
-        output: *mut Half,
-        n: i32,
-        k: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub(crate) fn q3k_gemv_batch_cuda(
+    pub fn q6k_gemv_batch_cuda(
         weight: *const u8,
         input: *const Half,
         output: *mut Half,
@@ -188,7 +159,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q3k_dequant_chunk_cuda(
+    pub fn q6k_dequant_chunk_cuda(
         weight: *const u8,
         out_bf16: *mut Half,
         n: i32,
@@ -198,7 +169,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q4k_gemv_cuda(
+    pub fn q3k_gemv_cuda(
         weight: *const u8,
         input: *const Half,
         output: *mut Half,
@@ -207,7 +178,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q4k_gemv_batch_cuda(
+    pub fn q3k_gemv_batch_cuda(
         weight: *const u8,
         input: *const Half,
         output: *mut Half,
@@ -217,7 +188,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn q4k_dequant_chunk_cuda(
+    pub fn q3k_dequant_chunk_cuda(
         weight: *const u8,
         out_bf16: *mut Half,
         n: i32,
@@ -227,7 +198,36 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn turboquant_weight_gemv_cuda(
+    pub fn q4k_gemv_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn q4k_gemv_batch_cuda(
+        weight: *const u8,
+        input: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn q4k_dequant_chunk_cuda(
+        weight: *const u8,
+        out_bf16: *mut Half,
+        n: i32,
+        k: i32,
+        k_start: i32,
+        k_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn turboquant_weight_gemv_cuda(
         packed: *const u8,
         scales: *const Half, // f16
         signs: *const i8,
@@ -243,7 +243,7 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    pub(crate) fn turboquant_weight_dequant_cuda(
+    pub fn turboquant_weight_dequant_cuda(
         packed: *const u8,
         scales: *const Half,
         signs: *const i8,

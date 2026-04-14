@@ -2,7 +2,7 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub(crate) fn prefill_attention_prep_cuda(
+    pub fn prefill_attention_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
         v_batch: *const Half,
@@ -22,7 +22,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn flashinfer_single_prefill(
+    pub fn flashinfer_single_prefill(
         q: *mut Half,
         k_cache: *mut Half,
         v_cache: *mut Half,
@@ -37,7 +37,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn flash_attention_prefill_hd256_cuda(
+    pub fn flash_attention_prefill_hd256_cuda(
         Q: *const Half,
         K_cache: *const Half,
         V_cache: *const Half,
@@ -52,7 +52,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn prefill_attention_hd256_prep_cuda(
+    pub fn prefill_attention_hd256_prep_cuda(
         q_full_batch: *const Half,
         k_batch: *const Half,
         v_batch: *const Half,
@@ -73,7 +73,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn attention_gate_batch_hd256_cuda(
+    pub fn attention_gate_batch_hd256_cuda(
         q_full_batch: *const Half,
         attn_out: *mut Half,
         num_q_heads: i32,
@@ -81,7 +81,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn fused_gqa_attention_decode_batched(
+    pub fn fused_gqa_attention_decode_batched(
         q_batch: *const Half,
         k_batch: *const Half,
         v_batch: *const Half,
@@ -106,7 +106,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn attention_decode_reduce_batched(
+    pub fn attention_decode_reduce_batched(
         partial_out: *const f32,
         partial_m: *const f32,
         partial_l: *const f32,
@@ -117,7 +117,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn fused_gqa_attention_decode(
+    pub fn fused_gqa_attention_decode(
         q_full: *const Half,
         k_full: *const Half,
         v_full: *const Half,
@@ -138,7 +138,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn attention_decode_reduce(
+    pub fn attention_decode_reduce(
         partial_out: *mut f32,
         partial_m: *mut f32,
         partial_l: *mut f32,
@@ -147,7 +147,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn decode_prep_paged_cuda(
+    pub fn decode_prep_paged_cuda(
         q_batch: *mut Half,
         k_batch: *const Half,
         v_batch: *const Half,
@@ -170,7 +170,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn flashinfer_batch_decode_plan(
+    pub fn flashinfer_batch_decode_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,
         int_workspace: *mut u8,
@@ -186,7 +186,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn flashinfer_batch_decode_run(
+    pub fn flashinfer_batch_decode_run(
         float_workspace: *mut u8,
         int_workspace: *mut u8,
         plan_info: *const u8,
@@ -207,7 +207,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn flashinfer_append_last_token_indices_cuda(
+    pub fn flashinfer_append_last_token_indices_cuda(
         kv_indices: *mut i32,
         kv_indptr: *const i32,
         last_token_indices: *const i32,
@@ -215,7 +215,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn flashinfer_batch_decode_hd256_plan(
+    pub fn flashinfer_batch_decode_hd256_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,
         int_workspace: *mut u8,
@@ -231,7 +231,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn flashinfer_batch_decode_hd256_run(
+    pub fn flashinfer_batch_decode_hd256_run(
         float_workspace: *mut u8,
         int_workspace: *mut u8,
         plan_info: *const u8,
@@ -252,7 +252,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn decode_prep_paged_hd256_cuda(
+    pub fn decode_prep_paged_hd256_cuda(
         q_full_batch: *const Half,
         q_out_batch: *mut Half,
         k_batch: *const Half,
@@ -277,7 +277,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn attention_gate_paged_hd256_cuda(
+    pub fn attention_gate_paged_hd256_cuda(
         q_full_batch: *const Half,
         attn_out: *mut Half,
         num_q_heads: i32,
@@ -285,7 +285,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn flashinfer_tc_decode_plan(
+    pub fn flashinfer_tc_decode_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,
         int_workspace: *mut u8,
@@ -302,7 +302,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn flashinfer_tc_decode_run(
+    pub fn flashinfer_tc_decode_run(
         float_workspace: *mut u8,
         int_workspace: *mut u8,
         plan_info: *const u8,
@@ -323,14 +323,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    pub(crate) fn decode_attention_int8_workspace_bytes(
+    pub fn decode_attention_int8_workspace_bytes(
         batch_size: i32,
         num_qo_heads: i32,
         head_dim: i32,
         num_splits: i32,
     ) -> usize;
 
-    pub(crate) fn decode_attention_int8_cuda(
+    pub fn decode_attention_int8_cuda(
         q: *const Half,
         k_data: *const i8,
         v_data: *const i8,
@@ -350,7 +350,7 @@ unsafe extern "C" {
         workspace_bytes: usize,
     ) -> CUresult;
 
-    pub(crate) fn decode_attention_fp8_cuda(
+    pub fn decode_attention_fp8_cuda(
         q: *const Half,
         k_data: *const u8, // FP8 E4M3
         v_data: *const u8, // FP8 E4M3

@@ -1,0 +1,25 @@
+[package]
+name = "infer-cuda-kernels"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+cuda = ["dep:cudarc"]
+no-cuda = []
+
+[dependencies]
+anyhow = "1.0"
+half = { version = "2.4", features = ["num-traits"] }
+log = "0.4"
+cudarc = { version = "0.18", features = [
+    "cuda-version-from-build-system",
+    "cublas",
+    "cuda-12080",
+    "f16",
+], optional = true }
+
+[build-dependencies]
+cc = "1.0"
+
+[lints]
+workspace = true

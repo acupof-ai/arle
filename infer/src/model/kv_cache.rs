@@ -23,107 +23,10 @@ use log::info;
 
 use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
 use crate::ops::kv_quant;
+pub use infer_cuda_kernels::{KVCacheDtype, KVFormat};
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.
 const OFFLOAD_BLOCK_SIZE: usize = 64;
-
-/// KV cache data type (contiguous cache).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KVCacheDtype {
-    /// Full precision bf16 (default).
-    BF16,
-    /// Per-head per-token symmetric INT8 quantization.
-    INT8,
-}
-
-/// KV pool storage format (paged pool).
-///
-/// Determines how KV data is stored in the TokenKVPool and which attention
-/// kernel is used during batched decode:
-/// - `BF16` → FlashInfer native decode (baseline)
-/// - `FP8E4M3` → custom split-KV decode with fused FP8 cast
-/// - `INT8` → custom split-KV decode with fused INT8 dequant
-/// - `TurboQuant` → rotation-based 2-4 bit fused decode attention
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KVFormat {
-    /// Full precision bf16, 2 bytes/element. FlashInfer native decode.
-    BF16,
-    /// FP8 E4M3, 1 byte/element, no separate scale. Custom fused decode kernel.
-    FP8E4M3,
-    /// INT8 + per-head per-token f32 scale. Custom fused-dequant decode kernel.
-    INT8,
-    /// TurboQuant: rotation + Lloyd-Max quantization with fused decode attention.
-    /// `key_bits` and `val_bits` control compression (2-4 bits each).
-    TurboQuant { key_bits: u8, val_bits: u8 },
-}
-
-impl Default for KVFormat {
-    fn default() -> Self {
-        Self::BF16
-    }
-}
-
-impl KVFormat {
-    /// Bytes per element for the data buffer (excluding scales/norms).
-    ///
-    /// For TurboQuant this returns the packed bytes per coordinate (approximate),
-    /// but the actual allocation uses [`Self::pool_bytes_per_token`] for accuracy.
-    pub fn bytes_per_element(self) -> usize {
-        match self {
-            Self::BF16 => 2,
-            Self::FP8E4M3 => 1,
-            Self::INT8 => 1,
-            // Approximate: ceil(bits / 8) — actual layout is per-head packed.
-            Self::TurboQuant { key_bits, .. } => {
-                let effective = if key_bits == 3 { 4 } else { key_bits as usize };
-                (effective + 7) / 8
-            }
-        }
-    }
-
-    /// Whether this format uses separate per-head per-token scale buffers (f32).
-    pub fn has_scales(self) -> bool {
-        matches!(self, Self::INT8)
-    }
-
-    /// Whether this format uses separate per-head per-token norm buffers (f16).
-    pub fn has_norms(self) -> bool {
-        matches!(self, Self::TurboQuant { .. })
-    }
-
-    /// Whether a bf16 working buffer is needed (for decode_prep_paged write target).
-    /// FP8, INT8, and TurboQuant need a working buffer because decode_prep_paged
-    /// outputs bf16, which then gets quantized into the pool.
-    pub fn needs_work_buffer(self) -> bool {
-        !matches!(self, Self::BF16)
-    }
-
-    /// Whether this is a TurboQuant format.
-    pub fn is_turboquant(self) -> bool {
-        matches!(self, Self::TurboQuant { .. })
-    }
-
-    /// Total bytes per token per KV head in the pool (data + norms).
-    /// Used for accurate budget calculation.
-    pub fn pool_bytes_per_kv_head(self, head_dim: usize) -> usize {
-        match self {
-            Self::BF16 => head_dim * 2,
-            Self::FP8E4M3 => head_dim,
-            Self::INT8 => head_dim + 4, // 1 byte/elem + 4 bytes f32 scale
-            Self::TurboQuant { key_bits, .. } => {
-                let packed =
-                    crate::model::turboquant_state::packed_bytes_per_head(head_dim, key_bits);
-                packed + 2 // + 2 bytes f16 norm
-            }
-        }
-    }
-}
-
-impl Default for KVCacheDtype {
-    fn default() -> Self {
-        Self::BF16
-    }
-}
 
 /// KV Cache — contiguous buffers for fused attention.
 pub(crate) struct KVCache {

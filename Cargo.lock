@@ -1488,6 +1488,7 @@ dependencies = [
  "half",
  "hf-hub",
  "infer-chat",
+ "infer-cuda-kernels",
  "libc",
  "log",
  "logforth",
@@ -1543,6 +1544,17 @@ dependencies = [
  "log",
  "rustyline",
  "serde_json",
+]
+
+[[package]]
+name = "infer-cuda-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc",
+ "half",
+ "log",
 ]
 
 [[package]]

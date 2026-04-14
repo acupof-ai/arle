@@ -1,12 +1,12 @@
-//! Proto-API contract for the CUDA backend.
+//! Proto-API contract for the CUDA kernel crate.
 //!
 //! This module is the single import point for the seven CUDA tensor / pool /
 //! metadata types that 25+ files in `model/` and `ops/` share. It exists for
 //! two reasons:
 //!
 //! 1. **Stable consumer surface.** Model code says
-//!    `use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, …};`
-//!    instead of three separate `use crate::backend::cuda::{tensor::…,
+//!    `use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, …};`
+//!    instead of three separate `use infer_cuda_kernels::{tensor::…,
 //!    paged_kv::…, flashinfer::…}` lines. The consumer's import block is
 //!    insulated from the underlying module layout.
 //!
@@ -47,14 +47,12 @@
 //! - `TokenKVPool` (paged_kv) — too narrow (3 callers).
 //! - Anything from `super::ffi::*` — the FFI submodule tree is its own
 //!   namespace; consumers that need `extern "C"` symbols use
-//!   `crate::backend::cuda::ffi::xxx` directly.
+//!   `infer_cuda_kernels::ffi::xxx` directly.
 //! - `EngineOptions` / `InferenceEngineOptions` — these are runtime
 //!   configuration types owned by `infer::server_engine`, not kernel types.
 //! - Any model-specific state (`Qwen3Model`, etc.) — those are application
-//!   types and stay inside `crate::model::*`.
+//!   types and stay inside `infer::model::*`.
 
-pub(crate) use super::flashinfer::FlashInferDecodeMetadata;
-pub(crate) use super::paged_kv::PagedKVPool;
-pub(crate) use super::tensor::{
-    DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, RawDevicePtr,
-};
+pub use super::flashinfer::FlashInferDecodeMetadata;
+pub use super::paged_kv::PagedKVPool;
+pub use super::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, RawDevicePtr};

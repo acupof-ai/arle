@@ -2,7 +2,7 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub(crate) fn kv_cache_to_paged_cuda(
+    pub fn kv_cache_to_paged_cuda(
         k_contiguous: *const Half,
         v_contiguous: *const Half,
         k_paged: *mut Half,
@@ -17,7 +17,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn kv_cache_to_paged_range_cuda(
+    pub fn kv_cache_to_paged_range_cuda(
         k_contiguous: *const Half,
         v_contiguous: *const Half,
         k_paged: *mut Half,
@@ -32,7 +32,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn paged_kv_append_cuda(
+    pub fn paged_kv_append_cuda(
         k_batch: *const Half,
         v_batch: *const Half,
         k_data: *mut Half,
@@ -47,7 +47,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn scatter_write_kv_cuda(
+    pub fn scatter_write_kv_cuda(
         k_batch: *const Half,
         v_batch: *const Half,
         k_pool: *mut Half,
@@ -59,7 +59,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn quantize_kv_bf16_to_int8_cuda(
+    pub fn quantize_kv_bf16_to_int8_cuda(
         kv_bf16: *const Half,
         kv_int8: *mut i8,
         scales: *mut f32,
@@ -71,7 +71,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn dequantize_kv_int8_to_bf16_cuda(
+    pub fn dequantize_kv_int8_to_bf16_cuda(
         kv_int8: *const i8,
         scales: *const f32,
         kv_bf16: *mut Half,
@@ -83,7 +83,7 @@ unsafe extern "C" {
     ) -> CUresult;
 
     #[allow(dead_code)]
-    pub(crate) fn dequantize_paged_kv_cuda(
+    pub fn dequantize_paged_kv_cuda(
         kv_int8: *const i8,
         scales: *const f32,
         kv_bf16: *mut Half,
@@ -95,7 +95,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn quantize_paged_kv_single_cuda(
+    pub fn quantize_paged_kv_single_cuda(
         kv_bf16: *const Half,
         kv_int8: *mut i8,
         scales: *mut f32,
@@ -107,7 +107,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn quantize_paged_kv_fp8_cuda(
+    pub fn quantize_paged_kv_fp8_cuda(
         kv_bf16: *const Half,
         kv_fp8: *mut u8,
         new_token_indices: *const i32,
@@ -118,7 +118,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn quantize_scatter_kv_fp8_cuda(
+    pub fn quantize_scatter_kv_fp8_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
         page_indices: *const i32,
@@ -130,7 +130,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn quantize_scatter_kv_fp8_range_cuda(
+    pub fn quantize_scatter_kv_fp8_range_cuda(
         kv_cont: *const Half,
         kv_fp8: *mut u8,
         page_indices: *const i32,
@@ -143,7 +143,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn kv_cache_to_paged_int8_cuda(
+    pub fn kv_cache_to_paged_int8_cuda(
         k_cont: *const i8,
         v_cont: *const i8,
         k_scales_cont: *const f32,
@@ -161,7 +161,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn kv_cache_to_paged_int8_range_cuda(
+    pub fn kv_cache_to_paged_int8_range_cuda(
         k_cont: *const i8,
         v_cont: *const i8,
         k_scales_cont: *const f32,
