@@ -119,15 +119,32 @@ this doc will get another path update pass at that point.
 
 ## 1 · Milestone M0.3 (formerly P0) — `page_size = 16` with per-format dispatch
 
+> **2026-04-14 update (commit `d902090`)** — implementation attempted
+> against this section was **stopped before any code was written**.
+> Two of the touch-point claims below turned out to be wrong, and one
+> CUDA kernel that the production prefill→pool migration depends on
+> is hardcoded NHD per-token. Full root cause and the rescoped P0
+> (now ~12 files including a new BF16 HND range kernel) are in
+> [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md).
+> Read that entry before re-attempting P0.
+
 ### 1.1 Lane breakdown
 
+> ⚠️ **The list below was the original plan.** Items marked
+> 🔴 require correction per the 2026-04-14 blocker entry; do not
+> implement them as written.
+
 #### Local (Mac) — `[L+R]` because all touched files are cuda-gated
-- [ ] `[L+R]` Edit `infer/src/paged_kv.rs:7,76-87,482-511,549-562,614,760` — add `page_size: usize` field on `TokenKVPool`, rewrite `alloc_tokens` as **two-level allocator** modeled on vLLM (see §1.2). Keep `Result<Vec<u32>>` signature even though all 4 callers discard the Vec — return `Vec::new()` for now to avoid touching call sites in the same PR
-- [ ] `[L+R]` Edit `infer/src/flashinfer_metadata.rs:124-180` — `indptr` becomes **cumulative pages** (was tokens); rewrite incremental update to distinguish "new token lands inside last page (bump `last_page_len`)" vs "spills to new page (append page id, reset `last_page_len = 1`)"
+- [ ] 🔴 `[L+R]` Edit `infer/src/backend/cuda/paged_kv.rs` (paths updated post route-A revert) — add `page_size: usize` field on `TokenKVPool`, rewrite `alloc_tokens` as **two-level allocator** modeled on vLLM (see §1.2). **Original plan said all 4 callers discard the Vec; only 2 of 4 do.** `scheduler/cuda/prefill.rs:184` and `:270` consume `new_indices` and feed it into `state.migrate_kv_range_to_paged(...)`. Returning `Vec::new()` would silently break prefix migration — `alloc_tokens` must return real indices.
+- [ ] `[L+R]` Edit `infer/src/backend/cuda/flashinfer.rs:124-180` (formerly `flashinfer_metadata.rs`) — `indptr` becomes **cumulative pages** (was tokens); rewrite incremental update to distinguish "new token lands inside last page (bump `last_page_len`)" vs "spills to new page (append page id, reset `last_page_len = 1`)"
 - [ ] `[L+R]` Edit `infer/src/model/qwen3/batch_decode.rs:384` — drop `let page_size = 1;`, read from `kv_pool.page_size`
-- [ ] `[L+R]` Edit `infer/src/model/qwen35/batch_decode.rs:724` — same
+- [ ] `[L+R]` Edit `infer/src/model/qwen35/batch_decode.rs:741` — same (line moved from 724)
 - [ ] `[L+R]` Edit `infer/src/model/glm4/batch_decode.rs:338` — same
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/decode.rs:193` — literal `1` → `paged_kv_pool.page_size`
+- [ ] 🔴 **MISSING** — Edit `infer/src/ops/attention.rs:673` and `:1068` — `let stride_page = paged.kv_pool.kv_dim;` must become `kv_dim * page_size` for `decode_prep_paged*` to write HND-correctly at `page_size > 1`. Mentioned in §1.2 line 104 as a caller responsibility but omitted from the touch-point list.
+- [ ] 🔴 **MISSING** — Add `kv_cache_to_paged_range_hnd_kernel` in `infer/csrc/cuda/kv/kv_cache_to_paged.cu` (~60 lines, additive, does NOT touch the existing range kernel or either forbidden quant kernel) + FFI declaration in `infer/src/backend/cuda/ffi.rs` + dispatch in `infer/src/model/kv_cache.rs::migrate_from_contiguous_range_bf16`. The existing `kv_cache_to_paged_range_kernel` writes NHD-per-token; FlashInfer reads HND. Without this addition, BF16 + `page_size > 1` produces silently wrong attention output. Plan §1.2 line 106 audited the wrong function.
+- [ ] 🔴 **MISSING** — `migrate_kv_range_to_paged` API change. Today it takes `&new_token_indices` (just the newly-allocated tail). The new HND kernel needs the slot's full page table. Either pass `slot: usize` and look up `pool.token_indices[slot]` inside, or pass the full table from the caller. Touches the function definition + 2 call sites in `prefill.rs`.
+- [ ] 🔴 **MISSING** — Add a kernel-level unit test that round-trips a synthetic contiguous tensor through the new HND range kernel at `page_size ∈ {1, 2, 4, 8, 16}` and asserts the HND addressing formula reads back the same bytes. **Required because e2e tests have weight drift** (see `project_remote_cuda_box.md`) and cannot serve as the regression gate for a kernel rewrite.
 - [ ] `[L]` Run `cargo check --no-default-features --features no-cuda` — verify nothing in the always-on modules broke
 - [ ] `[L]` Run `cargo check --no-default-features --features metal` — verify Metal build untouched
 - [ ] **Hand off to remote GPU** with the diff and the §1.3 caveat list
@@ -171,7 +188,8 @@ this doc will get another path update pass at that point.
 - ✅ [`paged_kv_append.cu:43-57`](file:///path/to/code/agent-infer/infer/csrc/cuda/paged_kv_append.cu) — `logical_page = pos / page_size`, `physical_page = page_indices[indptr[b] + logical_page]`, `stride_page = num_kv_heads * page_size * head_dim` (computed inside kernel). **Fully page_size-parametric.**
 - ✅ [`decode_prep_paged.cu:138-155`](file:///path/to/code/agent-infer/infer/csrc/cuda/decode_prep_paged.cu) (HD128) — uses `last_page_len - 1` for in-page offset; HND addressing correct. Caller must set `stride_page = num_kv_heads * page_size * head_dim`.
 - ✅ [`decode_prep_paged_hd256.cu:157-160`](file:///path/to/code/agent-infer/infer/csrc/cuda/decode_prep_paged_hd256.cu) — identical paging logic for Qwen3.5 full attention.
-- ✅ [`kv_cache_to_paged.cu:41-47`](file:///path/to/code/agent-infer/infer/csrc/cuda/kv_cache_to_paged.cu) (bf16 path) — full `pos / page_size` decomposition.
+- ✅ [`kv_cache_to_paged.cu:18-51`](../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L18) — `kv_cache_to_paged_kernel` (the non-range bf16 path) is fully page_size-parametric with HND output.
+- 🔴 **CORRECTION (2026-04-14)**: [`kv_cache_to_paged.cu:53-82`](../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L53) — `kv_cache_to_paged_range_kernel` (the **range** variant, which is what `migrate_from_contiguous_range_bf16` actually dispatches to from `scheduler/cuda/prefill.rs:184,270`) is hardcoded `dst = pool_idx * kv_dim + kv_head * head_dim + dim` — **NHD per-token**. Header comment line 53 explicitly says "for token-level (page_size=1) paged pools". This audit row missed the range variant; the production prefill path uses **only** the range kernel, never the non-range one. P0 needs a new HND-aware range kernel before BF16 can move off `page_size=1`.
 - ✅ All FlashInfer wrapper files (`flashinfer_decode.cu`, `flashinfer_decode_hd256.cu`, `flashinfer_tc_decode.cu`) just forward `page_size` into FlashInfer's `paged_kv_t<>`.
 - ⚠️ **`kv_cache_to_paged_int8_kernel` at [`kv_cache_to_paged.cu:64-103`](file:///path/to/code/agent-infer/infer/csrc/cuda/kv_cache_to_paged.cu#L64) hardcodes page_size=1.** Computes `pool_idx = page_indices[pos]` directly. No `page_size` parameter in signature.
 - ⚠️ **`kv_quant.cu:184,193,207,211`** (`quantize_paged_kv_fp8_kernel`, `quantize_scatter_kv_fp8_kernel`) — same NHD per-token assumption.
@@ -185,6 +203,9 @@ this doc will get another path update pass at that point.
 2. **`indptr` semantics change** — `build_indptr` cumulates pages now, not tokens. This is the most subtle change in P0; every caller of `pool.build_indptr()` must be re-audited. Currently 1 caller: `flashinfer_metadata.rs:124`.
 3. **Empty-slot filter** — `build_flashinfer_metadata` must skip slots with `seq_len == 0`. Currently it emits `last_page_len[i] = 0` for empty slots ([`paged_kv.rs:503`](file:///path/to/code/agent-infer/infer/src/paged_kv.rs#L503)), which violates FlashInfer's `[1, page_size]` invariant. The fact this hasn't crashed at page_size=1 is luck — FlashInfer treats `last_page_len=0` as "empty pages array, length 0", which the test path tolerates because `indptr[i+1] - indptr[i] = 0` for empty slots. At page_size>1 this no longer reliably aligns.
 4. **Two-level allocator data model** — slot-level state changes from `token_indices: Vec<Vec<u32>>` to `(page_indices: Vec<Vec<u32>>, last_page_len: Vec<u32>)`. The free list changes from `free_slots: Vec<u32>` to `free_pages: Vec<u32>` (pages, not tokens). Total pool bytes unchanged: `max_total_pages = max_total_tokens / page_size`.
+5. **2026-04-14: BF16 prefill→pool migration kernel is the actual P0 blocker.** Plan §1.2 Kernel Readiness audited `kv_cache_to_paged_kernel` (the non-range bf16 path) and concluded the bf16 migration was page_size-parametric. **The production prefill code never calls that function** — it dispatches through `migrate_kv_range_to_paged → kv_cache_to_paged_range_kernel`, which is hardcoded NHD per-token and explicitly only works at `page_size=1`. P0 must add a new `kv_cache_to_paged_range_hnd_kernel` (additive, ~60 lines CUDA) and route the BF16 migration through it. See [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md) for the full root cause, byte-offset proof, and the rescoped P0 file list (~12 files instead of the original ~7).
+6. **2026-04-14: `alloc_tokens` callers — 2 of 4 USE the returned `Vec`, not discard it.** Plan §1.1 said all 4 callers discard so returning `Vec::new()` was a safe shortcut for the two-level allocator rewrite. Verified false: `scheduler/cuda/prefill.rs:184` and `:270` consume `new_indices` and feed it to `state.migrate_kv_range_to_paged(...)`. The two-level allocator must return real indices that the migration kernel can address into the pool.
+7. **2026-04-14: `ops/attention.rs` `stride_page` is the implicit caller responsibility.** Plan §1.2 line 104 mentions "Caller must set `stride_page = num_kv_heads * page_size * head_dim`" but §1.1 omits `ops/attention.rs:673,1068` from the touch-point list. Without fixing both call sites, `decode_prep_paged` writes new tokens to the wrong byte offset at `page_size>1` even if migration is correct.
 
 ---
 
