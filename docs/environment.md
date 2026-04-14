@@ -41,6 +41,40 @@ Enable Metal KV pool path.
 
 Status: experimental.
 
+### `AGENT_INFER_METAL_DFLASH_MODEL`
+
+Enable Metal DFlash and point the backend at the draft model checkpoint.
+
+Accepted values:
+
+- local model directory
+- Hugging Face repo id
+
+Example:
+
+```bash
+export AGENT_INFER_METAL_DFLASH_MODEL=z-lab/Qwen3-4B-DFlash-b16
+./target/release/metal_serve --model-path mlx-community/Qwen3-4B-bf16
+```
+
+Status: experimental. Current implementation supports `Qwen3` targets only.
+
+### `AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS`
+
+Optional Metal DFlash block-size override.
+
+Example:
+
+```bash
+export AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS=16
+```
+
+Recommendation:
+
+- leave this unset unless benchmark data says otherwise
+
+Status: experimental.
+
 ### `AGENT_INFER_GDR_METAL_KERNEL`
 
 Influence Metal GDR kernel path selection.
@@ -201,6 +235,8 @@ These exist in the repository, but should be treated as less stable unless the
 docs promote them more clearly:
 
 - `AGENT_INFER_METAL_KV_POOL`
+- `AGENT_INFER_METAL_DFLASH_MODEL`
+- `AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS`
 - `AGENT_INFER_GDR_METAL_KERNEL`
 - `PEGAINFER_E2E_MODEL_PATH`
 - `FLASHINFER_INCLUDE_DIR`

@@ -16,6 +16,7 @@ State reflected here is based on repository evidence as of 2026-04-12.
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
 | Metal | Beta | Usable for local validation and serial serving, but not yet equivalent to CUDA serving runtime. |
+| Metal DFlash | Experimental | Apple Silicon speculative decode path. `Qwen3` only today; benchmark before use. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
 ---
@@ -40,7 +41,7 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported, including scheduler/runtime work. |
+| Qwen3.5 | Supported | Supported on normal runtime paths, but not on Metal DFlash. |
 | GLM4 | Limited support | Present in project state, but less established than Qwen paths. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
@@ -52,6 +53,7 @@ Notes:
 
 | Capability | Status | Notes |
 | --- | --- | --- |
+| Metal DFlash | Experimental | Currently validated on Qwen3 + Apple Silicon. Generation-heavy workloads first. |
 | FP8 KV cache | Beta | Implemented and benchmarked, still evolving. |
 | INT8 KV cache | Beta | Implemented and benchmarked, still evolving. |
 | TurboQuant KV | Experimental | Fast-moving optimization area. |
