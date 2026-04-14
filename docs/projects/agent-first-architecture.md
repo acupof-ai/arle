@@ -8,8 +8,11 @@ call is syntactically valid on first try, and every session can survive a
 process restart without paying the cold-prefill tax.
 
 This doc is a **priority ledger**, not a design spec. Each item is scoped to
-land as a single PR under the Phase 1 PR discipline (one main topic per PR,
-`art-grade-architecture-for-long-agent-infer.md`).
+land as a single PR under the Phase 1 PR discipline (one main topic per PR);
+the original "Phase 1 split" plan was reverted by Route-A on 2026-04-15 — see
+`docs/archives/art-grade-architecture-for-long-agent-infer.md` for the dead
+proposal and `docs/architecture.md` / `docs/codebase-map.md` for the current
+canonical workspace shape.
 
 ---
 
@@ -389,9 +392,10 @@ A4 is on the critical path for the stated goal.
 - [`tiered-kv-cache.md`](tiered-kv-cache.md) — Hierarchical KV cache project.
   Owns the implementation shape for A1, B1, and B3. Any contract change
   affecting those three items lands there first and propagates here.
-- `infer/docs/projects/art-grade-architecture-for-long-agent-infer.md` —
-  workspace crate topology and Phase-1 PR discipline (this doc operates
-  under those rules).
+- [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
+  archived 8-crate decomposition proposal. Its §六 governance rules and §七
+  acceptance criteria still inform PR discipline; its §一 / 二 / 三 crate
+  topology was reverted by Route-A.
 - `docs/architecture.md` — current workspace/package topology.
 - `docs/projects/mlx-backend-roadmap.md` — Metal-side work that must stay
   consistent with tier-A contract changes.

@@ -14,10 +14,11 @@ items share one code topology and must be built against one data-structure
 contract; splitting them into independent designs is how we end up with three
 incompatible caches. This doc owns that contract.
 
-This doc operates under the Phase-1 PR discipline in
-[`../../infer/docs/projects/art-grade-architecture-for-long-agent-infer.md`](../../infer/docs/projects/art-grade-architecture-for-long-agent-infer.md):
-one main topic per PR, structure-before-behavior, no mixed kernel+scheduler+
-workspace diffs in the same review.
+This doc operates under the Phase-1 PR discipline originally proposed in
+[`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md)
+(now archived; the crate topology was reverted by Route-A but the PR
+discipline still applies): one main topic per PR, structure-before-behavior,
+no mixed kernel+scheduler+workspace diffs in the same review.
 
 ---
 
@@ -638,10 +639,11 @@ again during implementation.
 - [`mlx-backend-roadmap.md`](mlx-backend-roadmap.md) — Metal side. P3 is
   the first point of contact; the MLX roadmap should link back here once
   P3 enters execution.
-- [`../../infer/docs/projects/art-grade-architecture-for-long-agent-infer.md`](../../infer/docs/projects/art-grade-architecture-for-long-agent-infer.md) —
-  workspace crate topology and PR discipline. This doc operates under its
-  rules; when P2 or later needs a promoted `infer-kv-tier` crate, that
-  promotion goes through the crate-admission criteria there.
+- [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
+  archived workspace crate topology proposal. PR discipline (§六) and crate
+  admission criteria (§七) still apply; the §一 topology was reverted by
+  Route-A. If P2 or later promotes a `kv_tier` module to a separate crate,
+  the promotion still has to pass the §六 "two direct consumers" gate.
 
 ---
 

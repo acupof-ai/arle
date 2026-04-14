@@ -1,12 +1,15 @@
 # Route A GPU Validation Prompt
 
-Use this checklist when validating the 2026-04-15 Route-A refactor on a CUDA
-host after the local Darwin lane has finished the structural rollback.
+Use this checklist when validating the 2026-04-15 Route-A refactor + the
+follow-up consolidation pass on a CUDA host after Darwin verification has
+landed.
 
 ## Goal
 
-Confirm that folding the abandoned runtime split back into `infer` changed only
-package/module structure and did not change build behavior or runtime semantics.
+Confirm that (a) folding the abandoned runtime split back into `infer` and
+(b) collapsing the duplicate `agent_engine` facade into `server_engine` only
+changed package/module structure and naming, not build behavior or runtime
+semantics.
 
 ## Commands
 
@@ -17,23 +20,36 @@ cargo fmt --all -- --check
 cargo check --workspace --no-default-features --features no-cuda
 cargo check -p infer --no-default-features --features cuda,no-cuda
 cargo check --workspace --no-default-features --features metal
-cargo test --workspace --release --no-default-features --features metal
-cargo clippy --workspace --no-default-features --features metal -- -D warnings
+CUDA_HOME=/usr/local/cuda cargo build --release
+cargo test --release --lib
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+cargo test --release --test e2e_qwen35
+scripts/bench_throughput_sweep.py --label post-route-a-cuda
 ```
 
 ## What to inspect
 
-- `infer/src/lib.rs` should have no legacy `#[path]` redirects into the
-  removed split-tree modules.
-- `infer/src/agent_engine.rs`, `infer/src/types.rs`,
-  `infer/src/events.rs`, and `infer/src/scheduler/policy.rs` should exist.
-- `Cargo.toml` workspace members should no longer list the four reverted crates.
-- `crates/` should contain only `infer-agent`, `infer-chat`, `infer-cli`,
+- `infer/src/lib.rs` has no legacy `#[path]` redirects.
+- `infer/src/agent_engine.rs` does **not** exist (deleted; its responsibilities
+  collapsed into `infer/src/server_engine.rs`).
+- `infer/src/types.rs`, `infer/src/events.rs`, `infer/src/scheduler/policy.rs`
+  exist as folded-in modules.
+- `infer/src/server_engine.rs` exposes the canonical surface: `InferenceEngine`
+  trait, `LoadedInferenceEngine` enum (CUDA + Metal + CPU variants),
+  `CompletionRequest`, `CompletionOutput`, `TokenUsage`,
+  `CompletionStreamDelta`, `ModelInferenceEngine<M>`, and the
+  `Qwen3InferenceEngine` / `Qwen35InferenceEngine` / `GLM4InferenceEngine`
+  aliases.
+- `Cargo.toml` workspace members do not list `infer-core`, `infer-engine`,
+  `infer-observability`, or `infer-policy`.
+- `crates/` contains only `infer-agent`, `infer-chat`, `infer-cli`,
   `infer-tools`, `mlx-sys`, and `README.md`.
 
 ## Final sweep
 
-Run the Route-A legacy-reference grep used in the acceptance checklist.
+```bash
+grep -rn 'AgentEngine\|AgentComplete\|LoadedAgentEngine\|RealServerEngine\|GenericServerEngine\|LoadedServerEngine\|\bServerEngine\b\|\bCompleteRequest\b\|\bCompleteOutput\b\|\bEngineOptions\b\|\bStreamDelta\b\|ProtocolChatMessage\|ProtocolToolCall\|ProtocolToolDefinition\|protocol_messages_to_prompt\|parse_protocol_tool_calls\|init_default_logging' --include='*.rs' --include='*.toml' .
+```
 
 Expected results:
 
