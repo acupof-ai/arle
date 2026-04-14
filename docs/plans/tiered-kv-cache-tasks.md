@@ -2,6 +2,14 @@
 
 **Status**: Active execution split for [`../projects/tiered-kv-cache.md`](../projects/tiered-kv-cache.md).
 
+**Revised 2026-04-15**: see §0.5 for the P0-P5 → M0-M5 remapping. The
+project doc was re-architected after an internal survey + 7-system industry
+comparison found three corrections (BlockId unification, RadixCache and
+TierDirectory merge, page_size=1 blocks tier transfer bandwidth). The
+detailed task lists per phase below are still largely correct; only the
+phase grouping and the file paths (post Route-A) change. Section §0.5
+translates old P0–P5 references into the new M0–M5 plan.
+
 This doc carves every phase from the project plan into three lanes so the
 local Mac dev box and the remote CUDA host can both stay busy at all times.
 The project doc is the **what + why**; this doc is the **where you do it**,
@@ -49,7 +57,67 @@ Every phase below has three subsections:
 
 ---
 
-## 1 · Phase P0 — `page_size = 16`
+## 0.5 · 2026-04-15 revision — P0-P5 → M0-M5 remapping
+
+Project doc §6 was re-organised into M0–M5 after the internal survey +
+industry comparison. The detailed per-phase task lists in §1–§6 below are
+still correct at the per-task level; only the phase groupings and a few
+file paths change. This table translates old phase references into the new
+milestone plan.
+
+| Old phase | New milestone | What changed | Task doc section |
+|---|---|---|---|
+| P0 page_size=16 | **M0.3** | Unchanged intent; now gated on the in-flight `infer-cuda-kernels` crate extraction landing. Per-format dispatch still applies (BF16 → 16, quantized → stay at 1). | §1 below |
+| P1 (a) structural (BlockId, kv_tier module, serde) | **retired** | The old `kv_tier::BlockId(u64)` / `TierDirectory` / `BlockDescriptor` skeleton is being deleted in M1. Do **not** extend it. The bug fixes from P1(a) (three `prefix_cache.rs` correctness bugs) are now **M0.2** — see §2.1 below. | §2 below, fragment |
+| P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | §2 below |
+| — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | (new, §2.1 addendum) |
+| — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | (new, §3.5 addendum) |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. Content unchanged. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | §3 below |
+| P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | §4 below |
+| P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | §5 below (keep for reference) |
+| P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | §6 below |
+
+**New M0 scope** (prereqs for M1, all independent PRs):
+
+- **M0.1** — BlockId unification. New `infer/src/types.rs::BlockId(u32)` +
+  `BlockFingerprint([u8; 16])`. Delete `infer/src/kv_tier/id.rs`. Update
+  `prefix_cache::BlockId` and `block_manager::BlockId` to re-export the
+  canonical type. Pure rename + `use` path updates, no algorithmic change.
+- **M0.2** — Three `prefix_cache.rs` correctness bugs
+  (`_split_node` ref_count inherit, `lookup` ancestor walk, `evict`
+  iterate orphans). Unit-tested, no scheduler changes. Details in §2.1 below.
+- **M0.3** — page_size lift from 1 to 16 with per-format dispatch (the old
+  P0). Blocks on the in-flight `infer-cuda-kernels` crate extraction
+  landing — after that extraction, the kernel files move from
+  `infer/csrc/cuda/kv/*.cu` to `crates/infer-cuda-kernels/csrc/kv/*.cu`.
+
+**Paths updated post Route-A (structural, not content)**:
+
+All "cuda-gated" file paths in the detailed task sections below shifted
+during the Route-A workspace rewrite (commit `d902090`) and the CUDA
+internal hygiene pass (commit `26c8f39`). The table below lists the
+renames that affect this doc:
+
+| Pre Route-A path | Current path |
+|---|---|
+| `infer/src/paged_kv.rs` | `infer/src/backend/cuda/paged_kv.rs` |
+| `infer/src/flashinfer_metadata.rs` | `infer/src/backend/cuda/flashinfer.rs` |
+| `infer/src/tensor.rs` | `infer/src/backend/cuda/tensor.rs` |
+| `infer/src/metal_kv_pool.rs` | `infer/src/backend/metal/kv_pool.rs` |
+| `infer/src/metal_prefix_cache.rs` | `infer/src/backend/metal/prefix_cache.rs` |
+| `infer/src/metal_gdr.rs` | `infer/src/backend/metal/gdr.rs` |
+| `infer/mlx-sys/src/lib.rs` | `crates/mlx-sys/src/lib.rs` |
+
+When reading §1–§6 below, apply these renames mentally. After the
+in-flight `infer-cuda-kernels` extraction PR lands, additional renames
+will apply (`infer/src/backend/cuda/*.rs` → `crates/infer-cuda-kernels/src/*.rs`,
+`infer/csrc/cuda/*.cu` → `crates/infer-cuda-kernels/csrc/*.cu`,
+`infer/tools/triton/*.py` → `crates/infer-cuda-kernels/tools/triton/*.py`);
+this doc will get another path update pass at that point.
+
+---
+
+## 1 · Milestone M0.3 (formerly P0) — `page_size = 16` with per-format dispatch
 
 ### 1.1 Lane breakdown
 
@@ -120,7 +188,7 @@ Every phase below has three subsections:
 
 ---
 
-## 2 · Phase P1 — wire RadixCache + introduce TierDirectory + session tags
+## 2 · Milestones M0.1, M0.2, M1 (formerly P1) — BlockId unify + prefix bug fixes + scheduler wire
 
 ### 2.1 Lane breakdown
 
@@ -193,7 +261,7 @@ Every phase below has three subsections:
 
 ---
 
-## 3 · Phase P2 — T2 host pinned tier + coordinator + auto offload
+## 3 · Milestones M2, M3 (formerly P2) — dual residency + T1 host pinned tier + coordinator
 
 ### 3.1 Lane breakdown
 
@@ -298,7 +366,7 @@ Both pure scoring functions: `&self`, snapshot in → decision out. No mutable s
 
 ---
 
-## 4 · Phase P3 — T3 disk tier + session save/load + Metal first contact
+## 4 · Milestone M4 (formerly P3) — T2 disk tier + session save/load + Metal first contact
 
 ### 4.1 Lane breakdown
 
@@ -409,7 +477,7 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 
 ---
 
-## 5 · Phase P4 — KVFlow-lite reuse-distance + cache-aware routing
+## 5 · Post-M4 experiment (formerly P4) — KVFlow-lite reuse-distance + cache-aware routing
 
 ### 5.1 Lane breakdown
 
@@ -474,7 +542,7 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 
 ---
 
-## 6 · Phase P5 — KVTransport trait freeze + NixlTransport stub
+## 6 · Milestone M5 (formerly P5) — KVTransport trait freeze + NixlTransport stub
 
 ### 6.1 Lane breakdown
 
@@ -635,13 +703,68 @@ These should already be running by the time P0 edits land:
 
 ---
 
-## 8 · Concrete next action
+## 8 · Concrete next action (revised 2026-04-15)
 
-1. **Now, remote GPU**: kick off §7.1 baseline collection. Specifically `--label page1` and `--label baseline-main-2026-04-13`. **Prerequisites** for P0's exit gate.
-2. **Now, local Mac**: P0 edits + the P1 (a) **bug fixes** in `prefix_cache.rs` (since those are pure-local and don't touch P0 files). The two phases can share an opening commit if we're disciplined: structure-only changes in P0, bug-fixes in P1 (a), zero behavior change in either.
-3. **When P0 edits compile clean** (`cargo check --features no-cuda` and `--features metal`), hand the diff to remote GPU for §1 verification.
-4. **While remote GPU runs P0 verification**, immediately start §2 P1 (a) on the local Mac. P1 (a) is fully `[L]` and touches zero P0 files.
-5. **Remote GPU after P0 verifies**: hold P0 PR open until baseline benches recorded; merge P0; immediately start P1 (b) verification cycle once local hands off.
+**Two things can start immediately in parallel** (both are pure-local,
+both are independent of the in-flight `infer-cuda-kernels` crate
+extraction, both have zero benchmark risk):
+
+1. **M0.1 · `BlockId` unification**. Create `infer/src/types.rs` with the
+   canonical `BlockId(u32)` and `BlockFingerprint([u8; 16])`. Delete
+   `infer/src/kv_tier/id.rs`. Update `prefix_cache::BlockId` to re-export.
+   Delete `block_manager::BlockId`. Mechanical rename + `use` path
+   updates; no algorithmic change. Exit gate: `grep -rn 'pub struct BlockId' infer/src/`
+   returns exactly one hit, and all three feature combos
+   (`cpu,no-cuda` / `metal` / `cuda,no-cuda`) compile clean.
+2. **M0.2 · three `prefix_cache.rs` bug fixes**. Touches only
+   `infer/src/prefix_cache.rs`. Adds three unit tests (one per bug). Pure
+   correctness — no scheduler wiring, no behaviour change outside the
+   unit tests. Full details in §2.1 below (the list of 3 bugs is
+   unchanged from the 2026-04-13 research, only the milestone label
+   changes).
+
+**M0.3 · `page_size = 1 → 16` with per-format dispatch** blocks on the
+in-flight `infer-cuda-kernels` extraction (kernel files move from
+`infer/csrc/cuda/` to `crates/infer-cuda-kernels/csrc/`). After the
+extraction lands, re-target the file edits to their new paths and
+execute §1 below with the per-format dispatch course correction from
+§1.3. **M0.3 is a prereq for M3, not for M1** — M1's exit gate is T0-only
+`cached_prompts` parity and does not depend on `page_size`. See project
+doc §6 M0.3 "Sequencing clarification" for the rationale.
+
+**M1 · wire `RadixCache` + delete `kv_tier/directory.rs`** depends on
+M0.1 (BlockId unification) and M0.2 (prefix_cache bug fixes). It does
+**not** depend on M0.3 or on the in-flight extraction — the file paths
+it touches (`infer/src/prefix_cache.rs`, `infer/src/scheduler/cuda/*.rs`,
+`infer/src/kv_tier/directory.rs`, `infer/src/server_engine.rs`) are all
+outside the extraction scope. Execute §2 below.
+
+**M1 may ship as one atomic PR or split into M1a+M1b**. The 2026-04-15
+draft said "must be one atomic PR"; Codex review showed a safe
+compilable split exists:
+- **M1a · structural** — extend the private `Node` struct in
+  `prefix_cache.rs` with new fields (`tier_location`, `session_id`,
+  `soft_pin_until`, `byte_len`, optional `fingerprint`). The struct is
+  private so no API surface changes. `cached_prompts` and `TierDirectory`
+  remain untouched; full test suite passes unchanged.
+- **M1b · behavior** — swap `scheduler/cuda/*.rs` and
+  `server_engine.rs:475-547` to use `radix_cache.lookup` instead of the
+  linear `cached_prompts` compare; add refcount inc/dec; delete
+  `kv_tier/directory.rs` and the `TierDirectory` re-export. Apply the
+  full M1 benchmark gate to this PR.
+Pick single-PR when reviewer bandwidth is high; split when it is not.
+
+**M2 · dual residency** is a new milestone added in the 2026-04-15
+revision; see §3.5 for details. It is a single-PR behaviour change on
+top of M1 with an agent-trace benchmark gate.
+
+**After M2**: proceed through §3 (M3 host pinned + coordinator, 3 stacked
+PRs), §4 (M4 disk + session save/load, 2 stacked), and keep M5 (NIXL
+real) as a deferred trigger-gated task.
+
+**Remote CUDA host, in parallel**: keep collecting baseline benches
+(§7.1 `--label page1` and `--label baseline-main-2026-04-13`) so that
+M0.3's exit gate has a comparison point when it unblocks.
 
 ---
 
@@ -654,6 +777,17 @@ These should already be running by the time P0 edits land:
 
 ## 10 · Changelog
 
+- **2026-04-15**: Major revision after internal survey + 7-system industry comparison. Project doc re-architected around three corrections; this doc gains §0.5 remapping + §8 rewrite + path updates. Summary of changes:
+  - **P0-P5 → M0-M5**: phase remapping. M0 now holds three pre-reqs (M0.1 BlockId unify, M0.2 prefix_cache bug fixes, M0.3 page_size lift). M1 is the single atomic PR that wires RadixCache into the scheduler **and** deletes `kv_tier/directory.rs` (the old P1(a) structural / P1(b) behavior split is superseded because the midway state is uncompilable).
+  - **New M2 (dual residency)** — the SGLang / vLLM / TRT-LLM "evict into free queue, pool reuses, lookup resurrects" pattern. Previously absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. Industry reference: SGLang Novita 40% → 80% prefix hit rate, -56% TTFT.
+  - **BlockId unification** (new M0.1). Three incompatible types existed (`kv_tier::BlockId(u64)`, `prefix_cache::BlockId(u32)`, `block_manager::BlockId(u32)`). Canonical is `types::BlockId(u32)`; content hash is a separate `types::BlockFingerprint([u8; 16])` only constructed when persistence / cross-node reuse is needed.
+  - **RadixCache ↔ TierDirectory merge**. The 2026-04-13 two-layer topology (radix tree → directory resolve) was not industry-proven. 7 of 7 surveyed systems merge them. The revised design puts `block_id`, `location: Cell<TierLocation>`, `last_access`, `session_id`, `soft_pin_until`, `byte_len`, `fingerprint` fields directly on `RadixNode`; `infer/src/kv_tier/directory.rs` (322 lines, 0 production callers) is deleted in M1.
+  - **Tier numbering** T0/T2/T3/T4 → T0/T1/T2/T3 for alignment with vLLM / SGLang / Mooncake / Dynamo KVBM documentation. No semantic change.
+  - **Coordinator threading model** commits to OS thread + crossbeam (the §3.3 course correction, now project doc §4.4), not tokio.
+  - **P4 KVFlow-lite** dropped from critical path. Ship LRU / SessionBiasedLru in M3; revisit reuse-distance only if M3's default policy proves insufficient.
+  - **P5 NIXL real RDMA** deferred. Trigger criteria documented in project doc §6 M5: prefill/decode disaggregation, cluster-wide session roaming, or second consumer of the kernel crate.
+  - **File paths updated for Route-A**: `infer/src/paged_kv.rs` → `infer/src/backend/cuda/paged_kv.rs`, `infer/src/metal_*` → `infer/src/backend/metal/*`, etc. See §0.5 table for the full rename list.
+  - **New sources** added: 14 industry research references (vLLM KV offloading connector blog, SGLang HiCache design, LMCache/CacheBlend, Mooncake FAST'25 paper, Dynamo KVBM, TRT-LLM KV reuse, etc.). Full list in project doc §12.
 - **2026-04-13**: Initial split (without per-phase research).
 - **2026-04-13** (later): Enriched with 6-agent industry research. Added §N.2 Industry references and §N.3 Course corrections subsections per phase. Major design changes:
   - P0: bf16-only at `page_size=16`; INT8/FP8 quantized paths stay at `page_size=1` behind `format.uses_paged_layout()`

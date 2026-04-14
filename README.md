@@ -19,7 +19,7 @@ agent-infer treats this as the core problem:
 
 | Capability | What it does | Impact |
 |---|---|---|
-| **Radix-tree prefix cache** | Content-addressable KV reuse across requests. Shared system prompts and conversation prefixes skip prefill entirely. | 100% cache hit on multi-turn agent benchmarks |
+| **Multi-turn KV reuse** | Slot-sticky prefix matching reuses the previous turn's KV in place. Shared system prompts and conversation prefixes skip prefill entirely. Cross-session radix-tree reuse wiring lands in the tiered-kv-cache M1 milestone; today's fast path is a per-slot linear compare. | 100% cache hit on single-session multi-turn agent benchmarks |
 | **Token-level KV pool** | page_size=1 pooling (SGLang-style). Zero fragmentation, instant alloc/free. | Eliminates memory waste from fixed-page padding |
 | **Transparent GPU-CPU offload** | Oldest KV blocks migrate to host RAM; prefetch back before attention. | Contexts beyond GPU VRAM capacity |
 | **Copy-on-write block sharing** | Paged blocks with ref-counting. Shared prefixes across concurrent requests use one copy. | N requests, 1x prefix memory |
@@ -229,7 +229,7 @@ Current package boundary for agent mode:
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
-Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn reuses prior context at 100% hit rate.
+Tools: `python` (execute Python snippets), `shell` (execute bash commands). KV prefix cache ensures each turn within a single session reuses prior context at 100% hit rate (slot-sticky match; cross-session reuse via radix tree lands in the tiered-kv-cache M1 milestone).
 On macOS, tool execution now uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
 
 On Apple Silicon, build the same CLI against the Metal backend:
