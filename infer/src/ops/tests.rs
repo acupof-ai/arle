@@ -3,7 +3,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use super::*;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use crate::backend::cuda::tensor::*;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
