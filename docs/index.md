@@ -40,6 +40,7 @@
 | [experience/errors/2026-04-14-broken-rebase-baseline.md](experience/errors/2026-04-14-broken-rebase-baseline.md) | Rebase / migration work must verify the upstream baseline before attributing errors |
 | **Experience — Wins** | |
 | [experience/wins/2026-04-09-marlin-prefill.md](experience/wins/2026-04-09-marlin-prefill.md) | Marlin W4 prefill: 5-25x TTFT speedup for long prompts |
+| [experience/wins/2026-04-14-metal-dflash-qwen3.md](experience/wins/2026-04-14-metal-dflash-qwen3.md) | Qwen3 Metal DFlash on M4 Pro: 20/256 generation-heavy workload hits 5.9x decode throughput when using the draft model's native block size |
 | [experience/wins/2026-04-09-native-w4-throughput.md](experience/wins/2026-04-09-native-w4-throughput.md) | Native W4 throughput results |
 | [experience/wins/2026-04-09-ppl-weight-quant.md](experience/wins/2026-04-09-ppl-weight-quant.md) | PPL evaluation for weight quantization |
 | [experience/wins/2026-04-09-bench-quant-quality.md](experience/wins/2026-04-09-bench-quant-quality.md) | Quantization quality benchmark results |
