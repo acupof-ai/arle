@@ -41,6 +41,22 @@ Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
 - **Backend isolation**: CUDA-only code gated behind `#[cfg(feature = "cuda")]`; Metal-only behind `#[cfg(feature = "metal")]`. Never `cfg`-leak backend types into cross-backend modules — route through `backend.rs`.
 - **Opportunistic cleanup**: Spot something inelegant → fix in separate commit.
 
+### Delegation to Codex
+
+Claude owns **direction**; Codex owns **execution**. Codex is reached via the `codex:codex-rescue` plugin (tool: `Agent` with `subagent_type: "codex:codex-rescue"`, or the MCP bridge `mcp__openmax__execute_with_codex`).
+
+| Area | Owner | Notes |
+|------|-------|-------|
+| Docs, planning, architecture, roadmaps | **Claude** | `docs/plans/`, `docs/experience/`, `docs/projects/`, design notes |
+| Code execution (implement / refactor / write & run tests) | **Codex** | Default executor for concrete coding tasks |
+| Code review (diffs, PR review) | **Codex** | Claude does not self-review substantial diffs |
+| Stuck-problem rescue | **Codex** | Triggered by the 2-strike rule below |
+
+- **Task-execution bias**: when a task boils down to "write/change code", delegate to Codex by default. Claude's job is to draft a precise brief (files, constraints, acceptance criteria), then integrate and verify Codex's output against the plan — not to hand-write the implementation.
+- **Code review via Codex**: route all non-trivial diff review through Codex. Claude does not self-review substantial diffs; if Claude did the writing, Codex reviews. If Codex did the writing, Claude reviews at the *plan/spec* level, not line-by-line.
+- **2-strike rule**: if Claude makes **two complete good-faith attempts** at a problem and still cannot resolve it, hand off to Codex via `codex:codex-rescue` instead of attempting a third time. The handoff brief must include: what was tried, what was observed, and why each attempt failed — so Codex can pick a different angle rather than re-running Claude's path.
+- **What stays with Claude**: planning docs, experience entries (`docs/experience/`), roadmap edits, user-facing explanations, cross-cutting architectural decisions, and the final integration step after Codex reports back.
+
 ### Benchmark Rules
 
 - **Snapshot before & after** in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
