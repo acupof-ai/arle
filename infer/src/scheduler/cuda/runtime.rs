@@ -198,21 +198,27 @@ impl<M: ModelForward> Scheduler<M> {
                 let req = self.active.remove(i);
                 let gen_tokens = req.generated_tokens.len() as u64;
 
-                self.paged_kv_pool.free_slot(req.slot_idx);
+                // M2a cleanup ordering: publish to the radix + retain
+                // pool pages BEFORE `free_slot`. `publish_to_prefix_cache`
+                // reads `token_indices(slot)` and calls `retain_pages`
+                // on the contiguous span that backs the prompt, so
+                // the subsequent `free_slot` leaves those pages in
+                // limbo instead of pushing them back to the primary
+                // free list. Pages beyond the last full block (i.e.
+                // the `prompt.len() % block_size` tail plus any
+                // generated tokens) are not retained and go back to
+                // the free pool as before.
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
-                    // Per-slot cached prompt stays as the authoritative
-                    // backing for the actual KV state in slot_idx's
-                    // contiguous buffer.
-                    self.cached_prompts[req.slot_idx] = prompt_tokens.to_vec();
-                    // Global prefix observer: fold the completed prompt
-                    // into the radix. The synthetic block ids come from
-                    // `next_prefix_block_id`; they are opaque here but
-                    // let the radix insert / lookup / release paths
-                    // exercise their full happy path during M1.
-                    self.publish_to_prefix_cache(prompt_tokens);
+                    let prompt_vec = prompt_tokens.to_vec();
+                    // Per-slot cached prompt stays as the legacy
+                    // authoritative backing for the linear
+                    // `best_prefix_slot` scan. M2b will retire it.
+                    self.cached_prompts[req.slot_idx] = prompt_vec.clone();
+                    self.publish_to_prefix_cache(req.slot_idx, &prompt_vec);
                 } else {
                     self.cached_prompts[req.slot_idx].clear();
                 }
+                self.paged_kv_pool.free_slot(req.slot_idx);
                 let _ = self.states[req.slot_idx].offload_kv_if_needed();
 
                 self.total_completed += 1;
@@ -243,6 +249,14 @@ impl<M: ModelForward> Scheduler<M> {
                 i += 1;
             }
         }
+
+        // M2a: amortised LRU eviction for the prefix cache.
+        // Runs after the per-request free_slot loop so the pool's
+        // retained fraction is fresh. No-op unless retained pages
+        // crossed `PREFIX_CACHE_HIGH_WATER`; then evicts down to
+        // `PREFIX_CACHE_LOW_WATER`. See
+        // `core::Scheduler::evict_prefix_cache_if_pressured`.
+        let _reclaimed = self.evict_prefix_cache_if_pressured();
     }
 }
 
