@@ -9,6 +9,7 @@
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research — XMA / accelerated model architectures future implications |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | **Active** — MLX Metal: Qwen3/3.5, direct `mlx-sys` bridge, serial serving |
 | **Plans** | |
+| [plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md) | **Blueprint** — Forward plan for the eventual `infer-cuda-kernels` crate extraction. Documents trip wires (FA-3 H100, MLA, NCCL, FP8 GEMM, spec-decode GPU, second consumer) and the one-day mechanical migration that executes when any trigger fires |
 | [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | **Active** — Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes per phase |
 | [plans/tiered-kv-cache-remote-validation.md](plans/tiered-kv-cache-remote-validation.md) | **Active** — Consolidated cargo / python command checklist for remote CUDA validation of the 2026-04-13 local batch |
 | [gpu-test-prompt.md](gpu-test-prompt.md) | **Active** — Route-A verification checklist for the post-refactor workspace layout |
