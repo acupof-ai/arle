@@ -153,9 +153,13 @@ fn find_triton_python() -> Result<String, String> {
         });
     }
 
+    let tool_venv = PathBuf::from("tools/triton/.venv/bin/python");
     let local_venv = PathBuf::from(".venv/bin/python");
     let mut diagnostics = Vec::new();
     let mut candidates = Vec::new();
+    if tool_venv.exists() {
+        candidates.push(tool_venv.to_string_lossy().to_string());
+    }
     if local_venv.exists() {
         candidates.push(local_venv.to_string_lossy().to_string());
     }

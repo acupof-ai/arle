@@ -63,7 +63,7 @@ extern "C" int flashinfer_tc_decode_plan(
         (uint32_t)num_qo_heads, (uint32_t)num_kv_heads,
         HEAD_DIM, HEAD_DIM,  // head_dim_qk, head_dim_vo
         (uint32_t)page_size,
-        /*enable_cuda_graph=*/false,
+        /*enable_cuda_graph=*/true,
         /*sizeof_dtype_o=*/(uint32_t)sizeof(DType),
         /*window_left=*/-1,
         /*fixed_split_size=*/-1,

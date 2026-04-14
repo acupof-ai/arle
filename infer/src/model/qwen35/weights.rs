@@ -6,7 +6,9 @@ use std::time::Instant;
 use super::config::{Config35, LayerType};
 use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::model::common::{self, MLP};
-use crate::weight_loader::{load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope};
+use crate::weight_loader::{
+    load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
+};
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
@@ -270,8 +272,9 @@ impl Qwen35Model {
             "Precomputing partial RoPE cache (rotary_dim={})",
             config.rotary_dim
         );
+        let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.rotary_dim, 4096, config.rope_theta)?;
+            precompute_rope(&ctx, config.rotary_dim, rope_cache_len, config.rope_theta)?;
 
         ctx.sync()?;
         info!(
@@ -694,8 +697,9 @@ impl Qwen35Model {
         // cos_cache have stride=256 while the CUDA kernel indexes with
         // stride=rotary_dim=64 → every position > 0 read garbage trig values,
         // collapsing attention to prompt-independent degenerate output.
+        let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
-            precompute_rope(ctx, config.rotary_dim, 4096, config.rope_theta)?;
+            precompute_rope(ctx, config.rotary_dim, rope_cache_len, config.rope_theta)?;
 
         ctx.sync()?;
         info!(

@@ -5,8 +5,9 @@
 //! `model::qwen3::batch_decode` so multiple model implementations can share it.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
+use super::ffi;
 use super::paged_kv::PagedKVPool;
 use super::tensor::DeviceContext;
 use crate::ops;
@@ -160,6 +161,8 @@ impl FlashInferDecodeMetadata {
         self.last_token_scratch
             .extend(pool.build_last_indices(slot_indices));
 
+        let use_gpu_incremental_update =
+            can_incremental_update && new_total <= self.max_total_pages;
         if can_incremental_update {
             append_last_token_indices_in_place(
                 &mut self.indices_scratch,
@@ -181,15 +184,31 @@ impl FlashInferDecodeMetadata {
             self.max_total_pages = self.indices_scratch.len();
             reallocated = true;
         }
-        ctx.stream
-            .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
-            .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
-        self.total_tokens = new_total;
 
         // Upload last-token pool indices (for INT8 quantize-after-write).
         ctx.stream
             .memcpy_htod(&self.last_token_scratch, &mut self.last_token_indices)
             .map_err(|e| anyhow::anyhow!("H2D last_token_indices: {e}"))?;
+        if use_gpu_incremental_update && !reallocated {
+            let (indices_ptr, _gidx) = self.kv_indices.device_ptr_mut(&ctx.stream);
+            let (indptr_ptr, _gindptr) = self.kv_indptr.device_ptr(&ctx.stream);
+            let (last_ptr, _glast) = self.last_token_indices.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::flashinfer_append_last_token_indices_cuda(
+                    indices_ptr as *mut i32,
+                    indptr_ptr as *const i32,
+                    last_ptr as *const i32,
+                    slot_indices.len() as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        } else {
+            ctx.stream
+                .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+                .map_err(|e| anyhow::anyhow!("H2D indices: {e}"))?;
+        }
+        self.total_tokens = new_total;
 
         // Re-plan when the batch size changed, lengths did not follow the
         // steady-state decode progression, or kv_indices had to move.

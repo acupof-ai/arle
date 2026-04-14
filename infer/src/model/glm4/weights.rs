@@ -6,7 +6,9 @@ use super::config::Config;
 use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::model::common::{self, MLP};
 use crate::ops;
-use crate::weight_loader::{load_tensor_1d, load_tensor_2d, precompute_rope};
+use crate::weight_loader::{
+    load_tensor_1d, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
+};
 
 /// Attention layer weights for GLM-4.
 ///
@@ -203,8 +205,9 @@ impl GLM4Model {
         )?;
 
         debug!("Precomputing RoPE cache on GPU");
+        let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
-            precompute_rope(&ctx, config.head_dim(), 4096, config.rope_theta())?;
+            precompute_rope(&ctx, config.head_dim(), rope_cache_len, config.rope_theta())?;
 
         ctx.sync()?;
         info!(

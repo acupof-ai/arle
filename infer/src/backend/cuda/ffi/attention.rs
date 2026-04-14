@@ -207,6 +207,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub(crate) fn flashinfer_append_last_token_indices_cuda(
+        kv_indices: *mut i32,
+        kv_indptr: *const i32,
+        last_token_indices: *const i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub(crate) fn flashinfer_batch_decode_hd256_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,

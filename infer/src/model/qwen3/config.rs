@@ -16,6 +16,10 @@ pub struct Config {
     pub bos_token_id: u32,
     pub eos_token_id: u32,
     pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub context_length: Option<usize>,
     #[serde(skip)]
     pub stop_token_ids: Vec<u32>,
 }
@@ -60,6 +64,10 @@ impl Config {
 
     pub fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token_ids.contains(&token_id)
+    }
+
+    pub fn rope_cache_len_hint(&self) -> Option<usize> {
+        self.max_position_embeddings.or(self.context_length)
     }
 
     fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {

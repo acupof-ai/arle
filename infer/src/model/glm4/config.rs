@@ -80,6 +80,10 @@ impl Config {
         10000.0 * self.rope_ratio
     }
 
+    pub fn rope_cache_len_hint(&self) -> Option<usize> {
+        Some(self.seq_length)
+    }
+
     /// Convenience accessors that map GLM-4 field names to the common naming
     /// convention used by the rest of the codebase.
     pub fn num_hidden_layers(&self) -> usize {
