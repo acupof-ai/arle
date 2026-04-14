@@ -92,10 +92,12 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 ### Tier A — defines whether we are agent-grade at all
 
 #### A1. Wire `RadixCache` into the CUDA scheduler (blocker for A2, A3, A4)
-> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P1.
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 M1
+> (formerly P1, renumbered in the 2026-04-15 revision — see tiered-kv-cache.md
+> §13 revision log).
 > A1 is folded into the Tiered KV Cache project — it ships as the first
-> behavior phase there. When P1 lands, move A1 to the Done section with a
-> pointer to the merged PRs.
+> behavior milestone (M1) there. When M1 lands, move A1 to the Done
+> section with a pointer to the merged PRs.
 
 - **What**: Replace `scheduler/cuda/runtime.rs::best_prefix_slot`'s
   `num_slots`-entry linear compare with a `RadixCache` lookup backed by
@@ -165,11 +167,13 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 ### Tier B — defines whether we are professional
 
 #### B1. Session KV snapshot persistence (needs A1)
-> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P3.
-> B1 is folded into the Tiered KV Cache project. The proposed
-> `infer/src/session_store.rs` does not land as a standalone module; its
-> functionality ships as `kv_tier::transport::disk` (T3 tier) plus the HTTP
-> save/load handlers. Radix `serde` lands in P1 as a P3 precondition.
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 M4
+> (formerly P3, renumbered 2026-04-15). B1 is folded into the Tiered KV
+> Cache project. The proposed `infer/src/session_store.rs` does not land
+> as a standalone module; its functionality ships as
+> `kv_tier::transport::disk` (T2 tier after the 2026-04-15 T0/T2/T3/T4 →
+> T0/T1/T2/T3 renumber) plus the HTTP save/load handlers. Radix `serde`
+> lands in M1 as an M4 precondition.
 
 - **What**: `POST /v1/sessions/{id}/save` serializes radix nodes + their
   KV blocks to local storage. `POST /v1/sessions/{id}/load` re-attaches.
@@ -198,10 +202,13 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   arguments; no mid-stream content↔tool_call rewrites.
 
 #### B3. Policy signals for prefix / session awareness
-> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 P2.
-> The signal extension itself has already shipped (commit `3e1d35f`); the
-> remaining `EvictionPolicy` trait + `SessionBiasedLru` default lands as the
-> Tiered KV Cache P2 structural PR. When P2 ships, move B3 to Done.
+> **Implementation spec**: [`tiered-kv-cache.md`](tiered-kv-cache.md) §6 M3
+> (formerly P2, renumbered 2026-04-15). The signal extension itself has
+> already shipped (commit `3e1d35f`); the remaining `EvictionPolicy`
+> trait + `SessionBiasedLru` default is already defined in
+> `scheduler/policy.rs:179-189` but has zero scheduler callers — it
+> lands as the M3b coordinator+watermarks stacked PR. When M3 ships,
+> move B3 to Done.
 
 - **What**: Extend `infer::scheduler::policy::SchedulerSignals` with
   `prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`. Add a built-in

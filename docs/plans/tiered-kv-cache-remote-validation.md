@@ -4,16 +4,32 @@
 G, I and their earlier A/B/C/D peers) into a single, mechanical list
 of cargo / python commands to run on the remote CUDA host.
 
+**2026-04-15 note**: this checklist was written against the 2026-04-13
+P0–P5 phase plan. The project has since re-organised into M0–M5 (see
+[`../projects/tiered-kv-cache.md`](../projects/tiered-kv-cache.md) §6 and
+[`tiered-kv-cache-tasks.md`](tiered-kv-cache-tasks.md) §0.5 for the
+remapping). The **per-commit validation commands in §4 below are
+unchanged** — they still match what the P1(a) structural commits did.
+The gaps at the end of §4 that were previously labelled "P1 (b)
+scheduler swap not yet landed" are now labelled **M1** and are still
+the next remote-validation work item when M1 lands. The file paths
+referenced below reflect the pre Route-A tree
+(`infer/src/paged_kv.rs`, `infer/src/flashinfer_metadata.rs`,
+`infer/src/metal_*`, etc.); post Route-A and post `infer-cuda-kernels`
+extraction, the equivalent paths are under `infer/src/backend/cuda/*`,
+`infer/src/backend/metal/*`, and eventually `crates/infer-cuda-kernels/`.
+The commands still work — Cargo resolves them — but when you read a
+file reference below, apply the rename mentally.
+
 This doc is the contract for what "remote validation" means after
 2026-04-13's local work. The Mac lane has already run everything that
 `cargo check --features no-cuda` and `cargo check --features metal` can
 validate; the remote lane is specifically for:
 
 1. The full CUDA build path (`cargo build --release`, default features).
-2. `cargo test --release` — `infer/src/paged_kv.rs`,
-   `infer/src/flashinfer_metadata.rs`, `infer/src/model/*`,
-   `infer/src/scheduler/cuda/*`, and `infer/src/ops/*` are all
-   `#[cfg(feature = "cuda")]`-gated and cannot be type-checked on Mac.
+2. `cargo test --release` — files under `backend/cuda/`, `model/*`,
+   `scheduler/cuda/*`, `ops/*` are all `#[cfg(feature = "cuda")]`-gated
+   and cannot be type-checked on Mac.
 3. `cargo test --release --test e2e` / `--test e2e_qwen35` — full
    greedy-decode numerical parity regression against baseline JSONs in
    `infer/test_data/`.
