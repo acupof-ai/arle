@@ -1,9 +1,14 @@
-//! T3 disk backend: [`DiskStore`] provides both a key-based blob store
+//! T2 disk backend: [`DiskStore`] provides both a key-based blob store
 //! and a [`BlockLocation::Disk`]-aware block allocator for the tiered KV
 //! cache skeleton.
 //!
-//! This is the **skeleton implementation** for the P3 disk tier. It
-//! lands now to prove two things on the local Mac lane:
+//! Tier number: the 2026-04-15 revision renamed T3 → T2 (project doc
+//! §4.1) to match industry convention; the old T3 label is preserved
+//! in some test/bench file names but the code uses T2.
+//!
+//! This is the **skeleton implementation** for the M4 disk tier
+//! (formerly P3, renamed in the 2026-04-15 revision). It lands now to
+//! prove two things on the local Mac lane:
 //! 1. `std::fs` I/O is sufficient for the skeleton (no tokio runtime
 //!    boilerplate, no async/await on the hot path).
 //! 2. The `BlockLocation::Disk { file_id, offset }` addressing model
@@ -17,7 +22,7 @@
 //! - Two layers on top of one root directory:
 //!   - **Keyed API** — `write` / `read` / `remove` use caller-supplied
 //!     relative paths and reject absolute paths or `..` traversal. Used
-//!     by the HTTP session save/load routes (P3 behavior PR) where the
+//!     by the HTTP session save/load routes (M4 behavior PR) where the
 //!     caller already has a stable key like the session id.
 //!   - **Block API** — `put_block` / `get_block` / `delete_block`
 //!     allocate sequential `file_id`s (via `AtomicU32`) and hand back a
@@ -25,7 +30,8 @@
 //!     eviction path where the radix cache doesn't have its own name
 //!     for the block yet.
 //! - Sequential `file_id` allocation. Not content-addressable yet —
-//!   that arrives in P3 behavior PR together with blake3 hashing.
+//!   that arrives in M4 behavior PR together with blake3 hashing (via
+//!   `crate::types::BlockFingerprint`).
 //! - One file per block; every block starts at offset `0` of its own
 //!   file. `offset` stays in [`BlockLocation::Disk`] for forward
 //!   compatibility with a future packed-file format.
