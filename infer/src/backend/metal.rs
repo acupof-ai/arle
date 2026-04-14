@@ -26,13 +26,15 @@
 //! ```
 
 #[cfg(feature = "metal")]
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "metal")]
 use std::time::Instant;
 
 #[cfg(feature = "metal")]
 use anyhow::anyhow;
+#[cfg(feature = "metal")]
+use anyhow::bail;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "metal")]
@@ -46,6 +48,9 @@ use crate::{
 
 #[path = "metal/config.rs"]
 mod config;
+#[cfg(feature = "metal")]
+#[path = "metal/dflash.rs"]
+mod dflash;
 #[cfg(feature = "metal")]
 #[path = "metal/forward.rs"]
 pub mod forward;
@@ -85,22 +90,24 @@ pub mod scheduler;
 
 // ── mlx types (Metal GPU required) ───────────────────────────────────────────
 #[cfg(feature = "metal")]
-use self::generate::{KV_CACHE_CHUNK, MetalGenerateOutput};
+use self::generate::{MetalGenerateOutput, KV_CACHE_CHUNK};
 #[cfg(feature = "metal")]
 use self::ops::{clear_metal_cache, extend_kv_cache, linear};
 #[cfg(feature = "metal")]
 use self::sampling::gpu_sample_token;
 #[cfg(feature = "metal")]
 use self::weights::{
-    MetalWeights, MlpInputProjection, WeightTensor, merge_quantized_projection_rows,
+    merge_quantized_projection_rows, MetalWeights, MlpInputProjection, WeightTensor,
 };
-use config::{MetalModelArch, MetalModelConfig, load_metal_config};
+use config::{load_metal_config, MetalModelArch, MetalModelConfig};
 #[cfg(feature = "metal")]
 use config::{MetalQwen35ArchConfig, MetalQwen35LayerType, QuantConfig};
 #[cfg(feature = "metal")]
+pub use dflash::MetalDflashOptions;
+#[cfg(feature = "metal")]
 use loader::{
-    TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
-    tie_lm_head_from_embed_tokens,
+    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
+    tie_lm_head_from_embed_tokens, TensorMap,
 };
 #[cfg(feature = "metal")]
 use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};
@@ -125,18 +132,33 @@ pub struct MetalBackend {
     // GPU required: populated in `load()` via mlx-sys-backed MLX tensors.
     #[cfg(feature = "metal")]
     weights: Option<MetalWeights>,
+    #[cfg(feature = "metal")]
+    dflash_options: Option<MetalDflashOptions>,
+    #[cfg(feature = "metal")]
+    dflash: Option<dflash::MetalDflashRuntime>,
     #[cfg(not(feature = "metal"))]
     _weights: (),
 }
 
 impl MetalBackend {
     pub fn new() -> Self {
+        Self::with_options(MetalBackendOptions::default())
+    }
+
+    pub fn with_options(options: MetalBackendOptions) -> Self {
+        #[cfg(not(feature = "metal"))]
+        let _ = &options;
+
         Self {
             model_dir: None,
             tokenizer: None,
             config: None,
             #[cfg(feature = "metal")]
             weights: None,
+            #[cfg(feature = "metal")]
+            dflash_options: options.dflash,
+            #[cfg(feature = "metal")]
+            dflash: None,
             #[cfg(not(feature = "metal"))]
             _weights: (),
         }
@@ -208,8 +230,18 @@ impl MetalBackend {
             let max_new_tokens = params.max_new_tokens.unwrap_or(512);
             let t0 = Instant::now();
 
-            let generated = match weights {
-                MetalWeights::Qwen3(weights) => self::generate::metal_generate(
+            let generated = if let Some(runtime) = self.dflash.as_ref() {
+                let weights = match weights {
+                    MetalWeights::Qwen3(weights) => weights,
+                    MetalWeights::Qwen35(_) => {
+                        bail!(
+                            "Metal DFlash draft '{}' is currently available for Qwen3 targets only",
+                            runtime.draft_model_id()
+                        );
+                    }
+                };
+                dflash::metal_generate_dflash_qwen3(
+                    runtime,
                     input_ids,
                     weights,
                     config,
@@ -217,24 +249,36 @@ impl MetalBackend {
                     max_new_tokens,
                     t0,
                     &mut on_token,
-                )?,
-                MetalWeights::Qwen35(weights) => metal_generate_qwen35(
-                    {
-                        if self::generate::metal_kv_pool_enabled() {
-                            log::warn!(
-                                "MetalKVPool is currently wired for the Qwen3 fallback path only; \
-                                 Qwen3.5 continues on the existing Metal route"
-                            );
-                        }
-                        input_ids
-                    },
-                    weights,
-                    config,
-                    params,
-                    max_new_tokens,
-                    t0,
-                    &mut on_token,
-                )?,
+                )?
+            } else {
+                match weights {
+                    MetalWeights::Qwen3(weights) => self::generate::metal_generate(
+                        input_ids,
+                        weights,
+                        config,
+                        params,
+                        max_new_tokens,
+                        t0,
+                        &mut on_token,
+                    )?,
+                    MetalWeights::Qwen35(weights) => metal_generate_qwen35(
+                        {
+                            if self::generate::metal_kv_pool_enabled() {
+                                log::warn!(
+                                    "MetalKVPool is currently wired for the Qwen3 fallback path only; \
+                                     Qwen3.5 continues on the existing Metal route"
+                                );
+                            }
+                            input_ids
+                        },
+                        weights,
+                        config,
+                        params,
+                        max_new_tokens,
+                        t0,
+                        &mut on_token,
+                    )?,
+                }
             };
 
             let ttft_s = generated.ttft_ms / 1000.0;
@@ -321,6 +365,12 @@ fn run_with_metal_panic_boundary<T>(_op: &str, f: impl FnOnce() -> Result<T>) ->
     f()
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct MetalBackendOptions {
+    #[cfg(feature = "metal")]
+    pub dflash: Option<MetalDflashOptions>,
+}
+
 impl Default for MetalBackend {
     fn default() -> Self {
         Self::new()
@@ -397,6 +447,17 @@ impl InferenceBackend for MetalBackend {
             };
             self.weights = Some(weights);
             log::info!("  weights loaded into Metal unified memory");
+
+            let dflash_options = self
+                .dflash_options
+                .clone()
+                .or(dflash::MetalDflashOptions::from_env()?);
+            self.dflash = if let Some(ref options) = dflash_options {
+                Some(dflash::MetalDflashRuntime::load(options, &config)?)
+            } else {
+                None
+            };
+            self.dflash_options = dflash_options;
         }
         #[cfg(not(feature = "metal"))]
         {
