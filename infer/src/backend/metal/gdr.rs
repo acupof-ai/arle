@@ -242,7 +242,7 @@ static GDR_METAL_KERNEL: std::sync::LazyLock<super::mlx::MetalKernel> =
             &["q", "k", "v", "g", "beta", "state_in", "T"],
             &["y", "state_out"],
             // Metal shader source — scalar gating, no mask (decode-only).
-            r#"
+            r"
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
@@ -306,7 +306,7 @@ static GDR_METAL_KERNEL: std::sync::LazyLock<super::mlx::MetalKernel> =
             auto s_idx = n_per_t * dk_idx + i;
             o_state[s_idx] = static_cast<StT>(state[i]);
         }
-        "#,
+        ",
         )
     });
 
@@ -314,6 +314,8 @@ static GDR_METAL_KERNEL: std::sync::LazyLock<super::mlx::MetalKernel> =
 /// inputs: q[B,T,Hk,Dk], k[B,T,Hk,Dk], v[B,T,Hv,Dv], g[B,T,Hv], beta[B,T,Hv], state[B,Hv,Dv,Dk]
 /// outputs: y[B,T,Hv,Dv], state_out[B,Hv,Dv,Dk]
 #[cfg(feature = "metal")]
+// reason: q/k/v/g/beta/hk/hv/dk/dv follow kernel math notation.
+#[allow(clippy::many_single_char_names)]
 fn metal_gdr_kernel_step(
     q: &MlxArray,
     k: &MlxArray,
@@ -438,9 +440,9 @@ fn try_cpp_gdr_forward(
         WeightTensor::Dense(_) => return None,
     };
 
-    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
-        .is_some_and(|v| v == "0");
+        .is_none_or(|value| value != "0");
 
     let inv_scale = 1.0 / (config.key_dim as f32).sqrt();
 
@@ -502,6 +504,7 @@ fn try_cpp_gdr_forward(
 ///
 /// # Returns
 /// - [1, hidden_size] output hidden state (after output projection)
+///
 /// Optimized GDR decode step matching mlx_lm's approach:
 /// - Standard mlx::conv1d instead of manual multiply+sum (saves ~4 ops)
 /// - State stored in [B, Hv, Dv, Dk] — no transposes around Metal kernel (saves 4 ops)
@@ -510,6 +513,8 @@ fn try_cpp_gdr_forward(
 ///
 /// Total ops: ~34 (down from ~60), matching mlx_lm.
 #[cfg(feature = "metal")]
+// reason: q/k/v/g/beta/qkv/hk/hv/dk/dv match the linear-attention math directly.
+#[allow(clippy::many_single_char_names)]
 pub fn metal_gdr_decode_step(
     x: &MlxArray,
     layer_weights: &MetalLinearAttnWeights,
@@ -517,12 +522,13 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
+    use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
+
     // Try the optional C++ step path first; it requires fully quantized weights.
     if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
         return result;
     }
     // Fallback to Rust per-op path for Dense weights.
-    use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
 
     let hk = config.num_key_heads as i32;
     let dk = config.key_dim as i32;
@@ -610,9 +616,9 @@ pub fn metal_gdr_decode_step(
     };
 
     // ── 5. Metal kernel GDR state update ─────────────────────────────────
-    let use_metal_kernel = !std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
+    let use_metal_kernel = std::env::var("AGENT_INFER_GDR_METAL_KERNEL")
         .ok()
-        .is_some_and(|v| v == "0");
+        .is_none_or(|value| value != "0");
 
     let y = if use_metal_kernel {
         // Reshape for kernel: q/k [1,1,Hk,Dk]→bf16, v [1,1,Hv,Dv]→bf16
