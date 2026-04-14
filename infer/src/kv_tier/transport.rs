@@ -74,13 +74,18 @@ impl std::error::Error for TransportError {}
 
 /// Backend-agnostic async KV transfer trait.
 ///
-/// Phase gates:
-/// - P2 — `LocalCudaTransport` (cudaMemcpyAsync on a dedicated copy stream)
-/// - P3 — `DiskTransport` (tokio::fs default, io_uring behind a feature flag)
-/// - P5 — `NixlTransport` (stub via `nixl-sys` with `stub-api` feature)
-/// - P6 — `MooncakeTransport` (direct TransferEngine binding)
+/// Milestone gates (tiered-kv-cache project, 2026-04-15 revision):
+/// - **M3** — `LocalCudaTransport` (cudaMemcpyAsync on a dedicated copy
+///   stream), not yet implemented
+/// - **M4** — `DiskStore` (tokio::fs default, io_uring behind a feature
+///   flag); a skeleton store already lives at [`disk::DiskStore`] but
+///   is not yet wired into a coordinator or this trait
+/// - **M5** — `NixlTransport` stub via `nixl-sys` with `stub-api`
+///   feature; the real impl behind `rdma-nixl-real` is trigger-gated
+/// - **Post-M5, trigger-gated** — Mooncake `TransferEngine` binding,
+///   reachable either as a direct impl or through NIXL's Mooncake plugin
 ///
-/// **Shape locked** per `docs/plans/tiered-kv-cache-tasks.md §6.3`:
+/// **Shape locked** per the 2026-04-13 research notes:
 /// `type Op: Send` (NOT `type Completion: Future`) because NIXL has no
 /// native `Future` — all four stacks expose polling completion. Keeping
 /// the trait Future-free lets each backend hide its own completion model;

@@ -4,15 +4,19 @@
 
 /// Storage medium for a KV block. Ordering (`Gpu < HostPinned < Disk <
 /// Remote`) reflects the distance from compute — nearer first.
+///
+/// Tier labels (T0/T1/T2/T3) match the 2026-04-15 tiered-kv-cache
+/// revision; see `docs/projects/tiered-kv-cache.md` §4.1 for the
+/// industry-aligned numbering rationale.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Tier {
     /// T0 — GPU HBM. Kernel-accessible.
     Gpu,
-    /// T2 — Host pinned DRAM. Coordinator-accessible only.
+    /// T1 — Host pinned DRAM. Coordinator-accessible only.
     HostPinned,
-    /// T3 — Local NVMe SSD.
+    /// T2 — Local NVMe SSD.
     Disk,
-    /// T4 — Remote node, reached over NIXL / Mooncake / UCX.
+    /// T3 — Remote node, reached over NIXL / Mooncake / UCX.
     Remote,
 }
 
@@ -48,10 +52,11 @@ impl BlockLocation {
 /// code must never parse the payload directly.
 ///
 /// Example payloads:
-/// - `NixlTransport` (P5): bincode of `(remote_agent_name, addr, len,
-///   mem_type, dev_id)` — fits in ~24–32 bytes for short agent names.
-/// - `MooncakeTransport` (P6): bincode of `(segment_handle, offset,
-///   length)` = 24 bytes.
+/// - `NixlTransport` (tiered-kv-cache M5): bincode of
+///   `(remote_agent_name, addr, len, mem_type, dev_id)` — fits in
+///   ~24–32 bytes for short agent names.
+/// - `MooncakeTransport` (post-M5, trigger-gated): bincode of
+///   `(segment_handle, offset, length)` = 24 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteBlockDesc {
     pub transport: TransportId,
@@ -63,9 +68,9 @@ pub struct RemoteBlockDesc {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum TransportId {
-    /// NVIDIA NIXL — lands in P5 as a stub.
+    /// NVIDIA NIXL — lands in tiered-kv-cache M5 as a stub.
     Nixl = 0,
-    /// Mooncake `TransferEngine` — deferred to P6.
+    /// Mooncake `TransferEngine` — post-M5, trigger-gated.
     Mooncake = 1,
     /// Reserved for future transports (UCX direct, libfabric, etc.).
     Reserved = 255,
