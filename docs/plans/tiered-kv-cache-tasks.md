@@ -65,17 +65,24 @@ still correct at the per-task level; only the phase groupings and a few
 file paths change. This table translates old phase references into the new
 milestone plan.
 
-| Old phase | New milestone | What changed | Task doc section |
-|---|---|---|---|
-| P0 page_size=16 | **M0.3** | Unchanged intent; now gated on the in-flight `infer-cuda-kernels` crate extraction landing. Per-format dispatch still applies (BF16 → 16, quantized → stay at 1). | §1 below |
-| P1 (a) structural (BlockId, kv_tier module, serde) | **retired** | The old `kv_tier::BlockId(u64)` / `TierDirectory` / `BlockDescriptor` skeleton is being deleted in M1. Do **not** extend it. The bug fixes from P1(a) (three `prefix_cache.rs` correctness bugs) are now **M0.2** — see §2.1 below. | §2 below, fragment |
-| P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | §2 below |
-| — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | (new, §2.1 addendum) |
-| — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | (new, §3.5 addendum) |
-| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. Content unchanged. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | §3 below |
-| P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | §4 below |
-| P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | §5 below (keep for reference) |
-| P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | §6 below |
+> **2026-04-14 session progress**: M0.1, M0.2, M1a, M1b, and **M2a** have
+> all landed on `main`. The remaining critical-path gap is **M2b**
+> (scheduler slot-selection flip + cross-slot resurrection read path +
+> alloc-OOM retry). M0.3 is still blocked on the in-flight Codex CUDA
+> kernel extraction stabilising. Full commit chain + delta summary in
+> [`../experience/wins/2026-04-14-tiered-kv-m1-m2a.md`](../experience/wins/2026-04-14-tiered-kv-m1-m2a.md).
+
+| Old phase | New milestone | What changed | Status | Task doc section |
+|---|---|---|---|---|
+| P0 page_size=16 | **M0.3** | Unchanged intent; now gated on the in-flight `infer-cuda-kernels` crate extraction landing. Per-format dispatch still applies (BF16 → 16, quantized → stay at 1). | **blocked** on Codex wave stabilising + BF16 HND range kernel rewrite (see §1 rescoped list in [`../experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md)) | §1 below |
+| P1 (a) structural (BlockId, kv_tier module, serde) | **retired** | The old `kv_tier::BlockId(u64)` / `TierDirectory` / `BlockDescriptor` skeleton is being deleted in M1. Do **not** extend it. The bug fixes from P1(a) (three `prefix_cache.rs` correctness bugs) are now **M0.2** — see §2.1 below. | **done** via M0.2 + M1a | §2 below, fragment |
+| P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
+| — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
+| — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b pending** (slot selector flip + resurrection read path + alloc-OOM retry) | (new, §3.5 addendum) |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. Content unchanged. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | pending — blocked on M2b landing | §3 below |
+| P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
+| P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
+| P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |
 
 **New M0 scope** (prereqs for M1, all independent PRs):
 

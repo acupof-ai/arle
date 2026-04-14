@@ -39,6 +39,7 @@
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash |
 | [experience/errors/2026-04-14-broken-rebase-baseline.md](experience/errors/2026-04-14-broken-rebase-baseline.md) | Rebase / migration work must verify the upstream baseline before attributing errors |
 | **Experience — Wins** | |
+| [experience/wins/2026-04-14-tiered-kv-m1-m2a.md](experience/wins/2026-04-14-tiered-kv-m1-m2a.md) | Tiered KV Cache M1a→M1b→M2a landed: kv_tier/directory.rs retired, RadixCache wired into CUDA scheduler, TokenKVPool gains refcount + watermark eviction so radix-held pages survive free_slot |
 | [experience/wins/2026-04-14-bench-single-token-kernel-port.md](experience/wins/2026-04-14-bench-single-token-kernel-port.md) | Qwen3-4B single-token decode: Triton→CUDA C port bench (−8.8 % decode tok/s, Qwen3.5 unchanged) + 9 % perf gap hypotheses |
 | [experience/wins/2026-04-09-marlin-prefill.md](experience/wins/2026-04-09-marlin-prefill.md) | Marlin W4 prefill: 5-25x TTFT speedup for long prompts |
 | [experience/wins/2026-04-14-metal-dflash-qwen3.md](experience/wins/2026-04-14-metal-dflash-qwen3.md) | Qwen3 Metal DFlash on M4 Pro: 20/256 generation-heavy workload hits 5.9x decode throughput when using the draft model's native block size |
