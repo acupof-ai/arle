@@ -11,7 +11,6 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 
-use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 use crate::ops;
 use crate::weight_loader::{
     load_shard_info, load_shard_info_fixed, load_tensor_2d, load_tensor_2d_maybe_quantized,
@@ -221,3 +220,4 @@ pub(crate) fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>>
         })
         .collect()
 }
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};

@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 use crate::gguf::{self, GgufFile};
+use infer_cuda_kernels::ffi;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
@@ -292,7 +293,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
         let mut centroids_host = vec![0.0f32; num_levels];
         let mut boundaries_host = vec![0.0f32; num_levels + 1];
         unsafe {
-            crate::backend::cuda::ffi::turboquant_lloyd_max(
+            ffi::turboquant_lloyd_max(
                 centroids_host.as_mut_ptr(),
                 boundaries_host.as_mut_ptr(),
                 num_levels as i32,
@@ -363,7 +364,7 @@ fn turboquant_dequant_at_load(
     let mut centroids = vec![0.0f32; num_levels];
     let mut boundaries = vec![0.0f32; num_levels + 1];
     unsafe {
-        crate::backend::cuda::ffi::turboquant_lloyd_max(
+        ffi::turboquant_lloyd_max(
             centroids.as_mut_ptr(),
             boundaries.as_mut_ptr(),
             num_levels as i32,

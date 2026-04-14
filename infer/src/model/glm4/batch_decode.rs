@@ -15,14 +15,14 @@ use log::info;
 use super::config::Config;
 use super::forward::GLM4State;
 use super::weights::{GLM4Model, TransformerBlock};
-use crate::backend::cuda::prelude::{
+use infer_cuda_kernels::kv_quant;
+use infer_cuda_kernels::kv_turboquant;
+use infer_cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
-use crate::ops::kv_quant;
-use crate::ops::kv_turboquant;
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 pub struct BatchDecodeBuffers {

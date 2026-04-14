@@ -21,8 +21,8 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::info;
 
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
-use crate::ops::kv_quant;
+use infer_cuda_kernels::kv_quant;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
 pub use infer_cuda_kernels::{KVCacheDtype, KVFormat};
 
 /// Block size for offloading (in tokens). Offload happens in multiples of this.

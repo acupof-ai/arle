@@ -4,7 +4,8 @@ use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::GLM4Model;
-use crate::backend::cuda::prelude::DeviceVec;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use infer_cuda_kernels::TokenKVPool;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
@@ -12,7 +13,7 @@ use crate::sampler::SamplingParams;
 
 /// Per-request mutable state for GLM-4.
 pub struct GLM4State {
-    pub(super) ctx: crate::backend::cuda::tensor::DeviceContext,
+    pub(super) ctx: DeviceContext,
     pub(crate) decode_bufs: DecodeBuffers,
     pub(crate) base: GenerationStateBase,
 }
@@ -63,8 +64,8 @@ impl GenerationState for GLM4State {
 
     fn migrate_kv_to_paged(
         &mut self,
-        ctx: &crate::backend::cuda::tensor::DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
         slot: usize,
     ) -> Result<()> {
         self.base.migrate_kv_to_paged(ctx, pool, slot)
@@ -72,8 +73,8 @@ impl GenerationState for GLM4State {
 
     fn migrate_kv_range_to_paged(
         &mut self,
-        ctx: &crate::backend::cuda::tensor::DeviceContext,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
         start_pos: usize,
         new_token_indices: &[u32],
     ) -> Result<()> {
@@ -101,7 +102,7 @@ impl ModelForward for GLM4Model {
     fn create_decode_context(
         &self,
         max_batch_size: usize,
-        pool: &crate::backend::cuda::paged_kv::PagedKVPool,
+        pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext> {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads();
@@ -176,7 +177,7 @@ impl ModelForward for GLM4Model {
         &self,
         tokens: &[u32],
         state: &mut Self::State,
-        pool: &crate::backend::cuda::paged_kv::TokenKVPool,
+        pool: &TokenKVPool,
         _slot: usize,
         new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
@@ -224,7 +225,7 @@ impl ModelForward for GLM4Model {
         self.config.is_stop_token(token_id)
     }
 
-    fn device_context(&self) -> &crate::backend::cuda::tensor::DeviceContext {
+    fn device_context(&self) -> &DeviceContext {
         &self.ctx
     }
 
@@ -330,7 +331,7 @@ impl ModelForward for GLM4Model {
         tokens: &[u32],
         states: &mut [Self::State],
         slot_indices: &[usize],
-        paged_kv_pool: Option<&mut crate::backend::cuda::paged_kv::PagedKVPool>,
+        paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
         skip_logit_scatter: bool,
     ) -> Result<()> {

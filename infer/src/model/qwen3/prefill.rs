@@ -1,12 +1,11 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use half::bf16;
 
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::backend::cuda::paged_kv::TokenKVPool;
-use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
+use infer_cuda_kernels::TokenKVPool;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill in `process_all_layers_batch`, eliminating

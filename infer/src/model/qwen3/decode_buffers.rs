@@ -5,14 +5,15 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::config::Config;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec};
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, RawDevicePtr};
+use infer_cuda_kernels::tensor::cache_ptr;
 
 /// Cached raw pointers for hot-path sampling ops (avoids cudarc device_ptr overhead).
 pub(crate) struct DecodeBufferPtrs {
-    pub logits_ptr: crate::backend::cuda::tensor::RawDevicePtr<half::bf16>,
+    pub logits_ptr: RawDevicePtr<half::bf16>,
     pub logits_len: usize,
-    pub sample_probs_ptr: crate::backend::cuda::tensor::RawDevicePtr<f32>,
-    pub sample_out_ptr: crate::backend::cuda::tensor::RawDevicePtr<i32>,
+    pub sample_probs_ptr: RawDevicePtr<f32>,
+    pub sample_out_ptr: RawDevicePtr<i32>,
 }
 
 /// Pre-allocated temporary buffers for the single-token decode path.
@@ -78,10 +79,10 @@ impl DecodeBuffers {
             .map_err(|e| anyhow::anyhow!("Alloc sample_out failed: {}", e))?;
 
         let ptrs = DecodeBufferPtrs {
-            logits_ptr: crate::backend::cuda::tensor::cache_ptr(&logits.data, ctx),
+            logits_ptr: cache_ptr(&logits.data, ctx),
             logits_len: config.vocab_size,
-            sample_probs_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_probs, ctx),
-            sample_out_ptr: crate::backend::cuda::tensor::cache_ptr(&sample_out, ctx),
+            sample_probs_ptr: cache_ptr(&sample_probs, ctx),
+            sample_out_ptr: cache_ptr(&sample_out, ctx),
         };
 
         Ok(Self {

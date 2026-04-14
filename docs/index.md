@@ -35,6 +35,7 @@
 | [experience/errors/2026-04-09-w4-gptq-quality.md](experience/errors/2026-04-09-w4-gptq-quality.md) | W4 GPTQ quality regression investigation |
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | 3 bugs causing FlashInfer batch decode crash |
+| [experience/errors/2026-04-14-broken-rebase-baseline.md](experience/errors/2026-04-14-broken-rebase-baseline.md) | Rebase / migration work must verify the upstream baseline before attributing errors |
 | **Experience — Wins** | |
 | [experience/wins/2026-04-09-marlin-prefill.md](experience/wins/2026-04-09-marlin-prefill.md) | Marlin W4 prefill: 5-25x TTFT speedup for long prompts |
 | [experience/wins/2026-04-09-native-w4-throughput.md](experience/wins/2026-04-09-native-w4-throughput.md) | Native W4 throughput results |

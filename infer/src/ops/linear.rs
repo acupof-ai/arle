@@ -15,8 +15,8 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
-use crate::backend::cuda::ffi;
-use crate::backend::cuda::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use infer_cuda_kernels::ffi;
+use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
 /// `DeviceMatrix::quant_bits` discriminators. Named so dispatch sites can
 /// `match` on intent instead of hardcoding magic numbers.
