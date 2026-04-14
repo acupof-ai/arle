@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
+use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -384,8 +384,8 @@ pub struct Tool {
 }
 
 impl Tool {
-    pub fn to_definition(&self) -> ProtocolToolDefinition {
-        ProtocolToolDefinition::new(
+    pub fn to_definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
             self.name.clone(),
             self.description.clone(),
             self.parameters.clone(),
@@ -412,7 +412,7 @@ impl BuiltinToolPolicyHooks {
     pub fn recover_tool_calls_from_user_request(
         &self,
         user_input: &str,
-        tools: &[ProtocolToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         if tool_available(tools, "python") && mentions_python_tool(user_input) {
             if let Some(code) = extract_python_code(user_input) {
@@ -446,7 +446,7 @@ impl BuiltinToolPolicyHooks {
     pub fn recover_tool_calls_from_draft(
         &self,
         draft: &str,
-        tools: &[ProtocolToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         if tool_available(tools, "python")
             && let Some(code) = extract_python_code(draft)
@@ -530,11 +530,11 @@ impl BuiltinToolPolicyHooks {
 fn single_tool_response(name: &str, arguments: serde_json::Value) -> ParsedAssistantResponse {
     ParsedAssistantResponse {
         content: String::new(),
-        tool_calls: vec![ProtocolToolCall::new(name, arguments)],
+        tool_calls: vec![ToolCall::new(name, arguments)],
     }
 }
 
-fn tool_available(tools: &[ProtocolToolDefinition], name: &str) -> bool {
+fn tool_available(tools: &[ToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.name == name)
 }
 
@@ -726,19 +726,20 @@ fn argument_as_str<'a>(arguments: &'a Value, key: &str) -> &'a str {
 
 /// Execute a tool by name with the given JSON arguments.
 pub fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
-    BuiltinToolKind::from_name(name)
-        .map(|tool| tool.execute(arguments))
-        .unwrap_or_else(|| format!("Error: unknown tool '{name}'"))
+    BuiltinToolKind::from_name(name).map_or_else(
+        || format!("Error: unknown tool '{name}'"),
+        |tool| tool.execute(arguments),
+    )
 }
 
 /// Execute a structured tool call.
-pub fn execute_tool_call(call: &ProtocolToolCall) -> String {
+pub fn execute_tool_call(call: &ToolCall) -> String {
     execute_tool(&call.name, &call.arguments)
 }
 
 /// Collect stdout + stderr from a process Output into a truncated string.
 /// Filters out nsjail's own warning/info lines from stderr.
-fn collect_output(output: std::process::Output) -> String {
+fn collect_output(output: &std::process::Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw_stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -815,10 +816,10 @@ fn execute_shell(command: &str) -> String {
             if output.status.code() == Some(137) {
                 return "Error: command killed (timeout or OOM)".to_string();
             }
-            collect_output(output)
+            collect_output(&output)
         }
         Ok(TimedCommandResult::TimedOut(output)) => {
-            let partial = collect_output(output);
+            let partial = collect_output(&output);
             if partial == "(no output)" {
                 "Error: command killed (timeout or OOM)".to_string()
             } else {
@@ -845,10 +846,10 @@ fn execute_python(code: &str) -> String {
             if output.status.code() == Some(137) {
                 return "Error: python killed (timeout or OOM)".to_string();
             }
-            collect_output(output)
+            collect_output(&output)
         }
         Ok(TimedCommandResult::TimedOut(output)) => {
-            let partial = collect_output(output);
+            let partial = collect_output(&output);
             if partial == "(no output)" {
                 "Error: python killed (timeout or OOM)".to_string()
             } else {

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use infer_core::SessionId;
+use crate::types::SessionId;
 
 use super::id::BlockId;
 use super::tier::{BlockLocation, Tier};

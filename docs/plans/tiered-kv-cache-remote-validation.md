@@ -101,17 +101,17 @@ Validate that commit as a whole.
 
 ### 4.1 EvictionPolicy (`81f5fb0`, task A)
 
-**File**: `crates/infer-policy/src/lib.rs` (+341 lines)
+**File**: `infer/src/scheduler/policy.rs` (+341 lines)
 
 ```bash
-cargo test -p infer-policy --release
+cargo test -p infer --release -- scheduler::policy
 # Expected: 19/19 pass (10 legacy admission/chunking + 9 new eviction).
 
-cargo clippy -p infer-policy --release -- -D warnings
+cargo clippy -p infer --release -- -D warnings
 # Expected: clean.
 ```
 
-No CUDA surface. `infer-policy` is already backend-agnostic; this
+No CUDA surface. `infer::scheduler::policy` is already backend-agnostic; this
 commit does not affect the runtime. Once the P2 behavior PR lands, the
 scheduler will pick one of the default `EvictionPolicy` impls.
 
@@ -353,7 +353,7 @@ or a dirty working tree.
 
 ```bash
 # Should exist:
-test -f crates/infer-policy/src/lib.rs            # A (EvictionPolicy)
+test -f infer/src/scheduler/policy.rs             # A (EvictionPolicy)
 test -f infer/src/prefix_cache.rs                  # B, E
 test -f infer/src/kv_tier.rs                       # C, H (entrypoint)
 test -f infer/src/kv_tier/id.rs                    # H
@@ -371,7 +371,7 @@ grep -q 'rdma-nixl-real = ' infer/Cargo.toml
 grep -q 'nixl-sys.*stub-api' infer/Cargo.toml
 
 # Unit test targets:
-grep -q 'EvictionPolicy'          crates/infer-policy/src/lib.rs
+grep -q 'EvictionPolicy'          infer/src/scheduler/policy.rs
 grep -q 'radix_cache_serde_roundtrip_preserves_lookups' infer/src/prefix_cache.rs
 grep -q 'split_node_inherits_ref_count_from_child'      infer/src/prefix_cache.rs
 grep -q 'evict_cascades_through_orphaned_parent_chain'  infer/src/prefix_cache.rs

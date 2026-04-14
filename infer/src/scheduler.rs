@@ -6,7 +6,7 @@
 //!                                                        ↓
 //!                                              GPU (one forward at a time)
 //!                                                        ↓
-//!                                              StreamDelta → HTTP Response
+//!                                              CompletionStreamDelta → HTTP Response
 //! ```
 //!
 //! The scheduler interleaves multiple requests on a single GPU by:
@@ -17,6 +17,7 @@
 
 mod batch;
 pub mod metrics;
+pub mod policy;
 mod types;
 
 #[cfg(feature = "cuda")]

@@ -3,7 +3,7 @@
 **Owner:** codex (local Mac, `--features metal`)
 **Prerequisite commit:** `7a876e1` (Round 2 housekeeping) — this plan assumes the tree is at or after that commit.
 **Status:** ready to execute
-**Do not start in parallel with Round 3 crate extraction.** Round 3 will move `backend/metal/*` wholesale into `crates/infer-engine`; if F1 and Round 3 run concurrently they will conflict on every `pub mod` line in `backend/metal.rs` and on the module visibility of `pub(super)` items. F1 must land first, then Round 3 picks up from the post-F1 state.
+**Round 3 note:** the old extracted-runtime plan was reverted by the 2026-04-15 Route-A refactor, so this warning is historical only.
 
 ---
 

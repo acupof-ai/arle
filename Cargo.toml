@@ -1,5 +1,26 @@
 [workspace]
-members = [".", "infer", "crates/mlx-sys", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-core", "crates/infer-engine", "crates/infer-observability", "crates/infer-policy", "crates/infer-tools"]
+members = [".", "infer", "crates/mlx-sys", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-tools"]
+
+# Workspace-wide lint posture. Only universally-agreed lints live here; crates
+# that want stricter pedantic enforcement (currently only `infer`) opt in via
+# their own `[lints.clippy]` block with `pedantic = "warn"`.
+[workspace.lints.clippy]
+# Default-level lints that this codebase disables because they fire on
+# legitimate patterns. See infer/Cargo.toml for the `pedantic`-level allows
+# that only apply to the `infer` crate.
+too_many_arguments = "allow"
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+# Restriction lints worth enforcing workspace-wide.
+dbg_macro = "warn"
+exit = "warn"
+get_unwrap = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
 
 [package]
 name = "agent-infer"
@@ -29,3 +50,6 @@ infer = { path = "infer", default-features = false }
 name = "agent-infer"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[lints]
+workspace = true

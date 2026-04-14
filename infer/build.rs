@@ -685,6 +685,30 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
 ///   1. FLASHINFER_INCLUDE_DIR env var (explicit override)
 ///   2. `pip show flashinfer-python` → Location + /flashinfer/data/include
 ///   3. `python3 -c "import flashinfer; ..."` (legacy, needs working import)
+// Recursively collect every `.cu` file under `dir` so domain subdirs
+// (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
+// Exclusion is by basename so the legacy-retired list keeps working.
+fn collect_cu_files(dir: &Path, replaced: &BTreeSet<&'static str>, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cu_files(&path, replaced, out);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) == Some("cu") && !replaced.contains(file_name)
+        {
+            out.push(path);
+        }
+    }
+}
+
 fn find_flashinfer_include() -> Option<String> {
     // 1. Explicit override
     if let Ok(dir) = std::env::var("FLASHINFER_INCLUDE_DIR") {
@@ -767,30 +791,6 @@ fn main() {
     let replaced_cuda_files = BTreeSet::from(["activation.cu", "elementwise.cu", "embedding.cu"]);
 
     let csrc_dir = Path::new("csrc/cuda");
-    // Recursively collect every `.cu` file under `csrc/cuda/` so domain subdirs
-    // (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
-    // Exclusion is by basename so the legacy-retired list keeps working.
-    fn collect_cu_files(dir: &Path, replaced: &BTreeSet<&'static str>, out: &mut Vec<PathBuf>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) => panic!("Failed to read {}: {}", dir.display(), err),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_cu_files(&path, replaced, out);
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if path.extension().and_then(|e| e.to_str()) == Some("cu")
-                && !replaced.contains(file_name)
-            {
-                out.push(path);
-            }
-        }
-    }
     let mut cu_files: Vec<PathBuf> = Vec::new();
     collect_cu_files(csrc_dir, &replaced_cuda_files, &mut cu_files);
     // Keep a stable compile order independent of filesystem iteration order.

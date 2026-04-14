@@ -67,7 +67,7 @@ confuse readers about which project they are looking at.
 | Metal KV pool | `SlotLedger` refcount-only, MLX unified memory, no tier concept | `infer/src/metal_kv_pool.rs` |
 | Metal prefix cache | Wraps RadixCache, not wired into scheduler | `infer/src/metal_prefix_cache.rs` |
 | Storage deps | None in any `Cargo.toml`; B1 session_store is paper-only | — |
-| `infer-policy` | `SchedulerSignals { prefix_hit_tokens, session_affinity_slot, turn_depth }` + `AdmissionPolicy` + `ChunkingPolicy` + `PrefixAwareAdmission` | `crates/infer-policy/src/lib.rs` |
+| `infer::scheduler::policy` | `SchedulerSignals { prefix_hit_tokens, session_affinity_slot, turn_depth }` + `AdmissionPolicy` + `ChunkingPolicy` + `PrefixAwareAdmission` | `infer/src/scheduler/policy.rs` |
 
 Three facts shape everything below:
 
@@ -272,10 +272,10 @@ Transport implementations, in order of planned delivery:
   `nixl-sys` from crates.io; uses its `stub-api` feature on CI builds without
   the native lib. Covers T4. NIXL in turn delegates to UCX, GDS, or Mooncake.
 
-### 5.4 EvictionPolicy (lives in `infer-policy`)
+### 5.4 EvictionPolicy (lives in `infer::scheduler::policy`)
 
 ```rust
-// crates/infer-policy/src/lib.rs — sibling to AdmissionPolicy / ChunkingPolicy
+// infer/src/scheduler/policy.rs — sibling to AdmissionPolicy / ChunkingPolicy
 
 pub enum SessionState { Active, Keepalive, Cold }
 
@@ -429,7 +429,8 @@ confuses the offload story.
 1. **Structural PR** — add `LocalCudaTransport`, `Coordinator`, pinned pool,
    watermark types. `TieredKvCache` gains `demote`/`promote` methods, but
    scheduler does not call them yet. `EvictionPolicy` trait lands in
-   `infer-policy` with the `SessionBiasedLru` default. No observable
+   internal module `infer::scheduler::policy` with the `SessionBiasedLru`
+   default. No observable
    behavior change (watermarks set so T0 never fills).
 2. **Behavior PR** — scheduler calls `TieredKvCache::evict_if_needed(sig)`
    at admission and post-decode; coordinator actually moves blocks. Delete
@@ -442,7 +443,7 @@ confuses the offload story.
   in-flight IO tracking, cancel-safe.
 - `infer/src/kv_tier/host_pool.rs` — stable-pointer pinned pool (backed by
   `cudaHostAlloc`).
-- `crates/infer-policy/src/lib.rs` — `EvictionPolicy` trait +
+- `infer/src/scheduler/policy.rs` — `EvictionPolicy` trait +
   `SessionBiasedLru` + `EvictionCandidate`.
 
 **Files (behavior)**:
@@ -520,7 +521,7 @@ admitting a session request, rank candidate slots by radix-subtree overlap,
 not just emptiness.
 
 **Files**:
-- `crates/infer-policy/src/lib.rs` — new `ReuseDistancePolicy` impl; expose
+- `infer/src/scheduler/policy.rs` — new `ReuseDistancePolicy` impl; expose
   a feature flag or config knob to select it over `SessionBiasedLru`.
 - `infer/src/scheduler/cuda/runtime.rs` — slot selection rewrite.
 - `infer/src/kv_tier/directory.rs` — add per-session turn-arrival ring
@@ -549,7 +550,7 @@ that when Phase 6 arrives, adding it is one transport impl, not a redesign.
   etc. but `register`/`deregister` are fully implemented because P5's gate
   is "can we register a pool region with NIXL without a runtime error".
 - `infer/Cargo.toml` — `rdma-nixl = ["dep:nixl-sys"]` feature.
-- `crates/infer-observability` — new event kind for tier transitions so
+- `infer/src/events.rs` — new event kind for tier transitions so
   P6 can observe transfer latencies the same way.
 
 **Exit**:

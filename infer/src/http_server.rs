@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
-use infer_chat::messages_to_prompt as chat_messages_to_prompt;
+use infer_chat::openai_messages_to_prompt as chat_messages_to_prompt;
 use log::{error, info, warn};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -28,11 +28,12 @@ use crate::sampler::{SamplingParams, sampling_params_from_request};
 #[cfg(test)]
 use crate::scheduler::SchedulerHandle;
 use crate::scheduler::{IncomingRequest, RequestPriority};
-use crate::server_engine::StreamDelta;
-use crate::server_engine::{CompleteOutput, FinishReason, Usage};
+use crate::server_engine::CompletionStreamDelta;
+use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
-    CompletionRequest, CompletionResponse, StreamChunk, StreamUsageChunk,
+    CompletionRequest as OpenAiCompletionRequest, CompletionResponse, StreamChunk,
+    StreamUsageChunk,
 };
 
 struct AppState {
@@ -46,11 +47,11 @@ struct RequestExecutionOptions {
     include_usage: bool,
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
-    session_id: Option<infer_core::SessionId>,
+    session_id: Option<crate::types::SessionId>,
 }
 
 impl RequestExecutionOptions {
-    fn from_completion(req: &CompletionRequest) -> Self {
+    fn from_completion(req: &OpenAiCompletionRequest) -> Self {
         Self {
             max_tokens: req.max_tokens_or_default(),
             stream: req.stream_or_default(),
@@ -97,7 +98,7 @@ impl RequestExecutionOptions {
     fn into_incoming_request(
         self,
         prompt: String,
-        delta_tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+        delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
     ) -> IncomingRequest {
         IncomingRequest {
             prompt,
@@ -114,7 +115,7 @@ impl RequestExecutionOptions {
 struct BufferedResponse {
     text: String,
     finish_reason: FinishReason,
-    usage: Usage,
+    usage: TokenUsage,
     token_logprobs: Vec<f32>,
 }
 
@@ -123,7 +124,7 @@ impl Default for BufferedResponse {
         Self {
             text: String::new(),
             finish_reason: FinishReason::Length,
-            usage: Usage {
+            usage: TokenUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
@@ -134,7 +135,7 @@ impl Default for BufferedResponse {
 }
 
 impl BufferedResponse {
-    fn apply_delta(&mut self, delta: &StreamDelta) {
+    fn apply_delta(&mut self, delta: &CompletionStreamDelta) {
         self.text.push_str(&delta.text_delta);
         if let Some(reason) = delta.finish_reason {
             self.finish_reason = reason;
@@ -147,8 +148,8 @@ impl BufferedResponse {
         }
     }
 
-    fn into_output(self) -> CompleteOutput {
-        CompleteOutput {
+    fn into_output(self) -> CompletionOutput {
+        CompletionOutput {
             text: self.text,
             finish_reason: self.finish_reason,
             usage: self.usage,
@@ -174,7 +175,7 @@ fn sse_done_stream() -> impl futures_util::Stream<Item = Result<Event, Infallibl
 }
 
 async fn collect_buffered_response(
-    mut delta_rx: UnboundedReceiver<StreamDelta>,
+    mut delta_rx: UnboundedReceiver<CompletionStreamDelta>,
     request_kind: &str,
 ) -> Result<BufferedResponse, ApiError> {
     let collect = async {
@@ -200,7 +201,7 @@ fn submit_request(
     handle: &dyn RequestHandle,
     options: RequestExecutionOptions,
     prompt: String,
-) -> Result<UnboundedReceiver<StreamDelta>, ApiError> {
+) -> Result<UnboundedReceiver<CompletionStreamDelta>, ApiError> {
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
     let incoming = options.into_incoming_request(prompt, delta_tx);
 
@@ -214,19 +215,19 @@ fn submit_request(
     Ok(delta_rx)
 }
 
-/// Build the SSE event(s) for a single [`StreamDelta`].
+/// Build the SSE event(s) for a single [`CompletionStreamDelta`].
 ///
 /// Always returns one event for the main chunk. If `include_usage` is true and
 /// this is the terminal delta (has a finish_reason), appends a second event with
 /// usage statistics.
 ///
 /// `make_chunk` converts the delta into the serializable chunk type.
-/// `make_usage` converts [`Usage`] into the serializable usage-chunk type.
+/// `make_usage` converts [`TokenUsage`] into the serializable usage-chunk type.
 fn delta_sse_events<C, U>(
-    delta: crate::server_engine::StreamDelta,
+    delta: crate::server_engine::CompletionStreamDelta,
     include_usage: bool,
-    make_chunk: impl FnOnce(crate::server_engine::StreamDelta) -> C,
-    make_usage: impl FnOnce(crate::server_engine::Usage) -> U,
+    make_chunk: impl FnOnce(crate::server_engine::CompletionStreamDelta) -> C,
+    make_usage: impl FnOnce(crate::server_engine::TokenUsage) -> U,
 ) -> Vec<Result<Event, Infallible>>
 where
     C: serde::Serialize,
@@ -252,7 +253,7 @@ where
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CompletionRequest>,
+    Json(req): Json<OpenAiCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let options = RequestExecutionOptions::from_completion(&req);
     let max_tokens = options.max_tokens;
@@ -439,16 +440,16 @@ mod tests {
         mock_scheduler_with_deltas(
             model_id,
             vec![
-                StreamDelta {
+                CompletionStreamDelta {
                     text_delta: String::new(),
                     finish_reason: None,
                     usage: None,
                     logprob: None,
                 },
-                StreamDelta {
+                CompletionStreamDelta {
                     text_delta: String::new(),
                     finish_reason: Some(FinishReason::Stop),
-                    usage: Some(Usage {
+                    usage: Some(TokenUsage {
                         prompt_tokens: 1,
                         completion_tokens: 1,
                         total_tokens: 2,
@@ -462,7 +463,7 @@ mod tests {
 
     fn mock_scheduler_with_deltas(
         model_id: &str,
-        deltas: Vec<StreamDelta>,
+        deltas: Vec<CompletionStreamDelta>,
         prefix_prompt_on_first_delta: bool,
     ) -> SchedulerHandle {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
@@ -476,7 +477,7 @@ mod tests {
                     } else {
                         delta.text_delta.clone()
                     };
-                    let _ = req.delta_tx.send(StreamDelta {
+                    let _ = req.delta_tx.send(CompletionStreamDelta {
                         text_delta,
                         finish_reason: delta.finish_reason,
                         usage: delta.usage,
@@ -733,7 +734,7 @@ mod tests {
         let app = build_app(mock_scheduler_with_deltas(
             "Qwen3-4B",
             vec![
-                StreamDelta {
+                CompletionStreamDelta {
                     text_delta:
                         "\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>"
                             .to_string(),
@@ -741,10 +742,10 @@ mod tests {
                     usage: None,
                     logprob: None,
                 },
-                StreamDelta {
+                CompletionStreamDelta {
                     text_delta: String::new(),
                     finish_reason: Some(FinishReason::Stop),
-                    usage: Some(Usage {
+                    usage: Some(TokenUsage {
                         prompt_tokens: 1,
                         completion_tokens: 1,
                         total_tokens: 2,

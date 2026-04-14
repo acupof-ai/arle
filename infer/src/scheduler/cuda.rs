@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::cuda::paged_kv::PagedKVPool;
 use crate::model::{GenerationState, ModelForward};
-use crate::server_engine::{FinishReason, StreamDelta, Usage};
+use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::Tokenizer;
 
 use super::{IncomingRequest, RequestPriority, SchedulerConfig, SchedulerHandle};

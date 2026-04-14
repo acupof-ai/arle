@@ -47,9 +47,6 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
 infer-chat = { path = "../crates/infer-chat" }
-infer-core = { path = "../crates/infer-core" }
-infer-policy = { path = "../crates/infer-policy" }
-infer-observability = { path = "../crates/infer-observability" }
 
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
@@ -120,7 +117,8 @@ doc_markdown = "allow"
 # Cherry-picked nursery lints
 redundant_clone = "warn"
 unused_peekable = "warn"
-# Restriction lints worth enforcing
+# Restriction lints worth enforcing (duplicated from workspace so the rest
+# still fire when pedantic is on)
 dbg_macro = "warn"
 exit = "warn"
 get_unwrap = "warn"

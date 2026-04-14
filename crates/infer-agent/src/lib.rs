@@ -1,28 +1,24 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infer_chat::{
-    ChatRole, ParsedAssistantResponse, ProtocolChatMessage, ProtocolToolCall,
-    ProtocolToolDefinition,
-};
-use infer_engine::{AgentCompleteRequest, AgentEngine};
+use infer::sampler::SamplingParams;
+use infer::server_engine::{CompletionRequest, InferenceEngine};
+use infer_chat::{ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub type Message = ProtocolChatMessage;
-#[cfg_attr(not(test), allow(dead_code))]
-pub type ToolCall = infer_chat::ToolCall;
+pub type Message = ChatMessage;
 
 pub trait ToolExecutor {
-    fn execute(&self, tool_call: &ProtocolToolCall) -> String;
+    fn execute(&self, tool_call: &ToolCall) -> String;
 }
 
 pub trait ToolPolicy {
     fn recover_tool_calls_from_user_request(
         &self,
         _user_input: &str,
-        _tools: &[ProtocolToolDefinition],
+        _tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         None
     }
@@ -30,7 +26,7 @@ pub trait ToolPolicy {
     fn recover_tool_calls_from_draft(
         &self,
         _draft: &str,
-        _tools: &[ProtocolToolDefinition],
+        _tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         None
     }
@@ -60,20 +56,20 @@ pub trait ToolPolicy {
     }
 }
 
-fn format_prompt(messages: &[Message], tools: &[ProtocolToolDefinition]) -> String {
-    infer_chat::protocol_messages_to_prompt(messages, tools)
+fn format_prompt(messages: &[Message], tools: &[ToolDefinition]) -> String {
+    infer_chat::messages_to_prompt(messages, tools)
 }
 
 fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    infer_chat::parse_protocol_tool_calls(text)
+    infer_chat::parse_tool_calls(text)
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a local CLI assistant.
+const DEFAULT_SYSTEM_PROMPT: &str = r"You are a local CLI assistant.
 Answer briefly.
 If a tool is needed, emit a <tool_call> block immediately with no explanation first.
 After tool results, answer directly.
 If the user asks for an exact format, output exactly that.
-Do not expose chain-of-thought."#;
+Do not expose chain-of-thought.";
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -192,11 +188,11 @@ impl AgentSession {
         &self.messages
     }
 
-    pub fn run_turn<E: AgentEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
+    pub fn run_turn<E: InferenceEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
         &mut self,
         engine: &mut E,
         user_input: &str,
-        tools: &[ProtocolToolDefinition],
+        tools: &[ToolDefinition],
         tool_executor: &X,
         tool_policy: &P,
         settings: AgentSettings,
@@ -245,10 +241,13 @@ impl AgentSession {
                 prompt.len()
             );
 
-            let output = engine.complete(AgentCompleteRequest {
+            let output = engine.complete(CompletionRequest {
                 prompt,
                 max_tokens: settings.max_tokens,
-                temperature: settings.temperature,
+                sampling: SamplingParams {
+                    temperature: settings.temperature,
+                    ..SamplingParams::default()
+                },
                 stop: Some(vec!["<|im_end|>".to_string()]),
                 logprobs: false,
             })?;
@@ -425,24 +424,24 @@ struct StoredToolCall {
 }
 
 impl StoredToolCall {
-    fn from_tool_call(tool_call: &ProtocolToolCall) -> Self {
+    fn from_tool_call(tool_call: &ToolCall) -> Self {
         Self {
             name: tool_call.name.clone(),
             arguments: tool_call.arguments.clone(),
         }
     }
 
-    fn into_tool_call(self) -> Result<ProtocolToolCall> {
+    fn into_tool_call(self) -> Result<ToolCall> {
         if self.name.trim().is_empty() {
             anyhow::bail!("tool call name cannot be empty");
         }
 
-        Ok(ProtocolToolCall::new(self.name, self.arguments))
+        Ok(ToolCall::new(self.name, self.arguments))
     }
 }
 
 fn execute_tool_calls(
-    tool_calls: &[ProtocolToolCall],
+    tool_calls: &[ToolCall],
     tool_executor: &dyn ToolExecutor,
     messages: &mut Vec<Message>,
     tool_calls_executed: &mut usize,
@@ -488,10 +487,10 @@ fn scalar_tool_result(result: &str) -> Option<String> {
     Some(line.to_string())
 }
 
-fn repair_tool_calls<E: AgentEngine + ?Sized>(
+fn repair_tool_calls<E: InferenceEngine + ?Sized>(
     engine: &mut E,
     messages: &[Message],
-    tools: &[ProtocolToolDefinition],
+    tools: &[ToolDefinition],
     settings: AgentSettings,
     assistant_draft: &str,
 ) -> Result<Option<ParsedAssistantResponse>> {
@@ -504,10 +503,13 @@ If no tool is needed, output exactly NO_TOOL.",
     ));
 
     let repair_prompt = format_prompt(&repair_messages, tools);
-    let repair_output = engine.complete(AgentCompleteRequest {
+    let repair_output = engine.complete(CompletionRequest {
         prompt: repair_prompt,
         max_tokens: settings.max_tokens.min(128),
-        temperature: 0.0,
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        },
         stop: Some(vec!["<|im_end|>".to_string()]),
         logprobs: false,
     })?;
@@ -531,14 +533,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
-    use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
-    use infer_engine::{
-        AgentCompleteOutput, AgentCompleteRequest, AgentEngine, AgentFinishReason, AgentUsage,
+    use infer::server_engine::{
+        CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
+        TokenUsage,
     };
+    use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
     use infer_tools::BuiltinToolPolicyHooks;
     use serde_json::json;
+    use tokio::sync::mpsc::UnboundedSender;
 
-    use super::{AgentSession, AgentSettings, Message, ToolCall, ToolExecutor, ToolPolicy};
+    use super::{AgentSession, AgentSettings, Message, ToolExecutor, ToolPolicy};
 
     struct FakeEngine {
         outputs: VecDeque<String>,
@@ -554,27 +558,50 @@ mod tests {
         }
     }
 
-    impl AgentEngine for FakeEngine {
+    impl InferenceEngine for FakeEngine {
         fn model_id(&self) -> &str {
             "fake"
         }
 
-        fn complete(&mut self, req: AgentCompleteRequest) -> Result<AgentCompleteOutput> {
+        fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
             self.prompts.push(req.prompt);
             let text = self
                 .outputs
                 .pop_front()
                 .ok_or_else(|| anyhow!("fake engine exhausted"))?;
-            Ok(AgentCompleteOutput {
-                usage: AgentUsage {
+            Ok(CompletionOutput {
+                usage: TokenUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
                 },
                 text,
-                finish_reason: AgentFinishReason::Stop,
+                finish_reason: FinishReason::Stop,
                 token_logprobs: Vec::new(),
             })
+        }
+
+        fn complete_stream(
+            &mut self,
+            req: CompletionRequest,
+            tx: UnboundedSender<CompletionStreamDelta>,
+        ) -> Result<()> {
+            let output = self.complete(req)?;
+            if !output.text.is_empty() {
+                let _ = tx.send(CompletionStreamDelta {
+                    text_delta: output.text.clone(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                });
+            }
+            let _ = tx.send(CompletionStreamDelta {
+                text_delta: String::new(),
+                finish_reason: Some(output.finish_reason),
+                usage: Some(output.usage),
+                logprob: None,
+            });
+            Ok(())
         }
     }
 
@@ -589,7 +616,7 @@ mod tests {
     struct TestToolExecutor;
 
     impl ToolExecutor for TestToolExecutor {
-        fn execute(&self, tool_call: &ProtocolToolCall) -> String {
+        fn execute(&self, tool_call: &ToolCall) -> String {
             infer_tools::execute_tool_call(tool_call)
         }
     }
@@ -604,7 +631,7 @@ mod tests {
         fn recover_tool_calls_from_user_request(
             &self,
             user_input: &str,
-            tools: &[ProtocolToolDefinition],
+            tools: &[ToolDefinition],
         ) -> Option<ParsedAssistantResponse> {
             BuiltinToolPolicyHooks.recover_tool_calls_from_user_request(user_input, tools)
         }
@@ -612,7 +639,7 @@ mod tests {
         fn recover_tool_calls_from_draft(
             &self,
             draft: &str,
-            tools: &[ProtocolToolDefinition],
+            tools: &[ToolDefinition],
         ) -> Option<ParsedAssistantResponse> {
             BuiltinToolPolicyHooks.recover_tool_calls_from_draft(draft, tools)
         }
@@ -656,8 +683,8 @@ mod tests {
         TestToolPolicy
     }
 
-    fn python_tool() -> ProtocolToolDefinition {
-        ProtocolToolDefinition::new(
+    fn python_tool() -> ToolDefinition {
+        ToolDefinition::new(
             "python",
             "Run Python",
             json!({
@@ -674,8 +701,8 @@ mod tests {
             .eq("1")
     }
 
-    fn shell_tool() -> ProtocolToolDefinition {
-        ProtocolToolDefinition::new(
+    fn shell_tool() -> ToolDefinition {
+        ToolDefinition::new(
             "shell",
             "Run shell",
             json!({
@@ -719,7 +746,7 @@ mod tests {
                     vec![ToolCall::new("shell", json!({ "command": "pwd" }))],
                 ),
             ],
-            &[ProtocolToolDefinition::new(
+            &[ToolDefinition::new(
                 "shell",
                 "Run a shell command",
                 json!({}),

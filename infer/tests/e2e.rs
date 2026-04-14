@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompleteRequest, FinishReason, RealServerEngine, ServerEngine, StreamDelta,
+    CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine, Qwen3InferenceEngine,
 };
 use infer::trace_reporter::FileReporter;
 
@@ -76,8 +76,8 @@ fn init_tracing() -> PathBuf {
     trace_dir
 }
 
-fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
-    CompleteRequest {
+fn make_request(prompt: &str, max_tokens: usize) -> CompletionRequest {
+    CompletionRequest {
         prompt: prompt.to_string(),
         max_tokens,
         sampling: SamplingParams::default(),
@@ -86,7 +86,9 @@ fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
     }
 }
 
-fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelta> {
+fn drain_deltas(
+    rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>,
+) -> Vec<CompletionStreamDelta> {
     let mut deltas = Vec::new();
     while let Ok(delta) = rx.try_recv() {
         deltas.push(delta);
@@ -106,7 +108,7 @@ fn test_e2e_generation() {
 
     info!("Loading engine...");
     let start = Instant::now();
-    let mut engine = RealServerEngine::load(&model_path, 42).expect("Failed to load engine");
+    let mut engine = Qwen3InferenceEngine::load(&model_path, 42).expect("Failed to load engine");
     info!("Engine loaded in {:.2?}", start.elapsed());
 
     // Build expected-output lookup from JSON
@@ -183,7 +185,7 @@ fn test_e2e_generation() {
                     .expect("complete_stream() failed");
             });
 
-            let mut deltas: Vec<StreamDelta> = Vec::new();
+            let mut deltas: Vec<CompletionStreamDelta> = Vec::new();
             let mut ttft = Duration::ZERO;
             let mut tpot_intervals: Vec<Duration> = Vec::new();
             let mut prev_time = start;

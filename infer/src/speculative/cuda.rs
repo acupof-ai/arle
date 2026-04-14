@@ -5,7 +5,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use super::{DraftModel, TokenProposal};
-use crate::backend::cuda::bootstrap::{EngineOptions, load_qwen3_components};
+use crate::backend::cuda::bootstrap::{InferenceEngineOptions, load_qwen3_components};
 use crate::model::{ModelForward, ModelRuntimeConfig, Qwen3Model};
 use crate::sampler::SamplingParams;
 
@@ -64,7 +64,7 @@ impl DraftEngine {
 
         let components = load_qwen3_components(
             &config.model_path,
-            EngineOptions {
+            InferenceEngineOptions {
                 enable_cuda_graph: config.runtime.enable_cuda_graph,
             },
         )?;

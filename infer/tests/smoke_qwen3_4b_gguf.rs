@@ -1,4 +1,4 @@
-//! Smoke test Qwen3-4B (NOT Qwen3.5) from GGUF via LoadedServerEngine auto-detect.
+//! Smoke test Qwen3-4B (NOT Qwen3.5) from GGUF via LoadedInferenceEngine auto-detect.
 //! Qwen3 has no linear attention — if this works, linear-attention is the
 //! Qwen3.5 failure site; if it also fails, the bug is in the shared GGUF path.
 //!
@@ -11,7 +11,8 @@ use std::time::Instant;
 
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompleteRequest, EngineOptions, LoadedServerEngine, ServerEngine, StreamDelta,
+    CompletionRequest, CompletionStreamDelta, InferenceEngine, InferenceEngineOptions,
+    LoadedInferenceEngine,
 };
 use tokio::sync::mpsc;
 
@@ -26,10 +27,10 @@ fn qwen3_4b_gguf_generate() {
     let p = path();
     println!("loading {p}");
     let t0 = Instant::now();
-    let mut engine = LoadedServerEngine::load_with_options(
+    let mut engine = LoadedInferenceEngine::load_with_options(
         &p,
         42,
-        EngineOptions {
+        InferenceEngineOptions {
             enable_cuda_graph: false,
         },
     )
@@ -50,7 +51,7 @@ fn qwen3_4b_gguf_generate() {
         long_prompt,
     ];
     for prompt in &prompts {
-        let req = infer::server_engine::CompleteRequest {
+        let req = infer::server_engine::CompletionRequest {
             prompt: prompt.clone(),
             max_tokens: 16,
             sampling: SamplingParams::default(),
@@ -59,9 +60,9 @@ fn qwen3_4b_gguf_generate() {
         };
         // Use the sync complete() so we can see the token_ids directly.
         let out = match &mut engine {
-            LoadedServerEngine::Qwen3(e) => e.complete(req).unwrap(),
-            LoadedServerEngine::Qwen35(e) => e.complete(req).unwrap(),
-            LoadedServerEngine::GLM4(e) => e.complete(req).unwrap(),
+            LoadedInferenceEngine::Qwen3(e) => e.complete(req).unwrap(),
+            LoadedInferenceEngine::Qwen35(e) => e.complete(req).unwrap(),
+            LoadedInferenceEngine::GLM4(e) => e.complete(req).unwrap(),
         };
         let shown: String = prompt.chars().take(60).collect();
         println!("prompt_len={} prompt_head={shown:?}", prompt.len());

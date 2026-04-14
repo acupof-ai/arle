@@ -1,6 +1,6 @@
 //! Shared observability schema across engine components.
 
-use infer_core::{InferenceMode, RequestEventKind, RequestId};
+use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
 /// Minimal event model for request lifecycle tracing.
 #[derive(Debug, Clone, PartialEq, Eq)]

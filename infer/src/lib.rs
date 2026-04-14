@@ -1,48 +1,35 @@
 // CUDA-only modules — excluded when `no-cuda` feature is active.
-// bootstrap, ffi, flashinfer_metadata, paged_kv, tensor, cuda_graph_pool
-// have all moved to `backend::cuda::*`. Model and ops remain here
-// until a follow-up round sorts their cross-backend status.
 #[cfg(feature = "cuda")]
-#[path = "../../crates/infer-engine/src/model.rs"]
 pub mod model;
 #[cfg(feature = "cuda")]
-#[path = "../../crates/infer-engine/src/ops.rs"]
 pub mod ops;
 #[cfg(feature = "cuda")]
-#[path = "../../crates/infer-engine/src/weight_loader.rs"]
 pub mod weight_loader;
 
 // Always-available modules (pure Rust, no GPU dependency).
-#[path = "../../crates/infer-engine/src/backend.rs"]
 pub mod backend;
 pub mod block_manager;
-#[path = "../../crates/infer-engine/src/error.rs"]
 pub mod error;
-#[path = "../../crates/infer-engine/src/gguf.rs"]
+pub mod events;
 pub mod gguf;
-#[path = "../../crates/infer-engine/src/hf_hub.rs"]
 pub mod hf_hub;
 pub mod http_server;
 pub mod kv_tier;
 pub mod logging;
 pub mod memory_planner;
 pub mod metrics;
-#[path = "../../crates/infer-engine/src/model_registry.rs"]
 pub mod model_registry;
 pub mod prefix_cache;
-#[path = "../../crates/infer-engine/src/quant.rs"]
 pub mod quant;
-#[path = "../../crates/infer-engine/src/request_handle.rs"]
 pub mod request_handle;
-#[path = "../../crates/infer-engine/src/sampler.rs"]
 pub mod sampler;
 pub mod scheduler;
 pub mod server_engine;
 pub mod speculative;
 pub mod tensor_parallel;
-#[path = "../../crates/infer-engine/src/tokenizer.rs"]
 pub mod tokenizer;
 pub mod trace_reporter;
+pub mod types;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};

@@ -58,23 +58,23 @@ wired are a connection problem, not a capability problem.
 - `grep -rE 'grammar|xgrammar|outlines|json_schema|constrained' infer/src/`
   returns zero matches.
 - Tool-call reliability currently depends on
-  `infer-chat::parse_tool_calls` running a regex + JSON bailout on fully
+  `infer_chat::openai_parse_tool_calls` running a regex + JSON bailout on fully
   generated text (`http_server/openai_v1.rs:296-309`). This is below the
   modern bar for serving 4B–8B agent models.
 
 ### Gap 5 — Session save/load is chat-only, not KV
 - `AgentSession::save_to_file` / `load_from_file` persist only
-  `Vec<ChatMessage>` JSON. On reload, the engine retokenizes and reruns the
+  `Vec<OpenAiChatMessage>` JSON. On reload, the engine retokenizes and reruns the
   full prefill from scratch. No KV block persistence.
 
 ### Gap 6 — Tool-call streaming is parsed post-hoc
-- `http_server::openai_v1.rs:296` calls `parse_tool_calls(&output.text)` on
+- `http_server::openai_v1.rs:296` calls `openai_parse_tool_calls(&output.text)` on
   the fully assembled response. Streaming clients cannot observe incremental
   `delta.tool_calls[].function.arguments`. Agent UX loses progressive
   tool-call animation.
 
 ### Gap 7 — Policy signals are not agent-aware
-- `infer_policy::SchedulerSignals { queued_requests, active_decodes }` is
+- `infer::scheduler::policy::SchedulerSignals { queued_requests, active_decodes }` is
   the entire input surface. It cannot express "prefer requests with prefix
   hits" or "the Nth turn of session S should not be preempted by a cold
   request".
@@ -200,14 +200,14 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 > remaining `EvictionPolicy` trait + `SessionBiasedLru` default lands as the
 > Tiered KV Cache P2 structural PR. When P2 ships, move B3 to Done.
 
-- **What**: Extend `infer_policy::SchedulerSignals` with
+- **What**: Extend `infer::scheduler::policy::SchedulerSignals` with
   `prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`. Add a built-in
   `PrefixAwareAdmission` that deprioritizes cold requests when warm ones
   are waiting.
 - **Why**: The policy crate currently cannot express the most basic
   agent-first admission rule.
 - **Where**:
-  - `crates/infer-policy/src/lib.rs` — extend struct + new policy.
+  - `infer/src/scheduler/policy.rs` — extend struct + new policy.
   - `infer/src/scheduler/batch.rs` and `infer/src/metal_scheduler.rs` —
     fill in the new signals at call sites.
 - **Exit**: Benchmarks show warm (session-continuation) requests do not
@@ -238,7 +238,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   flags before they have a working token.
 - **Where**:
   - `crates/infer-cli/src/args.rs` — add `serve` subcommand.
-  - `crates/infer-engine/src/lib.rs::LoadedAgentEngine::load` — runtime
+  - `infer/src/server_engine.rs::LoadedInferenceEngine::load` — runtime
     dispatch rather than compile-time cfg walls.
 - **Exit**: `cargo install agent-infer && agent-infer serve` produces a
   working server on Linux+CUDA, macOS+Metal, and CPU fallback, with no
@@ -247,7 +247,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 #### C2. Rust library quickstart
 - **What**: `examples/agent_loop.rs` showing ≤15 lines: load engine,
   loop `engine.complete(...)`. Link from README as example one.
-- **Why**: The current pub API (`LoadedAgentEngine` + `AgentEngine` trait)
+- **Why**: The current pub API (`LoadedInferenceEngine` + `InferenceEngine` trait)
   is clean but undocumented; newcomers must read `infer-cli::repl` to
   learn the pattern.
 - **Where**:
@@ -258,7 +258,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 #### C3. `GET /v1/trace/<req_id>` + `agent-infer doctor`
 - **What**:
   - Trace endpoint returns the per-request event timeline captured by
-    `infer_observability::EventSink`: enqueue / prefill_start / first_token /
+    `infer::events::EventSink`: enqueue / prefill_start / first_token /
     decode_step count / completed, with per-phase milliseconds and
     `prefix_hit_tokens`.
   - `agent-infer doctor` prints startup self-check: CUDA version, free

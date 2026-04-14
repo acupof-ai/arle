@@ -2,12 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use infer_core::SessionId;
-use infer_policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use tokio::sync::mpsc;
 
 use crate::sampler::SamplingParams;
-use crate::server_engine::StreamDelta;
+use crate::scheduler::policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
+use crate::server_engine::CompletionStreamDelta;
+use crate::types::SessionId;
 
 /// Preemption strategy when GPU memory is exhausted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
@@ -126,7 +126,7 @@ pub struct IncomingRequest {
     /// `docs/projects/agent-first-architecture.md::A2`.
     pub session_id: Option<SessionId>,
     /// Channel to send streaming deltas back to the HTTP handler.
-    pub delta_tx: mpsc::UnboundedSender<StreamDelta>,
+    pub delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
 }
 
 /// Error returned when the scheduler's waiting queue is full.

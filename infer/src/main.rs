@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use infer::backend::cuda::bootstrap::{
-    EngineOptions, ServerRuntimeConfig, detect_model_type, spawn_scheduler_handle_from_path,
+    InferenceEngineOptions, ServerRuntimeConfig, detect_model_type,
+    spawn_scheduler_handle_from_path,
 };
 use infer::http_server::build_app;
 use infer::logging;
@@ -118,7 +119,7 @@ async fn main() {
     info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
 
     let runtime = ServerRuntimeConfig {
-        engine: EngineOptions {
+        engine: InferenceEngineOptions {
             enable_cuda_graph: args.cuda_graph,
         },
         scheduler: SchedulerConfig {

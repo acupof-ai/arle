@@ -243,7 +243,7 @@ agent-infer/          ← top-level Cargo workspace
 - **`Scheduler`** (`infer/src/scheduler/`) — CUDA multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
 - **Metal scheduler** (`infer/src/backend/metal/scheduler.rs`) — Metal counterpart with its own KV pool (`backend/metal/kv_pool.rs`) and prefix cache (`backend/metal/prefix_cache.rs`).
 - **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
-- **`GenericServerEngine`** (`server_engine.rs`) — single-request engine for REPL/agent CLI.
+- **`InferenceEngine` trait + `LoadedInferenceEngine`** (`server_engine.rs`) — unified engine contract used by both the HTTP server and the agent CLI. `ModelInferenceEngine<M>` is the generic CUDA single-request engine; `BackendInferenceEngine<B>` wraps Metal/CPU backends behind the same trait; `LoadedInferenceEngine` is the dispatching enum.
 
 ### Model implementation pattern
 

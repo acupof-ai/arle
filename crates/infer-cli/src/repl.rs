@@ -8,13 +8,13 @@ use std::time::Instant;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer::server_engine::InferenceEngine;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_chat::{ParsedAssistantResponse, ProtocolToolCall, ProtocolToolDefinition};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_engine::AgentEngine;
+use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer_tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -44,7 +44,7 @@ struct BuiltinToolPolicy;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl ToolExecutor for BuiltinToolExecutor {
-    fn execute(&self, tool_call: &ProtocolToolCall) -> String {
+    fn execute(&self, tool_call: &ToolCall) -> String {
         execute_tool_call(tool_call)
     }
 }
@@ -54,7 +54,7 @@ impl ToolPolicy for BuiltinToolPolicy {
     fn recover_tool_calls_from_user_request(
         &self,
         user_input: &str,
-        tools: &[ProtocolToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         BuiltinToolPolicyHooks.recover_tool_calls_from_user_request(user_input, tools)
     }
@@ -62,7 +62,7 @@ impl ToolPolicy for BuiltinToolPolicy {
     fn recover_tool_calls_from_draft(
         &self,
         draft: &str,
-        tools: &[ProtocolToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
         BuiltinToolPolicyHooks.recover_tool_calls_from_draft(draft, tools)
     }
@@ -104,7 +104,7 @@ impl ToolPolicy for BuiltinToolPolicy {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn run_repl(
-    engine: &mut dyn AgentEngine,
+    engine: &mut dyn InferenceEngine,
     backend_name: &str,
     max_turns: usize,
     max_tokens: usize,
@@ -119,9 +119,9 @@ pub(crate) fn run_repl(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_banner(
-    engine: &dyn AgentEngine,
+    engine: &dyn InferenceEngine,
     backend_name: &str,
-    tools: &[ProtocolToolDefinition],
+    tools: &[ToolDefinition],
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
@@ -155,7 +155,7 @@ fn history_path() -> Option<PathBuf> {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_interactive_repl(
-    engine: &mut dyn AgentEngine,
+    engine: &mut dyn InferenceEngine,
     backend_name: &str,
     max_turns: usize,
     max_tokens: usize,
@@ -230,7 +230,7 @@ fn run_interactive_repl(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_piped_repl(
-    engine: &mut dyn AgentEngine,
+    engine: &mut dyn InferenceEngine,
     backend_name: &str,
     max_turns: usize,
     max_tokens: usize,
@@ -288,9 +288,9 @@ fn run_piped_repl(
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_repl_input(
-    engine: &mut dyn AgentEngine,
+    engine: &mut dyn InferenceEngine,
     backend_name: &str,
-    tools: &[ProtocolToolDefinition],
+    tools: &[ToolDefinition],
     session: &mut AgentSession,
     input: &str,
     max_turns: usize,
@@ -375,9 +375,9 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn execute_repl_command(
     command: ReplCommand,
-    engine: &mut dyn AgentEngine,
+    engine: &mut dyn InferenceEngine,
     backend_name: &str,
-    tools: &[ProtocolToolDefinition],
+    tools: &[ToolDefinition],
     session: &mut AgentSession,
     max_turns: usize,
     max_tokens: usize,
@@ -476,7 +476,7 @@ fn print_repl_help() {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn print_tools_help(tools: &[ProtocolToolDefinition]) {
+fn print_tools_help(tools: &[ToolDefinition]) {
     println!("Tools:");
     for tool in tools {
         println!("  {}: {}", tool.name, tool.description);

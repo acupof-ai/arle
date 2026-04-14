@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompleteRequest, EngineOptions, Qwen35ServerEngine, ServerEngine, StreamDelta,
+    CompletionRequest, CompletionStreamDelta, InferenceEngine, InferenceEngineOptions,
+    Qwen35InferenceEngine,
 };
 use tokio::sync::mpsc;
 
@@ -31,10 +32,10 @@ fn carnice_27b_q4k_load_and_generate() {
     let path = model_path();
     println!("loading Carnice-27b Q4_K_M from {path}");
     let t0 = Instant::now();
-    let mut engine = Qwen35ServerEngine::load_with_options(
+    let mut engine = Qwen35InferenceEngine::load_with_options(
         &path,
         42,
-        EngineOptions {
+        InferenceEngineOptions {
             enable_cuda_graph: false, // warmup on 27B takes forever; skip for smoke
         },
     )
@@ -56,14 +57,14 @@ fn carnice_27b_q4k_load_and_generate() {
     // Generation smoke — try very different prompts to tell "stuck token"
     // (same output regardless of prompt) apart from "bad but prompt-dependent".
     for prompt in ["The capital of France is", "1 + 1 = "] {
-        let req = CompleteRequest {
+        let req = CompletionRequest {
             prompt: prompt.to_string(),
             max_tokens: 8,
             sampling: SamplingParams::default(),
             stop: None,
             logprobs: true,
         };
-        let (tx, mut rx) = mpsc::unbounded_channel::<StreamDelta>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
         let t0 = Instant::now();
         engine
             .complete_stream(req, tx)

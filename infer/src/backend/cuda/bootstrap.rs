@@ -42,12 +42,12 @@ impl fmt::Display for ModelType {
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
-pub struct EngineOptions {
+pub struct InferenceEngineOptions {
     pub enable_cuda_graph: bool,
 }
 
 #[cfg(feature = "cuda")]
-impl Default for EngineOptions {
+impl Default for InferenceEngineOptions {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
@@ -58,7 +58,7 @@ impl Default for EngineOptions {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug)]
 pub struct ServerRuntimeConfig {
-    pub engine: EngineOptions,
+    pub engine: InferenceEngineOptions,
     pub scheduler: SchedulerConfig,
     pub seed: u64,
     pub max_seq_len: Option<usize>,
@@ -72,7 +72,7 @@ pub struct ServerRuntimeConfig {
 impl Default for ServerRuntimeConfig {
     fn default() -> Self {
         Self {
-            engine: EngineOptions::default(),
+            engine: InferenceEngineOptions::default(),
             scheduler: SchedulerConfig::runtime_defaults(4),
             seed: 42,
             max_seq_len: None,
@@ -125,8 +125,8 @@ pub enum LoadedModelComponents {
 #[cfg(feature = "cuda")]
 fn load_model_with<M>(
     model_path: &str,
-    options: EngineOptions,
-    load_model: impl FnOnce(&str, EngineOptions) -> Result<M>,
+    options: InferenceEngineOptions,
+    load_model: impl FnOnce(&str, InferenceEngineOptions) -> Result<M>,
 ) -> Result<ModelComponents<M>> {
     let resolved = resolve_model_path_for_runtime(model_path)?;
     let resolved_str = resolved.to_str().unwrap_or(model_path);
@@ -153,7 +153,7 @@ fn load_model_with<M>(
 #[cfg(feature = "cuda")]
 pub fn load_qwen3_components(
     model_path: &str,
-    options: EngineOptions,
+    options: InferenceEngineOptions,
 ) -> Result<ModelComponents<Qwen3Model>> {
     load_model_with(model_path, options, |model_path, options| {
         Qwen3Model::from_safetensors_with_runtime(
@@ -168,7 +168,7 @@ pub fn load_qwen3_components(
 #[cfg(feature = "cuda")]
 pub fn load_qwen35_components(
     model_path: &str,
-    options: EngineOptions,
+    options: InferenceEngineOptions,
 ) -> Result<ModelComponents<Qwen35Model>> {
     load_model_with(model_path, options, |model_path, options| {
         Qwen35Model::from_safetensors_with_options(model_path, options.enable_cuda_graph)
@@ -178,7 +178,7 @@ pub fn load_qwen35_components(
 #[cfg(feature = "cuda")]
 pub fn load_glm4_components(
     model_path: &str,
-    options: EngineOptions,
+    options: InferenceEngineOptions,
 ) -> Result<ModelComponents<GLM4Model>> {
     load_model_with(model_path, options, |model_path, options| {
         GLM4Model::from_safetensors(model_path, options.enable_cuda_graph)
@@ -188,7 +188,7 @@ pub fn load_glm4_components(
 #[cfg(feature = "cuda")]
 pub fn load_model_components(
     model_path: &str,
-    options: EngineOptions,
+    options: InferenceEngineOptions,
 ) -> Result<LoadedModelComponents> {
     match detect_model_type(model_path)? {
         ModelType::Qwen3 => Ok(LoadedModelComponents::Qwen3(load_qwen3_components(

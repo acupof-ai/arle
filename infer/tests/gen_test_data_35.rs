@@ -3,7 +3,9 @@
 /// Generate greedy reference outputs from our own Qwen3.5 engine.
 /// Run with: cargo test -r --test gen_test_data_35 -- --nocapture
 use infer::sampler::SamplingParams;
-use infer::server_engine::{CompleteRequest, EngineOptions, Qwen35ServerEngine, ServerEngine};
+use infer::server_engine::{
+    CompletionRequest, InferenceEngine, InferenceEngineOptions, Qwen35InferenceEngine,
+};
 use serde::Serialize;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -26,10 +28,10 @@ struct TestCase {
 fn generate_qwen35_test_data() {
     infer::logging::init_stderr("info");
 
-    let mut engine = Qwen35ServerEngine::load_with_options(
+    let mut engine = Qwen35InferenceEngine::load_with_options(
         MODEL_PATH,
         42,
-        EngineOptions {
+        InferenceEngineOptions {
             enable_cuda_graph: false,
         },
     )
@@ -66,7 +68,7 @@ fn generate_qwen35_test_data() {
     for (name, prompt, max_tokens) in &prompts {
         eprintln!("\n--- {name}: \"{prompt}\" (max_tokens={max_tokens}) ---");
         let out = engine
-            .complete(CompleteRequest {
+            .complete(CompletionRequest {
                 prompt: (*prompt).to_string(),
                 max_tokens: *max_tokens,
                 sampling: SamplingParams::default(),

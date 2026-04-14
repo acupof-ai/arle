@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use infer::sampler::SamplingParams;
-use infer::server_engine::{CompleteRequest, RealServerEngine, ServerEngine};
+use infer::server_engine::{CompletionRequest, InferenceEngine, Qwen3InferenceEngine};
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
 
@@ -105,12 +105,12 @@ fn regen_test_data() {
         test_data_path.display()
     );
 
-    let mut engine = RealServerEngine::load(&model_path, 42).expect("Failed to load model");
+    let mut engine = Qwen3InferenceEngine::load(&model_path, 42).expect("Failed to load model");
 
     let mut cases_json = Vec::new();
     for case in CASES {
         let prompt = wrap_prompt(case.prompt, prompt_style);
-        let req = CompleteRequest {
+        let req = CompletionRequest {
             prompt: prompt.clone(),
             max_tokens: case.max_new_tokens,
             sampling: SamplingParams {

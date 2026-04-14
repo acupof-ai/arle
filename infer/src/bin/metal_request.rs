@@ -9,7 +9,7 @@ use infer::backend::metal::MetalBackend;
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
 use infer::sampler::SamplingParams;
-use infer_chat::{ChatMessage, messages_to_prompt};
+use infer_chat::{OpenAiChatMessage, openai_messages_to_prompt};
 
 fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     let parsed: i32 = raw
@@ -87,7 +87,7 @@ fn load_prompt(args: &Args) -> Result<String> {
 fn build_chat_prompt(user_prompt: &str, system_prompt: Option<&str>) -> String {
     let mut messages = Vec::new();
     if let Some(system) = system_prompt {
-        messages.push(ChatMessage {
+        messages.push(OpenAiChatMessage {
             role: "system".into(),
             content: Some(system.to_string()),
             tool_calls: vec![],
@@ -95,14 +95,14 @@ fn build_chat_prompt(user_prompt: &str, system_prompt: Option<&str>) -> String {
             name: None,
         });
     }
-    messages.push(ChatMessage {
+    messages.push(OpenAiChatMessage {
         role: "user".into(),
         content: Some(user_prompt.to_string()),
         tool_calls: vec![],
         tool_call_id: None,
         name: None,
     });
-    messages_to_prompt(&messages, &[])
+    openai_messages_to_prompt(&messages, &[])
 }
 
 fn print_summary<W: Write>(
