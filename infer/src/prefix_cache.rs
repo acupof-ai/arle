@@ -426,6 +426,15 @@ impl RadixCache {
     // Stats
     // -------------------------------------------------------------------------
 
+    /// Block size the cache was constructed with (in tokens).
+    ///
+    /// Exposed so callers that generate block ids at insert time can
+    /// mint exactly the right number of ids per prompt without
+    /// duplicating the constant.
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     /// Total number of nodes in the tree (including root).
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -798,5 +807,108 @@ mod tests {
         assert_eq!(json, "42", "BlockId(N) must serialize as the bare N");
         let back: BlockId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    // ------------------------------------------------------------------
+    // M1 scheduler integration pattern — validates the exact usage
+    // shape `scheduler::cuda::core::Scheduler::publish_to_prefix_cache`
+    // + the `assign_slots` shadow observer rely on. Kept here (rather
+    // than in `scheduler/cuda/`) because the scheduler itself needs a
+    // full `Model` + CUDA context to construct and so cannot host a
+    // pure-Rust test.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn scheduler_shadow_observer_roundtrip_releases_all_refs() {
+        // Mirrors the M1 scheduler wiring: fresh cache, block_size=16
+        // (matches the `PREFIX_CACHE_BLOCK_SIZE` constant on the
+        // scheduler), synthetic block ids minted from a monotonic
+        // counter, insert on request-complete, lookup + release on
+        // next admission.
+        const BLOCK_SIZE: usize = 16;
+        let mut cache = RadixCache::new(BLOCK_SIZE);
+        let mut next_id: u32 = 0;
+
+        // Prompt A: 32 tokens = 2 blocks. Scheduler inserts on cleanup.
+        let prompt_a: Vec<u32> = (100..132).collect();
+        let blocks_a = {
+            let n = prompt_a.len() / BLOCK_SIZE;
+            let v: Vec<BlockId> = (0..n)
+                .map(|_| {
+                    let id = BlockId(next_id);
+                    next_id += 1;
+                    id
+                })
+                .collect();
+            assert_eq!(v.len(), 2, "32 tokens → exactly 2 blocks");
+            v
+        };
+        let inserted = cache.insert(&prompt_a, &blocks_a);
+        assert_eq!(inserted, 32);
+        assert_eq!(next_id, 2);
+        assert_eq!(cache.cached_block_count(), 2);
+
+        // New request arrives with the same prompt_a — scheduler runs
+        // `radix.lookup` on admission. The refs it bumps must be
+        // released before the assigner proceeds so the radix does not
+        // pin evictable blocks forever.
+        let (hit_len, hit_blocks) = cache.lookup(&prompt_a);
+        assert_eq!(hit_len, 32, "full prompt should hit both blocks");
+        assert_eq!(hit_blocks, blocks_a);
+        cache.release(&hit_blocks);
+
+        // After release, the matched nodes must evict cleanly (nothing
+        // is holding them). This is the invariant that makes the
+        // shadow observer safe to flip from "log-only" to "drives slot
+        // selection" in M2 without leaking paged-pool refs.
+        let freed = cache.evict(cache.cached_block_count());
+        assert_eq!(freed.len(), 2, "both blocks must be evictable");
+        assert_eq!(cache.cached_block_count(), 0);
+
+        // Fresh insert with a new id stream must succeed on the same
+        // cache (no residual state). This matches the "many requests
+        // arrive over the lifetime of a scheduler" pattern.
+        let prompt_b: Vec<u32> = (200..232).collect();
+        let blocks_b: Vec<BlockId> = (0..2)
+            .map(|_| {
+                let id = BlockId(next_id);
+                next_id += 1;
+                id
+            })
+            .collect();
+        assert_eq!(cache.insert(&prompt_b, &blocks_b), 32);
+        let (hit_len_b, hit_blocks_b) = cache.lookup(&prompt_b);
+        assert_eq!(hit_len_b, 32);
+        assert_eq!(hit_blocks_b, blocks_b);
+        cache.release(&hit_blocks_b);
+    }
+
+    #[test]
+    fn scheduler_shadow_observer_partial_block_is_dropped() {
+        // Mirrors publish_to_prefix_cache's early-return path: a
+        // prompt shorter than one block (or whose tail is <
+        // block_size) does not produce any cached entry.
+        const BLOCK_SIZE: usize = 16;
+        let mut cache = RadixCache::new(BLOCK_SIZE);
+
+        // 10-token prompt — zero full blocks.
+        let short: Vec<u32> = (0..10).collect();
+        let num_blocks = short.len() / BLOCK_SIZE;
+        assert_eq!(num_blocks, 0);
+        // publish_to_prefix_cache short-circuits before calling insert
+        // in this case, but even if it reached insert() with an empty
+        // blocks slice the semantics are the same: nothing inserted.
+        let inserted = cache.insert(&short, &[]);
+        assert_eq!(inserted, 0);
+        assert_eq!(cache.cached_block_count(), 0);
+
+        // 17-token prompt — exactly 1 full block, 1-token tail dropped.
+        let mixed: Vec<u32> = (0..17).collect();
+        let blocks = bids(&[999]);
+        assert_eq!(cache.insert(&mixed, &blocks), 16);
+        let (hit_len, hit_blocks) = cache.lookup(&mixed);
+        assert_eq!(hit_len, 16, "tail token must not round up");
+        assert_eq!(hit_blocks, blocks);
+        cache.release(&hit_blocks);
     }
 }

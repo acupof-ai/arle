@@ -1,6 +1,13 @@
 use super::*;
+use crate::prefix_cache::{BlockId, RadixCache};
 use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
 use crate::types::InferenceMode;
+
+/// Block size (in tokens) for the global `RadixCache` prefix observer.
+/// Chosen to match the M0.3 target paged-pool page size so that when
+/// M2 dual residency wires the radix directly onto the pool, the block
+/// boundaries already agree.
+pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
@@ -10,8 +17,28 @@ pub struct Scheduler<M: ModelForward> {
     /// Per-slot states (KV caches, decode buffers). Stored separately from
     /// slot metadata so we can pass `&mut [M::State]` to batched decode.
     pub(super) states: Vec<M::State>,
-    /// Per-slot cached prompts for prefix reuse.
+    /// Per-slot cached prompts for prefix reuse — authoritative for the
+    /// per-slot KV state until M2 dual residency lands. Lookups still
+    /// scan this linearly in `best_prefix_slot`; the radix cache below
+    /// is a shadow observer that accumulates cross-slot prefix stats
+    /// and will take over slot selection once pool pages gain refcounts.
     pub(super) cached_prompts: Vec<Vec<u32>>,
+    /// Global cross-slot prefix observer. Owned by the single-writer
+    /// scheduler thread, no lock needed. Populated on `cleanup()` with
+    /// each completed request's prompt and queried on `assign_slots()`
+    /// to surface the best achievable prefix hit length in the logs.
+    ///
+    /// M1 scope: infrastructure only, behavior unchanged. The
+    /// `BlockId`s stored under each node are **synthetic** — one fresh
+    /// id per `PREFIX_CACHE_BLOCK_SIZE`-token block, minted by
+    /// `next_prefix_block_id`. They do not correspond to any
+    /// paged-pool index yet; the mapping onto pool pages is M2.
+    pub(super) prefix_cache: RadixCache,
+    /// Monotonic counter for synthetic `BlockId`s inserted into
+    /// `prefix_cache`. Wraps on u32 overflow, which at 16 tokens per
+    /// block and ~10 M blocks per overflow cycle is not a concern for
+    /// any realistic deployment lifetime.
+    pub(super) next_prefix_block_id: u32,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -158,6 +185,8 @@ impl<M: ModelForward> Scheduler<M> {
             tokenizer,
             states,
             cached_prompts,
+            prefix_cache: RadixCache::new(PREFIX_CACHE_BLOCK_SIZE),
+            next_prefix_block_id: 0,
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
@@ -243,6 +272,48 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         Some(effective)
+    }
+
+    /// Insert a completed request's prompt into the global
+    /// [`RadixCache`] prefix observer.
+    ///
+    /// Each block-sized chunk of `prompt_tokens` gets a fresh synthetic
+    /// [`BlockId`] minted from `next_prefix_block_id`. Trailing partial
+    /// blocks are dropped per `RadixCache::insert` semantics. The ref
+    /// counts for all newly-inserted blocks start at zero so the next
+    /// lookup will be the only holder, and the scheduler's lookup path
+    /// releases immediately — no permanent ref accumulates.
+    ///
+    /// Called from `cleanup()` whenever a finished request has a
+    /// publishable cached prompt. M1 does not wire any eviction; the
+    /// radix grows monotonically for the life of the process. M2 will
+    /// attach eviction to paged-pool free events.
+    pub(super) fn publish_to_prefix_cache(&mut self, prompt_tokens: &[u32]) {
+        let block_size = self.prefix_cache.block_size();
+        let num_blocks = prompt_tokens.len() / block_size;
+        if num_blocks == 0 {
+            return;
+        }
+        let mut blocks: Vec<BlockId> = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            blocks.push(BlockId(self.next_prefix_block_id));
+            self.next_prefix_block_id = self.next_prefix_block_id.wrapping_add(1);
+        }
+        let inserted = self.prefix_cache.insert(prompt_tokens, &blocks);
+        if inserted != num_blocks * block_size {
+            // `insert` returns the number of tokens actually stored; a
+            // mismatch here would only happen if `blocks.len()` is
+            // smaller than `num_blocks`, which we just constructed, so
+            // this is a hard invariant violation. Log at warn so the
+            // scheduler loop does not panic.
+            warn!(
+                "prefix_cache.insert: expected {} tokens, got {} (num_blocks={}, tokens={})",
+                num_blocks * block_size,
+                inserted,
+                num_blocks,
+                prompt_tokens.len(),
+            );
+        }
     }
 
     pub(super) fn prefill_chunk_size(&self) -> usize {
