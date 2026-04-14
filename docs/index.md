@@ -18,6 +18,7 @@
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | **Complete** — TurboQuant Phases 1-3: KV cache + weight + fused decode attention |
 | **Resources** | |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
+| [resources/metal-dflash.md](resources/metal-dflash.md) | User guide for Metal DFlash: supported models, CLI/env usage, benchmark workflow, and current limits |
 | [architecture.md](architecture.md) | Current workspace/package topology and runtime split |
 | [codebase-map.md](codebase-map.md) | Current code map: runtime, crates, docs, tests, and entrypoints |
 | [stability-policy.md](stability-policy.md) | Governance draft: stable/beta/experimental/internal surface classification |

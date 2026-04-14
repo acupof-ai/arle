@@ -86,6 +86,24 @@ curl http://localhost:8000/v1/chat/completions \
 
 **Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only).
 
+## Metal DFlash
+
+Metal DFlash is available as an experimental Apple Silicon decode path for
+`Qwen3`.
+
+Quick example:
+
+```bash
+cargo run -p infer --bin metal_request --release --no-default-features --features metal,no-cuda -- \
+  --model mlx-community/Qwen3-4B-bf16 \
+  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --prompt "write a quicksort in python" \
+  --raw-prompt
+```
+
+For full usage, limits, and benchmark workflow, see
+[docs/resources/metal-dflash.md](docs/resources/metal-dflash.md).
+
 ---
 
 ## Stability and Support
@@ -96,7 +114,8 @@ curl http://localhost:8000/v1/chat/completions \
   `GET /metrics`, `GET /v1/stats`, and the main documented build/test workflows.
 - **Beta**: CLI agent behavior, Metal serving path, GGUF loading, benchmark tooling.
 - **Experimental**: fast-moving quantization paths, speculative decoding,
-  tensor-parallel scaffolding, and undocumented flags or environment variables.
+  tensor-parallel scaffolding, Metal DFlash, and undocumented flags or
+  environment variables.
 
 Current support should be read conservatively:
 
