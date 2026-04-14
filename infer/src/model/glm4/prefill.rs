@@ -2,7 +2,8 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
 use super::weights::{GLM4Model, TransformerBlock};
-use crate::backend::cuda::prelude::{DeviceContext, DeviceVec, HiddenStates, TokenKVPool};
+use crate::backend::cuda::paged_kv::TokenKVPool;
+use crate::backend::cuda::tensor::{DeviceContext, DeviceVec, HiddenStates};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
 
