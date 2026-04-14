@@ -47,12 +47,13 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
 infer-chat = { path = "../crates/infer-chat" }
+infer-cuda-kernels = { path = "../crates/infer-cuda-kernels", default-features = false }
 
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
-cuda = ["dep:cudarc", "dep:memmap2"]
+cuda = ["dep:cudarc", "dep:memmap2", "infer-cuda-kernels/cuda"]
 # Disable CUDA – allows compilation on macOS / CI without GPU. GPU ops panic at runtime.
-no-cuda = []
+no-cuda = ["infer-cuda-kernels/no-cuda"]
 # Development-oriented CPU backend for serial smoke tests and local validation.
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).

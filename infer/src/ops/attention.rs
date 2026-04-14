@@ -528,124 +528,7 @@ pub fn fused_attention_decode_into(
 // FlashInfer batch decode with paged KV cache
 // ============================================================================
 
-/// Workspace buffers for FlashInfer batch decode, allocated once and reused.
-///
-/// FlashInfer's plan/run API needs:
-/// - `float_workspace`: ~128MB GPU buffer for split-KV temp storage
-/// - `int_workspace`: ~8MB GPU buffer for plan metadata
-/// - `page_locked_workspace`: ~8MB CPU pinned buffer for plan H2D copy
-/// - `plan_info`: ~256 bytes opaque buffer for plan output
-pub struct FlashInferWorkspace {
-    /// GPU scratch for split-KV temporaries (~128MB)
-    pub float_workspace: CudaSlice<u8>,
-    pub float_workspace_bytes: usize,
-    /// GPU scratch for plan metadata (~8MB)
-    pub int_workspace: CudaSlice<u8>,
-    pub int_workspace_bytes: usize,
-    /// CPU pinned buffer for plan H2D copy (~8MB)
-    page_locked_workspace: *mut u8,
-    #[allow(dead_code)]
-    page_locked_workspace_bytes: usize,
-    /// Opaque plan info buffer (256 bytes, HOST pinned — used by CPU memcpy in FlashInfer)
-    pub plan_info: *mut u8,
-    /// LSE output buffer (log-sum-exp), nullable but we allocate for max batch
-    pub lse: CudaSlice<f32>,
-}
-
-// SAFETY: The page_locked_workspace is a pinned CPU allocation that is only accessed
-// from the single inference thread (same thread that calls plan/run). No concurrent access.
-unsafe impl Send for FlashInferWorkspace {}
-
-impl FlashInferWorkspace {
-    /// Default sizes matching FlashInfer's typical requirements.
-    /// 256MB for split-KV temporaries (sglang uses 512MB but we need headroom).
-    const FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MB
-    const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-    const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
-    const PLAN_INFO_BYTES: usize = 256;
-
-    /// Allocate FlashInfer workspace buffers.
-    ///
-    /// `max_batch_size` controls the LSE buffer size.
-    /// `num_qo_heads` is needed for LSE dimensioning.
-    pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
-        let float_workspace: CudaSlice<u8> = ctx
-            .stream
-            .alloc_zeros(Self::FLOAT_WORKSPACE_BYTES)
-            .map_err(|e| anyhow!("FlashInfer float_workspace alloc failed: {e}"))?;
-
-        let int_workspace: CudaSlice<u8> = ctx
-            .stream
-            .alloc_zeros(Self::INT_WORKSPACE_BYTES)
-            .map_err(|e| anyhow!("FlashInfer int_workspace alloc failed: {e}"))?;
-
-        // plan_info is read/written by CPU memcpy in FlashInfer — must be host memory
-        let plan_info = unsafe {
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let err = cudarc::driver::sys::cuMemAllocHost_v2(
-                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
-                Self::PLAN_INFO_BYTES,
-            );
-            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(anyhow!("cuMemAllocHost failed for plan_info: {:?}", err));
-            }
-            // Zero-initialize
-            std::ptr::write_bytes(ptr, 0, Self::PLAN_INFO_BYTES);
-            ptr
-        };
-
-        let lse: CudaSlice<f32> = ctx
-            .stream
-            .alloc_zeros(max_batch_size * num_qo_heads)
-            .map_err(|e| anyhow!("FlashInfer lse alloc failed: {e}"))?;
-
-        // Allocate page-locked (pinned) CPU memory via CUDA API
-        let page_locked_workspace = unsafe {
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let err = cudarc::driver::sys::cuMemAllocHost_v2(
-                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
-                Self::PAGE_LOCKED_WORKSPACE_BYTES,
-            );
-            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(anyhow!(
-                    "cuMemAllocHost failed for page_locked_workspace: {:?}",
-                    err
-                ));
-            }
-            ptr
-        };
-
-        Ok(Self {
-            float_workspace,
-            float_workspace_bytes: Self::FLOAT_WORKSPACE_BYTES,
-            int_workspace,
-            int_workspace_bytes: Self::INT_WORKSPACE_BYTES,
-            page_locked_workspace,
-            page_locked_workspace_bytes: Self::PAGE_LOCKED_WORKSPACE_BYTES,
-            plan_info,
-            lse,
-        })
-    }
-}
-
-impl Drop for FlashInferWorkspace {
-    fn drop(&mut self) {
-        if !self.page_locked_workspace.is_null() {
-            unsafe {
-                let _ = cudarc::driver::sys::cuMemFreeHost(
-                    self.page_locked_workspace as *mut std::ffi::c_void,
-                );
-            }
-            self.page_locked_workspace = std::ptr::null_mut();
-        }
-        if !self.plan_info.is_null() {
-            unsafe {
-                let _ = cudarc::driver::sys::cuMemFreeHost(self.plan_info as *mut std::ffi::c_void);
-            }
-            self.plan_info = std::ptr::null_mut();
-        }
-    }
-}
+pub use infer_cuda_kernels::flashinfer::FlashInferWorkspace;
 
 /// Batched decode prep for paged KV cache: QK-norm + RoPE (in-place on Q) + paged KV write.
 ///
@@ -748,35 +631,16 @@ pub fn flashinfer_batch_decode(
     let batch_size = q_batch.seq_len;
     let sm_scale = 1.0 / (head_dim as f32).sqrt();
 
-    // Step 1: Plan (CPU-side scheduling)
-    {
-        let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-        let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-        let ret = unsafe {
-            ffi::flashinfer_batch_decode_plan(
-                fw_ptr as *mut u8,
-                workspace.float_workspace_bytes,
-                iw_ptr as *mut u8,
-                workspace.page_locked_workspace,
-                workspace.int_workspace_bytes,
-                indptr_h.as_ptr(),
-                batch_size as i32,
-                num_qo_heads as i32,
-                num_kv_heads as i32,
-                page_size as i32,
-                head_dim as i32,
-                workspace.plan_info as *mut u8, // host pointer — FlashInfer uses CPU memcpy
-                ctx.stream.cu_stream(),
-            )
-        };
-        if ret != 0 {
-            return Err(anyhow!(
-                "flashinfer_batch_decode_plan failed with CUDA error {}",
-                ret
-            ));
-        }
-    }
+    infer_cuda_kernels::flashinfer::flashinfer_plan(
+        ctx,
+        indptr_h,
+        workspace,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )?;
 
     // Step 2: Run (GPU kernel)
     {
@@ -838,33 +702,16 @@ pub fn flashinfer_plan(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info as *mut u8,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_batch_decode_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
+    infer_cuda_kernels::flashinfer::flashinfer_plan(
+        ctx,
+        indptr_h,
+        workspace,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
 }
 
 /// FlashInfer tensor-core decode plan (uses prefill kernel for flat ITL).
@@ -883,34 +730,17 @@ pub fn flashinfer_tc_plan(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_tc_decode_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            qo_indptr_h.as_ptr(),
-            kv_indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info as *mut u8,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_tc_decode_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
+    infer_cuda_kernels::flashinfer::flashinfer_tc_plan(
+        ctx,
+        qo_indptr_h,
+        kv_indptr_h,
+        workspace,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
 }
 
 /// FlashInfer tensor-core decode run (GPU kernel). Uses prefill kernel.
@@ -1152,33 +982,16 @@ pub(crate) fn flashinfer_plan_hd256(
     page_size: usize,
     head_dim: usize,
 ) -> Result<()> {
-    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
-    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
-
-    let ret = unsafe {
-        ffi::flashinfer_batch_decode_hd256_plan(
-            fw_ptr as *mut u8,
-            workspace.float_workspace_bytes,
-            iw_ptr as *mut u8,
-            workspace.page_locked_workspace,
-            workspace.int_workspace_bytes,
-            indptr_h.as_ptr(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
-            workspace.plan_info as *mut u8,
-            ctx.stream.cu_stream(),
-        )
-    };
-    if ret != 0 {
-        return Err(anyhow!(
-            "flashinfer_batch_decode_hd256_plan failed with CUDA error {}",
-            ret
-        ));
-    }
-    Ok(())
+    infer_cuda_kernels::flashinfer::flashinfer_plan_hd256(
+        ctx,
+        indptr_h,
+        workspace,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
 }
 
 /// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.

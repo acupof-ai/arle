@@ -167,7 +167,7 @@ impl DeviceVec {
     }
 
     #[allow(clippy::cast_ptr_alignment)]
-    pub(crate) fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
+    pub fn from_safetensors(ctx: &DeviceContext, data: &[u8]) -> Result<Self> {
         if !data.len().is_multiple_of(2) {
             return Err(anyhow!(
                 "Data length must be even for bf16: got {} bytes",
@@ -898,7 +898,7 @@ impl DeviceMatrix {
     }
 
     #[allow(clippy::cast_ptr_alignment)]
-    pub(crate) fn from_safetensors(
+    pub fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],
         rows: usize,
@@ -1086,7 +1086,7 @@ impl HiddenStates {
 /// - The originating CudaSlice must not be reallocated.
 /// - Only used from the single inference thread (single CUDA stream).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RawDevicePtr<T> {
+pub struct RawDevicePtr<T> {
     ptr: u64,
     _marker: PhantomData<*const T>,
 }
@@ -1096,19 +1096,19 @@ unsafe impl<T> Send for RawDevicePtr<T> {}
 
 impl<T> RawDevicePtr<T> {
     /// Get as const pointer for kernel read parameters.
-    pub(crate) fn as_ptr(self) -> *const T {
+    pub fn as_ptr(self) -> *const T {
         self.ptr as *const T
     }
 
     /// Get as mut pointer for kernel write parameters.
-    pub(crate) fn as_mut_ptr(self) -> *mut T {
+    pub fn as_mut_ptr(self) -> *mut T {
         self.ptr as *mut T
     }
 }
 
 /// Extract and cache a raw device pointer from a CudaSlice.
 /// Calls device_ptr() once -- amortized over thousands of decode steps.
-pub(crate) fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T> {
+pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T> {
     use cudarc::driver::DevicePtr;
     let (ptr, _sync) = slice.device_ptr(&ctx.stream);
     RawDevicePtr {

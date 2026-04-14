@@ -2,7 +2,7 @@ use super::{CUresult, CUstream, Half};
 
 #[allow(dead_code)]
 unsafe extern "C" {
-    pub(crate) fn gated_delta_rule_decode_cuda(
+    pub fn gated_delta_rule_decode_cuda(
         qkv: *const Half,
         b_proj: *const Half,
         a_proj: *const Half,
@@ -17,7 +17,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn conv1d_decode_batch_cuda(
+    pub fn conv1d_decode_batch_cuda(
         x_batch: *const Half,
         conv_weight: *const Half,
         conv_state_ptrs: *mut *mut Half,
@@ -28,7 +28,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gdr_decode_batch_cuda(
+    pub fn gdr_decode_batch_cuda(
         qkv_batch: *const Half,
         b_proj_batch: *const Half,
         a_proj_batch: *const Half,
@@ -44,7 +44,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn conv1d_prefill_cuda(
+    pub fn conv1d_prefill_cuda(
         x_seq: *const Half,
         conv_weight: *const Half,
         conv_state: *mut Half,
@@ -55,7 +55,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_prepare_cuda(
+    pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
         a_proj: *const Half,
@@ -73,7 +73,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_cumsum_cuda(
+    pub fn gated_delta_rule_prefill_chunk_cumsum_cuda(
         g_in: *const f32,
         g_out: *mut f32,
         seq_len: i32,
@@ -81,7 +81,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_a_cuda(
+    pub fn gated_delta_rule_prefill_chunk_a_cuda(
         k: *const Half,
         g_cumsum: *const f32,
         beta: *const f32,
@@ -91,7 +91,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_solve_cuda(
+    pub fn gated_delta_rule_prefill_chunk_solve_cuda(
         a_tril: *const f32,
         a_inv: *mut Half,
         seq_len: i32,
@@ -99,7 +99,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_recompute_cuda(
+    pub fn gated_delta_rule_prefill_chunk_recompute_cuda(
         k: *const Half,
         v: *const Half,
         beta: *const f32,
@@ -112,7 +112,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_state_cuda(
+    pub fn gated_delta_rule_prefill_chunk_state_cuda(
         k: *const Half,
         w: *const Half,
         u: *const Half,
@@ -126,7 +126,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub(crate) fn gated_delta_rule_prefill_chunk_o_cuda(
+    pub fn gated_delta_rule_prefill_chunk_o_cuda(
         q: *const Half,
         k: *const Half,
         v_new: *const Half,

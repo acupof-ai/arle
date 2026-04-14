@@ -1,36 +1,36 @@
 use cudarc::driver::sys::{CUresult, CUstream};
 
 // Half type (16-bit float) - same layout as CUDA half
-pub(crate) type Half = u16;
+pub type Half = u16;
 
 #[path = "ffi/attention.rs"]
-pub(crate) mod attention;
+pub mod attention;
 #[path = "ffi/elementwise.rs"]
-pub(crate) mod elementwise;
+pub mod elementwise;
 #[path = "ffi/embedding.rs"]
-pub(crate) mod embedding;
+pub mod embedding;
 #[path = "ffi/gemm.rs"]
-pub(crate) mod gemm;
+pub mod gemm;
 #[path = "ffi/kv.rs"]
-pub(crate) mod kv;
+pub mod kv;
 #[path = "ffi/misc.rs"]
-pub(crate) mod misc;
+pub mod misc;
 #[path = "ffi/norm.rs"]
-pub(crate) mod norm;
+pub mod norm;
 #[path = "ffi/quant.rs"]
-pub(crate) mod quant;
+pub mod quant;
 #[path = "ffi/recurrent.rs"]
-pub(crate) mod recurrent;
+pub mod recurrent;
 #[path = "ffi/sampling.rs"]
-pub(crate) mod sampling;
+pub mod sampling;
 
-pub(crate) use attention::*;
-pub(crate) use elementwise::*;
-pub(crate) use embedding::*;
-pub(crate) use gemm::*;
-pub(crate) use kv::*;
-pub(crate) use misc::*;
-pub(crate) use norm::*;
-pub(crate) use quant::*;
-pub(crate) use recurrent::*;
-pub(crate) use sampling::*;
+pub use attention::*;
+pub use elementwise::*;
+pub use embedding::*;
+pub use gemm::*;
+pub use kv::*;
+pub use misc::*;
+pub use norm::*;
+pub use quant::*;
+pub use recurrent::*;
+pub use sampling::*;
