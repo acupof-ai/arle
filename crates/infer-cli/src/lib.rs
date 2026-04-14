@@ -11,7 +11,11 @@ use args::Args;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_engine::{AgentEngine, LoadedAgentEngine, init_default_logging, resolve_model_source};
+use infer::hf_hub::resolve_model_source;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer::logging::init_default;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
 #[cfg(all(not(feature = "cuda"), any(feature = "metal", feature = "cpu")))]
 use log::warn;
 
@@ -27,12 +31,12 @@ pub fn run() -> Result<()> {
 
     #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     {
-        init_default_logging();
+        init_default();
         let args = Args::parse();
         let model_source = resolve_model_source(args.model_path.as_deref())?;
         log::info!("Loading model from: {}", model_source);
         let load_start = Instant::now();
-        let mut engine = LoadedAgentEngine::load(&model_source, !args.no_cuda_graph)?;
+        let mut engine = LoadedInferenceEngine::load(&model_source, !args.no_cuda_graph)?;
         let backend_name = engine.backend_name().to_string();
 
         if let Some(max_kv) = args.max_gpu_kv {

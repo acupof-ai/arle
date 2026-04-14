@@ -1488,9 +1488,6 @@ dependencies = [
  "half",
  "hf-hub",
  "infer-chat",
- "infer-core",
- "infer-observability",
- "infer-policy",
  "libc",
  "log",
  "logforth",
@@ -1516,12 +1513,13 @@ name = "infer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "infer",
  "infer-chat",
- "infer-engine",
  "infer-tools",
  "log",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1538,47 +1536,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "infer",
  "infer-agent",
  "infer-chat",
- "infer-engine",
  "infer-tools",
  "log",
  "rustyline",
  "serde_json",
-]
-
-[[package]]
-name = "infer-core"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "infer-engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cudarc",
- "infer",
- "libc",
- "log",
- "memmap2",
- "mlx-sys",
-]
-
-[[package]]
-name = "infer-observability"
-version = "0.1.0"
-dependencies = [
- "infer-core",
-]
-
-[[package]]
-name = "infer-policy"
-version = "0.1.0"
-dependencies = [
- "infer-core",
 ]
 
 [[package]]

@@ -124,16 +124,15 @@ Workspace split summary:
 
 - `agent-infer` is now a thin binary wrapper.
 - `infer-cli` owns the REPL/CLI flow.
-- `infer-engine` owns model discovery, logging init, backend loading, and the
-  runtime adapter boundary; it should not depend on `infer-agent` internals.
+- `infer-agent` owns conversation state, tool-call recovery, and the agent turn loop.
+- `infer-tools` and `infer-chat` are reusable tool execution helpers and protocol types.
 - `infer` continues to own the HTTP server, scheduler, runtime, and backend
-  implementations.
+  implementations. `infer::server_engine::{InferenceEngine, LoadedInferenceEngine,
+  CompletionRequest, CompletionOutput}` is the single engine contract used by
+  both the HTTP server and the agent CLI.
 
 See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
-for the current package boundaries. This is still an interim Phase 1 split:
-the control-plane crates are separated, but the lower-level scheduler/runtime
-atomization is still pending; enqueue admission and decode-aware chunking now
-share stable policy contracts across the batch/CUDA/Metal paths.
+for the current package boundaries.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -224,11 +223,9 @@ Current package boundary for agent mode:
 
 - `agent-infer` -> thin binary wrapper
 - `infer-cli` -> REPL and slash commands
-- `infer-engine` -> backend loading and model auto-discovery, with no control-plane dependency back edge
+- `infer` -> `server_engine::LoadedInferenceEngine` backend loading and `hf_hub::resolve_model_source` for model auto-discovery
 - `infer-agent` -> conversation loop and tool-call recovery
 - `infer-tools` / `infer-chat` -> shared tool definitions, execution helpers, and protocol types
-
-The remaining Phase 1 work is now below the control-plane boundary: tightening deeper scheduler/KV extraction, keeping observability semantics stable, and deferring fuller eviction/KV policy atomization to later phases.
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 

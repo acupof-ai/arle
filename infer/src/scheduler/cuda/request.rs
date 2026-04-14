@@ -27,8 +27,8 @@ pub(crate) struct ActiveRequest {
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
     /// Consumed by slot-admission once A1 lands; currently informational.
-    pub(crate) session_id: Option<infer_core::SessionId>,
-    pub(crate) delta_tx: mpsc::UnboundedSender<StreamDelta>,
+    pub(crate) session_id: Option<crate::types::SessionId>,
+    pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Full decoded text, maintained incrementally.
     pub(crate) full_decoded: String,
     /// Number of tokens already decoded into full_decoded.
@@ -106,7 +106,7 @@ impl ActiveRequest {
             match check_stop_sequences(&self.full_decoded, stops) {
                 StopCheckResult::StopFound { stop_pos } => {
                     if stop_pos > self.sent_len {
-                        let _ = self.delta_tx.send(StreamDelta {
+                        let _ = self.delta_tx.send(CompletionStreamDelta {
                             text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
                             finish_reason: None,
                             usage: None,
@@ -120,7 +120,7 @@ impl ActiveRequest {
                 }
                 StopCheckResult::NoStop { safe_len } => {
                     if safe_len > self.sent_len {
-                        let _ = self.delta_tx.send(StreamDelta {
+                        let _ = self.delta_tx.send(CompletionStreamDelta {
                             text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
                             finish_reason: None,
                             usage: None,
@@ -134,7 +134,7 @@ impl ActiveRequest {
             // Snap to char boundary to avoid panic on multi-byte characters.
             let start = self.full_decoded.floor_char_boundary(self.sent_len);
             if start < self.full_decoded.len() {
-                let _ = self.delta_tx.send(StreamDelta {
+                let _ = self.delta_tx.send(CompletionStreamDelta {
                     text_delta: self.full_decoded[start..].to_string(),
                     finish_reason: None,
                     usage: None,
@@ -165,7 +165,7 @@ impl ActiveRequest {
                 let start = full_text.floor_char_boundary(self.sent_len);
                 let end = full_text.floor_char_boundary(end);
                 if end > start {
-                    let _ = self.delta_tx.send(StreamDelta {
+                    let _ = self.delta_tx.send(CompletionStreamDelta {
                         text_delta: full_text[start..end].to_string(),
                         finish_reason: None,
                         usage: None,
@@ -179,10 +179,10 @@ impl ActiveRequest {
     }
 
     fn send_finish(&self, reason: FinishReason) {
-        let _ = self.delta_tx.send(StreamDelta {
+        let _ = self.delta_tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(reason),
-            usage: Some(Usage {
+            usage: Some(TokenUsage {
                 prompt_tokens: self.prompt_tokens.len(),
                 completion_tokens: self.generated_tokens.len(),
                 total_tokens: self.prompt_tokens.len() + self.generated_tokens.len(),

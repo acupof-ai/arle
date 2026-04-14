@@ -77,6 +77,37 @@ pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf
     })
 }
 
+/// Resolve a model source for CLI-style callers.
+///
+/// Prefers an explicit flag value, then `AGENT_INFER_MODEL`, then local model
+/// auto-discovery using [`discover_local_model`].
+pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String> {
+    if let Some(model_path) = explicit_model_path
+        && !model_path.trim().is_empty()
+    {
+        return Ok(model_path.to_string());
+    }
+
+    if let Ok(model) = std::env::var("AGENT_INFER_MODEL")
+        && !model.trim().is_empty()
+    {
+        return Ok(model);
+    }
+
+    if let Some((candidate, local_path)) = discover_local_model() {
+        log::info!(
+            "Auto-detected local model '{}' at {}",
+            candidate,
+            local_path.display()
+        );
+        return Ok(candidate);
+    }
+
+    anyhow::bail!(
+        "No model specified and no local model was auto-detected. Pass --model-path or set AGENT_INFER_MODEL."
+    )
+}
+
 /// Download a model from HuggingFace Hub and return the local cache directory.
 ///
 /// Files are stored under `~/.cache/huggingface/hub/models--<org>--<repo>/snapshots/<sha>/`.

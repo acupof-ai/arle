@@ -10,13 +10,13 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use infer_core::{InferenceMode, RequestEventKind, RequestId};
-use infer_observability::{EngineEvent, EventSink, NoopEventSink};
-use infer_policy::{
+use crate::events::{EngineEvent, EventSink, NoopEventSink};
+use crate::scheduler::policy::{
     AdmissionPolicy, ChunkingPolicy, DecodeAwareChunking, QueueBoundAdmission, SchedulerSignals,
 };
-use std::sync::Arc;
+use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
 /// Request priority used by the Metal scheduler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]

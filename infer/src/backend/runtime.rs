@@ -15,7 +15,7 @@ use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
 use crate::request_handle::{RequestHandle, SubmitError};
 use crate::scheduler::IncomingRequest;
-use crate::server_engine::{FinishReason, StreamDelta, Usage};
+use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 
 /// Serial runtime handle for backends that only support one in-flight request.
 #[derive(Clone)]
@@ -203,13 +203,13 @@ where
         parse_finish_reason(&generated)
     };
 
-    let usage = Usage {
+    let usage = TokenUsage {
         prompt_tokens: generated.prompt_tokens,
         completion_tokens: generated.completion_tokens,
         total_tokens: generated.prompt_tokens + generated.completion_tokens,
     };
 
-    let _ = delta_tx.send(StreamDelta {
+    let _ = delta_tx.send(CompletionStreamDelta {
         text_delta: String::new(),
         finish_reason: Some(finish_reason),
         usage: Some(usage),
@@ -227,7 +227,7 @@ fn parse_finish_reason(generated: &GenerateResult) -> FinishReason {
 }
 
 fn send_text_delta(
-    delta_tx: &mpsc::UnboundedSender<StreamDelta>,
+    delta_tx: &mpsc::UnboundedSender<CompletionStreamDelta>,
     text_delta: String,
 ) -> Result<()> {
     if text_delta.is_empty() {
@@ -235,7 +235,7 @@ fn send_text_delta(
     }
 
     delta_tx
-        .send(StreamDelta {
+        .send(CompletionStreamDelta {
             text_delta,
             finish_reason: None,
             usage: None,
@@ -397,7 +397,10 @@ mod tests {
     fn make_request(
         prompt: &str,
         stop: Option<Vec<String>>,
-    ) -> (IncomingRequest, mpsc::UnboundedReceiver<StreamDelta>) {
+    ) -> (
+        IncomingRequest,
+        mpsc::UnboundedReceiver<CompletionStreamDelta>,
+    ) {
         let (delta_tx, delta_rx) = mpsc::unbounded_channel();
         (
             IncomingRequest {
@@ -444,7 +447,7 @@ mod tests {
         assert_eq!(deltas[2].finish_reason, Some(FinishReason::Stop));
         assert_eq!(
             deltas[2].usage,
-            Some(Usage {
+            Some(TokenUsage {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,

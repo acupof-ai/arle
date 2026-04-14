@@ -3,11 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use infer_core::{InferenceMode, RequestEventKind, RequestId};
-use infer_observability::{EngineEvent, EventSink, NoopEventSink};
-use infer_policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
-
 use crate::block_manager::{BlockId, BlockManager};
+use crate::events::{EngineEvent, EventSink, NoopEventSink};
+use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
+use crate::types::{InferenceMode, RequestEventKind, RequestId};
 
 use super::{PreemptionMode, RequestPriority};
 

@@ -371,7 +371,11 @@ pub fn compute_g(a_log: &MlxArray, alpha: &MlxArray, dt_bias: &MlxArray) -> MlxA
 
 /// Full GDR layer forward in C++ — one FFI call replaces ~40 individual ops.
 /// Returns the output tensor. Updates conv_state and gdr_state in place.
-#[allow(clippy::too_many_arguments)]
+///
+/// `metal_kernel` is a raw Metal kernel pointer that must be valid for the
+/// duration of the call when `use_metal_kernel` is true; callers are
+/// responsible for its lifetime.
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
 pub fn gdr_layer_forward(
     x: &MlxArray,
     qkvz_w: &MlxArray,

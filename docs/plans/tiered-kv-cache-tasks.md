@@ -38,8 +38,8 @@ Every phase below has three subsections:
 | `metal_kv_pool` | NO | YES ✓ |
 | `metal_prefix_cache` | NO | YES ✓ |
 | `scheduler` | NO (but `scheduler/cuda/*` files import cuda-gated types) | partial |
-| `crates/infer-policy` | n/a (separate crate) | YES ✓ |
-| `crates/infer-observability` | n/a | YES ✓ |
+| `infer/src/scheduler/policy.rs` | internal module | YES ✓ |
+| `infer/src/events.rs` | internal module | YES ✓ |
 | `infer/mlx-sys` | always built when `metal` feature on | YES (with `--features metal`) |
 
 **Lane rules**:
@@ -189,7 +189,7 @@ Every phase below has three subsections:
    - **Bug 3**: `evict()` only considers leaves; after removing a leaf, the now-childless parent should become a candidate in the same pass. SGLang re-pushes the orphaned parent onto its heap.
 3. **`session_id` does NOT become a cache key.** It stays in `SchedulerSignals` (already plumbed via commit `3e1d35f`) for slot affinity. The radix cache stays content-addressed.
 4. **`_cache` + free queue dual residency** is the vLLM pattern we'll need in P2 — cached blocks must remain reachable by hash even after their refcount drops to 0, until physically reassigned. Note this for the `TieredKvCache` directory shape.
-5. **Third independent cached_prompt site** at `server_engine.rs:437-475` (`prepare_with_prefix_cache`) — a single-slot linear compare against `self.cached_prompt`. P1 (b) should thread the `RadixCache` handle through `GenericServerEngine` too so there is **one** prefix cache per engine, not three.
+5. **Third independent cached_prompt site** at `server_engine.rs:437-475` (`prepare_with_prefix_cache`) — a single-slot linear compare against `self.cached_prompt`. P1 (b) should thread the `RadixCache` handle through `ModelInferenceEngine` too so there is **one** prefix cache per engine, not three.
 
 ---
 
@@ -198,7 +198,7 @@ Every phase below has three subsections:
 ### 3.1 Lane breakdown
 
 #### Structural PR (a) — Local (Mac)
-- [ ] `[L]` `crates/infer-policy/src/lib.rs` — add `EvictionPolicy` trait, `EvictionCandidate`, `SessionState`, `LruEviction` + `ReuseBiasedLru` + `HitCountLru` + `SessionBiasedLru` default. Pure scoring functions, no IO, no state mutation in `score()`.
+- [ ] `[L]` `infer/src/scheduler/policy.rs` — add `EvictionPolicy` trait, `EvictionCandidate`, `SessionState`, `LruEviction` + `ReuseBiasedLru` + `HitCountLru` + `SessionBiasedLru` default. Pure scoring functions, no IO, no state mutation in `score()`.
 - [ ] `[L]` Unit tests for all 4 default policy impls — pure Rust, fully local
 - [ ] `[L+R]` Add `infer/src/kv_tier/transport.rs` — `KVTransport` trait surface (this trait gets frozen in P5; P2 introduces it under a draft form)
 - [ ] `[L+R]` Add `infer/src/kv_tier/transport/local_cuda.rs` — `LocalCudaTransport` over `cudarc` async copy. Code-writeable on Mac, only `cargo build --release` on remote can verify
@@ -256,7 +256,7 @@ Every phase below has three subsections:
 - [Tokio cancel-safety RFD 400](https://rfd.shared.oxide.computer/rfd/400) — production patterns
 - [Cybernetist — Rust tokio task cancellation patterns](https://cybernetist.com/2024/04/19/rust-tokio-task-cancellation-patterns/) — `select! { biased; ... }` shape
 
-**Existing `infer-policy` shape** ([`crates/infer-policy/src/lib.rs:64-78,133-152`](file:///path/to/code/agent-infer/crates/infer-policy/src/lib.rs)):
+**Existing scheduler-policy shape** ([`infer/src/scheduler/policy.rs:64-78,133-152`](file:///path/to/code/agent-infer/infer/src/scheduler/policy.rs)):
 ```rust
 pub trait AdmissionPolicy: Send + Sync {
     fn allow(&self, signals: SchedulerSignals) -> bool;
@@ -271,7 +271,9 @@ Both pure scoring functions: `&self`, snapshot in → decision out. No mutable s
 
 1. **Use OS thread + crossbeam, NOT tokio.** Major change from the project doc which said "tokio task". Three reasons:
    - `cudarc::driver::CudaStream` is `!Send` until wrapped in `Arc`; tokio's `spawn` requires `Send + 'static`, forcing pointer dance OS threads avoid.
-   - `infer-core` / `infer-engine` currently pull **zero runtime dependency**; the scheduler runs on a raw `std::thread`. Staying off tokio keeps the layering clean.
+   - the relevant `infer` modules currently pull **zero runtime dependency**;
+     the scheduler runs on a raw `std::thread`. Staying off tokio keeps the
+     layering clean.
    - Cancel-safety becomes trivial: every `await` becomes `recv_timeout(1ms)`. No `select!` foot-guns.
 2. **Two dedicated streams, not one.** `write_stream` (D2H) + `load_stream` (H2D). The project doc's "one dedicated copy stream" was incomplete.
 3. **Layer-granular `cudaEvent` sync, not whole-request.** Record event on copy stream per layer; attention kernel waits on `compute_stream.wait_event(ev)` before reading that layer. Matches SGLang `LayerLoadingEvent`.
@@ -412,14 +414,14 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 ### 5.1 Lane breakdown
 
 #### Local (Mac)
-- [ ] `[L]` `crates/infer-policy/src/lib.rs` — `ReuseDistancePolicy` impl of `EvictionPolicy` (the trait shape from P2 accommodates this without modification; see §5.3)
+- [ ] `[L]` `infer/src/scheduler/policy.rs` — `ReuseDistancePolicy` impl of `EvictionPolicy` (the trait shape from P2 accommodates this without modification; see §5.3)
 - [ ] `[L]` `SessionArrivalTracker { rings: HashMap<SessionId, ArrivalRing>, alpha: f32 }` — internal state, RwLock or Mutex
 - [ ] `[L]` Unit tests with synthetic turn histories: predicted next-access-time, eviction ordering, cold-fallback to LRU
 - [ ] `[L]` `infer/src/kv_tier/directory.rs` — per-session ring buffer integration (mirror in pure-Rust under non-cuda mod for local check)
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs:135-152` — replace `best_prefix_slot` linear scan with Mooncake Algorithm 1: `cost(slot) = T_prefill_est + slot.residual_decode_cost + spill_penalty(slot)`
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs` — plumb `session_id` and `now` into slot selection (already partially threaded per commit `82a19b1`)
 - [ ] `[L]` `cargo check` both `--features no-cuda` and `--features metal`
-- [ ] `[L]` Pure-Rust test in `crates/infer-policy/tests/`: cross-session hit rate ≥85% on synthetic interleaved-session trace
+- [ ] `[L]` Pure-Rust test in `infer/src/scheduler/policy.rs`: cross-session hit rate ≥85% on synthetic interleaved-session trace
 
 #### Remote GPU
 - [ ] `[R]` Cross-session bench, 2-session alternating: prefix hit rate ≥85% (vs ≥70% in P1)
@@ -479,7 +481,7 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 #### Local (Mac) — entirely `[L]`
 - [ ] `[L]` Add `infer/src/kv_tier/transport/nixl.rs` — `NixlTransport` skeleton; `register / deregister` fully implemented (just calls into `nixl-sys::Agent::register_memory`); `put_batch / get_batch / poll / abort` return `todo!("P6")`
 - [ ] `[L]` Edit `infer/Cargo.toml` — add `nixl-sys = { version = "1.0", optional = true, features = ["stub-api"] }`; add features `rdma-nixl = ["dep:nixl-sys"]` (default = stub-api active) and `rdma-nixl-real = ["dep:nixl-sys"]` (no stub-api, links real libnixl.so on remote CUDA box)
-- [ ] `[L]` `crates/infer-observability` — add new variant of `RequestEventKind` for `TierTransition { from: Tier, to: Tier, bytes: u64, micros: u64 }`. Keep `EventSink::emit` signature stable
+- [ ] `[L]` `infer/src/events.rs` — add new variant of `RequestEventKind` for `TierTransition { from: Tier, to: Tier, bytes: u64, micros: u64 }`. Keep `EventSink::emit` signature stable
 - [ ] `[L]` Verify trait surface has not changed since P2 — if it has, go back and fix P2 instead of forking
 - [ ] `[L]` `cargo check --no-default-features --features no-cuda` — default still compiles (no nixl-sys dep)
 - [ ] `[L]` `cargo check --no-default-features --features no-cuda,rdma-nixl` — stub-api path compiles on Mac WITHOUT `libnixl.so`
@@ -582,7 +584,7 @@ int getNotifies(std::vector<NotifyDesc>& notifies);
 
    pub enum MemKind { Host, Vram { device: u32 }, Block { volume: u32 } }
    ```
-   `MemKind` maps 1:1 with NIXL's `MemType` for future-compat with GDS without enlarging the surface. A `Future` adapter (`TransportFuture<T>`) lives in `infer-engine`, NOT in the trait — keeps the trait `no_std`-friendly.
+   `MemKind` maps 1:1 with NIXL's `MemType` for future-compat with GDS without enlarging the surface. A `Future` adapter (`TransportFuture<T>`) lives in `infer`, NOT in the trait — keeps the trait `no_std`-friendly.
 2. **`BlockLocation::Remote` opaque + tag** (final shape):
    ```rust
    pub struct RemoteBlockDesc {
@@ -747,6 +749,6 @@ These should already be running by the time P0 edits land:
 - `infer/src/metal_gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
 - `infer/mlx-sys/src/lib.rs`
 - `infer/csrc/cuda/{paged_kv_append,decode_prep_paged,decode_prep_paged_hd256,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
-- `crates/infer-policy/src/lib.rs:64-78,133-152` — existing `AdmissionPolicy` / `ChunkingPolicy`
-- `crates/infer-observability/src/lib.rs:7-24` — existing `EngineEvent` / `EventSink`
+- `infer/src/scheduler/policy.rs:64-78,133-152` — existing `AdmissionPolicy` / `ChunkingPolicy`
+- `infer/src/events.rs:7-24` — existing `EngineEvent` / `EventSink`
 - `crates/infer-agent/src/lib.rs:166-188` — `AgentSession::save_to_path / load_from_path` (JSON-only today)

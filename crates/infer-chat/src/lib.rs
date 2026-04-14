@@ -1,28 +1,33 @@
 //! OpenAI-compatible chat request/response types layered on top of the shared
 //! chat/tool-call protocol helpers in [`crate::protocol`].
+//!
+//! Naming convention:
+//! - Types and functions prefixed `OpenAi` / `openai_` are the OpenAI wire
+//!   format (HTTP request/response bodies).
+//! - Unprefixed types and functions (`ChatMessage`, `ToolCall`, `ToolDefinition`,
+//!   `messages_to_prompt`, `parse_tool_calls`) are the internal canonical
+//!   protocol format, re-exported from [`crate::protocol`].
 
 pub mod protocol;
 
 pub use protocol::{
-    ChatMessage as ProtocolChatMessage, ChatRole, ParsedAssistantResponse, ToolCall,
-    ToolCall as ProtocolToolCall, ToolDefinition as ProtocolToolDefinition, build_tool_block,
-    messages_to_prompt as protocol_messages_to_prompt,
-    parse_tool_calls as parse_protocol_tool_calls,
+    ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition, build_tool_block,
+    messages_to_prompt, parse_tool_calls,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// A single message in a chat conversation.
+/// A single message in a chat conversation, in OpenAI wire format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChatMessage {
+pub struct OpenAiChatMessage {
     pub role: String,
     /// Text content. `None` when the assistant message contains only tool calls.
     #[serde(default)]
     pub content: Option<String>,
     /// Tool calls emitted by the assistant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCallObject>,
+    pub tool_calls: Vec<OpenAiToolCall>,
     /// Present on `tool` role messages — the call id being responded to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -33,16 +38,16 @@ pub struct ChatMessage {
 
 /// OpenAI-format tool call object embedded in an assistant message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolCallObject {
+pub struct OpenAiToolCall {
     pub id: String,
     #[serde(rename = "type")]
     pub call_type: String,
-    pub function: FunctionCall,
+    pub function: OpenAiFunctionCall,
 }
 
 /// Function name + JSON-encoded arguments.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FunctionCall {
+pub struct OpenAiFunctionCall {
     pub name: String,
     /// JSON string (not parsed object) — matches OpenAI wire format.
     pub arguments: String,
@@ -50,31 +55,29 @@ pub struct FunctionCall {
 
 /// Tool definition passed in a chat completion request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolDefinition {
+pub struct OpenAiToolDefinition {
     #[serde(rename = "type")]
     pub tool_type: String,
-    pub function: FunctionDefinition,
+    pub function: OpenAiFunctionDefinition,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FunctionDefinition {
+pub struct OpenAiFunctionDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Option<Value>,
 }
 
-pub type ParsedToolCall = ToolCall;
-
-impl From<&ToolCallObject> for ToolCall {
-    fn from(tool_call: &ToolCallObject) -> Self {
+impl From<&OpenAiToolCall> for ToolCall {
+    fn from(tool_call: &OpenAiToolCall) -> Self {
         let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
             .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
         Self::new(tool_call.function.name.clone(), arguments)
     }
 }
 
-impl From<&ChatMessage> for ProtocolChatMessage {
-    fn from(message: &ChatMessage) -> Self {
+impl From<&OpenAiChatMessage> for ChatMessage {
+    fn from(message: &OpenAiChatMessage) -> Self {
         let tool_calls = message.tool_calls.iter().map(ToolCall::from).collect();
 
         Self {
@@ -85,8 +88,8 @@ impl From<&ChatMessage> for ProtocolChatMessage {
     }
 }
 
-impl From<&ToolDefinition> for ProtocolToolDefinition {
-    fn from(tool: &ToolDefinition) -> Self {
+impl From<&OpenAiToolDefinition> for ToolDefinition {
+    fn from(tool: &OpenAiToolDefinition) -> Self {
         Self::new(
             tool.function.name.clone(),
             tool.function.description.clone().unwrap_or_default(),
@@ -100,26 +103,23 @@ impl From<&ToolDefinition> for ProtocolToolDefinition {
 
 /// Convert an OpenAI messages array + optional tool definitions into a
 /// ChatML prompt string ready for inference.
-pub fn messages_to_prompt(messages: &[ChatMessage], tools: &[ToolDefinition]) -> String {
-    let protocol_messages = messages
-        .iter()
-        .map(ProtocolChatMessage::from)
-        .collect::<Vec<_>>();
-    let protocol_tools = tools
-        .iter()
-        .map(ProtocolToolDefinition::from)
-        .collect::<Vec<_>>();
-    protocol_messages_to_prompt(&protocol_messages, &protocol_tools)
+pub fn openai_messages_to_prompt(
+    messages: &[OpenAiChatMessage],
+    tools: &[OpenAiToolDefinition],
+) -> String {
+    let protocol_messages = messages.iter().map(ChatMessage::from).collect::<Vec<_>>();
+    let protocol_tools = tools.iter().map(ToolDefinition::from).collect::<Vec<_>>();
+    messages_to_prompt(&protocol_messages, &protocol_tools)
 }
 
 /// Parse `<tool_call>...</tool_call>` blocks from model output.
 /// Returns `(visible_content, tool_calls)` where `visible_content` has the
 /// tool call blocks and `<think>` blocks stripped.
-pub fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+pub fn openai_parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let ParsedAssistantResponse {
         content,
         tool_calls,
-    } = parse_protocol_tool_calls(text);
+    } = parse_tool_calls(text);
     (content, tool_calls)
 }
 
@@ -129,36 +129,36 @@ mod tests {
 
     #[test]
     fn basic_user_message() {
-        let msgs = vec![ChatMessage {
+        let msgs = vec![OpenAiChatMessage {
             role: "user".into(),
             content: Some("hello".into()),
             tool_calls: vec![],
             tool_call_id: None,
             name: None,
         }];
-        let prompt = messages_to_prompt(&msgs, &[]);
+        let prompt = openai_messages_to_prompt(&msgs, &[]);
         assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
     fn tool_definition_injected_into_system() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![OpenAiToolDefinition {
             tool_type: "function".into(),
-            function: FunctionDefinition {
+            function: OpenAiFunctionDefinition {
                 name: "shell".into(),
                 description: Some("Run a shell command".into()),
                 parameters: None,
             },
         }];
-        let msgs = vec![ChatMessage {
+        let msgs = vec![OpenAiChatMessage {
             role: "user".into(),
             content: Some("hi".into()),
             tool_calls: vec![],
             tool_call_id: None,
             name: None,
         }];
-        let prompt = messages_to_prompt(&msgs, &tools);
+        let prompt = openai_messages_to_prompt(&msgs, &tools);
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains(r#""name":"shell""#));
     }
@@ -169,7 +169,7 @@ mod tests {
 <tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>"#;
-        let (content, calls) = parse_tool_calls(text);
+        let (content, calls) = openai_parse_tool_calls(text);
         assert_eq!(content, "Let me check that.");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
@@ -178,14 +178,14 @@ mod tests {
 
     #[test]
     fn invalid_openai_tool_arguments_fall_back_to_string() {
-        let prompt = messages_to_prompt(
-            &[ChatMessage {
+        let prompt = openai_messages_to_prompt(
+            &[OpenAiChatMessage {
                 role: "assistant".into(),
                 content: None,
-                tool_calls: vec![ToolCallObject {
+                tool_calls: vec![OpenAiToolCall {
                     id: "call_1".into(),
                     call_type: "function".into(),
-                    function: FunctionCall {
+                    function: OpenAiFunctionCall {
                         name: "shell".into(),
                         arguments: "not-json".into(),
                     },

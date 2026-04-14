@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::server_engine::{CompleteOutput, StreamDelta};
-use infer_chat::{ChatMessage, ProtocolToolCall, ToolDefinition, parse_tool_calls};
-use infer_core::SessionId;
+use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
+use crate::types::SessionId;
+use infer_chat::{OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls};
 
 /// Normalize a raw string session hint from a client request. Empty / whitespace
 /// ids are dropped so that "" and `null` behave identically.
@@ -110,8 +110,8 @@ struct Usage {
     total_tokens: usize,
 }
 
-impl From<crate::server_engine::Usage> for Usage {
-    fn from(value: crate::server_engine::Usage) -> Self {
+impl From<crate::server_engine::TokenUsage> for Usage {
+    fn from(value: crate::server_engine::TokenUsage) -> Self {
         Self {
             prompt_tokens: value.prompt_tokens,
             completion_tokens: value.completion_tokens,
@@ -121,7 +121,7 @@ impl From<crate::server_engine::Usage> for Usage {
 }
 
 impl CompletionResponse {
-    pub(super) fn from_output(model: String, created: u64, output: CompleteOutput) -> Self {
+    pub(super) fn from_output(model: String, created: u64, output: CompletionOutput) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4()),
             object: "text_completion",
@@ -167,7 +167,7 @@ impl StreamChunk {
         request_id: &str,
         created: u64,
         model: &str,
-        delta: StreamDelta,
+        delta: CompletionStreamDelta,
     ) -> Self {
         Self {
             id: request_id.to_string(),
@@ -202,7 +202,7 @@ impl StreamUsageChunk {
         request_id: &str,
         created: u64,
         model: &str,
-        usage: crate::server_engine::Usage,
+        usage: crate::server_engine::TokenUsage,
     ) -> Self {
         Self {
             id: request_id.to_string(),
@@ -222,7 +222,7 @@ impl StreamUsageChunk {
 pub(super) struct ChatCompletionRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,
-    pub(super) messages: Vec<ChatMessage>,
+    pub(super) messages: Vec<OpenAiChatMessage>,
     pub(super) max_tokens: Option<usize>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
@@ -239,7 +239,7 @@ pub(super) struct ChatCompletionRequest {
     pub(super) seed: Option<u64>,
     /// Tool definitions (OpenAI format).
     #[serde(default)]
-    pub(super) tools: Vec<ToolDefinition>,
+    pub(super) tools: Vec<OpenAiToolDefinition>,
     /// Optional client-supplied session/conversation identifier.
     ///
     /// See [`CompletionRequest::session_id`] for the routing contract.
@@ -313,8 +313,8 @@ struct ChatFunctionCall {
     arguments: String,
 }
 
-impl From<&ProtocolToolCall> for ChatToolCall {
-    fn from(value: &ProtocolToolCall) -> Self {
+impl From<&ToolCall> for ChatToolCall {
+    fn from(value: &ToolCall) -> Self {
         Self {
             id: format!("call_{}", Uuid::new_v4().simple()),
             call_type: "function",
@@ -327,8 +327,8 @@ impl From<&ProtocolToolCall> for ChatToolCall {
 }
 
 impl ChatCompletionResponse {
-    pub(super) fn from_output(model: String, created: u64, output: &CompleteOutput) -> Self {
-        let (content, parsed_calls) = parse_tool_calls(&output.text);
+    pub(super) fn from_output(model: String, created: u64, output: &CompletionOutput) -> Self {
+        let (content, parsed_calls) = openai_parse_tool_calls(&output.text);
         let tool_calls: Vec<ChatToolCall> = parsed_calls.iter().map(ChatToolCall::from).collect();
 
         let message = AssistantMessage {
@@ -415,7 +415,7 @@ impl ChatStreamChunk {
         request_id: &str,
         created: u64,
         model: &str,
-        delta: StreamDelta,
+        delta: CompletionStreamDelta,
     ) -> Self {
         let finish_reason = delta.finish_reason.map(|r| r.as_openai_str().to_string());
         Self {
@@ -453,7 +453,7 @@ impl ChatStreamUsageChunk {
         request_id: &str,
         created: u64,
         model: &str,
-        usage: crate::server_engine::Usage,
+        usage: crate::server_engine::TokenUsage,
     ) -> Self {
         Self {
             id: request_id.to_string(),

@@ -1,12 +1,12 @@
 use super::*;
+use crate::events::{EngineEvent, EventSink};
 use crate::sampler::SamplingParams;
-use crate::server_engine::StreamDelta;
-use infer_core::{InferenceMode, RequestEventKind, RequestId};
-use infer_observability::{EngineEvent, EventSink};
+use crate::server_engine::CompletionStreamDelta;
+use crate::types::{InferenceMode, RequestEventKind, RequestId};
 use std::sync::{Arc, Mutex};
 
 fn make_request() -> IncomingRequest {
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<CompletionStreamDelta>();
     IncomingRequest {
         prompt: "hello".to_string(),
         max_tokens: 32,

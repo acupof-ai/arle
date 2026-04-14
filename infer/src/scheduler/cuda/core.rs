@@ -1,6 +1,6 @@
 use super::*;
-use infer_core::InferenceMode;
-use infer_policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
+use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
+use crate::types::InferenceMode;
 
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {

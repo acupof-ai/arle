@@ -1,3 +1,9 @@
+> **ARCHIVED 2026-04-15 — Superseded by Route-A refactor.** The four-crate split
+> this plan described (`infer-core` / `infer-engine` / `infer-observability` /
+> `infer-policy`) was folded back into `infer` after it became clear the split
+> did not achieve real independence. See `docs/codebase-map.md` for the current
+> layout. This file is retained for history only.
+
 # Round 3 · Extract `backend`/`ops`/`model`/`scheduler` into `crates/infer-engine`
 
 **Owner:** remote Linux CUDA host (the only environment where nvcc + real GPU tests can run)

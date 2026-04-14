@@ -7,7 +7,7 @@ Round 2 (April 2026) collapsed the `infer/src/` root from 39 top-level `.rs` fil
 | F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** (`19a433d`) | [`backend-metal-split.md`](backend-metal-split.md) |
 | F2 | Audit `backend/cuda/graph_pool.rs` — deliberate scaffold or dead code? | ckl (decision), remote CUDA host (if wire-in) | **parked** (`Option B`) | §F2 below |
 | F3 | Document `--features cuda,no-cuda` type-check invocation | me | **done** (commit `4b493c8`) | — |
-| Round 3 | Extract `backend`/`ops`/`model`/`scheduler` into `crates/infer-engine` | remote Linux CUDA host | **queued** (starts after F1 lands) | [`cuda-crate-extraction.md`](cuda-crate-extraction.md) |
+| Round 3 | Extracted-runtime split | remote Linux CUDA host | **reverted** (2026-04-15, Route-A) | [`../archives/cuda-crate-extraction.md`](../archives/cuda-crate-extraction.md) |
 
 ## Ordering & coordination
 
@@ -18,14 +18,17 @@ F1 (codex, local Mac)  ──┐
      ↓                    │
      ↓                    F2 decision (ckl, any time — does not block F1)
      ↓                    │
-Round 3 (remote CUDA) ←──┘
+Round 3 (reverted by Route A) ←──┘
      ↓
     ship
 ```
 
-**F1 and Round 3 must be sequential**, not parallel. Round 3 Layer 1 moves `backend/metal/*` wholesale into `crates/infer-engine/`; if F1 is in flight at the same time, every `pub mod` line in `backend/metal.rs` collides and the cross-crate visibility decisions have to be redone. F1 first, Round 3 second.
+**F1 and Round 3 were sequential**, not parallel. That dependency no longer
+matters for current work because Route A reverted the extracted-runtime split
+before it ever shipped.
 
-**F2 can run in parallel** with either F1 or Round 3 because it touches only `backend/cuda/graph_pool.rs` (independent module, no internal consumers). But if Round 3 starts before F2 is decided, the decision has to be re-made in the new location (`crates/infer-engine/src/backend/cuda/graph_pool.rs`). Cleaner to close F2 before Round 3 ships.
+**F2 can still run in parallel** with follow-up backend work because it touches
+only `backend/cuda/graph_pool.rs` (independent module, no internal consumers).
 
 ---
 
@@ -195,26 +198,14 @@ This was the single most useful undocumented trick discovered during Round 2. It
 
 ## Round 3 · Crate extraction
 
-Owner: remote Linux CUDA host.
-Plan doc: [`cuda-crate-extraction.md`](cuda-crate-extraction.md) (self-contained, remote-executable).
-Prerequisites: Round 2 housekeeping merged ✓, F1 merged, ideally F2 decided (but not strictly required).
+> **Reversal note (2026-04-15):** Route A executed the opposite move. The
+> experimental extracted-runtime split was rolled back and the four
+> pseudo-independent crates were folded back into `infer`. The historical plan
+> is archived at [`../archives/cuda-crate-extraction.md`](../archives/cuda-crate-extraction.md).
 
-**What it does (summary).** Moves `backend/`, `ops/`, `model/`, `scheduler/`, `weight_loader.rs`, `gguf.rs`, `hf_hub.rs`, and several utility modules from the monolithic `infer` crate into `crates/infer-engine`. Secondary moves: `metrics.rs` / `trace_reporter.rs` / `logging.rs` → `crates/infer-observability`; optionally `sampler.rs` / `tokenizer.rs` / `error.rs` → `crates/infer-core`. The `infer` crate shrinks from ~44 000 lines to ~8 000 and becomes the thin http + bin shell it should always have been.
-
-**Why remote.** Layers 1–4 of Round 3 touch CUDA hot paths. Darwin can only verify rustc type-check via `cargo check --features cuda,no-cuda`; it cannot run the real nvcc build, cannot run e2e tests, and cannot run throughput benchmarks. A refactor of this size needs real CUDA integration validation — that's only available on the remote Linux host. Do not attempt Round 3 on Darwin except to prototype.
-
-**Exit criteria.** Six commits (Layer 0 feature prep + Layers 1–5) on `main`, each atomic, each verified locally on Darwin via the rustc-only matrix AND on the remote CUDA host via:
-- `CUDA_HOME=/usr/local/cuda cargo build --release`
-- `cargo test --release --lib`
-- `PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e`
-- `cargo test --release --test e2e_qwen35`
-- `scripts/bench_throughput_sweep.py --label round3-layer-N-after` with ≤ 1% throughput delta vs. the pre-Round-3 baseline snapshot.
-
-**Coordination note.** Round 3 is a large refactor — 5 atomic layers, potentially 500+ files touched across layers. Do not start without:
-1. F1 merged (confirmed via the F1 status row above).
-2. F2 decision made OR an explicit note saying "F2 defer, graph_pool carries over".
-3. A pre-Round-3 throughput sweep snapshot committed to `docs/experience/wins/YYYY-MM-DD-bench-pre-round3.md` — so regression detection is possible.
-4. A clean `origin/main` — no other PRs open that would conflict with the crate boundary.
+No further action remains under this heading. Any future runtime topology work
+should start from the current in-tree `infer` layout, not from the archived
+Round 3 split plan.
 
 ---
 

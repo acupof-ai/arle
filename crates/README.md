@@ -1,18 +1,17 @@
 # Workspace crates
 
-This folder hosts the extracted workspace crates around `infer`:
+This folder hosts the reusable crates around `infer`:
 
-- `infer-agent`: reusable CLI-agent session/control-plane logic.
-- `infer-chat`: shared ChatML/tool-call protocol and OpenAI chat surface types.
-- `infer-cli`: reusable REPL/CLI flow for the `agent-infer` binary.
-- `infer-core`: shared domain types.
-- `infer-engine`: runtime adapter boundary for backend-loaded engines; it must stay control-plane agnostic.
-- `infer-observability`: shared event schema + sink trait.
-- `infer-policy`: pluggable admission/chunking policy traits; enqueue admission and decode-aware chunking are wired across the current scheduler/runtime paths, with deeper eviction/KV integration still pending.
-- `infer-tools`: reusable builtin tool definitions and sandboxed execution.
+- `infer-agent`: reusable agent session/control-plane logic
+- `infer-chat`: shared ChatML/tool-call protocol and OpenAI chat surface types
+- `infer-cli`: reusable REPL/CLI flow for the `agent-infer` binary
+- `infer-tools`: reusable builtin tool definitions and sandboxed execution
+- `mlx-sys`: MLX C++ bridge used by the Metal backend
 
-`agent-infer` now depends on `infer-cli`, while `infer-cli` depends on
-`infer-engine`, `infer-agent`, `infer-chat`, and `infer-tools`. The root package
-is reduced to a thin binary wrapper.
-
-This split is still an interim Phase 1 boundary, not the final atomized workspace. The `infer-engine` -> control-plane back edge has been removed; the remaining work is deeper scheduler/KV extraction plus fuller eviction/KV policy wiring in later phases.
+The 2026-04-15 Route-A refactor folded the experimental `infer-core`,
+`infer-engine`, `infer-observability`, and `infer-policy` crates back into
+`infer` as in-tree modules (`types`, `events`, and `scheduler::policy`). The
+old `agent_engine` adapter was also collapsed: its trait and types merged into
+`infer::server_engine` (`InferenceEngine`, `LoadedInferenceEngine`,
+`CompletionRequest`, `CompletionOutput`, `TokenUsage`, …), so the HTTP server
+and the agent CLI now share a single engine contract.

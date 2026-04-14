@@ -2,6 +2,7 @@
 //! for CUDA graph capture over scheduler's direct graph handling. Not wired in.
 //! Revisit when scheduler area is actively being worked on.
 #![allow(dead_code)]
+#![allow(unreachable_pub)]
 //! Batched CUDA graph pool for multi-request decode.
 //!
 //! The decode path in vLLM/sglang replays pre-captured CUDA graphs to

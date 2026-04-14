@@ -1,3 +1,7 @@
+#[cfg(any(feature = "metal", feature = "cpu"))]
+use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(any(feature = "metal", feature = "cpu", test))]
+use std::path::Path;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
@@ -12,10 +16,16 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(any(feature = "metal", feature = "cpu"))]
+use crate::backend::InferenceBackend;
+#[cfg(feature = "cpu")]
+use crate::backend::cpu::CpuBackend;
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::bootstrap::{
-    EngineOptions, ModelType, ServerRuntimeConfig, detect_model_type, model_id_from_path,
+    InferenceEngineOptions, ModelType, ServerRuntimeConfig, detect_model_type,
 };
+#[cfg(feature = "metal")]
+use crate::backend::metal::MetalBackend;
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
@@ -24,7 +34,7 @@ use crate::tokenizer::Tokenizer;
 
 /// Truncate at the first occurrence of any stop string (OpenAI-compatible).
 /// Returns the prefix of `text` up to (but not including) the earliest stop.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu", test))]
 fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
     let mut earliest = None::<usize>;
     for s in stops {
@@ -74,7 +84,35 @@ fn truncate_at_stop<'a>(
     })
 }
 
-pub struct CompleteRequest {
+#[cfg(any(feature = "metal", feature = "cpu", test))]
+fn model_id_from_path(model_path: &str) -> String {
+    Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path)
+        .to_string()
+}
+
+#[cfg(any(feature = "metal", feature = "cpu"))]
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+#[cfg(any(feature = "metal", feature = "cpu", test))]
+fn parse_finish_reason(finish_reason: &str) -> FinishReason {
+    match finish_reason {
+        "length" => FinishReason::Length,
+        _ => FinishReason::Stop,
+    }
+}
+
+pub struct CompletionRequest {
     pub prompt: String,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
@@ -99,31 +137,31 @@ impl FinishReason {
     }
 }
 
-pub struct CompleteOutput {
+pub struct CompletionOutput {
     pub text: String,
     pub finish_reason: FinishReason,
-    pub usage: Usage,
+    pub usage: TokenUsage,
     /// Per-token log-probabilities (greedy only). Empty if logprobs not requested.
     pub token_logprobs: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Usage {
+pub struct TokenUsage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
 }
 
-pub struct StreamDelta {
+pub struct CompletionStreamDelta {
     pub text_delta: String,
     pub finish_reason: Option<FinishReason>,
-    pub usage: Option<Usage>,
+    pub usage: Option<TokenUsage>,
     /// Log-probability of the generated token (greedy only, None otherwise).
     #[allow(dead_code)]
     pub logprob: Option<f32>,
 }
 
-impl StreamDelta {
+impl CompletionStreamDelta {
     /// Create a text delta (no finish, no logprob).
     pub fn text(s: String) -> Self {
         Self {
@@ -135,18 +173,18 @@ impl StreamDelta {
     }
 }
 
-pub trait ServerEngine: Send {
+pub trait InferenceEngine: Send {
     /// Returns the model identifier (e.g. `"Qwen3-8B"`).
     fn model_id(&self) -> &str;
 
     /// Run a complete generation request synchronously and return the full output.
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput>;
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput>;
 
     /// Run a generation request, streaming token deltas through `tx` as they are produced.
     fn complete_stream(
         &mut self,
-        req: CompleteRequest,
-        tx: UnboundedSender<StreamDelta>,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
 }
 
@@ -374,17 +412,17 @@ fn generate_streaming_with_callback<M: ModelForward>(
 }
 
 // ============================================================================
-// Generic server engine — shared complete/complete_stream logic
+// Model inference engine — shared complete/complete_stream logic
 // ============================================================================
 
 /// Legacy single-request inference engine.
 ///
 /// **Deprecated**: Use [`crate::scheduler::Scheduler`] for production serving.
-/// `GenericServerEngine` processes one request at a time with no batching or
+/// `ModelInferenceEngine` processes one request at a time with no batching or
 /// continuous scheduling. It remains for the agent CLI REPL and E2E tests.
 /// New features should target the `Scheduler` path.
 #[cfg(feature = "cuda")]
-pub struct GenericServerEngine<M: ModelForward> {
+pub struct ModelInferenceEngine<M: ModelForward> {
     model_id: String,
     model: M,
     state: M::State,
@@ -395,7 +433,7 @@ pub struct GenericServerEngine<M: ModelForward> {
 }
 
 #[cfg(feature = "cuda")]
-impl<M: ModelForward> GenericServerEngine<M> {
+impl<M: ModelForward> ModelInferenceEngine<M> {
     fn from_model_components(
         components: crate::backend::cuda::bootstrap::ModelComponents<M>,
         seed: u64,
@@ -512,12 +550,12 @@ impl<M: ModelForward> GenericServerEngine<M> {
 }
 
 #[cfg(feature = "cuda")]
-impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
+impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
     fn model_id(&self) -> &str {
         &self.model_id
     }
 
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let (effective, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
         let (output_tokens, token_logprobs) = if req.logprobs && req.sampling.is_greedy() {
@@ -557,12 +595,12 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             text = truncated;
             finish_reason = FinishReason::Stop;
         }
-        let usage = Usage {
+        let usage = TokenUsage {
             prompt_tokens: prompt_tokens.len(),
             completion_tokens,
             total_tokens: output_tokens.len(),
         };
-        Ok(CompleteOutput {
+        Ok(CompletionOutput {
             text,
             finish_reason,
             usage,
@@ -572,8 +610,8 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 
     fn complete_stream(
         &mut self,
-        req: CompleteRequest,
-        tx: UnboundedSender<StreamDelta>,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let (tokens_to_process, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
@@ -612,7 +650,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                         {
                             if !to_send.is_empty()
                                 && tx
-                                    .send(StreamDelta {
+                                    .send(CompletionStreamDelta {
                                         text_delta: to_send,
                                         finish_reason: None,
                                         usage: None,
@@ -628,7 +666,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                         }
                         let to_send = &new_full[sent_len..];
                         sent_len = new_full.len();
-                        tx.send(StreamDelta {
+                        tx.send(CompletionStreamDelta {
                             text_delta: to_send.to_string(),
                             finish_reason: None,
                             usage: None,
@@ -636,7 +674,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                         })
                         .is_ok()
                     } else {
-                        tx.send(StreamDelta {
+                        tx.send(CompletionStreamDelta {
                             text_delta,
                             finish_reason: None,
                             usage: None,
@@ -668,7 +706,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                 let new_full = decoder.emitted_text().to_string();
                 if let Some((to_send, _)) = truncate_at_stop(&new_full, sent_len, stop_list) {
                     if !to_send.is_empty() {
-                        let _ = tx.send(StreamDelta {
+                        let _ = tx.send(CompletionStreamDelta {
                             text_delta: to_send,
                             finish_reason: None,
                             usage: None,
@@ -678,7 +716,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                 } else {
                     let to_send = &new_full[sent_len..];
                     if !to_send.is_empty() {
-                        let _ = tx.send(StreamDelta {
+                        let _ = tx.send(CompletionStreamDelta {
                             text_delta: to_send.to_string(),
                             finish_reason: None,
                             usage: None,
@@ -687,7 +725,7 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
                     }
                 }
             } else {
-                let _ = tx.send(StreamDelta {
+                let _ = tx.send(CompletionStreamDelta {
                     text_delta,
                     finish_reason: None,
                     usage: None,
@@ -702,10 +740,10 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
             FinishReason::Length
         };
 
-        let _ = tx.send(StreamDelta {
+        let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
-            usage: Some(Usage {
+            usage: Some(TokenUsage {
                 prompt_tokens: prompt_tokens.len(),
                 completion_tokens: stats.emitted_tokens,
                 total_tokens: prompt_tokens.len() + stats.emitted_tokens,
@@ -726,26 +764,134 @@ impl<M: ModelForward> ServerEngine for GenericServerEngine<M> {
 // ============================================================================
 
 #[cfg(feature = "cuda")]
-pub type RealServerEngine = GenericServerEngine<Qwen3Model>;
+pub type Qwen3InferenceEngine = ModelInferenceEngine<Qwen3Model>;
 #[cfg(feature = "cuda")]
-pub type Qwen35ServerEngine = GenericServerEngine<Qwen35Model>;
+pub type Qwen35InferenceEngine = ModelInferenceEngine<Qwen35Model>;
 #[cfg(feature = "cuda")]
-pub type GLM4ServerEngine = GenericServerEngine<GLM4Model>;
+pub type GLM4InferenceEngine = ModelInferenceEngine<GLM4Model>;
 
-#[cfg(feature = "cuda")]
-pub enum LoadedServerEngine {
-    Qwen3(RealServerEngine),
-    Qwen35(Qwen35ServerEngine),
-    GLM4(GLM4ServerEngine),
+#[cfg(any(feature = "metal", feature = "cpu"))]
+pub struct BackendInferenceEngine<B: InferenceBackend> {
+    model_id: String,
+    backend: B,
+}
+
+#[cfg(feature = "metal")]
+impl BackendInferenceEngine<MetalBackend> {
+    fn load(model_path: &str) -> Result<Self> {
+        let mut backend = MetalBackend::new();
+        backend.load(Path::new(model_path))?;
+        Ok(Self {
+            model_id: model_id_from_path(model_path),
+            backend,
+        })
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl BackendInferenceEngine<CpuBackend> {
+    fn load(model_path: &str) -> Result<Self> {
+        let mut backend = CpuBackend::new();
+        backend.load(Path::new(model_path))?;
+        Ok(Self {
+            model_id: model_id_from_path(model_path),
+            backend,
+        })
+    }
+}
+
+#[cfg(any(feature = "metal", feature = "cpu"))]
+impl<B: InferenceBackend> InferenceEngine for BackendInferenceEngine<B> {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
+        let mut sampling = req.sampling;
+        sampling.max_new_tokens = Some(req.max_tokens);
+
+        let generated = catch_unwind(AssertUnwindSafe(|| {
+            self.backend.generate(&req.prompt, &sampling)
+        }))
+        .map_err(|panic| {
+            anyhow::anyhow!(
+                "{} backend panicked during completion: {}",
+                self.backend.name(),
+                panic_message(panic)
+            )
+        })??;
+
+        let mut text = generated.text;
+        let mut finish_reason = parse_finish_reason(&generated.finish_reason);
+
+        if let Some(stops) = req.stop
+            && let Some(truncated) = truncate_at_first_stop(&text, &stops)
+        {
+            text = truncated;
+            finish_reason = FinishReason::Stop;
+        }
+
+        Ok(CompletionOutput {
+            text,
+            finish_reason,
+            usage: TokenUsage {
+                prompt_tokens: generated.prompt_tokens,
+                completion_tokens: generated.completion_tokens,
+                total_tokens: generated.prompt_tokens + generated.completion_tokens,
+            },
+            token_logprobs: Vec::new(),
+        })
+    }
+
+    fn complete_stream(
+        &mut self,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
+    ) -> Result<()> {
+        let output = self.complete(req)?;
+        if !output.text.is_empty() {
+            let _ = tx.send(CompletionStreamDelta {
+                text_delta: output.text.clone(),
+                finish_reason: None,
+                usage: None,
+                logprob: None,
+            });
+        }
+        let _ = tx.send(CompletionStreamDelta {
+            text_delta: String::new(),
+            finish_reason: Some(output.finish_reason),
+            usage: Some(output.usage),
+            logprob: None,
+        });
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub enum LoadedInferenceEngine {
+    #[cfg(feature = "cuda")]
+    Qwen3(Qwen3InferenceEngine),
+    #[cfg(feature = "cuda")]
+    Qwen35(Qwen35InferenceEngine),
+    #[cfg(feature = "cuda")]
+    GLM4(GLM4InferenceEngine),
+    #[cfg(feature = "metal")]
+    Metal(BackendInferenceEngine<MetalBackend>),
+    #[cfg(feature = "cpu")]
+    Cpu(BackendInferenceEngine<CpuBackend>),
 }
 
 #[cfg(feature = "cuda")]
-impl RealServerEngine {
+impl Qwen3InferenceEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, EngineOptions::default())
+        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
     }
 
-    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+    pub fn load_with_options(
+        model_path: &str,
+        seed: u64,
+        options: InferenceEngineOptions,
+    ) -> Result<Self> {
         let components =
             crate::backend::cuda::bootstrap::load_qwen3_components(model_path, options)?;
         Self::from_model_components(components, seed)
@@ -757,12 +903,16 @@ impl RealServerEngine {
 }
 
 #[cfg(feature = "cuda")]
-impl Qwen35ServerEngine {
+impl Qwen35InferenceEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, EngineOptions::default())
+        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
     }
 
-    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+    pub fn load_with_options(
+        model_path: &str,
+        seed: u64,
+        options: InferenceEngineOptions,
+    ) -> Result<Self> {
         let components =
             crate::backend::cuda::bootstrap::load_qwen35_components(model_path, options)?;
         Self::from_model_components(components, seed)
@@ -774,12 +924,16 @@ impl Qwen35ServerEngine {
 }
 
 #[cfg(feature = "cuda")]
-impl GLM4ServerEngine {
+impl GLM4InferenceEngine {
     pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, EngineOptions::default())
+        Self::load_with_options(model_path, seed, InferenceEngineOptions::default())
     }
 
-    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+    pub fn load_with_options(
+        model_path: &str,
+        seed: u64,
+        options: InferenceEngineOptions,
+    ) -> Result<Self> {
         let components =
             crate::backend::cuda::bootstrap::load_glm4_components(model_path, options)?;
         Self::from_model_components(components, seed)
@@ -790,77 +944,157 @@ impl GLM4ServerEngine {
     }
 }
 
-#[cfg(feature = "cuda")]
-impl LoadedServerEngine {
-    pub fn load(model_path: &str, seed: u64) -> Result<Self> {
-        Self::load_with_options(model_path, seed, EngineOptions::default())
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl LoadedInferenceEngine {
+    pub fn load(model_path: &str, enable_cuda_graph: bool) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        {
+            return Self::load_with_options(
+                model_path,
+                42,
+                InferenceEngineOptions { enable_cuda_graph },
+            );
+        }
+
+        #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+        {
+            let _ = enable_cuda_graph;
+            return Ok(Self::Metal(BackendInferenceEngine::load(model_path)?));
+        }
+
+        #[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "cpu"))]
+        {
+            let _ = enable_cuda_graph;
+            return Ok(Self::Cpu(BackendInferenceEngine::load(model_path)?));
+        }
+
+        #[allow(unreachable_code)]
+        {
+            let _ = (model_path, enable_cuda_graph);
+            anyhow::bail!("no inference backend enabled")
+        }
     }
 
-    pub fn load_with_options(model_path: &str, seed: u64, options: EngineOptions) -> Result<Self> {
+    #[cfg(feature = "cuda")]
+    pub fn load_with_options(
+        model_path: &str,
+        seed: u64,
+        options: InferenceEngineOptions,
+    ) -> Result<Self> {
         match detect_model_type(model_path)? {
-            ModelType::Qwen3 => Ok(Self::Qwen3(RealServerEngine::load_with_options(
+            ModelType::Qwen3 => Ok(Self::Qwen3(Qwen3InferenceEngine::load_with_options(
                 model_path, seed, options,
             )?)),
-            ModelType::Qwen35 => Ok(Self::Qwen35(Qwen35ServerEngine::load_with_options(
+            ModelType::Qwen35 => Ok(Self::Qwen35(Qwen35InferenceEngine::load_with_options(
                 model_path, seed, options,
             )?)),
-            ModelType::GLM4 => Ok(Self::GLM4(GLM4ServerEngine::load_with_options(
+            ModelType::GLM4 => Ok(Self::GLM4(GLM4InferenceEngine::load_with_options(
                 model_path, seed, options,
             )?)),
         }
     }
 
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::GLM4(_) => "cuda",
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => "metal",
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => "cpu",
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn model_type(&self) -> ModelType {
         match self {
             Self::Qwen3(_) => ModelType::Qwen3,
             Self::Qwen35(_) => ModelType::Qwen35,
             Self::GLM4(_) => ModelType::GLM4,
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => unreachable!("model_type is only defined for CUDA engines"),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => unreachable!("model_type is only defined for CUDA engines"),
         }
     }
 
     pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
         match self {
+            #[cfg(feature = "cuda")]
             Self::Qwen3(engine) => engine.set_max_gpu_kv(max_tokens),
+            #[cfg(feature = "cuda")]
             Self::Qwen35(engine) => engine.set_max_gpu_kv(max_tokens),
+            #[cfg(feature = "cuda")]
             Self::GLM4(engine) => engine.set_max_gpu_kv(max_tokens),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => {
+                let _ = max_tokens;
+            }
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => {
+                let _ = max_tokens;
+            }
         }
     }
 }
 
-#[cfg(feature = "cuda")]
-impl ServerEngine for LoadedServerEngine {
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl InferenceEngine for LoadedInferenceEngine {
     fn model_id(&self) -> &str {
         match self {
+            #[cfg(feature = "cuda")]
             Self::Qwen3(engine) => engine.model_id(),
+            #[cfg(feature = "cuda")]
             Self::Qwen35(engine) => engine.model_id(),
+            #[cfg(feature = "cuda")]
             Self::GLM4(engine) => engine.model_id(),
+            #[cfg(feature = "metal")]
+            Self::Metal(engine) => engine.model_id(),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.model_id(),
         }
     }
 
-    fn complete(&mut self, req: CompleteRequest) -> Result<CompleteOutput> {
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         match self {
+            #[cfg(feature = "cuda")]
             Self::Qwen3(engine) => engine.complete(req),
+            #[cfg(feature = "cuda")]
             Self::Qwen35(engine) => engine.complete(req),
+            #[cfg(feature = "cuda")]
             Self::GLM4(engine) => engine.complete(req),
+            #[cfg(feature = "metal")]
+            Self::Metal(engine) => engine.complete(req),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.complete(req),
         }
     }
 
     fn complete_stream(
         &mut self,
-        req: CompleteRequest,
-        tx: UnboundedSender<StreamDelta>,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
         match self {
+            #[cfg(feature = "cuda")]
             Self::Qwen3(engine) => engine.complete_stream(req, tx),
+            #[cfg(feature = "cuda")]
             Self::Qwen35(engine) => engine.complete_stream(req, tx),
+            #[cfg(feature = "cuda")]
             Self::GLM4(engine) => engine.complete_stream(req, tx),
+            #[cfg(feature = "metal")]
+            Self::Metal(engine) => engine.complete_stream(req, tx),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(engine) => engine.complete_stream(req, tx),
         }
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
-    use super::{truncate_at_first_stop, truncate_at_stop};
+    #[cfg(feature = "cuda")]
+    use super::truncate_at_stop;
+    use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
 
     #[test]
     fn test_truncate_at_first_stop() {
@@ -890,6 +1124,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn test_truncate_at_stop() {
         let stops = ["\n"];
@@ -902,5 +1137,21 @@ mod tests {
             truncate_at_stop("ab\n", 2, &stops),
             Some((String::new(), "\n"))
         );
+    }
+
+    #[test]
+    fn model_id_uses_final_path_segment() {
+        assert_eq!(
+            model_id_from_path("mlx-community/Qwen3-0.6B-4bit"),
+            "Qwen3-0.6B-4bit"
+        );
+        assert_eq!(model_id_from_path("/tmp/models/Qwen3-4B"), "Qwen3-4B");
+    }
+
+    #[test]
+    fn parse_finish_reason_defaults_to_stop() {
+        assert_eq!(parse_finish_reason("length"), FinishReason::Length);
+        assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
+        assert_eq!(parse_finish_reason("tool_calls"), FinishReason::Stop);
     }
 }

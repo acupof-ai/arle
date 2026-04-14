@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
-    CompleteRequest, EngineOptions, FinishReason, Qwen35ServerEngine, ServerEngine, StreamDelta,
+    CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
+    InferenceEngineOptions, Qwen35InferenceEngine,
 };
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3.5-4B");
@@ -44,8 +45,8 @@ fn init_logging() {
     infer::logging::init_stderr("info");
 }
 
-fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
-    CompleteRequest {
+fn make_request(prompt: &str, max_tokens: usize) -> CompletionRequest {
+    CompletionRequest {
         prompt: prompt.to_string(),
         max_tokens,
         sampling: SamplingParams::default(),
@@ -54,7 +55,9 @@ fn make_request(prompt: &str, max_tokens: usize) -> CompleteRequest {
     }
 }
 
-fn drain_deltas(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> Vec<StreamDelta> {
+fn drain_deltas(
+    rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>,
+) -> Vec<CompletionStreamDelta> {
     let mut deltas = Vec::new();
     while let Ok(delta) = rx.try_recv() {
         deltas.push(delta);
@@ -71,10 +74,10 @@ fn test_e2e_qwen35_generation() {
 
     info!("Loading Qwen3.5 engine...");
     let start = Instant::now();
-    let mut engine = Qwen35ServerEngine::load_with_options(
+    let mut engine = Qwen35InferenceEngine::load_with_options(
         MODEL_PATH,
         42,
-        EngineOptions {
+        InferenceEngineOptions {
             enable_cuda_graph: true,
         },
     )
@@ -153,7 +156,7 @@ fn test_e2e_qwen35_generation() {
                     .expect("complete_stream() failed");
             });
 
-            let mut deltas: Vec<StreamDelta> = Vec::new();
+            let mut deltas: Vec<CompletionStreamDelta> = Vec::new();
             let mut ttft = Duration::ZERO;
             let mut tpot_intervals: Vec<Duration> = Vec::new();
             let mut prev_time = start;

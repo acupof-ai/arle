@@ -38,7 +38,7 @@ _Date: 2026-04-14_
 关键现状：
 
 - `infer/src/scheduler/cuda/decode.rs` 现在是 batched single-token decode。
-- `crates/infer-engine/src/model.rs` 里的 `ModelForward` 只有：
+- `infer/src/model.rs` 里的 `ModelForward` 只有：
   - `forward_prefill()`
   - `forward_decode()`
   - `forward_decode_batch()`
@@ -107,7 +107,7 @@ _Date: 2026-04-14_
 建议放置位置：
 
 - request 级元数据：`infer/src/scheduler/cuda/request.rs`
-- GPU buffer / helper：`crates/infer-engine/src/model/*` 或 `crates/infer-engine/src/backend/cuda/*`
+- GPU buffer / helper：`infer/src/model/*` 或 `infer/src/backend/cuda/*`
 
 这个 buffer 的职责：
 
@@ -362,9 +362,9 @@ verify pass 才是主收益路径，优先 capture：
 
 文件：
 
-- `crates/infer-engine/src/model.rs`
-- `crates/infer-engine/src/model/qwen3/*`
-- `crates/infer-engine/src/backend/cuda/paged_kv.rs`
+- `infer/src/model.rs`
+- `infer/src/model/qwen3/*`
+- `infer/src/backend/cuda/paged_kv.rs`
 - `infer/src/scheduler/cuda/request.rs`
 
 ## Phase 3：scheduler 接 speculative

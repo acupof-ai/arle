@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use infer::model::{ModelRuntimeConfig, Qwen3Model};
 use infer::sampler::SamplingParams;
 use infer::scheduler::{IncomingRequest, RequestPriority, Scheduler};
-use infer::server_engine::StreamDelta;
+use infer::server_engine::CompletionStreamDelta;
 use infer::tokenizer::Tokenizer;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -27,7 +27,7 @@ fn init_logging() {
 }
 
 /// Collect the full text output from a stream of deltas.
-fn collect_output(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> String {
+fn collect_output(rx: &mut mpsc::UnboundedReceiver<CompletionStreamDelta>) -> String {
     let mut text = String::new();
     loop {
         match rx.blocking_recv() {
@@ -46,7 +46,10 @@ fn collect_output(rx: &mut mpsc::UnboundedReceiver<StreamDelta>) -> String {
 fn make_request(
     prompt: &str,
     max_tokens: usize,
-) -> (IncomingRequest, mpsc::UnboundedReceiver<StreamDelta>) {
+) -> (
+    IncomingRequest,
+    mpsc::UnboundedReceiver<CompletionStreamDelta>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let req = IncomingRequest {
         prompt: prompt.to_string(),

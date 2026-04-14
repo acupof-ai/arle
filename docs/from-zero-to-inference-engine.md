@@ -33,7 +33,7 @@ SchedulerHandle.submit()  →  channel  →  Scheduler.run()（独占线程）
                                                ↓
                                     model.forward(tokens, &mut state)
                                                ↓
-                                    StreamDelta  →  SSE / JSON 响应
+                                    CompletionStreamDelta  →  SSE / JSON 响应
 ```
 
 核心抽象只有三个：

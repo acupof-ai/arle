@@ -1,6 +1,6 @@
 //! Policy traits for admission and chunking decisions.
 
-use infer_core::InferenceMode;
+use crate::types::InferenceMode;
 
 /// Read-only scheduler signal snapshot for policy decisions.
 ///
