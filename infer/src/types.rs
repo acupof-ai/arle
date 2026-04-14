@@ -2,6 +2,53 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
+/// Opaque identifier for a KV block that is currently resident in some tier.
+///
+/// Scope: lives only as long as the block is in memory or on disk; **not**
+/// stable across restarts, **not** stable across nodes. Used by the radix
+/// tree, the paged KV pool, the block manager, and the tier-aware metadata
+/// on `RadixCache::Node`.
+///
+/// u32 is sufficient for the block counts we expect in any single process:
+/// worst-case `page_size=16` + 80 GB T0 HBM + 1 TB T1 host pinned on
+/// DeepSeek-V3 (64 layers × 8 KV heads × 128 head_dim × bf16 ≈ 256 KB/block)
+/// is roughly 4.5 M blocks — well below 2³². vLLM and SGLang also both use
+/// 32-bit block ids. Keeping `BlockId` at `u32` makes radix-tree nodes
+/// cache-line friendly.
+///
+/// **Do not confuse with [`BlockFingerprint`]**, which is the *content*
+/// hash used for persistence and cross-node reuse. `BlockId` is a pool
+/// slot id, not a content identifier.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct BlockId(pub u32);
+
+/// Content-addressable fingerprint for a KV block's semantic identity.
+///
+/// Stable across processes and across nodes. Two nodes (or two restarts)
+/// that independently prefill the same prefix with the same model produce
+/// the same fingerprint; this is the foundation for cross-node remote-tier
+/// reuse (tiered-kv-cache M5+) and for session save/load (M4).
+///
+/// Construction inputs, in order:
+///   1. model fingerprint (architecture + weight digest + numeric profile)
+///   2. layer index
+///   3. KV format (bf16 / fp8e4m3 / int8 / turboquant-2/3/4)
+///   4. parent fingerprint (chains the radix path for tree-walk-free dedup)
+///   5. token ids of THIS block, in order
+///
+/// Hash function: blake3 truncated to 128 bits. Birthday-bound collision
+/// rate is ~2⁻⁶⁴ for 2³² blocks, safe for any single installation. When
+/// two fingerprints are equal, callers verify the parent_fingerprint chain
+/// to catch the pathological case.
+///
+/// Currently only constructed when a block is actually persisted (M4) or
+/// migrated cross-node (M5). Radix-tree nodes carry an
+/// `Option<BlockFingerprint>` which is `None` for transient in-memory blocks.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct BlockFingerprint(pub [u8; 16]);
+
 /// Stable request identifier across scheduler/runtime boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(pub u64);
@@ -82,6 +129,22 @@ mod tests {
         let a = RequestId(7);
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn block_id_is_copy_and_ordered() {
+        let a = BlockId(1);
+        let b = a;
+        assert_eq!(a, b);
+        assert!(BlockId(1) < BlockId(2));
+    }
+
+    #[test]
+    fn block_fingerprint_round_trips() {
+        let bytes = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let fp = BlockFingerprint(bytes);
+        assert_eq!(fp.0, bytes);
+        assert_eq!(fp, BlockFingerprint(bytes));
     }
 
     #[test]
