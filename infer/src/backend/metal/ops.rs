@@ -1,14 +1,11 @@
-use anyhow::Result;
-
 use super::mlx::{
-    MlxArray, async_eval, clear_cache, concatenate_axis, matmul, quantized_matmul, zeros,
+    async_eval, clear_cache, concatenate_axis, matmul, quantized_matmul, zeros, MlxArray,
 };
 use super::weights::WeightTensor;
 
 #[cfg(feature = "metal")]
-pub(super) fn metal_async_eval(arr: &MlxArray) -> Result<()> {
+pub(super) fn metal_async_eval(arr: &MlxArray) {
     async_eval(&[arr]);
-    Ok(())
 }
 
 #[cfg(feature = "metal")]
@@ -17,15 +14,10 @@ pub(super) fn clear_metal_cache() {
 }
 
 #[cfg(feature = "metal")]
-pub(super) fn extend_kv_cache(
-    cache: &mut MlxArray,
-    n_kv_heads: i32,
-    head_dim: i32,
-    new_cap: i32,
-) -> Result<()> {
+pub(super) fn extend_kv_cache(cache: &mut MlxArray, n_kv_heads: i32, head_dim: i32, new_cap: i32) {
     let current_cap = cache.shape().get(2).copied().unwrap_or_default();
     if new_cap <= current_cap {
-        return Ok(());
+        return;
     }
 
     let extra = zeros(
@@ -33,7 +25,6 @@ pub(super) fn extend_kv_cache(
         cache.dtype(),
     );
     *cache = concatenate_axis(&[cache.clone(), extra], 2);
-    Ok(())
 }
 
 /// `x @ weight.T` — no bias, dispatches to dense matmul or quantized matmul.

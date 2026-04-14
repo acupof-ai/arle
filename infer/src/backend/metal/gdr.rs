@@ -137,7 +137,7 @@ pub struct MetalRecurrentState {
 impl MetalRecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
     pub fn new(num_linear_layers: usize, config: &MetalGdrConfig) -> Self {
-        use super::mlx::{Dtype, zeros};
+        use super::mlx::{zeros, Dtype};
 
         let mut states = Vec::with_capacity(num_linear_layers);
         let mut conv_states = Vec::with_capacity(num_linear_layers);
@@ -522,7 +522,7 @@ pub fn metal_gdr_decode_step(
     layer_idx: usize,
     config: &MetalGdrConfig,
 ) -> MlxArray {
-    use super::mlx::{Dtype, add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice};
+    use super::mlx::{add, as_dtype, multiply, reshape, rms_norm, sigmoid, silu, slice, Dtype};
 
     // Try the optional C++ step path first; it requires fully quantized weights.
     if let Some(result) = try_cpp_gdr_forward(x, layer_weights, state, layer_idx, config) {
@@ -801,7 +801,11 @@ mod tests {
 
     /// Reference softplus matching the CUDA kernel: x > 20 ? x : log(1 + exp(x))
     fn ref_softplus(x: f32) -> f32 {
-        if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() }
+        if x > 20.0 {
+            x
+        } else {
+            (1.0f32 + x.exp()).ln()
+        }
     }
 
     /// softplus must match the CUDA reference for small, moderate, and large values.

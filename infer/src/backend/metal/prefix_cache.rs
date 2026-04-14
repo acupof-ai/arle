@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Result};
 
 use crate::prefix_cache::{BlockId, RadixCache};
 

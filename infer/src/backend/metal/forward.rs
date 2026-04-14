@@ -69,7 +69,7 @@ pub(super) fn build_forward_graph(
     let logits = super::ops::linear(&last_x, &weights.lm_head); // [1, vocab]
 
     // P4: GPU-side sampling — stays on GPU, only scalar crosses on .item() later.
-    super::sampling::gpu_sample_token(&logits, params)
+    Ok(super::sampling::gpu_sample_token(&logits, params))
 }
 
 /// Single transformer layer for the maintained Rust/MLX Qwen3 path.
@@ -90,7 +90,7 @@ pub(super) fn rust_transformer_layer(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
-    mut metal_kv_pool: Option<&mut MetalKVPool>,
+    metal_kv_pool: Option<&mut MetalKVPool>,
     request_id: usize,
 ) -> Result<MlxArray> {
     use super::mlx::{
@@ -122,7 +122,7 @@ pub(super) fn rust_transformer_layer(
     let v = transpose_axes(&v, &[0, 2, 1, 3]); // [1, n_kv, seq, d]
 
     // 7. KV cache update
-    let (k_full, v_full) = if let Some(pool) = metal_kv_pool.as_deref_mut() {
+    let (k_full, v_full) = if let Some(pool) = metal_kv_pool {
         let k_rows = transpose_axes(&k, &[0, 2, 1, 3]);
         let k_rows = reshape(&k_rows, &[seq, n_kv_heads * head_dim]);
         let v_rows = transpose_axes(&v, &[0, 2, 1, 3]);

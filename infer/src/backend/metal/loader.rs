@@ -111,11 +111,11 @@ pub(super) fn load_embed_tokens_from_tensors(
 }
 
 #[cfg(feature = "metal")]
-pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &MlxArray) -> Result<WeightTensor> {
+pub(super) fn tie_lm_head_from_embed_tokens(embed_tokens: &MlxArray) -> WeightTensor {
     use super::mlx::{eval, transpose_all};
     let w_t = transpose_all(embed_tokens);
     eval(&[&w_t]);
-    Ok(WeightTensor::Dense(w_t))
+    WeightTensor::Dense(w_t)
 }
 
 fn collect_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
