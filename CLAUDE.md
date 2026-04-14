@@ -75,7 +75,7 @@ Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`. Mo
 
 ### GPU Kernel Optimization — Six Principles
 
-Every kernel in `csrc/cuda/` (CUDA) and `csrc/metal/` (Metal) must be evaluated against these. Use `ncu` for CUDA and Xcode Metal GPU capture / MLX instruments for Metal. The principles are universal; terminology translates (CUDA warp ↔ Metal SIMD-group, shared memory ↔ threadgroup memory, SM ↔ GPU core).
+Every kernel in `csrc/cuda/` (CUDA) and every performance-sensitive MLX / Metal bridge path under `crates/mlx-sys/src/` must be evaluated against these. Use `ncu` for CUDA and Xcode Metal GPU capture / MLX instruments for Metal. The principles are universal; terminology translates (CUDA warp ↔ Metal SIMD-group, shared memory ↔ threadgroup memory, SM ↔ GPU core).
 
 **1. Global Memory Coalescing**
 - Warp of 32 threads → hardware groups addresses by 128B cache line → 1 transaction per line.
@@ -228,10 +228,8 @@ agent-infer/          ← top-level Cargo workspace
 │   │   ├── http_server/         ← OpenAI-compatible HTTP API
 │   │   └── server_engine.rs     ← Single-request inference façade
 │   ├── csrc/cuda/{attention,gemm,kv,quant,misc}/  ← CUDA C kernels, grouped
-│   ├── csrc/metal/              ← C++ bridge glue (metal_fused_ops.cpp,
-│   │                              metal_fused_capi.cpp) — real Metal
-│   │                              kernels ship via MLX through mlx-sys
-│   ├── mlx-sys/                 ← Bindgen bridge to MLX C++ API
+│   ├── crates/mlx-sys/          ← MLX build + C++ bridge + Qwen3.5 compiled
+│   │                              model path for the Metal backend
 │   └── tools/triton/            ← Triton Python kernels (AOT compiled)
 └── scripts/          ← Benchmark + utility scripts
 ```
@@ -252,7 +250,7 @@ Each model is a flat module: `infer/src/model/<name>.rs` + `infer/src/model/<nam
 ### GPU kernel integration
 
 - **CUDA**: `infer/csrc/cuda/{attention,gemm,kv,quant,misc}/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/backend/cuda/ffi.rs`. `build.rs` recursively collects every `.cu` under `csrc/cuda/`, passes `-I csrc/cuda/` to nvcc so `common.cuh` resolves from any subdir, auto-detects SM, runs Triton AOT, links FlashInfer.
-- **Metal**: `infer/csrc/metal/` holds C++ bridge code (`metal_fused_ops.cpp`, `metal_fused_capi.cpp`) that calls into MLX — there are no `.metal` shader files here. The actual Metal kernels live inside the MLX library and are reached through `infer/mlx-sys/` (bindgen bridge to the MLX C++ API). Enabled via `--features metal`; `libc` pulled in for `getrusage`-based RSS reporting.
+- **Metal**: `crates/mlx-sys/` is the single source of truth for the Metal bridge: it builds MLX from source, compiles the C++ bridge (`mlx_bridge.cpp`, `mlx_qwen35_model.cpp`), and exposes the FFI consumed by `infer/src/backend/metal.rs`. There are no repo-local `.metal` shader files; the actual Metal kernels live inside MLX. Enabled via `--features metal`; `libc` is pulled in for `getrusage`-based RSS reporting.
 
 ### Key references
 

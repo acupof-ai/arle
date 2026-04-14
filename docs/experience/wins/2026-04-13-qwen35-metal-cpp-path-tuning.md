@@ -10,7 +10,7 @@
 
 - 默认 benchmark 路径已经走 `CppQwen35Model::generate()`
 - 运行时日志确认是 `Metal forward path: C++ full generate (all in C++)`
-- 因此本轮优化的收益和回归，都来自 `infer/mlx-sys/src/mlx_qwen35_model.cpp`
+- 因此本轮优化的收益和回归，都来自 `crates/mlx-sys/src/mlx_qwen35_model.cpp`
 
 ## Competitor Alignment Notes
 
@@ -158,7 +158,7 @@
 
 这轮还确认了一个很关键的 benchmark hygiene 规则：
 
-- 改过 `infer/mlx-sys/src/mlx_qwen35_model.cpp` 之后，不能直接相信增量构建出来的 A/B 数据
+- 改过 `crates/mlx-sys/src/mlx_qwen35_model.cpp` 之后，不能直接相信增量构建出来的 A/B 数据
 - 同一份源码，在脏 `target/` 下会出现明显偏低的 Metal benchmark
 - `cargo clean -p infer -p mlx-sys` 后重建，结果会明显回归正常区间
 
