@@ -14,8 +14,9 @@
 //! 2. The `BlockLocation::Disk { file_id, offset }` addressing model
 //!    survives a round trip through a real filesystem — [`DiskStore`]'s
 //!    `put_block` / `get_block` pair issue `BlockLocation` values that
-//!    the [`super::super::directory::TierDirectory`] can hand to the
-//!    scheduler directly.
+//!    the scheduler's prefix-cache layer can reference directly. The
+//!    pre-M1 `TierDirectory` holding area no longer exists; location
+//!    metadata now lives on the `RadixCache` node instead.
 //!
 //! # Scope (intentional)
 //!

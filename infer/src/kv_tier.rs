@@ -33,15 +33,17 @@
 //! either constructed only by unit tests or imported only by in-module
 //! dependencies. No file under `infer/src/scheduler/`,
 //! `infer/src/server_engine.rs`, `infer/src/model/`, or
-//! `infer/src/backend/` calls into `kv_tier::TierDirectory`,
-//! `kv_tier::KVTransport`, or `kv_tier::EvictionPolicy` from the hot
-//! path.
+//! `infer/src/backend/` calls into `kv_tier::KVTransport` or
+//! `kv_tier::EvictionPolicy` from the hot path.
 //!
-//! The project doc calls for M1 to delete [`directory::TierDirectory`]
-//! entirely and move its `BlockDescriptor` fields onto the private
-//! `Node` struct inside `infer/src/prefix_cache.rs`. Until that lands,
-//! the directory remains here as a legacy holding area. Do not extend
-//! it; add new fields to the radix-cache node instead.
+//! The former `directory::TierDirectory` / `BlockDescriptor` holding
+//! area was removed in M1 per project doc §5.2. Block metadata that
+//! used to live in `BlockDescriptor` (`ref_count`, `last_access`,
+//! `session_id`, `pin_until`, `tier`, `location`, `byte_len`) now
+//! belongs on [`crate::prefix_cache::RadixCache`]'s private `Node`
+//! struct, so there is a single source of truth for in-flight prefix
+//! blocks and eviction candidates. Do not reintroduce a parallel
+//! directory.
 //!
 //! # Invariants (current, after the 2026-04-15 revision)
 //!
@@ -85,34 +87,35 @@
 //!   [`crate::types::BlockFingerprint`].
 //! - [`tier`] — [`Tier`], [`BlockLocation`], [`RemoteBlockDesc`],
 //!   [`TransportId`], [`MemKind`].
-//! - [`directory`] — [`BlockDescriptor`], [`TierDirectory`],
-//!   [`DirectoryError`]. Scheduled for deletion in M1 per project
-//!   doc §5.2 (fields move onto `RadixCache::Node`). Zero production
-//!   callers today.
 //! - [`transport`] — [`KVTransport`] trait, [`TransferOp`],
 //!   [`TransportError`]. `DiskStore` is implemented in
 //!   `transport::disk`; `NixlTransport` is a stub in `transport::nixl`
 //!   behind `rdma-nixl`.
 //!
+//! The former `directory` submodule was deleted in M1; its fields
+//! (`ref_count`, `last_access`, `session_id`, `pin_until`, `tier`,
+//! `location`, `byte_len`) now live on [`crate::prefix_cache::RadixCache`]'s
+//! private `Node` struct so there is a single source of truth for
+//! in-flight prefix blocks. See project doc §5.2.
+//!
 //! All publicly useful types are re-exported at the `crate::kv_tier::`
 //! root so downstream callers do not need to know the submodule they
 //! live in.
 //!
-//! # Locking strategy (legacy, being retired in M1)
+//! # Locking strategy
 //!
-//! [`TierDirectory`] currently uses `RwLock<HashMap<..>>` for
-//! simplicity. The 2026-04-13 note about "revisit with `dashmap` or
-//! sharded map in M3 when the coordinator thread introduces write
-//! contention" is now moot: the directory is being deleted in M1 and
-//! its replacement lives inside `RadixCache`, whose locking is
-//! scheduler-thread-owned. No `dashmap` dependency is needed.
+//! Locking for prefix cache state is owned by [`crate::prefix_cache::RadixCache`]
+//! (scheduler-thread-owned today; will grow a reader lock when the
+//! M3 coordinator thread starts issuing promote/demote writes from a
+//! separate OS thread). The 2026-04-13 note about "revisit with
+//! `dashmap` or sharded map" is retired: the deleted directory was the
+//! only source of write contention it referred to, and its
+//! replacement inside `RadixCache` is single-writer by construction.
 
-pub mod directory;
 pub mod id;
 pub mod tier;
 pub mod transport;
 
-pub use directory::{BlockDescriptor, DirectoryError, TierDirectory};
 pub use id::BlockId;
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};
