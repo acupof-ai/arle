@@ -27,8 +27,8 @@ Benchmark rule:
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
 | `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, `M0.2c` Qwen3 same-length decode batching, and `M0.2d` Qwen3.5 same-length decode batching landed locally; throughput exit is still blocked on variable-length decode and per-step batch-state rebuild cost |
-| `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
-| `M0.4` memory + reuse observability | Partial | runtime-backed queue / latency / MLX memory metrics and allocator CLI knobs shipped; non-zero prefix reuse still depends on `M0.3` |
+| `M0.3` live prefix cache + KV pool | Partial | Qwen3 live runtime now does prefix lookup/import/publish in serving, but Qwen3.5 still lacks live prefix reuse |
+| `M0.4` memory + reuse observability | Shipped | live runtime metrics and MLX allocator knobs are wired; repeated-prefix Qwen3 smoke now drives non-zero `prefix_hit_rate` |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
 | `M1.2` models + responses API | Partial | `/v1/models` shipped; `/v1/responses` non-streaming subset shipped; streaming parity still pending |
 | `M1.3` structured outputs | Not shipped | no JSON-schema constrained decoding yet |
@@ -178,8 +178,8 @@ cargo check -p infer --no-default-features --features metal,no-cuda --bin metal_
 
 ### `M0.3` Live prefix cache + KV pool
 
-Status: partial. The runtime/HTTP metrics disconnect is fixed, but prefix reuse
-is still zero until `M0.3` lands.
+Status: partial. `Qwen3` now ships a live runtime-owned prefix cache + shared KV
+pool path, but `Qwen3.5` still lacks live prefix reuse.
 
 Acceptance:
 
@@ -189,18 +189,47 @@ Acceptance:
   single-request fallback only
 - the serving benchmark can demonstrate a measurable reuse effect on repeated
   prefixes, not just internal cache counters
+- non-goal for this tranche: Qwen3.5 recurrent-state prefix reuse
 
 Verification:
 
 ```bash
 cargo test -p infer --no-default-features --features metal,no-cuda --lib prefix_cache -- --nocapture
 cargo test -p infer --no-default-features --features metal,no-cuda --lib backend::metal::kv_pool -- --nocapture
-python3 scripts/bench_throughput_sweep.py --url http://127.0.0.1:8000 --quick --label metal-m0.3
+cargo test -p infer --no-default-features --features metal,no-cuda request_state -- --nocapture
+./target/release/metal_serve --model-path mlx-community/Qwen3-0.6B-4bit --port 8013 --kv-pool
+python3 - <<'PY'
+import json, time, urllib.request
+url='http://127.0.0.1:8013/v1/completions'
+prompt=('System: You are a precise benchmark assistant. '
+        'Summarize the same deployment checklist in one short sentence. '
+        'Checklist: verify auth, verify warmup, verify metrics, verify prefix cache, verify latency.')
+body=json.dumps({'model':'mlx-community/Qwen3-0.6B-4bit','prompt':prompt,'max_tokens':1,'temperature':0.0}).encode()
+for i in range(2):
+    req=urllib.request.Request(url, data=body, headers={'Content-Type':'application/json'}, method='POST')
+    t0=time.perf_counter()
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        resp.read()
+    print({'run': i + 1, 'elapsed_ms': round((time.perf_counter() - t0) * 1000, 1)})
+PY
+curl -s http://127.0.0.1:8013/metrics | rg 'infer_prefix_(lookups|hits|hit_rate)'
 ```
+
+Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
+
+- server startup now logs:
+  `Metal live prefix cache enabled for Qwen3: block_size=16, max_cached_tokens=8192`
+- sequential identical `max_tokens=1` requests over HTTP:
+  - run 1: `186.7 ms`
+  - run 2: `65.1 ms`
+- `/metrics` after warmup + the two requests:
+  - `infer_prefix_lookups_total = 3`
+  - `infer_prefix_hits_total = 1`
+  - `infer_prefix_hit_rate = 0.3333`
 
 ### `M0.4` Memory and reuse observability
 
-Status: not shipped.
+Status: shipped.
 
 Acceptance:
 
@@ -244,10 +273,12 @@ Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
   - `--cache-limit-bytes`
   - `--wired-limit-bytes`
 
-Remaining blocker:
+Notes:
 
-- `prefix_hit_rate` is present but remains `0` on the current live path because
-  `M0.3` shared-prefix reuse is still unwired
+- `prefix_hit_rate` is now a real, non-zero live metric on the shipped Qwen3
+  repeated-prefix path.
+- Qwen3.5 still lacks live prefix reuse, so a zero hit rate on that path is not
+  itself a regression.
 
 ## P1 · API And DX
 
