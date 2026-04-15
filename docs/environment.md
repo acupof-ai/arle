@@ -52,9 +52,21 @@ Override model path for selected CLI-side tests.
 
 ### `AGENT_INFER_METAL_KV_POOL`
 
-Enable Metal KV pool path.
+Legacy compatibility fallback for the experimental Metal KV pool path.
 
-Status: experimental.
+Current use:
+
+- `metal_request`
+- `metal_bench`
+- `metal_serve`
+
+Behavior:
+
+- If neither `--kv-pool` nor `--no-kv-pool` is passed, these entry points use
+  `AGENT_INFER_METAL_KV_POOL` as a fallback.
+- Prefer the explicit CLI flags over this environment variable.
+
+Status: experimental, fallback-only.
 
 ### `AGENT_INFER_GDR_METAL_KERNEL`
 

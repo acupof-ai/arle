@@ -9,6 +9,7 @@ clear execution order.
 This checklist is the execution companion to:
 
 - [../projects/mlx-backend-roadmap.md](../projects/mlx-backend-roadmap.md)
+- [2026-04-15-metal-backend-acceptance-plan.md](2026-04-15-metal-backend-acceptance-plan.md)
 
 ## P0 · Serving Floor
 
@@ -31,13 +32,16 @@ This checklist is the execution companion to:
 
 ## P1 · API And DX
 
-- [ ] `M1.1` Promote Metal experimental env toggles to documented CLI flags.
+- [x] `M1.1` Promote Metal experimental env toggles to documented CLI flags.
   Exit:
   no user-facing Metal serving behavior requires hidden env vars.
 - [ ] `M1.2` Add `/v1/models` and `/v1/responses`.
   Exit:
   standard OpenAI SDK flows work without compatibility shims for model discovery
   and the Responses API.
+  Status:
+  `2026-04-15`: `/v1/models` shipped and `/v1/responses` non-streaming subset
+  shipped; streaming parity still pending.
 - [ ] `M1.3` Add structured output support.
   Exit:
   `response_format` with JSON-schema constrained decoding is supported for chat

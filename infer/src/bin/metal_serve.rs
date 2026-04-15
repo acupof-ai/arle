@@ -11,15 +11,16 @@
 
 #![cfg(feature = "metal")]
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use infer::backend::metal::{MetalBackendOptions, MetalDflashOptions};
 use infer::backend::runtime::{
     BackendRuntimeHandle, spawn_metal_runtime_handle_from_path_with_options,
 };
-use infer::http_server::build_app;
+use infer::http_server::{HttpServerConfig, build_app_with_config};
 use infer::logging;
 use infer::request_handle::RequestHandle;
 use infer::sampler::SamplingParams;
@@ -45,8 +46,14 @@ struct Args {
     port: u16,
 
     /// Host or IP address to bind to.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     bind: String,
+
+    /// Optional Bearer API key required for `/v1/*` endpoints.
+    ///
+    /// If omitted, `AGENT_INFER_API_KEY` is used when present.
+    #[arg(long)]
+    api_key: Option<String>,
 
     /// Maximum waiting requests before rejecting new submissions.
     #[arg(long, default_value_t = 256)]
@@ -55,6 +62,14 @@ struct Args {
     /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
     #[arg(long, value_name = "PATH_OR_REPO")]
     dflash_draft_model: Option<String>,
+
+    /// Enable the experimental Metal KV pool for the Qwen3 fallback path.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_kv_pool")]
+    kv_pool: bool,
+
+    /// Disable the experimental Metal KV pool even if the env fallback is set.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
+    no_kv_pool: bool,
 
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
@@ -72,6 +87,18 @@ struct Args {
     /// Maximum generated tokens per startup warmup request.
     #[arg(long, default_value_t = 1)]
     warmup_max_new_tokens: usize,
+}
+
+impl Args {
+    fn kv_pool_override(&self) -> Option<bool> {
+        if self.kv_pool {
+            Some(true)
+        } else if self.no_kv_pool {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 #[tokio::main]
@@ -96,6 +123,7 @@ async fn main() -> Result<()> {
                     draft_model: draft_model.clone(),
                     speculative_tokens: args.speculative_tokens,
                 }),
+            kv_pool: args.kv_pool_override(),
         },
         args.max_waiting,
     )
@@ -111,6 +139,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    let api_key = resolve_api_key(args.api_key.as_deref());
+    if api_key.is_some() {
+        info!("Metal server API auth enabled for /v1/* endpoints");
+    }
+
     run_startup_warmup(
         &handle,
         args.warmup,
@@ -119,7 +152,13 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let app = build_app(handle);
+    let app = build_app_with_config(
+        handle,
+        infer::metrics::ServerMetrics::new(""),
+        HttpServerConfig {
+            api_key: api_key.map(Arc::<str>::from),
+        },
+    );
     let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))
         .await
         .with_context(|| format!("failed to bind {}:{}", args.bind, args.port))?;
@@ -140,6 +179,18 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install CTRL+C handler");
     info!("shutdown signal received");
+}
+
+fn resolve_api_key(explicit: Option<&str>) -> Option<String> {
+    let candidate = explicit
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("AGENT_INFER_API_KEY").ok())?;
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 async fn run_startup_warmup(

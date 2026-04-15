@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
@@ -76,10 +76,30 @@ struct Args {
     #[arg(long, value_name = "PATH_OR_REPO")]
     dflash_draft_model: Option<String>,
 
+    /// Enable the experimental Metal KV pool for the Qwen3 fallback path.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_kv_pool")]
+    kv_pool: bool,
+
+    /// Disable the experimental Metal KV pool even if the env fallback is set.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
+    no_kv_pool: bool,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
     speculative_tokens: Option<usize>,
+}
+
+impl Args {
+    fn kv_pool_override(&self) -> Option<bool> {
+        if self.kv_pool {
+            Some(true)
+        } else if self.no_kv_pool {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 fn load_prompt(args: &Args) -> Result<String> {
@@ -174,6 +194,7 @@ fn main() -> Result<()> {
                     draft_model: draft_model.clone(),
                     speculative_tokens: args.speculative_tokens,
                 }),
+            kv_pool: args.kv_pool_override(),
         });
         let load_start = Instant::now();
         backend

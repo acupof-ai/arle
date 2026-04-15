@@ -110,9 +110,11 @@ For full usage, limits, and benchmark workflow, see
 
 `agent-infer` uses explicit stability and support rules.
 
-- **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`),
-  `GET /metrics`, `GET /v1/stats`, and the main documented build/test workflows.
-- **Beta**: CLI agent behavior, Metal serving path, GGUF loading, benchmark tooling.
+- **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
+  `GET /v1/models`), `GET /metrics`, `GET /v1/stats`, and the main documented
+  build/test workflows.
+- **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
+  behavior, Metal serving path, GGUF loading, benchmark tooling.
 - **Experimental**: fast-moving quantization paths, speculative decoding,
   tensor-parallel scaffolding, Metal DFlash, and undocumented flags or
   environment variables.
@@ -155,7 +157,7 @@ for the current package boundaries.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  HTTP API  (/v1/completions, /v1/chat/completions, SSE)  │
+│  HTTP API  (/v1/completions, /v1/chat/completions, /v1/models, /v1/responses)  │
 └────────────────────────┬─────────────────────────────────┘
                          ▼
 ┌──────────────────────────────────────────────────────────┐
@@ -192,7 +194,15 @@ See [ROADMAP.md](ROADMAP.md) for the full plan.
 
 ## API
 
-OpenAI-compatible. Drop-in replacement for any client that speaks `/v1/completions` or `/v1/chat/completions`.
+OpenAI-compatible. Current HTTP surface:
+
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+- `GET /v1/models`
+- `POST /v1/responses` for the current non-streaming subset
+
+Streaming today remains on `/v1/chat/completions`; `/v1/responses` returns a
+clear `400` when `stream=true`.
 
 ```bash
 # Streaming
@@ -202,6 +212,14 @@ curl http://localhost:8000/v1/chat/completions \
 # Completions
 curl http://localhost:8000/v1/completions \
   -d '{"prompt":"The quick brown fox","max_tokens":64,"temperature":0.7}'
+
+# Model discovery
+curl http://localhost:8000/v1/models
+
+# Responses API (non-streaming subset)
+curl http://localhost:8000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Summarize radix prefix caching in one sentence.","max_output_tokens":32}'
 ```
 
 <details>
@@ -223,7 +241,8 @@ curl http://localhost:8000/v1/completions \
 
 </details>
 
-Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats` (human-readable).
+Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats`
+(human-readable).
 
 ---
 

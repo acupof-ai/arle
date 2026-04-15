@@ -136,6 +136,8 @@ pub struct MetalBackend {
     dflash_options: Option<MetalDflashOptions>,
     #[cfg(feature = "metal")]
     dflash: Option<dflash::MetalDflashRuntime>,
+    #[cfg(feature = "metal")]
+    kv_pool_enabled: bool,
     #[cfg(not(feature = "metal"))]
     _weights: (),
 }
@@ -159,6 +161,8 @@ impl MetalBackend {
             dflash_options: options.dflash,
             #[cfg(feature = "metal")]
             dflash: None,
+            #[cfg(feature = "metal")]
+            kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(options.kv_pool),
             #[cfg(not(feature = "metal"))]
             _weights: (),
         }
@@ -257,13 +261,14 @@ impl MetalBackend {
                         weights,
                         config,
                         params,
+                        self.kv_pool_enabled,
                         max_new_tokens,
                         t0,
                         &mut on_token,
                     )?,
                     MetalWeights::Qwen35(weights) => metal_generate_qwen35(
                         {
-                            if self::generate::metal_kv_pool_enabled() {
+                            if self.kv_pool_enabled {
                                 log::warn!(
                                     "MetalKVPool is currently wired for the Qwen3 fallback path only; \
                                      Qwen3.5 continues on the existing Metal route"
@@ -369,6 +374,8 @@ fn run_with_metal_panic_boundary<T>(_op: &str, f: impl FnOnce() -> Result<T>) ->
 pub struct MetalBackendOptions {
     #[cfg(feature = "metal")]
     pub dflash: Option<MetalDflashOptions>,
+    #[cfg(feature = "metal")]
+    pub kv_pool: Option<bool>,
 }
 
 impl Default for MetalBackend {

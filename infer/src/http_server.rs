@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::State,
+    http::{HeaderMap, header},
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
@@ -32,13 +33,19 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
-    CompletionRequest as OpenAiCompletionRequest, CompletionResponse, StreamChunk,
-    StreamUsageChunk,
+    CompletionRequest as OpenAiCompletionRequest, CompletionResponse, ModelsListResponse,
+    ResponsesInput, ResponsesRequest, ResponsesResponse, StreamChunk, StreamUsageChunk,
 };
 
 struct AppState {
     handle: Arc<dyn RequestHandle>,
     metrics: ServerMetrics,
+    config: HttpServerConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpServerConfig {
+    pub api_key: Option<Arc<str>>,
 }
 
 struct RequestExecutionOptions {
@@ -78,6 +85,28 @@ impl RequestExecutionOptions {
             max_tokens: req.max_tokens_or_default(),
             stream: req.stream_or_default(),
             include_usage: req.include_usage_or_default(),
+            sampling: sampling_params_from_request(
+                req.temperature,
+                req.top_p,
+                req.top_k,
+                req.min_p,
+                req.repetition_penalty,
+                req.frequency_penalty,
+                req.presence_penalty,
+                req.ignore_eos,
+                req.seed,
+                req.stop_token_ids.clone(),
+            ),
+            stop: req.stop.clone(),
+            session_id: req.session_id_parsed(),
+        }
+    }
+
+    fn from_responses(req: &ResponsesRequest) -> Self {
+        Self {
+            max_tokens: req.max_output_tokens_or_default(),
+            stream: req.stream_or_default(),
+            include_usage: false,
             sampling: sampling_params_from_request(
                 req.temperature,
                 req.top_p,
@@ -215,6 +244,77 @@ fn submit_request(
     Ok(delta_rx)
 }
 
+fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    let Some(expected_api_key) = state.config.api_key.as_deref() else {
+        return Ok(());
+    };
+
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .ok_or_else(|| ApiError::unauthorized("Missing Authorization: Bearer <token> header"))?;
+    let auth_value = auth_header
+        .to_str()
+        .map_err(|_| ApiError::unauthorized("Authorization header must be valid ASCII"))?;
+    let (scheme, supplied_api_key) = auth_value
+        .split_once(' ')
+        .ok_or_else(|| ApiError::unauthorized("Authorization header must use Bearer auth"))?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Err(ApiError::unauthorized(
+            "Authorization header must use Bearer auth",
+        ));
+    }
+    if supplied_api_key != expected_api_key {
+        return Err(ApiError::unauthorized("Invalid API key"));
+    }
+
+    Ok(())
+}
+
+fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
+    let mut messages = Vec::new();
+    if let Some(instructions) = req.instructions.as_deref() {
+        if !instructions.trim().is_empty() {
+            messages.push(infer_chat::OpenAiChatMessage {
+                role: "system".into(),
+                content: Some(instructions.to_string()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+    }
+
+    match &req.input {
+        ResponsesInput::Text(text) => {
+            if text.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "Input must not be empty",
+                    "empty_input",
+                ));
+            }
+            messages.push(infer_chat::OpenAiChatMessage {
+                role: "user".into(),
+                content: Some(text.clone()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        ResponsesInput::Message(message) => messages.push(message.clone()),
+        ResponsesInput::Messages(items) => {
+            if items.is_empty() {
+                return Err(ApiError::bad_request(
+                    "Input messages must not be empty",
+                    "empty_input",
+                ));
+            }
+            messages.extend(items.iter().cloned());
+        }
+    }
+
+    Ok(chat_messages_to_prompt(&messages, &req.tools))
+}
+
 /// Build the SSE event(s) for a single [`CompletionStreamDelta`].
 ///
 /// Always returns one event for the main chunk. If `include_usage` is true and
@@ -253,8 +353,10 @@ where
 
 async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<OpenAiCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
     let options = RequestExecutionOptions::from_completion(&req);
     let max_tokens = options.max_tokens;
     let stream = options.stream;
@@ -308,8 +410,10 @@ async fn completions(
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
     if req.messages.is_empty() {
         warn!("Rejecting empty messages request");
         return Err(ApiError::bad_request(
@@ -380,6 +484,45 @@ async fn chat_completions(
     }
 }
 
+async fn models_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    let response = ModelsListResponse::single(state.handle.model_id(), now_secs());
+    Ok(Json(response).into_response())
+}
+
+async fn responses_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ResponsesRequest>,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    if req.stream_or_default() {
+        return Err(ApiError::bad_request(
+            "Streaming is not supported on /v1/responses yet; use /v1/chat/completions for streaming",
+            "responses_stream_not_supported",
+        ));
+    }
+
+    let prompt = build_responses_prompt(&req)?;
+    let options = RequestExecutionOptions::from_responses(&req);
+    let max_tokens = options.max_tokens;
+    let model_id = state.handle.model_id().to_string();
+
+    info!(
+        "responses: prompt_len={}, max_output_tokens={}",
+        prompt.len(),
+        max_tokens,
+    );
+
+    let delta_rx = submit_request(state.handle.as_ref(), options, prompt)?;
+    let buffered = collect_buffered_response(delta_rx, "responses request").await?;
+    let response = ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
+    Ok(Json(response).into_response())
+}
+
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = state.metrics.render_prometheus();
     (
@@ -391,7 +534,10 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     )
 }
 
-async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn stats_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = authorize_v1_request(&headers, state.as_ref()) {
+        return err.into_response();
+    }
     let body = state.metrics.render_summary();
     (
         [(
@@ -400,6 +546,7 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         )],
         body,
     )
+        .into_response()
 }
 
 /// Build the Axum router with default (empty) metrics.
@@ -407,7 +554,7 @@ pub fn build_app<H>(handle: H) -> Router
 where
     H: RequestHandle + 'static,
 {
-    build_app_with_metrics(handle, ServerMetrics::new(""))
+    build_app_with_config(handle, ServerMetrics::new(""), HttpServerConfig::default())
 }
 
 /// Build the Axum router with a pre-configured `ServerMetrics` instance.
@@ -415,14 +562,29 @@ pub fn build_app_with_metrics<H>(handle: H, metrics: ServerMetrics) -> Router
 where
     H: RequestHandle + 'static,
 {
+    build_app_with_config(handle, metrics, HttpServerConfig::default())
+}
+
+/// Build the Axum router with explicit metrics and server configuration.
+pub fn build_app_with_config<H>(
+    handle: H,
+    metrics: ServerMetrics,
+    config: HttpServerConfig,
+) -> Router
+where
+    H: RequestHandle + 'static,
+{
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
         metrics,
+        config,
     });
 
     Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses_handler))
+        .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/stats", get(stats_handler))
         .with_state(state)
@@ -706,6 +868,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completions_reject_missing_api_key_when_auth_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn completions_accept_valid_bearer_api_key_when_auth_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-token")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stats_reject_missing_api_key_when_auth_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/stats")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn chat_completion_streaming_with_usage() {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
@@ -780,5 +1006,107 @@ mod tests {
             payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             serde_json::json!({"command":"pwd"}).to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_returns_loaded_model_id() {
+        let app = build_app(mock_scheduler("Qwen3-8B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["object"], "list");
+        assert_eq!(payload["data"][0]["id"], "Qwen3-8B");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_requires_auth_when_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_returns_openai_style_response_object() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","input":"hello","max_output_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["object"], "response");
+        assert_eq!(payload["model"], "Qwen3-4B");
+        assert_eq!(payload["usage"]["input_tokens"], 1);
+        assert!(
+            payload["output_text"]
+                .as_str()
+                .is_some_and(|text| text.contains("hello")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_streaming_for_now() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"input":"hello","max_output_tokens":1,"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_requires_auth_when_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"hello","max_output_tokens":1}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
