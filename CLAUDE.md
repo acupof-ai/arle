@@ -1,276 +1,184 @@
-# agent-infer — Claude Code Config
+# agent-infer — Agent Contract
 
-Assisting **ckl**. Agent contract below.
+Assisting **ckl**. **Project-specific** rules only; generic Rust/CUDA/Metal/git
+knowledge is intentionally absent. Load the relevant module `AGENTS.md`
+(§Module Guides) before editing inside that module.
 
 ---
 
-## Project Overview
+## Project shape
 
-Pure Rust LLM inference engine with dual GPU backends: **CUDA** (Linux/NVIDIA, via `cudarc` + FlashInfer + Triton AOT) and **Metal** (Apple Silicon, via `mlx-sys` bindgen bridge). No PyTorch, no frameworks. Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4. Continuous batching scheduler, OpenAI-compatible `/v1/completions` + `/v1/chat/completions` API. FlashInfer drives CUDA prefill (HD128) and batched decode.
+Pure-Rust LLM inference engine; no PyTorch, no Python on the hot path. Two
+backends plug into one contract (`server_engine::InferenceEngine`): the CUDA
+continuous-batching scheduler (Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT)
+and the Metal serial runtime (Apple Silicon, `crates/mlx-sys` C++ bridge).
+Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4.
+FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
+Tests compare against JSON baselines in `infer/test_data/` — regenerate
+after any change affecting numerical output.
 
-Primary language: **Rust** (inference engine + agent runtime). Secondary: **Python** (tooling, benchmarks, test scripts) + **CUDA C / Triton / Metal / C++** (kernels and bridges).
+**Workspace (post 2026-04-15 Route-A):**
+
+```
+agent-infer/
+├── src/                       ← thin infer-cli::run() binary
+├── infer/                     ← runtime crate (scheduler/model/ops/backends/HTTP)
+├── crates/
+│   ├── infer-cuda-kernels/    ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
+│   ├── infer-agent/chat/cli/tools
+└── docs/                      ← projects/ plans/ experience/ reviews/ resources/
+```
+
+CUDA kernels live at `crates/infer-cuda-kernels/csrc/`, **not** `infer/csrc/`
+(common mistake — extracted 2026-04-15).
 
 ---
 
 ## Rules
 
-### Execution Workflow
+### Execution phases (non-trivial tasks)
 
-Non-trivial tasks follow phases. **Each phase has a clear exit condition.**
+| Phase | Exit condition |
+|-------|----------------|
+| **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
+| **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
+| **Implement** (check prior art in `infer/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
+| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path) | Tests green, `cargo clippy -- -D warnings` clean. |
+| **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
-| Phase | Posture | Key rules |
-|-------|---------|-----------|
-| **Explore** | Cartographer | Trace callers/dependents before reading. Grep for existing implementations before writing new code. Trait change → list all implementors, mark blast radius. Uncertain → surface as open question, don't guess. |
-| **Plan** | Architect (decisions, not options) | "How would this fail?" before "how should this work?". >5 files → question if simpler path exists. Irreversible decision → stop, flag, wait. |
-| **Implement** | Contractor (build to spec) | Check prior art in `infer/src/` and `docs/` first. Outside plan → stop and update plan. Match adjacent code style. |
-| **Verify** | Adversary | `cargo test --workspace`. Each diff line must serve the goal. New `unwrap()` → can this panic? GPU code → CUDA/Metal errors, OOM, stream/command-buffer sync? Async → cancel-safe? |
-| **Reflect** | Retrospector | Bug >1 attempt → `docs/experience/errors/YYYY-MM-DD-slug.md`. Win → `docs/experience/wins/`. User corrected → write feedback memory. |
+Skip rules: trivial → Implement + Verify; exploration questions → Explore only.
 
-**Skip rules**: Trivial → Implement + Verify only. Exploration → Phase 1 only. "Just do it" → Implement + Verify.
+### Editing
 
-### Editing Rules
+- **Preserve by default.** Never delete content not explicitly in scope.
+- **Approach-first for >3 files or architectural decisions** — outline and wait.
+- **No half-states** (`feedback_no_half_states.md`): finish a refactor unit or
+  revert it, never leave parallel old+new paths in the tree.
 
-- **Preserve by default**: NEVER delete content not explicitly asked to change.
-- **Diff before delete**: Show what's being removed, get confirmation.
-- **Approach-first**: Changes >3 files or architectural decisions → outline approach and wait for approval.
+### Backend isolation (CRITICAL)
 
-### Behavior Rules
-
-- **Self-correction**: On ANY user correction → codify a preventive feedback memory before resuming.
-- **GPU/CPU separation**: Mark GPU-only code with `// GPU required` comments. CUDA/Triton/Metal kernel stubs use `todo!("GPU required: ...")`.
-- **Backend isolation**: CUDA-only code gated behind `#[cfg(feature = "cuda")]`; Metal-only behind `#[cfg(feature = "metal")]`. Never `cfg`-leak backend types into cross-backend modules — route through `backend.rs`.
-- **Opportunistic cleanup**: Spot something inelegant → fix in separate commit.
+- `#[cfg(feature = "cuda")]` / `#[cfg(feature = "metal")]` gating; **never
+  `cfg`-leak backend types into cross-backend modules** — route through
+  `backend.rs` / `server_engine.rs`.
+- CUDA stubs on non-CUDA targets: `todo!("GPU required: ...")`.
+- Pre-push type check on Mac without nvcc:
+  `cargo check -p infer --no-default-features --features cuda,no-cuda`.
 
 ### Delegation to Codex
 
-Claude owns **direction**; Codex owns **execution**. Codex is reached via the `codex:codex-rescue` plugin (tool: `Agent` with `subagent_type: "codex:codex-rescue"`, or the MCP bridge `mcp__openmax__execute_with_codex`).
+Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
+(Agent `subagent_type: "codex:codex-rescue"`) or `mcp__openmax__execute_with_codex`.
 
-| Area | Owner | Notes |
-|------|-------|-------|
-| Docs, planning, architecture, roadmaps | **Claude** | `docs/plans/`, `docs/experience/`, `docs/projects/`, design notes |
-| Code execution (implement / refactor / write & run tests) | **Codex** | Default executor for concrete coding tasks |
-| Code review (diffs, PR review) | **Codex** | Claude does not self-review substantial diffs |
-| Stuck-problem rescue | **Codex** | Triggered by the 2-strike rule below |
+| Area | Owner |
+|------|-------|
+| Docs, planning, architecture, roadmaps | Claude |
+| Code execution (implement/refactor/tests) | **Codex** |
+| Code review of non-trivial diffs | **Codex** |
+| Stuck-problem rescue | **Codex** (after 2 failed attempts) |
 
-- **Task-execution bias**: when a task boils down to "write/change code", delegate to Codex by default. Claude's job is to draft a precise brief (files, constraints, acceptance criteria), then integrate and verify Codex's output against the plan — not to hand-write the implementation.
-- **Code review via Codex**: route all non-trivial diff review through Codex. Claude does not self-review substantial diffs; if Claude did the writing, Codex reviews. If Codex did the writing, Claude reviews at the *plan/spec* level, not line-by-line.
-- **2-strike rule**: if Claude makes **two complete good-faith attempts** at a problem and still cannot resolve it, hand off to Codex via `codex:codex-rescue` instead of attempting a third time. The handoff brief must include: what was tried, what was observed, and why each attempt failed — so Codex can pick a different angle rather than re-running Claude's path.
-- **What stays with Claude**: planning docs, experience entries (`docs/experience/`), roadmap edits, user-facing explanations, cross-cutting architectural decisions, and the final integration step after Codex reports back.
+- **Task-execution bias:** when a task is "write/change code", draft a brief
+  (files, constraints, acceptance criteria) and delegate. Claude integrates
+  and verifies — Claude does not hand-write substantial diffs.
+- **2-strike rule:** two good-faith failed attempts → hand off. Brief must
+  list what was tried, what was observed, why each attempt failed, so Codex
+  picks a different angle.
+- **Claude always owns:** planning docs, experience entries, roadmap edits,
+  user-facing explanations, final integration after Codex reports back.
 
-### Benchmark Rules
+### Benchmarks
 
-- **Snapshot before & after** in `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`.
-- **Never overwrite** old snapshots — immutable history.
-- **Standard tool**: `scripts/bench_throughput_sweep.py` with `--label`.
-- **Include environment**: GPU model (e.g. A100 / M3 Max), CUDA or Metal version, model name, num_slots, non-default flags, feature set.
-- **Raw data**: Full output table, not summaries. After-snapshot references before-snapshot with delta on key metrics.
+- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`. **Never
+  overwrite**; after-snapshots cite before-snapshots with deltas.
+- Tool: `scripts/bench_throughput_sweep.py --label <name>`.
+- Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
+  feature set. Raw output table, not summaries.
 
-### Git Conventions
+### Git
 
-Commitizen format: `<type>(<scope>): <subject>`. Scope examples: `metal`, `cuda`, `scheduler`, `qwen3`, `glm4`, `http`.
+- Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
+  `scheduler`, `qwen3`, `qwen35`, `glm4`, `http`, `kv-tier`, `docs`.
+- Commit directly to `main` (no feature branches — `feedback_commit_to_main.md`).
+- After `git mv` + batch Edits, re-check `git status` and re-stage by path —
+  the fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).
 
-### Code Conventions
+### Code conventions
 
-Module files use the flat layout (`src/ops.rs` + `src/ops/`) — no `mod.rs`. Models follow the same pattern: `model/qwen3.rs` + `model/qwen3/`.
+- **Flat module layout, no `mod.rs`.** `src/ops.rs` declares `#[path = "ops/attention.rs"] mod attention;`
+  siblings; models follow `model/qwen3.rs` + `model/qwen3/`.
+- Weights `&self` (immutable, pool-shared); per-request mutable state in `State`
+  associated types.
 
-### GPU Kernel Optimization — Six Principles
+### GPU kernel work
 
-Every kernel in `csrc/cuda/` (CUDA) and every performance-sensitive MLX / Metal bridge path under `crates/mlx-sys/src/` must be evaluated against these. Use `ncu` for CUDA and Xcode Metal GPU capture / MLX instruments for Metal. The principles are universal; terminology translates (CUDA warp ↔ Metal SIMD-group, shared memory ↔ threadgroup memory, SM ↔ GPU core).
-
-**1. Global Memory Coalescing**
-- Warp of 32 threads → hardware groups addresses by 128B cache line → 1 transaction per line.
-- Optimal: consecutive threads access consecutive addresses (stride = `sizeof(elem)`, aligned).
-- Anti-pattern: `A[tid * N]` → stride N → 32 transactions instead of 1. Fix: transpose layout or tile.
-- Verify: substitute `tid = 0..31` into address expression; adjacent difference should = element size.
-- ncu metric: `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.avg` / requests. Ideal = 4 (128B/32B).
-
-**2. Shared Memory Bank Conflicts**
-- 32 banks, 4B each. Bank = `(byte_addr / 4) % 32`.
-- Same address → broadcast (free). Different addresses, same bank → serial (N-way conflict = N cycles).
-- Classic trigger: `smem[32][32]` column access → all hit bank 0. Fix: pad to `smem[32][33]`.
-- Distinct from coalescing: coalescing saves HBM bandwidth; bank-conflict-free saves smem latency.
-
-**3. Occupancy**
-- Active warps / max warps per SM. Limited by: threads, registers, shared memory, block count.
-- Sweet spot: ≥50%. Below 25% → scheduler starves → compute units idle.
-- Register pressure: >64 regs/thread → spill to local memory (HBM, ~400 cycles). Target 32-64.
-- Trade-off: more smem per block → fewer blocks → lower occupancy. Balance tile size vs. occupancy.
-
-**4. Tiling & Data Reuse**
-- HBM load costs ~400 cycles. Shared memory costs ~5 cycles. Load once, reuse N times.
-- GEMM: tile A and B into smem, each element reused by TILE threads → N/TILE HBM loads.
-- Applies to attention (Q×K reuse), convolution, any overlapping computation.
-- Larger tile = better reuse but more smem → occupancy drops. Profile to find sweet spot.
-
-**5. Warp Divergence**
-- Warp executes one instruction at a time. Branch → serialize both paths (masked execution).
-- `if (tid % 2)` → 2× slowdown. `if (tid / 32 % 2)` → zero cost (different warps, not divergent).
-- Fix: align branches to warp boundaries. Move divergent code outside inner loops.
-- Boundary checks `if (idx < N)` → only last warp affected → usually negligible.
-
-**6. Launch Config & Tail Effect**
-- Grid must be >> SM_count × blocks_per_SM, otherwise last wave underutilizes.
-- 900 blocks on 108 SMs (8 blocks/SM = 864 capacity): last wave = 36 blocks → 5% utilization.
-- Fix: align grid to SM capacity, or use persistent kernels with `atomicAdd` work-stealing.
-- Block size: 256 is default sweet spot. 128 for register-heavy kernels. 512+ only with profiling data.
+Touching `crates/infer-cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths?
+Evaluate against the project-specific heat map in
+[`docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md`](docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md)
+— that's where the audited priorities live. Measure with `ncu` (CUDA) or
+Xcode Metal capture / MLX instruments (Metal).
 
 ---
 
 ## Memory
 
-**Always-load**: auto memory + latest 3 from `docs/experience/errors/` and `docs/experience/wins/`.
+- **Always-load:** auto-memory index + latest 3 of `docs/experience/errors/`
+  and `docs/experience/wins/`.
+- **On-demand:** `docs/plans/`, `docs/projects/`, `docs/research/`, full
+  experience entries, `ROADMAP.md`.
+- **User correction → write preventive feedback memory before resuming.**
 
-**On-demand**: `docs/plans/`, `docs/research/`, full experience entries, `ROADMAP.md`.
-
-### Experience Entry Templates
-
-**Error** (`docs/experience/errors/YYYY-MM-DD-slug.md`):
+Experience entry skeletons:
 ```
-# YYYY-MM-DD · Title
-## Context
-## Root Cause
-## Fix
-## Rule
-```
-
-**Win** (`docs/experience/wins/YYYY-MM-DD-slug.md`):
-```
-# YYYY-MM-DD · Title
-## Context
-## What Worked
-## Rule
+errors/YYYY-MM-DD-slug.md: # Title  ## Context  ## Root Cause  ## Fix  ## Rule
+wins/YYYY-MM-DD-slug.md  : # Title  ## Context  ## What Worked  ## Rule
 ```
 
 ---
 
-## Build & Run
+## Build & run
 
-**Always use `--release`** — debug builds are extremely slow for GPU.
-
-```bash
-# CUDA build (Linux, default feature set = ["cuda"])
-CUDA_HOME=/usr/local/cuda cargo build --release
-
-# Metal build (Apple Silicon) — disables CUDA
-cargo build --release --no-default-features --features metal
-
-# No-GPU build — compiles on CI/macOS without any GPU backend (ops panic at runtime)
-cargo build --release --no-default-features --features no-cuda
-
-# Run inference server (CUDA)
-cargo run -p infer --release -- --model-path models/Qwen3.5-4B
-
-# Lint + format
-cargo clippy --workspace -- -D warnings
-cargo fmt --all -- --check
-```
-
-**Key env vars:**
-- `PEGAINFER_CUDA_SM` — CUDA SM target override (e.g. `120` or `120,80`)
-- `PEGAINFER_TRITON_PYTHON` — Python with Triton for AOT kernel generation
-- `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
-
-### Tests
+Always `--release` — debug GPU builds are unusably slow.
 
 ```bash
-# Unit tests (~9s)
-cargo test --release
+CUDA_HOME=/usr/local/cuda cargo build --release                              # CUDA
+cargo build --release --no-default-features --features metal                 # Metal
+cargo build --release --no-default-features --features no-cuda               # no-GPU
+cargo check -p infer --no-default-features --features cuda,no-cuda           # Mac CUDA-Rust typecheck
 
-# E2E greedy regression (requires GPU + model weights)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+cargo test --release                                   # ~9s, CPU-only
+cargo test --release --test e2e                        # GPU + weights
 cargo test --release --test e2e_qwen35
-
-# Single test
-cargo test -p infer --release -- <test_name>
-
-# Metal test suite (Apple Silicon)
 cargo test --release --no-default-features --features metal
-
-# Type-check CUDA-gated Rust on non-CUDA hosts (Darwin, CI without nvcc).
-# The `no-cuda` feature makes build.rs skip nvcc; the `cuda` feature still
-# enables `#[cfg(feature = "cuda")]` so rustc processes every CUDA-gated
-# module. Use this to validate refactors that touch CUDA-only code paths
-# before shipping to a CUDA host.
-cargo check -p infer --no-default-features --features cuda,no-cuda
-
-# Python tests
-pip install -e ".[dev]"
-python -m pytest tests/ -v
 ```
 
-E2E tests compare against JSON baselines in `infer/test_data/`. Regenerate baselines after any change that affects numerical output.
+Env vars: `PEGAINFER_CUDA_SM` (SM override), `PEGAINFER_TRITON_PYTHON`
+(Triton AOT Python), `PEGAINFER_TEST_MODEL_PATH` (default `models/Qwen3-4B`).
+Full list: [`docs/environment.md`](docs/environment.md).
 
 ---
 
-## Architecture
+## Module Guides
 
-### Workspace layout
+Load the relevant `AGENTS.md` **before** editing inside a module.
 
-```
-agent-infer/          ← top-level Cargo workspace
-├── src/              ← Rust agent binary (ChatML, tool calling, REPL)
-├── agent_infer/      ← Python agent package (async HTTP client mode)
-├── infer/            ← Inference engine (Rust library + GPU kernels)
-│   ├── src/
-│   │   ├── backend.rs           ← `InferenceBackend` trait + submodule declarations
-│   │   ├── backend/
-│   │   │   ├── cuda.rs + cuda/  ← CUDA plumbing: ffi, tensor, paged_kv,
-│   │   │   │                      graph_pool, flashinfer, bootstrap
-│   │   │   ├── metal.rs + metal/ ← Metal/MLX backend + its scheduler,
-│   │   │   │                       KV pool, prefix cache, GDR, mlx bridge
-│   │   │   ├── cpu.rs            ← Development CPU backend (feature `cpu`)
-│   │   │   └── runtime.rs        ← Serial runtime handle shared by CPU/Metal
-│   │   ├── model/               ← Model impls: qwen3/, qwen35/, glm4/
-│   │   ├── ops/                 ← Tensor ops (attention, linear, norm, …)
-│   │   ├── scheduler/           ← CUDA multi-request continuous batching
-│   │   ├── model_registry.rs    ← Model ID → builder map
-│   │   ├── sampler.rs           ← Sampling strategies
-│   │   ├── http_server/         ← OpenAI-compatible HTTP API
-│   │   └── server_engine.rs     ← Single-request inference façade
-│   ├── csrc/cuda/{attention,gemm,kv,quant,misc}/  ← CUDA C kernels, grouped
-│   ├── crates/mlx-sys/          ← MLX build + C++ bridge + Qwen3.5 compiled
-│   │                              model path for the Metal backend
-│   └── tools/triton/            ← Triton Python kernels (AOT compiled)
-└── scripts/          ← Benchmark + utility scripts
-```
-
-### Key abstractions
-
-- **`ModelForward` trait** (`infer/src/model.rs`) — `forward(&self, tokens, state)`; `tokens.len() > 1` → prefill, `== 1` → decode. Weights are `&self` (immutable), per-request state in associated `State` type.
-- **`InferenceBackend` trait** (`infer/src/backend.rs`) — abstracts CUDA vs. Metal vs. CPU execution; selected at compile time via `--features cuda|metal|cpu`. `backend::runtime` dispatches at runtime for the serial backends (Metal/CPU).
-- **`Scheduler`** (`infer/src/scheduler/`) — CUDA multi-request continuous batching. Decode-priority, chunked prefill (4096 tok, 64 when decode active), prefix-aware slot assignment. `--num-slots N` controls concurrency (default 4). CUDA Graph warmup for batch sizes 1–32.
-- **Metal scheduler** (`infer/src/backend/metal/scheduler.rs`) — Metal counterpart with its own KV pool (`backend/metal/kv_pool.rs`) and prefix cache (`backend/metal/prefix_cache.rs`).
-- **`SchedulerHandle`** — `Clone + Send` handle for submitting requests from HTTP handlers.
-- **`InferenceEngine` trait + `LoadedInferenceEngine`** (`server_engine.rs`) — unified engine contract used by both the HTTP server and the agent CLI. `ModelInferenceEngine<M>` is the generic CUDA single-request engine; `BackendInferenceEngine<B>` wraps Metal/CPU backends behind the same trait; `LoadedInferenceEngine` is the dispatching enum.
-
-### Model implementation pattern
-
-Each model is a flat module: `infer/src/model/<name>.rs` + `infer/src/model/<name>/`. Typical files: `config.rs`, `weights.rs`, `forward.rs`, `prefill.rs`, `decode.rs`, `batch_decode.rs`, `decode_buffers.rs`. Hybrid models (qwen35) add `recurrent_state.rs`, `prefill_buffers.rs`, `single_token_buffers.rs`.
-
-### GPU kernel integration
-
-- **CUDA**: `infer/csrc/cuda/{attention,gemm,kv,quant,misc}/` (CUDA C) + `infer/tools/triton/` (Triton). FFI in `infer/src/backend/cuda/ffi.rs`. `build.rs` recursively collects every `.cu` under `csrc/cuda/`, passes `-I csrc/cuda/` to nvcc so `common.cuh` resolves from any subdir, auto-detects SM, runs Triton AOT, links FlashInfer.
-- **Metal**: `crates/mlx-sys/` is the single source of truth for the Metal bridge: it builds MLX from source, compiles the C++ bridge (`mlx_bridge.cpp`, `mlx_qwen35_model.cpp`), and exposes the FFI consumed by `infer/src/backend/metal.rs`. There are no repo-local `.metal` shader files; the actual Metal kernels live inside MLX. Enabled via `--features metal`; `libc` is pulled in for `getrusage`-based RSS reporting.
-
-### Key references
-
-[ModelForward trait](infer/src/model.rs) · [Scheduler](infer/src/scheduler/) · [KV cache](infer/src/model/kv_cache.rs) · [Attention ops](infer/src/ops/attention.rs) · [HTTP server](infer/src/http_server.rs) · [Backend trait](infer/src/backend.rs) · [Metal backend](infer/src/backend/metal.rs) · [CUDA backend](infer/src/backend/cuda.rs) · [Roadmap](ROADMAP.md)
+| Path | Guide |
+|------|-------|
+| `infer/src/backend/` | [AGENTS.md](infer/src/backend/AGENTS.md) — backend trait, dispatch, cfg discipline |
+| `infer/src/backend/metal/` | [AGENTS.md](infer/src/backend/metal/AGENTS.md) — MLX bridge, unified memory, serial runtime |
+| `infer/src/scheduler/` | [AGENTS.md](infer/src/scheduler/AGENTS.md) — continuous batching, prefix cache, slot lifecycle |
+| `infer/src/model/` | [AGENTS.md](infer/src/model/AGENTS.md) — ModelForward, state/weights split, hybrid models |
+| `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |
+| `infer/src/kv_tier/` | [AGENTS.md](infer/src/kv_tier/AGENTS.md) — tier model, RadixCache invariant, MR stability |
+| `infer/src/http_server/` | [AGENTS.md](infer/src/http_server/AGENTS.md) — OpenAI v1 compat, `session_id`, streaming |
+| `crates/infer-cuda-kernels/` | [AGENTS.md](crates/infer-cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, Triton AOT |
+| `crates/mlx-sys/` | [AGENTS.md](crates/mlx-sys/AGENTS.md) — single Metal bridge, cmake+cc build, no repo `.metal` |
 
 ---
 
-## Documentation Workflow (PARA)
+## Core docs (on-demand)
 
-```
-docs/
-├── index.md           # Document index
-├── projects/          # Time-bound efforts with clear deliverables
-├── plans/             # Design plans for in-flight work
-├── experience/        # errors/ + wins/ + reviews/ — postmortems & playbooks
-├── reviews/           # Standalone code/architecture reviews
-├── resources/         # References with potential future value
-└── archives/          # Inactive items
-```
-
-- Docs cover what `--help` and code can't: pitfalls, diagnostic paths, decision context.
-- Refactor over append. Every document points to a next step.
-- At session start, read `index.md` and load relevant docs. At session end, update modified docs and `index.md`.
+- [`docs/index.md`](docs/index.md) — PARA index; always start a session here.
+- [`docs/codebase-map.md`](docs/codebase-map.md) — execution paths + where to start reading.
+- [`docs/architecture.md`](docs/architecture.md) — workspace topology + Option-A→B kernel-crate extraction story.
+- [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — final `infer-cuda-kernels` extraction blueprint (trip wires + acceptance).
+- [`docs/support-matrix.md`](docs/support-matrix.md) — backend / model / quant support levels.

@@ -1,0 +1,97 @@
+# `mlx-sys` — Agent Guide
+
+**Single source of truth** for the Metal bridge. Builds MLX from source,
+compiles the C++ bridge, exposes `extern "C"` FFI consumed by
+`infer::backend::metal`. Load this file before touching the Metal path from
+either side.
+
+## What lives here
+
+```
+crates/mlx-sys/
+├── Cargo.toml           — build-deps: cmake, cc
+├── build.rs             — MLX cmake build → C++ bridge cc build → link chain
+├── mlx/                 — CMakeLists.txt that FetchContent's MLX v0.31.1
+└── src/
+    ├── lib.rs           — extern "C" declarations (no mlx-c intermediate)
+    ├── mlx_bridge.cpp   — C++ wrappers for mlx::core API
+    ├── mlx_qwen35_model.cpp — dedicated C++ Qwen3.5 step model
+    └── mlx_common.h     — shared C header (dtype constants, struct layouts)
+```
+
+## Invariants (violating these breaks the Metal path)
+
+1. **No mlx-c shim.** `mlx_array` is an **opaque pointer to `mlx::core::array*`**,
+   reinterpret_cast in the bridge. Do not add a wrapper struct. Do not
+   import `mlx-c` crates.
+2. **No `.metal` shader files in this repo.** Metal kernels live inside MLX
+   itself (fetched by CMake). Any "new Metal kernel" is either an MLX PR
+   or a C++ change in `mlx_bridge.cpp` that composes existing MLX ops.
+3. **Dtype constants must match `mlx::core::Dtype::Val` and `mlx_common.h`.**
+   If you add a dtype, update all three sites (`lib.rs`, `mlx_common.h`, and
+   the bridge). The CI / type-check on Linux will not catch a drift — it's
+   Apple-only.
+4. **`mlx_last_error()` is thread-local.** Every C++→C boundary that can
+   throw must catch and set it. Rust callers must check for null return
+   and read `mlx_last_error()` immediately afterwards.
+5. **Single source of truth for the Metal bridge.** `infer::backend::metal`
+   consumes this crate; nothing else (no scheduler, no model registry)
+   should link `mlx-sys` directly. If you find yourself wiring mlx-sys
+   into a non-Metal module, you're recreating the bridge.
+6. **The Qwen3.5 step model is a separate C++ file** (`mlx_qwen35_model.cpp`),
+   not a generic MLX composition. It exists because Qwen3.5 hybrid attention
+   benefits from a fused C++ step path; Qwen3 still goes through the Rust
+   `rust_transformer_layer`. Don't merge the two without a bench snapshot.
+
+## Build chain (`build.rs`)
+
+1. **cmake** builds MLX from source via `FetchContent` (MLX v0.31.1).
+   Flags: `MLX_BUILD_METAL=ON`, `MLX_BUILD_ACCELERATE=ON`, tests/examples/
+   benchmarks/python OFF, `BUILD_SHARED_LIBS=OFF`, `CMAKE_CXX_STANDARD=17`.
+2. **cc** compiles `mlx_bridge.cpp` + `mlx_qwen35_model.cpp` as `libmlx_ffi.a`
+   with `-std=c++17 -Wno-deprecated-copy -Wno-unused-parameter -Wno-sign-compare`.
+3. **Link order (strict):**
+   - `static=mlx_ffi` (our bridge)
+   - `static=mlx` (the fetched library)
+   - macOS frameworks: `Metal`, `Foundation`, `Accelerate`, `MetalPerformanceShaders`
+   - `c++` (C++ stdlib)
+4. `cargo:rerun-if-changed` covers the three bridge files + `mlx/CMakeLists.txt`.
+   Touching MLX headers transitively does not trigger rebuild — if you
+   edit an MLX header in a fork, also bump `mlx/CMakeLists.txt`.
+
+## First-build cost
+
+Fetching + compiling MLX from source takes 5–15 minutes on an M-series Mac.
+Cached under `target/.../build/mlx-sys-*/out/build/_deps/mlx-src/`. A
+`cargo clean -p mlx-sys` is expensive — avoid unless the MLX version bumps.
+
+## FFI patterns (when adding bridge functions)
+
+- **Every function returning `*mut mlx_array` must set `mlx_last_error()`
+  and return `nullptr` on exception.** The Rust wrapper in
+  `infer/src/backend/metal/mlx.rs` relies on this contract.
+- **`mlx_array_clone` bumps the shared_ptr refcount**; `mlx_array_free`
+  decrements it. Always pair them. Rust wrappers already do this — don't
+  double-free when writing new bridge functions.
+- **Shape/dtype data crosses the boundary as `*const i32` + `i32 ndim`**,
+  never `std::vector`. Don't introduce `std::string` or STL containers in
+  the public bridge API.
+
+## Common mistakes
+
+- Importing `mlx_sys::*` from `infer::scheduler` or `infer::model`. **Wrong.**
+  All MLX types are behind `infer::backend::metal::mlx::*` (the thin wrapper).
+- Adding a second C++ model file without wiring `build.rs`. `cc::Build::new()`
+  must explicitly `.file(...)` each `.cpp`; there's no glob.
+- Forgetting to add new frameworks to the link line. Rare — MLX's own
+  dependencies cover most things — but a new MPS call may require more.
+
+## Pointers
+
+- `infer/src/backend/metal/AGENTS.md` — the Rust consumer side.
+- `infer/src/backend/metal/mlx.rs` — the thin wrapper that turns this
+  FFI into safe-ish Rust.
+- `docs/plans/2026-04-15-metal-backend-execution-checklist.md` — active
+  Metal backend checklist.
+- `docs/experience/wins/2026-04-13-qwen35-metal-cpp-path-tuning.md` — why
+  the dedicated C++ step model beat the generic Rust path for Qwen3.5.
