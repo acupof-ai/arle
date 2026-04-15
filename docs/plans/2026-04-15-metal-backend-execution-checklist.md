@@ -34,7 +34,7 @@ This checklist is the execution companion to:
   generation TPS, but the quick HTTP sweep stayed flat (`512/256 C=4`
   `66.4 -> 66.2 tok/s`), so the milestone is still open because variable-length
   decode and per-step batch-state rebuild cost still dominate the serving exit.
-- [ ] `M0.3` Wire Metal prefix cache + KV pool into the live scheduler path.
+- [x] `M0.3` Wire Metal prefix cache + KV pool into the live scheduler path.
   Exit:
   shared-prefix requests skip matched prefill in the serving path, not only in
   the single-request fallback path.
@@ -44,8 +44,10 @@ This checklist is the execution companion to:
   prefill publishes aligned prompt prefixes back into the runtime cache, and a
   local repeated-prefix smoke on `mlx-community/Qwen3-0.6B-4bit` moved
   `prefix_hit_rate` to `0.3333` with sequential `max_tokens=1` latency
-  dropping from `186.7ms -> 65.1ms`. The milestone stays open because
-  `Qwen3.5` still lacks live prefix reuse.
+  dropping from `186.7ms -> 65.1ms`. `Qwen3.5-4B-MLX-4bit` now also ships
+  live prefix reuse through replayed compiled-path snapshots; a repeated-prompt
+  smoke moved latency from `533.9ms -> 145.6ms` and `/metrics` now reports
+  `infer_prefix_hits_total=1` / `infer_prefix_hit_rate=0.3333` on that path.
 - [x] `M0.4` Expose Metal memory and reuse observability.
   Exit:
   `/metrics` and `/v1/stats` surface at least `prefix_hit_rate`, `kv_util`,
@@ -63,13 +65,15 @@ This checklist is the execution companion to:
 - [x] `M1.1` Promote Metal experimental env toggles to documented CLI flags.
   Exit:
   no user-facing Metal serving behavior requires hidden env vars.
-- [ ] `M1.2` Add `/v1/models` and `/v1/responses`.
+- [x] `M1.2` Add `/v1/models` and `/v1/responses`.
   Exit:
   standard OpenAI SDK flows work without compatibility shims for model discovery
   and the Responses API.
   Status:
-  `2026-04-15`: `/v1/models` shipped and `/v1/responses` non-streaming subset
-  shipped; streaming parity still pending.
+  `2026-04-15`: `/v1/models` shipped first, then `/v1/responses` gained both
+  non-streaming and SSE forms. Streaming now emits `response.created`,
+  `response.output_text.delta`, and terminal `response.completed` before
+  `[DONE]`.
 - [ ] `M1.3` Add structured output support.
   Exit:
   `response_format` with JSON-schema constrained decoding is supported for chat

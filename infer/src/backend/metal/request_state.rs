@@ -236,6 +236,14 @@ pub(crate) struct Qwen3PrefixSnapshot {
     pub v_rows_by_layer: Vec<MlxArray>,
 }
 
+pub(crate) struct Qwen35PrefixSnapshot {
+    pub token_ids: Vec<u32>,
+    pub kv_flat: Vec<MlxArray>,
+    pub gdr_flat: Vec<MlxArray>,
+    pub cache_len: i32,
+    pub kv_capacity: i32,
+}
+
 impl<'a> MetalRequestState<'a> {
     pub(super) fn new(
         weights: &'a MetalWeights,
@@ -494,6 +502,70 @@ impl<'a> MetalRequestState<'a> {
                 }))
             }
             MetalRequestStateInner::Qwen35(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn import_qwen35_prefix_snapshot(
+        &mut self,
+        snapshot: &Qwen35PrefixSnapshot,
+        matched_len: usize,
+    ) -> Result<bool> {
+        match &mut self.inner {
+            MetalRequestStateInner::Qwen35(state) => {
+                ensure!(
+                    state.phase == MetalRequestPhase::Prefill,
+                    "Qwen3.5 prefix import requires Prefill phase, got {:?}",
+                    state.phase
+                );
+                ensure!(
+                    state.prompt_cursor == 0 && state.generated_tokens == 0,
+                    "Qwen3.5 prefix import requires a fresh request state"
+                );
+                ensure!(
+                    matched_len == snapshot.token_ids.len(),
+                    "Qwen3.5 prefix import length {} does not match snapshot {}",
+                    matched_len,
+                    snapshot.token_ids.len()
+                );
+                ensure!(
+                    snapshot.cache_len == matched_len as i32,
+                    "Qwen3.5 prefix snapshot cache_len {} does not match {} tokens",
+                    snapshot.cache_len,
+                    matched_len
+                );
+                if matched_len == 0 || matched_len >= state.prompt_tokens.len() {
+                    return Ok(false);
+                }
+
+                state
+                    .driver
+                    .import_prefix_snapshot(snapshot)
+                    .context("import Qwen3.5 cached prefix snapshot")?;
+                state.prompt_cursor = matched_len;
+                Ok(true)
+            }
+            MetalRequestStateInner::Qwen3(_) => Ok(false),
+        }
+    }
+
+    pub(crate) fn export_qwen35_prompt_prefixes(
+        &self,
+        block_size: usize,
+    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen35(state) => {
+                if block_size == 0 {
+                    return Ok(Vec::new());
+                }
+                let aligned_len = (state.prompt_cursor / block_size) * block_size;
+                if aligned_len == 0 {
+                    return Ok(Vec::new());
+                }
+                state
+                    .driver
+                    .build_prefix_snapshots(&state.prompt_tokens[..aligned_len], block_size)
+            }
+            MetalRequestStateInner::Qwen3(_) => Ok(Vec::new()),
         }
     }
 }
@@ -1356,6 +1428,87 @@ impl<'a> Qwen35StepDriver<'a> {
             }
             self.kv_capacity = new_cap;
         }
+    }
+
+    fn import_prefix_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
+        ensure!(
+            snapshot.cache_len > 0,
+            "Qwen3.5 prefix import requires a non-empty snapshot"
+        );
+        ensure!(
+            snapshot.kv_capacity >= snapshot.cache_len,
+            "Qwen3.5 prefix snapshot capacity {} is smaller than cache_len {}",
+            snapshot.kv_capacity,
+            snapshot.cache_len
+        );
+        match &mut self.mode {
+            Qwen35StepMode::Cpp(state) => {
+                state.kv_flat = snapshot.kv_flat.clone();
+                state.gdr_flat = snapshot.gdr_flat.clone();
+                self.kv_capacity = snapshot.kv_capacity;
+                self.cache_len = snapshot.cache_len;
+                Ok(())
+            }
+            Qwen35StepMode::Rust(_) => bail!(
+                "Qwen3.5 live prefix reuse currently requires the compiled C++ step path"
+            ),
+        }
+    }
+
+    fn export_current_cpp_snapshot(&self, token_ids: Vec<u32>) -> Result<Qwen35PrefixSnapshot> {
+        let cache_len = self.cache_len;
+        ensure!(cache_len > 0, "Qwen3.5 prefix export requires a non-empty cache");
+        match &self.mode {
+            Qwen35StepMode::Cpp(state) => Ok(Qwen35PrefixSnapshot {
+                token_ids,
+                kv_flat: state.kv_flat.clone(),
+                gdr_flat: state.gdr_flat.clone(),
+                cache_len,
+                kv_capacity: self.kv_capacity,
+            }),
+            Qwen35StepMode::Rust(_) => bail!(
+                "Qwen3.5 live prefix export currently requires the compiled C++ step path"
+            ),
+        }
+    }
+
+    fn build_prefix_snapshots(
+        &self,
+        prompt_tokens: &[u32],
+        block_size: usize,
+    ) -> Result<Vec<Qwen35PrefixSnapshot>> {
+        ensure!(block_size > 0, "Qwen3.5 prefix snapshot block size must be > 0");
+        ensure!(
+            prompt_tokens.len().is_multiple_of(block_size),
+            "Qwen3.5 prefix snapshot build requires a block-aligned prompt"
+        );
+        if !matches!(self.mode, Qwen35StepMode::Cpp(_)) || prompt_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut replay = Qwen35StepDriver::new(
+            self.weights,
+            self.config,
+            &self.params,
+            prompt_tokens,
+            1,
+        )
+        .context("build replay driver for Qwen3.5 prefix snapshots")?;
+        let mut snapshots = Vec::with_capacity(prompt_tokens.len() / block_size);
+
+        for chunk in prompt_tokens.chunks(block_size) {
+            replay
+                .prefill_tokens(chunk, false)
+                .context("replay Qwen3.5 prompt chunk for prefix snapshot")?;
+            let materialized = replay.cache_len as usize;
+            snapshots.push(
+                replay
+                    .export_current_cpp_snapshot(prompt_tokens[..materialized].to_vec())
+                    .context("export replayed Qwen3.5 prefix snapshot")?,
+            );
+        }
+
+        Ok(snapshots)
     }
 }
 

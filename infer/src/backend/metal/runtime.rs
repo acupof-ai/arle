@@ -13,6 +13,7 @@ use super::kv_pool::MetalKVPool;
 use super::prefix_cache::MetalPrefixCache;
 use super::request_state::{
     MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
+    Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
     MetalRequestPriority, MetalScheduleDecision, MetalScheduler, MetalSchedulerConfig,
@@ -150,9 +151,27 @@ impl ActiveMetalRequest {
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
 const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
 
-struct MetalLivePrefixRuntime {
+enum MetalLivePrefixRuntime {
+    Qwen3(MetalQwen3PrefixRuntime),
+    Qwen35(MetalQwen35PrefixRuntime),
+}
+
+struct MetalQwen3PrefixRuntime {
     pool: MetalKVPool,
     cache: MetalPrefixCache,
+}
+
+struct MetalQwen35CachedPrefix {
+    snapshot: Qwen35PrefixSnapshot,
+    last_used_tick: u64,
+}
+
+struct MetalQwen35PrefixRuntime {
+    entries: HashMap<Vec<u32>, MetalQwen35CachedPrefix>,
+    max_cached_tokens: usize,
+    cached_tokens: usize,
+    next_tick: u64,
+    block_size: usize,
 }
 
 struct MetalPrefixAdmission {
@@ -163,36 +182,66 @@ impl MetalLivePrefixRuntime {
     fn new(backend: &'static MetalBackend, config: &MetalSchedulerConfig) -> Result<Option<Self>> {
         let model_config = backend.config.as_ref().context("model not loaded")?;
         let weights = backend.weights.as_ref().context("weights not loaded")?;
-        let MetalWeights::Qwen3(weights) = weights else {
-            return Ok(None);
-        };
-
         let max_total_tokens = (config
             .max_active_requests
             .saturating_mul(config.prefill_chunk_size)
             .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
         .max(METAL_PREFIX_BLOCK_SIZE * 8);
-        let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
-        let pool = MetalKVPool::new(
-            model_config.num_hidden_layers,
-            model_config.num_key_value_heads,
-            model_config.head_dim,
-            max_total_tokens,
-            kv_dtype,
-        )
-        .context("create live Metal prefix KV pool")?;
+        match weights {
+            MetalWeights::Qwen3(weights) => {
+                let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
+                let pool = MetalKVPool::new(
+                    model_config.num_hidden_layers,
+                    model_config.num_key_value_heads,
+                    model_config.head_dim,
+                    max_total_tokens,
+                    kv_dtype,
+                )
+                .context("create live Metal prefix KV pool")?;
 
-        info!(
-            "Metal live prefix cache enabled for Qwen3: block_size={}, max_cached_tokens={}",
-            METAL_PREFIX_BLOCK_SIZE, max_total_tokens
-        );
+                info!(
+                    "Metal live prefix cache enabled for Qwen3: block_size={}, max_cached_tokens={}",
+                    METAL_PREFIX_BLOCK_SIZE, max_total_tokens
+                );
 
-        Ok(Some(Self {
-            pool,
-            cache: MetalPrefixCache::new(METAL_PREFIX_BLOCK_SIZE),
-        }))
+                Ok(Some(Self::Qwen3(MetalQwen3PrefixRuntime {
+                    pool,
+                    cache: MetalPrefixCache::new(METAL_PREFIX_BLOCK_SIZE),
+                })))
+            }
+            MetalWeights::Qwen35(_) => {
+                info!(
+                    "Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size={}, max_cached_tokens={}",
+                    METAL_PREFIX_BLOCK_SIZE, max_total_tokens
+                );
+                Ok(Some(Self::Qwen35(MetalQwen35PrefixRuntime::new(
+                    max_total_tokens,
+                    METAL_PREFIX_BLOCK_SIZE,
+                ))))
+            }
+        }
     }
 
+    fn prepare_request(
+        &mut self,
+        request: &mut ActiveMetalRequest,
+        metrics: &ServerMetrics,
+    ) -> Result<MetalPrefixAdmission> {
+        match self {
+            MetalLivePrefixRuntime::Qwen3(runtime) => runtime.prepare_request(request, metrics),
+            MetalLivePrefixRuntime::Qwen35(runtime) => runtime.prepare_request(request, metrics),
+        }
+    }
+
+    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
+        match self {
+            MetalLivePrefixRuntime::Qwen3(runtime) => runtime.publish_prompt_prefix(request),
+            MetalLivePrefixRuntime::Qwen35(runtime) => runtime.publish_prompt_prefix(request),
+        }
+    }
+}
+
+impl MetalQwen3PrefixRuntime {
     fn prepare_request(
         &mut self,
         request: &mut ActiveMetalRequest,
@@ -325,6 +374,140 @@ impl MetalLivePrefixRuntime {
         } else {
             aligned
         }
+    }
+}
+
+impl MetalQwen35PrefixRuntime {
+    fn new(max_cached_tokens: usize, block_size: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_cached_tokens,
+            cached_tokens: 0,
+            next_tick: 1,
+            block_size,
+        }
+    }
+
+    fn prepare_request(
+        &mut self,
+        request: &mut ActiveMetalRequest,
+        metrics: &ServerMetrics,
+    ) -> Result<MetalPrefixAdmission> {
+        let prompt_tokens = &request.prompt_tokens;
+        if prompt_tokens.len() < self.block_size {
+            metrics.record_prefix_lookup(false);
+            return Ok(MetalPrefixAdmission {
+                scheduler_prompt_tokens: prompt_tokens.clone(),
+            });
+        }
+
+        let Some(prefix_key) = self.lookup_longest_prefix(prompt_tokens) else {
+            metrics.record_prefix_lookup(false);
+            return Ok(MetalPrefixAdmission {
+                scheduler_prompt_tokens: prompt_tokens.clone(),
+            });
+        };
+
+        let imported = if let Some(snapshot) = self.entries.get(&prefix_key).map(|entry| &entry.snapshot)
+        {
+            request
+                .request_state
+                .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
+                .context("import matched Qwen3.5 prefix snapshot into request state")?
+        } else {
+            false
+        };
+
+        metrics.record_prefix_lookup(imported);
+        if !imported {
+            return Ok(MetalPrefixAdmission {
+                scheduler_prompt_tokens: prompt_tokens.clone(),
+            });
+        }
+
+        self.touch(&prefix_key);
+        Ok(MetalPrefixAdmission {
+            scheduler_prompt_tokens: prompt_tokens[prefix_key.len()..].to_vec(),
+        })
+    }
+
+    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
+        let snapshots = request
+            .request_state
+            .export_qwen35_prompt_prefixes(self.block_size)
+            .context("export Qwen3.5 prompt prefix snapshots")?;
+        for snapshot in snapshots {
+            self.insert_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn lookup_longest_prefix(&self, prompt_tokens: &[u32]) -> Option<Vec<u32>> {
+        self.entries
+            .keys()
+            .filter(|tokens| {
+                let prefix_len = tokens.len();
+                prefix_len >= self.block_size
+                    && prefix_len < prompt_tokens.len()
+                    && prompt_tokens.starts_with(tokens.as_slice())
+            })
+            .max_by_key(|tokens| tokens.len())
+            .cloned()
+    }
+
+    fn insert_snapshot(&mut self, snapshot: Qwen35PrefixSnapshot) -> Result<()> {
+        let token_count = snapshot.token_ids.len();
+        if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
+            return Ok(());
+        }
+        let tick = self.bump_tick();
+        if let Some(existing) = self.entries.get_mut(&snapshot.token_ids) {
+            existing.last_used_tick = tick;
+            return Ok(());
+        }
+        if token_count > self.max_cached_tokens {
+            return Ok(());
+        }
+
+        self.ensure_capacity_for(token_count);
+        let key = snapshot.token_ids.clone();
+        self.cached_tokens += token_count;
+        self.entries.insert(
+            key,
+            MetalQwen35CachedPrefix {
+                snapshot,
+                last_used_tick: tick,
+            },
+        );
+        Ok(())
+    }
+
+    fn ensure_capacity_for(&mut self, needed_tokens: usize) {
+        while self.cached_tokens.saturating_add(needed_tokens) > self.max_cached_tokens {
+            let Some((lru_key, lru_tokens)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_tick)
+                .map(|(tokens, entry)| (tokens.clone(), entry.snapshot.token_ids.len()))
+            else {
+                break;
+            };
+            self.entries.remove(&lru_key);
+            self.cached_tokens = self.cached_tokens.saturating_sub(lru_tokens);
+        }
+    }
+
+    fn touch(&mut self, key: &[u32]) {
+        let tick = self.bump_tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.last_used_tick = tick;
+        }
+    }
+
+    fn bump_tick(&mut self) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick = self.next_tick.saturating_add(1);
+        tick
     }
 }
 

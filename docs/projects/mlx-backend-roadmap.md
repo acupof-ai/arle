@@ -46,8 +46,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
    当前状态：Qwen3 live runtime 已接上 runtime-owned prefix cache + shared KV
    pool；admission 会先 lookup/import，再把 suffix 交给 scheduler，terminal
-   prefill 会把 aligned prompt prefix publish 回共享 cache。Qwen3.5 仍未进入这条
-   live prefix reuse 路径。
+   prefill 会把 aligned prompt prefix publish 回共享 cache。Qwen3.5 也已进入这条
+   live prefix reuse 路径，但当前实现是 replayed snapshot cache，不是 zero-copy
+   shared recurrent-state ownership。
 3. 暴露 Metal queue depth / prefix hit / active + peak memory / KV util 等 serving 级指标。
    当前状态：runtime-backed queue / TTFT / E2E / MLX active/peak/cache memory
    已落地；`prefix_hit_rate` 现在已在 Qwen3 live repeated-prefix smoke 中变成
@@ -59,8 +60,11 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 ### P1 · Product surface
 
 4. 完成 `/v1/responses` streaming parity，而不是只停留在 non-streaming 子集。
+   当前状态：已落地。SSE 现在稳定发出 `response.created`、
+   `response.output_text.delta`、`response.completed`，然后再发 `[DONE]`。
 5. 增加结构化输出 / constrained decoding，让 tool-calling 成为一等路径。
 6. 提供一条 Apple Silicon 的单命令安装 / 启动路径，避免用户理解 Cargo features。
+   当前状态：已落地。`scripts/start_metal_serve.sh` 是第一条推荐入口。
 
 ### Background work, not main thread
 
