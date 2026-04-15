@@ -460,8 +460,17 @@ impl<M: ModelForward> Scheduler<M> {
                 )
             })
             .collect();
+        let block_fingerprints: Vec<crate::types::BlockFingerprint> = (0..num_blocks)
+            .map(|i| {
+                crate::types::BlockFingerprint::compute_from_tokens(
+                    &prompt_tokens[i * block_size..(i + 1) * block_size],
+                )
+            })
+            .collect();
 
-        let inserted = self.prefix_cache.insert(prompt_tokens, &blocks);
+        let inserted =
+            self.prefix_cache
+                .insert_with_fingerprints(prompt_tokens, &blocks, &block_fingerprints);
         if inserted != required_tokens {
             warn!(
                 "prefix_cache.insert: expected {} tokens, got {} (slot={}, num_blocks={}, prompt={})",

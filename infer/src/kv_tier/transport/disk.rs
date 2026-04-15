@@ -332,4 +332,25 @@ mod tests {
         let err = store.get_block(&loc, None).expect_err("get after delete");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
+
+    #[test]
+    fn disk_store_round_trip_preserves_fingerprint() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let payload: Vec<u8> = (0..4096u64).map(|i| (i % 256) as u8).collect();
+        let fingerprint_for = |bytes: &[u8]| {
+            crate::types::BlockFingerprint::compute_from_tokens(
+                &bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let location = store.put_block(&payload).expect("put_block");
+        let read_back = store.get_block(&location, None).expect("get_block");
+
+        assert_eq!(fingerprint_for(&payload), fingerprint_for(&read_back));
+        assert_eq!(read_back, payload);
+    }
 }

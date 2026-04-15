@@ -49,6 +49,31 @@ pub struct BlockId(pub u32);
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BlockFingerprint(pub [u8; 16]);
 
+impl BlockFingerprint {
+    /// Compute a 16-byte content hash over a full-block token slice.
+    /// Local placeholder — final hash function (BLAKE3 vs xxHash3) deferred to M4.
+    /// Stability within a single process run is the only requirement.
+    pub fn compute_from_tokens(tokens: &[u32]) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h1 = DefaultHasher::new();
+        tokens.hash(&mut h1);
+        "pegainfer-kv-v1-a".hash(&mut h1);
+        let v1 = h1.finish();
+
+        let mut h2 = DefaultHasher::new();
+        tokens.hash(&mut h2);
+        "pegainfer-kv-v1-b".hash(&mut h2);
+        let v2 = h2.finish();
+
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&v1.to_le_bytes());
+        bytes[8..].copy_from_slice(&v2.to_le_bytes());
+        BlockFingerprint(bytes)
+    }
+}
+
 /// Stable request identifier across scheduler/runtime boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequestId(pub u64);
@@ -164,6 +189,16 @@ mod tests {
         let fp = BlockFingerprint(bytes);
         assert_eq!(fp.0, bytes);
         assert_eq!(fp, BlockFingerprint(bytes));
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_and_sensitive() {
+        let a = BlockFingerprint::compute_from_tokens(&[1, 2, 3, 4]);
+        let b = BlockFingerprint::compute_from_tokens(&[1, 2, 3, 4]);
+        let c = BlockFingerprint::compute_from_tokens(&[1, 2, 3, 5]);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
