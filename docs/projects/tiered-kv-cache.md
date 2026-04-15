@@ -979,9 +979,12 @@ for the stacked M2b + M0.3 + M3a local batches.
   status**: the contract/state-machine tranche is now in-tree
   (`lookup_or_stage`, `LookupOutcome`, `StageTicket`, pure
   `PageLifecycleState`, ticketed coordinator staging events, and
-  `evict_with_policy` already wired on the cleanup/allocation path).
-  The remaining work is runtime behavior: scheduler admission hooks,
-  watermark rewiring, live staging, and remote CUDA validation. Remote
+  `evict_with_policy` already wired on the cleanup/allocation path), and
+  the first safe runtime wire is now local too: scheduler admission uses
+  plannerless `lookup_or_stage(..., None)` classification, live
+  queue/decode-derived eviction signals, and session/keepalive metadata
+  stamping. The remaining work is **real staged completion / promotion**
+  plus remote CUDA validation. Remote
   checklist: `docs/plans/tiered-kv-cache-m3b-remote-acceptance.md`.
 - **M3c · T1→T0 promotion path + delete legacy CPU offload.**
   The **cleanup half is now shipped locally**: the old contiguous
