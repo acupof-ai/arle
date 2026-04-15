@@ -273,7 +273,7 @@ pub fn decode_attention_int8(
     k_scales_ptr: u64,
     v_scales_ptr: u64,
     kv_indices: &CudaSlice<i32>,
-    kv_indptr: &CudaSlice<i32>,
+    kv_meta: &CudaSlice<i32>,
     o: &mut HiddenStates,
     batch_size: usize,
     num_qo_heads: usize,
@@ -289,7 +289,7 @@ pub fn decode_attention_int8(
     }
     let (q_ptr, _g1) = q.data.device_ptr(&ctx.stream);
     let (ki_ptr, _g2) = kv_indices.device_ptr(&ctx.stream);
-    let (ip_ptr, _g3) = kv_indptr.device_ptr(&ctx.stream);
+    let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
     let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
     unsafe {
@@ -327,7 +327,7 @@ pub fn decode_attention_fp8(
     k_data_ptr: u64,
     v_data_ptr: u64,
     kv_indices: &CudaSlice<i32>,
-    kv_indptr: &CudaSlice<i32>,
+    kv_meta: &CudaSlice<i32>,
     o: &mut HiddenStates,
     batch_size: usize,
     num_qo_heads: usize,
@@ -343,7 +343,7 @@ pub fn decode_attention_fp8(
     }
     let (q_ptr, _g1) = q.data.device_ptr(&ctx.stream);
     let (ki_ptr, _g2) = kv_indices.device_ptr(&ctx.stream);
-    let (ip_ptr, _g3) = kv_indptr.device_ptr(&ctx.stream);
+    let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
     let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
     unsafe {

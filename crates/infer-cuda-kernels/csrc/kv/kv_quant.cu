@@ -170,7 +170,7 @@ cudaError_t dequantize_kv_int8_to_bf16_cuda(
 __global__ void quantize_paged_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,    // working buffer [max_total_tokens * kv_dim]
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // FP8 pool [max_total_tokens * kv_dim]
-    const int32_t* __restrict__ new_token_indices, // [batch_size] pool index of newest token
+    const int32_t* __restrict__ new_token_indices, // [batch_size] token row of newest token
     int num_kv_heads,
     int head_dim,
     int kv_dim)
@@ -181,8 +181,12 @@ __global__ void quantize_paged_kv_fp8_kernel(
 
     if (d >= head_dim) return;
 
-    int pool_idx = new_token_indices[batch_idx];
-    int offset = pool_idx * kv_dim + kv_head * head_dim + d;
+    constexpr int kPageSize = 16;
+    int token_row = new_token_indices[batch_idx];
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int row_idx = page_idx * kPageSize + offset_in_page;
+    int offset = row_idx * kv_dim + kv_head * head_dim + d;
     float val = __bfloat162float(kv_bf16[offset]);
     kv_fp8[offset] = __nv_fp8_e4m3(val);
 }
@@ -193,7 +197,7 @@ __global__ void quantize_paged_kv_fp8_kernel(
 __global__ void quantize_scatter_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_cont,    // [num_kv_heads, max_seq_len, head_dim] HND
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // [max_total_tokens, kv_dim] NHD
-    const int32_t* __restrict__ page_indices,     // [seq_len] pool indices
+    const int32_t* __restrict__ page_indices,     // [token_count] token rows
     int start_pos,
     int max_seq_len,
     int num_kv_heads,
@@ -206,11 +210,15 @@ __global__ void quantize_scatter_kv_fp8_kernel(
     if (d >= head_dim) return;
 
     int pos = start_pos + rel_pos;
-    int pool_idx = page_indices[rel_pos];
+    constexpr int kPageSize = 16;
+    int token_row = page_indices[rel_pos];
+    int page_idx = token_row / kPageSize;
+    int offset_in_page = token_row % kPageSize;
+    int row_idx = page_idx * kPageSize + offset_in_page;
     // Source: HND
     int src = kv_head * max_seq_len * head_dim + pos * head_dim + d;
     // Dest: NHD
-    int dst = pool_idx * kv_dim + kv_head * head_dim + d;
+    int dst = row_idx * kv_dim + kv_head * head_dim + d;
     float val = __bfloat162float(kv_cont[src]);
     kv_fp8[dst] = __nv_fp8_e4m3(val);
 }

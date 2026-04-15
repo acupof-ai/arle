@@ -6,9 +6,9 @@
 //! pages**. This matches FlashInfer's HND paged layout:
 //!   `[max_pages, num_kv_heads, page_size, head_dim]`.
 //!
-//! For quantized formats we intentionally keep `page_size = 1` in M0.3 because
-//! the existing INT8 / FP8 / TurboQuant scatter paths are still token-level.
-//! BF16 lifts to `page_size = 16`.
+//! BF16 / INT8 / FP8 E4M3 now all use `page_size = 16`. TurboQuant remains
+//! token-granular (`page_size = 1`) until its decode and migration kernels are
+//! rewritten around paged layout.
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -103,16 +103,16 @@ pub struct TokenKVPool {
 
 /// FlashInfer-compatible metadata for a batch of requests.
 ///
-/// With `page_size = 1`:
-/// - `indptr[i+1] - indptr[i]` = number of tokens (= pages) for request `i`
+/// With `page_size = 16`:
+/// - `indptr[i+1] - indptr[i]` = number of pages for request `i`
 /// - `indices` = concatenated physical pool indices for all requests
-/// - `last_page_len` = all 1s (every "page" is exactly 1 token)
+/// - `last_page_len` = tokens used in the final page for each request
 pub struct FlashInferMeta {
     /// Cumulative token counts: `[batch_size + 1]`
     pub indptr: Vec<i32>,
     /// Concatenated physical pool indices for the batch.
     pub indices: Vec<i32>,
-    /// All 1s — each page holds exactly 1 token.
+    /// Tokens used in the final page for each request.
     pub last_page_len: Vec<i32>,
 }
 
@@ -778,11 +778,21 @@ impl TokenKVPool {
         indices
     }
 
-    /// Build only the last physical page id per slot.
+    /// Build the token-row index of the newest token in each slot.
+    ///
+    /// For `page_size=1` this is identical to the last physical page id. For
+    /// paged quantized pools (`page_size=16`), the quantize-single fast path
+    /// needs the exact token row, not just the page id.
     pub fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
-            .map(|&slot| *self.page_indices[slot].last().expect("slot has no pages") as i32)
+            .map(|&slot| {
+                let seq_len = self.seq_lens[slot];
+                debug_assert!(seq_len > 0, "slot has no live tokens");
+                let last_pos = seq_len - 1;
+                let page = self.page_indices[slot][last_pos / self.page_size];
+                (page as usize * self.page_size + (last_pos % self.page_size)) as i32
+            })
             .collect()
     }
 
@@ -798,6 +808,18 @@ impl TokenKVPool {
                 }
             })
             .collect()
+    }
+
+    /// Build packed decode metadata for quantized page-aware kernels:
+    /// `[page_indptr..., last_page_len...]`.
+    ///
+    /// `page_indptr` is length `batch + 1` and indexes into the page-granular
+    /// `kv_indices` array. `last_page_len` is length `batch` and records how
+    /// many logical tokens in the final page are valid.
+    pub fn build_quantized_decode_indptr(&self, slots: &[usize]) -> Vec<i32> {
+        let mut packed = self.build_indptr(slots);
+        packed.extend(self.build_last_page_lens(slots));
+        packed
     }
 
     /// Migrate KV data from contiguous per-slot cache into the paged pool.
@@ -1305,13 +1327,54 @@ mod tests {
             }
             rows
         }
+
+        fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {
+            slots
+                .iter()
+                .map(|&slot| {
+                    let seq_len = self.seq_lens[slot];
+                    let last_pos = seq_len - 1;
+                    let page = self.page_indices[slot][last_pos / self.page_size];
+                    (page as usize * self.page_size + (last_pos % self.page_size)) as i32
+                })
+                .collect()
+        }
+
+        fn build_indptr(&self, slots: &[usize]) -> Vec<i32> {
+            let mut indptr = Vec::with_capacity(slots.len() + 1);
+            indptr.push(0);
+            for &slot in slots {
+                let last = *indptr.last().unwrap();
+                indptr.push(last + self.page_indices[slot].len() as i32);
+            }
+            indptr
+        }
+
+        fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
+            slots
+                .iter()
+                .map(|&slot| {
+                    if self.seq_lens[slot] == 0 {
+                        0
+                    } else {
+                        ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
+                    }
+                })
+                .collect()
+        }
+
+        fn build_quantized_decode_indptr(&self, slots: &[usize]) -> Vec<i32> {
+            let mut packed = self.build_indptr(slots);
+            packed.extend(self.build_last_page_lens(slots));
+            packed
+        }
     }
 
     #[test]
-    fn format_default_page_sizes_match_m0_3_dispatch() {
+    fn format_default_page_sizes_match_quantized_page16_dispatch() {
         assert_eq!(KVFormat::BF16.default_page_size(), 16);
-        assert_eq!(KVFormat::INT8.default_page_size(), 1);
-        assert_eq!(KVFormat::FP8E4M3.default_page_size(), 1);
+        assert_eq!(KVFormat::INT8.default_page_size(), 16);
+        assert_eq!(KVFormat::FP8E4M3.default_page_size(), 16);
         assert_eq!(
             KVFormat::TurboQuant {
                 key_bits: 3,
@@ -1347,6 +1410,35 @@ mod tests {
         assert_eq!(pool.page_indices_for_token_range(0, 0, 16), &[0]);
         assert_eq!(pool.page_indices_for_token_range(0, 12, 8), &[0, 1]);
         assert_eq!(pool.token_rows_for_range(0, 14, 4), vec![14, 15, 16, 17]);
+    }
+
+    #[test]
+    fn last_indices_track_last_token_row_under_page_size_16() {
+        // Pool needs at least 5 pages to satisfy 20 + 33 = 53 tokens at
+        // page_size=16 (slot 0 → 2 pages, slot 1 → 3 pages). Use 6 to mirror
+        // the adjacent `quantized_decode_indptr_*` test.
+        // After alloc: slot 0 = pages [0, 1], slot 1 = pages [2, 3, 4].
+        // - slot 0 last_pos = 19 → page_indices[0][1] = 1 → row = 1*16+3 = 19
+        // - slot 1 last_pos = 32 → page_indices[1][2] = 4 → row = 4*16+0 = 64
+        let mut pool = MockPool::new(6, 2, 16);
+        pool.alloc_tokens(0, 20);
+        pool.alloc_tokens(1, 33);
+
+        assert_eq!(pool.build_last_indices(&[0, 1]), vec![19, 64]);
+    }
+
+    #[test]
+    fn quantized_decode_indptr_packs_page_offsets_and_last_page_lens() {
+        let mut pool = MockPool::new(6, 2, 16);
+        pool.alloc_tokens(0, 20);
+        pool.alloc_tokens(1, 33);
+
+        assert_eq!(pool.build_indptr(&[0, 1]), vec![0, 2, 5]);
+        assert_eq!(pool.build_last_page_lens(&[0, 1]), vec![4, 1]);
+        assert_eq!(
+            pool.build_quantized_decode_indptr(&[0, 1]),
+            vec![0, 2, 5, 4, 1]
+        );
     }
 
     #[test]

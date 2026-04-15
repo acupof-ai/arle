@@ -149,6 +149,9 @@ pub struct BatchDecodeBuffers35 {
 
     // ── FlashInfer metadata (for full attention layers) ──
     pub(crate) metadata: FlashInferDecodeMetadata,
+    /// Packed page-aware metadata for quantized decode kernels:
+    /// `[page_indptr..., last_page_len...]`.
+    quantized_kv_meta: CudaSlice<i32>,
 
     /// Piecewise CUDA Graph cache for groups of consecutive linear layers.
     /// Indexed by [group_idx][batch_size - 1].
@@ -263,6 +266,10 @@ impl BatchDecodeBuffers35 {
                 max_total_pages,
                 num_qheads,
             )?,
+            quantized_kv_meta: ctx
+                .stream
+                .alloc_zeros(2 * max_batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta: {e}"))?,
 
             // Piecewise graph cache: one entry per group of consecutive linear layers.
             // For Qwen3.5: full_attention_interval=4 → 8 groups of 3 linear layers.
@@ -387,6 +394,13 @@ impl Qwen35Model {
         // NOTE: set_batch_size, upload_token_ids, update_metadata, and
         // plan_attention are now called by the scheduler via DecodeContextOps
         // before this method is invoked.
+        if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
+            let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
+            self.ctx
+                .stream
+                .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
+                .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+        }
 
         bufs.common.embedding_out.seq_len = batch_size;
 
@@ -892,7 +906,7 @@ impl Qwen35Model {
                         kv_pool.k_scales_ptr(full_idx, stream),
                         kv_pool.v_scales_ptr(full_idx, stream),
                         &bufs.metadata.kv_indices,
-                        &bufs.metadata.kv_indptr,
+                        &bufs.quantized_kv_meta,
                         &mut bufs.attn.attn_output,
                         batch_size,
                         num_heads,
@@ -912,7 +926,7 @@ impl Qwen35Model {
                         kv_pool.k_data_ptr(full_idx, stream),
                         kv_pool.v_data_ptr(full_idx, stream),
                         &bufs.metadata.kv_indices,
-                        &bufs.metadata.kv_indptr,
+                        &bufs.quantized_kv_meta,
                         &mut bufs.attn.attn_output,
                         batch_size,
                         num_heads,
