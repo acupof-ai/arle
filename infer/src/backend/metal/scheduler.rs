@@ -88,6 +88,8 @@ pub enum MetalSchedulerError {
     QueueFull,
     EmptyPrompt,
     UnknownRequest(RequestId),
+    PrefillIncomplete(RequestId),
+    DecodeAlreadyStarted(RequestId),
     WrongPhase {
         req_id: RequestId,
         expected: MetalRequestPhase,
@@ -102,6 +104,12 @@ impl fmt::Display for MetalSchedulerError {
             Self::QueueFull => write!(f, "waiting queue is full"),
             Self::EmptyPrompt => write!(f, "prompt_tokens must not be empty"),
             Self::UnknownRequest(req_id) => write!(f, "unknown request {req_id:?}"),
+            Self::PrefillIncomplete(req_id) => {
+                write!(f, "request {req_id:?} has not finished prefill yet")
+            }
+            Self::DecodeAlreadyStarted(req_id) => {
+                write!(f, "request {req_id:?} already has decode state")
+            }
             Self::WrongPhase {
                 req_id,
                 expected,
@@ -328,6 +336,55 @@ impl MetalScheduler {
 
             state.last_token = Some(sampled_token);
             state.generated_tokens += 1;
+            state.generated_tokens >= state.max_tokens
+        };
+
+        self.emit_event(
+            req_id,
+            RequestEventKind::DecodeStep,
+            Some(InferenceMode::Decode),
+        );
+
+        if should_finish {
+            self.finish_request(req_id);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Commit the first sampled token produced by the terminal prefill chunk.
+    ///
+    /// Prefill computes logits for the prompt tail; the scheduler records the
+    /// first sampled token here so the subsequent decode step consumes that
+    /// token, not the prompt's final token a second time.
+    pub fn complete_prefill(
+        &mut self,
+        req_id: RequestId,
+        sampled_token: u32,
+    ) -> Result<bool, MetalSchedulerError> {
+        let should_finish = {
+            let state = self
+                .requests
+                .get_mut(&req_id)
+                .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
+
+            if state.phase != MetalRequestPhase::Decoding {
+                return Err(MetalSchedulerError::WrongPhase {
+                    req_id,
+                    expected: MetalRequestPhase::Decoding,
+                    actual: state.phase,
+                });
+            }
+            if state.prefill_progress < state.prompt_len() {
+                return Err(MetalSchedulerError::PrefillIncomplete(req_id));
+            }
+            if state.generated_tokens > 0 {
+                return Err(MetalSchedulerError::DecodeAlreadyStarted(req_id));
+            }
+
+            state.last_token = Some(sampled_token);
+            state.generated_tokens = 1;
             state.generated_tokens >= state.max_tokens
         };
 
@@ -737,7 +794,7 @@ mod tests {
 
         assert!(
             sched
-                .advance_decode(req, 99)
+                .complete_prefill(req, 99)
                 .expect("request should finish")
         );
 
@@ -765,6 +822,50 @@ mod tests {
                     mode: Some(InferenceMode::Decode),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn terminal_prefill_records_first_token_before_decode_loop() {
+        let mut sched = make_scheduler(1, 4, 4);
+        let req = sched
+            .submit(vec![1, 2, 3, 4], 3, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        match sched.step() {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.prompt_end, 4);
+                assert_eq!(sched.request_phase(req), Some(MetalRequestPhase::Decoding));
+            }
+            other => panic!("expected initial prefill, got {other:?}"),
+        }
+
+        assert!(!sched.complete_prefill(req, 77).expect("complete prefill"));
+
+        match sched.step() {
+            MetalScheduleDecision::DecodeBatch(batch) => {
+                assert_eq!(batch.req_ids, vec![req]);
+                assert_eq!(batch.input_tokens, vec![77]);
+            }
+            other => panic!("expected decode batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_prefill_rejects_duplicate_first_token_commit() {
+        let mut sched = make_scheduler(1, 4, 4);
+        let req = sched
+            .submit(vec![1, 2, 3, 4], 3, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        let _ = sched.step();
+        sched
+            .complete_prefill(req, 77)
+            .expect("first complete_prefill");
+        assert_eq!(
+            sched.complete_prefill(req, 88),
+            Err(MetalSchedulerError::DecodeAlreadyStarted(req))
         );
     }
 

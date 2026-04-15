@@ -336,7 +336,7 @@ impl CppQwen35Model {
     }
 
     /// Run one decode step. Returns logits. Updates caches in place.
-    fn step(
+    pub(super) fn step(
         &self,
         token: &MlxArray,
         cache_pos: i32,
@@ -756,7 +756,7 @@ pub(super) fn metal_generate_qwen35(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qwen35_forward_step(
+pub(super) fn qwen35_forward_step(
     token: &MlxArray,
     weights: &Qwen35MetalWeights,
     config: &MetalModelConfig,

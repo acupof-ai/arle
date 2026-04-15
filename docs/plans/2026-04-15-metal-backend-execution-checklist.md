@@ -22,6 +22,9 @@ This checklist is the execution companion to:
   Exit:
   live HTTP traffic no longer goes through the single-request runtime; scheduler
   owns admission, step selection, and request cleanup.
+  Status:
+  `2026-04-15`: `M0.2a` local request-state layer landed for Qwen3/Qwen3.5;
+  `metal_serve` rewiring and throughput exit are still pending.
 - [ ] `M0.3` Wire Metal prefix cache + KV pool into the live scheduler path.
   Exit:
   shared-prefix requests skip matched prefill in the serving path, not only in

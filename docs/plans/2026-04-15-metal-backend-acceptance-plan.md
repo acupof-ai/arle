@@ -26,7 +26,7 @@ Benchmark rule:
 | Milestone | Status | Notes |
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
-| `M0.2` live Metal scheduler | Blocked / not shipped | requires resumable per-request execution state, not just router rewiring |
+| `M0.2` live Metal scheduler | Blocked / not shipped | `M0.2a` local request-state layer landed; serving/runtime rewiring is still pending |
 | `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
 | `M0.4` memory + reuse observability | Not shipped | current stats still stop at queue / KV utilization / TTFT histograms |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
@@ -78,6 +78,9 @@ Required sub-gates:
 
 #### `M0.2a` Resumable Metal request state
 
+Status: local structural tranche landed on 2026-04-15; scheduler-backed serving
+is still pending.
+
 Acceptance:
 
 - Qwen3 and Qwen3.5 each expose a request state object that supports:
@@ -90,7 +93,9 @@ Acceptance:
 Verification:
 
 ```bash
+cargo test -p infer --no-default-features --features metal,no-cuda request_state -- --nocapture
 cargo test -p infer --no-default-features --features metal,no-cuda --lib metal::scheduler -- --nocapture
+cargo check -p infer --no-default-features --features metal,no-cuda --bin metal_serve
 ```
 
 #### `M0.2b` Scheduler-backed serving path
