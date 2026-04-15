@@ -68,7 +68,7 @@ confuse readers about which project they are looking at.
 
 ---
 
-## 3 · Current state (2026-04-15, post M2b + M0.3 + M3a + M3b + M3c-cleanup local implementation)
+## 3 · Current state (2026-04-15, post M2b + M0.3 + M3a + M3b + M3c-cleanup local implementation AND L4 remote acceptance)
 
 Updated after M1a + M1b + M2a landed (commits `08718ad`, `323aee0`,
 `4402ab0`) **and** the 2026-04-15 local batches that (a) switched CUDA
@@ -80,17 +80,20 @@ and tier-aware `RadixNode` metadata), (d) added the first M3b staged-lookup /
 page-lifecycle contract surface, (e) wired the local scheduler onto a
 plannerless `lookup_or_stage` / live-eviction-signals path, and (f) retired
 the legacy contiguous CPU KV offload path locally in the M3c cleanup tranche.
-The two remaining live gaps are now **real staged completion / promotion**
+M2b, M0.3, M3a, M3b, and M3c all have **L4 remote acceptance sign-off as
+of 2026-04-15** — see the per-milestone win notes
+`docs/experience/wins/2026-04-15-tiered-kv-{m2b,m0.3-m3a,m3b,m3c}-remote.md`.
+The one remaining live gap is **real staged completion / promotion**
 (`StageTicket` completion, coordinator polling, host-pinned bytes becoming
-usable on GPU) and **remote CUDA acceptance**. One constraint is still
-explicit: **M2b does not do cross-slot page aliasing**. Reuse remains limited
+usable on GPU). One constraint is still explicit: **M2b does not do
+cross-slot page aliasing**. Reuse remains limited
 to the case where the radix hit maps to a currently free slot whose
 contiguous state still materialises the matched prefix.
 
 | Area | State | File:line |
 |---|---|---|
-| CUDA paged pool | **M0.3 local shipped**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Remote CUDA validation is still pending. | `crates/infer-cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
-| CUDA legacy contiguous KV offload | **M3c cleanup local shipped**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Remote CUDA regression validation is still pending. | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/infer-cli/src/args.rs` |
+| CUDA paged pool | **M0.3 accepted 2026-04-15 on L4**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Same-host `page1 → page16` sweep is within noise on C≤4 and recovers C≥8 from the 2026-04-13 zero-throughput regression (see `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`). | `crates/infer-cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
+| CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/infer-cli/src/args.rs` |
 | `infer/src/prefix_cache.rs` | Leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`) plus **M2b tombstone GC scaffolding** (`free_nodes`, `alloc_node`, `gc_orphan_tombstones()`). **M3a/M3b local now also land the tier-aware contract surface and runtime metadata mutators**: `hit_count`, `tier_location`, `session_id`, `fingerprint`, `byte_len`, `soft_pin_until`, `lookup_or_stage(...) -> LookupOutcome`, plus public setters so scheduler code can stamp GPU/session/keepalive truth onto published blocks. | `infer/src/prefix_cache.rs`, `infer/src/kv_tier/lookup.rs` |
 | CUDA scheduler prefix logic | **M2b local shipped, M3b degraded runtime wire landed, M3c cleanup applied**: `assign_slots()` now uses plannerless `lookup_or_stage(..., None)` as a classifier, proactively trims retained pages before slot assignment, reuses prefixes only when every matched block is `ReadyOnGpu`, and downgrades staged hits to cold prefill. `step_new()` still truncates / replays contiguous KV directly, and `cleanup()` publishes prefixes under a retain hard cap (`0.90`) while decode preemption clears slot ownership. **Cross-slot page aliasing is intentionally not implemented** — reuse is safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
 | Legacy API compatibility | `set_max_gpu_kv` remains as a compatibility no-op warning so CLI / external callers do not break in the same batch that deletes the old CPU offload implementation. This shim should be removed in a later surface-cleanup PR, not mixed into the runtime staging work. | `infer/src/server_engine.rs`, `crates/infer-cli/src/lib.rs`, `crates/infer-cli/src/args.rs` |
@@ -886,7 +889,7 @@ selector flip required the pool's refcount discipline to already exist.
 - 4 new `MockPool`-based refcount unit tests in
   `crates/infer-cuda-kernels`. **Done.**
 
-#### M2b · selector flip + retain hard cap + tombstone GC — **local implementation shipped; remote CUDA validation pending**
+#### M2b · selector flip + retain hard cap + tombstone GC — **accepted 2026-04-15 on L4**
 
 This is the **first** milestone where prefix reuse becomes
 load-bearing. Scope:

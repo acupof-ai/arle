@@ -1,13 +1,13 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post tiered-KV M3b runtime wire + M3c local sync).
+Last refreshed: 2026-04-15 (post tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
 | Path | Status | TL;DR |
 | --- | --- | --- |
 | **Projects** | | |
-| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b-runtime + M3c-cleanup local shipped** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, staged-lookup/page-lifecycle contract, plannerless runtime wiring, and the legacy contiguous CPU-offload retirement all landed locally; remote CUDA acceptance and real staging completion remain pending |
+| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b + M3c accepted on L4 2026-04-15** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, staged-lookup/page-lifecycle contract, plannerless runtime wiring, and the legacy contiguous CPU-offload retirement all shipped and signed off on the L4 host; only real staged completion / promotion still pending |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active | Priority ledger for agent-grade serving — radix wiring, session routing, constrained decoding, speculative decoding. P-labels superseded by tiered-kv M-milestones |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Partially shipped** | TurboQuant Phases 1–3 (KV + weight + fused decode attention) shipped via [`turboquant-integration.md`](plans/turboquant-integration.md); FP8-native FlashInfer track deferred |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | MLX Metal: Qwen3/3.5 direct `mlx-sys` bridge, but roadmap now explicitly prioritizes scheduler-first serving over more single-request-only tuning |
@@ -15,10 +15,10 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research radar | Observations on accelerated-model-architecture repos (training/experimental, not serving) |
 | **Plans** | | |
 | [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | Active | Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes, milestone-by-milestone |
-| [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M2b local batch |
-| [plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md](plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M0.3 + M3a local batch |
-| [plans/tiered-kv-cache-m3b-remote-acceptance.md](plans/tiered-kv-cache-m3b-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M3b contract + local runtime-wire batches |
-| [plans/tiered-kv-cache-m3c-remote-acceptance.md](plans/tiered-kv-cache-m3c-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M3c local cleanup batch |
+| [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m2b-remote.md` |
+| [plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md](plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md` |
+| [plans/tiered-kv-cache-m3b-remote-acceptance.md](plans/tiered-kv-cache-m3b-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m3b-remote.md` |
+| [plans/tiered-kv-cache-m3c-remote-acceptance.md](plans/tiered-kv-cache-m3c-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m3c-remote.md` |
 | [plans/tiered-kv-cache-remote-validation.md](plans/tiered-kv-cache-remote-validation.md) | Active (2026-04-13 batch) | Older remote validation checklist; for the M2b batch use the M2b remote acceptance doc above |
 | [plans/2026-04-15-metal-backend-execution-checklist.md](plans/2026-04-15-metal-backend-execution-checklist.md) | Active | Prioritized execution checklist for turning Metal from serial beta into production-grade Apple Silicon serving |
 | [plans/2026-04-15-metal-backend-acceptance-plan.md](plans/2026-04-15-metal-backend-acceptance-plan.md) | Active | Strict acceptance gates for Metal serving, API, DX, and the remaining live-scheduler blockers |
@@ -60,6 +60,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [code-review.md](code-review.md) | Reference | Standing code-review guidelines |
 | [../crates/README.md](../crates/README.md) | Reference | Workspace crate ownership and dependency boundaries |
 | **Experience — errors (latest first)** | | |
+| [experience/errors/2026-04-15-e2e-phase3-replay-drift.md](experience/errors/2026-04-15-e2e-phase3-replay-drift.md) | | e2e Phase 3 replay drift: `PrefixReuseAction::ReplayFinalToken` in the single-request engine is not numerically consistent with cold batch prefill — fall back to full recompute on exact match |
 | [experience/errors/2026-04-14-p0-page16-blocker.md](experience/errors/2026-04-14-p0-page16-blocker.md) | | M0.3 page_size=16 blocker: BF16 prefill→pool migration kernel is NHD-only; FlashInfer reads HND |
 | [experience/errors/2026-04-14-broken-rebase-baseline.md](experience/errors/2026-04-14-broken-rebase-baseline.md) | | Rebase / migration must verify upstream baseline before attributing errors |
 | [experience/errors/2026-04-13-batched-decode-high-concurrency.md](experience/errors/2026-04-13-batched-decode-high-concurrency.md) | | Batched decode regression at high concurrency |
@@ -73,6 +74,10 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-tiered-kv-m2b-remote.md](experience/wins/2026-04-15-tiered-kv-m2b-remote.md) | | Tiered KV M2b L4 remote acceptance: static/build/test gates, agent-trace 14/14, 100x shared-prefix `bad=0`, found + fixed e2e Phase 3 replay drift in the single-request engine |
+| [experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md](experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md) | | Tiered KV M0.3 + M3a L4 remote acceptance: BF16 `page_size=16` sweep flat on C≤4, long contexts slightly up, C≥8 recovered from 2026-04-13 zero-throughput regression |
+| [experience/wins/2026-04-15-tiered-kv-m3b-remote.md](experience/wins/2026-04-15-tiered-kv-m3b-remote.md) | | Tiered KV M3b L4 remote acceptance: contract + runtime-wire tranche signed off, all `lookup_or_stage_*` and `PageLifecycleState` tests green on CUDA |
+| [experience/wins/2026-04-15-tiered-kv-m3c-remote.md](experience/wins/2026-04-15-tiered-kv-m3c-remote.md) | | Tiered KV M3c L4 remote acceptance: legacy contiguous CPU KV offload retirement confirmed non-regressing on long-session agent trace, TTFT within noise of M2b baseline |
 | [experience/wins/2026-04-15-metal-m0.2a-bench-validation.md](experience/wins/2026-04-15-metal-m0.2a-bench-validation.md) | | Metal M0.2a bench check: direct path stayed flat and quick HTTP sweep still shows the serial-serving shape |
 | [experience/wins/2026-04-15-metal-m0.2a-request-state-local.md](experience/wins/2026-04-15-metal-m0.2a-request-state-local.md) | | Metal M0.2a local landing: resumable Qwen3/Qwen3.5 request state now owns prefill/decode/cleanup ahead of serving rewiring |
 | [experience/wins/2026-04-15-tiered-kv-m3b-runtime-local.md](experience/wins/2026-04-15-tiered-kv-m3b-runtime-local.md) | | Tiered KV M3b local runtime wire: admission uses plannerless `lookup_or_stage`, eviction scores use live signals, and published blocks stamp session/keepalive metadata |
