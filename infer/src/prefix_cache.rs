@@ -59,6 +59,18 @@ use crate::types::{BlockFingerprint, SessionId};
 /// `docs/projects/tiered-kv-cache.md` §5.1 for the rationale.
 pub use crate::types::BlockId;
 
+/// Coalesced metadata update for one cached block.
+///
+/// `session_id` / `soft_pin_until` use `Option<Option<T>>` so callers can
+/// distinguish "leave untouched" from "explicitly clear".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockMetadataUpdate {
+    pub location: Option<BlockLocation>,
+    pub byte_len: Option<u32>,
+    pub session_id: Option<Option<SessionId>>,
+    pub soft_pin_until: Option<Option<u64>>,
+}
+
 /// A node in the radix tree.
 #[derive(Serialize, Deserialize)]
 struct Node {
@@ -147,6 +159,9 @@ pub struct RadixCache {
     block_size: usize,
     /// Monotonically increasing clock for LRU tracking.
     clock: u64,
+    /// Optional lookup-time keepalive extension for already-soft-pinned blocks.
+    #[serde(default)]
+    soft_pin_keepalive_ticks: Option<u64>,
 }
 
 impl RadixCache {
@@ -154,6 +169,19 @@ impl RadixCache {
     ///
     /// `block_size` must match the KV block size used by the block manager.
     pub fn new(block_size: usize) -> Self {
+        Self::new_with_soft_pin_keepalive(block_size, None)
+    }
+
+    /// Create a radix cache that refreshes already-soft-pinned blocks on every
+    /// successful lookup / lookup_or_stage hit.
+    pub fn with_soft_pin_keepalive(block_size: usize, soft_pin_keepalive_ticks: u64) -> Self {
+        Self::new_with_soft_pin_keepalive(block_size, Some(soft_pin_keepalive_ticks))
+    }
+
+    fn new_with_soft_pin_keepalive(
+        block_size: usize,
+        soft_pin_keepalive_ticks: Option<u64>,
+    ) -> Self {
         assert!(block_size > 0, "block_size must be > 0");
         let root = Node::new(vec![], None, 0);
         Self {
@@ -161,6 +189,7 @@ impl RadixCache {
             free_nodes: Vec::new(),
             block_size,
             clock: 0,
+            soft_pin_keepalive_ticks,
         }
     }
 
@@ -186,6 +215,18 @@ impl RadixCache {
         }
     }
 
+    fn maybe_refresh_soft_pin(node: &mut Node, now: u64, soft_pin_keepalive_ticks: Option<u64>) {
+        if let (Some(_), Some(ticks)) = (node.soft_pin_until, soft_pin_keepalive_ticks) {
+            node.soft_pin_until = Some(now.saturating_add(ticks));
+        }
+    }
+
+    fn find_block_node_mut(&mut self, block: BlockId) -> Option<&mut Node> {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.block_id == Some(block))
+    }
+
     // -------------------------------------------------------------------------
     // Lookup
     // -------------------------------------------------------------------------
@@ -201,6 +242,7 @@ impl RadixCache {
     /// when the request is done with them.
     pub fn lookup(&mut self, tokens: &[u32]) -> (usize, Vec<BlockId>) {
         let now = self.tick();
+        let soft_pin_keepalive_ticks = self.soft_pin_keepalive_ticks;
         let mut node_idx = Self::root();
         let mut pos = 0;
         let mut matched_blocks = Vec::new();
@@ -239,6 +281,11 @@ impl RadixCache {
             if let Some(bid) = self.nodes[child_idx].block_id {
                 self.nodes[child_idx].ref_count += 1;
                 self.nodes[child_idx].hit_count = self.nodes[child_idx].hit_count.saturating_add(1);
+                Self::maybe_refresh_soft_pin(
+                    &mut self.nodes[child_idx],
+                    now,
+                    soft_pin_keepalive_ticks,
+                );
                 matched_blocks.push(bid);
             }
 
@@ -272,6 +319,7 @@ impl RadixCache {
         planner: Option<&dyn StagePlanner>,
     ) -> LookupOutcome {
         let now = self.tick();
+        let soft_pin_keepalive_ticks = self.soft_pin_keepalive_ticks;
         let mut node_idx = Self::root();
         let mut pos = 0;
         let mut blocks = Vec::new();
@@ -309,6 +357,7 @@ impl RadixCache {
             if let Some(block_id) = child.block_id {
                 child.ref_count += 1;
                 child.hit_count = child.hit_count.saturating_add(1);
+                Self::maybe_refresh_soft_pin(child, now, soft_pin_keepalive_ticks);
 
                 let byte_len = child.byte_len.max(self.block_size as u32);
                 let (hit_kind, request) = match child.tier_location.clone() {
@@ -656,10 +705,15 @@ impl RadixCache {
                     continue;
                 }
 
-                match best {
-                    Some((best_score, best_idx))
-                        if best_score < score || (best_score == score && best_idx <= idx) => {}
-                    _ => best = Some((score, idx)),
+                let keep_existing_best = match best {
+                    Some((best_score, best_idx)) => {
+                        let ordering = best_score.total_cmp(&score);
+                        ordering.is_lt() || (ordering.is_eq() && best_idx <= idx)
+                    }
+                    None => false,
+                };
+                if !keep_existing_best {
+                    best = Some((score, idx));
                 }
             }
 
@@ -778,9 +832,7 @@ impl RadixCache {
 
     /// Stamp the physical location for a cached block.
     pub fn set_block_location(&mut self, block: BlockId, location: BlockLocation) -> bool {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.block_id == Some(block))
+        self.find_block_node_mut(block)
             .map(|node| {
                 node.tier_location = Some(location);
             })
@@ -789,9 +841,7 @@ impl RadixCache {
 
     /// Stamp the byte length metadata for a cached block.
     pub fn set_block_byte_len(&mut self, block: BlockId, byte_len: u32) -> bool {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.block_id == Some(block))
+        self.find_block_node_mut(block)
             .map(|node| {
                 node.byte_len = byte_len;
             })
@@ -800,9 +850,7 @@ impl RadixCache {
 
     /// Stamp the session affinity metadata for a cached block.
     pub fn set_block_session_id(&mut self, block: BlockId, session_id: Option<SessionId>) -> bool {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.block_id == Some(block))
+        self.find_block_node_mut(block)
             .map(|node| {
                 node.session_id = session_id;
             })
@@ -815,13 +863,48 @@ impl RadixCache {
         block: BlockId,
         soft_pin_until: Option<u64>,
     ) -> bool {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.block_id == Some(block))
+        self.find_block_node_mut(block)
             .map(|node| {
                 node.soft_pin_until = soft_pin_until;
             })
             .is_some()
+    }
+
+    /// Update multiple metadata fields for one cached block with a single node
+    /// lookup in the radix backing store.
+    pub fn update_block_metadata(&mut self, block: BlockId, update: BlockMetadataUpdate) -> bool {
+        self.find_block_node_mut(block)
+            .map(|node| {
+                if let Some(location) = update.location {
+                    node.tier_location = Some(location);
+                }
+                if let Some(byte_len) = update.byte_len {
+                    node.byte_len = byte_len;
+                }
+                if let Some(session_id) = update.session_id {
+                    node.session_id = session_id;
+                }
+                if let Some(soft_pin_until) = update.soft_pin_until {
+                    node.soft_pin_until = soft_pin_until;
+                }
+            })
+            .is_some()
+    }
+
+    /// Extend the deadline of an already-soft-pinned block relative to the
+    /// cache's current logical clock.
+    ///
+    /// Returns `true` only when the block exists and already had a
+    /// `soft_pin_until` value to refresh.
+    pub fn bump_soft_pin(&mut self, block: BlockId, ticks_ahead: u64) -> bool {
+        let deadline = self.clock.saturating_add(ticks_ahead);
+        match self.find_block_node_mut(block) {
+            Some(node) if node.soft_pin_until.is_some() => {
+                node.soft_pin_until = Some(deadline);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Current logical clock value used by lookup/insert/eviction bookkeeping.
@@ -1571,6 +1654,55 @@ mod tests {
     }
 
     #[test]
+    fn lookup_or_stage_ignores_trailing_tombstone_for_gpu_ready_prefix() {
+        let mut cache = RadixCache::new(4);
+        let tokens: Vec<u32> = (1..=12).collect();
+        cache.insert(&tokens, &bids(&[10, 20, 30]));
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(30)))
+            .unwrap();
+        cache.nodes[idx].block_id = None;
+        cache.nodes[idx].tier_location = Some(BlockLocation::Disk {
+            file_id: 9,
+            offset: 0,
+        });
+        cache.nodes[idx].byte_len = 4096;
+
+        let outcome = cache.lookup_or_stage(&tokens, LookupHeuristics::default(), None);
+        let ready_on_gpu = outcome
+            .blocks
+            .iter()
+            .filter(|block| !matches!(block.hit_kind, HitKind::Miss))
+            .all(|block| matches!(block.hit_kind, HitKind::ReadyOnGpu));
+
+        assert_eq!(outcome.matched_len, 8);
+        assert_eq!(
+            outcome.blocks,
+            vec![
+                LookupBlock {
+                    block_id: Some(BlockId(10)),
+                    hit_kind: HitKind::ReadyOnGpu,
+                },
+                LookupBlock {
+                    block_id: Some(BlockId(20)),
+                    hit_kind: HitKind::ReadyOnGpu,
+                },
+                LookupBlock {
+                    block_id: None,
+                    hit_kind: HitKind::Miss,
+                },
+            ]
+        );
+        assert!(
+            ready_on_gpu,
+            "scheduler admission should ignore trailing tombstones when checking T0 readiness"
+        );
+    }
+
+    #[test]
     fn metadata_mutators_stamp_session_and_soft_pin() {
         let mut cache = RadixCache::new(4);
         cache.insert(&[1, 2, 3, 4], &bids(&[10]));
@@ -1593,5 +1725,88 @@ mod tests {
         assert!(cache.set_block_soft_pin_until(BlockId(10), None));
         assert_eq!(cache.nodes[idx].session_id, None);
         assert_eq!(cache.nodes[idx].soft_pin_until, None);
+    }
+
+    #[test]
+    fn update_block_metadata_coalesces_session_and_soft_pin_updates() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        assert!(cache.update_block_metadata(
+            BlockId(10),
+            BlockMetadataUpdate {
+                location: Some(BlockLocation::Gpu { slot: 7 }),
+                byte_len: Some(4096),
+                session_id: Some(Some(SessionId::from("session-1"))),
+                soft_pin_until: Some(Some(42)),
+            }
+        ));
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .unwrap();
+        assert_eq!(
+            cache.nodes[idx].tier_location,
+            Some(BlockLocation::Gpu { slot: 7 })
+        );
+        assert_eq!(cache.nodes[idx].byte_len, 4096);
+        assert_eq!(
+            cache.nodes[idx].session_id,
+            Some(SessionId::from("session-1"))
+        );
+        assert_eq!(cache.nodes[idx].soft_pin_until, Some(42));
+
+        assert!(cache.update_block_metadata(
+            BlockId(10),
+            BlockMetadataUpdate {
+                location: None,
+                byte_len: None,
+                session_id: Some(None),
+                soft_pin_until: Some(None),
+            }
+        ));
+        assert_eq!(
+            cache.nodes[idx].tier_location,
+            Some(BlockLocation::Gpu { slot: 7 })
+        );
+        assert_eq!(cache.nodes[idx].byte_len, 4096);
+        assert_eq!(cache.nodes[idx].session_id, None);
+        assert_eq!(cache.nodes[idx].soft_pin_until, None);
+    }
+
+    #[test]
+    fn lookup_refreshes_existing_soft_pin_without_starting_new_pins() {
+        let mut cache = RadixCache::with_soft_pin_keepalive(4, 64);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .unwrap();
+        assert_eq!(cache.nodes[idx].soft_pin_until, None);
+
+        let (_, blocks) = cache.lookup(&[1, 2, 3, 4]);
+        assert_eq!(blocks, bids(&[10]));
+        assert_eq!(
+            cache.nodes[idx].soft_pin_until, None,
+            "lookup should not start pinning cold blocks"
+        );
+        cache.release(&blocks);
+
+        assert!(cache.set_block_soft_pin_until(BlockId(10), Some(20)));
+        cache.clock = 10;
+
+        let (_, blocks) = cache.lookup(&[1, 2, 3, 4]);
+        assert_eq!(blocks, bids(&[10]));
+        assert_eq!(cache.nodes[idx].soft_pin_until, Some(75));
+        cache.release(&blocks);
+
+        let outcome = cache.lookup_or_stage(&[1, 2, 3, 4], LookupHeuristics::default(), None);
+        assert_eq!(outcome.matched_len, 4);
+        assert_eq!(cache.nodes[idx].soft_pin_until, Some(76));
+        cache.release(&[BlockId(10)]);
     }
 }
