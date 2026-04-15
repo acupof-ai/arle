@@ -26,8 +26,8 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | Complete (post-impl) | TurboQuant Phases 1–3 reference: KV TurboQuant → weight ITQ3_S → fused decode attention. Canonical post-implementation design |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | Active | Qwen3.5 SGLang parity — prefix cache fixed, batched prefill remaining |
 | [plans/speculative-decoding-impl.md](plans/speculative-decoding-impl.md) | Architecture plan | DraftEngine + SpeculativeScheduler integration plan; CPU-only `speculative.rs` exists, GPU integration not started |
-| [plans/q4k-native-gpu.md](plans/q4k-native-gpu.md) | Queued | Native Q4_K GPU kernel design for GGUF; not yet started |
-| [plans/gemma-gguf-support.md](plans/gemma-gguf-support.md) | Queued | Gemma 4 model support + full GGUF loader; planning only |
+| [plans/q4k-native-gpu.md](plans/q4k-native-gpu.md) | **Shipped (post-impl)** | Native Q4_K GPU kernel (`q4k_gemv`) + packed GGUF loader fast path. Preserved as post-implementation design reference. Carnice-27B fits on L4-24GB. |
+| [plans/gemma-gguf-support.md](plans/gemma-gguf-support.md) | Split — GGUF shipped, Gemma queued | GGUF loading (BF16/F16/Q8_0/Q4_K_M) **shipped** alongside the Q4_K path; Gemma 4 model still unwired (detection in `model_registry` only, no `model/gemma*.rs`) |
 | [plans/kv-quant-remote-validation.md](plans/kv-quant-remote-validation.md) | Active | Validation checklist for the suffix-only KV migration patch (BF16/FP8/INT8/TQ3); no recorded results yet |
 | [plans/backend-reorg-followups.md](plans/backend-reorg-followups.md) | Tracker | Round 2 backend reorg follow-ups: F1 done (`19a433d`), F2 parked (Option B), F3 done (`4b493c8`), Round 3 reverted by Route-A |
 | **Research** | | |

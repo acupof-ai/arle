@@ -2,7 +2,7 @@
 
 > Status: **Near-complete** — prefix cache fixed (2026-04-09), batched prefill remaining
 > Created: 2026-04-01
-> Updated: 2026-04-09
+> Updated: 2026-04-09 (Steps 1–7 record); remaining-work list verified still open on 2026-04-15 (grep `batched_prefill` returns zero hits in `model/qwen35/` and `scheduler/cuda/`)
 > Goal: Match SGLang 0.5.9 throughput on Qwen3.5-4B
 
 ---
