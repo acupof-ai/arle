@@ -57,8 +57,8 @@ impl MetalDflashRuntime {
             "Metal DFlash currently supports Qwen3 only; Qwen3.5 still needs recurrent rollback integration"
         );
 
-        let draft_model_dir =
-            hf_hub::resolve_model_path(&options.draft_model).with_context(|| {
+        let draft_model_dir = hf_hub::resolve_weighted_model_path(&options.draft_model)
+            .with_context(|| {
                 format!(
                     "failed to resolve DFlash draft model '{}'",
                     options.draft_model

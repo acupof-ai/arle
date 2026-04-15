@@ -48,6 +48,24 @@ pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     download_from_hub(model_id_or_path)
 }
 
+/// Resolve a checkpoint source for callers that need config + weights but not a
+/// tokenizer.
+///
+/// This is used for auxiliary checkpoints such as Metal DFlash draft models,
+/// which are often stored in the local HuggingFace cache without tokenizer
+/// files.
+pub fn resolve_weighted_model_path(model_id_or_path: &str) -> Result<PathBuf> {
+    if let Some(local) = resolve_local_weighted_model_path(model_id_or_path) {
+        log::info!("Using local weighted model path: {}", local.display());
+        return Ok(local);
+    }
+
+    log::info!(
+        "Weighted model not found locally — downloading from HuggingFace: {model_id_or_path}"
+    );
+    download_from_hub(model_id_or_path)
+}
+
 /// Resolve a model source using local paths and local HuggingFace cache only.
 ///
 /// Returns `None` when no local candidate exists.
@@ -60,6 +78,21 @@ pub fn resolve_local_model_path(model_id_or_path: &str) -> Option<PathBuf> {
     local_model_search_candidates(model_id_or_path)
         .into_iter()
         .find(|candidate| is_model_dir(candidate))
+}
+
+/// Resolve a model source using local paths and local HuggingFace cache only.
+///
+/// Unlike [`resolve_local_model_path`], this only requires `config.json` plus at
+/// least one local weight shard; tokenizer files are optional.
+pub fn resolve_local_weighted_model_path(model_id_or_path: &str) -> Option<PathBuf> {
+    let local = Path::new(model_id_or_path);
+    if is_weighted_model_dir(local) {
+        return Some(local.to_path_buf());
+    }
+
+    local_model_search_candidates(model_id_or_path)
+        .into_iter()
+        .find(|candidate| is_weighted_model_dir(candidate))
 }
 
 /// Discover the best local model from a curated candidate list.
@@ -309,6 +342,28 @@ fn is_model_dir(path: &Path) -> bool {
     path.is_dir() && path.join("config.json").exists() && path.join("tokenizer.json").exists()
 }
 
+fn is_weighted_model_dir(path: &Path) -> bool {
+    if !path.is_dir() || !path.join("config.json").exists() {
+        return false;
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        // HuggingFace snapshot directories commonly expose files as symlinks to
+        // the blob store, so use `Path::is_file()` instead of `DirEntry::file_type()`.
+        if !entry.path().is_file() {
+            return false;
+        }
+        matches!(
+            entry.path().extension().and_then(|ext| ext.to_str()),
+            Some("safetensors" | "bin")
+        )
+    })
+}
+
 fn fetch_file(repo: &ApiRepo, filename: &str, model_id: &str) -> Result<PathBuf> {
     log::info!("  ↓ {filename}");
     repo.get(filename)
@@ -327,6 +382,7 @@ fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
 mod tests {
     use super::{
         common_local_roots, has_safetensors_twin, parse_hf_model_id, resolve_local_model_path,
+        resolve_local_weighted_model_path,
     };
 
     #[test]
@@ -357,6 +413,33 @@ mod tests {
 
         assert_eq!(
             resolve_local_model_path(tmp.path().to_str().expect("utf8")),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_local_weighted_model_path_accepts_weight_only_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("config.json"), "{}").expect("config");
+        std::fs::write(tmp.path().join("model.safetensors"), "").expect("weights");
+
+        assert_eq!(
+            resolve_local_weighted_model_path(tmp.path().to_str().expect("utf8")),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_local_weighted_model_path_accepts_symlinked_weights() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        std::fs::write(tmp.path().join("config.json"), "{}").expect("config");
+        let blob = blob_dir.path().join("model.safetensors");
+        std::fs::write(&blob, "").expect("weights");
+        std::os::unix::fs::symlink(&blob, tmp.path().join("model.safetensors")).expect("symlink");
+
+        assert_eq!(
+            resolve_local_weighted_model_path(tmp.path().to_str().expect("utf8")),
             Some(tmp.path().to_path_buf())
         );
     }
