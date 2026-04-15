@@ -26,7 +26,7 @@ Benchmark rule:
 | Milestone | Status | Notes |
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
-| `M0.2` live Metal scheduler | Blocked / not shipped | `M0.2a` local request-state layer landed; serving/runtime rewiring is still pending |
+| `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state and `M0.2b` live scheduler runtime landed locally; throughput exit still blocked on batched decode |
 | `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
 | `M0.4` memory + reuse observability | Not shipped | current stats still stop at queue / KV utilization / TTFT histograms |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
@@ -65,14 +65,19 @@ Exit signal:
 
 ### `M0.2` Replace serial runtime with a live `MetalScheduler`
 
-Status: not shipped. This is the current hard blocker.
+Status: partial / not shipped. The live scheduler path exists locally, but the
+milestone exit is still blocked by throughput.
 
-Why blocked:
+Current state:
 
-- `infer/src/backend/metal/scheduler.rs` is still an accounting scheduler.
-- `metal_serve` still depends on `BackendRuntimeHandle`.
-- the Metal backend still exposes whole-request generation, not resumable
-  request state that a live scheduler can step.
+- `M0.2a` request state landed for Qwen3 / Qwen3.5.
+- `M0.2b` rewired standard `metal_serve` traffic onto a live Metal scheduler
+  runtime with chunked prefill, decode-priority interleave, and cancellation
+  cleanup.
+- `metal_serve` still falls back to the legacy serial runtime when Metal
+  DFlash is enabled.
+- aggregate throughput is still below the old serial baseline because decode is
+  request-by-request inside the scheduler loop.
 
 Required sub-gates:
 
@@ -111,19 +116,34 @@ Acceptance:
 - TTFT no longer scales roughly linearly with queue depth the way the current
   serial runtime does
 
+Status: local runtime landed on 2026-04-15; TTFT exit passed, throughput exit
+still pending.
+
 Verification:
 
 ```bash
 rg -n "BackendRuntimeHandle" infer/src/bin/metal_serve.rs infer/src/http_server.rs
-cargo test -p infer --no-default-features --features metal,no-cuda metal_scheduler -- --nocapture
+cargo test -p infer --no-default-features --features metal,no-cuda metal::scheduler -- --nocapture
 python3 scripts/bench_throughput_sweep.py --url http://127.0.0.1:8000 --quick --label metal-m0.2
 ```
 
 Exit signal:
 
-- on the same machine / model / build, `C>=4` rows no longer look throughput-flat
-  relative to `C=1`
-- TTFT at `C>=4` is not dominated by request-level FIFO queueing
+- `metal_serve` no longer imports `BackendRuntimeHandle` on the standard path
+- on the same machine / model / build, TTFT at `C>=4` is no longer dominated by
+  request-level FIFO queueing
+- aggregate throughput at `C>=4` materially exceeds the old serial-server shape
+  instead of merely trading throughput for latency
+
+Current local evidence (2026-04-15, M4 Pro, `Qwen3.5-4B-MLX-4bit`, quick HTTP sweep):
+
+- old serial reference (`M0.2a`): `512/256 C=4` = `65.8 tok/s`, `TTFT p50 7994 ms`
+- current live runtime (`M0.2b`): `512/256 C=4` = `58.7 tok/s`, `TTFT p50 1826 ms`
+
+Interpretation:
+
+- latency exit is materially better (`-77%` TTFT p50)
+- throughput exit is still blocked (`-11%` aggregate throughput vs the serial reference)
 
 #### `M0.2c` Runtime retirement proof
 

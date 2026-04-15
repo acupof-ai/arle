@@ -15,7 +15,7 @@ State reflected here is based on repository evidence as of 2026-04-15.
 | Backend | Status | Meaning |
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
-| Metal | Beta | Usable for local validation and serial serving, but not yet equivalent to CUDA serving runtime. |
+| Metal | Beta | Usable for local validation and live scheduler-backed serving, but still missing batched decode / prefix-reuse parity with CUDA. |
 | Metal DFlash | Experimental | Apple Silicon speculative decode path. `Qwen3` only today; benchmark before use. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 

@@ -123,7 +123,8 @@ Current support should be read conservatively:
 
 - **CUDA on Linux** is the primary supported serving path.
 - **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
-  scheduler runtime.
+  scheduler runtime. Standard `metal_serve` now uses a live Metal scheduler
+  runtime, but batched decode / prefix-reuse parity is still pending.
 - **CPU-only / `no-cuda`** now includes a development-oriented CPU backend for
   local smoke tests and request-path validation, but it is still not a
   production inference target.
@@ -285,7 +286,10 @@ cargo run --release -p infer --no-default-features --features metal,no-cuda --bi
   --model-path mlx-community/Qwen3-0.6B-4bit --port 8000
 ```
 
-Current status: `metal_serve` is usable for single-request validation on Qwen3/Qwen3.5, but it still runs through a serial backend runtime rather than the CUDA-style continuous batching scheduler.
+Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
+Metal scheduler runtime with chunked prefill and decode-priority interleave.
+It still does not have cross-request batched decode, and Metal DFlash still
+uses the legacy serial runtime path.
 
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
 
