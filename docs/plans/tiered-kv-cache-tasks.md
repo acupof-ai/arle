@@ -87,7 +87,7 @@ milestone plan.
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
 | — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m2b-remote.md`) (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
 | P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a + M3b contract + M3c cleanup all accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`, `wins/2026-04-15-tiered-kv-m3b-remote.md`, `wins/2026-04-15-tiered-kv-m3c-remote.md`); **real staged completion / promotion still pending** | §3 below |
-| P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
+| P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | **M4 a/b/c/d local landed 2026-04-16** (`66d38ad` BLAKE3 `compute` + input chain, `c7cc0d6` `DiskStore` postcard wire, `7b72d02` `RadixCache::reconcile` + serde round-trip, `c87c68b` pure-Rust `http_server::sessions` save/load); **remote CUDA acceptance pending** (`tiered-kv-cache-m4-remote-acceptance.md`); HTTP route wrappers + Metal MLX wired-memory bindings deferred | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
 | P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |
 
@@ -478,27 +478,47 @@ Both pure scoring functions: `&self`, snapshot in → decision out. No mutable s
 
 ## 4 · Milestone M4 (formerly P3) — T2 disk tier + session save/load + Metal first contact
 
+> **2026-04-16 local follow-on on `main`**:
+> `66d38ad feat(kv-tier): upgrade BlockFingerprint to BLAKE3 with full input chain (M4a)` —
+> `BlockFingerprint::compute(KvContentContext, tokens)` BLAKE3 over
+> model_fingerprint / kv_format_tag / parent / tokens canonical
+> domain-tagged encoding; `Scheduler::model_fingerprint`;
+> `KVFormat::stable_tag()` locks wire IDs.
+> `c7cc0d6 feat(kv-tier): DiskStore postcard wire format + fingerprint-keyed blocks (M4b)` —
+> `DiskBlockHeader { magic b"PEGAKV01", version 1, fingerprint,
+> kv_format_tag, payload_len }`, postcard header + raw payload,
+> `<fingerprint-hex>.kv` filename, 9 disk tests green.
+> `7b72d02 feat(kv-tier): RadixCache::reconcile + serde round-trip end-to-end (M4c)` —
+> `reconcile(known: &HashMap<BlockFingerprint, BlockId>) -> ReconcileReport`
+> with remapped / tombstoned / orphans_cleared counts; runtime-only
+> fields marked `#[serde(default, skip)]`; 44 prefix_cache tests
+> green.
+> `c87c68b feat(kv-tier): session save/load pure-Rust module (M4d)` —
+> `infer/src/http_server/sessions.rs` with `save_session` /
+> `load_session` / `LoadedSession` + 3 end-to-end unit tests
+> (happy path, missing payload tombstone, tampered disk error).
+> Remote CUDA acceptance pending; use
+> `docs/plans/tiered-kv-cache-m4-remote-acceptance.md` as the
+> combined acceptance checklist.
+
 ### 4.1 Lane breakdown
 
 P3 has the most local content of any phase — **all of P3 is `[L]` except the linux io_uring path**.
 
 #### Disk transport — Local (Mac)
-- [ ] `[L]` Add `infer/src/kv_tier/transport/disk.rs`
-  - **Default = `tokio::fs` on all platforms** (research correction; see §4.3)
-  - `cfg(target_os = "linux")` + `cfg(feature = "disk-io-uring")` → optional io_uring path via `compio` or `monoio`, **off by default**
-  - macOS: `fcntl(F_NOCACHE)` for cache bypass (NOT `O_DIRECT` which doesn't exist on Darwin)
-- [ ] `[L]` Allocation-stable region: one large pre-extended file per node, indexed by `(file_id, offset)`. Filename = blake3 of `(model_id, tokenizer_id, token_prefix)` (LMCache pattern)
-- [ ] `[L]` Wire format (per §4.2): postcard-encoded versioned header + raw bf16/f16 trailer matching `MetalKVPool` row stride
-- [ ] `[L]` Unit tests fully local: write block, read back, hash match, version round-trip
-- [ ] `[L]` Add `postcard = "1"` and `blake3 = "1.5"` to `infer/Cargo.toml`
-- [ ] `[L]` **Move `memmap2` out of cuda feature gate** so disk tier can mmap on Mac too
+- [x] `[L]` Add `infer/src/kv_tier/transport/disk.rs` — pre-M4 baseline shipped in M3a scaffolding; M4b (`c7cc0d6`) added the postcard header + fingerprint-hex filename content-addressable layout on top
+- [x] `[L]` Wire format (per §4.2): postcard-encoded versioned header + raw payload (M4b `DiskBlockHeader { magic b"PEGAKV01", version 1, fingerprint, kv_format_tag, payload_len }`)
+- [x] `[L]` Unit tests fully local: write block, read back, hash match, version round-trip, magic/version/fingerprint rejection paths (M4b: 9 disk tests)
+- [x] `[L]` Add `postcard = "1"` and `blake3 = "1"` to `infer/Cargo.toml` (workspace deps, M4a + M4b)
+- [ ] `[L]` **Move `memmap2` out of cuda feature gate** so disk tier can mmap on Mac too (deferred — M4 did not need mmap for the current round-trip path)
+- [ ] `[L]` macOS `fcntl(F_NOCACHE)` and linux io_uring fast paths — deferred; `std::fs` is sufficient for the M4 contract
 
 #### HTTP session routes — Local (Mac)
-- [ ] `[L]` Add `infer/src/http_server/sessions.rs` — `POST /v1/sessions/:id/save`, `POST /v1/sessions/:id/load`, `GET /v1/sessions/:id/manifest`, `DELETE /v1/sessions/:id` handlers
-- [ ] `[L]` Edit `infer/src/http_server.rs:422-427` — register routes alongside `/v1/completions`
-- [ ] `[L]` Idempotency-Key header support; ETag = content_hash for skip-re-upload
-- [ ] `[L]` `crates/infer-agent/src/lib.rs:166-188` — extend `save_to_path / load_from_path` with optional `Option<KvBlobRef>` on `SessionSnapshot` pointing at content hash; existing JSON-only path remains
-- [ ] `[L]` `cargo test -p infer http_server::sessions` — green on Mac
+- [x] `[L]` Add `infer/src/http_server/sessions.rs` — **pure Rust** `save_session` / `load_session` + `LoadedSession` + `SessionSnapshotError` shipped in M4d (`c87c68b`). **HTTP axum handlers deliberately NOT wrapped in this batch** — the function signatures need one more review before they become user-facing API contract.
+- [ ] `[L]` Edit `infer/src/http_server.rs` — register `POST /v1/sessions/:id/save` / `POST /v1/sessions/:id/load` / `GET /v1/sessions/:id/manifest` / `DELETE /v1/sessions/:id` axum routes (deferred to a follow-up M4 HTTP batch)
+- [ ] `[L]` Idempotency-Key header support; ETag = content_hash for skip-re-upload (deferred to the HTTP wrapper batch)
+- [ ] `[L]` `crates/infer-agent/src/lib.rs` — extend `save_to_path / load_from_path` with optional `Option<KvBlobRef>` on `SessionSnapshot` pointing at content hash (deferred — depends on the HTTP wrapper)
+- [x] `[L]` `cargo test -p infer --release --no-default-features --features no-cuda sessions` — **3 tests green on Mac** (M4d)
 
 #### MLX wired memory bindings — Local (Mac)
 - [ ] `[L]` Edit `crates/mlx-sys/src/mlx_bridge.cpp` — add 6 new C bridges (see §4.2)

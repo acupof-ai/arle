@@ -68,7 +68,7 @@ confuse readers about which project they are looking at.
 
 ---
 
-## 3 · Current state (2026-04-16, post M2b + M0.3 + M3a + M3b + M3c remote acceptance AND Tier A/B/C local runtime promotion)
+## 3 · Current state (2026-04-16, post M2b + M0.3 + M3a + M3b + M3c + Tier A/B/C remote acceptance AND M4 a/b/c/d local BLAKE3 / disk / reconcile / session save-load)
 
 Updated after M1a + M1b + M2a landed (commits `08718ad`, `323aee0`,
 `4402ab0`) **and** the 2026-04-15 local batches that (a) switched CUDA
@@ -83,17 +83,33 @@ the legacy contiguous CPU KV offload path locally in the M3c cleanup tranche.
 M2b, M0.3, M3a, M3b, and M3c all have **L4 remote acceptance sign-off as
 of 2026-04-15** — see the per-milestone win notes
 `docs/experience/wins/2026-04-15-tiered-kv-{m2b,m0.3-m3a,m3b,m3c}-remote.md`.
-Three 2026-04-16 follow-on commits are now on `main`: `d3d1e46`
-(Tier A coordinator wire + staged admission), `e0f69f9` (Tier B
-publish-time fingerprints + disk round-trip test), and `9b01c2a`
-(Tier C O(1) radix block index + `SchedulerConfig` knobs). These land the
-local M3 promotion/runtime tranche; combined remote CUDA acceptance for the
-Tier A/B/C follow-on is still pending. The one remaining live gap is **real
-async staged completion / promotion** (`cudaMemcpyAsync` completion rather
-than the local synchronous echo, plus the future DiskStore stage path). One
-constraint is still explicit: **M2b does not do
-cross-slot page aliasing**. Reuse remains limited
-to the case where the radix hit maps to a currently free slot whose
+Three 2026-04-16 follow-on commits landed the Tier A/B/C local M3
+runtime promotion: `d3d1e46` (Tier A coordinator wire + staged
+admission), `e0f69f9` (Tier B publish-time fingerprints + disk
+round-trip test), and `9b01c2a` (Tier C O(1) radix block index +
+`SchedulerConfig` knobs). Tier A/B/C **also now has L4 remote
+acceptance sign-off** (`875669a`).
+
+On top of that, the 2026-04-16 M4 local batch shipped:
+`66d38ad` (M4a BLAKE3 `BlockFingerprint::compute` + full
+`KvContentContext` input chain + `Scheduler::model_fingerprint` +
+`KVFormat::stable_tag`), `c7cc0d6` (M4b `DiskStore` postcard header
++ fingerprint-hex `.kv` filename + magic/version/fingerprint
+check), `7b72d02` (M4c `RadixCache::reconcile` + full serde
+round-trip + runtime-only fields marked `#[serde(skip)]`), and
+`c87c68b` (M4d pure-Rust `infer/src/http_server/sessions.rs` with
+`save_session` / `load_session` / `LoadedSession` / 3 end-to-end
+unit tests). Combined remote CUDA acceptance for M4 is pending;
+see `docs/plans/tiered-kv-cache-m4-remote-acceptance.md`.
+
+The remaining live gaps are: **real async staged completion /
+promotion** (`cudaMemcpyAsync` completion rather than the local
+synchronous echo, plus the future DiskStore-on-coordinator stage
+path), the HTTP route wrappers around the M4d session module, and
+the Metal MLX wired-memory bindings that were cut from the M4
+batch. One constraint is still explicit: **M2b does not do
+cross-slot page aliasing**. Reuse remains limited to the case
+where the radix hit maps to a currently free slot whose
 contiguous state still materialises the matched prefix.
 
 | Area | State | File:line |

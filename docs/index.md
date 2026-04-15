@@ -1,13 +1,13 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post Metal runtime memory-limit controls + Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
+Last refreshed: 2026-04-15 (post Metal Qwen3 live prefix reuse + Metal runtime memory-limit controls + Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
 | Path | Status | TL;DR |
 | --- | --- | --- |
 | **Projects** | | |
-| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b + M3c accepted on L4 2026-04-15; Tier A/B/C local follow-on landed 2026-04-16** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, staged-lookup/page-lifecycle contract, plannerless runtime wiring, local Tier A/B/C promotion follow-on, and the legacy contiguous CPU-offload retirement all shipped; only combined remote acceptance plus real async staged completion / promotion still pending |
+| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b + M3c + Tier A/B/C accepted on L4 2026-04-15; M4 a/b/c/d local landed 2026-04-16** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, staged-lookup/page-lifecycle contract, plannerless runtime wiring, Tier A/B/C runtime promotion, and M4 BLAKE3 fingerprint + DiskStore postcard + `RadixCache::reconcile` + pure-Rust session save/load module all shipped; remote CUDA acceptance for M4 + real async staged completion / promotion + HTTP route wrappers still pending |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active | Priority ledger for agent-grade serving — radix wiring, session routing, constrained decoding, speculative decoding. P-labels superseded by tiered-kv M-milestones |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Partially shipped** | TurboQuant Phases 1–3 (KV + weight + fused decode attention) shipped via [`turboquant-integration.md`](plans/turboquant-integration.md); FP8-native FlashInfer track deferred |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | MLX Metal: Qwen3/3.5 direct `mlx-sys` bridge, but roadmap now explicitly prioritizes scheduler-first serving over more single-request-only tuning |
@@ -74,6 +74,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-metal-qwen3-live-prefix-reuse.md](experience/wins/2026-04-15-metal-qwen3-live-prefix-reuse.md) | | Metal live scheduler runtime now does real Qwen3 prefix lookup/import/publish; repeated-prefix HTTP smoke moved `infer_prefix_hit_rate` above zero and cut sequential `max_tokens=1` latency from `186.7ms` to `65.1ms` |
 | [experience/wins/2026-04-15-metal-runtime-memory-limits.md](experience/wins/2026-04-15-metal-runtime-memory-limits.md) | | Metal now exposes MLX allocator controls on `metal_request` / `metal_bench` / `metal_serve`, and a real server smoke confirmed the new flags apply before load while `/metrics` and `/v1/stats` stay live |
 | [experience/wins/2026-04-15-metal-observability-runtime-metrics.md](experience/wins/2026-04-15-metal-observability-runtime-metrics.md) | | Metal `/metrics` and `/v1/stats` now report real runtime-backed queue / latency / MLX memory values on both the live scheduler path and the serial DFlash fallback |
 | [experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md](experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md) | | Metal live runtime gained a real Qwen3.5 same-length compiled-step batch path; the direct path improved slightly, but HTTP quick sweep stayed flat because per-step batch-state rebuild still dominates |
