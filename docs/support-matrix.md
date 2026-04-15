@@ -60,6 +60,16 @@ Notes:
 | GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
 | GGUF loading | Beta | Supported loader path; Q4_K native GPU kernel still on the roadmap. |
 
+Backend note:
+
+- The `FP8 KV cache`, `INT8 KV cache`, and `TurboQuant KV` rows above describe
+  the shipped project-wide quantized-KV work, which is currently CUDA-backed.
+- Metal / MLX does **not** currently ship quantized KV cache. The live Metal
+  path stores KV in the model's native dtype today, typically `bf16` / `f16`,
+  and it does not expose a `--kv-cache-dtype` surface.
+- Metal can still run weight-quantized MLX models; that is separate from
+  quantized KV cache support.
+
 ---
 
 ## 4a. Speculative Decoding Matrix
