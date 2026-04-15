@@ -1,0 +1,70 @@
+{
+  "label": "peak-bf16",
+  "results": [
+    {
+      "concurrency": 1,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "completed": 1,
+      "total_emitted": 128,
+      "wall_total_s": 4.39678809399993,
+      "aggregate_tok_per_s": 29.112160346020538,
+      "ttft_p50_ms": 85.27066999886301,
+      "ttft_p99_ms": 85.27066999886301,
+      "wall_per_req_p50_s": 4.396600866999506,
+      "wall_per_req_p99_s": 4.396600866999506
+    },
+    {
+      "concurrency": 4,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "completed": 4,
+      "total_emitted": 512,
+      "wall_total_s": 4.7880477709986735,
+      "aggregate_tok_per_s": 106.93293477588026,
+      "ttft_p50_ms": 206.086479998703,
+      "ttft_p99_ms": 333.9559849991929,
+      "wall_per_req_p50_s": 4.786891769999784,
+      "wall_per_req_p99_s": 4.78732578799827
+    },
+    {
+      "concurrency": 7,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "completed": 7,
+      "total_emitted": 896,
+      "wall_total_s": 5.23264795599971,
+      "aggregate_tok_per_s": 171.2326163606428,
+      "ttft_p50_ms": 344.3188099990948,
+      "ttft_p99_ms": 642.8939720026392,
+      "wall_per_req_p50_s": 5.197565282996948,
+      "wall_per_req_p99_s": 5.231311256997287
+    },
+    {
+      "concurrency": 14,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "completed": 9,
+      "total_emitted": 1847,
+      "wall_total_s": 13.981947151998611,
+      "aggregate_tok_per_s": 132.09891154079963,
+      "ttft_p50_ms": 2926.9006734994036,
+      "ttft_p99_ms": 5726.814945999649,
+      "wall_per_req_p50_s": 7.249458016500284,
+      "wall_per_req_p99_s": 13.978905897001823
+    },
+    {
+      "concurrency": 28,
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "completed": 2,
+      "total_emitted": 984,
+      "wall_total_s": 6.7041553760027455,
+      "aggregate_tok_per_s": 146.77464122060601,
+      "ttft_p50_ms": 3624.1435010015266,
+      "ttft_p99_ms": 6608.93290599779,
+      "wall_per_req_p50_s": 6.69791319649994,
+      "wall_per_req_p99_s": 6.702656825000304
+    }
+  ]
+}
