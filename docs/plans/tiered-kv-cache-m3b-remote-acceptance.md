@@ -1,7 +1,8 @@
-# Tiered KV Cache M3b (contract tranche) — remote CUDA acceptance
+# Tiered KV Cache M3b (contract + local runtime wire) — remote CUDA acceptance
 
 **Status**: Active. This is the acceptance contract for the 2026-04-15
-local M3b contract/state-machine batch.
+local M3b contract/state-machine batch plus the follow-up degraded
+runtime-wire batch.
 
 **Scope under test**:
 - `RadixCache::lookup_or_stage(...)` exists and classifies GPU / host /
@@ -13,12 +14,20 @@ local M3b contract/state-machine batch.
   in-tree and covered by tests.
 - `RadixCache::evict_with_policy(...)` remains the live eviction path for
   scheduler cleanup/allocation.
+- CUDA admission now consumes plannerless `lookup_or_stage(..., None)` as a
+  classifier: only `ReadyOnGpu` hits stay reusable; staged hits degrade to
+  cold prefill.
+- Published radix blocks stamp `BlockLocation::Gpu { slot }`, `byte_len`,
+  `session_id`, and a soft-pin keepalive deadline.
 
 **Explicit non-scope**:
-- No live scheduler/runtime consumer of `lookup_or_stage` yet.
-- No watermark retune in CUDA scheduler yet.
+- No real `StageTicket` completion path yet.
+- No watermark retune/config surface yet.
 - No real T1↔T0 promotion path yet.
-- No deletion of legacy `model/kv_cache.rs` CPU offload yet.
+- The current tree may also include the later M3c cleanup that deleted the
+  legacy contiguous CPU-offload path. Validate that separately via
+  `tiered-kv-cache-m3c-remote-acceptance.md`; this checklist is still scoped
+  to M3b behavior up to the degraded local runtime wire.
 
 This doc turns the M3b local batch from "contract landed" into "accepted on
 a CUDA host". If a step fails, stop and record the failure under
@@ -42,10 +51,10 @@ a CUDA host". If a step fails, stop and record the failure under
 Run these before any long build/test job:
 
 ```bash
-rg -n "lookup_or_stage|set_block_location|set_block_byte_len" infer/src/prefix_cache.rs
+rg -n "lookup_or_stage|set_block_location|set_block_byte_len|set_block_session_id|set_block_soft_pin_until" infer/src/prefix_cache.rs
 ```
 
-Expected: matches for the new lookup contract helpers.
+Expected: matches for the lookup contract helpers and runtime metadata mutators.
 
 ```bash
 rg -n "HitKind|LookupOutcome|LookupHeuristics|StageTicket|StagePlanner|PageLifecycleState" infer/src/kv_tier infer/src/kv_tier.rs
@@ -58,15 +67,19 @@ Expected: matches in `kv_tier/lookup.rs`, `kv_tier/coordinator.rs`, and
 rg -n "lookup_or_stage|StageTicket|PageLifecycleState" infer/src/scheduler/cuda
 ```
 
-Expected: **no output**. This batch should not have silently wired live
-CUDA runtime behavior yet.
+Expected:
+- `lookup_or_stage` matches in `runtime.rs`
+- no `StageTicket` / `PageLifecycleState` consumer in scheduler code yet
+- the scheduler still does not poll or complete staged transfers
 
 ```bash
-rg -n "evict_with_policy" infer/src/prefix_cache.rs infer/src/scheduler/cuda/core.rs
+rg -n "evict_with_policy|SchedulerSignals::default\\(\\)|eviction_signals|set_block_session_id|set_block_soft_pin_until" infer/src/prefix_cache.rs infer/src/scheduler/cuda/{core,runtime}.rs
 ```
 
-Expected: matches in both files; cleanup/allocation still flow through the
-policy-scored path.
+Expected:
+- `evict_with_policy` and `eviction_signals` matches in `core.rs`
+- no remaining `SchedulerSignals::default()` at the runtime eviction call sites
+- metadata stamp helpers are called from `core.rs`
 
 ---
 
@@ -85,7 +98,7 @@ cargo fmt --all -- --check
 Acceptance:
 - [ ] All commands pass.
 - [ ] No new CUDA-only linker/runtime failure is introduced by the M3b
-      contract tranche.
+      contract/runtime-wire tranche.
 - [ ] Golden outputs remain unchanged.
 
 ---
@@ -102,10 +115,20 @@ cargo test -p infer --release kv_tier
 
 Acceptance:
 - [ ] `prefix_cache` tests pass, including the new `lookup_or_stage`
-      classifications.
+      classifications and metadata mutators.
 - [ ] `kv_tier` tests pass, including `StageTicket` staging events and
       `PageLifecycleState` transitions.
 - [ ] `LocalCudaTransport` structural tests still pass on the CUDA host.
+
+Additional runtime smoke:
+
+```bash
+rg -n "lookup_or_stage\\(.*None\\)" infer/src/scheduler/cuda/runtime.rs
+```
+
+Expected: one plannerless admission consumer. This confirms the scheduler is
+using the new classifier contract without pretending staged bytes can
+complete on GPU yet.
 
 Optional explicit grep smoke:
 

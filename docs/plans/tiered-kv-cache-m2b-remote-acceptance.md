@@ -6,8 +6,12 @@ local M2b batch.
 **Scope under test**:
 - CUDA scheduler admission now uses radix-driven reusable-prefix selection.
 - Scheduler-owned `cached_prompts: Vec<Vec<u32>>` is deleted.
-- Prefix reuse prefetches CPU-offloaded contiguous KV before any
-  `truncate_to()` / `migrate_kv_range_to_paged()` path reads it.
+- At the time of the original M2b local batch, prefix reuse still crossed a
+  temporary `prefetch_kv_to_gpu()` bridge before any
+  `truncate_to()` / `migrate_kv_range_to_paged()` path read contiguous KV.
+  **If the current tree already includes the later M3c cleanup, that bridge
+  is gone; validate the deletion separately via
+  `tiered-kv-cache-m3c-remote-acceptance.md`.**
 - Pool allocation retry (`alloc_pool_tokens_with_retry`) can force one
   synchronous prefix-cache eviction on OOM.
 - Retain hard cap (`0.90`) and radix tombstone GC are active.
@@ -49,10 +53,14 @@ rg -n "reusable_prefix_len|reusable_cached_prompt_len|block_owner_slots|slot_mat
 Expected: matches in `request.rs`, `runtime.rs`, `core.rs`, and `prefill.rs`.
 
 ```bash
-rg -n "prefetch_kv_to_gpu" infer/src/model.rs infer/src/model/qwen3/forward.rs infer/src/model/qwen35/forward.rs infer/src/model/glm4/forward.rs
+rg -n "prefetch_kv_to_gpu" infer/src/model.rs infer/src/model/qwen3/forward.rs infer/src/model/qwen35/forward.rs infer/src/model/glm4/forward.rs || true
 ```
 
-Expected: one trait method plus one implementation in each CUDA model state.
+Expected:
+- On the original M2b tree: one trait method plus one implementation in each
+  CUDA model state.
+- On a newer tree that already includes M3c: no output, and the dedicated
+  M3c checklist must also be run.
 
 ---
 
