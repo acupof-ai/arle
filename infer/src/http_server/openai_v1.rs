@@ -612,6 +612,20 @@ impl From<crate::server_engine::TokenUsage> for ResponsesUsage {
 
 impl ResponsesResponse {
     pub(super) fn from_output(model: String, created_at: u64, output: CompletionOutput) -> Self {
+        Self::from_output_with_id(
+            format!("resp_{}", Uuid::new_v4().simple()),
+            model,
+            created_at,
+            output,
+        )
+    }
+
+    pub(super) fn from_output_with_id(
+        id: String,
+        model: String,
+        created_at: u64,
+        output: CompletionOutput,
+    ) -> Self {
         let (content, parsed_calls) = openai_parse_tool_calls(&output.text);
         let mut items = Vec::new();
 
@@ -640,7 +654,7 @@ impl ResponsesResponse {
         );
 
         Self {
-            id: format!("resp_{}", Uuid::new_v4().simple()),
+            id,
             object: "response",
             created_at,
             status: "completed",
@@ -648,6 +662,54 @@ impl ResponsesResponse {
             output: items,
             output_text: content,
             usage: output.usage.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ResponsesStreamCreatedEvent {
+    id: String,
+    object: &'static str,
+    created_at: u64,
+    status: &'static str,
+    model: String,
+}
+
+impl ResponsesStreamCreatedEvent {
+    pub(super) fn new(id: String, created_at: u64, model: String) -> Self {
+        Self {
+            id,
+            object: "response",
+            created_at,
+            status: "in_progress",
+            model,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ResponsesStreamDeltaEvent {
+    id: String,
+    object: &'static str,
+    created_at: u64,
+    status: &'static str,
+    model: String,
+    output_index: usize,
+    content_index: usize,
+    delta: String,
+}
+
+impl ResponsesStreamDeltaEvent {
+    pub(super) fn new(id: String, created_at: u64, model: String, delta: String) -> Self {
+        Self {
+            id,
+            object: "response",
+            created_at,
+            status: "in_progress",
+            model,
+            output_index: 0,
+            content_index: 0,
+            delta,
         }
     }
 }
