@@ -751,3 +751,21 @@ pub fn cache_memory_bytes() -> u64 {
     panic_if_mlx_error("mlx_get_cache_memory");
     value
 }
+
+pub fn set_memory_limit_bytes(limit: u64) -> u64 {
+    let previous = unsafe { mlx_sys::mlx_set_memory_limit(limit as usize) as u64 };
+    panic_if_mlx_error("mlx_set_memory_limit");
+    previous
+}
+
+pub fn set_cache_limit_bytes(limit: u64) -> u64 {
+    let previous = unsafe { mlx_sys::mlx_set_cache_limit(limit as usize) as u64 };
+    panic_if_mlx_error("mlx_set_cache_limit");
+    previous
+}
+
+pub fn set_wired_limit_bytes(limit: u64) -> u64 {
+    let previous = unsafe { mlx_sys::mlx_set_wired_limit(limit as usize) as u64 };
+    panic_if_mlx_error("mlx_set_wired_limit");
+    previous
+}

@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::{ArgAction, Parser};
-use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
+use infer::backend::metal::{
+    MetalBackend, MetalBackendOptions, MetalDflashOptions, MetalRuntimeLimits,
+};
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
 use infer::sampler::SamplingParams;
@@ -84,6 +86,18 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
+    /// Override the MLX allocator memory limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    memory_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator cache limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    cache_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator wired limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    wired_limit_bytes: Option<usize>,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
@@ -98,6 +112,14 @@ impl Args {
             Some(false)
         } else {
             None
+        }
+    }
+
+    fn runtime_limits(&self) -> MetalRuntimeLimits {
+        MetalRuntimeLimits {
+            memory_limit_bytes: self.memory_limit_bytes,
+            cache_limit_bytes: self.cache_limit_bytes,
+            wired_limit_bytes: self.wired_limit_bytes,
         }
     }
 }
@@ -195,6 +217,7 @@ fn main() -> Result<()> {
                     speculative_tokens: args.speculative_tokens,
                 }),
             kv_pool: args.kv_pool_override(),
+            runtime_limits: args.runtime_limits(),
         });
         let load_start = Instant::now();
         backend

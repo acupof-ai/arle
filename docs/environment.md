@@ -87,6 +87,24 @@ Behavior:
 
 Status: experimental, fallback-only.
 
+### Metal runtime memory limits
+
+The MLX allocator limits for Metal are currently exposed as CLI flags, not
+environment variables:
+
+- `--memory-limit-bytes`
+- `--cache-limit-bytes`
+- `--wired-limit-bytes`
+
+Current use:
+
+- `metal_request`
+- `metal_bench`
+- `metal_serve`
+
+These are applied before model load and affect the whole process-local MLX
+allocator state.
+
 ### `AGENT_INFER_GDR_METAL_KERNEL`
 
 Influence Metal GDR kernel path selection.

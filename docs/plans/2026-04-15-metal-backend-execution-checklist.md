@@ -46,7 +46,9 @@ This checklist is the execution companion to:
   `2026-04-15`: runtime-backed queue / TTFT / E2E / MLX memory metrics landed
   on both the live scheduler runtime and the serial DFlash fallback path. The
   remaining open edge is that `prefix_hit_rate` is still a real-but-zero gauge
-  until `M0.3` wires shared-prefix reuse into the live serving path.
+  until `M0.3` wires shared-prefix reuse into the live serving path. The same
+  tranche now also exposes `--memory-limit-bytes` / `--cache-limit-bytes` /
+  `--wired-limit-bytes` on all user-facing Metal entry points.
 
 ## P1 · API And DX
 

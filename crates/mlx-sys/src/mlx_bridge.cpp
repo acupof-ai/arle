@@ -670,6 +670,21 @@ size_t mlx_get_cache_memory() {
     MLX_TRY_RETURN_VALUE(0, mlx::core::get_cache_memory());
 }
 
+/// Set the MLX allocator memory limit in bytes.
+size_t mlx_set_memory_limit(size_t limit) {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::set_memory_limit(limit));
+}
+
+/// Set the MLX allocator cache limit in bytes.
+size_t mlx_set_cache_limit(size_t limit) {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::set_cache_limit(limit));
+}
+
+/// Set the MLX allocator wired limit in bytes.
+size_t mlx_set_wired_limit(size_t limit) {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::set_wired_limit(limit));
+}
+
 /// Release cached Metal buffers and other allocator caches.
 /// Equivalent to `mx.metal.clear_cache()` in Python.
 void mlx_metal_clear_cache() {

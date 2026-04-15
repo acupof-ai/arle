@@ -284,7 +284,8 @@ For OpenAI-compatible serving on Apple Silicon:
 
 ```bash
 cargo run --release -p infer --no-default-features --features metal,no-cuda --bin metal_serve -- \
-  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000
+  --model-path mlx-community/Qwen3-0.6B-4bit --port 8000 \
+  --memory-limit-bytes 25769803776 --cache-limit-bytes 8589934592
 ```
 
 Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
@@ -292,6 +293,10 @@ Metal scheduler runtime with chunked prefill and decode-priority interleave.
 It now has narrow same-length cross-request decode batching for Qwen3 and
 Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
 uses the legacy serial runtime path.
+For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
+`metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
+`--wired-limit-bytes` so MLX allocator behavior can be capped before model
+load.
 
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
 

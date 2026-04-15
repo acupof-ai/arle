@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser};
+use infer::backend::metal::MetalRuntimeLimits;
 use serde::{Deserialize, Serialize};
 
 /// Metal backend benchmark: prompt speed, TTFT, decode throughput, peak RSS.
@@ -83,6 +84,18 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
+    /// Override the MLX allocator memory limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    memory_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator cache limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    cache_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator wired limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    wired_limit_bytes: Option<usize>,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
@@ -97,6 +110,14 @@ impl Cli {
             Some(false)
         } else {
             None
+        }
+    }
+
+    fn runtime_limits(&self) -> MetalRuntimeLimits {
+        MetalRuntimeLimits {
+            memory_limit_bytes: self.memory_limit_bytes,
+            cache_limit_bytes: self.cache_limit_bytes,
+            wired_limit_bytes: self.wired_limit_bytes,
         }
     }
 }
@@ -331,6 +352,7 @@ fn run_bench() -> Result<()> {
                 speculative_tokens: cli.speculative_tokens,
             }),
         kv_pool: cli.kv_pool_override(),
+        runtime_limits: cli.runtime_limits(),
     });
     backend.load(std::path::Path::new(&cli.model))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
