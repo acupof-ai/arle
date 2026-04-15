@@ -6,6 +6,7 @@ References:
 
 - [2026-04-15-metal-backend-execution-checklist.md](2026-04-15-metal-backend-execution-checklist.md)
 - [../projects/mlx-backend-roadmap.md](../projects/mlx-backend-roadmap.md)
+- [../reviews/2026-04-15-metal-ecosystem-route-correction.md](../reviews/2026-04-15-metal-ecosystem-route-correction.md)
 
 Completion rule for every milestone:
 
@@ -13,6 +14,12 @@ Completion rule for every milestone:
 2. user-facing docs are updated in the same change
 3. the listed verification commands pass
 4. any remaining non-goals are stated explicitly
+
+Benchmark rule:
+
+- direct `metal_bench` is a required sanity check, not a serving milestone exit
+- `M0.2` and later serving milestones require an HTTP sweep against
+  `metal_serve`, not just direct benchmark output
 
 ## Status Snapshot
 
@@ -94,13 +101,24 @@ Acceptance:
   `BackendRuntimeHandle`
 - the scheduler owns admission, prefill/decode selection, and cleanup
 - request cancellation or disconnect cannot leak request state
+- aggregate throughput under concurrency rises materially beyond the current
+  serial-server shape
+- TTFT no longer scales roughly linearly with queue depth the way the current
+  serial runtime does
 
 Verification:
 
 ```bash
 rg -n "BackendRuntimeHandle" infer/src/bin/metal_serve.rs infer/src/http_server.rs
 cargo test -p infer --no-default-features --features metal,no-cuda metal_scheduler -- --nocapture
+python3 scripts/bench_throughput_sweep.py --url http://127.0.0.1:8000 --quick --label metal-m0.2
 ```
+
+Exit signal:
+
+- on the same machine / model / build, `C>=4` rows no longer look throughput-flat
+  relative to `C=1`
+- TTFT at `C>=4` is not dominated by request-level FIFO queueing
 
 #### `M0.2c` Runtime retirement proof
 
@@ -109,6 +127,8 @@ Acceptance:
 - `metal_serve` no longer imports or constructs the serial runtime
 - concurrent requests can make forward progress without request-level FIFO
   serialization
+- a detached-worktree or equivalent isolated build can reproduce the serving
+  benchmark used for sign-off
 
 Verification:
 
@@ -126,12 +146,15 @@ Acceptance:
 - scheduler-owned request state uses prefix cache lookups before prefill
 - KV pool lifecycle is tied to request admission / completion, not the old
   single-request fallback only
+- the serving benchmark can demonstrate a measurable reuse effect on repeated
+  prefixes, not just internal cache counters
 
 Verification:
 
 ```bash
 cargo test -p infer --no-default-features --features metal,no-cuda --lib prefix_cache -- --nocapture
 cargo test -p infer --no-default-features --features metal,no-cuda --lib backend::metal::kv_pool -- --nocapture
+python3 scripts/bench_throughput_sweep.py --url http://127.0.0.1:8000 --quick --label metal-m0.3
 ```
 
 ### `M0.4` Memory and reuse observability
@@ -147,6 +170,8 @@ Acceptance:
   - `peak_memory`
   - queue depth
 - scheduler updates these from the live Metal serving path
+- those numbers are sufficient to explain the result of the `M0.2/M0.3` HTTP
+  sweep without having to attach a profiler trace first
 
 Verification:
 
