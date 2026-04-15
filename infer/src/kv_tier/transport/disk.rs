@@ -1,84 +1,109 @@
-//! T2 disk backend: [`DiskStore`] provides both a key-based blob store
-//! and a [`BlockLocation::Disk`]-aware block allocator for the tiered KV
-//! cache skeleton.
+//! T2 disk backend: [`DiskStore`] provides both a keyed blob store and a
+//! content-addressable block store for the tiered KV cache skeleton.
 //!
 //! Tier number: the 2026-04-15 revision renamed T3 → T2 (project doc
-//! §4.1) to match industry convention; the old T3 label is preserved
-//! in some test/bench file names but the code uses T2.
+//! §4.1) to match industry convention; the old T3 label is preserved in
+//! some historical notes but the code uses T2.
 //!
-//! This is the **skeleton implementation** for the M4 disk tier
-//! (formerly P3, renamed in the 2026-04-15 revision). It lands now to
-//! prove two things on the local Mac lane:
-//! 1. `std::fs` I/O is sufficient for the skeleton (no tokio runtime
-//!    boilerplate, no async/await on the hot path).
-//! 2. The `BlockLocation::Disk { file_id, offset }` addressing model
-//!    survives a round trip through a real filesystem — [`DiskStore`]'s
-//!    `put_block` / `get_block` pair issue `BlockLocation` values that
-//!    the scheduler's prefix-cache layer can reference directly. The
-//!    pre-M1 `TierDirectory` holding area no longer exists; location
-//!    metadata now lives on the `RadixCache` node instead.
+//! This file now carries the M4b local disk format:
+//! 1. block files are named by [`crate::types::BlockFingerprint`] so a
+//!    restarted process can reconcile persisted content by semantic
+//!    identity instead of transient pool slot ids;
+//! 2. each file starts with a postcard-encoded [`DiskBlockHeader`]
+//!    followed by the raw KV payload bytes.
 //!
 //! # Scope (intentional)
 //!
 //! - Two layers on top of one root directory:
 //!   - **Keyed API** — `write` / `read` / `remove` use caller-supplied
 //!     relative paths and reject absolute paths or `..` traversal. Used
-//!     by the HTTP session save/load routes (M4 behavior PR) where the
-//!     caller already has a stable key like the session id.
+//!     by session save/load code where the caller already has a stable key
+//!     such as a session id.
 //!   - **Block API** — `put_block` / `get_block` / `delete_block`
-//!     allocate sequential `file_id`s (via `AtomicU32`) and hand back a
-//!     [`BlockLocation::Disk`] for each put. Used by the coordinator
-//!     eviction path where the radix cache doesn't have its own name
-//!     for the block yet.
-//! - Sequential `file_id` allocation. Not content-addressable yet —
-//!   that arrives in M4 behavior PR together with blake3 hashing (via
-//!   `crate::types::BlockFingerprint`).
-//! - One file per block; every block starts at offset `0` of its own
-//!   file. `offset` stays in [`BlockLocation::Disk`] for forward
-//!   compatibility with a future packed-file format.
+//!     allocate content-addressable files named by the 16-byte
+//!     fingerprint (`32` lowercase hex chars + `.kv`) and return a
+//!     [`DiskBlockLocation`] for later reads/deletes.
+//! - One file per block. The payload is still an opaque raw byte blob
+//!   owned by the caller; only the header is interpreted here.
 //! - Synchronous I/O via `std::fs`. The `KVTransport` trait is sync
 //!   too, so this is the natural fit; the coordinator does its own
 //!   thread management.
-//! - No checksum / integrity verification yet. Relies on fs reliability.
-//!
-//! See `docs/plans/tiered-kv-cache-tasks.md §4.2` for research — LMCache
-//! and SGLang both use the "one file per chunk, in-memory index, rebuild
-//! on startup" pattern, and this matches.
+//! - Header validation on read: magic, version, payload length, and
+//!   optional fingerprint match.
 //!
 //! # Non-scope (deferred)
 //!
-//! - `KVTransport` trait impl over this store — lands in M4 behavior PR
-//!   once the coordinator owns a registered host buffer to copy
-//!   to/from.
-//! - Content-addressable filenames (blake3 hash of bytes via
-//!   `crate::types::BlockFingerprint`) — M4 behavior PR.
+//! - `KVTransport` trait impl over this store — lands once the
+//!   coordinator owns a registered host buffer to copy to/from.
 //! - `O_DIRECT` / `F_NOCACHE` — optional optimization, only matters
 //!   when the store is large enough that page-cache pollution hurts.
 //! - `tokio::fs` async path — only useful once the coordinator drives
 //!   I/O from an async context.
 //! - `io_uring` — deferred indefinitely per §4.3 course corrections.
-//! - Rebuilding `next_file_id` by scanning the directory on startup —
-//!   every new [`DiskStore`] instance starts at `file_id = 0`, which
-//!   works for the skeleton but will collide with an existing directory
-//!   containing `0.blk`. M4 behavior PR adds a `rescan()` that walks
-//!   the root and bumps the counter past the highest observed id.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::super::tier::BlockLocation;
+use crate::types::BlockFingerprint;
+
+const DISK_BLOCK_MAGIC: [u8; 8] = *b"PEGAKV01";
+const DISK_BLOCK_VERSION: u16 = 1;
+
+/// Stable on-disk location for a persisted KV block.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DiskBlockLocation {
+    pub path: PathBuf,
+    pub payload_len: u64,
+    pub fingerprint: BlockFingerprint,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DiskBlockHeader {
+    magic: [u8; 8],
+    version: u16,
+    fingerprint: [u8; 16],
+    kv_format_tag: u8,
+    payload_len: u64,
+}
+
+impl DiskBlockHeader {
+    fn new(fingerprint: BlockFingerprint, kv_format_tag: u8, payload_len: u64) -> Self {
+        Self {
+            magic: DISK_BLOCK_MAGIC,
+            version: DISK_BLOCK_VERSION,
+            fingerprint: fingerprint.0,
+            kv_format_tag,
+            payload_len,
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<(Self, &[u8])> {
+        let (header, payload) = postcard::take_from_bytes::<DiskBlockHeader>(bytes)
+            .map_err(|err| invalid_data(format!("disk store: failed to decode header: {err}")))?;
+        if header.magic != DISK_BLOCK_MAGIC {
+            return Err(invalid_data("disk store: invalid block magic"));
+        }
+        if header.version != DISK_BLOCK_VERSION {
+            return Err(invalid_data("disk store: unsupported block version"));
+        }
+        let payload_len = usize::try_from(header.payload_len)
+            .map_err(|_| invalid_data("disk store: payload length exceeds platform usize"))?;
+        if payload.len() != payload_len {
+            return Err(invalid_data("disk store: payload length mismatch"));
+        }
+        Ok((header, payload))
+    }
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
 
 /// Stable local filesystem backing for persisted KV blobs.
-///
-/// Not `Clone` — the `AtomicU32` file-id allocator is a single source of
-/// truth and cloning it would hand out colliding ids. Callers that need
-/// to share a store across threads should wrap it in [`std::sync::Arc`].
 #[derive(Debug)]
 pub struct DiskStore {
     root: PathBuf,
-    next_file_id: AtomicU32,
 }
 
 impl DiskStore {
@@ -86,10 +111,7 @@ impl DiskStore {
     /// directory — call [`DiskStore::create_root`] if it might not
     /// exist yet.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            next_file_id: AtomicU32::new(0),
-        }
+        Self { root: root.into() }
     }
 
     /// Root directory used by this store.
@@ -100,9 +122,9 @@ impl DiskStore {
     /// Returns the canonical storage path for `key`.
     ///
     /// Keys are treated as relative paths and rejected if they escape
-    /// the root. This is the defense the HTTP session save/load routes
-    /// use to keep untrusted `session_id` values from reaching
-    /// arbitrary files.
+    /// the root. This is the defense the session save/load routes use
+    /// to keep untrusted `session_id` values from reaching arbitrary
+    /// files.
     pub fn path_for(&self, key: impl AsRef<Path>) -> io::Result<PathBuf> {
         let key = key.as_ref();
         if key.is_absolute() {
@@ -154,83 +176,131 @@ impl DiskStore {
         }
     }
 
-    // ── Block API (BlockLocation::Disk aware) ────────────────────────
+    // ── Block API (content-addressable) ──────────────────────────────
 
-    /// Relative filename for a given `file_id`. Kept private so the
-    /// block-api caller never has to think about directory layout.
-    fn block_filename(file_id: u32) -> String {
-        format!("{file_id}.blk")
-    }
+    fn block_filename(fingerprint: BlockFingerprint) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
 
-    /// Write `bytes` as a new block and return the resulting
-    /// [`BlockLocation`] so the caller can register it with the tier
-    /// directory. Each call allocates a fresh `file_id`, so callers do
-    /// not need to worry about collisions.
-    pub fn put_block(&self, bytes: &[u8]) -> io::Result<BlockLocation> {
-        self.create_root()?;
-        let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
-        self.write(Self::block_filename(file_id), bytes)?;
-        Ok(BlockLocation::Disk { file_id, offset: 0 })
-    }
-
-    /// Read a block back from the store.
-    ///
-    /// `len` is the number of bytes to return starting at the block's
-    /// `offset`. Pass `None` to read the whole file — the skeleton
-    /// stores one block per file so this is usually what the caller
-    /// wants. Returns `Err(io::ErrorKind::InvalidInput)` if `location`
-    /// is not a `Disk` variant.
-    pub fn get_block(&self, location: &BlockLocation, len: Option<u64>) -> io::Result<Vec<u8>> {
-        let BlockLocation::Disk { file_id, offset } = location else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "disk store: block location is not a Disk variant",
-            ));
-        };
-        let path = self.path_for(Self::block_filename(*file_id))?;
-        let bytes = fs::read(&path)?;
-        let offset = *offset as usize;
-        if offset > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "disk store: offset past end of block file",
-            ));
+        let mut filename = String::with_capacity(35);
+        for byte in fingerprint.0 {
+            filename.push(char::from(HEX[(byte >> 4) as usize]));
+            filename.push(char::from(HEX[(byte & 0x0f) as usize]));
         }
-        let available = bytes.len() - offset;
-        let want = match len {
-            Some(n) => {
-                let n = n as usize;
-                if n > available {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "disk store: requested len past end of block file",
-                    ));
-                }
-                n
+        filename.push_str(".kv");
+        filename
+    }
+
+    /// Writes a content-addressed block file and returns its stable disk
+    /// location metadata.
+    pub fn put_block(
+        &self,
+        fingerprint: BlockFingerprint,
+        kv_format_tag: u8,
+        payload: &[u8],
+    ) -> io::Result<DiskBlockLocation> {
+        self.create_root()?;
+
+        let payload_len = u64::try_from(payload.len())
+            .map_err(|_| invalid_data("disk store: payload too large"))?;
+        let header = DiskBlockHeader::new(fingerprint, kv_format_tag, payload_len);
+        let header_bytes = postcard::to_allocvec(&header)
+            .map_err(|err| invalid_data(format!("disk store: failed to encode header: {err}")))?;
+        let mut file_bytes = Vec::with_capacity(header_bytes.len() + payload.len());
+        file_bytes.extend_from_slice(&header_bytes);
+        file_bytes.extend_from_slice(payload);
+
+        let path = self.path_for(Self::block_filename(fingerprint))?;
+        fs::write(&path, file_bytes)?;
+
+        Ok(DiskBlockLocation {
+            path,
+            payload_len,
+            fingerprint,
+        })
+    }
+
+    /// Reads a block back from the store and validates its postcard
+    /// header before returning the raw payload bytes.
+    pub fn get_block(
+        &self,
+        location: &DiskBlockLocation,
+        expected_fingerprint: Option<BlockFingerprint>,
+    ) -> io::Result<Vec<u8>> {
+        let bytes = fs::read(&location.path)?;
+        let (header, payload) = DiskBlockHeader::decode(&bytes)?;
+
+        if let Some(expected) = expected_fingerprint {
+            if header.fingerprint != expected.0 {
+                return Err(invalid_data("disk store: fingerprint mismatch"));
             }
-            None => available,
-        };
-        Ok(bytes[offset..offset + want].to_vec())
+        }
+
+        Ok(payload.to_vec())
     }
 
     /// Delete a block's backing file. Missing files are ignored so the
-    /// operation is idempotent — useful for the eviction path where
-    /// coordinator bookkeeping may race with an explicit delete.
-    pub fn delete_block(&self, location: &BlockLocation) -> io::Result<()> {
-        let BlockLocation::Disk { file_id, .. } = location else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "disk store: block location is not a Disk variant",
-            ));
-        };
-        self.remove(Self::block_filename(*file_id))
+    /// operation is idempotent — useful for eviction flows where
+    /// bookkeeping may race with an explicit delete.
+    pub fn delete_block(&self, location: &DiskBlockLocation) -> io::Result<()> {
+        match fs::remove_file(&location.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::KvContentContext;
     use tempfile::tempdir;
+
+    const TEST_MODEL_FINGERPRINT: &[u8] = b"qwen3-4b";
+    const TEST_PARENT_FINGERPRINT: BlockFingerprint = BlockFingerprint([0xA5; 16]);
+
+    fn payload_words(payload: &[u8]) -> Vec<u32> {
+        let mut chunks = payload.chunks_exact(4);
+        let words = chunks
+            .by_ref()
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        assert!(
+            chunks.remainder().is_empty(),
+            "payload must be divisible by 4 for fingerprint test"
+        );
+        words
+    }
+
+    fn fingerprint_for_payload(payload: &[u8], kv_format_tag: u8) -> BlockFingerprint {
+        BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: TEST_MODEL_FINGERPRINT,
+                kv_format_tag,
+                parent: Some(TEST_PARENT_FINGERPRINT),
+            },
+            &payload_words(payload),
+        )
+    }
+
+    fn tampered_fingerprint(fingerprint: BlockFingerprint) -> BlockFingerprint {
+        let mut bytes = fingerprint.0;
+        bytes[0] ^= 0xFF;
+        BlockFingerprint(bytes)
+    }
+
+    fn write_raw_block(path: &Path, header: &DiskBlockHeader, payload: &[u8]) {
+        let mut bytes = postcard::to_allocvec(header).expect("serialize header");
+        bytes.extend_from_slice(payload);
+        fs::write(path, bytes).expect("write block file");
+    }
+
+    fn read_header_and_payload(path: &Path) -> (DiskBlockHeader, Vec<u8>) {
+        let bytes = fs::read(path).expect("read block file");
+        let (header, payload) =
+            postcard::take_from_bytes::<DiskBlockHeader>(&bytes).expect("decode block file");
+        (header, payload.to_vec())
+    }
 
     // ── Keyed API tests ──────────────────────────────────────────────
 
@@ -258,78 +328,54 @@ mod tests {
     fn put_block_and_get_block_roundtrip() {
         let dir = tempdir().unwrap();
         let store = DiskStore::new(dir.path());
-        let payload = b"the quick brown fox jumps over the lazy dog";
+        let kv_format_tag = 3;
+        let payload = b"0123456789abcdef0123456789abcdef".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
 
-        let location = store.put_block(payload).expect("put_block");
-        match location {
-            BlockLocation::Disk { file_id, offset } => {
-                assert_eq!(file_id, 0, "first put_block should get file_id=0");
-                assert_eq!(offset, 0);
-            }
-            _ => panic!("put_block should return a Disk location"),
-        }
+        let location = store
+            .put_block(fingerprint, kv_format_tag, &payload)
+            .expect("put_block");
 
-        let read_back = store.get_block(&location, None).expect("get_block");
+        assert_eq!(
+            location.path,
+            dir.path().join(DiskStore::block_filename(fingerprint))
+        );
+        assert_eq!(location.payload_len, payload.len() as u64);
+        assert_eq!(location.fingerprint, fingerprint);
+
+        let read_back = store
+            .get_block(&location, Some(fingerprint))
+            .expect("get_block");
         assert_eq!(read_back, payload);
-    }
 
-    #[test]
-    fn sequential_put_blocks_advance_file_id() {
-        let dir = tempdir().unwrap();
-        let store = DiskStore::new(dir.path());
-        let a = store.put_block(b"alpha").unwrap();
-        let b = store.put_block(b"beta").unwrap();
-        let c = store.put_block(b"gamma").unwrap();
-
-        let ids: Vec<u32> = [a, b, c]
-            .iter()
-            .map(|loc| match loc {
-                BlockLocation::Disk { file_id, .. } => *file_id,
-                _ => panic!("put_block returned non-Disk location"),
-            })
-            .collect();
-        assert_eq!(ids, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn get_block_honors_explicit_len() {
-        let dir = tempdir().unwrap();
-        let store = DiskStore::new(dir.path());
-        let loc = store.put_block(b"hello world").unwrap();
-        let prefix = store.get_block(&loc, Some(5)).expect("prefix read");
-        assert_eq!(prefix, b"hello");
-    }
-
-    #[test]
-    fn get_block_out_of_bounds_errors() {
-        let dir = tempdir().unwrap();
-        let store = DiskStore::new(dir.path());
-        let loc = store.put_block(b"abc").unwrap();
-        let err = store
-            .get_block(&loc, Some(100))
-            .expect_err("should fail past end");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn block_api_rejects_non_disk_location() {
-        let dir = tempdir().unwrap();
-        let store = DiskStore::new(dir.path());
-        let bad = BlockLocation::Gpu { slot: 42 };
-        let get_err = store.get_block(&bad, None).expect_err("get rejects Gpu");
-        assert_eq!(get_err.kind(), io::ErrorKind::InvalidInput);
-        let del_err = store.delete_block(&bad).expect_err("delete rejects Gpu");
-        assert_eq!(del_err.kind(), io::ErrorKind::InvalidInput);
+        let (header, stored_payload) = read_header_and_payload(&location.path);
+        assert_eq!(header.magic, DISK_BLOCK_MAGIC);
+        assert_eq!(header.version, DISK_BLOCK_VERSION);
+        assert_eq!(header.fingerprint, fingerprint.0);
+        assert_eq!(header.kv_format_tag, kv_format_tag);
+        assert_eq!(header.payload_len, payload.len() as u64);
+        assert_eq!(stored_payload, payload);
     }
 
     #[test]
     fn delete_block_is_idempotent() {
         let dir = tempdir().unwrap();
         let store = DiskStore::new(dir.path());
-        let loc = store.put_block(b"ephemeral").unwrap();
-        store.delete_block(&loc).expect("first delete");
-        store.delete_block(&loc).expect("second delete is a no-op");
-        let err = store.get_block(&loc, None).expect_err("get after delete");
+        let kv_format_tag = 1;
+        let payload = b"deadbeef".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+        let location = store
+            .put_block(fingerprint, kv_format_tag, &payload)
+            .unwrap();
+
+        store.delete_block(&location).expect("first delete");
+        store
+            .delete_block(&location)
+            .expect("second delete is a no-op");
+
+        let err = store
+            .get_block(&location, Some(fingerprint))
+            .expect_err("get after delete");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
@@ -337,20 +383,148 @@ mod tests {
     fn disk_store_round_trip_preserves_fingerprint() {
         let dir = tempdir().unwrap();
         let store = DiskStore::new(dir.path());
+        let kv_format_tag = 9;
         let payload: Vec<u8> = (0..4096u64).map(|i| (i % 256) as u8).collect();
-        let fingerprint_for = |bytes: &[u8]| {
-            crate::types::BlockFingerprint::compute_from_tokens(
-                &bytes
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
 
-        let location = store.put_block(&payload).expect("put_block");
-        let read_back = store.get_block(&location, None).expect("get_block");
+        let location = store
+            .put_block(fingerprint, kv_format_tag, &payload)
+            .expect("put_block");
 
-        assert_eq!(fingerprint_for(&payload), fingerprint_for(&read_back));
+        let read_back = store
+            .get_block(&location, Some(fingerprint))
+            .expect("get_block with matching fingerprint");
+        let wrong_fingerprint = tampered_fingerprint(fingerprint);
+        let err = store
+            .get_block(&location, Some(wrong_fingerprint))
+            .expect_err("tampered fingerprint should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(read_back, payload);
+
+        let (header, stored_payload) = read_header_and_payload(&location.path);
+        assert_eq!(header.magic, DISK_BLOCK_MAGIC);
+        assert_eq!(header.version, DISK_BLOCK_VERSION);
+        assert_eq!(header.fingerprint, fingerprint.0);
+        assert_eq!(header.kv_format_tag, kv_format_tag);
+        assert_eq!(header.payload_len, payload.len() as u64);
+        assert_eq!(stored_payload, payload);
+    }
+
+    #[test]
+    fn disk_store_rejects_wrong_magic() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 4;
+        let payload = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+        let path = store.path_for("bad-magic.kv").unwrap();
+        store.create_root().unwrap();
+
+        write_raw_block(
+            &path,
+            &DiskBlockHeader {
+                magic: *b"BADMAGC!",
+                version: DISK_BLOCK_VERSION,
+                fingerprint: fingerprint.0,
+                kv_format_tag,
+                payload_len: payload.len() as u64,
+            },
+            &payload,
+        );
+
+        let err = store
+            .get_block(
+                &DiskBlockLocation {
+                    path,
+                    payload_len: payload.len() as u64,
+                    fingerprint,
+                },
+                Some(fingerprint),
+            )
+            .expect_err("bad magic should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn disk_store_rejects_version_mismatch() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 5;
+        let payload = vec![8, 9, 10, 11, 12, 13, 14, 15];
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+        let path = store.path_for("wrong-version.kv").unwrap();
+        store.create_root().unwrap();
+
+        write_raw_block(
+            &path,
+            &DiskBlockHeader {
+                magic: DISK_BLOCK_MAGIC,
+                version: DISK_BLOCK_VERSION + 1,
+                fingerprint: fingerprint.0,
+                kv_format_tag,
+                payload_len: payload.len() as u64,
+            },
+            &payload,
+        );
+
+        let err = store
+            .get_block(
+                &DiskBlockLocation {
+                    path,
+                    payload_len: payload.len() as u64,
+                    fingerprint,
+                },
+                Some(fingerprint),
+            )
+            .expect_err("version mismatch should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn disk_store_filename_is_fingerprint_hex() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 7;
+        let payload_a = b"abcdefghijklmnop".to_vec();
+        let payload_b = b"ponmlkjihgfedcba".to_vec();
+        let fingerprint_a = fingerprint_for_payload(&payload_a, kv_format_tag);
+        let fingerprint_b = fingerprint_for_payload(&payload_b, kv_format_tag);
+
+        let location_a = store
+            .put_block(fingerprint_a, kv_format_tag, &payload_a)
+            .unwrap();
+        let location_b = store
+            .put_block(fingerprint_b, kv_format_tag, &payload_b)
+            .unwrap();
+        let location_a_again = store
+            .put_block(fingerprint_a, kv_format_tag, &payload_a)
+            .unwrap();
+
+        assert_ne!(fingerprint_a, fingerprint_b);
+        assert_ne!(location_a.path, location_b.path);
+        assert_eq!(location_a.path, location_a_again.path);
+        assert_eq!(
+            location_a
+                .path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some(DiskStore::block_filename(fingerprint_a).as_str())
+        );
+        assert_eq!(
+            location_b
+                .path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some(DiskStore::block_filename(fingerprint_b).as_str())
+        );
+        assert_eq!(
+            store
+                .get_block(&location_a_again, Some(fingerprint_a))
+                .unwrap(),
+            payload_a
+        );
     }
 }
