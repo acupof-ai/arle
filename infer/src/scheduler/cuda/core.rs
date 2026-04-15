@@ -42,6 +42,8 @@ pub(super) const PREFIX_CACHE_RETAIN_HARD_CAP: f64 = 0.90;
 /// without pretending to be wall-clock time. Re-tune it only against real
 /// session-trace benches.
 pub(super) const PREFIX_CACHE_KEEPALIVE_TICKS: u64 = 64;
+/// 8x regular keepalive; tick=one-lookup.
+pub(super) const STAGE_WAIT_KEEPALIVE_TICKS: u64 = 512;
 
 fn prefix_cache_retain_hard_cap_pages(total_pages: usize) -> usize {
     (total_pages as f64 * PREFIX_CACHE_RETAIN_HARD_CAP) as usize
@@ -49,6 +51,13 @@ fn prefix_cache_retain_hard_cap_pages(total_pages: usize) -> usize {
 
 fn can_publish_prefix_pages(retained_pages: usize, total_pages: usize, new_pages: usize) -> bool {
     retained_pages.saturating_add(new_pages) <= prefix_cache_retain_hard_cap_pages(total_pages)
+}
+
+pub(super) struct StagedAdmission {
+    pub(super) request: IncomingRequest,
+    pub(super) prompt_tokens: Vec<u32>,
+    pub(super) block_ids: Vec<BlockId>,
+    pub(super) enqueued_at_clock: u64,
 }
 
 /// CUDA-backed scheduler state and initialization.
@@ -102,6 +111,12 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) block_owner_slots: HashMap<BlockId, usize>,
     /// Reverse index for `block_owner_slots`, keyed by slot.
     pub(super) slot_owned_blocks: Vec<Vec<BlockId>>,
+    pub(super) coordinator_handle: crate::kv_tier::CoordinatorHandle,
+    pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
+    pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    pub(super) stage_waiting: HashMap<crate::kv_tier::StageTicket, StagedAdmission>,
+    pub(super) coordinator_unavailable: bool,
+    pub(super) page_lifecycle: crate::kv_tier::coordinator::PageLifecycle,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -261,6 +276,11 @@ impl<M: ModelForward> Scheduler<M> {
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
+        let page_lifecycle =
+            crate::kv_tier::coordinator::PageLifecycle::new(paged_kv_pool.max_total_pages);
+        let (coordinator, coordinator_handle, coordinator_events) =
+            crate::kv_tier::Coordinator::new(config.max_slots.max(16));
+        let coordinator_thread = Some(coordinator.spawn("pegainfer-tiered-kv-coord"));
         let scheduler = Self {
             config: config.clone(),
             model,
@@ -274,6 +294,12 @@ impl<M: ModelForward> Scheduler<M> {
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
+            coordinator_handle,
+            coordinator_events,
+            coordinator_thread,
+            stage_waiting: HashMap::new(),
+            coordinator_unavailable: false,
+            page_lifecycle,
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
@@ -493,6 +519,25 @@ impl<M: ModelForward> Scheduler<M> {
                     soft_pin_until: Some(keepalive_deadline),
                 },
             );
+            for &page in &block_pages[block_i] {
+                if let Err(err) = self.page_lifecycle.mark_resident(page as usize) {
+                    match err {
+                        crate::kv_tier::coordinator::PageLifecycleError::InvalidTransition {
+                            ..
+                        } => log::debug!(
+                            "page lifecycle mark_resident ignored for page {}: {}",
+                            page,
+                            err
+                        ),
+                        crate::kv_tier::coordinator::PageLifecycleError::UnknownPage { .. } => {
+                            warn!(
+                                "page lifecycle unknown page {} during publish: {}",
+                                page, err
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -549,9 +594,34 @@ impl<M: ModelForward> Scheduler<M> {
             blocks_to_evict,
         );
         let mut reclaimed_pages: usize = 0;
+        let sentinel_ticket = crate::kv_tier::StageTicket(u64::MAX);
         for bid in evicted {
             if let Some(pages) = self.block_to_pages.remove(&bid) {
                 self.block_owner_slots.remove(&bid);
+                for &page in &pages {
+                    // A5 stub: sentinel ticket represents "instant demote"
+                    // until coordinator transport lane is wired.
+                    if let Err(err) = self.page_lifecycle.begin_demote(
+                        page as usize,
+                        sentinel_ticket,
+                        BlockLocation::HostPinned { offset: 0 },
+                    ) {
+                        log::debug!(
+                            "page lifecycle begin_demote ignored for page {}: {}",
+                            page,
+                            err
+                        );
+                    } else if let Err(err) = self
+                        .page_lifecycle
+                        .finish_demote(page as usize, sentinel_ticket)
+                    {
+                        log::debug!(
+                            "page lifecycle finish_demote ignored for page {}: {}",
+                            page,
+                            err
+                        );
+                    }
+                }
                 let freed_now = self.paged_kv_pool.release_pages(&pages);
                 reclaimed_pages += freed_now.len();
             }
@@ -817,6 +887,21 @@ impl<M: ModelForward> Scheduler<M> {
             sizes.push(max_bs);
         }
         sizes
+    }
+}
+
+impl<M: ModelForward> Drop for Scheduler<M> {
+    fn drop(&mut self) {
+        let _ = self
+            .coordinator_handle
+            .send(crate::kv_tier::CoordinatorCommand::Shutdown);
+        if let Some(thread) = self.coordinator_thread.take() {
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!("Coordinator thread shutdown failed: {}", err),
+                Err(_) => warn!("Coordinator thread panicked during shutdown"),
+            }
+        }
     }
 }
 

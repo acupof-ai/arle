@@ -178,6 +178,11 @@ pub enum CoordinatorEvent {
         ticket: StageTicket,
         request_count: usize,
     },
+    /// Stub completes immediately after `StagingQueued` on the local lane; real
+    /// CUDA path must emit this only after the copy stream reports done.
+    StagingCompleted {
+        ticket: StageTicket,
+    },
 }
 
 #[derive(Clone)]
@@ -235,18 +240,24 @@ impl Coordinator {
     pub fn run_once(&self) -> Result<bool> {
         match self.rx.recv_timeout(Duration::from_millis(1)) {
             Ok(cmd) => {
-                let evt = match &cmd {
+                match &cmd {
                     CoordinatorCommand::Stage { ticket, requests } => {
-                        CoordinatorEvent::StagingQueued {
-                            ticket: *ticket,
-                            request_count: requests.len(),
-                        }
+                        self.events
+                            .send(CoordinatorEvent::StagingQueued {
+                                ticket: *ticket,
+                                request_count: requests.len(),
+                            })
+                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                        self.events
+                            .send(CoordinatorEvent::StagingCompleted { ticket: *ticket })
+                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
                     }
-                    _ => CoordinatorEvent::CommandQueued(cmd.clone()),
-                };
-                self.events
-                    .send(evt)
-                    .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                    _ => {
+                        self.events
+                            .send(CoordinatorEvent::CommandQueued(cmd.clone()))
+                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                    }
+                }
                 Ok(!matches!(cmd, CoordinatorCommand::Shutdown))
             }
             Err(RecvTimeoutError::Timeout) => Ok(true),
@@ -268,6 +279,7 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prefix_cache::RadixCache;
 
     #[test]
     fn coordinator_receives_commands() {
@@ -298,6 +310,86 @@ mod tests {
                 ticket,
                 request_count: 1,
             }
+        );
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StagingCompleted { ticket }
+        );
+    }
+
+    #[test]
+    fn stage_command_emits_queued_then_completed_events() {
+        let (coordinator, handle, events) = Coordinator::new(4);
+        let ticket = StageTicket(17);
+        handle
+            .send(CoordinatorCommand::Stage {
+                ticket,
+                requests: vec![StageRequest {
+                    block_id: BlockId(9),
+                    from: BlockLocation::HostPinned { offset: 0 },
+                    byte_len: 4096,
+                }],
+            })
+            .unwrap();
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StagingQueued {
+                ticket,
+                request_count: 1,
+            }
+        );
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StagingCompleted { ticket }
+        );
+    }
+
+    #[test]
+    fn coordinator_shutdown_joins_thread_cleanly() {
+        let (coordinator, handle, _events) = Coordinator::new(4);
+        let join_handle = coordinator.spawn("pegainfer-tiered-kv-coord-test");
+        handle.send(CoordinatorCommand::Shutdown).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(join_handle.join());
+        });
+
+        let join_result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("coordinator join timed out");
+        assert!(matches!(join_result, Ok(Ok(()))));
+    }
+
+    #[test]
+    fn lookup_or_stage_with_coordinator_emits_queued_then_completed_events() {
+        let mut cache = RadixCache::with_soft_pin_keepalive(4, 64);
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        cache.insert(&tokens, &[BlockId(10), BlockId(20)]);
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 0 }));
+        assert!(cache.set_block_byte_len(BlockId(10), 8192));
+
+        let (coordinator, handle, events) = Coordinator::new(4);
+        let outcome = cache.lookup_or_stage(
+            &tokens,
+            crate::kv_tier::LookupHeuristics::default(),
+            Some(&handle),
+        );
+        let ticket = outcome.staging_ticket.expect("staging ticket");
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StagingQueued {
+                ticket,
+                request_count: 1,
+            }
+        );
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StagingCompleted { ticket }
         );
     }
 

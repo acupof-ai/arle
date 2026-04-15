@@ -1,4 +1,6 @@
+use super::core::STAGE_WAIT_KEEPALIVE_TICKS;
 use super::*;
+use crate::prefix_cache::BlockMetadataUpdate;
 
 fn best_reusable_slot_for_radix_hit(
     matched_blocks: &[crate::prefix_cache::BlockId],
@@ -34,6 +36,66 @@ fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock]) -> bool {
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn drain_coordinator_events(&mut self) {
+        loop {
+            match self.coordinator_events.try_recv() {
+                Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
+                | Ok(crate::kv_tier::CoordinatorEvent::StagingQueued { .. }) => {}
+                Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
+                    let Some(staged) = self.stage_waiting.remove(&ticket) else {
+                        log::debug!(
+                            "Dropping staging completion for unknown ticket {}",
+                            ticket.0
+                        );
+                        continue;
+                    };
+                    let waited_ticks = self
+                        .prefix_cache
+                        .logical_clock()
+                        .saturating_sub(staged.enqueued_at_clock);
+                    for &block_id in &staged.block_ids {
+                        let _ = self.prefix_cache.update_block_metadata(
+                            block_id,
+                            BlockMetadataUpdate {
+                                // A4 stub: ready-but-not-yet-owned-by-slot sentinel; real slot
+                                // assigned in publish_to_prefix_cache.
+                                location: Some(crate::kv_tier::BlockLocation::Gpu {
+                                    slot: u32::MAX,
+                                }),
+                                ..BlockMetadataUpdate::default()
+                            },
+                        );
+                    }
+                    self.prefix_cache.release(&staged.block_ids);
+                    for &block_id in &staged.block_ids {
+                        let _ = self.prefix_cache.update_block_metadata(
+                            block_id,
+                            BlockMetadataUpdate {
+                                soft_pin_until: Some(None),
+                                ..BlockMetadataUpdate::default()
+                            },
+                        );
+                    }
+                    log::debug!(
+                        "Staging completed for ticket={} (prompt={} tokens, staged_blocks={}, waited_ticks={})",
+                        ticket.0,
+                        staged.prompt_tokens.len(),
+                        staged.block_ids.len(),
+                        waited_ticks
+                    );
+                    self.waiting.push_front(staged.request);
+                    self.waiting_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    error!("Coordinator event channel disconnected");
+                    self.coordinator_unavailable = true;
+                    break;
+                }
+            }
+        }
+    }
+
     /// Run the scheduler loop. Blocks until all handles are dropped.
     pub fn run(mut self) {
         self.warmup_cuda_graphs();
@@ -44,7 +106,9 @@ impl<M: ModelForward> Scheduler<M> {
                 self.waiting.push_back(req);
             }
 
-            if self.active.is_empty() && self.waiting.is_empty() {
+            self.drain_coordinator_events();
+
+            if self.active.is_empty() && self.waiting.is_empty() && self.stage_waiting.is_empty() {
                 match self.request_rx.blocking_recv() {
                     Some(req) => {
                         self.waiting_count.fetch_sub(1, Ordering::Relaxed);
@@ -105,22 +169,64 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             };
 
+            let planner = if self.coordinator_unavailable {
+                None
+            } else {
+                Some(&self.coordinator_handle as &dyn crate::kv_tier::StagePlanner)
+            };
             let lookup = self.prefix_cache.lookup_or_stage(
                 &prompt_tokens,
                 crate::kv_tier::LookupHeuristics::default(),
-                None,
+                planner,
             );
+            let radix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .filter_map(|block| block.block_id)
+                .collect();
+            if let Some(ticket) = lookup.staging_ticket {
+                if lookup.recompute_advised {
+                    self.prefix_cache.release(&radix_blocks);
+                } else {
+                    let stage_deadline = self
+                        .prefix_cache
+                        .logical_clock()
+                        .saturating_add(STAGE_WAIT_KEEPALIVE_TICKS);
+                    for &block_id in &radix_blocks {
+                        let _ = self.prefix_cache.update_block_metadata(
+                            block_id,
+                            BlockMetadataUpdate {
+                                soft_pin_until: Some(Some(stage_deadline)),
+                                ..BlockMetadataUpdate::default()
+                            },
+                        );
+                    }
+                    log::info!(
+                        "Request {} staged on ticket={} (prompt={} tokens, staged_blocks={})",
+                        self.next_id,
+                        ticket.0,
+                        prompt_tokens.len(),
+                        radix_blocks.len()
+                    );
+                    self.stage_waiting.insert(
+                        ticket,
+                        super::core::StagedAdmission {
+                            request: incoming,
+                            prompt_tokens,
+                            block_ids: radix_blocks,
+                            enqueued_at_clock: self.prefix_cache.logical_clock(),
+                        },
+                    );
+                    continue;
+                }
+            }
+
             let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
             let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
                 lookup.matched_len
             } else {
                 0
             };
-            let radix_blocks: Vec<_> = lookup
-                .blocks
-                .iter()
-                .filter_map(|block| block.block_id)
-                .collect();
             let gpu_ready_prefix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()
