@@ -1,4 +1,5 @@
 mod openai_v1;
+pub mod sessions;
 
 use std::convert::Infallible;
 use std::sync::Arc;
