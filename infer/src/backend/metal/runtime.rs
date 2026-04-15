@@ -9,10 +9,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
-use super::request_state::{MetalRequestPhase as RuntimePhase, MetalRequestState};
+use super::kv_pool::MetalKVPool;
+use super::prefix_cache::MetalPrefixCache;
+use super::request_state::{
+    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
+};
 use super::scheduler::{
     MetalRequestPriority, MetalScheduleDecision, MetalScheduler, MetalSchedulerConfig,
 };
+use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
 use crate::metrics::ServerMetrics;
@@ -26,7 +31,7 @@ struct ActiveMetalRequest {
     request_state: MetalRequestState<'static>,
     decoder: IncrementalDecoder<'static>,
     stop_processor: StopChunkProcessor,
-    prompt_tokens: usize,
+    prompt_tokens: Vec<u32>,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
 }
@@ -48,7 +53,7 @@ impl ActiveMetalRequest {
                 request_state,
                 decoder: tokenizer.incremental_decoder(),
                 stop_processor: StopChunkProcessor::new(incoming.stop.unwrap_or_default()),
-                prompt_tokens: prompt_tokens.len(),
+                prompt_tokens,
                 admitted_at: Instant::now(),
                 first_token_at: None,
             },
@@ -104,10 +109,11 @@ impl ActiveMetalRequest {
             map_finish_reason(self.request_state.finish_reason())
         };
         let completion_tokens = self.request_state.generated_tokens();
+        let prompt_tokens = self.prompt_tokens.len();
         let usage = TokenUsage {
-            prompt_tokens: self.prompt_tokens,
+            prompt_tokens,
             completion_tokens,
-            total_tokens: self.prompt_tokens + completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         };
 
         let _ = self.delta_tx.send(CompletionStreamDelta {
@@ -135,6 +141,207 @@ impl ActiveMetalRequest {
         }
         Ok(())
     }
+
+    fn prompt_len(&self) -> usize {
+        self.prompt_tokens.len()
+    }
+}
+
+const METAL_PREFIX_BLOCK_SIZE: usize = 16;
+const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
+
+struct MetalLivePrefixRuntime {
+    pool: MetalKVPool,
+    cache: MetalPrefixCache,
+}
+
+struct MetalPrefixAdmission {
+    scheduler_prompt_tokens: Vec<u32>,
+}
+
+impl MetalLivePrefixRuntime {
+    fn new(backend: &'static MetalBackend, config: &MetalSchedulerConfig) -> Result<Option<Self>> {
+        let model_config = backend.config.as_ref().context("model not loaded")?;
+        let weights = backend.weights.as_ref().context("weights not loaded")?;
+        let MetalWeights::Qwen3(weights) = weights else {
+            return Ok(None);
+        };
+
+        let max_total_tokens = (config
+            .max_active_requests
+            .saturating_mul(config.prefill_chunk_size)
+            .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
+        .max(METAL_PREFIX_BLOCK_SIZE * 8);
+        let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
+        let pool = MetalKVPool::new(
+            model_config.num_hidden_layers,
+            model_config.num_key_value_heads,
+            model_config.head_dim,
+            max_total_tokens,
+            kv_dtype,
+        )
+        .context("create live Metal prefix KV pool")?;
+
+        info!(
+            "Metal live prefix cache enabled for Qwen3: block_size={}, max_cached_tokens={}",
+            METAL_PREFIX_BLOCK_SIZE, max_total_tokens
+        );
+
+        Ok(Some(Self {
+            pool,
+            cache: MetalPrefixCache::new(METAL_PREFIX_BLOCK_SIZE),
+        }))
+    }
+
+    fn prepare_request(
+        &mut self,
+        request: &mut ActiveMetalRequest,
+        metrics: &ServerMetrics,
+    ) -> Result<MetalPrefixAdmission> {
+        let prompt_tokens = &request.prompt_tokens;
+        if prompt_tokens.len() < self.cache.block_size() {
+            metrics.record_prefix_lookup(false);
+            return Ok(MetalPrefixAdmission {
+                scheduler_prompt_tokens: prompt_tokens.clone(),
+            });
+        }
+
+        let hit = self
+            .cache
+            .lookup(prompt_tokens)
+            .context("lookup Metal live prefix cache")?;
+        let reusable_len = self.reusable_prefix_len(prompt_tokens.len(), hit.matched_len);
+        let scheduler_prompt_tokens = if reusable_len > 0 {
+            request
+                .request_state
+                .import_qwen3_prefix_from_pool(
+                    &self.pool,
+                    reusable_len,
+                    &hit.slot_indices[..reusable_len],
+                )
+                .context("import matched Metal prefix into request state")?;
+            prompt_tokens[reusable_len..].to_vec()
+        } else {
+            prompt_tokens.clone()
+        };
+        self.cache
+            .release(&hit.slot_indices)
+            .context("release Metal live prefix cache lookup pins")?;
+        metrics.record_prefix_lookup(reusable_len > 0);
+
+        Ok(MetalPrefixAdmission {
+            scheduler_prompt_tokens,
+        })
+    }
+
+    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
+        let publish_len =
+            (request.prompt_len() / self.cache.block_size()) * self.cache.block_size();
+        if publish_len == 0 {
+            return Ok(());
+        }
+
+        let Some(snapshot) = request
+            .request_state
+            .export_qwen3_prompt_prefix(publish_len)
+            .context("export Qwen3 prompt prefix for live prefix cache")?
+        else {
+            return Ok(());
+        };
+
+        self.publish_snapshot(snapshot)
+    }
+
+    fn publish_snapshot(&mut self, snapshot: Qwen3PrefixSnapshot) -> Result<()> {
+        let full_len = snapshot.token_ids.len();
+        if full_len == 0 {
+            return Ok(());
+        }
+
+        let hit = self
+            .cache
+            .lookup(&snapshot.token_ids)
+            .context("lookup cached Metal prefix before publish")?;
+        let matched_len = hit.matched_len.min(full_len);
+        if matched_len == full_len {
+            self.cache
+                .release(&hit.slot_indices)
+                .context("release publish-time Metal prefix lookup pins")?;
+            return Ok(());
+        }
+
+        let new_len = full_len - matched_len;
+        self.ensure_capacity_for(new_len)?;
+        let mut slot_indices = hit.slot_indices.clone();
+        self.cache
+            .release(&hit.slot_indices)
+            .context("release partial publish-time Metal prefix lookup pins")?;
+
+        let new_slots = self
+            .pool
+            .alloc_slots(new_len)
+            .context("alloc Metal prefix cache slots for publish")?;
+        for (layer_idx, (k_rows, v_rows)) in snapshot
+            .k_rows_by_layer
+            .iter()
+            .zip(snapshot.v_rows_by_layer.iter())
+            .enumerate()
+        {
+            let suffix_k = slice_rows(k_rows, matched_len, full_len)?;
+            let suffix_v = slice_rows(v_rows, matched_len, full_len)?;
+            self.pool
+                .write_kv_slots(layer_idx, &new_slots, &suffix_k, &suffix_v)
+                .with_context(|| format!("write Metal prefix cache rows for layer {layer_idx}"))?;
+        }
+        slot_indices.extend_from_slice(&new_slots);
+        self.cache
+            .insert(&snapshot.token_ids, &slot_indices)
+            .context("insert published Qwen3 prompt into Metal prefix cache")?;
+        Ok(())
+    }
+
+    fn ensure_capacity_for(&mut self, needed_tokens: usize) -> Result<()> {
+        while self.pool.available_tokens() < needed_tokens {
+            let freed = self.cache.evict(1);
+            if freed.is_empty() {
+                bail!(
+                    "Metal live prefix cache out of space (need {}, available {})",
+                    needed_tokens,
+                    self.pool.available_tokens()
+                );
+            }
+            self.pool
+                .release_slots(&freed)
+                .context("release evicted Metal prefix-cache slots")?;
+        }
+        Ok(())
+    }
+
+    fn reusable_prefix_len(&self, prompt_len: usize, matched_len: usize) -> usize {
+        let block_size = self.cache.block_size();
+        let aligned = matched_len / block_size * block_size;
+        if aligned >= prompt_len {
+            aligned.saturating_sub(block_size)
+        } else {
+            aligned
+        }
+    }
+}
+
+fn slice_rows(
+    array: &super::mlx::MlxArray,
+    start: usize,
+    end: usize,
+) -> Result<super::mlx::MlxArray> {
+    use super::mlx::slice;
+
+    let end_i32 = i32::try_from(end).context("slice_rows end overflow")?;
+    let start_i32 = i32::try_from(start).context("slice_rows start overflow")?;
+    let width = *array
+        .shape()
+        .get(1)
+        .context("slice_rows expects a rank-2 row-major array")?;
+    Ok(slice(array, &[start_i32, 0], &[end_i32, width], &[1, 1]))
 }
 
 /// Spawn the first live Metal scheduler runtime.
@@ -248,6 +455,7 @@ fn run_metal_scheduler_runtime(
     metrics: ServerMetrics,
     config: MetalSchedulerConfig,
 ) -> Result<()> {
+    let mut prefix_runtime = MetalLivePrefixRuntime::new(backend, &config)?;
     let mut scheduler = MetalScheduler::new(config)?;
     let mut active = HashMap::<RequestId, ActiveMetalRequest>::new();
     let mut request_rx_closed = false;
@@ -260,6 +468,7 @@ fn run_metal_scheduler_runtime(
             tokenizer,
             &handle,
             &metrics,
+            &mut prefix_runtime,
             &mut request_rx,
             &mut request_rx_closed,
             &mut scheduler,
@@ -282,6 +491,7 @@ fn run_metal_scheduler_runtime(
                         tokenizer,
                         incoming,
                         &metrics,
+                        &mut prefix_runtime,
                         &mut scheduler,
                         &mut active,
                     );
@@ -300,6 +510,7 @@ fn run_metal_scheduler_runtime(
                 prefill.req_id,
                 prefill.input_tokens.len(),
                 &metrics,
+                &mut prefix_runtime,
                 &mut scheduler,
                 &mut active,
             ),
@@ -312,6 +523,7 @@ fn run_metal_scheduler_runtime(
                     prefill.req_id,
                     prefill.input_tokens.len(),
                     &metrics,
+                    &mut prefix_runtime,
                     &mut scheduler,
                     &mut active,
                 );
@@ -329,6 +541,7 @@ fn drain_incoming_requests(
     tokenizer: &'static Tokenizer,
     handle: &SchedulerHandle,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     request_rx: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     request_rx_closed: &mut bool,
     scheduler: &mut MetalScheduler,
@@ -338,7 +551,15 @@ fn drain_incoming_requests(
         match request_rx.try_recv() {
             Ok(incoming) => {
                 handle.consume_one();
-                admit_request(backend, tokenizer, incoming, metrics, scheduler, active);
+                admit_request(
+                    backend,
+                    tokenizer,
+                    incoming,
+                    metrics,
+                    prefix_runtime,
+                    scheduler,
+                    active,
+                );
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -354,6 +575,7 @@ fn admit_request(
     tokenizer: &'static Tokenizer,
     incoming: IncomingRequest,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -362,7 +584,7 @@ fn admit_request(
     }
 
     let priority = map_request_priority(incoming.priority);
-    let (prompt_tokens, max_tokens, request) =
+    let (prompt_tokens, max_tokens, mut request) =
         match ActiveMetalRequest::from_incoming(backend, tokenizer, incoming) {
             Ok(request) => request,
             Err(err) => {
@@ -372,7 +594,19 @@ fn admit_request(
             }
         };
 
-    let req_id = match scheduler.submit(prompt_tokens, max_tokens, priority) {
+    let scheduler_prompt_tokens = match prefix_runtime.as_mut() {
+        Some(prefix_runtime) => match prefix_runtime.prepare_request(&mut request, metrics) {
+            Ok(admission) => admission.scheduler_prompt_tokens,
+            Err(err) => {
+                error!("Metal prefix-cache admission failed: {err:#}");
+                metrics.record_request_failed();
+                return;
+            }
+        },
+        None => prompt_tokens.clone(),
+    };
+
+    let req_id = match scheduler.submit(scheduler_prompt_tokens, max_tokens, priority) {
         Ok(req_id) => req_id,
         Err(err) => {
             error!("Metal scheduler submit failed: {err}");
@@ -390,6 +624,7 @@ fn execute_prefill_chunk(
     req_id: RequestId,
     budget: usize,
     metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -441,6 +676,12 @@ fn execute_prefill_chunk(
         } => {
             let mut scheduler_finished = false;
             if let Some(token) = emitted_token {
+                if let Some(prefix_runtime) = prefix_runtime.as_mut()
+                    && let Some(request) = active.get(&req_id)
+                    && let Err(err) = prefix_runtime.publish_prompt_prefix(request)
+                {
+                    warn!("Metal live prefix publish failed for {:?}: {err:#}", req_id);
+                }
                 match scheduler.complete_prefill(req_id, token) {
                     Ok(done) => scheduler_finished = done,
                     Err(err) => {
@@ -726,7 +967,7 @@ fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalReques
         0.0
     };
     metrics.record_request_completed(
-        request.prompt_tokens as u64,
+        request.prompt_len() as u64,
         completion_tokens,
         ttft_s,
         tpot_s,
