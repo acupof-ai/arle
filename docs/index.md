@@ -74,6 +74,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-bench-metal-rerun.md](experience/wins/2026-04-15-bench-metal-rerun.md) | | Metal rerun snapshot on `f7b3b84`: direct path stayed flat and `metal_serve` quick sweep reproduced the post-`M0.2b` shape (`512/256 C=4` at `65.5 tok/s`, `TTFT p50 1742ms`) |
 | [experience/wins/2026-04-15-tiered-kv-m2b-remote.md](experience/wins/2026-04-15-tiered-kv-m2b-remote.md) | | Tiered KV M2b L4 remote acceptance: static/build/test gates, agent-trace 14/14, 100x shared-prefix `bad=0`, found + fixed e2e Phase 3 replay drift in the single-request engine |
 | [experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md](experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md) | | Tiered KV M0.3 + M3a L4 remote acceptance: BF16 `page_size=16` sweep flat on C≤4, long contexts slightly up, C≥8 recovered from 2026-04-13 zero-throughput regression |
 | [experience/wins/2026-04-15-tiered-kv-m3b-remote.md](experience/wins/2026-04-15-tiered-kv-m3b-remote.md) | | Tiered KV M3b L4 remote acceptance: contract + runtime-wire tranche signed off, all `lookup_or_stage_*` and `PageLifecycleState` tests green on CUDA |
