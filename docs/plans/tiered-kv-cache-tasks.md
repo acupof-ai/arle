@@ -65,12 +65,16 @@ still correct at the per-task level; only the phase groupings and a few
 file paths change. This table translates old phase references into the new
 milestone plan.
 
-> **2026-04-14 session progress**: M0.1, M0.2, M1a, M1b, and **M2a** have
-> all landed on `main`. The remaining critical-path gap is **M2b**
-> (scheduler slot-selection flip + cross-slot resurrection read path +
-> alloc-OOM retry). M0.3 is still blocked on the in-flight Codex CUDA
-> kernel extraction stabilising. Full commit chain + delta summary in
-> [`../experience/wins/2026-04-14-tiered-kv-m1-m2a.md`](../experience/wins/2026-04-14-tiered-kv-m1-m2a.md).
+> **2026-04-15 progress update**: M0.1, M0.2, M1a, M1b, and M2a are on
+> `main`, and the **M2b local implementation has landed in the working
+> tree**: scheduler admission now uses radix-driven reusable-prefix
+> selection, `cached_prompts: Vec<Vec<u32>>` is gone from the CUDA
+> scheduler, prefix reuse prefetches any CPU-offloaded contiguous KV
+> before reading it, and alloc-OOM now forces one synchronous
+> prefix-cache eviction retry. The safety audit kept **no cross-slot page
+> aliasing** in this batch; reuse is safe same-slot resurrection only.
+> The remaining critical-path gap is **remote CUDA acceptance** plus M0.3.
+> Remote checklist: [`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md).
 
 | Old phase | New milestone | What changed | Status | Task doc section |
 |---|---|---|---|---|
@@ -78,7 +82,7 @@ milestone plan.
 | P1 (a) structural (BlockId, kv_tier module, serde) | **retired** | The old `kv_tier::BlockId(u64)` / `TierDirectory` / `BlockDescriptor` skeleton is being deleted in M1. Do **not** extend it. The bug fixes from P1(a) (three `prefix_cache.rs` correctness bugs) are now **M0.2** — see §2.1 below. | **done** via M0.2 + M1a | §2 below, fragment |
 | P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
-| — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b pending** (slot selector flip + resurrection read path + alloc-OOM retry) | (new, §3.5 addendum) |
+| — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b local done, remote CUDA acceptance pending** (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
 | P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. Content unchanged. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | pending — blocked on M2b landing | §3 below |
 | P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
@@ -236,18 +240,29 @@ this doc will get another path update pass at that point.
 - [ ] `[R]` `cargo test --release` — entire suite still green; new tests included
 
 #### Behavior PR (b) — `[L+R]`
-- [ ] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs:114-141` — hold `Arc<TieredKvCache>`; remove `cached_prompts: Vec<Vec<u32>>`
-- [ ] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs:75-151` — admission rewrite using radix lookup
-- [ ] `[L+R]` Edit `infer/src/scheduler/cuda/request.rs` — `ActiveRequest` carries `Vec<BlockId>` accumulator
-- [ ] `[L+R]` Edit `infer/src/scheduler/cuda/prefill.rs:14` — read prefix hit length from radix lookup result, drop linear compare
-- [ ] `[L+R]` Edit `infer/src/server_engine.rs:437-475` — drop the second-source-of-truth `cached_prompt: Vec<u32>` (third one if you count `metal_prefix_cache.rs`'s wrapper that's never called)
-- [ ] `[L+R]` Edit `infer/src/paged_kv.rs` — expose `alloc_slot / free_slot / read_into / write_from` as the T0 physical layer
-- [ ] `[L]` `cargo check --no-default-features --features no-cuda` and `--features metal` — Rust types still align across the boundary
+
+> **2026-04-15 update**: the local implementation is done. The checklist
+> below is now split into "landed locally" vs "still required on a CUDA
+> host". One design correction from the audit: the line item that used to
+> require cross-slot physical alias / `read_into` / `write_from` support
+> is intentionally deferred. M2b currently reuses only a free slot whose
+> contiguous state still materialises the matched prefix.
+
+- [x] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs` — remove scheduler `cached_prompts`, add `slot_materialized_prompt_lens`, `block_owner_slots`, `slot_owned_blocks`, retain hard cap, and alloc retry helpers
+- [x] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs` — admission rewrite using radix lookup
+- [x] `[L+R]` Edit `infer/src/scheduler/cuda/request.rs` — `ActiveRequest` carries reusable-prefix metadata (`reusable_prefix_len`, `reusable_cached_prompt_len`)
+- [x] `[L+R]` Edit `infer/src/scheduler/cuda/prefill.rs` — read prefix hit length from radix lookup result, prefetch CPU-offloaded contiguous KV before reuse, and migrate matched ranges via alloc-retry path
+- [x] `[L+R]` Edit `infer/src/model.rs` + model state impls — add `prefetch_kv_to_gpu()` for the scheduler-side reuse path
+- [x] `[L+R]` Edit `infer/src/server_engine.rs` — single-request engine still keeps its own single-slot `cached_prompt`, but its reuse path is now correctness-aligned with the scheduler: prefetch before reuse, snapshot after prefill, restore/truncate before extending the cached prompt
+- [ ] `[L+R]` Cross-slot paged-pool alias / physical `read_into` / `write_from` support — **deferred by safety audit**, not part of accepted M2b scope
+- [x] `[L]` `cargo check -p infer --tests --no-default-features --features cuda,no-cuda`
+- [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda prefix_cache`
+- [x] `[L]` `cargo fmt --all -- --check`
 - [ ] `[R]` `cargo build --release` green
 - [ ] `[R]` Full e2e + greedy_consistency
-- [ ] `[R]` **Regression gates** (from `agent-first-architecture.md` §5): `grep -r cached_prompts infer/src/` returns empty; `grep -r RadixCache infer/src/scheduler/` returns non-empty
-- [ ] `[R]` Cross-session benchmark on `scripts/bench_agent_trace.py` (built in §7.1): 2-session alternating trace, prefix hit rate ≥70%
-- [ ] `[R]` Bench markdown in `docs/experience/wins/`
+- [ ] `[R]` **Regression gates**: `rg -n "cached_prompts: Vec<Vec<u32>>|best_prefix_slot_for_cached_prompts" infer/src/scheduler/cuda` returns empty; `rg -n "reusable_prefix_len|reusable_cached_prompt_len|block_owner_slots|slot_materialized_prompt_lens" infer/src/scheduler/cuda` returns non-empty
+- [ ] `[R]` Cross-session benchmark on `scripts/bench_agent_trace.py`: TTFT improves vs the M2a baseline on the same host
+- [ ] `[R]` Bench / acceptance markdown in `docs/experience/wins/`
 
 ### 2.2 Industry references
 
@@ -285,7 +300,7 @@ this doc will get another path update pass at that point.
    - **Bug 3**: `evict()` only considers leaves; after removing a leaf, the now-childless parent should become a candidate in the same pass. SGLang re-pushes the orphaned parent onto its heap.
 3. **`session_id` does NOT become a cache key.** It stays in `SchedulerSignals` (already plumbed via commit `3e1d35f`) for slot affinity. The radix cache stays content-addressed.
 4. **`_cache` + free queue dual residency** is the vLLM pattern we'll need in P2 — cached blocks must remain reachable by hash even after their refcount drops to 0, until physically reassigned. Note this for the `TieredKvCache` directory shape.
-5. **Third independent cached_prompt site** at `server_engine.rs:437-475` (`prepare_with_prefix_cache`) — a single-slot linear compare against `self.cached_prompt`. P1 (b) should thread the `RadixCache` handle through `ModelInferenceEngine` too so there is **one** prefix cache per engine, not three.
+5. **Third independent cached_prompt site** at `server_engine.rs` (`prepare_with_prefix_cache`) — a single-slot linear compare against `self.cached_prompt`. Its correctness path is now aligned with the scheduler (prefetch + snapshot/restore), but it is still intentionally a **single-slot** cache rather than a shared radix-owned store. That is acceptable for the deprecated serial engine; do not confuse it with the scheduler's cross-request cache topology.
 
 ---
 
@@ -783,8 +798,11 @@ compilable split exists:
 Pick single-PR when reviewer bandwidth is high; split when it is not.
 
 **M2 · dual residency** is a new milestone added in the 2026-04-15
-revision; see §3.5 for details. It is a single-PR behaviour change on
-top of M1 with an agent-trace benchmark gate.
+revision; see §3.5 for details. M2a is shipped, and the safe M2b local
+variant is now implemented: radix-driven admission, same-slot
+resurrection, alloc retry, retain hard cap, tombstone GC. The remaining
+work is the remote CUDA acceptance pass in
+[`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md).
 
 **After M2**: proceed through §3 (M3 host pinned + coordinator, 3 stacked
 PRs), §4 (M4 disk + session save/load, 2 stacked), and keep M5 (NIXL

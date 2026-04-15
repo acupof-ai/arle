@@ -1,6 +1,21 @@
+> **Archived 2026-04-15** — Steps 1–4 shipped; C=4 exceeds SGLang on
+> Qwen3-8B per the win notes
+> [`../experience/wins/2026-04-01-sglang-parity-steps1-4.md`](../experience/wins/2026-04-01-sglang-parity-steps1-4.md)
+> and
+> [`../experience/wins/2026-04-01-throughput-vs-sglang.md`](../experience/wins/2026-04-01-throughput-vs-sglang.md).
+> The remaining C=1 gap is kernel-bound and outside this plan's scope.
+>
+> **Disambiguation**: this is the **Qwen3-8B** parity plan. For the
+> still-active **Qwen3.5** parity work (batched prefill outstanding),
+> see [`../plans/qwen35-sglang-parity.md`](../plans/qwen35-sglang-parity.md).
+> The two were renamed during this archive to make the model split
+> obvious.
+
+---
+
 # Plan: 追平 sglang 0.5.9 (Qwen3-8B · A100-40GB · 同配置)
 
-> Status: **Done** — Steps 1-4 complete. C=4 exceeds sglang. C=1 gap is kernel-bound.
+> Status: **Done — Archived** — Steps 1-4 complete. C=4 exceeds sglang. C=1 gap is kernel-bound.
 > Created: 2026-04-01
 > Updated: 2026-04-01
 > Goal: 在相同硬件和模型下，匹配或超越 sglang 0.5.9 的默认配置吞吐量

@@ -1,7 +1,28 @@
+> **Archived 2026-04-15** — design spec **was not implemented as written**.
+> The `LinearWeight` enum + dispatch architecture proposed in this doc
+> was never built; `grep -rn 'enum LinearWeight' infer/` returns only
+> this archived doc itself. The actual production quantization path
+> landed via **TurboQuant** (Phases 1–3) instead — see
+> [`../plans/turboquant-integration.md`](../plans/turboquant-integration.md)
+> for the shipped design, and
+> [`../experience/wins/2026-04-08-weight-quantization.md`](../experience/wins/2026-04-08-weight-quantization.md)
+> /
+> [`../experience/wins/2026-04-09-marlin-prefill.md`](../experience/wins/2026-04-09-marlin-prefill.md)
+> /
+> [`../experience/wins/2026-04-09-w4-int8kv-combo.md`](../experience/wins/2026-04-09-w4-int8kv-combo.md)
+> for the shipped numbers. The `Status: Complete` line below was
+> aspirational; line 362's "Waiting for design review approval. On
+> approval, start P1 (LinearWeight enum)" reflects the true terminal
+> state. Preserved for the rationale + four-risk analysis (CUDA Graph
+> compat, merged QKV, desc_act, prefill perf), which is still useful
+> background reading for any future revisit of typed-weight dispatch.
+
+---
+
 # Quantization Architecture Design
 
-**Status**: Complete  
-**Date**: 2026-04-02 (design) / 2026-04-09 (implemented)  
+**Status**: ~~Complete~~ **Archived — design spec, never implemented (see banner above)**
+**Date**: 2026-04-02 (design) / ~~2026-04-09 (implemented)~~ implementation never started
 **Goal**: Support GPTQ/AWQ INT4 quantized models, unlocking 4x weight compression with minimal throughput regression
 
 ---

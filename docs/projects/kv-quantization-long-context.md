@@ -1,6 +1,32 @@
 # KV 量化存储与 Agent 长上下文解决方案
 
-> Status: **Active** | Created: 2026-04-08
+> Status: **Partially shipped — TurboQuant track complete, FP8-native track deferred**
+> Created: 2026-04-08 · Status updated: 2026-04-15
+
+> **Status crosswalk (2026-04-15)**:
+>
+> - **Phase 1 — KV TurboQuant 3-bit fused dequant** — **shipped**. See
+>   [`../experience/wins/2026-04-08-kv-quant-fused-dequant.md`](../experience/wins/2026-04-08-kv-quant-fused-dequant.md)
+>   and [`../plans/turboquant-integration.md`](../plans/turboquant-integration.md)
+>   §Phase 1.
+> - **Phase 2 — Weight TurboQuant (ITQ3_S)** — **shipped (2026-04-09)**. See
+>   [`../experience/wins/2026-04-08-weight-quantization.md`](../experience/wins/2026-04-08-weight-quantization.md)
+>   and `turboquant-integration.md` §Phase 2 (Weight track).
+> - **Phase 3 — Fused decode attention with quantized KV** — **shipped** for all
+>   3 production models (Qwen3, Qwen3.5, GLM4). See
+>   [`../experience/wins/2026-04-08-int8-kv-batched-decode.md`](../experience/wins/2026-04-08-int8-kv-batched-decode.md)
+>   and `turboquant-integration.md` §Phase 3.
+> - **Track 1 — FP8 native FlashInfer + BF16→FP8 quantize-on-write** —
+>   **deferred future design**. The §1 "design lesson" below explains why the
+>   first-attempt INT8 paged pool + per-layer dequant approach was
+>   abandoned — TurboQuant became the actual production path. The FP8
+>   FlashInfer-native track described in this doc was never implemented;
+>   if it returns, it does so as a separate plan.
+>
+> Treat §第一部分 onwards as the **historical design rationale** that
+> motivated TurboQuant. The TurboQuant doc
+> ([`../plans/turboquant-integration.md`](../plans/turboquant-integration.md))
+> is the canonical reference for what shipped.
 
 ---
 

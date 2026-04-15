@@ -21,6 +21,11 @@ extraction, the equivalent paths are under `infer/src/backend/cuda/*`,
 The commands still work — Cargo resolves them — but when you read a
 file reference below, apply the rename mentally.
 
+**For the 2026-04-15 M2b local batch, use**
+[`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md)
+**instead.** This doc remains the acceptance record for the older
+2026-04-13 structural batch.
+
 This doc is the contract for what "remote validation" means after
 2026-04-13's local work. The Mac lane has already run everything that
 `cargo check --features no-cuda` and `cargo check --features metal` can

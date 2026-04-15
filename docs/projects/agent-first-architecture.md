@@ -14,6 +14,40 @@ the original "Phase 1 split" plan was reverted by Route-A on 2026-04-15 — see
 proposal and `docs/architecture.md` / `docs/codebase-map.md` for the current
 canonical workspace shape.
 
+> **Status update — 2026-04-15** (post M1+M2a, post Codex review)
+>
+> The original P1/P2/P3 phase numbers on items in this doc are **superseded**
+> by the M0–M5 milestone scheme in
+> [`tiered-kv-cache.md`](tiered-kv-cache.md) §6. Crosswalk:
+>
+> - **A1** (Wire RadixCache into scheduler) — **partially shipped**.
+>   M1b (`323aee0`) wired RadixCache as a shadow observer; M2a (`4402ab0`)
+>   added per-page refcount + watermark eviction so radix-held pages
+>   survive `free_slot`. M2b (selector flip + resurrect read path) is the
+>   next milestone — see `tiered-kv-cache.md` §6 M2b.
+> - **A2** (HTTP `session_id`) — plumbed in `http_server/openai_v1.rs`
+>   and `scheduler/types.rs::IncomingRequest`; **scheduler does not consume
+>   it yet**. Still open.
+> - **B1** (Session save/load + disk tier) — `infer/src/session_store.rs`
+>   was never created; the disk tier landed instead as
+>   `infer/src/kv_tier/transport/disk.rs::DiskStore`. The HTTP routes
+>   are scoped under `tiered-kv-cache.md` §6 M4.
+> - **B3** (Session-aware eviction) — landed as
+>   `infer/src/scheduler/policy.rs::SessionBiasedLru` (and 3 sibling
+>   `EvictionPolicy` impls). **Trait shipped, zero call sites** —
+>   convergence onto the policy trait is `tiered-kv-cache.md` §5.4.1
+>   under M3b.
+> - **C6** (Agent workload benchmark) — **shipped** as
+>   `scripts/bench_agent_trace.py`.
+>
+> The §1 "current gap diagnosis" below was written before M1b/M2a
+> shipped and uses pre-Route-A file paths in some places (e.g.
+> `infer/src/metal_scheduler.rs` is now
+> `infer/src/backend/metal/scheduler.rs`,
+> `infer/src/server_engine.rs:437-475` no longer matches). Treat §1 as
+> the original-state record; the canonical post-M2a state lives in
+> [`tiered-kv-cache.md`](tiered-kv-cache.md) §3.
+
 ---
 
 ## 1 · Current gap diagnosis

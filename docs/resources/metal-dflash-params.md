@@ -162,7 +162,8 @@ Command shape:
 | --- | --- | --- | --- | --- |
 | `--model-path <MODEL_PATH>` | Yes | none | Target model path or HF repo id | Server form uses `--model-path`, not `--model` |
 | `--port <PORT>` | No | `8000` | HTTP listen port | OpenAI-compatible API |
-| `--bind <HOST>` | No | `0.0.0.0` | Host or IP address to bind to | Use `127.0.0.1` for local-only access |
+| `--bind <HOST>` | No | `127.0.0.1` | Host or IP address to bind to | Pass `0.0.0.0` explicitly if you want non-local access |
+| `--api-key <TOKEN>` | No | disabled | Require `Authorization: Bearer <TOKEN>` on `/v1/*` endpoints | Falls back to `AGENT_INFER_API_KEY` when the flag is omitted |
 | `--max-waiting <N>` | No | `256` | Max queued requests before rejection | Server is still serial, not batched |
 | `--dflash-draft-model <PATH_OR_REPO>` | No | disabled | Enable DFlash | Shared DFlash flag |
 | `--speculative-tokens <N>` | No | draft default | Override block size | Shared DFlash flag |
