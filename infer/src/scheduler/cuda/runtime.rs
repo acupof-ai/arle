@@ -1,4 +1,3 @@
-use super::core::STAGE_WAIT_KEEPALIVE_TICKS;
 use super::*;
 use crate::prefix_cache::BlockMetadataUpdate;
 
@@ -191,7 +190,7 @@ impl<M: ModelForward> Scheduler<M> {
                     let stage_deadline = self
                         .prefix_cache
                         .logical_clock()
-                        .saturating_add(STAGE_WAIT_KEEPALIVE_TICKS);
+                        .saturating_add(self.config.stage_wait_keepalive_ticks);
                     for &block_id in &radix_blocks {
                         let _ = self.prefix_cache.update_block_metadata(
                             block_id,

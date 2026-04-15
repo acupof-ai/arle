@@ -162,6 +162,12 @@ pub struct RadixCache {
     /// Optional lookup-time keepalive extension for already-soft-pinned blocks.
     #[serde(default)]
     soft_pin_keepalive_ticks: Option<u64>,
+    /// O(1) reverse index: `block_id → self.nodes` slot. Always kept in sync
+    /// with insert / evict / tombstone paths so `find_block_node_mut` doesn't
+    /// have to scan `self.nodes`. Skipped by serde — rebuild via
+    /// [`Self::rebuild_block_index`] after deserialization.
+    #[serde(default, skip)]
+    block_index: HashMap<BlockId, usize>,
 }
 
 impl RadixCache {
@@ -190,6 +196,21 @@ impl RadixCache {
             block_size,
             clock: 0,
             soft_pin_keepalive_ticks,
+            block_index: HashMap::new(),
+        }
+    }
+
+    /// Rebuild [`Self::block_index`] from the current `nodes` array.
+    ///
+    /// Callers that deserialize a snapshot (which does not persist the index)
+    /// or that bulk-mutate `block_id`s via `rebuild_from_fingerprints` should
+    /// call this once to restore O(1) `find_block_node_mut` behavior.
+    pub fn rebuild_block_index(&mut self) {
+        self.block_index.clear();
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(bid) = node.block_id {
+                self.block_index.insert(bid, idx);
+            }
         }
     }
 
@@ -222,9 +243,8 @@ impl RadixCache {
     }
 
     fn find_block_node_mut(&mut self, block: BlockId) -> Option<&mut Node> {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.block_id == Some(block))
+        let idx = *self.block_index.get(&block)?;
+        self.nodes.get_mut(idx)
     }
 
     // -------------------------------------------------------------------------
@@ -481,8 +501,15 @@ impl RadixCache {
 
                     // Update block_id if child has the right size.
                     if child_tokens.len() == self.block_size && block_idx < blocks.len() {
-                        self.nodes[child_idx].block_id = Some(blocks[block_idx]);
+                        let new_bid = blocks[block_idx];
+                        if let Some(old_bid) = self.nodes[child_idx].block_id
+                            && old_bid != new_bid
+                        {
+                            self.block_index.remove(&old_bid);
+                        }
+                        self.nodes[child_idx].block_id = Some(new_bid);
                         self.nodes[child_idx].fingerprint = Some(fps[block_idx]);
+                        self.block_index.insert(new_bid, child_idx);
                         block_idx += 1;
                     }
 
@@ -513,6 +540,9 @@ impl RadixCache {
                     let shared_idx = self.alloc_node(shared_node);
 
                     // Rewire the original child to become a child of the shared node.
+                    // `block_index[old_block]` already points at child_idx (if
+                    // old_block was Some) — the slot itself hasn't moved, only
+                    // its edge label, so no index fix-up is needed here.
                     self.nodes[child_idx].tokens = old_suffix;
                     self.nodes[child_idx].block_id = old_block;
                     self.nodes[child_idx].children = old_children;
@@ -543,6 +573,9 @@ impl RadixCache {
                     let mut new_node = Node::new(edge_tokens.clone(), block_id, now);
                     new_node.fingerprint = fingerprint;
                     let new_idx = self.alloc_node(new_node);
+                    if let Some(bid) = block_id {
+                        self.block_index.insert(bid, new_idx);
+                    }
 
                     let first_tok = edge_tokens[0];
                     self.nodes[node_idx].children.insert(first_tok, new_idx);
@@ -570,11 +603,19 @@ impl RadixCache {
         &mut self,
         known: &std::collections::HashSet<BlockFingerprint>,
     ) {
+        let mut stale_ids: Vec<BlockId> = Vec::new();
         for node in &mut self.nodes {
             match node.fingerprint {
                 Some(fp) if known.contains(&fp) => {}
-                _ => node.block_id = None,
+                _ => {
+                    if let Some(stale) = node.block_id.take() {
+                        stale_ids.push(stale);
+                    }
+                }
             }
+        }
+        for bid in stale_ids {
+            self.block_index.remove(&bid);
         }
     }
 
@@ -659,6 +700,7 @@ impl RadixCache {
 
             evicted_set.insert(victim_idx);
             if let Some(bid) = self.nodes[victim_idx].block_id.take() {
+                self.block_index.remove(&bid);
                 freed.push(bid);
             }
         }
@@ -756,6 +798,7 @@ impl RadixCache {
 
             evicted_set.insert(victim_idx);
             if let Some(bid) = self.nodes[victim_idx].block_id.take() {
+                self.block_index.remove(&bid);
                 freed.push(bid);
             }
         }
@@ -1118,6 +1161,45 @@ mod tests {
         let (len, blocks) = cache.lookup(&tokens);
         assert_eq!(len, 4);
         assert_eq!(blocks, bids(&[10]));
+    }
+
+    #[test]
+    fn block_index_tracks_inserts_and_evictions() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        cache.insert(&[9, 10, 11, 12], &bids(&[30]));
+
+        // O(1) lookup via set_block_location: returns true when the index
+        // knows about the block and the underlying node is reachable.
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+        assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
+        assert!(cache.set_block_location(BlockId(30), BlockLocation::Gpu { slot: 0 }));
+
+        let freed = cache.evict(1);
+        assert_eq!(freed.len(), 1);
+        let evicted_bid = freed[0];
+        assert!(!cache.set_block_location(evicted_bid, BlockLocation::Gpu { slot: 0 }));
+
+        // Re-insert a fresh block; index must now find it O(1).
+        cache.insert(&[100, 101, 102, 103], &bids(&[40]));
+        assert!(cache.set_block_location(BlockId(40), BlockLocation::Gpu { slot: 1 }));
+    }
+
+    #[test]
+    fn rebuild_block_index_round_trips_after_serde() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+
+        let snapshot = serde_json::to_string(&cache).expect("serialize");
+        let mut restored: RadixCache = serde_json::from_str(&snapshot).expect("deserialize");
+
+        // Right after deserialize, the index is empty (skip+default).
+        assert!(!restored.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+
+        restored.rebuild_block_index();
+        assert!(restored.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+        assert!(restored.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 0 }));
     }
 
     #[test]
