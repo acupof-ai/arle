@@ -80,6 +80,56 @@ infer_tokens_generated_total{model="Qwen3-0.6B-4bit",} 8
 - `prefix_hit_rate` 仍然为 `0`，因为 `M0.3` 还没有把 shared-prefix reuse
   接入 live Metal serving
 
+### 三条用户入口都已走过真实 load + run
+
+除了 `--help`，本地还补了最小真实执行验证：
+
+```bash
+./target/release/metal_request \
+  --model mlx-community/Qwen3-0.6B-4bit \
+  --prompt 'Say hi.' \
+  --raw-prompt \
+  --warmup 0 \
+  --max-new-tokens 8 \
+  --memory-limit-bytes 25769803776 \
+  --cache-limit-bytes 4294967296 \
+  --wired-limit-bytes 0
+```
+
+结果：
+
+```text
+Prompt tokens: 3
+Output tokens: 8
+TTFT: 39.4 ms
+Prompt TPS: 76.1 tok/s
+Gen TPS: 298.0 tok/s
+```
+
+以及：
+
+```bash
+./target/release/metal_bench \
+  --model mlx-community/Qwen3-0.6B-4bit \
+  --prompt-tokens 16 \
+  --generation-tokens 16 \
+  --warmup 1 \
+  --runs 1 \
+  --memory-limit-bytes 25769803776 \
+  --cache-limit-bytes 4294967296 \
+  --wired-limit-bytes 0 \
+  --json
+```
+
+结果摘要：
+
+```text
+prompt_tps: 1212.7
+generation_tps: 308.3
+repo_e2e_tps: 245.8
+ttft_ms: 13.2
+```
+
 ## Rule
 
 Metal `M0.4` 不能只停留在“指标能看见”。
