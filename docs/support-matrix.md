@@ -41,7 +41,7 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported on normal runtime paths, but not on Metal DFlash. |
+| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path, but Metal DFlash is still unsupported. |
 | GLM4 | Limited support | Present in project state, but less established than Qwen paths. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |

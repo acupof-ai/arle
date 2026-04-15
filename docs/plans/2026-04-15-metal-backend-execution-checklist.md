@@ -29,8 +29,11 @@ This checklist is the execution companion to:
   throughput (`58.7 tok/s`) still trailed the old serial reference (`65.8 tok/s`).
   `M0.2c` then added same-length Qwen3 decode batching and improved focused
   Qwen3 server throughput from `23.30 -> 25.39 tok/s` at `C=4`, but the
-  milestone is still open because heterogeneous decode batches and Qwen3.5
-  serving remain effectively unchanged.
+  milestone stayed open. `M0.2d` then added same-length Qwen3.5 batched decode
+  through the compiled MLX bridge; direct `128/128` improved from `82.0 -> 84.2`
+  generation TPS, but the quick HTTP sweep stayed flat (`512/256 C=4`
+  `66.4 -> 66.2 tok/s`), so the milestone is still open because variable-length
+  decode and per-step batch-state rebuild cost still dominate the serving exit.
 - [ ] `M0.3` Wire Metal prefix cache + KV pool into the live scheduler path.
   Exit:
   shared-prefix requests skip matched prefill in the serving path, not only in

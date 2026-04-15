@@ -288,7 +288,8 @@ cargo run --release -p infer --no-default-features --features metal,no-cuda --bi
 
 Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
 Metal scheduler runtime with chunked prefill and decode-priority interleave.
-It still does not have cross-request batched decode, and Metal DFlash still
+It now has narrow same-length cross-request decode batching for Qwen3 and
+Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
 uses the legacy serial runtime path.
 
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
