@@ -35,7 +35,8 @@ use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest as OpenAiCompletionRequest, CompletionResponse, ModelsListResponse,
-    ResponsesInput, ResponsesRequest, ResponsesResponse, StreamChunk, StreamUsageChunk,
+    ResponsesInput, ResponsesRequest, ResponsesResponse, ResponsesStreamCreatedEvent,
+    ResponsesStreamDeltaEvent, StreamChunk, StreamUsageChunk,
 };
 
 struct AppState {
@@ -277,7 +278,7 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
         if !instructions.trim().is_empty() {
             messages.push(infer_chat::OpenAiChatMessage {
                 role: "system".into(),
-                content: Some(instructions.to_string()),
+                content: Some(instructions.into()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 name: None,
@@ -295,7 +296,7 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
             }
             messages.push(infer_chat::OpenAiChatMessage {
                 role: "user".into(),
-                content: Some(text.clone()),
+                content: Some(text.clone().into()),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 name: None,
@@ -350,6 +351,152 @@ where
         }
     }
     events
+}
+
+fn sse_json_event<T: serde::Serialize>(
+    event_name: &'static str,
+    payload: &T,
+) -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event(event_name)
+        .data(serde_json::to_string(payload).expect("SSE payload serialization")))
+}
+
+enum ResponsesSseState {
+    Start {
+        response_id: String,
+        created_at: u64,
+        model_id: String,
+        delta_rx: UnboundedReceiver<CompletionStreamDelta>,
+        buffered: BufferedResponse,
+    },
+    Streaming {
+        response_id: String,
+        created_at: u64,
+        model_id: String,
+        delta_rx: UnboundedReceiver<CompletionStreamDelta>,
+        buffered: BufferedResponse,
+        final_pending: bool,
+    },
+    Done,
+}
+
+fn responses_sse_stream(
+    delta_rx: UnboundedReceiver<CompletionStreamDelta>,
+    response_id: String,
+    created_at: u64,
+    model_id: String,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(
+        ResponsesSseState::Start {
+            response_id,
+            created_at,
+            model_id,
+            delta_rx,
+            buffered: BufferedResponse::default(),
+        },
+        |state| async move {
+            match state {
+                ResponsesSseState::Start {
+                    response_id,
+                    created_at,
+                    model_id,
+                    delta_rx,
+                    buffered,
+                } => {
+                    let event = sse_json_event(
+                        "response.created",
+                        &ResponsesStreamCreatedEvent::new(
+                            response_id.clone(),
+                            created_at,
+                            model_id.clone(),
+                        ),
+                    );
+                    Some((
+                        event,
+                        ResponsesSseState::Streaming {
+                            response_id,
+                            created_at,
+                            model_id,
+                            delta_rx,
+                            buffered,
+                            final_pending: false,
+                        },
+                    ))
+                }
+                ResponsesSseState::Streaming {
+                    response_id,
+                    created_at,
+                    model_id,
+                    mut delta_rx,
+                    mut buffered,
+                    final_pending,
+                } => {
+                    if final_pending {
+                        let response = ResponsesResponse::from_output_with_id(
+                            response_id.clone(),
+                            model_id.clone(),
+                            created_at,
+                            buffered.into_output(),
+                        );
+                        let event = sse_json_event("response.completed", &response);
+                        return Some((event, ResponsesSseState::Done));
+                    }
+
+                    while let Some(delta) = delta_rx.recv().await {
+                        let has_text = !delta.text_delta.is_empty();
+                        let is_terminal = delta.finish_reason.is_some();
+                        let text_delta = delta.text_delta.clone();
+                        buffered.apply_delta(&delta);
+
+                        if has_text {
+                            let event = sse_json_event(
+                                "response.output_text.delta",
+                                &ResponsesStreamDeltaEvent::new(
+                                    response_id.clone(),
+                                    created_at,
+                                    model_id.clone(),
+                                    text_delta,
+                                ),
+                            );
+                            return Some((
+                                event,
+                                ResponsesSseState::Streaming {
+                                    response_id,
+                                    created_at,
+                                    model_id,
+                                    delta_rx,
+                                    buffered,
+                                    final_pending: is_terminal,
+                                },
+                            ));
+                        }
+
+                        if is_terminal {
+                            let response = ResponsesResponse::from_output_with_id(
+                                response_id.clone(),
+                                model_id.clone(),
+                                created_at,
+                                buffered.into_output(),
+                            );
+                            let event = sse_json_event("response.completed", &response);
+                            return Some((event, ResponsesSseState::Done));
+                        }
+                    }
+
+                    let response = ResponsesResponse::from_output_with_id(
+                        response_id.clone(),
+                        model_id.clone(),
+                        created_at,
+                        buffered.into_output(),
+                    );
+                    let event = sse_json_event("response.completed", &response);
+                    Some((event, ResponsesSseState::Done))
+                }
+                ResponsesSseState::Done => None,
+            }
+        },
+    )
 }
 
 async fn completions(
@@ -500,16 +647,10 @@ async fn responses_handler(
     Json(req): Json<ResponsesRequest>,
 ) -> Result<Response, ApiError> {
     authorize_v1_request(&headers, state.as_ref())?;
-    if req.stream_or_default() {
-        return Err(ApiError::bad_request(
-            "Streaming is not supported on /v1/responses yet; use /v1/chat/completions for streaming",
-            "responses_stream_not_supported",
-        ));
-    }
-
     let prompt = build_responses_prompt(&req)?;
     let options = RequestExecutionOptions::from_responses(&req);
     let max_tokens = options.max_tokens;
+    let stream = options.stream;
     let model_id = state.handle.model_id().to_string();
 
     info!(
@@ -519,9 +660,16 @@ async fn responses_handler(
     );
 
     let delta_rx = submit_request(state.handle.as_ref(), options, prompt)?;
-    let buffered = collect_buffered_response(delta_rx, "responses request").await?;
-    let response = ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
-    Ok(Json(response).into_response())
+    if stream {
+        let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+        let created_at = now_secs();
+        let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
+        Ok(Sse::new(stream.chain(sse_done_stream())).into_response())
+    } else {
+        let buffered = collect_buffered_response(delta_rx, "responses request").await?;
+        let response = ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
+        Ok(Json(response).into_response())
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1076,7 +1224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_endpoint_rejects_streaming_for_now() {
+    async fn responses_endpoint_streams_deltas_and_final_event_before_done() {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
             .method("POST")
@@ -1088,7 +1236,40 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        let created_pos = payload
+            .find("event: response.created")
+            .expect(&format!("missing created event: {payload}"));
+        let delta_pos = payload
+            .find("event: response.output_text.delta")
+            .expect(&format!("missing delta event: {payload}"));
+        let completed_pos = payload
+            .find("event: response.completed")
+            .expect(&format!("missing completed event: {payload}"));
+        let done_pos = payload
+            .find("[DONE]")
+            .expect(&format!("missing terminal done event: {payload}"));
+
+        assert!(
+            created_pos < delta_pos && delta_pos < completed_pos && completed_pos < done_pos,
+            "payload={payload}"
+        );
+        assert!(
+            payload.contains(r#""delta":"ok:<|im_start|>user"#),
+            "payload={payload}"
+        );
+        assert!(
+            payload.contains(r#""status":"completed""#),
+            "payload={payload}"
+        );
+        assert!(
+            payload.contains(r#""usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}"#),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
