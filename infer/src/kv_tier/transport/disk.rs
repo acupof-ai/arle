@@ -190,8 +190,20 @@ impl DiskStore {
         filename
     }
 
+    /// Public canonical path for a fingerprinted block. Re-derived on
+    /// every read/write from the store root + fingerprint — callers
+    /// **cannot** influence the final path by tampering with a stored
+    /// `DiskBlockLocation`. This is the defense against session
+    /// snapshot–driven path traversal (M4 review finding B2).
+    pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
+        self.path_for(Self::block_filename(fingerprint))
+    }
+
     /// Writes a content-addressed block file and returns its stable disk
-    /// location metadata.
+    /// location metadata. Writes are **crash-safe**: the payload is
+    /// written to `<path>.tmp` first and then atomically renamed onto
+    /// `<path>`, so a mid-write crash never leaves a partially-written
+    /// file under the canonical name (M4 review finding B3).
     pub fn put_block(
         &self,
         fingerprint: BlockFingerprint,
@@ -209,8 +221,19 @@ impl DiskStore {
         file_bytes.extend_from_slice(&header_bytes);
         file_bytes.extend_from_slice(payload);
 
-        let path = self.path_for(Self::block_filename(fingerprint))?;
-        fs::write(&path, file_bytes)?;
+        let path = self.block_path_for(fingerprint)?;
+        // Crash-safe atomic write: stage to a .tmp sibling, then rename.
+        let mut tmp_path = path.clone();
+        let tmp_name = format!(
+            "{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("block")
+        );
+        tmp_path.set_file_name(tmp_name);
+        fs::write(&tmp_path, &file_bytes)?;
+        if let Err(err) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
 
         Ok(DiskBlockLocation {
             path,
@@ -221,18 +244,40 @@ impl DiskStore {
 
     /// Reads a block back from the store and validates its postcard
     /// header before returning the raw payload bytes.
+    ///
+    /// **Path re-rooting (M4 review finding B2)**: the read path is
+    /// always re-derived from `location.fingerprint` via
+    /// [`DiskStore::block_path_for`]; `location.path` is treated as
+    /// advisory and may **not** point outside the store root. If the
+    /// two disagree, the call errors out with `InvalidData` — a
+    /// tampered session snapshot that carries a doctored `path` cannot
+    /// drive the store to read an arbitrary file.
     pub fn get_block(
         &self,
         location: &DiskBlockLocation,
         expected_fingerprint: Option<BlockFingerprint>,
     ) -> io::Result<Vec<u8>> {
-        let bytes = fs::read(&location.path)?;
+        if let Some(expected) = expected_fingerprint
+            && location.fingerprint != expected
+        {
+            return Err(invalid_data(
+                "disk store: fingerprint mismatch (location vs expected)",
+            ));
+        }
+        let canonical = self.block_path_for(location.fingerprint)?;
+        if location.path != canonical {
+            return Err(invalid_data(
+                "disk store: refused location.path outside canonical root",
+            ));
+        }
+
+        let bytes = fs::read(&canonical)?;
         let (header, payload) = DiskBlockHeader::decode(&bytes)?;
 
-        if let Some(expected) = expected_fingerprint {
-            if header.fingerprint != expected.0 {
-                return Err(invalid_data("disk store: fingerprint mismatch"));
-            }
+        if header.fingerprint != location.fingerprint.0 {
+            return Err(invalid_data(
+                "disk store: on-disk fingerprint does not match location",
+            ));
         }
 
         Ok(payload.to_vec())
@@ -241,8 +286,13 @@ impl DiskStore {
     /// Delete a block's backing file. Missing files are ignored so the
     /// operation is idempotent — useful for eviction flows where
     /// bookkeeping may race with an explicit delete.
+    ///
+    /// The path is re-derived from `location.fingerprint`; the
+    /// advisory `location.path` is not trusted (same reasoning as
+    /// [`DiskStore::get_block`]).
     pub fn delete_block(&self, location: &DiskBlockLocation) -> io::Result<()> {
-        match fs::remove_file(&location.path) {
+        let canonical = self.block_path_for(location.fingerprint)?;
+        match fs::remove_file(&canonical) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),

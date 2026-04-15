@@ -18,10 +18,18 @@ pub enum KVFormat {
 }
 
 impl KVFormat {
-    /// Stable wire-level discriminants used in persisted KV fingerprints.
-    /// These values must not change once written to disk.
-    pub fn stable_tag(&self) -> u8 {
-        match *self {
+    /// Stable wire-level discriminant used in persisted KV fingerprints.
+    /// **These values must not change once written to disk.** Adding a
+    /// new variant without assigning a unique tag here is a
+    /// compile-time-adjacent error: the match must stay exhaustive and
+    /// every `TurboQuant` bit-pair combination that ships to production
+    /// gets its own explicit arm. Unknown bit-pairs return `None` so
+    /// callers can fail fast instead of stamping a collision-prone
+    /// fallback onto the disk format (M4 review finding A4 — the old
+    /// `saturating_add` fallback could collapse two distinct bit-pairs
+    /// onto the same tag).
+    pub fn stable_tag(&self) -> Option<u8> {
+        let tag = match *self {
             Self::BF16 => 1,
             Self::INT8 => 3,
             Self::FP8E4M3 => 4,
@@ -37,10 +45,9 @@ impl KVFormat {
                 key_bits: 4,
                 val_bits: 4,
             } => 12,
-            Self::TurboQuant { key_bits, val_bits } => 32u8
-                .saturating_add((key_bits & 0x0f) << 4)
-                .saturating_add(val_bits & 0x0f),
-        }
+            Self::TurboQuant { .. } => return None,
+        };
+        Some(tag)
     }
 
     pub fn default_page_size(self) -> usize {
@@ -97,16 +104,16 @@ mod tests {
 
     #[test]
     fn stable_tags_are_fixed() {
-        assert_eq!(KVFormat::BF16.stable_tag(), 1);
-        assert_eq!(KVFormat::INT8.stable_tag(), 3);
-        assert_eq!(KVFormat::FP8E4M3.stable_tag(), 4);
+        assert_eq!(KVFormat::BF16.stable_tag(), Some(1));
+        assert_eq!(KVFormat::INT8.stable_tag(), Some(3));
+        assert_eq!(KVFormat::FP8E4M3.stable_tag(), Some(4));
         assert_eq!(
             KVFormat::TurboQuant {
                 key_bits: 2,
                 val_bits: 2,
             }
             .stable_tag(),
-            10,
+            Some(10),
         );
         assert_eq!(
             KVFormat::TurboQuant {
@@ -114,7 +121,7 @@ mod tests {
                 val_bits: 3,
             }
             .stable_tag(),
-            11,
+            Some(11),
         );
         assert_eq!(
             KVFormat::TurboQuant {
@@ -122,7 +129,38 @@ mod tests {
                 val_bits: 4,
             }
             .stable_tag(),
-            12,
+            Some(12),
+        );
+    }
+
+    #[test]
+    fn stable_tag_returns_none_for_unassigned_turboquant_shape() {
+        // Bit-pair combinations that have no explicit tag assignment
+        // must return None so callers fail fast instead of writing a
+        // collision-prone fallback onto disk (M4 review finding A4).
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 2,
+                val_bits: 3,
+            }
+            .stable_tag(),
+            None,
+        );
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 14,
+                val_bits: 15,
+            }
+            .stable_tag(),
+            None,
+        );
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 15,
+                val_bits: 15,
+            }
+            .stable_tag(),
+            None,
         );
     }
 }
