@@ -12,7 +12,7 @@ Load this file before editing anything under `kv_tier/`, and re-read
 
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
-| T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`. |
+| T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/infer-cuda-kernels/src/paged_kv.rs`. |
 | T1   | Host pinned DRAM  | ~10 µs   | M3 (CUDA only). `host_pool.rs` skeleton exists, locally-verifiable bookkeeping only. |
 | T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` impl exists, not yet wired into a coordinator. |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |

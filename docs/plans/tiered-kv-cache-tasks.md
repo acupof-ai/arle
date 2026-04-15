@@ -48,7 +48,7 @@ Every phase below has three subsections:
 | `scheduler` | NO (but `scheduler/cuda/*` files import cuda-gated types) | partial |
 | `infer/src/scheduler/policy.rs` | internal module | YES ✓ |
 | `infer/src/events.rs` | internal module | YES ✓ |
-| `infer/mlx-sys` | always built when `metal` feature on | YES (with `--features metal`) |
+| `crates/mlx-sys` | always built when `metal` feature on | YES (with `--features metal`) |
 
 **Lane rules**:
 - A task is `[L]` only if both `cargo check --features no-cuda` AND `cargo check --features metal` validate it. Any change inside `paged_kv` / `flashinfer_metadata` / `scheduler/cuda/*` / `model/*` / `ops/*` is automatically `[R]` or `[L+R]`.
@@ -207,7 +207,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 
 **Migration path**:
 - **vLLM/SGLang prefill DIRECTLY into paged blocks.** No contiguous intermediate. `attn_impl.forward` calls FlashInfer `append_paged_kv_cache` with the slot-mapping from `KVCacheManager.allocate_slots` before the kernel runs.
-- **agent-infer's `migrate_from_contiguous`** at [`paged_kv.rs:571-624`](file:///path/to/code/agent-infer/infer/src/paged_kv.rs#L571) is a **legacy artifact** of the old `ContiguousKVCache`. It works at page_size=1 because `kv_cache_to_paged.cu:41-47` uses `logical_page = pos / page_size`.
+- **agent-infer's `migrate_from_contiguous`** at [`crates/infer-cuda-kernels/src/paged_kv.rs`](../../crates/infer-cuda-kernels/src/paged_kv.rs) is a **legacy artifact** of the old `ContiguousKVCache`. It works at page_size=1 because `kv_cache_to_paged.cu:41-47` uses `logical_page = pos / page_size`.
 - **Recommendation**: P0 keeps the migration path. Mark `migrate_from_contiguous` as `#[deprecated = "P1: prefill direct into paged blocks"]`. Schedule P1+ follow-up to remove contiguous prefill entirely (matches vLLM/SGLang).
 
 **Kernel readiness** (verified by reading `crates/infer-cuda-kernels/csrc/`):
@@ -227,7 +227,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
    - **Recommended**: gate `page_size` per-format. `TokenKVPool::page_size` becomes `match format { BF16 => 16, INT8 | FP8E4M3 | TurboQuant => 1 }`. Document the divergence prominently. Schedule P1.5 to either rewrite the INT8 kernels with `pos / page_size` decomposition or move INT8 to a separate HND format. **Single-line change in `with_format`**: `let page_size = if format.uses_paged_layout() { 16 } else { 1 };`
    - Alternative: rewrite `kv_cache_to_paged_int8_kernel` and the FP8 quantize kernels in P0. Bigger blast radius, kernel work, +1 PR. **Defer.**
 2. **`indptr` semantics change** — `build_indptr` cumulates pages now, not tokens. This is the most subtle change in P0; every caller of `pool.build_indptr()` must be re-audited. Currently 1 caller: `flashinfer_metadata.rs:124`.
-3. **Empty-slot filter** — `build_flashinfer_metadata` must skip slots with `seq_len == 0`. Currently it emits `last_page_len[i] = 0` for empty slots ([`paged_kv.rs:503`](file:///path/to/code/agent-infer/infer/src/paged_kv.rs#L503)), which violates FlashInfer's `[1, page_size]` invariant. The fact this hasn't crashed at page_size=1 is luck — FlashInfer treats `last_page_len=0` as "empty pages array, length 0", which the test path tolerates because `indptr[i+1] - indptr[i] = 0` for empty slots. At page_size>1 this no longer reliably aligns.
+3. **Empty-slot filter** — `build_flashinfer_metadata` must skip slots with `seq_len == 0`. Currently it emits `last_page_len[i] = 0` for empty slots ([`crates/infer-cuda-kernels/src/paged_kv.rs`](../../crates/infer-cuda-kernels/src/paged_kv.rs)), which violates FlashInfer's `[1, page_size]` invariant. The fact this hasn't crashed at page_size=1 is luck — FlashInfer treats `last_page_len=0` as "empty pages array, length 0", which the test path tolerates because `indptr[i+1] - indptr[i] = 0` for empty slots. At page_size>1 this no longer reliably aligns.
 4. **Two-level allocator data model** — slot-level state changes from `token_indices: Vec<Vec<u32>>` to `(page_indices: Vec<Vec<u32>>, last_page_len: Vec<u32>)`. The free list changes from `free_slots: Vec<u32>` to `free_pages: Vec<u32>` (pages, not tokens). Total pool bytes unchanged: `max_total_pages = max_total_tokens / page_size`.
 5. **2026-04-14: BF16 prefill→pool migration kernel is the actual P0 blocker.** Plan §1.2 Kernel Readiness audited `kv_cache_to_paged_kernel` (the non-range bf16 path) and concluded the bf16 migration was page_size-parametric. **The production prefill code never calls that function** — it dispatches through `migrate_kv_range_to_paged → kv_cache_to_paged_range_kernel`, which is hardcoded NHD per-token and explicitly only works at `page_size=1`. P0 must add a new `kv_cache_to_paged_range_hnd_kernel` (additive, ~60 lines CUDA) and route the BF16 migration through it. See [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md) for the full root cause, byte-offset proof, and the rescoped P0 file list (~12 files instead of the original ~7).
 6. **2026-04-14: `alloc_tokens` callers — 2 of 4 USE the returned `Vec`, not discard it.** Plan §1.1 said all 4 callers discard so returning `Vec::new()` was a safe shortcut for the two-level allocator rewrite. Verified false: `scheduler/cuda/prefill.rs:184` and `:270` consume `new_indices` and feed it to `state.migrate_kv_range_to_paged(...)`. The two-level allocator must return real indices that the migration kernel can address into the pool.
@@ -478,10 +478,10 @@ P3 has the most local content of any phase — **all of P3 is `[L]` except the l
 - [ ] `[L]` `cargo test -p infer http_server::sessions` — green on Mac
 
 #### MLX wired memory bindings — Local (Mac)
-- [ ] `[L]` Edit `infer/mlx-sys/src/mlx_bridge.cpp` — add 6 new C bridges (see §4.2)
-- [ ] `[L]` Edit `infer/mlx-sys/src/lib.rs:468` — extern declarations for the 6 new functions
-- [ ] `[L]` Edit `infer/src/metal_kv_pool.rs:223-262` — read `mlx_metal_device_max_recommended_working_set_size()` at init, cap `max_total_tokens` per §4.2 formula
-- [ ] `[L]` Edit `infer/src/metal_prefix_cache.rs` — disk tier hook through `TieredKvCache` façade
+- [ ] `[L]` Edit `crates/mlx-sys/src/mlx_bridge.cpp` — add 6 new C bridges (see §4.2)
+- [ ] `[L]` Edit `crates/mlx-sys/src/lib.rs` — extern declarations for the 6 new functions
+- [ ] `[L]` Edit `infer/src/backend/metal/kv_pool.rs` — read `mlx_metal_device_max_recommended_working_set_size()` at init, cap `max_total_tokens` per §4.2 formula
+- [ ] `[L]` Edit `infer/src/backend/metal/prefix_cache.rs` — disk tier hook through `TieredKvCache` façade
 - [ ] `[L]` `cargo build --release --no-default-features --features metal` — Metal build green
 - [ ] `[L]` `cargo test --release --no-default-features --features metal` — Metal tests green
 - [ ] `[L]` Long-context Metal smoke test on Mac: 16k+ token session with bounded pool — must NOT panic (mlx-lm #883 mitigation gate)
@@ -533,7 +533,7 @@ namespace mlx::core::metal {
 - **`set_wired_limit` semantics**: macOS 15.0+ only (no-op on older); default `0` (no guarantee); mlx-lm sets to `max_recommended_working_set_size` ≈ 75 % of RAM at boot; returns previous limit.
 - **`set_wired_limit` failure modes**: exceeds system hard limit → error; raising system ceiling needs `sysctl` + admin.
 - **mlx-lm #883 failure mode**: mlx_lm.server boots with wired_limit ≈ 75 % RAM. Wired memory **cannot be swapped**. KV cache grows unboundedly because mlx_lm.server **does not honor `--max-kv-size`** (issue #615). When KV + weights crosses wired ceiling, `IOGPUMemory.cpp` hits "prepare count underflow" → **kernel panic** (not process crash).
-- **agent-infer's existing `mlx-sys` binding** ([`infer/mlx-sys/src/lib.rs:468`](file:///path/to/code/agent-infer/infer/mlx-sys/src/lib.rs#L468)): only `mlx_metal_clear_cache()`. Need to add 6 new C bridges.
+- **agent-infer's existing `mlx-sys` binding** ([`crates/mlx-sys/src/lib.rs`](../../crates/mlx-sys/src/lib.rs)): only `mlx_metal_clear_cache()`. Need to add 6 new C bridges.
 
 **Bounded MLX KV pool formula**:
 ```
@@ -706,7 +706,7 @@ int getNotifies(std::vector<NotifyDesc>& notifies);
 - **Same shape as NIXL**: register MR, build descriptor list, submit batch, poll/notify completion. **No native Future.** A single trait covers both.
 - Rust binding directory exists at `mooncake-transfer-engine/rust/` but actual `lib.rs` returned 404 on direct fetch. **Defer Mooncake to P6.** Bind NIXL only in P5; Mooncake reaches us through NIXL's `"Mooncake"` plugin.
 
-**`metal_gdr.rs` reality check** ([`infer/src/metal_gdr.rs:1-20`](file:///path/to/code/agent-infer/infer/src/metal_gdr.rs)): module doc reads "Implements the Qwen3.5 linear attention decode step using MLX high-level ops". **Confirmed: Gated Delta Rule, NOT GPUDirect RDMA.** Filename is misleading; rename to `metal_qwen35_gdr.rs` is a separate cleanup PR (NOT part of P5).
+**`backend/metal/gdr.rs` reality check** ([`infer/src/backend/metal/gdr.rs`](../../infer/src/backend/metal/gdr.rs)): module doc reads "Implements the Qwen3.5 linear attention decode step using MLX high-level ops". **Confirmed: Gated Delta Rule, NOT GPUDirect RDMA.** Filename is misleading; rename to `backend/metal/qwen35_gdr.rs` is a separate cleanup PR (NOT part of P5).
 
 **Register-once requirement**:
 - All three stacks (UCX, NIXL, Mooncake) require **allocation-stable MRs**. Hardware constraint (IOMMU page-table pinning + HCA memory key caches), not library policy.
@@ -960,17 +960,17 @@ M0.3's exit gate has a comparison point when it unblocks.
 - [Monoio benchmark docs](https://github.com/redacted/monoio/blob/master/docs/en/benchmark.md)
 
 ### Local files (referenced repeatedly)
-- `infer/src/paged_kv.rs` (cuda-gated)
-- `infer/src/flashinfer_metadata.rs` (cuda-gated)
+- `crates/infer-cuda-kernels/src/paged_kv.rs` (cuda-gated, post `a4e12f5` extraction)
+- `crates/infer-cuda-kernels/src/flashinfer.rs` (cuda-gated, post `a4e12f5` extraction)
 - `infer/src/prefix_cache.rs` (always-on, local-checkable)
 - `infer/src/scheduler/cuda/{prefill,decode,core,runtime,request}.rs` (cuda-gated)
 - `infer/src/server_engine.rs`
 - `infer/src/model/kv_cache.rs` — resident-only contiguous KV cache after the
   M3c cleanup; the legacy CPU-offload surface is gone
-- `infer/src/metal_kv_pool.rs`
-- `infer/src/metal_prefix_cache.rs`
-- `infer/src/metal_gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
-- `infer/mlx-sys/src/lib.rs`
+- `infer/src/backend/metal/kv_pool.rs`
+- `infer/src/backend/metal/prefix_cache.rs`
+- `infer/src/backend/metal/gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
+- `crates/mlx-sys/src/lib.rs`
 - `crates/infer-cuda-kernels/csrc/kv/{paged_kv_append,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
 - `crates/infer-cuda-kernels/csrc/attention/{decode_prep_paged,decode_prep_paged_hd256}.cu`
 - `infer/src/scheduler/policy.rs:64-78,133-152` — existing `AdmissionPolicy` / `ChunkingPolicy`
