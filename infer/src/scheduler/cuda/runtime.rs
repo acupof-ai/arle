@@ -190,7 +190,6 @@ impl<M: ModelForward> Scheduler<M> {
                     self.slot_materialized_prompt_lens[req.slot_idx] = 0;
                 }
                 self.paged_kv_pool.free_slot(req.slot_idx);
-                let _ = self.states[req.slot_idx].offload_kv_if_needed();
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;

@@ -24,8 +24,8 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
-    /// Max KV cache tokens on GPU. Excess offloads to CPU.
-    /// Use a small value (e.g. 512) to test KV offload behavior.
+    /// Deprecated compatibility flag. Legacy contiguous CPU KV offload has
+    /// been retired, so this value is ignored.
     #[arg(long)]
     pub(crate) max_gpu_kv: Option<usize>,
 }

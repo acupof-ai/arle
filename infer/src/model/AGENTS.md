@@ -26,10 +26,8 @@ Model implementations (`qwen3`, `qwen35`, `glm4`) + the `ModelForward` and
 and snapshottable:
 
 - `truncate_to(len)`, `reset()` — slot reuse.
-- `set_max_seq_len`, `set_max_gpu_kv`, `set_kv_dtype` — **must be called before
+- `set_max_seq_len`, `set_kv_dtype` — **must be called before
   the KV cache is first initialized**; after that they are silent no-ops.
-- `offload_kv_if_needed` / `prefetch_kv_to_gpu` — legacy CPU offload path,
-  slated for deletion once tiered-KV M3c lands.
 - `migrate_kv_to_paged` / `migrate_kv_range_to_paged` — contiguous → paged pool
   migration; called after prefill, before the first decode step.
 - `save_prefix_snapshot` / `restore_prefix_snapshot` + `supports_partial_prefix`

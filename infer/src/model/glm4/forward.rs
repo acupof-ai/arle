@@ -46,24 +46,12 @@ impl GenerationState for GLM4State {
         self.base.truncate_to(len)
     }
 
-    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.base.set_max_gpu_kv(max_tokens);
-    }
-
     fn set_max_seq_len(&mut self, max_seq: usize) {
         self.base.set_max_seq_len(max_seq);
     }
 
     fn set_kv_dtype(&mut self, dtype: crate::model::kv_cache::KVCacheDtype) {
         self.base.set_kv_dtype(dtype);
-    }
-
-    fn offload_kv_if_needed(&mut self) -> Result<()> {
-        self.base.offload_kv_if_needed(&self.ctx)
-    }
-
-    fn prefetch_kv_to_gpu(&mut self) -> Result<()> {
-        self.base.kv_cache.prefetch_to_gpu(&self.ctx)
     }
 
     fn migrate_kv_to_paged(
@@ -154,11 +142,6 @@ impl ModelForward for GLM4Model {
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
-        // Prefetch offloaded KV before prefill.
-        if state.base.kv_cache.has_offloaded() {
-            state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
-        }
-
         let start_pos = state.base.kv_cache.len();
         let hidden = self.get_embeddings_batch(tokens)?;
         let hidden = self.process_all_layers_batch(hidden, start_pos, &mut state.base.kv_cache)?;
@@ -189,9 +172,6 @@ impl ModelForward for GLM4Model {
         if tokens.len() == 1 {
             self.forward_decode(tokens[0], state)?;
         } else {
-            if state.base.kv_cache.has_offloaded() {
-                state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
-            }
             let start_pos = state.base.kv_cache.len();
             let hidden = self.get_embeddings_batch(tokens)?;
             let hidden = self.process_all_layers_batch_with_pool(

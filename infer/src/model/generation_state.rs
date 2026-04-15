@@ -52,20 +52,12 @@ impl GenerationStateBase {
         Ok(())
     }
 
-    pub(crate) fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.kv_cache.set_max_gpu_seq_len(max_tokens);
-    }
-
     pub(crate) fn set_max_seq_len(&mut self, max_seq: usize) {
         self.kv_cache.set_max_seq_len(max_seq);
     }
 
     pub(crate) fn set_kv_dtype(&mut self, dtype: super::kv_cache::KVCacheDtype) {
         self.kv_cache.set_dtype(dtype);
-    }
-
-    pub(crate) fn offload_kv_if_needed(&mut self, ctx: &DeviceContext) -> Result<()> {
-        self.kv_cache.offload_if_needed(ctx)
     }
 
     pub(crate) fn migrate_kv_to_paged(

@@ -8,8 +8,10 @@ use std::time::Instant;
 use anyhow::Result;
 #[cfg(feature = "cuda")]
 use fastrace::local::LocalSpan;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use log::warn;
 #[cfg(feature = "cuda")]
-use log::{debug, info, warn};
+use log::{debug, info};
 #[cfg(feature = "cuda")]
 use rand::SeedableRng;
 #[cfg(feature = "cuda")]
@@ -522,10 +524,12 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
         })
     }
 
-    /// Set the maximum KV cache tokens to keep on GPU.
-    /// Tokens beyond this are offloaded to CPU. Used to simulate memory pressure.
+    /// Compatibility no-op. Legacy contiguous CPU KV offload has been retired.
     pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.state.set_max_gpu_kv(max_tokens);
+        warn!(
+            "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload has been retired",
+            max_tokens
+        );
     }
 
     /// Prepare state for a new request, reusing cached KV prefix where possible.
@@ -537,8 +541,6 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
     /// - **Full prefix hit**: Reuse entire cached KV, only prefill the new suffix.
     /// - **Partial prefix hit**: Truncate KV to the common prefix (no full reset),
     ///   then prefill from the divergence point. Saves re-computing the shared part.
-    /// - **KV offload prefetch**: If KV data was offloaded to CPU, automatically
-    ///   prefetch it back to GPU before the prefill starts.
     fn prepare_with_prefix_cache(&mut self, prompt_tokens: &[u32]) -> Result<(Vec<u32>, usize)> {
         let cached_len = self.cached_prompt.len();
         let prefix_len = self
@@ -577,7 +579,6 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                 // Exact prompt match: rewind to N-1 tokens and replay only the
                 // final prompt token so logits reflect the current prompt
                 // without duplicating it in KV.
-                self.state.prefetch_kv_to_gpu()?;
                 info!(
                     "KV prefix cache FULL HIT: exact match, replaying final token with {}/{} tokens reused",
                     replay_from,
@@ -588,7 +589,6 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                 Ok((prompt_tokens[replay_from..].to_vec(), replay_from))
             }
             PrefixReuseAction::ReuseFullCachedPrefix { prefix_len } => {
-                self.state.prefetch_kv_to_gpu()?;
                 if self.state.supports_partial_prefix() {
                     self.state.truncate_to(prefix_len)?;
                 }
@@ -637,7 +637,6 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
             PrefixReuseAction::PartialReuse { prefix_len } => {
                 // Partial prefix hit — truncate KV to common prefix and reuse it.
                 // This avoids re-computing the shared prefix entirely.
-                self.state.prefetch_kv_to_gpu()?;
                 info!(
                     "KV prefix cache PARTIAL: reusing {}/{} common tokens, truncating {} stale tokens",
                     prefix_len,
@@ -681,9 +680,8 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
             )?;
             (tokens, vec![])
         };
-        // Update cached prompt and offload excess KV for next request
+        // Update cached prompt for next request.
         self.cached_prompt = prompt_tokens.clone();
-        self.state.offload_kv_if_needed()?;
         // output_tokens = effective_prompt + generated tokens
         let completion_tokens = output_tokens.len().saturating_sub(effective.len());
         let mut text = self.tokenizer.decode(&output_tokens[effective.len()..])?;
@@ -854,9 +852,8 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
             logprob: None,
         });
 
-        // Update cached prompt and offload excess KV for next request
+        // Update cached prompt for next request.
         self.cached_prompt = prompt_tokens;
-        self.state.offload_kv_if_needed()?;
 
         Ok(())
     }
@@ -1131,11 +1128,17 @@ impl LoadedInferenceEngine {
             Self::GLM4(engine) => engine.set_max_gpu_kv(max_tokens),
             #[cfg(feature = "metal")]
             Self::Metal(_) => {
-                let _ = max_tokens;
+                warn!(
+                    "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload was CUDA-only and has been retired",
+                    max_tokens
+                );
             }
             #[cfg(feature = "cpu")]
             Self::Cpu(_) => {
-                let _ = max_tokens;
+                warn!(
+                    "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload has been retired",
+                    max_tokens
+                );
             }
         }
     }
