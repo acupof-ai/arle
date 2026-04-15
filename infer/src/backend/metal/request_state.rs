@@ -5,7 +5,7 @@ use super::config::{MetalModelArch, MetalModelConfig};
 use super::forward::build_forward_graph;
 use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
-use super::mlx::{MlxArray, eval, zeros};
+use super::mlx::{MlxArray, concatenate_axis, eval, slice, take_axis, zeros};
 use super::ops::{clear_metal_cache, extend_kv_cache};
 use super::qwen35::{CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step};
 use super::sampling::{gpu_sample_token, validate_metal_sampling_params};
@@ -244,6 +244,93 @@ pub(crate) struct Qwen35PrefixSnapshot {
     pub kv_capacity: i32,
 }
 
+pub(crate) struct Qwen35PackedDecodeBatch<'a> {
+    weights: &'a Qwen35MetalWeights,
+    config: &'a MetalModelConfig,
+    arch: &'a super::config::MetalQwen35ArchConfig,
+    cache_len: i32,
+    kv_capacity: i32,
+    n_kv_per_request: i32,
+    n_gdr_per_request: i32,
+    packed_kv_flat: Vec<MlxArray>,
+    packed_gdr_flat: Vec<MlxArray>,
+}
+
+impl<'a> Qwen35PackedDecodeBatch<'a> {
+    pub(crate) fn batch_size(&self) -> usize {
+        self.packed_kv_flat
+            .first()
+            .or_else(|| self.packed_gdr_flat.first())
+            .map(|array| array.shape().first().copied().unwrap_or(0).max(0) as usize)
+            .unwrap_or(0)
+    }
+
+    fn matches_driver(&self, driver: &Qwen35StepDriver<'a>) -> bool {
+        std::ptr::eq(self.weights, driver.weights)
+            && std::ptr::eq(self.config, driver.config)
+            && std::ptr::eq(self.arch, driver.arch)
+            && driver.cache_len == self.cache_len
+            && driver.kv_capacity == self.kv_capacity
+            && matches!(driver.mode, Qwen35StepMode::Cpp(_))
+    }
+
+    fn ensure_capacity_for_states(
+        &mut self,
+        states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+        needed_tokens: i32,
+    ) {
+        while needed_tokens > self.kv_capacity {
+            let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
+            for cache in &mut self.packed_kv_flat {
+                extend_kv_cache(
+                    cache,
+                    self.config.num_key_value_heads as i32,
+                    self.config.head_dim as i32,
+                    new_cap,
+                );
+            }
+            self.kv_capacity = new_cap;
+            for state in states.iter_mut() {
+                state.driver.kv_capacity = new_cap;
+            }
+        }
+    }
+
+    pub(crate) fn retain_rows(&mut self, row_indices: &[usize]) -> Result<()> {
+        if row_indices.len() == self.batch_size()
+            && row_indices.iter().enumerate().all(|(idx, row)| idx == *row)
+        {
+            return Ok(());
+        }
+
+        let indices: Vec<i32> = row_indices
+            .iter()
+            .map(|&row| i32::try_from(row).context("Qwen3.5 packed batch row index overflow"))
+            .collect::<Result<_>>()?;
+        let index_arr = MlxArray::from_slice_i32(
+            &indices,
+            &[i32::try_from(indices.len()).context("Qwen3.5 packed batch row count overflow")?],
+        );
+
+        for tensor in &mut self.packed_kv_flat {
+            let old = std::mem::replace(tensor, take_axis(tensor, &index_arr, 0));
+            drop(old);
+        }
+        for tensor in &mut self.packed_gdr_flat {
+            let old = std::mem::replace(tensor, take_axis(tensor, &index_arr, 0));
+            drop(old);
+        }
+
+        let mut eval_refs =
+            Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len());
+        eval_refs.extend(self.packed_kv_flat.iter());
+        eval_refs.extend(self.packed_gdr_flat.iter());
+        let eval_refs: Vec<&MlxArray> = eval_refs.into_iter().collect();
+        eval(&eval_refs);
+        Ok(())
+    }
+}
+
 impl<'a> MetalRequestState<'a> {
     pub(super) fn new(
         weights: &'a MetalWeights,
@@ -423,6 +510,80 @@ impl<'a> MetalRequestState<'a> {
                 Ok(Some(sampled))
             }
         }
+    }
+
+    pub(crate) fn try_build_qwen35_packed_decode_batch(
+        states: &mut [&mut MetalRequestState<'a>],
+    ) -> Result<Option<Qwen35PackedDecodeBatch<'a>>> {
+        if states.len() < 2 {
+            return Ok(None);
+        }
+
+        let mut qwen35_states = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            match &mut state_ref.inner {
+                MetalRequestStateInner::Qwen35(qwen35) => {
+                    if qwen35.phase() != MetalRequestPhase::Decode {
+                        return Ok(None);
+                    }
+                    qwen35_states.push(qwen35);
+                }
+                MetalRequestStateInner::Qwen3(_) => return Ok(None),
+            }
+        }
+
+        try_build_qwen35_packed_decode_batch(&mut qwen35_states)
+    }
+
+    pub(crate) fn try_decode_qwen35_packed_batch(
+        states: &mut [&mut MetalRequestState<'a>],
+        batch: &mut Qwen35PackedDecodeBatch<'a>,
+    ) -> Result<Option<Vec<u32>>> {
+        if states.len() < 2 {
+            return Ok(None);
+        }
+
+        let mut qwen35_states = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            match &mut state_ref.inner {
+                MetalRequestStateInner::Qwen35(qwen35) => {
+                    if qwen35.phase() != MetalRequestPhase::Decode
+                        || !batch.matches_driver(&qwen35.driver)
+                    {
+                        return Ok(None);
+                    }
+                    qwen35_states.push(qwen35);
+                }
+                MetalRequestStateInner::Qwen3(_) => return Ok(None),
+            }
+        }
+
+        if qwen35_states.len() != batch.batch_size() {
+            return Ok(None);
+        }
+
+        let sampled = decode_qwen35_packed_batch(&mut qwen35_states, batch)?;
+        Ok(Some(sampled))
+    }
+
+    pub(crate) fn sync_qwen35_packed_decode_batch(
+        states: &mut [&mut MetalRequestState<'a>],
+        batch: &Qwen35PackedDecodeBatch<'a>,
+    ) -> Result<()> {
+        let mut qwen35_states = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            match &mut state_ref.inner {
+                MetalRequestStateInner::Qwen35(qwen35) => qwen35_states.push(qwen35),
+                MetalRequestStateInner::Qwen3(_) => {
+                    bail!("sync_qwen35_packed_decode_batch received mixed model batch")
+                }
+            }
+        }
+
+        sync_qwen35_packed_decode_batch(&mut qwen35_states, batch)
     }
 
     pub fn cancel(&mut self) -> Result<()> {
@@ -754,11 +915,241 @@ fn decode_qwen3_batch(
     Ok(sampled_tokens)
 }
 
+fn try_build_qwen35_packed_decode_batch<'a>(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+) -> Result<Option<Qwen35PackedDecodeBatch<'a>>> {
+    ensure!(
+        !states.is_empty(),
+        "try_build_qwen35_packed_decode_batch requires at least one request state"
+    );
+
+    let first = &states[0].driver;
+    let weights = first.weights;
+    let config = first.config;
+    let arch = first.arch;
+    let cache_len = first.cache_len;
+    let kv_capacity = first.kv_capacity;
+
+    let (n_kv_per_request, n_gdr_per_request) = match &first.mode {
+        Qwen35StepMode::Cpp(state) => (
+            i32::try_from(state.kv_flat.len())
+                .context("Qwen3.5 packed decode batch kv count overflow")?,
+            i32::try_from(state.gdr_flat.len())
+                .context("Qwen3.5 packed decode batch gdr count overflow")?,
+        ),
+        Qwen35StepMode::Rust(_) => return Ok(None),
+    };
+
+    for state in states.iter() {
+        if !std::ptr::eq(state.driver.weights, weights)
+            || !std::ptr::eq(state.driver.config, config)
+            || !std::ptr::eq(state.driver.arch, arch)
+        {
+            return Ok(None);
+        }
+        if state.driver.cache_len != cache_len || state.driver.kv_capacity != kv_capacity {
+            return Ok(None);
+        }
+        match &state.driver.mode {
+            Qwen35StepMode::Cpp(cpp) => {
+                if i32::try_from(cpp.kv_flat.len())
+                    .context("Qwen3.5 packed decode batch kv count overflow")?
+                    != n_kv_per_request
+                    || i32::try_from(cpp.gdr_flat.len())
+                        .context("Qwen3.5 packed decode batch gdr count overflow")?
+                        != n_gdr_per_request
+                {
+                    return Ok(None);
+                }
+            }
+            Qwen35StepMode::Rust(_) => return Ok(None),
+        }
+    }
+
+    let mut packed_kv_flat = Vec::with_capacity(n_kv_per_request as usize);
+    for kv_idx in 0..n_kv_per_request as usize {
+        let mut per_request = Vec::with_capacity(states.len());
+        for state in states.iter() {
+            let Qwen35StepMode::Cpp(cpp) = &state.driver.mode else {
+                unreachable!("checked above");
+            };
+            per_request.push(cpp.kv_flat[kv_idx].clone());
+        }
+        packed_kv_flat.push(concatenate_axis(&per_request, 0));
+    }
+
+    let mut packed_gdr_flat = Vec::with_capacity(n_gdr_per_request as usize);
+    for gdr_idx in 0..n_gdr_per_request as usize {
+        let mut per_request = Vec::with_capacity(states.len());
+        for state in states.iter() {
+            let Qwen35StepMode::Cpp(cpp) = &state.driver.mode else {
+                unreachable!("checked above");
+            };
+            per_request.push(cpp.gdr_flat[gdr_idx].clone());
+        }
+        packed_gdr_flat.push(concatenate_axis(&per_request, 0));
+    }
+
+    let mut eval_refs = Vec::with_capacity(packed_kv_flat.len() + packed_gdr_flat.len());
+    eval_refs.extend(packed_kv_flat.iter());
+    eval_refs.extend(packed_gdr_flat.iter());
+    let eval_refs: Vec<&MlxArray> = eval_refs.into_iter().collect();
+    eval(&eval_refs);
+
+    Ok(Some(Qwen35PackedDecodeBatch {
+        weights,
+        config,
+        arch,
+        cache_len,
+        kv_capacity,
+        n_kv_per_request,
+        n_gdr_per_request,
+        packed_kv_flat,
+        packed_gdr_flat,
+    }))
+}
+
+fn sync_qwen35_packed_decode_batch<'a>(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+    batch: &Qwen35PackedDecodeBatch<'a>,
+) -> Result<()> {
+    ensure!(
+        states.len() == batch.batch_size(),
+        "sync_qwen35_packed_decode_batch expected {} states, got {}",
+        batch.batch_size(),
+        states.len()
+    );
+
+    for (row_idx, state) in states.iter_mut().enumerate() {
+        ensure!(
+            batch.matches_driver(&state.driver)
+                || (state.driver.cache_len == batch.cache_len
+                    && std::ptr::eq(state.driver.weights, batch.weights)
+                    && std::ptr::eq(state.driver.config, batch.config)
+                    && std::ptr::eq(state.driver.arch, batch.arch)
+                    && matches!(state.driver.mode, Qwen35StepMode::Cpp(_))),
+            "sync_qwen35_packed_decode_batch state mismatch at row {row_idx}"
+        );
+        let row = i32::try_from(row_idx).context("sync_qwen35_packed_decode_batch row overflow")?;
+        match &mut state.driver.mode {
+            Qwen35StepMode::Cpp(cpp) => {
+                for (slot, packed) in cpp.kv_flat.iter_mut().zip(batch.packed_kv_flat.iter()) {
+                    let old = std::mem::replace(slot, slice_row(packed, row));
+                    drop(old);
+                }
+                for (slot, packed) in cpp.gdr_flat.iter_mut().zip(batch.packed_gdr_flat.iter()) {
+                    let old = std::mem::replace(slot, slice_row(packed, row));
+                    drop(old);
+                }
+                state.driver.kv_capacity = batch.kv_capacity;
+                state.driver.cache_len = batch.cache_len;
+            }
+            Qwen35StepMode::Rust(_) => {
+                bail!("sync_qwen35_packed_decode_batch requires compiled Qwen3.5 state")
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_qwen35_packed_batch<'a>(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+    batch: &mut Qwen35PackedDecodeBatch<'a>,
+) -> Result<Vec<u32>> {
+    ensure!(
+        !states.is_empty(),
+        "decode_qwen35_packed_batch requires at least one request state"
+    );
+    ensure!(
+        states.len() == batch.batch_size(),
+        "decode_qwen35_packed_batch expected {} states, got {}",
+        batch.batch_size(),
+        states.len()
+    );
+
+    if batch.cache_len > 0 && batch.cache_len % KV_CACHE_CHUNK == 0 {
+        clear_metal_cache();
+    }
+
+    batch.ensure_capacity_for_states(states, batch.cache_len + 1);
+
+    let input_tokens: Vec<u32> = states
+        .iter()
+        .map(|state| {
+            state
+                .last_token
+                .context("decode_qwen35_packed_batch requires a committed prefill token")
+        })
+        .collect::<Result<_>>()?;
+    let token_values: Vec<i32> = input_tokens.iter().map(|&token| token as i32).collect();
+    let token_arr =
+        MlxArray::from_slice_i32(
+            &token_values,
+            &[i32::try_from(states.len())
+                .context("decode_qwen35_packed_batch batch size overflow")?],
+        );
+
+    let cpp_model = batch
+        .weights
+        .cpp_model
+        .as_ref()
+        .context("decode_qwen35_packed_batch requires the compiled Qwen3.5 path")?;
+    let logits = cpp_model.step_batch_packed(
+        &token_arr,
+        i32::try_from(states.len()).context("decode_qwen35_packed_batch batch size overflow")?,
+        batch.cache_len,
+        &mut batch.packed_kv_flat,
+        batch.n_kv_per_request,
+        &mut batch.packed_gdr_flat,
+        batch.n_gdr_per_request,
+    )?;
+
+    let mut eval_refs: Vec<&MlxArray> =
+        Vec::with_capacity(1 + batch.packed_kv_flat.len() + batch.packed_gdr_flat.len());
+    eval_refs.push(&logits);
+    eval_refs.extend(batch.packed_kv_flat.iter());
+    eval_refs.extend(batch.packed_gdr_flat.iter());
+    eval(&eval_refs);
+
+    let logits_shape = logits.shape().to_vec();
+    ensure!(
+        !logits_shape.is_empty()
+            && logits_shape[0]
+                == i32::try_from(states.len())
+                    .context("decode_qwen35_packed_batch batch shape overflow")?,
+        "decode_qwen35_packed_batch expected batched logits, got shape {:?}",
+        logits_shape
+    );
+
+    let mut sampled_arrays = Vec::with_capacity(states.len());
+    for row_idx in 0..states.len() {
+        let row = i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
+        sampled_arrays.push(gpu_sample_token(
+            &slice_row(&logits, row),
+            &states[row_idx].driver.params,
+        ));
+    }
+    let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
+    eval(&sample_refs);
+
+    batch.cache_len += 1;
+
+    let mut sampled_tokens = Vec::with_capacity(states.len());
+    for (state, sampled) in states.iter_mut().zip(sampled_arrays.iter()) {
+        let token = sampled.item_i32() as u32;
+        state.driver.cache_len = batch.cache_len;
+        state.driver.kv_capacity = batch.kv_capacity;
+        state.record_sampled_token(token)?;
+        sampled_tokens.push(token);
+    }
+
+    Ok(sampled_tokens)
+}
+
 fn decode_qwen35_batch(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'_>>],
 ) -> Result<Vec<u32>> {
-    use super::mlx::{eval, slice};
-
     ensure!(
         !states.is_empty(),
         "decode_qwen35_batch requires at least one request state"
@@ -918,6 +1309,15 @@ fn decode_qwen35_batch(
     );
 
     Ok(sampled_tokens)
+}
+
+fn slice_row(array: &MlxArray, row: i32) -> MlxArray {
+    let mut start = vec![0; array.shape().len()];
+    let mut end = array.shape().to_vec();
+    let strides = vec![1; array.shape().len()];
+    start[0] = row;
+    end[0] = row + 1;
+    slice(array, &start, &end, &strides)
 }
 
 struct Qwen3StepDriver<'a> {

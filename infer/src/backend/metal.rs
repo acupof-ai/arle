@@ -160,9 +160,16 @@ impl MetalBackend {
         Self::with_options(MetalBackendOptions::default())
     }
 
+    // The `metal` feature branch destructures `options` to consume
+    // its fields; the no-cuda branch only needs the value to exist
+    // so the `with_options` API stays uniform across feature gates.
+    // Clippy's needless_pass_by_value fires on the no-cuda branch
+    // alone — suppress at the function level since the by-value
+    // signature is intentional for the metal branch.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn with_options(options: MetalBackendOptions) -> Self {
         #[cfg(not(feature = "metal"))]
-        let _ = &options;
+        let _ = options;
         #[cfg(feature = "metal")]
         let MetalBackendOptions {
             dflash,

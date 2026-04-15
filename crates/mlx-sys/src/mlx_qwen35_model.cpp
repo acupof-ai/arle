@@ -1073,6 +1073,65 @@ int32_t qwen35_compiled_step_batch(
     }
 }
 
+int32_t qwen35_compiled_step_batch_packed(
+    void* model,
+    mlx_array* token_ids,    // int32 vector [batch]
+    int32_t batch_size,
+    int32_t cache_pos,
+    mlx_array** packed_kv_caches,
+    int32_t n_kv,
+    mlx_array** packed_gdr_states,
+    int32_t n_gdr,
+    mlx_array** out_logits,
+    mlx_array** out_packed_kv_caches,
+    mlx_array** out_packed_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error("qwen35_compiled_step_batch_packed requires batch_size > 0");
+        }
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = 1;
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+
+        for (int kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
+            inputs.push_back(*to_arr(packed_kv_caches[kv_idx]));
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr; ++gdr_idx) {
+            inputs.push_back(*to_arr(packed_gdr_states[gdr_idx]));
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+
+        for (int kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
+            out_packed_kv_caches[kv_idx] = from_arr(std::move(outputs[1 + kv_idx]));
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr; ++gdr_idx) {
+            out_packed_gdr_states[gdr_idx] = from_arr(std::move(outputs[1 + n_kv + gdr_idx]));
+        }
+
+        m->current_batch_size = 1;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_batch_size = 1;
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_prefill(
     void* model,
     mlx_array* token_ids,    // int32 vector [prompt_len]
