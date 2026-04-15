@@ -387,6 +387,58 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    pub(super) fn prefill(
+        &self,
+        tokens: &MlxArray,
+        prompt_len: i32,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray],
+        gdr_states: &mut [MlxArray],
+    ) -> Result<MlxArray> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_prefill(
+                self.0,
+                tokens.as_raw(),
+                prompt_len,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
     #[allow(clippy::items_after_statements)]
     pub(crate) fn generate(

@@ -70,6 +70,9 @@ mod qwen35;
 #[path = "metal/request_state.rs"]
 pub mod request_state;
 #[cfg(feature = "metal")]
+#[path = "metal/runtime.rs"]
+pub mod runtime;
+#[cfg(feature = "metal")]
 #[path = "metal/sampling.rs"]
 pub mod sampling;
 #[cfg(feature = "metal")]
@@ -114,6 +117,10 @@ use loader::{
 };
 #[cfg(feature = "metal")]
 use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};
+#[cfg(feature = "metal")]
+pub use runtime::{
+    spawn_metal_scheduler_handle_from_path, spawn_metal_scheduler_handle_from_path_with_options,
+};
 
 // NOTE: The legacy fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were
 // removed during the mlx-sys migration. Qwen3 now runs on the maintained

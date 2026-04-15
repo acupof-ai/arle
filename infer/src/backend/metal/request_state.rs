@@ -31,6 +31,19 @@ pub struct PrefillChunkResult {
 
 trait StepDriver {
     fn prefill_token(&mut self, token: u32, terminal_prompt: bool) -> Result<Option<u32>>;
+    fn prefill_tokens(&mut self, tokens: &[u32], terminal_prompt: bool) -> Result<Option<u32>> {
+        let mut emitted = None;
+        for (idx, &token) in tokens.iter().enumerate() {
+            let is_terminal = terminal_prompt && idx + 1 == tokens.len();
+            let sampled = self.prefill_token(token, is_terminal)?;
+            if is_terminal {
+                emitted = sampled;
+            } else if sampled.is_some() {
+                bail!("non-terminal prefill step unexpectedly emitted a sampled token");
+            }
+        }
+        Ok(emitted)
+    }
     fn decode_token(&mut self, token: u32) -> Result<u32>;
     fn cleanup(&mut self) -> Result<()> {
         Ok(())
@@ -110,29 +123,26 @@ impl<D: StepDriver> ResumableRequestState<D> {
             self.phase
         );
 
-        let mut processed = 0usize;
-        while processed < budget && self.prompt_cursor < self.prompt_tokens.len() {
-            let token = self.prompt_tokens[self.prompt_cursor];
-            let terminal_prompt = self.prompt_cursor + 1 == self.prompt_tokens.len();
-            let sampled = self.driver.prefill_token(token, terminal_prompt)?;
-            self.prompt_cursor += 1;
-            processed += 1;
+        let remaining = self.prompt_tokens.len() - self.prompt_cursor;
+        let processed = budget.min(remaining);
+        let prompt_end = self.prompt_cursor + processed;
+        let terminal_prompt = prompt_end == self.prompt_tokens.len();
+        let sampled = self.driver.prefill_tokens(
+            &self.prompt_tokens[self.prompt_cursor..prompt_end],
+            terminal_prompt,
+        )?;
+        self.prompt_cursor = prompt_end;
 
-            if terminal_prompt {
-                let sampled_token =
-                    sampled.context("terminal prefill step did not emit a sampled token")?;
-                self.record_sampled_token(sampled_token)?;
-                return Ok(PrefillChunkResult {
-                    processed_tokens: processed,
-                    emitted_token: Some(sampled_token),
-                    phase: self.phase,
-                    finish_reason: self.finish_reason,
-                });
-            }
-
-            if sampled.is_some() {
-                bail!("non-terminal prefill step unexpectedly emitted a sampled token");
-            }
+        if terminal_prompt {
+            let sampled_token =
+                sampled.context("terminal prefill step did not emit a sampled token")?;
+            self.record_sampled_token(sampled_token)?;
+            return Ok(PrefillChunkResult {
+                processed_tokens: processed,
+                emitted_token: Some(sampled_token),
+                phase: self.phase,
+                finish_reason: self.finish_reason,
+            });
         }
 
         Ok(PrefillChunkResult {
@@ -718,6 +728,64 @@ impl StepDriver for Qwen35StepDriver<'_> {
             Ok(Some(sampled.item_i32() as u32))
         } else {
             Ok(None)
+        }
+    }
+
+    fn prefill_tokens(&mut self, tokens: &[u32], terminal_prompt: bool) -> Result<Option<u32>> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+
+        let use_cpp_batch_prefill = matches!(self.mode, Qwen35StepMode::Cpp(_)) && tokens.len() > 1;
+        if use_cpp_batch_prefill {
+            self.ensure_capacity(self.cache_len + tokens.len() as i32);
+        }
+
+        match &mut self.mode {
+            Qwen35StepMode::Cpp(state) if tokens.len() > 1 => {
+                let token_values: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+                let token_arr = MlxArray::from_slice_i32(&token_values, &[tokens.len() as i32]);
+                let cpp_model: &CppQwen35Model = self
+                    .weights
+                    .cpp_model
+                    .as_ref()
+                    .context("Qwen3.5 C++ prefill path missing compiled model")?;
+                let logits = cpp_model.prefill(
+                    &token_arr,
+                    tokens.len() as i32,
+                    self.cache_len,
+                    &mut state.kv_flat,
+                    &mut state.gdr_flat,
+                )?;
+                let mut step_outputs: Vec<&MlxArray> =
+                    Vec::with_capacity(1 + state.kv_flat.len() + state.gdr_flat.len());
+                step_outputs.push(&logits);
+                step_outputs.extend(state.kv_flat.iter());
+                step_outputs.extend(state.gdr_flat.iter());
+                eval(&step_outputs);
+                self.cache_len += tokens.len() as i32;
+
+                if terminal_prompt {
+                    let sampled = gpu_sample_token(&logits, &self.params);
+                    eval(&[&sampled]);
+                    Ok(Some(sampled.item_i32() as u32))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => {
+                let mut emitted = None;
+                for (idx, &token) in tokens.iter().enumerate() {
+                    let is_terminal = terminal_prompt && idx + 1 == tokens.len();
+                    let sampled = self.prefill_token(token, is_terminal)?;
+                    if is_terminal {
+                        emitted = sampled;
+                    } else if sampled.is_some() {
+                        bail!("non-terminal prefill step unexpectedly emitted a sampled token");
+                    }
+                }
+                Ok(emitted)
+            }
         }
     }
 

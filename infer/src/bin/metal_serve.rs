@@ -1,13 +1,14 @@
 //! Metal-backed OpenAI-compatible inference server.
 //!
-//! **Limitation:** This server uses a serial runtime (`BackendRuntimeHandle`)
-//! that processes one request at a time. Concurrent requests are queued, not
-//! batched. The scheduler, continuous batching, decode-priority scheduling,
-//! and chunked prefill from the CUDA path are NOT connected here.
+//! Standard Metal serving now uses a live `MetalScheduler` runtime with
+//! chunked prefill and decode-priority interleaving on top of the request-state
+//! API.
 //!
-//! For production multi-request serving, the Metal backend needs a proper
-//! `MetalScheduler` that mirrors the CUDA `Scheduler` design with KV cache
-//! lifecycle management and batch decode support.
+//! **Current limitation:** decode work is still executed request-by-request
+//! inside the scheduler loop; cross-request batched GPU decode is not wired
+//! yet. When Metal DFlash is enabled, the server still falls back to the
+//! legacy serial runtime because the scheduler runtime does not yet support
+//! speculative decode.
 
 #![cfg(feature = "metal")]
 
@@ -16,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
-use infer::backend::metal::{MetalBackendOptions, MetalDflashOptions};
-use infer::backend::runtime::{
-    BackendRuntimeHandle, spawn_metal_runtime_handle_from_path_with_options,
+use infer::backend::metal::{
+    MetalBackendOptions, MetalDflashOptions, spawn_metal_scheduler_handle_from_path_with_options,
 };
+use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options;
 use infer::http_server::{HttpServerConfig, build_app_with_config};
 use infer::logging;
 use infer::request_handle::RequestHandle;
@@ -34,7 +35,7 @@ const WARMUP_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Parser)]
 #[command(
     name = "metal_serve",
-    about = "Metal-backed OpenAI-compatible server (serial runtime, single-request)"
+    about = "Metal-backed OpenAI-compatible server (live Metal scheduler; DFlash stays serial)"
 )]
 struct Args {
     /// Model directory or HuggingFace model ID.
@@ -113,21 +114,41 @@ async fn main() -> Result<()> {
         bail!("--warmup-max-new-tokens must be >= 1 when --warmup > 0");
     }
 
-    let handle = spawn_metal_runtime_handle_from_path_with_options(
-        &args.model_path,
-        MetalBackendOptions {
-            dflash: args
-                .dflash_draft_model
-                .as_ref()
-                .map(|draft_model| MetalDflashOptions {
-                    draft_model: draft_model.clone(),
-                    speculative_tokens: args.speculative_tokens,
-                }),
-            kv_pool: args.kv_pool_override(),
-        },
-        args.max_waiting,
-    )
-    .with_context(|| format!("failed to start Metal runtime for {}", args.model_path))?;
+    let backend_options = MetalBackendOptions {
+        dflash: args
+            .dflash_draft_model
+            .as_ref()
+            .map(|draft_model| MetalDflashOptions {
+                draft_model: draft_model.clone(),
+                speculative_tokens: args.speculative_tokens,
+            }),
+        kv_pool: args.kv_pool_override(),
+    };
+    let handle: Arc<dyn RequestHandle> = if args.dflash_draft_model.is_some() {
+        info!("Metal DFlash currently uses the legacy serial runtime path");
+        Arc::new(
+            spawn_metal_runtime_handle_from_path_with_options(
+                &args.model_path,
+                backend_options.clone(),
+                args.max_waiting,
+            )
+            .with_context(|| format!("failed to start Metal runtime for {}", args.model_path))?,
+        )
+    } else {
+        Arc::new(
+            spawn_metal_scheduler_handle_from_path_with_options(
+                &args.model_path,
+                backend_options,
+                args.max_waiting,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to start Metal scheduler runtime for {}",
+                    args.model_path
+                )
+            })?,
+        )
+    };
 
     if let Some(draft_model) = &args.dflash_draft_model {
         info!(
@@ -194,7 +215,7 @@ fn resolve_api_key(explicit: Option<&str>) -> Option<String> {
 }
 
 async fn run_startup_warmup(
-    handle: &BackendRuntimeHandle,
+    handle: &dyn RequestHandle,
     runs: usize,
     prompt: &str,
     max_new_tokens: usize,
@@ -263,7 +284,7 @@ async fn run_startup_warmup(
 }
 
 fn submit_warmup_request(
-    handle: &BackendRuntimeHandle,
+    handle: &dyn RequestHandle,
     prompt: &str,
     max_new_tokens: usize,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<CompletionStreamDelta>> {

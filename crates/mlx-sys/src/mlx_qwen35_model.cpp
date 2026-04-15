@@ -981,6 +981,51 @@ int32_t qwen35_compiled_step(
     }
 }
 
+int32_t qwen35_compiled_prefill(
+    void* model,
+    mlx_array* token_ids,    // int32 vector [prompt_len]
+    int32_t prompt_len,
+    int32_t cache_pos,
+    mlx_array** kv_caches, int32_t n_kv,
+    mlx_array** gdr_states, int32_t n_gdr,
+    mlx_array** out_logits,
+    mlx_array** out_kv_caches,
+    mlx_array** out_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        m->current_cache_pos = cache_pos;
+        m->current_seq_len = prompt_len;
+        m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(kv_caches[i]));
+        for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(gdr_states[i]));
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+        for (int i = 0; i < n_kv; ++i)
+            out_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
+        for (int i = 0; i < n_gdr; ++i)
+            out_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
+
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return -1;
+    }
+}
+
 // ── Full decode loop in C++ ────────────────────────────────────────────────
 // Keeps ALL intermediate arrays alive within the loop body, matching
 // Python's behavior where locals survive until the next loop iteration.
