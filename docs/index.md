@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post M2b local impl + tiered-kv doc cleanup + projects/plans audit).
+Last refreshed: 2026-04-15 (post Metal acceptance plan + HTTP API/DX tranche + tiered-kv doc cleanup).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -18,6 +18,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M2b local batch |
 | [plans/tiered-kv-cache-remote-validation.md](plans/tiered-kv-cache-remote-validation.md) | Active (2026-04-13 batch) | Older remote validation checklist; for the M2b batch use the M2b remote acceptance doc above |
 | [plans/2026-04-15-metal-backend-execution-checklist.md](plans/2026-04-15-metal-backend-execution-checklist.md) | Active | Prioritized execution checklist for turning Metal from serial beta into production-grade Apple Silicon serving |
+| [plans/2026-04-15-metal-backend-acceptance-plan.md](plans/2026-04-15-metal-backend-acceptance-plan.md) | Active | Strict acceptance gates for Metal serving, API, DX, and the remaining live-scheduler blockers |
 | [plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md) | Blueprint | Forward plan for the eventual `infer-cuda-kernels` crate extraction (already partially extracted). Trip wires: FA-3 H100, MLA, NCCL, FP8 GEMM, spec-decode GPU, second consumer |
 | [plans/turboquant-integration.md](plans/turboquant-integration.md) | Complete (post-impl) | TurboQuant Phases 1–3 reference: KV TurboQuant → weight ITQ3_S → fused decode attention. Canonical post-implementation design |
 | [plans/qwen35-sglang-parity.md](plans/qwen35-sglang-parity.md) | Active | Qwen3.5 SGLang parity — prefix cache fixed, batched prefill remaining |

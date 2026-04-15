@@ -60,6 +60,8 @@ cargo run -p infer --bin metal_request --release --no-default-features --feature
 | `--temperature <F>` | No | `0.0` | Sampling temperature | `0.0` means greedy |
 | `--top-k <K>` | No | `-1` | Top-k sampling | Metal currently accepts only `-1` or `1` |
 | `--ignore-eos` | No | `false` | Keep generating past EOS | Useful for fixed-length measurement |
+| `--kv-pool` | No | env fallback | Enable the experimental Metal KV pool | Only affects the Qwen3 fallback path today |
+| `--no-kv-pool` | No | env fallback | Force-disable the Metal KV pool | Overrides `AGENT_INFER_METAL_KV_POOL` |
 | `--dflash-draft-model <PATH_OR_REPO>` | No | disabled | Enable DFlash | Shared DFlash flag |
 | `--speculative-tokens <N>` | No | draft default | Override block size | Shared DFlash flag |
 
@@ -106,6 +108,8 @@ cargo run -p infer --bin metal_bench --release --no-default-features --features 
 | `--save-baseline <PATH>` | No | none | Write current results as a baseline JSON file | Does not compare |
 | `--compare-baseline <PATH>` | No | none | Compare against an existing baseline | Fails if metrics regress past thresholds |
 | `--update-baseline <PATH>` | No | none | Overwrite a baseline only if thresholds pass | Safe update flow |
+| `--kv-pool` | No | env fallback | Enable the experimental Metal KV pool | Only affects the Qwen3 fallback path today |
+| `--no-kv-pool` | No | env fallback | Force-disable the Metal KV pool | Overrides `AGENT_INFER_METAL_KV_POOL` |
 | `--dflash-draft-model <PATH_OR_REPO>` | No | disabled | Enable DFlash | Shared DFlash flag |
 | `--speculative-tokens <N>` | No | draft default | Override block size | Shared DFlash flag |
 
@@ -165,6 +169,8 @@ Command shape:
 | `--bind <HOST>` | No | `127.0.0.1` | Host or IP address to bind to | Pass `0.0.0.0` explicitly if you want non-local access |
 | `--api-key <TOKEN>` | No | disabled | Require `Authorization: Bearer <TOKEN>` on `/v1/*` endpoints | Falls back to `AGENT_INFER_API_KEY` when the flag is omitted |
 | `--max-waiting <N>` | No | `256` | Max queued requests before rejection | Server is still serial, not batched |
+| `--kv-pool` | No | env fallback | Enable the experimental Metal KV pool | Only affects the Qwen3 fallback path today |
+| `--no-kv-pool` | No | env fallback | Force-disable the Metal KV pool | Overrides `AGENT_INFER_METAL_KV_POOL` |
 | `--dflash-draft-model <PATH_OR_REPO>` | No | disabled | Enable DFlash | Shared DFlash flag |
 | `--speculative-tokens <N>` | No | draft default | Override block size | Shared DFlash flag |
 | `--warmup <N>` | No | `1` | Number of startup warmup requests before serving traffic | Moves cold-start cost ahead of the first real request |
@@ -193,10 +199,11 @@ Rejected today:
 
 ## Removed environment variables
 
-These DFlash environment variables are no longer the intended user interface:
+These environment variables are no longer the intended user interface:
 
 - `AGENT_INFER_METAL_DFLASH_MODEL`
 - `AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS`
+- `AGENT_INFER_METAL_KV_POOL`
 
 Use explicit CLI flags instead.
 

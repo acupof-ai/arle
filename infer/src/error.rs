@@ -52,6 +52,18 @@ impl ApiError {
         }
     }
 
+    /// 401 Unauthorized — missing or invalid authentication credentials.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error",
+                code: "unauthorized",
+            },
+        }
+    }
+
     /// 504 Gateway Timeout — request took too long.
     pub fn timeout(elapsed_secs: u64) -> Self {
         Self {

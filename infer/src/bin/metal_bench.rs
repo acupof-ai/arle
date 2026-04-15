@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use serde::{Deserialize, Serialize};
 
 /// Metal backend benchmark: prompt speed, TTFT, decode throughput, peak RSS.
@@ -75,10 +75,30 @@ struct Cli {
     #[arg(long, value_name = "PATH_OR_REPO")]
     dflash_draft_model: Option<String>,
 
+    /// Enable the experimental Metal KV pool for the Qwen3 fallback path.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_kv_pool")]
+    kv_pool: bool,
+
+    /// Disable the experimental Metal KV pool even if the env fallback is set.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
+    no_kv_pool: bool,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
     speculative_tokens: Option<usize>,
+}
+
+impl Cli {
+    fn kv_pool_override(&self) -> Option<bool> {
+        if self.kv_pool {
+            Some(true)
+        } else if self.no_kv_pool {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 struct Run {
@@ -310,6 +330,7 @@ fn run_bench() -> Result<()> {
                 draft_model: draft_model.clone(),
                 speculative_tokens: cli.speculative_tokens,
             }),
+        kv_pool: cli.kv_pool_override(),
     });
     backend.load(std::path::Path::new(&cli.model))?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;

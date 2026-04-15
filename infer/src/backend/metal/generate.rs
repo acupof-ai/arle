@@ -22,15 +22,19 @@ pub(super) struct MetalGenerateOutput {
     pub(super) total_time_ms: f64,
 }
 
-// TODO: dead code for current use cases — MetalKVPool is only activated via
-// the `AGENT_INFER_METAL_KV_POOL=1` env var and only wired into the Qwen3
-// fallback path. Qwen3.5 bypasses it entirely (see the warning at the call
-// site). Consider removing if the KV pool experiment is abandoned.
+// TODO: MetalKVPool is only wired into the Qwen3 fallback path. Qwen3.5
+// bypasses it entirely (see the warning at the call site). Keep the env-var
+// fallback for compatibility, but prefer explicit CLI/backend options.
 #[cfg(feature = "metal")]
-pub(super) fn metal_kv_pool_enabled() -> bool {
+fn metal_kv_pool_env_enabled() -> bool {
     std::env::var("AGENT_INFER_METAL_KV_POOL")
         .ok()
         .is_some_and(|value| metal_kv_pool_flag_is_truthy(&value))
+}
+
+#[cfg(feature = "metal")]
+pub(super) fn resolve_metal_kv_pool_enabled(explicit: Option<bool>) -> bool {
+    explicit.unwrap_or_else(metal_kv_pool_env_enabled)
 }
 
 #[cfg(feature = "metal")]
@@ -79,6 +83,7 @@ pub(super) fn metal_generate(
     weights: &StandardMetalWeights,
     config: &MetalModelConfig,
     params: &SamplingParams,
+    use_kv_pool: bool,
     max_new_tokens: usize,
     t0: Instant,
     on_token: &mut impl FnMut(u32) -> Result<()>,
@@ -127,12 +132,11 @@ pub(super) fn metal_generate(
     let eps = config.rms_norm_eps as f32;
     let rope_base = config.rope_theta as f32;
     let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
-    let use_kv_pool = metal_kv_pool_enabled();
     super::sampling::validate_metal_sampling_params(params)?;
 
     log::info!("Metal transformer path: Rust/MLX");
     if use_kv_pool {
-        log::info!("MetalKVPool enabled via AGENT_INFER_METAL_KV_POOL=1");
+        log::info!("MetalKVPool enabled for Qwen3 fallback path");
     }
 
     // P5: KV cache starts at the next 256-token boundary above the prefill length,
@@ -303,5 +307,11 @@ mod tests {
                 "{value:?} should be falsey"
             );
         }
+    }
+
+    #[test]
+    fn explicit_kv_pool_override_beats_env_default() {
+        assert!(resolve_metal_kv_pool_enabled(Some(true)));
+        assert!(!resolve_metal_kv_pool_enabled(Some(false)));
     }
 }
