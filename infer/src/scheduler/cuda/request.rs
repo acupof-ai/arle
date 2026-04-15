@@ -44,6 +44,15 @@ pub(crate) struct ActiveRequest {
     pub(crate) prefix_byte_len: usize,
     /// Latest token's log-probability (greedy only, set by scheduler decode step).
     pub(crate) latest_logprob: Option<f32>,
+    /// Block-aligned prefix length that was proven reusable at admission time.
+    /// This is derived from the global radix lookup, not a slot-local token
+    /// compare. Zero means the request should start cold.
+    pub(crate) reusable_prefix_len: usize,
+    /// Total prompt length currently materialized in the assigned slot's state
+    /// at admission time. Lets `step_new()` preserve the exact-hit /
+    /// prompt-prefix-of-cached / extendable-prefix distinctions without keeping
+    /// a parallel `cached_prompts: Vec<Vec<u32>>` token store.
+    pub(crate) reusable_cached_prompt_len: usize,
 }
 
 impl ActiveRequest {
@@ -249,6 +258,8 @@ mod tests {
             cacheable_prompt_len: 0,
             prefix_byte_len: 0,
             latest_logprob: None,
+            reusable_prefix_len: 0,
+            reusable_cached_prompt_len: 0,
         }
     }
 

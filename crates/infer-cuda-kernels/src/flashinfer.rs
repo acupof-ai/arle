@@ -37,12 +37,12 @@ pub struct FlashInferDecodeMetadata {
     prev_slot_epochs: Vec<u64>,
     /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
     qo_indptr_h: Vec<i32>,
-    /// Pool index of the most recently allocated token per request [max_batch_size].
-    /// Used for INT8 quantize-after-write in batched decode.
+    /// Physical page id of the last logical page per request [max_batch_size].
+    /// Used only by the page_size=1 quantize-after-write fast paths.
     pub last_token_indices: CudaSlice<i32>,
     /// Host scratch for building last_token_indices.
     last_token_scratch: Vec<i32>,
-    /// Total tokens across all requests from last update (sum of seq_lens).
+    /// Total pages across all requests from last update.
     total_tokens: usize,
     /// Batch size from last successful plan (for plan caching).
     plan_batch_size: usize,
@@ -369,14 +369,22 @@ impl FlashInferDecodeMetadata {
             .map(|&slot| pool.slot_epoch(slot))
             .collect();
         let next_indptr_h = pool.build_indptr(slot_indices);
+        let page_size = pool.page_size;
         let same_batch_identity =
             self.prev_slot_indices == slot_indices && self.prev_slot_epochs == slot_epochs;
-        let can_incremental_update = same_batch_identity
+        let can_incremental_update = page_size == 1
+            && same_batch_identity
             && can_append_decode_step(&self.indptr_h, &next_indptr_h)
             && self.indices_scratch.len() == self.total_tokens;
-        let reuse_plan = same_batch_identity
-            && self.plan_batch_size == slot_indices.len()
-            && can_reuse_decode_plan(&self.indptr_h, &next_indptr_h);
+        let reuse_plan = if page_size == 1 {
+            same_batch_identity
+                && self.plan_batch_size == slot_indices.len()
+                && can_reuse_decode_plan(&self.indptr_h, &next_indptr_h)
+        } else {
+            same_batch_identity
+                && self.plan_batch_size == slot_indices.len()
+                && self.indptr_h == next_indptr_h
+        };
         let last_page_lens_h = pool.build_last_page_lens(slot_indices);
 
         // Build positions (each request's current sequence position).
@@ -418,8 +426,8 @@ impl FlashInferDecodeMetadata {
             );
         } else {
             self.indices_scratch.clear();
-            self.indices_scratch.extend(flatten_token_indices(
-                slot_indices.iter().map(|&slot| pool.token_indices(slot)),
+            self.indices_scratch.extend(flatten_page_indices(
+                slot_indices.iter().map(|&slot| pool.page_indices(slot)),
             ));
         }
         if self.indices_scratch.len() > self.max_total_pages {
@@ -572,9 +580,9 @@ impl FlashInferDecodeMetadata {
     }
 }
 
-fn flatten_token_indices<'a>(token_groups: impl IntoIterator<Item = &'a [u32]>) -> Vec<i32> {
+fn flatten_page_indices<'a>(page_groups: impl IntoIterator<Item = &'a [u32]>) -> Vec<i32> {
     let mut flat = Vec::new();
-    for group in token_groups {
+    for group in page_groups {
         flat.extend(group.iter().map(|&idx| idx as i32));
     }
     flat
@@ -626,13 +634,13 @@ fn can_reuse_decode_plan(prev_indptr: &[i32], next_indptr: &[i32]) -> bool {
 mod tests {
     use super::{
         append_last_token_indices_in_place, can_append_decode_step, can_reuse_decode_plan,
-        flatten_token_indices,
+        flatten_page_indices,
     };
 
     #[test]
-    fn flatten_token_indices_preserves_per_slot_segments() {
+    fn flatten_page_indices_preserves_per_slot_segments() {
         let flat =
-            flatten_token_indices([&[10_u32, 11, 12][..], &[20_u32, 21, 22][..], &[30_u32][..]]);
+            flatten_page_indices([&[10_u32, 11, 12][..], &[20_u32, 21, 22][..], &[30_u32][..]]);
         assert_eq!(flat, vec![10, 11, 12, 20, 21, 22, 30]);
     }
 

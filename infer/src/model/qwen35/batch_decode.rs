@@ -738,7 +738,7 @@ impl Qwen35Model {
         let num_heads = c.num_attention_heads;
         let num_kv_heads = c.num_key_value_heads;
         let head_dim = c.head_dim;
-        let page_size = 1;
+        let page_size = kv_pool.page_size;
 
         // 1. Input RMSNorm (offset variant)
         ops::rms_norm_batch_offset_into(

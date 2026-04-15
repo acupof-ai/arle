@@ -16,183 +16,192 @@ impl<M: ModelForward> Scheduler<M> {
     /// Compute prefix cache for a new request and begin chunked prefill.
     pub(super) fn step_new(&mut self, idx: usize) {
         let default_chunk_size = self.prefill_chunk_size();
-        let req = &mut self.active[idx];
-        if req.delta_tx.is_closed() {
-            req.phase = Phase::Finished;
+        if self.active[idx].delta_tx.is_closed() {
+            self.active[idx].phase = Phase::Finished;
             return;
         }
 
-        let si = req.slot_idx;
-        let cached = &mut self.cached_prompts[si];
-        let state = &mut self.states[si];
-
-        let raw_prefix_len = cached
-            .iter()
-            .zip(req.prompt_tokens.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
+        let si = self.active[idx].slot_idx;
+        let req_id = self.active[idx].id;
+        let prompt_len = self.active[idx].prompt_tokens.len();
+        let raw_prefix_len = self.active[idx].reusable_prefix_len;
+        let cached_prompt_len = self.active[idx].reusable_cached_prompt_len;
 
         // Hybrid models (e.g. Qwen3.5) cannot truncate recurrent state to an
         // arbitrary prefix length. Downgrade partial hits to MISS; only full
         // hits benefit from snapshot/restore.
-        let prefix_len = if raw_prefix_len > 0
-            && raw_prefix_len < cached.len()
-            && !state.supports_partial_prefix()
-        {
-            0
-        } else {
-            raw_prefix_len
-        };
-        let exact_full_prefix_hit =
-            is_exact_full_prefix_hit(req.prompt_tokens.len(), cached.len(), prefix_len);
-        let prompt_prefix_of_cached_hit =
-            is_prompt_prefix_of_cached_hit(req.prompt_tokens.len(), cached.len(), prefix_len);
-        let mut pool_prefix_len = prefix_len;
+        let (effective, pool_prefix_len) = {
+            let req = &mut self.active[idx];
+            let state = &mut self.states[si];
 
-        let effective = if exact_full_prefix_hit {
-            if state.supports_partial_prefix() {
-                // An exact prompt match can safely keep the prefix up to N-1
-                // tokens and replay only the final prompt token. This refreshes
-                // the next-token logits without duplicating it in KV.
-                let replay_from = prefix_len.saturating_sub(1);
-                info!(
-                    "Request {}: prefix HIT {}/{} tokens (exact full match, replaying final token with {} reused)",
-                    req.id,
-                    prefix_len,
-                    req.prompt_tokens.len(),
-                    replay_from
-                );
-                if let Err(e) = state.truncate_to(replay_from) {
-                    error!(
-                        "Request {}: truncate on full prompt reuse hit failed: {}",
-                        req.id, e
-                    );
-                    req.phase = Phase::Finished;
-                    return;
-                }
-                cached.truncate(replay_from);
-                pool_prefix_len = replay_from;
-                req.prompt_tokens[replay_from..].to_vec()
+            let prefix_len = if raw_prefix_len > 0
+                && raw_prefix_len < cached_prompt_len
+                && !state.supports_partial_prefix()
+            {
+                0
             } else {
+                raw_prefix_len
+            };
+            let exact_full_prefix_hit =
+                is_exact_full_prefix_hit(prompt_len, cached_prompt_len, prefix_len);
+            let prompt_prefix_of_cached_hit =
+                is_prompt_prefix_of_cached_hit(prompt_len, cached_prompt_len, prefix_len);
+            let mut pool_prefix_len = prefix_len;
+
+            let effective = if exact_full_prefix_hit {
+                if state.supports_partial_prefix() {
+                    if let Err(e) = state.prefetch_kv_to_gpu() {
+                        error!("Request {}: prefix prefetch failed: {}", req.id, e);
+                        req.phase = Phase::Finished;
+                        return;
+                    }
+                    // An exact prompt match can safely keep the prefix up to N-1
+                    // tokens and replay only the final prompt token. This refreshes
+                    // the next-token logits without duplicating it in KV.
+                    let replay_from = prefix_len.saturating_sub(1);
+                    info!(
+                        "Request {}: prefix HIT {}/{} tokens (exact full match, replaying final token with {} reused)",
+                        req.id, prefix_len, prompt_len, replay_from
+                    );
+                    if let Err(e) = state.truncate_to(replay_from) {
+                        error!(
+                            "Request {}: truncate on full prompt reuse hit failed: {}",
+                            req.id, e
+                        );
+                        req.phase = Phase::Finished;
+                        return;
+                    }
+                    self.slot_materialized_prompt_lens[si] = replay_from;
+                    pool_prefix_len = replay_from;
+                    req.prompt_tokens[replay_from..].to_vec()
+                } else {
+                    info!(
+                        "Request {}: prefix HIT {}/{} tokens (exact full match, recomputing prompt to refresh logits)",
+                        req.id, prefix_len, prompt_len
+                    );
+                    if let Err(e) = state.reset() {
+                        error!("Request {}: reset failed: {}", req.id, e);
+                        req.phase = Phase::Finished;
+                        return;
+                    }
+                    self.slot_materialized_prompt_lens[si] = 0;
+                    pool_prefix_len = 0;
+                    req.prompt_tokens.clone()
+                }
+            } else if prompt_prefix_of_cached_hit {
                 info!(
-                    "Request {}: prefix HIT {}/{} tokens (exact full match, recomputing prompt to refresh logits)",
-                    req.id,
-                    prefix_len,
-                    req.prompt_tokens.len()
+                    "Request {}: prefix HIT {}/{} tokens (cached prompt had extra suffix, recomputing prompt for correctness)",
+                    req.id, prefix_len, prompt_len
                 );
                 if let Err(e) = state.reset() {
                     error!("Request {}: reset failed: {}", req.id, e);
                     req.phase = Phase::Finished;
                     return;
                 }
-                cached.clear();
+                self.slot_materialized_prompt_lens[si] = 0;
                 pool_prefix_len = 0;
                 req.prompt_tokens.clone()
-            }
-        } else if prompt_prefix_of_cached_hit {
-            info!(
-                "Request {}: prefix HIT {}/{} tokens (cached prompt had extra suffix, recomputing prompt for correctness)",
-                req.id,
-                prefix_len,
-                req.prompt_tokens.len()
-            );
-            if let Err(e) = state.reset() {
-                error!("Request {}: reset failed: {}", req.id, e);
-                req.phase = Phase::Finished;
-                return;
-            }
-            cached.clear();
-            pool_prefix_len = 0;
-            req.prompt_tokens.clone()
-        } else if prefix_len > 0 && prefix_len == cached.len() {
-            // Truncate contiguous KV cache to prefix length — removes stale
-            // decode tokens from the previous request. Without this, migration
-            // to paged pool reads invalid memory (CUDA_ERROR_ILLEGAL_ADDRESS).
-            if let Err(e) = state.truncate_to(prefix_len) {
-                error!("Request {}: truncate on prefix hit failed: {}", req.id, e);
-                if let Err(e2) = state.reset() {
-                    error!("Request {}: reset failed: {}", req.id, e2);
+            } else if prefix_len > 0 && prefix_len == cached_prompt_len {
+                if let Err(e) = state.prefetch_kv_to_gpu() {
+                    error!("Request {}: prefix prefetch failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                    return;
                 }
-                cached.clear();
-                req.phase = Phase::Prefilling {
-                    effective_tokens: req.prompt_tokens.clone(),
-                    progress: 0,
-                };
-                return;
-            }
-
-            // Full prefix hit — restore recurrent state snapshot to undo
-            // decode-token contamination from the previous request.
-            match state.restore_prefix_snapshot() {
-                Ok(true) => info!(
-                    "Request {}: prefix HIT {}/{} tokens (recurrent state restored)",
-                    req.id,
-                    prefix_len,
-                    req.prompt_tokens.len()
-                ),
-                Ok(false) => info!(
-                    "Request {}: prefix HIT {}/{} tokens",
-                    req.id,
-                    prefix_len,
-                    req.prompt_tokens.len()
-                ),
-                Err(e) => {
-                    warn!(
-                        "Request {}: prefix hit but snapshot restore failed ({}), falling back to MISS",
-                        req.id, e
-                    );
+                // Truncate contiguous KV cache to prefix length — removes stale
+                // decode tokens from the previous request. Without this, migration
+                // to paged pool reads invalid memory (CUDA_ERROR_ILLEGAL_ADDRESS).
+                if let Err(e) = state.truncate_to(prefix_len) {
+                    error!("Request {}: truncate on prefix hit failed: {}", req.id, e);
                     if let Err(e2) = state.reset() {
                         error!("Request {}: reset failed: {}", req.id, e2);
-                        req.phase = Phase::Finished;
-                        return;
                     }
-                    cached.clear();
+                    self.slot_materialized_prompt_lens[si] = 0;
                     req.phase = Phase::Prefilling {
                         effective_tokens: req.prompt_tokens.clone(),
                         progress: 0,
                     };
                     return;
                 }
-            }
-            req.prompt_tokens[prefix_len..].to_vec()
-        } else if prefix_len > 0 {
-            info!(
-                "Request {}: prefix PARTIAL {}/{} tokens",
-                req.id,
-                prefix_len,
-                req.prompt_tokens.len()
-            );
-            if let Err(e) = state.truncate_to(prefix_len) {
-                error!("Request {}: truncate failed: {}", req.id, e);
-                req.phase = Phase::Finished;
-                return;
-            }
-            cached.truncate(prefix_len);
-            req.prompt_tokens[prefix_len..].to_vec()
-        } else {
-            info!("Request {}: prefix MISS", req.id);
-            if let Err(e) = state.reset() {
-                error!("Request {}: reset failed: {}", req.id, e);
-                req.phase = Phase::Finished;
-                return;
-            }
-            cached.clear();
-            req.prompt_tokens.clone()
+
+                // Full prefix hit — restore recurrent state snapshot to undo
+                // decode-token contamination from the previous request.
+                match state.restore_prefix_snapshot() {
+                    Ok(true) => info!(
+                        "Request {}: prefix HIT {}/{} tokens (recurrent state restored)",
+                        req.id, prefix_len, prompt_len
+                    ),
+                    Ok(false) => info!(
+                        "Request {}: prefix HIT {}/{} tokens",
+                        req.id, prefix_len, prompt_len
+                    ),
+                    Err(e) => {
+                        warn!(
+                            "Request {}: prefix hit but snapshot restore failed ({}), falling back to MISS",
+                            req.id, e
+                        );
+                        if let Err(e2) = state.reset() {
+                            error!("Request {}: reset failed: {}", req.id, e2);
+                            req.phase = Phase::Finished;
+                            return;
+                        }
+                        self.slot_materialized_prompt_lens[si] = 0;
+                        req.phase = Phase::Prefilling {
+                            effective_tokens: req.prompt_tokens.clone(),
+                            progress: 0,
+                        };
+                        return;
+                    }
+                }
+                self.slot_materialized_prompt_lens[si] = prefix_len;
+                req.prompt_tokens[prefix_len..].to_vec()
+            } else if prefix_len > 0 {
+                if let Err(e) = state.prefetch_kv_to_gpu() {
+                    error!("Request {}: prefix prefetch failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                    return;
+                }
+                info!(
+                    "Request {}: prefix PARTIAL {}/{} tokens",
+                    req.id, prefix_len, prompt_len
+                );
+                if let Err(e) = state.truncate_to(prefix_len) {
+                    error!("Request {}: truncate failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                    return;
+                }
+                self.slot_materialized_prompt_lens[si] = prefix_len;
+                req.prompt_tokens[prefix_len..].to_vec()
+            } else {
+                info!("Request {}: prefix MISS", req.id);
+                if let Err(e) = state.reset() {
+                    error!("Request {}: reset failed: {}", req.id, e);
+                    req.phase = Phase::Finished;
+                    return;
+                }
+                self.slot_materialized_prompt_lens[si] = 0;
+                req.prompt_tokens.clone()
+            };
+
+            (effective, pool_prefix_len)
         };
 
         if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
-            match self.paged_kv_pool.alloc_tokens(si, pool_prefix_len) {
+            match self.alloc_pool_tokens_with_retry(si, pool_prefix_len) {
                 Err(e) => {
-                    error!("Request {}: pool alloc for prefix failed: {}", req.id, e);
+                    error!("Request {}: pool alloc for prefix failed: {}", req_id, e);
                 }
-                Ok(new_indices) => {
+                Ok(_new_pages) => {
                     let ctx = self.model.device_context();
-                    if let Err(e) =
-                        state.migrate_kv_range_to_paged(ctx, &self.paged_kv_pool, 0, &new_indices)
-                    {
+                    if let Err(e) = self.states[si].migrate_kv_range_to_paged(
+                        ctx,
+                        &self.paged_kv_pool,
+                        si,
+                        0,
+                        pool_prefix_len,
+                    ) {
                         error!(
                             "Request {}: prefix KV migration to pool failed: {}",
-                            req.id, e
+                            req_id, e
                         );
                     }
                 }
@@ -201,12 +210,12 @@ impl<M: ModelForward> Scheduler<M> {
 
         info!(
             "Request {}: chunked prefill starting ({} effective tokens, chunk_size={})",
-            req.id,
+            req_id,
             effective.len(),
             default_chunk_size
         );
 
-        req.phase = Phase::Prefilling {
+        self.active[idx].phase = Phase::Prefilling {
             effective_tokens: effective,
             progress: 0,
         };
@@ -216,24 +225,13 @@ impl<M: ModelForward> Scheduler<M> {
     /// first token and transition to Decoding.
     pub(super) fn step_prefill_chunk(&mut self, idx: usize) {
         let chunk_size = self.prefill_chunk_size();
-
-        let Self {
-            model,
-            tokenizer,
-            states,
-            active,
-            rng,
-            paged_kv_pool,
-            ..
-        } = self;
-
-        let req = &mut active[idx];
-        if req.delta_tx.is_closed() {
-            req.phase = Phase::Finished;
+        if self.active[idx].delta_tx.is_closed() {
+            self.active[idx].phase = Phase::Finished;
             return;
         }
 
-        let (effective_tokens, progress) = match &mut req.phase {
+        let slot_idx = self.active[idx].slot_idx;
+        let (effective_tokens, progress) = match &mut self.active[idx].phase {
             Phase::Prefilling {
                 effective_tokens,
                 progress,
@@ -245,13 +243,14 @@ impl<M: ModelForward> Scheduler<M> {
         let chunk_end = (*progress + chunk_size).min(total);
         let chunk = &effective_tokens[*progress..chunk_end];
 
-        let slot_idx = req.slot_idx;
-        let state = &mut states[slot_idx];
-        let forward_result = model.forward_prefill(chunk, state);
+        let forward_result = self
+            .model
+            .forward_prefill(chunk, &mut self.states[slot_idx]);
 
         if let Err(e) = forward_result {
-            error!("Request {}: prefill chunk failed: {}", req.id, e);
-            req.phase = Phase::Finished;
+            let req_id = self.active[idx].id;
+            error!("Request {}: prefill chunk failed: {}", req_id, e);
+            self.active[idx].phase = Phase::Finished;
             return;
         }
 
@@ -260,26 +259,33 @@ impl<M: ModelForward> Scheduler<M> {
             *progress = new_progress;
             info!(
                 "Request {}: prefill chunk {}/{} tokens",
-                req.id, new_progress, total
+                self.active[idx].id, new_progress, total
             );
             return;
         }
 
-        if paged_kv_pool.is_active() {
-            let pool_start = paged_kv_pool.seq_len(slot_idx);
-            match paged_kv_pool.alloc_tokens(slot_idx, total) {
+        if self.paged_kv_pool.is_active() {
+            let pool_start = self.paged_kv_pool.seq_len(slot_idx);
+            match self.alloc_pool_tokens_with_retry(slot_idx, total) {
                 Err(e) => {
-                    error!("Request {}: pool alloc for migration failed: {}", req.id, e);
+                    error!(
+                        "Request {}: pool alloc for migration failed: {}",
+                        self.active[idx].id, e
+                    );
                 }
-                Ok(new_indices) => {
-                    let ctx = model.device_context();
-                    if let Err(e) = state.migrate_kv_range_to_paged(
+                Ok(_new_pages) => {
+                    let ctx = self.model.device_context();
+                    if let Err(e) = self.states[slot_idx].migrate_kv_range_to_paged(
                         ctx,
-                        paged_kv_pool,
+                        &self.paged_kv_pool,
+                        slot_idx,
                         pool_start,
-                        &new_indices,
+                        total,
                     ) {
-                        error!("Request {}: KV migration to pool failed: {}", req.id, e);
+                        error!(
+                            "Request {}: KV migration to pool failed: {}",
+                            self.active[idx].id, e
+                        );
                     }
                 }
             }
@@ -288,36 +294,43 @@ impl<M: ModelForward> Scheduler<M> {
         // Snapshot auxiliary state (recurrent/SSM) after prefill completes.
         // On the next full prefix hit for this slot, restore_prefix_snapshot()
         // reverts to this clean state, avoiding decode-token contamination.
-        if let Err(e) = state.save_prefix_snapshot() {
+        if let Err(e) = self.states[slot_idx].save_prefix_snapshot() {
             warn!(
                 "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
-                req.id, e
+                self.active[idx].id, e
             );
         } else {
-            req.mark_prompt_cacheable();
+            self.active[idx].mark_prompt_cacheable();
         }
 
-        match model.select_token(state, &req.sampling, rng) {
+        let sampling = self.active[idx].sampling.clone();
+        match self
+            .model
+            .select_token(&mut self.states[slot_idx], &sampling, &mut self.rng)
+        {
             Ok(token) => {
-                if !req.sampling.ignore_eos && model.is_stop_token(token) {
-                    req.finish(FinishReason::Stop, tokenizer);
+                if !self.active[idx].sampling.ignore_eos && self.model.is_stop_token(token) {
+                    self.active[idx].finish(FinishReason::Stop, &self.tokenizer);
                     return;
                 }
-                req.generated_tokens.push(token);
-                req.emit_delta(tokenizer);
+                self.active[idx].generated_tokens.push(token);
+                self.active[idx].emit_delta(&self.tokenizer);
 
-                if matches!(req.phase, Phase::Finished) {
+                if matches!(self.active[idx].phase, Phase::Finished) {
                     return;
                 }
-                if req.generated_tokens.len() >= req.max_tokens {
-                    req.finish(FinishReason::Length, tokenizer);
+                if self.active[idx].generated_tokens.len() >= self.active[idx].max_tokens {
+                    self.active[idx].finish(FinishReason::Length, &self.tokenizer);
                 } else {
-                    req.phase = Phase::Decoding;
+                    self.active[idx].phase = Phase::Decoding;
                 }
             }
             Err(e) => {
-                error!("Request {}: select_token failed: {}", req.id, e);
-                req.phase = Phase::Finished;
+                error!(
+                    "Request {}: select_token failed: {}",
+                    self.active[idx].id, e
+                );
+                self.active[idx].phase = Phase::Finished;
             }
         }
     }

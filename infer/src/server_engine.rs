@@ -9,7 +9,7 @@ use anyhow::Result;
 #[cfg(feature = "cuda")]
 use fastrace::local::LocalSpan;
 #[cfg(feature = "cuda")]
-use log::{debug, info};
+use log::{debug, info, warn};
 #[cfg(feature = "cuda")]
 use rand::SeedableRng;
 #[cfg(feature = "cuda")]
@@ -50,6 +50,55 @@ fn truncate_at_first_stop(text: &str, stops: &[String]) -> Option<String> {
         }
     }
     earliest.map(|pos| text[..pos].to_string())
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrefixReuseAction {
+    Miss,
+    FullRecompute,
+    ReplayFinalToken { replay_from: usize },
+    ReuseFullCachedPrefix { prefix_len: usize },
+    PartialReuse { prefix_len: usize },
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn choose_prefix_reuse_action(
+    prompt_len: usize,
+    cached_len: usize,
+    prefix_len: usize,
+    supports_partial_prefix: bool,
+) -> PrefixReuseAction {
+    if prefix_len == 0 {
+        return PrefixReuseAction::Miss;
+    }
+
+    let exact_full_match = prefix_len == prompt_len && prefix_len == cached_len;
+    if exact_full_match {
+        return if supports_partial_prefix {
+            PrefixReuseAction::ReplayFinalToken {
+                replay_from: prefix_len.saturating_sub(1),
+            }
+        } else {
+            PrefixReuseAction::FullRecompute
+        };
+    }
+
+    let prompt_is_strict_prefix_of_cached = prefix_len == prompt_len;
+    if prompt_is_strict_prefix_of_cached {
+        return PrefixReuseAction::FullRecompute;
+    }
+
+    let prompt_extends_cached_exactly = prefix_len == cached_len;
+    if prompt_extends_cached_exactly {
+        return PrefixReuseAction::ReuseFullCachedPrefix { prefix_len };
+    }
+
+    if supports_partial_prefix {
+        PrefixReuseAction::PartialReuse { prefix_len }
+    } else {
+        PrefixReuseAction::FullRecompute
+    }
 }
 
 /// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
@@ -220,6 +269,12 @@ fn generate<M: ModelForward>(
 
     let ttft_start = Instant::now();
     model.forward_prefill(prompt_tokens, state)?;
+    if let Err(e) = state.save_prefix_snapshot() {
+        warn!(
+            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
+            e
+        );
+    }
     let next_token = model.select_token(state, params, rng)?;
     let ttft = ttft_start.elapsed();
 
@@ -291,6 +346,12 @@ fn generate_tokens_with_logprobs_inner<M: ModelForward>(
     let mut logprobs = Vec::new();
 
     model.forward_prefill(prompt_tokens, state)?;
+    if let Err(e) = state.save_prefix_snapshot() {
+        warn!(
+            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
+            e
+        );
+    }
     let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
     if let Some(lp) = lp {
         logprobs.push(lp);
@@ -339,6 +400,12 @@ fn generate_streaming_with_callback<M: ModelForward>(
 
     let ttft_start = Instant::now();
     model.forward_prefill(prompt_tokens, state)?;
+    if let Err(e) = state.save_prefix_snapshot() {
+        warn!(
+            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
+            e
+        );
+    }
     let next_token = model.select_token(state, params, rng)?;
     let ttft = ttft_start.elapsed();
     debug!(
@@ -473,22 +540,44 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
     /// - **KV offload prefetch**: If KV data was offloaded to CPU, automatically
     ///   prefetch it back to GPU before the prefill starts.
     fn prepare_with_prefix_cache(&mut self, prompt_tokens: &[u32]) -> Result<(Vec<u32>, usize)> {
+        let cached_len = self.cached_prompt.len();
         let prefix_len = self
             .cached_prompt
             .iter()
             .zip(prompt_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
-
-        if prefix_len > 0
-            && prefix_len == prompt_tokens.len()
-            && prefix_len == self.cached_prompt.len()
-        {
-            if self.state.supports_partial_prefix() {
+        match choose_prefix_reuse_action(
+            prompt_tokens.len(),
+            cached_len,
+            prefix_len,
+            self.state.supports_partial_prefix(),
+        ) {
+            PrefixReuseAction::Miss => {
+                info!("KV prefix cache MISS: resetting");
+                self.state.reset()?;
+                self.cached_prompt.clear();
+                Ok((prompt_tokens.to_vec(), 0))
+            }
+            PrefixReuseAction::FullRecompute => {
+                let reason = if prefix_len > 0 && prefix_len == prompt_tokens.len() {
+                    "cached prompt has extra suffix"
+                } else {
+                    "non-truncatable state"
+                };
+                info!(
+                    "KV prefix cache FULL/PARTIAL HIT: {} , falling back to full prefill",
+                    reason
+                );
+                self.state.reset()?;
+                self.cached_prompt.clear();
+                Ok((prompt_tokens.to_vec(), 0))
+            }
+            PrefixReuseAction::ReplayFinalToken { replay_from } => {
                 // Exact prompt match: rewind to N-1 tokens and replay only the
                 // final prompt token so logits reflect the current prompt
                 // without duplicating it in KV.
-                let replay_from = prefix_len.saturating_sub(1);
+                self.state.prefetch_kv_to_gpu()?;
                 info!(
                     "KV prefix cache FULL HIT: exact match, replaying final token with {}/{} tokens reused",
                     replay_from,
@@ -497,54 +586,68 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                 self.state.truncate_to(replay_from)?;
                 self.cached_prompt.truncate(replay_from);
                 Ok((prompt_tokens[replay_from..].to_vec(), replay_from))
-            } else {
-                // Hybrid/recurrent models cannot safely rewind to N-1 tokens from a
-                // post-prefill snapshot, so prefer correctness over reuse here.
-                info!(
-                    "KV prefix cache FULL HIT: non-truncatable state, falling back to full prefill"
-                );
-                self.state.reset()?;
-                self.cached_prompt.clear();
-                Ok((prompt_tokens.to_vec(), 0))
             }
-        } else if prefix_len > 0 && prefix_len == prompt_tokens.len() {
-            // The new prompt is a strict prefix of a longer cached prompt.
-            // Replaying just the final token here can leave the state/KV in a
-            // configuration that diverges from a clean prefill, so recompute.
-            info!(
-                "KV prefix cache FULL HIT: cached prompt has extra suffix, recomputing prompt for correctness"
-            );
-            self.state.reset()?;
-            self.cached_prompt.clear();
-            Ok((prompt_tokens.to_vec(), 0))
-        } else if prefix_len > 0 && prefix_len == self.cached_prompt.len() {
-            let suffix = prompt_tokens[prefix_len..].to_vec();
-            info!(
-                "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
-                prefix_len,
-                prompt_tokens.len(),
-                prefix_len as f64 / prompt_tokens.len() as f64 * 100.0
-            );
-            Ok((suffix, prefix_len))
-        } else if prefix_len > 0 {
-            // Partial prefix hit — truncate KV to common prefix and reuse it.
-            // This avoids re-computing the shared prefix entirely.
-            info!(
-                "KV prefix cache PARTIAL: reusing {}/{} common tokens, truncating {} stale tokens",
-                prefix_len,
-                prompt_tokens.len(),
-                self.cached_prompt.len() - prefix_len,
-            );
-            self.state.truncate_to(prefix_len)?;
-            self.cached_prompt.truncate(prefix_len);
-            let suffix = prompt_tokens[prefix_len..].to_vec();
-            Ok((suffix, prefix_len))
-        } else {
-            // No prefix match — full reset.
-            info!("KV prefix cache MISS: resetting");
-            self.state.reset()?;
-            self.cached_prompt.clear();
-            Ok((prompt_tokens.to_vec(), 0))
+            PrefixReuseAction::ReuseFullCachedPrefix { prefix_len } => {
+                self.state.prefetch_kv_to_gpu()?;
+                if self.state.supports_partial_prefix() {
+                    self.state.truncate_to(prefix_len)?;
+                }
+                match self.state.restore_prefix_snapshot() {
+                    Ok(true) => {
+                        info!(
+                            "KV prefix cache HIT: restored clean prompt snapshot for {}/{} reused tokens",
+                            prefix_len,
+                            prompt_tokens.len()
+                        );
+                    }
+                    Ok(false) if self.state.supports_partial_prefix() => {
+                        info!(
+                            "KV prefix cache HIT: reusing {}/{} tokens (saving {:.1}% prefill)",
+                            prefix_len,
+                            prompt_tokens.len(),
+                            prefix_len as f64 / prompt_tokens.len() as f64 * 100.0
+                        );
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "KV prefix cache HIT: snapshot missing for non-truncatable state, falling back to full prefill"
+                        );
+                        self.state.reset()?;
+                        self.cached_prompt.clear();
+                        return Ok((prompt_tokens.to_vec(), 0));
+                    }
+                    Err(e) if self.state.supports_partial_prefix() => {
+                        warn!(
+                            "KV prefix cache HIT: snapshot restore failed ({}), continuing with truncation-only reuse",
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "KV prefix cache HIT: snapshot restore failed for non-truncatable state ({}), falling back to full prefill",
+                            e
+                        );
+                        self.state.reset()?;
+                        self.cached_prompt.clear();
+                        return Ok((prompt_tokens.to_vec(), 0));
+                    }
+                }
+                Ok((prompt_tokens[prefix_len..].to_vec(), prefix_len))
+            }
+            PrefixReuseAction::PartialReuse { prefix_len } => {
+                // Partial prefix hit — truncate KV to common prefix and reuse it.
+                // This avoids re-computing the shared prefix entirely.
+                self.state.prefetch_kv_to_gpu()?;
+                info!(
+                    "KV prefix cache PARTIAL: reusing {}/{} common tokens, truncating {} stale tokens",
+                    prefix_len,
+                    prompt_tokens.len(),
+                    self.cached_prompt.len() - prefix_len,
+                );
+                self.state.truncate_to(prefix_len)?;
+                self.cached_prompt.truncate(prefix_len);
+                Ok((prompt_tokens[prefix_len..].to_vec(), prefix_len))
+            }
         }
     }
 }
@@ -1095,6 +1198,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::truncate_at_stop;
     use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
+    #[cfg(any(feature = "cuda", test))]
+    use super::{PrefixReuseAction, choose_prefix_reuse_action};
 
     #[test]
     fn test_truncate_at_first_stop() {
@@ -1153,5 +1258,37 @@ mod tests {
         assert_eq!(parse_finish_reason("length"), FinishReason::Length);
         assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
         assert_eq!(parse_finish_reason("tool_calls"), FinishReason::Stop);
+    }
+
+    #[test]
+    fn choose_prefix_reuse_action_covers_scheduler_aligned_cases() {
+        assert_eq!(
+            choose_prefix_reuse_action(4, 4, 4, true),
+            PrefixReuseAction::ReplayFinalToken { replay_from: 3 }
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(4, 4, 4, false),
+            PrefixReuseAction::FullRecompute
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(6, 4, 4, true),
+            PrefixReuseAction::ReuseFullCachedPrefix { prefix_len: 4 }
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(6, 5, 3, true),
+            PrefixReuseAction::PartialReuse { prefix_len: 3 }
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(6, 5, 3, false),
+            PrefixReuseAction::FullRecompute
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(3, 5, 3, true),
+            PrefixReuseAction::FullRecompute
+        );
+        assert_eq!(
+            choose_prefix_reuse_action(5, 5, 0, true),
+            PrefixReuseAction::Miss
+        );
     }
 }

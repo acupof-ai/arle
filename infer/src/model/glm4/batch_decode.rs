@@ -335,7 +335,7 @@ impl GLM4Model {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads();
         let head_dim = self.config.head_dim();
-        let page_size = 1;
+        let page_size = kv_pool.page_size;
 
         // 1. Batched RMSNorm
         ops::rms_norm_batch_into(

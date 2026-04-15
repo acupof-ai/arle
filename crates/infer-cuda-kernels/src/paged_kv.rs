@@ -1,15 +1,14 @@
-//! Token-level KV Cache Pool — FlashInfer-compatible token-granularity KV storage.
+//! Paged KV cache pool — FlashInfer-compatible KV storage with runtime
+//! `page_size`.
 //!
-//! Instead of fixed-size pages of N tokens, every token gets its own slot index
-//! in a pre-allocated pool (like SGLang's `TokenToKVPool`). This simplifies
-//! bookkeeping: no page tables, no last_page_len calculations, no partial pages.
+//! The pool keeps **token-level sequence accounting** (`seq_len(slot)` is always
+//! in logical tokens) while allocating and retaining storage in **physical
+//! pages**. This matches FlashInfer's HND paged layout:
+//!   `[max_pages, num_kv_heads, page_size, head_dim]`.
 //!
-//! For FlashInfer compatibility we use `page_size = 1`, so each "page" is one
-//! token. The pool buffers use NHD layout:
-//!   `[max_total_tokens, num_kv_heads * head_dim]` row-major bf16 per layer.
-//!
-//! Token at pool index `idx`, head `h`, dim `d`:
-//!   offset = `idx * kv_dim + h * head_dim + d`
+//! For quantized formats we intentionally keep `page_size = 1` in M0.3 because
+//! the existing INT8 / FP8 / TurboQuant scatter paths are still token-level.
+//! BF16 lifts to `page_size = 16`.
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr};
@@ -22,7 +21,7 @@ use crate::kv_turboquant::turboquant_quantize_paged_single;
 use crate::kv_types::{KVCacheDtype, KVFormat};
 use crate::turboquant_state::TurboQuantLayerState;
 
-/// Token-level KV cache pool — shared across all request slots.
+/// Paged KV cache pool — shared across all request slots.
 ///
 /// Storage is format-aware via `KVFormat`:
 /// - `BF16`: `k_data`/`v_data` are `CudaSlice<u8>` holding bf16 (2 bytes/elem)
@@ -33,7 +32,10 @@ use crate::turboquant_state::TurboQuantLayerState;
 /// target for `decode_prep_paged`, which outputs bf16. After the prep kernel,
 /// new tokens are quantized from the working buffer into the pool.
 pub struct TokenKVPool {
-    /// K data per layer: raw bytes, layout `[max_total_tokens, kv_dim]` × bytes_per_elem
+    /// K data per layer. Backing bytes are sized for
+    /// `[max_total_pages, num_kv_heads, page_size, head_dim]`, which is bytewise
+    /// identical to `[max_total_tokens, kv_dim]` because
+    /// `max_total_tokens = max_total_pages * page_size`.
     k_data: Vec<CudaSlice<u8>>,
     /// V data per layer: same layout
     v_data: Vec<CudaSlice<u8>>,
@@ -55,12 +57,14 @@ pub struct TokenKVPool {
     pub tq_k_state: Option<TurboQuantLayerState>,
     pub tq_v_state: Option<TurboQuantLayerState>,
 
-    /// Free token slot indices (stack-based allocator, LIFO).
-    free_slots: Vec<u32>,
+    /// Free physical pages (stack-based allocator, LIFO).
+    free_pages: Vec<u32>,
 
-    /// Per-request token mappings: `token_indices[slot][i]` = physical pool index
-    /// for logical position `i` of the request occupying that slot.
-    token_indices: Vec<Vec<u32>>,
+    /// Per-request page tables: `page_indices[slot][i]` = physical page id for
+    /// logical page `i` of the request occupying that slot.
+    page_indices: Vec<Vec<u32>>,
+    /// Per-request logical token lengths.
+    seq_lens: Vec<usize>,
     /// Monotonic slot epoch bumped whenever a slot is released.
     /// Lets decode metadata distinguish "same slot index, different request".
     slot_epochs: Vec<u64>,
@@ -78,7 +82,7 @@ pub struct TokenKVPool {
     /// limbo pages back onto the free list when their refcount hits
     /// zero. [`retain_pages`] is the corresponding bump.
     ///
-    /// The vector is sized to `max_total_tokens`, so indexing by a
+    /// The vector is sized to `max_total_pages`, so indexing by a
     /// physical page id is always in-bounds.
     page_ref_count: Vec<u32>,
 
@@ -90,6 +94,8 @@ pub struct TokenKVPool {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub max_total_tokens: usize,
+    pub max_total_pages: usize,
+    pub page_size: usize,
     pub num_slots: usize,
     /// `num_kv_heads * head_dim` — stride for one token row in the pool buffer.
     pub kv_dim: usize,
@@ -204,6 +210,7 @@ impl TokenKVPool {
     ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
         let bpe = format.bytes_per_element();
+        let page_size = format.default_page_size();
         let budget = compute_budget_breakdown(
             num_layers,
             num_kv_heads,
@@ -212,12 +219,15 @@ impl TokenKVPool {
             budget_bytes,
             format,
         );
-        let max_total_tokens = budget.max_total_tokens;
+        let max_total_pages = budget.max_total_tokens.div_ceil(page_size).max(num_slots);
+        let max_total_tokens = max_total_pages * page_size;
 
         info!(
-            "TokenKVPool: {} max tokens, {:.1} GB for {} layers \
+            "TokenKVPool: {} max tokens ({} pages @ page_size={}), {:.1} GB for {} layers \
              ({} kv_heads x {} head_dim, kv_dim={}, format={:?})",
             max_total_tokens,
+            max_total_pages,
+            page_size,
             (max_total_tokens as u64 * budget.total_bytes_per_token as u64) as f64 / 1e9,
             num_layers,
             num_kv_heads,
@@ -312,10 +322,11 @@ impl TokenKVPool {
             );
         }
 
-        let free_slots: Vec<u32> = (0..max_total_tokens as u32).rev().collect();
-        let token_indices = vec![Vec::new(); num_slots];
+        let free_pages: Vec<u32> = (0..max_total_pages as u32).rev().collect();
+        let page_indices = vec![Vec::new(); num_slots];
+        let seq_lens = vec![0; num_slots];
         let slot_epochs = vec![0; num_slots];
-        let page_ref_count = vec![0_u32; max_total_tokens];
+        let page_ref_count = vec![0_u32; max_total_pages];
 
         // Quantized split-KV attention workspace.
         // FP8 reuses the same two-phase reduction scratch layout as INT8.
@@ -368,8 +379,9 @@ impl TokenKVPool {
             v_norms,
             tq_k_state,
             tq_v_state,
-            free_slots,
-            token_indices,
+            free_pages,
+            page_indices,
+            seq_lens,
             slot_epochs,
             page_ref_count,
             format,
@@ -378,35 +390,52 @@ impl TokenKVPool {
             num_kv_heads,
             head_dim,
             max_total_tokens,
+            max_total_pages,
+            page_size,
             num_slots,
             kv_dim,
         })
     }
 
-    /// Allocate `count` token slots for the request in `slot`.
+    /// Allocate `count` logical tokens for the request in `slot`.
     ///
-    /// Returns the newly allocated physical pool indices. These are appended to
-    /// the slot's token_indices list.
+    /// Returns the newly allocated physical page ids. Existing callers mostly
+    /// ignore the return value; the canonical slot state lives inside
+    /// `page_indices[slot]` + `seq_lens[slot]`.
     pub fn alloc_tokens(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
-        if count > self.free_slots.len() {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let used_in_last_page = self.seq_lens[slot] % self.page_size;
+        let available_in_last_page = if used_in_last_page == 0 {
+            0
+        } else {
+            self.page_size - used_in_last_page
+        };
+        let remaining_after_fill = count.saturating_sub(available_in_last_page);
+        let new_page_count = remaining_after_fill.div_ceil(self.page_size);
+
+        if new_page_count > self.free_pages.len() {
             return Err(anyhow!(
-                "TokenKVPool: out of token slots (requested {}, available {})",
+                "TokenKVPool: out of pages (requested {} tokens / {} new pages, available {} pages)",
                 count,
-                self.free_slots.len()
+                new_page_count,
+                self.free_pages.len()
             ));
         }
 
-        let mut new_indices = Vec::with_capacity(count);
-        for _ in 0..count {
-            // SAFETY: we checked len >= count above.
+        let mut new_pages = Vec::with_capacity(new_page_count);
+        for _ in 0..new_page_count {
             let idx = self
-                .free_slots
+                .free_pages
                 .pop()
-                .expect("invariant: free_slots.len() >= count checked above");
-            new_indices.push(idx);
+                .expect("invariant: free_pages.len() >= new_page_count checked above");
+            new_pages.push(idx);
         }
-        self.token_indices[slot].extend_from_slice(&new_indices);
-        Ok(new_indices)
+        self.page_indices[slot].extend_from_slice(&new_pages);
+        self.seq_lens[slot] += count;
+        Ok(new_pages)
     }
 
     /// Free all token slots for a request.
@@ -428,19 +457,20 @@ impl TokenKVPool {
     /// so decode metadata invalidation logic stays correct even when
     /// pages are retained in limbo.
     pub fn free_slot(&mut self, slot: usize) {
-        if !self.token_indices[slot].is_empty() {
+        if !self.page_indices[slot].is_empty() {
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
         }
-        for &idx in &self.token_indices[slot] {
+        for &idx in &self.page_indices[slot] {
             let usize_idx = idx as usize;
             if self.page_ref_count[usize_idx] == 0 {
-                self.free_slots.push(idx);
+                self.free_pages.push(idx);
             }
             // else: page is pinned by an external reference (today: the
             // radix cache). Leave it out of the free list; it will
             // rejoin when `release_pages` drives the refcount to zero.
         }
-        self.token_indices[slot].clear();
+        self.page_indices[slot].clear();
+        self.seq_lens[slot] = 0;
     }
 
     /// Bump the external reference count on each of the given pages by one.
@@ -490,7 +520,7 @@ impl TokenKVPool {
             let next = cur.saturating_sub(1);
             self.page_ref_count[usize_idx] = next;
             if next == 0 {
-                self.free_slots.push(idx);
+                self.free_pages.push(idx);
                 newly_freed.push(idx);
             }
         }
@@ -506,14 +536,14 @@ impl TokenKVPool {
         self.page_ref_count.iter().filter(|&&rc| rc > 0).count()
     }
 
-    /// Get token indices for a request (physical pool indices, in logical order).
-    pub fn token_indices(&self, slot: usize) -> &[u32] {
-        &self.token_indices[slot]
+    /// Get the page table for a request (physical page ids in logical-page order).
+    pub fn page_indices(&self, slot: usize) -> &[u32] {
+        &self.page_indices[slot]
     }
 
     /// Get the sequence length for a request (number of tokens allocated).
     pub fn seq_len(&self, slot: usize) -> usize {
-        self.token_indices[slot].len()
+        self.seq_lens[slot]
     }
 
     /// Monotonic identifier for the current logical occupant of `slot`.
@@ -521,9 +551,69 @@ impl TokenKVPool {
         self.slot_epochs[slot]
     }
 
-    /// Number of free token slots remaining in the pool.
+    /// Number of logical tokens that can still be allocated without eviction.
+    ///
+    /// This includes:
+    /// - every token position inside completely free pages
+    /// - unused tail space in each live slot's last partially-filled page
     pub fn free_count(&self) -> usize {
-        self.free_slots.len()
+        let partial_capacity = self
+            .seq_lens
+            .iter()
+            .map(|&len| {
+                let used = len % self.page_size;
+                if used == 0 { 0 } else { self.page_size - used }
+            })
+            .sum::<usize>();
+        self.free_pages.len() * self.page_size + partial_capacity
+    }
+
+    fn page_span_for_token_range(
+        &self,
+        slot: usize,
+        start_pos: usize,
+        token_count: usize,
+    ) -> std::ops::Range<usize> {
+        let seq_len = self.seq_len(slot);
+        debug_assert!(
+            start_pos + token_count <= seq_len,
+            "token range [{start_pos}, {}) exceeds seq_len={seq_len}",
+            start_pos + token_count
+        );
+        let start_page = start_pos / self.page_size;
+        let end_page = (start_pos + token_count).div_ceil(self.page_size);
+        start_page..end_page
+    }
+
+    pub fn page_indices_for_token_range(
+        &self,
+        slot: usize,
+        start_pos: usize,
+        token_count: usize,
+    ) -> &[u32] {
+        let span = self.page_span_for_token_range(slot, start_pos, token_count);
+        &self.page_indices[slot][span]
+    }
+
+    pub fn token_rows_for_range(
+        &self,
+        slot: usize,
+        start_pos: usize,
+        token_count: usize,
+    ) -> Vec<u32> {
+        let seq_len = self.seq_len(slot);
+        debug_assert!(
+            start_pos + token_count <= seq_len,
+            "token range [{start_pos}, {}) exceeds seq_len={seq_len}",
+            start_pos + token_count
+        );
+        let mut rows = Vec::with_capacity(token_count);
+        for pos in start_pos..start_pos + token_count {
+            let page_idx = self.page_indices[slot][pos / self.page_size];
+            let offset = (pos % self.page_size) as u32;
+            rows.push(page_idx * self.page_size as u32 + offset);
+        }
+        rows
     }
 
     /// Whether the pool has allocated buffers.
@@ -631,11 +721,6 @@ impl TokenKVPool {
     }
 
     /// Build FlashInfer-compatible metadata for a batch of slots.
-    ///
-    /// With `page_size = 1`:
-    /// - `indptr[i+1] - indptr[i]` = token count for request `i`
-    /// - `indices` = concatenated physical pool indices
-    /// - `last_page_len` = all 1s
     pub fn build_flashinfer_metadata(&self, slots: &[usize]) -> FlashInferMeta {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
         let mut indices = Vec::new();
@@ -643,16 +728,19 @@ impl TokenKVPool {
 
         indptr.push(0i32);
         for &slot in slots {
-            let toks = &self.token_indices[slot];
-            for &idx in toks {
+            let pages = &self.page_indices[slot];
+            for &idx in pages {
                 indices.push(idx as i32);
             }
             let prev = *indptr
                 .last()
                 .expect("invariant: indptr always has at least one element (initialized with 0)");
-            indptr.push(prev + toks.len() as i32);
-            // page_size=1 ⇒ last_page_len is always 1 (if seq_len > 0).
-            last_page_len.push(if toks.is_empty() { 0 } else { 1 });
+            indptr.push(prev + pages.len() as i32);
+            last_page_len.push(if self.seq_lens[slot] == 0 {
+                0
+            } else {
+                ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
+            });
         }
 
         FlashInferMeta {
@@ -666,7 +754,7 @@ impl TokenKVPool {
     // ── can transition incrementally.                                         ──
 
     /// Build FlashInfer indptr array for a batch of slots.
-    /// `indptr[i+1] - indptr[i]` = token count (= page count with page_size=1).
+    /// `indptr[i+1] - indptr[i]` = page count for request `i`.
     pub fn build_indptr(&self, slots: &[usize]) -> Vec<i32> {
         let mut indptr = Vec::with_capacity(slots.len() + 1);
         indptr.push(0);
@@ -674,61 +762,60 @@ impl TokenKVPool {
             let last = *indptr
                 .last()
                 .expect("invariant: indptr always has at least one element (initialized with 0)");
-            indptr.push(last + self.token_indices[slot].len() as i32);
+            indptr.push(last + self.page_indices[slot].len() as i32);
         }
         indptr
     }
 
-    /// Build FlashInfer page-indices array (concatenated token pool indices).
+    /// Build FlashInfer page-indices array (concatenated physical page ids).
     pub fn build_indices(&self, slots: &[usize]) -> Vec<i32> {
         let mut indices = Vec::new();
         for &slot in slots {
-            for &idx in &self.token_indices[slot] {
+            for &idx in &self.page_indices[slot] {
                 indices.push(idx as i32);
             }
         }
         indices
     }
 
-    /// Build only the LAST token index per slot (for incremental GPU update).
-    /// Returns B values — the most recently allocated pool index for each slot.
+    /// Build only the last physical page id per slot.
     pub fn build_last_indices(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
-            .map(|&slot| *self.token_indices[slot].last().expect("slot has no tokens") as i32)
+            .map(|&slot| *self.page_indices[slot].last().expect("slot has no pages") as i32)
             .collect()
     }
 
-    /// Build FlashInfer last_page_len array — always all-1s for page_size=1.
+    /// Build FlashInfer last_page_len array.
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
             .map(|&slot| {
-                if self.token_indices[slot].is_empty() {
+                if self.seq_lens[slot] == 0 {
                     0
                 } else {
-                    1
+                    ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
                 }
             })
             .collect()
     }
 
-    /// Migrate KV data from contiguous per-slot cache into the token pool.
+    /// Migrate KV data from contiguous per-slot cache into the paged pool.
     ///
     /// Called after prefill completes. Copies `seq_len(slot)` tokens of K/V
     /// from each contiguous layer buffer into the corresponding token slots
     /// in the pool.
     ///
     /// The contiguous cache layout is `[max_seq_len_contiguous, kv_dim]` per layer.
-    fn upload_token_indices(
+    fn upload_page_indices(
         &self,
         ctx: &super::tensor::DeviceContext,
-        token_indices: &[u32],
+        page_indices: &[u32],
     ) -> Result<cudarc::driver::CudaSlice<i32>> {
-        let token_indices_i32: Vec<i32> = token_indices.iter().map(|&p| p as i32).collect();
+        let page_indices_i32: Vec<i32> = page_indices.iter().map(|&p| p as i32).collect();
         ctx.stream
-            .clone_htod(&token_indices_i32)
-            .map_err(|e| anyhow!("H2D token_indices failed: {e}"))
+            .clone_htod(&page_indices_i32)
+            .map_err(|e| anyhow!("H2D page_indices failed: {e}"))
     }
 
     fn migrate_from_contiguous_range_bf16(
@@ -737,35 +824,40 @@ impl TokenKVPool {
         contiguous_k_caches: &[super::tensor::DeviceVec],
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
+        slot: usize,
         start_pos: usize,
-        new_token_indices: &[u32],
+        token_count: usize,
         k_dst_ptr: impl Fn(usize) -> u64,
         v_dst_ptr: impl Fn(usize) -> u64,
     ) -> Result<()> {
-        let token_count = new_token_indices.len();
         if token_count == 0 || self.k_data.is_empty() {
             return Ok(());
         }
 
-        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
-        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
+        let page_indices_gpu = self.upload_page_indices(
+            ctx,
+            self.page_indices_for_token_range(slot, 0, self.seq_len(slot)),
+        )?;
+        let (pi_ptr, _gpi) = page_indices_gpu.device_ptr(&ctx.stream);
+        let stride_page = self.kv_dim * self.page_size;
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
             unsafe {
-                ffi::kv_cache_to_paged_range_cuda(
+                ffi::kv_cache_to_paged_range_hnd_cuda(
                     k_src_ptr as *const ffi::Half,
                     v_src_ptr as *const ffi::Half,
                     k_dst_ptr(layer) as *mut ffi::Half,
                     v_dst_ptr(layer) as *mut ffi::Half,
-                    ti_ptr as *const i32,
+                    pi_ptr as *const i32,
                     start_pos as i32,
                     max_seq_len_contiguous as i32,
                     token_count as i32,
                     self.num_kv_heads as i32,
+                    self.page_size as i32,
                     self.head_dim as i32,
-                    self.kv_dim as i32,
+                    stride_page as i32,
                     ctx.stream.cu_stream(),
                 )
                 .result()?;
@@ -781,16 +873,18 @@ impl TokenKVPool {
         contiguous_k_caches: &[super::tensor::DeviceVec],
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
+        slot: usize,
         start_pos: usize,
-        new_token_indices: &[u32],
+        token_count: usize,
     ) -> Result<()> {
         self.migrate_from_contiguous_range_bf16(
             ctx,
             contiguous_k_caches,
             contiguous_v_caches,
             max_seq_len_contiguous,
+            slot,
             start_pos,
-            new_token_indices,
+            token_count,
             |layer| self.k_data_ptr(layer, &ctx.stream),
             |layer| self.v_data_ptr(layer, &ctx.stream),
         )
@@ -804,14 +898,14 @@ impl TokenKVPool {
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
-        let token_idxs = &self.token_indices[slot];
         self.migrate_from_contiguous_range(
             ctx,
             contiguous_k_caches,
             contiguous_v_caches,
             max_seq_len_contiguous,
+            slot,
             0,
-            token_idxs,
+            self.seq_len(slot),
         )
     }
 
@@ -835,7 +929,7 @@ impl TokenKVPool {
             return Ok(());
         }
 
-        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
         let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
 
         for layer in 0..self.num_layers.min(contiguous_k_q.len()) {
@@ -884,7 +978,7 @@ impl TokenKVPool {
         contiguous_v_scales: &[cudarc::driver::CudaSlice<f32>],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
-        let token_idxs = &self.token_indices[slot];
+        let token_idxs = self.token_rows_for_range(slot, 0, self.seq_len(slot));
         self.migrate_from_contiguous_int8_range(
             ctx,
             contiguous_k_q,
@@ -893,7 +987,7 @@ impl TokenKVPool {
             contiguous_v_scales,
             max_seq_len_contiguous,
             0,
-            token_idxs,
+            &token_idxs,
         )
     }
 
@@ -915,7 +1009,7 @@ impl TokenKVPool {
             return Ok(());
         }
 
-        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             quantize_scatter_kv_fp8_range(
                 ctx,
@@ -954,14 +1048,14 @@ impl TokenKVPool {
         contiguous_v_caches: &[super::tensor::DeviceVec],
         max_seq_len_contiguous: usize,
     ) -> Result<()> {
-        let token_idxs = &self.token_indices[slot];
+        let token_idxs = self.token_rows_for_range(slot, 0, self.seq_len(slot));
         self.migrate_from_contiguous_fp8_range(
             ctx,
             contiguous_k_caches,
             contiguous_v_caches,
             max_seq_len_contiguous,
             0,
-            token_idxs,
+            &token_idxs,
         )
     }
 
@@ -979,7 +1073,7 @@ impl TokenKVPool {
             return Ok(());
         }
 
-        let token_indices_gpu = self.upload_token_indices(ctx, new_token_indices)?;
+        let token_indices_gpu = self.upload_page_indices(ctx, new_token_indices)?;
         let k_state = self
             .tq_k_state
             .as_ref()
@@ -989,16 +1083,28 @@ impl TokenKVPool {
             .as_ref()
             .ok_or_else(|| anyhow!("TurboQuant V state missing"))?;
 
-        self.migrate_from_contiguous_range_bf16(
-            ctx,
-            contiguous_k_caches,
-            contiguous_v_caches,
-            max_seq_len_contiguous,
-            start_pos,
-            new_token_indices,
-            |_| self.k_work_ptr(&ctx.stream),
-            |_| self.v_work_ptr(&ctx.stream),
-        )?;
+        let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
+        for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
+            let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
+            let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
+            unsafe {
+                ffi::kv_cache_to_paged_range_cuda(
+                    k_src_ptr as *const ffi::Half,
+                    v_src_ptr as *const ffi::Half,
+                    self.k_work_ptr(&ctx.stream) as *mut ffi::Half,
+                    self.v_work_ptr(&ctx.stream) as *mut ffi::Half,
+                    ti_ptr as *const i32,
+                    start_pos as i32,
+                    max_seq_len_contiguous as i32,
+                    token_count as i32,
+                    self.num_kv_heads as i32,
+                    self.head_dim as i32,
+                    self.kv_dim as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
 
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             turboquant_quantize_paged_single(
@@ -1036,9 +1142,8 @@ impl TokenKVPool {
 /// Backward-compatible alias. New code should use `TokenKVPool` directly.
 pub type PagedKVPool = TokenKVPool;
 
-/// Page size is 1 for token-level pool (used by callers that pass `page_size`
-/// to FlashInfer / CUDA kernels).
-pub const DEFAULT_PAGE_SIZE: usize = 1;
+/// Default BF16 paged-KV page size used by M0.3.
+pub const DEFAULT_PAGE_SIZE: usize = 16;
 
 #[cfg(test)]
 mod tests {
@@ -1074,29 +1179,6 @@ mod tests {
         assert_eq!(budget.max_total_tokens, 32);
     }
 
-    #[test]
-    fn slot_epoch_advances_only_when_a_live_slot_is_released() {
-        let mut epochs = vec![0_u64, 0_u64];
-        let mut token_indices = vec![vec![10_u32, 11_u32], Vec::<u32>::new()];
-        let mut free_slots = Vec::<u32>::new();
-
-        if !token_indices[0].is_empty() {
-            epochs[0] = epochs[0].saturating_add(1);
-        }
-        for &idx in &token_indices[0] {
-            free_slots.push(idx);
-        }
-        token_indices[0].clear();
-
-        if !token_indices[1].is_empty() {
-            epochs[1] = epochs[1].saturating_add(1);
-        }
-
-        assert_eq!(epochs, vec![1, 0]);
-        assert_eq!(free_slots, vec![10, 11]);
-        assert!(token_indices[0].is_empty());
-    }
-
     // ------------------------------------------------------------------
     // M2a pool refcount mechanics — pure book-keeping tests that exercise
     // `retain_pages` / `release_pages` / `free_slot` without needing a
@@ -1110,30 +1192,44 @@ mod tests {
     /// standing up a real CUDA context. Keeps the same invariants as
     /// `TokenKVPool` for the M2a paths.
     struct MockPool {
-        free_slots: Vec<u32>,
-        token_indices: Vec<Vec<u32>>,
+        page_size: usize,
+        free_pages: Vec<u32>,
+        page_indices: Vec<Vec<u32>>,
+        seq_lens: Vec<usize>,
         slot_epochs: Vec<u64>,
         page_ref_count: Vec<u32>,
     }
 
     impl MockPool {
-        fn new(max_total_tokens: usize, num_slots: usize) -> Self {
+        fn new(max_total_pages: usize, num_slots: usize, page_size: usize) -> Self {
             Self {
-                free_slots: (0..max_total_tokens as u32).rev().collect(),
-                token_indices: vec![Vec::new(); num_slots],
+                page_size,
+                free_pages: (0..max_total_pages as u32).rev().collect(),
+                page_indices: vec![Vec::new(); num_slots],
+                seq_lens: vec![0; num_slots],
                 slot_epochs: vec![0; num_slots],
-                page_ref_count: vec![0_u32; max_total_tokens],
+                page_ref_count: vec![0_u32; max_total_pages],
             }
         }
 
-        fn alloc(&mut self, slot: usize, count: usize) -> Vec<u32> {
-            assert!(self.free_slots.len() >= count, "mock pool OOM");
-            let mut out = Vec::with_capacity(count);
-            for _ in 0..count {
-                out.push(self.free_slots.pop().unwrap());
+        fn alloc_tokens(&mut self, slot: usize, count: usize) -> Vec<u32> {
+            let used_in_last_page = self.seq_lens[slot] % self.page_size;
+            let available_in_last_page = if used_in_last_page == 0 {
+                0
+            } else {
+                self.page_size - used_in_last_page
+            };
+            let remaining_after_fill = count.saturating_sub(available_in_last_page);
+            let new_page_count = remaining_after_fill.div_ceil(self.page_size);
+            assert!(self.free_pages.len() >= new_page_count, "mock pool OOM");
+
+            let mut new_pages = Vec::with_capacity(new_page_count);
+            for _ in 0..new_page_count {
+                new_pages.push(self.free_pages.pop().unwrap());
             }
-            self.token_indices[slot].extend_from_slice(&out);
-            out
+            self.page_indices[slot].extend_from_slice(&new_pages);
+            self.seq_lens[slot] += count;
+            new_pages
         }
 
         fn retain(&mut self, pages: &[u32]) {
@@ -1149,7 +1245,7 @@ mod tests {
                 let cur = self.page_ref_count[pu];
                 self.page_ref_count[pu] = cur.saturating_sub(1);
                 if self.page_ref_count[pu] == 0 {
-                    self.free_slots.push(p);
+                    self.free_pages.push(p);
                     freed.push(p);
                 }
             }
@@ -1157,20 +1253,122 @@ mod tests {
         }
 
         fn free_slot(&mut self, slot: usize) {
-            if !self.token_indices[slot].is_empty() {
+            if !self.page_indices[slot].is_empty() {
                 self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             }
-            for &idx in &self.token_indices[slot] {
+            for &idx in &self.page_indices[slot] {
                 if self.page_ref_count[idx as usize] == 0 {
-                    self.free_slots.push(idx);
+                    self.free_pages.push(idx);
                 }
             }
-            self.token_indices[slot].clear();
+            self.page_indices[slot].clear();
+            self.seq_lens[slot] = 0;
         }
 
         fn retained_count(&self) -> usize {
             self.page_ref_count.iter().filter(|&&rc| rc > 0).count()
         }
+
+        fn free_count(&self) -> usize {
+            let partial_capacity = self
+                .seq_lens
+                .iter()
+                .map(|&len| {
+                    let used = len % self.page_size;
+                    if used == 0 { 0 } else { self.page_size - used }
+                })
+                .sum::<usize>();
+            self.free_pages.len() * self.page_size + partial_capacity
+        }
+
+        fn page_indices_for_token_range(
+            &self,
+            slot: usize,
+            start_pos: usize,
+            token_count: usize,
+        ) -> &[u32] {
+            let start_page = start_pos / self.page_size;
+            let end_page = (start_pos + token_count).div_ceil(self.page_size);
+            &self.page_indices[slot][start_page..end_page]
+        }
+
+        fn token_rows_for_range(
+            &self,
+            slot: usize,
+            start_pos: usize,
+            token_count: usize,
+        ) -> Vec<u32> {
+            let mut rows = Vec::with_capacity(token_count);
+            for pos in start_pos..start_pos + token_count {
+                let page = self.page_indices[slot][pos / self.page_size];
+                rows.push(page * self.page_size as u32 + (pos % self.page_size) as u32);
+            }
+            rows
+        }
+    }
+
+    #[test]
+    fn format_default_page_sizes_match_m0_3_dispatch() {
+        assert_eq!(KVFormat::BF16.default_page_size(), 16);
+        assert_eq!(KVFormat::INT8.default_page_size(), 1);
+        assert_eq!(KVFormat::FP8E4M3.default_page_size(), 1);
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 3,
+                val_bits: 4,
+            }
+            .default_page_size(),
+            1
+        );
+    }
+
+    #[test]
+    fn alloc_tokens_reuses_tail_before_grabbing_a_new_page() {
+        let mut pool = MockPool::new(4, 1, 16);
+        let first = pool.alloc_tokens(0, 8);
+        let second = pool.alloc_tokens(0, 4);
+
+        assert_eq!(first, vec![0]);
+        assert!(
+            second.is_empty(),
+            "tail room should satisfy the second alloc"
+        );
+        assert_eq!(pool.page_indices[0], vec![0]);
+        assert_eq!(pool.seq_lens[0], 12);
+        assert_eq!(pool.free_pages, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn token_ranges_map_to_pages_and_rows_under_page_size_16() {
+        let mut pool = MockPool::new(4, 1, 16);
+        pool.alloc_tokens(0, 20);
+
+        assert_eq!(pool.page_indices[0], vec![0, 1]);
+        assert_eq!(pool.page_indices_for_token_range(0, 0, 16), &[0]);
+        assert_eq!(pool.page_indices_for_token_range(0, 12, 8), &[0, 1]);
+        assert_eq!(pool.token_rows_for_range(0, 14, 4), vec![14, 15, 16, 17]);
+    }
+
+    #[test]
+    fn free_count_includes_partial_tail_capacity() {
+        let mut pool = MockPool::new(3, 2, 16);
+        pool.alloc_tokens(0, 8);
+        pool.alloc_tokens(1, 16);
+
+        assert_eq!(pool.free_pages, vec![2]);
+        assert_eq!(pool.free_count(), 24, "1 free page + 8 token tail room");
+    }
+
+    #[test]
+    fn slot_epoch_advances_only_when_a_live_slot_is_released() {
+        let mut pool = MockPool::new(4, 2, 16);
+        pool.alloc_tokens(0, 8);
+
+        pool.free_slot(0);
+        pool.free_slot(1);
+
+        assert_eq!(pool.slot_epochs, vec![1, 0]);
+        assert!(pool.page_indices[0].is_empty());
     }
 
     #[test]
@@ -1180,26 +1378,21 @@ mod tests {
         // before. Exactly the ordering the scheduler runs on cleanup:
         //   1. scheduler.publish_to_prefix_cache → retain_pages
         //   2. paged_kv_pool.free_slot
-        let mut pool = MockPool::new(8, 2);
-        let _ = pool.alloc(0, 4); // slot 0 takes 4 pages
-        assert_eq!(pool.token_indices[0].len(), 4);
-        assert_eq!(pool.free_slots.len(), 4);
+        let mut pool = MockPool::new(4, 2, 16);
+        let _ = pool.alloc_tokens(0, 20); // slot 0 takes 2 pages
+        assert_eq!(pool.page_indices[0].len(), 2);
+        assert_eq!(pool.free_pages.len(), 2);
 
-        // Radix retains 2 of the 4 pages (block_size = 2 hypothetically).
-        let retained = vec![pool.token_indices[0][0], pool.token_indices[0][1]];
+        let retained = vec![pool.page_indices[0][0]];
         pool.retain(&retained);
-        assert_eq!(pool.retained_count(), 2);
+        assert_eq!(pool.retained_count(), 1);
 
         pool.free_slot(0);
-        // Slot is empty but the 2 retained pages did NOT go back to
+        // Slot is empty but the retained page did NOT go back to
         // the free list.
-        assert!(pool.token_indices[0].is_empty());
-        assert_eq!(
-            pool.free_slots.len(),
-            6,
-            "2 pinned, 2 freed + 4 original free"
-        );
-        assert_eq!(pool.retained_count(), 2);
+        assert!(pool.page_indices[0].is_empty());
+        assert_eq!(pool.free_pages.len(), 3, "1 pinned page remains in limbo");
+        assert_eq!(pool.retained_count(), 1);
         assert_eq!(pool.slot_epochs[0], 1);
     }
 
@@ -1208,18 +1401,18 @@ mod tests {
         // Second half of the M2a cycle: once the radix evicts / drops
         // the retained pages, `release_pages` pushes them back to the
         // free list with no double-free and no lost pages.
-        let mut pool = MockPool::new(8, 2);
-        let alloc = pool.alloc(0, 4);
-        let retained: Vec<u32> = alloc[..2].to_vec();
+        let mut pool = MockPool::new(4, 2, 16);
+        let alloc = pool.alloc_tokens(0, 20);
+        let retained: Vec<u32> = alloc[..1].to_vec();
         pool.retain(&retained);
         pool.free_slot(0);
-        assert_eq!(pool.free_slots.len(), 6);
+        assert_eq!(pool.free_pages.len(), 3);
 
         // Radix eviction path drops the pages.
         let freed_now = pool.release(&retained);
-        assert_eq!(freed_now.len(), 2);
+        assert_eq!(freed_now.len(), 1);
         assert_eq!(pool.retained_count(), 0);
-        assert_eq!(pool.free_slots.len(), 8, "every page back in the free pool");
+        assert_eq!(pool.free_pages.len(), 4, "every page back in the free pool");
     }
 
     #[test]
@@ -1229,17 +1422,17 @@ mod tests {
         // matches the scheduler's "shadow observer" fallback lookup
         // pattern: bump → log → release, page stays in its owning
         // slot the whole time.
-        let mut pool = MockPool::new(8, 2);
-        let alloc = pool.alloc(0, 4);
+        let mut pool = MockPool::new(4, 2, 16);
+        let alloc = pool.alloc_tokens(0, 20);
         let pg = alloc[0];
         pool.retain(&[pg]);
         assert_eq!(pool.page_ref_count[pg as usize], 1);
-        assert_eq!(pool.token_indices[0].len(), 4);
-        assert_eq!(pool.free_slots.len(), 4);
+        assert_eq!(pool.page_indices[0].len(), 2);
+        assert_eq!(pool.free_pages.len(), 2);
 
         let freed = pool.release(&[pg]);
         // refcount dropped to 0, but the page is still in slot 0 —
-        // `release` unconditionally pushes to free_slots which gives
+        // `release` unconditionally pushes to free_pages which gives
         // a duplicate entry. The scheduler contract is that release
         // only runs on pages that are either in limbo OR still in a
         // slot that is ALSO about to be released. Document this by
@@ -1252,15 +1445,15 @@ mod tests {
     fn double_retain_needs_double_release_to_free() {
         // Two radix insert passes on the same prefix should not free
         // the underlying pages after a single release cycle.
-        let mut pool = MockPool::new(4, 1);
-        let alloc = pool.alloc(0, 2);
+        let mut pool = MockPool::new(2, 1, 16);
+        let alloc = pool.alloc_tokens(0, 20);
         pool.retain(&alloc);
         pool.retain(&alloc);
         assert_eq!(pool.page_ref_count[alloc[0] as usize], 2);
         pool.free_slot(0);
         assert_eq!(
-            pool.free_slots.len(),
-            2,
+            pool.free_pages.len(),
+            0,
             "both pages pinned, neither in free list"
         );
 
@@ -1277,7 +1470,7 @@ mod tests {
             2,
             "second release drops to 0 → both pages freed"
         );
-        assert_eq!(pool.free_slots.len(), 4);
+        assert_eq!(pool.free_pages.len(), 2);
         assert_eq!(pool.retained_count(), 0);
     }
 }
