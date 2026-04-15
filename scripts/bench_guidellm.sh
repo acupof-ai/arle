@@ -35,6 +35,12 @@ DATA="prompt_tokens=1024,output_tokens=256"
 MAX_SECONDS=60
 RANDOM_SEED=20260416
 OUTPUTS="json,csv,html"
+# **Pin the HTTP backend explicitly.** guidellm 0.6.0's default backend is
+# `vllm_python` (an in-process vLLM import) which silently reports 0
+# successful requests against our infer HTTP server and then crashes the
+# sweep profile with "Invalid rates in sweep; aborting". We speak the
+# OpenAI v1 HTTP API, so `openai_http` is the correct backend to use.
+BACKEND="openai_http"
 # guidellm's default backend validation probes GET /health, which
 # metal_serve / cuda-infer do not expose. Point it at /v1/models instead
 # (we already rely on that route being present in preflight below).
@@ -43,6 +49,13 @@ BACKEND_KWARGS='{"validate_backend": "/v1/models"}'
 
 TARGET="http://localhost:8000"
 MODEL="Qwen/Qwen3-4B"
+# Local path used for tokenizer lookup during synthetic prompt generation.
+# If the HF name isn't in the local HF cache, the synthetic_text dataset
+# deserializer can't download it in sandboxed environments and bails with
+# "OSError: Qwen3-4B is not a local folder". Defaults to a weights dir
+# that already exists on CUDA and Metal bring-up boxes.
+PROCESSOR_DEFAULT="models/Qwen3-4B"
+PROCESSOR=""
 LABEL=""
 
 usage() {
@@ -67,6 +80,9 @@ while [[ $# -gt 0 ]]; do
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; exit 2; }
             MODEL="$2"; shift 2 ;;
+        --processor)
+            [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
+            PROCESSOR="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         --*)
@@ -152,17 +168,29 @@ echo "    seed   : $RANDOM_SEED"
 echo "    output : $OUTPUT_DIR"
 echo
 
+# Tokenizer source: explicit --processor wins, else local path if it
+# exists, else fall back to the HF model name (network required).
+if [[ -z "$PROCESSOR" ]]; then
+    if [[ -d "$REPO_ROOT/$PROCESSOR_DEFAULT" ]]; then
+        PROCESSOR="$REPO_ROOT/$PROCESSOR_DEFAULT"
+    else
+        PROCESSOR="$MODEL"
+    fi
+fi
+echo "    processor: $PROCESSOR"
+
 set +e
 guidellm benchmark run \
     --target "$TARGET" \
     --model "$MODEL" \
-    --processor "$MODEL" \
+    --processor "$PROCESSOR" \
     --profile "$PROFILE" \
     --data "$DATA" \
     --max-seconds "$MAX_SECONDS" \
     --random-seed "$RANDOM_SEED" \
     --output-dir "$OUTPUT_DIR" \
     --outputs "$OUTPUTS" \
+    --backend "$BACKEND" \
     --backend-kwargs "$BACKEND_KWARGS"
 gdl_rc=$?
 set -e
