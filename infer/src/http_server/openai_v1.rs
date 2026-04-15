@@ -54,6 +54,11 @@ pub(super) struct CompletionRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,
     pub(super) prompt: String,
+    /// Maximum number of tokens to generate. Accepts the modern OpenAI
+    /// spelling `max_completion_tokens` as an alias so bench tools that
+    /// emit the new field (guidellm 0.6+, litellm, openai-python ≥ 1.40)
+    /// do not silently fall back to the server default.
+    #[serde(default, alias = "max_completion_tokens")]
     pub(super) max_tokens: Option<usize>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
@@ -255,6 +260,9 @@ pub(super) struct ChatCompletionRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,
     pub(super) messages: Vec<OpenAiChatMessage>,
+    /// Maximum completion tokens. Accepts the modern OpenAI spelling
+    /// `max_completion_tokens` as an alias; see `CompletionRequest`.
+    #[serde(default, alias = "max_completion_tokens")]
     pub(super) max_tokens: Option<usize>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
