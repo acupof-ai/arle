@@ -252,7 +252,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   agent-first admission rule.
 - **Where**:
   - `infer/src/scheduler/policy.rs` — extend struct + new policy.
-  - `infer/src/scheduler/batch.rs` and `infer/src/metal_scheduler.rs` —
+  - `infer/src/scheduler/batch.rs` and `infer/src/backend/metal/scheduler.rs` —
     fill in the new signals at call sites.
 - **Exit**: Benchmarks show warm (session-continuation) requests do not
   get starved behind bursts of cold requests.

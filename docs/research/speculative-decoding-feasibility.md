@@ -72,7 +72,7 @@ the paged pool. This is simpler than full transactional semantics.
 
 ### What Needs to be Built
 
-**1. DraftModel GPU Implementation** (`infer/src/backend/cuda/speculative.rs`)
+**1. DraftModel GPU Implementation** (new file, would land alongside `infer/src/speculative.rs` — current CPU-only framework location — with GPU kernels contributed to `crates/infer-cuda-kernels/`)
 - `DraftEngine`: wraps a second loaded model (e.g. Qwen3-0.5B)
 - Reuses CUDA scheduler infrastructure but runs single-threaded
 - `draft_batch()` → calls `model.forward()` K times, collects token + probability
