@@ -1,0 +1,80 @@
+# `infer::scheduler` — Agent Guide
+
+CUDA multi-request continuous batching + policy/accounting scaffolding that
+works with any backend. Load before editing any scheduler internals.
+
+## Module map
+
+| Path | Role |
+|------|------|
+| `scheduler.rs` | Module root + `pub use` surface. |
+| `batch.rs` | **Backend-agnostic** CPU accounting scheduler (`BatchScheduler`) for lifecycle events + dry-run testing. |
+| `types.rs` | `IncomingRequest`, `SchedulerHandle`, `SchedulerConfig`, `SchedulerFull`. The config defaults live in `SchedulerConfig::runtime_defaults(num_slots)`. |
+| `policy.rs` | `SchedulerSignals`, `AdmissionPolicy`, `ChunkingPolicy`, `DecodeAwareChunking`. Agent-aware fields (`prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`) are plumbed but only wired under the tiered-KV project (`docs/projects/agent-first-architecture.md::B3`). |
+| `metrics.rs` | Scheduler metrics accounting. |
+| `cuda/core.rs` | CUDA `Scheduler<M: ModelForward>` struct + construction. Owns slots, paged KV pool, radix prefix cache, `block_owner_slots`. |
+| `cuda/prefill.rs` | `step_new` — chunked prefill + prefix-hit paths (exact-full, prompt-prefix-of-cached, partial). |
+| `cuda/decode.rs` | `step_decode_batch` — batched decode + preemption (evicts the request with most generated tokens when pool can't fit). |
+| `cuda/request.rs` | Per-request state (`ActiveRequest`, `Phase`). |
+| `cuda/runtime.rs` | `run_loop` — the single-writer scheduler thread. |
+| `cuda/execution.rs` | Per-step execution glue. |
+
+## Invariants you will break if you're not careful
+
+1. **The scheduler thread is the only writer** to `states`, `prefix_cache`,
+   `block_to_pages`, `block_owner_slots`, `paged_kv_pool`. Taking any of
+   these behind an `Arc<Mutex<…>>` is a design change — don't do it without
+   reading `docs/projects/tiered-kv-cache.md §5.2`.
+2. **`BlockId` = physical pool page index** (`u32`), not a content hash.
+   Content hashing uses `crate::types::BlockFingerprint` and only exists at
+   persist/migrate boundaries (M4/M5). See `infer/src/kv_tier/AGENTS.md`.
+3. **Prefix-cache retention caps** (`cuda/core.rs`):
+   - `PREFIX_CACHE_HIGH_WATER = 0.75` → cleanup trigger
+   - `PREFIX_CACHE_LOW_WATER  = 0.50` → cleanup target
+   - `PREFIX_CACHE_RETAIN_HARD_CAP = 0.90` → new prompts no longer publish
+     above this, so fresh admissions can't starve on pinned-cold pages.
+   These are tuned — change only with a bench snapshot.
+4. **`PREFIX_CACHE_BLOCK_SIZE = 16` matches the paged-pool page size.**
+   Changing one without the other breaks M2 dual residency.
+5. **`ChunkingPolicy` is decode-aware.** Default prefill chunk = 4096;
+   drops to 64 when decode is active so prefill can't starve decode ITL.
+   The test is `active_decodes > 0`, not "any running request".
+6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
+   downgrades partial prefix hits to full MISS when
+   `!state.supports_partial_prefix()`. Only full-prefix hits benefit from
+   `save_prefix_snapshot` / `restore_prefix_snapshot`.
+7. **Preemption policy = highest-KV-cost victim** (most generated tokens),
+   *recompute* mode (re-queue + re-prefill). Do not change without updating
+   `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md`.
+8. **Slot reuse is single-slot-only.** `block_owner_slots` tracks which free
+   slot can reuse a radix block's contiguous state. Cross-slot page aliasing
+   is intentionally unsupported — M2b closed that door deliberately
+   (`docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md`).
+
+## Common mistakes
+
+- Putting model-specific code in `scheduler/cuda/*`. Decode-batch kernel
+  invocation lives on `M::DecodeContext` via the `DecodeContextOps` trait —
+  add methods there, not `if model_type == …` here.
+- Adding a second `HashMap<BlockId, ...>`. There are already two
+  (`block_to_pages`, `block_owner_slots`) with distinct roles; the radix
+  itself is the third source of truth. A new one usually means you are
+  duplicating existing state.
+- Calling `SchedulerHandle::submit` from the scheduler thread itself. The
+  handle is for *external* submitters (HTTP, CLI). Internal resubmission
+  (e.g. preemption recompute) pushes back onto `waiting` directly.
+
+## Tests
+
+- `scheduler/tests.rs` — unit tests for admission + chunking policy.
+- `infer/tests/e2e*.rs` — full E2E against JSON baselines; run on GPU hosts.
+- `infer/tests/greedy_consistency.rs` — regression gate for scheduler vs
+  single-request numerical drift.
+
+## Pointers
+
+- `docs/projects/tiered-kv-cache.md` — project driving scheduler internals right now.
+- `docs/plans/tiered-kv-cache-tasks.md` — milestone ledger.
+- `docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md` — what changed at M2b.
+- `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md` —
+  preemption policy rationale.
