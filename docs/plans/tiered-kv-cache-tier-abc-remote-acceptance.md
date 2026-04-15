@@ -8,7 +8,7 @@ M2b + M0.3/M3a + M3b + M3c stack.
 - Tier A (`d3d1e46`): the CUDA scheduler now owns a live coordinator thread,
   passes a real `CoordinatorHandle` as `StagePlanner`, parks staged requests
   in `stage_waiting`, and re-admits them when `StagingCompleted` arrives.
-- Tier B (`9e276cd`): publish computes `BlockFingerprint` per block and routes
+- Tier B (`e0f69f9`): publish computes `BlockFingerprint` per block and routes
   inserts through `RadixCache::insert_with_fingerprints(...)`; DiskStore round
   trips bytes plus fingerprint locally.
 - Tier C (`9b01c2a`): `RadixCache` keeps a private `block_index` for O(1)
