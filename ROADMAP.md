@@ -8,9 +8,9 @@ Related docs:
 
 ---
 
-## Current State (2026-04-14)
+## Current State (2026-04-15)
 
-Working: Qwen3/Qwen3.5/GLM4 inference, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, KV cache + CPU offload, token-level KV pool (SGLang-style), continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (data structure), paged KV block manager (accounting), speculative decoding framework (CPU stubs), tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, throughput benchmark suite.
+Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, **Tiered KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 remote NIXL)** with radix-driven prefix reuse and page-level staging (`page_size=16` for BF16), token-level KV pool, continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + `/v1/responses` (non-streaming) + `/v1/models` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (tier-aware `RadixNode` with fingerprint + session affinity), speculative decoding framework (CPU stubs) + Metal DFlash experimental path on Qwen3, tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, **native Q4_K GPU kernel + GGUF loader (BF16/F16/Q8_0/Q4_K_M)**, **Metal backend with resumable request state (M0.2a)**, throughput benchmark suite.
 
 **Recent milestones (April 2026)**:
 - Qwen3-8B throughput at SGLang parity: C=1 -8%, C=4 +2%, TTFT 2.5x faster
@@ -20,8 +20,13 @@ Working: Qwen3/Qwen3.5/GLM4 inference, FlashInfer single prefill (HD128) + Trito
 - **GPTQ/AWQ INT4 production-ready**: format detection, W4A16 GEMV, Marlin W4 prefill (5-25x TTFT speedup)
 - **FP8 KV cache**: custom fused FP8 E4M3 decode attention, 50% KV memory reduction
 - Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
+- **Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c locally shipped and remote-accepted on L4 (2026-04-15)**: scheduler selector flip to radix, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract + page-lifecycle state machine, legacy contiguous CPU KV offload retired. See `docs/projects/tiered-kv-cache.md`.
+- **`infer-cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/infer-cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → infer-cuda-kernels`.
+- **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
+- **Metal M0.2a resumable request state**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving wiring (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
+- **CPU offload retired**: the legacy contiguous `model/kv_cache.rs` CPU-offload surface (`k_host/v_host`, `OFFLOAD_BLOCK_SIZE=64`, `prefetch/offload` hooks) deleted in M3c (`c3f65f7`). `set_max_gpu_kv` remains as a compatibility no-op warning only.
 
-Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration, FlashAttention-3 (H100), scheduler preemption with KV swap.
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal scheduler-backed serving (M0.2b — still `BackendRuntimeHandle` today), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
 
 ---
 
@@ -172,25 +177,18 @@ ShareGPT dataset loader for realistic prompt distributions.
 
 ## Phase 1 — Core GPU Features (GPU required)
 
-### 1.1 PagedAttention Kernel
-**Files**: `crates/infer-cuda-kernels/csrc/attention/paged_attention.cu`, `infer/src/ops/attention.rs`
+### 1.1 PagedAttention Kernel ✅ Shipped
+**Files**: `crates/infer-cuda-kernels/csrc/attention/{flashinfer_decode,flashinfer_decode_hd256,decode_prep_paged,decode_prep_paged_hd256,fused_attention}.cu`, `infer/src/ops/attention.rs`
 **Goal**: Replace contiguous KV cache with paged blocks. Eliminates memory fragmentation, enables sharing blocks across requests (prefix cache), enables swap.
 
-```c
-// CUDA kernel signature
-void paged_attention_decode(
-    float* out,                    // [num_heads, head_dim]
-    const float* q,                // [num_heads, head_dim]
-    const float* k_cache,          // [num_gpu_blocks, block_size, num_kv_heads, head_dim]
-    const float* v_cache,          // [num_gpu_blocks, block_size, num_kv_heads, head_dim]
-    const int* block_table,        // [max_context_len / block_size]
-    int context_len,
-    int block_size,
-    int num_heads, int num_kv_heads, int head_dim
-);
-```
+Shipped via a three-path split (not a single `paged_attention_decode`):
+- **BF16 decode**: FlashInfer paged decode via `flashinfer_decode.cu` (HD128) + `flashinfer_decode_hd256.cu` (HD256).
+- **INT8/FP8 decode**: custom split-KV kernels with in-register fused dequant in `decode_attention_quantized.cu`.
+- **TurboQuant decode**: Q-rotation + centroid gather in `decode_attention_turboquant.cu` — no KV dequantization materialized.
+- **Prefill**: FlashInfer `prefill_attention.cu` + `prefill_attention_hd256.cu`.
+- **Paged metadata staging**: `flashinfer_metadata.cu` + `decode_prep_paged{,_hd256}.cu` build per-request page-indices on GPU.
 
-Placeholder stub in `ops/attention.rs` with `todo!("GPU required: paged attention decode")`.
+Pool bookkeeping lives in `crates/infer-cuda-kernels/src/paged_kv.rs` (`PagedKVPool` + `TokenKVPool`).
 
 ---
 
@@ -309,37 +307,54 @@ impl WeightLoader {
 
 ---
 
-### 2.2 GPTQ / AWQ INT4 Kernels
-**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_int4.cu`
+### 2.2 GPTQ / AWQ INT4 Kernels ✅ Shipped
+**Files**: `crates/infer-cuda-kernels/csrc/gemm/{quantized_gemv,marlin_kernel,marlin_repack}.cu`
 **Goal**: Fused dequantize-GEMM kernels for INT4 weights. Required for serving quantized open-source models (most popular community models are GPTQ/AWQ quantized).
 
-Implement W4A16 (INT4 weights, FP16 activations) via:
-- Exllama v2 kernel (GPTQ) as reference
-- Marlin kernel (AWQ/GPTQ) for A100+ — tile-level dequant fused with GEMM
+Shipped:
+- **W4A16 GEMV** for decode — `quantized_gemv.cu` handles the single-token dequant-fused path.
+- **Marlin W4 prefill** — `marlin_kernel.cu` + `marlin_repack.cu` for A100+ tile-level dequant fused with GEMM; 5–25× TTFT speedup on long prompts.
 
 ---
 
-### 2.3 FP8 (E4M3) Kernels
-**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_fp8.cu`
-**Goal**: FP8 GEMM for H100 (SM90). Required for DeepSeek-V3 native precision.
+### 2.3 FP8 (E4M3) KV Cache + Attention ✅ Shipped
+**Files**: `crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`, `crates/infer-cuda-kernels/csrc/kv/kv_quant.cu`, `crates/infer-cuda-kernels/src/kv_quant.rs`
+**Goal**: FP8 KV cache for long-context agent workloads.
 
-- `__nv_fp8_e4m3` weight storage, BF16 accumulation
-- Static per-tensor scaling (DeepSeek-V3 style)
-- Dynamic per-token activation scaling
+Shipped as an **FP8 KV path**, not an FP8 GEMM path — the latency win for agent workloads comes from halving KV bandwidth, not from FP8 matmul on the weight side.
+- FP8 E4M3 KV storage via `migrate_from_contiguous_fp8` and `quantize_scatter_kv_fp8`.
+- Custom fused-dequant decode attention with FP32 cast in `decode_attention_quantized.cu`.
+- 50 % KV memory reduction vs BF16.
 
----
-
-### 2.4 INT8 / SmoothQuant
-**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_int8.cu`
-**Goal**: INT8 W8A8 GEMM using cuBLAS `cublasLtMatmul` with INT8 I/O.
-
-SmoothQuant migration: apply channel-wise scale to activations before quantizing.
+Native FP8 **weight** GEMM (DeepSeek-V3 style) remains deferred — not required until a model that ships FP8 weights is wired.
 
 ---
 
-### 2.5 GGUF Loading
-**Files**: `infer/src/weight_loader.rs`, add gguf reader
-**Goal**: Load GGUF format files (llama.cpp ecosystem). Read GGUF header, tensor layout, Q4_K_M / Q8_0 block formats. Dequantize on load to BF16.
+### 2.4 INT8 / W8A16 ✅ Shipped
+**Files**: `crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu`, `crates/infer-cuda-kernels/csrc/kv/kv_quant.cu`
+**Goal**: INT8 weight + INT8 KV cache paths for memory savings.
+
+Shipped:
+- **W8A16 GEMV / GEMM** via `quantized_gemv.cu` for INT8-weight decode.
+- **INT8 KV** via `kv_quant.cu` with symmetric per-head per-token scaling + fused-dequant decode attention in `decode_attention_quantized.cu`.
+SmoothQuant activation migration is not applied today — W8A16 is sufficient for the coverage goal.
+
+---
+
+### 2.5 GGUF Loading ✅
+**Files**: `infer/src/gguf.rs`, `infer/src/weight_loader.rs`
+**Goal**: Load GGUF format files (llama.cpp ecosystem). Read GGUF header, tensor layout, Q4_K_M / Q8_0 block formats.
+
+Shipped:
+- Minimal GGUF parser with tensor directory + per-tensor readers
+- BF16 / F16 / Q8_0 fast paths in `load_tensor_2d_gguf`
+- **Q4_K_M native GPU path** — `q4k_gemv_kernel` in
+  `crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu` keeps superblocks
+  packed on GPU (no BF16 intermediate), with `DeviceMatrix::from_quantized_q4k`
+  consuming verbatim 144-byte Q4_K superblock bytes. Carnice-27B (64L × 5120d)
+  fits on L4-24GB. See [docs/plans/q4k-native-gpu.md](docs/plans/q4k-native-gpu.md).
+- V-head byte-level row permutation for linear-attention weights
+- 3 test suites: `q4k_kernel_correctness.rs`, `ground_truth_q4k.rs`, `smoke_carnice_27b_q4k.rs`
 
 ---
 
@@ -470,7 +485,7 @@ Phase 2 (Quantization) ✅ COMPLETE
   2.2 GPTQ/AWQ          ✅ (W4A16 GEMV + Marlin W4 prefill)
   2.3 FP8               ✅ (FP8 KV cache + custom fused decode)
   2.4 INT8              ✅ (W8A16 GEMV/GEMM + INT8 KV fused-dequant)
-  2.5 GGUF              → deferred
+  2.5 GGUF              ✅ (BF16/F16/Q8_0 + native Q4_K packed GPU kernel)
 
 Phase 3 (TP/PP/EP)
   3.1 NCCL primitives   → Phase 1 complete
@@ -494,20 +509,30 @@ Phase 5 (Optimization)
 
 ## Immediate Next Steps
 
-Phase 0 complete. Quantization (Phase 2) largely complete. Focus on performance and robustness:
+Phase 0 complete. Quantization (Phase 2) complete including GGUF/Q4_K.
+Tiered KV Cache M2b+M0.3+M3a+M3b+M3c locally shipped and L4 remote-accepted.
+Focus on performance, robustness, and Metal parity:
 
 1. ~~**Qwen3.5 SGLang parity**~~ — ✅ prefix cache fixed, ITL/TTFT ahead at C≤16
-2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant all production-ready
+2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant/GGUF+Q4_K all production-ready
 3. ~~**Scheduler preemption with KV swap**~~ — ✅ recompute mode done (swap mode deferred)
 4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
-5. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass (CUDA)
-6. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
+5. ~~**Tiered KV Cache M0–M3**~~ — ✅ M2b+M0.3+M3a+M3b+M3c locally + L4 remote-accepted.
+   Next: M3b runtime promotion path, M4 disk persistence + session save/load.
+6. **Metal M0.2b scheduler-backed serving** — `metal_serve` still goes through `BackendRuntimeHandle`;
+   M0.2a request state is landed but the scheduler wire-up + observability exit (M0.3/M0.4) are
+   still the hard blocker. See [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
+7. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass (CUDA)
+8. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
    need: DraftEngine, KV rollback in PagedKvPool, SpeculativeScheduler, CUDA Graph 2-phase.
    Research: standard draft model (Qwen3-0.5B) first; EAGLE2 / DFlash-MLX as phase 2.
+   Metal DFlash experimental path on Qwen3 is shipped.
    See [docs/research/speculative-decoding-feasibility.md](docs/research/speculative-decoding-feasibility.md)
-7. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
-8. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
-9. **1.2 FlashAttention-3** — H100 utilization improvement
+9. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
+10. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
+11. **1.2 FlashAttention-3** — H100 utilization improvement
+12. **1.7 Gemma 4 Model** — detection in `model_registry.rs` shipped, per-model forward still
+    unwired. See [docs/plans/gemma-gguf-support.md](docs/plans/gemma-gguf-support.md).
 
 ### Research Notes (2026-04-14)
 
