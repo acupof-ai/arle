@@ -155,22 +155,35 @@ Total bytes per token per KV head: `ceil(D * bits / 8) + 2`.
 
 ### 3.4 File Structure
 
+> **Post-extraction note (2026-04-15).** The file tree below reflects where
+> things landed during the TurboQuant integration. After the
+> `infer-cuda-kernels` kernel-crate extraction, `paged_kv.rs`, `ffi.rs`,
+> `turboquant_state.rs`, and `kv_turboquant.rs` moved into
+> `crates/infer-cuda-kernels/src/`, and `turboquant.cu` moved into
+> `crates/infer-cuda-kernels/csrc/quant/`. The dispatch and model-owned
+> pieces stayed in `infer/`.
+
 ```
 infer/
 ├── src/
 │   ├── ops/
-│   │   ├── kv_turboquant.rs         # NEW — TQ quantize/dequantize/init FFI wrappers
-│   │   └── linear.rs                # MODIFIED — add TQ weight dispatch (Phase 2)
+│   │   └── linear.rs                # MODIFIED — TQ weight dispatch (Phase 2)
 │   ├── model/
 │   │   ├── kv_cache.rs              # MODIFIED — TurboQuant format in KVCache
-│   │   └── turboquant_state.rs      # NEW — TurboQuantState, codebook precompute
-│   ├── paged_kv.rs                  # MODIFIED — TQ pool layout + pointer accessors
-│   ├── quant.rs                     # MODIFIED — TurboQuant format detection
-│   ├── ffi.rs                       # MODIFIED — TQ FFI declarations
-│   └── ops.rs                       # MODIFIED — register kv_turboquant module
-├── csrc/cuda/
-│   └── turboquant.cu                # NEW — all TQ CUDA kernels
-└── build.rs                         # MODIFIED — compile turboquant.cu
+│   │   └── qwen35/ etc.             # MODIFIED — use TQ dispatch when selected
+│   └── quant.rs                     # MODIFIED — TurboQuant format detection
+
+crates/infer-cuda-kernels/
+├── src/
+│   ├── kv_turboquant.rs             # TQ quantize/dequantize/init FFI wrappers
+│   ├── turboquant_state.rs          # TurboQuantState, codebook precompute
+│   ├── paged_kv.rs                  # TQ pool layout + pointer accessors
+│   ├── ffi.rs + ffi/quant.rs        # TQ FFI declarations
+│   └── …
+├── csrc/quant/
+│   ├── turboquant.cu                # TQ CUDA kernels
+│   └── turboquant_fast.cu           # Faster TQ variants
+└── build.rs                         # compiles csrc/quant/*.cu
 ```
 
 ---

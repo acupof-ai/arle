@@ -1,23 +1,33 @@
 # `infer-cuda-kernels` extraction blueprint
 
-**Status:** queued, not yet triggered. Execute when one of the trip wires in §2 fires.
-**Owner of the trigger decision:** ckl.
-**Owner of the execution:** Codex on the remote Linux + CUDA host (Darwin can rustc-verify but not nvcc-link).
-**Prerequisites:** all currently-landed Route-A and CUDA-internal hygiene commits (`d902090`, `909e8cc`, `d3136ba`, `26c8f39`, `efcc991`).
+**Status:** ✅ **executed** — landed in `a4e12f5 refactor(cuda): extract infer-cuda-kernels api`
+(with fmt follow-up `f81e2d5`). Kept as a historical reference for the trip
+wires and decision rationale; §3 Target topology has been updated to match
+what actually landed. For the current workspace shape see
+[`../architecture.md`](../architecture.md) §"Kernel-Crate Extraction".
+**Original trigger decision owner:** ckl.
+**Execution:** landed through a single focused PR on the CUDA-equipped host.
+**Prerequisites (all landed):** Route-A revert + CUDA-internal hygiene moves
+(`d902090`, `909e8cc`, `d3136ba`, `26c8f39`, `efcc991`).
 
-This is the forward-looking plan for migrating `infer/src/backend/cuda/**` plus
-`infer/csrc/cuda/**` plus `infer/tools/triton/**` plus the relevant build.rs
-slice into a standalone `crates/infer-cuda-kernels/` crate. The plan exists so
-that when the trigger fires, the work is **mechanical, not architectural** —
-no re-debate, no scope creep, no Route-A 2.0.
+This was the forward-looking plan for migrating `infer/src/backend/cuda/**`
+plus `infer/csrc/cuda/**` plus `infer/tools/triton/**` plus the relevant
+build.rs slice into a standalone `crates/infer-cuda-kernels/` crate. The plan
+was designed so the execution was **mechanical, not architectural** — no
+re-debate, no scope creep, no Route-A 2.0. That property held: the extraction
+landed in one commit, the before/after benchmarks stayed within the ≤1%
+delta bar, and the §5 procedure below matches what was actually run (with
+one notable divergence — see the §3 note about `csrc/cuda/` being flattened
+out during the move).
 
 ---
 
-## 1 · Why we did not extract yet
+## 1 · Why we pre-staged before extracting
 
-The 2026-04-15 strategic discussion (Claude + Codex independent reads) chose
-**option A (monolithic `infer`)** with three internal hygiene moves
-(committed as `26c8f39` and `efcc991`) instead of immediate extraction. The
+The 2026-04-15 strategic discussion (Claude + Codex independent reads) first
+chose **option A (monolithic `infer`)** with three internal hygiene moves
+(committed as `26c8f39` and `efcc991`) instead of jumping straight to
+extraction. The
 reasoning, in one paragraph:
 
 > Today's `bootstrap.rs` reaches into `crate::model::*`, `crate::scheduler::*`,
@@ -42,8 +52,10 @@ The internal hygiene moves that ARE landed:
 4. **Dead Triton kernels deleted** (`flash_attention_prefill`, `attention_decode`,
    `attention_reduce`, single-token `embedding`).
 
-These moves make the eventual extraction cheaper because the seams are already
-where they need to be. The work below assumes those seams.
+These moves made the subsequent extraction cheap because the seams were
+already where they needed to be. The §5 procedure below assumes those seams
+and they held during execution — the `pub(crate) → pub` flip in `prelude.rs`
+was a one-line change per type, exactly as §4 predicted.
 
 ---
 
@@ -57,7 +69,7 @@ project is committed to following SGLang/vLLM in capability:
 | **T1** | **Parallel kernel build configs producing incompatible `.a` artifacts** | E.g. when FA-3 H100 work introduces sm_90-only kernel paths that conflict with sm_80 fallbacks, or when a vendored FlashInfer fork needs a different include search path. A single `infer/build.rs` cannot ship two different `libkernels_cuda.a` flavors. Extraction lets each artifact live in its own crate (or feature-gated within one). |
 | **T2** | **Adding NCCL tensor parallel communication** | `ROADMAP.md` §"Missing" explicitly calls this out. NCCL pulls in `libnccl` linkage + multi-GPU coordination kernels. Today the build script already has feature gates piling up (`cuda`, `no-cuda`, `metal`, `cpu`, `rdma-nixl`, `rdma-nixl-real`); adding `nccl` on top will start producing combinatorial build matrices that don't fit cleanly under one crate's feature flags. |
 | **T3** | **FlashAttention-3 (H100 / sm_90) prefill** | `ROADMAP.md` §1.2. FA-3 needs warp specialization + async pipeline. The current `prefill_attention.cu` + `flashinfer_single_prefill` path is sm_80-tuned. Adding FA-3 means **two parallel attention kernel implementations selected by SM target** — i.e., trip wire T1 follows. |
-| **T4** | **MLA attention (DeepSeek-V2/V3/R1) + DeepSeek MoE + FP8 GEMM (sm_90)** | `ROADMAP.md` §1.3 + §1.4. This is essentially a second compute backend: new attention algorithm (latent KV compression), new GEMM family (FP8 E4M3), new model family. ~30+ new kernel files. The `csrc/cuda/` tree doubles in size, and the parallel kernel set forces T1 / T2 anyway. |
+| **T4** | **MLA attention (DeepSeek-V2/V3/R1) + DeepSeek MoE + FP8 GEMM (sm_90)** | `ROADMAP.md` §1.3 + §1.4. This is essentially a second compute backend: new attention algorithm (latent KV compression), new GEMM family (FP8 E4M3), new model family. ~30+ new kernel files. The `crates/infer-cuda-kernels/csrc/` tree doubles in size, and the parallel kernel set forces T1 / T2 anyway. |
 | **T5** | **Speculative decoding GPU integration** | `ROADMAP.md` §"Missing". Today `infer/src/speculative.rs` and `infer/src/speculative/cuda.rs` are CPU stubs. Real GPU integration means a draft kernel surface that gets called from inside the scheduler hot loop. The existing scheduler→backend→cuda boundary will need cleanup before this lands cleanly. |
 | **T6** | **A second team / external consumer starts owning only the kernel layer** | E.g. another inference project wants to reuse `infer-cuda-kernels` directly without pulling in the agent runtime. The "two direct consumers" admission criterion from `docs/archives/art-grade-architecture-for-long-agent-infer.md` §六 is met. |
 
@@ -69,7 +81,14 @@ extracted crate from day one.
 
 ---
 
-## 3 · Target topology
+## 3 · Target topology (as actually landed)
+
+> **Divergence from the pre-extraction draft of this section.** The earlier
+> draft kept an `infer/csrc/cuda/` → `crates/infer-cuda-kernels/csrc/cuda/`
+> rename during the move. At execution time we flattened that — the `cuda/`
+> subdirectory was dropped and the domain folders (`attention/`, `gemm/`,
+> `kv/`, `misc/`, `quant/`) became direct children of `csrc/`. Everything
+> else below matches the final layout.
 
 ```
 agent-infer/                        ← workspace root (unchanged)
@@ -77,11 +96,17 @@ agent-infer/                        ← workspace root (unchanged)
 │   ├── infer-agent/                ← unchanged
 │   ├── infer-chat/                 ← unchanged
 │   ├── infer-cli/                  ← unchanged
-│   ├── infer-cuda-kernels/         ← NEW
+│   ├── infer-cuda-kernels/         ← shipped
 │   │   ├── Cargo.toml              ← cudarc + cc + flashinfer detection;
 │   │   │                              `cuda` and `no-cuda` features mirror infer's
 │   │   ├── build.rs                ← lifted from infer/build.rs (nvcc + Triton AOT)
-│   │   ├── csrc/cuda/              ← lifted from infer/csrc/cuda/
+│   │   ├── csrc/                   ← lifted from infer/csrc/cuda/ (flattened)
+│   │   │   ├── attention/          ← flashinfer_*, fused_attention, prefill_attention, …
+│   │   │   ├── gemm/               ← gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
+│   │   │   ├── kv/                 ← paged_kv_append, kv_cache_to_paged, kv_quant, scatter_kv
+│   │   │   ├── quant/              ← turboquant, turboquant_fast, dtype_convert
+│   │   │   ├── misc/               ← norm, sampling, pos_enc, conv1d, gdr, fused_mlp, …
+│   │   │   └── common.cuh
 │   │   ├── tools/triton/           ← lifted from infer/tools/triton/
 │   │   └── src/
 │   │       ├── lib.rs              ← `pub use ffi::*;` + `pub use prelude::*;`
@@ -92,7 +117,8 @@ agent-infer/                        ← workspace root (unchanged)
 │   │       │                          / RawDevicePtr / HiddenStates
 │   │       ├── paged_kv.rs         ← PagedKVPool / TokenKVPool
 │   │       ├── flashinfer.rs       ← FlashInferDecodeMetadata / workspace
-│   │       ├── graph_pool.rs       ← parked F2 scaffold (still pub(crate))
+│   │       ├── graph_pool.rs
+│   │       ├── kv_quant.rs / kv_turboquant.rs / kv_types.rs / turboquant_state.rs
 │   │       └── prelude.rs          ← THE public API surface (see §4)
 │   ├── infer-tools/                ← unchanged
 │   └── mlx-sys/                    ← unchanged
@@ -103,9 +129,9 @@ agent-infer/                        ← workspace root (unchanged)
 │   ├── tools/                      ← (gone — moved to infer-cuda-kernels)
 │   └── src/
 │       ├── backend/
-│       │   ├── cuda/               ← gone, except ONE thin façade file
-│       │   └── cuda.rs             ← `pub use infer_cuda_kernels::*;` re-export
-│       ├── backend/cuda/bootstrap.rs   ← STAYS in infer (uses model + scheduler)
+│       │   ├── cuda.rs             ← `pub use infer_cuda_kernels::*;` re-export shim
+│       │   └── cuda/
+│       │       └── bootstrap.rs    ← STAYS in infer (uses model + scheduler)
 │       ├── model/                  ← unchanged (imports via infer_cuda_kernels::prelude)
 │       ├── ops/                    ← unchanged (imports via infer_cuda_kernels::ffi)
 │       ├── scheduler/              ← unchanged
@@ -165,10 +191,19 @@ cargo check --workspace --no-default-features --features metal
 Capture before-snapshot benchmarks per CLAUDE.md `Benchmark Rules`:
 `docs/experience/wins/YYYY-MM-DD-bench-pre-cuda-extraction.md`.
 
-### 5.2 — Move files
+### 5.2 — Move files (what actually ran)
+
+The actual extraction flattened the `csrc/cuda/` subdirectory during the
+move, so the domain folders (`attention/`, `gemm/`, `kv/`, `misc/`,
+`quant/`) ended up as direct children of `csrc/` inside the new crate:
 
 ```
-git mv infer/csrc/cuda                      crates/infer-cuda-kernels/csrc/cuda
+git mv infer/csrc/cuda/attention            crates/infer-cuda-kernels/csrc/attention
+git mv infer/csrc/cuda/gemm                 crates/infer-cuda-kernels/csrc/gemm
+git mv infer/csrc/cuda/kv                   crates/infer-cuda-kernels/csrc/kv
+git mv infer/csrc/cuda/misc                 crates/infer-cuda-kernels/csrc/misc
+git mv infer/csrc/cuda/quant                crates/infer-cuda-kernels/csrc/quant
+git mv infer/csrc/cuda/common.cuh           crates/infer-cuda-kernels/csrc/common.cuh
 git mv infer/tools/triton                   crates/infer-cuda-kernels/tools/triton
 git mv infer/src/backend/cuda/ffi.rs        crates/infer-cuda-kernels/src/ffi.rs
 git mv infer/src/backend/cuda/ffi           crates/infer-cuda-kernels/src/ffi

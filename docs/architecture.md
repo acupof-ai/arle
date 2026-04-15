@@ -83,87 +83,106 @@ infer binary / metal_serve / cpu_serve
   still live in the `infer` crate; this document tracks package ownership, not
   every implementation detail.
 
-## Future Evolution
+## Kernel-Crate Extraction (post-2026-04-15)
 
-The current monolithic `infer` shape is **option A** in a two-step path that
-ends at **option B (kernel-only crate extraction)**. The decision and the
-trip wires were locked in on 2026-04-15 after a strategic discussion between
-Claude and Codex, with explicit framing on long-term maintainability and
-upgradeability rather than short-term build speed.
+The workspace originally had two decision points: whether to split the CUDA
+kernel layer out of `infer` (option B), and, if so, what the minimal safe
+surface looked like. The discussion happened between Claude and Codex on
+2026-04-15 and the trip wires were locked in before execution so the work
+could land as mechanical refactor, not re-debate.
 
-### Why we stopped at option A for now
+The extraction **landed in commit `a4e12f5 refactor(cuda): extract
+infer-cuda-kernels api`**, followed by `f81e2d5 style(workspace): run
+cargo fmt after kernel-crate extraction`. From that point on, the
+"option A vs option B" framing is historical; the current tree is
+option B.
 
-Today's `infer/src/backend/cuda/bootstrap.rs` reaches into `crate::model::*`,
-`crate::scheduler::*`, `crate::tokenizer::Tokenizer`, and
-`crate::model_registry::*` to load and dispatch model-specific CUDA engines.
-Extracting `backend/cuda/` now would force `Tokenizer`, `KVCacheDtype`,
-`ModelType`, and the per-model weight structs to become `pub` cross-crate,
-and `bootstrap.rs::load_*_components` would straddle the new crate boundary —
-the exact failure mode of the four-shell Route-A split that was reverted in
-the same week. So we keep it monolithic and instead **pre-stage the future
-boundary** through three internal moves that landed as commits `26c8f39` and
-`efcc991`:
+### Current layout (what the extraction moved)
 
-1. `infer/src/backend/cuda/ffi.rs` is split into 10 domain submodules
+```
+crates/infer-cuda-kernels/
+├── Cargo.toml
+├── build.rs                 ← nvcc + Triton AOT, lifted from infer/build.rs
+├── csrc/
+│   ├── attention/           ← flashinfer_*, fused_attention, prefill_attention, decode_prep_paged, …
+│   ├── gemm/                ← gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
+│   ├── kv/                  ← paged_kv_append, kv_cache_to_paged, kv_quant, scatter_kv
+│   ├── quant/               ← turboquant, turboquant_fast, dtype_convert
+│   ├── misc/                ← norm, sampling, pos_enc, conv1d, gdr, fused_mlp, …
+│   └── common.cuh
+├── tools/triton/            ← flash_attention_prefill_hd256, gated_delta_rule_chunkwise, silu_mul, basic, …
+└── src/
+    ├── lib.rs
+    ├── ffi.rs + ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,recurrent,misc}.rs
+    ├── tensor.rs            ← DeviceContext / DeviceVec / DeviceMatrix / HiddenStates / RawDevicePtr
+    ├── paged_kv.rs          ← PagedKVPool / TokenKVPool
+    ├── flashinfer.rs        ← FlashInferDecodeMetadata / workspace
+    ├── graph_pool.rs
+    ├── kv_quant.rs / kv_turboquant.rs / kv_types.rs / turboquant_state.rs
+    └── prelude.rs           ← public API surface (the proto-API graduated)
+```
+
+```
+infer/
+└── src/backend/
+    ├── cuda.rs              ← thin `pub use infer_cuda_kernels::*;` re-export
+    │                           shim; ~60 `crate::backend::cuda::…` call sites
+    │                           keep resolving unchanged.
+    └── cuda/
+        └── bootstrap.rs     ← STAYS in infer; reaches into crate::model::*,
+                                crate::scheduler::*, crate::tokenizer::Tokenizer,
+                                crate::model_registry::*.
+```
+
+The dependency edge is **`infer → infer-cuda-kernels`, never the reverse**.
+`bootstrap.rs` is the only file where kernel concerns and model/scheduler
+concerns meet; keeping it in `infer` is what let the kernel crate ship
+without forcing `Tokenizer`, `KVCacheDtype`, `ModelType`, or per-model
+weight structs to become cross-crate `pub`.
+
+### Why the earlier internal hygiene work still matters
+
+Three pre-extraction moves landed in commits `26c8f39` and `efcc991` and
+are what made the single-day extraction actually mechanical:
+
+1. `infer/src/backend/cuda/ffi.rs` was split into 10 domain submodules
    (`ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,
-   recurrent,misc}.rs`) with re-exports from the parent.
-2. `infer/src/backend/cuda/prelude.rs` is the **proto-API contract** —
-   seven cross-cutting types that 25+ files import through. The prelude is
-   intentionally narrow and policed by a "≥3 consumers + stable + would not
-   force any `infer` type to become cross-crate `pub`" rule documented in
-   the file itself.
-3. `infer/build.rs` derives Triton `cargo:rerun-if-changed` from a
-   directory walk, so the build script can never drift from the actual
-   kernel set.
+   recurrent,misc}.rs`). They carried over intact to
+   `crates/infer-cuda-kernels/src/ffi/`.
+2. `prelude.rs` was the **proto-API contract** — seven cross-cutting types
+   that 25+ files imported through, gated by a "≥3 consumers + stable +
+   would not force any `infer` type to become cross-crate `pub`" rule.
+   At extraction time those `pub(crate)` items became real cross-crate
+   `pub` with no new symbols added.
+3. Triton `cargo:rerun-if-changed` is derived from a `read_dir(tools/triton)`
+   walk so the build script can never drift from the actual kernel set.
 
-### When option B kicks in
+### Further extraction (still future)
 
-Any **one** of these triggers (all on `ROADMAP.md::Missing`) executes the
-extraction blueprint at `docs/plans/cuda-kernel-crate-extraction.md`:
+The kernel-crate extraction was deliberately narrow. The items below remain
+anti-goals **unless** a concrete second consumer forces them — the bar
+documented in `docs/archives/art-grade-architecture-for-long-agent-infer.md`
+§六 / §七 applies:
 
-| Trigger | Why it forces extraction |
-|---|---|
-| **T1** Parallel kernel build configs producing incompatible `.a` artifacts | A single `infer/build.rs` cannot ship two different `libkernels_cuda.a` flavors. |
-| **T2** NCCL tensor parallel communication | Adds `libnccl` linkage + multi-GPU coordination kernels on top of an already-crowded build feature matrix. |
-| **T3** FlashAttention-3 (H100 / sm_90) prefill | Two parallel attention kernel implementations selected by SM target → triggers T1. |
-| **T4** MLA attention (DeepSeek-V2/V3/R1) + FP8 GEMM (sm_90) | Doubles the size of `csrc/cuda/`; new attention algorithm + new GEMM family. |
-| **T5** Speculative decoding GPU integration | Adds a draft kernel surface called from inside the scheduler hot loop. |
-| **T6** A second consumer of the kernel layer | The "two direct consumers" admission criterion is met. |
-
-The blueprint is one focused day of mechanical work on the CUDA host because
-the seams (ffi domain split, prelude proto-API, Triton auto-derive) are
-already in place. **Trip wire response is "execute the plan", not "decide
-again".**
-
-### What option B looks like
-
-After extraction:
-
-```
-crates/infer-cuda-kernels/    ← NEW: csrc/cuda/, tools/triton/, ffi/, tensor,
-                                paged_kv, flashinfer, graph_pool, prelude
-infer/                        ← thin runtime + HTTP shell; bootstrap.rs stays
-                                here because it pulls model + scheduler
-```
-
-`infer/src/backend/cuda.rs` becomes a thin `pub use infer_cuda_kernels::*;`
-re-export shim so 60+ existing `crate::backend::cuda::…` call sites do not
-need to change. The dependency edge is **`infer → infer-cuda-kernels`,
-never the reverse.** No `infer-ops`, no `infer-scheduler-core`, no
-`infer-runtime-api` — those are the anti-goals documented in the blueprint
-because they would re-create the bootstrap straddle problem.
-
-### Anti-goals
-
-- **No `infer-ops` crate.** Ops are tightly coupled to model layouts.
+- **No `infer-ops` crate.** Ops are tightly coupled to model data layouts.
 - **No `infer-scheduler-core` crate.** The CUDA scheduler reaches into
   `PagedKVPool`, `FlashInferDecodeMetadata`, and model-specific types in
-  bootstrap.
+  `bootstrap`.
+- **No `infer-runtime-api` trait crate.** Already covered by
+  `infer::server_engine::InferenceEngine`.
+- **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
+  both layers; splitting them creates a `*-sys` boundary with one consumer.
+
+The original trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM, T4 spec
+decoding, T5 second external consumer) are now arguments for the **next**
+extraction boundary — whichever one, if any, eventually peels scheduler
+or model layers out. They are no longer arguments about the kernel crate.
+
+### Additional anti-goal (CPU backend)
+
 - **No CPU backend extraction.** `infer/src/backend/cpu.rs` is a 309-line
   smoke-test backend that generates synthetic responses; extracting it
   would create a one-consumer crate with zero independence benefit.
-- **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
-  both layers; splitting them creates a `*-sys` boundary with one consumer.
 
 ### Cross-references
 

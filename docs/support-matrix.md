@@ -6,7 +6,7 @@ limited, and what validation exists for each area.
 If something is not listed as supported here, do not assume it is supported
 just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-12.
+State reflected here is based on repository evidence as of 2026-04-15.
 
 ---
 
@@ -53,13 +53,21 @@ Notes:
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Metal DFlash | Experimental | Currently validated on Qwen3 + Apple Silicon. Generation-heavy workloads first. |
-| FP8 KV cache | Beta | Implemented and benchmarked, still evolving. |
-| INT8 KV cache | Beta | Implemented and benchmarked, still evolving. |
-| TurboQuant KV | Experimental | Fast-moving optimization area. |
-| W8 / W4 / W2 weight quantization | Beta | Present and actively evolving. |
-| GPTQ / AWQ | Beta | Active support path, not yet fully standardized. |
-| GGUF loading | Beta | Recently added and still maturing. |
+| FP8 KV cache | Beta | FP8 E4M3 + fused-dequant decode attention; 50% KV memory reduction, benchmarked. |
+| INT8 KV cache | Beta | INT8 W8A16 GEMV/GEMM + INT8 KV fused-dequant decode; benchmarked. |
+| TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
+| W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
+| GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
+| GGUF loading | Beta | Supported loader path; Q4_K native GPU kernel still on the roadmap. |
+
+---
+
+## 4a. Speculative Decoding Matrix
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Metal DFlash | Experimental | Apple Silicon speculative decode path. Validated on Qwen3 today; benchmark before use. |
+| CUDA speculative decoding | Not shipped | `infer/src/speculative.rs` is a CPU-only framework; GPU integration pending (see `plans/speculative-decoding-impl.md`). |
 
 ---
 

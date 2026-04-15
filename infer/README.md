@@ -214,59 +214,73 @@ E2E tests compare against JSON baselines in `test_data/`. Regenerate baselines a
 ### Source layout
 
 ```
-src/
-├── main.rs                # CLI entry point + HTTP server (axum)
-├── server_engine.rs       # Model detection, single-request engine
-├── http_server/              # /v1/completions, /v1/chat/completions, SSE
-├── scheduler.rs + scheduler/ # Continuous batching scheduler (batch, types, cuda/)
-├── model.rs + model/         # ModelForward + GenerationState + model impls
-│   ├── cuda_graph.rs         # CUDA Graph capture/replay (per batch size)
-│   ├── kv_cache.rs           # KV cache + CPU offload
-│   ├── qwen3/                # Qwen3: weights, forward, prefill, decode
-│   ├── qwen35/               # Qwen3.5: weights, forward, recurrent_state
-│   └── glm4/                 # GLM4
-├── backend.rs + backend/     # InferenceBackend trait + submodules
-│   ├── cuda.rs + cuda/       # CUDA plumbing: ffi, tensor, paged_kv,
-│   │                           graph_pool, flashinfer, bootstrap
-│   ├── metal.rs + metal/     # Metal/MLX backend: mlx bridge, gdr,
-│   │                           kv_pool, prefix_cache, scheduler, qwen35
-│   ├── cpu.rs                # Development CPU backend (feature `cpu`)
-│   └── runtime.rs            # Serial runtime handle for CPU/Metal
-├── ops.rs + ops/             # GPU operator dispatch
-│   ├── attention.rs          # GQA attention, FlashInfer paged decode
-│   ├── linear.rs             # GEMV, cuBLAS GEMM, batched GEMM
-│   ├── norm.rs               # RMSNorm, fused Add+RMSNorm
-│   ├── recurrent.rs          # Conv1d, Gated Delta Rule (Qwen3.5)
-│   └── sampling.rs           # GPU argmax, top-k/top-p, batched sampling
-├── sampler.rs                # Sampling params + CPU sampler
-└── tokenizer.rs              # HuggingFace tokenizers wrapper
-
-csrc/cuda/                    # CUDA C kernels, grouped by domain
-├── attention/                # flashinfer_*, fused_attention, prefill_attention, ...
-├── gemm/                     # gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
-├── kv/                       # kv_cache_to_paged, paged_kv_append, kv_quant, scatter_kv
-├── quant/                    # turboquant, turboquant_fast, dtype_convert
-└── misc/                     # norm, sampling, pos_enc, conv1d, gdr, fused_mlp, ...
-
-tools/triton/              # Triton AOT kernels (compiled at build time)
-├── flash_attention_prefill_kernel.py
-├── attention_decode_kernel.py
-├── gated_delta_rule_chunkwise_kernels.py
-└── gen_triton_aot.py      # AOT driver — 16+ kernels compiled to C wrappers
+infer/src/
+├── main.rs                  # CLI entry point + HTTP server (axum)
+├── server_engine.rs         # Unified InferenceEngine contract + LoadedInferenceEngine
+├── http_server.rs + http_server/  # /v1/completions, /v1/chat/completions, /v1/responses, SSE
+├── scheduler/               # Continuous batching scheduler (batch, types, policy, cuda/)
+├── model.rs + model/        # ModelForward + GenerationState + per-model impls
+│   ├── generation_state.rs  # Per-request mutable state
+│   ├── qwen3/               # Qwen3: weights, forward, prefill, decode, batch_decode
+│   ├── qwen35/              # Qwen3.5: hybrid linear + full attention
+│   └── glm4/                # GLM4
+├── backend.rs + backend/    # InferenceBackend trait + submodules
+│   ├── cuda.rs              # Thin `pub use infer_cuda_kernels::*;` re-export shim
+│   ├── cuda/bootstrap.rs    # Model loading, runtime config, scheduler bring-up
+│   ├── metal.rs + metal/    # Metal/MLX backend: mlx bridge, gdr, kv_pool,
+│   │                          prefix_cache, scheduler, generate, forward
+│   ├── cpu.rs               # Development CPU backend (feature `cpu`)
+│   └── runtime.rs           # Serial runtime handle for CPU/Metal
+├── ops.rs + ops/            # GPU operator dispatch (attention, linear, norm,
+│                              recurrent, sampling, elementwise, embedding, kv_ops)
+├── kv_tier/                 # Tiered KV cache skeleton (T0 GPU → T1 host → T2 disk)
+├── prefix_cache.rs          # Radix-tree prefix cache
+├── block_manager.rs         # KV block accounting for the batch scheduler
+├── sampler.rs               # Sampling params + CPU sampler
+└── tokenizer.rs             # HuggingFace tokenizers wrapper
 ```
+
+The CUDA C kernels and Triton AOT sources used to live at `infer/csrc/cuda/`
+and `infer/tools/triton/`, but were extracted into their own crate on
+2026-04-15 (`a4e12f5 refactor(cuda): extract infer-cuda-kernels api`). They
+now live at:
+
+```
+crates/infer-cuda-kernels/
+├── Cargo.toml / build.rs     # nvcc + Triton AOT (lifted from infer/build.rs)
+├── csrc/
+│   ├── attention/            # flashinfer_*, fused_attention, prefill_attention, decode_prep_paged, ...
+│   ├── gemm/                 # gemv, quantized_gemv, marlin_*, turboquant_weight_gemv
+│   ├── kv/                   # paged_kv_append, kv_cache_to_paged, kv_quant, scatter_kv
+│   ├── quant/                # turboquant, turboquant_fast, dtype_convert
+│   └── misc/                 # norm, sampling, pos_enc, conv1d, gdr, fused_mlp, ...
+├── tools/triton/             # Triton AOT kernels (compiled at build time)
+│   ├── flash_attention_prefill_hd256_kernel.py
+│   ├── gated_delta_rule_chunkwise_kernels.py
+│   ├── basic_kernels.py / silu_mul_kernel.py
+│   └── gen_triton_aot.py     # AOT driver — 13 kernels compiled to C wrappers
+└── src/                      # FFI, tensor, paged_kv, flashinfer, graph_pool, prelude
+```
+
+`infer/src/backend/cuda.rs` re-exports `infer_cuda_kernels::*` so existing
+`crate::backend::cuda::…` call sites keep resolving. See
+[`../docs/plans/cuda-kernel-crate-extraction.md`](../docs/plans/cuda-kernel-crate-extraction.md)
+for the extraction blueprint (now marked executed) and
+[`../docs/architecture.md`](../docs/architecture.md) §"Kernel-Crate Extraction"
+for the canonical current shape.
 
 ### Triton AOT
 
-Triton kernels are compiled at build time into generated C wrappers. Runtime has no Python dependency. Build triggers when `tools/triton/` sources change; output lands in `target/`. See `tools/triton/README.md` for setup.
+Triton kernels are compiled at build time into generated C wrappers. Runtime has no Python dependency. Build triggers when `crates/infer-cuda-kernels/tools/triton/` sources change; output lands in `target/`. See `crates/infer-cuda-kernels/tools/triton/README.md` for setup.
 
 ## Roadmap
 
-Phase 0 (foundation) is complete. Active focus:
+Phase 0 (foundation) and Phase 2 (quantization) are complete. Active focus:
 
-- **Qwen3.5 SGLang parity** — close ITL gap via batched recurrent kernels (in progress)
+- **Qwen3.5 SGLang parity** — batched prefill remaining; prefix cache + overlap scheduling already done
 - **Llama 3/4** — most requested model architecture
 - **DeepSeek-V3 / R1** — requires MLA attention first
-- **Quantization GPU kernels** (GPTQ/AWQ INT4, FP8, INT8)
+- **Tiered KV cache** — hierarchical T0 GPU → T1 host → T2 NVMe → T3 NIXL
 
 Future:
 - FlashAttention-3 (SM90 / H100)

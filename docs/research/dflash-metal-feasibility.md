@@ -55,7 +55,7 @@ it's a viable first step.
 
 ### Cons / Risks
 1. **External C++ dependency**: integrating DFlash-MLX's C++ draft head would require
-   additions to `infer/csrc/metal/` and the MLX bridge
+   additions to `crates/mlx-sys/` (the MLX + C++ bridge)
 2. **Checkpoint availability**: DFlash draft heads are fine-tuned on the target model's
    hidden states — need the appropriate checkpoint for Qwen3-4B
 3. **Agent-infer Metal is single-request**: current Metal scheduler handles one request at a time;
