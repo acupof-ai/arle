@@ -67,6 +67,9 @@ pub mod ops;
 #[path = "metal/qwen35.rs"]
 mod qwen35;
 #[cfg(feature = "metal")]
+#[path = "metal/request_state.rs"]
+pub mod request_state;
+#[cfg(feature = "metal")]
 #[path = "metal/sampling.rs"]
 pub mod sampling;
 #[cfg(feature = "metal")]
@@ -209,6 +212,25 @@ impl MetalBackend {
         run_with_metal_panic_boundary("token-id generation", || {
             self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
         })
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn create_request_state(
+        &self,
+        input_ids: &[u32],
+        params: &SamplingParams,
+    ) -> Result<request_state::MetalRequestState<'_>> {
+        let config = self.config.as_ref().context("model not loaded")?;
+        let weights = self.weights.as_ref().context("weights not loaded")?;
+        let max_new_tokens = params.max_new_tokens.unwrap_or(512);
+        request_state::MetalRequestState::new(
+            weights,
+            config,
+            input_ids.to_vec(),
+            params,
+            self.kv_pool_enabled,
+            max_new_tokens,
+        )
     }
 
     #[allow(unused_mut)]
