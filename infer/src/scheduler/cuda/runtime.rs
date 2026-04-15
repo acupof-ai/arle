@@ -52,12 +52,15 @@ impl<M: ModelForward> Scheduler<M> {
                         .prefix_cache
                         .logical_clock()
                         .saturating_sub(staged.enqueued_at_clock);
+                    // Flip the staged blocks to ReadyOnGpu so the next
+                    // lookup_or_stage sees them as T0 hits. `u32::MAX` is
+                    // a "ready but not yet owned by a slot" sentinel;
+                    // `publish_to_prefix_cache` will overwrite it with a
+                    // real slot once decode picks up the request.
                     for &block_id in &staged.block_ids {
                         let _ = self.prefix_cache.update_block_metadata(
                             block_id,
                             BlockMetadataUpdate {
-                                // A4 stub: ready-but-not-yet-owned-by-slot sentinel; real slot
-                                // assigned in publish_to_prefix_cache.
                                 location: Some(crate::kv_tier::BlockLocation::Gpu {
                                     slot: u32::MAX,
                                 }),
@@ -65,16 +68,17 @@ impl<M: ModelForward> Scheduler<M> {
                             },
                         );
                     }
+                    // Release the stage-era refs but **deliberately leave
+                    // `soft_pin_until` at its stage-wait deadline**. The
+                    // soft pin keeps eviction off these blocks until the
+                    // re-admission's next `lookup_or_stage` refreshes it
+                    // down to the normal keepalive_ticks. Without this,
+                    // the window between `release` and the second lookup
+                    // is unprotected — the next `assign_slots` call runs
+                    // `evict_prefix_cache_if_pressured` before picking
+                    // the parked request back up and could reclaim the
+                    // just-staged blocks.
                     self.prefix_cache.release(&staged.block_ids);
-                    for &block_id in &staged.block_ids {
-                        let _ = self.prefix_cache.update_block_metadata(
-                            block_id,
-                            BlockMetadataUpdate {
-                                soft_pin_until: Some(None),
-                                ..BlockMetadataUpdate::default()
-                            },
-                        );
-                    }
                     log::debug!(
                         "Staging completed for ticket={} (prompt={} tokens, staged_blocks={}, waited_ticks={})",
                         ticket.0,
@@ -87,7 +91,33 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    error!("Coordinator event channel disconnected");
+                    // Coordinator thread gone — we cannot complete any
+                    // future StageTicket. Cold-requeue every parked
+                    // admission so the idle-exit guard in `run()` can
+                    // fire and waiting requests are not leaked. Release
+                    // stage-era refs but leave soft_pin_until untouched
+                    // (same reasoning as the completion path above —
+                    // the re-admission might still hit the prefix).
+                    let pending = std::mem::take(&mut self.stage_waiting);
+                    if !pending.is_empty() {
+                        error!(
+                            "Coordinator event channel disconnected; cold-requeuing {} staged admissions",
+                            pending.len()
+                        );
+                    } else {
+                        error!("Coordinator event channel disconnected");
+                    }
+                    for (ticket, staged) in pending {
+                        self.prefix_cache.release(&staged.block_ids);
+                        warn!(
+                            "Cold-requeuing ticket {} ({} prompt tokens, {} staged blocks dropped)",
+                            ticket.0,
+                            staged.prompt_tokens.len(),
+                            staged.block_ids.len()
+                        );
+                        self.waiting.push_front(staged.request);
+                        self.waiting_count.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.coordinator_unavailable = true;
                     break;
                 }

@@ -197,6 +197,16 @@ impl CoordinatorHandle {
             .send(cmd)
             .map_err(|e| anyhow!("coordinator send failed: {e}"))
     }
+
+    /// Best-effort non-blocking `Shutdown` signal. Safe to call from a
+    /// `Drop` path where a blocking `send` on a full bounded channel
+    /// would deadlock. If the command channel is already full the
+    /// signal is dropped; the caller should then rely on *channel
+    /// disconnect* (dropping every `CoordinatorHandle` clone plus the
+    /// events receiver) to terminate the coordinator thread.
+    pub fn try_send_shutdown(&self) {
+        let _ = self.tx.try_send(CoordinatorCommand::Shutdown);
+    }
 }
 
 impl StagePlanner for CoordinatorHandle {

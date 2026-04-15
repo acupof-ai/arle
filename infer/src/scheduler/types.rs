@@ -336,6 +336,20 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_config_accepts_retain_cap_at_unit_boundary() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_retain_hard_cap = 1.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_retain_cap_above_unit_boundary() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_retain_hard_cap = 1.01;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn scheduler_config_rejects_stage_wait_below_keepalive() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.prefix_cache_keepalive_ticks = 128;
