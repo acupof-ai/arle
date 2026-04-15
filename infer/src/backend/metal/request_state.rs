@@ -651,13 +651,15 @@ fn decode_qwen35_batch(
     let token_arr = MlxArray::from_slice_i32(&token_values, &[batch]);
 
     let n_kv_per_request = match &states[0].driver.mode {
-        Qwen35StepMode::Cpp(state) => i32::try_from(state.kv_flat.len())
-            .context("decode_qwen35_batch kv count overflow")?,
+        Qwen35StepMode::Cpp(state) => {
+            i32::try_from(state.kv_flat.len()).context("decode_qwen35_batch kv count overflow")?
+        }
         Qwen35StepMode::Rust(_) => unreachable!("checked above"),
     };
     let n_gdr_per_request = match &states[0].driver.mode {
-        Qwen35StepMode::Cpp(state) => i32::try_from(state.gdr_flat.len())
-            .context("decode_qwen35_batch gdr count overflow")?,
+        Qwen35StepMode::Cpp(state) => {
+            i32::try_from(state.gdr_flat.len()).context("decode_qwen35_batch gdr count overflow")?
+        }
         Qwen35StepMode::Rust(_) => unreachable!("checked above"),
     };
 
@@ -705,7 +707,10 @@ fn decode_qwen35_batch(
         start[0] = row;
         end[0] = row + 1;
         let row_logits = slice(&logits, &start, &end, &strides);
-        sampled_arrays.push(gpu_sample_token(&row_logits, &states[row_idx].driver.params));
+        sampled_arrays.push(gpu_sample_token(
+            &row_logits,
+            &states[row_idx].driver.params,
+        ));
     }
     let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
     eval(&sample_refs);
