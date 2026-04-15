@@ -486,7 +486,13 @@ static int choose_decode_num_splits(
     err = cudaGetDeviceProperties(&props, device);
     if (err != cudaSuccess || props.multiProcessorCount <= 0) return 1;
 
-    constexpr int kTargetBlocksPerSm = 4;
+    // 32 blocks/SM saturates the kMaxSplits=32 cap on L4 (SM89, 58 SMs) for
+    // Qwen3-4B. num_splits=8 (old kTargetBlocksPerSm=4) left us at ~14% warp
+    // occupancy and compute-bound on softmax/reduce; splits=16 recovered
+    // ~11% ITL at 25k; splits=32 aims for the workspace ceiling. Both INT8
+    // and FP8 variants pre-allocate their workspace at num_splits=32 in
+    // paged_kv.rs, so 32 is the hard ceiling we must not exceed.
+    constexpr int kTargetBlocksPerSm = 32;
     constexpr int kMaxSplits = 32;
 
     int target_blocks = props.multiProcessorCount * kTargetBlocksPerSm;
