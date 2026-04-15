@@ -38,17 +38,25 @@ This checklist is the execution companion to:
   Exit:
   shared-prefix requests skip matched prefill in the serving path, not only in
   the single-request fallback path.
-- [ ] `M0.4` Expose Metal memory and reuse observability.
+  Status:
+  `2026-04-15`: `Qwen3` now has a live runtime-owned prefix cache + shared KV
+  pool path. Admission does lookup+import before scheduler submit, terminal
+  prefill publishes aligned prompt prefixes back into the runtime cache, and a
+  local repeated-prefix smoke on `mlx-community/Qwen3-0.6B-4bit` moved
+  `prefix_hit_rate` to `0.3333` with sequential `max_tokens=1` latency
+  dropping from `186.7ms -> 65.1ms`. The milestone stays open because
+  `Qwen3.5` still lacks live prefix reuse.
+- [x] `M0.4` Expose Metal memory and reuse observability.
   Exit:
   `/metrics` and `/v1/stats` surface at least `prefix_hit_rate`, `kv_util`,
   `active_memory`, `peak_memory`, and queue depth.
   Status:
   `2026-04-15`: runtime-backed queue / TTFT / E2E / MLX memory metrics landed
-  on both the live scheduler runtime and the serial DFlash fallback path. The
-  remaining open edge is that `prefix_hit_rate` is still a real-but-zero gauge
-  until `M0.3` wires shared-prefix reuse into the live serving path. The same
-  tranche now also exposes `--memory-limit-bytes` / `--cache-limit-bytes` /
-  `--wired-limit-bytes` on all user-facing Metal entry points.
+  on both the live scheduler runtime and the serial DFlash fallback path, and
+  `prefix_hit_rate` is now non-zero on the shipped Qwen3 repeated-prefix live
+  path. The same tranche now also exposes `--memory-limit-bytes` /
+  `--cache-limit-bytes` / `--wired-limit-bytes` on all user-facing Metal entry
+  points.
 
 ## P1 · API And DX
 
