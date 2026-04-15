@@ -479,6 +479,19 @@ pub fn rope(x: &MlxArray, dims: i32, trad: bool, base: f32, scale: f32, off: i32
         "mlx_fast_rope",
     )
 }
+pub fn rope_dynamic(
+    x: &MlxArray,
+    dims: i32,
+    trad: bool,
+    base: f32,
+    scale: f32,
+    off: &MlxArray,
+) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_rope_dynamic(x.0, dims, trad, base, scale, off.0) },
+        "mlx_fast_rope_dynamic",
+    )
+}
 pub fn scaled_dot_product_attention(
     q: &MlxArray,
     k: &MlxArray,
@@ -490,6 +503,18 @@ pub fn scaled_dot_product_attention(
     mlx_array_from_raw_or_panic(
         unsafe { mlx_sys::mlx_fast_sdpa(q.0, k.0, v.0, scale, m.as_ptr()) },
         "mlx_fast_sdpa",
+    )
+}
+pub fn scaled_dot_product_attention_masked(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: &MlxArray,
+) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_fast_sdpa_masked(q.0, k.0, v.0, scale, mask.0) },
+        "mlx_fast_sdpa_masked",
     )
 }
 pub fn categorical(logits: &MlxArray) -> MlxArray {

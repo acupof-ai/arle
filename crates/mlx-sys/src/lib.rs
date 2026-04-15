@@ -409,6 +409,14 @@ unsafe extern "C" {
         scale: f32,
         offset: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_fast_rope_dynamic(
+        x: *mut mlx_array,
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        scale: f32,
+        offset: *mut mlx_array,
+    ) -> *mut mlx_array;
     /// Scaled dot-product attention.
     /// mask_mode: "" for no mask, "causal" for causal masking.
     /// NEVER pass null — std::string(nullptr) is UB.
@@ -418,6 +426,13 @@ unsafe extern "C" {
         v: *mut mlx_array,
         scale: f32,
         mask_mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+    pub fn mlx_fast_sdpa_masked(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        scale: f32,
+        mask: *mut mlx_array,
     ) -> *mut mlx_array;
 
     // === Random ===

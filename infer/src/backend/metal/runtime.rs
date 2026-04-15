@@ -131,9 +131,9 @@ impl ActiveMetalRequest {
 /// Spawn the first live Metal scheduler runtime.
 ///
 /// This runtime uses the request-state API to interleave chunked prefill and
-/// decode scheduling. It does not yet implement cross-request batched GPU
-/// decode; decode steps are still executed request-by-request inside the
-/// scheduler loop.
+/// decode scheduling. Qwen3 decode batches are executed as one cross-request
+/// GPU graph; unsupported decode batches fall back to request-by-request
+/// execution inside the scheduler loop.
 pub fn spawn_metal_scheduler_handle_from_path_with_options(
     model_path: &str,
     options: MetalBackendOptions,
@@ -419,6 +419,71 @@ fn execute_decode_batch(
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
+    if req_ids.is_empty() {
+        return;
+    }
+
+    let mut staged = Vec::with_capacity(req_ids.len());
+    for req_id in req_ids {
+        let Some(request) = active.remove(&req_id) else {
+            warn!("Metal decode batch referenced missing request {:?}", req_id);
+            scheduler.finish_request(req_id);
+            continue;
+        };
+        staged.push((req_id, request));
+    }
+
+    let mut open = Vec::with_capacity(staged.len());
+    for (req_id, request) in staged {
+        if request.delta_closed() {
+            scheduler.finish_request(req_id);
+            continue;
+        }
+        open.push((req_id, request));
+    }
+
+    let batch_result = if open.len() >= 2 {
+        let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
+            .iter_mut()
+            .map(|(_, request)| &mut request.request_state)
+            .collect();
+        match MetalRequestState::decode_batch(&mut request_refs) {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Metal batched decode failed: {err:#}");
+                for (req_id, request) in open {
+                    cancel_detached_request(req_id, request, scheduler);
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(sampled_tokens) = batch_result {
+        for ((req_id, mut request), sampled_token) in open.into_iter().zip(sampled_tokens) {
+            if let Err(err) = request.process_token(sampled_token) {
+                error!("Metal batched decode post-process failed for {:?}: {err:#}", req_id);
+                cancel_detached_request(req_id, request, scheduler);
+                continue;
+            }
+            finish_or_requeue_decoded_request(req_id, request, sampled_token, scheduler, active);
+        }
+        return;
+    }
+
+    for (req_id, request) in open {
+        execute_decode_single(req_id, request, scheduler, active);
+    }
+}
+
+fn execute_decode_single(
+    req_id: RequestId,
+    mut request: ActiveMetalRequest,
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
     enum Outcome {
         Progress {
             sampled_token: u32,
@@ -429,59 +494,103 @@ fn execute_decode_batch(
         Failed(anyhow::Error),
     }
 
-    for req_id in req_ids {
-        let outcome = {
-            let Some(request) = active.get_mut(&req_id) else {
-                warn!("Metal decode batch referenced missing request {:?}", req_id);
-                scheduler.finish_request(req_id);
-                continue;
-            };
-
-            if request.delta_closed() {
-                Outcome::ClientDropped
-            } else {
-                match request.decode_step() {
-                    Ok(sampled_token) => Outcome::Progress {
-                        sampled_token,
-                        runtime_finished: request.phase() == RuntimePhase::Finished,
-                        stop_hit: request.stop_hit(),
-                    },
-                    Err(err) => {
-                        if request.delta_closed() {
-                            Outcome::ClientDropped
-                        } else {
-                            Outcome::Failed(err)
-                        }
-                    }
-                }
-            }
-        };
-
-        match outcome {
-            Outcome::Progress {
+    let outcome = if request.delta_closed() {
+        Outcome::ClientDropped
+    } else {
+        match request.decode_step() {
+            Ok(sampled_token) => Outcome::Progress {
                 sampled_token,
-                runtime_finished,
-                stop_hit,
-            } => {
-                let scheduler_finished = match scheduler.advance_decode(req_id, sampled_token) {
-                    Ok(done) => done,
-                    Err(err) => {
-                        error!("Metal advance_decode failed for {:?}: {err}", req_id);
-                        cancel_request(req_id, scheduler, active);
-                        continue;
-                    }
-                };
-
-                if runtime_finished || stop_hit || scheduler_finished {
-                    finalize_request(req_id, scheduler, active);
+                runtime_finished: request.phase() == RuntimePhase::Finished,
+                stop_hit: request.stop_hit(),
+            },
+            Err(err) => {
+                if request.delta_closed() {
+                    Outcome::ClientDropped
+                } else {
+                    Outcome::Failed(err)
                 }
-            }
-            Outcome::ClientDropped => cancel_request(req_id, scheduler, active),
-            Outcome::Failed(err) => {
-                error!("Metal decode step failed for {:?}: {err:#}", req_id);
-                cancel_request(req_id, scheduler, active);
             }
         }
+    };
+
+    match outcome {
+        Outcome::Progress {
+            sampled_token,
+            runtime_finished,
+            stop_hit,
+        } => {
+            let scheduler_finished = match scheduler.advance_decode(req_id, sampled_token) {
+                Ok(done) => done,
+                Err(err) => {
+                    error!("Metal advance_decode failed for {:?}: {err}", req_id);
+                    cancel_detached_request(req_id, request, scheduler);
+                    return;
+                }
+            };
+
+            if runtime_finished || stop_hit || scheduler_finished {
+                finalize_detached_request(req_id, request, scheduler);
+            } else {
+                active.insert(req_id, request);
+            }
+        }
+        Outcome::ClientDropped => {
+            scheduler.finish_request(req_id);
+            if let Err(err) = request.cancel() {
+                warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
+            }
+        }
+        Outcome::Failed(err) => {
+            error!("Metal decode step failed for {:?}: {err:#}", req_id);
+            cancel_detached_request(req_id, request, scheduler);
+        }
+    }
+}
+
+fn finish_or_requeue_decoded_request(
+    req_id: RequestId,
+    request: ActiveMetalRequest,
+    sampled_token: u32,
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
+    let runtime_finished = request.phase() == RuntimePhase::Finished;
+    let stop_hit = request.stop_hit();
+    let scheduler_finished = match scheduler.advance_decode(req_id, sampled_token) {
+        Ok(done) => done,
+        Err(err) => {
+            error!("Metal advance_decode failed for {:?}: {err}", req_id);
+            cancel_detached_request(req_id, request, scheduler);
+            return;
+        }
+    };
+
+    if runtime_finished || stop_hit || scheduler_finished {
+        finalize_detached_request(req_id, request, scheduler);
+    } else {
+        active.insert(req_id, request);
+    }
+}
+
+fn cancel_detached_request(
+    req_id: RequestId,
+    mut request: ActiveMetalRequest,
+    scheduler: &mut MetalScheduler,
+) {
+    scheduler.finish_request(req_id);
+    if let Err(err) = request.cancel() {
+        warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
+    }
+}
+
+fn finalize_detached_request(
+    req_id: RequestId,
+    mut request: ActiveMetalRequest,
+    scheduler: &mut MetalScheduler,
+) {
+    scheduler.finish_request(req_id);
+    if let Err(err) = request.send_final_delta() {
+        warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
 }
 
