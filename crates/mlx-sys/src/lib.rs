@@ -512,6 +512,12 @@ unsafe extern "C" {
     pub fn mlx_get_peak_memory() -> usize;
     /// Cached MLX allocator memory in bytes.
     pub fn mlx_get_cache_memory() -> usize;
+    /// Set the MLX allocator memory limit in bytes. Returns the previous limit.
+    pub fn mlx_set_memory_limit(limit: usize) -> usize;
+    /// Set the MLX allocator cache limit in bytes. Returns the previous limit.
+    pub fn mlx_set_cache_limit(limit: usize) -> usize;
+    /// Set the MLX allocator wired limit in bytes. Returns the previous limit.
+    pub fn mlx_set_wired_limit(limit: usize) -> usize;
     /// Release cached Metal buffers and other allocator caches.
     /// Equivalent to `mx.metal.clear_cache()` in Python.
     pub fn mlx_metal_clear_cache();

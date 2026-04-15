@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
+Last refreshed: 2026-04-15 (post Metal runtime memory-limit controls + Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -74,6 +74,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-metal-runtime-memory-limits.md](experience/wins/2026-04-15-metal-runtime-memory-limits.md) | | Metal now exposes MLX allocator controls on `metal_request` / `metal_bench` / `metal_serve`, and a real server smoke confirmed the new flags apply before load while `/metrics` and `/v1/stats` stay live |
 | [experience/wins/2026-04-15-metal-observability-runtime-metrics.md](experience/wins/2026-04-15-metal-observability-runtime-metrics.md) | | Metal `/metrics` and `/v1/stats` now report real runtime-backed queue / latency / MLX memory values on both the live scheduler path and the serial DFlash fallback |
 | [experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md](experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md) | | Metal live runtime gained a real Qwen3.5 same-length compiled-step batch path; the direct path improved slightly, but HTTP quick sweep stayed flat because per-step batch-state rebuild still dominates |
 | [experience/wins/2026-04-15-metal-qwen3-same-length-batch-decode.md](experience/wins/2026-04-15-metal-qwen3-same-length-batch-decode.md) | | Metal live runtime gained a real Qwen3 same-length decode batch path; focused Qwen3 serving improved, while Qwen3.5 stayed effectively flat |

@@ -28,7 +28,7 @@ Benchmark rule:
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
 | `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, `M0.2c` Qwen3 same-length decode batching, and `M0.2d` Qwen3.5 same-length decode batching landed locally; throughput exit is still blocked on variable-length decode and per-step batch-state rebuild cost |
 | `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
-| `M0.4` memory + reuse observability | Partial | runtime-backed queue / latency / MLX memory metrics shipped; non-zero prefix reuse still depends on `M0.3` |
+| `M0.4` memory + reuse observability | Partial | runtime-backed queue / latency / MLX memory metrics and allocator CLI knobs shipped; non-zero prefix reuse still depends on `M0.3` |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
 | `M1.2` models + responses API | Partial | `/v1/models` shipped; `/v1/responses` non-streaming subset shipped; streaming parity still pending |
 | `M1.3` structured outputs | Not shipped | no JSON-schema constrained decoding yet |
@@ -211,6 +211,10 @@ Acceptance:
   - `peak_memory`
   - queue depth
 - scheduler updates these from the live Metal serving path
+- user-facing Metal entry points expose the same MLX allocator controls:
+  - `--memory-limit-bytes`
+  - `--cache-limit-bytes`
+  - `--wired-limit-bytes`
 - those numbers are sufficient to explain the result of the `M0.2/M0.3` HTTP
   sweep without having to attach a profiler trace first
 
@@ -219,6 +223,9 @@ Verification:
 ```bash
 curl http://127.0.0.1:8000/metrics | rg 'prefix_hit_rate|active_memory|peak_memory|infer_requests_waiting|infer_kv_gpu_utilization'
 curl http://127.0.0.1:8000/v1/stats
+./target/debug/metal_serve --help | rg 'memory-limit-bytes|cache-limit-bytes|wired-limit-bytes'
+./target/debug/metal_bench --help | rg 'memory-limit-bytes|cache-limit-bytes|wired-limit-bytes'
+./target/debug/metal_request --help | rg 'memory-limit-bytes|cache-limit-bytes|wired-limit-bytes'
 ```
 
 Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
@@ -232,6 +239,10 @@ Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
   - `infer_memory_active_bytes`
   - `infer_memory_peak_bytes`
   - `infer_memory_cache_bytes`
+- user-facing Metal binaries now expose allocator controls:
+  - `--memory-limit-bytes`
+  - `--cache-limit-bytes`
+  - `--wired-limit-bytes`
 
 Remaining blocker:
 

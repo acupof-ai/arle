@@ -48,6 +48,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    当前状态：runtime-backed queue / TTFT / E2E / MLX active/peak/cache memory
    已落地；`prefix_hit_rate` 指标面已接好，但变成非零仍依赖 `M0.3` 的
    shared-prefix reuse。
+   补充状态：`metal_request` / `metal_bench` / `metal_serve` 现已暴露
+   `--memory-limit-bytes` / `--cache-limit-bytes` / `--wired-limit-bytes`，
+   allocator control 不再只能靠 MLX 内部默认值。
 
 ### P1 · Product surface
 

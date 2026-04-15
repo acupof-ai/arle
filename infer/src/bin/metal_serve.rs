@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use infer::backend::metal::{
-    MetalBackendOptions, MetalDflashOptions,
+    MetalBackendOptions, MetalDflashOptions, MetalRuntimeLimits,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
 use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options_and_metrics;
@@ -73,6 +73,18 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "kv_pool")]
     no_kv_pool: bool,
 
+    /// Override the MLX allocator memory limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    memory_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator cache limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    cache_limit_bytes: Option<usize>,
+
+    /// Override the MLX allocator wired limit in bytes before model load.
+    #[arg(long, value_name = "BYTES")]
+    wired_limit_bytes: Option<usize>,
+
     /// Override the DFlash speculative block size.
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
@@ -101,6 +113,14 @@ impl Args {
             None
         }
     }
+
+    fn runtime_limits(&self) -> MetalRuntimeLimits {
+        MetalRuntimeLimits {
+            memory_limit_bytes: self.memory_limit_bytes,
+            cache_limit_bytes: self.cache_limit_bytes,
+            wired_limit_bytes: self.wired_limit_bytes,
+        }
+    }
 }
 
 #[tokio::main]
@@ -124,6 +144,7 @@ async fn main() -> Result<()> {
                 speculative_tokens: args.speculative_tokens,
             }),
         kv_pool: args.kv_pool_override(),
+        runtime_limits: args.runtime_limits(),
     };
     let model_id = std::path::Path::new(&args.model_path)
         .file_name()

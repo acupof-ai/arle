@@ -149,6 +149,8 @@ pub struct MetalBackend {
     dflash: Option<dflash::MetalDflashRuntime>,
     #[cfg(feature = "metal")]
     kv_pool_enabled: bool,
+    #[cfg(feature = "metal")]
+    runtime_limits: MetalRuntimeLimits,
     #[cfg(not(feature = "metal"))]
     _weights: (),
 }
@@ -161,6 +163,12 @@ impl MetalBackend {
     pub fn with_options(options: MetalBackendOptions) -> Self {
         #[cfg(not(feature = "metal"))]
         let _ = &options;
+        #[cfg(feature = "metal")]
+        let MetalBackendOptions {
+            dflash,
+            kv_pool,
+            runtime_limits,
+        } = options;
 
         Self {
             model_dir: None,
@@ -169,11 +177,13 @@ impl MetalBackend {
             #[cfg(feature = "metal")]
             weights: None,
             #[cfg(feature = "metal")]
-            dflash_options: options.dflash,
+            dflash_options: dflash,
             #[cfg(feature = "metal")]
             dflash: None,
             #[cfg(feature = "metal")]
-            kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(options.kv_pool),
+            kv_pool_enabled: self::generate::resolve_metal_kv_pool_enabled(kv_pool),
+            #[cfg(feature = "metal")]
+            runtime_limits,
             #[cfg(not(feature = "metal"))]
             _weights: (),
         }
@@ -406,6 +416,46 @@ pub struct MetalBackendOptions {
     pub dflash: Option<MetalDflashOptions>,
     #[cfg(feature = "metal")]
     pub kv_pool: Option<bool>,
+    #[cfg(feature = "metal")]
+    pub runtime_limits: MetalRuntimeLimits,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone, Debug, Default)]
+pub struct MetalRuntimeLimits {
+    pub memory_limit_bytes: Option<usize>,
+    pub cache_limit_bytes: Option<usize>,
+    pub wired_limit_bytes: Option<usize>,
+}
+
+#[cfg(feature = "metal")]
+impl MetalRuntimeLimits {
+    fn apply(&self) {
+        if let Some(limit) = self.memory_limit_bytes {
+            let previous = mlx::set_memory_limit_bytes(limit as u64);
+            log::info!(
+                "Metal runtime memory limit set to {} bytes (previous {})",
+                limit,
+                previous
+            );
+        }
+        if let Some(limit) = self.cache_limit_bytes {
+            let previous = mlx::set_cache_limit_bytes(limit as u64);
+            log::info!(
+                "Metal runtime cache limit set to {} bytes (previous {})",
+                limit,
+                previous
+            );
+        }
+        if let Some(limit) = self.wired_limit_bytes {
+            let previous = mlx::set_wired_limit_bytes(limit as u64);
+            log::info!(
+                "Metal runtime wired limit set to {} bytes (previous {})",
+                limit,
+                previous
+            );
+        }
+    }
 }
 
 impl Default for MetalBackend {
@@ -432,6 +482,9 @@ impl InferenceBackend for MetalBackend {
     /// - An existing local directory (e.g. `/path/to/Qwen3-0.6B-4bit`)
     /// - A HuggingFace model ID (e.g. `"mlx-community/Qwen3-0.6B-4bit"`)
     fn load(&mut self, model_path: &Path) -> Result<()> {
+        #[cfg(feature = "metal")]
+        self.runtime_limits.apply();
+
         // ── 1. Resolve model path ────────────────────────────────────────────
         let path_str = model_path.to_string_lossy();
         let local_dir = hf_hub::resolve_model_path(&path_str)
