@@ -1,0 +1,53 @@
+{
+  "label": "longseq-bf16",
+  "results": [
+    {
+      "label": "longseq-bf16-4000",
+      "input_target": 4000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 755.8534330000839,
+      "itl_p50_ms": 35.17446799924073,
+      "itl_p99_ms": 35.425592440224136,
+      "wall_s": 5.223088921999079,
+      "tok_per_sec": 24.506571094525697
+    },
+    {
+      "label": "longseq-bf16-8000",
+      "input_target": 8000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 824.4641860001138,
+      "itl_p50_ms": 37.413351999930455,
+      "itl_p99_ms": 37.648504160533776,
+      "wall_s": 5.576940332999584,
+      "tok_per_sec": 22.951653121085947
+    },
+    {
+      "label": "longseq-bf16-16000",
+      "input_target": 16000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 2112.869219999993,
+      "itl_p50_ms": 41.81273799986229,
+      "itl_p99_ms": 42.00870507993386,
+      "wall_s": 7.423844797000129,
+      "tok_per_sec": 17.241739758854198
+    },
+    {
+      "label": "longseq-bf16-25000",
+      "input_target": 25000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 6306.201734998467,
+      "itl_p50_ms": 33.07967700129666,
+      "itl_p99_ms": 33.48826840010588,
+      "wall_s": 10.512108272998375,
+      "tok_per_sec": 12.176434705185022
+    }
+  ]
+}
