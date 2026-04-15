@@ -575,18 +575,23 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                 self.cached_prompt.clear();
                 Ok((prompt_tokens.to_vec(), 0))
             }
-            PrefixReuseAction::ReplayFinalToken { replay_from } => {
-                // Exact prompt match: rewind to N-1 tokens and replay only the
-                // final prompt token so logits reflect the current prompt
-                // without duplicating it in KV.
+            PrefixReuseAction::ReplayFinalToken { replay_from: _ } => {
+                // Exact prompt match. Rewinding to N-1 and replaying the final
+                // token via a single-token forward_prefill is not numerically
+                // identical to a cold batch prefill of the same N tokens —
+                // FlashInfer and the attention prep kernels produce
+                // slightly different position-N-1 logits at batch=1 vs batch=N,
+                // and greedy argmax flips. See
+                // `docs/experience/errors/2026-04-15-e2e-phase3-replay-drift.md`.
+                // Fall back to a full recompute: correctness over the ~one
+                // prefill saved, which only ever helps exact-same-prompt
+                // retries in the single-request engine.
                 info!(
-                    "KV prefix cache FULL HIT: exact match, replaying final token with {}/{} tokens reused",
-                    replay_from,
-                    prompt_tokens.len()
+                    "KV prefix cache FULL HIT: exact match, falling back to full recompute for numerical consistency"
                 );
-                self.state.truncate_to(replay_from)?;
-                self.cached_prompt.truncate(replay_from);
-                Ok((prompt_tokens[replay_from..].to_vec(), replay_from))
+                self.state.reset()?;
+                self.cached_prompt.clear();
+                Ok((prompt_tokens.to_vec(), 0))
             }
             PrefixReuseAction::ReuseFullCachedPrefix { prefix_len } => {
                 if self.state.supports_partial_prefix() {
