@@ -230,6 +230,12 @@ enum MetalRequestStateInner<'a> {
     Qwen35(ResumableRequestState<Qwen35StepDriver<'a>>),
 }
 
+pub(crate) struct Qwen3PrefixSnapshot {
+    pub token_ids: Vec<u32>,
+    pub k_rows_by_layer: Vec<MlxArray>,
+    pub v_rows_by_layer: Vec<MlxArray>,
+}
+
 impl<'a> MetalRequestState<'a> {
     pub(super) fn new(
         weights: &'a MetalWeights,
@@ -415,6 +421,79 @@ impl<'a> MetalRequestState<'a> {
         match &mut self.inner {
             MetalRequestStateInner::Qwen3(state) => state.cancel(),
             MetalRequestStateInner::Qwen35(state) => state.cancel(),
+        }
+    }
+
+    pub(crate) fn import_qwen3_prefix_from_pool(
+        &mut self,
+        shared_pool: &MetalKVPool,
+        matched_len: usize,
+        slot_indices: &[u32],
+    ) -> Result<bool> {
+        match &mut self.inner {
+            MetalRequestStateInner::Qwen3(state) => {
+                ensure!(
+                    state.phase == MetalRequestPhase::Prefill,
+                    "Qwen3 prefix import requires Prefill phase, got {:?}",
+                    state.phase
+                );
+                ensure!(
+                    state.prompt_cursor == 0 && state.generated_tokens == 0,
+                    "Qwen3 prefix import requires a fresh request state"
+                );
+                ensure!(
+                    matched_len == slot_indices.len(),
+                    "Qwen3 prefix import length {} does not match {} slot indices",
+                    matched_len,
+                    slot_indices.len()
+                );
+                if matched_len == 0 || matched_len >= state.prompt_tokens.len() {
+                    return Ok(false);
+                }
+
+                state
+                    .driver
+                    .import_prefix_from_pool(shared_pool, slot_indices)
+                    .context("import Qwen3 cached prefix into request state")?;
+                state.prompt_cursor = matched_len;
+                Ok(true)
+            }
+            MetalRequestStateInner::Qwen35(_) => Ok(false),
+        }
+    }
+
+    pub(crate) fn export_qwen3_prompt_prefix(
+        &self,
+        token_count: usize,
+    ) -> Result<Option<Qwen3PrefixSnapshot>> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => {
+                if token_count == 0 {
+                    return Ok(None);
+                }
+                ensure!(
+                    token_count <= state.prompt_tokens.len(),
+                    "Qwen3 prefix export requested {} prompt tokens but prompt only has {}",
+                    token_count,
+                    state.prompt_tokens.len()
+                );
+                ensure!(
+                    token_count <= state.prompt_cursor,
+                    "Qwen3 prefix export requested {} tokens but only {} prompt tokens are materialized",
+                    token_count,
+                    state.prompt_cursor
+                );
+                let (k_rows_by_layer, v_rows_by_layer) = state
+                    .driver
+                    .export_prefix_rows(token_count)
+                    .context("export Qwen3 cached prefix rows")?;
+                Ok(Some(Qwen3PrefixSnapshot {
+                    token_ids: state.prompt_tokens[..token_count].to_vec(),
+                    k_rows_by_layer,
+                    v_rows_by_layer,
+                }))
+            }
+            MetalRequestStateInner::Qwen35(_) => Ok(None),
         }
     }
 }
@@ -902,6 +981,134 @@ impl<'a> Qwen3StepDriver<'a> {
             }
             self.kv_capacity = new_cap;
         }
+    }
+
+    fn import_prefix_from_pool(
+        &mut self,
+        shared_pool: &MetalKVPool,
+        slot_indices: &[u32],
+    ) -> Result<()> {
+        use super::mlx::{reshape, slice_update, transpose_axes};
+
+        if slot_indices.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            self.cache_len == 0,
+            "Qwen3 prefix import requires an empty cache"
+        );
+        ensure!(
+            shared_pool.num_layers() == self.k_caches.len()
+                && shared_pool.num_kv_heads() == self.n_kv_heads as usize
+                && shared_pool.head_dim() == self.head_dim as usize,
+            "Qwen3 prefix import requires matching KV geometry"
+        );
+
+        let prefix_len =
+            i32::try_from(slot_indices.len()).context("Qwen3 prefix import length overflow")?;
+        self.ensure_capacity(prefix_len);
+        if let Some(pool) = self.kv_pool.as_mut() {
+            pool.alloc_tokens(METAL_REQUEST_STATE_ID, slot_indices.len())
+                .context("alloc request-local MetalKVPool slots for imported prefix")?;
+        }
+
+        for layer_idx in 0..self.k_caches.len() {
+            let (k_rows, v_rows) = shared_pool
+                .gather_kv_rows(layer_idx, slot_indices)
+                .with_context(|| {
+                    format!("gather shared Metal prefix rows for layer {layer_idx}")
+                })?;
+
+            if let Some(pool) = self.kv_pool.as_mut() {
+                pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_rows, &v_rows)
+                    .with_context(|| {
+                        format!(
+                            "write imported Qwen3 prefix into request-local pool layer {layer_idx}"
+                        )
+                    })?;
+            } else {
+                let k = reshape(&k_rows, &[1, prefix_len, self.n_kv_heads, self.head_dim]);
+                let k = transpose_axes(&k, &[0, 2, 1, 3]);
+                let v = reshape(&v_rows, &[1, prefix_len, self.n_kv_heads, self.head_dim]);
+                let v = transpose_axes(&v, &[0, 2, 1, 3]);
+                self.k_caches[layer_idx] = slice_update(
+                    &mut self.k_caches[layer_idx],
+                    &k,
+                    &[0, 0, 0, 0],
+                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
+                );
+                self.v_caches[layer_idx] = slice_update(
+                    &mut self.v_caches[layer_idx],
+                    &v,
+                    &[0, 0, 0, 0],
+                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
+                );
+            }
+        }
+
+        self.cache_len = prefix_len;
+        Ok(())
+    }
+
+    fn export_prefix_rows(&self, token_count: usize) -> Result<(Vec<MlxArray>, Vec<MlxArray>)> {
+        use super::mlx::{reshape, slice, transpose_axes};
+
+        ensure!(
+            token_count > 0,
+            "Qwen3 prefix export requires at least one token"
+        );
+        ensure!(
+            token_count <= self.cache_len as usize,
+            "Qwen3 prefix export requested {} tokens but cache_len is {}",
+            token_count,
+            self.cache_len
+        );
+
+        let prefix_len =
+            i32::try_from(token_count).context("Qwen3 prefix export length overflow")?;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let mut k_rows_by_layer = Vec::with_capacity(self.k_caches.len());
+        let mut v_rows_by_layer = Vec::with_capacity(self.v_caches.len());
+
+        for layer_idx in 0..self.k_caches.len() {
+            let (k_rows, v_rows) = if let Some(pool) = self.kv_pool.as_ref() {
+                let request_slots = pool
+                    .token_indices(METAL_REQUEST_STATE_ID)
+                    .context("Qwen3 prefix export missing request-local MetalKVPool slots")?;
+                ensure!(
+                    token_count <= request_slots.len(),
+                    "Qwen3 prefix export requested {} tokens but pool only tracks {} slots",
+                    token_count,
+                    request_slots.len()
+                );
+                pool.gather_kv_rows(layer_idx, &request_slots[..token_count])
+                    .with_context(|| {
+                        format!("gather request-local Qwen3 prefix rows for layer {layer_idx}")
+                    })?
+            } else {
+                let k = slice(
+                    &self.k_caches[layer_idx],
+                    &[0, 0, 0, 0],
+                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
+                    &[1, 1, 1, 1],
+                );
+                let k = transpose_axes(&k, &[0, 2, 1, 3]);
+                let k = reshape(&k, &[prefix_len, kv_dim]);
+                let v = slice(
+                    &self.v_caches[layer_idx],
+                    &[0, 0, 0, 0],
+                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
+                    &[1, 1, 1, 1],
+                );
+                let v = transpose_axes(&v, &[0, 2, 1, 3]);
+                let v = reshape(&v, &[prefix_len, kv_dim]);
+                (k, v)
+            };
+            k_rows_by_layer.push(k_rows);
+            v_rows_by_layer.push(v_rows);
+        }
+
+        Ok((k_rows_by_layer, v_rows_by_layer))
     }
 }
 

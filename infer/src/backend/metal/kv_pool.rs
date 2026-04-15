@@ -73,6 +73,15 @@ impl SlotLedger {
     }
 
     fn alloc_tokens(&mut self, request_id: usize, count: usize) -> Result<Vec<u32>> {
+        let new_indices = self.alloc_detached_slots(count)?;
+        self.request_slots
+            .entry(request_id)
+            .or_default()
+            .extend_from_slice(&new_indices);
+        Ok(new_indices)
+    }
+
+    fn alloc_detached_slots(&mut self, count: usize) -> Result<Vec<u32>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -93,10 +102,6 @@ impl SlotLedger {
             self.bump_refcount(idx)?;
             new_indices.push(idx);
         }
-        self.request_slots
-            .entry(request_id)
-            .or_default()
-            .extend_from_slice(&new_indices);
         Ok(new_indices)
     }
 
@@ -144,6 +149,16 @@ impl SlotLedger {
                 self.release_slot(idx);
             }
         }
+    }
+
+    fn release_slots(&mut self, slots: &[u32]) -> Result<()> {
+        for &slot in slots {
+            self.slot_index(slot)?;
+        }
+        for &slot in slots {
+            self.release_slot(slot);
+        }
+        Ok(())
     }
 
     fn max_total_tokens(&self) -> usize {
@@ -269,6 +284,11 @@ impl MetalKVPool {
         self.ledger.alloc_tokens(request_id, count)
     }
 
+    /// Allocate detached token slots not associated with any active request.
+    pub fn alloc_slots(&mut self, count: usize) -> Result<Vec<u32>> {
+        self.ledger.alloc_detached_slots(count)
+    }
+
     /// Share an existing token-slot slice with `request_id`.
     ///
     /// Each slot in `slots` has its reference count incremented and is appended
@@ -293,6 +313,11 @@ impl MetalKVPool {
         self.ledger.free_request(request_id);
     }
 
+    /// Release detached token slots back into the pool.
+    pub fn release_slots(&mut self, slots: &[u32]) -> Result<()> {
+        self.ledger.release_slots(slots)
+    }
+
     /// Scatter-write K/V tensors into the pool at the request's token positions.
     ///
     /// `k` and `v` should each be shaped `[num_new_tokens, kv_dim]` (2D), where
@@ -308,8 +333,6 @@ impl MetalKVPool {
         k: &MlxArray,
         v: &MlxArray,
     ) -> Result<()> {
-        use super::mlx::{slice_update, take_axis};
-
         let indices = self
             .ledger
             .token_indices(request_id)
@@ -327,10 +350,35 @@ impl MetalKVPool {
                 indices.len()
             ));
         }
-        let write_indices = &indices[indices.len() - num_tokens..];
+        let write_indices = indices[indices.len() - num_tokens..].to_vec();
+        self.write_kv_slots(layer, &write_indices, k, v)
+    }
+
+    /// Scatter-write K/V tensors into explicitly provided token slots.
+    pub fn write_kv_slots(
+        &mut self,
+        layer: usize,
+        slot_indices: &[u32],
+        k: &MlxArray,
+        v: &MlxArray,
+    ) -> Result<()> {
+        use super::mlx::{slice_update, take_axis};
+
+        let num_tokens = k.shape().first().copied().unwrap_or(0) as usize;
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        if num_tokens != slot_indices.len() {
+            return Err(anyhow!(
+                "MetalKVPool: write_kv_slots got {} tokens for {} explicit slots",
+                num_tokens,
+                slot_indices.len()
+            ));
+        }
         let kv_dim = self.kv_dim as i32;
 
-        for (i, &pool_idx) in write_indices.iter().enumerate() {
+        for (i, &pool_idx) in slot_indices.iter().enumerate() {
+            self.ledger.slot_index(pool_idx)?;
             let idx_arr = MlxArray::from_slice_i32(&[i as i32], &[1]);
             let row_k = take_axis(k, &idx_arr, 0);
             let row_v = take_axis(v, &idx_arr, 0);
@@ -348,26 +396,14 @@ impl MetalKVPool {
     /// Gather K/V from the pool for a request, returning contiguous tensors
     /// shaped `[1, n_kv_heads, seq_len, head_dim]` ready for attention.
     pub fn gather_kv(&self, layer: usize, request_id: usize) -> Result<(MlxArray, MlxArray)> {
-        use super::mlx::{reshape, take_axis, transpose_axes};
-
         let indices = self
             .ledger
             .token_indices(request_id)
             .ok_or_else(|| anyhow!("MetalKVPool: unknown request_id {request_id}"))?;
+        let (k_gathered, v_gathered) = self.gather_kv_rows(layer, indices)?;
 
         let seq_len = indices.len() as i32;
-        if seq_len == 0 {
-            return Err(anyhow!(
-                "MetalKVPool: gather_kv called with no tokens for request {request_id}"
-            ));
-        }
-
-        let idx_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
-        let idx_arr = MlxArray::from_slice_i32(&idx_i32, &[seq_len]);
-
-        let k_gathered = take_axis(&self.k_pool[layer], &idx_arr, 0);
-        let v_gathered = take_axis(&self.v_pool[layer], &idx_arr, 0);
-
+        use super::mlx::{reshape, transpose_axes};
         let n_kv = self.num_kv_heads as i32;
         let hd = self.head_dim as i32;
         let k_out = reshape(&k_gathered, &[1, seq_len, n_kv, hd]);
@@ -377,6 +413,30 @@ impl MetalKVPool {
         let v_out = transpose_axes(&v_out, &[0, 2, 1, 3]);
 
         Ok((k_out, v_out))
+    }
+
+    /// Gather raw `[seq_len, kv_dim]` K/V rows from explicit token slots.
+    pub fn gather_kv_rows(
+        &self,
+        layer: usize,
+        slot_indices: &[u32],
+    ) -> Result<(MlxArray, MlxArray)> {
+        use super::mlx::take_axis;
+
+        let seq_len = slot_indices.len() as i32;
+        if seq_len == 0 {
+            return Err(anyhow!("MetalKVPool: gather_kv_rows called with no slots"));
+        }
+        for &slot in slot_indices {
+            self.ledger.slot_index(slot)?;
+        }
+
+        let idx_i32: Vec<i32> = slot_indices.iter().map(|&i| i as i32).collect();
+        let idx_arr = MlxArray::from_slice_i32(&idx_i32, &[seq_len]);
+
+        let k_gathered = take_axis(&self.k_pool[layer], &idx_arr, 0);
+        let v_gathered = take_axis(&self.v_pool[layer], &idx_arr, 0);
+        Ok((k_gathered, v_gathered))
     }
 
     /// Number of token slots currently in use across all requests.
@@ -514,5 +574,20 @@ mod tests {
 
         ledger.free_request(2);
         assert_eq!(ledger.available_tokens(), 4);
+    }
+
+    #[test]
+    fn detached_slots_round_trip_without_request_ownership() {
+        let mut ledger = SlotLedger::new(4);
+        let detached = ledger.alloc_detached_slots(2).expect("alloc detached");
+        assert_eq!(detached, vec![0, 1]);
+        assert_eq!(ledger.available_tokens(), 2);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 1);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 1);
+
+        ledger.release_slots(&detached).expect("release detached");
+        assert_eq!(ledger.available_tokens(), 4);
+        assert_eq!(ledger.slot_refcount(0).unwrap(), 0);
+        assert_eq!(ledger.slot_refcount(1).unwrap(), 0);
     }
 }
