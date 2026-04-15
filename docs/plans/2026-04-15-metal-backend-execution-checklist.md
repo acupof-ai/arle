@@ -24,7 +24,9 @@ This checklist is the execution companion to:
   owns admission, step selection, and request cleanup.
   Status:
   `2026-04-15`: `M0.2a` local request-state layer landed for Qwen3/Qwen3.5;
-  `metal_serve` rewiring and throughput exit are still pending.
+  `M0.2b` rewired standard `metal_serve` onto a live scheduler runtime and
+  cut `512/256 C=4` TTFT p50 from `7994ms` to `1826ms`, but aggregate
+  throughput (`58.7 tok/s`) still trails the old serial reference (`65.8 tok/s`).
 - [ ] `M0.3` Wire Metal prefix cache + KV pool into the live scheduler path.
   Exit:
   shared-prefix requests skip matched prefill in the serving path, not only in

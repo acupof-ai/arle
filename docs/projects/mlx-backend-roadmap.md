@@ -14,10 +14,15 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 
 当前 serving 架构仍然有一个明确边界：
 
-- HTTP 服务走 [`backend_runtime.rs`](../../infer/src/backend_runtime.rs) 的串行 runtime
-- [`metal_scheduler.rs`](../../infer/src/metal_scheduler.rs) 目前还是 CPU 调度骨架，还没接到真实执行热路径
+- 标准 `metal_serve` 已经走 live Metal scheduler runtime，不再默认走串行
+  `BackendRuntimeHandle`
+- Metal DFlash 仍然走串行 fallback，因为 speculative decode 还没接进新的
+  scheduler runtime
+- 当前 scheduler runtime 只有 chunked prefill + decode-priority interleave，
+  还没有跨请求 batched decode
 
-这意味着今天的 Metal 能跑、能测、能回归，但还不具备 CUDA 路径那种连续批处理 serving 能力。
+这意味着今天的 Metal 已经不再是“纯串行 serving”，但还没有达到 CUDA
+路径那种真正以 batched decode / prefix reuse 为核心的 serving 形态。
 
 本路线现在按两个外部基线校准：
 
@@ -30,7 +35,7 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 
 ### P0 · Serving floor
 
-1. 把 `MetalScheduler` 接入真实执行循环，替换当前串行 runtime。
+1. 把跨请求 batched decode 接进现有 live Metal scheduler runtime。
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
 3. 暴露 Metal queue depth / prefix hit / active + peak memory / KV util 等 serving 级指标。
 
@@ -61,4 +66,3 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 2. Gemma 4 text path
 
 Llama 不在这条近期路线的优先级里。
-
