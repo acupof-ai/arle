@@ -453,9 +453,30 @@ impl<M: ModelForward> Scheduler<M> {
                 )
             })
             .collect();
+        // M4 review A4: `stable_tag()` is now `Option<u8>`. If the
+        // live pool format has no assigned tag (a future
+        // TurboQuant bit-pair combination that shipped to the pool
+        // but not to the disk format), publish silently with no
+        // fingerprints — persistence is not available for that
+        // format yet. Warn once per publish so operators notice.
+        let kv_format_tag = match self.paged_kv_pool.format.stable_tag() {
+            Some(tag) => tag,
+            None => {
+                warn!(
+                    "prefix_cache publish: live KV format has no stable_tag assignment; \
+                     fingerprints skipped for slot {} (format = {:?})",
+                    slot_idx, self.paged_kv_pool.format,
+                );
+                // Zero = "unset"; persistence code refuses format 0
+                // at load time, so this can never drive a cross-format
+                // reload. Still stamp fingerprints because Tier C's
+                // O(1) block_index and M4c's reconcile both want a
+                // non-zero fingerprint on each published node.
+                0
+            }
+        };
         let mut parent_fingerprint: Option<BlockFingerprint> = None;
         let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(num_blocks);
-        let kv_format_tag = self.paged_kv_pool.format.stable_tag();
         for i in 0..num_blocks {
             let fp = BlockFingerprint::compute(
                 KvContentContext {

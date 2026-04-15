@@ -52,6 +52,20 @@ pub enum SessionSnapshotError {
         path: String,
         reason: String,
     },
+    /// Loading a snapshot whose `kv_format_tag` does not match the
+    /// currently-live pool. Covers two real hazards: (a) restoring a
+    /// BF16 session into an INT8 pool, which would silently
+    /// corrupt decode; (b) bumping the stable tag scheme and then
+    /// reloading an older session snapshot. M4 review finding D1.
+    #[error("kv format mismatch: snapshot={snapshot} live_pool={live}")]
+    FormatMismatch { snapshot: u8, live: u8 },
+    /// The caller's `allocate_block_id` callback ran out of capacity
+    /// mid-restore (returned `None`). Covers M4 review finding D2 —
+    /// pool exhaustion at reload time was previously a silent panic
+    /// path. Now surfaces as a structured error so the HTTP wrapper
+    /// can translate it into a 503 / retry.
+    #[error("pool exhausted while minting block id for {fingerprint_hex}")]
+    PoolExhausted { fingerprint_hex: String },
 }
 
 pub struct LoadedSession {
@@ -98,17 +112,29 @@ where
 
 pub fn load_session<F>(
     snapshot: &SessionSnapshot,
+    expected_kv_format_tag: u8,
     disk: &DiskStore,
     mut allocate_block_id: F,
 ) -> Result<LoadedSession, SessionSnapshotError>
 where
-    F: FnMut(BlockFingerprint) -> BlockId,
+    F: FnMut(BlockFingerprint) -> Option<BlockId>,
 {
     if snapshot.version != 1 {
         return Err(SessionSnapshotError::DeserializeManifest(format!(
             "unsupported session snapshot version {}",
             snapshot.version
         )));
+    }
+
+    // M4 review D1: refuse to splice a snapshot saved under one KV
+    // numeric format into a live pool running a different format —
+    // the byte layout of the payloads would not match and decode
+    // would silently corrupt.
+    if snapshot.kv_format_tag != expected_kv_format_tag {
+        return Err(SessionSnapshotError::FormatMismatch {
+            snapshot: snapshot.kv_format_tag,
+            live: expected_kv_format_tag,
+        });
     }
 
     let mut radix: RadixCache = serde_json::from_slice(&snapshot.radix_bytes)
@@ -154,7 +180,15 @@ where
         }
 
         kv_payloads.insert(fingerprint, payload);
-        known.insert(fingerprint, allocate_block_id(fingerprint));
+        // M4 review D2: fallible pool allocation. A None here means
+        // the live pool cannot absorb this block; surface as a
+        // structured error instead of panicking on an infallible
+        // closure contract.
+        let block_id =
+            allocate_block_id(fingerprint).ok_or_else(|| SessionSnapshotError::PoolExhausted {
+                fingerprint_hex: entry.fingerprint_hex.clone(),
+            })?;
+        known.insert(fingerprint, block_id);
     }
 
     let report = radix.reconcile(&known);
@@ -249,10 +283,10 @@ mod tests {
         .expect("save session");
 
         let mut next_block_id = 100u32;
-        let mut loaded = load_session(&snapshot, &disk, |_| {
+        let mut loaded = load_session(&snapshot, 7, &disk, |_| {
             let block_id = BlockId(next_block_id);
             next_block_id += 1;
-            block_id
+            Some(block_id)
         })
         .expect("load session");
 
@@ -289,7 +323,8 @@ mod tests {
         assert_eq!(snapshot.persisted_blocks.len(), 1);
         assert_eq!(snapshot.persisted_blocks[0].fingerprint_hex.len(), 32);
 
-        let mut loaded = load_session(&snapshot, &disk, |_| BlockId(77)).expect("load session");
+        let mut loaded =
+            load_session(&snapshot, 9, &disk, |_| Some(BlockId(77))).expect("load session");
         assert_eq!(loaded.report.remapped, 1);
         assert_eq!(loaded.report.tombstoned, 1);
         assert_eq!(loaded.kv_payloads.len(), 1);
@@ -323,10 +358,81 @@ mod tests {
         let disk_path = PathBuf::from(&snapshot.persisted_blocks[0].location.0);
         fs::write(&disk_path, b"wrong-bytes").expect("tamper disk payload");
 
-        match load_session(&snapshot, &disk, |_| BlockId(99)) {
+        match load_session(&snapshot, 3, &disk, |_| Some(BlockId(99))) {
             Err(SessionSnapshotError::DiskBlockMismatch { .. }) => {}
             Err(other) => panic!("expected DiskBlockMismatch, got {other:?}"),
             Ok(_) => panic!("tampered payload should fail"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_kv_format_tag_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let disk = crate::kv_tier::transport::DiskStore::new(dir.path());
+        let mut radix = RadixCache::new(4);
+        let tokens = [1, 2, 3, 4];
+        let fingerprint = BlockFingerprint([0x66; 16]);
+        radix.insert_with_fingerprints(&tokens, &[BlockId(5)], &[fingerprint]);
+
+        // Saved under tag=1 (BF16)
+        let snapshot = save_session(
+            "session-fmt",
+            1,
+            &radix,
+            &disk,
+            |fp| (fp == fingerprint).then(|| b"payload".to_vec()),
+            &[fingerprint],
+        )
+        .expect("save session");
+
+        // Live pool is tag=3 (INT8). Must refuse.
+        match load_session(&snapshot, 3, &disk, |_| Some(BlockId(42))) {
+            Err(SessionSnapshotError::FormatMismatch { snapshot, live }) => {
+                assert_eq!(snapshot, 1);
+                assert_eq!(live, 3);
+            }
+            Err(other) => panic!("expected FormatMismatch, got {other:?}"),
+            Ok(_) => panic!("format-mismatched load should fail"),
+        }
+    }
+
+    #[test]
+    fn load_surfaces_pool_exhaustion() {
+        let dir = tempdir().expect("tempdir");
+        let disk = crate::kv_tier::transport::DiskStore::new(dir.path());
+        let mut radix = RadixCache::new(4);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let fp_a = BlockFingerprint([0x77; 16]);
+        let fp_b = BlockFingerprint([0x88; 16]);
+        radix.insert_with_fingerprints(&tokens, &[BlockId(1), BlockId(2)], &[fp_a, fp_b]);
+
+        let snapshot = save_session(
+            "session-exhaust",
+            1,
+            &radix,
+            &disk,
+            |_| Some(b"payload".to_vec()),
+            &[fp_a, fp_b],
+        )
+        .expect("save session");
+
+        // Allocator runs out after the first block: fingerprint order
+        // inside the snapshot isn't stable, so match against either
+        // parsed fingerprint rather than hard-coding one.
+        let mut minted = 0u32;
+        match load_session(&snapshot, 1, &disk, |_| {
+            if minted == 0 {
+                minted = 1;
+                Some(BlockId(500))
+            } else {
+                None
+            }
+        }) {
+            Err(SessionSnapshotError::PoolExhausted { fingerprint_hex }) => {
+                assert_eq!(fingerprint_hex.len(), 32);
+            }
+            Err(other) => panic!("expected PoolExhausted, got {other:?}"),
+            Ok(_) => panic!("load with exhausted allocator should fail"),
         }
     }
 }
