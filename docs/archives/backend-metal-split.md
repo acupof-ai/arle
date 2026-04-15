@@ -1,8 +1,21 @@
+> **Archived 2026-04-15** — F1 metal split executed and merged. Final
+> commits: `64c0baa refactor(metal): extract per-step forward graph`,
+> `32875b2 refactor(metal): extract generation loop`, and
+> `19a433d style(metal): rustfmt post-split + line count verification`.
+> The plan was closed out in `f59238c docs(plans): close out F1 metal
+> split`. Status of the F1 work item is tracked in
+> [`../plans/backend-reorg-followups.md`](../plans/backend-reorg-followups.md)
+> §F1. This file is preserved for the original execution rationale and
+> file-by-file split discipline; see the linked commits for the actual
+> shipped layout.
+
+---
+
 # F1 · Split `infer/src/backend/metal.rs` into topical submodules
 
 **Owner:** codex (local Mac, `--features metal`)
 **Prerequisite commit:** `7a876e1` (Round 2 housekeeping) — this plan assumes the tree is at or after that commit.
-**Status:** ready to execute
+**Status:** ~~ready to execute~~ **executed (2026-04-13, commits above)**
 **Round 3 note:** the old extracted-runtime plan was reverted by the 2026-04-15 Route-A refactor, so this warning is historical only.
 
 ---

@@ -31,6 +31,21 @@ export AGENT_INFER_MODEL=models/Qwen3-4B
 ./target/release/agent-infer --max-turns 10
 ```
 
+### `AGENT_INFER_API_KEY`
+
+Default Bearer token for HTTP serving entry points that opt into API auth.
+
+Current use:
+
+- `metal_serve` uses this when `--api-key` is omitted.
+
+Example:
+
+```bash
+export AGENT_INFER_API_KEY=dev-secret
+./target/release/metal_serve --model-path mlx-community/Qwen3-4B-bf16
+```
+
 ### `AGENT_INFER_TEST_MODEL_PATH`
 
 Override model path for selected CLI-side tests.

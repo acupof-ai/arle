@@ -1,3 +1,24 @@
+> **Archived 2026-04-15** — the bug captured in this doc lives in the
+> **legacy contiguous CPU offload** path (`KVCache::offload_if_needed`
+> at `infer/src/model/kv_cache.rs:517-590`, `OFFLOAD_BLOCK_SIZE = 64`).
+> That entire code path is now slated for full deletion in
+> [`../projects/tiered-kv-cache.md`](../projects/tiered-kv-cache.md)
+> §6 M3c (see also §3 fact 5 and §8 pitfall 13). Once M3c lands, the
+> bug is "fixed by deletion": the new paged-pool tiering does not
+> share the failure mode, and the legacy offload that triggered the
+> panic no longer exists.
+>
+> One M2b note: the 2026-04-15 M2b batch added
+> `GenerationState::prefetch_kv_to_gpu()` which currently *uses* the
+> legacy offload path as a correctness bridge before prefix reuse
+> reads contiguous KV. M3c will need to delete that hook too — see
+> the tiered-kv project doc §6 M3c sub-PR scope.
+>
+> Preserved for the root-cause analysis (`max_seq_len` accounting
+> mismatch), which informs M3c's invariant choice.
+
+---
+
 # 2026-04-13 CUDA KV Long-Prefix Follow-up
 
 ## What Landed Today

@@ -68,20 +68,28 @@ confuse readers about which project they are looking at.
 
 ---
 
-## 3 · Current state (2026-04-15, post M1+M2a + Codex review)
+## 3 · Current state (2026-04-15, post M2b local implementation)
 
-Updated after M1a + M1b + M2a landed (commits `08718ad`, `323aee0`, `4402ab0`)
-and the Codex 2026-04-15 review surfaced two issues the previous draft of
-this section under-emphasised: the legacy `model/kv_cache.rs` CPU offload
-as a parallel "second source of truth", and the `policy.rs` scoring trait
-being bypassed by M2a's hand-rolled watermark. Both are flagged below.
+Updated after M1a + M1b + M2a landed (commits `08718ad`, `323aee0`,
+`4402ab0`) **and** the 2026-04-15 local M2b batch switched CUDA scheduler
+admission from the legacy per-slot `cached_prompts` scan to the radix-driven
+reusable-prefix path. The 2026-04-15 review findings still stand: the legacy
+`model/kv_cache.rs` CPU offload remains a second source of truth we must
+retire before M3c, and `policy.rs` is still bypassed by the hand-rolled
+watermark loop. One additional constraint is now explicit: **M2b does not do
+cross-slot page aliasing**. Reuse is limited to the case where the radix hit
+maps to a currently free slot whose contiguous state still materialises the
+matched prefix; if that contiguous KV had been CPU-offloaded, the scheduler
+prefetches it back before any `truncate_to` / `migrate_kv_range_to_paged`
+path runs.
 
 | Area | State | File:line |
 |---|---|---|
 | CUDA paged pool | `page_size = 1`, token-granular LIFO + **per-page refcount via M2a** (`page_ref_count: Vec<u32>` + `retain_pages` / `release_pages` / refcount-aware `free_slot` — pages with refcount > 0 stay in limbo across `free_slot`) | `crates/infer-cuda-kernels/src/paged_kv.rs:71-83,416-440` |
 | CUDA legacy contiguous KV offload | Separate code path: `k_host/v_host` shadow buffers with `OFFLOAD_BLOCK_SIZE = 64`, default off in serving but still compiles, still has tests, still shapes the model batch-decode call sites. **Must be retired before M3 or we end up with two truths for "where is layer L's KV right now"** — see §8 pitfall 13. | `infer/src/model/kv_cache.rs:29,517-590` |
-| `infer/src/prefix_cache.rs` | 914 lines, leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`); **wired into scheduler as M2a authoritative pinned-page store**. Private `Node` still carries only `(tokens, block_id: Option<BlockId>, ref_count, last_access, children)` — **no `tier_location` / `fingerprint` / `session_id` / `byte_len` / `soft_pin_until` fields yet**, those are M2b/M3 work. | `infer/src/prefix_cache.rs:55-69` |
-| CUDA scheduler prefix logic | **M1b shipped**: radix runs as a shadow observer, logs cross-slot hit length per admission. **M2a shipped**: refcount-aware `free_slot` + side map `block_to_pages: HashMap<BlockId, Vec<u32>>` + `evict_prefix_cache_if_pressured` (high=0.75, low=0.50). **Slot selection still goes through legacy `cached_prompts: Vec<Vec<u32>>` linear scan** — the M2b behavior flip has not landed. | `infer/src/scheduler/cuda/core.rs:42,333,430`, `infer/src/scheduler/cuda/runtime.rs:20-30,191` |
+| `infer/src/prefix_cache.rs` | Leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`) plus **M2b tombstone GC scaffolding**: reclaimed-node free list (`free_nodes`), `alloc_node`, and `gc_orphan_tombstones()` so repeated evict/insert cycles stop growing the backing node array without bound. Private `Node` still has **no `tier_location` / `fingerprint` / `session_id` / `byte_len` / `soft_pin_until` fields yet** — those remain M3/M4 work. | `infer/src/prefix_cache.rs:97-147,382-527` |
+| CUDA scheduler prefix logic | **M2b local shipped**: `assign_slots()` uses radix lookup + `block_owner_slots` + `slot_materialized_prompt_lens` to pick a reusable free slot; `step_new()` consumes `reusable_prefix_len` / `reusable_cached_prompt_len`, calls `prefetch_kv_to_gpu()` before any prefix-reuse read of contiguous KV, and replays / truncates model state accordingly; `cleanup()` publishes prefixes under a retain hard cap (`0.90`) and decode preemption clears slot ownership. **Cross-slot page aliasing is intentionally not implemented** — reuse is safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs:3-230`, `infer/src/scheduler/cuda/core.rs:28-39,49-91,335-590`, `infer/src/scheduler/cuda/prefill.rs:17-334`, `infer/src/scheduler/cuda/decode.rs:47-123` |
+| Model state prefetch hook | `GenerationState::prefetch_kv_to_gpu()` is now required by the scheduler-side prefix reuse path so CPU-offloaded contiguous KV is rehydrated before `truncate_to()` / `migrate_kv_range_to_paged()` touches it. Implemented for Qwen3, Qwen3.5, and GLM4. | `infer/src/model.rs:91-126`, `infer/src/model/qwen3/forward.rs:61-76`, `infer/src/model/qwen35/forward.rs:85-100`, `infer/src/model/glm4/forward.rs:61-76` |
 | `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). Remaining: `tier.rs`, `transport.rs`, `transport/disk.rs`, `transport/nixl.rs`. `DiskStore` round-trips bytes; `NixlTransport` stub compiles under `rdma-nixl` (stub-api). **Zero scheduler consumers**, no coordinator yet. | `infer/src/kv_tier/**` |
 | `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` lives next to it but **has zero call sites** — M4 session save/load needs to be the first consumer (see §5.1, §6 M4). | `infer/src/types.rs:8` |
 | `infer::scheduler::policy` | Trait + 4 impls (`LruEviction`, `ReuseBiasedLru`, `HitCountLru`, `SessionBiasedLru`) plus `EvictionCandidate` data struct + `SchedulerSignals`. **Zero call sites — `evict_prefix_cache_if_pressured` is a hand-rolled high/low-watermark loop that bypasses `EvictionPolicy::score` entirely**. M3 must converge them; see §5.4. | `infer/src/scheduler/policy.rs:178,226,246,277,310` |
@@ -93,11 +101,11 @@ being bypassed by M2a's hand-rolled watermark. Both are flagged below.
 
 Seven facts shape everything below (original fact 6 "P1(a) shipped, P1(b) never did" retired by M1b landing; replaced with the policy.rs / hand-rolled watermark divergence that Codex 2026-04-15 surfaced):
 
-1. **Production data path is single-tier today, but T0 dual residency is half-built.** `paged_kv.rs:416-440` retains pages through `free_slot` when the radix holds them, so cross-request prefix bytes physically survive. The **selector** has not been switched to consume them — `assign_slots` still picks via `cached_prompts`. M2b is the behavior flip.
-2. **`RadixCache` is wired but not yet load-bearing.** It is M2a's authoritative pinned-page store, but `runtime.rs:191` (`best_prefix_slot_for_cached_prompts`) still drives slot selection. The radix's `lookup` runs only as a shadow observer, logging the achievable cross-slot hit length so M2b's selector flip can be measured against it.
+1. **Production data path is still T0-only, but dual residency is now load-bearing inside the safe reuse envelope.** `paged_kv.rs:416-440` retains pages through `free_slot`, and `assign_slots` now picks a reusable free slot from radix hits instead of scanning `cached_prompts`. The missing piece is **not** selector wiring anymore; it is the future T1/T2/T3 coordinator.
+2. **`RadixCache` is now load-bearing for CUDA admission, publish, and eviction.** The radix is no longer just a shadow observer: it drives reusable-prefix selection, holds the pinned-page ownership map, and its eviction feeds both the amortised cleanup watermark loop and the alloc-OOM retry path. What it still does **not** own yet is tier metadata (`tier_location`, fingerprints, session persistence).
 3. **`page_size = 1` is still the production path.** M0.3 (lift to 16 for BF16/FP16, keep 1 for INT8/FP8/quant) is unblocked and pending. **No tier work can begin until M0.3 lands** — `cudaMemcpyAsync` of 16 separate non-contiguous pages per "logical block" is bandwidth-hostile. See §6 M3a sequencing.
 4. **`BlockId` unified, `BlockFingerprint` exists but unused.** When session save/load (M4) lands, **save format must address blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. The serde derives on `RadixCache` are forward-compat scaffolding only; reload requires a fingerprint-based reconciliation pass that has not been written. Doc previously did not call this out; §6 M4 now does.
-5. **Two parallel CPU offload code paths exist.** The new paged-pool tiering (§4) and the old contiguous-KV `model/kv_cache.rs` offload (`OFFLOAD_BLOCK_SIZE = 64`) cannot both grow. The old path is dormant in serving but still compiles, has tests, and shapes model call sites. **M3c must delete it before T0↔T1 transfer through the new path goes live**, otherwise we end up with two truths for "where is layer L's KV right now". See §8 pitfall 13.
+5. **Two parallel CPU offload code paths still exist.** M2b now touches the old contiguous-KV path in exactly one place: before prefix reuse reads contiguous KV, `prefetch_kv_to_gpu()` rehydrates any CPU-offloaded state back onto the device. That is a correctness bridge, not an endorsement of the old path. **M3c must still delete the legacy offload before T0↔T1 transfer through the new path goes live**, otherwise we end up with two truths for "where is layer L's KV right now". See §8 pitfall 13.
 6. **`policy.rs` scoring trait is shipped but bypassed.** `evict_prefix_cache_if_pressured` in `scheduler/cuda/core.rs:430` is a hand-rolled watermark loop that does not consult `EvictionPolicy::score`. M3 must converge eviction onto the policy trait — otherwise we have two competing eviction implementations the moment T1 lands. See §5.4 convergence note.
 7. **`NixlTransport` trait shape is the right bet.** `type Op: Send` + explicit `poll()` + `abort()` — survives the Codex review unchanged. NIXL ↔ Mooncake plugin compatibility confirmed in 2026-04-15 industry research.
 
@@ -828,10 +836,10 @@ outputs unchanged on a CUDA host; shadow-observer logging present;
 
 The previous draft described M2 as one PR. **Reality**: it splits
 cleanly into a data-model PR (M2a, shipped) and a behavior-flip PR
-(M2b, pending). The split is exactly the "data model first, behavior
-flip second" pattern that worked for M1, applied here because the
-scheduler-side selector flip requires the pool's refcount discipline
-to already exist.
+(M2b, local implementation shipped; remote CUDA validation pending).
+The split is exactly the "data model first, behavior flip second"
+pattern that worked for M1, applied here because the scheduler-side
+selector flip required the pool's refcount discipline to already exist.
 
 #### M2a · refcount + watermark + side map — **shipped (`4402ab0`)**
 
@@ -855,57 +863,61 @@ to already exist.
 - 4 new `MockPool`-based refcount unit tests in
   `crates/infer-cuda-kernels`. **Done.**
 
-#### M2b · selector flip + retain hard cap + tombstone GC — **pending**
+#### M2b · selector flip + retain hard cap + tombstone GC — **local implementation shipped; remote CUDA validation pending**
 
 This is the **first** milestone where prefix reuse becomes
 load-bearing. Scope:
 
-1. **Replace `best_prefix_slot_for_cached_prompts`
-   (`infer/src/scheduler/cuda/runtime.rs:20-30,191`) with a
-   radix-aware selector** that uses the M1b shadow lookup as the
-   ground truth. Slots that map to a non-empty radix hit win over
-   slots whose `cached_prompts` happens to match — and `cached_prompts`
-   is then deleted in the same PR.
-2. **Add the resurrect read path in `step_new`** that, when
-   `radix.lookup` returns a hit, copies the matched pages' state into
-   the new slot (or, more cheaply, advances the slot's
-   `token_indices` to alias the matched pages directly across slot
-   boundaries) and skips `forward_prefill` over the matched prefix.
-   This is the change that delivers the actual TTFT win — M1b+M2a
-   alone are net-neutral on single-request benches.
-3. **`alloc_tokens` OOM → `evict_prefix_cache_if_pressured` retry.**
-   Today `alloc_tokens` returns `Err` on OOM with no retry path. The
-   amortised cleanup-time eviction holds under steady-state load but
-   an adversarial burst of long-prompt admissions can drain the free
-   list between two `cleanup` calls. M2b adds the synchronous retry.
-4. **Retain hard cap.** M2a's `0.75 / 0.50` watermark is an *evict
-   trigger*, not a *retain cap*. If a single long prefix is held by
-   100 concurrent requests, `ref_count > 0` skips it during eviction
-   and the pool can saturate. Add `retained_count <
-   max_total_tokens × 0.9` as a hard cap: above it, lookups
-   intentionally do not retain — the hit is reported but the bytes
-   are not pinned, so the requester pays prefill instead of starving
-   admission. This is the "fail open" path under pressure.
-5. **Tombstone-GC scaffolding**: `RadixCache::evict_with_policy` adds
-   a second pass that prunes `block_id == None && ref_count == 0`
-   stubs left behind by the byte eviction. Without this pass the
-   radix tree grows unboundedly across long sessions. (Still no
-   tombstone *cap* in M2b — that lands in M3 alongside the policy
-   trait wire.)
-6. **Delete `cached_prompts`**. After (1) replaces its only consumer,
-   the field is dead.
+1. **Selector flip landed.** `best_prefix_slot_for_cached_prompts`
+   is gone from `scheduler/cuda/runtime.rs`; admission now uses
+   `radix.lookup(...)` + `block_owner_slots` + `slot_materialized_prompt_lens`
+   to pick the deepest reusable free slot, and the scheduler-owned
+   `cached_prompts: Vec<Vec<u32>>` store has been deleted.
+2. **Safe resurrection path landed in `step_new()`.** When a radix hit
+   maps to a reusable free slot, `step_new()` consumes
+   `reusable_prefix_len` / `reusable_cached_prompt_len`, restores or
+   truncates model state as needed, and skips `forward_prefill` over
+   the matched prefix. If the contiguous KV had been CPU-offloaded,
+   the scheduler first calls `prefetch_kv_to_gpu()` so the subsequent
+   `truncate_to()` / `migrate_kv_range_to_paged()` path never reads a
+   stale host-shadow source.
+3. **`alloc_tokens` OOM retry landed** as
+   `alloc_pool_tokens_with_retry(...)`. Both the prefix-reuse migration
+   path and the normal prefill/decode allocation path can now force a
+   synchronous prefix-cache eviction and retry once before failing the
+   request.
+4. **Retain hard cap landed** at `max_total_tokens × 0.9`. Above the
+   cap, `publish_to_prefix_cache()` intentionally skips publishing the
+   completed prompt into the retained T0 prefix cache. The hit is still
+   observable by the caller, but the bytes are not pinned, so admission
+   fails open instead of starving fresh allocations.
+5. **Tombstone-GC scaffolding landed** via `free_nodes`,
+   `alloc_node()`, and `gc_orphan_tombstones()`. Repeated
+   evict/insert cycles now reclaim blockless `ref_count == 0`
+   structure instead of letting the node vector grow monotonically.
+   There is still **no tombstone cap** in M2b; M3 keeps the policy
+   convergence / cap work.
+6. **Intentional non-scope**: cross-slot page aliasing did **not**
+   ship. The M2b audit kept the safe variant only: reuse is allowed
+   when a radix hit maps to a free slot whose contiguous state still
+   materialises the prefix. Sharing paged-pool ownership across slots
+   remains future work once the pool has explicit alias-safe lifetime
+   semantics.
 
 **Exit**:
-1. `grep -rn cached_prompts infer/src/` returns empty
-2. Two-session alternating trace: second visit to the same system
-   prompt achieves **≥ 95% prefix hit rate** (was ~0% pre-M2b)
-3. `scripts/bench_agent_trace.py` shows TTFT drop on the
-   agent-workload benchmark vs M2a baseline
-4. `cargo test --release --test e2e` / `e2e_qwen35` golden outputs
-   unchanged
-5. Stress test: 100 concurrent requests sharing one 4 k-token prefix
-   does not cause `alloc_tokens` to error out (the retain hard cap
-   protects pool free-list)
+1. `rg -n "cached_prompts: Vec<Vec<u32>>|best_prefix_slot_for_cached_prompts" infer/src/scheduler/cuda`
+   returns empty
+2. Remote CUDA: `cargo build --release`, `cargo test --release`,
+   `cargo test --release --test e2e`, `cargo test --release --test e2e_qwen35`,
+   and `cargo test --release --test greedy_consistency` pass unchanged
+3. `scripts/bench_agent_trace.py` shows TTFT drop on the agent-workload
+   benchmark vs the M2a baseline on the same host
+4. Stress test: 100 concurrent requests sharing one 4 k-token prefix
+   does not produce pool-allocation failures (`alloc_pool_tokens_with_retry`
+   + retain hard cap protect the free list)
+5. The dedicated acceptance checklist in
+   [`../plans/tiered-kv-cache-m2b-remote-acceptance.md`](../plans/tiered-kv-cache-m2b-remote-acceptance.md)
+   is completed and archived into `docs/experience/wins/`
 
 ### M3 — T1 host pinned tier + coordinator (stacked PR series)
 
@@ -1059,7 +1071,7 @@ original plan, and the M2/M3 expansions added by Codex 2026-04-15.
 | M1a | 1 | Delete `kv_tier/directory.rs` (pure subtraction) | **shipped (`08718ad`)** |
 | M1b | 1 | RadixCache shadow observer wired into Scheduler (behavior-neutral) | **shipped (`323aee0`)** |
 | M2a | 1 | Per-page refcount + side map + watermark eviction loop (data model) | **shipped (`4402ab0`)** |
-| M2b | 1 | Selector flip + retain hard cap + tombstone GC + delete `cached_prompts` (behavior, benchmark gate) | **pending** |
+| M2b | 1 | Selector flip + safe same-slot resurrection + alloc retry + retain hard cap + tombstone GC + delete scheduler `cached_prompts` (behavior, benchmark gate) | **local impl done; remote validation pending** |
 | M3a | 1 | `HostPinnedPool` + `LocalCudaTransport` + `Node` field extension (structural) | not started |
 | M3b | 1 | Coordinator OS thread + page lifecycle state machine + policy convergence + recompute fallback + `lookup_or_stage` interface (behavior, benchmark gate) | not started |
 | M3c | 1 | T1→T0 promotion + delete legacy `model/kv_cache.rs` CPU offload (structural cleanup) | not started |
@@ -1457,7 +1469,8 @@ that needed to be elevated to first-class doc sections:
 6. **Tombstone vs real entry framing for "index-only" radix nodes.**
    First revision left `block_id == None && ref_count == 0` stubs as
    an unhandled edge case in `RadixCache::evict`. New §4.3.1 names them
-   "tombstones", caps them, and gives M2b/M3 explicit GC scope.
+   "tombstones", lets M2b reclaim them opportunistically, and leaves any
+   policy-driven cap work to M3.
 7. **Retain hard cap as distinct from evict watermark.** First revision
    conflated them. New §8 pitfall 16 + §6 M2b scope (4) split them
    into "evict trigger" and "fail-open retain cap".
@@ -1472,7 +1485,8 @@ that needed to be elevated to first-class doc sections:
 10. **§6 M1, M2 rewritten to reflect what actually shipped.** First
     revision described M1 as "one atomic PR maybe split"; reality
     shipped as M1a + M1b. M2 is now decomposed into M2a (shipped) +
-    M2b (pending) with explicit scope for each.
+    M2b (local impl shipped, remote CUDA validation pending) with
+    explicit scope for each.
 11. **§7 PR table** updated with shipped status per row.
 
 Every change in this revision is additive or replaces stale prose with
@@ -1559,19 +1573,12 @@ revision supersedes all three of those as documented above.
 
 **Next, in dependency order**:
 
-1. **M2b · selector flip** (next target). Replace
-   `best_prefix_slot_for_cached_prompts`
-   (`infer/src/scheduler/cuda/runtime.rs:20-30,191`) with a radix-aware
-   selector + add the resurrect read path in `step_new` that copies
-   matched pages' state into the new slot and skips prefill for the
-   matched prefix. Wire `alloc_tokens` OOM → `evict_prefix_cache_if_pressured`
-   retry. Add the retain hard cap (`retained_count <
-   max_total_tokens × 0.9`). Add the tombstone GC pass (`block_id ==
-   None && ref_count == 0` cleanup). Delete `cached_prompts`.
-   Validation: `bench_serving matrix --concurrency 4 --prompt-lens
-   128,512 --output-lens 64`, expect measurable TTFT win on repeated
-   prompts. M2a's `MockPool` refcount tests stay as the regression
-   gate. **No tier work in M2b — still T0-only.**
+1. **M2b · remote CUDA acceptance** (immediate next step). Run the
+   build/test/benchmark/stress checklist in
+   [`../plans/tiered-kv-cache-m2b-remote-acceptance.md`](../plans/tiered-kv-cache-m2b-remote-acceptance.md),
+   record the TTFT delta vs the M2a baseline, and archive the result
+   in `docs/experience/wins/`. This is the gate from "local impl done"
+   to "M2b accepted". **Still T0-only.**
 2. **M0.3 · `page_size = 1 → 16`** (parallel track, hard prereq for
    M3). Per-format dispatch — keep `page_size=1` for INT8/FP8/quant
    paths, lift to 16 for BF16/FP16. Kernel files at
