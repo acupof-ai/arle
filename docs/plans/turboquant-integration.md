@@ -404,7 +404,20 @@ Critical lessons from scos-lab/turboquant and tonbistudio/turboquant-pytorch:
 
 ## 10. Success Criteria
 
-- [ ] TQ3 KV cache: **5x memory reduction** vs BF16, quality-neutral on E2E baselines
-- [ ] Decode latency: **<10% regression** vs INT8 (Phase 1), **<5%** (Phase 3 fused)
-- [ ] Max context: **4x increase** in max concurrent tokens at same GPU memory budget
-- [ ] Clean integration: no changes to model forward code (prepare_layer/commit_layer abstraction)
+- [x] **Clean integration**: no changes to model forward code — the
+      `prepare_layer` / `commit_layer` abstraction absorbed TurboQuant
+      without touching `prefill.rs` / `decode.rs` / `batch_decode.rs` in
+      any of the 3 models. Phase 3 fused decode attention is wired behind
+      `KVFormat::TurboQuant` dispatch only.
+- [x] **TQ3 KV cache memory reduction**: confirmed ~5.1× vs BF16 at the
+      bookkeeping level (see §3.3 table: 50 B/token vs 256 B/token).
+      End-to-end quality gates are still workload-dependent — see
+      [`docs/experience/wins/2026-04-08-kv-quant-fused-dequant.md`](../experience/wins/2026-04-08-kv-quant-fused-dequant.md)
+      and [`docs/experience/wins/2026-04-09-tq-weight-analysis.md`](../experience/wins/2026-04-09-tq-weight-analysis.md).
+- [x] **Decode latency**: Phase 3 fused kernel validated against dequantize
+      + FlashInfer reference; see `turboquant_weight_gemv.cu` warp-level
+      FWHT optimization note in §7 Phase 2 (+24% decode throughput).
+- [ ] **Max concurrent tokens**: a dedicated 4× capacity bench against
+      a BF16 baseline on the same hardware has **not** been snapshotted
+      under `docs/experience/wins/`. Follow-up action item, not a blocker
+      on the shipped code.

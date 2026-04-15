@@ -2,6 +2,17 @@
 
 Date: 2026-04-14
 
+> **Scope note (2026-04-15).** This checklist targets the specific
+> suffix-only KV migration patch stack that landed around `335b08b^` → `HEAD`
+> on 2026-04-14. It is **not** the acceptance doc for the later
+> M2b/M0.3/M3a/M3b/M3c stack that followed on 2026-04-15 — those have
+> their own per-milestone acceptance checklists under
+> `tiered-kv-cache-m{2b,0.3-m3a,3b,3c}-remote-acceptance.md` (all
+> accepted on L4 per `docs/index.md`). Keep this doc as the reference
+> for the suffix-only migration benchmarks; if you run it today against
+> HEAD, note that HEAD now includes the M2b-and-later changes and your
+> A/B will mix two independent optimization waves.
+
 ## What changed
 
 This patch optimizes the prefill -> paged-KV handoff without changing decode kernels:

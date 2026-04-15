@@ -1,5 +1,32 @@
 # Q4_K Native GPU Kernel — Carnice-27b on L4-24GB
 
+> **Status: Shipped** (post 2026-04-10). This plan describes the design that
+> actually landed. The native Q4_K path is in production:
+>
+> - Kernel: [`crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu`](../../crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu)
+>   (`q4k_gemv_kernel` + batched variant)
+> - FFI: [`crates/infer-cuda-kernels/src/ffi/gemm.rs`](../../crates/infer-cuda-kernels/src/ffi/gemm.rs)
+>   (`q4k_gemv_cuda`)
+> - `DeviceMatrix::from_quantized_q4k`: [`crates/infer-cuda-kernels/src/tensor.rs`](../../crates/infer-cuda-kernels/src/tensor.rs)
+> - GGUF packed reader: `gguf::read_tensor_q4k_packed` in [`infer/src/gguf.rs`](../../infer/src/gguf.rs)
+> - Loader fast path: [`infer/src/weight_loader.rs`](../../infer/src/weight_loader.rs)
+>   (`load_tensor_2d_gguf` Q4_K branch at ~line 879, `load_tensor_2d_gguf_v_reorder_rows`
+>   at ~line 722)
+> - Dispatch: [`infer/src/ops/linear.rs`](../../infer/src/ops/linear.rs) — `quant_bits == 44` → q4k path
+> - Tests: [`infer/tests/q4k_kernel_correctness.rs`](../../infer/tests/q4k_kernel_correctness.rs)
+>   (419 lines), [`infer/tests/ground_truth_q4k.rs`](../../infer/tests/ground_truth_q4k.rs),
+>   [`infer/tests/smoke_carnice_27b_q4k.rs`](../../infer/tests/smoke_carnice_27b_q4k.rs)
+>
+> Related bug-resolution experience entries:
+> [`docs/experience/errors/2026-04-09-carnice-27b-q4k-oom.md`](../experience/errors/2026-04-09-carnice-27b-q4k-oom.md),
+> [`docs/experience/errors/2026-04-10-gguf-load-path-forward-garbage.md`](../experience/errors/2026-04-10-gguf-load-path-forward-garbage.md),
+> [`docs/experience/errors/2026-04-10-remaining-gguf-bugs.md`](../experience/errors/2026-04-10-remaining-gguf-bugs.md).
+>
+> The design below is preserved as a reference for the rationale (tensor
+> coverage decision, superblock alignment argument, kernel layout). The
+> "Next step" section at the bottom is historical — steps 1→8 have all
+> been implemented.
+
 ## Goal
 
 Load Carnice-27b (Qwen3_5ForCausalLM, 64L, 5120 hidden, 17408 intermediate) from a Q4_K_M GGUF (~16.5 GB on disk) onto a single L4-24GB, with **GPU resident memory matching the quantized size expectation** (~16-18 GB including the BF16 fallback subset + KV/activations).
@@ -116,6 +143,8 @@ Key points:
 - Q5_K / Q6_K native kernels.
 - Fixing the linear-attention col-reorder case for packed weights (requires dequant + requant, or custom kernel with an in-K permutation LUT).
 
-## Next step
+## Next step (historical)
 
-Implement 1→8, then run verification 1→5.
+Implement 1→8, then run verification 1→5. **All eight implementation steps
+and verification 1–5 have landed** — see the status banner at the top of
+this file for the final code locations.

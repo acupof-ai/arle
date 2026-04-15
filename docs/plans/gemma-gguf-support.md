@@ -1,8 +1,24 @@
 # Plan: Gemma 4 Model + GGUF Loading
 
-**Status**: Planning  
-**Date**: 2026-04-10  
+**Status**: Split — GGUF **shipped**, Gemma model **still queued**
+**Date**: 2026-04-10 (original) / 2026-04-15 (status update)
 **Goal**: Minimal-effort multi-architecture support via Gemma 4 + GGUF weight format
+
+> **2026-04-15 status update.** The two halves of this plan diverged:
+>
+> - **GGUF loading (§2): shipped.** The minimal parser in
+>   [`infer/src/gguf.rs`](../../infer/src/gguf.rs) landed, `weight_loader.rs`
+>   has BF16 / F16 / Q8_0 / Q4_K_M fast paths, and
+>   [`plans/q4k-native-gpu.md`](q4k-native-gpu.md) describes the native Q4_K
+>   kernel that is now in production. See the three 2026-04-10 experience
+>   errors under `docs/experience/errors/2026-04-10-*gguf*.md` for the debug
+>   trail that preceded it.
+> - **Gemma 4 model (§1): still not shipped.** `model_registry.rs` detects
+>   `Gemma{,2,3,4}ForCausalLM` architectures and maps them to `ModelArch::Gemma`,
+>   but `backend/cuda/bootstrap.rs` has no Gemma load path and no
+>   `model/gemma*.rs` files exist. The Gemma-specific forward-pass work
+>   (pre+post RMSNorm, logit soft-cap, sliding-window attention) below is
+>   still accurate as a forward-looking design.
 
 ---
 
@@ -54,9 +70,28 @@
 
 ---
 
-## 2. GGUF Loading
+## 2. GGUF Loading — **Shipped**
 
-### What exists
+> Phase 1 (BF16/F16), Phase 2 (Q8_0), and Phase 3 (Q4_K_M, via the native
+> q4k_gemv path, not dequant-to-BF16 as originally sketched) all landed.
+> The design sections below describe the pre-implementation plan; the
+> implementation matches the Phase 1/2 shape but Phase 3 chose the **keep
+> Q4_K packed on GPU** path documented in
+> [`q4k-native-gpu.md`](q4k-native-gpu.md) instead of the "dequant at load
+> to BF16" option in §2 below.
+
+### What exists (2026-04-15)
+- `infer/src/gguf.rs`: minimal parser + tensor directory + per-tensor
+  readers (`read_tensor_bf16`, `read_tensor_q4k_packed`, Q8_0 fast path)
+- `infer/src/weight_loader.rs`: `load_tensor_2d_gguf` with BF16 / F16 /
+  Q8_0 / Q4_K_M fast paths, plus `load_tensor_2d_gguf_v_reorder_rows`
+  for V-head row permutation on packed Q4_K
+- GGUF → HF name mapping handled inline in `weight_loader.rs`
+- Integrated with the 3 currently-supported models (Qwen3, Qwen3.5, GLM4)
+
+### Original plan (preserved for historical rationale)
+
+### What existed (2026-04-10, at plan-write time)
 - `quant.rs`: `QuantFormat::Gguf`, `GgufConfig`, `try_load_gguf()` (finds .gguf file)
 - `weight_loader.rs`: no GGUF tensor reading (only safetensors)
 
