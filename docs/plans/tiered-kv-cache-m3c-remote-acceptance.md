@@ -15,10 +15,11 @@ local M3c cleanup batch.
   `TokenKVPool` budget semantics that still exist.
 
 **Explicit non-scope**:
-- No real T1 runtime staging completion yet: the current tree may already
-  include the M3b contract/runtime-wire batch (`lookup_or_stage`,
-  keepalive stamping, watermark rewiring), but staged bytes still do not
-  complete back onto GPU on this lane.
+- M3b runtime-local already landed the plannerless `lookup_or_stage`
+  classifier and `soft_pin_until` keepalive stamping; see
+  [`tiered-kv-cache-m3b-remote-acceptance.md`](tiered-kv-cache-m3b-remote-acceptance.md)
+  for the preceding contract + runtime-wire acceptance tranche.
+- No real T1 runtime staging completion yet.
 - No real host-pinned promotion path yet.
 - No disk/session persistence yet.
 
@@ -31,6 +32,9 @@ and the contract/state-machine gate in
 
 ## 1 · Preflight
 
+- Order reminder for reviewers: M2b → M0.3/M3a → M3b contract/runtime wire
+  ([`tiered-kv-cache-m3b-remote-acceptance.md`](tiered-kv-cache-m3b-remote-acceptance.md))
+  → M3c cleanup.
 - [ ] `git status --short` is clean or only contains the intended stacked diff.
 - [ ] `git rev-parse --abbrev-ref HEAD` points at the branch to validate.
 - [ ] `nvidia-smi` shows the target GPU.
