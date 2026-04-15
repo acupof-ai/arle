@@ -4,11 +4,10 @@
 //! chunked prefill and decode-priority interleaving on top of the request-state
 //! API.
 //!
-//! **Current limitation:** decode work is still executed request-by-request
-//! inside the scheduler loop; cross-request batched GPU decode is not wired
-//! yet. When Metal DFlash is enabled, the server still falls back to the
-//! legacy serial runtime because the scheduler runtime does not yet support
-//! speculative decode.
+//! **Current limitation:** same-length Qwen3 / Qwen3.5 decode batches now have
+//! cross-request GPU paths, but variable-length decode batching is still
+//! missing and Metal DFlash still falls back to the legacy serial runtime
+//! because the scheduler runtime does not yet support speculative decode.
 
 #![cfg(feature = "metal")]
 
@@ -18,11 +17,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use infer::backend::metal::{
-    MetalBackendOptions, MetalDflashOptions, spawn_metal_scheduler_handle_from_path_with_options,
+    MetalBackendOptions, MetalDflashOptions,
+    spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
-use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options;
+use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options_and_metrics;
 use infer::http_server::{HttpServerConfig, build_app_with_config};
 use infer::logging;
+use infer::metrics::ServerMetrics;
 use infer::request_handle::RequestHandle;
 use infer::sampler::SamplingParams;
 use infer::scheduler::{IncomingRequest, RequestPriority};
@@ -124,22 +125,30 @@ async fn main() -> Result<()> {
             }),
         kv_pool: args.kv_pool_override(),
     };
+    let model_id = std::path::Path::new(&args.model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&args.model_path)
+        .to_string();
+    let metrics = ServerMetrics::new(&model_id);
     let handle: Arc<dyn RequestHandle> = if args.dflash_draft_model.is_some() {
         info!("Metal DFlash currently uses the legacy serial runtime path");
         Arc::new(
-            spawn_metal_runtime_handle_from_path_with_options(
+            spawn_metal_runtime_handle_from_path_with_options_and_metrics(
                 &args.model_path,
                 backend_options.clone(),
                 args.max_waiting,
+                metrics.clone(),
             )
             .with_context(|| format!("failed to start Metal runtime for {}", args.model_path))?,
         )
     } else {
         Arc::new(
-            spawn_metal_scheduler_handle_from_path_with_options(
+            spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
                 &args.model_path,
                 backend_options,
                 args.max_waiting,
+                metrics.clone(),
             )
             .with_context(|| {
                 format!(
@@ -175,7 +184,7 @@ async fn main() -> Result<()> {
 
     let app = build_app_with_config(
         handle,
-        infer::metrics::ServerMetrics::new(""),
+        metrics,
         HttpServerConfig {
             api_key: api_key.map(Arc::<str>::from),
         },

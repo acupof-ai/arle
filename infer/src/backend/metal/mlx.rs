@@ -733,3 +733,21 @@ pub fn clear_cache() {
     }
     panic_if_mlx_error("mlx_metal_clear_cache");
 }
+
+pub fn active_memory_bytes() -> u64 {
+    let value = unsafe { mlx_sys::mlx_get_active_memory() as u64 };
+    panic_if_mlx_error("mlx_get_active_memory");
+    value
+}
+
+pub fn peak_memory_bytes() -> u64 {
+    let value = unsafe { mlx_sys::mlx_get_peak_memory() as u64 };
+    panic_if_mlx_error("mlx_get_peak_memory");
+    value
+}
+
+pub fn cache_memory_bytes() -> u64 {
+    let value = unsafe { mlx_sys::mlx_get_cache_memory() as u64 };
+    panic_if_mlx_error("mlx_get_cache_memory");
+    value
+}

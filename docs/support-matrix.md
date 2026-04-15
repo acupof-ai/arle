@@ -90,8 +90,8 @@ Backend note:
 | `/v1/models` | Stable | Loaded-model discovery endpoint. |
 | `/v1/responses` | Beta | Non-streaming subset shipped; streaming parity still pending. |
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
-| `/metrics` | Stable | Prometheus endpoint. |
-| `/v1/stats` | Stable | Human-readable stats endpoint. |
+| `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
+| `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 
 ---

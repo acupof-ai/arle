@@ -19,6 +19,11 @@
 //! | `infer_kv_gpu_utilization` | gauge | GPU KV cache utilization [0,1] |
 //! | `infer_kv_gpu_blocks_free` | gauge | Free GPU KV blocks |
 //! | `infer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
+//! | `infer_prefix_hits_total` | counter | Prefix-cache lookup hits |
+//! | `infer_prefix_lookups_total` | counter | Prefix-cache lookups |
+//! | `infer_memory_active_bytes` | gauge | Active MLX allocator memory |
+//! | `infer_memory_peak_bytes` | gauge | Peak MLX allocator memory |
+//! | `infer_memory_cache_bytes` | gauge | Cached MLX allocator memory |
 
 use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,12 +164,17 @@ struct MetricsInner {
     pub tokens_generated_total: AtomicU64,
     pub tokens_prompt_total: AtomicU64,
     pub requests_failed_total: AtomicU64,
+    pub prefix_hits_total: AtomicU64,
+    pub prefix_lookups_total: AtomicU64,
 
     // Gauges (atomic).
     pub requests_active: AtomicU64,
     pub requests_waiting: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
     pub kv_gpu_blocks_total: AtomicU64,
+    pub memory_active_bytes: AtomicU64,
+    pub memory_peak_bytes: AtomicU64,
+    pub memory_cache_bytes: AtomicU64,
 
     // Histograms (mutex-protected — infrequent writes per request).
     pub histograms: Mutex<HistogramSet>,
@@ -181,10 +191,15 @@ impl ServerMetrics {
                 tokens_generated_total: AtomicU64::new(0),
                 tokens_prompt_total: AtomicU64::new(0),
                 requests_failed_total: AtomicU64::new(0),
+                prefix_hits_total: AtomicU64::new(0),
+                prefix_lookups_total: AtomicU64::new(0),
                 requests_active: AtomicU64::new(0),
                 requests_waiting: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
                 kv_gpu_blocks_total: AtomicU64::new(0),
+                memory_active_bytes: AtomicU64::new(0),
+                memory_peak_bytes: AtomicU64::new(0),
+                memory_cache_bytes: AtomicU64::new(0),
                 histograms: Mutex::new(HistogramSet::new()),
                 model_id: model_id.to_string(),
             }),
@@ -228,6 +243,16 @@ impl ServerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one prefix-cache lookup and whether it hit a reusable prefix.
+    pub fn record_prefix_lookup(&self, hit: bool) {
+        self.inner
+            .prefix_lookups_total
+            .fetch_add(1, Ordering::Relaxed);
+        if hit {
+            self.inner.prefix_hits_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Set the number of currently-active requests.
     pub fn set_active(&self, n: u64) {
         self.inner.requests_active.store(n, Ordering::Relaxed);
@@ -244,6 +269,17 @@ impl ServerMetrics {
         self.inner
             .kv_gpu_blocks_total
             .store(total, Ordering::Relaxed);
+    }
+
+    /// Update MLX allocator memory gauges in bytes.
+    pub fn set_memory_bytes(&self, active: u64, peak: u64, cache: u64) {
+        self.inner
+            .memory_active_bytes
+            .store(active, Ordering::Relaxed);
+        self.inner.memory_peak_bytes.store(peak, Ordering::Relaxed);
+        self.inner
+            .memory_cache_bytes
+            .store(cache, Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------------
@@ -277,6 +313,14 @@ impl ServerMetrics {
             return 0.0;
         }
         (total - free) as f64 / total as f64
+    }
+
+    pub fn prefix_hit_rate(&self) -> f64 {
+        let lookups = self.inner.prefix_lookups_total.load(Ordering::Relaxed);
+        if lookups == 0 {
+            return 0.0;
+        }
+        self.inner.prefix_hits_total.load(Ordering::Relaxed) as f64 / lookups as f64
     }
 
     // -----------------------------------------------------------------------
@@ -322,6 +366,42 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        out.push_str("# HELP infer_requests_failed_total Total failed inference requests.\n");
+        out.push_str("# TYPE infer_requests_failed_total counter\n");
+        writeln!(
+            out,
+            "infer_requests_failed_total{{{labels}}} {}",
+            self.inner.requests_failed_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_prefix_lookups_total Total prefix-cache lookups.\n");
+        out.push_str("# TYPE infer_prefix_lookups_total counter\n");
+        writeln!(
+            out,
+            "infer_prefix_lookups_total{{{labels}}} {}",
+            self.inner.prefix_lookups_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_prefix_hits_total Total reusable prefix-cache hits.\n");
+        out.push_str("# TYPE infer_prefix_hits_total counter\n");
+        writeln!(
+            out,
+            "infer_prefix_hits_total{{{labels}}} {}",
+            self.inner.prefix_hits_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_prefix_hit_rate Reusable prefix-cache hit rate [0,1].\n");
+        out.push_str("# TYPE infer_prefix_hit_rate gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_hit_rate{{{labels}}} {:.4}",
+            self.prefix_hit_rate()
+        )
+        .unwrap();
+
         // Gauges
         out.push_str("# HELP infer_requests_active Currently running requests.\n");
         out.push_str("# TYPE infer_requests_active gauge\n");
@@ -361,6 +441,33 @@ impl ServerMetrics {
         out.push_str("# TYPE infer_kv_gpu_blocks_total gauge\n");
         writeln!(out, "infer_kv_gpu_blocks_total{{{labels}}} {total}").unwrap();
 
+        out.push_str("# HELP infer_memory_active_bytes Active MLX allocator memory in bytes.\n");
+        out.push_str("# TYPE infer_memory_active_bytes gauge\n");
+        writeln!(
+            out,
+            "infer_memory_active_bytes{{{labels}}} {}",
+            self.inner.memory_active_bytes.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_memory_peak_bytes Peak MLX allocator memory in bytes.\n");
+        out.push_str("# TYPE infer_memory_peak_bytes gauge\n");
+        writeln!(
+            out,
+            "infer_memory_peak_bytes{{{labels}}} {}",
+            self.inner.memory_peak_bytes.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_memory_cache_bytes Cached MLX allocator memory in bytes.\n");
+        out.push_str("# TYPE infer_memory_cache_bytes gauge\n");
+        writeln!(
+            out,
+            "infer_memory_cache_bytes{{{labels}}} {}",
+            self.inner.memory_cache_bytes.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
         // Histograms
         if let Ok(h) = self.inner.histograms.lock() {
             out.push_str("# HELP infer_ttft_seconds Time to first token latency.\n");
@@ -394,14 +501,24 @@ impl ServerMetrics {
             .as_ref()
             .and_then(|h| h.tpot.percentile(0.50))
             .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let active_mb =
+            self.inner.memory_active_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        let peak_mb =
+            self.inner.memory_peak_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        let cache_mb =
+            self.inner.memory_cache_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
 
         format!(
-            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% ttft_p50={} ttft_p99={} tpot_p50={}",
+            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB ttft_p50={} ttft_p99={} tpot_p50={}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
             self.tokens_generated_total(),
             self.kv_gpu_utilization() * 100.0,
+            self.prefix_hit_rate() * 100.0,
+            active_mb,
+            peak_mb,
+            cache_mb,
             ttft_p50,
             ttft_p99,
             tpot_p50,
@@ -446,12 +563,16 @@ mod tests {
         m.set_active(2);
         m.set_waiting(5);
         m.set_kv_gpu_blocks(100, 200);
+        m.record_prefix_lookup(true);
+        m.set_memory_bytes(1234, 5678, 42);
 
         let rendered = m.render_prometheus();
         assert!(rendered.contains("infer_requests_total"));
         assert!(rendered.contains("infer_requests_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_requests_active{model=\"Qwen3-4B\",} 2"));
         assert!(rendered.contains("infer_requests_waiting{model=\"Qwen3-4B\",} 5"));
+        assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
+        assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_ttft_seconds_count"));
         assert!(rendered.contains("infer_tpot_seconds_count"));
         assert!(rendered.contains("infer_e2e_seconds_count"));
@@ -465,6 +586,7 @@ mod tests {
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
+        assert!(s.contains("prefix_hit_rate=0.0%"));
     }
 
     #[test]

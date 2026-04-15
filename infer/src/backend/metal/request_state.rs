@@ -314,6 +314,17 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub fn kv_pool_usage(&self) -> Option<(usize, usize)> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => state
+                .driver
+                .kv_pool
+                .as_ref()
+                .map(|pool| (pool.total_tokens_used(), pool.max_total_tokens())),
+            MetalRequestStateInner::Qwen35(_) => None,
+        }
+    }
+
     pub fn prefill_chunk(&mut self, budget: usize) -> Result<PrefillChunkResult> {
         match &mut self.inner {
             MetalRequestStateInner::Qwen3(state) => state.prefill_chunk(budget),

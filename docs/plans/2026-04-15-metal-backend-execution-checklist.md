@@ -42,6 +42,11 @@ This checklist is the execution companion to:
   Exit:
   `/metrics` and `/v1/stats` surface at least `prefix_hit_rate`, `kv_util`,
   `active_memory`, `peak_memory`, and queue depth.
+  Status:
+  `2026-04-15`: runtime-backed queue / TTFT / E2E / MLX memory metrics landed
+  on both the live scheduler runtime and the serial DFlash fallback path. The
+  remaining open edge is that `prefix_hit_rate` is still a real-but-zero gauge
+  until `M0.3` wires shared-prefix reuse into the live serving path.
 
 ## P1 · API And DX
 

@@ -15,6 +15,7 @@ use super::metal::MetalBackendOptions;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
+use crate::metrics::ServerMetrics;
 use crate::request_handle::{RequestHandle, SubmitError};
 use crate::scheduler::IncomingRequest;
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
@@ -90,11 +91,28 @@ pub fn spawn_backend_runtime_handle<B>(
 where
     B: StreamingInferenceBackend + 'static,
 {
+    spawn_backend_runtime_handle_with_metrics(
+        backend,
+        model_id,
+        max_waiting,
+        ServerMetrics::new(""),
+    )
+}
+
+pub fn spawn_backend_runtime_handle_with_metrics<B>(
+    backend: B,
+    model_id: impl Into<Arc<str>>,
+    max_waiting: usize,
+    metrics: ServerMetrics,
+) -> BackendRuntimeHandle
+where
+    B: StreamingInferenceBackend + 'static,
+{
     let (tx, rx) = mpsc::unbounded_channel();
     let waiting_count = Arc::new(AtomicUsize::new(0));
     let handle = BackendRuntimeHandle::new(tx, model_id.into(), waiting_count.clone(), max_waiting);
 
-    std::thread::spawn(move || run_backend_runtime(backend, rx, waiting_count));
+    std::thread::spawn(move || run_backend_runtime(backend, rx, waiting_count, metrics));
     handle
 }
 
@@ -118,6 +136,28 @@ pub fn spawn_metal_runtime_handle_from_path_with_options(
 ) -> Result<BackendRuntimeHandle> {
     use std::path::Path;
 
+    let model_id = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path)
+        .to_string();
+    spawn_metal_runtime_handle_from_path_with_options_and_metrics(
+        model_path,
+        options,
+        max_waiting,
+        ServerMetrics::new(&model_id),
+    )
+}
+
+#[cfg(feature = "metal")]
+pub fn spawn_metal_runtime_handle_from_path_with_options_and_metrics(
+    model_path: &str,
+    options: MetalBackendOptions,
+    max_waiting: usize,
+    metrics: ServerMetrics,
+) -> Result<BackendRuntimeHandle> {
+    use std::path::Path;
+
     let mut backend = MetalBackend::with_options(options);
     backend.load(Path::new(model_path))?;
 
@@ -127,10 +167,11 @@ pub fn spawn_metal_runtime_handle_from_path_with_options(
         .unwrap_or(model_path)
         .to_string();
 
-    Ok(spawn_backend_runtime_handle(
+    Ok(spawn_backend_runtime_handle_with_metrics(
         backend,
         Arc::<str>::from(model_id),
         max_waiting,
+        metrics,
     ))
 }
 
@@ -162,12 +203,17 @@ fn run_backend_runtime<B>(
     backend: B,
     mut rx: mpsc::UnboundedReceiver<IncomingRequest>,
     waiting_count: Arc<AtomicUsize>,
+    metrics: ServerMetrics,
 ) where
     B: StreamingInferenceBackend,
 {
     while let Some(req) = rx.blocking_recv() {
         waiting_count.fetch_sub(1, Ordering::AcqRel);
-        let result = catch_unwind(AssertUnwindSafe(|| execute_request(&backend, req)));
+        metrics.set_waiting(waiting_count.load(Ordering::Acquire) as u64);
+        metrics.set_active(1);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            execute_request(&backend, req, &metrics)
+        }));
         let outcome = match result {
             Ok(result) => result,
             Err(panic) => Err(anyhow!(
@@ -177,7 +223,10 @@ fn run_backend_runtime<B>(
         };
         if let Err(err) = outcome {
             error!("backend runtime request failed: {err:#}");
+            metrics.record_request_failed();
         }
+        metrics.set_active(0);
+        metrics.set_waiting(waiting_count.load(Ordering::Acquire) as u64);
     }
 }
 
@@ -191,7 +240,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn execute_request<B>(backend: &B, req: IncomingRequest) -> Result<()>
+fn execute_request<B>(backend: &B, req: IncomingRequest, metrics: &ServerMetrics) -> Result<()>
 where
     B: StreamingInferenceBackend,
 {
@@ -207,6 +256,21 @@ where
         }
         Ok(())
     })?;
+
+    let ttft_s = generated.ttft_ms / 1000.0;
+    let e2e_s = generated.total_time_ms / 1000.0;
+    let tpot_s = if generated.completion_tokens > 1 {
+        (e2e_s - ttft_s).max(0.0) / (generated.completion_tokens - 1) as f64
+    } else {
+        0.0
+    };
+    metrics.record_request_completed(
+        generated.prompt_tokens as u64,
+        generated.completion_tokens as u64,
+        ttft_s,
+        tpot_s,
+        e2e_s,
+    );
 
     if let Some(final_delta) = stop_processor.finish() {
         send_text_delta(&delta_tx, final_delta)?;

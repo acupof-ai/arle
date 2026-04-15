@@ -45,6 +45,9 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    same-length 路径包装成完成态。
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
 3. 暴露 Metal queue depth / prefix hit / active + peak memory / KV util 等 serving 级指标。
+   当前状态：runtime-backed queue / TTFT / E2E / MLX active/peak/cache memory
+   已落地；`prefix_hit_rate` 指标面已接好，但变成非零仍依赖 `M0.3` 的
+   shared-prefix reuse。
 
 ### P1 · Product surface
 

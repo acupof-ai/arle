@@ -3,6 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{error, info, warn};
@@ -14,6 +15,7 @@ use super::scheduler::{
 };
 use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
+use crate::metrics::ServerMetrics;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -25,6 +27,8 @@ struct ActiveMetalRequest {
     decoder: IncrementalDecoder<'static>,
     stop_processor: StopChunkProcessor,
     prompt_tokens: usize,
+    admitted_at: Instant,
+    first_token_at: Option<Instant>,
 }
 
 impl ActiveMetalRequest {
@@ -45,6 +49,8 @@ impl ActiveMetalRequest {
                 decoder: tokenizer.incremental_decoder(),
                 stop_processor: StopChunkProcessor::new(incoming.stop.unwrap_or_default()),
                 prompt_tokens: prompt_tokens.len(),
+                admitted_at: Instant::now(),
+                first_token_at: None,
             },
         ))
     }
@@ -114,6 +120,9 @@ impl ActiveMetalRequest {
     }
 
     fn process_token(&mut self, token_id: u32) -> Result<()> {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Instant::now());
+        }
         if let Some(chunk) = self.decoder.step(token_id)? {
             self.push_text_chunk(&chunk)?;
         }
@@ -138,6 +147,25 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options(
     model_path: &str,
     options: MetalBackendOptions,
     max_waiting: usize,
+) -> Result<SchedulerHandle> {
+    let model_id = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(model_path)
+        .to_string();
+    spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
+        model_path,
+        options,
+        max_waiting,
+        ServerMetrics::new(&model_id),
+    )
+}
+
+pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
+    model_path: &str,
+    options: MetalBackendOptions,
+    max_waiting: usize,
+    metrics: ServerMetrics,
 ) -> Result<SchedulerHandle> {
     if options.dflash.is_some() {
         bail!(
@@ -180,6 +208,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options(
                 tokenizer,
                 rx,
                 runtime_handle,
+                metrics,
                 MetalSchedulerConfig {
                     max_waiting_requests: 0,
                     ..MetalSchedulerConfig::default()
@@ -216,6 +245,7 @@ fn run_metal_scheduler_runtime(
     tokenizer: &'static Tokenizer,
     mut request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     handle: SchedulerHandle,
+    metrics: ServerMetrics,
     config: MetalSchedulerConfig,
 ) -> Result<()> {
     let mut scheduler = MetalScheduler::new(config)?;
@@ -229,12 +259,14 @@ fn run_metal_scheduler_runtime(
             backend,
             tokenizer,
             &handle,
+            &metrics,
             &mut request_rx,
             &mut request_rx_closed,
             &mut scheduler,
             &mut active,
         );
         reap_closed_clients(&mut scheduler, &mut active);
+        refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
 
         if request_rx_closed && active.is_empty() && scheduler.waiting_len() == 0 {
             info!("Metal scheduler runtime shutting down: all handles dropped");
@@ -245,7 +277,15 @@ fn run_metal_scheduler_runtime(
             match request_rx.blocking_recv() {
                 Some(incoming) => {
                     handle.consume_one();
-                    admit_request(backend, tokenizer, incoming, &mut scheduler, &mut active);
+                    admit_request(
+                        backend,
+                        tokenizer,
+                        incoming,
+                        &metrics,
+                        &mut scheduler,
+                        &mut active,
+                    );
+                    refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
                 }
                 None => {
                     request_rx_closed = true;
@@ -259,22 +299,26 @@ fn run_metal_scheduler_runtime(
             MetalScheduleDecision::PrefillChunk(prefill) => execute_prefill_chunk(
                 prefill.req_id,
                 prefill.input_tokens.len(),
+                &metrics,
                 &mut scheduler,
                 &mut active,
             ),
             MetalScheduleDecision::DecodeBatch(batch) => {
-                execute_decode_batch(batch.req_ids, &mut scheduler, &mut active);
+                execute_decode_batch(batch.req_ids, &metrics, &mut scheduler, &mut active);
             }
             MetalScheduleDecision::Mixed { decode, prefill } => {
-                execute_decode_batch(decode.req_ids, &mut scheduler, &mut active);
+                execute_decode_batch(decode.req_ids, &metrics, &mut scheduler, &mut active);
                 execute_prefill_chunk(
                     prefill.req_id,
                     prefill.input_tokens.len(),
+                    &metrics,
                     &mut scheduler,
                     &mut active,
                 );
             }
         }
+
+        refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
     }
 
     Ok(())
@@ -284,6 +328,7 @@ fn drain_incoming_requests(
     backend: &'static MetalBackend,
     tokenizer: &'static Tokenizer,
     handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
     request_rx: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     request_rx_closed: &mut bool,
     scheduler: &mut MetalScheduler,
@@ -293,7 +338,7 @@ fn drain_incoming_requests(
         match request_rx.try_recv() {
             Ok(incoming) => {
                 handle.consume_one();
-                admit_request(backend, tokenizer, incoming, scheduler, active);
+                admit_request(backend, tokenizer, incoming, metrics, scheduler, active);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -308,6 +353,7 @@ fn admit_request(
     backend: &'static MetalBackend,
     tokenizer: &'static Tokenizer,
     incoming: IncomingRequest,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -321,6 +367,7 @@ fn admit_request(
             Ok(request) => request,
             Err(err) => {
                 error!("Metal scheduler request init failed: {err:#}");
+                metrics.record_request_failed();
                 return;
             }
         };
@@ -329,6 +376,7 @@ fn admit_request(
         Ok(req_id) => req_id,
         Err(err) => {
             error!("Metal scheduler submit failed: {err}");
+            metrics.record_request_failed();
             return;
         }
     };
@@ -341,6 +389,7 @@ fn admit_request(
 fn execute_prefill_chunk(
     req_id: RequestId,
     budget: usize,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -396,6 +445,7 @@ fn execute_prefill_chunk(
                     Ok(done) => scheduler_finished = done,
                     Err(err) => {
                         error!("Metal complete_prefill failed for {:?}: {err}", req_id);
+                        metrics.record_request_failed();
                         cancel_request(req_id, scheduler, active);
                         return;
                     }
@@ -403,12 +453,13 @@ fn execute_prefill_chunk(
             }
 
             if runtime_finished || stop_hit || scheduler_finished {
-                finalize_request(req_id, scheduler, active);
+                finalize_request(req_id, metrics, scheduler, active);
             }
         }
         Outcome::ClientDropped => cancel_request(req_id, scheduler, active),
         Outcome::Failed(err) => {
             error!("Metal prefill chunk failed for {:?}: {err:#}", req_id);
+            metrics.record_request_failed();
             cancel_request(req_id, scheduler, active);
         }
     }
@@ -416,6 +467,7 @@ fn execute_prefill_chunk(
 
 fn execute_decode_batch(
     req_ids: Vec<RequestId>,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -451,6 +503,7 @@ fn execute_decode_batch(
             Ok(result) => result,
             Err(err) => {
                 error!("Metal batched decode failed: {err:#}");
+                metrics.record_request_failed();
                 for (req_id, request) in open {
                     cancel_detached_request(req_id, request, scheduler);
                 }
@@ -468,22 +521,31 @@ fn execute_decode_batch(
                     "Metal batched decode post-process failed for {:?}: {err:#}",
                     req_id
                 );
+                metrics.record_request_failed();
                 cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
-            finish_or_requeue_decoded_request(req_id, request, sampled_token, scheduler, active);
+            finish_or_requeue_decoded_request(
+                req_id,
+                request,
+                sampled_token,
+                metrics,
+                scheduler,
+                active,
+            );
         }
         return;
     }
 
     for (req_id, request) in open {
-        execute_decode_single(req_id, request, scheduler, active);
+        execute_decode_single(req_id, request, metrics, scheduler, active);
     }
 }
 
 fn execute_decode_single(
     req_id: RequestId,
     mut request: ActiveMetalRequest,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -526,13 +588,14 @@ fn execute_decode_single(
                 Ok(done) => done,
                 Err(err) => {
                     error!("Metal advance_decode failed for {:?}: {err}", req_id);
+                    metrics.record_request_failed();
                     cancel_detached_request(req_id, request, scheduler);
                     return;
                 }
             };
 
             if runtime_finished || stop_hit || scheduler_finished {
-                finalize_detached_request(req_id, request, scheduler);
+                finalize_detached_request(req_id, request, metrics, scheduler);
             } else {
                 active.insert(req_id, request);
             }
@@ -545,6 +608,7 @@ fn execute_decode_single(
         }
         Outcome::Failed(err) => {
             error!("Metal decode step failed for {:?}: {err:#}", req_id);
+            metrics.record_request_failed();
             cancel_detached_request(req_id, request, scheduler);
         }
     }
@@ -554,6 +618,7 @@ fn finish_or_requeue_decoded_request(
     req_id: RequestId,
     request: ActiveMetalRequest,
     sampled_token: u32,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -563,13 +628,14 @@ fn finish_or_requeue_decoded_request(
         Ok(done) => done,
         Err(err) => {
             error!("Metal advance_decode failed for {:?}: {err}", req_id);
+            metrics.record_request_failed();
             cancel_detached_request(req_id, request, scheduler);
             return;
         }
     };
 
     if runtime_finished || stop_hit || scheduler_finished {
-        finalize_detached_request(req_id, request, scheduler);
+        finalize_detached_request(req_id, request, metrics, scheduler);
     } else {
         active.insert(req_id, request);
     }
@@ -589,9 +655,11 @@ fn cancel_detached_request(
 fn finalize_detached_request(
     req_id: RequestId,
     mut request: ActiveMetalRequest,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
 ) {
     scheduler.finish_request(req_id);
+    record_request_completed(metrics, &request);
     if let Err(err) = request.send_final_delta() {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
@@ -626,6 +694,7 @@ fn cancel_request(
 
 fn finalize_request(
     req_id: RequestId,
+    metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
@@ -633,6 +702,7 @@ fn finalize_request(
     let Some(mut request) = active.remove(&req_id) else {
         return;
     };
+    record_request_completed(metrics, &request);
     if let Err(err) = request.cancel() {
         warn!("Metal request cleanup failed for {:?}: {err:#}", req_id);
     }
@@ -641,6 +711,51 @@ fn finalize_request(
     {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
+}
+
+fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalRequest) {
+    let completion_tokens = request.request_state.generated_tokens() as u64;
+    let e2e_s = request.admitted_at.elapsed().as_secs_f64();
+    let ttft_s = request
+        .first_token_at
+        .map(|first| first.duration_since(request.admitted_at).as_secs_f64())
+        .unwrap_or(e2e_s);
+    let tpot_s = if completion_tokens > 1 {
+        (e2e_s - ttft_s).max(0.0) / (completion_tokens - 1) as f64
+    } else {
+        0.0
+    };
+    metrics.record_request_completed(
+        request.prompt_tokens as u64,
+        completion_tokens,
+        ttft_s,
+        tpot_s,
+        e2e_s,
+    );
+}
+
+fn refresh_runtime_metrics(
+    metrics: &ServerMetrics,
+    handle: &SchedulerHandle,
+    scheduler: &MetalScheduler,
+    active: &HashMap<RequestId, ActiveMetalRequest>,
+) {
+    metrics.set_active(active.len() as u64);
+    metrics.set_waiting((handle.waiting_count() + scheduler.waiting_len()) as u64);
+
+    let (kv_used, kv_total) = active.values().fold((0u64, 0u64), |acc, request| {
+        if let Some((used, total)) = request.request_state.kv_pool_usage() {
+            (acc.0 + used as u64, acc.1 + total as u64)
+        } else {
+            acc
+        }
+    });
+    metrics.set_kv_gpu_blocks(kv_total.saturating_sub(kv_used), kv_total);
+    metrics.set_memory_bytes(
+        super::mlx::active_memory_bytes(),
+        super::mlx::peak_memory_bytes(),
+        super::mlx::cache_memory_bytes(),
+    );
 }
 
 fn map_request_priority(priority: RequestPriority) -> MetalRequestPriority {
