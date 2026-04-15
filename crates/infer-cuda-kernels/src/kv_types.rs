@@ -18,6 +18,31 @@ pub enum KVFormat {
 }
 
 impl KVFormat {
+    /// Stable wire-level discriminants used in persisted KV fingerprints.
+    /// These values must not change once written to disk.
+    pub fn stable_tag(&self) -> u8 {
+        match *self {
+            Self::BF16 => 1,
+            Self::INT8 => 3,
+            Self::FP8E4M3 => 4,
+            Self::TurboQuant {
+                key_bits: 2,
+                val_bits: 2,
+            } => 10,
+            Self::TurboQuant {
+                key_bits: 3,
+                val_bits: 3,
+            } => 11,
+            Self::TurboQuant {
+                key_bits: 4,
+                val_bits: 4,
+            } => 12,
+            Self::TurboQuant { key_bits, val_bits } => 32u8
+                .saturating_add((key_bits & 0x0f) << 4)
+                .saturating_add(val_bits & 0x0f),
+        }
+    }
+
     pub fn default_page_size(self) -> usize {
         match self {
             Self::BF16 => 16,
@@ -63,5 +88,41 @@ impl KVFormat {
                 packed + 2
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KVFormat;
+
+    #[test]
+    fn stable_tags_are_fixed() {
+        assert_eq!(KVFormat::BF16.stable_tag(), 1);
+        assert_eq!(KVFormat::INT8.stable_tag(), 3);
+        assert_eq!(KVFormat::FP8E4M3.stable_tag(), 4);
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 2,
+                val_bits: 2,
+            }
+            .stable_tag(),
+            10,
+        );
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 3,
+                val_bits: 3,
+            }
+            .stable_tag(),
+            11,
+        );
+        assert_eq!(
+            KVFormat::TurboQuant {
+                key_bits: 4,
+                val_bits: 4,
+            }
+            .stable_tag(),
+            12,
+        );
     }
 }
