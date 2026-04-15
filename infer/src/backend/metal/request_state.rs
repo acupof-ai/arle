@@ -1132,11 +1132,13 @@ fn decode_qwen35_packed_batch<'a>(
                 .context("decode_qwen35_packed_batch reshape overflow")?],
         ));
         eval(&[&sampled]);
-        sampled
-            .as_slice_i32()
-            .iter()
-            .map(|&token| token as u32)
-            .collect::<Vec<_>>()
+        (0..states.len())
+            .map(|row_idx| {
+                let row =
+                    i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
+                Ok(slice_row(&sampled, row).item_i32() as u32)
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
         let mut sampled_arrays = Vec::with_capacity(states.len());
         for row_idx in 0..states.len() {
@@ -1339,18 +1341,11 @@ fn slice_row(array: &MlxArray, row: i32) -> MlxArray {
 }
 
 fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver<'_>>]) -> bool {
-    let Some(first) = states.first() else {
-        return false;
-    };
-    let params = &first.driver.params;
-    states.iter().all(|state| {
-        let other = &state.driver.params;
-        params.temperature == other.temperature
-            && params.top_k == other.top_k
-            && params.top_p == other.top_p
-            && params.min_p == other.min_p
-            && params.is_greedy() == other.is_greedy()
-    })
+    let _ = states;
+    // `gpu_sample_token` is still a scalar path on Metal. Do not treat it as a
+    // batched sampler until the MLX bridge exposes a real batched sampling
+    // kernel/result shape.
+    false
 }
 
 struct Qwen3StepDriver<'a> {
