@@ -133,7 +133,7 @@ Seven facts shape everything below (original fact 6 "P1(a) shipped, P1(b) never 
 1. **Production data path is still T0-only, but dual residency is now load-bearing inside the safe reuse envelope.** `paged_kv.rs` retains pages through `free_slot`, and `assign_slots` now picks a reusable free slot from radix hits instead of scanning `cached_prompts`. The missing piece is **not** selector wiring anymore; it is remote validation plus the remaining M3b/M3c runtime wiring that turns the new T1 scaffolding into a real promotion/demotion path.
 2. **`RadixCache` is now load-bearing for CUDA admission, publish, and eviction.** The radix is no longer just a shadow observer: it drives reusable-prefix selection, holds the pinned-page ownership map, owns tier/session/keepalive/fingerprint metadata, and now keeps a private `block_index` for O(1) `BlockId` lookup. What it still does **not** own yet is the cross-restart reconciliation logic that turns those fingerprints into durable identity.
 3. **Per-format `page_size` dispatch is accepted remotely and no longer blocks M3.** BF16 lifted to `page_size = 16`; INT8 / FP8 / TurboQuant deliberately remain at `page_size = 1` until their token-granular kernels are rewritten. The remaining CUDA gate is the combined Tier A/B/C follow-on acceptance, not the allocator/kernel rewrite.
-4. **`BlockId` unified, `BlockFingerprint` now computes at publish time but is still a local placeholder.** When session save/load (M4) lands, **save format must address blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. The current two-seed `DefaultHasher` packing is good enough for local plumbing only; reload still requires a real cross-process reconciliation pass that has not been written.
+4. **`BlockId` unified, `BlockFingerprint` now computes at publish time with a real BLAKE3 hash over a full domain-tagged input chain.** `BlockFingerprint::compute(KvContentContext, tokens)` mixes `model_fingerprint`, `kv_format_tag`, `parent`, and `tokens` under a version-tagged prefix (`"pegainfer-kv-v2\x00"`), and the reload path uses `RadixCache::reconcile(known)` to remap ids against a fresh pool. **Save format addresses blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. What is still deferred: a real weight-checksum upgrade for `model_fingerprint` (currently `blake3(model_id)` as a per-engine stable identifier), and the HTTP route wrappers around `save_session` / `load_session`.
 5. **The old contiguous CPU offload is retired locally, but its public compatibility shim remains.** The runtime no longer produces or consumes `k_host/v_host` shadow buffers, so there is now one local truth for CUDA KV residency. What remains is the compatibility no-op surface (`set_max_gpu_kv`) plus the remote CUDA regression pass that proves the deletion did not regress long-session reuse. See §8 pitfall 13.
 6. **`policy.rs` scoring trait is now wired into live cleanup/allocation eviction, but the knobs moved to `SchedulerConfig`.** The current follow-on work is no longer "converge onto the policy trait"; it is "keep the configured high/low/retain/keepalive values bench-backed while the Tier A/B/C remote CUDA gate is still pending." See §5.4 convergence note.
 7. **`NixlTransport` trait shape is the right bet.** `type Op: Send` + explicit `poll()` + `abort()` — survives the Codex review unchanged. NIXL ↔ Mooncake plugin compatibility confirmed in 2026-04-15 industry research.
@@ -488,9 +488,14 @@ pub struct BlockId(pub u32);
 ///   4. parent fingerprint (chains the radix path)
 ///   5. token ids of THIS block, in order
 ///
-/// Local placeholder: two `DefaultHasher` outputs with different seeds,
-/// packed into 16 bytes. Final stable cross-process hashing is deferred
-/// to M4.
+/// Shipped: BLAKE3 over a canonical domain-tagged encoding of
+/// `(model_fingerprint, kv_format_tag, parent, tokens)`, truncated to
+/// 16 bytes (`infer/src/types.rs::BlockFingerprint::compute`). Within
+/// one engine instance the hash is stable across restarts and hosts,
+/// satisfying the M4 session save/load reconciliation contract. The
+/// remaining upgrade path is using a real weight checksum (not just
+/// `blake3(model_id)`) for `model_fingerprint`, deferred to M5-era
+/// cross-node reuse work.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct BlockFingerprint(pub [u8; 16]);
 ```
@@ -1197,13 +1202,17 @@ here so that M0.2's test suite references them by number.
 6. **Mooncake metadata service.** If we add a Mooncake transport later,
    Mooncake Store needs etcd (or its own master). That is a deployment-
    story decision, not a transport-trait one. Keep the trait oblivious.
-7. **`BlockFingerprint` is still a local placeholder.** The current tree
-   packs two seeded `DefaultHasher` outputs into 16 bytes. That is good
-   enough for local publish-time plumbing and disk round-trip tests, but
-   it is **not** the final cross-process identity story. M4 must replace
-   it with a stable fingerprint and keep the `parent_fingerprint` chain
-   check for the pathological collision case. u32 `BlockId` has no such
-   issue — it is not a hash, just a pool slot id.
+7. **`BlockFingerprint` now uses real BLAKE3.** M4a shipped
+   `BlockFingerprint::compute(KvContentContext, tokens)` as a BLAKE3
+   hash over a canonical domain-tagged encoding of
+   `(model_fingerprint, kv_format_tag, parent, tokens)`. Same model +
+   same format + same parent-chain + same tokens → same 16-byte
+   fingerprint across process restarts and across hosts. M4c's
+   `RadixCache::reconcile` and M4d's `save_session` / `load_session`
+   both depend on that stability. The remaining upgrade path is
+   replacing `model_fingerprint` from `blake3(model_id)` to a real
+   weight checksum; that is M5-era cross-node reuse work. u32
+   `BlockId` has no such issue — it is not a hash, just a pool slot id.
 8. **Scheduler single-threadedness.** Today the scheduler owns all KV
    under one thread and needs no locks. The coordinator is a second owner.
    M3b's directory-owning structure (now `RadixCache`, not `TierDirectory`)
