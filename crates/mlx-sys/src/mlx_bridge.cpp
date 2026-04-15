@@ -246,6 +246,12 @@ mlx_array* mlx_fast_rope(mlx_array* x, int32_t dims, bool traditional,
         *to_arr(x), dims, traditional, base, scale, offset)));
 }
 
+mlx_array* mlx_fast_rope_dynamic(mlx_array* x, int32_t dims, bool traditional,
+                                 float base, float scale, mlx_array* offset) {
+    MLX_TRY_RETURN(from_arr(fast::rope(
+        *to_arr(x), dims, traditional, base, scale, *to_arr(offset))));
+}
+
 mlx_array* mlx_fast_sdpa(mlx_array* q, mlx_array* k, mlx_array* v,
                          float scale, const char* mask_mode) {
     // mask_mode: "" for no mask, "causal" for causal masking.
@@ -254,6 +260,15 @@ mlx_array* mlx_fast_sdpa(mlx_array* q, mlx_array* k, mlx_array* v,
         std::string mode(mask_mode);
         return from_arr(fast::scaled_dot_product_attention(
             *to_arr(q), *to_arr(k), *to_arr(v), scale, mode));
+    }());
+}
+
+mlx_array* mlx_fast_sdpa_masked(mlx_array* q, mlx_array* k, mlx_array* v,
+                                float scale, mlx_array* mask_arr) {
+    MLX_TRY_RETURN([&]() {
+        return from_arr(fast::scaled_dot_product_attention(
+            *to_arr(q), *to_arr(k), *to_arr(v), scale, "",
+            *to_arr(mask_arr)));
     }());
 }
 

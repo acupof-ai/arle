@@ -328,12 +328,239 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    /// Try to execute one cross-request Qwen3 decode batch.
+    ///
+    /// Returns `Ok(None)` when the batch is not eligible for the Qwen3 batched
+    /// path (for example Qwen3.5 requests or non-decode phases), so the caller
+    /// can fall back to per-request decode. Returns sampled tokens in the same
+    /// order as the input slice on success.
+    pub fn decode_batch(states: &mut [&mut MetalRequestState<'a>]) -> Result<Option<Vec<u32>>> {
+        if states.len() < 2 {
+            return Ok(None);
+        }
+
+        let mut qwen3_states = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            match &mut state_ref.inner {
+                MetalRequestStateInner::Qwen3(qwen3) => {
+                    if qwen3.phase() != MetalRequestPhase::Decode {
+                        return Ok(None);
+                    }
+                    qwen3_states.push(qwen3);
+                }
+                MetalRequestStateInner::Qwen35(_) => return Ok(None),
+            }
+        }
+
+        let first_cache_len = qwen3_states[0].driver.cache_len;
+        if qwen3_states
+            .iter()
+            .any(|state| state.driver.cache_len != first_cache_len)
+        {
+            return Ok(None);
+        }
+
+        let sampled = decode_qwen3_batch(&mut qwen3_states)?;
+        Ok(Some(sampled))
+    }
+
     pub fn cancel(&mut self) -> Result<()> {
         match &mut self.inner {
             MetalRequestStateInner::Qwen3(state) => state.cancel(),
             MetalRequestStateInner::Qwen35(state) => state.cancel(),
         }
     }
+}
+
+fn decode_qwen3_batch(
+    states: &mut [&mut ResumableRequestState<Qwen3StepDriver<'_>>],
+) -> Result<Vec<u32>> {
+    use super::mlx::{
+        concatenate_axis, eval, rms_norm, slice, take_axis, transpose_axes,
+    };
+    use super::ops::linear;
+
+    ensure!(
+        !states.is_empty(),
+        "decode_qwen3_batch requires at least one request state"
+    );
+
+    let batch = i32::try_from(states.len()).context("decode_qwen3_batch batch size overflow")?;
+    let first = &states[0].driver;
+    let weights = first.weights;
+    let n_heads = first.n_heads;
+    let n_kv_heads = first.n_kv_heads;
+    let head_dim = first.head_dim;
+    let attn_scale = first.attn_scale;
+    let rope_base = first.rope_base;
+    let eps = first.eps;
+    let kv_dim = n_kv_heads * head_dim;
+    let cache_len = first.cache_len;
+    let end_pos = cache_len + 1;
+
+    for state in states.iter() {
+        ensure!(
+            std::ptr::eq(state.driver.weights, weights),
+            "decode_qwen3_batch requires identical Qwen3 weight handles"
+        );
+        ensure!(
+            state.driver.n_heads == n_heads
+                && state.driver.n_kv_heads == n_kv_heads
+                && state.driver.head_dim == head_dim,
+            "decode_qwen3_batch requires identical Qwen3 geometry"
+        );
+    }
+
+    let input_tokens: Vec<u32> = states
+        .iter()
+        .map(|state| {
+            state
+                .last_token
+                .context("decode_qwen3_batch requires a committed prefill token")
+        })
+        .collect::<Result<_>>()?;
+
+    if states.iter().any(|state| {
+        let cache_len = state.driver.cache_len;
+        cache_len > 0 && cache_len % KV_CACHE_CHUNK == 0
+    }) {
+        clear_metal_cache();
+    }
+
+    for state in states.iter_mut() {
+        let driver = &mut state.driver;
+        if let Some(pool) = driver.kv_pool.as_mut() {
+            pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
+                .context("alloc MetalKVPool slot for batched decode")?;
+        } else {
+            driver.ensure_capacity(driver.cache_len + 1);
+        }
+    }
+
+    let token_values: Vec<i32> = input_tokens.iter().map(|&token| token as i32).collect();
+    let token_arr = MlxArray::from_slice_i32(&token_values, &[batch]);
+    let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
+
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let residual = x.clone();
+        let x_norm = rms_norm(&x, &layer.input_layernorm, eps);
+        let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x_norm);
+
+        let q = super::mlx::reshape(&q_raw, &[batch, 1, n_heads, head_dim]);
+        let q = rms_norm(&q, &layer.q_norm, eps);
+        let q = transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = super::mlx::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len);
+
+        let k = super::mlx::reshape(&k_raw, &[batch, 1, n_kv_heads, head_dim]);
+        let k = rms_norm(&k, &layer.k_norm, eps);
+        let k = transpose_axes(&k, &[0, 2, 1, 3]);
+        let k = super::mlx::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len);
+
+        let v = super::mlx::reshape(&v_raw, &[batch, 1, n_kv_heads, head_dim]);
+        let v = transpose_axes(&v, &[0, 2, 1, 3]);
+
+        let k_rows = transpose_axes(&k, &[0, 2, 1, 3]);
+        let k_rows = super::mlx::reshape(&k_rows, &[batch, kv_dim]);
+        let v_rows = transpose_axes(&v, &[0, 2, 1, 3]);
+        let v_rows = super::mlx::reshape(&v_rows, &[batch, kv_dim]);
+
+        let mut batch_k = Vec::with_capacity(states.len());
+        let mut batch_v = Vec::with_capacity(states.len());
+        for (row_idx, state) in states.iter_mut().enumerate() {
+            let row = i32::try_from(row_idx).context("decode_qwen3_batch row index overflow")?;
+            let row_k = slice(&k_rows, &[row, 0], &[row + 1, kv_dim], &[1, 1]);
+            let row_v = slice(&v_rows, &[row, 0], &[row + 1, kv_dim], &[1, 1]);
+
+            let (k_full, v_full) = if let Some(pool) = state.driver.kv_pool.as_mut() {
+                pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &row_k, &row_v)
+                    .context("write MetalKVPool during batched decode")?;
+                pool.gather_kv(layer_idx, METAL_REQUEST_STATE_ID)
+                    .context("gather MetalKVPool during batched decode")?
+            } else {
+                let k_token = slice(
+                    &k,
+                    &[row, 0, 0, 0],
+                    &[row + 1, n_kv_heads, 1, head_dim],
+                    &[1, 1, 1, 1],
+                );
+                let v_token = slice(
+                    &v,
+                    &[row, 0, 0, 0],
+                    &[row + 1, n_kv_heads, 1, head_dim],
+                    &[1, 1, 1, 1],
+                );
+                state.driver.k_caches[layer_idx] = super::mlx::slice_update(
+                    &mut state.driver.k_caches[layer_idx],
+                    &k_token,
+                    &[0, 0, state.driver.cache_len, 0],
+                    &[1, n_kv_heads, end_pos, head_dim],
+                );
+                state.driver.v_caches[layer_idx] = super::mlx::slice_update(
+                    &mut state.driver.v_caches[layer_idx],
+                    &v_token,
+                    &[0, 0, state.driver.cache_len, 0],
+                    &[1, n_kv_heads, end_pos, head_dim],
+                );
+                let k_full = slice(
+                    &state.driver.k_caches[layer_idx],
+                    &[0, 0, 0, 0],
+                    &[1, n_kv_heads, end_pos, head_dim],
+                    &[1, 1, 1, 1],
+                );
+                let v_full = slice(
+                    &state.driver.v_caches[layer_idx],
+                    &[0, 0, 0, 0],
+                    &[1, n_kv_heads, end_pos, head_dim],
+                    &[1, 1, 1, 1],
+                );
+                (k_full, v_full)
+            };
+
+            batch_k.push(k_full);
+            batch_v.push(v_full);
+        }
+
+        let k_full = concatenate_axis(&batch_k, 0);
+        let v_full = concatenate_axis(&batch_v, 0);
+        let attn_out = super::mlx::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None);
+        let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = super::mlx::reshape(&attn_out, &[batch, n_heads * head_dim]);
+        let attn_out = linear(&attn_out, &layer.o_proj);
+        x = super::mlx::add(&residual, &attn_out);
+
+        let residual2 = x.clone();
+        let xn = rms_norm(&x, &layer.post_attention_layernorm, eps);
+        let (gate_raw, up) = layer.mlp_inputs.project(&xn);
+        let gate = super::mlx::silu(&gate_raw);
+        let mlp = linear(&super::mlx::multiply(&gate, &up), &layer.down_proj);
+        x = super::mlx::add(&residual2, &mlp);
+    }
+
+    let logits = linear(&rms_norm(&x, &weights.norm, eps), &weights.lm_head);
+    let mut sampled_tokens = Vec::with_capacity(states.len());
+    let mut sampled_arrays = Vec::with_capacity(states.len());
+    for (row_idx, state) in states.iter().enumerate() {
+        let row = i32::try_from(row_idx).context("decode_qwen3_batch sample row overflow")?;
+        let row_logits = slice(
+            &logits,
+            &[row, 0],
+            &[row + 1, logits.shape()[1]],
+            &[1, 1],
+        );
+        sampled_arrays.push(gpu_sample_token(&row_logits, &state.driver.sample_params));
+    }
+    let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
+    eval(&sample_refs);
+
+    for (state, sampled) in states.iter_mut().zip(sampled_arrays.iter()) {
+        let token = sampled.item_i32() as u32;
+        state.driver.cache_len += 1;
+        state.record_sampled_token(token)?;
+        sampled_tokens.push(token);
+    }
+
+    Ok(sampled_tokens)
 }
 
 struct Qwen3StepDriver<'a> {
