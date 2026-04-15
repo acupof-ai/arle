@@ -71,6 +71,14 @@ pub struct BlockMetadataUpdate {
     pub soft_pin_until: Option<Option<u64>>,
 }
 
+/// Summary of a fingerprint reconciliation pass after deserializing a snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub remapped: usize,
+    pub tombstoned: usize,
+    pub orphans_cleared: usize,
+}
+
 /// A node in the radix tree.
 #[derive(Serialize, Deserialize)]
 struct Node {
@@ -80,8 +88,12 @@ struct Node {
     /// if this node has not yet been committed to the GPU.
     block_id: Option<BlockId>,
     /// Number of in-flight requests currently pinning this node.
+    /// Runtime-only: in-flight pins do not survive a snapshot boundary.
+    #[serde(default, skip)]
     ref_count: u32,
     /// Monotonically increasing access clock (set on insert/lookup).
+    /// Runtime-only: restored caches restart their LRU epoch from zero.
+    #[serde(default, skip)]
     last_access: u64,
     /// How many times this node's block participated in a successful lookup.
     #[serde(default)]
@@ -99,7 +111,8 @@ struct Node {
     #[serde(default)]
     byte_len: u32,
     /// Logical soft pin deadline (scheduler tick / epoch), if any.
-    #[serde(default)]
+    /// Runtime-only: the deadline is relative to the process-local clock.
+    #[serde(default, skip)]
     soft_pin_until: Option<u64>,
     /// Children, indexed by the first token of their edge.
     children: HashMap<u32, usize>,
@@ -158,6 +171,9 @@ pub struct RadixCache {
     /// `block_size` tokens. Must match the paged KV block size.
     block_size: usize,
     /// Monotonically increasing clock for LRU tracking.
+    /// Runtime-only: snapshots keep structure/metadata, then restart the
+    /// logical access epoch from zero after restore.
+    #[serde(default, skip)]
     clock: u64,
     /// Optional lookup-time keepalive extension for already-soft-pinned blocks.
     #[serde(default)]
@@ -203,7 +219,7 @@ impl RadixCache {
     /// Rebuild [`Self::block_index`] from the current `nodes` array.
     ///
     /// Callers that deserialize a snapshot (which does not persist the index)
-    /// or that bulk-mutate `block_id`s via `rebuild_from_fingerprints` should
+    /// or that bulk-mutate `block_id`s via [`Self::reconcile`] should
     /// call this once to restore O(1) `find_block_node_mut` behavior.
     pub fn rebuild_block_index(&mut self) {
         self.block_index.clear();
@@ -594,29 +610,34 @@ impl RadixCache {
         block_idx * self.block_size
     }
 
-    /// Post-deserialization pass: zeroes out block_ids that cannot be mapped
-    /// to the fresh pool. Keeps tree shape so scheduler can re-populate
-    /// block_ids on next insert. If a block_index field exists on the cache,
-    /// the caller must rebuild it after this call (Tier D will merge those
-    /// paths).
-    pub fn rebuild_from_fingerprints(
+    /// Post-deserialization pass: reconcile saved fingerprints against a fresh
+    /// pool mapping and rebuild the O(1) reverse block index.
+    ///
+    /// `BlockId` is only stable inside one allocator instance, so any
+    /// save/load path that restores a `RadixCache` onto a new pool must call
+    /// this before treating `block_id` as live. Nodes without fingerprints
+    /// cannot be reconciled and are downgraded to tombstones.
+    pub fn reconcile(
         &mut self,
-        known: &std::collections::HashSet<BlockFingerprint>,
-    ) {
-        let mut stale_ids: Vec<BlockId> = Vec::new();
+        known: &std::collections::HashMap<BlockFingerprint, BlockId>,
+    ) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
         for node in &mut self.nodes {
-            match node.fingerprint {
-                Some(fp) if known.contains(&fp) => {}
-                _ => {
-                    if let Some(stale) = node.block_id.take() {
-                        stale_ids.push(stale);
-                    }
+            if let Some(fp) = node.fingerprint {
+                if let Some(&block_id) = known.get(&fp) {
+                    node.block_id = Some(block_id);
+                    report.remapped += 1;
+                } else {
+                    node.block_id = None;
+                    report.tombstoned += 1;
                 }
+            } else {
+                node.block_id = None;
+                report.orphans_cleared += 1;
             }
         }
-        for bid in stale_ids {
-            self.block_index.remove(&bid);
-        }
+        self.rebuild_block_index();
+        report
     }
 
     // -------------------------------------------------------------------------
@@ -995,7 +1016,7 @@ impl RadixCache {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use super::*;
     use crate::kv_tier::{LookupHeuristics, StagePlanner, StageRequest, StageTicket};
@@ -1465,13 +1486,15 @@ mod tests {
 
     #[test]
     fn radix_cache_serde_roundtrip_preserves_lookups() {
-        let mut cache = RadixCache::new(4);
+        let mut cache = RadixCache::with_soft_pin_keepalive(4, 5);
 
         // Populate with three sequences sharing a common prefix so the
         // tree has a non-trivial shape with a split.
         cache.insert(&[1, 2, 3, 4], &bids(&[10]));
         cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
         cache.insert(&[1, 2, 3, 4, 9, 10, 11, 12], &bids(&[10, 30]));
+        let _ = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(cache.set_block_soft_pin_until(BlockId(20), Some(123)));
 
         let before_node_count = cache.node_count();
         let before_cached = cache.cached_block_count();
@@ -1490,6 +1513,15 @@ mod tests {
 
         assert_eq!(restored.node_count(), before_node_count);
         assert_eq!(restored.cached_block_count(), before_cached);
+        assert_eq!(restored.logical_clock(), 0);
+        assert!(restored.nodes.iter().all(|node| node.ref_count == 0));
+        assert!(restored.nodes.iter().all(|node| node.last_access == 0));
+        assert!(
+            restored
+                .nodes
+                .iter()
+                .all(|node| node.soft_pin_until.is_none())
+        );
 
         // Every prefix the original cache had should still resolve after
         // the round trip. Note: `lookup` bumps ref_count — that is
@@ -1503,27 +1535,116 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_from_fingerprints_preserves_known_block_ids_after_deserialize() {
+    fn reconcile_remaps_known_fingerprints_into_new_pool() {
         let mut cache = RadixCache::new(4);
-        let fps = [BlockFingerprint([0x11; 16]), BlockFingerprint([0x22; 16])];
+        let fp_a = BlockFingerprint([0x11; 16]);
+        let fp_b = BlockFingerprint([0x22; 16]);
         cache.insert_with_fingerprints(
             &[1, 2, 3, 4, 5, 6, 7, 8],
             &[BlockId(10), BlockId(20)],
-            &fps,
+            &[fp_a, fp_b],
         );
 
         let json = serde_json::to_string(&cache).expect("serialize RadixCache");
         let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
-        let known: std::collections::HashSet<BlockFingerprint> = fps.into_iter().collect();
+        let known = HashMap::from([(fp_a, BlockId(100)), (fp_b, BlockId(200))]);
 
-        restored.rebuild_from_fingerprints(&known);
+        let report = restored.reconcile(&known);
 
-        let restored_block_ids: Vec<BlockId> = restored
+        assert_eq!(report.remapped, 2);
+        assert_eq!(report.tombstoned, 0);
+        assert!(restored.find_block_node_mut(BlockId(100)).is_some());
+        assert!(restored.find_block_node_mut(BlockId(200)).is_some());
+        assert!(restored.find_block_node_mut(BlockId(10)).is_none());
+    }
+
+    #[test]
+    fn reconcile_tombstones_fingerprints_missing_in_new_pool() {
+        let mut cache = RadixCache::new(4);
+        let fp_a = BlockFingerprint([0x11; 16]);
+        let fp_b = BlockFingerprint([0x22; 16]);
+        cache.insert_with_fingerprints(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[BlockId(10), BlockId(20)],
+            &[fp_a, fp_b],
+        );
+
+        let json = serde_json::to_string(&cache).expect("serialize RadixCache");
+        let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+
+        let report = restored.reconcile(&HashMap::from([(fp_a, BlockId(100))]));
+
+        assert_eq!(report.remapped, 1);
+        assert_eq!(report.tombstoned, 1);
+        let tombstoned = restored
             .nodes
             .iter()
-            .filter_map(|node| node.block_id)
-            .collect();
-        assert_eq!(restored_block_ids, vec![BlockId(10), BlockId(20)]);
+            .find(|node| node.fingerprint == Some(fp_b))
+            .expect("fingerprinted node should still exist structurally");
+        assert_eq!(tombstoned.block_id, None);
+    }
+
+    #[test]
+    fn reconcile_clears_orphan_nodes_with_no_fingerprint() {
+        let mut cache = RadixCache::new(4);
+        let fingerprint = BlockFingerprint([0x11; 16]);
+        cache.insert_with_fingerprints(&[1, 2, 3, 4], &[BlockId(10)], &[fingerprint]);
+
+        let orphan_idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .expect("block node should exist");
+        cache.nodes[orphan_idx].fingerprint = None;
+
+        let report = cache.reconcile(&HashMap::new());
+
+        assert!(report.orphans_cleared >= 1);
+        assert_eq!(cache.nodes[orphan_idx].block_id, None);
+    }
+
+    #[test]
+    fn serde_round_trip_then_reconcile_end_to_end() {
+        let mut cache = RadixCache::with_soft_pin_keepalive(4, 7);
+        let fp_a = BlockFingerprint([0x11; 16]);
+        let fp_b = BlockFingerprint([0x22; 16]);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        cache.insert_with_fingerprints(&tokens, &[BlockId(10), BlockId(20)], &[fp_a, fp_b]);
+        assert!(cache.set_block_soft_pin_until(BlockId(20), Some(88)));
+
+        let expected = cache.lookup_or_stage(&tokens, LookupHeuristics::default(), None);
+        let expected_hit_kinds: Vec<HitKind> =
+            expected.blocks.iter().map(|block| block.hit_kind).collect();
+
+        let json = serde_json::to_string(&cache).expect("serialize RadixCache");
+        drop(cache);
+
+        let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+        assert_eq!(restored.logical_clock(), 0);
+        assert!(restored.nodes.iter().all(|node| node.ref_count == 0));
+        assert!(restored.nodes.iter().all(|node| node.last_access == 0));
+        assert!(
+            restored
+                .nodes
+                .iter()
+                .all(|node| node.soft_pin_until.is_none())
+        );
+
+        let report =
+            restored.reconcile(&HashMap::from([(fp_a, BlockId(100)), (fp_b, BlockId(200))]));
+        assert_eq!(report.remapped, 2);
+        assert_eq!(report.tombstoned, 0);
+
+        let outcome = restored.lookup_or_stage(&tokens, LookupHeuristics::default(), None);
+        let block_ids: Vec<Option<BlockId>> =
+            outcome.blocks.iter().map(|block| block.block_id).collect();
+        let hit_kinds: Vec<HitKind> = outcome.blocks.iter().map(|block| block.hit_kind).collect();
+
+        assert_eq!(outcome.matched_len, expected.matched_len);
+        assert_eq!(hit_kinds, expected_hit_kinds);
+        assert_eq!(block_ids, vec![Some(BlockId(100)), Some(BlockId(200))]);
+        assert_eq!(outcome.staging_ticket, expected.staging_ticket);
+        assert_eq!(outcome.recompute_advised, expected.recompute_advised);
     }
 
     #[test]
