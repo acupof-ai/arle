@@ -18,8 +18,10 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 // `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
 // comments on `prefix_cache_high_water` / `prefix_cache_low_water` /
 // `prefix_cache_retain_hard_cap` / `prefix_cache_keepalive_ticks` /
-// `stage_wait_keepalive_ticks` there for defaults and env overrides
-// (`PEGAINFER_PREFIX_*` / `PEGAINFER_STAGE_WAIT_*`).
+// `stage_wait_keepalive_ticks` there for the defaults and validation
+// semantics. Per the project env-var policy (`docs/environment.md` §0),
+// these are **not** env-driven — callers assign directly to
+// `SchedulerConfig` fields. Env vars are reserved for debug-only knobs.
 
 fn prefix_cache_retain_hard_cap_pages(total_pages: usize, cap_fraction: f64) -> usize {
     (total_pages as f64 * cap_fraction) as usize
@@ -889,9 +891,28 @@ impl<M: ModelForward> Scheduler<M> {
 
 impl<M: ModelForward> Drop for Scheduler<M> {
     fn drop(&mut self) {
-        let _ = self
-            .coordinator_handle
-            .send(crate::kv_tier::CoordinatorCommand::Shutdown);
+        // Non-blocking shutdown hint. If the command channel is full we
+        // still force-disconnect below; the coordinator's `rx.recv_timeout`
+        // will then observe Disconnected and return from `run_once`.
+        self.coordinator_handle.try_send_shutdown();
+        // Force-disconnect both sides of the coordinator by swapping our
+        // handle and events receiver for dummy channels we immediately
+        // drop. Without this, `thread.join()` can deadlock: a blocking
+        // `send(Shutdown)` on a full command channel, or a coordinator
+        // that is itself stuck on `self.events.send(...)` because the
+        // scheduler stopped draining events before reaching Drop.
+        //
+        // Dropping `_old_handle` here is the last `CoordinatorCommand`
+        // sender (the scheduler was the only owner), so the command
+        // channel disconnects. Dropping `_old_events` kills the
+        // coordinator's event path on its next send. Either one is
+        // sufficient to unwedge `run_once`; we do both for safety.
+        let (dummy_coord, dummy_handle, dummy_events) = crate::kv_tier::Coordinator::new(1);
+        drop(dummy_coord);
+        let _old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
+        let _old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);
+        drop(_old_handle);
+        drop(_old_events);
         if let Some(thread) = self.coordinator_thread.take() {
             match thread.join() {
                 Ok(Ok(())) => {}

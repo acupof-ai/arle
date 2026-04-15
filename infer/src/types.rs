@@ -26,26 +26,25 @@ pub struct BlockId(pub u32);
 
 /// Content-addressable fingerprint for a KV block's semantic identity.
 ///
-/// Stable across processes and across nodes. Two nodes (or two restarts)
-/// that independently prefill the same prefix with the same model produce
-/// the same fingerprint; this is the foundation for cross-node remote-tier
-/// reuse (tiered-kv-cache M5+) and for session save/load (M4).
+/// The **design target** is a cross-process / cross-node stable hash that
+/// lets two independent prefills of the same prefix agree on identity —
+/// the foundation for session save/load (tiered-kv-cache M4) and
+/// cross-node remote-tier reuse (M5+). The **current implementation**
+/// (`compute_from_tokens`) is a local placeholder: two `DefaultHasher`
+/// passes with different salt strings packed into 16 bytes. That gives
+/// within-process determinism — same tokens → same fingerprint — but
+/// **NOT** stability across processes or Rust toolchain upgrades, because
+/// `DefaultHasher` is explicitly allowed to change.
 ///
-/// Construction inputs, in order:
-///   1. model fingerprint (architecture + weight digest + numeric profile)
-///   2. layer index
-///   3. KV format (bf16 / fp8e4m3 / int8 / turboquant-2/3/4)
-///   4. parent fingerprint (chains the radix path for tree-walk-free dedup)
-///   5. token ids of THIS block, in order
+/// Upgrading to a stable hash (BLAKE3 / xxHash3 + full construction
+/// inputs: model fingerprint, layer index, KV format, parent fingerprint,
+/// block tokens) is the M4 call site's responsibility. Until then,
+/// fingerprints are meaningful only inside a single process run — just
+/// enough for the publish-time `RadixCache::insert_with_fingerprints`
+/// path and the local `DiskStore` round-trip test.
 ///
-/// Hash function: blake3 truncated to 128 bits. Birthday-bound collision
-/// rate is ~2⁻⁶⁴ for 2³² blocks, safe for any single installation. When
-/// two fingerprints are equal, callers verify the parent_fingerprint chain
-/// to catch the pathological case.
-///
-/// Currently only constructed when a block is actually persisted (M4) or
-/// migrated cross-node (M5). Radix-tree nodes carry an
-/// `Option<BlockFingerprint>` which is `None` for transient in-memory blocks.
+/// Radix-tree nodes carry `Option<BlockFingerprint>`; `None` means a
+/// transient in-memory block that never went through the publish path.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BlockFingerprint(pub [u8; 16]);
 
