@@ -69,6 +69,11 @@ This checklist is the execution companion to:
 - [ ] `M2.3` Add capture/profiling ergonomics.
   Exit:
   MLX / Metal capture can be enabled from the CLI and documented for regression work.
+- [ ] `M2.4` Make Metal KV quantization an explicit go / no-go decision instead of an implied gap.
+  Exit:
+  docs and roadmap explicitly state that Metal serving does not currently ship
+  quantized KV cache; a follow-up implementation only starts when long-context /
+  high-concurrency Apple workloads justify it after `M0.2/M0.3/M0.4`.
 
 ## Execution Order
 

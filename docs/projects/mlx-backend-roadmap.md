@@ -53,6 +53,28 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
    - 不把 direct-bench 提升误判成 serving 提升
 8. 在 Metal 路径里把“不支持的架构”保持为显式失败，不允许静默按 Qwen 解析。
 
+## Quantized KV Posture
+
+Metal 这条线现在要把“量化 KV 是否需要做”说清楚，不再和 CUDA 能力混写：
+
+- 当前 Metal / MLX serving **不支持** `fp8` / `int8` / `tq2-4` 这类量化 KV cache。
+- 今天的 Metal KV 仍然是模型原生 dtype，通常是 `bf16` / `f16`。
+- 现阶段这不是 P0，也不是 P1。Metal 的主瓶颈仍然是 batched decode、live prefix
+  reuse、serving observability，以及产品级 API / DX。
+
+什么时候才值得推进 Metal KV quant：
+
+1. `M0.2/M0.3/M0.4` 已完成，Metal serving 已具备真正的并发调度和复用。
+2. 目标 workload 明确落在 `C > 4` 且 prompt / session 长度持续超过 `8K` tokens。
+3. 或者 Apple 用户明确需要在统一内存机器上塞更大的模型 / 更长上下文。
+
+当前判断：
+
+- `FP8 KV` 在 MLX / Apple Silicon 上不是优先路线。当前 MLX 没有一等 FP8 tensor
+  dtype，Apple GPU 也没有 CUDA 那种 FP8 decode kernel 生态。
+- 如果未来真的做，第一候选更像是 `INT8` 或 `TurboQuant / PolarQuant` 风格的
+  压缩 KV，而不是照搬 CUDA 的 FP8 方案。
+
 ## Model Scope
 
 当前已接通并持续优化：
