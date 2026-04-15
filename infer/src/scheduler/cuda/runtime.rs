@@ -86,8 +86,15 @@ impl<M: ModelForward> Scheduler<M> {
                         staged.block_ids.len(),
                         waited_ticks
                     );
+                    // `waiting_count` tracks the `request_rx` channel
+                    // depth (decremented at intake, incremented only at
+                    // `SchedulerHandle::submit`). `self.waiting` is the
+                    // scheduler-internal VecDeque; moving a request
+                    // into its front here is NOT a new submission, so
+                    // we MUST NOT `fetch_add(1)` — doing so would
+                    // permanently inflate the counter, break the idle
+                    // exit guard, and saturate backpressure.
                     self.waiting.push_front(staged.request);
-                    self.waiting_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -107,6 +114,10 @@ impl<M: ModelForward> Scheduler<M> {
                     } else {
                         error!("Coordinator event channel disconnected");
                     }
+                    // Same `waiting_count` semantics as the completion
+                    // path: re-queuing into `self.waiting.push_front`
+                    // is not a new submission, so the counter stays
+                    // untouched here.
                     for (ticket, staged) in pending {
                         self.prefix_cache.release(&staged.block_ids);
                         warn!(
@@ -116,7 +127,6 @@ impl<M: ModelForward> Scheduler<M> {
                             staged.block_ids.len()
                         );
                         self.waiting.push_front(staged.request);
-                        self.waiting_count.fetch_add(1, Ordering::Relaxed);
                     }
                     self.coordinator_unavailable = true;
                     break;
