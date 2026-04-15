@@ -102,9 +102,11 @@ Typical value:
 export PEGAINFER_TRITON_PYTHON=.venv/bin/python
 ```
 
-### `PEGAINFER_CUDA_SM`
+### `PEGAINFER_CUDA_SM` (alt: `CUDA_SM`)
 
-Override detected CUDA SM targets.
+Override detected CUDA SM targets. Consumed by `crates/infer-cuda-kernels/build.rs`
+during nvcc + Triton AOT compile; falls back to `CUDA_SM`, then `nvidia-smi`,
+then `sm_80`.
 
 Examples:
 
@@ -231,6 +233,29 @@ docs promote them more clearly:
 - `AGENT_INFER_GDR_METAL_KERNEL`
 - `PEGAINFER_E2E_MODEL_PATH`
 - `FLASHINFER_INCLUDE_DIR`
+- `PEGAINFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
+- `PEGAINFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
+  `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)
+- `AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES` — keep prefill
+  intermediate tensors in the Qwen3.5 C++ step model (`mlx_qwen35_model.cpp`)
+  for debugging; default off
+- `AGENT_INFER_QWEN35_CPP_CLEAR_CACHE` — force MLX cache clears between
+  Qwen3.5 C++ steps
+- `AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY` — only materialize
+  the last token's logits during prefill (default on for the C++ path)
+- `AGENT_INFER_QWEN35_CPP_SEPARATE_MLP` — split the MLP evaluation into
+  separate up/gate/down passes instead of the fused path
+- `AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER` /
+  `AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER` — force the helper-kernel
+  variants of g-beta and QK norm during Qwen3.5 prefill
+- `AGENT_INFER_QWEN35_CPP_GDR_TG_Y` /
+  `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
+  `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y
+  size tuning knobs for the Qwen3.5 C++ recurrent-state path
+
+All `AGENT_INFER_QWEN35_CPP_*` knobs are internal C++ bridge debugging
+aids; they are not part of any stable contract and may be renamed or
+removed without notice.
 
 If you add, rename, or deprecate an environment variable, update this document
 in the same PR.

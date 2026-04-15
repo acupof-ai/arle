@@ -2,6 +2,8 @@
 
 > 本文记录 agent-infer 项目的构建历程——一个纯 Rust + CUDA 的 LLM 推理引擎，从第一行代码到 8 并发 811 tok/s（SGLang 的 90%）、142 个单元测试全绿，中间走了哪些弯路，做了哪些选择。
 
+> **2026-04-15 编辑注:** 这篇文章写作时(2026-03~04 初)描述的**连续 buffer + 64-token 对齐 block 的 CPU offload**已经在 2026-04-15 的 M3c cleanup(commit `c3f65f7 refactor(model): retire legacy contiguous kv offload`)中**整段删除**。当前的内存分层方案走的是 **Tiered KV Cache**(T0 GPU HBM → T1 host pinned DRAM → T2 NVMe → T3 远程 NIXL),以页粒度(`page_size=16`)管理,不再按 64-token 对齐。文中"KV Cache"段的 CPU offload 叙述保留为当时走过的路径记录;实际架构参考 [`docs/projects/tiered-kv-cache.md`](projects/tiered-kv-cache.md)。
+
 ---
 
 ## 为什么要自己写
