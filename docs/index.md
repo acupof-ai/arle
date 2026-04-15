@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post Metal ecosystem route correction review + roadmap reprioritization).
+Last refreshed: 2026-04-15 (post Metal bench validation snapshot + route correction).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -73,6 +73,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
 | [experience/wins/2026-04-15-tiered-kv-m3b-local.md](experience/wins/2026-04-15-tiered-kv-m3b-local.md) | | Tiered KV M3b local contract tranche: `lookup_or_stage`, `StageTicket`, and pure page lifecycle landed without pretending CUDA runtime wiring exists |
+| [experience/wins/2026-04-15-metal-api-dx-bench-validation.md](experience/wins/2026-04-15-metal-api-dx-bench-validation.md) | | Metal API/DX validation snapshot on M4 Pro: direct path stayed healthy, but `metal_serve` stayed throughput-flat under concurrency and confirmed `M0.2` is still the serving blocker |
 | [experience/wins/2026-04-15-tiered-kv-m0.3-m3a-local.md](experience/wins/2026-04-15-tiered-kv-m0.3-m3a-local.md) | | Tiered KV M0.3 + M3a local landing: BF16 `page_size=16`, page-aware pool, host-tier skeleton, tier-aware node metadata |
 | [experience/wins/2026-04-15-tiered-kv-m2b-local.md](experience/wins/2026-04-15-tiered-kv-m2b-local.md) | | Tiered KV M2b local landing: scheduler selector flip, safe same-slot resurrection, alloc retry, retain hard cap, tombstone GC |
 | [experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md](experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md) | | Route-A revert + CUDA internal hygiene: 4-shell-crate split reverted, ffi.rs split into 10 domain modules, prelude as proto-API |
