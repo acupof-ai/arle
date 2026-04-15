@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use super::cpu::CpuBackend;
 #[cfg(feature = "metal")]
 use super::metal::MetalBackend;
+#[cfg(feature = "metal")]
+use super::metal::MetalBackendOptions;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
 use crate::backend::{GenerateResult, StreamingInferenceBackend};
@@ -101,9 +103,22 @@ pub fn spawn_metal_runtime_handle_from_path(
     model_path: &str,
     max_waiting: usize,
 ) -> Result<BackendRuntimeHandle> {
+    spawn_metal_runtime_handle_from_path_with_options(
+        model_path,
+        MetalBackendOptions::default(),
+        max_waiting,
+    )
+}
+
+#[cfg(feature = "metal")]
+pub fn spawn_metal_runtime_handle_from_path_with_options(
+    model_path: &str,
+    options: MetalBackendOptions,
+    max_waiting: usize,
+) -> Result<BackendRuntimeHandle> {
     use std::path::Path;
 
-    let mut backend = MetalBackend::new();
+    let mut backend = MetalBackend::with_options(options);
     backend.load(Path::new(model_path))?;
 
     let model_id = Path::new(model_path)

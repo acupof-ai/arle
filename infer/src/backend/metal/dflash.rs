@@ -15,9 +15,6 @@ use super::{
 };
 use crate::{hf_hub, sampler::SamplingParams};
 
-const DFLASH_MODEL_ENV: &str = "AGENT_INFER_METAL_DFLASH_MODEL";
-const DFLASH_SPECULATIVE_TOKENS_ENV: &str = "AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS";
-
 #[derive(Clone, Debug)]
 pub struct MetalDflashOptions {
     pub draft_model: String,
@@ -25,38 +22,18 @@ pub struct MetalDflashOptions {
 }
 
 impl MetalDflashOptions {
-    pub fn from_env() -> Result<Option<Self>> {
-        let Some(draft_model) = std::env::var(DFLASH_MODEL_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-
-        let speculative_tokens = std::env::var(DFLASH_SPECULATIVE_TOKENS_ENV)
-            .ok()
-            .map(|raw| {
-                raw.trim().parse::<usize>().with_context(|| {
-                    format!(
-                        "invalid {} value {raw:?}: expected a positive integer",
-                        DFLASH_SPECULATIVE_TOKENS_ENV
-                    )
-                })
-            })
-            .transpose()?;
-
-        if let Some(tokens) = speculative_tokens {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.draft_model.trim().is_empty(),
+            "Metal DFlash draft model must not be empty"
+        );
+        if let Some(tokens) = self.speculative_tokens {
             ensure!(
                 tokens > 0,
-                "{DFLASH_SPECULATIVE_TOKENS_ENV} must be >= 1 when set"
+                "Metal DFlash speculative token override must be >= 1 when set"
             );
         }
-
-        Ok(Some(Self {
-            draft_model,
-            speculative_tokens,
-        }))
+        Ok(())
     }
 }
 
@@ -74,6 +51,7 @@ impl MetalDflashRuntime {
         options: &MetalDflashOptions,
         target_config: &MetalModelConfig,
     ) -> Result<Self> {
+        options.validate()?;
         ensure!(
             matches!(target_config.arch, MetalModelArch::Qwen3),
             "Metal DFlash currently supports Qwen3 only; Qwen3.5 still needs recurrent rollback integration"
