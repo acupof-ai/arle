@@ -50,8 +50,8 @@ confuse readers about which project they are looking at.
 ## 2 · Non-goals
 
 - **New attention kernels.** page_size is a pool/bookkeeping change, not a
-  kernel rewrite; everything under `infer/csrc/cuda/` that touches paged KV
-  already parameterizes page_size.
+  kernel rewrite; everything under `crates/infer-cuda-kernels/csrc/` that
+  touches paged KV already parameterizes page_size.
 - **Metal hierarchy.** MLX unified memory makes T0↔T1 a self-memcpy; Metal
   only joins at M4 for T2 (disk), and only because the wired-memory
   kernel panic in mlx-lm #883 forces us to bound the KV pool somehow.
@@ -1254,9 +1254,8 @@ already shipped, and M1 can proceed on M0.1 alone.
   the first point of contact; the MLX roadmap should link back here once
   M4 enters execution.
 - [`cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md) —
-  M0.3 **blocks on** the extraction's `.cu` file moves landing. After the
-  extraction lands, M0.3's kernel file paths change from
-  `infer/csrc/cuda/kv/*.cu` to `crates/infer-cuda-kernels/csrc/kv/*.cu`.
+  the `.cu` file moves landed 2026-04-15, so M0.3 kernel references now live at
+  `crates/infer-cuda-kernels/csrc/kv/*.cu` (and `crates/infer-cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
 - [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
   archived workspace crate topology proposal. PR discipline (§六) and
   crate admission criteria (§七) still apply; the §一 topology was

@@ -121,12 +121,14 @@ renames that affect this doc:
 | `infer/src/metal_gdr.rs` | `infer/src/backend/metal/gdr.rs` |
 | `infer/mlx-sys/src/lib.rs` | `crates/mlx-sys/src/lib.rs` |
 
-When reading §1–§6 below, apply these renames mentally. After the
-in-flight `infer-cuda-kernels` extraction PR lands, additional renames
-will apply (`infer/src/backend/cuda/*.rs` → `crates/infer-cuda-kernels/src/*.rs`,
-`infer/csrc/cuda/*.cu` → `crates/infer-cuda-kernels/csrc/*.cu`,
-`infer/tools/triton/*.py` → `crates/infer-cuda-kernels/tools/triton/*.py`);
-this doc will get another path update pass at that point.
+When reading §1–§6 below, apply these renames mentally. The
+`infer-cuda-kernels` extraction landed on 2026-04-15, so `.cu` and Triton
+paths have also moved: `infer/csrc/cuda/*.cu` →
+`crates/infer-cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/*.cu` and
+`infer/tools/triton/*.py` → `crates/infer-cuda-kernels/tools/triton/*.py`.
+Kernel-path references in this doc have been updated in place against the
+2026-04-14 CUDA six-principles review file list; the `infer/src/backend/cuda/*.rs`
+Rust side is still inside `infer` pending option B.
 
 ---
 
@@ -201,14 +203,14 @@ this doc will get another path update pass at that point.
 - **agent-infer's `migrate_from_contiguous`** at [`paged_kv.rs:571-624`](file:///path/to/code/agent-infer/infer/src/paged_kv.rs#L571) is a **legacy artifact** of the old `ContiguousKVCache`. It works at page_size=1 because `kv_cache_to_paged.cu:41-47` uses `logical_page = pos / page_size`.
 - **Recommendation**: P0 keeps the migration path. Mark `migrate_from_contiguous` as `#[deprecated = "P1: prefill direct into paged blocks"]`. Schedule P1+ follow-up to remove contiguous prefill entirely (matches vLLM/SGLang).
 
-**Kernel readiness** (verified by reading `infer/csrc/cuda/*.cu`):
-- ✅ [`paged_kv_append.cu:43-57`](file:///path/to/code/agent-infer/infer/csrc/cuda/paged_kv_append.cu) — `logical_page = pos / page_size`, `physical_page = page_indices[indptr[b] + logical_page]`, `stride_page = num_kv_heads * page_size * head_dim` (computed inside kernel). **Fully page_size-parametric.**
-- ✅ [`decode_prep_paged.cu:138-155`](file:///path/to/code/agent-infer/infer/csrc/cuda/decode_prep_paged.cu) (HD128) — uses `last_page_len - 1` for in-page offset; HND addressing correct. Caller must set `stride_page = num_kv_heads * page_size * head_dim`.
-- ✅ [`decode_prep_paged_hd256.cu:157-160`](file:///path/to/code/agent-infer/infer/csrc/cuda/decode_prep_paged_hd256.cu) — identical paging logic for Qwen3.5 full attention.
-- ✅ [`kv_cache_to_paged.cu:18-51`](../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L18) — `kv_cache_to_paged_kernel` (the non-range bf16 path) is fully page_size-parametric with HND output.
-- 🔴 **CORRECTION (2026-04-14)**: [`kv_cache_to_paged.cu:53-82`](../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L53) — `kv_cache_to_paged_range_kernel` (the **range** variant, which is what `migrate_from_contiguous_range_bf16` actually dispatches to from `scheduler/cuda/prefill.rs:184,270`) is hardcoded `dst = pool_idx * kv_dim + kv_head * head_dim + dim` — **NHD per-token**. Header comment line 53 explicitly says "for token-level (page_size=1) paged pools". This audit row missed the range variant; the production prefill path uses **only** the range kernel, never the non-range one. P0 needs a new HND-aware range kernel before BF16 can move off `page_size=1`.
-- ✅ All FlashInfer wrapper files (`flashinfer_decode.cu`, `flashinfer_decode_hd256.cu`, `flashinfer_tc_decode.cu`) just forward `page_size` into FlashInfer's `paged_kv_t<>`.
-- ⚠️ **`kv_cache_to_paged_int8_kernel` at [`kv_cache_to_paged.cu:64-103`](file:///path/to/code/agent-infer/infer/csrc/cuda/kv_cache_to_paged.cu#L64) hardcodes page_size=1.** Computes `pool_idx = page_indices[pos]` directly. No `page_size` parameter in signature.
+**Kernel readiness** (verified by reading `crates/infer-cuda-kernels/csrc/`):
+- ✅ [`kv/paged_kv_append.cu:43-57`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/kv/paged_kv_append.cu) — `logical_page = pos / page_size`, `physical_page = page_indices[indptr[b] + logical_page]`, `stride_page = num_kv_heads * page_size * head_dim` (computed inside kernel). **Fully page_size-parametric.**
+- ✅ [`attention/decode_prep_paged.cu:138-155`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/attention/decode_prep_paged.cu) (HD128) — uses `last_page_len - 1` for in-page offset; HND addressing correct. Caller must set `stride_page = num_kv_heads * page_size * head_dim`.
+- ✅ [`attention/decode_prep_paged_hd256.cu:157-160`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu) — identical paging logic for Qwen3.5 full attention.
+- ✅ [`kv/kv_cache_to_paged.cu:18-51`](../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L18) — `kv_cache_to_paged_kernel` (the non-range bf16 path) is fully page_size-parametric with HND output.
+- 🔴 **CORRECTION (2026-04-14)**: [`kv/kv_cache_to_paged.cu:53-82`](../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L53) — `kv_cache_to_paged_range_kernel` (the **range** variant, which is what `migrate_from_contiguous_range_bf16` actually dispatches to from `scheduler/cuda/prefill.rs:184,270`) is hardcoded `dst = pool_idx * kv_dim + kv_head * head_dim + dim` — **NHD per-token**. Header comment line 53 explicitly says "for token-level (page_size=1) paged pools". This audit row missed the range variant; the production prefill path uses **only** the range kernel, never the non-range one. P0 needs a new HND-aware range kernel before BF16 can move off `page_size=1`.
+- ✅ All FlashInfer wrapper files (`attention/flashinfer_decode.cu`, `attention/flashinfer_decode_hd256.cu`, `attention/flashinfer_tc_decode.cu`) just forward `page_size` into FlashInfer's `paged_kv_t<>`.
+- ⚠️ **`kv_cache_to_paged_int8_kernel` at [`kv/kv_cache_to_paged.cu:64-103`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L64) hardcodes page_size=1.** Computes `pool_idx = page_indices[pos]` directly. No `page_size` parameter in signature.
 - ⚠️ **`kv_quant.cu:184,193,207,211`** (`quantize_paged_kv_fp8_kernel`, `quantize_scatter_kv_fp8_kernel`) — same NHD per-token assumption.
 - ⚠️ **`scatter_kv.cu`** — entirely page_size=1.
 
@@ -959,7 +961,8 @@ M0.3's exit gate has a comparison point when it unblocks.
 - `infer/src/metal_prefix_cache.rs`
 - `infer/src/metal_gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
 - `infer/mlx-sys/src/lib.rs`
-- `infer/csrc/cuda/{paged_kv_append,decode_prep_paged,decode_prep_paged_hd256,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
+- `crates/infer-cuda-kernels/csrc/kv/{paged_kv_append,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
+- `crates/infer-cuda-kernels/csrc/attention/{decode_prep_paged,decode_prep_paged_hd256}.cu`
 - `infer/src/scheduler/policy.rs:64-78,133-152` — existing `AdmissionPolicy` / `ChunkingPolicy`
 - `infer/src/events.rs:7-24` — existing `EngineEvent` / `EventSink`
 - `crates/infer-agent/src/lib.rs:166-188` — `AgentSession::save_to_path / load_from_path` (JSON-only today)
