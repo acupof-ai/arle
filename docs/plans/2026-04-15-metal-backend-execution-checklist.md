@@ -10,6 +10,7 @@ This checklist is the execution companion to:
 
 - [../projects/mlx-backend-roadmap.md](../projects/mlx-backend-roadmap.md)
 - [2026-04-15-metal-backend-acceptance-plan.md](2026-04-15-metal-backend-acceptance-plan.md)
+- [../reviews/2026-04-15-metal-ecosystem-route-correction.md](../reviews/2026-04-15-metal-ecosystem-route-correction.md)
 
 ## P0 · Serving Floor
 
@@ -71,3 +72,17 @@ This checklist is the execution companion to:
 3. Fold `M0.3` and `M0.4` into the same scheduler integration track so reuse can
    be measured as soon as it exists.
 4. Start `M1` only after the live Metal serving path has real batching and reuse.
+5. Treat `metal_bench` as a sanity check, not as the serving milestone exit.
+   `metal_serve` must pass an HTTP throughput sweep once `M0.2` is in.
+
+## Route Guardrails
+
+These guardrails come from the 2026-04-15 ecosystem review:
+
+- Do not count direct `metal_bench` wins as serving progress.
+- Do not start another single-request-only tuning wave before `M0.2/M0.3/M0.4`
+  unless it fixes correctness, memory safety, or a build blocker.
+- Use `mlx-lm` as the direct execution reference and `vllm-metal` /
+  Docker Model Runner as the serving reference.
+- Treat install DX as competitive scope, not polish work. One-command Apple
+  setup belongs on the product path, not the backlog tail.

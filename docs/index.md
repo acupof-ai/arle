@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post tiered-kv M3b contract tranche + remote acceptance update).
+Last refreshed: 2026-04-15 (post Metal ecosystem route correction review + roadmap reprioritization).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -10,7 +10,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b-contract local shipped** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, and the first `lookup_or_stage` / page-lifecycle contract all landed locally; remote CUDA acceptance and runtime wiring still pending |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active | Priority ledger for agent-grade serving — radix wiring, session routing, constrained decoding, speculative decoding. P-labels superseded by tiered-kv M-milestones |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Partially shipped** | TurboQuant Phases 1–3 (KV + weight + fused decode attention) shipped via [`turboquant-integration.md`](plans/turboquant-integration.md); FP8-native FlashInfer track deferred |
-| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | MLX Metal: Qwen3/3.5 direct `mlx-sys` bridge, serial serving runtime, scheduler not yet on hot path |
+| [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | MLX Metal: Qwen3/3.5 direct `mlx-sys` bridge, but roadmap now explicitly prioritizes scheduler-first serving over more single-request-only tuning |
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | Done | Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration. Historical record |
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research radar | Observations on accelerated-model-architecture repos (training/experimental, not serving) |
 | **Plans** | | |
@@ -34,6 +34,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [research/dflash-metal-feasibility.md](research/dflash-metal-feasibility.md) | Feasibility | DFlash (speculative) on Metal: feasible, medium priority. Now partially shipped via the experimental Metal DFlash path |
 | [research/kv-quantization-metal.md](research/kv-quantization-metal.md) | Feasibility | KV quant on Metal deprioritized: MLX has no FP8 dtype, BF16-only; defer until C>4 with long contexts |
 | **Reviews** | | |
+| [reviews/2026-04-15-metal-ecosystem-route-correction.md](reviews/2026-04-15-metal-ecosystem-route-correction.md) | Active | External Apple Silicon serving reality check: `vllm-metal` / Docker / `mlx-lm` / Ollama calibration, local serial-server symptoms, and the corrected Metal execution order |
 | [reviews/2026-04-14-cuda-kernel-six-principles-review.md](reviews/2026-04-14-cuda-kernel-six-principles-review.md) | Living reference | CUDA kernel 六要素审计 + Heat Map (P0/P1/P2 priorities) + first-wave optimizations. Source of truth for the next kernel-perf wave |
 | [reviews/2026-04-06-10k-star-readiness.md](reviews/2026-04-06-10k-star-readiness.md) | Assessment (updated 2026-04-10) | 10K-star readiness review: technical foundation strong, governance/release discipline scoped as follow-up |
 | [experience/reviews/2026-04-02-cuda-link-optimization-gaps.md](experience/reviews/2026-04-02-cuda-link-optimization-gaps.md) | Code review | CUDA path optimization gaps in Qwen3.5 batched decode |
