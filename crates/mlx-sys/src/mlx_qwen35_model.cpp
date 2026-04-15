@@ -342,6 +342,7 @@ struct Qwen35CompiledModel {
     // Runtime state (set before each forward call)
     int current_cache_pos = 0;
     int current_seq_len = 1;  // 1 for decode, >1 for batch prefill
+    int current_batch_size = 1;
     bool current_last_logits_only = false;
     mutable array current_gdr_t_arr = array(1);
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
@@ -367,6 +368,7 @@ struct Qwen35CompiledModel {
         const array& k_cache, const array& v_cache, int cache_pos,
         array& new_k_cache, array& new_v_cache
     ) const {
+        int B = current_batch_size;
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
         int S = current_seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
@@ -379,38 +381,38 @@ struct Qwen35CompiledModel {
         array q(0), gate_val(0);
         if (lw.has_qk_gate) {
             // Qwen3.5: Q has gate — split at head_dim
-            auto q_full = reshape(q_proj_out, {1, S, nh, hd * 2});
+            auto q_full = reshape(q_proj_out, {B, S, nh, hd * 2});
             auto q_gate = split(q_full, Shape{hd}, -1);
             q = fast::rms_norm(q_gate[0], lw.q_norm_w, rms_eps);
             gate_val = q_gate[1];
         } else {
             // Qwen3: standard Q, no gate
-            q = fast::rms_norm(reshape(q_proj_out, {1, S, nh, hd}), lw.q_norm_w, rms_eps);
+            q = fast::rms_norm(reshape(q_proj_out, {B, S, nh, hd}), lw.q_norm_w, rms_eps);
         }
         q = transpose(q, {0, 2, 1, 3});
         q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
-        auto k = reshape(k_raw, {1, S, nkv, hd});
+        auto k = reshape(k_raw, {B, S, nkv, hd});
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
         k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
-        auto v = reshape(v_raw, {1, S, nkv, hd});
+        auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
 
         int end = cache_pos + S;
-        new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {1,nkv,end,hd});
-        new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {1,nkv,end,hd});
-        auto k_full = slice(new_k_cache, {0,0,0,0}, {1,nkv,end,hd});
-        auto v_full = slice(new_v_cache, {0,0,0,0}, {1,nkv,end,hd});
+        new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
+        new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
+        auto k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
+        auto v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
 
         std::string mask_mode = (S > 1) ? "causal" : "";
         auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask_mode);
-        attn_out = reshape(transpose(attn_out, {0,2,1,3}), {1, S, nh*hd});
+        attn_out = reshape(transpose(attn_out, {0,2,1,3}), {B, S, nh*hd});
 
         array result(0);
         if (lw.has_qk_gate) {
-            auto gate = reshape(gate_val, {1, S, nh*hd});
+            auto gate = reshape(gate_val, {B, S, nh*hd});
             result = lw.o_proj.apply(compiled_precise_sigmoid_mul()({gate, attn_out})[0]);
         } else {
             result = lw.o_proj.apply(attn_out);
@@ -434,6 +436,7 @@ struct Qwen35CompiledModel {
         array& gdr_state_out, array& conv_state_out,
         const array& gdr_t_arr
     ) const {
+        int B = current_batch_size;
         int hk = lw.num_key_heads, dk = lw.key_dim;
         int hv = lw.num_value_heads, dv = lw.value_dim;
         int q_dim = hk * dk, k_dim = q_dim, v_dim = hv * dv;
@@ -441,13 +444,13 @@ struct Qwen35CompiledModel {
         int S = current_seq_len;
         bool keep_intermediates = keep_step_intermediates();
 
-        auto x_3d = reshape(x, {1, S, hidden_size});
+        auto x_3d = reshape(x, {B, S, hidden_size});
 
         // Projections
         array qkv(0), z_raw(0), b_raw(0), a_raw(0);
         if (lw.use_separate_proj) {
             qkv = lw.qkv_proj.apply(x_3d);
-            z_raw = reshape(lw.z_proj.apply(x_3d), {1, S, hv, dv});
+            z_raw = reshape(lw.z_proj.apply(x_3d), {B, S, hv, dv});
             b_raw = lw.b_proj.apply(x_3d);
             a_raw = lw.a_proj.apply(x_3d);
         } else {
@@ -470,7 +473,7 @@ struct Qwen35CompiledModel {
         auto conv_input = concatenate({conv_state_in, qkv}, 1);
         int n_keep = lw.conv_kernel - 1;
         int conv_total = n_keep + S;
-        conv_state_out = contiguous(slice(conv_input, {0, conv_total - n_keep, 0}, {1, conv_total, qkv_dim}));
+        conv_state_out = contiguous(slice(conv_input, {0, conv_total - n_keep, 0}, {B, conv_total, qkv_dim}));
         auto conv_out = conv1d(conv_input, lw.conv1d_w, 1, 0, 1, qkv_dim);
         conv_out = compiled_silu()({conv_out})[0];
 
@@ -479,9 +482,9 @@ struct Qwen35CompiledModel {
         if (keep_intermediates) {
             for (auto& a : qkv_parts) intermediates.push_back(a);
         }
-        auto q_raw = reshape(qkv_parts[0], {1, S, hk, dk});
-        auto k_raw = reshape(qkv_parts[1], {1, S, hk, dk});
-        auto v_raw = reshape(qkv_parts[2], {1, S, hv, dv});
+        auto q_raw = reshape(qkv_parts[0], {B, S, hk, dk});
+        auto k_raw = reshape(qkv_parts[1], {B, S, hk, dk});
+        auto v_raw = reshape(qkv_parts[2], {B, S, hv, dv});
 
         array q(0), k(0);
         if (use_qwen35_cpp_qk_norm_helper()) {
@@ -513,7 +516,7 @@ struct Qwen35CompiledModel {
             std::vector<array> inputs = {
                 q, k, v_bf16, g_3d, beta_3d, gdr_state_in, gdr_t_arr
             };
-            std::vector<Shape> out_shapes = {{1, S, hv, dv}, gdr_state_in.shape()};
+            std::vector<Shape> out_shapes = {{B, S, hv, dv}, gdr_state_in.shape()};
             std::vector<Dtype> out_dtypes = {bfloat16, float32};
             std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
                 {"Dk", fast::TemplateArg(dk)},
@@ -528,7 +531,7 @@ struct Qwen35CompiledModel {
                 inputs,
                 out_shapes,
                 out_dtypes,
-                std::make_tuple(32, dv, hv),
+                std::make_tuple(32, dv, B * hv),
                 std::make_tuple(32, threadgroup_y, 1),
                 tmpl,
                 std::nullopt,
@@ -543,33 +546,33 @@ struct Qwen35CompiledModel {
             }
         } else {
             int heads_per_key = hv / hk;
-            auto g_4d = reshape(g, {1, hv, 1, 1});
+            auto g_4d = reshape(g, {B, hv, 1, 1});
             auto s_decayed = gdr_state_in * g_4d;
 
             // GQA: repeat k/q from [1,1,Hk,Dk] to [1,Hv,Dk] by inserting + broadcasting
             array k_exp = (heads_per_key > 1)
-                ? reshape(broadcast_to(expand_dims(k, 3), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
-                : reshape(k, {1,hv,dk});
+                ? reshape(broadcast_to(expand_dims(k, 3), {B,1,hk,heads_per_key,dk}), {B,hv,dk})
+                : reshape(k, {B,hv,dk});
             array q_exp = (heads_per_key > 1)
-                ? reshape(broadcast_to(expand_dims(q, 3), {1,1,hk,heads_per_key,dk}), {1,hv,dk})
-                : reshape(q, {1,hv,dk});
+                ? reshape(broadcast_to(expand_dims(q, 3), {B,1,hk,heads_per_key,dk}), {B,hv,dk})
+                : reshape(q, {B,hv,dk});
 
-            auto v_3d = reshape(v_raw, {1, hv, dv});
-            auto k_4d = reshape(k_exp, {1, hv, 1, dk});
+            auto v_3d = reshape(v_raw, {B, hv, dv});
+            auto k_4d = reshape(k_exp, {B, hv, 1, dk});
             auto kv_mem = sum(s_decayed * k_4d, -1, false);
-            auto beta_3d = reshape(beta, {1, hv, 1});
+            auto beta_3d = reshape(beta, {B, hv, 1});
             auto delta = (v_3d - kv_mem) * beta_3d;
-            gdr_state_out = s_decayed + reshape(delta, {1,hv,dv,1}) * k_4d;
-            auto q_4d = reshape(q_exp, {1, hv, 1, dk});
-            y = reshape(sum(gdr_state_out * q_4d, -1, false), {1,1,hv,dv});
+            gdr_state_out = s_decayed + reshape(delta, {B,hv,dv,1}) * k_4d;
+            auto q_4d = reshape(q_exp, {B, hv, 1, dk});
+            y = reshape(sum(gdr_state_out * q_4d, -1, false), {B,1,hv,dv});
         }
 
         // Output norm + gate (S-aware)
-        auto y_heads = reshape(y, {S * hv, dv});
+        auto y_heads = reshape(y, {B * S * hv, dv});
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
-        auto z_gated = reshape(z_raw, {S * hv, dv});
+        auto z_gated = reshape(z_raw, {B * S * hv, dv});
         auto out = compiled_precise_silu_mul()({z_gated, normed})[0];
-        auto result = lw.out_proj.apply(reshape(out, {1, S, hv*dv}));
+        auto result = lw.out_proj.apply(reshape(out, {B, S, hv*dv}));
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
         if (keep_intermediates) {
@@ -627,11 +630,12 @@ struct Qwen35CompiledModel {
 
         auto token_id = inputs[0];
         int cache_pos = current_cache_pos;
+        int B = current_batch_size;
         int S = current_seq_len;  // 1 for decode, >1 for batch prefill
 
         int F = n_full_attn, G = n_gdr;
         auto x = take(embed_tokens, flatten(token_id), 0);
-        x = reshape(x, {1, S, hidden_size});
+        x = reshape(x, {B, S, hidden_size});
         bool keep_intermediates = keep_step_intermediates();
         current_gdr_t_arr = array(S);
 
@@ -696,7 +700,7 @@ struct Qwen35CompiledModel {
             final_x = slice(
                 final_x,
                 {0, current_seq_len - 1, 0},
-                {1, current_seq_len, hidden_size}
+                {B, current_seq_len, hidden_size}
             );
         }
         // Use quantized matmul for tied lm_head (same as mlx_lm's as_linear).
@@ -952,6 +956,8 @@ int32_t qwen35_compiled_step(
         mlx_clear_error();
 
         m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
 
         // Build inputs vector
         std::vector<array> inputs;
@@ -981,6 +987,92 @@ int32_t qwen35_compiled_step(
     }
 }
 
+int32_t qwen35_compiled_step_batch(
+    void* model,
+    mlx_array* token_ids,    // int32 vector [batch]
+    int32_t batch_size,
+    int32_t cache_pos,
+    mlx_array** kv_caches,
+    int32_t n_kv_per_request,
+    mlx_array** gdr_states,
+    int32_t n_gdr_per_request,
+    mlx_array** out_logits,
+    mlx_array** out_kv_caches,
+    mlx_array** out_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error("qwen35_compiled_step_batch requires batch_size > 0");
+        }
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = 1;
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv_per_request + n_gdr_per_request);
+        inputs.push_back(*to_arr(token_ids));
+
+        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
+            std::vector<array> per_request;
+            per_request.reserve(batch_size);
+            for (int b = 0; b < batch_size; ++b) {
+                per_request.push_back(*to_arr(kv_caches[b * n_kv_per_request + kv_idx]));
+            }
+            inputs.push_back(concatenate(per_request, 0));
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
+            std::vector<array> per_request;
+            per_request.reserve(batch_size);
+            for (int b = 0; b < batch_size; ++b) {
+                per_request.push_back(*to_arr(gdr_states[b * n_gdr_per_request + gdr_idx]));
+            }
+            inputs.push_back(concatenate(per_request, 0));
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+
+        auto slice_batch_row = [](const array& arr, int row) {
+            Shape start = arr.shape();
+            Shape end = arr.shape();
+            std::fill(start.begin(), start.end(), 0);
+            start[0] = row;
+            end[0] = row + 1;
+            return slice(arr, start, end);
+        };
+
+        for (int kv_idx = 0; kv_idx < n_kv_per_request; ++kv_idx) {
+            const auto& batched = outputs[1 + kv_idx];
+            for (int b = 0; b < batch_size; ++b) {
+                out_kv_caches[b * n_kv_per_request + kv_idx] =
+                    from_arr(slice_batch_row(batched, b));
+            }
+        }
+
+        for (int gdr_idx = 0; gdr_idx < n_gdr_per_request; ++gdr_idx) {
+            const auto& batched = outputs[1 + n_kv_per_request + gdr_idx];
+            for (int b = 0; b < batch_size; ++b) {
+                out_gdr_states[b * n_gdr_per_request + gdr_idx] =
+                    from_arr(slice_batch_row(batched, b));
+            }
+        }
+
+        m->current_batch_size = 1;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_batch_size = 1;
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_prefill(
     void* model,
     mlx_array* token_ids,    // int32 vector [prompt_len]
@@ -997,6 +1089,7 @@ int32_t qwen35_compiled_prefill(
         mlx_clear_error();
 
         m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
         m->current_seq_len = prompt_len;
         m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
 
@@ -1015,11 +1108,13 @@ int32_t qwen35_compiled_prefill(
         for (int i = 0; i < n_gdr; ++i)
             out_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
 
+        m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
+        m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
         return -1;
