@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::kv_tier::BlockLocation;
 use crate::prefix_cache::{BlockId, RadixCache};
 use crate::scheduler::policy::{
     ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
@@ -31,6 +32,9 @@ pub(super) const PREFIX_CACHE_LOW_WATER: f64 = 0.50;
 /// completed prompts are not published into the retained T0 prefix cache so
 /// fresh admissions cannot be starved by pinned-but-cold pages.
 pub(super) const PREFIX_CACHE_RETAIN_HARD_CAP: f64 = 0.90;
+/// Number of logical radix-clock ticks to soft-pin freshly published session
+/// prefixes before they become evictable again.
+pub(super) const PREFIX_CACHE_KEEPALIVE_TICKS: u64 = 64;
 
 fn prefix_cache_retain_hard_cap_pages(total_pages: usize) -> usize {
     (total_pages as f64 * PREFIX_CACHE_RETAIN_HARD_CAP) as usize
@@ -116,6 +120,43 @@ pub struct Scheduler<M: ModelForward> {
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn eviction_signals(&self) -> SchedulerSignals {
+        SchedulerSignals::queue_state(
+            self.waiting.len(),
+            self.active
+                .iter()
+                .filter(|req| matches!(req.phase, Phase::Decoding))
+                .count(),
+        )
+    }
+
+    fn prefix_cache_watermarks_pages(&self) -> (usize, usize) {
+        let total = self.paged_kv_pool.max_total_pages;
+        let high = (total as f64 * PREFIX_CACHE_HIGH_WATER) as usize;
+        let low = (total as f64 * PREFIX_CACHE_LOW_WATER) as usize;
+        (high, low)
+    }
+
+    pub(super) fn refresh_session_keepalive(
+        &mut self,
+        blocks: &[BlockId],
+        session_id: Option<crate::types::SessionId>,
+    ) {
+        let keepalive_deadline = session_id.as_ref().map(|_| {
+            self.prefix_cache
+                .logical_clock()
+                .saturating_add(PREFIX_CACHE_KEEPALIVE_TICKS)
+        });
+        for &bid in blocks {
+            let _ = self
+                .prefix_cache
+                .set_block_session_id(bid, session_id.clone());
+            let _ = self
+                .prefix_cache
+                .set_block_soft_pin_until(bid, keepalive_deadline);
+        }
+    }
+
     /// Create a new scheduler and its handle.
     ///
     /// `num_slots` controls how many concurrent requests can be active (each gets
@@ -358,7 +399,12 @@ impl<M: ModelForward> Scheduler<M> {
     /// the number of tokens currently allocated to the slot (i.e.
     /// `paged_kv_pool.seq_len(slot_idx)`). Both are true at the
     /// `cleanup()` call site where this is invoked.
-    pub(super) fn publish_to_prefix_cache(&mut self, slot_idx: usize, prompt_tokens: &[u32]) {
+    pub(super) fn publish_to_prefix_cache(
+        &mut self,
+        slot_idx: usize,
+        prompt_tokens: &[u32],
+        session_id: Option<crate::types::SessionId>,
+    ) {
         let block_size = self.prefix_cache.block_size();
         let num_blocks = prompt_tokens.len() / block_size;
         if num_blocks == 0 {
@@ -422,6 +468,11 @@ impl<M: ModelForward> Scheduler<M> {
             .collect();
         self.paged_kv_pool.retain_pages(&slot_pages);
         self.slot_owned_blocks[slot_idx].clear();
+        let block_byte_len = self
+            .model
+            .kv_cache_bytes_per_token()
+            .saturating_mul(block_size)
+            .min(u32::MAX as usize) as u32;
         for (block_i, &bid) in blocks.iter().enumerate() {
             let pages_for_block = block_pages[block_i].clone();
             // If a prior publish already registered this BlockId
@@ -436,7 +487,15 @@ impl<M: ModelForward> Scheduler<M> {
                 .or_insert_with(|| pages_for_block);
             self.block_owner_slots.insert(bid, slot_idx);
             self.slot_owned_blocks[slot_idx].push(bid);
+            let _ = self.prefix_cache.set_block_location(
+                bid,
+                BlockLocation::Gpu {
+                    slot: slot_idx as u32,
+                },
+            );
+            let _ = self.prefix_cache.set_block_byte_len(bid, block_byte_len);
         }
+        self.refresh_session_keepalive(&blocks, session_id);
     }
 
     /// Remove the transient "this free slot still owns a materialized prompt
@@ -473,11 +532,10 @@ impl<M: ModelForward> Scheduler<M> {
             return 0;
         }
         let retained = self.paged_kv_pool.retained_count();
-        let high = (total as f64 * PREFIX_CACHE_HIGH_WATER) as usize;
+        let (high, target) = self.prefix_cache_watermarks_pages();
         if retained <= high {
             return 0;
         }
-        let target = (total as f64 * PREFIX_CACHE_LOW_WATER) as usize;
         let want_free = retained.saturating_sub(target);
         let pages_per_block = self
             .prefix_cache
@@ -489,7 +547,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let evicted = self.prefix_cache.evict_with_policy(
             &SessionBiasedLru::default(),
-            SchedulerSignals::default(),
+            self.eviction_signals(),
             blocks_to_evict,
         );
         let mut reclaimed_pages: usize = 0;
@@ -535,7 +593,7 @@ impl<M: ModelForward> Scheduler<M> {
                 .max(1);
             let evicted = self.prefix_cache.evict_with_policy(
                 &SessionBiasedLru::default(),
-                SchedulerSignals::default(),
+                self.eviction_signals(),
                 blocks_to_evict,
             );
             if evicted.is_empty() {

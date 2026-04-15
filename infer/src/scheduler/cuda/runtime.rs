@@ -79,6 +79,7 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn assign_slots(&mut self) {
         while !self.waiting.is_empty() {
+            let _ = self.evict_prefix_cache_if_pressured();
             let free_slots = self.free_slots();
             if free_slots.is_empty() {
                 break;
@@ -97,14 +98,40 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             };
 
-            let (radix_hit_len, radix_blocks) = self.prefix_cache.lookup(&prompt_tokens);
+            let lookup = self.prefix_cache.lookup_or_stage(
+                &prompt_tokens,
+                crate::kv_tier::LookupHeuristics::default(),
+                None,
+            );
+            let ready_on_gpu = lookup
+                .blocks
+                .iter()
+                .all(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu));
+            let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
+                lookup.matched_len
+            } else {
+                0
+            };
+            let radix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .filter_map(|block| block.block_id)
+                .collect();
+            let reusable_blocks = if ready_on_gpu && !lookup.recompute_advised {
+                radix_blocks.as_slice()
+            } else {
+                &[]
+            };
             let reusable = best_reusable_slot_for_radix_hit(
-                &radix_blocks,
+                reusable_blocks,
                 &free_slots,
                 &self.block_owner_slots,
                 &self.slot_materialized_prompt_lens,
                 self.prefix_cache.block_size(),
             );
+            if ready_on_gpu && incoming.session_id.is_some() && !radix_blocks.is_empty() {
+                self.refresh_session_keepalive(&radix_blocks, incoming.session_id.clone());
+            }
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 reusable.unwrap_or((free_slots[0], 0, 0));
             self.prefix_cache.release(&radix_blocks);
@@ -123,13 +150,22 @@ impl<M: ModelForward> Scheduler<M> {
                     reusable_cached_prompt_len,
                     self.waiting.len()
                 );
-            } else if radix_hit_len > 0 {
+            } else if lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised) {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, radix_hit={} but bytes are not ready on GPU, falling back to cold prefill, queue={})",
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    lookup.matched_len,
+                    self.waiting.len()
+                );
+            } else if lookup.matched_len > 0 {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, radix_hit={} but no reusable free slot state, queue={})",
                     id,
                     slot_idx,
                     prompt_tokens.len(),
-                    radix_hit_len,
+                    lookup.matched_len,
                     self.waiting.len()
                 );
             } else {
@@ -185,7 +221,7 @@ impl<M: ModelForward> Scheduler<M> {
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
                     let prompt_vec = prompt_tokens.to_vec();
                     self.slot_materialized_prompt_lens[req.slot_idx] = prompt_vec.len();
-                    self.publish_to_prefix_cache(req.slot_idx, &prompt_vec);
+                    self.publish_to_prefix_cache(req.slot_idx, &prompt_vec, req.session_id.clone());
                 } else {
                     self.slot_materialized_prompt_lens[req.slot_idx] = 0;
                 }
