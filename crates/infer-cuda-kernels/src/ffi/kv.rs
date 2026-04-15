@@ -32,6 +32,22 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn kv_cache_to_paged_range_hnd_cuda(
+        k_contiguous: *const Half,
+        v_contiguous: *const Half,
+        k_paged: *mut Half,
+        v_paged: *mut Half,
+        page_indices: *const i32,
+        start_pos: i32,
+        max_seq_len: i32,
+        token_count: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        head_dim: i32,
+        stride_page: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn paged_kv_append_cuda(
         k_batch: *const Half,
         v_batch: *const Half,

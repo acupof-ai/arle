@@ -62,6 +62,10 @@ impl GenerationState for GLM4State {
         self.base.offload_kv_if_needed(&self.ctx)
     }
 
+    fn prefetch_kv_to_gpu(&mut self) -> Result<()> {
+        self.base.kv_cache.prefetch_to_gpu(&self.ctx)
+    }
+
     fn migrate_kv_to_paged(
         &mut self,
         ctx: &DeviceContext,
@@ -75,11 +79,12 @@ impl GenerationState for GLM4State {
         &mut self,
         ctx: &DeviceContext,
         pool: &PagedKVPool,
+        slot: usize,
         start_pos: usize,
-        new_token_indices: &[u32],
+        token_count: usize,
     ) -> Result<()> {
         self.base
-            .migrate_kv_range_to_paged(ctx, pool, start_pos, new_token_indices)
+            .migrate_kv_range_to_paged(ctx, pool, slot, start_pos, token_count)
     }
 }
 
@@ -110,7 +115,7 @@ impl ModelForward for GLM4Model {
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
         let inter_dim = self.config.intermediate_size();
-        let max_pages = pool.max_total_tokens;
+        let max_pages = pool.max_total_pages;
         super::batch_decode::BatchDecodeBuffers::new(
             &self.ctx,
             &self.config,

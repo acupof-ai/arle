@@ -102,14 +102,17 @@ impl GenerationStateBase {
                 self.kv_cache.v_scales(),
                 self.kv_cache.max_seq_len(),
             ),
-            KVFormat::TurboQuant { .. } => pool.migrate_from_contiguous_turboquant_range(
-                ctx,
-                self.kv_cache.k_caches(),
-                self.kv_cache.v_caches(),
-                self.kv_cache.max_seq_len(),
-                0,
-                pool.token_indices(slot),
-            ),
+            KVFormat::TurboQuant { .. } => {
+                let token_rows = pool.token_rows_for_range(slot, 0, pool.seq_len(slot));
+                pool.migrate_from_contiguous_turboquant_range(
+                    ctx,
+                    self.kv_cache.k_caches(),
+                    self.kv_cache.v_caches(),
+                    self.kv_cache.max_seq_len(),
+                    0,
+                    &token_rows,
+                )
+            }
         }
     }
 
@@ -117,8 +120,9 @@ impl GenerationStateBase {
         &self,
         ctx: &DeviceContext,
         pool: &PagedKVPool,
+        slot: usize,
         start_pos: usize,
-        new_token_indices: &[u32],
+        token_count: usize,
     ) -> Result<()> {
         use super::kv_cache::KVFormat;
 
@@ -128,35 +132,45 @@ impl GenerationStateBase {
                 self.kv_cache.k_caches(),
                 self.kv_cache.v_caches(),
                 self.kv_cache.max_seq_len(),
+                slot,
                 start_pos,
-                new_token_indices,
+                token_count,
             ),
-            KVFormat::FP8E4M3 => pool.migrate_from_contiguous_fp8_range(
-                ctx,
-                self.kv_cache.k_caches(),
-                self.kv_cache.v_caches(),
-                self.kv_cache.max_seq_len(),
-                start_pos,
-                new_token_indices,
-            ),
-            KVFormat::INT8 => pool.migrate_from_contiguous_int8_range(
-                ctx,
-                self.kv_cache.k_caches_q(),
-                self.kv_cache.v_caches_q(),
-                self.kv_cache.k_scales(),
-                self.kv_cache.v_scales(),
-                self.kv_cache.max_seq_len(),
-                start_pos,
-                new_token_indices,
-            ),
-            KVFormat::TurboQuant { .. } => pool.migrate_from_contiguous_turboquant_range(
-                ctx,
-                self.kv_cache.k_caches(),
-                self.kv_cache.v_caches(),
-                self.kv_cache.max_seq_len(),
-                start_pos,
-                new_token_indices,
-            ),
+            KVFormat::FP8E4M3 => {
+                let token_rows = pool.token_rows_for_range(slot, start_pos, token_count);
+                pool.migrate_from_contiguous_fp8_range(
+                    ctx,
+                    self.kv_cache.k_caches(),
+                    self.kv_cache.v_caches(),
+                    self.kv_cache.max_seq_len(),
+                    start_pos,
+                    &token_rows,
+                )
+            }
+            KVFormat::INT8 => {
+                let token_rows = pool.token_rows_for_range(slot, start_pos, token_count);
+                pool.migrate_from_contiguous_int8_range(
+                    ctx,
+                    self.kv_cache.k_caches_q(),
+                    self.kv_cache.v_caches_q(),
+                    self.kv_cache.k_scales(),
+                    self.kv_cache.v_scales(),
+                    self.kv_cache.max_seq_len(),
+                    start_pos,
+                    &token_rows,
+                )
+            }
+            KVFormat::TurboQuant { .. } => {
+                let token_rows = pool.token_rows_for_range(slot, start_pos, token_count);
+                pool.migrate_from_contiguous_turboquant_range(
+                    ctx,
+                    self.kv_cache.k_caches(),
+                    self.kv_cache.v_caches(),
+                    self.kv_cache.max_seq_len(),
+                    start_pos,
+                    &token_rows,
+                )
+            }
         }
     }
 }

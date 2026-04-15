@@ -18,6 +18,13 @@ pub enum KVFormat {
 }
 
 impl KVFormat {
+    pub fn default_page_size(self) -> usize {
+        match self {
+            Self::BF16 => 16,
+            Self::FP8E4M3 | Self::INT8 | Self::TurboQuant { .. } => 1,
+        }
+    }
+
     pub fn bytes_per_element(self) -> usize {
         match self {
             Self::BF16 => 2,

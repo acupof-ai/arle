@@ -40,6 +40,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::kv_tier::BlockLocation;
+use crate::types::{BlockFingerprint, SessionId};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -64,6 +67,24 @@ struct Node {
     ref_count: u32,
     /// Monotonically increasing access clock (set on insert/lookup).
     last_access: u64,
+    /// How many times this node's block participated in a successful lookup.
+    #[serde(default)]
+    hit_count: u32,
+    /// Cross-tier location of this node's bytes once the coordinator is wired.
+    #[serde(default)]
+    tier_location: Option<BlockLocation>,
+    /// Serialized session affinity hint for future policy / persistence work.
+    #[serde(default)]
+    session_id: Option<SessionId>,
+    /// Optional content fingerprint used by the M4/M5 persistence paths.
+    #[serde(default)]
+    fingerprint: Option<BlockFingerprint>,
+    /// Byte length of the block payload in its current tier.
+    #[serde(default)]
+    byte_len: u32,
+    /// Logical soft pin deadline (scheduler tick / epoch), if any.
+    #[serde(default)]
+    soft_pin_until: Option<u64>,
     /// Children, indexed by the first token of their edge.
     children: HashMap<u32, usize>,
 }
@@ -75,6 +96,12 @@ impl Node {
             block_id,
             ref_count: 0,
             last_access: now,
+            hit_count: 0,
+            tier_location: None,
+            session_id: None,
+            fingerprint: None,
+            byte_len: 0,
+            soft_pin_until: None,
             children: HashMap::new(),
         }
     }
@@ -97,6 +124,9 @@ impl Node {
 pub struct RadixCache {
     /// All nodes, indexed by stable integer IDs.
     nodes: Vec<Node>,
+    /// Reclaimed node slots available for reuse after tombstone GC.
+    #[serde(default)]
+    free_nodes: Vec<usize>,
     /// Index 0 is always the virtual root (empty token sequence).
     // root index is always 0
     /// Block size: a node gets a block_id only when it holds exactly
@@ -115,6 +145,7 @@ impl RadixCache {
         let root = Node::new(vec![], None, 0);
         Self {
             nodes: vec![root],
+            free_nodes: Vec::new(),
             block_size,
             clock: 0,
         }
@@ -128,6 +159,18 @@ impl RadixCache {
     /// Returns the root node index (always 0).
     fn root() -> usize {
         0
+    }
+
+    /// Allocate a node slot, reusing a reclaimed tombstone if possible.
+    fn alloc_node(&mut self, node: Node) -> usize {
+        if let Some(idx) = self.free_nodes.pop() {
+            self.nodes[idx] = node;
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(node);
+            idx
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -182,6 +225,7 @@ impl RadixCache {
 
             if let Some(bid) = self.nodes[child_idx].block_id {
                 self.nodes[child_idx].ref_count += 1;
+                self.nodes[child_idx].hit_count = self.nodes[child_idx].hit_count.saturating_add(1);
                 matched_blocks.push(bid);
             }
 
@@ -273,8 +317,7 @@ impl RadixCache {
                     let shared_tokens = child_tokens[..split_point].to_vec();
                     let mut shared_node = Node::new(shared_tokens, None, now);
                     shared_node.ref_count = old_ref_count;
-                    let shared_idx = self.nodes.len();
-                    self.nodes.push(shared_node);
+                    let shared_idx = self.alloc_node(shared_node);
 
                     // Rewire the original child to become a child of the shared node.
                     self.nodes[child_idx].tokens = old_suffix;
@@ -304,8 +347,7 @@ impl RadixCache {
                     };
 
                     let new_node = Node::new(edge_tokens.clone(), block_id, now);
-                    let new_idx = self.nodes.len();
-                    self.nodes.push(new_node);
+                    let new_idx = self.alloc_node(new_node);
 
                     let first_tok = edge_tokens[0];
                     self.nodes[node_idx].children.insert(first_tok, new_idx);
@@ -419,7 +461,74 @@ impl RadixCache {
                 .retain(|_, child_idx| !evicted_set.contains(child_idx));
         }
 
+        self.gc_orphan_tombstones();
+
         freed
+    }
+
+    /// Reclaim orphaned tombstones after eviction.
+    ///
+    /// A node is reclaimable when it is:
+    /// - not the root,
+    /// - blockless (`block_id == None`),
+    /// - unpinned (`ref_count == 0`), and
+    /// - childless once already-reclaimable descendants are ignored.
+    ///
+    /// Reclaimed slots are pushed onto `free_nodes` so later inserts can reuse
+    /// them instead of letting the backing `Vec<Node>` grow without bound.
+    fn gc_orphan_tombstones(&mut self) {
+        use std::collections::HashSet;
+
+        let mut reclaimable: HashSet<usize> = HashSet::new();
+
+        loop {
+            let mut progressed = false;
+
+            for idx in 1..self.nodes.len() {
+                if reclaimable.contains(&idx) {
+                    continue;
+                }
+
+                let node = &self.nodes[idx];
+                if node.block_id.is_some() || node.ref_count != 0 {
+                    continue;
+                }
+
+                if node
+                    .children
+                    .iter()
+                    .all(|(_, child_idx)| reclaimable.contains(child_idx))
+                {
+                    reclaimable.insert(idx);
+                    progressed = true;
+                }
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        if reclaimable.is_empty() {
+            return;
+        }
+
+        for node in &mut self.nodes {
+            node.children
+                .retain(|_, child_idx| !reclaimable.contains(child_idx));
+        }
+
+        let mut reclaimed: Vec<usize> = reclaimable.into_iter().collect();
+        reclaimed.sort_unstable();
+        for idx in reclaimed {
+            let node = &mut self.nodes[idx];
+            node.tokens.clear();
+            node.block_id = None;
+            node.ref_count = 0;
+            node.last_access = 0;
+            node.children.clear();
+            self.free_nodes.push(idx);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -438,6 +547,11 @@ impl RadixCache {
     /// Total number of nodes in the tree (including root).
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Number of reclaimed node slots waiting to be reused.
+    pub fn free_node_count(&self) -> usize {
+        self.free_nodes.len()
     }
 
     /// Number of cached blocks (nodes with a `block_id`).
@@ -810,9 +924,9 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M1 scheduler integration pattern — validates the exact usage
+    // Scheduler integration pattern — validates the exact usage
     // shape `scheduler::cuda::core::Scheduler::publish_to_prefix_cache`
-    // + the `assign_slots` shadow observer rely on. Kept here (rather
+    // + the admission lookup path rely on. Kept here (rather
     // than in `scheduler/cuda/`) because the scheduler itself needs a
     // full `Model` + CUDA context to construct and so cannot host a
     // pure-Rust test.
@@ -858,9 +972,9 @@ mod tests {
         cache.release(&hit_blocks);
 
         // After release, the matched nodes must evict cleanly (nothing
-        // is holding them). This is the invariant that makes the
-        // shadow observer safe to flip from "log-only" to "drives slot
-        // selection" in M2 without leaking paged-pool refs.
+        // is holding them). This is the invariant that keeps the
+        // admission path safe now that the radix is load-bearing for
+        // slot selection.
         let freed = cache.evict(cache.cached_block_count());
         assert_eq!(freed.len(), 2, "both blocks must be evictable");
         assert_eq!(cache.cached_block_count(), 0);
@@ -910,5 +1024,57 @@ mod tests {
         assert_eq!(hit_len, 16, "tail token must not round up");
         assert_eq!(hit_blocks, blocks);
         cache.release(&hit_blocks);
+    }
+
+    #[test]
+    fn evict_prunes_orphan_tombstones_into_free_list() {
+        let mut cache = RadixCache::new(4);
+
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        // Force a split at the second block so the shared parent becomes
+        // a blockless tombstone once the leaf is evicted.
+        cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
+
+        assert_eq!(cache.cached_block_count(), 2);
+        let before_nodes = cache.node_count();
+
+        let freed = cache.evict(1);
+        assert_eq!(freed, bids(&[20]));
+        assert_eq!(cache.cached_block_count(), 1);
+        assert_eq!(
+            cache.free_node_count(),
+            2,
+            "leaf and shared tombstone should be reclaimed"
+        );
+        assert_eq!(
+            cache.node_count(),
+            before_nodes,
+            "reclaiming a tombstone should not grow the backing node array"
+        );
+    }
+
+    #[test]
+    fn insert_reuses_reclaimed_tombstone_slots() {
+        let mut cache = RadixCache::new(4);
+
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        cache.insert(&[1, 2, 3, 4, 5, 6, 9, 10], &bids(&[10, 99]));
+        let _ = cache.evict(1);
+
+        let before_nodes = cache.node_count();
+        assert_eq!(cache.free_node_count(), 2);
+
+        cache.insert(&[1, 2, 3, 4, 11, 12, 13, 14], &bids(&[10, 77]));
+
+        assert_eq!(
+            cache.node_count(),
+            before_nodes,
+            "insert should reuse the reclaimed tombstone slot instead of appending"
+        );
+        assert_eq!(
+            cache.free_node_count(),
+            1,
+            "reused tombstone slot should be removed from the free list"
+        );
     }
 }

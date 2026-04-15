@@ -103,6 +103,9 @@ pub trait GenerationState {
     fn set_kv_dtype(&mut self, dtype: kv_cache::KVCacheDtype);
     /// Offload excess KV to CPU if over GPU budget. Called between requests.
     fn offload_kv_if_needed(&mut self) -> Result<()>;
+    /// Prefetch any CPU-offloaded KV back to GPU before prefix reuse reads the
+    /// contiguous cache directly. No-op when nothing is offloaded.
+    fn prefetch_kv_to_gpu(&mut self) -> Result<()>;
 
     /// Migrate KV data from contiguous cache to paged pool.
     /// Called after prefill completes, before first decode step.
@@ -118,8 +121,9 @@ pub trait GenerationState {
         &mut self,
         ctx: &DeviceContext,
         pool: &PagedKVPool,
+        slot: usize,
         start_pos: usize,
-        new_token_indices: &[u32],
+        token_count: usize,
     ) -> Result<()>;
 
     // -- Prefix cache support for hybrid models (recurrent + full attention) --
