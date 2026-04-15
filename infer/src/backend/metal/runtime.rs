@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use super::kv_pool::MetalKVPool;
 use super::prefix_cache::MetalPrefixCache;
 use super::request_state::{
-    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot, Qwen35PrefixSnapshot,
+    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
+    Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
     MetalRequestPriority, MetalScheduleDecision, MetalScheduler, MetalSchedulerConfig,
@@ -171,6 +172,11 @@ struct MetalQwen35PrefixRuntime {
     cached_tokens: usize,
     next_tick: u64,
     block_size: usize,
+}
+
+struct CachedQwen35DecodeBatch {
+    req_ids: Vec<RequestId>,
+    batch: Qwen35PackedDecodeBatch<'static>,
 }
 
 struct MetalPrefixAdmission {
@@ -640,6 +646,7 @@ fn run_metal_scheduler_runtime(
     let mut prefix_runtime = MetalLivePrefixRuntime::new(backend, &config)?;
     let mut scheduler = MetalScheduler::new(config)?;
     let mut active = HashMap::<RequestId, ActiveMetalRequest>::new();
+    let mut qwen35_decode_batch_cache: Option<CachedQwen35DecodeBatch> = None;
     let mut request_rx_closed = false;
 
     info!("Metal scheduler runtime started");
@@ -697,10 +704,22 @@ fn run_metal_scheduler_runtime(
                 &mut active,
             ),
             MetalScheduleDecision::DecodeBatch(batch) => {
-                execute_decode_batch(batch.req_ids, &metrics, &mut scheduler, &mut active);
+                execute_decode_batch(
+                    batch.req_ids,
+                    &metrics,
+                    &mut scheduler,
+                    &mut active,
+                    &mut qwen35_decode_batch_cache,
+                );
             }
             MetalScheduleDecision::Mixed { decode, prefill } => {
-                execute_decode_batch(decode.req_ids, &metrics, &mut scheduler, &mut active);
+                execute_decode_batch(
+                    decode.req_ids,
+                    &metrics,
+                    &mut scheduler,
+                    &mut active,
+                    &mut qwen35_decode_batch_cache,
+                );
                 execute_prefill_chunk(
                     prefill.req_id,
                     prefill.input_tokens.len(),
@@ -893,6 +912,7 @@ fn execute_decode_batch(
     metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
 ) {
     if req_ids.is_empty() {
         return;
@@ -917,25 +937,41 @@ fn execute_decode_batch(
         open.push((req_id, request));
     }
 
-    let batch_result = if open.len() >= 2 {
-        let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
-            .iter_mut()
-            .map(|(_, request)| &mut request.request_state)
-            .collect();
-        match MetalRequestState::decode_batch(&mut request_refs) {
-            Ok(result) => result,
+    let batch_result =
+        match execute_qwen35_packed_decode_batch(&mut open, active, qwen35_decode_batch_cache) {
+            Ok(Some(result)) => Some(result),
+            Ok(None) => {
+                invalidate_qwen35_decode_batch_cache(qwen35_decode_batch_cache, active, &mut open);
+                if open.len() >= 2 {
+                    let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
+                        .iter_mut()
+                        .map(|(_, request)| &mut request.request_state)
+                        .collect();
+                    match MetalRequestState::decode_batch(&mut request_refs) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            error!("Metal batched decode failed: {err:#}");
+                            metrics.record_request_failed();
+                            for (req_id, request) in open {
+                                cancel_detached_request(req_id, request, scheduler);
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
             Err(err) => {
-                error!("Metal batched decode failed: {err:#}");
+                error!("Metal packed Qwen3.5 decode failed: {err:#}");
                 metrics.record_request_failed();
+                invalidate_qwen35_decode_batch_cache(qwen35_decode_batch_cache, active, &mut open);
                 for (req_id, request) in open {
                     cancel_detached_request(req_id, request, scheduler);
                 }
                 return;
             }
-        }
-    } else {
-        None
-    };
+        };
 
     if let Some(sampled_tokens) = batch_result {
         for ((req_id, mut request), sampled_token) in open.into_iter().zip(sampled_tokens) {
@@ -963,6 +999,124 @@ fn execute_decode_batch(
     for (req_id, request) in open {
         execute_decode_single(req_id, request, metrics, scheduler, active);
     }
+}
+
+fn execute_qwen35_packed_decode_batch(
+    open: &mut Vec<(RequestId, ActiveMetalRequest)>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    cache: &mut Option<CachedQwen35DecodeBatch>,
+) -> Result<Option<Vec<u32>>> {
+    if open.len() < 2 {
+        return Ok(None);
+    }
+
+    let current_req_ids: Vec<RequestId> = open.iter().map(|(req_id, _)| *req_id).collect();
+
+    if let Some(cached) = cache.as_mut() {
+        if cached.req_ids != current_req_ids {
+            if let Some(retained_rows) = retained_row_indices(&cached.req_ids, &current_req_ids) {
+                cached.batch.retain_rows(&retained_rows)?;
+                cached.req_ids = current_req_ids.clone();
+            } else {
+                invalidate_qwen35_decode_batch_cache(cache, active, open);
+            }
+        }
+    }
+
+    if cache.is_none() {
+        let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
+            .iter_mut()
+            .map(|(_, request)| &mut request.request_state)
+            .collect();
+        let Some(batch) =
+            MetalRequestState::try_build_qwen35_packed_decode_batch(&mut request_refs)?
+        else {
+            return Ok(None);
+        };
+        *cache = Some(CachedQwen35DecodeBatch {
+            req_ids: current_req_ids.clone(),
+            batch,
+        });
+    }
+
+    let cached = cache
+        .as_mut()
+        .context("Qwen3.5 packed decode cache missing after build")?;
+    if cached.req_ids != current_req_ids {
+        invalidate_qwen35_decode_batch_cache(cache, active, open);
+        return Ok(None);
+    }
+
+    let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
+        .iter_mut()
+        .map(|(_, request)| &mut request.request_state)
+        .collect();
+    MetalRequestState::try_decode_qwen35_packed_batch(&mut request_refs, &mut cached.batch)
+}
+
+fn invalidate_qwen35_decode_batch_cache(
+    cache: &mut Option<CachedQwen35DecodeBatch>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    open: &mut Vec<(RequestId, ActiveMetalRequest)>,
+) {
+    let Some(mut cached) = cache.take() else {
+        return;
+    };
+
+    let mut row_indices = Vec::new();
+    let mut state_ptrs = Vec::new();
+    for (row_idx, req_id) in cached.req_ids.iter().enumerate() {
+        if let Some((_, request)) = open.iter_mut().find(|(candidate, _)| candidate == req_id) {
+            row_indices.push(row_idx);
+            state_ptrs.push((&mut request.request_state) as *mut MetalRequestState<'static>);
+            continue;
+        }
+        if let Some(request) = active.get_mut(req_id) {
+            row_indices.push(row_idx);
+            state_ptrs.push((&mut request.request_state) as *mut MetalRequestState<'static>);
+        }
+    }
+
+    if row_indices.is_empty() {
+        return;
+    }
+
+    if row_indices.len() != cached.req_ids.len() {
+        if let Err(err) = cached.batch.retain_rows(&row_indices) {
+            error!("Metal packed Qwen3.5 cache retain_rows failed during invalidate: {err:#}");
+            return;
+        }
+    }
+
+    let mut request_refs: Vec<&mut MetalRequestState<'static>> = state_ptrs
+        .into_iter()
+        .map(|ptr| unsafe { &mut *ptr })
+        .collect();
+    if let Err(err) =
+        MetalRequestState::sync_qwen35_packed_decode_batch(&mut request_refs, &cached.batch)
+    {
+        error!("Metal packed Qwen3.5 cache sync failed during invalidate: {err:#}");
+    }
+}
+
+fn retained_row_indices(
+    previous_req_ids: &[RequestId],
+    current_req_ids: &[RequestId],
+) -> Option<Vec<usize>> {
+    let mut indices = Vec::with_capacity(current_req_ids.len());
+    let mut cursor = 0usize;
+    for req_id in current_req_ids {
+        let Some(relative) = previous_req_ids[cursor..]
+            .iter()
+            .position(|candidate| candidate == req_id)
+        else {
+            return None;
+        };
+        let absolute = cursor + relative;
+        indices.push(absolute);
+        cursor = absolute + 1;
+    }
+    Some(indices)
 }
 
 fn execute_decode_single(
