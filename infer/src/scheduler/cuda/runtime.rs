@@ -39,7 +39,9 @@ impl<M: ModelForward> Scheduler<M> {
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
-                | Ok(crate::kv_tier::CoordinatorEvent::StagingQueued { .. }) => {}
+                | Ok(crate::kv_tier::CoordinatorEvent::StagingQueued { .. })
+                | Ok(crate::kv_tier::CoordinatorEvent::SpillQueued { .. })
+                | Ok(crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. }) => {}
                 Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
                     let Some(staged) = self.stage_waiting.remove(&ticket) else {
                         log::debug!(
@@ -130,6 +132,43 @@ impl<M: ModelForward> Scheduler<M> {
                     }
                     self.coordinator_unavailable = true;
                     break;
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
+                    log::debug!(
+                        "Spill completed for ticket={} ({} persisted blocks)",
+                        ticket.0,
+                        locations.len()
+                    );
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::SpillFailed {
+                    ticket,
+                    failed_block,
+                    reason,
+                }) => {
+                    warn!(
+                        "Spill failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::RehydrateCompleted {
+                    ticket,
+                    rehydrated_blocks,
+                }) => {
+                    log::debug!(
+                        "Rehydrate completed for ticket={} ({} restored blocks)",
+                        ticket.0,
+                        rehydrated_blocks.len()
+                    );
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::RehydrateFailed {
+                    ticket,
+                    failed_block,
+                    reason,
+                }) => {
+                    warn!(
+                        "Rehydrate failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
                 }
             }
         }

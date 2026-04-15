@@ -1,3 +1,4 @@
+#[allow(clippy::struct_field_names, clippy::needless_pass_by_value)]
 mod openai_v1;
 pub mod sessions;
 
@@ -5,12 +6,14 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Request as AxumRequest;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, header},
+    middleware,
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
@@ -31,7 +34,7 @@ use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::SchedulerHandle;
 use crate::scheduler::{IncomingRequest, RequestPriority};
 use crate::server_engine::CompletionStreamDelta;
-use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
+use crate::server_engine::{CompletionOutput, FinishReason, InferenceEngine, TokenUsage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest as OpenAiCompletionRequest, CompletionResponse, ModelsListResponse,
@@ -246,8 +249,8 @@ fn submit_request(
     Ok(delta_rx)
 }
 
-fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
-    let Some(expected_api_key) = state.config.api_key.as_deref() else {
+fn authorize_headers(headers: &HeaderMap, expected_api_key: Option<&str>) -> Result<(), ApiError> {
+    let Some(expected_api_key) = expected_api_key else {
         return Ok(());
     };
 
@@ -270,6 +273,20 @@ fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), Api
     }
 
     Ok(())
+}
+
+fn authorize_v1_request(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    authorize_headers(headers, state.config.api_key.as_deref())
+}
+
+async fn authorize_session_request(
+    State(expected_api_key): State<Option<Arc<str>>>,
+    headers: HeaderMap,
+    request: AxumRequest,
+    next: middleware::Next,
+) -> Result<Response, ApiError> {
+    authorize_headers(&headers, expected_api_key.as_deref())?;
+    Ok(next.run(request).await)
 }
 
 fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
@@ -353,13 +370,10 @@ where
     events
 }
 
-fn sse_json_event<T: serde::Serialize>(
-    event_name: &'static str,
-    payload: &T,
-) -> Result<Event, Infallible> {
-    Ok(Event::default()
+fn sse_json_event<T: serde::Serialize>(event_name: &'static str, payload: &T) -> Event {
+    Event::default()
         .event(event_name)
-        .data(serde_json::to_string(payload).expect("SSE payload serialization")))
+        .data(serde_json::to_string(payload).expect("SSE payload serialization"))
 }
 
 enum ResponsesSseState {
@@ -413,7 +427,7 @@ fn responses_sse_stream(
                         ),
                     );
                     Some((
-                        event,
+                        Ok(event),
                         ResponsesSseState::Streaming {
                             response_id,
                             created_at,
@@ -440,7 +454,7 @@ fn responses_sse_stream(
                             buffered.into_output(),
                         );
                         let event = sse_json_event("response.completed", &response);
-                        return Some((event, ResponsesSseState::Done));
+                        return Some((Ok(event), ResponsesSseState::Done));
                     }
 
                     while let Some(delta) = delta_rx.recv().await {
@@ -460,7 +474,7 @@ fn responses_sse_stream(
                                 ),
                             );
                             return Some((
-                                event,
+                                Ok(event),
                                 ResponsesSseState::Streaming {
                                     response_id,
                                     created_at,
@@ -480,7 +494,7 @@ fn responses_sse_stream(
                                 buffered.into_output(),
                             );
                             let event = sse_json_event("response.completed", &response);
-                            return Some((event, ResponsesSseState::Done));
+                            return Some((Ok(event), ResponsesSseState::Done));
                         }
                     }
 
@@ -491,7 +505,7 @@ fn responses_sse_stream(
                         buffered.into_output(),
                     );
                     let event = sse_json_event("response.completed", &response);
-                    Some((event, ResponsesSseState::Done))
+                    Some((Ok(event), ResponsesSseState::Done))
                 }
                 ResponsesSseState::Done => None,
             }
@@ -703,7 +717,12 @@ pub fn build_app<H>(handle: H) -> Router
 where
     H: RequestHandle + 'static,
 {
-    build_app_with_config(handle, ServerMetrics::new(""), HttpServerConfig::default())
+    build_app_inner(
+        handle,
+        ServerMetrics::new(""),
+        HttpServerConfig::default(),
+        None,
+    )
 }
 
 /// Build the Axum router with a pre-configured `ServerMetrics` instance.
@@ -711,7 +730,7 @@ pub fn build_app_with_metrics<H>(handle: H, metrics: ServerMetrics) -> Router
 where
     H: RequestHandle + 'static,
 {
-    build_app_with_config(handle, metrics, HttpServerConfig::default())
+    build_app_inner(handle, metrics, HttpServerConfig::default(), None)
 }
 
 /// Build the Axum router with explicit metrics and server configuration.
@@ -723,20 +742,77 @@ pub fn build_app_with_config<H>(
 where
     H: RequestHandle + 'static,
 {
+    build_app_inner(handle, metrics, config, None)
+}
+
+pub fn build_app_with_session_engine<H, E>(handle: H, engine: Arc<tokio::sync::RwLock<E>>) -> Router
+where
+    H: RequestHandle + 'static,
+    E: InferenceEngine + Send + Sync + 'static,
+{
+    build_app_inner(
+        handle,
+        ServerMetrics::new(""),
+        HttpServerConfig::default(),
+        Some(Router::new().nest("/{session_id}", sessions::session_router(engine))),
+    )
+}
+
+pub fn build_app_with_config_and_session_engine<H, E>(
+    handle: H,
+    engine: Arc<tokio::sync::RwLock<E>>,
+    metrics: ServerMetrics,
+    config: HttpServerConfig,
+) -> Router
+where
+    H: RequestHandle + 'static,
+    E: InferenceEngine + Send + Sync + 'static,
+{
+    build_app_inner(
+        handle,
+        metrics,
+        config,
+        Some(Router::new().nest("/{session_id}", sessions::session_router(engine))),
+    )
+}
+
+fn build_app_inner<H>(
+    handle: H,
+    metrics: ServerMetrics,
+    config: HttpServerConfig,
+    session_routes: Option<Router>,
+) -> Router
+where
+    H: RequestHandle + 'static,
+{
+    let session_api_key = config.api_key.clone();
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
         metrics,
         config,
     });
 
-    Router::new()
+    // The session subtree (if present) is already fully-stated by
+    // `sessions::session_router(engine)` and wrapped at `/{session_id}`
+    // before entering this function, so we apply the auth middleware
+    // via `.layer(...)` and mount the whole subtree as a service.
+    let mut router: Router<Arc<AppState>> = Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/v1/stats", get(stats_handler))
-        .with_state(state)
+        .route("/v1/stats", get(stats_handler));
+
+    if let Some(session_routes) = session_routes {
+        let guarded = session_routes.layer(middleware::from_fn_with_state(
+            session_api_key,
+            authorize_session_request,
+        ));
+        router = router.nest_service("/v1/sessions", guarded);
+    }
+
+    router.with_state(state)
 }
 
 #[cfg(test)]

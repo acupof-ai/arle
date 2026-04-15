@@ -230,6 +230,31 @@ impl RadixCache {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fingerprints_for_session(&self, session_id: &str) -> Vec<BlockFingerprint> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match (node.session_id.as_ref(), node.fingerprint) {
+                (Some(node_session), Some(fingerprint)) if node_session.as_str() == session_id => {
+                    Some(fingerprint)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn block_id_for_fingerprint(
+        &self,
+        fingerprint: BlockFingerprint,
+    ) -> Option<BlockId> {
+        self.nodes.iter().find_map(|node| {
+            (node.fingerprint == Some(fingerprint))
+                .then_some(node.block_id)
+                .flatten()
+        })
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
