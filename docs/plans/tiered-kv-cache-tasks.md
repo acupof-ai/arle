@@ -328,6 +328,17 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 > `crossbeam-channel` dependency, and the first tier-aware `RadixNode`
 > metadata fields. The checklist below is now split into "already landed
 > locally" vs "still pending on a CUDA host / later M3 behavior PRs".
+>
+> **2026-04-16 follow-on on `main`**:
+> `d3d1e46 feat(kv-tier): wire M3 coordinator + staged admission` —
+> named coordinator thread + ticketed staged-admission re-entry.
+> `9e276cd feat(kv-tier): compute BlockFingerprint at publish + disk round-trip test` —
+> publish-time fingerprints + local DiskStore fingerprint preservation.
+> `9b01c2a perf(kv-tier): O(1) RadixCache block lookup + SchedulerConfig knobs` —
+> private `block_index` + watermark/keepalive promotion onto config.
+> Remote CUDA acceptance is still pending for this Tier A/B/C follow-on;
+> use `docs/plans/tiered-kv-cache-tier-abc-remote-acceptance.md` as the
+> combined acceptance checklist.
 
 #### Structural PR (a) — Local (Mac)
 - [x] `[L]` `infer/src/scheduler/policy.rs` — `EvictionPolicy` trait + default
@@ -364,6 +375,18 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
       page-lifecycle state machine with local tests
 - [x] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs` — add admission-time pressure trimming and switch admission to plannerless `lookup_or_stage(..., None)` classification where only `ReadyOnGpu` hits remain reusable. Landed in local M3b runtime-wire batch.
 - [x] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs` — route prefix-cache eviction through live queue/decode-derived `SchedulerSignals`, centralize watermark helpers, and stamp published blocks with GPU/session/keepalive metadata. Landed in local M3b runtime-wire batch.
+- [x] `[L+R]` Tier A local follow-on (`d3d1e46`) — `Scheduler::with_config`
+      spawns the named coordinator thread, `assign_slots` passes
+      `Some(&coordinator_handle)` as `StagePlanner`, staged requests park in
+      `stage_waiting`, and the run loop drains coordinator events before
+      re-admitting `StagingCompleted` tickets.
+- [x] `[L+R]` Tier B local follow-on (`9e276cd`) — publish computes
+      `BlockFingerprint::compute_from_tokens`, routes radix inserts through
+      `insert_with_fingerprints(...)`, and the local DiskStore round-trip
+      test preserves both bytes and fingerprint.
+- [x] `[L+R]` Tier C local follow-on (`9b01c2a`) — `RadixCache` keeps a
+      private O(1) `block_index`, and the prefix-cache watermarks /
+      keepalive knobs now live on `SchedulerConfig` with validation.
 - [x] `[L+R]` **Diff before delete** — confirm `grep -r 'offload_if_needed\|ensure_on_gpu\|k_host\|v_host' infer/src/` is reduced to the legacy offload surface plus `infer/src/ops/tests.rs` variable-name collisions before deleting. Landed in local M3c cleanup (`c3f65f7`).
 - [x] `[L+R]` **Delete** legacy contiguous CPU-offload state from `infer/src/model/kv_cache.rs` — `k_host`, `v_host`, `ensure_on_gpu`, `offload_if_needed`, `OFFLOAD_BLOCK_SIZE = 64`, `gpu_has_full_seq`, `offloaded_len`, `max_gpu_seq_len`. Landed in local M3c cleanup (`c3f65f7`).
 - [x] `[L+R]` Rewrite the matching mirror in `tests/test_kv_cache.py` to the resident-only metadata model that still exists. Landed in local M3c cleanup (`c3f65f7`).
