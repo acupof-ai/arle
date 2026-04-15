@@ -161,9 +161,28 @@ requires TC / IMMA — Option C below).
 
 vLLM and SGLang both delegate quant KV decode to this upstream
 FlashInfer API. Our in-tree `flashinfer_decode.cu` wrapper is
-BF16-only today, but the FlashInfer 0.6.6 API we already link has
-a `trtllm_batch_decode_with_kv_cache` function that takes FP8 K/V
-and handles the fused dequant + IMMA / TC path internally.
+BF16-only today.
+
+**2026-04-15 correction (Codex investigation result)**:
+`trtllm_batch_decode_with_kv_cache` in FlashInfer 0.6.3 — the
+version we already link — is **Python-only**, defined at
+`flashinfer/decode.py:2104`. There is no precompiled `.so` exposing
+the symbol (`nm` returns nothing for `trtllm_batch_decode*`), and
+the closest C++ helper `trtllm_paged_attention_decode` in
+`data/csrc/trtllm_fmha_kernel_launcher.cu` is exported through
+TVM-FFI as `__tvm_ffi_trtllm_paged_attention_decode` — not a normal
+C ABI we can FFI to without vendoring the TVM-FFI runtime as a
+dependency. vLLM and SGLang both call this through Python, not
+through a C ABI.
+
+The next-closest path that IS callable from C++ today:
+**`flashinfer::BatchDecodeWithPagedKVCacheDispatched`** at
+`/usr/local/lib/python3.12/dist-packages/flashinfer/data/include/flashinfer/attention/decode.cuh:741`.
+It is a generic templated paged decode entry point, not the TRTLLM
+XQA kernel, but it IS a real header we can include and link to.
+Quantised dispatch through this path needs additional per-block
+scale plumbing on our side, but it avoids the TVM-FFI vendoring
+problem.
 
 Effort: unknown without a prototype. The bindings would add:
 
