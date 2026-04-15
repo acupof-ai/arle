@@ -1,0 +1,53 @@
+{
+  "label": "longseq-int8-optionA",
+  "results": [
+    {
+      "label": "longseq-int8-optionA-4000",
+      "input_target": 4000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 756.8987409995316,
+      "itl_p50_ms": 37.00485999979719,
+      "itl_p99_ms": 37.53669700039609,
+      "wall_s": 5.459606148000603,
+      "tok_per_sec": 23.44491462023789
+    },
+    {
+      "label": "longseq-int8-optionA-8000",
+      "input_target": 8000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 811.9419449994894,
+      "itl_p50_ms": 40.89330799979507,
+      "itl_p99_ms": 41.31993783979851,
+      "wall_s": 5.998314341999503,
+      "tok_per_sec": 21.33932846829297
+    },
+    {
+      "label": "longseq-int8-optionA-16000",
+      "input_target": 16000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 2098.347223000019,
+      "itl_p50_ms": 48.48381299962057,
+      "itl_p99_ms": 49.652324560447596,
+      "wall_s": 8.254935396000292,
+      "tok_per_sec": 15.505875438106878
+    },
+    {
+      "label": "longseq-int8-optionA-25000",
+      "input_target": 25000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 115,
+      "ttft_ms": 6389.9915580004745,
+      "itl_p50_ms": 56.87153300004866,
+      "itl_p99_ms": 57.92600734857842,
+      "wall_s": 12.929064900999947,
+      "tok_per_sec": 8.894688121729962
+    }
+  ]
+}

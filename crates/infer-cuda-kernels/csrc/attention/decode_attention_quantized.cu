@@ -111,55 +111,111 @@ __global__ void decode_attention_int8_partial_kernel(
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    // ── Warp-parallel token processing with vectorized loads ──
-    for (int t = warp_id; t < my_tokens; t += NUM_WARPS) {
-        int global_t = my_start + t;
-        int pool_idx = kv_indices[tok_start_global + global_t];
-        int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
-        int scale_off = pool_idx * num_kv_heads + kv_head;
+    __shared__ int8_t smem_k[2][TILE_TOKENS][HEAD_DIM];
+    __shared__ int8_t smem_v[2][TILE_TOKENS][HEAD_DIM];
+    __shared__ float smem_k_scales[2][TILE_TOKENS];
+    __shared__ float smem_v_scales[2][TILE_TOKENS];
 
-        float k_scale = K_scales[scale_off];
-
-        // QK dot product — vectorized INT8 load (4 bytes = 4× INT8 per thread)
-        float qk = 0.0f;
-        {
-            int d_base = lane_id * EPT;
-            // Load 4 consecutive INT8 values as a single 32-bit word (coalesced)
-            int32_t k_packed = *reinterpret_cast<const int32_t*>(&K_data[base + d_base]);
-            #pragma unroll
-            for (int i = 0; i < EPT; i++) {
-                float k_val = static_cast<float>(static_cast<int8_t>((k_packed >> (i * 8)) & 0xFF)) * k_scale;
-                qk += q_reg[i] * k_val;
-            }
-        }
-        qk = warp_reduce_sum(qk);
-
-        // Online softmax
-        float m_new = fmaxf(m_local, qk);
-        float exp_diff = __expf(m_local - m_new);
-        float exp_qk = __expf(qk - m_new);
-        float l_new = l_local * exp_diff + exp_qk;
-
-        // V accumulation — vectorized INT8 load
-        float v_scale = V_scales[scale_off];
-        {
-            int d_base = lane_id * EPT;
-            int32_t v_packed = *reinterpret_cast<const int32_t*>(&V_data[base + d_base]);
-            #pragma unroll
-            for (int i = 0; i < EPT; i++) {
-                float v_val = static_cast<float>(static_cast<int8_t>((v_packed >> (i * 8)) & 0xFF)) * v_scale;
-                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
-            }
-        }
-
-        m_local = m_new;
-        l_local = l_new;
-    }
-
-    // ── Cross-warp merge (within this block) ──
+    // ── Cross-warp merge scratch (within this block) ──
     __shared__ float smem_m[NUM_WARPS];
     __shared__ float smem_l[NUM_WARPS];
     __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
+
+    const int d_base = lane_id * EPT;
+    int tile_count = (my_tokens + TILE_TOKENS - 1) / TILE_TOKENS;
+
+    // Preload the first tile before entering the pipelined loop.
+    {
+        int tile_tokens = min(TILE_TOKENS, my_tokens);
+        for (int t = warp_id; t < tile_tokens; t += NUM_WARPS) {
+            int global_t = my_start + t;
+            int pool_idx = kv_indices[tok_start_global + global_t];
+            int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
+            int scale_off = pool_idx * num_kv_heads + kv_head;
+
+            __pipeline_memcpy_async(
+                &smem_k[0][t][d_base],
+                &K_data[base + d_base],
+                sizeof(int8_t) * EPT);
+            __pipeline_memcpy_async(
+                &smem_v[0][t][d_base],
+                &V_data[base + d_base],
+                sizeof(int8_t) * EPT);
+            if (lane_id == 0) {
+                __pipeline_memcpy_async(&smem_k_scales[0][t], &K_scales[scale_off], sizeof(float));
+                __pipeline_memcpy_async(&smem_v_scales[0][t], &V_scales[scale_off], sizeof(float));
+            }
+        }
+        __pipeline_commit();
+    }
+
+    // ── Warp-parallel token processing with tiled async preload ──
+    for (int tile_idx = 0; tile_idx < tile_count; tile_idx++) {
+        int stage = tile_idx & 1;
+        int tile_start = tile_idx * TILE_TOKENS;
+        int tile_tokens = min(TILE_TOKENS, my_tokens - tile_start);
+
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        int next_tile_idx = tile_idx + 1;
+        if (next_tile_idx < tile_count) {
+            int next_stage = next_tile_idx & 1;
+            int next_tile_start = next_tile_idx * TILE_TOKENS;
+            int next_tile_tokens = min(TILE_TOKENS, my_tokens - next_tile_start);
+
+            for (int t = warp_id; t < next_tile_tokens; t += NUM_WARPS) {
+                int global_t = my_start + next_tile_start + t;
+                int pool_idx = kv_indices[tok_start_global + global_t];
+                int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
+                int scale_off = pool_idx * num_kv_heads + kv_head;
+
+                __pipeline_memcpy_async(
+                    &smem_k[next_stage][t][d_base],
+                    &K_data[base + d_base],
+                    sizeof(int8_t) * EPT);
+                __pipeline_memcpy_async(
+                    &smem_v[next_stage][t][d_base],
+                    &V_data[base + d_base],
+                    sizeof(int8_t) * EPT);
+                if (lane_id == 0) {
+                    __pipeline_memcpy_async(&smem_k_scales[next_stage][t], &K_scales[scale_off], sizeof(float));
+                    __pipeline_memcpy_async(&smem_v_scales[next_stage][t], &V_scales[scale_off], sizeof(float));
+                }
+            }
+            __pipeline_commit();
+        }
+
+        for (int t = warp_id; t < tile_tokens; t += NUM_WARPS) {
+            float k_scale = smem_k_scales[stage][t];
+
+            float qk = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                float k_val = static_cast<float>(smem_k[stage][t][d_base + i]) * k_scale;
+                qk += q_reg[i] * k_val;
+            }
+            qk = warp_reduce_sum(qk);
+
+            // Online softmax
+            float m_new = fmaxf(m_local, qk);
+            float exp_diff = __expf(m_local - m_new);
+            float exp_qk = __expf(qk - m_new);
+            float l_new = l_local * exp_diff + exp_qk;
+
+            float v_scale = smem_v_scales[stage][t];
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                float v_val = static_cast<float>(smem_v[stage][t][d_base + i]) * v_scale;
+                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+            }
+
+            m_local = m_new;
+            l_local = l_new;
+        }
+
+        __syncthreads();
+    }
 
     if (lane_id == 0) {
         smem_m[warp_id] = m_local;
