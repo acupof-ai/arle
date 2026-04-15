@@ -4,7 +4,7 @@ Round 2 (April 2026) collapsed the `infer/src/` root from 39 top-level `.rs` fil
 
 | # | Item | Owner | Status | Plan |
 |---|---|---|---|---|
-| F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** (`19a433d`) | [`backend-metal-split.md`](backend-metal-split.md) |
+| F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** — commits `64c0baa` / `32875b2` / `19a433d` / `f59238c` | §F1 below |
 | F2 | Audit `graph_pool.rs` — deliberate scaffold or dead code? (now at `crates/infer-cuda-kernels/src/graph_pool.rs` post `a4e12f5`) | ckl (decision), remote CUDA host (if wire-in) | **parked** (`Option B`) | §F2 below |
 | F3 | Document `--features cuda,no-cuda` type-check invocation | me | **done** (commit `4b493c8`) | — |
 | Round 3 | Extracted-runtime split | remote Linux CUDA host | **reverted** (2026-04-15, Route-A) | [`../archives/cuda-crate-extraction.md`](../archives/cuda-crate-extraction.md) |
@@ -36,7 +36,10 @@ only `graph_pool.rs` (independent module, no internal consumers; post
 ## F1 · Split `backend/metal.rs`
 
 Owner: codex on local Mac.
-Plan doc: [`backend-metal-split.md`](backend-metal-split.md) (self-contained, codex-executable).
+Plan doc: retired — the original `docs/plans/backend-metal-split.md` was
+archived after execution and then pruned 2026-04-15 once every reference
+from active docs was replaced with commit refs. Historical execution rationale
+is recoverable via `git log` on the commits below if needed.
 Prerequisite: commit `7a876e1` or later (Round 2 housekeeping).
 
 Status: done on 2026-04-13.
@@ -76,7 +79,7 @@ Local Metal regression benchmark against a pre-split baseline on `mlx-community/
 - `cargo clippy -p infer --no-default-features --features metal -- -D warnings`
 - `cargo check -p infer --no-default-features --features metal --bin metal_bench --bin metal_request --bin metal_serve`
 
-No line-count ranges exceeded (see §2 in the plan doc). Zero semantic changes — this is pure relocation.
+No line-count ranges exceeded. Zero semantic changes — this was pure relocation.
 
 When F1 lands, update the status row in the table above with the final commit SHA and move on to Round 3 (or F2 if it hasn't been decided yet).
 

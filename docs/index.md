@@ -119,12 +119,5 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/wins/2026-03-31-throughput-profiling.md](experience/wins/2026-03-31-throughput-profiling.md) | | Profiling-driven throughput optimization |
 | [experience/wins/2026-03-31-nsys-profiling-decode.md](experience/wins/2026-03-31-nsys-profiling-decode.md) | | nsys profiling methodology |
 | **Archives (inactive)** | | |
-| [archives/quantization-architecture-design-spec.md](archives/quantization-architecture-design-spec.md) | Archived 2026-04-15 | LinearWeight enum design spec — never implemented; TurboQuant became the actual production path |
-| [archives/sglang-parity-qwen3-8b.md](archives/sglang-parity-qwen3-8b.md) | Archived 2026-04-15 | Qwen3-8B SGLang parity — Steps 1–4 done, C=4 exceeds. (Qwen3.5 parity is still active under `plans/qwen35-sglang-parity.md`) |
-| [archives/backend-metal-split.md](archives/backend-metal-split.md) | Archived 2026-04-15 | F1 metal split executed — commits `64c0baa` / `32875b2` / `19a433d` / `f59238c` |
-| [archives/2026-04-13-cuda-kv-long-prefix-followup.md](archives/2026-04-13-cuda-kv-long-prefix-followup.md) | Archived 2026-04-15 | KVCache offload panic in legacy CPU offload path; whole code path slated for deletion in tiered-kv M3c |
-| [archives/cuda-crate-extraction.md](archives/cuda-crate-extraction.md) | Archived | 4-shell-crate extraction proposal reverted by Route-A on 2026-04-15 |
-| [archives/art-grade-architecture-for-long-agent-infer.md](archives/art-grade-architecture-for-long-agent-infer.md) | Archived | Earlier "art-grade architecture" workspace topology proposal — reverted by Route-A; PR discipline still applies |
-| [archives/mlx-optimization.md](archives/mlx-optimization.md) | Archived | Early MLX optimization plan — superseded by current Metal roadmap |
-| [archives/mlx-metal-phase1-validation.md](archives/mlx-metal-phase1-validation.md) | Archived | MLX Metal Phase 1 validation record |
-| [archives/mlx-performance-analysis.md](archives/mlx-performance-analysis.md) | Archived | MLX performance analysis snapshot |
+| [archives/cuda-crate-extraction.md](archives/cuda-crate-extraction.md) | Archived | Round-3 four-shell-crate extraction proposal reverted by Route-A on 2026-04-15; kept as the cautionary "overly broad" reference cited from the active kernel-crate blueprint |
+| [archives/art-grade-architecture-for-long-agent-infer.md](archives/art-grade-architecture-for-long-agent-infer.md) | Archived | Earlier "art-grade architecture" workspace topology proposal — reverted by Route-A, but §六 governance and §七 acceptance criteria are still load-bearing for current architecture decisions |

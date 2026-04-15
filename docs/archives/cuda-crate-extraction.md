@@ -9,7 +9,7 @@
 **Owner:** remote Linux CUDA host (the only environment where nvcc + real GPU tests can run)
 **Prerequisite commits:**
 - `7a876e1` (Round 2 housekeeping) — backend/{cuda,metal,cpu,runtime} layout in place.
-- All F1 commits from `docs/plans/backend-metal-split.md` — Metal must be split first so `backend/metal/*` is a clean set of topical files, not one 1766-line monolith.
+- All F1 commits (Metal split) — Metal must be split first so `backend/metal/*` is a clean set of topical files, not one 1766-line monolith. F1 is tracked in `../plans/backend-reorg-followups.md` §F1; the original plan doc `backend-metal-split.md` was pruned 2026-04-15 after execution.
 - A clean working tree on `main`, current with `origin/main`.
 
 **Status:** design complete, not yet executed

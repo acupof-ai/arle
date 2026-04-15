@@ -62,6 +62,3 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 
 Llama 不在这条近期路线的优先级里。
 
-## Historical Notes
-
-`docs/archives/` 下的 MLX 文档保留的是历史阶段记录，很多内容描述的是更早的 Python/asyncio 原型路径，不应当再当作当前实现文档使用。
