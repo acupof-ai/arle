@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Throughput sweep benchmark: vary input/output lengths and concurrency.
 
+**DEPRECATED** — new wins MUST use ``scripts/bench_guidellm.sh <label>``.
+This script is kept only so historical wins in ``docs/experience/wins/``
+remain reproducible. See ``docs/plans/guidellm-integration.md`` for the
+canonical benchmark plumbing.
+
 Measures throughput (output tok/s), TTFT, and ITL across different
 sequence length configurations. Results are comparable with sglang/vllm benchmarks.
 
@@ -23,6 +28,13 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass, field
+
+print(
+    "DEPRECATED: scripts/bench_throughput_sweep.py is superseded by "
+    "scripts/bench_guidellm.sh (canonical). This script is kept only for "
+    "reproducing historical wins. See docs/plans/guidellm-integration.md.",
+    file=sys.stderr,
+)
 
 try:
     import httpx
