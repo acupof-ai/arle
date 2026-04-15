@@ -797,6 +797,37 @@ impl RadixCache {
             })
             .is_some()
     }
+
+    /// Stamp the session affinity metadata for a cached block.
+    pub fn set_block_session_id(&mut self, block: BlockId, session_id: Option<SessionId>) -> bool {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.block_id == Some(block))
+            .map(|node| {
+                node.session_id = session_id;
+            })
+            .is_some()
+    }
+
+    /// Stamp or clear the logical soft-pin deadline for a cached block.
+    pub fn set_block_soft_pin_until(
+        &mut self,
+        block: BlockId,
+        soft_pin_until: Option<u64>,
+    ) -> bool {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.block_id == Some(block))
+            .map(|node| {
+                node.soft_pin_until = soft_pin_until;
+            })
+            .is_some()
+    }
+
+    /// Current logical clock value used by lookup/insert/eviction bookkeeping.
+    pub fn logical_clock(&self) -> u64 {
+        self.clock
+    }
 }
 
 // ============================================================================
@@ -1537,5 +1568,30 @@ mod tests {
                 hit_kind: HitKind::Miss,
             }]
         );
+    }
+
+    #[test]
+    fn metadata_mutators_stamp_session_and_soft_pin() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        assert!(cache.set_block_session_id(BlockId(10), Some(SessionId::from("session-1"))));
+        assert!(cache.set_block_soft_pin_until(BlockId(10), Some(42)));
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .unwrap();
+        assert_eq!(
+            cache.nodes[idx].session_id,
+            Some(SessionId::from("session-1"))
+        );
+        assert_eq!(cache.nodes[idx].soft_pin_until, Some(42));
+
+        assert!(cache.set_block_session_id(BlockId(10), None));
+        assert!(cache.set_block_soft_pin_until(BlockId(10), None));
+        assert_eq!(cache.nodes[idx].session_id, None);
+        assert_eq!(cache.nodes[idx].soft_pin_until, None);
     }
 }
