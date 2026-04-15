@@ -16,8 +16,6 @@ use infer::hf_hub::resolve_model_source;
 use infer::logging::init_default;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
-#[cfg(all(not(feature = "cuda"), any(feature = "metal", feature = "cpu")))]
-use log::warn;
 
 pub fn run() -> Result<()> {
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
@@ -40,13 +38,6 @@ pub fn run() -> Result<()> {
         let backend_name = engine.backend_name().to_string();
 
         if let Some(max_kv) = args.max_gpu_kv {
-            #[cfg(feature = "cuda")]
-            log::info!(
-                "Setting max GPU KV to {} tokens (offload test mode)",
-                max_kv
-            );
-            #[cfg(not(feature = "cuda"))]
-            warn!("Ignoring --max-gpu-kv: only supported by the CUDA backend");
             engine.set_max_gpu_kv(max_kv);
         }
         log::info!(

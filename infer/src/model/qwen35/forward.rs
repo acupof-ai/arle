@@ -70,24 +70,12 @@ impl GenerationState for Qwen35State {
         self.recurrent_state.restore_snapshot(&self.ctx)
     }
 
-    fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        self.base.set_max_gpu_kv(max_tokens);
-    }
-
     fn set_max_seq_len(&mut self, max_seq: usize) {
         self.base.set_max_seq_len(max_seq);
     }
 
     fn set_kv_dtype(&mut self, dtype: crate::model::kv_cache::KVCacheDtype) {
         self.base.set_kv_dtype(dtype);
-    }
-
-    fn offload_kv_if_needed(&mut self) -> Result<()> {
-        self.base.offload_kv_if_needed(&self.ctx)
-    }
-
-    fn prefetch_kv_to_gpu(&mut self) -> Result<()> {
-        self.base.kv_cache.prefetch_to_gpu(&self.ctx)
     }
 
     fn migrate_kv_to_paged(
@@ -191,11 +179,6 @@ impl ModelForward for Qwen35Model {
     }
 
     fn forward_prefill(&self, tokens: &[u32], state: &mut Self::State) -> Result<()> {
-        // Prefetch offloaded KV before prefill.
-        if state.base.kv_cache.has_offloaded() {
-            state.base.kv_cache.prefetch_to_gpu(&self.ctx)?;
-        }
-
         let logits =
             self.prefill_forward(tokens, &mut state.base.kv_cache, &mut state.recurrent_state)?;
         state.base.prefill_logits = Some(logits);

@@ -50,11 +50,6 @@ impl<M: ModelForward> Scheduler<M> {
 
             let effective = if exact_full_prefix_hit {
                 if state.supports_partial_prefix() {
-                    if let Err(e) = state.prefetch_kv_to_gpu() {
-                        error!("Request {}: prefix prefetch failed: {}", req.id, e);
-                        req.phase = Phase::Finished;
-                        return;
-                    }
                     // An exact prompt match can safely keep the prefix up to N-1
                     // tokens and replay only the final prompt token. This refreshes
                     // the next-token logits without duplicating it in KV.
@@ -102,14 +97,8 @@ impl<M: ModelForward> Scheduler<M> {
                 pool_prefix_len = 0;
                 req.prompt_tokens.clone()
             } else if prefix_len > 0 && prefix_len == cached_prompt_len {
-                if let Err(e) = state.prefetch_kv_to_gpu() {
-                    error!("Request {}: prefix prefetch failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
-                    return;
-                }
                 // Truncate contiguous KV cache to prefix length — removes stale
-                // decode tokens from the previous request. Without this, migration
-                // to paged pool reads invalid memory (CUDA_ERROR_ILLEGAL_ADDRESS).
+                // decode tokens from the previous request before migration reads it.
                 if let Err(e) = state.truncate_to(prefix_len) {
                     error!("Request {}: truncate on prefix hit failed: {}", req.id, e);
                     if let Err(e2) = state.reset() {
@@ -155,11 +144,6 @@ impl<M: ModelForward> Scheduler<M> {
                 self.slot_materialized_prompt_lens[si] = prefix_len;
                 req.prompt_tokens[prefix_len..].to_vec()
             } else if prefix_len > 0 {
-                if let Err(e) = state.prefetch_kv_to_gpu() {
-                    error!("Request {}: prefix prefetch failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
-                    return;
-                }
                 info!(
                     "Request {}: prefix PARTIAL {}/{} tokens",
                     req.id, prefix_len, prompt_len

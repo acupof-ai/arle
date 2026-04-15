@@ -93,19 +93,12 @@ pub trait GenerationState {
     fn reset(&mut self) -> Result<()>;
     /// Truncate KV cache to `len` tokens, keeping the first `len` tokens.
     fn truncate_to(&mut self, len: usize) -> Result<()>;
-    /// Set max KV tokens on GPU. Excess offloads to CPU.
-    fn set_max_gpu_kv(&mut self, max_tokens: usize);
-    /// Set the maximum sequence length (total, GPU + CPU) for the KV cache.
+    /// Set the maximum contiguous sequence length for the KV cache.
     /// Must be called before the KV cache is first initialized.
     fn set_max_seq_len(&mut self, max_seq: usize);
     /// Set KV cache quantization dtype (BF16 or INT8).
     /// Must be called before the KV cache is first initialized.
     fn set_kv_dtype(&mut self, dtype: kv_cache::KVCacheDtype);
-    /// Offload excess KV to CPU if over GPU budget. Called between requests.
-    fn offload_kv_if_needed(&mut self) -> Result<()>;
-    /// Prefetch any CPU-offloaded KV back to GPU before prefix reuse reads the
-    /// contiguous cache directly. No-op when nothing is offloaded.
-    fn prefetch_kv_to_gpu(&mut self) -> Result<()>;
 
     /// Migrate KV data from contiguous cache to paged pool.
     /// Called after prefill completes, before first decode step.
