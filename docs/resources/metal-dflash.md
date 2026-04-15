@@ -119,6 +119,7 @@ path is already validated.
 ./target/release/metal_serve \
   --model-path mlx-community/Qwen3-4B-bf16 \
   --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --warmup 1 \
   --port 8000
 ```
 
