@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post Metal Qwen3 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
+Last refreshed: 2026-04-15 (post Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -74,6 +74,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md](experience/wins/2026-04-15-metal-qwen35-same-length-batch-decode.md) | | Metal live runtime gained a real Qwen3.5 same-length compiled-step batch path; the direct path improved slightly, but HTTP quick sweep stayed flat because per-step batch-state rebuild still dominates |
 | [experience/wins/2026-04-15-metal-qwen3-same-length-batch-decode.md](experience/wins/2026-04-15-metal-qwen3-same-length-batch-decode.md) | | Metal live runtime gained a real Qwen3 same-length decode batch path; focused Qwen3 serving improved, while Qwen3.5 stayed effectively flat |
 | [experience/wins/2026-04-15-metal-dflash-rerun-local.md](experience/wins/2026-04-15-metal-dflash-rerun-local.md) | | Metal DFlash rerun on current tree: direct Qwen3 decode-heavy win still holds, but `metal_serve` stays queue-shaped under concurrency because DFlash is still on the legacy serial runtime |
 | [experience/wins/2026-04-15-bench-metal-rerun.md](experience/wins/2026-04-15-bench-metal-rerun.md) | | Metal rerun snapshot on `f7b3b84`: direct path stayed flat and `metal_serve` quick sweep reproduced the post-`M0.2b` shape (`512/256 C=4` at `65.5 tok/s`, `TTFT p50 1742ms`) |

@@ -26,7 +26,7 @@ Benchmark rule:
 | Milestone | Status | Notes |
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
-| `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, and `M0.2c` Qwen3 same-length decode batching landed locally; throughput exit is still blocked on heterogeneous decode and Qwen3.5 |
+| `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, `M0.2c` Qwen3 same-length decode batching, and `M0.2d` Qwen3.5 same-length decode batching landed locally; throughput exit is still blocked on variable-length decode and per-step batch-state rebuild cost |
 | `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
 | `M0.4` memory + reuse observability | Not shipped | current stats still stop at queue / KV utilization / TTFT histograms |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
@@ -76,8 +76,9 @@ Current state:
   cleanup.
 - `metal_serve` still falls back to the legacy serial runtime when Metal
   DFlash is enabled.
-- aggregate throughput is still below the old serial baseline because decode is
-  request-by-request inside the scheduler loop.
+- aggregate throughput is still below the full milestone exit because the live
+  runtime only batches narrow same-length decode cases today, and Qwen3.5 still
+  rebuilds batched state on every decode step.
 
 Required sub-gates:
 
@@ -117,8 +118,8 @@ Acceptance:
   serial runtime does
 
 Status: local runtime landed on 2026-04-15; `M0.2c` added same-length Qwen3
-decode batching. TTFT exit passed, but the general throughput exit is still
-pending.
+decode batching and `M0.2d` added same-length Qwen3.5 decode batching. TTFT
+exit passed, but the general throughput exit is still pending.
 
 Verification:
 
@@ -149,11 +150,15 @@ Interpretation:
   still not the full exit:
   - focused Qwen3 server check: `C=4` throughput `23.30 -> 25.39 tok/s`
     (`+9.0%`), `TTFT p50 3559 -> 2716 ms` (`-23.7%`)
-  - quick Qwen3.5 sweep stayed effectively flat: `512/256 C=4`
-    `65.5 -> 66.4 tok/s`, `TTFT p50 1742 -> 1737 ms`
-  - interpretation: the runtime shape improved for Qwen3, but the serving-wide
-    throughput exit remains blocked on heterogeneous decode batching and a real
-    Qwen3.5 batched path
+  - `M0.2d` added a real same-length Qwen3.5 batched compiled-step path:
+    direct `128/128` improved from `82.0 -> 84.2 tok/s` generation TPS
+    (`+2.7%`)
+  - quick Qwen3.5 sweep still stayed effectively flat: `512/256 C=4`
+    `66.4 -> 66.2 tok/s`, `TTFT p50 1737 -> 1757 ms`
+  - interpretation: the runtime shape improved for Qwen3, and Qwen3.5 now has
+    a real batched decode path, but the serving-wide throughput exit remains
+    blocked on variable-length decode and the cost of rebuilding batched
+    request state each step
 
 #### `M0.2c` Runtime retirement proof
 
