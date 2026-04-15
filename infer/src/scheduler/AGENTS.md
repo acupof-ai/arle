@@ -28,10 +28,10 @@ works with any backend. Load before editing any scheduler internals.
 2. **`BlockId` = physical pool page index** (`u32`), not a content hash.
    Content hashing uses `crate::types::BlockFingerprint` and only exists at
    persist/migrate boundaries (M4/M5). See `infer/src/kv_tier/AGENTS.md`.
-3. **Prefix-cache retention caps** (`cuda/core.rs`):
-   - `PREFIX_CACHE_HIGH_WATER = 0.75` → cleanup trigger
-   - `PREFIX_CACHE_LOW_WATER  = 0.50` → cleanup target
-   - `PREFIX_CACHE_RETAIN_HARD_CAP = 0.90` → new prompts no longer publish
+3. **Prefix-cache retention caps** (`SchedulerConfig::runtime_defaults`):
+   - `prefix_cache_high_water = 0.75` → cleanup trigger
+   - `prefix_cache_low_water = 0.50` → cleanup target
+   - `prefix_cache_retain_hard_cap = 0.90` → new prompts no longer publish
      above this, so fresh admissions can't starve on pinned-cold pages.
    These are tuned — change only with a bench snapshot.
 4. **`PREFIX_CACHE_BLOCK_SIZE = 16` matches the paged-pool page size.**
