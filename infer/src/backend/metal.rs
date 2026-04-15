@@ -448,10 +448,7 @@ impl InferenceBackend for MetalBackend {
             self.weights = Some(weights);
             log::info!("  weights loaded into Metal unified memory");
 
-            let dflash_options = self
-                .dflash_options
-                .clone()
-                .or(dflash::MetalDflashOptions::from_env()?);
+            let dflash_options = self.dflash_options.clone();
             self.dflash = if let Some(ref options) = dflash_options {
                 Some(dflash::MetalDflashRuntime::load(options, &config)?)
             } else {

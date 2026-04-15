@@ -12,7 +12,8 @@
 #![cfg(feature = "metal")]
 
 use clap::Parser;
-use infer::backend::runtime::spawn_metal_runtime_handle_from_path;
+use infer::backend::metal::{MetalBackendOptions, MetalDflashOptions};
+use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options;
 use infer::http_server::build_app;
 use infer::logging;
 use log::info;
@@ -34,6 +35,15 @@ struct Args {
     /// Maximum waiting requests before rejecting new submissions.
     #[arg(long, default_value_t = 256)]
     max_waiting: usize,
+
+    /// Enable Metal DFlash with the given draft model path or HuggingFace repo.
+    #[arg(long, value_name = "PATH_OR_REPO")]
+    dflash_draft_model: Option<String>,
+
+    /// Override the DFlash speculative block size.
+    /// Defaults to the draft config; lower values can reduce throughput.
+    #[arg(long)]
+    speculative_tokens: Option<usize>,
 }
 
 #[tokio::main]
@@ -41,8 +51,17 @@ async fn main() {
     logging::init_default();
 
     let args = Args::parse();
-    let handle = spawn_metal_runtime_handle_from_path(&args.model_path, args.max_waiting)
-        .expect("failed to start Metal runtime");
+    let handle = spawn_metal_runtime_handle_from_path_with_options(
+        &args.model_path,
+        MetalBackendOptions {
+            dflash: args.dflash_draft_model.as_ref().map(|draft_model| MetalDflashOptions {
+                draft_model: draft_model.clone(),
+                speculative_tokens: args.speculative_tokens,
+            }),
+        },
+        args.max_waiting,
+    )
+    .expect("failed to start Metal runtime");
 
     let app = build_app(handle);
     let addr = format!("0.0.0.0:{}", args.port);

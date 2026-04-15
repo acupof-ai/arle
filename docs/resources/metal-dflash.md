@@ -27,7 +27,7 @@ Supported now:
 - Entry points:
   - `metal_request`
   - `metal_bench`
-  - `metal_serve` via environment variables
+  - `metal_serve`
 
 Not supported yet:
 
@@ -109,18 +109,13 @@ path is already validated.
 
 ## Serving
 
-`metal_serve` does not expose explicit DFlash CLI flags today. Use environment
-variables instead:
+`metal_serve` exposes the same DFlash controls as the request/bench tools:
 
 ```bash
-export AGENT_INFER_METAL_DFLASH_MODEL=z-lab/Qwen3-4B-DFlash-b16
-./target/release/metal_serve --model-path mlx-community/Qwen3-4B-bf16 --port 8000
-```
-
-Optional override:
-
-```bash
-export AGENT_INFER_METAL_DFLASH_SPECULATIVE_TOKENS=16
+./target/release/metal_serve \
+  --model-path mlx-community/Qwen3-4B-bf16 \
+  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
+  --port 8000
 ```
 
 ## Configuration
