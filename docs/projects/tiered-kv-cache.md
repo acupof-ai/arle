@@ -84,7 +84,7 @@ M2b, M0.3, M3a, M3b, and M3c all have **L4 remote acceptance sign-off as
 of 2026-04-15** — see the per-milestone win notes
 `docs/experience/wins/2026-04-15-tiered-kv-{m2b,m0.3-m3a,m3b,m3c}-remote.md`.
 Three 2026-04-16 follow-on commits are now on `main`: `d3d1e46`
-(Tier A coordinator wire + staged admission), `9e276cd` (Tier B
+(Tier A coordinator wire + staged admission), `e0f69f9` (Tier B
 publish-time fingerprints + disk round-trip test), and `9b01c2a`
 (Tier C O(1) radix block index + `SchedulerConfig` knobs). These land the
 local M3 promotion/runtime tranche; combined remote CUDA acceptance for the
@@ -1143,7 +1143,7 @@ original plan, and the M2/M3 expansions added by Codex 2026-04-15.
 | M3a | 1 | `HostPinnedPool` + `LocalCudaTransport` + `Node` field extension (structural) | **accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`) |
 | M3b | 1 | Coordinator OS thread + page lifecycle state machine + policy convergence + recompute fallback + `lookup_or_stage` interface (behavior, benchmark gate) | **accepted 2026-04-15 on L4** for the contract/runtime-wire tranche, with Tier A/B/C follow-on local landing and combined remote acceptance still pending |
 | M3c | 1 | T1→T0 promotion + delete legacy `model/kv_cache.rs` CPU offload (structural cleanup) | **accepted 2026-04-15 on L4** for the cleanup tranche; Tier A/B/C follow-on remote acceptance still pending |
-| M3 follow-on (Tier A/B/C) | 3 | Tier A coordinator wire + staged admission, Tier B publish-time fingerprints + disk round-trip test, Tier C O(1) radix `block_index` + `SchedulerConfig` knobs | **local landed** (`d3d1e46`, `9e276cd`, `9b01c2a`); remote CUDA acceptance pending |
+| M3 follow-on (Tier A/B/C) | 3 | Tier A coordinator wire + staged admission, Tier B publish-time fingerprints + disk round-trip test, Tier C O(1) radix `block_index` + `SchedulerConfig` knobs | **local landed** (`d3d1e46`, `e0f69f9`, `9b01c2a`); remote CUDA acceptance pending |
 | M4a | 1 | Disk format change + MLX wired-memory bindings (structural) | not started |
 | M4b | 1 | HTTP session save/load routes + fingerprint-reconciliation reload (behavior) | not started |
 | M5 | deferred | triggered, not scheduled — see §6 M5 | deferred |

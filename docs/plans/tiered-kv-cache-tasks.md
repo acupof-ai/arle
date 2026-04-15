@@ -332,7 +332,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 > **2026-04-16 follow-on on `main`**:
 > `d3d1e46 feat(kv-tier): wire M3 coordinator + staged admission` —
 > named coordinator thread + ticketed staged-admission re-entry.
-> `9e276cd feat(kv-tier): compute BlockFingerprint at publish + disk round-trip test` —
+> `e0f69f9 feat(kv-tier): compute BlockFingerprint at publish + disk round-trip test` —
 > publish-time fingerprints + local DiskStore fingerprint preservation.
 > `9b01c2a perf(kv-tier): O(1) RadixCache block lookup + SchedulerConfig knobs` —
 > private `block_index` + watermark/keepalive promotion onto config.
@@ -380,7 +380,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
       `Some(&coordinator_handle)` as `StagePlanner`, staged requests park in
       `stage_waiting`, and the run loop drains coordinator events before
       re-admitting `StagingCompleted` tickets.
-- [x] `[L+R]` Tier B local follow-on (`9e276cd`) — publish computes
+- [x] `[L+R]` Tier B local follow-on (`e0f69f9`) — publish computes
       `BlockFingerprint::compute_from_tokens`, routes radix inserts through
       `insert_with_fingerprints(...)`, and the local DiskStore round-trip
       test preserves both bytes and fingerprint.
