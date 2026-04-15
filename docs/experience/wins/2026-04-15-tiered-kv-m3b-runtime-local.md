@@ -20,8 +20,10 @@ without pretending that staged bytes can already complete back onto GPU.
   - `ReadyOnGpu` hits still drive same-slot resurrection
   - staged / recompute-advised hits are downgraded to cold prefill
   - no fake `StageTicket` completion path was introduced
-- Switched prefix-cache eviction scoring from `SchedulerSignals::default()` to
-  live queue/decode-derived signals.
+- Plumbed queue/decode state into the prefix-cache eviction call site so
+  future pressure-sensitive policies have a live signal to consume. Scoring
+  output is currently bit-identical — no `EvictionPolicy` impl reads queue
+  pressure yet.
 - Stamped published radix blocks with truthful runtime metadata:
   `BlockLocation::Gpu { slot }`, `byte_len`, `session_id`, and a conservative
   soft-pin keepalive deadline.
