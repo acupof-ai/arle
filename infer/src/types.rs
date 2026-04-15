@@ -26,50 +26,77 @@ pub struct BlockId(pub u32);
 
 /// Content-addressable fingerprint for a KV block's semantic identity.
 ///
-/// The **design target** is a cross-process / cross-node stable hash that
-/// lets two independent prefills of the same prefix agree on identity —
-/// the foundation for session save/load (tiered-kv-cache M4) and
-/// cross-node remote-tier reuse (M5+). The **current implementation**
-/// (`compute_from_tokens`) is a local placeholder: two `DefaultHasher`
-/// passes with different salt strings packed into 16 bytes. That gives
-/// within-process determinism — same tokens → same fingerprint — but
-/// **NOT** stability across processes or Rust toolchain upgrades, because
-/// `DefaultHasher` is explicitly allowed to change.
-///
-/// Upgrading to a stable hash (BLAKE3 / xxHash3 + full construction
-/// inputs: model fingerprint, layer index, KV format, parent fingerprint,
-/// block tokens) is the M4 call site's responsibility. Until then,
-/// fingerprints are meaningful only inside a single process run — just
-/// enough for the publish-time `RadixCache::insert_with_fingerprints`
-/// path and the local `DiskStore` round-trip test.
+/// The stable hash binds token content to the model identity, KV pool format,
+/// and radix-path parent chain so persisted blocks do not collide across
+/// mismatched engines or reload contexts. `compute_from_tokens` remains as a
+/// compatibility shim for local tests that only care about deterministic token
+/// sensitivity.
 ///
 /// Radix-tree nodes carry `Option<BlockFingerprint>`; `None` means a
 /// transient in-memory block that never went through the publish path.
+///
+/// Non-token inputs to `BlockFingerprint::compute`. These bind a
+/// fingerprint to the specific (model, numeric format, parent
+/// block) it was produced under, so two blocks with the same token
+/// content but different parent chains or different KV formats
+/// hash to different fingerprints. Required for M4 session
+/// save/load: a reloaded session under the wrong model or wrong
+/// format must not collide with a saved one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvContentContext<'a> {
+    /// Stable per-engine identifier for the model weights.
+    pub model_fingerprint: &'a [u8],
+    /// Pool numeric format wire-level u8 discriminant (stable numeric id).
+    pub kv_format_tag: u8,
+    /// Parent block's fingerprint, or None for the first block in a radix path.
+    pub parent: Option<BlockFingerprint>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BlockFingerprint(pub [u8; 16]);
 
 impl BlockFingerprint {
-    /// Compute a 16-byte content hash over a full-block token slice.
-    /// Local placeholder — final hash function (BLAKE3 vs xxHash3) deferred to M4.
-    /// Stability within a single process run is the only requirement.
-    pub fn compute_from_tokens(tokens: &[u32]) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut h1 = DefaultHasher::new();
-        tokens.hash(&mut h1);
-        "pegainfer-kv-v1-a".hash(&mut h1);
-        let v1 = h1.finish();
-
-        let mut h2 = DefaultHasher::new();
-        tokens.hash(&mut h2);
-        "pegainfer-kv-v1-b".hash(&mut h2);
-        let v2 = h2.finish();
-
+    /// Compute a stable 16-byte content fingerprint over the full block
+    /// identity chain.
+    pub fn compute(ctx: KvContentContext<'_>, tokens: &[u32]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"pegainfer-kv-v2\x00");
+        h.update(b"model\x00");
+        h.update(&(ctx.model_fingerprint.len() as u64).to_le_bytes());
+        h.update(ctx.model_fingerprint);
+        h.update(b"fmt\x00");
+        h.update(&[ctx.kv_format_tag]);
+        h.update(b"parent\x00");
+        match ctx.parent {
+            Some(fp) => {
+                h.update(&[1u8]);
+                h.update(&fp.0);
+            }
+            None => {
+                h.update(&[0u8]);
+            }
+        }
+        h.update(b"tokens\x00");
+        h.update(&(tokens.len() as u64).to_le_bytes());
+        for &t in tokens {
+            h.update(&t.to_le_bytes());
+        }
+        let full = h.finalize();
         let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&v1.to_le_bytes());
-        bytes[8..].copy_from_slice(&v2.to_le_bytes());
+        bytes.copy_from_slice(&full.as_bytes()[..16]);
         BlockFingerprint(bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn compute_from_tokens(tokens: &[u32]) -> Self {
+        Self::compute(
+            KvContentContext {
+                model_fingerprint: b"",
+                kv_format_tag: 0,
+                parent: None,
+            },
+            tokens,
+        )
     }
 }
 
@@ -198,6 +225,79 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn fingerprint_compute_is_stable_across_equivalent_context() {
+        let ctx = KvContentContext {
+            model_fingerprint: b"qwen3-4b",
+            kv_format_tag: 2,
+            parent: Some(BlockFingerprint([0x11; 16])),
+        };
+        let a = BlockFingerprint::compute(ctx, &[1, 2, 3, 4]);
+        let b = BlockFingerprint::compute(ctx, &[1, 2, 3, 4]);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_compute_differs_on_different_model() {
+        let tokens = [1, 2, 3, 4];
+        let a = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: b"qwen3-4b",
+                kv_format_tag: 1,
+                parent: None,
+            },
+            &tokens,
+        );
+        let b = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: b"glm4",
+                kv_format_tag: 1,
+                parent: None,
+            },
+            &tokens,
+        );
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_compute_differs_on_different_parent() {
+        let tokens = [1, 2, 3, 4];
+        let a = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: b"qwen3-4b",
+                kv_format_tag: 1,
+                parent: Some(BlockFingerprint([0x11; 16])),
+            },
+            &tokens,
+        );
+        let b = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: b"qwen3-4b",
+                kv_format_tag: 1,
+                parent: Some(BlockFingerprint([0x22; 16])),
+            },
+            &tokens,
+        );
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_compute_empty_tokens_is_non_trivial() {
+        let fp = BlockFingerprint::compute(
+            KvContentContext {
+                model_fingerprint: b"",
+                kv_format_tag: 0,
+                parent: None,
+            },
+            &[],
+        );
+
+        assert_ne!(fp, BlockFingerprint([0; 16]));
     }
 
     #[test]

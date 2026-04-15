@@ -22,6 +22,9 @@ rest_pat_in_fully_bound_structs = "warn"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
+[workspace.dependencies]
+blake3 = { version = "1", default-features = false, features = ["std"] }
+
 [package]
 name = "agent-infer"
 version = "0.1.0"

@@ -6,7 +6,7 @@ use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{
     ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
 };
-use crate::types::InferenceMode;
+use crate::types::{BlockFingerprint, InferenceMode, KvContentContext};
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
 /// Chosen to match the M0.3 target paged-pool page size so that when
@@ -49,6 +49,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) config: SchedulerConfig,
     pub(super) model: M,
     pub(super) tokenizer: Tokenizer,
+    /// Stable within one engine instance; real weight checksum upgrade is M5-era work.
+    pub(super) model_fingerprint: Vec<u8>,
     /// Per-slot states (KV caches, decode buffers). Stored separately from
     /// slot metadata so we can pass `&mut [M::State]` to batched decode.
     pub(super) states: Vec<M::State>,
@@ -269,6 +271,7 @@ impl<M: ModelForward> Scheduler<M> {
             config: config.clone(),
             model,
             tokenizer,
+            model_fingerprint: blake3::hash(model_id.as_bytes()).as_bytes().to_vec(),
             states,
             slot_materialized_prompt_lens,
             prefix_cache: RadixCache::with_soft_pin_keepalive(
@@ -450,13 +453,21 @@ impl<M: ModelForward> Scheduler<M> {
                 )
             })
             .collect();
-        let block_fingerprints: Vec<crate::types::BlockFingerprint> = (0..num_blocks)
-            .map(|i| {
-                crate::types::BlockFingerprint::compute_from_tokens(
-                    &prompt_tokens[i * block_size..(i + 1) * block_size],
-                )
-            })
-            .collect();
+        let mut parent_fingerprint: Option<BlockFingerprint> = None;
+        let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(num_blocks);
+        let kv_format_tag = self.paged_kv_pool.format.stable_tag();
+        for i in 0..num_blocks {
+            let fp = BlockFingerprint::compute(
+                KvContentContext {
+                    model_fingerprint: &self.model_fingerprint,
+                    kv_format_tag,
+                    parent: parent_fingerprint,
+                },
+                &prompt_tokens[i * block_size..(i + 1) * block_size],
+            );
+            block_fingerprints.push(fp);
+            parent_fingerprint = Some(fp);
+        }
 
         let inserted =
             self.prefix_cache
