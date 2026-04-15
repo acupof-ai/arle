@@ -437,6 +437,19 @@ impl RadixCache {
     /// Returns the number of tokens actually inserted (may be less than
     /// `tokens.len()` if `tokens` is not a whole number of blocks).
     pub fn insert(&mut self, tokens: &[u32], blocks: &[BlockId]) -> usize {
+        let fingerprints = vec![BlockFingerprint([0; 16]); blocks.len()];
+        self.insert_with_fingerprints(tokens, blocks, &fingerprints)
+    }
+
+    /// Insert (or update) a prefix of `tokens` with block IDs and their
+    /// per-block content fingerprints.
+    pub fn insert_with_fingerprints(
+        &mut self,
+        tokens: &[u32],
+        blocks: &[BlockId],
+        fps: &[BlockFingerprint],
+    ) -> usize {
+        assert_eq!(blocks.len(), fps.len(), "blocks/fps length mismatch");
         if blocks.is_empty() || tokens.is_empty() {
             return 0;
         }
@@ -469,6 +482,7 @@ impl RadixCache {
                     // Update block_id if child has the right size.
                     if child_tokens.len() == self.block_size && block_idx < blocks.len() {
                         self.nodes[child_idx].block_id = Some(blocks[block_idx]);
+                        self.nodes[child_idx].fingerprint = Some(fps[block_idx]);
                         block_idx += 1;
                     }
 
@@ -517,15 +531,17 @@ impl RadixCache {
                 while pos < tokens.len() && block_idx < blocks.len() {
                     let end = (pos + self.block_size).min(tokens.len());
                     let edge_tokens = tokens[pos..end].to_vec();
-                    let block_id = if edge_tokens.len() == self.block_size {
+                    let (block_id, fingerprint) = if edge_tokens.len() == self.block_size {
                         let bid = blocks[block_idx];
+                        let fp = fps[block_idx];
                         block_idx += 1;
-                        Some(bid)
+                        (Some(bid), Some(fp))
                     } else {
-                        None
+                        (None, None)
                     };
 
-                    let new_node = Node::new(edge_tokens.clone(), block_id, now);
+                    let mut new_node = Node::new(edge_tokens.clone(), block_id, now);
+                    new_node.fingerprint = fingerprint;
                     let new_idx = self.alloc_node(new_node);
 
                     let first_tok = edge_tokens[0];
@@ -543,6 +559,23 @@ impl RadixCache {
         }
 
         block_idx * self.block_size
+    }
+
+    /// Post-deserialization pass: zeroes out block_ids that cannot be mapped
+    /// to the fresh pool. Keeps tree shape so scheduler can re-populate
+    /// block_ids on next insert. If a block_index field exists on the cache,
+    /// the caller must rebuild it after this call (Tier D will merge those
+    /// paths).
+    pub fn rebuild_from_fingerprints(
+        &mut self,
+        known: &std::collections::HashSet<BlockFingerprint>,
+    ) {
+        for node in &mut self.nodes {
+            match node.fingerprint {
+                Some(fp) if known.contains(&fp) => {}
+                _ => node.block_id = None,
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1088,6 +1121,26 @@ mod tests {
     }
 
     #[test]
+    fn insert_stamps_fingerprint_on_cached_nodes() {
+        let mut cache = RadixCache::new(4);
+        cache.insert_with_fingerprints(
+            &[1, 2, 3, 4],
+            &[BlockId(10)],
+            &[BlockFingerprint([0x11; 16])],
+        );
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|n| n.block_id == Some(BlockId(10)))
+            .unwrap();
+        assert_eq!(
+            cache.nodes[idx].fingerprint,
+            Some(BlockFingerprint([0x11; 16]))
+        );
+    }
+
+    #[test]
     fn cached_block_count() {
         let mut cache = RadixCache::new(4);
         assert_eq!(cache.cached_block_count(), 0);
@@ -1365,6 +1418,30 @@ mod tests {
         assert_eq!(blocks_a, bids(&[10, 20]));
         assert_eq!(len_b, 8);
         assert_eq!(blocks_b, bids(&[10, 30]));
+    }
+
+    #[test]
+    fn rebuild_from_fingerprints_preserves_known_block_ids_after_deserialize() {
+        let mut cache = RadixCache::new(4);
+        let fps = [BlockFingerprint([0x11; 16]), BlockFingerprint([0x22; 16])];
+        cache.insert_with_fingerprints(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &[BlockId(10), BlockId(20)],
+            &fps,
+        );
+
+        let json = serde_json::to_string(&cache).expect("serialize RadixCache");
+        let mut restored: RadixCache = serde_json::from_str(&json).expect("deserialize RadixCache");
+        let known: std::collections::HashSet<BlockFingerprint> = fps.into_iter().collect();
+
+        restored.rebuild_from_fingerprints(&known);
+
+        let restored_block_ids: Vec<BlockId> = restored
+            .nodes
+            .iter()
+            .filter_map(|node| node.block_id)
+            .collect();
+        assert_eq!(restored_block_ids, vec![BlockId(10), BlockId(20)]);
     }
 
     #[test]
