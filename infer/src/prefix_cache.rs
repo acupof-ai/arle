@@ -40,7 +40,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::kv_tier::BlockLocation;
+use crate::kv_tier::{
+    BlockLocation, HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StagePlanner,
+    StageRequest,
+};
 use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
 
@@ -105,6 +108,15 @@ impl Node {
             soft_pin_until: None,
             children: HashMap::new(),
         }
+    }
+
+    fn is_tombstone(&self) -> bool {
+        self.block_id.is_none()
+            && (self.tier_location.is_some()
+                || self.session_id.is_some()
+                || self.fingerprint.is_some()
+                || self.byte_len != 0
+                || self.soft_pin_until.is_some())
     }
 }
 
@@ -245,6 +257,123 @@ impl RadixCache {
         }
 
         (rounded, matched_blocks)
+    }
+
+    /// Lookup cached blocks and classify whether they are ready in T0, need
+    /// staging from another tier, or have fallen back to an index-only miss.
+    ///
+    /// This is the local M3b contract surface. It does **not** wire the
+    /// scheduler to the coordinator yet; it only makes the lookup result
+    /// explicit and testable on the no-cuda / metal lanes.
+    pub fn lookup_or_stage(
+        &mut self,
+        tokens: &[u32],
+        heuristics: LookupHeuristics,
+        planner: Option<&dyn StagePlanner>,
+    ) -> LookupOutcome {
+        let now = self.tick();
+        let mut node_idx = Self::root();
+        let mut pos = 0;
+        let mut blocks = Vec::new();
+        let mut stage_requests = Vec::new();
+
+        loop {
+            self.nodes[node_idx].last_access = now;
+
+            if pos >= tokens.len() {
+                break;
+            }
+
+            let next_token = tokens[pos];
+            let Some(child_idx) = self.nodes[node_idx].children.get(&next_token).copied() else {
+                break;
+            };
+
+            let child_tokens = self.nodes[child_idx].tokens.clone();
+            let remaining = &tokens[pos..];
+            let match_len = child_tokens
+                .iter()
+                .zip(remaining.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if match_len < child_tokens.len() {
+                break;
+            }
+
+            pos += match_len;
+
+            let child = &mut self.nodes[child_idx];
+            child.last_access = now;
+
+            if let Some(block_id) = child.block_id {
+                child.ref_count += 1;
+                child.hit_count = child.hit_count.saturating_add(1);
+
+                let byte_len = child.byte_len.max(self.block_size as u32);
+                let (hit_kind, request) = match child.tier_location.clone() {
+                    Some(BlockLocation::HostPinned { .. }) => (
+                        HitKind::StagingFromHost,
+                        child.tier_location.clone().map(|from| StageRequest {
+                            block_id,
+                            from,
+                            byte_len,
+                        }),
+                    ),
+                    Some(BlockLocation::Disk { .. } | BlockLocation::Remote { .. }) => (
+                        HitKind::StagingFromDisk,
+                        child.tier_location.clone().map(|from| StageRequest {
+                            block_id,
+                            from,
+                            byte_len,
+                        }),
+                    ),
+                    Some(BlockLocation::Gpu { .. }) | None => (HitKind::ReadyOnGpu, None),
+                };
+
+                if let Some(request) = request {
+                    stage_requests.push(request);
+                }
+
+                blocks.push(LookupBlock {
+                    block_id: Some(block_id),
+                    hit_kind,
+                });
+            } else if child.is_tombstone() {
+                blocks.push(LookupBlock {
+                    block_id: None,
+                    hit_kind: HitKind::Miss,
+                });
+                break;
+            }
+
+            node_idx = child_idx;
+        }
+
+        let matched_blocks = blocks
+            .iter()
+            .filter(|block| !matches!(block.hit_kind, HitKind::Miss))
+            .count();
+        let matched_len = (matched_blocks * self.block_size).min(pos);
+
+        let recompute_advised = stage_requests.iter().any(|request| {
+            let hit_kind = match request.from {
+                BlockLocation::HostPinned { .. } => HitKind::StagingFromHost,
+                BlockLocation::Disk { .. } | BlockLocation::Remote { .. } => {
+                    HitKind::StagingFromDisk
+                }
+                BlockLocation::Gpu { .. } => HitKind::ReadyOnGpu,
+            };
+            heuristics.advise_recompute(hit_kind, self.block_size, request.byte_len as u64)
+        });
+
+        let staging_ticket = if stage_requests.is_empty() || recompute_advised {
+            None
+        } else {
+            planner.and_then(|planner| planner.stage(&stage_requests))
+        };
+
+        LookupOutcome::new(matched_len, blocks, staging_ticket, recompute_advised)
     }
 
     // -------------------------------------------------------------------------
@@ -646,6 +775,28 @@ impl RadixCache {
     pub fn cached_block_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.block_id.is_some()).count()
     }
+
+    /// Stamp the physical location for a cached block.
+    pub fn set_block_location(&mut self, block: BlockId, location: BlockLocation) -> bool {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.block_id == Some(block))
+            .map(|node| {
+                node.tier_location = Some(location);
+            })
+            .is_some()
+    }
+
+    /// Stamp the byte length metadata for a cached block.
+    pub fn set_block_byte_len(&mut self, block: BlockId, byte_len: u32) -> bool {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.block_id == Some(block))
+            .map(|node| {
+                node.byte_len = byte_len;
+            })
+            .is_some()
+    }
 }
 
 // ============================================================================
@@ -654,10 +805,34 @@ impl RadixCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::kv_tier::{LookupHeuristics, StagePlanner, StageRequest, StageTicket};
 
     fn bids(ids: &[u32]) -> Vec<BlockId> {
         ids.iter().map(|&id| BlockId(id)).collect()
+    }
+
+    struct RecordingPlanner {
+        requests: Mutex<Vec<StageRequest>>,
+        ticket: StageTicket,
+    }
+
+    impl RecordingPlanner {
+        fn new(ticket: u64) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                ticket: StageTicket(ticket),
+            }
+        }
+    }
+
+    impl StagePlanner for RecordingPlanner {
+        fn stage(&self, requests: &[StageRequest]) -> Option<StageTicket> {
+            self.requests.lock().unwrap().extend_from_slice(requests);
+            Some(self.ticket)
+        }
     }
 
     #[test]
@@ -1241,6 +1416,126 @@ mod tests {
             cache.free_node_count(),
             1,
             "reused tombstone slot should be removed from the free list"
+        );
+    }
+
+    #[test]
+    fn lookup_or_stage_defaults_to_ready_on_gpu() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        let outcome = cache.lookup_or_stage(&[1, 2, 3, 4], LookupHeuristics::default(), None);
+
+        assert_eq!(outcome.matched_len, 4);
+        assert_eq!(
+            outcome.blocks,
+            vec![LookupBlock {
+                block_id: Some(BlockId(10)),
+                hit_kind: HitKind::ReadyOnGpu,
+            }]
+        );
+        assert_eq!(outcome.staging_ticket, None);
+        assert!(!outcome.recompute_advised);
+    }
+
+    #[test]
+    fn lookup_or_stage_queues_host_stage() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+        assert!(cache.set_block_byte_len(BlockId(10), 8192));
+
+        let planner = RecordingPlanner::new(41);
+        let outcome =
+            cache.lookup_or_stage(&[1, 2, 3, 4], LookupHeuristics::default(), Some(&planner));
+
+        assert_eq!(outcome.matched_len, 4);
+        assert_eq!(outcome.staging_ticket, Some(StageTicket(41)));
+        assert_eq!(
+            outcome.blocks,
+            vec![LookupBlock {
+                block_id: Some(BlockId(10)),
+                hit_kind: HitKind::StagingFromHost,
+            }]
+        );
+        assert!(!outcome.recompute_advised);
+
+        let recorded = planner.requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![StageRequest {
+                block_id: BlockId(10),
+                from: BlockLocation::HostPinned { offset: 4096 },
+                byte_len: 8192,
+            }]
+        );
+    }
+
+    #[test]
+    fn lookup_or_stage_advises_recompute_for_small_disk_hit() {
+        let mut cache = RadixCache::new(16);
+        let tokens: Vec<u32> = (0..16).collect();
+        cache.insert(&tokens, &bids(&[10]));
+        assert!(cache.set_block_location(
+            BlockId(10),
+            BlockLocation::Disk {
+                file_id: 1,
+                offset: 0,
+            }
+        ));
+        assert!(cache.set_block_byte_len(BlockId(10), 2 * 1024 * 1024));
+
+        let planner = RecordingPlanner::new(7);
+        let outcome = cache.lookup_or_stage(
+            &tokens,
+            LookupHeuristics {
+                prefill_tokens_per_sec: 200_000.0,
+                host_bandwidth_bytes_per_sec: 25.0 * 1024.0 * 1024.0 * 1024.0,
+                disk_bandwidth_bytes_per_sec: 50.0 * 1024.0 * 1024.0,
+            },
+            Some(&planner),
+        );
+
+        assert_eq!(outcome.matched_len, 16);
+        assert_eq!(outcome.staging_ticket, None);
+        assert!(outcome.recompute_advised);
+        assert_eq!(
+            outcome.blocks,
+            vec![LookupBlock {
+                block_id: Some(BlockId(10)),
+                hit_kind: HitKind::StagingFromDisk,
+            }]
+        );
+    }
+
+    #[test]
+    fn lookup_or_stage_surfaces_tombstone_miss() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        let idx = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .unwrap();
+        cache.nodes[idx].block_id = None;
+        cache.nodes[idx].tier_location = Some(BlockLocation::Disk {
+            file_id: 9,
+            offset: 0,
+        });
+        cache.nodes[idx].byte_len = 4096;
+
+        let outcome = cache.lookup_or_stage(&[1, 2, 3, 4], LookupHeuristics::default(), None);
+
+        assert_eq!(outcome.matched_len, 0);
+        assert_eq!(outcome.staging_ticket, None);
+        assert!(!outcome.recompute_advised);
+        assert_eq!(
+            outcome.blocks,
+            vec![LookupBlock {
+                block_id: None,
+                hit_kind: HitKind::Miss,
+            }]
         );
     }
 }
