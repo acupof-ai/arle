@@ -1,0 +1,93 @@
+{
+  "label": "fp8-quick",
+  "timestamp": "2026-04-15T09:20:38.882504",
+  "gpu": "NVIDIA L4",
+  "platform": "Linux-6.6.113+-x86_64-with-glibc2.35",
+  "url": "http://localhost:8000",
+  "configs": [
+    {
+      "input_len": 128,
+      "output_len": 128,
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_output_tokens": 1024,
+      "wall_time": 34.1366446018219,
+      "throughput": 29.997089987729733,
+      "ttft_p50": 39.844512939453125,
+      "ttft_p99": 45.754194259643555,
+      "itl_p50": 33.288002014160156,
+      "itl_p99": 33.31494331359863,
+      "errors": 0
+    },
+    {
+      "input_len": 128,
+      "output_len": 512,
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_output_tokens": 4096,
+      "wall_time": 137.24253010749817,
+      "throughput": 29.84497587440074,
+      "ttft_p50": 44.85607147216797,
+      "ttft_p99": 46.0050106048584,
+      "itl_p50": 33.43319892883301,
+      "itl_p99": 33.44917297363281,
+      "errors": 0
+    },
+    {
+      "input_len": 512,
+      "output_len": 256,
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_output_tokens": 2048,
+      "wall_time": 69.5112235546112,
+      "throughput": 29.46286794090162,
+      "ttft_p50": 87.7389907836914,
+      "ttft_p99": 88.61637115478516,
+      "itl_p50": 33.72979164123535,
+      "itl_p99": 33.75411033630371,
+      "errors": 0
+    },
+    {
+      "input_len": 1024,
+      "output_len": 256,
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_output_tokens": 2048,
+      "wall_time": 71.28246665000916,
+      "throughput": 28.730767834613605,
+      "ttft_p50": 165.83490371704102,
+      "ttft_p99": 166.2883758544922,
+      "itl_p50": 34.301042556762695,
+      "itl_p99": 34.307003021240234,
+      "errors": 0
+    },
+    {
+      "input_len": 2048,
+      "output_len": 256,
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_output_tokens": 2048,
+      "wall_time": 73.9188814163208,
+      "throughput": 27.706046963365104,
+      "ttft_p50": 275.5615711212158,
+      "ttft_p99": 279.1874408721924,
+      "itl_p50": 35.16221046447754,
+      "itl_p99": 35.17413139343262,
+      "errors": 0
+    },
+    {
+      "input_len": 512,
+      "output_len": 256,
+      "concurrency": 4,
+      "num_requests": 8,
+      "total_output_tokens": 2048,
+      "wall_time": 19.36383318901062,
+      "throughput": 105.76418315575465,
+      "ttft_p50": 283.27059745788574,
+      "ttft_p99": 391.01600646972656,
+      "itl_p50": 36.38005256652832,
+      "itl_p99": 36.383628845214844,
+      "errors": 0
+    }
+  ]
+}
