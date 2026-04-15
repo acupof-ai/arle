@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::fmt;
 
 use crate::scheduler::{IncomingRequest, SchedulerHandle};
@@ -27,5 +29,18 @@ impl RequestHandle for SchedulerHandle {
 
     fn model_id(&self) -> &str {
         SchedulerHandle::model_id(self)
+    }
+}
+
+impl<T> RequestHandle for Arc<T>
+where
+    T: RequestHandle + ?Sized,
+{
+    fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+        (**self).submit(req)
+    }
+
+    fn model_id(&self) -> &str {
+        (**self).model_id()
     }
 }
