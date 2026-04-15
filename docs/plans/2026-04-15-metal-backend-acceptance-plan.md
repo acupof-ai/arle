@@ -26,7 +26,7 @@ Benchmark rule:
 | Milestone | Status | Notes |
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
-| `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state and `M0.2b` live scheduler runtime landed locally; throughput exit still blocked on batched decode |
+| `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, and `M0.2c` Qwen3 same-length decode batching landed locally; throughput exit is still blocked on heterogeneous decode and Qwen3.5 |
 | `M0.3` live prefix cache + KV pool | Not shipped | KV pool still only affects the Qwen3 single-request fallback path |
 | `M0.4` memory + reuse observability | Not shipped | current stats still stop at queue / KV utilization / TTFT histograms |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
@@ -116,8 +116,9 @@ Acceptance:
 - TTFT no longer scales roughly linearly with queue depth the way the current
   serial runtime does
 
-Status: local runtime landed on 2026-04-15; TTFT exit passed, throughput exit
-still pending.
+Status: local runtime landed on 2026-04-15; `M0.2c` added same-length Qwen3
+decode batching. TTFT exit passed, but the general throughput exit is still
+pending.
 
 Verification:
 
@@ -144,14 +145,23 @@ Interpretation:
 
 - latency exit is materially better (`-77%` TTFT p50)
 - throughput exit is still blocked (`-11%` aggregate throughput vs the serial reference)
+- post-`M0.2c`, Qwen3 same-length decode batches now show a real local win, but
+  still not the full exit:
+  - focused Qwen3 server check: `C=4` throughput `23.30 -> 25.39 tok/s`
+    (`+9.0%`), `TTFT p50 3559 -> 2716 ms` (`-23.7%`)
+  - quick Qwen3.5 sweep stayed effectively flat: `512/256 C=4`
+    `65.5 -> 66.4 tok/s`, `TTFT p50 1742 -> 1737 ms`
+  - interpretation: the runtime shape improved for Qwen3, but the serving-wide
+    throughput exit remains blocked on heterogeneous decode batching and a real
+    Qwen3.5 batched path
 
 #### `M0.2c` Runtime retirement proof
 
 Acceptance:
 
 - `metal_serve` no longer imports or constructs the serial runtime
-- concurrent requests can make forward progress without request-level FIFO
-  serialization
+- concurrent requests can make forward progress without pure request-level FIFO
+  serialization on the standard path
 - a detached-worktree or equivalent isolated build can reproduce the serving
   benchmark used for sign-off
 
