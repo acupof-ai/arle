@@ -252,6 +252,14 @@ docs.
 - `bench-output/` accidentally gets committed because someone overrode
   the gitignore → wrapper should refuse to run if the output dir is
   tracked.
+- **Metal backend cannot ride `--profile sweep` or `--profile throughput`
+  yet.** Sweep's throughput-burst stage trips the MLX metal allocator's
+  live-buffer-count cap (499000) and panics the scheduler permanently.
+  Root cause + fix plan in
+  [`docs/experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md`](../experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md).
+  Until that lands, Metal wins entries must be produced with
+  `--profile synchronous` or `--profile constant --rate <low>` — see
+  the 2026-04-15 smoke win for the exact invocation. CUDA is unaffected.
 
 ---
 
