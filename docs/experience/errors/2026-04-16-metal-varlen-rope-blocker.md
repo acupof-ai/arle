@@ -1,109 +1,123 @@
-# Metal variable-length decode: shared-`cache_pos` RoPE is wrong for left-padded rows
+# Metal variable-length decode RoPE — resolved same session, documented so the miss is visible
+
+## Status
+
+**Resolved 2026-04-16, same session as the initial write-up.** This
+note is retained as a retrospective — the "blocker" framing was wrong,
+and the reason it was wrong is worth remembering.
 
 ## Context
 
-2026-04-16. Phase 1 of the Metal continuous batching work ported the
-mlx-lm `BatchKVCache` pattern to `Qwen35PackedDecodeBatch`: left-pad the
-short rows, build an additive causal mask zeroing columns
-`[0, left_padding[b])`, send the mask through a new `attn_mask` parameter
-on the `qwen35_compiled_step_batch_packed` FFI.
+2026-04-16. Phase 1 of Metal continuous batching landed the mlx-lm
+`BatchKVCache` pattern for Qwen3.5 packed decode (left-padding +
+additive causal mask). Initial write-up of this file concluded:
 
-The **masking** half of that plan is correct — MLX `fast::scaled_dot_product_attention`
-broadcasts the `[B, 1, 1, key_len]` mask across heads and the row's
-padded prefix contributes no attention. Unit test
-`backend::metal::mlx::tests::build_varlen_decode_mask_marks_left_padding`
-covers the mask shape and values.
+> Fixing per-row RoPE requires landing per-row `fast::rope(..., array
+> offset)`. A first test (`rope_dynamic_matches_rope_for_same_length_batch`)
+> comparing the array-offset path against scalar-offset on a same-length
+> batch produced `0 != 16.828888` — the array-offset shape convention
+> was unclear. Deferred to Phase 2.
 
-The scaffolding (`batch_cache_len` + `left_padding` fields on the packed
-batch, `left_pad_kv_cache_row`, `strip_left_padding_from_packed_row`,
-`admit_rows`, `admit_row_indices` in the runtime, the mask builder, the
-C++ bridge mask parameter) all landed. But the **actual relaxation** in
-`try_build_qwen35_packed_decode_batch` — accepting rows with mismatched
-`cache_len` — had to be reverted before merge. This note explains why
-and what Phase 2 needs to solve.
+That conclusion was wrong. Both the test failure AND the conclusion.
 
-## Root cause
+## Root cause of the miss
 
-`crates/mlx-sys/src/mlx_qwen35_model.cpp` `Qwen35CompiledModel::full_attn_step`
-applies RoPE with a **single shared scalar offset**:
+The failing test pitted `rope(x, scalar_offset=5)` against
+`rope_dynamic(x, array_offset=[5, 5])` on a `[2, 3, 1, 4]` input and
+expected element-wise equivalence. The first mismatched element had
+`lhs = 0, rhs = 16.828888`. Claude read that as "array-offset is
+broken" and deferred.
 
-```cpp
-int cache_pos = m->current_cache_pos;  // = batch_cache_len
-q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
-k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+Codex's code review caught it: look at which side is zero and which
+side is 16.83. A 20-line Python probe would have answered it:
+
+```python
+x = mx.arange(24, dtype=mx.float32).reshape(2, 3, 1, 4)
+scalar = fast.rope(x, 4, traditional=False, base=10000.0, scale=1.0, offset=5)
+array  = fast.rope(x, 4, traditional=False, base=10000.0, scale=1.0, offset=mx.array([5, 5], dtype=mx.int32))
+print(scalar.flatten().tolist()[12:24])  # all zeros
+print(array.flatten().tolist()[12:24])   # correct rotated values
 ```
 
-With same-length batches (`left_padding == [0, 0, …]`) the shared
-`cache_pos` equals every row's own `cache_len`, so the rotation is
-correct. With variable-length batches, a row whose `cache_len =
-batch_cache_len - left_pad` should be rotated at **position
-`batch_cache_len - left_pad`**, not at `batch_cache_len`. Rotating the
-new Q and K for that row at the wrong position scrambles the positional
-encoding — attention then produces garbage output for the row.
+**MLX 0.31.1's `fast::rope(..., int offset)` silently zeros out batch
+rows > 0 on `[B, H, S=1, D]` input.** Prefill (`S > 1`) and `B == 1`
+decode are both fine. The bug fires exactly on our compiled
+batched-decode shape. Repros on:
 
-This isn't a mask issue and the mask can't compensate. The mask zeros
-out which cached K/V positions a query attends to; it cannot re-rotate
-the query itself.
+- `[2, 3, 1, 4]` — toy shape
+- `[2, 16, 1, 128]` — Qwen3.5 production shape
 
-## Fix (Phase 2)
+The test was comparing a broken reference against a correct output.
+The array-offset path was right all along.
 
-MLX has a second `fast::rope` overload that takes `const array& offset`
-instead of `int offset` (`mlx/include/mlx/fast.h:36`). The mlx-lm
-`BatchKVCache` uses it: `self.offset = mx.array([-l for l in
-left_padding])` — a rank-1 `int32` vector of length `B`. The per-layer
-attention block then calls
-`queries = self.rope(queries, offset=cache.offset)` on a `[B, n_heads,
-L, head_dim]` query tensor, and MLX applies the per-row offset to each
-batch element.
+## Impact in the tree
 
-Porting this requires three things:
+- **Production same-length Qwen3/Qwen3.5 batched decode has been
+  silently wrong for rows > 0 since M0.2c/d landed** (2026-04-15).
+  Batched attention for any row beyond the first was computed with
+  zero-rotated Q and K — i.e. position-agnostic. Generated tokens for
+  those rows were not NaN or obviously broken, just positionally
+  confused.
+- Throughput benchmarks (`guidellm`, `bench_throughput_sweep.py`)
+  measured tokens/sec, not correctness, so the regression was
+  invisible to the serving dashboards.
+- The initial Phase 1 patch preserved the bug (and added a new
+  scaffold to work around the wrong conclusion about it).
 
-1. **Pin the offset-array shape convention.** Codex added
-   `crates/mlx-sys/src/mlx_bridge.cpp::mlx_fast_rope_dynamic` and a
-   Rust wrapper `super::mlx::rope_dynamic(x, dims, trad, base, scale,
-   off: &MlxArray) -> MlxArray`. An initial equivalence test
-   `rope_dynamic_matches_rope_for_same_length_batch` (input `[2, 3, 1,
-   4]`, offsets `&[5, 5]` as `&[2]`) produced a divergence
-   `0 != 16.828888` on MLX 0.31.1. The test was deleted and the
-   investigation deferred — before trusting `rope_dynamic` in the hot
-   path we need a small, isolated repro that confirms the exact shape
-   MLX expects (suspected `[B]` but the failure mode suggests otherwise),
-   and a known-correct reference value from a Python `mx.fast.rope`
-   call.
+## Fix
 
-2. **Plumb per-row offsets through the bridge.** Add an optional
-   `rope_offsets: *mut mlx_array` parameter to
-   `qwen35_compiled_step_batch_packed` alongside `attn_mask`, stash it
-   into a new `current_rope_offsets: mlx::core::array` field on
-   `Qwen35CompiledModel`, and branch `full_attn_step` to call
-   `fast::rope(q, ..., current_rope_offsets)` when
-   `current_has_rope_offsets` is set. Clear on success and exception
-   paths, same as the mask.
+Always route batched-decode RoPE through the array-offset overload:
 
-3. **Re-enable the varlen admission path.** Remove the same-length
-   check in `try_build_qwen35_packed_decode_batch` (see
-   `infer/src/backend/metal/request_state.rs:1195-1221`) and let
-   `left_padding[i] = batch_cache_len - state.driver.cache_len` take
-   effect. The packed KV construction already uses
-   `left_pad_kv_cache_row`; the mask path is already wired; only the
-   guard needs to lift.
+```cpp
+// crates/mlx-sys/src/mlx_qwen35_model.cpp (full_attn_step)
+if (current_has_rope_offsets) {
+    q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
+    k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
+} else {
+    // scalar path — only safe for B == 1 (prefill, single-request decode)
+    q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+    k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+}
+```
 
-Also verify the Qwen3 pure-Rust `decode_qwen3_batch` path
-(`request_state.rs:734`) — it too hardcodes a shared `cache_len` when
-calling `super::mlx::rope(&q, ..., cache_len)`. Same fix shape (per-row
-rope_dynamic), different call site.
+On the Rust side, `decode_qwen35_packed_batch`,
+`decode_qwen35_batch`, and `decode_qwen3_batch` always build an
+`int32[B]` per-row offsets array (values differ when varlen, are
+uniform when same-length, still go through the array path either way
+to stay correct for `B > 1`).
 
-## Rule
+The fix is pinned by
+`backend::metal::mlx::tests::rope_dynamic_works_on_b_gt_1_s_eq_1_and_matches_per_row_reference`,
+which verifies the B=2 array-rope path matches per-row B=1 scalar-rope
+references at different offsets.
 
-**If a compiled-graph step rotates Q/K with a single scalar position,
-every row in that step must share that position.** For variable-length
-continuous batching, the positional encoding is per-row state, not
-batch-global state. The mask only changes which keys a query attends
-to; it cannot retroactively re-RoPE the query itself.
+## Rules
 
-A varlen plan that addresses the attention mask without also
-addressing per-row RoPE will produce correct-looking shapes and wrong
-numerical output — the kind of bug that only shows up under load and
-under concurrent mixed-length traffic, not in single-request smoke
-tests. Catch this by always walking the compiled attention path
-line-by-line for any position-dependent op.
+1. **When a test comparing a new path against a reference path fails,
+   confirm which side is wrong before assuming the new path is
+   broken.** A failing element `lhs = 0, rhs = 16.83` could mean lhs
+   is broken (returning zero for non-zero input) or rhs is broken
+   (returning garbage). Ask which is the reference and which is the
+   novel path, then run the novel path against an INDEPENDENT
+   reference — not the one you're already suspecting.
+
+2. **MLX lazy eval + per-kernel dispatch means silent numerical bugs
+   are a real failure mode.** A miscompiled code path can return zeros
+   or uniform values without any error. Correctness regressions must
+   be bound to reference values, not "didn't crash" or "matches
+   something nearby." Throughput benchmarks measure throughput, not
+   correctness — they cannot catch this class of bug.
+
+3. **For any position-dependent op in a compiled forward pass (RoPE,
+   ALiBi, sinusoidal embeddings, etc.), verify the B > 1 case against
+   B = 1 per-row references, not just against a scalar-offset call on
+   the same B > 1 tensor.** The scalar-offset call may itself be the
+   broken codepath.
+
+4. **Delegate the first-opinion pass on a correctness-sensitive diff
+   to a separate reviewer.** Claude's own self-review missed the
+   scalar-rope bug for the same reason Claude wrote the bug in the
+   first place — "rope_dynamic is the new thing, so rope_dynamic is
+   the suspect." Codex's review asked "is there a trivial fix Claude
+   missed?" specifically to guard against that bias, and the answer
+   was yes.

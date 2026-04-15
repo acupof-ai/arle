@@ -1071,24 +1071,22 @@ fn execute_qwen35_packed_decode_batch(
                 cached.batch.retain_rows(&retained_rows)?;
                 cached.req_ids = current_req_ids.clone();
             } else if let Some(new_indices) = admit_row_indices(&cached.req_ids, &current_req_ids) {
-                // Prefix-preserving grow: existing rows still first (in order),
-                // new rows appended at the end.
-                //
-                // Phase 1 same-length gate: only admit new rows whose own
-                // `cache_len` *exactly equals* the current batch cursor. A
-                // `cache_len < batch_cursor` row would need `left_padding > 0`,
-                // which the mask path handles correctly but the shared-scalar
-                // RoPE inside `full_attn_step` does NOT — the new row's Q
-                // would be rotated to the wrong position and its attention
-                // output would be garbage.
-                // See docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
-                // Phase 2 lifts this to `<= batch_cursor` once per-row RoPE
-                // is wired through the C++ bridge.
+                // Prefix-preserving grow: existing rows still first (in
+                // order), new rows appended at the end. Admit when every new
+                // row's own `cache_len` is `<= batch_cursor`. A row with
+                // `cache_len < batch_cursor` gets left-padded up to the
+                // cursor and receives its per-row RoPE offset via the
+                // `rope_offsets` array passed through the bridge — so both
+                // the attention mask and positional encoding stay correct.
+                // A row with `cache_len > batch_cursor` would force the
+                // cursor to bump and re-pad every existing row, which costs
+                // more than a full rebuild, so we fall through to invalidate
+                // in that case.
                 let batch_cursor = cached.batch.batch_cache_len();
                 let admittable = new_indices.iter().all(|&idx| {
                     open.get(idx)
                         .and_then(|(_, request)| request.request_state.qwen35_decode_cursor())
-                        .is_some_and(|cache_len| cache_len == batch_cursor)
+                        .is_some_and(|cache_len| cache_len <= batch_cursor)
                 });
                 if admittable {
                     let mut request_refs: Vec<&mut MetalRequestState<'static>> = open

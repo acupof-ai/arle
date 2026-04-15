@@ -763,14 +763,60 @@ mod tests {
         assert_eq!(values[4], 0.0);
     }
 
-    // NOTE: `fast::rope` with an `array` offset (Rust wrapper `rope_dynamic`)
-    // is the intended Phase 2 hook for per-row RoPE in variable-length
-    // batches. An initial sanity-check test comparing `rope_dynamic` against
-    // scalar `rope` for a same-length batch did not pass out of the box on
-    // MLX 0.31.1 — the offset-array shape convention still needs to be
-    // pinned down before we rely on it. See
-    // docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md for the
-    // open investigation.
+    // MLX 0.31.1: `fast::rope(..., int offset)` on a `[B, H, S=1, D]` tensor
+    // with `B > 1` silently zeroes out batch rows > 0. The array-offset
+    // overload (`rope_dynamic`) works correctly. This test pins the
+    // workaround so a future MLX upgrade (or an accidental swap back to the
+    // scalar path) can't silently regress Qwen3/Qwen3.5 batched decode.
+    //
+    // Repro of the raw bug is skipped — it depends on MLX lazy-eval global
+    // state which makes it flaky under `--test-threads`. See
+    // `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`.
+
+    #[test]
+    fn rope_dynamic_works_on_b_gt_1_s_eq_1_and_matches_per_row_reference() {
+        // The actual workaround: feed an int32[B] offsets array, get
+        // correct per-row rotation. Verifies row 0 == scalar B=1 at its
+        // offset AND row 1 == scalar B=1 at its offset.
+        let _guard = metal_test_guard();
+        let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
+        let x = MlxArray::from_slice_f32(&values, &[2, 3, 1, 4]);
+
+        // Per-row offsets: row 0 @ pos 5, row 1 @ pos 3.
+        let offsets = MlxArray::from_slice_i32(&[5, 3], &[2]);
+        let batched = rope_dynamic(&x, 4, false, 10000.0, 1.0, &offsets);
+        eval(&[&batched]);
+
+        // Per-row references via B=1 scalar rope (which works correctly).
+        let row0_values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let row0 = MlxArray::from_slice_f32(&row0_values, &[1, 3, 1, 4]);
+        let row0_ref = rope(&row0, 4, false, 10000.0, 1.0, 5);
+
+        let row1_values: Vec<f32> = (12..24).map(|v| v as f32).collect();
+        let row1 = MlxArray::from_slice_f32(&row1_values, &[1, 3, 1, 4]);
+        let row1_ref = rope(&row1, 4, false, 10000.0, 1.0, 3);
+
+        eval(&[&row0_ref, &row1_ref]);
+
+        let batched_flat = batched.as_slice_f32();
+        let row0_ref_flat = row0_ref.as_slice_f32();
+        let row1_ref_flat = row1_ref.as_slice_f32();
+
+        for (i, (lhs, rhs)) in batched_flat[0..12]
+            .iter()
+            .zip(row0_ref_flat.iter())
+            .enumerate()
+        {
+            assert!((lhs - rhs).abs() < 1e-5, "row 0 index {i}: {lhs} != {rhs}");
+        }
+        for (i, (lhs, rhs)) in batched_flat[12..24]
+            .iter()
+            .zip(row1_ref_flat.iter())
+            .enumerate()
+        {
+            assert!((lhs - rhs).abs() < 1e-5, "row 1 index {i}: {lhs} != {rhs}");
+        }
+    }
 }
 
 /// Release cached Metal buffers and other allocator caches.

@@ -347,6 +347,16 @@ struct Qwen35CompiledModel {
     mutable array current_gdr_t_arr = array(1);
     mutable array current_attn_mask = array(0);
     mutable bool current_has_attn_mask = false;
+    // Per-row RoPE offsets (int32 array of length batch_size).
+    //
+    // Workaround for MLX 0.31.1: `fast::rope(..., int offset)` on a
+    // `[B, H, S=1, D]` input with `B > 1` silently zeroes batch rows > 0.
+    // The array-offset overload (`fast::rope(..., const array& offset)`) works
+    // correctly for B=1 AND B>1, so we always route batched-decode RoPE
+    // through it. The same array slot also carries per-row offsets for
+    // variable-length batches (each row rotated at its own logical position).
+    mutable array current_rope_offsets = array(0);
+    mutable bool current_has_rope_offsets = false;
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -392,12 +402,23 @@ struct Qwen35CompiledModel {
             q = fast::rms_norm(reshape(q_proj_out, {B, S, nh, hd}), lw.q_norm_w, rms_eps);
         }
         q = transpose(q, {0, 2, 1, 3});
-        q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
 
         auto k = reshape(k_raw, {B, S, nkv, hd});
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
-        k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+
+        if (current_has_rope_offsets) {
+            // Array-offset path. Handles B>1 correctly AND carries per-row
+            // logical positions for variable-length decode (each row's
+            // offset = batch_cache_len - left_padding[row]).
+            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
+            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
+        } else {
+            // Scalar path. Only safe for B == 1 (prefill or single-request
+            // decode); batched decode callers MUST set current_rope_offsets.
+            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
+        }
 
         auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
@@ -1015,6 +1036,7 @@ int32_t qwen35_compiled_step_batch(
     mlx_array** gdr_states,
     int32_t n_gdr_per_request,
     mlx_array* attn_mask,
+    mlx_array* rope_offsets,  // nullable int32[batch_size] per-row RoPE offsets
     mlx_array** out_logits,
     mlx_array** out_kv_caches,
     mlx_array** out_gdr_states
@@ -1035,6 +1057,12 @@ int32_t qwen35_compiled_step_batch(
             m->current_attn_mask = *to_arr(attn_mask);
         } else {
             m->current_attn_mask = array(0);
+        }
+        m->current_has_rope_offsets = rope_offsets != nullptr;
+        if (m->current_has_rope_offsets) {
+            m->current_rope_offsets = *to_arr(rope_offsets);
+        } else {
+            m->current_rope_offsets = array(0);
         }
 
         std::vector<array> inputs;
@@ -1091,12 +1119,16 @@ int32_t qwen35_compiled_step_batch(
 
         m->current_attn_mask = array(0);
         m->current_has_attn_mask = false;
+        m->current_rope_offsets = array(0);
+        m->current_has_rope_offsets = false;
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
         m->current_attn_mask = array(0);
         m->current_has_attn_mask = false;
+        m->current_rope_offsets = array(0);
+        m->current_has_rope_offsets = false;
         m->current_batch_size = 1;
         return -1;
     }
@@ -1112,6 +1144,7 @@ int32_t qwen35_compiled_step_batch_packed(
     mlx_array** packed_gdr_states,
     int32_t n_gdr,
     mlx_array* attn_mask,
+    mlx_array* rope_offsets,  // nullable int32[batch_size] per-row RoPE offsets
     mlx_array** out_logits,
     mlx_array** out_packed_kv_caches,
     mlx_array** out_packed_gdr_states
@@ -1132,6 +1165,12 @@ int32_t qwen35_compiled_step_batch_packed(
             m->current_attn_mask = *to_arr(attn_mask);
         } else {
             m->current_attn_mask = array(0);
+        }
+        m->current_has_rope_offsets = rope_offsets != nullptr;
+        if (m->current_has_rope_offsets) {
+            m->current_rope_offsets = *to_arr(rope_offsets);
+        } else {
+            m->current_rope_offsets = array(0);
         }
 
         std::vector<array> inputs;
@@ -1161,12 +1200,16 @@ int32_t qwen35_compiled_step_batch_packed(
 
         m->current_attn_mask = array(0);
         m->current_has_attn_mask = false;
+        m->current_rope_offsets = array(0);
+        m->current_has_rope_offsets = false;
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
         m->current_attn_mask = array(0);
         m->current_has_attn_mask = false;
+        m->current_rope_offsets = array(0);
+        m->current_has_rope_offsets = false;
         m->current_batch_size = 1;
         return -1;
     }
