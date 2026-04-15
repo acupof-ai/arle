@@ -19,10 +19,12 @@
 //!   proves the trait shape is forward-compatible with real NIXL.
 
 pub mod disk;
+pub mod local_cuda;
 #[cfg(feature = "rdma-nixl")]
 pub mod nixl;
 
 pub use disk::DiskStore;
+pub use local_cuda::LocalCudaTransport;
 #[cfg(feature = "rdma-nixl")]
 pub use nixl::NixlTransport;
 

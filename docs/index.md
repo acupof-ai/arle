@@ -7,7 +7,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | Path | Status | TL;DR |
 | --- | --- | --- |
 | **Projects** | | |
-| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b local shipped** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). M1+M2a+M2b local landed; remote CUDA acceptance pending. M3 (coordinator + page lifecycle + policy convergence + recompute fallback) next |
+| [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a local shipped** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, and the first host-tier skeleton all landed locally; remote CUDA acceptance pending before M3b |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active | Priority ledger for agent-grade serving — radix wiring, session routing, constrained decoding, speculative decoding. P-labels superseded by tiered-kv M-milestones |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Partially shipped** | TurboQuant Phases 1–3 (KV + weight + fused decode attention) shipped via [`turboquant-integration.md`](plans/turboquant-integration.md); FP8-native FlashInfer track deferred |
 | [projects/mlx-backend-roadmap.md](projects/mlx-backend-roadmap.md) | Active | MLX Metal: Qwen3/3.5 direct `mlx-sys` bridge, serial serving runtime, scheduler not yet on hot path |
@@ -16,6 +16,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | **Plans** | | |
 | [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | Active | Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes, milestone-by-milestone |
 | [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M2b local batch |
+| [plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md](plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md) | Active | Remote CUDA acceptance checklist for the 2026-04-15 M0.3 + M3a local batch |
 | [plans/tiered-kv-cache-remote-validation.md](plans/tiered-kv-cache-remote-validation.md) | Active (2026-04-13 batch) | Older remote validation checklist; for the M2b batch use the M2b remote acceptance doc above |
 | [plans/2026-04-15-metal-backend-execution-checklist.md](plans/2026-04-15-metal-backend-execution-checklist.md) | Active | Prioritized execution checklist for turning Metal from serial beta into production-grade Apple Silicon serving |
 | [plans/2026-04-15-metal-backend-acceptance-plan.md](plans/2026-04-15-metal-backend-acceptance-plan.md) | Active | Strict acceptance gates for Metal serving, API, DX, and the remaining live-scheduler blockers |
@@ -69,6 +70,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [experience/errors/2026-04-02-rope-axis-bug.md](experience/errors/2026-04-02-rope-axis-bug.md) | | RoPE axis bug in Qwen3.5 |
 | [experience/errors/2026-03-31-flashinfer-segfault-debug.md](experience/errors/2026-03-31-flashinfer-segfault-debug.md) | | 3 bugs causing FlashInfer batch decode crash |
 | **Experience — wins (latest first)** | | |
+| [experience/wins/2026-04-15-tiered-kv-m0.3-m3a-local.md](experience/wins/2026-04-15-tiered-kv-m0.3-m3a-local.md) | | Tiered KV M0.3 + M3a local landing: BF16 `page_size=16`, page-aware pool, host-tier skeleton, tier-aware node metadata |
 | [experience/wins/2026-04-15-tiered-kv-m2b-local.md](experience/wins/2026-04-15-tiered-kv-m2b-local.md) | | Tiered KV M2b local landing: scheduler selector flip, safe same-slot resurrection, alloc retry, retain hard cap, tombstone GC |
 | [experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md](experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md) | | Route-A revert + CUDA internal hygiene: 4-shell-crate split reverted, ffi.rs split into 10 domain modules, prelude as proto-API |
 | [experience/wins/2026-04-14-tiered-kv-m1-m2a.md](experience/wins/2026-04-14-tiered-kv-m1-m2a.md) | | Tiered KV M1a→M1b→M2a: directory.rs retired, RadixCache wired, TokenKVPool gains refcount + watermark eviction |

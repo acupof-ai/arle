@@ -2,13 +2,15 @@
 //!
 //! See `crate::kv_tier` for the module-level design notes.
 
+use serde::{Deserialize, Serialize};
+
 /// Storage medium for a KV block. Ordering (`Gpu < HostPinned < Disk <
 /// Remote`) reflects the distance from compute — nearer first.
 ///
 /// Tier labels (T0/T1/T2/T3) match the 2026-04-15 tiered-kv-cache
 /// revision; see `docs/projects/tiered-kv-cache.md` §4.1 for the
 /// industry-aligned numbering rationale.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Tier {
     /// T0 — GPU HBM. Kernel-accessible.
     Gpu,
@@ -21,7 +23,7 @@ pub enum Tier {
 }
 
 /// Physical location of a block's bytes. Variants match [`Tier`] 1:1.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlockLocation {
     /// GPU pool slot index. Interpretation is pool-specific.
     Gpu { slot: u32 },
@@ -57,7 +59,7 @@ impl BlockLocation {
 ///   ~24–32 bytes for short agent names.
 /// - `MooncakeTransport` (post-M5, trigger-gated): bincode of
 ///   `(segment_handle, offset, length)` = 24 bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteBlockDesc {
     pub transport: TransportId,
     pub payload: Vec<u8>,
@@ -65,7 +67,7 @@ pub struct RemoteBlockDesc {
 
 /// Discriminator for [`RemoteBlockDesc::payload`]. Kept small so the
 /// enum fits in one byte and serialization is cheap.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TransportId {
     /// NVIDIA NIXL — lands in tiered-kv-cache M5 as a stub.
@@ -79,7 +81,7 @@ pub enum TransportId {
 /// Memory kind used by [`super::transport::KVTransport::register`]. Maps
 /// 1:1 to NIXL's `MemType` enum (Dram / Vram / Block / Object / File) so
 /// future backends have room to grow.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MemKind {
     /// CPU-visible pinned DRAM (`cudaHostAlloc` / `cudaHostRegister`).
     Host,
