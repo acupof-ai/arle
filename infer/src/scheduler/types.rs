@@ -44,6 +44,27 @@ pub struct SchedulerConfig {
     pub kv_pool_headroom_bytes: usize,
     /// Fallback KV pool budget (bytes) when GPU memory query fails.
     pub kv_pool_fallback_bytes: usize,
+    /// Prefix-cache eviction high-water mark as a fraction of
+    /// `max_total_tokens`. Above this the scheduler evicts LRU radix
+    /// blocks back to `prefix_cache_low_water`. Default 0.75.
+    pub prefix_cache_high_water: f64,
+    /// Prefix-cache eviction low-water mark (default 0.50). The high/low
+    /// gap prevents evict-then-insert thrash.
+    pub prefix_cache_low_water: f64,
+    /// Hard cap for radix-retained pages as a fraction of
+    /// `max_total_tokens`. Above this fresh publishes are dropped to
+    /// keep free-list headroom. Default 0.90.
+    pub prefix_cache_retain_hard_cap: f64,
+    /// Soft-pin extension, in **radix logical clock ticks**, applied to
+    /// session-owned blocks on publish and refreshed on lookup hit. One
+    /// tick = one successful `lookup`, `lookup_or_stage`, or `insert`
+    /// call (see `prefix_cache.rs::tick`). Default 64. Re-tune against
+    /// real session-trace benches by assigning this field explicitly.
+    pub prefix_cache_keepalive_ticks: u64,
+    /// Soft-pin extension applied to blocks while the scheduler waits
+    /// for a `StageTicket` completion. 8x the regular keepalive by
+    /// default (512) to survive any plausible stub completion latency.
+    pub stage_wait_keepalive_ticks: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -58,6 +79,15 @@ impl Default for SchedulerConfig {
             min_seq_len: 256,
             kv_pool_headroom_bytes: 4 * 1024 * 1024 * 1024,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
+            // Defaults match the M3b shipped constants in
+            // `scheduler/cuda/core.rs`. Tune via explicit field
+            // assignment on a `SchedulerConfig`; env overrides are
+            // reserved for genuinely debug-only knobs.
+            prefix_cache_high_water: 0.75,
+            prefix_cache_low_water: 0.50,
+            prefix_cache_retain_hard_cap: 0.90,
+            prefix_cache_keepalive_ticks: 64,
+            stage_wait_keepalive_ticks: 512,
         }
     }
 }
@@ -67,7 +97,9 @@ impl SchedulerConfig {
     ///
     /// This keeps the existing `Default` implementation stable for the
     /// CPU-only scheduling/accounting layer while making the serving defaults
-    /// explicit at the call site.
+    /// explicit at the call site. Callers that want to tune the prefix-cache
+    /// watermarks or keepalive ticks should assign directly to the relevant
+    /// field after calling this — no env-var escape hatches.
     pub fn runtime_defaults(max_slots: usize) -> Self {
         Self {
             max_slots,
@@ -91,6 +123,27 @@ impl SchedulerConfig {
         }
         if self.min_seq_len > 32768 {
             anyhow::bail!("min_seq_len must be ≤ 32768");
+        }
+        if !(0.0 < self.prefix_cache_high_water && self.prefix_cache_high_water < 1.0) {
+            anyhow::bail!("prefix_cache_high_water must be in (0, 1)");
+        }
+        if !(0.0 < self.prefix_cache_low_water
+            && self.prefix_cache_low_water < self.prefix_cache_high_water)
+        {
+            anyhow::bail!("prefix_cache_low_water must be in (0, prefix_cache_high_water)");
+        }
+        if !(self.prefix_cache_high_water <= self.prefix_cache_retain_hard_cap
+            && self.prefix_cache_retain_hard_cap <= 1.0)
+        {
+            anyhow::bail!(
+                "prefix_cache_retain_hard_cap must satisfy prefix_cache_high_water ≤ cap ≤ 1"
+            );
+        }
+        if self.prefix_cache_keepalive_ticks == 0 {
+            anyhow::bail!("prefix_cache_keepalive_ticks must be ≥ 1");
+        }
+        if self.stage_wait_keepalive_ticks < self.prefix_cache_keepalive_ticks {
+            anyhow::bail!("stage_wait_keepalive_ticks must be ≥ prefix_cache_keepalive_ticks");
         }
         Ok(())
     }
@@ -247,5 +300,57 @@ impl SchedulerHandle {
     /// Whether the queue is currently full.
     pub fn is_full(&self) -> bool {
         !self.admission_allows(self.waiting_count())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_defaults_match_documented_defaults() {
+        let cfg = SchedulerConfig::runtime_defaults(8);
+        assert_eq!(cfg.max_slots, 8);
+        assert_eq!(cfg.prefill_chunk_size, 4096);
+        assert_eq!(cfg.prefix_cache_high_water, 0.75);
+        assert_eq!(cfg.prefix_cache_low_water, 0.50);
+        assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
+        assert_eq!(cfg.prefix_cache_keepalive_ticks, 64);
+        assert_eq!(cfg.stage_wait_keepalive_ticks, 512);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_inverted_watermarks() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_low_water = 0.80;
+        cfg.prefix_cache_high_water = 0.75;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_retain_cap_below_high_water() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_retain_hard_cap = 0.60;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_stage_wait_below_keepalive() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_keepalive_ticks = 128;
+        cfg.stage_wait_keepalive_ticks = 64;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_tunable_via_direct_field_assignment() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefix_cache_high_water = 0.80;
+        cfg.prefix_cache_low_water = 0.60;
+        cfg.prefix_cache_retain_hard_cap = 0.95;
+        cfg.prefix_cache_keepalive_ticks = 128;
+        cfg.stage_wait_keepalive_ticks = 1024;
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -14,43 +14,25 @@ use crate::types::InferenceMode;
 /// boundaries already agree.
 pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 
-/// High-water mark for pool pages held by the radix cache, as a
-/// fraction of `max_total_tokens`. When `retained_count / total`
-/// exceeds this, `cleanup()` triggers LRU eviction down to
-/// [`PREFIX_CACHE_EVICT_LOW_WATER`].
-///
-/// Rationale: at 75% retained the next fresh admission is likely to
-/// hit pool OOM on `alloc_tokens`. Keeping headroom above the free
-/// list avoids having to retry alloc with eviction in the hot path.
-pub(super) const PREFIX_CACHE_HIGH_WATER: f64 = 0.75;
+// Prefix-cache watermark / keepalive tunables moved to
+// `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
+// comments on `prefix_cache_high_water` / `prefix_cache_low_water` /
+// `prefix_cache_retain_hard_cap` / `prefix_cache_keepalive_ticks` /
+// `stage_wait_keepalive_ticks` there for defaults and env overrides
+// (`PEGAINFER_PREFIX_*` / `PEGAINFER_STAGE_WAIT_*`).
 
-/// Low-water mark for the same eviction loop: evict down to this
-/// fraction of `max_total_tokens`. The gap between high and low
-/// prevents thrash (evict-then-re-insert on every cleanup).
-pub(super) const PREFIX_CACHE_LOW_WATER: f64 = 0.50;
-/// Hard cap for radix-held retained pages. Above this threshold, new
-/// completed prompts are not published into the retained T0 prefix cache so
-/// fresh admissions cannot be starved by pinned-but-cold pages.
-pub(super) const PREFIX_CACHE_RETAIN_HARD_CAP: f64 = 0.90;
-/// Number of logical radix-clock ticks to keep a session-published prefix
-/// softly pinned before it becomes evictable again.
-///
-/// One radix tick is one successful `lookup`, `lookup_or_stage`, or `insert`
-/// call because each of those paths bumps the shared logical clock exactly
-/// once via `RadixCache::tick` in `prefix_cache.rs`. `64` is an empirical local
-/// default: long enough to cover a short burst of follow-up session turns
-/// without pretending to be wall-clock time. Re-tune it only against real
-/// session-trace benches.
-pub(super) const PREFIX_CACHE_KEEPALIVE_TICKS: u64 = 64;
-/// 8x regular keepalive; tick=one-lookup.
-pub(super) const STAGE_WAIT_KEEPALIVE_TICKS: u64 = 512;
-
-fn prefix_cache_retain_hard_cap_pages(total_pages: usize) -> usize {
-    (total_pages as f64 * PREFIX_CACHE_RETAIN_HARD_CAP) as usize
+fn prefix_cache_retain_hard_cap_pages(total_pages: usize, cap_fraction: f64) -> usize {
+    (total_pages as f64 * cap_fraction) as usize
 }
 
-fn can_publish_prefix_pages(retained_pages: usize, total_pages: usize, new_pages: usize) -> bool {
-    retained_pages.saturating_add(new_pages) <= prefix_cache_retain_hard_cap_pages(total_pages)
+fn can_publish_prefix_pages(
+    retained_pages: usize,
+    total_pages: usize,
+    new_pages: usize,
+    cap_fraction: f64,
+) -> bool {
+    retained_pages.saturating_add(new_pages)
+        <= prefix_cache_retain_hard_cap_pages(total_pages, cap_fraction)
 }
 
 pub(super) struct StagedAdmission {
@@ -154,8 +136,8 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn prefix_cache_watermarks_pages(&self) -> (usize, usize) {
         let total = self.paged_kv_pool.max_total_pages;
-        let high = (total as f64 * PREFIX_CACHE_HIGH_WATER) as usize;
-        let low = (total as f64 * PREFIX_CACHE_LOW_WATER) as usize;
+        let high = (total as f64 * self.config.prefix_cache_high_water) as usize;
+        let low = (total as f64 * self.config.prefix_cache_low_water) as usize;
         (high, low)
     }
 
@@ -289,7 +271,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_materialized_prompt_lens,
             prefix_cache: RadixCache::with_soft_pin_keepalive(
                 PREFIX_CACHE_BLOCK_SIZE,
-                PREFIX_CACHE_KEEPALIVE_TICKS,
+                config.prefix_cache_keepalive_ticks,
             ),
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
@@ -437,14 +419,20 @@ impl<M: ModelForward> Scheduler<M> {
         let required_pages = block_pages.iter().map(|pages| pages.len()).sum::<usize>();
         let retained_pages = self.paged_kv_pool.retained_count();
         let total_pages = self.paged_kv_pool.max_total_pages;
-        if !can_publish_prefix_pages(retained_pages, total_pages, required_pages) {
+        let retain_cap_fraction = self.config.prefix_cache_retain_hard_cap;
+        if !can_publish_prefix_pages(
+            retained_pages,
+            total_pages,
+            required_pages,
+            retain_cap_fraction,
+        ) {
             info!(
                 "prefix cache publish skipped for slot {}: retain hard cap hit \
                  (retained={}, new_pages={}, cap={}, total={})",
                 slot_idx,
                 retained_pages,
                 required_pages,
-                prefix_cache_retain_hard_cap_pages(total_pages),
+                prefix_cache_retain_hard_cap_pages(total_pages, retain_cap_fraction),
                 total_pages,
             );
             return;
@@ -501,7 +489,7 @@ impl<M: ModelForward> Scheduler<M> {
         let keepalive_deadline = session_id.as_ref().map(|_| {
             self.prefix_cache
                 .logical_clock()
-                .saturating_add(PREFIX_CACHE_KEEPALIVE_TICKS)
+                .saturating_add(self.config.prefix_cache_keepalive_ticks)
         });
         for (block_i, &bid) in blocks.iter().enumerate() {
             let pages_for_block = block_pages[block_i].clone();
@@ -918,17 +906,19 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 mod tests {
     use super::{can_publish_prefix_pages, prefix_cache_retain_hard_cap_pages};
 
+    const HARD_CAP: f64 = 0.90;
+
     #[test]
     fn retain_hard_cap_is_ninety_percent_of_pool() {
-        assert_eq!(prefix_cache_retain_hard_cap_pages(100), 90);
-        assert_eq!(prefix_cache_retain_hard_cap_pages(16), 14);
+        assert_eq!(prefix_cache_retain_hard_cap_pages(100, HARD_CAP), 90);
+        assert_eq!(prefix_cache_retain_hard_cap_pages(16, HARD_CAP), 14);
     }
 
     #[test]
     fn publish_is_denied_once_new_pages_cross_hard_cap() {
-        assert!(can_publish_prefix_pages(70, 100, 20));
-        assert!(can_publish_prefix_pages(80, 100, 10));
-        assert!(!can_publish_prefix_pages(81, 100, 10));
-        assert!(!can_publish_prefix_pages(90, 100, 1));
+        assert!(can_publish_prefix_pages(70, 100, 20, HARD_CAP));
+        assert!(can_publish_prefix_pages(80, 100, 10, HARD_CAP));
+        assert!(!can_publish_prefix_pages(81, 100, 10, HARD_CAP));
+        assert!(!can_publish_prefix_pages(90, 100, 1, HARD_CAP));
     }
 }
