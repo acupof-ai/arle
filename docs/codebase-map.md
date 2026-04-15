@@ -61,7 +61,7 @@ infer/src/main.rs
   -> scheduler/cuda/*
   -> model.rs + model/*
   -> ops.rs + ops/*
-  -> infer/csrc kernels / FlashInfer / CUDA graph path
+  -> crates/infer-cuda-kernels kernels / FlashInfer / CUDA graph path
 ```
 
 Key files:

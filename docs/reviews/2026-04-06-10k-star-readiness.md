@@ -4,7 +4,9 @@
 
 以顶级开源作者视角，从 7 个维度审查 agent-infer 是否具备成为万星项目的条件。
 
-**更新结论（2026-04-10）：项目已经跨过“玩具 / 个人项目”阶段，具备成长为高质量开源 AI 基础设施的技术底座；但若目标是“顶级 AI 项目”与“可长期被很多维护者共同维护”，当前短板已不再主要是代码能不能跑，而是模块边界、兼容性治理、发布纪律、多人协作约束和可预期的演进机制。**
+**更新结论（2026-04-10）：项目已经跨过"玩具 / 个人项目"阶段，具备成长为高质量开源 AI 基础设施的技术底座；但若目标是"顶级 AI 项目"与"可长期被很多维护者共同维护"，当前短板已不再主要是代码能不能跑，而是模块边界、兼容性治理、发布纪律、多人协作约束和可预期的演进机制。**
+
+**二次更新（2026-04-15）：原审查里一部分具体事实已经过时——模型覆盖已扩到 Qwen3/Qwen3.5/GLM4 三族；GPTQ/AWQ W4 + Marlin W4 prefill、FP8/INT8 KV + 融合反量化 decode、TurboQuant 2–4 bit 全链路都已落地；`docs/stability-policy.md`、`docs/support-matrix.md`、`docs/compatibility.md`、`docs/perf-and-correctness-gates.md` 都已经存在。下文保留原结论以便对比，但相关段落已就地标注。**
 
 换句话说：
 
@@ -25,9 +27,9 @@
 - Unsafe 代码极少且全部有 invariant 注释，FFI 层全检 CUresult
 - 性能已达 SGLang 同级（TTFT 4.6x 快，吞吐 0.92-0.99x）
 
-**不足：**
-- 仅支持 Qwen3/3.5 两个模型族 — 最大障碍，万星项目必须覆盖 Llama、DeepSeek、Gemma 等主流模型
-- 无量化支持（GPTQ/AWQ/GGUF）— 社区大多跑量化模型
+**不足（2026-04-15 订正）：**
+- 仅支持 Qwen3 / Qwen3.5 / GLM4 三个模型族 — 相对 vLLM / SGLang 仍偏窄，万星项目仍需补齐 Llama、DeepSeek、Gemma 等主流模型
+- 量化链路已不再是空白：GPTQ/AWQ W4A16 GEMV + Marlin W4 prefill、FP8 E4M3 KV、INT8 W8A16 + INT8 KV、TurboQuant 2–4 bit KV/weight 全链路均已 production-ready；GGUF 加载路径也已接通（见 `ROADMAP.md` Phase 2 与 `docs/experience/wins/` 条目）。剩余的是把这些做成稳定的支持矩阵承诺
 
 ## 二、文档与 README — 7/10
 
@@ -36,11 +38,11 @@
 - 内部架构文档（docs/architecture.md 51KB）非常详细
 - ROADMAP.md 清晰分阶段
 
-**致命缺失：**
-- 无 LICENSE 文件 — README 写了 MIT 但文件不存在，法律上等于 all rights reserved
-- README 缺少 badge 行（build status, license, crates.io）
-- 无 logo / 视觉标识
-- Quick Start 步骤偏多，缺少一键 Docker 方案
+**致命缺失（2026-04-15 订正）：**
+- ~~无 LICENSE 文件~~ — ✅ 已补齐（见 `LICENSE`）
+- ~~README 缺少 badge 行~~ — ✅ 已补 CI、License、Release 三枚 badge
+- 无 logo / 视觉标识（仍然缺）
+- Quick Start 步骤偏多，虽已补一键 Docker 方案（`ghcr.io/cklxx/agent-infer:latest`），但"5 分钟跑起来"的第一次体验仍靠手动拉 CUDA 环境
 
 ## 三、社区基础设施 — 6/10（已补基础，但离成熟治理仍有距离）
 
@@ -236,23 +238,23 @@
 
 下面这些是比我之前方案更高一层、且必须补的内容。
 
-### P0 — 维护体系与契约层
+### P0 — 维护体系与契约层（2026-04-15 状态已订正）
 
 1. **定义 Stability Policy**
    - 说明 CLI/API/env var/feature 的稳定等级
-   - 建议新增 `docs/stability-policy.md`
+   - ✅ `docs/stability-policy.md` 已存在；剩余工作是让它真正被 PR 流程引用
 
 2. **定义 Support Matrix**
    - backend × OS × feature × model family × quant format
-   - 建议新增 `docs/support-matrix.md`
+   - ✅ `docs/support-matrix.md` 已存在；需要随新模型/量化路径持续更新
 
 3. **定义 Compatibility & Deprecation Policy**
    - 明确 breaking change 处理方式
-   - 建议新增 `docs/compatibility.md`
+   - ✅ `docs/compatibility.md` 已存在；release 流程尚未真正跑过一轮 deprecation
 
 4. **定义 Benchmark / Accuracy Gate**
    - 哪些改动必须跑哪些验证
-   - 建议新增 `docs/perf-and-correctness-gates.md`
+   - ✅ `docs/perf-and-correctness-gates.md` 已存在；需要把它接到 PR checklist 上成为强约束
 
 ### P1 — 多维护者协作层
 
@@ -277,30 +279,32 @@
 
 ## 七、竞争定位 — 6/10
 
+2026-04-15 订正后的对比：
+
 | 对比项 | agent-infer | vLLM | SGLang | llama.cpp |
 |--------|-------------|------|--------|-----------|
-| 模型覆盖 | 1 族 | 50+ | 30+ | 100+ |
-| 量化 | 无 | FP8/INT8/AWQ/GPTQ | 同 | Q4/Q5/Q8/... |
-| 多 GPU | 无 | TP/PP | TP | 无 |
+| 模型覆盖 | 3 族（Qwen3 / Qwen3.5 / GLM4） | 50+ | 30+ | 100+ |
+| 量化 | W4A16 (GPTQ/AWQ + Marlin), W8A16, FP8 KV, INT8 KV, TurboQuant 2–4 bit | FP8/INT8/AWQ/GPTQ | 同 | Q4/Q5/Q8/... |
+| 多 GPU | TP config + sharding math 落地，NCCL comm 未接 | TP/PP | TP | 无 |
 | 语言 | Rust | Python+C++ | Python+C++ | C/C++ |
 | 上手难度 | 高 | 低 | 低 | 极低 |
 
-核心差异化：Pure Rust（安全、单二进制）+ 极低 TTFT。但模型覆盖和量化差距是数量级的。
+核心差异化：Pure Rust（安全、单二进制）+ 极低 TTFT。量化已不再是硬短板，但模型覆盖仍然是数量级差距。
 
 ---
 
 ## 十一、修订后的万星路径：分阶段行动计划
 
-### Phase A — 契约与维护基础（1-2 周）
+### Phase A — 契约与维护基础（2026-04-15 状态）
 
 1. 收敛 `infer` public API / feature gating
-2. 拆 `src/agent.rs`，降低核心控制流复杂度
-3. 统一协议真源（tool call / chat protocol）
+2. 拆 `src/agent.rs`，降低核心控制流复杂度（Route-A 后 `agent_engine.rs` 已被折叠回 `server_engine.rs`，REPL 逻辑搬到 `infer-cli`）
+3. 统一协议真源（tool call / chat protocol）已落在 `infer-chat`
 4. 统一 env var 命名与兼容策略
-5. 新增 `docs/stability-policy.md`
-6. 新增 `docs/support-matrix.md`
-7. 新增 `docs/compatibility.md`
-8. 新增 `docs/perf-and-correctness-gates.md`
+5. ✅ `docs/stability-policy.md` 已存在
+6. ✅ `docs/support-matrix.md` 已存在
+7. ✅ `docs/compatibility.md` 已存在
+8. ✅ `docs/perf-and-correctness-gates.md` 已存在
 
 ### Phase B — 发布纪律与多人协作（2-4 周）
 

@@ -174,7 +174,7 @@ for the current package boundaries.
 └────────────────────────┬─────────────────────────────────┘
                          ▼
       FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
-         (CUDA C + Triton AOT, infer/csrc/)
+         (CUDA C + Triton AOT, crates/infer-cuda-kernels/)
 ```
 
 ---
@@ -185,6 +185,7 @@ for the current package boundaries.
 |-------|-----------|:------:|
 | Qwen3 (0.5B-72B) | GQA | :white_check_mark: |
 | Qwen3.5-4B | Hybrid (linear + full attention) | :white_check_mark: |
+| GLM4 | GQA | :white_check_mark: |
 | Llama 3 / 4 | GQA | Planned |
 | DeepSeek-V3 / R1 | MLA | Planned |
 

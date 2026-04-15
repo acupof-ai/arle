@@ -173,7 +173,7 @@ ShareGPT dataset loader for realistic prompt distributions.
 ## Phase 1 — Core GPU Features (GPU required)
 
 ### 1.1 PagedAttention Kernel
-**Files**: `infer/csrc/paged_attention.cu`, `infer/src/ops/attention.rs`
+**Files**: `crates/infer-cuda-kernels/csrc/attention/paged_attention.cu`, `infer/src/ops/attention.rs`
 **Goal**: Replace contiguous KV cache with paged blocks. Eliminates memory fragmentation, enables sharing blocks across requests (prefix cache), enables swap.
 
 ```c
@@ -195,7 +195,7 @@ Placeholder stub in `ops/attention.rs` with `todo!("GPU required: paged attentio
 ---
 
 ### 1.2 FlashAttention-3 (prefill)
-**Files**: `infer/tools/triton/flash_attention_v3_kernel.py`, `infer/src/ops/attention.rs`
+**Files**: `crates/infer-cuda-kernels/tools/triton/flash_attention_v3_kernel.py`, `infer/src/ops/attention.rs`
 **Goal**: Upgrade prefill kernel from FA2 → FA3 for better A100/H100 utilization. FA3 uses warp specialization + async pipeline.
 
 Key improvements over FA2:
@@ -310,7 +310,7 @@ impl WeightLoader {
 ---
 
 ### 2.2 GPTQ / AWQ INT4 Kernels
-**Files**: `infer/csrc/gemm_int4.cu`
+**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_int4.cu`
 **Goal**: Fused dequantize-GEMM kernels for INT4 weights. Required for serving quantized open-source models (most popular community models are GPTQ/AWQ quantized).
 
 Implement W4A16 (INT4 weights, FP16 activations) via:
@@ -320,7 +320,7 @@ Implement W4A16 (INT4 weights, FP16 activations) via:
 ---
 
 ### 2.3 FP8 (E4M3) Kernels
-**Files**: `infer/csrc/gemm_fp8.cu`
+**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_fp8.cu`
 **Goal**: FP8 GEMM for H100 (SM90). Required for DeepSeek-V3 native precision.
 
 - `__nv_fp8_e4m3` weight storage, BF16 accumulation
@@ -330,7 +330,7 @@ Implement W4A16 (INT4 weights, FP16 activations) via:
 ---
 
 ### 2.4 INT8 / SmoothQuant
-**Files**: `infer/csrc/gemm_int8.cu`
+**Files**: `crates/infer-cuda-kernels/csrc/gemm/gemm_int8.cu`
 **Goal**: INT8 W8A8 GEMM using cuBLAS `cublasLtMatmul` with INT8 I/O.
 
 SmoothQuant migration: apply channel-wise scale to activations before quantizing.
