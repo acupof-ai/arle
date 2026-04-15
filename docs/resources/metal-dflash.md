@@ -18,6 +18,10 @@ Today this implementation is intended for:
 
 It is not a generic speculative-decoding surface yet.
 
+Parameter reference:
+
+- [metal-dflash-params.md](metal-dflash-params.md)
+
 ## Current support
 
 Supported now:
