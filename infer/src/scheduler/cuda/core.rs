@@ -409,7 +409,22 @@ impl<M: ModelForward> Scheduler<M> {
         session_id: Option<crate::types::SessionId>,
     ) {
         let block_size = self.prefix_cache.block_size();
-        let num_blocks = prompt_tokens.len() / block_size;
+        // The slot's `seq_len` is the actual ground truth for how many tokens
+        // are currently allocated in the paged pool. `prompt_tokens.len()`
+        // is the snapshot the caller saved at request submission time and
+        // can be LARGER than the slot's current footprint after a
+        // recompute-style preemption: in that case the slot was rolled back
+        // to a shorter prefix (or zero) but cleanup() still calls us with
+        // the original prompt. Capping `num_blocks` to the slot's actual
+        // page coverage prevents the
+        // `paged_kv.rs:595 page_indices_for_token_range` index-OOB panic
+        // that fires when we ask for pages past the slot's allocation.
+        // See docs/experience/wins/2026-04-15-bench-longseq-int8-splits32.md
+        // and 2026-04-15-bench-hbm-peak-throughput.md for the trigger
+        // sequences.
+        let slot_tokens_now = self.paged_kv_pool.seq_len(slot_idx);
+        let publishable_tokens = prompt_tokens.len().min(slot_tokens_now);
+        let num_blocks = publishable_tokens / block_size;
         if num_blocks == 0 {
             return;
         }
@@ -490,9 +505,17 @@ impl<M: ModelForward> Scheduler<M> {
             parent_fingerprint = Some(fp);
         }
 
-        let inserted =
-            self.prefix_cache
-                .insert_with_fingerprints(prompt_tokens, &blocks, &block_fingerprints);
+        // Slice prompt_tokens to the actually-publishable prefix so the
+        // radix insert walks only the blocks we have fingerprints for.
+        // Without this, when `slot_tokens_now < prompt_tokens.len()` the
+        // insert path would try to traverse blocks past `num_blocks` and
+        // mismatch its own internal block count.
+        let publishable_prompt = &prompt_tokens[..required_tokens];
+        let inserted = self.prefix_cache.insert_with_fingerprints(
+            publishable_prompt,
+            &blocks,
+            &block_fingerprints,
+        );
         if inserted != required_tokens {
             warn!(
                 "prefix_cache.insert: expected {} tokens, got {} (slot={}, num_blocks={}, prompt={})",

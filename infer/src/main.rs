@@ -50,12 +50,24 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     decode_prefill_cap: usize,
 
-    /// GPU memory (MB) reserved as headroom when auto-sizing KV cache.
+    /// GPU memory (MB) reserved at scheduler pool init time as a safety
+    /// margin on top of the weights + contiguous KV + pool budget. This is
+    /// the *pool-side* reserve, separate from `auto_num_slots`'s pre-load
+    /// reservation; reduce both flags together if you want to claw HBM
+    /// back from `auto_num_slots`.
     #[arg(long, default_value_t = 512)]
     gpu_reserved_mb: usize,
 
-    /// KV pool headroom (MB) reserved during pool initialization.
-    /// Covers BatchDecodeBuffers (~750MB), CUDA Graph captures (~500MB), and workspace.
+    /// KV pool headroom (MB) carved out of the GPU budget before the
+    /// `TokenKVPool` is sized. Default 4096 MB covers BatchDecodeBuffers
+    /// (~750MB), CUDA Graph captures (~500MB), FlashInfer workspace
+    /// (~256MB), per-stream scratch, and a safety pad. **Auto-sizing
+    /// links to this flag**: lowering it (e.g. `--kv-pool-headroom-mb
+    /// 1024`) frees ~3 GB for additional slots when combined with
+    /// `--gpu-reserved-mb` ≪ default. On a 24 GB L4, the default values
+    /// intentionally leave ~5 GB of HBM unused for safety; tune both
+    /// flags down together when you trust your workload's peak
+    /// memory footprint.
     #[arg(long, default_value_t = 4096)]
     kv_pool_headroom_mb: usize,
 
@@ -97,9 +109,18 @@ async fn main() {
     info!("=== Infer Server - {} (GPU) ===", model_type);
     info!("Loading model...");
     let start = Instant::now();
-    let num_slots = args
-        .num_slots
-        .unwrap_or_else(|| auto_num_slots(model_path, args.max_seq_len));
+    let (kv_cache_dtype, kv_pool_format) =
+        parse_kv_cache_mode(&args.kv_cache_dtype).unwrap_or_else(|err| panic!("{err}"));
+
+    let num_slots = args.num_slots.unwrap_or_else(|| {
+        auto_num_slots(
+            model_path,
+            args.max_seq_len,
+            kv_pool_format,
+            args.gpu_reserved_mb,
+            args.kv_pool_headroom_mb,
+        )
+    });
 
     info!(
         "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={}",
@@ -113,9 +134,6 @@ async fn main() {
         },
         args.kv_cache_dtype,
     );
-
-    let (kv_cache_dtype, kv_pool_format) =
-        parse_kv_cache_mode(&args.kv_cache_dtype).unwrap_or_else(|err| panic!("{err}"));
     info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
 
     let runtime = ServerRuntimeConfig {
@@ -212,18 +230,45 @@ fn parse_kv_cache_mode(mode: &str) -> std::result::Result<(KVCacheDtype, KVForma
 /// Auto-calculate num_slots from GPU memory and model config.
 ///
 /// Strategy: estimate model weight size from safetensor files, subtract from GPU free
-/// memory, divide remaining by per-slot cost (KV cache + recurrent state at target
-/// sequence length). Clamp to [4, 128].
-fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
+/// memory, take out the pool-side reserves the user passed via CLI flags, then
+/// divide the remainder by the per-slot KV-cache cost at the requested dtype.
+/// Clamp to [4, 128].
+///
+/// **Dtype awareness** (2026-04-15): the per-slot estimate now respects
+/// `kv_pool_format`, so INT8 / FP8 quant pools auto-size to roughly twice the
+/// number of slots BF16 picks at the same `max_seq_len`. Without this, the
+/// auto-sizer was bf16-blind and quant KV silently lost its capacity benefit
+/// at default flags. See
+/// `docs/experience/wins/2026-04-15-bench-hbm-peak-throughput.md` for the
+/// HBM inventory that surfaced this.
+///
+/// **Reserve linking** (2026-04-15): instead of a 6 GB hardcoded headroom,
+/// the reserve is now derived from `--gpu-reserved-mb` + `--kv-pool-headroom-mb`
+/// + a 1 GB safety pad. Users who lower the headroom flags will see the
+/// extra HBM flow into more slots automatically.
+fn auto_num_slots(
+    model_path: &str,
+    max_seq_len: Option<usize>,
+    kv_pool_format: KVFormat,
+    gpu_reserved_mb: usize,
+    kv_pool_headroom_mb: usize,
+) -> usize {
     use infer::backend::cuda::tensor::DeviceContext;
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;
-    // Reserve memory for: BatchDecodeBuffers (~500MB), FlashInfer workspace (256MB),
-    // CUDA Graph captures (~200MB), paged KV pool overhead, and safety margin.
-    const RESERVED_BYTES: usize = 6 * 1024 * 1024 * 1024; // 6 GB headroom
+    // Safety pad on top of the user-controlled reserves: covers per-stream
+    // scratch and CUDA driver alloc fragmentation that the explicit budget
+    // numbers don't capture. Empirically observed peak HBM under saturating
+    // load is ~1.3 GB above the strict (weights + contig + pool) floor.
+    const SAFETY_PAD_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
     const MIN_SLOTS: usize = 4;
     const MAX_SLOTS: usize = 128;
+
+    let reserved_bytes = gpu_reserved_mb
+        .saturating_mul(1024 * 1024)
+        .saturating_add(kv_pool_headroom_mb.saturating_mul(1024 * 1024))
+        .saturating_add(SAFETY_PAD_BYTES);
 
     let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
 
@@ -257,16 +302,17 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
         }
     };
 
-    // Available = GPU free - weights (already loaded by now? no, not yet) - reserved
-    // Since we're called before model load, we estimate available after load
+    // Available = GPU free - weights (estimated, not yet loaded) - reserved.
+    // The reserved value is now derived from CLI flags so the user can claw
+    // HBM back into more slots by lowering --kv-pool-headroom-mb.
     let available = free_bytes
         .saturating_sub(weight_bytes as usize)
-        .saturating_sub(RESERVED_BYTES);
+        .saturating_sub(reserved_bytes);
 
-    // Per-slot cost estimate: KV cache at seq_len tokens
-    // Conservative estimate: 2 (K+V) * layers * heads * head_dim * 2 (bf16) * seq_len
-    // Read from config.json for accuracy
-    let per_slot_bytes = estimate_per_slot_bytes(model_path, seq_len);
+    // Per-slot cost estimate: KV cache + recurrent state at seq_len tokens.
+    // Now dtype-aware: INT8/FP8 quant pools roughly halve the per-slot cost
+    // vs bf16 and produce ~2× the slot count at default flags.
+    let per_slot_bytes = estimate_per_slot_bytes(model_path, seq_len, kv_pool_format);
 
     let slots = if per_slot_bytes > 0 {
         (available / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
@@ -275,14 +321,18 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
     };
 
     info!(
-        "auto_num_slots: gpu_free={:.1}GB, weights={:.1}GB, reserved={:.1}GB, \
-         available={:.1}GB, per_slot={:.1}MB (seq_len={}), slots={}",
+        "auto_num_slots: gpu_free={:.1}GB, weights={:.1}GB, reserved={:.1}GB \
+         (gpu_reserved={:.1}GB + pool_headroom={:.1}GB + safety_pad=1.0GB), \
+         available={:.1}GB, per_slot={:.1}MB (seq_len={}, dtype={:?}), slots={}",
         free_bytes as f64 / 1e9,
         weight_bytes as f64 / 1e9,
-        RESERVED_BYTES as f64 / 1e9,
+        reserved_bytes as f64 / 1e9,
+        gpu_reserved_mb as f64 / 1024.0,
+        kv_pool_headroom_mb as f64 / 1024.0,
         available as f64 / 1e9,
         per_slot_bytes as f64 / 1e6,
         seq_len,
+        kv_pool_format,
         slots,
     );
 
@@ -290,7 +340,12 @@ fn auto_num_slots(model_path: &str, max_seq_len: Option<usize>) -> usize {
 }
 
 /// Estimate per-slot memory cost from model config.json.
-fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
+///
+/// `kv_pool_format` is consulted for the contiguous KV byte width so INT8 and
+/// FP8 quant pools auto-size to the smaller per-token footprint instead of
+/// being charged as bf16. The recurrent state (Qwen3.5 hybrid models) is
+/// always f32 regardless of the KV format choice.
+fn estimate_per_slot_bytes(model_path: &str, seq_len: usize, kv_pool_format: KVFormat) -> usize {
     use std::path::Path;
 
     let config_path = Path::new(model_path).join("config.json");
@@ -313,10 +368,15 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize) -> usize {
         .unwrap_or(num_layers as u64) as usize;
     let kv_layers = num_full_attn.min(num_layers);
 
-    // Per-slot contiguous KV: 2 (K+V) * kv_layers * num_kv_heads * head_dim * 2 (bf16) * seq_len
-    // This is pre-allocated by the scheduler for each slot.
-    let kv_bytes = 2 * kv_layers * num_kv_heads * head_dim * 2 * seq_len;
-    // Also account for paged KV pool share (roughly 1x contiguous cost per slot)
+    // Per-slot contiguous KV bytes, dtype-aware via
+    // KVFormat::pool_bytes_per_kv_head (BF16=2*head_dim, INT8=head_dim+4
+    // including per-token f32 scale, FP8=head_dim, TurboQuant=packed+norms).
+    let bytes_per_kv_head_side = kv_pool_format.pool_bytes_per_kv_head(head_dim);
+    let kv_bytes = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side * seq_len;
+    // Also account for paged KV pool share (roughly 1× contiguous cost per slot).
+    // The pool allocator buys this back later via --kv-pool-headroom-mb, but
+    // for the per-slot capacity estimate we charge 2× contiguous to stay
+    // conservative on the total slot footprint.
     let kv_bytes = kv_bytes * 2;
 
     // Recurrent state (if hybrid): per linear layer, fixed size independent of seq_len
