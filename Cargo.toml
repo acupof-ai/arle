@@ -24,6 +24,7 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.dependencies]
 blake3 = { version = "1", default-features = false, features = ["std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [package]
 name = "agent-infer"
