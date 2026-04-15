@@ -1,0 +1,53 @@
+{
+  "label": "longseq-int8-splits32-postpull",
+  "results": [
+    {
+      "label": "longseq-int8-splits32-postpull-4000",
+      "input_target": 4000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 749.8451229985221,
+      "itl_p50_ms": 37.052602998301154,
+      "itl_p99_ms": 37.65941907899105,
+      "wall_s": 5.458267424997757,
+      "tok_per_sec": 23.450664841701595
+    },
+    {
+      "label": "longseq-int8-splits32-postpull-8000",
+      "input_target": 8000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 818.8958840000851,
+      "itl_p50_ms": 40.31530800057226,
+      "itl_p99_ms": 40.69107216098928,
+      "wall_s": 5.941037037999195,
+      "tok_per_sec": 21.545060093264034
+    },
+    {
+      "label": "longseq-int8-splits32-postpull-16000",
+      "input_target": 16000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 2063.4471329976805,
+      "itl_p50_ms": 47.018018001836026,
+      "itl_p99_ms": 47.9749392393569,
+      "wall_s": 8.035125479997077,
+      "tok_per_sec": 15.930056141456369
+    },
+    {
+      "label": "longseq-int8-splits32-postpull-25000",
+      "input_target": 25000,
+      "output": 128,
+      "prompt_tokens_reported": null,
+      "emitted_tokens": 128,
+      "ttft_ms": 6354.979502000788,
+      "itl_p50_ms": 55.20986800183891,
+      "itl_p99_ms": 56.207407959445845,
+      "wall_s": 13.365025211998727,
+      "tok_per_sec": 9.577235955012293
+    }
+  ]
+}
