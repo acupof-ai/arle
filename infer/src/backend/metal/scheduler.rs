@@ -457,6 +457,31 @@ impl MetalScheduler {
             .count()
     }
 
+    pub fn rewrite_waiting_prompt(
+        &mut self,
+        req_id: RequestId,
+        prompt_tokens: Vec<u32>,
+    ) -> Result<(), MetalSchedulerError> {
+        if prompt_tokens.is_empty() {
+            return Err(MetalSchedulerError::EmptyPrompt);
+        }
+
+        let state = self
+            .requests
+            .get_mut(&req_id)
+            .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
+        if state.phase != MetalRequestPhase::Waiting || state.prefill_progress != 0 {
+            return Err(MetalSchedulerError::WrongPhase {
+                req_id,
+                expected: MetalRequestPhase::Waiting,
+                actual: state.phase,
+            });
+        }
+
+        state.prompt_tokens = prompt_tokens;
+        Ok(())
+    }
+
     fn build_decode_batch(&self) -> MetalDecodeBatch {
         let mut states: Vec<&MetalRequestState> = self
             .requests

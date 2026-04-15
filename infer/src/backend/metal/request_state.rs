@@ -1122,29 +1122,47 @@ fn decode_qwen35_packed_batch<'a>(
         logits_shape
     );
 
-    let mut sampled_arrays = Vec::with_capacity(states.len());
-    for row_idx in 0..states.len() {
-        let row = i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
-        sampled_arrays.push(gpu_sample_token(
-            &slice_row(&logits, row),
-            &states[row_idx].driver.params,
-        ));
-    }
-    let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
-    eval(&sample_refs);
-
     batch.cache_len += 1;
 
-    let mut sampled_tokens = Vec::with_capacity(states.len());
-    for (state, sampled) in states.iter_mut().zip(sampled_arrays.iter()) {
-        let token = sampled.item_i32() as u32;
+    let sampled_tokens = if qwen35_can_batch_sample(states) {
+        let sampled = gpu_sample_token(&logits, &states[0].driver.params);
+        let sampled = super::mlx::contiguous(&super::mlx::reshape(
+            &sampled,
+            &[i32::try_from(states.len())
+                .context("decode_qwen35_packed_batch reshape overflow")?],
+        ));
+        eval(&[&sampled]);
+        sampled
+            .as_slice_i32()
+            .iter()
+            .map(|&token| token as u32)
+            .collect::<Vec<_>>()
+    } else {
+        let mut sampled_arrays = Vec::with_capacity(states.len());
+        for row_idx in 0..states.len() {
+            let row = i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
+            sampled_arrays.push(gpu_sample_token(
+                &slice_row(&logits, row),
+                &states[row_idx].driver.params,
+            ));
+        }
+        let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
+        eval(&sample_refs);
+        sampled_arrays
+            .iter()
+            .map(|sampled| sampled.item_i32() as u32)
+            .collect::<Vec<_>>()
+    };
+
+    let mut sampled_tokens_out = Vec::with_capacity(states.len());
+    for (state, token) in states.iter_mut().zip(sampled_tokens.into_iter()) {
         state.driver.cache_len = batch.cache_len;
         state.driver.kv_capacity = batch.kv_capacity;
         state.record_sampled_token(token)?;
-        sampled_tokens.push(token);
+        sampled_tokens_out.push(token);
     }
 
-    Ok(sampled_tokens)
+    Ok(sampled_tokens_out)
 }
 
 fn decode_qwen35_batch(
@@ -1318,6 +1336,21 @@ fn slice_row(array: &MlxArray, row: i32) -> MlxArray {
     start[0] = row;
     end[0] = row + 1;
     slice(array, &start, &end, &strides)
+}
+
+fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver<'_>>]) -> bool {
+    let Some(first) = states.first() else {
+        return false;
+    };
+    let params = &first.driver.params;
+    states.iter().all(|state| {
+        let other = &state.driver.params;
+        params.temperature == other.temperature
+            && params.top_k == other.top_k
+            && params.top_p == other.top_p
+            && params.min_p == other.min_p
+            && params.is_greedy() == other.is_greedy()
+    })
 }
 
 struct Qwen3StepDriver<'a> {
