@@ -464,7 +464,10 @@ fn execute_decode_batch(
     if let Some(sampled_tokens) = batch_result {
         for ((req_id, mut request), sampled_token) in open.into_iter().zip(sampled_tokens) {
             if let Err(err) = request.process_token(sampled_token) {
-                error!("Metal batched decode post-process failed for {:?}: {err:#}", req_id);
+                error!(
+                    "Metal batched decode post-process failed for {:?}: {err:#}",
+                    req_id
+                );
                 cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
