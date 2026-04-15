@@ -1070,6 +1070,36 @@ fn execute_qwen35_packed_decode_batch(
             if let Some(retained_rows) = retained_row_indices(&cached.req_ids, &current_req_ids) {
                 cached.batch.retain_rows(&retained_rows)?;
                 cached.req_ids = current_req_ids.clone();
+            } else if let Some(new_indices) = admit_row_indices(&cached.req_ids, &current_req_ids) {
+                // Prefix-preserving grow: existing rows still first (in order),
+                // new rows appended at the end.
+                //
+                // Phase 1 same-length gate: only admit new rows whose own
+                // `cache_len` *exactly equals* the current batch cursor. A
+                // `cache_len < batch_cursor` row would need `left_padding > 0`,
+                // which the mask path handles correctly but the shared-scalar
+                // RoPE inside `full_attn_step` does NOT — the new row's Q
+                // would be rotated to the wrong position and its attention
+                // output would be garbage.
+                // See docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
+                // Phase 2 lifts this to `<= batch_cursor` once per-row RoPE
+                // is wired through the C++ bridge.
+                let batch_cursor = cached.batch.batch_cache_len();
+                let admittable = new_indices.iter().all(|&idx| {
+                    open.get(idx)
+                        .and_then(|(_, request)| request.request_state.qwen35_decode_cursor())
+                        .is_some_and(|cache_len| cache_len == batch_cursor)
+                });
+                if admittable {
+                    let mut request_refs: Vec<&mut MetalRequestState<'static>> = open
+                        .iter_mut()
+                        .map(|(_, request)| &mut request.request_state)
+                        .collect();
+                    cached.batch.admit_rows(&mut request_refs, &new_indices)?;
+                    cached.req_ids.clone_from(&current_req_ids);
+                } else {
+                    invalidate_qwen35_decode_batch_cache(cache, active, open);
+                }
             } else {
                 invalidate_qwen35_decode_batch_cache(cache, active, open);
             }
@@ -1170,6 +1200,28 @@ fn retained_row_indices(
         cursor = absolute + 1;
     }
     Some(indices)
+}
+
+/// Prefix-preserving grow detector: if `current_req_ids` starts with
+/// `previous_req_ids` in the exact same order, return the indices of the
+/// new rows (the tail of `current_req_ids`). Otherwise return `None` and
+/// the caller falls back to full invalidate.
+///
+/// We deliberately restrict to the prefix case rather than any supersequence
+/// because `Qwen35PackedDecodeBatch::admit_rows` appends the new rows at the
+/// end of the packed KV tensors — arbitrary splicing would require extra
+/// `take_axis` reorders.
+fn admit_row_indices(
+    previous_req_ids: &[RequestId],
+    current_req_ids: &[RequestId],
+) -> Option<Vec<usize>> {
+    if current_req_ids.len() <= previous_req_ids.len() {
+        return None;
+    }
+    if &current_req_ids[..previous_req_ids.len()] != previous_req_ids {
+        return None;
+    }
+    Some((previous_req_ids.len()..current_req_ids.len()).collect())
 }
 
 fn execute_decode_single(

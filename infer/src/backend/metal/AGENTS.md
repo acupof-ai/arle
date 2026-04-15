@@ -48,20 +48,52 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    Transpose **before** calling rope so `T = seq`, not `T = heads`.
    (Auto-memory: `feedback_mlx_rope_layout.md`, `feedback_mlx_rope_axis.md`;
    incident: `docs/experience/errors/2026-04-02-rope-axis-bug.md`.)
-4. **Metal scheduler is currently accounting-only.** It validates policy
-   decisions without touching the real execution path. Wiring it in is
-   tracked under `docs/plans/2026-04-15-metal-backend-acceptance-plan.md`.
-   Don't assume `MetalScheduler::admit` runs on the hot path yet.
+4. **Metal scheduler is on the hot path** as of `M0.2b` (2026-04-15).
+   `run_metal_scheduler_runtime` (`runtime.rs:639`) drives
+   `MetalScheduler::step()` → `PrefillChunk` / `DecodeBatch` / `Mixed` /
+   `Idle` and dispatches each decision through `execute_prefill_chunk` /
+   `execute_decode_batch`. Qwen3.5 same-length batched decode runs through
+   `CachedQwen35DecodeBatch` (`runtime.rs:1057`) with `retain_rows` (shrink)
+   + `admit_rows` (prefix-preserving grow via `admit_row_indices`). Qwen3
+   batched decode goes through `MetalRequestState::decode_batch` →
+   `decode_qwen3_batch` and still requires same-length. **Variable-length
+   decode batching is scaffolded but not yet enabled** — see the
+   left-padding pattern in invariant #8 and the open blocker in
+   [`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`](../../../docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md).
 5. **Qwen3 and Qwen3.5 take different paths.** Qwen3 runs through the Rust
    `rust_transformer_layer` path in `forward.rs`. Qwen3.5 delegates to the
    dedicated C++ step model in `qwen35.rs` + `mlx-sys/src/mlx_qwen35_model.cpp`
    — don't mix them.
 6. **DFlash (speculative decode) is experimental and optional.** Guarded by
    `MetalDflashOptions`; empty draft model = feature off. See
-   `docs/resources/metal-dflash.md` for user-facing flags.
-7. **`serial runtime`** (`backend/runtime.rs`) is what handles request
-   queuing for the Metal backend today. The backend itself only exposes
-   `InferenceBackend::generate` — concurrency is the runtime's problem.
+   `docs/resources/metal-dflash.md` for user-facing flags. DFlash still runs
+   on the **legacy serial runtime** (`backend/runtime.rs` — the non-scheduler
+   path) because the scheduler runtime does not yet understand DFlash slot
+   ownership.
+7. **Variable-length decode uses left-padding + additive mask**
+   (mlx-lm `BatchKVCache` pattern). `Qwen35PackedDecodeBatch` carries a
+   shared `batch_cache_len` cursor and a per-row `left_padding: Vec<i32>`;
+   `build_varlen_decode_mask` (`mlx.rs`) produces the `[B, 1, 1, key_len]`
+   additive `-inf` mask; `left_pad_kv_cache_row` +
+   `strip_left_padding_from_packed_row` (`request_state.rs`) convert
+   between the per-request zero-aligned layout and the batch-shared
+   left-aligned layout. `admit_rows` appends new (shorter) rows into an
+   active packed batch without a full rebuild. **The relaxation is
+   currently gated off** — `try_build_qwen35_packed_decode_batch` still
+   requires equal `cache_len` because the C++ `full_attn_step` uses a
+   single scalar RoPE position (`cache_pos = batch_cache_len`), which is
+   wrong for rows with nonzero `left_pad`. Phase 2 will pin down the MLX
+   `fast::rope(..., array offset)` convention, thread per-row offsets
+   through `qwen35_compiled_step_batch_packed`, and lift the guard.
+   Everything above is inert same-length scaffolding until then.
+8. **The hot-path runtime is `run_metal_scheduler_runtime`** in
+   `backend/metal/runtime.rs`, NOT the legacy `backend/runtime.rs`.
+   The backend exposes `InferenceBackend::generate` and
+   `StreamingInferenceBackend::generate_stream`; `metal_serve` routes
+   traffic through the scheduler runtime. Concurrency, admission,
+   cancellation, prefix reuse, and KV-pool lifecycle all live on the
+   scheduler side. The legacy serial runtime is retained only for DFlash
+   (see invariant #6).
 
 ## Build requirements
 
@@ -80,5 +112,9 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
 - `docs/resources/metal-dflash-params.md` — DFlash CLI parameter reference.
 - `docs/experience/errors/2026-04-09-metal-optimization-pitfalls.md` — Metal-specific
   optimization gotchas collected from earlier waves.
+- `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md` —
+  why variable-length decode batching is scaffolded but not yet enabled,
+  and what Phase 2 must solve (per-row RoPE via `fast::rope(..., array
+  offset)`).
 - `docs/experience/wins/2026-04-14-metal-dflash-qwen3.md` — reference win
   (5.9× decode on M4 Pro).

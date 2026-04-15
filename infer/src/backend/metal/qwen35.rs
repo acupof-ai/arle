@@ -396,6 +396,7 @@ impl CppQwen35Model {
         n_kv_per_request: i32,
         gdr_states: &mut [MlxArray],
         n_gdr_per_request: i32,
+        attn_mask: Option<&MlxArray>,
     ) -> Result<MlxArray> {
         let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
             kv_caches.iter().map(MlxArray::as_raw).collect();
@@ -417,6 +418,7 @@ impl CppQwen35Model {
                 n_kv_per_request,
                 gdr_ptrs.as_mut_ptr(),
                 n_gdr_per_request,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
                 &raw mut out_logits,
                 out_kv.as_mut_ptr(),
                 out_gdr.as_mut_ptr(),
@@ -448,6 +450,7 @@ impl CppQwen35Model {
         n_kv: i32,
         packed_gdr_states: &mut [MlxArray],
         n_gdr: i32,
+        attn_mask: Option<&MlxArray>,
     ) -> Result<MlxArray> {
         let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
             packed_kv_caches.iter().map(MlxArray::as_raw).collect();
@@ -470,6 +473,7 @@ impl CppQwen35Model {
                 n_kv,
                 gdr_ptrs.as_mut_ptr(),
                 n_gdr,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
                 &raw mut out_logits,
                 out_kv.as_mut_ptr(),
                 out_gdr.as_mut_ptr(),
