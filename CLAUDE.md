@@ -88,11 +88,21 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
 
 ### Benchmarks
 
-- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-<label>.md`. **Never
-  overwrite**; after-snapshots cite before-snapshots with deltas.
-- Tool: `scripts/bench_throughput_sweep.py --label <name>`.
+- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
+  using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
+  skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
+- **Canonical tool: `scripts/bench_guidellm.sh <label>`** — thin wrapper around
+  [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm) (vLLM
+  official, LLM-native TTFT/ITL/tok-s metrics, sweep profile, HTML report).
+  Canonical params are locked in
+  [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3;
+  changing them is a deliberate commit, not a flag flip.
+- `scripts/bench_throughput_sweep.py` is **deprecated** — kept only so
+  historical wins remain reproducible. New wins MUST use the guidellm wrapper.
 - Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
   feature set. Raw output table, not summaries.
+- Install the Python dep once: `pip install -e .[bench]` (guidellm ships in
+  the `bench` extra).
 
 ### Git
 

@@ -67,3 +67,14 @@ implementation detail.
 - `docs/projects/agent-first-architecture.md` — session routing design.
 - `docs/plans/2026-04-15-metal-backend-acceptance-plan.md` — HTTP API
   acceptance gates for the Metal backend.
+
+## Performance verification
+
+External perf measurement of this HTTP surface is done via
+[`vllm-project/guidellm`](https://github.com/vllm-project/guidellm), wrapped
+by [`scripts/bench_guidellm.sh`](../../../scripts/bench_guidellm.sh). That
+wrapper is the **canonical** throughput / TTFT / ITL truth source — do not
+hand-roll alternative load generators when changing anything in this module,
+run the wrapper and snapshot to `docs/experience/wins/`. Canonical params
+and plumbing live in
+[`docs/plans/guidellm-integration.md`](../../../docs/plans/guidellm-integration.md).
