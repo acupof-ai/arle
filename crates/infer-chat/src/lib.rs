@@ -24,7 +24,7 @@ pub struct OpenAiChatMessage {
     pub role: String,
     /// Text content. `None` when the assistant message contains only tool calls.
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<OpenAiChatContent>,
     /// Tool calls emitted by the assistant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<OpenAiToolCall>,
@@ -34,6 +34,59 @@ pub struct OpenAiChatMessage {
     /// Present on `tool` role messages — the tool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Message content as sent by OAI-compatible clients.
+///
+/// Modern tools (OpenAI SDK, vllm-project/guidellm, LiteLLM, LangChain's
+/// openai adapter) always send `content` as a **part array**
+/// (`[{"type":"text","text":"..."}, ...]`) to leave room for multimodal
+/// inputs, while older tools still send a plain string. Our server is
+/// text-only so we accept both and flatten via [`Self::to_text`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OpenAiChatContent {
+    /// Legacy plain-text form: `"content": "hello"`.
+    Text(String),
+    /// Modern part-array form: `"content": [{"type":"text","text":"hello"}, ...]`.
+    /// Kept as untyped `Value` so unsupported part types (image_url, audio,
+    /// etc.) do not fail deserialization — they are simply ignored by
+    /// [`Self::to_text`].
+    Parts(Vec<Value>),
+}
+
+impl OpenAiChatContent {
+    /// Flatten to a plain text string. For the Parts form, concatenates
+    /// every `{"type":"text","text":"..."}` part in order; parts whose type
+    /// is not `text` are silently skipped (we are a text-only server).
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            out.push_str(text);
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+impl From<String> for OpenAiChatContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for OpenAiChatContent {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
 }
 
 /// OpenAI-format tool call object embedded in an assistant message.
@@ -82,7 +135,11 @@ impl From<&OpenAiChatMessage> for ChatMessage {
 
         Self {
             role: ChatRole::from(message.role.as_str()),
-            content: message.content.clone().unwrap_or_default(),
+            content: message
+                .content
+                .as_ref()
+                .map(OpenAiChatContent::to_text)
+                .unwrap_or_default(),
             tool_calls,
         }
     }

@@ -140,7 +140,7 @@ fn build_chat_prompt(user_prompt: &str, system_prompt: Option<&str>) -> String {
     if let Some(system) = system_prompt {
         messages.push(OpenAiChatMessage {
             role: "system".into(),
-            content: Some(system.to_string()),
+            content: Some(system.into()),
             tool_calls: vec![],
             tool_call_id: None,
             name: None,
@@ -148,7 +148,7 @@ fn build_chat_prompt(user_prompt: &str, system_prompt: Option<&str>) -> String {
     }
     messages.push(OpenAiChatMessage {
         role: "user".into(),
-        content: Some(user_prompt.to_string()),
+        content: Some(user_prompt.into()),
         tool_calls: vec![],
         tool_call_id: None,
         name: None,
