@@ -18,8 +18,10 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
   `BackendRuntimeHandle`
 - Metal DFlash 仍然走串行 fallback，因为 speculative decode 还没接进新的
   scheduler runtime
-- 当前 scheduler runtime 只有 chunked prefill + decode-priority interleave，
-  还没有跨请求 batched decode
+- 当前 scheduler runtime 已有第一版跨请求 decode batching，但边界还很明确：
+  - Qwen3 同长度 decode batch 会走共享 MLX 图
+  - Qwen3.5 仍然是顺序 decode fallback
+  - 变长 decode batch 仍然没有进入 batched GPU 路径
 
 这意味着今天的 Metal 已经不再是“纯串行 serving”，但还没有达到 CUDA
 路径那种真正以 batched decode / prefix reuse 为核心的 serving 形态。
@@ -36,6 +38,8 @@ Apple Silicon 的 Rust Metal 路径现在已经不是实验性占位：
 ### P0 · Serving floor
 
 1. 把跨请求 batched decode 接进现有 live Metal scheduler runtime。
+   当前状态：Qwen3 同长度 decode batch 已落地；下一步是变长 batch 和
+   Qwen3.5 batched decode，而不是继续把 same-length 路径包装成完成态。
 2. 把 prefix cache / KV pool 生命周期接到多请求服务路径，而不是只在单请求 fallback 中复用。
 3. 暴露 Metal queue depth / prefix hit / active + peak memory / KV util 等 serving 级指标。
 
