@@ -19,6 +19,7 @@
 | **Resources** | |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV cache quantization research: methods, frameworks, eval metrics |
 | [resources/metal-dflash.md](resources/metal-dflash.md) | User guide for Metal DFlash: supported models, CLI/env usage, benchmark workflow, and current limits |
+| [resources/metal-dflash-params.md](resources/metal-dflash-params.md) | Metal DFlash parameter reference for `metal_request`, `metal_bench`, and `metal_serve` |
 | [architecture.md](architecture.md) | Current workspace/package topology and runtime split |
 | [codebase-map.md](codebase-map.md) | Current code map: runtime, crates, docs, tests, and entrypoints |
 | [stability-policy.md](stability-policy.md) | Governance draft: stable/beta/experimental/internal surface classification |
