@@ -1044,6 +1044,14 @@ fn decode_qwen3_batch(
     let token_arr = MlxArray::from_slice_i32(&token_values, &[batch]);
     let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
 
+    // MLX 0.31.1 scalar-rope `[B>1, H, S=1, D]` workaround: always feed an
+    // int32[B] offsets array so the `fast::rope(..., const array&)` overload
+    // is used. Same-length batch here, so every entry is `cache_len`; when
+    // this path grows to varlen the values diverge.
+    // See docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
+    let rope_offsets_data: Vec<i32> = vec![cache_len; states.len()];
+    let rope_offsets = MlxArray::from_slice_i32(&rope_offsets_data, &[batch]);
+
     for (layer_idx, layer) in weights.layers.iter().enumerate() {
         let residual = x.clone();
         let x_norm = rms_norm(&x, &layer.input_layernorm, eps);
@@ -1052,12 +1060,12 @@ fn decode_qwen3_batch(
         let q = super::mlx::reshape(&q_raw, &[batch, 1, n_heads, head_dim]);
         let q = rms_norm(&q, &layer.q_norm, eps);
         let q = transpose_axes(&q, &[0, 2, 1, 3]);
-        let q = super::mlx::rope(&q, head_dim, false, rope_base, 1.0f32, cache_len);
+        let q = super::mlx::rope_dynamic(&q, head_dim, false, rope_base, 1.0f32, &rope_offsets);
 
         let k = super::mlx::reshape(&k_raw, &[batch, 1, n_kv_heads, head_dim]);
         let k = rms_norm(&k, &layer.k_norm, eps);
         let k = transpose_axes(&k, &[0, 2, 1, 3]);
-        let k = super::mlx::rope(&k, head_dim, false, rope_base, 1.0f32, cache_len);
+        let k = super::mlx::rope_dynamic(&k, head_dim, false, rope_base, 1.0f32, &rope_offsets);
 
         let v = super::mlx::reshape(&v_raw, &[batch, 1, n_kv_heads, head_dim]);
         let v = transpose_axes(&v, &[0, 2, 1, 3]);
@@ -1184,24 +1192,19 @@ fn try_build_qwen35_packed_decode_batch<'a>(
         Qwen35StepMode::Rust(_) => return Ok(None),
     };
 
-    // Phase 1 scaffolding is in place (mask FFI param, `left_padding` field,
-    // `build_varlen_decode_mask`, `admit_rows`, `strip_left_padding_from_packed_row`)
-    // but the Qwen3.5 C++ `full_attn_step` still RoPE-rotates Q/K with a shared
-    // `cache_pos = batch_cache_len`. For rows with `left_pad > 0` that would
-    // apply the wrong positional encoding — attention values would be garbage.
-    // Until per-row RoPE lands via `fast::rope(..., array offset)` on the
-    // C++ side, keep the same-length admission check.
-    // See docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
-    let cache_len = states[0].driver.cache_len;
-    let kv_capacity = states[0].driver.kv_capacity;
+    // Shape / model identity check only. `cache_len` and `kv_capacity` are
+    // allowed to differ across rows — we unify them below via a shared
+    // `batch_cache_len` cursor + per-row `left_padding` (mlx-lm BatchKVCache
+    // pattern). Correctness of variable-length batching depends on both the
+    // attention mask (columns [0, left_pad) zeroed) AND per-row RoPE offsets
+    // (each row's Q/K rotated at its own logical position). The rope offsets
+    // ride through the bridge via `current_rope_offsets` on
+    // `Qwen35CompiledModel`; see `decode_qwen35_packed_batch` below.
     for state in states.iter() {
         if !std::ptr::eq(state.driver.weights, weights)
             || !std::ptr::eq(state.driver.config, config)
             || !std::ptr::eq(state.driver.arch, arch)
         {
-            return Ok(None);
-        }
-        if state.driver.cache_len != cache_len || state.driver.kv_capacity != kv_capacity {
             return Ok(None);
         }
         match &state.driver.mode {
@@ -1219,12 +1222,33 @@ fn try_build_qwen35_packed_decode_batch<'a>(
             Qwen35StepMode::Rust(_) => return Ok(None),
         }
     }
-    let batch_cache_len = cache_len;
-    let target_kv_capacity = kv_capacity;
-    // Same-length path: every row already has left_pad = 0, so the mask
-    // builder fast-path in `decode_qwen35_packed_batch` skips mask materialization
-    // and the C++ step falls through to the legacy string-mode attention.
-    let left_padding = vec![0i32; states.len()];
+
+    // Shared batch cursor = max of all per-row cache_lens. Rows with shorter
+    // caches get left-padded up to this cursor so every row writes its next
+    // decode token at the same column (`batch_cache_len`).
+    let mut batch_cache_len: i32 = 0;
+    let mut target_kv_capacity: i32 = 0;
+    for state in states.iter() {
+        batch_cache_len = batch_cache_len.max(state.driver.cache_len);
+        target_kv_capacity = target_kv_capacity.max(state.driver.kv_capacity);
+    }
+    // Capacity must fit the next decode write (batch_cache_len + 1) rounded up
+    // to KV_CACHE_CHUNK so future grow steps stay aligned.
+    target_kv_capacity = target_kv_capacity.max(round_up_kv_capacity(batch_cache_len + 1));
+
+    // Normalize every state's own storage up to target_kv_capacity before we
+    // read its KV arrays — concatenate_axis requires identical trailing shapes.
+    for state in states.iter_mut() {
+        state.driver.ensure_capacity(target_kv_capacity);
+        state.driver.kv_capacity = target_kv_capacity;
+    }
+
+    let mut left_padding = Vec::with_capacity(states.len());
+    for state in states.iter() {
+        let pad = batch_cache_len - state.driver.cache_len;
+        debug_assert!(pad >= 0);
+        left_padding.push(pad);
+    }
 
     let mut packed_kv_flat = Vec::with_capacity(n_kv_per_request as usize);
     for kv_idx in 0..n_kv_per_request as usize {
@@ -1373,9 +1397,9 @@ fn decode_qwen35_packed_batch<'a>(
                 .context("decode_qwen35_packed_batch batch size overflow")?],
         );
 
-    // Only materialize the additive mask when at least one row is left-padded.
-    // Same-length batches take the no-mask fast path (identical to pre-varlen
-    // behavior), so this is byte-equivalent for the common case.
+    // Only materialize the additive attention mask when at least one row is
+    // left-padded; same-length batches take the no-mask fast path (identical
+    // to pre-varlen behavior).
     let needs_mask = batch.left_padding.iter().any(|&pad| pad != 0);
     let mask_opt: Option<MlxArray> = if needs_mask {
         Some(super::mlx::build_varlen_decode_mask(
@@ -1385,6 +1409,29 @@ fn decode_qwen35_packed_batch<'a>(
     } else {
         None
     };
+
+    // ALWAYS build per-row RoPE offsets for the packed (batched) decode.
+    //
+    // Two reasons:
+    //   1. Varlen correctness — each row's new Q/K must rotate at its own
+    //      logical position `batch_cache_len - left_padding[row]`, not at
+    //      the shared `batch_cache_len`.
+    //   2. MLX 0.31.1 bug workaround — `fast::rope(..., int offset)` on a
+    //      `[B, H, S=1, D]` tensor with `B > 1` silently zeroes out batch
+    //      rows > 0. The array-offset overload works for both B=1 and B>1.
+    //      So even same-length batches (all offsets equal) must go through
+    //      the array path to stay correct. See
+    //      docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
+    let rope_offsets_data: Vec<i32> = batch
+        .left_padding
+        .iter()
+        .map(|&pad| batch.batch_cache_len - pad)
+        .collect();
+    let rope_offsets = MlxArray::from_slice_i32(
+        &rope_offsets_data,
+        &[i32::try_from(rope_offsets_data.len())
+            .context("decode_qwen35_packed_batch rope offsets overflow")?],
+    );
 
     let cpp_model = batch
         .weights
@@ -1400,6 +1447,7 @@ fn decode_qwen35_packed_batch<'a>(
         &mut batch.packed_gdr_flat,
         batch.n_gdr_per_request,
         mask_opt.as_ref(),
+        Some(&rope_offsets),
     )?;
 
     let mut eval_refs: Vec<&MlxArray> =
@@ -1551,6 +1599,13 @@ fn decode_qwen35_batch(
         }
     }
 
+    // Same MLX 0.31.1 scalar-rope `[B>1, H, S=1, D]` bug workaround as
+    // `decode_qwen35_packed_batch`: always feed a per-row rope offsets
+    // array. This is a same-length batch so every row shares `cache_len`,
+    // but we still need the array path to stay correct for B > 1.
+    let rope_offsets_data: Vec<i32> = vec![cache_len; states.len()];
+    let rope_offsets = MlxArray::from_slice_i32(&rope_offsets_data, &[batch]);
+
     let logits = cpp_model.step_batch(
         &token_arr,
         batch,
@@ -1560,6 +1615,7 @@ fn decode_qwen35_batch(
         &mut flat_gdr,
         n_gdr_per_request,
         None,
+        Some(&rope_offsets),
     )?;
 
     let mut step_outputs: Vec<&MlxArray> = Vec::with_capacity(1 + flat_kv.len() + flat_gdr.len());

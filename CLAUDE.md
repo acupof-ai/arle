@@ -12,10 +12,9 @@ Pure-Rust LLM inference engine; no PyTorch, no Python on the hot path. Two
 backends plug into one contract (`server_engine::InferenceEngine`): the CUDA
 continuous-batching scheduler (Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT)
 and the Metal scheduler runtime (Apple Silicon, `crates/mlx-sys` C++ bridge —
-continuous batching with same-length packed decode; variable-length is
-scaffolded but gated on a pending RoPE fix, see
-[`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7 and
-[`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`](docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md)).
+continuous batching with variable-length packed decode via mlx-lm
+`BatchKVCache` pattern: left-padding + additive mask + per-row RoPE offsets,
+see [`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7).
 Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4.
 FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
 Tests compare against JSON baselines in `infer/test_data/` — regenerate

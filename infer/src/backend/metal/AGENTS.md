@@ -70,22 +70,26 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    on the **legacy serial runtime** (`backend/runtime.rs` — the non-scheduler
    path) because the scheduler runtime does not yet understand DFlash slot
    ownership.
-7. **Variable-length decode uses left-padding + additive mask**
-   (mlx-lm `BatchKVCache` pattern). `Qwen35PackedDecodeBatch` carries a
-   shared `batch_cache_len` cursor and a per-row `left_padding: Vec<i32>`;
-   `build_varlen_decode_mask` (`mlx.rs`) produces the `[B, 1, 1, key_len]`
-   additive `-inf` mask; `left_pad_kv_cache_row` +
-   `strip_left_padding_from_packed_row` (`request_state.rs`) convert
-   between the per-request zero-aligned layout and the batch-shared
-   left-aligned layout. `admit_rows` appends new (shorter) rows into an
-   active packed batch without a full rebuild. **The relaxation is
-   currently gated off** — `try_build_qwen35_packed_decode_batch` still
-   requires equal `cache_len` because the C++ `full_attn_step` uses a
-   single scalar RoPE position (`cache_pos = batch_cache_len`), which is
-   wrong for rows with nonzero `left_pad`. Phase 2 will pin down the MLX
-   `fast::rope(..., array offset)` convention, thread per-row offsets
-   through `qwen35_compiled_step_batch_packed`, and lift the guard.
-   Everything above is inert same-length scaffolding until then.
+7. **Variable-length decode uses left-padding + additive mask + per-row
+   RoPE offsets** (mlx-lm `BatchKVCache` pattern).
+   `Qwen35PackedDecodeBatch` carries a shared `batch_cache_len` cursor
+   and a per-row `left_padding: Vec<i32>`. Every batched-decode step
+   passes two supplementary arrays through the C++ bridge:
+   - `attn_mask` from `build_varlen_decode_mask` (`mlx.rs`) — additive
+     `[B, 1, 1, key_len]` with `-inf` at columns `[0, left_padding[b])`
+     — only materialized when at least one row is padded.
+   - `rope_offsets`, an int32[B] vector of per-row logical positions
+     (`batch_cache_len - left_padding[row]`) — **always** materialized
+     for batched decode. Both same-length AND varlen batches take the
+     array-offset RoPE path because MLX 0.31.1's scalar-offset
+     `fast::rope` silently drops batch rows > 0 on `[B, H, S=1, D]`
+     input (see the tripwire tests in `backend::metal::mlx::tests` and
+     `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`).
+   `left_pad_kv_cache_row` + `strip_left_padding_from_packed_row`
+   (`request_state.rs`) convert between the per-request zero-aligned
+   layout and the batch-shared left-aligned layout. `admit_rows` appends
+   new shorter rows into an active packed batch without a full rebuild;
+   the runtime admit pre-check is `cache_len <= batch_cursor`.
 8. **The hot-path runtime is `run_metal_scheduler_runtime`** in
    `backend/metal/runtime.rs`, NOT the legacy `backend/runtime.rs`.
    The backend exposes `InferenceBackend::generate` and
