@@ -26,6 +26,13 @@ fn best_reusable_slot_for_radix_hit(
     None
 }
 
+fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock]) -> bool {
+    blocks
+        .iter()
+        .filter(|block| !matches!(block.hit_kind, crate::kv_tier::HitKind::Miss))
+        .all(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+}
+
 impl<M: ModelForward> Scheduler<M> {
     /// Run the scheduler loop. Blocks until all handles are dropped.
     pub fn run(mut self) {
@@ -103,10 +110,7 @@ impl<M: ModelForward> Scheduler<M> {
                 crate::kv_tier::LookupHeuristics::default(),
                 None,
             );
-            let ready_on_gpu = lookup
-                .blocks
-                .iter()
-                .all(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu));
+            let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
             let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
                 lookup.matched_len
             } else {
@@ -117,21 +121,24 @@ impl<M: ModelForward> Scheduler<M> {
                 .iter()
                 .filter_map(|block| block.block_id)
                 .collect();
-            let reusable_blocks = if ready_on_gpu && !lookup.recompute_advised {
-                radix_blocks.as_slice()
-            } else {
-                &[]
-            };
-            let reusable = best_reusable_slot_for_radix_hit(
-                reusable_blocks,
+            let gpu_ready_prefix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+                .filter_map(|block| block.block_id)
+                .collect();
+            let reusable_gpu_prefix = best_reusable_slot_for_radix_hit(
+                &gpu_ready_prefix_blocks,
                 &free_slots,
                 &self.block_owner_slots,
                 &self.slot_materialized_prompt_lens,
                 self.prefix_cache.block_size(),
             );
-            if ready_on_gpu && incoming.session_id.is_some() && !radix_blocks.is_empty() {
-                self.refresh_session_keepalive(&radix_blocks, incoming.session_id.clone());
-            }
+            let reusable = if ready_on_gpu && !lookup.recompute_advised {
+                reusable_gpu_prefix
+            } else {
+                None
+            };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 reusable.unwrap_or((free_slots[0], 0, 0));
             self.prefix_cache.release(&radix_blocks);
@@ -150,32 +157,37 @@ impl<M: ModelForward> Scheduler<M> {
                     reusable_cached_prompt_len,
                     self.waiting.len()
                 );
-            } else if lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised) {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, radix_hit={} but bytes are not ready on GPU, falling back to cold prefill, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    lookup.matched_len,
-                    self.waiting.len()
-                );
-            } else if lookup.matched_len > 0 {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, radix_hit={} but no reusable free slot state, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    lookup.matched_len,
-                    self.waiting.len()
-                );
             } else {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    self.waiting.len()
-                );
+                let bytes_not_on_gpu =
+                    lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised);
+                let no_reusable_free_slot = lookup.matched_len > 0
+                    && !gpu_ready_prefix_blocks.is_empty()
+                    && reusable_gpu_prefix.is_none();
+                // A radix match is only reusable when the bytes already live in
+                // T0 and a free slot still materializes that prefix. When
+                // either precondition fails we degrade to cold prefill, but we
+                // keep both blockers in the log so admission debugging does not
+                // lose the "no reusable free slot" signal behind a staging miss.
+                if bytes_not_on_gpu || no_reusable_free_slot {
+                    info!(
+                        "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
+                        id,
+                        slot_idx,
+                        prompt_tokens.len(),
+                        lookup.matched_len,
+                        bytes_not_on_gpu,
+                        no_reusable_free_slot,
+                        self.waiting.len()
+                    );
+                } else {
+                    info!(
+                        "Request {} → slot {} (prompt={} tokens, queue={})",
+                        id,
+                        slot_idx,
+                        prompt_tokens.len(),
+                        self.waiting.len()
+                    );
+                }
             }
 
             self.active.push(ActiveRequest {

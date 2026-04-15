@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::kv_tier::BlockLocation;
-use crate::prefix_cache::{BlockId, RadixCache};
+use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{
     ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
 };
@@ -32,8 +32,15 @@ pub(super) const PREFIX_CACHE_LOW_WATER: f64 = 0.50;
 /// completed prompts are not published into the retained T0 prefix cache so
 /// fresh admissions cannot be starved by pinned-but-cold pages.
 pub(super) const PREFIX_CACHE_RETAIN_HARD_CAP: f64 = 0.90;
-/// Number of logical radix-clock ticks to soft-pin freshly published session
-/// prefixes before they become evictable again.
+/// Number of logical radix-clock ticks to keep a session-published prefix
+/// softly pinned before it becomes evictable again.
+///
+/// One radix tick is one successful `lookup`, `lookup_or_stage`, or `insert`
+/// call because each of those paths bumps the shared logical clock exactly
+/// once via `RadixCache::tick` in `prefix_cache.rs`. `64` is an empirical local
+/// default: long enough to cover a short burst of follow-up session turns
+/// without pretending to be wall-clock time. Re-tune it only against real
+/// session-trace benches.
 pub(super) const PREFIX_CACHE_KEEPALIVE_TICKS: u64 = 64;
 
 fn prefix_cache_retain_hard_cap_pages(total_pages: usize) -> usize {
@@ -135,26 +142,6 @@ impl<M: ModelForward> Scheduler<M> {
         let high = (total as f64 * PREFIX_CACHE_HIGH_WATER) as usize;
         let low = (total as f64 * PREFIX_CACHE_LOW_WATER) as usize;
         (high, low)
-    }
-
-    pub(super) fn refresh_session_keepalive(
-        &mut self,
-        blocks: &[BlockId],
-        session_id: Option<crate::types::SessionId>,
-    ) {
-        let keepalive_deadline = session_id.as_ref().map(|_| {
-            self.prefix_cache
-                .logical_clock()
-                .saturating_add(PREFIX_CACHE_KEEPALIVE_TICKS)
-        });
-        for &bid in blocks {
-            let _ = self
-                .prefix_cache
-                .set_block_session_id(bid, session_id.clone());
-            let _ = self
-                .prefix_cache
-                .set_block_soft_pin_until(bid, keepalive_deadline);
-        }
     }
 
     /// Create a new scheduler and its handle.
@@ -280,7 +267,10 @@ impl<M: ModelForward> Scheduler<M> {
             tokenizer,
             states,
             slot_materialized_prompt_lens,
-            prefix_cache: RadixCache::new(PREFIX_CACHE_BLOCK_SIZE),
+            prefix_cache: RadixCache::with_soft_pin_keepalive(
+                PREFIX_CACHE_BLOCK_SIZE,
+                PREFIX_CACHE_KEEPALIVE_TICKS,
+            ),
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
@@ -473,6 +463,11 @@ impl<M: ModelForward> Scheduler<M> {
             .kv_cache_bytes_per_token()
             .saturating_mul(block_size)
             .min(u32::MAX as usize) as u32;
+        let keepalive_deadline = session_id.as_ref().map(|_| {
+            self.prefix_cache
+                .logical_clock()
+                .saturating_add(PREFIX_CACHE_KEEPALIVE_TICKS)
+        });
         for (block_i, &bid) in blocks.iter().enumerate() {
             let pages_for_block = block_pages[block_i].clone();
             // If a prior publish already registered this BlockId
@@ -487,15 +482,18 @@ impl<M: ModelForward> Scheduler<M> {
                 .or_insert_with(|| pages_for_block);
             self.block_owner_slots.insert(bid, slot_idx);
             self.slot_owned_blocks[slot_idx].push(bid);
-            let _ = self.prefix_cache.set_block_location(
+            let _ = self.prefix_cache.update_block_metadata(
                 bid,
-                BlockLocation::Gpu {
-                    slot: slot_idx as u32,
+                BlockMetadataUpdate {
+                    location: Some(BlockLocation::Gpu {
+                        slot: slot_idx as u32,
+                    }),
+                    byte_len: Some(block_byte_len),
+                    session_id: Some(session_id.clone()),
+                    soft_pin_until: Some(keepalive_deadline),
                 },
             );
-            let _ = self.prefix_cache.set_block_byte_len(bid, block_byte_len);
         }
-        self.refresh_session_keepalive(&blocks, session_id);
     }
 
     /// Remove the transient "this free slot still owns a materialized prompt
