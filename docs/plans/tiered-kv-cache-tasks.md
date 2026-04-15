@@ -86,7 +86,7 @@ milestone plan.
 | P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
 | — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b local done, remote CUDA acceptance pending** (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
-| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a local done; M3b local policy-convergence started; remote CUDA smoke still pending before runtime behavior** | §3 below |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a local done; M3b local contract/state-machine + policy convergence done; remote CUDA smoke and runtime behavior still pending** | §3 below |
 | P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
 | P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |
@@ -344,13 +344,27 @@ this doc will get another path update pass at that point.
 - [x] `[L+R]` Add `RadixCache::evict_with_policy(...)` and route the CUDA
       scheduler's cleanup/allocation eviction path through
       `SessionBiasedLru::default()`
+- [x] `[L+R]` Add `infer/src/kv_tier/lookup.rs` and re-export
+      `HitKind`, `LookupOutcome`, `LookupHeuristics`, `StageTicket`, and
+      `StagePlanner` at `crate::kv_tier::*`
+- [x] `[L+R]` Edit `infer/src/prefix_cache.rs` — add metadata stamp helpers
+      and `lookup_or_stage(...)` classification for GPU / host / disk /
+      tombstone hits
+- [x] `[L+R]` Edit `infer/src/kv_tier/coordinator.rs` — add ticketed
+      staging commands/events plus the pure `Free | Resident | Demoting`
+      page-lifecycle state machine with local tests
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs` — eviction hook at admission (`evict_if_needed`) and post-decode (`stamp_keepalive`)
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs` — pass watermark thresholds (high=0.90, low=0.75 per §3.2) into `TieredKvCache`
 - [ ] `[L+R]` **Diff before delete** — confirm `grep -r 'offload_if_needed\|ensure_on_gpu\|k_host\|v_host' infer/src/` returns ONLY `infer/src/model/kv_cache.rs` (21 internal hits) + `infer/src/model/generation_state.rs` (1 hit, audit + strip) + `infer/src/ops/tests.rs` (6 unit-test local-variable name collisions, keep). Confirmed by P2 research grep.
 - [ ] `[L+R]` **Delete** `infer/src/model/kv_cache.rs:130-168` — `k_host`, `v_host`, `ensure_on_gpu`, `offload_if_needed`, `OFFLOAD_BLOCK_SIZE = 64`, `gpu_has_full_seq`, `offloaded_len`, `max_gpu_seq_len`
 - [ ] `[L+R]` Delete the matching mirror in `tests/test_kv_cache.py:135,138,262,367,373,382,383,394`
-- [ ] `[L]` `cargo check --features no-cuda` and `--features metal` still green
+- [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda prefix_cache`
+- [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda kv_tier`
+- [x] `[L]` `cargo check -p infer --tests --no-default-features --features cuda,no-cuda`
+- [x] `[L]` `cargo check -p infer --no-default-features --features metal`
 - [ ] `[R]` `cargo build --release`, full e2e suite, `greedy_consistency`
+- [ ] `[R]` Remote CUDA acceptance via
+      `tiered-kv-cache-m3b-remote-acceptance.md`
 - [ ] `[R]` Long-context bench (32k+ cumulative tokens, num_slots=4) that OOMs on main now runs to completion
 - [ ] `[R]` `scripts/bench_throughput_sweep.py --label tier-T2`; ≤3% steady-state regression vs P1 baseline
 - [ ] `[R]` Bench markdown in `docs/experience/wins/`
