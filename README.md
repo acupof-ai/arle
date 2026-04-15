@@ -86,10 +86,43 @@ curl http://localhost:8000/v1/chat/completions \
 
 **Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only).
 
-## Metal DFlash
+## Metal on Apple Silicon
 
-Metal DFlash is available as an experimental Apple Silicon decode path for
-`Qwen3`.
+For first-time local bring-up, use the canonical wrapper:
+
+```bash
+./scripts/start_metal_serve.sh
+```
+
+That script builds and runs `metal_serve` with the Metal backend feature set
+already selected. It defaults to `mlx-community/Qwen3-0.6B-4bit`, binds to
+`127.0.0.1:8000`, and forwards any extra `metal_serve` flags after `--`.
+
+To override the defaults:
+
+```bash
+./scripts/start_metal_serve.sh mlx-community/Qwen3-4B-bf16 8012 -- --warmup 0
+```
+
+If you prefer the direct Cargo invocation, it is still available:
+
+```bash
+cargo run --release -p infer --no-default-features --features metal,no-cuda --bin metal_serve -- \
+  --model-path mlx-community/Qwen3-0.6B-4bit
+```
+
+Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
+Metal scheduler runtime with chunked prefill and decode-priority interleave.
+It now has narrow same-length cross-request decode batching for Qwen3 and
+Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
+uses the legacy serial runtime path.
+For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
+`metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
+`--wired-limit-bytes` so MLX allocator behavior can be capped before model
+load.
+
+Metal DFlash remains available as an experimental Apple Silicon decode path
+for `Qwen3`.
 
 Quick example:
 
@@ -124,7 +157,9 @@ Current support should be read conservatively:
 - **CUDA on Linux** is the primary supported serving path.
 - **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
   scheduler runtime. Standard `metal_serve` now uses a live Metal scheduler
-  runtime, but batched decode / prefix-reuse parity is still pending.
+  runtime and the repo now ships `scripts/start_metal_serve.sh` as the
+  canonical first-time Apple bring-up path, but batched decode / prefix-reuse
+  parity is still pending.
 - **CPU-only / `no-cuda`** now includes a development-oriented CPU backend for
   local smoke tests and request-path validation, but it is still not a
   production inference target.
@@ -280,23 +315,21 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-For OpenAI-compatible serving on Apple Silicon:
+For OpenAI-compatible serving on Apple Silicon, the canonical first-time path
+is the wrapper script:
+
+```bash
+./scripts/start_metal_serve.sh
+```
+
+It expands to the Metal `cargo run` invocation below, but hides the feature
+flags and defaults the model / bind / port:
 
 ```bash
 cargo run --release -p infer --no-default-features --features metal,no-cuda --bin metal_serve -- \
   --model-path mlx-community/Qwen3-0.6B-4bit --port 8000 \
   --memory-limit-bytes 25769803776 --cache-limit-bytes 8589934592
 ```
-
-Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
-Metal scheduler runtime with chunked prefill and decode-priority interleave.
-It now has narrow same-length cross-request decode batching for Qwen3 and
-Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
-uses the legacy serial runtime path.
-For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
-`metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
-`--wired-limit-bytes` so MLX allocator behavior can be capped before model
-load.
 
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
 

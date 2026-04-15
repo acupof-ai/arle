@@ -74,10 +74,11 @@ This checklist is the execution companion to:
   Exit:
   `response_format` with JSON-schema constrained decoding is supported for chat
   requests; tool-call reliability no longer depends on post-hoc parsing only.
-- [ ] `M1.4` Add a one-command Apple Silicon path.
+- [x] `M1.4` Add a one-command Apple Silicon path.
   Exit:
   documented install/run flow no longer assumes Cargo feature knowledge for a
-  first-time Metal user.
+  first-time Metal user, and `scripts/start_metal_serve.sh` is the canonical
+  entrypoint.
 
 ## P2 · Product Breadth
 

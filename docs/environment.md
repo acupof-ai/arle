@@ -65,6 +65,30 @@ export AGENT_INFER_API_KEY=dev-secret
 ./target/release/metal_serve --model-path mlx-community/Qwen3-4B-bf16
 ```
 
+### Apple Silicon one-command bring-up
+
+The canonical first-time Metal serving entrypoint is
+[`scripts/start_metal_serve.sh`](../scripts/start_metal_serve.sh). It hides the
+Cargo feature flags, builds `metal_serve`, and starts the server on
+`127.0.0.1:8000`.
+
+Defaults:
+
+- model: `AGENT_INFER_MODEL` if set, otherwise `mlx-community/Qwen3-0.6B-4bit`
+- port: `8000`
+- bind: `127.0.0.1`
+
+Examples:
+
+```bash
+./scripts/start_metal_serve.sh
+./scripts/start_metal_serve.sh mlx-community/Qwen3-4B-bf16 8012 -- --warmup 0
+```
+
+Extra `metal_serve` flags go after `--`. For example, you can still pass
+`--api-key`, `--memory-limit-bytes`, `--cache-limit-bytes`, or
+`--wired-limit-bytes` through the wrapper.
+
 ### `AGENT_INFER_TEST_MODEL_PATH`
 
 Override model path for selected CLI-side tests.

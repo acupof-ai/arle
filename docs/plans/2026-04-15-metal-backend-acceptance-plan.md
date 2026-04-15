@@ -32,7 +32,7 @@ Benchmark rule:
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
 | `M1.2` models + responses API | Partial | `/v1/models` shipped; `/v1/responses` non-streaming subset shipped; streaming parity still pending |
 | `M1.3` structured outputs | Not shipped | no JSON-schema constrained decoding yet |
-| `M1.4` one-command Apple path | Not shipped | still assumes Cargo for first-time local bring-up |
+| `M1.4` one-command Apple path | Shipped | `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path |
 
 ## P0 · Serving Floor
 
@@ -368,13 +368,33 @@ Acceptance:
 
 ### `M1.4` One-command Apple Silicon path
 
-Status: not shipped.
+Status: shipped.
 
 Acceptance:
 
 - a first-time Apple user can install and start a local Metal server without
   needing to reason about Cargo feature flags
-- docs point to a single canonical install/run command or script
+- docs point to `scripts/start_metal_serve.sh` as the canonical install/run
+  command
+- the wrapper defaults to a small local model and forwards extra `metal_serve`
+  flags after `--`
+
+Verification:
+
+```bash
+./scripts/start_metal_serve.sh --help
+rg -n "start_metal_serve.sh" README.md docs/environment.md \
+  docs/plans/2026-04-15-metal-backend-acceptance-plan.md \
+  docs/plans/2026-04-15-metal-backend-execution-checklist.md \
+  docs/support-matrix.md
+```
+
+Exit signal:
+
+- first-time Apple users are directed to the same script in the README,
+  environment doc, and acceptance plan
+- the wrapper hides feature flags and makes the local Metal server start path
+  repeatable without cargo-flag knowledge
 
 ## P2 · Product Breadth
 
