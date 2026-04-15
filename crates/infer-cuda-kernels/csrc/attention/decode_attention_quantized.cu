@@ -23,6 +23,10 @@
 // Tokens per shared memory tile (loaded via cp.async pipeline)
 #define TILE_TOKENS 16
 
+namespace {
+constexpr int kQuantPageSize = TILE_TOKENS;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -46,7 +50,7 @@ __global__ void decode_attention_int8_partial_kernel(
     const float* __restrict__ K_scales,
     const float* __restrict__ V_scales,
     const int32_t* __restrict__ kv_indices,
-    const int32_t* __restrict__ kv_indptr,
+    const int32_t* __restrict__ kv_meta,
     float* __restrict__ partial_out,   // [num_splits, total_q_heads, HEAD_DIM]
     float* __restrict__ partial_m,     // [num_splits, total_q_heads]
     float* __restrict__ partial_l,     // [num_splits, total_q_heads]
@@ -73,15 +77,20 @@ __global__ void decode_attention_int8_partial_kernel(
     int lane_id = threadIdx.x % WARP_SIZE;
 
     // Determine this block's token range
-    int tok_start_global = kv_indptr[req_idx];
-    int tok_end_global   = kv_indptr[req_idx + 1];
-    int total_tokens = tok_end_global - tok_start_global;
+    const int32_t* page_indptr = kv_meta;
+    const int32_t* last_page_len = kv_meta + (batch_size + 1);
+    int page_start_global = page_indptr[req_idx];
+    int page_end_global = page_indptr[req_idx + 1];
+    int total_pages = page_end_global - page_start_global;
+    int total_tokens = total_pages == 0
+        ? 0
+        : (total_pages - 1) * kQuantPageSize + last_page_len[req_idx];
 
-    int chunk_size = (total_tokens + num_splits - 1) / num_splits;
-    int my_start = split_idx * chunk_size;
-    int my_end = min(my_start + chunk_size, total_tokens);
+    int page_chunk_size = (total_pages + num_splits - 1) / num_splits;
+    int my_page_start = split_idx * page_chunk_size;
+    int my_page_end = min(my_page_start + page_chunk_size, total_pages);
 
-    if (my_start >= total_tokens) {
+    if (my_page_start >= total_pages) {
         // This split has no tokens — write sentinel
         int out_idx = split_idx * (batch_size * num_qo_heads) + total_q_idx;
         if (threadIdx.x == 0) {
@@ -93,8 +102,6 @@ __global__ void decode_attention_int8_partial_kernel(
         }
         return;
     }
-
-    int my_tokens = my_end - my_start;
 
     // ── Load Q into registers ──
     float q_reg[EPT];
@@ -122,71 +129,49 @@ __global__ void decode_attention_int8_partial_kernel(
     __shared__ float smem_o[NUM_WARPS * HEAD_DIM];
 
     const int d_base = lane_id * EPT;
-    int tile_count = (my_tokens + TILE_TOKENS - 1) / TILE_TOKENS;
-
-    // Preload the first tile before entering the pipelined loop.
-    {
-        int tile_tokens = min(TILE_TOKENS, my_tokens);
-        for (int t = warp_id; t < tile_tokens; t += NUM_WARPS) {
-            int global_t = my_start + t;
-            int pool_idx = kv_indices[tok_start_global + global_t];
-            int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
-            int scale_off = pool_idx * num_kv_heads + kv_head;
+    auto preload_page = [&](int stage, int page_local_idx) {
+        int global_page = my_page_start + page_local_idx;
+        int page_idx = kv_indices[page_start_global + global_page];
+        int row_base = page_idx * kQuantPageSize;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
+            int row_idx = row_base + t;
+            int base = row_idx * kv_dim + kv_head * HEAD_DIM;
+            int scale_off = row_idx * num_kv_heads + kv_head;
 
             __pipeline_memcpy_async(
-                &smem_k[0][t][d_base],
+                &smem_k[stage][t][d_base],
                 &K_data[base + d_base],
                 sizeof(int8_t) * EPT);
             __pipeline_memcpy_async(
-                &smem_v[0][t][d_base],
+                &smem_v[stage][t][d_base],
                 &V_data[base + d_base],
                 sizeof(int8_t) * EPT);
             if (lane_id == 0) {
-                __pipeline_memcpy_async(&smem_k_scales[0][t], &K_scales[scale_off], sizeof(float));
-                __pipeline_memcpy_async(&smem_v_scales[0][t], &V_scales[scale_off], sizeof(float));
+                __pipeline_memcpy_async(&smem_k_scales[stage][t], &K_scales[scale_off], sizeof(float));
+                __pipeline_memcpy_async(&smem_v_scales[stage][t], &V_scales[scale_off], sizeof(float));
             }
         }
         __pipeline_commit();
-    }
+    };
 
-    // ── Warp-parallel token processing with tiled async preload ──
-    for (int tile_idx = 0; tile_idx < tile_count; tile_idx++) {
-        int stage = tile_idx & 1;
-        int tile_start = tile_idx * TILE_TOKENS;
-        int tile_tokens = min(TILE_TOKENS, my_tokens - tile_start);
+    preload_page(0, 0);
+
+    // ── Warp-parallel token processing with page-sized tiled async preload ──
+    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+        int stage = page_local_idx & 1;
+        int global_page = my_page_start + page_local_idx;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
 
         __pipeline_wait_prior(0);
         __syncthreads();
 
-        int next_tile_idx = tile_idx + 1;
-        if (next_tile_idx < tile_count) {
-            int next_stage = next_tile_idx & 1;
-            int next_tile_start = next_tile_idx * TILE_TOKENS;
-            int next_tile_tokens = min(TILE_TOKENS, my_tokens - next_tile_start);
-
-            for (int t = warp_id; t < next_tile_tokens; t += NUM_WARPS) {
-                int global_t = my_start + next_tile_start + t;
-                int pool_idx = kv_indices[tok_start_global + global_t];
-                int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
-                int scale_off = pool_idx * num_kv_heads + kv_head;
-
-                __pipeline_memcpy_async(
-                    &smem_k[next_stage][t][d_base],
-                    &K_data[base + d_base],
-                    sizeof(int8_t) * EPT);
-                __pipeline_memcpy_async(
-                    &smem_v[next_stage][t][d_base],
-                    &V_data[base + d_base],
-                    sizeof(int8_t) * EPT);
-                if (lane_id == 0) {
-                    __pipeline_memcpy_async(&smem_k_scales[next_stage][t], &K_scales[scale_off], sizeof(float));
-                    __pipeline_memcpy_async(&smem_v_scales[next_stage][t], &V_scales[scale_off], sizeof(float));
-                }
-            }
-            __pipeline_commit();
+        int next_page_local_idx = page_local_idx + 1;
+        if (next_page_local_idx < my_page_end - my_page_start) {
+            preload_page(next_page_local_idx & 1, next_page_local_idx);
         }
 
-        for (int t = warp_id; t < tile_tokens; t += NUM_WARPS) {
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
             float k_scale = smem_k_scales[stage][t];
 
             float qk = 0.0f;
@@ -326,7 +311,7 @@ __global__ void decode_attention_fp8_partial_kernel(
     const __nv_fp8_e4m3* __restrict__ K_data,
     const __nv_fp8_e4m3* __restrict__ V_data,
     const int32_t* __restrict__ kv_indices,
-    const int32_t* __restrict__ kv_indptr,
+    const int32_t* __restrict__ kv_meta,
     float* __restrict__ partial_out,
     float* __restrict__ partial_m,
     float* __restrict__ partial_l,
@@ -351,21 +336,24 @@ __global__ void decode_attention_fp8_partial_kernel(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    int tok_start_global = kv_indptr[req_idx];
-    int tok_end_global   = kv_indptr[req_idx + 1];
-    int total_tokens = tok_end_global - tok_start_global;
-    int chunk_size = (total_tokens + num_splits - 1) / num_splits;
-    int my_start = split_idx * chunk_size;
-    int my_end = min(my_start + chunk_size, total_tokens);
+    const int32_t* page_indptr = kv_meta;
+    const int32_t* last_page_len = kv_meta + (batch_size + 1);
+    int page_start_global = page_indptr[req_idx];
+    int page_end_global = page_indptr[req_idx + 1];
+    int total_pages = page_end_global - page_start_global;
+    int total_tokens = total_pages == 0
+        ? 0
+        : (total_pages - 1) * kQuantPageSize + last_page_len[req_idx];
+    int page_chunk_size = (total_pages + num_splits - 1) / num_splits;
+    int my_page_start = split_idx * page_chunk_size;
+    int my_page_end = min(my_page_start + page_chunk_size, total_pages);
 
-    if (my_start >= total_tokens) {
+    if (my_page_start >= total_pages) {
         int out_idx = split_idx * (batch_size * num_qo_heads) + total_q_idx;
         if (threadIdx.x == 0) { partial_m[out_idx] = -FLT_MAX; partial_l[out_idx] = 0.0f; }
         if (threadIdx.x < HEAD_DIM) partial_out[out_idx * HEAD_DIM + threadIdx.x] = 0.0f;
         return;
     }
-
-    int my_tokens = my_end - my_start;
 
     float q_reg[EPT];
     #pragma unroll
@@ -380,34 +368,40 @@ __global__ void decode_attention_fp8_partial_kernel(
     float m_local = -FLT_MAX;
     float l_local = 0.0f;
 
-    for (int t = warp_id; t < my_tokens; t += NUM_WARPS) {
-        int global_t = my_start + t;
-        int pool_idx = kv_indices[tok_start_global + global_t];
-        int base = pool_idx * kv_dim + kv_head * HEAD_DIM;
+    for (int page_local_idx = 0; page_local_idx < my_page_end - my_page_start; page_local_idx++) {
+        int global_page = my_page_start + page_local_idx;
+        int page_idx = kv_indices[page_start_global + global_page];
+        int row_base = page_idx * kQuantPageSize;
+        int page_tokens = (global_page == total_pages - 1) ? last_page_len[req_idx] : kQuantPageSize;
 
-        // FP8 dequant: direct cast, no scale
-        float qk = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            int d = lane_id * EPT + i;
-            float k_val = static_cast<float>(K_data[base + d]);
-            qk += q_reg[i] * k_val;
+        for (int t = warp_id; t < page_tokens; t += NUM_WARPS) {
+            int row_idx = row_base + t;
+            int base = row_idx * kv_dim + kv_head * HEAD_DIM;
+
+            // FP8 dequant: direct cast, no scale
+            float qk = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                int d = lane_id * EPT + i;
+                float k_val = static_cast<float>(K_data[base + d]);
+                qk += q_reg[i] * k_val;
+            }
+            qk = warp_reduce_sum(qk);
+
+            float m_new = fmaxf(m_local, qk);
+            float exp_diff = __expf(m_local - m_new);
+            float exp_qk = __expf(qk - m_new);
+            float l_new = l_local * exp_diff + exp_qk;
+
+            #pragma unroll
+            for (int i = 0; i < EPT; i++) {
+                int d = lane_id * EPT + i;
+                float v_val = static_cast<float>(V_data[base + d]);
+                o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
+            }
+            m_local = m_new;
+            l_local = l_new;
         }
-        qk = warp_reduce_sum(qk);
-
-        float m_new = fmaxf(m_local, qk);
-        float exp_diff = __expf(m_local - m_new);
-        float exp_qk = __expf(qk - m_new);
-        float l_new = l_local * exp_diff + exp_qk;
-
-        #pragma unroll
-        for (int i = 0; i < EPT; i++) {
-            int d = lane_id * EPT + i;
-            float v_val = static_cast<float>(V_data[base + d]);
-            o_reg[i] = o_reg[i] * exp_diff + exp_qk * v_val;
-        }
-        m_local = m_new;
-        l_local = l_new;
     }
 
     // Cross-warp merge (same as INT8 variant)

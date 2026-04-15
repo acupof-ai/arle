@@ -51,6 +51,9 @@ pub struct BatchDecodeBuffers {
     token_ids_scratch: Vec<i32>,
 
     pub(crate) metadata: FlashInferDecodeMetadata,
+    /// Packed page-aware metadata for quantized decode kernels:
+    /// `[page_indptr..., last_page_len...]`.
+    quantized_kv_meta: CudaSlice<i32>,
 
     /// Dummy Q/K norm weights (all ones) for decode_prep_paged.
     /// GLM-4 has no Q/K norm.
@@ -115,6 +118,10 @@ impl BatchDecodeBuffers {
                 max_total_pages,
                 num_qheads,
             )?,
+            quantized_kv_meta: ctx
+                .stream
+                .alloc_zeros(2 * max_batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Alloc quantized_kv_meta failed: {e}"))?,
 
             dummy_q_norm: DeviceVec::ones(ctx, config.head_dim())?,
             dummy_k_norm: DeviceVec::ones(ctx, config.head_dim())?,
@@ -225,6 +232,13 @@ impl GLM4Model {
 
         // Note: token IDs H2D, metadata update, and FlashInfer plan are now
         // handled by the scheduler via DecodeContextOps before this call.
+        if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
+            let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
+            self.ctx
+                .stream
+                .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
+                .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+        }
 
         bufs.embedding_out.seq_len = batch_size;
 
@@ -487,7 +501,7 @@ impl GLM4Model {
                         kv_pool.k_scales_ptr(layer_idx, stream),
                         kv_pool.v_scales_ptr(layer_idx, stream),
                         &bufs.metadata.kv_indices,
-                        &bufs.metadata.kv_indptr,
+                        &bufs.quantized_kv_meta,
                         &mut bufs.attn_output,
                         batch_size,
                         num_heads,
@@ -507,7 +521,7 @@ impl GLM4Model {
                         kv_pool.k_data_ptr(layer_idx, stream),
                         kv_pool.v_data_ptr(layer_idx, stream),
                         &bufs.metadata.kv_indices,
-                        &bufs.metadata.kv_indptr,
+                        &bufs.quantized_kv_meta,
                         &mut bufs.attn_output,
                         batch_size,
                         num_heads,

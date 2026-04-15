@@ -15,6 +15,10 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+namespace {
+constexpr int kQuantPageSize = 16;
+}
+
 __global__ void kv_cache_to_paged_kernel(
     const __nv_bfloat16* __restrict__ k_contiguous,  // [num_kv_heads, max_seq_len, head_dim]
     const __nv_bfloat16* __restrict__ v_contiguous,  // [num_kv_heads, max_seq_len, head_dim]
@@ -121,12 +125,14 @@ __global__ void kv_cache_to_paged_range_hnd_kernel(
 
 // ============================================================================
 // INT8 variant: copy quantized INT8 data + scales from contiguous (HND)
-// to paged (NHD) layout with scale transposition.
+// to paged (NHD) layout with scale transposition. Quantized paged pools use
+// `page_size=16`, so the physical row for token `pos` is:
+//   row = page_indices[pos / 16] * 16 + (pos % 16)
 //
 // Contiguous INT8 data: [num_kv_heads, max_seq_len, head_dim] (HND)
 // Contiguous scales:    [num_kv_heads, max_seq_len]
-// Paged INT8 data:      pool_idx * kv_dim + kv_head * head_dim + d (NHD)
-// Paged scales:         pool_idx * num_kv_heads + kv_head
+// Paged INT8 data:      row * kv_dim + kv_head * head_dim + d (NHD)
+// Paged scales:         row * num_kv_heads + kv_head
 //
 // Grid: (num_kv_heads, seq_len)  Threads: head_dim
 // ============================================================================
@@ -139,7 +145,7 @@ __global__ void kv_cache_to_paged_int8_kernel(
     int8_t* __restrict__ v_paged,
     float* __restrict__ k_scales_paged,          // [max_tokens, num_kv_heads]
     float* __restrict__ v_scales_paged,
-    const int32_t* __restrict__ page_indices,    // [seq_len] token pool indices
+    const int32_t* __restrict__ page_indices,    // [ceil(seq_len / 16)] page ids
     int max_seq_len,
     int seq_len,
     int num_kv_heads,
@@ -152,12 +158,14 @@ __global__ void kv_cache_to_paged_int8_kernel(
 
     if (pos >= seq_len || dim >= head_dim) return;
 
-    int pool_idx = page_indices[pos];
+    int page_idx = page_indices[pos / kQuantPageSize];
+    int offset_in_page = pos % kQuantPageSize;
+    int row_idx = page_idx * kQuantPageSize + offset_in_page;
 
     // Source: HND contiguous
     int src_data = kv_head * max_seq_len * head_dim + pos * head_dim + dim;
     // Destination: NHD paged
-    int dst_data = pool_idx * kv_dim + kv_head * head_dim + dim;
+    int dst_data = row_idx * kv_dim + kv_head * head_dim + dim;
 
     k_paged[dst_data] = k_cont[src_data];
     v_paged[dst_data] = v_cont[src_data];
@@ -165,7 +173,7 @@ __global__ void kv_cache_to_paged_int8_kernel(
     // Copy scales (one thread per (kv_head, pos) pair)
     if (dim == 0) {
         int src_scale = kv_head * max_seq_len + pos;
-        int dst_scale = pool_idx * num_kv_heads + kv_head;
+        int dst_scale = row_idx * num_kv_heads + kv_head;
         k_scales_paged[dst_scale] = k_scales_cont[src_scale];
         v_scales_paged[dst_scale] = v_scales_cont[src_scale];
     }
@@ -180,7 +188,7 @@ __global__ void kv_cache_to_paged_int8_range_kernel(
     int8_t* __restrict__ v_paged,
     float* __restrict__ k_scales_paged,          // [max_tokens, num_kv_heads]
     float* __restrict__ v_scales_paged,
-    const int32_t* __restrict__ token_indices,   // [token_count] token pool indices
+    const int32_t* __restrict__ token_indices,   // [token_count] token rows
     int start_pos,
     int max_seq_len,
     int token_count,
@@ -195,17 +203,20 @@ __global__ void kv_cache_to_paged_int8_range_kernel(
     if (rel_pos >= token_count || dim >= head_dim) return;
 
     int pos = start_pos + rel_pos;
-    int pool_idx = token_indices[rel_pos];
+    int token_row = token_indices[rel_pos];
+    int page_idx = token_row / kQuantPageSize;
+    int offset_in_page = token_row % kQuantPageSize;
+    int row_idx = page_idx * kQuantPageSize + offset_in_page;
 
     int src_data = kv_head * max_seq_len * head_dim + pos * head_dim + dim;
-    int dst_data = pool_idx * kv_dim + kv_head * head_dim + dim;
+    int dst_data = row_idx * kv_dim + kv_head * head_dim + dim;
 
     k_paged[dst_data] = k_cont[src_data];
     v_paged[dst_data] = v_cont[src_data];
 
     if (dim == 0) {
         int src_scale = kv_head * max_seq_len + pos;
-        int dst_scale = pool_idx * num_kv_heads + kv_head;
+        int dst_scale = row_idx * num_kv_heads + kv_head;
         k_scales_paged[dst_scale] = k_scales_cont[src_scale];
         v_scales_paged[dst_scale] = v_scales_cont[src_scale];
     }
