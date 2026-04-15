@@ -345,6 +345,8 @@ struct Qwen35CompiledModel {
     int current_batch_size = 1;
     bool current_last_logits_only = false;
     mutable array current_gdr_t_arr = array(1);
+    mutable array current_attn_mask = array(0);
+    mutable bool current_has_attn_mask = false;
     // Keep previous step's arrays alive to prevent premature GPU buffer release.
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
@@ -406,8 +408,24 @@ struct Qwen35CompiledModel {
         auto k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
         auto v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
 
-        std::string mask_mode = (S > 1) ? "causal" : "";
-        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, mask_mode);
+        array attn_out(0);
+        if (current_has_attn_mask) {
+            attn_out = fast::scaled_dot_product_attention(
+                q,
+                k_full,
+                v_full,
+                attn_scale,
+                "",
+                current_attn_mask);
+        } else {
+            std::string mask_mode = (S > 1) ? "causal" : "";
+            attn_out = fast::scaled_dot_product_attention(
+                q,
+                k_full,
+                v_full,
+                attn_scale,
+                mask_mode);
+        }
         attn_out = reshape(transpose(attn_out, {0,2,1,3}), {B, S, nh*hd});
 
         array result(0);
@@ -996,6 +1014,7 @@ int32_t qwen35_compiled_step_batch(
     int32_t n_kv_per_request,
     mlx_array** gdr_states,
     int32_t n_gdr_per_request,
+    mlx_array* attn_mask,
     mlx_array** out_logits,
     mlx_array** out_kv_caches,
     mlx_array** out_gdr_states
@@ -1011,6 +1030,12 @@ int32_t qwen35_compiled_step_batch(
         m->current_cache_pos = cache_pos;
         m->current_batch_size = batch_size;
         m->current_seq_len = 1;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv_per_request + n_gdr_per_request);
@@ -1064,10 +1089,14 @@ int32_t qwen35_compiled_step_batch(
             }
         }
 
+        m->current_attn_mask = array(0);
+        m->current_has_attn_mask = false;
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
+        m->current_attn_mask = array(0);
+        m->current_has_attn_mask = false;
         m->current_batch_size = 1;
         return -1;
     }
@@ -1082,6 +1111,7 @@ int32_t qwen35_compiled_step_batch_packed(
     int32_t n_kv,
     mlx_array** packed_gdr_states,
     int32_t n_gdr,
+    mlx_array* attn_mask,
     mlx_array** out_logits,
     mlx_array** out_packed_kv_caches,
     mlx_array** out_packed_gdr_states
@@ -1097,6 +1127,12 @@ int32_t qwen35_compiled_step_batch_packed(
         m->current_cache_pos = cache_pos;
         m->current_batch_size = batch_size;
         m->current_seq_len = 1;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -1123,10 +1159,14 @@ int32_t qwen35_compiled_step_batch_packed(
             out_packed_gdr_states[gdr_idx] = from_arr(std::move(outputs[1 + n_kv + gdr_idx]));
         }
 
+        m->current_attn_mask = array(0);
+        m->current_has_attn_mask = false;
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
+        m->current_attn_mask = array(0);
+        m->current_has_attn_mask = false;
         m->current_batch_size = 1;
         return -1;
     }

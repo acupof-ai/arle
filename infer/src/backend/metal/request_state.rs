@@ -14,6 +14,82 @@ use crate::sampler::SamplingParams;
 
 const METAL_REQUEST_STATE_ID: usize = 0;
 
+fn round_up_kv_capacity(tokens: i32) -> i32 {
+    ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
+}
+
+fn left_pad_kv_cache_row(
+    array: &MlxArray,
+    left_pad: i32,
+    cache_len: i32,
+    target_kv_capacity: i32,
+) -> MlxArray {
+    let shape = array.shape();
+    debug_assert_eq!(shape.len(), 4);
+    debug_assert_eq!(shape[0], 1);
+    debug_assert!(left_pad >= 0);
+    debug_assert!(cache_len >= 0);
+    debug_assert!(left_pad + cache_len <= target_kv_capacity);
+
+    let n_kv = shape[1];
+    let head_dim = shape[3];
+    let mut padded = zeros(&[1, n_kv, target_kv_capacity, head_dim], array.dtype());
+    if cache_len == 0 {
+        return padded;
+    }
+
+    let valid = slice(
+        array,
+        &[0, 0, 0, 0],
+        &[1, n_kv, cache_len, head_dim],
+        &[1, 1, 1, 1],
+    );
+    padded = super::mlx::slice_update(
+        &mut padded,
+        &valid,
+        &[0, 0, left_pad, 0],
+        &[1, n_kv, left_pad + cache_len, head_dim],
+    );
+    padded
+}
+
+fn strip_left_padding_from_packed_row(
+    array: &MlxArray,
+    row: i32,
+    left_pad: i32,
+    batch_cache_len: i32,
+    row_kv_capacity: i32,
+) -> MlxArray {
+    let row_slice = slice_row(array, row);
+    let shape = row_slice.shape();
+    debug_assert_eq!(shape.len(), 4);
+    debug_assert_eq!(shape[0], 1);
+    debug_assert!(left_pad >= 0);
+    debug_assert!(batch_cache_len >= left_pad);
+
+    let n_kv = shape[1];
+    let head_dim = shape[3];
+    let valid_len = batch_cache_len - left_pad;
+    let mut unpadded = zeros(&[1, n_kv, row_kv_capacity, head_dim], row_slice.dtype());
+    if valid_len == 0 {
+        return unpadded;
+    }
+
+    let valid = slice(
+        &row_slice,
+        &[0, 0, left_pad, 0],
+        &[1, n_kv, batch_cache_len, head_dim],
+        &[1, 1, 1, 1],
+    );
+    unpadded = super::mlx::slice_update(
+        &mut unpadded,
+        &valid,
+        &[0, 0, 0, 0],
+        &[1, n_kv, valid_len, head_dim],
+    );
+    unpadded
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetalRequestPhase {
     Prefill,
@@ -248,8 +324,9 @@ pub(crate) struct Qwen35PackedDecodeBatch<'a> {
     weights: &'a Qwen35MetalWeights,
     config: &'a MetalModelConfig,
     arch: &'a super::config::MetalQwen35ArchConfig,
-    cache_len: i32,
+    batch_cache_len: i32,
     kv_capacity: i32,
+    left_padding: Vec<i32>,
     n_kv_per_request: i32,
     n_gdr_per_request: i32,
     packed_kv_flat: Vec<MlxArray>,
@@ -265,12 +342,17 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             .unwrap_or(0)
     }
 
+    /// Shared column cursor for this packed batch. All rows write their next
+    /// decode token at this column; rows that joined late are left-padded so
+    /// their valid KV data sits in `[left_padding[i], batch_cache_len)`.
+    pub(crate) fn batch_cache_len(&self) -> i32 {
+        self.batch_cache_len
+    }
+
     fn matches_driver(&self, driver: &Qwen35StepDriver<'a>) -> bool {
         std::ptr::eq(self.weights, driver.weights)
             && std::ptr::eq(self.config, driver.config)
             && std::ptr::eq(self.arch, driver.arch)
-            && driver.cache_len == self.cache_len
-            && driver.kv_capacity == self.kv_capacity
             && matches!(driver.mode, Qwen35StepMode::Cpp(_))
     }
 
@@ -279,6 +361,9 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
         states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
         needed_tokens: i32,
     ) {
+        for state in states.iter_mut() {
+            state.driver.kv_capacity = state.driver.kv_capacity.max(self.kv_capacity);
+        }
         while needed_tokens > self.kv_capacity {
             let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
             for cache in &mut self.packed_kv_flat {
@@ -320,6 +405,154 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
             let old = std::mem::replace(tensor, take_axis(tensor, &index_arr, 0));
             drop(old);
         }
+        self.left_padding = row_indices
+            .iter()
+            .map(|&row| self.left_padding[row])
+            .collect();
+
+        let mut eval_refs =
+            Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len());
+        eval_refs.extend(self.packed_kv_flat.iter());
+        eval_refs.extend(self.packed_gdr_flat.iter());
+        let eval_refs: Vec<&MlxArray> = eval_refs.into_iter().collect();
+        eval(&eval_refs);
+        Ok(())
+    }
+
+    pub(crate) fn admit_rows(
+        &mut self,
+        states: &mut [&mut MetalRequestState<'a>],
+        new_indices: &[usize],
+    ) -> Result<()> {
+        if new_indices.is_empty() {
+            return Ok(());
+        }
+
+        let mut target_kv_capacity = self.kv_capacity;
+        for &idx in new_indices {
+            let Some(state) = states.get(idx) else {
+                bail!("Qwen3.5 packed batch admit_rows index {idx} out of range");
+            };
+            let state_ref: &MetalRequestState<'a> = state;
+            let MetalRequestStateInner::Qwen35(qwen35) = &state_ref.inner else {
+                bail!("Qwen3.5 packed batch admit_rows received mixed model batch");
+            };
+            if qwen35.phase() != MetalRequestPhase::Decode {
+                bail!("Qwen3.5 packed batch admit_rows requires Decode phase");
+            }
+            target_kv_capacity = target_kv_capacity.max(qwen35.driver.kv_capacity);
+        }
+        target_kv_capacity = round_up_kv_capacity(target_kv_capacity);
+        while target_kv_capacity > self.kv_capacity {
+            let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
+            for cache in &mut self.packed_kv_flat {
+                extend_kv_cache(
+                    cache,
+                    self.config.num_key_value_heads as i32,
+                    self.config.head_dim as i32,
+                    new_cap,
+                );
+            }
+            self.kv_capacity = new_cap;
+        }
+
+        let mut new_kv_rows: Vec<Vec<MlxArray>> = (0..self.n_kv_per_request)
+            .map(|_| Vec::with_capacity(new_indices.len()))
+            .collect();
+        let mut new_gdr_rows: Vec<Vec<MlxArray>> = (0..self.n_gdr_per_request)
+            .map(|_| Vec::with_capacity(new_indices.len()))
+            .collect();
+        let mut new_left_padding = Vec::with_capacity(new_indices.len());
+
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            if let MetalRequestStateInner::Qwen35(qwen35) = &mut state_ref.inner {
+                if self.matches_driver(&qwen35.driver) {
+                    qwen35.driver.kv_capacity = qwen35.driver.kv_capacity.max(self.kv_capacity);
+                }
+            }
+        }
+
+        for &idx in new_indices {
+            let state_ref: &mut MetalRequestState<'a> = states.get_mut(idx).ok_or_else(|| {
+                anyhow::anyhow!("Qwen3.5 packed batch admit_rows index {idx} out of range")
+            })?;
+            let MetalRequestStateInner::Qwen35(qwen35) = &mut state_ref.inner else {
+                bail!("Qwen3.5 packed batch admit_rows received mixed model batch");
+            };
+            ensure!(
+                qwen35.phase() == MetalRequestPhase::Decode,
+                "Qwen3.5 packed batch admit_rows requires Decode phase"
+            );
+            ensure!(
+                std::ptr::eq(qwen35.driver.weights, self.weights)
+                    && std::ptr::eq(qwen35.driver.config, self.config)
+                    && std::ptr::eq(qwen35.driver.arch, self.arch),
+                "Qwen3.5 packed batch admit_rows requires matching model handles"
+            );
+
+            qwen35.driver.ensure_capacity(self.kv_capacity);
+            qwen35.driver.kv_capacity = self.kv_capacity;
+            let left_pad = self.batch_cache_len - qwen35.driver.cache_len;
+            ensure!(
+                left_pad >= 0,
+                "Qwen3.5 packed batch cannot admit cache_len {} into batch_cache_len {}",
+                qwen35.driver.cache_len,
+                self.batch_cache_len
+            );
+
+            match &mut qwen35.driver.mode {
+                Qwen35StepMode::Cpp(cpp) => {
+                    ensure!(
+                        i32::try_from(cpp.kv_flat.len())
+                            .context("Qwen3.5 packed batch admit_rows kv count overflow")?
+                            == self.n_kv_per_request
+                            && i32::try_from(cpp.gdr_flat.len())
+                                .context("Qwen3.5 packed batch admit_rows gdr count overflow")?
+                                == self.n_gdr_per_request,
+                        "Qwen3.5 packed batch admit_rows requires matching state vector counts"
+                    );
+                    for (slot_idx, slot) in cpp.kv_flat.iter().enumerate() {
+                        new_kv_rows[slot_idx].push(left_pad_kv_cache_row(
+                            slot,
+                            left_pad,
+                            qwen35.driver.cache_len,
+                            self.kv_capacity,
+                        ));
+                    }
+                    for (slot_idx, slot) in cpp.gdr_flat.iter().enumerate() {
+                        new_gdr_rows[slot_idx].push(slot.clone());
+                    }
+                }
+                Qwen35StepMode::Rust(_) => {
+                    bail!("Qwen3.5 packed batch admit_rows requires compiled Qwen3.5 state")
+                }
+            }
+
+            new_left_padding.push(left_pad);
+        }
+
+        for (slot_idx, appended_rows) in new_kv_rows.iter_mut().enumerate() {
+            let mut concatenated = Vec::with_capacity(1 + appended_rows.len());
+            concatenated.push(self.packed_kv_flat[slot_idx].clone());
+            concatenated.append(appended_rows);
+            let old = std::mem::replace(
+                &mut self.packed_kv_flat[slot_idx],
+                concatenate_axis(&concatenated, 0),
+            );
+            drop(old);
+        }
+        for (slot_idx, appended_rows) in new_gdr_rows.iter_mut().enumerate() {
+            let mut concatenated = Vec::with_capacity(1 + appended_rows.len());
+            concatenated.push(self.packed_gdr_flat[slot_idx].clone());
+            concatenated.append(appended_rows);
+            let old = std::mem::replace(
+                &mut self.packed_gdr_flat[slot_idx],
+                concatenate_axis(&concatenated, 0),
+            );
+            drop(old);
+        }
+        self.left_padding.extend(new_left_padding);
 
         let mut eval_refs =
             Vec::with_capacity(self.packed_kv_flat.len() + self.packed_gdr_flat.len());
@@ -509,6 +742,19 @@ impl<'a> MetalRequestState<'a> {
                 let sampled = decode_qwen35_batch(&mut qwen35_states)?;
                 Ok(Some(sampled))
             }
+        }
+    }
+
+    /// Return this request's Qwen3.5 decode cursor (`cache_len`) if it is a
+    /// Qwen3.5 request currently in the `Decode` phase. Used by the scheduler
+    /// runtime to decide whether a freshly prefilled row can join an existing
+    /// packed batch without forcing a full cache rebuild.
+    pub(crate) fn qwen35_decode_cursor(&self) -> Option<i32> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen35(state) if state.phase() == MetalRequestPhase::Decode => {
+                Some(state.driver.cache_len)
+            }
+            _ => None,
         }
     }
 
@@ -927,8 +1173,6 @@ fn try_build_qwen35_packed_decode_batch<'a>(
     let weights = first.weights;
     let config = first.config;
     let arch = first.arch;
-    let cache_len = first.cache_len;
-    let kv_capacity = first.kv_capacity;
 
     let (n_kv_per_request, n_gdr_per_request) = match &first.mode {
         Qwen35StepMode::Cpp(state) => (
@@ -940,6 +1184,16 @@ fn try_build_qwen35_packed_decode_batch<'a>(
         Qwen35StepMode::Rust(_) => return Ok(None),
     };
 
+    // Phase 1 scaffolding is in place (mask FFI param, `left_padding` field,
+    // `build_varlen_decode_mask`, `admit_rows`, `strip_left_padding_from_packed_row`)
+    // but the Qwen3.5 C++ `full_attn_step` still RoPE-rotates Q/K with a shared
+    // `cache_pos = batch_cache_len`. For rows with `left_pad > 0` that would
+    // apply the wrong positional encoding — attention values would be garbage.
+    // Until per-row RoPE lands via `fast::rope(..., array offset)` on the
+    // C++ side, keep the same-length admission check.
+    // See docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md.
+    let cache_len = states[0].driver.cache_len;
+    let kv_capacity = states[0].driver.kv_capacity;
     for state in states.iter() {
         if !std::ptr::eq(state.driver.weights, weights)
             || !std::ptr::eq(state.driver.config, config)
@@ -965,19 +1219,37 @@ fn try_build_qwen35_packed_decode_batch<'a>(
             Qwen35StepMode::Rust(_) => return Ok(None),
         }
     }
+    let batch_cache_len = cache_len;
+    let target_kv_capacity = kv_capacity;
+    // Same-length path: every row already has left_pad = 0, so the mask
+    // builder fast-path in `decode_qwen35_packed_batch` skips mask materialization
+    // and the C++ step falls through to the legacy string-mode attention.
+    let left_padding = vec![0i32; states.len()];
 
     let mut packed_kv_flat = Vec::with_capacity(n_kv_per_request as usize);
     for kv_idx in 0..n_kv_per_request as usize {
         let mut per_request = Vec::with_capacity(states.len());
-        for state in states.iter() {
+        for (row_idx, state) in states.iter().enumerate() {
             let Qwen35StepMode::Cpp(cpp) = &state.driver.mode else {
                 unreachable!("checked above");
             };
-            per_request.push(cpp.kv_flat[kv_idx].clone());
+            let pad = left_padding[row_idx];
+            if pad == 0 {
+                per_request.push(cpp.kv_flat[kv_idx].clone());
+            } else {
+                per_request.push(left_pad_kv_cache_row(
+                    &cpp.kv_flat[kv_idx],
+                    pad,
+                    state.driver.cache_len,
+                    target_kv_capacity,
+                ));
+            }
         }
         packed_kv_flat.push(concatenate_axis(&per_request, 0));
     }
 
+    // GDR state is per-request recurrent state (not a time-series cache), so
+    // it does NOT get left-padded — just stacked along the batch axis.
     let mut packed_gdr_flat = Vec::with_capacity(n_gdr_per_request as usize);
     for gdr_idx in 0..n_gdr_per_request as usize {
         let mut per_request = Vec::with_capacity(states.len());
@@ -1000,8 +1272,9 @@ fn try_build_qwen35_packed_decode_batch<'a>(
         weights,
         config,
         arch,
-        cache_len,
-        kv_capacity,
+        batch_cache_len,
+        kv_capacity: target_kv_capacity,
+        left_padding,
         n_kv_per_request,
         n_gdr_per_request,
         packed_kv_flat,
@@ -1022,27 +1295,37 @@ fn sync_qwen35_packed_decode_batch<'a>(
 
     for (row_idx, state) in states.iter_mut().enumerate() {
         ensure!(
-            batch.matches_driver(&state.driver)
-                || (state.driver.cache_len == batch.cache_len
-                    && std::ptr::eq(state.driver.weights, batch.weights)
-                    && std::ptr::eq(state.driver.config, batch.config)
-                    && std::ptr::eq(state.driver.arch, batch.arch)
-                    && matches!(state.driver.mode, Qwen35StepMode::Cpp(_))),
+            batch.matches_driver(&state.driver),
             "sync_qwen35_packed_decode_batch state mismatch at row {row_idx}"
         );
         let row = i32::try_from(row_idx).context("sync_qwen35_packed_decode_batch row overflow")?;
+        let left_pad = batch.left_padding[row_idx];
         match &mut state.driver.mode {
             Qwen35StepMode::Cpp(cpp) => {
+                // KV caches carry per-column valid-mask positions; strip the
+                // left pad so each row's own cache is left-aligned again.
                 for (slot, packed) in cpp.kv_flat.iter_mut().zip(batch.packed_kv_flat.iter()) {
-                    let old = std::mem::replace(slot, slice_row(packed, row));
+                    let new_slot = if left_pad == 0 {
+                        slice_row(packed, row)
+                    } else {
+                        strip_left_padding_from_packed_row(
+                            packed,
+                            row,
+                            left_pad,
+                            batch.batch_cache_len,
+                            batch.kv_capacity,
+                        )
+                    };
+                    let old = std::mem::replace(slot, new_slot);
                     drop(old);
                 }
+                // GDR recurrent state is not time-series — no pad to strip.
                 for (slot, packed) in cpp.gdr_flat.iter_mut().zip(batch.packed_gdr_flat.iter()) {
                     let old = std::mem::replace(slot, slice_row(packed, row));
                     drop(old);
                 }
                 state.driver.kv_capacity = batch.kv_capacity;
-                state.driver.cache_len = batch.cache_len;
+                state.driver.cache_len = batch.batch_cache_len - left_pad;
             }
             Qwen35StepMode::Rust(_) => {
                 bail!("sync_qwen35_packed_decode_batch requires compiled Qwen3.5 state")
@@ -1068,11 +1351,11 @@ fn decode_qwen35_packed_batch<'a>(
         states.len()
     );
 
-    if batch.cache_len > 0 && batch.cache_len % KV_CACHE_CHUNK == 0 {
+    if batch.batch_cache_len > 0 && batch.batch_cache_len % KV_CACHE_CHUNK == 0 {
         clear_metal_cache();
     }
 
-    batch.ensure_capacity_for_states(states, batch.cache_len + 1);
+    batch.ensure_capacity_for_states(states, batch.batch_cache_len + 1);
 
     let input_tokens: Vec<u32> = states
         .iter()
@@ -1090,6 +1373,19 @@ fn decode_qwen35_packed_batch<'a>(
                 .context("decode_qwen35_packed_batch batch size overflow")?],
         );
 
+    // Only materialize the additive mask when at least one row is left-padded.
+    // Same-length batches take the no-mask fast path (identical to pre-varlen
+    // behavior), so this is byte-equivalent for the common case.
+    let needs_mask = batch.left_padding.iter().any(|&pad| pad != 0);
+    let mask_opt: Option<MlxArray> = if needs_mask {
+        Some(super::mlx::build_varlen_decode_mask(
+            &batch.left_padding,
+            batch.batch_cache_len,
+        ))
+    } else {
+        None
+    };
+
     let cpp_model = batch
         .weights
         .cpp_model
@@ -1098,11 +1394,12 @@ fn decode_qwen35_packed_batch<'a>(
     let logits = cpp_model.step_batch_packed(
         &token_arr,
         i32::try_from(states.len()).context("decode_qwen35_packed_batch batch size overflow")?,
-        batch.cache_len,
+        batch.batch_cache_len,
         &mut batch.packed_kv_flat,
         batch.n_kv_per_request,
         &mut batch.packed_gdr_flat,
         batch.n_gdr_per_request,
+        mask_opt.as_ref(),
     )?;
 
     let mut eval_refs: Vec<&MlxArray> =
@@ -1122,7 +1419,7 @@ fn decode_qwen35_packed_batch<'a>(
         logits_shape
     );
 
-    batch.cache_len += 1;
+    batch.batch_cache_len += 1;
 
     let sampled_tokens = if qwen35_can_batch_sample(states) {
         let sampled = gpu_sample_token(&logits, &states[0].driver.params);
@@ -1157,8 +1454,14 @@ fn decode_qwen35_packed_batch<'a>(
     };
 
     let mut sampled_tokens_out = Vec::with_capacity(states.len());
-    for (state, token) in states.iter_mut().zip(sampled_tokens.into_iter()) {
-        state.driver.cache_len = batch.cache_len;
+    for (row_idx, (state, token)) in states
+        .iter_mut()
+        .zip(sampled_tokens.into_iter())
+        .enumerate()
+    {
+        // Each row's own logical length = batch_cursor - its own pad, so a
+        // row that joined late stays at its shorter length.
+        state.driver.cache_len = batch.batch_cache_len - batch.left_padding[row_idx];
         state.driver.kv_capacity = batch.kv_capacity;
         state.record_sampled_token(token)?;
         sampled_tokens_out.push(token);
@@ -1256,6 +1559,7 @@ fn decode_qwen35_batch(
         n_kv_per_request,
         &mut flat_gdr,
         n_gdr_per_request,
+        None,
     )?;
 
     let mut step_outputs: Vec<&MlxArray> = Vec::with_capacity(1 + flat_kv.len() + flat_gdr.len());

@@ -11,7 +11,11 @@ knowledge is intentionally absent. Load the relevant module `AGENTS.md`
 Pure-Rust LLM inference engine; no PyTorch, no Python on the hot path. Two
 backends plug into one contract (`server_engine::InferenceEngine`): the CUDA
 continuous-batching scheduler (Linux/NVIDIA, `cudarc` + FlashInfer + Triton AOT)
-and the Metal serial runtime (Apple Silicon, `crates/mlx-sys` C++ bridge).
+and the Metal scheduler runtime (Apple Silicon, `crates/mlx-sys` C++ bridge —
+continuous batching with same-length packed decode; variable-length is
+scaffolded but gated on a pending RoPE fix, see
+[`infer/src/backend/metal/AGENTS.md`](infer/src/backend/metal/AGENTS.md) §7 and
+[`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`](docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md)).
 Models: Qwen3 (4B/8B), Qwen3.5-4B (hybrid linear + full attention), GLM4.
 FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
 Tests compare against JSON baselines in `infer/test_data/` — regenerate
@@ -174,7 +178,7 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 | Path | Guide |
 |------|-------|
 | `infer/src/backend/` | [AGENTS.md](infer/src/backend/AGENTS.md) — backend trait, dispatch, cfg discipline |
-| `infer/src/backend/metal/` | [AGENTS.md](infer/src/backend/metal/AGENTS.md) — MLX bridge, unified memory, serial runtime |
+| `infer/src/backend/metal/` | [AGENTS.md](infer/src/backend/metal/AGENTS.md) — MLX bridge, unified memory, scheduler runtime + varlen scaffolding |
 | `infer/src/scheduler/` | [AGENTS.md](infer/src/scheduler/AGENTS.md) — continuous batching, prefix cache, slot lifecycle |
 | `infer/src/model/` | [AGENTS.md](infer/src/model/AGENTS.md) — ModelForward, state/weights split, hybrid models |
 | `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |

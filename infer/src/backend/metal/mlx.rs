@@ -492,6 +492,35 @@ pub fn rope_dynamic(
         "mlx_fast_rope_dynamic",
     )
 }
+pub fn build_varlen_decode_mask(left_padding: &[i32], batch_cache_len: i32) -> MlxArray {
+    debug_assert!(!left_padding.is_empty());
+    debug_assert!(batch_cache_len >= 0);
+    debug_assert!(i32::try_from(left_padding.len()).is_ok());
+    debug_assert!(
+        left_padding
+            .iter()
+            .all(|&padding| (0..=batch_cache_len).contains(&padding))
+    );
+
+    let batch = left_padding.len() as i32;
+    let key_len = batch_cache_len + 1;
+    let cols_data: Vec<f32> = (0..key_len).map(|col| col as f32).collect();
+    let pad_data: Vec<f32> = left_padding.iter().map(|&padding| padding as f32).collect();
+
+    let cols = MlxArray::from_slice_f32(&cols_data, &[1, key_len]);
+    let cols = broadcast_to(&cols, &[batch, key_len]);
+    let pad = MlxArray::from_slice_f32(&pad_data, &[batch, 1]);
+    let pad = broadcast_to(&pad, &[batch, key_len]);
+    let cond = greater(&pad, &cols);
+
+    let neg_inf = MlxArray::scalar_f32(f32::NEG_INFINITY);
+    let neg_inf = broadcast_to(&neg_inf, &[batch, key_len]);
+    let zero = zeros(&[batch, key_len], Dtype::Float32);
+    let mask = where_(&cond, &neg_inf, &zero);
+    let mask = expand_dims(&expand_dims(&mask, 1), 1);
+    eval(&[&mask]);
+    mask
+}
 pub fn scaled_dot_product_attention(
     q: &MlxArray,
     k: &MlxArray,
@@ -720,6 +749,28 @@ mod tests {
         eval(&[&c]);
         assert!((c.as_slice_f32()[0] - 5.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn build_varlen_decode_mask_marks_left_padding() {
+        let _guard = metal_test_guard();
+        let mask = build_varlen_decode_mask(&[2, 0], 3);
+        assert_eq!(mask.shape(), &[2, 1, 1, 4]);
+
+        let values = mask.as_slice_f32();
+        assert!(values[0].is_infinite() && values[0].is_sign_negative());
+        assert!(values[1].is_infinite() && values[1].is_sign_negative());
+        assert_eq!(values[2], 0.0);
+        assert_eq!(values[4], 0.0);
+    }
+
+    // NOTE: `fast::rope` with an `array` offset (Rust wrapper `rope_dynamic`)
+    // is the intended Phase 2 hook for per-row RoPE in variable-length
+    // batches. An initial sanity-check test comparing `rope_dynamic` against
+    // scalar `rope` for a same-length batch did not pass out of the box on
+    // MLX 0.31.1 — the offset-array shape convention still needs to be
+    // pinned down before we rely on it. See
+    // docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md for the
+    // open investigation.
 }
 
 /// Release cached Metal buffers and other allocator caches.
