@@ -203,18 +203,6 @@ impl MlxArray {
             std::slice::from_raw_parts(ptr, len)
         }
     }
-    pub fn as_slice_i32(&self) -> &[i32] {
-        unsafe {
-            let ptr = mlx_sys::mlx_array_data_int32(self.0);
-            let len = mlx_sys::mlx_array_size(self.0);
-            if ptr.is_null() && len > 0 {
-                panic_if_mlx_error("mlx_array_data_int32");
-                panic!("mlx_array_data_int32 returned null for non-empty array");
-            }
-            panic_if_mlx_error("mlx_array_data_int32");
-            std::slice::from_raw_parts(ptr, len)
-        }
-    }
 }
 
 // ── Ops ──────────────────────────────────────────────────────────────────────

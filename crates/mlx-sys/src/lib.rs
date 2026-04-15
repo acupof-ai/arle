@@ -58,8 +58,6 @@ unsafe extern "C" {
     pub fn mlx_array_item_float32(a: *mut mlx_array) -> f32;
     /// Access the underlying data pointer (after eval). Caller must not free.
     pub fn mlx_array_data_float32(a: *mut mlx_array) -> *const f32;
-    /// Access the underlying int32 data pointer (after eval). Caller must not free.
-    pub fn mlx_array_data_int32(a: *mut mlx_array) -> *const i32;
     pub fn mlx_array_size(a: *mut mlx_array) -> usize;
 
     // === Binary ops ===
