@@ -55,13 +55,14 @@ Rules:
 
 ## 2. Current Classification
 
-This reflects repository state as of 2026-04-10.
+This reflects repository state as of 2026-04-15.
 
 ### Stable
 
 - documented HTTP APIs
-  - `/v1/completions`
-  - `/v1/chat/completions`
+  - `POST /v1/completions`
+  - `POST /v1/chat/completions`
+  - `GET /v1/models`
 - `GET /metrics`
 - `GET /v1/stats`
 - documented build, test, lint, and format workflows in `README.md` and
@@ -69,6 +70,7 @@ This reflects repository state as of 2026-04-10.
 
 ### Beta
 
+- `POST /v1/responses` (current non-streaming subset; streaming parity still pending)
 - CLI agent behavior
 - Metal serving path
 - GGUF loading path
@@ -76,9 +78,10 @@ This reflects repository state as of 2026-04-10.
 
 ### Experimental
 
-- fast-moving quantization paths
-- speculative decoding
-- tensor-parallel scaffolding
+- fast-moving quantization paths (TurboQuant KV, W2, new quant formats)
+- Metal DFlash speculative decode path
+- speculative decoding framework on CUDA (CPU stubs only today)
+- tensor-parallel scaffolding (sharding math shipped, NCCL comm not wired)
 - undocumented flags or undocumented environment variables
 
 ### Internal

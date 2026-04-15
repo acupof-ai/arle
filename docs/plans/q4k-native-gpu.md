@@ -92,8 +92,8 @@ Key points:
 1. **`gguf.rs`** — add `read_tensor_q4k_packed(name) -> Result<Vec<u8>>` (thin wrapper around `read_tensor_raw`, validates dtype + block count).
 2. **`tensor.rs`** — add `DeviceMatrix::from_quantized_q4k(ctx, packed_bytes, rows, cols)`. New field: we will overload `quant_bits` — use `quant_bits = 44` as the Q4_K discriminator (4-bit, K superblock) to avoid changing the struct shape. The existing W4A16 path continues to use `quant_bits=4`. `group_size` is set to 256 (superblock size) as informational only.
 3. **`ffi.rs`** — extern bindings: `q4k_gemv_cuda`, `q4k_gemv_batch_cuda`, `q4k_dequant_chunk_cuda`.
-4. **`csrc/cuda/quantized_gemv.cu`** — add `q4k_gemv_kernel` + batched variant + C wrappers.
-5. **`csrc/cuda/q4k_dequant.cu`** (new) — `q4k_dequant_chunk_kernel` for prefill tile, plus wrapper.
+4. **`crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu`** — add `q4k_gemv_kernel` + batched variant + C wrappers.
+5. **`crates/infer-cuda-kernels/csrc/quant/q4k_dequant.cu`** (new) — `q4k_dequant_chunk_kernel` for prefill tile, plus wrapper.
 6. **`ops/linear.rs`** — dispatch `quant_bits == 44` to `q4k_gemv_cuda` (decode) and to the dequant-chunk + cuBLAS path (prefill).
 7. **`weight_loader.rs`**:
     - Add Q4_K fast path to `load_tensor_2d_gguf` (mirror the Q8_0 branch).
