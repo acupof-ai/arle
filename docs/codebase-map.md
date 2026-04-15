@@ -1,7 +1,10 @@
 # agent-infer Codebase Map
 
-Updated 2026-04-15. This document describes the repository as it exists after
-the Route-A refactor folded the partial runtime split back into `infer`.
+Updated 2026-04-15 (post `infer-cuda-kernels` extraction, tiered KV
+M3a/M3b/M3c local, and Metal M0.2a request-state landing). This document
+describes the repository as it exists after the Route-A refactor folded the
+partial runtime split back into `infer`, and after the CUDA kernel layer was
+extracted into `crates/infer-cuda-kernels/` (commit `a4e12f5`).
 
 ## 1. Workspace at a glance
 
@@ -131,14 +134,16 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 ### Memory, KV, caching, and batching support
 
 - `infer/src/block_manager.rs`: KV block accounting for the batch scheduler
-- `infer/src/backend/cuda/paged_kv.rs`: token-level KV pool for CUDA paged attention
-- `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse
+- `crates/infer-cuda-kernels/src/paged_kv.rs`: token-level KV pool for CUDA paged attention (page-aware, BF16 `page_size=16`)
+- `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse; tier-aware `RadixNode` metadata (`hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`) + `lookup_or_stage` contract
+- `infer/src/kv_tier.rs` + `infer/src/kv_tier/{lookup,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); M3a host-tier skeleton + M3b `lookup_or_stage` contract + page-lifecycle state machine landed locally 2026-04-15
 - `infer/src/memory_planner.rs`: memory planning helpers
-- `infer/src/backend/cuda/graph_pool.rs`: CUDA graph capture/reuse support
-- `infer/src/backend/cuda/flashinfer.rs`: paged-KV metadata staging for FlashInfer
+- `crates/infer-cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
+- `crates/infer-cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer
 - `infer/src/backend/metal/kv_pool.rs`
 - `infer/src/backend/metal/prefix_cache.rs`
 - `infer/src/backend/metal/gdr.rs`
+- `infer/src/backend/metal/request_state.rs`: resumable Metal request state layer for Qwen3 / Qwen3.5 (prefill in chunks, one-step decode, deterministic cleanup); M0.2a landed locally 2026-04-15
 
 ### Models, kernels, and numerics
 
@@ -148,7 +153,7 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 - `infer/src/model/glm4.rs`
 - supporting files under `infer/src/model/`
 - `infer/src/ops.rs` and `infer/src/ops/*`
-- `infer/src/backend/cuda/tensor.rs`: CUDA tensor/device abstractions
+- `crates/infer-cuda-kernels/src/tensor.rs`: CUDA tensor/device abstractions (`DeviceContext`, `DeviceVec`, `DeviceMatrix`, `HiddenStates`, `RawDevicePtr`)
 - `infer/src/weight_loader.rs`: weight loading
 - `infer/src/gguf.rs`: GGUF parsing
 - `infer/src/quant.rs`: quantization metadata + dispatch

@@ -15,11 +15,15 @@ scheduler swap not yet landed" are now labelled **M1** and are still
 the next remote-validation work item when M1 lands. The file paths
 referenced below reflect the pre Route-A tree
 (`infer/src/paged_kv.rs`, `infer/src/flashinfer_metadata.rs`,
-`infer/src/metal_*`, etc.); post Route-A and post `infer-cuda-kernels`
-extraction, the equivalent paths are under `infer/src/backend/cuda/*`,
-`infer/src/backend/metal/*`, and eventually `crates/infer-cuda-kernels/`.
-The commands still work — Cargo resolves them — but when you read a
-file reference below, apply the rename mentally.
+`infer/src/metal_*`, etc.); post Route-A and post the `infer-cuda-kernels`
+extraction (2026-04-15 `a4e12f5`), the kernel Rust layer is now under
+`crates/infer-cuda-kernels/src/` (`paged_kv.rs`, `flashinfer.rs`,
+`graph_pool.rs`, `tensor.rs`, `ffi.rs` + `ffi/*`, `prelude.rs`,
+`kv_quant.rs`, `kv_turboquant.rs`, `kv_types.rs`, `turboquant_state.rs`),
+and the Metal layer is under `infer/src/backend/metal/*`. Only
+`bootstrap.rs` remains in `infer/src/backend/cuda/`. The commands still
+work — Cargo resolves them — but when you read a file reference below,
+apply the rename mentally.
 
 **For the 2026-04-15 M2b local batch, use**
 [`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md)

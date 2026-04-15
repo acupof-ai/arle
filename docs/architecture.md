@@ -187,7 +187,7 @@ or model layers out. They are no longer arguments about the kernel crate.
 ### Cross-references
 
 - `docs/plans/cuda-kernel-crate-extraction.md` — full execution blueprint.
-- `infer/src/backend/cuda/prelude.rs` — the proto-API contract.
+- `crates/infer-cuda-kernels/src/prelude.rs` — the proto-API contract (graduated from `infer/src/backend/cuda/prelude.rs` at extraction time).
 - `docs/archives/art-grade-architecture-for-long-agent-infer.md` — the
   ambitious 8-crate split that Route-A reverted; §六 governance and §七
   acceptance criteria still inform the trip wire bar.

@@ -5,7 +5,7 @@ Round 2 (April 2026) collapsed the `infer/src/` root from 39 top-level `.rs` fil
 | # | Item | Owner | Status | Plan |
 |---|---|---|---|---|
 | F1 | Split `backend/metal.rs` (1766 lines) into topical submodules | codex (local Mac) | **done** (`19a433d`) | [`backend-metal-split.md`](backend-metal-split.md) |
-| F2 | Audit `backend/cuda/graph_pool.rs` — deliberate scaffold or dead code? | ckl (decision), remote CUDA host (if wire-in) | **parked** (`Option B`) | §F2 below |
+| F2 | Audit `graph_pool.rs` — deliberate scaffold or dead code? (now at `crates/infer-cuda-kernels/src/graph_pool.rs` post `a4e12f5`) | ckl (decision), remote CUDA host (if wire-in) | **parked** (`Option B`) | §F2 below |
 | F3 | Document `--features cuda,no-cuda` type-check invocation | me | **done** (commit `4b493c8`) | — |
 | Round 3 | Extracted-runtime split | remote Linux CUDA host | **reverted** (2026-04-15, Route-A) | [`../archives/cuda-crate-extraction.md`](../archives/cuda-crate-extraction.md) |
 
@@ -28,7 +28,8 @@ matters for current work because Route A reverted the extracted-runtime split
 before it ever shipped.
 
 **F2 can still run in parallel** with follow-up backend work because it touches
-only `backend/cuda/graph_pool.rs` (independent module, no internal consumers).
+only `graph_pool.rs` (independent module, no internal consumers; post
+2026-04-15 the file lives at `crates/infer-cuda-kernels/src/graph_pool.rs`).
 
 ---
 
@@ -81,13 +82,21 @@ When F1 lands, update the status row in the table above with the final commit SH
 
 ---
 
-## F2 · `backend/cuda/graph_pool.rs` audit
+## F2 · `graph_pool.rs` audit
 
 Owner: ckl must make the call; execution depends on the call.
-Location: `infer/src/backend/cuda/graph_pool.rs` (441 lines).
+Location: `crates/infer-cuda-kernels/src/graph_pool.rs` (~441 lines, post
+`a4e12f5 refactor(cuda): extract infer-cuda-kernels api`). Analysis below
+predates the 2026-04-15 kernel-crate extraction and refers to the file's
+former location `infer/src/backend/cuda/graph_pool.rs`; the decision text
+is preserved for historical record.
 
-Status: parked via Option B. `graph_pool.rs` remains in-tree as an internal scaffold,
-explicitly marked hibernating until scheduler work resumes.
+Status: parked via Option B. `graph_pool.rs` now lives inside
+`infer-cuda-kernels` as an internal scaffold, explicitly marked
+hibernating until scheduler work resumes. Because the file moved to the
+kernel crate, Option B's visibility-downgrade action item is no longer
+directly applicable — the kernel crate's `prelude.rs` / `lib.rs`
+re-export surface is the new lever.
 
 ### Evidence
 

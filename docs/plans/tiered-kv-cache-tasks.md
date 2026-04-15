@@ -86,7 +86,7 @@ milestone plan.
 | P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
 | — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b local done, remote CUDA acceptance pending** (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
-| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a local done; M3b local contract/state-machine + policy convergence done; remote CUDA smoke and runtime behavior still pending** | §3 below |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a local done; M3b local contract/state-machine + policy convergence done; M3c legacy-offload cleanup local done; runtime behavior and remote CUDA smoke still pending** | §3 below |
 | P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
 | P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |
@@ -104,31 +104,38 @@ milestone plan.
   P0). **Local implementation landed** on the extracted
   `crates/infer-cuda-kernels/**` paths; remote CUDA validation remains.
 
-**Paths updated post Route-A (structural, not content)**:
+**Paths updated post Route-A + `infer-cuda-kernels` extraction (structural, not content)**:
 
 All "cuda-gated" file paths in the detailed task sections below shifted
-during the Route-A workspace rewrite (commit `d902090`) and the CUDA
-internal hygiene pass (commit `26c8f39`). The table below lists the
-renames that affect this doc:
+twice: first during the Route-A workspace rewrite (commit `d902090`) and
+the CUDA internal hygiene pass (commit `26c8f39`), then again during the
+`infer-cuda-kernels` kernel-crate extraction on 2026-04-15 (commit
+`a4e12f5 refactor(cuda): extract infer-cuda-kernels api`). The table
+below lists the **final** current paths:
 
 | Pre Route-A path | Current path |
 |---|---|
-| `infer/src/paged_kv.rs` | `infer/src/backend/cuda/paged_kv.rs` |
-| `infer/src/flashinfer_metadata.rs` | `infer/src/backend/cuda/flashinfer.rs` |
-| `infer/src/tensor.rs` | `infer/src/backend/cuda/tensor.rs` |
+| `infer/src/paged_kv.rs` | `crates/infer-cuda-kernels/src/paged_kv.rs` |
+| `infer/src/flashinfer_metadata.rs` | `crates/infer-cuda-kernels/src/flashinfer.rs` |
+| `infer/src/tensor.rs` | `crates/infer-cuda-kernels/src/tensor.rs` |
+| `infer/src/graph_pool.rs` | `crates/infer-cuda-kernels/src/graph_pool.rs` |
+| `infer/src/ffi.rs` | `crates/infer-cuda-kernels/src/ffi.rs` + `ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,recurrent,misc}.rs` |
 | `infer/src/metal_kv_pool.rs` | `infer/src/backend/metal/kv_pool.rs` |
 | `infer/src/metal_prefix_cache.rs` | `infer/src/backend/metal/prefix_cache.rs` |
 | `infer/src/metal_gdr.rs` | `infer/src/backend/metal/gdr.rs` |
 | `infer/mlx-sys/src/lib.rs` | `crates/mlx-sys/src/lib.rs` |
 
 When reading §1–§6 below, apply these renames mentally. The
-`infer-cuda-kernels` extraction landed on 2026-04-15, so `.cu` and Triton
-paths have also moved: `infer/csrc/cuda/*.cu` →
+`infer-cuda-kernels` extraction landed on 2026-04-15, so the entire CUDA
+kernel Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`,
+`ffi`, `kv_quant`, `kv_turboquant`, `kv_types`, `turboquant_state`,
+`prelude`) now lives in `crates/infer-cuda-kernels/src/`. The only
+file that remains under `infer/src/backend/cuda/` is `bootstrap.rs`,
+which reaches into `crate::model::*` / `crate::scheduler::*` and
+therefore stays in `infer`. `.cu` and Triton paths moved together:
+`infer/csrc/cuda/*.cu` →
 `crates/infer-cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/*.cu` and
 `infer/tools/triton/*.py` → `crates/infer-cuda-kernels/tools/triton/*.py`.
-Kernel-path references in this doc have been updated in place against the
-2026-04-14 CUDA six-principles review file list; the `infer/src/backend/cuda/*.rs`
-Rust side is still inside `infer` pending option B.
 
 ---
 
@@ -357,9 +364,9 @@ Rust side is still inside `infer` pending option B.
       page-lifecycle state machine with local tests
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/runtime.rs` — eviction hook at admission (`evict_if_needed`) and post-decode (`stamp_keepalive`)
 - [ ] `[L+R]` Edit `infer/src/scheduler/cuda/core.rs` — pass watermark thresholds (high=0.90, low=0.75 per §3.2) into `TieredKvCache`
-- [ ] `[L+R]` **Diff before delete** — confirm `grep -r 'offload_if_needed\|ensure_on_gpu\|k_host\|v_host' infer/src/` returns ONLY `infer/src/model/kv_cache.rs` (21 internal hits) + `infer/src/model/generation_state.rs` (1 hit, audit + strip) + `infer/src/ops/tests.rs` (6 unit-test local-variable name collisions, keep). Confirmed by P2 research grep.
-- [ ] `[L+R]` **Delete** `infer/src/model/kv_cache.rs:130-168` — `k_host`, `v_host`, `ensure_on_gpu`, `offload_if_needed`, `OFFLOAD_BLOCK_SIZE = 64`, `gpu_has_full_seq`, `offloaded_len`, `max_gpu_seq_len`
-- [ ] `[L+R]` Delete the matching mirror in `tests/test_kv_cache.py:135,138,262,367,373,382,383,394`
+- [x] `[L+R]` **Diff before delete** — confirm `grep -r 'offload_if_needed\|ensure_on_gpu\|k_host\|v_host' infer/src/` is reduced to the legacy offload surface plus `infer/src/ops/tests.rs` variable-name collisions before deleting. Landed in local M3c cleanup (`c3f65f7`).
+- [x] `[L+R]` **Delete** legacy contiguous CPU-offload state from `infer/src/model/kv_cache.rs` — `k_host`, `v_host`, `ensure_on_gpu`, `offload_if_needed`, `OFFLOAD_BLOCK_SIZE = 64`, `gpu_has_full_seq`, `offloaded_len`, `max_gpu_seq_len`. Landed in local M3c cleanup (`c3f65f7`).
+- [x] `[L+R]` Rewrite the matching mirror in `tests/test_kv_cache.py` to the resident-only metadata model that still exists. Landed in local M3c cleanup (`c3f65f7`).
 - [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda prefix_cache`
 - [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda kv_tier`
 - [x] `[L]` `cargo check -p infer --tests --no-default-features --features cuda,no-cuda`
@@ -367,6 +374,8 @@ Rust side is still inside `infer` pending option B.
 - [ ] `[R]` `cargo build --release`, full e2e suite, `greedy_consistency`
 - [ ] `[R]` Remote CUDA acceptance via
       `tiered-kv-cache-m3b-remote-acceptance.md`
+- [ ] `[R]` Remote CUDA acceptance for the M3c cleanup via
+      `tiered-kv-cache-m3c-remote-acceptance.md`
 - [ ] `[R]` Long-context bench (32k+ cumulative tokens, num_slots=4) that OOMs on main now runs to completion
 - [ ] `[R]` `scripts/bench_throughput_sweep.py --label tier-T2`; ≤3% steady-state regression vs P1 baseline
 - [ ] `[R]` Bench markdown in `docs/experience/wins/`
@@ -865,7 +874,7 @@ M0.3's exit gate has a comparison point when it unblocks.
   - **Coordinator threading model** commits to OS thread + crossbeam (the §3.3 course correction, now project doc §4.4), not tokio.
   - **P4 KVFlow-lite** dropped from critical path. Ship LRU / SessionBiasedLru in M3; revisit reuse-distance only if M3's default policy proves insufficient.
   - **P5 NIXL real RDMA** deferred. Trigger criteria documented in project doc §6 M5: prefill/decode disaggregation, cluster-wide session roaming, or second consumer of the kernel crate.
-  - **File paths updated for Route-A**: `infer/src/paged_kv.rs` → `infer/src/backend/cuda/paged_kv.rs`, `infer/src/metal_*` → `infer/src/backend/metal/*`, etc. See §0.5 table for the full rename list.
+  - **File paths updated for Route-A + kernel-crate extraction**: `infer/src/paged_kv.rs` → `crates/infer-cuda-kernels/src/paged_kv.rs` (post-extraction 2026-04-15 `a4e12f5`), `infer/src/metal_*` → `infer/src/backend/metal/*`, etc. See §0.5 table for the full rename list.
   - **New sources** added: 14 industry research references (vLLM KV offloading connector blog, SGLang HiCache design, LMCache/CacheBlend, Mooncake FAST'25 paper, Dynamo KVBM, TRT-LLM KV reuse, etc.). Full list in project doc §12.
 - **2026-04-13**: Initial split (without per-phase research).
 - **2026-04-13** (later): Enriched with 6-agent industry research. Added §N.2 Industry references and §N.3 Course corrections subsections per phase. Major design changes:
@@ -956,7 +965,8 @@ M0.3's exit gate has a comparison point when it unblocks.
 - `infer/src/prefix_cache.rs` (always-on, local-checkable)
 - `infer/src/scheduler/cuda/{prefill,decode,core,runtime,request}.rs` (cuda-gated)
 - `infer/src/server_engine.rs`
-- `infer/src/model/kv_cache.rs:130-168` — legacy CPU offload (deleted in P2)
+- `infer/src/model/kv_cache.rs` — resident-only contiguous KV cache after the
+  M3c cleanup; the legacy CPU-offload surface is gone
 - `infer/src/metal_kv_pool.rs`
 - `infer/src/metal_prefix_cache.rs`
 - `infer/src/metal_gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
