@@ -244,7 +244,8 @@ curl http://localhost:8000/v1/responses \
 </details>
 
 Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats`
-(human-readable).
+(human-readable). On Metal, these now expose live queue / latency / MLX memory
+stats from the running runtime, not just a detached placeholder metrics object.
 
 ---
 

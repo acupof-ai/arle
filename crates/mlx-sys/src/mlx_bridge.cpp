@@ -655,6 +655,21 @@ void mlx_metal_kernel_apply(void* kernel,
 
 // === Memory management ===
 
+/// Current active MLX allocator memory in bytes.
+size_t mlx_get_active_memory() {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::get_active_memory());
+}
+
+/// Peak MLX allocator memory in bytes.
+size_t mlx_get_peak_memory() {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::get_peak_memory());
+}
+
+/// Cached MLX allocator memory in bytes.
+size_t mlx_get_cache_memory() {
+    MLX_TRY_RETURN_VALUE(0, mlx::core::get_cache_memory());
+}
+
 /// Release cached Metal buffers and other allocator caches.
 /// Equivalent to `mx.metal.clear_cache()` in Python.
 void mlx_metal_clear_cache() {

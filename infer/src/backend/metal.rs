@@ -120,6 +120,7 @@ use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};
 #[cfg(feature = "metal")]
 pub use runtime::{
     spawn_metal_scheduler_handle_from_path, spawn_metal_scheduler_handle_from_path_with_options,
+    spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
 
 // NOTE: The legacy fused-ops FFI modules (`metal_ffi`, `metal_capi_ffi`) were

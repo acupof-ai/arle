@@ -506,6 +506,12 @@ unsafe extern "C" {
 
     // === Memory management ===
 
+    /// Current active MLX allocator memory in bytes.
+    pub fn mlx_get_active_memory() -> usize;
+    /// Peak MLX allocator memory in bytes.
+    pub fn mlx_get_peak_memory() -> usize;
+    /// Cached MLX allocator memory in bytes.
+    pub fn mlx_get_cache_memory() -> usize;
     /// Release cached Metal buffers and other allocator caches.
     /// Equivalent to `mx.metal.clear_cache()` in Python.
     pub fn mlx_metal_clear_cache();
