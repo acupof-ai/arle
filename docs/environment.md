@@ -9,6 +9,25 @@ truth.
 
 ---
 
+## 0. Policy (2026-04-16, Tier C)
+
+**Env vars are reserved for: build, test model paths, setup, and genuinely
+debug/diagnostic runtime overrides.**
+
+**Tuning knobs go on structs**, not env vars. The canonical example is
+`SchedulerConfig` in `infer/src/scheduler/types.rs`: prefix-cache
+watermarks (`prefix_cache_high_water`, `prefix_cache_low_water`,
+`prefix_cache_retain_hard_cap`), keepalive ticks
+(`prefix_cache_keepalive_ticks`, `stage_wait_keepalive_ticks`), and
+chunking caps are struct fields with `validate()` guards. Callers that
+want to tune them construct a `SchedulerConfig::runtime_defaults(..)`
+and assign directly — **there is no `PEGAINFER_PREFIX_HIGH_WATER`** or
+any other magic env var for runtime tuning. If you want an env-var
+escape hatch for a specific tuning knob, justify it as a debug aid and
+document the debug-only status here.
+
+---
+
 ## 1. Naming Rule
 
 - Prefer `AGENT_INFER_*` for user-facing runtime behavior when available.
@@ -165,7 +184,33 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 
 ### `PEGAINFER_E2E_MODEL_PATH`
 
-Override model path for selected E2E regeneration flows.
+Override model path for selected E2E regeneration flows
+(`infer/tests/regen_test_data.rs`).
+
+### `PEGAINFER_QWEN3_PATH`
+
+Override model path for the Qwen3-4B GGUF smoke test
+(`infer/tests/smoke_qwen3_4b_gguf.rs`). Default:
+`models/Qwen3-4B-GGUF`.
+
+### `PEGAINFER_Q35_PATH`
+
+Override model path for the Qwen3.5 GGUF smoke test
+(`infer/tests/smoke_qwen35_gguf.rs`).
+
+### `PEGAINFER_QWEN35_4B_GGUF_PATH`
+
+Override model path for the Qwen3.5 4B GGUF ground-truth Q4_K test
+(`infer/tests/ground_truth_q4k.rs`).
+
+### `PEGAINFER_CARNICE_PATH`
+
+Override model path for Carnice 27B Q4_K / real-tensor-dequant /
+dtype-audit tests
+(`infer/tests/smoke_carnice_27b_q4k.rs`,
+`infer/tests/carnice_real_tensor_dequant.rs`,
+`infer/tests/carnice_dtype_audit.rs`,
+`infer/tests/carnice_tensor_probe.rs`).
 
 ### `PEGAINFER_URL`
 
@@ -174,6 +219,22 @@ Base URL for integration-style Python API tests.
 ### `PEGAINFER_MODEL`
 
 Model name expected by integration-style Python API tests.
+
+### `AGENT_INFER_TEST_MODEL_PATH`
+
+CLI-side live-agent integration test model path override
+(`tests/cli_agent_live.rs`).
+
+### `HF_TOKEN`
+
+HuggingFace API token used for private-model downloads in
+`infer/src/hf_hub.rs`. Unset by default; required for gated
+models on the `resolve_model_path` path.
+
+### `HF_HOME`
+
+HuggingFace local cache root override (consumed by `hf_hub.rs`).
+Defaults to `$HOME/.cache/huggingface`.
 
 ---
 
@@ -236,6 +297,18 @@ docs promote them more clearly:
 - `PEGAINFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
 - `PEGAINFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
   `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)
+- `PEGAINFER_DEBUG_DUMP` — enable tensor debug-dump capture in
+  `infer/src/model/common.rs` (default off; set to any value to enable)
+- `PEGAINFER_QWEN3_FP32_RESIDUAL` — force FP32 residual accumulation on
+  the Qwen3 prefill path (`infer/src/model/qwen3/prefill.rs`); debug aid
+  for numerical-stability investigations
+- `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj
+  path in `infer/src/backend/metal/qwen35.rs`. Default on; set to `0`
+  to force the fused route for A/B comparison
+- `METAL_NO_CPP` — disable the Metal Qwen3.5 C++ route entirely
+  (`infer/src/backend/metal/qwen35.rs:1255`). Default unset (C++
+  route enabled). Set to any value to fall back to the Rust reference
+  path for debugging
 - `AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES` — keep prefill
   intermediate tensors in the Qwen3.5 C++ step model (`mlx_qwen35_model.cpp`)
   for debugging; default off
