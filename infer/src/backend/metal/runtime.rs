@@ -16,7 +16,8 @@ use super::request_state::{
     Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
-    MetalRequestPriority, MetalScheduleDecision, MetalScheduler, MetalSchedulerConfig,
+    MetalRequestPhase as SchedulerPhase, MetalRequestPriority, MetalScheduleDecision,
+    MetalScheduler, MetalSchedulerConfig,
 };
 use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
@@ -664,6 +665,7 @@ fn run_metal_scheduler_runtime(
             &mut active,
         );
         reap_closed_clients(&mut scheduler, &mut active);
+        refresh_waiting_prefix_hits(&metrics, &mut prefix_runtime, &mut scheduler, &mut active);
         refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
 
         if request_rx_closed && active.is_empty() && scheduler.waiting_len() == 0 {
@@ -735,6 +737,57 @@ fn run_metal_scheduler_runtime(
     }
 
     Ok(())
+}
+
+fn refresh_waiting_prefix_hits(
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
+    let Some(prefix_runtime) = prefix_runtime.as_mut() else {
+        return;
+    };
+
+    let req_ids: Vec<RequestId> = active
+        .iter()
+        .filter_map(|(req_id, request)| {
+            (request.phase() == RuntimePhase::Prefill
+                && request.request_state.prompt_progress() == 0
+                && scheduler.request_phase(*req_id) == Some(SchedulerPhase::Waiting))
+            .then_some(*req_id)
+        })
+        .collect();
+
+    for req_id in req_ids {
+        let Some(request) = active.get_mut(&req_id) else {
+            continue;
+        };
+
+        let original_len = request.prompt_len();
+        let admission = match prefix_runtime.prepare_request(request, metrics) {
+            Ok(admission) => admission,
+            Err(err) => {
+                error!(
+                    "Metal waiting-prefix refresh failed for {:?}: {err:#}",
+                    req_id
+                );
+                continue;
+            }
+        };
+        if admission.scheduler_prompt_tokens.len() >= original_len {
+            continue;
+        }
+
+        if let Err(err) =
+            scheduler.rewrite_waiting_prompt(req_id, admission.scheduler_prompt_tokens)
+        {
+            warn!(
+                "Metal waiting-prefix refresh could not rewrite scheduler prompt for {:?}: {err}",
+                req_id
+            );
+        }
+    }
 }
 
 fn drain_incoming_requests(

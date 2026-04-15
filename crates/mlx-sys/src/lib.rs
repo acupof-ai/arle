@@ -58,6 +58,8 @@ unsafe extern "C" {
     pub fn mlx_array_item_float32(a: *mut mlx_array) -> f32;
     /// Access the underlying data pointer (after eval). Caller must not free.
     pub fn mlx_array_data_float32(a: *mut mlx_array) -> *const f32;
+    /// Access the underlying int32 data pointer (after eval). Caller must not free.
+    pub fn mlx_array_data_int32(a: *mut mlx_array) -> *const i32;
     pub fn mlx_array_size(a: *mut mlx_array) -> usize;
 
     // === Binary ops ===
@@ -376,6 +378,20 @@ unsafe extern "C" {
         out_logits: *mut *mut mlx_array,
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_step_batch_packed(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        batch_size: i32,
+        cache_pos: i32,
+        packed_kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        packed_gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+        out_logits: *mut *mut mlx_array,
+        out_packed_kv_caches: *mut *mut mlx_array,
+        out_packed_gdr_states: *mut *mut mlx_array,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_prefill(
