@@ -27,10 +27,10 @@ Benchmark rule:
 | --- | --- | --- |
 | `M0.1` local-only bind + auth | Shipped | `metal_serve` defaults to `127.0.0.1`; optional Bearer auth protects `/v1/*` |
 | `M0.2` live Metal scheduler | Partial / not shipped | `M0.2a` request state, `M0.2b` live scheduler runtime, `M0.2c` Qwen3 same-length decode batching, and `M0.2d` Qwen3.5 same-length decode batching landed locally; throughput exit is still blocked on variable-length decode and per-step batch-state rebuild cost |
-| `M0.3` live prefix cache + KV pool | Partial | Qwen3 live runtime now does prefix lookup/import/publish in serving, but Qwen3.5 still lacks live prefix reuse |
+| `M0.3` live prefix cache + KV pool | Shipped | Qwen3 uses runtime-owned shared KV pool + prefix cache; Qwen3.5 now ships snapshot-replay prefix reuse on the compiled path |
 | `M0.4` memory + reuse observability | Shipped | live runtime metrics and MLX allocator knobs are wired; repeated-prefix Qwen3 smoke now drives non-zero `prefix_hit_rate` |
 | `M1.1` Metal env toggles to CLI flags | Shipped | `--kv-pool` / `--no-kv-pool` added to all user-facing Metal entry points |
-| `M1.2` models + responses API | Partial | `/v1/models` shipped; `/v1/responses` non-streaming subset shipped; streaming parity still pending |
+| `M1.2` models + responses API | Shipped | `/v1/models` and `/v1/responses` now ship in both non-streaming and SSE forms |
 | `M1.3` structured outputs | Not shipped | no JSON-schema constrained decoding yet |
 | `M1.4` one-command Apple path | Shipped | `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path |
 
@@ -178,8 +178,9 @@ cargo check -p infer --no-default-features --features metal,no-cuda --bin metal_
 
 ### `M0.3` Live prefix cache + KV pool
 
-Status: partial. `Qwen3` now ships a live runtime-owned prefix cache + shared KV
-pool path, but `Qwen3.5` still lacks live prefix reuse.
+Status: shipped. `Qwen3` ships a live runtime-owned prefix cache + shared KV
+pool path, and `Qwen3.5` now ships live prefix reuse via replayed compiled-path
+snapshots on the scheduler runtime.
 
 Acceptance:
 
@@ -189,7 +190,7 @@ Acceptance:
   single-request fallback only
 - the serving benchmark can demonstrate a measurable reuse effect on repeated
   prefixes, not just internal cache counters
-- non-goal for this tranche: Qwen3.5 recurrent-state prefix reuse
+- non-goal for this tranche: zero-copy shared recurrent-state ownership for Qwen3.5
 
 Verification:
 
@@ -215,7 +216,7 @@ PY
 curl -s http://127.0.0.1:8013/metrics | rg 'infer_prefix_(lookups|hits|hit_rate)'
 ```
 
-Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
+Current local evidence (2026-04-15, M4 Pro):
 
 - server startup now logs:
   `Metal live prefix cache enabled for Qwen3: block_size=16, max_cached_tokens=8192`
@@ -226,6 +227,17 @@ Current local evidence (2026-04-15, M4 Pro, `Qwen3-0.6B-4bit`):
   - `infer_prefix_lookups_total = 3`
   - `infer_prefix_hits_total = 1`
   - `infer_prefix_hit_rate = 0.3333`
+- `Qwen3.5-4B-MLX-4bit` now logs:
+  `Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size=16, max_cached_tokens=8192`
+- sequential identical `max_tokens=1` requests on `Qwen3.5-4B-MLX-4bit`:
+  - run 1: `533.9 ms`
+  - run 2: `145.6 ms`
+  - run 3: `186.2 ms`
+- `/metrics` and `/v1/stats` after the Qwen3.5 smoke:
+  - `infer_prefix_lookups_total = 3`
+  - `infer_prefix_hits_total = 1`
+  - `infer_prefix_hit_rate = 0.3333`
+  - `/v1/stats` reports `prefix_hit_rate=33.3%`
 
 ### `M0.4` Memory and reuse observability
 
@@ -277,8 +289,8 @@ Notes:
 
 - `prefix_hit_rate` is now a real, non-zero live metric on the shipped Qwen3
   repeated-prefix path.
-- Qwen3.5 still lacks live prefix reuse, so a zero hit rate on that path is not
-  itself a regression.
+- Qwen3.5 prefix reuse is copy-based snapshot replay today, not zero-copy shared
+  recurrent-state ownership.
 
 ## P1 · API And DX
 
@@ -306,7 +318,7 @@ cargo check -p infer --no-default-features --features metal,no-cuda --bin metal_
 
 ### `M1.2` Add `/v1/models` and `/v1/responses`
 
-Status: partial.
+Status: shipped.
 
 #### `M1.2a` `/v1/models`
 
@@ -346,7 +358,7 @@ curl -X POST http://127.0.0.1:8000/v1/responses \
 
 #### `M1.2c` `/v1/responses` streaming parity
 
-Status: not shipped.
+Status: shipped.
 
 Acceptance:
 
@@ -354,6 +366,15 @@ Acceptance:
 - final stream event carries terminal status / usage
 - tool-call outputs stream cleanly or are explicitly deferred with a terminal
   structured item
+
+Verification:
+
+```bash
+cargo test -p infer --no-default-features --features metal,no-cuda http_server::tests -- --nocapture
+curl -N -X POST http://127.0.0.1:8000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"ignored-by-server","input":"hello","max_output_tokens":16,"stream":true}'
+```
 
 ### `M1.3` Structured outputs
 

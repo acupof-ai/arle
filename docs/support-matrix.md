@@ -15,7 +15,7 @@ State reflected here is based on repository evidence as of 2026-04-15.
 | Backend | Status | Meaning |
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
-| Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3 now has live prefix reuse; `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path; Metal is still missing full batched-decode / prefix-reuse parity with CUDA, especially for Qwen3.5. |
+| Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3 ships live prefix reuse with a shared KV pool; Qwen3.5 now ships live prefix reuse via replayed compiled-path snapshots; `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path. Metal is still missing full batched-decode parity with CUDA, especially on variable-length Qwen3.5 decode. |
 | Metal DFlash | Experimental | Apple Silicon speculative decode path. `Qwen3` only today; benchmark before use. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
@@ -88,7 +88,7 @@ Backend note:
 | `/v1/completions` | Stable | Documented public API. |
 | `/v1/chat/completions` | Stable | Documented public API. |
 | `/v1/models` | Stable | Loaded-model discovery endpoint. |
-| `/v1/responses` | Beta | Non-streaming subset shipped; streaming parity still pending. |
+| `/v1/responses` | Beta | Non-streaming and SSE forms shipped. Streaming emits `response.created`, `response.output_text.delta`, and terminal `response.completed`; structured outputs are still missing. |
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
 | `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
