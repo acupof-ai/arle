@@ -12,8 +12,7 @@ use tokio::sync::mpsc;
 use super::kv_pool::MetalKVPool;
 use super::prefix_cache::MetalPrefixCache;
 use super::request_state::{
-    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
-    Qwen35PrefixSnapshot,
+    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
     MetalRequestPriority, MetalScheduleDecision, MetalScheduler, MetalSchedulerConfig,
@@ -408,15 +407,15 @@ impl MetalQwen35PrefixRuntime {
             });
         };
 
-        let imported = if let Some(snapshot) = self.entries.get(&prefix_key).map(|entry| &entry.snapshot)
-        {
-            request
-                .request_state
-                .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
-                .context("import matched Qwen3.5 prefix snapshot into request state")?
-        } else {
-            false
-        };
+        let imported =
+            if let Some(snapshot) = self.entries.get(&prefix_key).map(|entry| &entry.snapshot) {
+                request
+                    .request_state
+                    .import_qwen35_prefix_snapshot(snapshot, prefix_key.len())
+                    .context("import matched Qwen3.5 prefix snapshot into request state")?
+            } else {
+                false
+            };
 
         metrics.record_prefix_lookup(imported);
         if !imported {

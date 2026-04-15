@@ -1449,15 +1449,18 @@ impl<'a> Qwen35StepDriver<'a> {
                 self.cache_len = snapshot.cache_len;
                 Ok(())
             }
-            Qwen35StepMode::Rust(_) => bail!(
-                "Qwen3.5 live prefix reuse currently requires the compiled C++ step path"
-            ),
+            Qwen35StepMode::Rust(_) => {
+                bail!("Qwen3.5 live prefix reuse currently requires the compiled C++ step path")
+            }
         }
     }
 
     fn export_current_cpp_snapshot(&self, token_ids: Vec<u32>) -> Result<Qwen35PrefixSnapshot> {
         let cache_len = self.cache_len;
-        ensure!(cache_len > 0, "Qwen3.5 prefix export requires a non-empty cache");
+        ensure!(
+            cache_len > 0,
+            "Qwen3.5 prefix export requires a non-empty cache"
+        );
         match &self.mode {
             Qwen35StepMode::Cpp(state) => Ok(Qwen35PrefixSnapshot {
                 token_ids,
@@ -1466,9 +1469,9 @@ impl<'a> Qwen35StepDriver<'a> {
                 cache_len,
                 kv_capacity: self.kv_capacity,
             }),
-            Qwen35StepMode::Rust(_) => bail!(
-                "Qwen3.5 live prefix export currently requires the compiled C++ step path"
-            ),
+            Qwen35StepMode::Rust(_) => {
+                bail!("Qwen3.5 live prefix export currently requires the compiled C++ step path")
+            }
         }
     }
 
@@ -1477,7 +1480,10 @@ impl<'a> Qwen35StepDriver<'a> {
         prompt_tokens: &[u32],
         block_size: usize,
     ) -> Result<Vec<Qwen35PrefixSnapshot>> {
-        ensure!(block_size > 0, "Qwen3.5 prefix snapshot block size must be > 0");
+        ensure!(
+            block_size > 0,
+            "Qwen3.5 prefix snapshot block size must be > 0"
+        );
         ensure!(
             prompt_tokens.len().is_multiple_of(block_size),
             "Qwen3.5 prefix snapshot build requires a block-aligned prompt"
@@ -1486,14 +1492,9 @@ impl<'a> Qwen35StepDriver<'a> {
             return Ok(Vec::new());
         }
 
-        let mut replay = Qwen35StepDriver::new(
-            self.weights,
-            self.config,
-            &self.params,
-            prompt_tokens,
-            1,
-        )
-        .context("build replay driver for Qwen3.5 prefix snapshots")?;
+        let mut replay =
+            Qwen35StepDriver::new(self.weights, self.config, &self.params, prompt_tokens, 1)
+                .context("build replay driver for Qwen3.5 prefix snapshots")?;
         let mut snapshots = Vec::with_capacity(prompt_tokens.len() / block_size);
 
         for chunk in prompt_tokens.chunks(block_size) {
