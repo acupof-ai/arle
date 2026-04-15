@@ -43,6 +43,9 @@ Important limitation:
 
 - The current Metal server is serial. DFlash improves single-request decode,
   but it does not turn `metal_serve` into a batched serving runtime.
+- Draft checkpoints commonly do not ship tokenizer files. This is expected; the
+  target model tokenizer remains the source of truth, and local HuggingFace
+  cache resolution should use config + weights only.
 
 ## Validated model pair
 
