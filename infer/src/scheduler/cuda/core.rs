@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::prefix_cache::{BlockId, RadixCache};
-use crate::scheduler::policy::{ChunkingPolicy, DecodeAwareChunking, SchedulerSignals};
+use crate::scheduler::policy::{
+    ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
+};
 use crate::types::InferenceMode;
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
@@ -485,7 +487,11 @@ impl<M: ModelForward> Scheduler<M> {
         if blocks_to_evict == 0 {
             return 0;
         }
-        let evicted = self.prefix_cache.evict(blocks_to_evict);
+        let evicted = self.prefix_cache.evict_with_policy(
+            &SessionBiasedLru::default(),
+            SchedulerSignals::default(),
+            blocks_to_evict,
+        );
         let mut reclaimed_pages: usize = 0;
         for bid in evicted {
             if let Some(pages) = self.block_to_pages.remove(&bid) {
@@ -527,7 +533,11 @@ impl<M: ModelForward> Scheduler<M> {
             let blocks_to_evict = remaining
                 .div_ceil((pages_per_block * self.paged_kv_pool.page_size).max(1))
                 .max(1);
-            let evicted = self.prefix_cache.evict(blocks_to_evict);
+            let evicted = self.prefix_cache.evict_with_policy(
+                &SessionBiasedLru::default(),
+                SchedulerSignals::default(),
+                blocks_to_evict,
+            );
             if evicted.is_empty() {
                 break;
             }

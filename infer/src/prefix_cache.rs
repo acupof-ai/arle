@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::kv_tier::BlockLocation;
+use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
 
 // ============================================================================
@@ -466,6 +467,93 @@ impl RadixCache {
         freed
     }
 
+    /// Evict up to `n` blocks using the provided policy.
+    ///
+    /// This is the M3b convergence path that lets production callers move off
+    /// the hard-coded LRU loop and onto the shared [`EvictionPolicy`] trait.
+    /// The implementation keeps the same iterative active-leaf semantics as
+    /// [`Self::evict`]: after each victim is chosen, its parent can become an
+    /// evictable active leaf in the same call.
+    pub fn evict_with_policy(
+        &mut self,
+        policy: &dyn EvictionPolicy,
+        signals: SchedulerSignals,
+        n: usize,
+    ) -> Vec<BlockId> {
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut freed: Vec<BlockId> = Vec::with_capacity(n);
+        let mut evicted_set: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(n);
+        let now = self.clock;
+
+        while freed.len() < n {
+            let mut best: Option<(f32, usize)> = None;
+
+            for (idx, node) in self.nodes.iter().enumerate() {
+                if idx == Self::root() || evicted_set.contains(&idx) {
+                    continue;
+                }
+
+                if node.block_id.is_none() {
+                    continue;
+                }
+
+                let active_leaf = node
+                    .children
+                    .iter()
+                    .all(|(_, child_idx)| evicted_set.contains(child_idx));
+                if !active_leaf {
+                    continue;
+                }
+
+                let slot = match node.tier_location {
+                    Some(BlockLocation::Gpu { slot }) => slot,
+                    _ => 0,
+                };
+                let soft_pinned = node.soft_pin_until.is_some_and(|deadline| deadline > now);
+                let candidate = EvictionCandidate {
+                    slot,
+                    tokens: self.block_size as u32,
+                    last_access_step: node.last_access,
+                    hit_count: node.hit_count,
+                    prefix_depth: node.tokens.len() as u32,
+                    pinned: node.ref_count != 0 || soft_pinned,
+                };
+                let score = policy.score(candidate, signals);
+                if !score.is_finite() {
+                    continue;
+                }
+
+                match best {
+                    Some((best_score, best_idx))
+                        if best_score < score || (best_score == score && best_idx <= idx) => {}
+                    _ => best = Some((score, idx)),
+                }
+            }
+
+            let Some((_, victim_idx)) = best else {
+                break;
+            };
+
+            evicted_set.insert(victim_idx);
+            if let Some(bid) = self.nodes[victim_idx].block_id.take() {
+                freed.push(bid);
+            }
+        }
+
+        for node in &mut self.nodes {
+            node.children
+                .retain(|_, child_idx| !evicted_set.contains(child_idx));
+        }
+
+        self.gc_orphan_tombstones();
+
+        freed
+    }
+
     /// Reclaim orphaned tombstones after eviction.
     ///
     /// A node is reclaimable when it is:
@@ -863,6 +951,84 @@ mod tests {
             "only the unlocked deepest leaf should be evicted"
         );
         assert_eq!(cache.cached_block_count(), 2);
+    }
+
+    #[test]
+    fn evict_with_policy_matches_lru_when_signals_are_cold() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[100]));
+        cache.insert(&[5, 6, 7, 8], &bids(&[200]));
+
+        let _ = cache.lookup(&[5, 6, 7, 8]);
+        cache.release(&bids(&[200]));
+
+        let freed = cache.evict_with_policy(
+            &crate::scheduler::policy::LruEviction,
+            SchedulerSignals::default(),
+            1,
+        );
+        assert_eq!(freed, bids(&[100]));
+    }
+
+    #[test]
+    fn evict_with_policy_respects_session_affinity_slot() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[100]));
+        cache.insert(&[5, 6, 7, 8], &bids(&[200]));
+
+        let idx_a = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(100)))
+            .unwrap();
+        let idx_b = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(200)))
+            .unwrap();
+        cache.nodes[idx_a].tier_location = Some(BlockLocation::Gpu { slot: 1 });
+        cache.nodes[idx_b].tier_location = Some(BlockLocation::Gpu { slot: 7 });
+        cache.nodes[idx_a].last_access = 10;
+        cache.nodes[idx_b].last_access = 1;
+
+        let freed = cache.evict_with_policy(
+            &crate::scheduler::policy::SessionBiasedLru::default(),
+            SchedulerSignals {
+                session_affinity_slot: Some(7),
+                ..SchedulerSignals::default()
+            },
+            1,
+        );
+        assert_eq!(freed, bids(&[100]));
+    }
+
+    #[test]
+    fn evict_with_policy_skips_soft_pinned_nodes() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[100]));
+        cache.insert(&[5, 6, 7, 8], &bids(&[200]));
+
+        let idx_a = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(100)))
+            .unwrap();
+        let idx_b = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(200)))
+            .unwrap();
+        cache.clock = 100;
+        cache.nodes[idx_a].soft_pin_until = Some(200);
+        cache.nodes[idx_a].last_access = 0;
+        cache.nodes[idx_b].last_access = 1;
+
+        let freed = cache.evict_with_policy(
+            &crate::scheduler::policy::LruEviction,
+            SchedulerSignals::default(),
+            1,
+        );
+        assert_eq!(freed, bids(&[200]));
     }
 
     // ──────────────────────────────────────────────────────────────────
