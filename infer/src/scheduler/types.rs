@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -65,6 +66,23 @@ pub struct SchedulerConfig {
     /// for a `StageTicket` completion. 8x the regular keepalive by
     /// default (512) to survive any plausible stub completion latency.
     pub stage_wait_keepalive_ticks: u64,
+    /// T1 host-pinned pool eviction high-water mark as a fraction of
+    /// the pool's `capacity_bytes`. Above this the coordinator spills
+    /// LRU blocks out to T2 disk. Default 0.85. Tuning for T1→T2
+    /// spill threshold lives on the config, not on an env var —
+    /// same policy as the T0 watermarks in Tier C.
+    pub t1_host_pinned_high_water: f64,
+    /// T1 host-pinned pool eviction low-water mark. Spill runs down to
+    /// this fraction of the pool's capacity before stopping. Default
+    /// 0.70. Must be strictly less than `t1_host_pinned_high_water`.
+    pub t1_host_pinned_low_water: f64,
+    /// Soft-pin extension applied to blocks freshly-promoted from T2
+    /// back to T1. Prevents an immediately-rehydrated block from being
+    /// spilled back out by the same cleanup tick. Default 128 radix
+    /// logical clock ticks.
+    pub t1_host_pinned_keepalive_ticks: u64,
+    /// Root directory used by the session snapshot disk store.
+    pub disk_store_root: PathBuf,
 }
 
 impl Default for SchedulerConfig {
@@ -88,6 +106,13 @@ impl Default for SchedulerConfig {
             prefix_cache_retain_hard_cap: 0.90,
             prefix_cache_keepalive_ticks: 64,
             stage_wait_keepalive_ticks: 512,
+            // T1 host-pinned watermarks — mirror T0 policy at a
+            // slightly higher retention target because host pinned
+            // pool churn is cheaper than GPU pool churn.
+            t1_host_pinned_high_water: 0.85,
+            t1_host_pinned_low_water: 0.70,
+            t1_host_pinned_keepalive_ticks: 128,
+            disk_store_root: std::env::temp_dir().join("pegainfer-kv"),
         }
     }
 }
@@ -144,6 +169,17 @@ impl SchedulerConfig {
         }
         if self.stage_wait_keepalive_ticks < self.prefix_cache_keepalive_ticks {
             anyhow::bail!("stage_wait_keepalive_ticks must be ≥ prefix_cache_keepalive_ticks");
+        }
+        if !(0.0 < self.t1_host_pinned_high_water && self.t1_host_pinned_high_water < 1.0) {
+            anyhow::bail!("t1_host_pinned_high_water must be in (0, 1)");
+        }
+        if !(0.0 < self.t1_host_pinned_low_water
+            && self.t1_host_pinned_low_water < self.t1_host_pinned_high_water)
+        {
+            anyhow::bail!("t1_host_pinned_low_water must be in (0, t1_host_pinned_high_water)");
+        }
+        if self.t1_host_pinned_keepalive_ticks == 0 {
+            anyhow::bail!("t1_host_pinned_keepalive_ticks must be ≥ 1");
         }
         Ok(())
     }
@@ -317,7 +353,32 @@ mod tests {
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
         assert_eq!(cfg.prefix_cache_keepalive_ticks, 64);
         assert_eq!(cfg.stage_wait_keepalive_ticks, 512);
+        assert_eq!(cfg.t1_host_pinned_high_water, 0.85);
+        assert_eq!(cfg.t1_host_pinned_low_water, 0.70);
+        assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_inverted_t1_watermarks() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.t1_host_pinned_low_water = 0.90;
+        cfg.t1_host_pinned_high_water = 0.85;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_t1_high_water_out_of_range() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.t1_host_pinned_high_water = 1.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_t1_keepalive() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.t1_host_pinned_keepalive_ticks = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

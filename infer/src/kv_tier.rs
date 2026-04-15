@@ -112,6 +112,7 @@
 //! only source of write contention it referred to, and its
 //! replacement inside `RadixCache` is single-writer by construction.
 
+#[allow(clippy::match_same_arms)]
 pub mod coordinator;
 pub mod host_pool;
 pub mod id;

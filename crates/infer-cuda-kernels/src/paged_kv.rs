@@ -438,6 +438,67 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Allocate detached physical pages that are not yet owned by any slot.
+    ///
+    /// This is the minimal pool primitive needed by the session-restore path:
+    /// restored blocks must reserve stable physical pages before a live slot
+    /// claims them.
+    pub fn alloc_detached_pages(&mut self, count: usize) -> Result<Vec<u32>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > self.free_pages.len() {
+            return Err(anyhow!(
+                "TokenKVPool: out of pages (requested {count}, available {} pages)",
+                self.free_pages.len()
+            ));
+        }
+
+        let mut new_pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx = self
+                .free_pages
+                .pop()
+                .expect("invariant: free_pages.len() >= count checked above");
+            new_pages.push(idx);
+        }
+        Ok(new_pages)
+    }
+
+    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
+    pub fn copy_pages_to_host(&self, pages: &[u32]) -> Result<Vec<u8>> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = pages;
+            todo!("PagedKVPool::copy_pages_to_host requires validation on a CUDA host")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = pages;
+            Err(anyhow!(
+                "PagedKVPool::copy_pages_to_host is unavailable without feature=cuda"
+            ))
+        }
+    }
+
+    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
+    pub fn copy_pages_from_host(&self, pages: &[u32], payload: &[u8]) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let _ = pages;
+            let _ = payload;
+            todo!("PagedKVPool::copy_pages_from_host requires validation on a CUDA host")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = pages;
+            let _ = payload;
+            Err(anyhow!(
+                "PagedKVPool::copy_pages_from_host is unavailable without feature=cuda"
+            ))
+        }
+    }
+
     /// Free all token slots for a request.
     ///
     /// Each page in the slot transitions based on its external reference

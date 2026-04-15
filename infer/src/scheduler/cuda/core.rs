@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::kv_tier::BlockLocation;
+use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{
     ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
@@ -76,6 +77,7 @@ pub struct Scheduler<M: ModelForward> {
     /// reuse is still limited to slots whose contiguous state remains
     /// materialized; cross-slot page aliasing is intentionally unsupported.
     pub(super) prefix_cache: RadixCache,
+    pub(super) disk_store: Arc<DiskStore>,
     /// Side map from `BlockId` → full contiguous page span for that
     /// block. The radix stores just the first page of each block
     /// (block id = `slot_pages[i * block_size]`), but the actual
@@ -143,6 +145,63 @@ impl<M: ModelForward> Scheduler<M> {
         let high = (total as f64 * self.config.prefix_cache_high_water) as usize;
         let low = (total as f64 * self.config.prefix_cache_low_water) as usize;
         (high, low)
+    }
+
+    pub fn session_fingerprints(&self, session_id: &str) -> Vec<BlockFingerprint> {
+        self.prefix_cache.fingerprints_for_session(session_id)
+    }
+
+    pub fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
+        let block_id = self.prefix_cache.block_id_for_fingerprint(fingerprint)?;
+        let pages = self.block_to_pages.get(&block_id)?;
+        self.paged_kv_pool.copy_pages_to_host(pages).ok()
+    }
+
+    pub fn install_restored_kv(
+        &mut self,
+        payloads: &HashMap<BlockFingerprint, Vec<u8>>,
+    ) -> Box<dyn FnMut(BlockFingerprint) -> Option<BlockId> + Send> {
+        let pages_per_block = self
+            .prefix_cache
+            .block_size()
+            .div_ceil(self.paged_kv_pool.page_size)
+            .max(1);
+        let mut prepared = HashMap::with_capacity(payloads.len());
+
+        for (&fingerprint, payload) in payloads {
+            let Ok(pages) = self.paged_kv_pool.alloc_detached_pages(pages_per_block) else {
+                break;
+            };
+            if self
+                .paged_kv_pool
+                .copy_pages_from_host(&pages, payload)
+                .is_err()
+            {
+                continue;
+            }
+
+            let block_id = BlockId(
+                *pages
+                    .first()
+                    .expect("detached restored block must allocate at least one page"),
+            );
+            self.block_to_pages.insert(block_id, pages);
+            prepared.insert(fingerprint, block_id);
+        }
+
+        Box::new(move |fingerprint| prepared.remove(&fingerprint))
+    }
+
+    pub fn kv_format_tag(&self) -> u8 {
+        self.paged_kv_pool.format.stable_tag().unwrap_or(0)
+    }
+
+    pub fn session_disk_store(&self) -> &DiskStore {
+        self.disk_store.as_ref()
+    }
+
+    pub fn session_radix_cache(&self) -> &RadixCache {
+        &self.prefix_cache
     }
 
     /// Create a new scheduler and its handle.
@@ -278,6 +337,7 @@ impl<M: ModelForward> Scheduler<M> {
                 PREFIX_CACHE_BLOCK_SIZE,
                 config.prefix_cache_keepalive_ticks,
             ),
+            disk_store: Arc::new(DiskStore::new(config.disk_store_root.clone())),
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,

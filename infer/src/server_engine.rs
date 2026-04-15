@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(feature = "metal", feature = "cpu", test))]
@@ -33,6 +34,7 @@ use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35M
 use crate::sampler::SamplingParams;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
+use crate::types::{BlockFingerprint, BlockId};
 
 /// Truncate at the first occurrence of any stop string (OpenAI-compatible).
 /// Returns the prefix of `text` up to (but not including) the earliest stop.
@@ -237,6 +239,40 @@ pub trait InferenceEngine: Send {
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()>;
+
+    fn session_fingerprints(&self, session_id: &str) -> Vec<BlockFingerprint> {
+        let _ = session_id;
+        Vec::new()
+    }
+
+    fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
+        let _ = fingerprint;
+        None
+    }
+
+    fn install_restored_kv(
+        &mut self,
+        payloads: &HashMap<BlockFingerprint, Vec<u8>>,
+    ) -> Box<dyn FnMut(BlockFingerprint) -> Option<BlockId> + Send> {
+        let _ = payloads;
+        Box::new(|_| None)
+    }
+
+    fn kv_format_tag(&self) -> u8 {
+        0
+    }
+
+    fn session_disk_store(
+        &self,
+    ) -> std::result::Result<&crate::kv_tier::transport::DiskStore, &'static str> {
+        Err("engine does not expose a session-scoped DiskStore")
+    }
+
+    fn session_radix_cache(
+        &self,
+    ) -> std::result::Result<&crate::prefix_cache::RadixCache, &'static str> {
+        Err("engine does not expose a session-scoped RadixCache")
+    }
 }
 
 // ============================================================================

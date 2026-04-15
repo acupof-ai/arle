@@ -1,13 +1,22 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, Path, State},
+    http::StatusCode,
+    routing::{delete, get, post},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::transport::disk::DiskBlockLocation;
 use crate::prefix_cache::{BlockId, RadixCache, ReconcileReport};
+use crate::server_engine::InferenceEngine;
 use crate::types::BlockFingerprint;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +83,100 @@ pub struct LoadedSession {
     pub report: ReconcileReport,
 }
 
+fn load_snapshot_payloads(
+    snapshot: &SessionSnapshot,
+    expected_kv_format_tag: u8,
+    disk: &DiskStore,
+) -> Result<(RadixCache, HashMap<BlockFingerprint, Vec<u8>>), SessionSnapshotError> {
+    if snapshot.version != 1 {
+        return Err(SessionSnapshotError::DeserializeManifest(format!(
+            "unsupported session snapshot version {}",
+            snapshot.version
+        )));
+    }
+
+    if snapshot.kv_format_tag != expected_kv_format_tag {
+        return Err(SessionSnapshotError::FormatMismatch {
+            snapshot: snapshot.kv_format_tag,
+            live: expected_kv_format_tag,
+        });
+    }
+
+    let radix: RadixCache = serde_json::from_slice(&snapshot.radix_bytes)
+        .map_err(SessionSnapshotError::DeserializeRadix)?;
+    let mut kv_payloads = HashMap::with_capacity(snapshot.persisted_blocks.len());
+
+    for entry in &snapshot.persisted_blocks {
+        let fingerprint = parse_fingerprint_hex(&entry.fingerprint_hex)?;
+        let location = DiskBlockLocation {
+            path: PathBuf::from(&entry.location.0),
+            payload_len: entry.payload_len,
+            fingerprint,
+        };
+        let payload = match disk.get_block(&location, Some(fingerprint)) {
+            Ok(payload) => payload,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(SessionSnapshotError::MissingDiskBlock {
+                    fingerprint_hex: entry.fingerprint_hex.clone(),
+                    path: entry.location.0.clone(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                return Err(SessionSnapshotError::DiskBlockMismatch {
+                    fingerprint_hex: entry.fingerprint_hex.clone(),
+                    path: entry.location.0.clone(),
+                    reason: err.to_string(),
+                });
+            }
+            Err(err) => return Err(SessionSnapshotError::Io(err)),
+        };
+
+        let payload_len = payload.len() as u64;
+        if payload_len != entry.payload_len {
+            return Err(SessionSnapshotError::DiskBlockMismatch {
+                fingerprint_hex: entry.fingerprint_hex.clone(),
+                path: entry.location.0.clone(),
+                reason: format!(
+                    "payload length mismatch: manifest={} disk={payload_len}",
+                    entry.payload_len
+                ),
+            });
+        }
+
+        kv_payloads.insert(fingerprint, payload);
+    }
+
+    Ok((radix, kv_payloads))
+}
+
+fn reconcile_loaded_session<F>(
+    snapshot: &SessionSnapshot,
+    mut radix: RadixCache,
+    kv_payloads: HashMap<BlockFingerprint, Vec<u8>>,
+    mut allocate_block_id: F,
+) -> Result<LoadedSession, SessionSnapshotError>
+where
+    F: FnMut(BlockFingerprint) -> Option<BlockId>,
+{
+    let mut known = HashMap::with_capacity(snapshot.persisted_blocks.len());
+
+    for entry in &snapshot.persisted_blocks {
+        let fingerprint = parse_fingerprint_hex(&entry.fingerprint_hex)?;
+        let block_id =
+            allocate_block_id(fingerprint).ok_or_else(|| SessionSnapshotError::PoolExhausted {
+                fingerprint_hex: entry.fingerprint_hex.clone(),
+            })?;
+        known.insert(fingerprint, block_id);
+    }
+
+    let report = radix.reconcile(&known);
+    Ok(LoadedSession {
+        radix,
+        kv_payloads,
+        report,
+    })
+}
+
 pub fn save_session<F>(
     session_id: &str,
     kv_format_tag: u8,
@@ -114,89 +217,13 @@ pub fn load_session<F>(
     snapshot: &SessionSnapshot,
     expected_kv_format_tag: u8,
     disk: &DiskStore,
-    mut allocate_block_id: F,
+    allocate_block_id: F,
 ) -> Result<LoadedSession, SessionSnapshotError>
 where
     F: FnMut(BlockFingerprint) -> Option<BlockId>,
 {
-    if snapshot.version != 1 {
-        return Err(SessionSnapshotError::DeserializeManifest(format!(
-            "unsupported session snapshot version {}",
-            snapshot.version
-        )));
-    }
-
-    // M4 review D1: refuse to splice a snapshot saved under one KV
-    // numeric format into a live pool running a different format —
-    // the byte layout of the payloads would not match and decode
-    // would silently corrupt.
-    if snapshot.kv_format_tag != expected_kv_format_tag {
-        return Err(SessionSnapshotError::FormatMismatch {
-            snapshot: snapshot.kv_format_tag,
-            live: expected_kv_format_tag,
-        });
-    }
-
-    let mut radix: RadixCache = serde_json::from_slice(&snapshot.radix_bytes)
-        .map_err(SessionSnapshotError::DeserializeRadix)?;
-    let mut kv_payloads = HashMap::with_capacity(snapshot.persisted_blocks.len());
-    let mut known = HashMap::with_capacity(snapshot.persisted_blocks.len());
-
-    for entry in &snapshot.persisted_blocks {
-        let fingerprint = parse_fingerprint_hex(&entry.fingerprint_hex)?;
-        let location = DiskBlockLocation {
-            path: PathBuf::from(&entry.location.0),
-            payload_len: entry.payload_len,
-            fingerprint,
-        };
-        let payload = match disk.get_block(&location, Some(fingerprint)) {
-            Ok(payload) => payload,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(SessionSnapshotError::MissingDiskBlock {
-                    fingerprint_hex: entry.fingerprint_hex.clone(),
-                    path: entry.location.0.clone(),
-                });
-            }
-            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                return Err(SessionSnapshotError::DiskBlockMismatch {
-                    fingerprint_hex: entry.fingerprint_hex.clone(),
-                    path: entry.location.0.clone(),
-                    reason: err.to_string(),
-                });
-            }
-            Err(err) => return Err(SessionSnapshotError::Io(err)),
-        };
-
-        let payload_len = payload.len() as u64;
-        if payload_len != entry.payload_len {
-            return Err(SessionSnapshotError::DiskBlockMismatch {
-                fingerprint_hex: entry.fingerprint_hex.clone(),
-                path: entry.location.0.clone(),
-                reason: format!(
-                    "payload length mismatch: manifest={} disk={payload_len}",
-                    entry.payload_len
-                ),
-            });
-        }
-
-        kv_payloads.insert(fingerprint, payload);
-        // M4 review D2: fallible pool allocation. A None here means
-        // the live pool cannot absorb this block; surface as a
-        // structured error instead of panicking on an infallible
-        // closure contract.
-        let block_id =
-            allocate_block_id(fingerprint).ok_or_else(|| SessionSnapshotError::PoolExhausted {
-                fingerprint_hex: entry.fingerprint_hex.clone(),
-            })?;
-        known.insert(fingerprint, block_id);
-    }
-
-    let report = radix.reconcile(&known);
-    Ok(LoadedSession {
-        radix,
-        kv_payloads,
-        report,
-    })
+    let (radix, kv_payloads) = load_snapshot_payloads(snapshot, expected_kv_format_tag, disk)?;
+    reconcile_loaded_session(snapshot, radix, kv_payloads, allocate_block_id)
 }
 
 fn fingerprint_to_hex(fingerprint: BlockFingerprint) -> String {
@@ -247,17 +274,291 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SaveRequestBody {
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadResponseBody {
+    pub remapped: usize,
+    pub tombstoned: usize,
+    pub orphans_cleared: usize,
+    pub kv_payloads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+    pub kind: &'static str,
+    pub expected: Option<u8>,
+    pub got: Option<u8>,
+}
+
+fn snapshot_error_to_response(err: &SessionSnapshotError) -> (StatusCode, Json<ErrorBody>) {
+    let (status, kind, expected, got) = match err {
+        SessionSnapshotError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io", None, None),
+        SessionSnapshotError::SerializeRadix(_) | SessionSnapshotError::SerializeManifest(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "serialize", None, None)
+        }
+        SessionSnapshotError::DeserializeRadix(_)
+        | SessionSnapshotError::DeserializeManifest(_) => {
+            (StatusCode::BAD_REQUEST, "deserialize", None, None)
+        }
+        SessionSnapshotError::MissingDiskBlock { .. } => {
+            (StatusCode::NOT_FOUND, "missing_block", None, None)
+        }
+        SessionSnapshotError::DiskBlockMismatch { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, "tampered", None, None)
+        }
+        SessionSnapshotError::FormatMismatch { snapshot, live } => (
+            StatusCode::BAD_REQUEST,
+            "format_mismatch",
+            Some(*live),
+            Some(*snapshot),
+        ),
+        SessionSnapshotError::PoolExhausted { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pool_exhausted",
+            None,
+            None,
+        ),
+    };
+
+    (
+        status,
+        Json(ErrorBody {
+            error: err.to_string(),
+            kind,
+            expected,
+            got,
+        }),
+    )
+}
+
+fn unsupported_response(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorBody {
+            error: message.into(),
+            kind: "unsupported",
+            expected: None,
+            got: None,
+        }),
+    )
+}
+
+async fn handle_save<E: InferenceEngine>(
+    Path(session_id): Path<String>,
+    State(engine): State<Arc<RwLock<E>>>,
+    Json(req): Json<SaveRequestBody>,
+) -> Result<Json<SessionSnapshot>, (StatusCode, Json<ErrorBody>)> {
+    let engine = engine.read().await;
+    let disk = {
+        let store = engine.session_disk_store().map_err(unsupported_response)?;
+        DiskStore::new(store.root().to_path_buf())
+    };
+    let radix = engine.session_radix_cache().map_err(unsupported_response)?;
+    let fingerprints = if req.fingerprints.is_empty() {
+        engine.session_fingerprints(&session_id)
+    } else {
+        req.fingerprints
+            .iter()
+            .map(|fingerprint| parse_fingerprint_hex(fingerprint))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| snapshot_error_to_response(&err))?
+    };
+
+    let snapshot = save_session(
+        &session_id,
+        engine.kv_format_tag(),
+        radix,
+        &disk,
+        |fingerprint| engine.read_block_payload(fingerprint),
+        &fingerprints,
+    )
+    .map_err(|err| snapshot_error_to_response(&err))?;
+    Ok(Json(snapshot))
+}
+
+async fn handle_load<E: InferenceEngine>(
+    State(engine): State<Arc<RwLock<E>>>,
+    Json(snapshot): Json<SessionSnapshot>,
+) -> Result<Json<LoadResponseBody>, (StatusCode, Json<ErrorBody>)> {
+    let (disk, expected_kv_format_tag) = {
+        let engine = engine.read().await;
+        let disk = engine.session_disk_store().map_err(unsupported_response)?;
+        (
+            DiskStore::new(disk.root().to_path_buf()),
+            engine.kv_format_tag(),
+        )
+    };
+    let (radix, kv_payloads) = load_snapshot_payloads(&snapshot, expected_kv_format_tag, &disk)
+        .map_err(|err| snapshot_error_to_response(&err))?;
+
+    let mut engine = engine.write().await;
+    let mut allocate_block_id = engine.install_restored_kv(&kv_payloads);
+    let loaded = reconcile_loaded_session(&snapshot, radix, kv_payloads, |fingerprint| {
+        allocate_block_id(fingerprint)
+    })
+    .map_err(|err| snapshot_error_to_response(&err))?;
+
+    Ok(Json(LoadResponseBody {
+        remapped: loaded.report.remapped,
+        tombstoned: loaded.report.tombstoned,
+        orphans_cleared: loaded.report.orphans_cleared,
+        kv_payloads: loaded.kv_payloads.len(),
+    }))
+}
+
+async fn handle_manifest(Path(_session_id): Path<String>) -> (StatusCode, Json<ErrorBody>) {
+    // TODO(2026-04-16): persist session manifests so GET /manifest can replay
+    // the last saved snapshot for this session id.
+    unsupported_response("session manifest persistence is not implemented yet")
+}
+
+async fn handle_delete(Path(_session_id): Path<String>) -> (StatusCode, Json<ErrorBody>) {
+    // TODO(2026-04-16): delete persisted session manifests and backing blocks
+    // once the manifest storage path is wired.
+    unsupported_response("session deletion is not implemented yet")
+}
+
+pub fn session_router<E>(engine: Arc<RwLock<E>>) -> Router
+where
+    E: InferenceEngine + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/save", post(handle_save::<E>))
+        .route("/load", post(handle_load::<E>))
+        .route("/manifest", get(handle_manifest))
+        .route("/", delete(handle_delete))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .with_state(engine)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tempfile::TempDir;
     use tempfile::tempdir;
+    use tokio::sync::RwLock;
+    use tower::util::ServiceExt;
 
-    use super::{SessionSnapshotError, load_session, save_session};
+    use super::{
+        SaveRequestBody, SessionSnapshot, SessionSnapshotError, load_session, save_session,
+        session_router,
+    };
+    use crate::kv_tier::transport::DiskStore;
     use crate::prefix_cache::{BlockId, RadixCache};
+    use crate::server_engine::{
+        CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine,
+    };
     use crate::types::BlockFingerprint;
+
+    struct MockEngine {
+        radix: RadixCache,
+        disk: DiskStore,
+        payloads: HashMap<BlockFingerprint, Vec<u8>>,
+        next_block_id: u32,
+        format_tag: u8,
+        fingerprints: Vec<BlockFingerprint>,
+    }
+
+    impl InferenceEngine for MockEngine {
+        fn model_id(&self) -> &str {
+            "mock-engine"
+        }
+
+        fn complete(&mut self, _req: CompletionRequest) -> anyhow::Result<CompletionOutput> {
+            panic!("MockEngine::complete is not used in session route tests")
+        }
+
+        fn complete_stream(
+            &mut self,
+            _req: CompletionRequest,
+            _tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+        ) -> anyhow::Result<()> {
+            panic!("MockEngine::complete_stream is not used in session route tests")
+        }
+
+        fn session_fingerprints(&self, _session_id: &str) -> Vec<BlockFingerprint> {
+            self.fingerprints.clone()
+        }
+
+        fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
+            self.payloads.get(&fingerprint).cloned()
+        }
+
+        fn install_restored_kv(
+            &mut self,
+            payloads: &HashMap<BlockFingerprint, Vec<u8>>,
+        ) -> Box<dyn FnMut(BlockFingerprint) -> Option<BlockId> + Send> {
+            let mut remapped = HashMap::with_capacity(payloads.len());
+            for (&fingerprint, payload) in payloads {
+                self.payloads.insert(fingerprint, payload.clone());
+                remapped.insert(fingerprint, BlockId(self.next_block_id));
+                self.next_block_id += 1;
+            }
+            Box::new(move |fingerprint| remapped.remove(&fingerprint))
+        }
+
+        fn kv_format_tag(&self) -> u8 {
+            self.format_tag
+        }
+
+        fn session_disk_store(&self) -> Result<&DiskStore, &'static str> {
+            Ok(&self.disk)
+        }
+
+        fn session_radix_cache(&self) -> Result<&crate::prefix_cache::RadixCache, &'static str> {
+            Ok(&self.radix)
+        }
+    }
+
+    fn mock_engine(tempdir: &TempDir, format_tag: u8) -> MockEngine {
+        let disk = DiskStore::new(tempdir.path());
+        let mut radix = RadixCache::new(4);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let fp_a = BlockFingerprint([0x91; 16]);
+        let fp_b = BlockFingerprint([0x92; 16]);
+        radix.insert_with_fingerprints(&tokens, &[BlockId(10), BlockId(20)], &[fp_a, fp_b]);
+
+        MockEngine {
+            radix,
+            disk,
+            payloads: HashMap::from([(fp_a, b"payload-a".to_vec()), (fp_b, b"payload-b".to_vec())]),
+            next_block_id: 100,
+            format_tag,
+            fingerprints: vec![fp_a, fp_b],
+        }
+    }
+
+    async fn response_json<T: serde::de::DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> T {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&bytes).expect("deserialize response json")
+    }
+
+    fn mounted_session_app(engine: MockEngine) -> Router {
+        Router::new().nest_service(
+            "/v1/sessions",
+            Router::new().nest(
+                "/{session_id}",
+                session_router(Arc::new(RwLock::new(engine))),
+            ),
+        )
+    }
 
     #[test]
     fn save_then_load_round_trips_radix_and_payloads() {
@@ -434,5 +735,126 @@ mod tests {
             Err(other) => panic!("expected PoolExhausted, got {other:?}"),
             Ok(_) => panic!("load with exhausted allocator should fail"),
         }
+    }
+
+    #[tokio::test]
+    async fn save_route_returns_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-save/save")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&SaveRequestBody::default())
+                            .expect("serialize save body"),
+                    ))
+                    .expect("build save request"),
+            )
+            .await
+            .expect("save route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: SessionSnapshot = response_json(response).await;
+        assert_eq!(snapshot.session_id, "session-save");
+        assert!(!snapshot.persisted_blocks.is_empty());
+        assert!(!snapshot.radix_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_route_refuses_format_mismatch() {
+        let dir = tempdir().expect("tempdir");
+        let source_engine = mock_engine(&dir, 1);
+        let snapshot = save_session(
+            "session-fmt",
+            source_engine.format_tag,
+            &source_engine.radix,
+            &source_engine.disk,
+            |fingerprint| source_engine.payloads.get(&fingerprint).cloned(),
+            &source_engine.fingerprints,
+        )
+        .expect("save snapshot");
+        let app = mounted_session_app(mock_engine(&dir, 3));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-fmt/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&snapshot).expect("serialize snapshot"),
+                    ))
+                    .expect("build load request"),
+            )
+            .await
+            .expect("load route response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "format_mismatch");
+        assert_eq!(body["expected"], 3);
+        assert_eq!(body["got"], 1);
+    }
+
+    #[tokio::test]
+    async fn load_route_refuses_tampered_payload() {
+        let dir = tempdir().expect("tempdir");
+        let source_engine = mock_engine(&dir, 1);
+        let snapshot = save_session(
+            "session-tampered",
+            source_engine.format_tag,
+            &source_engine.radix,
+            &source_engine.disk,
+            |fingerprint| source_engine.payloads.get(&fingerprint).cloned(),
+            &source_engine.fingerprints,
+        )
+        .expect("save snapshot");
+        let tampered_path = PathBuf::from(&snapshot.persisted_blocks[0].location.0);
+        fs::write(&tampered_path, b"junk").expect("overwrite persisted block");
+
+        let app = mounted_session_app(mock_engine(&dir, 1));
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-tampered/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&snapshot).expect("serialize snapshot"),
+                    ))
+                    .expect("build load request"),
+            )
+            .await
+            .expect("load route response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "tampered");
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_enforced() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+        let oversized_snapshot = SessionSnapshot {
+            version: 1,
+            session_id: "session-big".to_string(),
+            kv_format_tag: 1,
+            radix_bytes: vec![7u8; 10 * 1024 * 1024],
+            persisted_blocks: Vec::new(),
+        };
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-big/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&oversized_snapshot)
+                            .expect("serialize oversized snapshot"),
+                    ))
+                    .expect("build oversized request"),
+            )
+            .await
+            .expect("body-limit response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
