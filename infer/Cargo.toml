@@ -46,6 +46,7 @@ rand = "0.10"
 tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
+crossbeam-channel = "0.5"
 infer-chat = { path = "../crates/infer-chat" }
 infer-cuda-kernels = { path = "../crates/infer-cuda-kernels", default-features = false }
 

@@ -112,10 +112,14 @@
 //! only source of write contention it referred to, and its
 //! replacement inside `RadixCache` is single-writer by construction.
 
+pub mod coordinator;
+pub mod host_pool;
 pub mod id;
 pub mod tier;
 pub mod transport;
 
+pub use coordinator::{Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle};
+pub use host_pool::{HostPinnedPool, HostPinnedRegion};
 pub use id::BlockId;
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};

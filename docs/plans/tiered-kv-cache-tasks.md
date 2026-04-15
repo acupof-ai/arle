@@ -73,17 +73,20 @@ milestone plan.
 > before reading it, and alloc-OOM now forces one synchronous
 > prefix-cache eviction retry. The safety audit kept **no cross-slot page
 > aliasing** in this batch; reuse is safe same-slot resurrection only.
-> The remaining critical-path gap is **remote CUDA acceptance** plus M0.3.
-> Remote checklist: [`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md).
+> The remaining critical-path gap is now **remote CUDA acceptance** for the
+> stacked M2b + M0.3 + M3a local batches. Remote checklists:
+> [`tiered-kv-cache-m2b-remote-acceptance.md`](tiered-kv-cache-m2b-remote-acceptance.md)
+> and
+> [`tiered-kv-cache-m0.3-m3a-remote-acceptance.md`](tiered-kv-cache-m0.3-m3a-remote-acceptance.md).
 
 | Old phase | New milestone | What changed | Status | Task doc section |
 |---|---|---|---|---|
-| P0 page_size=16 | **M0.3** | Unchanged intent; now gated on the in-flight `infer-cuda-kernels` crate extraction landing. Per-format dispatch still applies (BF16 → 16, quantized → stay at 1). | **blocked** on Codex wave stabilising + BF16 HND range kernel rewrite (see §1 rescoped list in [`../experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md)) | §1 below |
+| P0 page_size=16 | **M0.3** | Unchanged intent. Per-format dispatch still applies (BF16 → 16, quantized → stay at 1). The kernel-crate path move is now absorbed into the landed local diff. | **local impl done; remote CUDA acceptance pending** | §1 below |
 | P1 (a) structural (BlockId, kv_tier module, serde) | **retired** | The old `kv_tier::BlockId(u64)` / `TierDirectory` / `BlockDescriptor` skeleton is being deleted in M1. Do **not** extend it. The bug fixes from P1(a) (three `prefix_cache.rs` correctness bugs) are now **M0.2** — see §2.1 below. | **done** via M0.2 + M1a | §2 below, fragment |
 | P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
 | — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b local done, remote CUDA acceptance pending** (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
-| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. Content unchanged. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | pending — blocked on M2b landing | §3 below |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a local done; M3b/M3c pending; remote CUDA smoke pending for M3a** | §3 below |
 | P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | pending | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
 | P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |
@@ -98,9 +101,8 @@ milestone plan.
   (`_split_node` ref_count inherit, `lookup` ancestor walk, `evict`
   iterate orphans). Unit-tested, no scheduler changes. Details in §2.1 below.
 - **M0.3** — page_size lift from 1 to 16 with per-format dispatch (the old
-  P0). Blocks on the in-flight `infer-cuda-kernels` crate extraction
-  landing — after that extraction, the kernel files move from
-  `infer/csrc/cuda/kv/*.cu` to `crates/infer-cuda-kernels/csrc/kv/*.cu`.
+  P0). **Local implementation landed** on the extracted
+  `crates/infer-cuda-kernels/**` paths; remote CUDA validation remains.
 
 **Paths updated post Route-A (structural, not content)**:
 
@@ -130,14 +132,14 @@ this doc will get another path update pass at that point.
 
 ## 1 · Milestone M0.3 (formerly P0) — `page_size = 16` with per-format dispatch
 
-> **2026-04-14 update (commit `d902090`)** — implementation attempted
-> against this section was **stopped before any code was written**.
-> Two of the touch-point claims below turned out to be wrong, and one
-> CUDA kernel that the production prefill→pool migration depends on
-> is hardcoded NHD per-token. Full root cause and the rescoped P0
-> (now ~12 files including a new BF16 HND range kernel) are in
-> [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md).
-> Read that entry before re-attempting P0.
+> **2026-04-15 update** — the local implementation is now in the working
+> tree: BF16 lifted to `page_size=16`, quantized formats remain at `1`,
+> the pool became page-aware, and a new BF16 HND range kernel landed.
+> The 2026-04-14 blocker entry remains relevant as **historical root
+> cause** for why the final touch list grew to ~12 files; read
+> [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md)
+> if you need the byte-offset proof. What remains open is **remote CUDA
+> acceptance**, not local implementation.
 
 ### 1.1 Lane breakdown
 
@@ -146,19 +148,23 @@ this doc will get another path update pass at that point.
 > implement them as written.
 
 #### Local (Mac) — `[L+R]` because all touched files are cuda-gated
-- [ ] 🔴 `[L+R]` Edit `infer/src/backend/cuda/paged_kv.rs` (paths updated post route-A revert) — add `page_size: usize` field on `TokenKVPool`, rewrite `alloc_tokens` as **two-level allocator** modeled on vLLM (see §1.2). **Original plan said all 4 callers discard the Vec; only 2 of 4 do.** `scheduler/cuda/prefill.rs:184` and `:270` consume `new_indices` and feed it into `state.migrate_kv_range_to_paged(...)`. Returning `Vec::new()` would silently break prefix migration — `alloc_tokens` must return real indices.
-- [ ] `[L+R]` Edit `infer/src/backend/cuda/flashinfer.rs:124-180` (formerly `flashinfer_metadata.rs`) — `indptr` becomes **cumulative pages** (was tokens); rewrite incremental update to distinguish "new token lands inside last page (bump `last_page_len`)" vs "spills to new page (append page id, reset `last_page_len = 1`)"
-- [ ] `[L+R]` Edit `infer/src/model/qwen3/batch_decode.rs:384` — drop `let page_size = 1;`, read from `kv_pool.page_size`
-- [ ] `[L+R]` Edit `infer/src/model/qwen35/batch_decode.rs:741` — same (line moved from 724)
-- [ ] `[L+R]` Edit `infer/src/model/glm4/batch_decode.rs:338` — same
-- [ ] `[L+R]` Edit `infer/src/scheduler/cuda/decode.rs:193` — literal `1` → `paged_kv_pool.page_size`
-- [ ] 🔴 **MISSING** — Edit `infer/src/ops/attention.rs:673` and `:1068` — `let stride_page = paged.kv_pool.kv_dim;` must become `kv_dim * page_size` for `decode_prep_paged*` to write HND-correctly at `page_size > 1`. Mentioned in §1.2 line 104 as a caller responsibility but omitted from the touch-point list.
-- [ ] 🔴 **MISSING** — Add `kv_cache_to_paged_range_hnd_kernel` in `infer/csrc/cuda/kv/kv_cache_to_paged.cu` (~60 lines, additive, does NOT touch the existing range kernel or either forbidden quant kernel) + FFI declaration in `infer/src/backend/cuda/ffi.rs` + dispatch in `infer/src/model/kv_cache.rs::migrate_from_contiguous_range_bf16`. The existing `kv_cache_to_paged_range_kernel` writes NHD-per-token; FlashInfer reads HND. Without this addition, BF16 + `page_size > 1` produces silently wrong attention output. Plan §1.2 line 106 audited the wrong function.
-- [ ] 🔴 **MISSING** — `migrate_kv_range_to_paged` API change. Today it takes `&new_token_indices` (just the newly-allocated tail). The new HND kernel needs the slot's full page table. Either pass `slot: usize` and look up `pool.token_indices[slot]` inside, or pass the full table from the caller. Touches the function definition + 2 call sites in `prefill.rs`.
-- [ ] 🔴 **MISSING** — Add a kernel-level unit test that round-trips a synthetic contiguous tensor through the new HND range kernel at `page_size ∈ {1, 2, 4, 8, 16}` and asserts the HND addressing formula reads back the same bytes. **Required because e2e tests have weight drift** (see `project_remote_cuda_box.md`) and cannot serve as the regression gate for a kernel rewrite.
-- [ ] `[L]` Run `cargo check --no-default-features --features no-cuda` — verify nothing in the always-on modules broke
-- [ ] `[L]` Run `cargo check --no-default-features --features metal` — verify Metal build untouched
-- [ ] **Hand off to remote GPU** with the diff and the §1.3 caveat list
+- [x] `[L+R]` Rework `TokenKVPool` into a page-aware allocator with runtime
+      `page_size`, per-format dispatch, page tables, `seq_lens`, and BF16
+      `page_size=16` defaulting through `KVFormat::default_page_size()`
+- [x] `[L+R]` Rewrite FlashInfer decode metadata to consume runtime
+      `page_size`, cumulative page-based `indptr`, and page-table flattening
+- [x] `[L+R]` Update model batch-decode call sites and CUDA decode planning
+      to read `kv_pool.page_size`
+- [x] `[L+R]` Add `kv_cache_to_paged_range_hnd_cuda` and route BF16 range
+      migration through the full page table
+- [x] `[L+R]` Change `migrate_kv_range_to_paged` to take
+      `(slot, start_pos, token_count)` rather than only the newly allocated
+      tail ids
+- [x] `[L]` `cargo check -p infer-cuda-kernels --tests --no-default-features --features cuda,no-cuda`
+- [x] `[L]` `cargo check -p infer --tests --no-default-features --features cuda,no-cuda`
+- [x] `[L]` `cargo check -p infer --no-default-features --features metal`
+- [ ] `[R]` Remote CUDA acceptance via
+      `tiered-kv-cache-m0.3-m3a-remote-acceptance.md`
 
 #### Remote GPU — `[R]`
 - [ ] `[R]` `cargo build --release` — CUDA compile + FlashInfer link green
@@ -308,19 +314,29 @@ this doc will get another path update pass at that point.
 
 ### 3.1 Lane breakdown
 
+> **2026-04-15 update** — the M3a structural skeleton is now in the working
+> tree: `HostPinnedPool`, `LocalCudaTransport`, `Coordinator`, the
+> `crossbeam-channel` dependency, and the first tier-aware `RadixNode`
+> metadata fields. The checklist below is now split into "already landed
+> locally" vs "still pending on a CUDA host / later M3 behavior PRs".
+
 #### Structural PR (a) — Local (Mac)
-- [ ] `[L]` `infer/src/scheduler/policy.rs` — add `EvictionPolicy` trait, `EvictionCandidate`, `SessionState`, `LruEviction` + `ReuseBiasedLru` + `HitCountLru` + `SessionBiasedLru` default. Pure scoring functions, no IO, no state mutation in `score()`.
-- [ ] `[L]` Unit tests for all 4 default policy impls — pure Rust, fully local
-- [ ] `[L+R]` Add `infer/src/kv_tier/transport.rs` — `KVTransport` trait surface (this trait gets frozen in P5; P2 introduces it under a draft form)
-- [ ] `[L+R]` Add `infer/src/kv_tier/transport/local_cuda.rs` — `LocalCudaTransport` over `cudarc` async copy. Code-writeable on Mac, only `cargo build --release` on remote can verify
-- [ ] `[L+R]` Add `infer/src/kv_tier/host_pool.rs` — `HostPinnedPool` over `cudaHostAlloc`; **allocation-stable base pointer** (P5 RDMA precondition)
-- [ ] `[L+R]` Add `infer/src/kv_tier/coordinator.rs` — **OS thread (NOT tokio task)**, owns 2 dedicated CUDA streams, in-flight queue, drains via `crossbeam::channel::Receiver::recv_timeout(1ms)`
-- [ ] `[L+R]` `TieredKvCache::demote / promote` — route to coordinator (no-op until behavior PR sets watermarks)
-- [ ] `[L]` `cargo check --features no-cuda` — non-CUDA bits (the policy crate, the trait, channel types) compile
-- [ ] `[L]` `cargo check --features metal` — Metal build untouched
+- [x] `[L]` `infer/src/scheduler/policy.rs` — `EvictionPolicy` trait + default
+      impls already existed from earlier local work
+- [x] `[L+R]` `infer/src/kv_tier/transport.rs` — `KVTransport` trait surface
+- [x] `[L+R]` `infer/src/kv_tier/transport/local_cuda.rs` — structural stub
+      that validates local GPU↔host-pinned transfer pairs and abort state
+- [x] `[L+R]` `infer/src/kv_tier/host_pool.rs` — allocation-stable host-pool
+      bookkeeping with pure-Rust tests
+- [x] `[L+R]` `infer/src/kv_tier/coordinator.rs` — OS thread + bounded
+      channel skeleton with local tests
+- [ ] `[L+R]` `TieredKvCache::demote / promote` / scheduler consumers —
+      deferred to M3b
+- [x] `[L]` `cargo test -p infer --no-default-features --features no-cuda kv_tier`
+- [x] `[L]` `cargo check -p infer --no-default-features --features metal`
 
 #### Structural PR (a) — Remote GPU
-- [ ] `[R]` `cargo build --release` — `cudarc` + `cudaHostAlloc` + dedicated copy stream all link
+- [ ] `[R]` `cargo build --release` — `cudarc` + `cudaHostAlloc` scaffolding all link
 - [ ] `[R]` Unit smoke: register a host pinned region, do one async D2H copy on `write_stream`, do one H2D on `load_stream`, verify checksums
 - [ ] `[R]` `cargo test --release` — full suite still green (no behavior change yet)
 
@@ -720,7 +736,7 @@ Work the remote GPU host can run **while** the local Mac is busy. None of this i
 
 These should already be running by the time P0 edits land:
 
-- [ ] `[R]` **`--label page1` baseline**: explicit pre-P0 snapshot under current `page_size=1` regime. **Required** for P0 delta comparison.
+- [ ] `[R]` **`--label page1` historical baseline**: explicit pre-M0.3 snapshot from the old `page_size=1` BF16 regime. Keep for delta comparison if the host does not already have a recorded baseline.
 - [ ] `[R]` **Baseline collection**: `scripts/bench_throughput_sweep.py --label baseline-main-2026-04-13` — every model + slot config we ship. Becomes regression gate from P0 onwards. Save to `docs/experience/wins/2026-04-13-bench-baseline.md`.
 - [ ] `[R]` **Long-context agent baseline**: 32k+ token agent trace, num_slots=4, current main. Numbers we compare against in P2's "must run to completion" gate.
 - [ ] `[R]` **Greedy regression sample**: full `e2e + e2e_qwen35 + greedy_consistency` on current main, capture pass/fail counts as post-merge baseline.
@@ -766,14 +782,12 @@ These should already be running by the time P0 edits land:
    research. 22 prefix_cache unit tests green. See project doc §8 items
    10–12 for the code locations.
 
-**M0.3 · `page_size = 1 → 16` with per-format dispatch** blocks on the
-in-flight `infer-cuda-kernels` extraction (kernel files move from
-`infer/csrc/cuda/` to `crates/infer-cuda-kernels/csrc/`). After the
-extraction lands, re-target the file edits to their new paths and
-execute §1 below with the per-format dispatch course correction from
-§1.3. **M0.3 is a prereq for M3, not for M1** — M1's exit gate is T0-only
-`cached_prompts` parity and does not depend on `page_size`. See project
-doc §6 M0.3 "Sequencing clarification" for the rationale.
+**M0.3 · `page_size = 1 → 16` with per-format dispatch** is now **local
+done, remote CUDA acceptance pending**. The file-path migration into
+`crates/infer-cuda-kernels/**` already happened; the remaining gate is the
+remote checklist in `tiered-kv-cache-m0.3-m3a-remote-acceptance.md`.
+**M0.3 is a prereq for M3 behavior, not for M1** — M1's exit gate is T0-only
+`cached_prompts` parity and does not depend on `page_size`.
 
 **M1 · wire `RadixCache` + delete `kv_tier/directory.rs`** depends on
 M0.1 (BlockId unification) and M0.2 (prefix_cache bug fixes). It does
