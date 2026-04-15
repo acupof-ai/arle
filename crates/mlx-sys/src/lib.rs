@@ -364,6 +364,20 @@ unsafe extern "C" {
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_step_batch(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        batch_size: i32,
+        cache_pos: i32,
+        kv_caches: *mut *mut mlx_array,
+        n_kv_per_request: i32,
+        gdr_states: *mut *mut mlx_array,
+        n_gdr_per_request: i32,
+        out_logits: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+        out_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_prefill(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,

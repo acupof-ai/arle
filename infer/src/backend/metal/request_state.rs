@@ -339,30 +339,65 @@ impl<'a> MetalRequestState<'a> {
             return Ok(None);
         }
 
-        let mut qwen3_states = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            let state_ref: &mut MetalRequestState<'a> = state;
-            match &mut state_ref.inner {
-                MetalRequestStateInner::Qwen3(qwen3) => {
-                    if qwen3.phase() != MetalRequestPhase::Decode {
-                        return Ok(None);
+        match &mut states[0].inner {
+            MetalRequestStateInner::Qwen3(_) => {
+                let mut qwen3_states = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    let state_ref: &mut MetalRequestState<'a> = state;
+                    match &mut state_ref.inner {
+                        MetalRequestStateInner::Qwen3(qwen3) => {
+                            if qwen3.phase() != MetalRequestPhase::Decode {
+                                return Ok(None);
+                            }
+                            qwen3_states.push(qwen3);
+                        }
+                        MetalRequestStateInner::Qwen35(_) => return Ok(None),
                     }
-                    qwen3_states.push(qwen3);
                 }
-                MetalRequestStateInner::Qwen35(_) => return Ok(None),
+
+                let first_cache_len = qwen3_states[0].driver.cache_len;
+                if qwen3_states
+                    .iter()
+                    .any(|state| state.driver.cache_len != first_cache_len)
+                {
+                    return Ok(None);
+                }
+
+                let sampled = decode_qwen3_batch(&mut qwen3_states)?;
+                Ok(Some(sampled))
+            }
+            MetalRequestStateInner::Qwen35(_) => {
+                let mut qwen35_states = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    let state_ref: &mut MetalRequestState<'a> = state;
+                    match &mut state_ref.inner {
+                        MetalRequestStateInner::Qwen35(qwen35) => {
+                            if qwen35.phase() != MetalRequestPhase::Decode {
+                                return Ok(None);
+                            }
+                            qwen35_states.push(qwen35);
+                        }
+                        MetalRequestStateInner::Qwen3(_) => return Ok(None),
+                    }
+                }
+
+                let first_cache_len = qwen35_states[0].driver.cache_len;
+                let first_kv_capacity = qwen35_states[0].driver.kv_capacity;
+                let cpp_mode = matches!(qwen35_states[0].driver.mode, Qwen35StepMode::Cpp(_));
+                if !cpp_mode
+                    || qwen35_states.iter().any(|state| {
+                        state.driver.cache_len != first_cache_len
+                            || state.driver.kv_capacity != first_kv_capacity
+                            || !matches!(state.driver.mode, Qwen35StepMode::Cpp(_))
+                    })
+                {
+                    return Ok(None);
+                }
+
+                let sampled = decode_qwen35_batch(&mut qwen35_states)?;
+                Ok(Some(sampled))
             }
         }
-
-        let first_cache_len = qwen3_states[0].driver.cache_len;
-        if qwen3_states
-            .iter()
-            .any(|state| state.driver.cache_len != first_cache_len)
-        {
-            return Ok(None);
-        }
-
-        let sampled = decode_qwen3_batch(&mut qwen3_states)?;
-        Ok(Some(sampled))
     }
 
     pub fn cancel(&mut self) -> Result<()> {
@@ -376,9 +411,7 @@ impl<'a> MetalRequestState<'a> {
 fn decode_qwen3_batch(
     states: &mut [&mut ResumableRequestState<Qwen3StepDriver<'_>>],
 ) -> Result<Vec<u32>> {
-    use super::mlx::{
-        concatenate_axis, eval, rms_norm, slice, take_axis, transpose_axes,
-    };
+    use super::mlx::{concatenate_axis, eval, rms_norm, slice, take_axis, transpose_axes};
     use super::ops::linear;
 
     ensure!(
@@ -523,7 +556,8 @@ fn decode_qwen3_batch(
 
         let k_full = concatenate_axis(&batch_k, 0);
         let v_full = concatenate_axis(&batch_v, 0);
-        let attn_out = super::mlx::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None);
+        let attn_out =
+            super::mlx::scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None);
         let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
         let attn_out = super::mlx::reshape(&attn_out, &[batch, n_heads * head_dim]);
         let attn_out = linear(&attn_out, &layer.o_proj);
@@ -542,12 +576,7 @@ fn decode_qwen3_batch(
     let mut sampled_arrays = Vec::with_capacity(states.len());
     for (row_idx, state) in states.iter().enumerate() {
         let row = i32::try_from(row_idx).context("decode_qwen3_batch sample row overflow")?;
-        let row_logits = slice(
-            &logits,
-            &[row, 0],
-            &[row + 1, logits.shape()[1]],
-            &[1, 1],
-        );
+        let row_logits = slice(&logits, &[row, 0], &[row + 1, logits.shape()[1]], &[1, 1]);
         sampled_arrays.push(gpu_sample_token(&row_logits, &state.driver.sample_params));
     }
     let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
@@ -559,6 +588,167 @@ fn decode_qwen3_batch(
         state.record_sampled_token(token)?;
         sampled_tokens.push(token);
     }
+
+    Ok(sampled_tokens)
+}
+
+fn decode_qwen35_batch(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'_>>],
+) -> Result<Vec<u32>> {
+    use super::mlx::{eval, slice};
+
+    ensure!(
+        !states.is_empty(),
+        "decode_qwen35_batch requires at least one request state"
+    );
+
+    let batch = i32::try_from(states.len()).context("decode_qwen35_batch batch size overflow")?;
+    let first = &states[0].driver;
+    let weights = first.weights;
+    let config = first.config;
+    let arch = first.arch;
+    let cache_len = first.cache_len;
+    let kv_capacity = first.kv_capacity;
+    let cpp_model = weights
+        .cpp_model
+        .as_ref()
+        .context("decode_qwen35_batch requires the compiled Qwen3.5 path")?;
+
+    for state in states.iter() {
+        ensure!(
+            std::ptr::eq(state.driver.weights, weights)
+                && std::ptr::eq(state.driver.config, config)
+                && std::ptr::eq(state.driver.arch, arch),
+            "decode_qwen35_batch requires identical Qwen3.5 model handles"
+        );
+        ensure!(
+            state.driver.cache_len == cache_len && state.driver.kv_capacity == kv_capacity,
+            "decode_qwen35_batch requires identical cache_len and kv_capacity"
+        );
+        ensure!(
+            matches!(state.driver.mode, Qwen35StepMode::Cpp(_)),
+            "decode_qwen35_batch requires compiled Qwen3.5 state"
+        );
+    }
+
+    if cache_len > 0 && cache_len % KV_CACHE_CHUNK == 0 {
+        clear_metal_cache();
+    }
+
+    for state in states.iter_mut() {
+        state.driver.ensure_capacity(state.driver.cache_len + 1);
+    }
+
+    let input_tokens: Vec<u32> = states
+        .iter()
+        .map(|state| {
+            state
+                .last_token
+                .context("decode_qwen35_batch requires a committed prefill token")
+        })
+        .collect::<Result<_>>()?;
+    let token_values: Vec<i32> = input_tokens.iter().map(|&token| token as i32).collect();
+    let token_arr = MlxArray::from_slice_i32(&token_values, &[batch]);
+
+    let n_kv_per_request = match &states[0].driver.mode {
+        Qwen35StepMode::Cpp(state) => i32::try_from(state.kv_flat.len())
+            .context("decode_qwen35_batch kv count overflow")?,
+        Qwen35StepMode::Rust(_) => unreachable!("checked above"),
+    };
+    let n_gdr_per_request = match &states[0].driver.mode {
+        Qwen35StepMode::Cpp(state) => i32::try_from(state.gdr_flat.len())
+            .context("decode_qwen35_batch gdr count overflow")?,
+        Qwen35StepMode::Rust(_) => unreachable!("checked above"),
+    };
+
+    let mut flat_kv = Vec::with_capacity(states.len() * n_kv_per_request as usize);
+    let mut flat_gdr = Vec::with_capacity(states.len() * n_gdr_per_request as usize);
+    for state in states.iter() {
+        match &state.driver.mode {
+            Qwen35StepMode::Cpp(cpp) => {
+                flat_kv.extend(cpp.kv_flat.iter().cloned());
+                flat_gdr.extend(cpp.gdr_flat.iter().cloned());
+            }
+            Qwen35StepMode::Rust(_) => unreachable!("checked above"),
+        }
+    }
+
+    let logits = cpp_model.step_batch(
+        &token_arr,
+        batch,
+        cache_len,
+        &mut flat_kv,
+        n_kv_per_request,
+        &mut flat_gdr,
+        n_gdr_per_request,
+    )?;
+
+    let mut step_outputs: Vec<&MlxArray> = Vec::with_capacity(1 + flat_kv.len() + flat_gdr.len());
+    step_outputs.push(&logits);
+    step_outputs.extend(flat_kv.iter());
+    step_outputs.extend(flat_gdr.iter());
+    eval(&step_outputs);
+
+    let logits_shape = logits.shape().to_vec();
+    ensure!(
+        !logits_shape.is_empty() && logits_shape[0] == batch,
+        "decode_qwen35_batch expected batched logits, got shape {:?}",
+        logits_shape
+    );
+
+    let mut sampled_arrays = Vec::with_capacity(states.len());
+    for row_idx in 0..states.len() {
+        let row = i32::try_from(row_idx).context("decode_qwen35_batch row overflow")?;
+        let mut start = vec![0; logits_shape.len()];
+        let mut end = logits_shape.clone();
+        let strides = vec![1; logits_shape.len()];
+        start[0] = row;
+        end[0] = row + 1;
+        let row_logits = slice(&logits, &start, &end, &strides);
+        sampled_arrays.push(gpu_sample_token(&row_logits, &states[row_idx].driver.params));
+    }
+    let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
+    eval(&sample_refs);
+
+    let mut kv_iter = flat_kv.into_iter();
+    let mut gdr_iter = flat_gdr.into_iter();
+    let mut sampled_tokens = Vec::with_capacity(states.len());
+
+    for (state, sampled) in states.iter_mut().zip(sampled_arrays.iter()) {
+        match &mut state.driver.mode {
+            Qwen35StepMode::Cpp(cpp) => {
+                for slot in cpp.kv_flat.iter_mut() {
+                    let old = std::mem::replace(
+                        slot,
+                        kv_iter
+                            .next()
+                            .context("decode_qwen35_batch missing KV output")?,
+                    );
+                    drop(old);
+                }
+                for slot in cpp.gdr_flat.iter_mut() {
+                    let old = std::mem::replace(
+                        slot,
+                        gdr_iter
+                            .next()
+                            .context("decode_qwen35_batch missing GDR output")?,
+                    );
+                    drop(old);
+                }
+            }
+            Qwen35StepMode::Rust(_) => unreachable!("checked above"),
+        }
+
+        let token = sampled.item_i32() as u32;
+        state.driver.cache_len += 1;
+        state.record_sampled_token(token)?;
+        sampled_tokens.push(token);
+    }
+
+    ensure!(
+        kv_iter.next().is_none() && gdr_iter.next().is_none(),
+        "decode_qwen35_batch produced unexpected extra state outputs"
+    );
 
     Ok(sampled_tokens)
 }
