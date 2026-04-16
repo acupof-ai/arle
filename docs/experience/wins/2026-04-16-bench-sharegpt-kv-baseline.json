@@ -1,24 +1,31 @@
 {
-  "label": "sharegpt-200-c4-kv-baseline",
-  "timestamp": "2026-04-16T06:40:10.168770+00:00",
+  "label": "sharegpt-200-c4-kv-baseline-v2",
+  "timestamp": "2026-04-16T07:17:49.706172+00:00",
   "model": "Qwen3-4B",
   "dataset": "ShareGPT_V3 (200 prompts)",
   "concurrency": 4,
   "max_tokens": 256,
   "hardware": "NVIDIA L4 24GB, CUDA 12.8",
+  "commit": "aef22a7",
+  "server_side_stats": {
+    "ttft_p50": "75.0ms",
+    "ttft_p99": "100.0ms",
+    "tpot_p50": "40.0ms",
+    "prefix_hit_rate": "0.5%"
+  },
   "results": {
     "total_requests": 200,
-    "wall_time_s": 460.52,
+    "wall_time_s": 460.51,
     "throughput_tok_s": 110.9,
     "request_rate": 0.43,
     "prompt_tokens": 35465,
     "output_tokens": 51067,
-    "ttft_p50_ms": 110.5,
-    "ttft_p90_ms": 312.5,
-    "ttft_p99_ms": 652.7,
+    "ttft_p50_ms": 110.7,
+    "ttft_p90_ms": 314.0,
+    "ttft_p99_ms": 658.6,
     "itl_p50_ms": 34.8,
     "itl_p90_ms": 35.4,
-    "itl_p99_ms": 41.8,
-    "e2e_p50_ms": 9087.6
+    "itl_p99_ms": 42.5,
+    "e2e_p50_ms": 9092.9
   }
 }

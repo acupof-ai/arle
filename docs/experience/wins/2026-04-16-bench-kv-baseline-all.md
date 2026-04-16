@@ -14,17 +14,17 @@ serially (one at a time) on a single L4 GPU with exclusive access.
 
 ## 1. guidellm sweep (canonical, prompt=4096 tokens, output=256 tokens)
 
-Source: `bench-output/2026-04-16-cuda-l4-kv-baseline/benchmarks.json`
-Wins file: `2026-04-16-bench-guidellm-cuda-l4-kv-baseline.md`
+Source: `bench-output/2026-04-16-cuda-l4-kv-baseline-v2/benchmarks.json`
+Wins file: `2026-04-16-bench-guidellm-cuda-l4-kv-baseline-v2.md`
 
 | rate | TTFT p50 (ms) | TTFT p99 (ms) | ITL p50 (ms) | ITL p99 (ms) | out tok/s | req/s |
 |---|---|---|---|---|---|---|
-| sync | 805 | 836.3 | 35.56 | 35.61 | **26.26** | 0.1 |
-| throughput | 21347.8 | 51390.6 | 53.77 | 68.25 | **89.56** | 0.35 |
-| 0.131 r/s | 1270.2 | 1306.4 | 40.8 | 40.97 | 31.72 | 0.117 |
-| 0.350 r/s | 1253.5 | 1290.2 | 50.52 | 54.63 | **73.64** | 0.283 |
+| **sync** | 766.3 | 784.3 | 35.46 | 35.53 | **26.43** | 0.1 |
+| **throughput** | 21290.7 | 51425.3 | 53.71 | 69.94 | **89.39** | 0.35 |
+| 0.131 r/s | 1244.8 | 1304.9 | 40.86 | 41.06 | 31.66 | 0.117 |
+| 0.350 r/s | 1243.1 | 1316.0 | 50.55 | 54.23 | **73.67** | 0.283 |
 
-**Key numbers:** sync decode 26.26 tok/s (ITL 35.6ms), saturation throughput 89.56 tok/s.
+**Key numbers:** sync decode **26.43 tok/s** (ITL 35.5ms), saturation throughput **89.39 tok/s**.
 
 ## 2. ShareGPT (200 prompts, concurrency=4, max_tokens=256)
 
@@ -75,6 +75,35 @@ These numbers are the **first official KV cache baseline** for the L4 CUDA backe
 All future bench runs MUST cite this file as the baseline and show deltas.
 
 **Exit criteria for KV tiered cache project (P1):**
-- Cross-session prefix hit rate ≥ 70% (currently 0% — sessions don't share prompts in default trace)
+- Cross-session prefix hit rate ≥ 70% (currently 0% — see caveat below)
 - No throughput regression vs this baseline at any concurrency level
 - ITL p99 ≤ 50ms under concurrent load
+
+## Known test-behaviour limitations
+
+**Agent trace prefix_hit_rate=0% is a test artefact, not a system bug.**
+
+Root cause: the default trace (`scripts/data/agent_trace_default.jsonl`) has
+6 sessions with 4 distinct system prompts. With num_slots=7 and concurrency=4,
+every session occupies a different slot. After a request completes, the slot
+is freed and its materialized KV is overwritten by the next session's request.
+The radix tree records the prefix, but `best_reusable_slot_for_radix_hit()`
+cannot find a free slot with matching materialized state — so it falls back
+to MISS.
+
+Only agent-001 turn 2 hits a PARTIAL (48/77 tokens) because it arrives
+immediately after agent-001 turn 0 completes on the same slot.
+
+**What would make the test meaningful:**
+1. Multiple requests in the SAME session sent sequentially (multi-turn within
+   one session) — each turn extends the prefix, same slot reuses it.
+2. A shared system prompt across ALL sessions (not just 2 of 6) AND enough
+   slots that at least one retains the materialized prefix between sessions.
+3. Higher slot count (> session count) so freed slots survive long enough
+   for cross-session reuse.
+
+**Underlying system limitation (documented in `tiered-kv-cache.md` §3):**
+Cross-slot page aliasing is intentionally unsupported. Prefix reuse is limited
+to same-slot resurrection: the radix tree knows the prefix exists, but the
+scheduler can only reuse it if the slot's contiguous KV state still materialises
+the matched tokens. This is a Phase-2 (M3 → M5) upgrade target.
