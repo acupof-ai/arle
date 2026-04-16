@@ -774,6 +774,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=cublasLt");
 
     println!("cargo:rerun-if-changed=csrc/");
     println!("cargo:rerun-if-changed=build.rs");

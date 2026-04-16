@@ -1,5 +1,7 @@
 #include "common.cuh"
+#include <cublasLt.h>
 #include <cublas_v2.h>
+#include <unordered_map>
 
 // ============================================================================
 // Hand-written GEMV: y = A @ x (row-major matrix)
@@ -185,9 +187,166 @@ __global__ void attention_weighted_sum_kernel(
 // for the 252 GEMMs per prefill. Never used under CUDA Graphs.
 cublasHandle_t g_cublas_handle = nullptr;
 cublasHandle_t g_cublas_prefill_handle = nullptr;
+cublasLtHandle_t g_cublaslt_handle = nullptr;
 
 static void *g_cublas_workspace = nullptr;
 static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
+static void *g_cublaslt_workspace = nullptr;
+static constexpr size_t kWorkspaceBytes = 4 * 1024 * 1024;
+
+struct GemmKey {
+  int M;
+  int N;
+  int K;
+
+  bool operator==(const GemmKey &other) const {
+    return M == other.M && N == other.N && K == other.K;
+  }
+};
+
+struct GemmKeyHash {
+  size_t operator()(const GemmKey &key) const {
+    size_t h = static_cast<size_t>(key.M);
+    h = h * 1315423911u + static_cast<size_t>(key.N);
+    h = h * 1315423911u + static_cast<size_t>(key.K);
+    return h;
+  }
+};
+
+static std::unordered_map<GemmKey, cublasLtMatmulAlgo_t, GemmKeyHash> g_algo_cache;
+static bool g_gemm_graphsafe_mode = false;
+
+static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+                                        __nv_bfloat16 *Y, int M, int N, int K,
+                                        cudaStream_t stream, cublasHandle_t handle) {
+  const float h_alpha = 1.0f;
+  const float h_beta = 0.0f;
+  if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+  if (cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                   M, N, K,
+                   &h_alpha,
+                   W, CUDA_R_16BF, K,
+                   X, CUDA_R_16BF, K,
+                   &h_beta,
+                   Y, CUDA_R_16BF, M,
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+  return cudaGetLastError();
+}
+
+static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+                                      __nv_bfloat16 *Y, int M, int N, int K,
+                                      cudaStream_t stream) {
+  cublasLtMatmulDesc_t operation_desc = nullptr;
+  cublasLtMatrixLayout_t w_desc = nullptr;
+  cublasLtMatrixLayout_t x_desc = nullptr;
+  cublasLtMatrixLayout_t y_desc = nullptr;
+  cublasLtMatmulPreference_t preference = nullptr;
+
+  const float h_alpha = 1.0f;
+  const float h_beta = 0.0f;
+  const GemmKey key{M, N, K};
+
+  if (cublasLtMatmulDescCreate(&operation_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+      CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+
+  cublasOperation_t transa = CUBLAS_OP_T;
+  cublasOperation_t transb = CUBLAS_OP_N;
+  if (cublasLtMatmulDescSetAttribute(operation_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                     &transa, sizeof(transa)) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatmulDescSetAttribute(operation_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                     &transb, sizeof(transb)) != CUBLAS_STATUS_SUCCESS) {
+    cublasLtMatmulDescDestroy(operation_desc);
+    return cudaErrorUnknown;
+  }
+
+  if (cublasLtMatrixLayoutCreate(&w_desc, CUDA_R_16BF, K, M, K) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&x_desc, CUDA_R_16BF, K, N, K) != CUBLAS_STATUS_SUCCESS ||
+      cublasLtMatrixLayoutCreate(&y_desc, CUDA_R_16BF, M, N, M) != CUBLAS_STATUS_SUCCESS) {
+    if (y_desc != nullptr) cublasLtMatrixLayoutDestroy(y_desc);
+    if (x_desc != nullptr) cublasLtMatrixLayoutDestroy(x_desc);
+    if (w_desc != nullptr) cublasLtMatrixLayoutDestroy(w_desc);
+    cublasLtMatmulDescDestroy(operation_desc);
+    return cudaErrorUnknown;
+  }
+
+  auto algo_it = g_algo_cache.find(key);
+  if (algo_it == g_algo_cache.end()) {
+    if (g_gemm_graphsafe_mode) {
+      cublasLtMatrixLayoutDestroy(y_desc);
+      cublasLtMatrixLayoutDestroy(x_desc);
+      cublasLtMatrixLayoutDestroy(w_desc);
+      cublasLtMatmulDescDestroy(operation_desc);
+      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, g_cublas_handle);
+    }
+
+    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatrixLayoutDestroy(y_desc);
+      cublasLtMatrixLayoutDestroy(x_desc);
+      cublasLtMatrixLayoutDestroy(w_desc);
+      cublasLtMatmulDescDestroy(operation_desc);
+      return cudaErrorUnknown;
+    }
+
+    if (cublasLtMatmulPreferenceSetAttribute(
+            preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &kWorkspaceBytes, sizeof(kWorkspaceBytes)) != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatmulPreferenceDestroy(preference);
+      cublasLtMatrixLayoutDestroy(y_desc);
+      cublasLtMatrixLayoutDestroy(x_desc);
+      cublasLtMatrixLayoutDestroy(w_desc);
+      cublasLtMatmulDescDestroy(operation_desc);
+      return cudaErrorUnknown;
+    }
+
+    cublasLtMatmulHeuristicResult_t heuristic_results[8];
+    int returned_algo_count = 0;
+    cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+        g_cublaslt_handle, operation_desc, w_desc, x_desc, y_desc, y_desc,
+        preference, 8, heuristic_results, &returned_algo_count);
+    cublasLtMatmulPreferenceDestroy(preference);
+    preference = nullptr;
+
+    if (heuristic_status == CUBLAS_STATUS_SUCCESS && returned_algo_count > 0) {
+      algo_it = g_algo_cache.emplace(key, heuristic_results[0].algo).first;
+    } else {
+      cublasLtMatrixLayoutDestroy(y_desc);
+      cublasLtMatrixLayoutDestroy(x_desc);
+      cublasLtMatrixLayoutDestroy(w_desc);
+      cublasLtMatmulDescDestroy(operation_desc);
+      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, g_cublas_prefill_handle);
+    }
+  }
+
+  if (cublasLtMatmul(g_cublaslt_handle, operation_desc,
+                     &h_alpha,
+                     W, w_desc,
+                     X, x_desc,
+                     &h_beta,
+                     Y, y_desc,
+                     Y, y_desc,
+                     &algo_it->second,
+                     g_gemm_graphsafe_mode ? nullptr : g_cublaslt_workspace,
+                     g_gemm_graphsafe_mode ? 0 : kWorkspaceBytes,
+                     stream) != CUBLAS_STATUS_SUCCESS) {
+    cublasLtMatrixLayoutDestroy(y_desc);
+    cublasLtMatrixLayoutDestroy(x_desc);
+    cublasLtMatrixLayoutDestroy(w_desc);
+    cublasLtMatmulDescDestroy(operation_desc);
+    return cudaErrorUnknown;
+  }
+
+  cublasLtMatrixLayoutDestroy(y_desc);
+  cublasLtMatrixLayoutDestroy(x_desc);
+  cublasLtMatrixLayoutDestroy(w_desc);
+  cublasLtMatmulDescDestroy(operation_desc);
+  return cudaGetLastError();
+}
 
 extern "C" {
 
@@ -199,8 +358,18 @@ void cublas_init() {
   if (g_cublas_prefill_handle == nullptr) {
     cublasCreate(&g_cublas_prefill_handle);
     cublasSetMathMode(g_cublas_prefill_handle, CUBLAS_TENSOR_OP_MATH);
+  }
+  if (g_cublaslt_handle == nullptr) {
+    cublasLtCreate(&g_cublaslt_handle);
+  }
+  if (g_cublas_workspace == nullptr) {
     cudaMalloc(&g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+  }
+  if (g_cublas_prefill_handle != nullptr && g_cublas_workspace != nullptr) {
     cublasSetWorkspace(g_cublas_prefill_handle, g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+  }
+  if (g_cublaslt_workspace == nullptr) {
+    cudaMalloc(&g_cublaslt_workspace, kWorkspaceBytes);
   }
 }
 
@@ -213,10 +382,19 @@ void cublas_destroy() {
     cublasDestroy(g_cublas_prefill_handle);
     g_cublas_prefill_handle = nullptr;
   }
+  if (g_cublaslt_handle != nullptr) {
+    cublasLtDestroy(g_cublaslt_handle);
+    g_cublaslt_handle = nullptr;
+  }
   if (g_cublas_workspace != nullptr) {
     cudaFree(g_cublas_workspace);
     g_cublas_workspace = nullptr;
   }
+  if (g_cublaslt_workspace != nullptr) {
+    cudaFree(g_cublaslt_workspace);
+    g_cublaslt_workspace = nullptr;
+  }
+  g_algo_cache.clear();
 }
 
 
@@ -246,36 +424,18 @@ cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloa
 // Uses prefill handle (with workspace) — only called from prefill path, never under CUDA Graphs.
 cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                int M, int N, int K, cudaStream_t stream) {
-  const float h_alpha = 1.0f;
-  const float h_beta = 0.0f;
-  cublasSetStream(g_cublas_prefill_handle, stream);
-  cublasGemmEx(g_cublas_prefill_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               M, N, K,
-               &h_alpha,
-               W, CUDA_R_16BF, K,
-               X, CUDA_R_16BF, K,
-               &h_beta,
-               Y, CUDA_R_16BF, M,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    return cudaGetLastError();
+  g_gemm_graphsafe_mode = false;
+  return gemm_cublaslt_impl(W, X, Y, M, N, K, stream);
 }
 
 // Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
 // Safe for CUDA Graph capture and decode path.
 cudaError_t gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
                           int M, int N, int K, cudaStream_t stream) {
-  const float h_alpha = 1.0f;
-  const float h_beta = 0.0f;
-  cublasSetStream(g_cublas_handle, stream);
-  cublasGemmEx(g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-               M, N, K,
-               &h_alpha,
-               W, CUDA_R_16BF, K,
-               X, CUDA_R_16BF, K,
-               &h_beta,
-               Y, CUDA_R_16BF, M,
-               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    return cudaGetLastError();
+  g_gemm_graphsafe_mode = true;
+  cudaError_t status = gemm_cublaslt_impl(W, X, Y, M, N, K, stream);
+  g_gemm_graphsafe_mode = false;
+  return status;
 }
 
 void attention_scores_cuda(const __nv_bfloat16 *q, const __nv_bfloat16 *k_cache, __nv_bfloat16 *scores,
