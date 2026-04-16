@@ -2610,9 +2610,45 @@ impl StepDriver for Qwen35StepDriver<'_> {
             }
 
             // 2. Buffer empty → run one full speculative block.
-            //    TODO(phase4): wire qwen35_dflash_speculative_block here
-            //    once C++ tape-mode kernel and FFI are integrated.
-            //    For now, fall through to standard decode.
+            if let Qwen35StepMode::Cpp(ref mut cpp_state) = self.mode {
+                let target_hidden = dflash
+                    .target_hidden
+                    .take()
+                    .context("Qwen3.5 DFlash decode_token: target_hidden not set")?;
+
+                let cpp_model = self
+                    .weights
+                    .cpp_model
+                    .as_ref()
+                    .context("Qwen3.5 DFlash requires C++ compiled model")?;
+
+                let block = dflash::qwen35_dflash_speculative_block(
+                    dflash.runtime,
+                    token,
+                    &target_hidden,
+                    &self.weights.embed_tokens,
+                    &self.weights.lm_head,
+                    dflash.config,
+                    cpp_model,
+                    &self.params,
+                    &mut cpp_state.kv_flat,
+                    &mut cpp_state.gdr_flat,
+                    &mut self.cache_len,
+                    &mut dflash.draft_state,
+                )?;
+
+                dflash.acceptance_lengths.push(block.accepted_inputs);
+                dflash.target_hidden = Some(block.updated_target_hidden);
+
+                for &t in &block.accepted_tokens {
+                    dflash.token_buffer.push_back(t);
+                }
+                return Ok(dflash
+                    .token_buffer
+                    .pop_front()
+                    .context("Qwen3.5 DFlash block produced zero tokens")?);
+            }
+            // Rust mode fallback: fall through to standard decode
         }
 
         // ── Standard single-token decode ─────────────────────────────────

@@ -75,6 +75,10 @@ impl CppQwen35Model {
     pub(crate) fn from_raw(ptr: *mut std::ffi::c_void) -> Self {
         Self(ptr)
     }
+    /// Raw pointer to the underlying C++ model (for FFI calls).
+    pub(crate) fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
     /// Build a C++ step model from loaded Rust weights. Returns None if weights
     /// are not fully supported by the C++ route.
     fn build(
