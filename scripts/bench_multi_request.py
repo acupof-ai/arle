@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Multi-request benchmark for infer scheduler."""
+"""Multi-request benchmark for infer scheduler.
 
+Usage:
+  python3 scripts/bench_multi_request.py --url http://localhost:8000
+"""
+
+import argparse
 import asyncio
 import time
 import statistics
@@ -8,8 +13,15 @@ import httpx
 import json
 import sys
 
-BASE_URL = "http://localhost:8200/v1/completions"
-MODEL = "Qwen3-8B"
+_args = None
+
+
+def _base_url():
+    return f"{_args.url}/v1/completions"
+
+
+def _model():
+    return _args.model
 
 # Shared long system prompt (~1500 tokens) to test prefix cache
 SYSTEM_PREFIX = """<|im_start|>system
@@ -50,8 +62,8 @@ async def send_request(client, prompt, max_tokens=32, stream=False):
     if stream:
         tokens_times = []
         text = ""
-        async with client.stream("POST", BASE_URL, json={
-            "model": MODEL, "prompt": prompt, "max_tokens": max_tokens,
+        async with client.stream("POST", _base_url(), json={
+            "model": _model(), "prompt": prompt, "max_tokens": max_tokens,
             "temperature": 0, "stream": True,
         }, timeout=120) as resp:
             async for line in resp.aiter_lines():
@@ -67,8 +79,8 @@ async def send_request(client, prompt, max_tokens=32, stream=False):
         elapsed = (time.perf_counter() - t0) * 1000
         return {"text": text, "elapsed_ms": elapsed, "token_times": tokens_times, "t0": t0}
     else:
-        resp = await client.post(BASE_URL, json={
-            "model": MODEL, "prompt": prompt, "max_tokens": max_tokens,
+        resp = await client.post(_base_url(), json={
+            "model": _model(), "prompt": prompt, "max_tokens": max_tokens,
             "temperature": 0,
         }, timeout=120)
         elapsed = (time.perf_counter() - t0) * 1000
@@ -180,11 +192,24 @@ async def bench_stress(client, n=8, max_tokens=32):
     return successes, failures, wall_time
 
 
+async def fetch_stats(url: str) -> dict | None:
+    async with httpx.AsyncClient() as c:
+        try:
+            resp = await c.get(f"{url}/v1/stats", timeout=5)
+            if resp.status_code != 200:
+                return None
+            return {k: v for tok in resp.text.split() if "=" in tok for k, v in [tok.split("=", 1)]}
+        except Exception:
+            return None
+
+
 async def main():
     print("=" * 70)
     print("PEGAINFER MULTI-REQUEST BENCHMARK")
-    print(f"Model: {MODEL}  |  Server: {BASE_URL}")
+    print(f"Model: {_model()}  |  Server: {_args.url}")
     print("=" * 70)
+
+    stats_before = await fetch_stats(_args.url)
 
     async with httpx.AsyncClient() as client:
         # Warmup
@@ -243,6 +268,21 @@ async def main():
             print(f"{'Stress N=16 throughput':<40} {t16/(wall_16/1000):>9.1f} tok/s")
         print("=" * 70)
 
+    stats_after = await fetch_stats(_args.url)
+    if stats_after:
+        print(f"\n/v1/stats: prefix_hit_rate={stats_after.get('prefix_hit_rate','?')} "
+              f"kv_util={stats_after.get('kv_util','?')} "
+              f"ttft_p50={stats_after.get('ttft_p50','?')} tpot_p50={stats_after.get('tpot_p50','?')}")
+
+
+def cli():
+    global _args
+    p = argparse.ArgumentParser(description="Multi-request scheduler benchmark")
+    p.add_argument("--url", default="http://localhost:8000", help="Server URL")
+    p.add_argument("--model", default="default", help="Model name in request body")
+    _args = p.parse_args()
+    asyncio.run(main())
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

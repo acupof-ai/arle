@@ -116,7 +116,7 @@ async def run_scenario(client: httpx.AsyncClient, url: str, scenario: dict, max_
         messages.append({"role": "user", "content": user_msg})
 
         payload = {
-            "model": "qwen3-8b",
+            "model": "default",
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0.0,
