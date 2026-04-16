@@ -1005,8 +1005,24 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // ── 2. Snapshot GDR states before verify ──
     let gdr_snapshot: Vec<Arr> = target_gdr_flat.iter().map(|a| a.clone()).collect();
 
-    // ── 3. Enable tape mode, verify via C++ model ──
+    log::info!(
+        "qwen35_dflash_speculative_block: starting draft+verify, block_size={}",
+        runtime.block_size
+    );
+    // ── 3. Enable tape mode + hidden capture, verify via C++ model ──
     unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true) };
+    let layer_ids_i32: Vec<i32> = runtime
+        .target_layer_ids
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+    unsafe {
+        mlx_sys::qwen35_set_capture_layers(
+            cpp_model.as_raw(),
+            layer_ids_i32.as_ptr(),
+            layer_ids_i32.len() as i32,
+        );
+    };
 
     let mut posterior_tokens = Vec::with_capacity(runtime.block_size);
     for (step, &tok) in block_tokens.iter().enumerate() {
@@ -1023,6 +1039,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
     }
 
     unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), false) };
+    unsafe { mlx_sys::qwen35_set_capture_layers(cpp_model.as_raw(), std::ptr::null(), 0) };
 
     // ── 4. Token matching ──
     let matched = block_tokens
@@ -1155,11 +1172,40 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // Update target cache position to accepted count
     *target_cache_len += accepted_inputs as i32;
 
-    // ── 6. Build result (hidden state capture deferred — use dummy for now) ──
-    // TODO: capture target hidden states at target_layer_ids for the next draft block.
-    // For now, reuse the input target_hidden (works for the first block; subsequent
-    // blocks need proper hidden state capture from the verify forward).
-    let updated_target_hidden = target_hidden.clone();
+    // ── 6. Capture target hidden states from C++ model ──
+    let n_captured = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
+    let updated_target_hidden = if n_captured > 0 {
+        let mut captured: Vec<MlxArray> = Vec::with_capacity(n_captured as usize);
+        for ci in 0..n_captured {
+            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+            let rc = unsafe {
+                mlx_sys::qwen35_get_captured_hidden(cpp_model.as_raw(), ci, &raw mut h_ptr)
+            };
+            if rc == 0 && !h_ptr.is_null() {
+                captured.push(unsafe { Arr::from_raw(h_ptr) });
+            }
+        }
+        if !captured.is_empty() {
+            // Each captured hidden is [B, S, hidden_size] from the verify forward.
+            // Reshape to [S, hidden_size] (drop batch dim) and slice to accepted_inputs.
+            let mut sliced: Vec<MlxArray> = Vec::with_capacity(captured.len());
+            for h in &captured {
+                let shape = h.shape();
+                // shape = [1, block_size, hidden_size] → reshape to [block_size, hidden_size]
+                let seq = shape.get(1).copied().unwrap_or(1);
+                let hdim = shape.get(2).copied().unwrap_or(1);
+                let flat = super::mlx::reshape(h, &[seq, hdim]);
+                let accepted_i32 = i32::try_from(accepted_inputs).unwrap_or(1);
+                let cut = slice(&flat, &[0, 0], &[accepted_i32, hdim], &[1, 1]);
+                sliced.push(cut);
+            }
+            concatenate_axis(&sliced, 1)
+        } else {
+            target_hidden.clone()
+        }
+    } else {
+        target_hidden.clone()
+    };
 
     let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
     for &tok in block_tokens
