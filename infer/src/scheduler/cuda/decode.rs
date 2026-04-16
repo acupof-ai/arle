@@ -1,8 +1,9 @@
 use super::*;
+use crate::scheduler::cuda::core::PendingDecode;
 
 impl<M: ModelForward> Scheduler<M> {
     /// Batch all decode requests into a single GPU forward pass.
-    pub(super) fn step_decode_batch(&mut self) {
+    pub(super) fn step_decode_launch(&mut self) {
         let decode_indices: Vec<usize> = self
             .active
             .iter()
@@ -217,44 +218,104 @@ impl<M: ModelForward> Scheduler<M> {
             }
             return;
         }
-        let sampled_result = if all_greedy {
-            match self.model.sample_batch_greedy(&slot_indices, decode_ctx) {
-                Ok(Some(tokens)) => Ok(tokens),
-                Ok(None) => {
+
+        let greedy_launched = if all_greedy {
+            match self
+                .model
+                .sample_batch_greedy_launch(&slot_indices, decode_ctx)
+            {
+                Ok(true) => true,
+                Ok(false) => {
                     if let Err(e) = self.model.prepare_batch_sampling_fallback(
                         &mut self.states,
                         &slot_indices,
                         decode_ctx,
                     ) {
-                        Err(e)
-                    } else {
-                        self.model.select_tokens_batch(
-                            &mut self.states,
-                            &slot_indices,
-                            &sampling_params,
-                            &mut self.rng,
-                        )
+                        error!("Preparing batched sampling fallback failed: {}", e);
+                        for &req_idx in &decode_indices {
+                            self.active[req_idx].phase = Phase::Finished;
+                        }
+                        return;
                     }
+                    false
+                }
+                Err(e) => {
+                    error!("Batched greedy sampling launch failed: {}", e);
+                    for &req_idx in &decode_indices {
+                        self.active[req_idx].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+
+        self.pending_decode = Some(PendingDecode {
+            decode_indices,
+            slot_indices,
+            all_greedy,
+            greedy_launched,
+            sampling_params_greedy: sampling_params
+                .iter()
+                .map(|p| p.is_greedy() && !p.has_penalties())
+                .collect(),
+        });
+    }
+
+    pub(super) fn step_decode_readback(&mut self) {
+        let pending = match self.pending_decode.take() {
+            Some(pending) => pending,
+            None => return,
+        };
+        let decode_ctx = self.decode_bufs.as_mut().unwrap();
+
+        let sampled_result = if pending.greedy_launched {
+            // Argmax kernel was launched — sync + readback
+            match self
+                .model
+                .sample_batch_greedy_readback(&pending.slot_indices, decode_ctx)
+            {
+                Ok(Some(tokens)) => Ok(tokens),
+                Ok(None) => {
+                    let params: Vec<&crate::sampler::SamplingParams> = pending
+                        .decode_indices
+                        .iter()
+                        .zip(&pending.sampling_params_greedy)
+                        .map(|(&i, _)| &self.active[i].sampling)
+                        .collect();
+                    self.model.select_tokens_batch(
+                        &mut self.states,
+                        &pending.slot_indices,
+                        &params,
+                        &mut self.rng,
+                    )
                 }
                 Err(e) => Err(e),
             }
         } else {
+            let params: Vec<&crate::sampler::SamplingParams> = pending
+                .decode_indices
+                .iter()
+                .zip(&pending.sampling_params_greedy)
+                .map(|(&i, _)| &self.active[i].sampling)
+                .collect();
             self.model.select_tokens_batch(
                 &mut self.states,
-                &slot_indices,
-                &sampling_params,
+                &pending.slot_indices,
+                &params,
                 &mut self.rng,
             )
         };
+
         match sampled_result {
             Ok(sampled_tokens) => {
-                // Read logprobs from decode context (set by sample_batch_greedy)
-                let logprobs_host: Option<&[f32]> = if all_greedy {
+                let logprobs_host: Option<&[f32]> = if pending.greedy_launched {
                     Some(crate::model::DecodeContextOps::logprobs_host(&*decode_ctx))
                 } else {
                     None
                 };
-                for (j, &req_idx) in decode_indices.iter().enumerate() {
+                for (j, &req_idx) in pending.decode_indices.iter().enumerate() {
                     let token = sampled_tokens[j];
                     let req = &mut self.active[req_idx];
                     req.latest_logprob = logprobs_host.and_then(|lps| lps.get(j).copied());
@@ -273,7 +334,7 @@ impl<M: ModelForward> Scheduler<M> {
             }
             Err(e) => {
                 error!("Batched sampling failed: {}", e);
-                for &req_idx in &decode_indices {
+                for &req_idx in &pending.decode_indices {
                     self.active[req_idx].phase = Phase::Finished;
                 }
             }
