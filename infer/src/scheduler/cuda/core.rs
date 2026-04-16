@@ -15,6 +15,11 @@ use crate::types::{BlockFingerprint, InferenceMode, KvContentContext};
 /// boundaries already agree.
 pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 
+/// Contiguous KV working buffer per slot (tokens). Only prefill uses it;
+/// decode writes directly to the paged pool via `decode_prep_paged`.
+/// Prefill chunk size is capped to this value to prevent buffer overflow.
+pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
+
 // Prefix-cache watermark / keepalive tunables moved to
 // `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
 // comments on `prefix_cache_high_water` / `prefix_cache_low_water` /
@@ -273,11 +278,6 @@ impl<M: ModelForward> Scheduler<M> {
         let (tx, rx) = mpsc::unbounded_channel();
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
-
-        // Contiguous KV only needs to hold a small working buffer for prefill
-        // chunks. The paged pool carries the full sequence. Must match the
-        // CONTIGUOUS_CHUNK_SIZE used by auto_num_slots in main.rs.
-        const CONTIGUOUS_KV_TOKENS: usize = 512;
 
         let mut states = Vec::with_capacity(config.max_slots);
         let mut slot_materialized_prompt_lens = Vec::with_capacity(config.max_slots);
@@ -864,6 +864,7 @@ impl<M: ModelForward> Scheduler<M> {
         .next_chunk_size(InferenceMode::Prefill, signals)
         .max(1)
         .min(self.config.prefill_chunk_size)
+        .min(CONTIGUOUS_KV_TOKENS) // Cap to contiguous buffer to prevent overflow
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
