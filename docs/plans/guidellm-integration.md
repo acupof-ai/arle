@@ -32,9 +32,7 @@ stop hand-rolling.
   — those measure **internal behaviour** (prefix-cache hit rate, offload
   paths, agent-trace shapes) that guidellm can't observe from outside.
 - PPL / quality evals — out of scope; guidellm is a performance tool.
-- `scripts/bench_throughput_sweep.py` — kept in-tree with a deprecation
-  banner so existing wins entries stay reproducible, but new wins MUST cite
-  guidellm. See §4.
+- PPL / quality evals — out of scope; guidellm is a performance tool only.
 
 ---
 
@@ -42,7 +40,7 @@ stop hand-rolling.
 
 | # | Decision | Rationale |
 |---|---|---|
-| 1 | **guidellm = sole truth** for throughput / TTFT / ITL wins. `bench_throughput_sweep.py` gets a deprecation banner but stays. | Don't delete reproducibility for past wins; don't duplicate future wins. |
+| 1 | **guidellm = sole truth** for throughput / TTFT / ITL wins. `bench_throughput_sweep.py` is deleted; historical wins that cited it stay readable. | Single canonical tool; no duplicate scripts. |
 | 2 | **Wrapper script assumes the server is already running.** | Avoids "my bench crashed the server" failure mode; keeps concerns orthogonal. |
 | 3 | **Same canonical config for CUDA and Metal backends.** | One `profile=sweep`, one dataset shape — makes cross-backend comparison a pure hardware delta, not a dataset delta. |
 
@@ -57,7 +55,7 @@ subject says so, and new wins reference the date of the change.
 
 ```
 --profile sweep
---data   prompt_tokens=1024,output_tokens=256
+--data   prompt_tokens=4096,output_tokens=256
 --max-seconds 60
 --outputs json,csv,html
 --random-seed 20260416

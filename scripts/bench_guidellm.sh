@@ -31,7 +31,7 @@ set -euo pipefail
 
 # ---- Canonical params (locked, see docs/plans/guidellm-integration.md §3) ----
 PROFILE="sweep"
-DATA="prompt_tokens=1024,output_tokens=256"
+DATA="prompt_tokens=4096,output_tokens=256"
 MAX_SECONDS=60
 RANDOM_SEED=20260416
 OUTPUTS="json,csv,html"
