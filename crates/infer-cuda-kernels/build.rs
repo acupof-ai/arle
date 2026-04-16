@@ -97,9 +97,7 @@ fn detect_sm_targets() -> Vec<String> {
     );
     // Default to sm_80 (A100) when no GPU is detected, allowing compilation
     // on CI/dev machines. The binary will still require a compatible GPU at runtime.
-    println!(
-        "cargo:warning=Defaulting to sm_80 (A100). Override with INFER_CUDA_SM if needed."
-    );
+    println!("cargo:warning=Defaulting to sm_80 (A100). Override with INFER_CUDA_SM if needed.");
     vec!["80".to_string()]
 }
 

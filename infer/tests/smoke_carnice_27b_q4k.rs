@@ -21,8 +21,7 @@ use infer::server_engine::{
 use tokio::sync::mpsc;
 
 fn model_path() -> String {
-    std::env::var("INFER_CARNICE_PATH")
-        .unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
+    std::env::var("INFER_CARNICE_PATH").unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
 }
 
 #[test]

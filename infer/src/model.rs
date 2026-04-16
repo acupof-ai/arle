@@ -343,4 +343,20 @@ pub trait ModelForward: Send {
         }
         Ok(())
     }
+
+    /// Mixed-batch forward: B decode tokens + C prefill tokens in one eager forward pass.
+    /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if not supported.
+    fn forward_mixed_batch(
+        &self,
+        _decode_tokens: &[u32],
+        _prefill_tokens: &[u32],
+        _states: &mut [Self::State],
+        _decode_slot_indices: &[usize],
+        _prefill_slot_idx: usize,
+        _prefill_start_pos: usize,
+        _paged_kv_pool: Option<&mut PagedKVPool>,
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
