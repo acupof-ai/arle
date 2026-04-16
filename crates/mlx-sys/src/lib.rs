@@ -511,6 +511,19 @@ unsafe extern "C" {
         gqa_factor: i32,
     ) -> *mut mlx_array;
 
+    // === Qwen3.5 DFlash tape mode ===
+
+    pub fn qwen35_set_tape_mode(model: *mut std::ffi::c_void, enabled: bool);
+    pub fn qwen35_get_tape_count(model: *mut std::ffi::c_void) -> i32;
+    pub fn qwen35_get_tape(
+        model: *mut std::ffi::c_void,
+        idx: i32,
+        out_tape: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+        out_g: *mut *mut mlx_array,
+        out_qkv: *mut *mut mlx_array,
+    ) -> i32;
+
     // === Random ===
 
     pub fn mlx_random_categorical(logits: *mut mlx_array, axis: i32) -> *mut mlx_array;

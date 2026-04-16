@@ -162,6 +162,86 @@ auto& gated_delta_kernel() {
     return kernel;
 }
 
+// Tape-recording variant of gated_delta_kernel — same computation but
+// additionally outputs the innovation tape (delta at each timestep).
+auto& gated_delta_tape_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gated_delta_step_tape",
+        {"q", "k", "v", "g", "beta", "state_in", "T"},
+        {"y", "state_out", "innovation_tape"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        for (int t = 0; t < T; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            // Record innovation tape
+            if (thread_index_in_simdgroup == 0) {
+                tape_[dv_idx] = static_cast<InT>(delta);
+            }
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+                out += state[i] * q_[s_idx];
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            tape_ += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
 // Compiled compute_g: g = exp(neg_exp_a * softplus(a + dt_bias))
 // `neg_exp_a = -exp(A_log.f32)` is precomputed once at load time.
 // Matches mlx_lm's runtime math while saving one per-step exp per layer.
@@ -365,6 +445,20 @@ struct Qwen35CompiledModel {
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
 
+    // ── DFlash tape mode ──────────────────────────────────────────────
+    // When enabled, gdr_step() records innovation tapes for each GDR layer
+    // (used for O(accepted) rollback during speculative decode rejection).
+    bool tape_mode = false;
+    // Per-GDR-layer tape recordings: (innovation_tape, k, g, qkv).
+    // Populated during forward() when tape_mode=true, cleared at start of each step.
+    struct GdrTapeEntry {
+        array innovation_tape = array(0);
+        array k = array(0);
+        array g = array(0);
+        array qkv = array(0);
+    };
+    mutable std::vector<GdrTapeEntry> gdr_tapes;
+
     bool keep_step_intermediates() const {
         return current_seq_len == 1 || keep_prefill_intermediates();
     }
@@ -566,19 +660,43 @@ struct Qwen35CompiledModel {
                 {"StT", fast::TemplateArg(float32)},
             };
 
-            auto result = gated_delta_kernel()(
-                inputs,
-                out_shapes,
-                out_dtypes,
-                std::make_tuple(32, dv, B * hv),
-                std::make_tuple(32, threadgroup_y, 1),
-                tmpl,
-                std::nullopt,
-                false,
-                {});
-
-            y = std::move(result[0]);
-            gdr_state_out = std::move(result[1]);
+            if (tape_mode) {
+                // Tape-recording variant: same computation + records innovation_tape
+                std::vector<Shape> tape_out_shapes = {{B, S, hv, dv}, gdr_state_in.shape(), {B, S, hv, dv}};
+                std::vector<Dtype> tape_out_dtypes = {bfloat16, float32, bfloat16};
+                auto result = gated_delta_tape_kernel()(
+                    inputs,
+                    tape_out_shapes,
+                    tape_out_dtypes,
+                    std::make_tuple(32, dv, B * hv),
+                    std::make_tuple(32, threadgroup_y, 1),
+                    tmpl,
+                    std::nullopt,
+                    false,
+                    {});
+                y = std::move(result[0]);
+                gdr_state_out = std::move(result[1]);
+                // Record tape for rollback
+                gdr_tapes.push_back({
+                    std::move(result[2]),  // innovation_tape
+                    contiguous(k),         // k
+                    contiguous(g_3d),      // g
+                    contiguous(qkv),       // qkv for conv rebuild
+                });
+            } else {
+                auto result = gated_delta_kernel()(
+                    inputs,
+                    out_shapes,
+                    out_dtypes,
+                    std::make_tuple(32, dv, B * hv),
+                    std::make_tuple(32, threadgroup_y, 1),
+                    tmpl,
+                    std::nullopt,
+                    false,
+                    {});
+                y = std::move(result[0]);
+                gdr_state_out = std::move(result[1]);
+            }
             if (keep_intermediates) {
                 intermediates.push_back(g_3d);
                 intermediates.push_back(beta_3d);
@@ -666,6 +784,8 @@ struct Qwen35CompiledModel {
         // Clear intermediates from previous step (releases old GPU buffers)
         intermediates.clear();
         intermediates.reserve(current_seq_len == 1 ? 2048 : 128);
+        // Clear tapes from previous step (rebuilt if tape_mode is on)
+        gdr_tapes.clear();
 
         auto token_id = inputs[0];
         int cache_pos = current_cache_pos;
@@ -1442,6 +1562,40 @@ int32_t qwen35_compiled_generate(
             *out_count = 0;
         }
 
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+// ── DFlash tape mode API ─────────────────────────────────────────────
+
+void qwen35_set_tape_mode(void* model, bool enabled) {
+    auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+    m->tape_mode = enabled;
+    if (!enabled) m->gdr_tapes.clear();
+}
+
+int32_t qwen35_get_tape_count(void* model) {
+    auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+    return static_cast<int32_t>(m->gdr_tapes.size());
+}
+
+/// Get tape arrays for a GDR layer. Returns new array handles (caller must free).
+int32_t qwen35_get_tape(void* model, int32_t idx,
+                        mlx_array** out_tape, mlx_array** out_k,
+                        mlx_array** out_g, mlx_array** out_qkv) {
+    try {
+        auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+        if (idx < 0 || idx >= static_cast<int32_t>(m->gdr_tapes.size()))
+            throw std::out_of_range("tape index out of range");
+        auto& t = m->gdr_tapes[idx];
+        // Allocate new shared_ptr-wrapped arrays (same pattern as qwen35 step outputs)
+        *out_tape = reinterpret_cast<mlx_array*>(new array(t.innovation_tape));
+        *out_k = reinterpret_cast<mlx_array*>(new array(t.k));
+        *out_g = reinterpret_cast<mlx_array*>(new array(t.g));
+        *out_qkv = reinterpret_cast<mlx_array*>(new array(t.qkv));
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
