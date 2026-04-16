@@ -34,7 +34,7 @@ a real byte-moving transport path. Two tiers are in scope:
 On `main` after the Tier A/B/C + M4 batches:
 
 - `Scheduler::with_config` spawns a `Coordinator` OS thread named
-  `pegainfer-tiered-kv-coord` (`infer/src/kv_tier/coordinator.rs`).
+  `infer-tiered-kv-coord` (`infer/src/kv_tier/coordinator.rs`).
   The thread's `run_once` drains its `bounded` command channel and
   emits events back to the scheduler.
 - Scheduler admission calls `lookup_or_stage(..., Some(&handle))`;
@@ -292,8 +292,8 @@ CUDA_HOME=/usr/local/cuda cargo test --release --test tier_promotion_end_to_end
 # Full matrix
 CUDA_HOME=/usr/local/cuda cargo build --release
 cargo test --release
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e_qwen35
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e_qwen35
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```

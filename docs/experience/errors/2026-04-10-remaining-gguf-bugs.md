@@ -7,12 +7,12 @@ Each has a separate root cause — knocking one down will not help the others.
 ## Bug 1 · `dequantize_row_q4_K` in `gguf.rs` is wrong
 
 **Symptom**: Qwen3.5-4B Q4_K_M (and Q4_K_S) produce degenerate output
-(`"back back back..."`) even with `PEGAINFER_FORCE_BF16_QUANT=1`, which
+(`"back back back..."`) even with `INFER_FORCE_BF16_QUANT=1`, which
 skips the native Q4_K GEMV kernel entirely and uses CPU-side dequant +
 BF16 upload.
 
 **Evidence the kernel is not at fault**:
-- `PEGAINFER_FORCE_BF16_QUANT=1` forces `gguf.read_tensor_bf16()` → BF16
+- `INFER_FORCE_BF16_QUANT=1` forces `gguf.read_tensor_bf16()` → BF16
   `DeviceMatrix::from_host()`, skipping `from_quantized_q4k`.
 - Same garbage output with and without the env var.
 - Qwen3.5-4B Q6_K (`dequantize_row_q6_K`) works fine through the same
@@ -93,7 +93,7 @@ double-applying it. Grep llama.cpp `convert_hf_to_gguf.py` for
 
 **Symptom**: Qwen3-4B (plain, no linear attention, 36 layers) loaded
 from `Qwen3-4B-Q4_K_M.gguf` produces identical repeating garbage
-(`"零食零食..."` / `"不懂不懂..."`) for any prompt. `PEGAINFER_FORCE_BF16_QUANT=1`
+(`"零食零食..."` / `"不懂不懂..."`) for any prompt. `INFER_FORCE_BF16_QUANT=1`
 reproduces the same output → not the native Q4_K kernel.
 
 **Why this is a separate bug from #1 and #2**:

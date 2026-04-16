@@ -2,7 +2,7 @@
 //! Qwen3 has no linear attention — if this works, linear-attention is the
 //! Qwen3.5 failure site; if it also fails, the bug is in the shared GGUF path.
 //!
-//!   PEGAINFER_QWEN3_PATH=/abs/path/to/models/Qwen3-4B-GGUF \
+//!   INFER_QWEN3_PATH=/abs/path/to/models/Qwen3-4B-GGUF \
 //!       cargo test --release --test smoke_qwen3_4b_gguf -- --nocapture --ignored
 
 #![cfg(feature = "cuda")]
@@ -17,7 +17,7 @@ use infer::server_engine::{
 use tokio::sync::mpsc;
 
 fn path() -> String {
-    std::env::var("PEGAINFER_QWEN3_PATH").unwrap_or_else(|_| "models/Qwen3-4B-GGUF".to_string())
+    std::env::var("INFER_QWEN3_PATH").unwrap_or_else(|_| "models/Qwen3-4B-GGUF".to_string())
 }
 
 #[test]

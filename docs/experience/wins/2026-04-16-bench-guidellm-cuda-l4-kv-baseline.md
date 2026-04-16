@@ -13,7 +13,7 @@
 - **Hardware:** NVIDIA L4 24GB, CUDA 12.8, driver 580.82.07
 - **Commit:** c1956da (feat: wire ServerMetrics + optimize bench scripts)
 - **Feature set:** `cargo build --release -p infer` (default CUDA features)
-- **Non-default flags / env vars:** `PEGAINFER_CUDA_SM=89`
+- **Non-default flags / env vars:** `INFER_CUDA_SM=89`
 - **Server launch:** `./target/release/infer --model-path models/Qwen3-4B --port 8000`
 - **Baseline:** first canonical run — no prior snapshot to diff against
 

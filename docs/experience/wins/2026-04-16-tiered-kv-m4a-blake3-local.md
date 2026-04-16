@@ -22,7 +22,7 @@ in a fresh `TokenKVPool`.
   parent }` packages the non-token inputs so the compute chain stays
   type-checked instead of a loose `&[u8]` concatenation.
 - New `BlockFingerprint::compute(ctx, tokens) -> Self` walks a
-  canonical domain-tagged byte sequence (`"pegainfer-kv-v2\x00"` +
+  canonical domain-tagged byte sequence (`"infer-kv-v2\x00"` +
   `"model\x00"` + len + bytes + `"fmt\x00"` + tag +
   `"parent\x00"` + 0/1 + optional 16 bytes + `"tokens\x00"` + len +
   u32 LE token bytes) and truncates the 32-byte BLAKE3 output to 16

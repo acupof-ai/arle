@@ -205,7 +205,7 @@ async def fetch_stats(url: str) -> dict | None:
 
 async def main():
     print("=" * 70)
-    print("PEGAINFER MULTI-REQUEST BENCHMARK")
+    print("INFER MULTI-REQUEST BENCHMARK")
     print(f"Model: {_model()}  |  Server: {_args.url}")
     print("=" * 70)
 

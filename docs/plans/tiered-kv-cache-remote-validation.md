@@ -61,7 +61,7 @@ Before running any of the checks below, confirm:
 - [ ] `CUDA_HOME` points at a CUDA 12.x install; `nvcc --version`
   prints.
 - [ ] `nvidia-smi` shows at least one GPU.
-- [ ] `PEGAINFER_TEST_MODEL_PATH` is set (or the default
+- [ ] `INFER_TEST_MODEL_PATH` is set (or the default
   `models/Qwen3-4B` exists) for e2e tests.
 - [ ] For optional NIXL validation: `NIXL_PREFIX` points at a NIXL
   install, or set `NIXL_NO_STUBS_FALLBACK=0` (default) to let the

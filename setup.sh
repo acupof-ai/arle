@@ -329,10 +329,10 @@ do_build() {
     export PATH="$CUDA_HOME/bin:$PATH"
     export LIBRARY_PATH="$CUDA_HOME/lib64/stubs:${LIBRARY_PATH:-}"
     # Triton AOT needs Python from venv
-    export PEGAINFER_TRITON_PYTHON="$(which python)"
+    export INFER_TRITON_PYTHON="$(which python)"
 
     info "CUDA_HOME=$CUDA_HOME"
-    info "TRITON_PYTHON=$PEGAINFER_TRITON_PYTHON"
+    info "TRITON_PYTHON=$INFER_TRITON_PYTHON"
     info "SM targets: $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr '\n' ' ')"
 
     local start

@@ -67,7 +67,7 @@ fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
 }
 
 fn detect_sm_targets() -> Vec<String> {
-    if let Ok(env) = std::env::var("PEGAINFER_CUDA_SM").or_else(|_| std::env::var("CUDA_SM")) {
+    if let Ok(env) = std::env::var("INFER_CUDA_SM").or_else(|_| std::env::var("CUDA_SM")) {
         let mut sms = Vec::new();
         for token in env.split(',') {
             if let Some(sm) = parse_sm_token(token) {
@@ -93,12 +93,12 @@ fn detect_sm_targets() -> Vec<String> {
     }
 
     println!(
-        "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set PEGAINFER_CUDA_SM/CUDA_SM environment variable to override."
+        "cargo:warning=Failed to detect GPU SMs via nvidia-smi. Set INFER_CUDA_SM/CUDA_SM environment variable to override."
     );
     // Default to sm_80 (A100) when no GPU is detected, allowing compilation
     // on CI/dev machines. The binary will still require a compatible GPU at runtime.
     println!(
-        "cargo:warning=Defaulting to sm_80 (A100). Override with PEGAINFER_CUDA_SM if needed."
+        "cargo:warning=Defaulting to sm_80 (A100). Override with INFER_CUDA_SM if needed."
     );
     vec!["80".to_string()]
 }
@@ -139,16 +139,16 @@ fn probe_triton_python(candidate: &str) -> Result<String, String> {
 }
 
 fn find_triton_python() -> Result<String, String> {
-    if let Ok(candidate) = std::env::var("PEGAINFER_TRITON_PYTHON") {
+    if let Ok(candidate) = std::env::var("INFER_TRITON_PYTHON") {
         let candidate = candidate.trim();
         if candidate.is_empty() {
             return Err(
-                "PEGAINFER_TRITON_PYTHON is set but empty. See tools/triton/README.md.".to_string(),
+                "INFER_TRITON_PYTHON is set but empty. See tools/triton/README.md.".to_string(),
             );
         }
         return probe_triton_python(candidate).map_err(|message| {
             format!(
-                "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See tools/triton/README.md."
+                "INFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See tools/triton/README.md."
             )
         });
     }
@@ -173,7 +173,7 @@ fn find_triton_python() -> Result<String, String> {
     }
 
     Err(format!(
-        "Could not find a Python interpreter with Triton installed. Set PEGAINFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
+        "Could not find a Python interpreter with Triton installed. Set INFER_TRITON_PYTHON, bootstrap .venv, or ensure `python3 -c 'import triton'` works. Probe results: {}.",
         diagnostics.join(" | ")
     ))
 }
@@ -187,7 +187,7 @@ fn triton_target(sm_targets: &[String]) -> String {
 
     if sm_targets.len() > 1 {
         println!(
-            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. Set PEGAINFER_CUDA_SM to pin one target explicitly."
+            "cargo:warning=Triton AOT currently emits one cubin per kernel spec; using highest detected target sm_{max_sm}. Set INFER_CUDA_SM to pin one target explicitly."
         );
     }
 
@@ -582,7 +582,7 @@ fn compile_triton_aot_kernels(cuda_path: &str, out_dir: &Path, sm_targets: &[Str
         }
     }
     println!("cargo:rerun-if-changed=tools/triton");
-    println!("cargo:rerun-if-env-changed=PEGAINFER_TRITON_PYTHON");
+    println!("cargo:rerun-if-env-changed=INFER_TRITON_PYTHON");
 }
 
 /// Find FlashInfer C++ include directory.
@@ -619,7 +619,7 @@ fn find_flashinfer_include() -> Option<String> {
     }
 
     // 2. pip show (works even when flashinfer can't be imported)
-    let python = std::env::var("PEGAINFER_TRITON_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let python = std::env::var("INFER_TRITON_PYTHON").unwrap_or_else(|_| "python3".to_string());
     if let Ok(output) = Command::new(&python)
         .args(["-m", "pip", "show", "flashinfer-python"])
         .output()
@@ -780,6 +780,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
-    println!("cargo:rerun-if-env-changed=PEGAINFER_CUDA_SM");
+    println!("cargo:rerun-if-env-changed=INFER_CUDA_SM");
     println!("cargo:rerun-if-env-changed=CUDA_SM");
 }

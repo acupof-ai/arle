@@ -55,8 +55,8 @@ pkill -f "vllm serve"
 Same flow, different server:
 
 ```bash
-# Start (Qwen3.5 requires PEGAINFER_TRITON_PYTHON for AOT Triton kernels)
-RUST_LOG=warn PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+# Start (Qwen3.5 requires INFER_TRITON_PYTHON for AOT Triton kernels)
+RUST_LOG=warn INFER_TRITON_PYTHON=./.venv/bin/python \
   cargo run --release -- --model-path $MODEL_PATH --port $PORT &
 
 # Poll until ready — infer has no /v1/models; probe with a minimal completions request

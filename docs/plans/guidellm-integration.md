@@ -126,7 +126,7 @@ Behaviour:
      hint and exit 2.
   2. Check target responds to `/v1/models`. If not → exit 2 with
      "server not running at <target>, start it with
-     scripts/start_pegainfer.sh first".
+     scripts/start_infer.sh first".
   3. Invoke:
         guidellm benchmark \
             --target "$TARGET" --model "$MODEL" \

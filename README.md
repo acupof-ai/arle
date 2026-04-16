@@ -350,7 +350,7 @@ cargo run -p agent-infer --no-default-features --features cpu,no-cuda,cli -- \
   --model-path Qwen/Qwen3-0.6B --max-turns 1 --max-tokens 64
 
 # E2E (requires GPU + model weights)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 
 # Agent CLI live-model E2E on Apple Silicon (auto-detects a local model when available)
 cargo test --release --no-default-features --features metal,no-cuda,cli -- --ignored --nocapture

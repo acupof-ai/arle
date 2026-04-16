@@ -289,7 +289,7 @@ cargo clippy --workspace --no-default-features --features metal -- -D warnings
 ```bash
 CUDA_HOME=/usr/local/cuda cargo build --release
 CUDA_HOME=/usr/local/cuda cargo test --release --lib
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --test e2e_qwen35
 
 # Throughput regression check (per docs/experience/wins/ convention):

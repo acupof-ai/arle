@@ -110,7 +110,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_high_water: 0.85,
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
-            disk_store_root: std::env::temp_dir().join("pegainfer-kv"),
+            disk_store_root: std::env::temp_dir().join("infer-kv"),
         }
     }
 }

@@ -354,7 +354,7 @@ impl<M: ModelForward> Scheduler<M> {
             crate::kv_tier::coordinator::PageLifecycle::new(paged_kv_pool.max_total_pages);
         let (coordinator, coordinator_handle, coordinator_events) =
             crate::kv_tier::Coordinator::new(config.max_slots.max(16));
-        let coordinator_thread = Some(coordinator.spawn("pegainfer-tiered-kv-coord"));
+        let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
         let scheduler = Self {
             config: config.clone(),
             metrics,

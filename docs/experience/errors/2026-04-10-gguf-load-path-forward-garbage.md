@@ -40,9 +40,9 @@ bug is exclusively in the GGUF load path.
    `log(|A|)` per the `-exp(a_log) * softplus(...)` delta-rule kernel.
 5. **RMSNorm offset subtraction** (`load_tensor_1d_gguf_offset_norm`
    subtracts 1.0 to match the `(1+w)*x` kernel) is self-consistent; toggling
-   it via `PEGAINFER_DEBUG_NO_NORM_SUB` changes nothing.
+   it via `INFER_DEBUG_NO_NORM_SUB` changes nothing.
 6. **Forcing BF16 dequant for all 2D tensors** via
-   `PEGAINFER_FORCE_BF16_QUANT=1` still produces garbage — just a
+   `INFER_FORCE_BF16_QUANT=1` still produces garbage — just a
    *different* garbage. Rules out the native GPU packed path as the
    root cause: the shared CPU dequant + upload path is equally broken.
 7. **Linear attention is not the cause.** Qwen3-4B (pure dense
@@ -51,7 +51,7 @@ bug is exclusively in the GGUF load path.
 ## Update (2026-04-10 night) — layer-by-layer instrumentation
 
 Added `debug_dump_hidden()` in `model::common` (gated by
-`PEGAINFER_DEBUG_DUMP=1`) and wired it through the Qwen3 prefill loop to
+`INFER_DEBUG_DUMP=1`) and wired it through the Qwen3 prefill loop to
 dump head[0..8], tail[N-4..N], min/max/rms at four checkpoints per layer.
 Side-by-side run of Qwen3-4B safetensors vs Q4_K_M GGUF on the prompt
 "The capital of France is" yields:

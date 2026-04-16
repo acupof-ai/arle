@@ -4,7 +4,7 @@
 //! physical memory budget and generates non-garbage tokens.
 //!
 //! Enable with:
-//!   PEGAINFER_CARNICE_PATH=/abs/path/to/models/Carnice-27b-GGUF \
+//!   INFER_CARNICE_PATH=/abs/path/to/models/Carnice-27b-GGUF \
 //!       cargo test --release --test smoke_carnice_27b_q4k -- --nocapture --ignored
 //!
 //! Ignored by default because it needs the 16 GB GGUF + a ~24 GB GPU.
@@ -21,7 +21,7 @@ use infer::server_engine::{
 use tokio::sync::mpsc;
 
 fn model_path() -> String {
-    std::env::var("PEGAINFER_CARNICE_PATH")
+    std::env::var("INFER_CARNICE_PATH")
         .unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
 }
 

@@ -49,9 +49,9 @@ every length, every sampling config → one repeating token (`"零食零食..."`
 `"不懂不懂..."`). Same symptom on Qwen3.5-4B. Bisect showed:
 
 - Dequant kernels match llama.cpp Python reference byte-for-byte.
-- `PEGAINFER_FORCE_BF16_QUANT=1` (skip all packed GPU kernels, dequant at load
+- `INFER_FORCE_BF16_QUANT=1` (skip all packed GPU kernels, dequant at load
   to BF16) → identical garbage. Rules out Q4_K GEMV kernel bugs.
-- `PEGAINFER_QWEN3_FP32_RESIDUAL=1` (fp32 residual shadow across all 36 layers
+- `INFER_QWEN3_FP32_RESIDUAL=1` (fp32 residual shadow across all 36 layers
   of Qwen3-4B) → identical garbage. Rules out bf16 residual accumulation.
 - Output is completely prompt-independent — even a 2300-token prompt vs an
   8-token prompt produce the same tokens. Points to degenerate final hidden

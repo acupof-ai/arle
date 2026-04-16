@@ -14,7 +14,7 @@
 - **Commit:** 3b75e5e
 - **Feature set:** `cargo build --release <features>`
 - **Non-default flags / env vars:** <list or "none">
-- **Server launch:** `scripts/start_pegainfer.sh <model> <port>` (or equivalent)
+- **Server launch:** `scripts/start_infer.sh <model> <port>` (or equivalent)
 
 ## Canonical params (DO NOT CHANGE PER-RUN)
 

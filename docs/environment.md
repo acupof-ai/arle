@@ -3,7 +3,7 @@
 This document lists the environment variables used by `agent-infer` across
 runtime, build, test, and setup workflows.
 
-The repository currently contains both `AGENT_INFER_*` and `PEGAINFER_*`
+The repository currently contains both `AGENT_INFER_*` and `INFER_*`
 variables. Until naming is fully unified, use this document as the source of
 truth.
 
@@ -21,7 +21,7 @@ watermarks (`prefix_cache_high_water`, `prefix_cache_low_water`,
 (`prefix_cache_keepalive_ticks`, `stage_wait_keepalive_ticks`), and
 chunking caps are struct fields with `validate()` guards. Callers that
 want to tune them construct a `SchedulerConfig::runtime_defaults(..)`
-and assign directly — **there is no `PEGAINFER_PREFIX_HIGH_WATER`** or
+and assign directly — **there is no `INFER_PREFIX_HIGH_WATER`** or
 any other magic env var for runtime tuning. If you want an env-var
 escape hatch for a specific tuning knob, justify it as a debug aid and
 document the debug-only status here.
@@ -31,7 +31,7 @@ document the debug-only status here.
 ## 1. Naming Rule
 
 - Prefer `AGENT_INFER_*` for user-facing runtime behavior when available.
-- Treat `PEGAINFER_*` primarily as legacy, build, test, or compatibility
+- Treat `INFER_*` primarily as legacy, build, test, or compatibility
   variables unless documented otherwise.
 - Treat undocumented variables as internal or experimental.
 
@@ -153,17 +153,17 @@ export CUDA_HOME=/usr/local/cuda
 
 Windows-style alternative to `CUDA_HOME`.
 
-### `PEGAINFER_TRITON_PYTHON`
+### `INFER_TRITON_PYTHON`
 
 Python interpreter with Triton installed for build-time AOT kernel generation.
 
 Typical value:
 
 ```bash
-export PEGAINFER_TRITON_PYTHON=.venv/bin/python
+export INFER_TRITON_PYTHON=.venv/bin/python
 ```
 
-### `PEGAINFER_CUDA_SM` (alt: `CUDA_SM`)
+### `INFER_CUDA_SM` (alt: `CUDA_SM`)
 
 Override detected CUDA SM targets. Consumed by `crates/infer-cuda-kernels/build.rs`
 during nvcc + Triton AOT compile; falls back to `CUDA_SM`, then `nvidia-smi`,
@@ -172,8 +172,8 @@ then `sm_80`.
 Examples:
 
 ```bash
-export PEGAINFER_CUDA_SM=80
-export PEGAINFER_CUDA_SM=80,90
+export INFER_CUDA_SM=80
+export INFER_CUDA_SM=80,90
 ```
 
 ### `FLASHINFER_INCLUDE_DIR`
@@ -214,38 +214,38 @@ Default: `python3`
 
 ## 5. Test and Integration Variables
 
-### `PEGAINFER_TEST_MODEL_PATH`
+### `INFER_TEST_MODEL_PATH`
 
 Override model path for infer-side GPU tests.
 
 Example:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 ```
 
-### `PEGAINFER_E2E_MODEL_PATH`
+### `INFER_E2E_MODEL_PATH`
 
 Override model path for selected E2E regeneration flows
 (`infer/tests/regen_test_data.rs`).
 
-### `PEGAINFER_QWEN3_PATH`
+### `INFER_QWEN3_PATH`
 
 Override model path for the Qwen3-4B GGUF smoke test
 (`infer/tests/smoke_qwen3_4b_gguf.rs`). Default:
 `models/Qwen3-4B-GGUF`.
 
-### `PEGAINFER_Q35_PATH`
+### `INFER_Q35_PATH`
 
 Override model path for the Qwen3.5 GGUF smoke test
 (`infer/tests/smoke_qwen35_gguf.rs`).
 
-### `PEGAINFER_QWEN35_4B_GGUF_PATH`
+### `INFER_QWEN35_4B_GGUF_PATH`
 
 Override model path for the Qwen3.5 4B GGUF ground-truth Q4_K test
 (`infer/tests/ground_truth_q4k.rs`).
 
-### `PEGAINFER_CARNICE_PATH`
+### `INFER_CARNICE_PATH`
 
 Override model path for Carnice 27B Q4_K / real-tensor-dequant /
 dtype-audit tests
@@ -254,11 +254,11 @@ dtype-audit tests
 `infer/tests/carnice_dtype_audit.rs`,
 `infer/tests/carnice_tensor_probe.rs`).
 
-### `PEGAINFER_URL`
+### `INFER_URL`
 
 Base URL for integration-style Python API tests.
 
-### `PEGAINFER_MODEL`
+### `INFER_MODEL`
 
 Model name expected by integration-style Python API tests.
 
@@ -309,20 +309,20 @@ export AGENT_INFER_MODEL=models/Qwen3-4B
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
-export PEGAINFER_TRITON_PYTHON=.venv/bin/python
+export INFER_TRITON_PYTHON=.venv/bin/python
 ```
 
 ### GPU tests
 
 ```bash
-export PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B
+export INFER_TEST_MODEL_PATH=models/Qwen3-4B
 ```
 
 ### Integration API tests
 
 ```bash
-export PEGAINFER_URL=http://localhost:8000
-export PEGAINFER_MODEL=Qwen3-8B
+export INFER_URL=http://localhost:8000
+export INFER_MODEL=Qwen3-8B
 ```
 
 ---
@@ -334,14 +334,14 @@ docs promote them more clearly:
 
 - `AGENT_INFER_METAL_KV_POOL`
 - `AGENT_INFER_GDR_METAL_KERNEL`
-- `PEGAINFER_E2E_MODEL_PATH`
+- `INFER_E2E_MODEL_PATH`
 - `FLASHINFER_INCLUDE_DIR`
-- `PEGAINFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
-- `PEGAINFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
+- `INFER_ROPE_CACHE_LEN` — override RoPE cache allocation length in `weight_loader.rs`
+- `INFER_FORCE_BF16_QUANT` — skip all packed-quant fast paths in
   `weight_loader.rs` and force BF16 tensor load (debug aid for quant-format issues)
-- `PEGAINFER_DEBUG_DUMP` — enable tensor debug-dump capture in
+- `INFER_DEBUG_DUMP` — enable tensor debug-dump capture in
   `infer/src/model/common.rs` (default off; set to any value to enable)
-- `PEGAINFER_QWEN3_FP32_RESIDUAL` — force FP32 residual accumulation on
+- `INFER_QWEN3_FP32_RESIDUAL` — force FP32 residual accumulation on
   the Qwen3 prefill path (`infer/src/model/qwen3/prefill.rs`); debug aid
   for numerical-stability investigations
 - `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj

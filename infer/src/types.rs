@@ -60,7 +60,7 @@ impl BlockFingerprint {
     /// identity chain.
     pub fn compute(ctx: KvContentContext<'_>, tokens: &[u32]) -> Self {
         let mut h = blake3::Hasher::new();
-        h.update(b"pegainfer-kv-v2\x00");
+        h.update(b"infer-kv-v2\x00");
         h.update(b"model\x00");
         h.update(&(ctx.model_fingerprint.len() as u64).to_le_bytes());
         h.update(ctx.model_fingerprint);

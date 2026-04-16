@@ -22,7 +22,7 @@ cargo check -p infer --no-default-features --features cuda,no-cuda
 cargo check --workspace --no-default-features --features metal
 CUDA_HOME=/usr/local/cuda cargo build --release
 cargo test --release --lib
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --test e2e_qwen35
 scripts/bench_throughput_sweep.py --label post-route-a-cuda
 ```

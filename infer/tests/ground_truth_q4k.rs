@@ -10,7 +10,7 @@ use half::bf16;
 use infer::gguf::GgufFile;
 
 fn path_4b() -> String {
-    std::env::var("PEGAINFER_QWEN35_4B_GGUF_PATH")
+    std::env::var("INFER_QWEN35_4B_GGUF_PATH")
         .unwrap_or_else(|_| "models/Qwen3.5-4B-GGUF-test/Qwen3.5-4B-Q4_K_M.gguf".to_string())
 }
 

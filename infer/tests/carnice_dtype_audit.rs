@@ -1,7 +1,7 @@
 //! Audit dtype distribution in the Carnice-27b GGUF to see which tensors
 //! actually end up on which loader path. Skipped unless the model is present.
 //!
-//!   PEGAINFER_CARNICE_PATH=/path/to/models/Carnice-27b-GGUF \
+//!   INFER_CARNICE_PATH=/path/to/models/Carnice-27b-GGUF \
 //!       cargo test --release --test carnice_dtype_audit -- --nocapture --ignored
 
 #![cfg(feature = "cuda")]
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use infer::gguf::GgufFile;
 
 fn model_path() -> String {
-    std::env::var("PEGAINFER_CARNICE_PATH")
+    std::env::var("INFER_CARNICE_PATH")
         .unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
 }
 

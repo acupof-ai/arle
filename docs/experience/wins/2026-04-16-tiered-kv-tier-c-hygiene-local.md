@@ -26,7 +26,7 @@ without recompiling. No architectural moves — pure hygiene.
   checks. Misconfigured configs refuse to construct a scheduler.
 - Callers tune by explicit field assignment on a `SchedulerConfig`;
   there is deliberately **no env-var escape hatch**. The only
-  `PEGAINFER_*` env vars that exist in the tree are debug-only
+  `INFER_*` env vars that exist in the tree are debug-only
   diagnostic overrides (SM override, Triton python path, test model
   path, API disable flag).
 - Verified locally with:
