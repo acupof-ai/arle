@@ -2198,6 +2198,40 @@ impl StepDriver for Qwen3StepDriver<'_> {
     }
 }
 
+/// Innovation tape from one GDR layer during a speculative verify block.
+/// Used for O(accepted) rollback instead of O(N) re-forward.
+struct GdrTape {
+    /// Innovation delta at each timestep: [1, N, Hv, Dv]
+    innovation_tape: MlxArray,
+    /// Key projections: [1, N, Hk, Dk]
+    k: MlxArray,
+    /// Gating values: [1, N, Hv]
+    g: MlxArray,
+    /// Raw QKV for conv state rebuild: [1, N, qkv_dim]
+    qkv: MlxArray,
+}
+
+/// DFlash speculative decode state for Qwen3.5 hybrid models.
+/// Extends the Qwen3 DFlash pattern with GDR recurrent rollback.
+struct Qwen35DFlashState {
+    runtime: &'static MetalDflashRuntime,
+    config: &'static MetalModelConfig,
+    /// Draft model KV state (pure transformer, same as Qwen3 DFlash).
+    draft_state: dflash::ContiguousKvState,
+    /// Target-layer hidden states for the next draft block.
+    target_hidden: Option<MlxArray>,
+    /// Multi-token buffer from speculative acceptance.
+    token_buffer: VecDeque<u32>,
+    /// Which target-model layers to capture hidden states from.
+    target_layer_ids: Vec<usize>,
+    /// Per-block acceptance lengths for metrics.
+    acceptance_lengths: Vec<usize>,
+    /// GDR state snapshot taken before each verify (for rollback).
+    gdr_snapshot: Option<Vec<MlxArray>>,
+    /// Per-layer tapes recorded during verify (for partial replay).
+    gdr_tapes: Vec<GdrTape>,
+}
+
 struct Qwen35CppState {
     kv_flat: Vec<MlxArray>,
     gdr_flat: Vec<MlxArray>,
@@ -2222,6 +2256,8 @@ struct Qwen35StepDriver<'a> {
     kv_capacity: i32,
     cache_len: i32,
     mode: Qwen35StepMode,
+    /// DFlash speculative decode state (None = standard decode).
+    dflash: Option<Qwen35DFlashState>,
 }
 
 impl<'a> Qwen35StepDriver<'a> {
@@ -2287,6 +2323,7 @@ impl<'a> Qwen35StepDriver<'a> {
             kv_capacity: initial_cap,
             cache_len: 0,
             mode,
+            dflash: None,
         })
     }
 
@@ -2565,6 +2602,20 @@ impl StepDriver for Qwen35StepDriver<'_> {
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
+        // ── DFlash speculative path (Qwen3.5) ────────────────────────────
+        if let Some(dflash) = self.dflash.as_mut() {
+            // 1. Drain buffer first — cheap, no GPU work.
+            if let Some(buffered) = dflash.token_buffer.pop_front() {
+                return Ok(buffered);
+            }
+
+            // 2. Buffer empty → run one full speculative block.
+            //    TODO(phase4): wire qwen35_dflash_speculative_block here
+            //    once C++ tape-mode kernel and FFI are integrated.
+            //    For now, fall through to standard decode.
+        }
+
+        // ── Standard single-token decode ─────────────────────────────────
         if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
             clear_metal_cache();
         }

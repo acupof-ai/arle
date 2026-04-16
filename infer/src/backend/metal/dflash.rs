@@ -58,8 +58,11 @@ impl MetalDflashRuntime {
     ) -> Result<Self> {
         options.validate()?;
         ensure!(
-            matches!(target_config.arch, MetalModelArch::Qwen3),
-            "Metal DFlash currently supports Qwen3 only; Qwen3.5 still needs recurrent rollback integration"
+            matches!(
+                target_config.arch,
+                MetalModelArch::Qwen3 | MetalModelArch::Qwen35(_)
+            ),
+            "Metal DFlash requires Qwen3 or Qwen3.5 target model"
         );
 
         let draft_model_dir = hf_hub::resolve_weighted_model_path(&options.draft_model)
