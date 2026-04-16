@@ -18,23 +18,23 @@ Benchmark comparison after implementing 5 optimizations (commits `cc81b65`, `faf
 - Bench: `scripts/bench_throughput.py`, synthetic prompts, greedy (temp=0),
   max_tokens=256, serial runs (one GPU)
 
-## Results — Decode Throughput Comparison (post-overlap `faf5efd`)
+## Results — Final (overlap + prefill pipeline, `dbf111b`)
 
 | Concurrency | pegainfer tok/s | SGLang tok/s | Parity | ITL pega (ms) | ITL sglang (ms) |
 |---|---|---|---|---|---|
 | **B=1** | 30.1 | 30.1 | **100.0%** | 33.2 | 33.0 |
-| **B=4** | 113.1 | 116.0 | **97.5%** | 34.8 | 34.2 |
-| **B=8** | 219.3 | 227.8 | **96.3%** | 35.1 | 34.8 |
-| **B=16** | 408.1 | 440.9 | **92.6%** | 36.3 | 35.9 |
+| **B=4** | 114.2 | 115.9 | **98.5%** | 34.5 | 34.3 |
+| **B=8** | 220.1 | 228.3 | **96.4%** | 35.0 | 34.8 |
+| **B=16** | 408.4 | 441.7 | **92.5%** | 36.5 | 35.9 |
 
-### Pre-overlap snapshot (autotune only, `cc81b65`)
+### Progression
 
-| Concurrency | pegainfer tok/s | Parity |
-|---|---|---|
-| B=1 | 30.0 | 99.7% |
-| B=4 | 113.0 | 97.4% |
-| B=8 | 218.1 | 95.7% |
-| B=16 | 413.3 | 93.7% |
+| Concurrency | Baseline (pre-session) | Autotune (`cc81b65`) | + Overlap (`faf5efd`) | + Prefill pipeline (`dbf111b`) |
+|---|---|---|---|---|
+| B=1 | 99.5% | 99.7% | 100.0% | **100.0%** |
+| B=4 | 98.3% | 97.4% | 97.5% | **98.5%** |
+| B=8 | 96.4% | 95.7% | 96.3% | **96.4%** |
+| B=16 | 92.7% | 93.7% | 92.6% | **92.5%** |
 
 ## Previous Parity (pre-autotune, from session notes)
 
