@@ -347,7 +347,7 @@ fn auto_num_slots(
 /// always f32 regardless of the KV format choice.
 fn estimate_per_slot_bytes(
     model_path: &str,
-    _seq_len: usize,
+    seq_len: usize,
     chunk_size: usize,
     kv_pool_format: KVFormat,
 ) -> usize {
@@ -377,10 +377,10 @@ fn estimate_per_slot_bytes(
     // KVFormat::pool_bytes_per_kv_head (BF16=2*head_dim, INT8=head_dim+4
     // including per-token f32 scale, FP8=head_dim, TurboQuant=packed+norms).
     let bytes_per_kv_head_side = kv_pool_format.pool_bytes_per_kv_head(head_dim);
-    let kv_bytes = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side * chunk_size;
-    // Paged pool memory is budgeted separately via --kv-pool-headroom-mb
-    // (default 4GB). The previous 2× multiplier was double-counting the pool
-    // share and limiting Qwen3-4B to 7 slots on L4 (should be ~14+).
+    // Per-slot cost = contiguous working buffer (chunk_size) + paged pool share (full seq_len).
+    // Contiguous is the small prefill chunk; paged covers the full sequence.
+    let bytes_per_token_kv = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side;
+    let kv_bytes = bytes_per_token_kv * chunk_size + bytes_per_token_kv * seq_len;
 
     // Recurrent state (if hybrid): per linear layer, fixed size independent of seq_len
     let num_linear_layers = num_layers.saturating_sub(kv_layers);

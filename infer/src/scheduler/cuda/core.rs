@@ -274,15 +274,17 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
 
+        // Contiguous KV only needs to hold a small working buffer for prefill
+        // chunks. The paged pool carries the full sequence. Must match the
+        // CONTIGUOUS_CHUNK_SIZE used by auto_num_slots in main.rs.
+        const CONTIGUOUS_KV_TOKENS: usize = 512;
+
         let mut states = Vec::with_capacity(config.max_slots);
         let mut slot_materialized_prompt_lens = Vec::with_capacity(config.max_slots);
         let mut slot_owned_blocks = Vec::with_capacity(config.max_slots);
         for i in 0..config.max_slots {
             let mut state = model.create_state()?;
-            // Contiguous KV only needs to hold a single prefill chunk; the
-            // paged pool carries the full effective sequence budget.
-            let contiguous_seq = config.prefill_chunk_size.max(256);
-            state.set_max_seq_len(contiguous_seq);
+            state.set_max_seq_len(CONTIGUOUS_KV_TOKENS);
             state.set_kv_dtype(kv_cache_dtype);
             states.push(state);
             slot_materialized_prompt_lens.push(0);
@@ -291,9 +293,8 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let paged_kv_pool = {
-            let contiguous_max = config.prefill_chunk_size.max(256);
             let bytes_per_token = model.kv_cache_bytes_per_token();
-            let contiguous_cost = config.max_slots * contiguous_max * bytes_per_token;
+            let contiguous_cost = config.max_slots * CONTIGUOUS_KV_TOKENS * bytes_per_token;
             let headroom = config.kv_pool_headroom_bytes;
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
