@@ -21,8 +21,7 @@ pub struct FlashInferDecodeMetadata {
     pub kv_indptr: CudaSlice<i32>,
     pub kv_last_page_len: CudaSlice<i32>,
     /// Q indptr for tensor-core decode: [0, 1, 2, ..., B] (1 token per request).
-    #[allow(dead_code)]
-    pub q_indptr: CudaSlice<i32>,
+    pub qo_indptr: CudaSlice<i32>,
     pub flashinfer_ws: FlashInferWorkspace,
     pub max_total_pages: usize,
     /// Scratch buffer for building positions on the host side.
@@ -36,7 +35,7 @@ pub struct FlashInferDecodeMetadata {
     /// Previous slot epochs; changes when a slot is recycled for a new request.
     prev_slot_epochs: Vec<u64>,
     /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
-    qo_indptr_h: Vec<i32>,
+    pub qo_indptr_h: Vec<i32>,
     /// Physical page id of the last logical page per request [max_batch_size].
     /// Used only by the page_size=1 quantize-after-write fast paths.
     pub last_token_indices: CudaSlice<i32>,
@@ -307,15 +306,10 @@ impl FlashInferDecodeMetadata {
         max_total_pages: usize,
         num_qheads: usize,
     ) -> Result<Self> {
-        // Pre-build q_indptr for TC decode: [0, 1, 2, ..., max_batch_size]
-        let qo_indptr_h: Vec<i32> = (0..=(max_batch_size as i32)).collect();
-        let mut q_indptr: CudaSlice<i32> = ctx
+        let qo_indptr: CudaSlice<i32> = ctx
             .stream
             .alloc_zeros(max_batch_size + 1)
-            .map_err(|e| anyhow::anyhow!("Alloc q_indptr failed: {e}"))?;
-        ctx.stream
-            .memcpy_htod(&qo_indptr_h, &mut q_indptr)
-            .map_err(|e| anyhow::anyhow!("H2D q_indptr: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Alloc qo_indptr failed: {e}"))?;
 
         Ok(Self {
             positions: ctx
@@ -334,7 +328,7 @@ impl FlashInferDecodeMetadata {
                 .stream
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
-            q_indptr,
+            qo_indptr,
             flashinfer_ws: FlashInferWorkspace::new(ctx, max_batch_size, num_qheads)?,
             max_total_pages,
             positions_scratch: Vec::with_capacity(max_batch_size),
@@ -342,7 +336,7 @@ impl FlashInferDecodeMetadata {
             indptr_h: Vec::with_capacity(max_batch_size + 1),
             prev_slot_indices: Vec::with_capacity(max_batch_size),
             prev_slot_epochs: Vec::with_capacity(max_batch_size),
-            qo_indptr_h,
+            qo_indptr_h: vec![0i32; max_batch_size + 1],
             last_token_indices: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
@@ -403,6 +397,11 @@ impl FlashInferDecodeMetadata {
         ctx.stream
             .memcpy_htod(&last_page_lens_h, &mut self.kv_last_page_len)
             .map_err(|e| anyhow::anyhow!("H2D last_page_len: {e}"))?;
+        self.qo_indptr_h.clear();
+        self.qo_indptr_h.extend(0..=slot_indices.len() as i32);
+        ctx.stream
+            .memcpy_htod(&self.qo_indptr_h, &mut self.qo_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D qo_indptr: {e}"))?;
 
         let new_total = *self
             .indptr_h

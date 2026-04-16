@@ -800,6 +800,71 @@ pub fn flashinfer_run_layer(
     Ok(())
 }
 
+/// FlashInfer tensor-core run step only (GPU kernel). Call once per layer after a single plan call.
+#[allow(clippy::too_many_arguments)]
+pub fn flashinfer_tc_run_layer(
+    ctx: &DeviceContext,
+    q_batch: &HiddenStates,
+    qo_indptr_gpu: &CudaSlice<i32>,
+    kv_pool: &PagedKVPool,
+    layer_idx: usize,
+    kv_indptr_gpu: &CudaSlice<i32>,
+    kv_indices_gpu: &CudaSlice<i32>,
+    kv_last_page_len_gpu: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    workspace: &mut FlashInferWorkspace,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    page_size: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let batch_size = q_batch.seq_len;
+    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+
+    let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
+    let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
+    let (q_ptr, _gq) = q_batch.data.device_ptr(&ctx.stream);
+    let (qoi_ptr, _gqoi) = qo_indptr_gpu.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (ind_ptr, _gind) = kv_indptr_gpu.device_ptr(&ctx.stream);
+    let (idx_ptr, _gidx) = kv_indices_gpu.device_ptr(&ctx.stream);
+    let (lp_ptr, _glp) = kv_last_page_len_gpu.device_ptr(&ctx.stream);
+    let (lse_ptr, _glse) = workspace.lse.device_ptr_mut(&ctx.stream);
+
+    let k_pool_ptr = kv_pool.k_ptr(layer_idx, &ctx.stream);
+    let v_pool_ptr = kv_pool.v_ptr(layer_idx, &ctx.stream);
+
+    let ret = unsafe {
+        ffi::flashinfer_tc_decode_run(
+            fw_ptr as *mut u8,
+            iw_ptr as *mut u8,
+            workspace.plan_info as *const u8,
+            q_ptr as *mut ffi::Half,
+            qoi_ptr as *mut i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            ind_ptr as *mut i32,
+            idx_ptr as *mut i32,
+            lp_ptr as *mut i32,
+            o_ptr as *mut ffi::Half,
+            lse_ptr as *mut f32,
+            batch_size as i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            sm_scale,
+            ctx.stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_tc_decode_run failed with CUDA error {}",
+            ret
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // HD256 variants for Qwen3.5 full attention (head_dim=256, partial RoPE, gate)
 // ============================================================================

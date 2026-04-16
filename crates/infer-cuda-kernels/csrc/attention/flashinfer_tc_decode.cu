@@ -52,7 +52,7 @@ extern "C" int flashinfer_tc_decode_plan(
 
     flashinfer::PrefillPlanInfo plan_info;
 
-    uint32_t total_num_rows = (uint32_t)batch_size;  // 1 query token per request
+    uint32_t total_num_rows = (uint32_t)qo_indptr_h[batch_size];  // sum of all qo_lens
 
     cudaError_t err = flashinfer::PrefillPlan<IdType>(
         float_workspace, float_workspace_bytes,
