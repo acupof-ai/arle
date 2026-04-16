@@ -202,15 +202,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        let prefill_pending = self
-            .active
-            .iter()
-            .any(|req| matches!(req.phase, Phase::New | Phase::Prefilling { .. }));
-        if prefill_pending {
-            use crate::model::DecodeContextOps;
-            decode_ctx.invalidate_graph_cache(token_ids.len());
-        }
-
         let forward_result = self.model.forward_decode_batch(
             &token_ids,
             &mut self.states,
