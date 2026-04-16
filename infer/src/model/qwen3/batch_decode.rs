@@ -365,7 +365,20 @@ impl Qwen3Model {
             // function only accesses other fields of bufs (normed, q_batch, etc.)
             // and swaps hidden_ptr's target with bufs.hidden_out. No aliasing.
             let hidden = unsafe { &mut *hidden_ptr };
-            self.decode_batch_layer_inner(layer_idx, layer, hidden, bufs, kv_pool)?;
+            let skip_input_norm = layer_idx > 0;
+            let next_input_norm = self
+                .layers
+                .get(layer_idx + 1)
+                .map(|next_layer| &next_layer.input_layernorm);
+            self.decode_batch_layer_inner(
+                layer_idx,
+                layer,
+                hidden,
+                bufs,
+                kv_pool,
+                skip_input_norm,
+                next_input_norm,
+            )?;
         }
 
         // Final norm + logits. hidden is whichever buffer was last written.
@@ -390,6 +403,8 @@ impl Qwen3Model {
         hidden: &mut HiddenStates,
         bufs: &mut BatchDecodeBuffers,
         kv_pool: &PagedKVPool,
+        skip_input_norm: bool,
+        next_input_norm: Option<&DeviceVec>,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
         let num_heads = self.config.num_attention_heads;
@@ -398,13 +413,15 @@ impl Qwen3Model {
         let page_size = kv_pool.page_size;
 
         // 1. Batched RMSNorm → bufs.normed [B, hidden_dim]
-        ops::rms_norm_batch_into(
-            &self.ctx,
-            hidden,
-            &layer.input_layernorm,
-            eps,
-            &mut bufs.normed,
-        );
+        if !skip_input_norm {
+            ops::rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            );
+        }
 
         // 2. QKV projection
         if layer.attention.q_proj.is_quantized() {
@@ -736,9 +753,20 @@ impl Qwen3Model {
             &mut bufs.o_buf,
         );
 
-        // 9. Batched residual add
-        ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
-        std::mem::swap(hidden, &mut bufs.hidden_out);
+        // 9. Batched residual add, optionally fused with the next layer's input RMSNorm.
+        if let Some(next_input_norm) = next_input_norm {
+            ops::fused_add_rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &bufs.o_buf,
+                next_input_norm,
+                eps,
+                &mut bufs.normed,
+            );
+        } else {
+            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            std::mem::swap(hidden, &mut bufs.hidden_out);
+        }
 
         Ok(())
     }
