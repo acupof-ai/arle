@@ -23,7 +23,7 @@ import sys
 import threading
 import json
 
-MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "infer/models/Qwen3-8B"
+MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen3-8B"
 MAX_TOKENS = 4096
 PROMPT = "Write a detailed history of computing from Babbage to modern AI."
 
