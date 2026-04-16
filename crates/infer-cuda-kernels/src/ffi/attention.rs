@@ -37,6 +37,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn flashinfer_single_prefill_hd256(
+        q: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        output: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        tmp_buffer: *mut Half,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn flash_attention_prefill_hd256_cuda(
         Q: *const Half,
         K_cache: *const Half,

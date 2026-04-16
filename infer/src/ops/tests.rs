@@ -320,8 +320,6 @@ fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
         let v_cache = DeviceVec::from_host(&ctx, &v_cache_host_bf16)?;
         let mut out = HiddenStates::zeros(&ctx, q_dim, seq_len)?;
 
-        let start_pos_buf: cudarc::driver::CudaSlice<i32> =
-            ctx.stream.clone_htod(&[start_pos as i32])?;
         flash_attention_prefill_hd256_into(
             &ctx,
             &q_batch,
@@ -330,7 +328,7 @@ fn test_flash_attention_prefill_hd256_matches_cpu_reference() -> Result<()> {
             &mut out,
             num_qheads,
             num_kvheads,
-            &start_pos_buf,
+            start_pos,
         )?;
 
         let out_host_bf16 = ctx.stream.clone_dtoh(&out.data)?;

@@ -158,7 +158,7 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     output: &mut HiddenStates,
     num_q_heads: usize,
     num_kv_heads: usize,
-    start_pos_buf: &CudaSlice<i32>,
+    start_pos: usize,
 ) -> Result<()> {
     let seq_len = q_batch.seq_len;
     let q_dim = q_batch.hidden_dim;
@@ -167,7 +167,6 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     assert_eq!(q_dim, output.hidden_dim, "output hidden_dim mismatch");
     assert_eq!(seq_len, output.seq_len, "output seq_len mismatch");
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
-    let gqa_ratio = num_q_heads / num_kv_heads;
 
     // Derive max_seq_len from KV cache buffer size.
     let max_seq_len = k_cache.len / (num_kv_heads * head_dim);
@@ -176,25 +175,31 @@ pub(crate) fn flash_attention_prefill_hd256_into(
     let (kc_ptr, _gkc) = k_cache.data.device_ptr(&ctx.stream);
     let (vc_ptr, _gvc) = v_cache.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (sp_ptr, _gsp) = start_pos_buf.device_ptr(&ctx.stream);
 
-    let result = unsafe {
-        ffi::flash_attention_prefill_hd256_cuda(
-            q_ptr as *const ffi::Half,
-            kc_ptr as *const ffi::Half,
-            vc_ptr as *const ffi::Half,
+    let kv_len = start_pos + seq_len;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let ret = unsafe {
+        ffi::flashinfer_single_prefill_hd256(
+            q_ptr as *mut ffi::Half,
+            kc_ptr as *mut ffi::Half,
+            vc_ptr as *mut ffi::Half,
             o_ptr as *mut ffi::Half,
             num_q_heads as i32,
             num_kv_heads as i32,
-            gqa_ratio as i32,
             seq_len as i32,
-            sp_ptr as *const i32,
+            kv_len as i32,
             max_seq_len as i32,
-            q_dim as i32,
+            sm_scale,
+            std::ptr::null_mut(),
             ctx.stream.cu_stream(),
         )
     };
-    result.result()?;
+    if ret != 0 {
+        return Err(anyhow!(
+            "flashinfer_single_prefill_hd256 failed: CUDA error {}",
+            ret
+        ));
+    }
 
     Ok(())
 }
@@ -233,6 +238,7 @@ pub(crate) fn prefill_attention_hd256_batch(
         &mut q_prepped,
         num_q_heads,
         num_kv_heads,
+        start_pos,
         &start_pos_buf,
         rotary_dim,
     )
@@ -253,6 +259,7 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
     q_prepped: &mut HiddenStates,
     num_q_heads: usize,
     num_kv_heads: usize,
+    start_pos: usize,
     start_pos_buf: &CudaSlice<i32>,
     rotary_dim: usize,
 ) -> Result<()> {
@@ -318,7 +325,7 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
         output,
         num_q_heads,
         num_kv_heads,
-        start_pos_buf,
+        start_pos,
     )?;
 
     unsafe {

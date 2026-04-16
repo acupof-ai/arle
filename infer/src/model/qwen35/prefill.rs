@@ -344,6 +344,7 @@ impl Qwen35Model {
                     ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
                     ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
 
+                    let start_pos = kv_cache.len();
                     let (kc, vc) = kv_cache.get_cache_mut(&self.ctx, full_idx)?;
                     let nrp = ops::NormRopeParams {
                         q_norm: &attn.q_norm,
@@ -367,6 +368,7 @@ impl Qwen35Model {
                         &mut bufs.q_prepped,
                         c.num_attention_heads,
                         c.num_key_value_heads,
+                        start_pos,
                         &bufs.start_pos_buf,
                         c.rotary_dim,
                     )?;
