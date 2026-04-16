@@ -295,18 +295,23 @@ impl<M: ModelForward> Scheduler<M> {
         let paged_kv_pool = {
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * CONTIGUOUS_KV_TOKENS * bytes_per_token;
-            let headroom = config.kv_pool_headroom_bytes;
+            // SGLang-compatible: pool budget = free − contiguous − headroom.
+            // Headroom is derived from mem_fraction_static via the auto-sizer;
+            // here we just subtract contiguous cost from post-weight-load free memory.
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
-                Ok((free, _)) => free.saturating_sub(contiguous_cost.saturating_add(headroom)),
+                Ok((free, total)) => {
+                    let headroom = ((total as f64) * (1.0 - config.mem_fraction_static)) as usize;
+                    free.saturating_sub(contiguous_cost.saturating_add(headroom))
+                }
                 Err(_) => config.kv_pool_fallback_bytes,
             };
 
             info!(
-                "TokenKVPool budget: {:.1} GB (contiguous KV={:.1} GB, headroom={:.1} GB)",
+                "TokenKVPool budget: {:.1} GB (contiguous={:.1} GB, fraction={:.0}%)",
                 budget_bytes as f64 / 1e9,
                 contiguous_cost as f64 / 1e9,
-                headroom as f64 / 1e9,
+                config.mem_fraction_static * 100.0,
             );
 
             let ctx = model.device_context();
@@ -415,9 +420,9 @@ impl<M: ModelForward> Scheduler<M> {
             }
         };
 
-        let reserved = config.gpu_reserved_bytes;
+        let headroom = ((total_bytes as f64) * (1.0 - config.mem_fraction_static)) as usize;
         let min_seq = config.min_seq_len;
-        let available = free_bytes.saturating_sub(reserved);
+        let available = free_bytes.saturating_sub(headroom);
         let bytes_per_token = model.kv_cache_bytes_per_token();
         let total_kv_budget = available;
         let per_slot_budget = total_kv_budget / config.max_slots.max(1);
@@ -426,11 +431,11 @@ impl<M: ModelForward> Scheduler<M> {
 
         info!(
             "KV cache auto-sizing: gpu_free={:.1} GB, gpu_total={:.1} GB, \
-             reserved={:.1} GB, bytes_per_token={}, num_slots={}, \
+             headroom={:.1} GB, bytes_per_token={}, num_slots={}, \
              affordable_seq_len={}, effective_max_seq_len={}",
             free_bytes as f64 / 1e9,
             total_bytes as f64 / 1e9,
-            reserved as f64 / 1e9,
+            headroom as f64 / 1e9,
             bytes_per_token,
             config.max_slots,
             affordable_seq_len,
