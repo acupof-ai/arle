@@ -21,9 +21,22 @@ impl<M: ModelForward> Scheduler<M> {
             self.pending_decode.is_none(),
             "pending decode must be cleared before scheduler step"
         );
+        self.pending_mixed_prefill_idx = None;
         let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            self.step_decode_launch();
+            let mixed_prefill_idx = self
+                .active
+                .iter()
+                .enumerate()
+                .find(|(_, r)| {
+                    matches!(r.phase, Phase::Prefilling { .. }) && !r.delta_tx.is_closed()
+                })
+                .map(|(i, _)| i);
+            if let Some(pi) = mixed_prefill_idx {
+                self.step_decode_launch_mixed(pi);
+            } else {
+                self.step_decode_launch();
+            }
             t.elapsed().as_micros()
         } else {
             0
@@ -83,11 +96,10 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             1 // High concurrency: protect decode latency
         };
-        // TODO(mixed-batch): once `PendingDecode` tracks a merged prefill
-        // request, exclude it here so Phase 2c does not run a duplicate prefill
-        // after the decode launch queued the mixed eager forward on the same stream.
+        let already_mixed = self.pending_mixed_prefill_idx.take();
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
+            .filter(|&i| Some(i) != already_mixed)
             .take(max_prefills)
             .collect();
         for idx in prefill_indices {

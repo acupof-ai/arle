@@ -476,6 +476,101 @@ impl FlashInferDecodeMetadata {
         Ok(reallocated)
     }
 
+    /// Upload metadata for a mixed decode + single-chunk prefill batch.
+    ///
+    /// Layout:
+    /// - decode requests: one Q row each
+    /// - prefill request: `prefill_token_count` consecutive Q rows
+    /// - `qo_indptr`: `[0, 1, 2, ..., B, B + C]`
+    pub fn update_mixed(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        decode_slot_indices: &[usize],
+        prefill_slot_idx: usize,
+        prefill_start_pos: usize,
+        prefill_token_count: usize,
+    ) -> Result<bool> {
+        if decode_slot_indices.is_empty() || prefill_token_count == 0 {
+            return Ok(false);
+        }
+
+        let request_count = decode_slot_indices.len() + 1;
+        let total_qo_rows = decode_slot_indices.len() + prefill_token_count;
+        let mut all_slots = Vec::with_capacity(request_count);
+        all_slots.extend_from_slice(decode_slot_indices);
+        all_slots.push(prefill_slot_idx);
+
+        self.positions_scratch.clear();
+        self.positions_scratch.extend(
+            decode_slot_indices
+                .iter()
+                .map(|&slot| (pool.seq_len(slot) - 1) as i32),
+        );
+        self.positions_scratch.extend(
+            (prefill_start_pos..prefill_start_pos + prefill_token_count).map(|pos| pos as i32),
+        );
+
+        self.indptr_h = pool.build_indptr(&all_slots);
+
+        let mut last_page_lens_h = pool.build_last_page_lens(decode_slot_indices);
+        let prefill_seq_len = pool.seq_len(prefill_slot_idx);
+        last_page_lens_h.push(if prefill_seq_len == 0 {
+            0
+        } else {
+            ((prefill_seq_len - 1) % pool.page_size + 1) as i32
+        });
+
+        self.qo_indptr_h.clear();
+        self.qo_indptr_h
+            .extend(0..=decode_slot_indices.len() as i32);
+        self.qo_indptr_h.push(total_qo_rows as i32);
+
+        self.indices_scratch.clear();
+        self.indices_scratch.extend(flatten_page_indices(
+            all_slots.iter().map(|&slot| pool.page_indices(slot)),
+        ));
+
+        let mut reallocated = false;
+        if self.indices_scratch.len() > self.max_total_pages {
+            self.kv_indices = ctx
+                .stream
+                .alloc_zeros(self.indices_scratch.len())
+                .map_err(|e| anyhow::anyhow!("Realloc mixed kv_indices: {e}"))?;
+            self.max_total_pages = self.indices_scratch.len();
+            reallocated = true;
+        }
+
+        ctx.stream
+            .memcpy_htod(&self.positions_scratch, &mut self.positions)
+            .map_err(|e| anyhow::anyhow!("H2D mixed positions: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.indptr_h, &mut self.kv_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D mixed indptr: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&last_page_lens_h, &mut self.kv_last_page_len)
+            .map_err(|e| anyhow::anyhow!("H2D mixed last_page_len: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.qo_indptr_h, &mut self.qo_indptr)
+            .map_err(|e| anyhow::anyhow!("H2D mixed qo_indptr: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&self.indices_scratch, &mut self.kv_indices)
+            .map_err(|e| anyhow::anyhow!("H2D mixed indices: {e}"))?;
+
+        self.total_tokens = *self
+            .indptr_h
+            .last()
+            .expect("mixed indptr must contain the terminal entry")
+            as usize;
+        self.plan_dirty = true;
+        self.plan_batch_size = 0;
+        self.prev_slot_indices.clear();
+        self.prev_slot_epochs.clear();
+        self.last_token_scratch.clear();
+
+        Ok(reallocated)
+    }
+
     /// Call FlashInfer's plan step (CPU-side scheduling).
     ///
     /// Must be called once per decode step after `update()`, before any layer

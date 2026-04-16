@@ -428,4 +428,34 @@ impl ModelForward for Qwen3Model {
             _ => self.decode_batch_contiguous(tokens, states, slot_indices),
         }
     }
+
+    fn supports_mixed_batch(&self) -> bool {
+        true
+    }
+
+    fn forward_mixed_batch(
+        &self,
+        decode_tokens: &[u32],
+        prefill_tokens: &[u32],
+        states: &mut [Self::State],
+        decode_slot_indices: &[usize],
+        prefill_slot_idx: usize,
+        prefill_start_pos: usize,
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        match paged_kv_pool {
+            Some(pool) if pool.is_active() => self.decode_batch_with_prefill(
+                decode_tokens,
+                prefill_tokens,
+                states,
+                decode_slot_indices,
+                prefill_slot_idx,
+                prefill_start_pos,
+                pool,
+                decode_ctx,
+            ),
+            _ => Ok(false),
+        }
+    }
 }

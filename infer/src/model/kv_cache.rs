@@ -336,6 +336,11 @@ impl KVCache {
         &self.v_cache
     }
 
+    /// Mutable access to the K/V cache pair for one layer.
+    pub(crate) fn layer_kv_caches_mut(&mut self, layer: usize) -> (&mut DeviceVec, &mut DeviceVec) {
+        (&mut self.k_cache[layer], &mut self.v_cache[layer])
+    }
+
     /// Access contiguous INT8 K caches for migration to paged pool.
     pub(crate) fn k_caches_q(&self) -> &[CudaSlice<i8>] {
         &self.k_cache_q

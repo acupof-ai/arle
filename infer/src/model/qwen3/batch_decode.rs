@@ -6,10 +6,10 @@
 //! then FlashInfer's batch decode handles attention in a single launch.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use log::info;
 
 use super::config::Config;
@@ -18,6 +18,7 @@ use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
+use infer_cuda_kernels::ffi;
 use infer_cuda_kernels::kv_quant;
 use infer_cuda_kernels::kv_turboquant;
 use infer_cuda_kernels::prelude::{
@@ -90,6 +91,7 @@ unsafe impl Send for BatchDecodeBuffers {}
 
 #[allow(dead_code)]
 pub(crate) struct MixedBatchBuffers {
+    embedding_out: HiddenStates,
     hidden_out: HiddenStates,
     normed: HiddenStates,
     q_batch: HiddenStates,
@@ -97,6 +99,8 @@ pub(crate) struct MixedBatchBuffers {
     v_batch: HiddenStates,
     qkv_batch: HiddenStates,
     attn_output: HiddenStates,
+    gate_out: HiddenStates,
+    up_out: HiddenStates,
     o_buf: HiddenStates,
     gate_up_out: HiddenStates,
     act_out: HiddenStates,
@@ -119,6 +123,7 @@ impl MixedBatchBuffers {
         let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
 
         Ok(Self {
+            embedding_out: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
             hidden_out: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
             normed: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
             q_batch: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
@@ -126,6 +131,8 @@ impl MixedBatchBuffers {
             v_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
             qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_tokens)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
+            gate_out: HiddenStates::zeros(ctx, model_config.intermediate_size, max_tokens)?,
+            up_out: HiddenStates::zeros(ctx, model_config.intermediate_size, max_tokens)?,
             o_buf: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
             gate_up_out: HiddenStates::zeros(ctx, 2 * model_config.intermediate_size, max_tokens)?,
             act_out: HiddenStates::zeros(ctx, model_config.intermediate_size, max_tokens)?,
@@ -142,6 +149,23 @@ impl MixedBatchBuffers {
             )?,
             max_tokens,
         })
+    }
+
+    fn set_seq_len(&mut self, seq_len: usize) {
+        self.embedding_out.seq_len = seq_len;
+        self.hidden_out.seq_len = seq_len;
+        self.normed.seq_len = seq_len;
+        self.q_batch.seq_len = seq_len;
+        self.k_batch.seq_len = seq_len;
+        self.v_batch.seq_len = seq_len;
+        self.qkv_batch.seq_len = seq_len;
+        self.attn_output.seq_len = seq_len;
+        self.gate_out.seq_len = seq_len;
+        self.up_out.seq_len = seq_len;
+        self.o_buf.seq_len = seq_len;
+        self.gate_up_out.seq_len = seq_len;
+        self.act_out.seq_len = seq_len;
+        self.logits.seq_len = seq_len;
     }
 }
 
@@ -311,21 +335,392 @@ impl Qwen3Model {
     #[allow(dead_code)]
     pub(crate) fn decode_batch_with_prefill(
         &self,
-        _decode_tokens: &[u32],
-        _prefill_tokens: &[u32],
-        _states: &mut [Qwen3State],
-        _decode_slot_indices: &[usize],
-        _prefill_slot_idx: usize,
-        _prefill_start_pos: usize,
+        decode_tokens: &[u32],
+        prefill_tokens: &[u32],
+        states: &mut [Qwen3State],
+        decode_slot_indices: &[usize],
+        prefill_slot_idx: usize,
+        prefill_start_pos: usize,
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<bool> {
-        let _mixed = bufs.mixed_buffers_mut(self, paged_kv_pool)?;
-        // TODO(mixed-batch): wire eager mixed decode+prefill once the Rust side
-        // exposes the paged multi-token prefill prep path with validated kernel
-        // argument ordering. Until then, fall back to the existing separate
-        // decode-only + prefill-only scheduler paths.
-        Ok(false)
+        let b = decode_tokens.len();
+        let c = prefill_tokens.len();
+        if b == 0 || c == 0 {
+            return Ok(false);
+        }
+        if paged_kv_pool.format != KVFormat::BF16 || c > MIXED_PREFILL_CAP {
+            return Ok(false);
+        }
+        let pool_seq = paged_kv_pool.seq_len(prefill_slot_idx);
+        if pool_seq != prefill_start_pos {
+            return Ok(false);
+        }
+
+        let prefill_state = &mut states[prefill_slot_idx];
+        if prefill_state.base.kv_cache.k_caches().is_empty()
+            || prefill_start_pos + c > prefill_state.base.kv_cache.max_seq_len()
+        {
+            return Ok(false);
+        }
+
+        paged_kv_pool.alloc_tokens(prefill_slot_idx, c)?;
+
+        if bufs.logits_batch.is_none() {
+            let vocab_size = self.output_projection().rows;
+            bufs.logits_batch = Some(HiddenStates::zeros(
+                &self.ctx,
+                vocab_size,
+                bufs.max_batch_size,
+            )?);
+        }
+        let logits_batch_ptr = bufs.logits_batch.as_mut().unwrap() as *mut HiddenStates;
+
+        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool)?;
+        let total_tokens = b + c;
+        if total_tokens > mixed.max_tokens {
+            return Ok(false);
+        }
+        mixed.set_seq_len(total_tokens);
+
+        let mut combined_tokens = Vec::with_capacity(total_tokens);
+        combined_tokens.extend(decode_tokens.iter().map(|&tok| tok as i32));
+        combined_tokens.extend(prefill_tokens.iter().map(|&tok| tok as i32));
+        self.ctx
+            .stream
+            .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
+            .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
+
+        let _ = mixed.metadata.update_mixed(
+            &self.ctx,
+            paged_kv_pool,
+            decode_slot_indices,
+            prefill_slot_idx,
+            prefill_start_pos,
+            c,
+        )?;
+        mixed.metadata.tc_plan(
+            &self.ctx,
+            b + 1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            paged_kv_pool.page_size,
+            self.config.head_dim,
+        )?;
+
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &mixed.token_ids_gpu,
+            &mut mixed.embedding_out,
+        )?;
+
+        let prefill_page_table: Vec<i32> = paged_kv_pool
+            .page_indices(prefill_slot_idx)
+            .iter()
+            .map(|&idx| idx as i32)
+            .collect();
+
+        let hidden_ptr = &mut mixed.embedding_out as *mut HiddenStates;
+        let eps = self.config.rms_norm_eps;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let bf16_size = std::mem::size_of::<u16>();
+        let page_size = paged_kv_pool.page_size;
+        let prefill_max_seq_len = prefill_state.base.kv_cache.max_seq_len() as i32;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let hidden = unsafe { &mut *hidden_ptr };
+            let skip_input_norm = layer_idx > 0;
+            let next_input_norm = self
+                .layers
+                .get(layer_idx + 1)
+                .map(|next_layer| &next_layer.input_layernorm);
+
+            if !skip_input_norm {
+                ops::rms_norm_batch_into(
+                    &self.ctx,
+                    hidden,
+                    &layer.input_layernorm,
+                    eps,
+                    &mut mixed.normed,
+                );
+            }
+
+            if layer.attention.q_proj.is_quantized() {
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.attention.q_proj,
+                    &mixed.normed,
+                    &mut mixed.q_batch,
+                );
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.attention.k_proj,
+                    &mixed.normed,
+                    &mut mixed.k_batch,
+                );
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.attention.v_proj,
+                    &mixed.normed,
+                    &mut mixed.v_batch,
+                );
+            } else {
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.attention.qkv_proj,
+                    &mixed.normed,
+                    &mut mixed.qkv_batch,
+                );
+                ops::split_qkv_batch(
+                    &self.ctx,
+                    &mixed.qkv_batch,
+                    &mut mixed.q_batch,
+                    &mut mixed.k_batch,
+                    &mut mixed.v_batch,
+                )?;
+            }
+
+            let nrp = ops::NormRopeParams {
+                q_norm: &layer.attention.q_norm,
+                k_norm: &layer.attention.k_norm,
+                cos_cache: &self.cos_cache,
+                sin_cache: &self.sin_cache,
+                rms_eps: eps,
+            };
+
+            let (q_ptr, _gq) = mixed.q_batch.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _gk) = mixed.k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _gv) = mixed.v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _gcos) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _gsin) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (pos_ptr, _gpos) = mixed.metadata.positions.device_ptr(&self.ctx.stream);
+            let (ind_ptr, _gind) = mixed.metadata.kv_indptr.device_ptr(&self.ctx.stream);
+            let (idx_ptr, _gidx) = mixed.metadata.kv_indices.device_ptr(&self.ctx.stream);
+            let (lp_ptr, _glp) = mixed.metadata.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let k_pool_ptr = paged_kv_pool.k_ptr(layer_idx, &self.ctx.stream);
+            let v_pool_ptr = paged_kv_pool.v_ptr(layer_idx, &self.ctx.stream);
+
+            unsafe {
+                ffi::decode_prep_paged_cuda(
+                    q_ptr as *mut ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    pos_ptr as *const i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                    idx_ptr as *const i32,
+                    ind_ptr as *const i32,
+                    lp_ptr as *const i32,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    page_size as i32,
+                    (paged_kv_pool.kv_dim * page_size) as i32,
+                    b as i32,
+                    eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+
+            let q_prefill_ptr = (q_ptr as usize + b * q_dim * bf16_size) as *mut ffi::Half;
+            let k_prefill_ptr = (k_ptr as usize + b * kv_dim * bf16_size) as *mut ffi::Half;
+            let v_prefill_ptr = (v_ptr as usize + b * kv_dim * bf16_size) as *const ffi::Half;
+            let (k_cache, v_cache) = prefill_state.base.kv_cache.layer_kv_caches_mut(layer_idx);
+            let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&self.ctx.stream);
+            let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&self.ctx.stream);
+
+            unsafe {
+                ffi::prefill_attention_prep_dual_write_cuda(
+                    q_prefill_ptr,
+                    k_prefill_ptr,
+                    v_prefill_ptr,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    kc_ptr as *mut ffi::Half,
+                    vc_ptr as *mut ffi::Half,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    c as i32,
+                    prefill_start_pos as i32,
+                    prefill_max_seq_len,
+                    eps,
+                    self.ctx.stream.cu_stream(),
+                    prefill_page_table.as_ptr(),
+                    page_size as i32,
+                    k_pool_ptr as *mut ffi::Half,
+                    v_pool_ptr as *mut ffi::Half,
+                )
+                .result()?;
+            }
+
+            let ret = {
+                let (fw_ptr, _gfw) = mixed
+                    .metadata
+                    .flashinfer_ws
+                    .float_workspace
+                    .device_ptr_mut(&self.ctx.stream);
+                let (iw_ptr, _giw) = mixed
+                    .metadata
+                    .flashinfer_ws
+                    .int_workspace
+                    .device_ptr_mut(&self.ctx.stream);
+                let (qoi_ptr, _gqoi) = mixed.metadata.qo_indptr.device_ptr(&self.ctx.stream);
+                let (o_ptr, _go) = mixed.attn_output.data.device_ptr_mut(&self.ctx.stream);
+                let (lse_ptr, _glse) = mixed
+                    .metadata
+                    .flashinfer_ws
+                    .lse
+                    .device_ptr_mut(&self.ctx.stream);
+
+                unsafe {
+                    ffi::flashinfer_tc_decode_run(
+                        fw_ptr as *mut u8,
+                        iw_ptr as *mut u8,
+                        mixed.metadata.flashinfer_ws.plan_info as *const u8,
+                        q_ptr as *const ffi::Half,
+                        qoi_ptr as *const i32,
+                        k_pool_ptr as *const ffi::Half,
+                        v_pool_ptr as *const ffi::Half,
+                        ind_ptr as *const i32,
+                        idx_ptr as *const i32,
+                        lp_ptr as *const i32,
+                        o_ptr as *mut ffi::Half,
+                        lse_ptr as *mut f32,
+                        (b + 1) as i32,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        page_size as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        self.ctx.stream.cu_stream(),
+                    )
+                }
+            };
+            if ret != 0 {
+                return Err(anyhow::anyhow!(
+                    "flashinfer_tc_decode_run failed with CUDA error {}",
+                    ret
+                ));
+            }
+
+            ops::gemm_into(
+                &self.ctx,
+                &layer.attention.o_proj,
+                &mixed.attn_output,
+                &mut mixed.o_buf,
+            );
+
+            ops::fused_add_rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &mixed.o_buf,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut mixed.normed,
+            );
+
+            if layer.mlp.gate_proj.is_quantized() {
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.mlp.gate_proj,
+                    &mixed.normed,
+                    &mut mixed.gate_out,
+                );
+                ops::gemm_into(
+                    &self.ctx,
+                    &layer.mlp.up_proj,
+                    &mixed.normed,
+                    &mut mixed.up_out,
+                );
+                ops::silu_mul_batch_into(
+                    &self.ctx,
+                    &mixed.gate_out,
+                    &mixed.up_out,
+                    &mut mixed.act_out,
+                )?;
+            } else {
+                ops::gemm_into(
+                    &self.ctx,
+                    layer
+                        .mlp
+                        .gate_up_proj
+                        .as_ref()
+                        .expect("merged gate_up_proj required"),
+                    &mixed.normed,
+                    &mut mixed.gate_up_out,
+                );
+                ops::silu_mul_fused_batch_into(&self.ctx, &mixed.gate_up_out, &mut mixed.act_out)?;
+            }
+
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.down_proj,
+                &mixed.act_out,
+                &mut mixed.o_buf,
+            );
+
+            if let Some(next_input_norm) = next_input_norm {
+                ops::fused_add_rms_norm_batch_into(
+                    &self.ctx,
+                    hidden,
+                    &mixed.o_buf,
+                    next_input_norm,
+                    eps,
+                    &mut mixed.normed,
+                );
+            } else {
+                ops::add_batch_into(&self.ctx, hidden, &mixed.o_buf, &mut mixed.hidden_out)?;
+                std::mem::swap(hidden, &mut mixed.hidden_out);
+            }
+        }
+
+        prefill_state.base.kv_cache.advance_seq_len(c);
+
+        let hidden = unsafe { &*hidden_ptr };
+        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &mixed.normed,
+            &mut mixed.logits,
+        );
+
+        {
+            let logits = unsafe { &mut *logits_batch_ptr };
+            logits.seq_len = b;
+            let src = mixed.logits.data.slice(0..b * logits.hidden_dim);
+            let mut dst = logits.data.slice_mut(0..b * logits.hidden_dim);
+            self.ctx
+                .stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
+        }
+
+        if prefill_state.base.prefill_logits.is_none() {
+            prefill_state.base.prefill_logits =
+                Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
+        }
+        ops::extract_vec_into(
+            &self.ctx,
+            &mixed.logits,
+            total_tokens - 1,
+            prefill_state.base.prefill_logits.as_mut().unwrap(),
+        )?;
+
+        Ok(true)
     }
 
     /// Batched decode: process B tokens from B different requests in one pass.
