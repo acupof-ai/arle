@@ -203,6 +203,18 @@ impl MlxArray {
             std::slice::from_raw_parts(ptr, len)
         }
     }
+    pub fn as_slice_i32(&self) -> Vec<i32> {
+        unsafe {
+            let ptr = mlx_sys::mlx_array_data_int32(self.0);
+            let len = mlx_sys::mlx_array_size(self.0);
+            if ptr.is_null() && len > 0 {
+                panic_if_mlx_error("mlx_array_data_int32");
+                panic!("mlx_array_data_int32 returned null for non-empty array");
+            }
+            panic_if_mlx_error("mlx_array_data_int32");
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        }
+    }
 }
 
 // ── Ops ──────────────────────────────────────────────────────────────────────
@@ -291,6 +303,12 @@ pub fn sum_axis(a: &MlxArray, ax: i32, kd: bool) -> MlxArray {
 }
 pub fn argmax(a: &MlxArray) -> MlxArray {
     mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_argmax(a.0, false) }, "mlx_argmax")
+}
+pub fn argmax_axis(a: &MlxArray, axis: i32) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_argmax_axis(a.0, axis, false) },
+        "mlx_argmax_axis",
+    )
 }
 pub fn where_(c: &MlxArray, a: &MlxArray, b: &MlxArray) -> MlxArray {
     mlx_array_from_raw_or_panic(unsafe { mlx_sys::mlx_where(c.0, a.0, b.0) }, "mlx_where")
