@@ -1024,15 +1024,30 @@ pub(crate) fn qwen35_dflash_speculative_block(
         );
     };
 
+    let n_capture_layers = runtime.target_layer_ids.len();
+    let mut per_step_hidden: Vec<Vec<MlxArray>> = Vec::with_capacity(runtime.block_size);
     let mut posterior_tokens = Vec::with_capacity(runtime.block_size);
     for (step, &tok) in block_tokens.iter().enumerate() {
-        let token_arr = Arr::from_slice_i32(&[tok as i32], &[1]);
+        let token_arr = MlxArray::from_slice_i32(&[tok as i32], &[1]);
         let logits = cpp_model.step(
             &token_arr,
             *target_cache_len + step as i32,
             target_kv_flat,
             target_gdr_flat,
         )?;
+        // BUG1 fix: capture hidden immediately — next step() overwrites prev_outputs
+        let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
+        let mut step_captures = Vec::with_capacity(n_cap.max(0) as usize);
+        for ci in 0..n_cap {
+            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+            let rc = unsafe {
+                mlx_sys::qwen35_get_captured_hidden(cpp_model.as_raw(), ci, &raw mut h_ptr)
+            };
+            if rc == 0 && !h_ptr.is_null() {
+                step_captures.push(unsafe { MlxArray::from_raw(h_ptr) });
+            }
+        }
+        per_step_hidden.push(step_captures);
         let sampled = super::sampling::gpu_sample_token(&logits, params);
         eval(&[&sampled]);
         posterior_tokens.push(sampled.item_i32() as u32);
@@ -1070,6 +1085,11 @@ pub(crate) fn qwen35_dflash_speculative_block(
             if i % 2 == 0 {
                 // Restore gdr_state from snapshot
                 target_gdr_flat[i] = snapshot_arr.clone();
+                // BUG4 fix: also restore conv_state from snapshot before rebuild
+                let conv_idx = i + 1;
+                if conv_idx < target_gdr_flat.len() && conv_idx < gdr_snapshot.len() {
+                    target_gdr_flat[conv_idx] = gdr_snapshot[conv_idx].clone();
+                }
                 // Replay accepted steps using tape
                 let tape_idx = i / 2;
                 let tape_count = unsafe { mlx_sys::qwen35_get_tape_count(cpp_model.as_raw()) };
@@ -1172,40 +1192,41 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // Update target cache position to accepted count
     *target_cache_len += accepted_inputs as i32;
 
-    // ── 6. Capture target hidden states from C++ model ──
-    let n_captured = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
-    let updated_target_hidden = if n_captured > 0 {
-        let mut captured: Vec<MlxArray> = Vec::with_capacity(n_captured as usize);
-        for ci in 0..n_captured {
-            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-            let rc = unsafe {
-                mlx_sys::qwen35_get_captured_hidden(cpp_model.as_raw(), ci, &raw mut h_ptr)
-            };
-            if rc == 0 && !h_ptr.is_null() {
-                captured.push(unsafe { Arr::from_raw(h_ptr) });
+    // ── 6. Build target_hidden from per-step captured hidden states ──
+    // Each step captured n_capture_layers hidden arrays, each [1, 1, hidden_size].
+    // Stack accepted steps per layer, then concatenate layers along hidden dim.
+    let updated_target_hidden =
+        if !per_step_hidden.is_empty() && per_step_hidden[0].len() == n_capture_layers {
+            let mut layer_stacks: Vec<Arr> = Vec::with_capacity(n_capture_layers);
+            for li in 0..n_capture_layers {
+                let per_tok: Vec<Arr> = per_step_hidden
+                    .iter()
+                    .take(accepted_inputs)
+                    .filter_map(|step| step.get(li).cloned())
+                    .collect();
+                if per_tok.is_empty() {
+                    layer_stacks.clear();
+                    break;
+                }
+                // Each element is [1, 1, hidden_size]. Reshape to [1, hidden_size] and stack.
+                let reshaped: Vec<Arr> = per_tok
+                    .iter()
+                    .map(|h| {
+                        let s = h.shape();
+                        let hdim = s.last().copied().unwrap_or(1);
+                        super::mlx::reshape(h, &[1, hdim])
+                    })
+                    .collect();
+                layer_stacks.push(concatenate_axis(&reshaped, 0));
             }
-        }
-        if !captured.is_empty() {
-            // Each captured hidden is [B, S, hidden_size] from the verify forward.
-            // Reshape to [S, hidden_size] (drop batch dim) and slice to accepted_inputs.
-            let mut sliced: Vec<MlxArray> = Vec::with_capacity(captured.len());
-            for h in &captured {
-                let shape = h.shape();
-                // shape = [1, block_size, hidden_size] → reshape to [block_size, hidden_size]
-                let seq = shape.get(1).copied().unwrap_or(1);
-                let hdim = shape.get(2).copied().unwrap_or(1);
-                let flat = super::mlx::reshape(h, &[seq, hdim]);
-                let accepted_i32 = i32::try_from(accepted_inputs).unwrap_or(1);
-                let cut = slice(&flat, &[0, 0], &[accepted_i32, hdim], &[1, 1]);
-                sliced.push(cut);
+            if layer_stacks.len() == n_capture_layers {
+                concatenate_axis(&layer_stacks, 1)
+            } else {
+                target_hidden.clone()
             }
-            concatenate_axis(&sliced, 1)
         } else {
             target_hidden.clone()
-        }
-    } else {
-        target_hidden.clone()
-    };
+        };
 
     let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
     for &tok in block_tokens

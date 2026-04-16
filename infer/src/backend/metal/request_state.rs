@@ -603,8 +603,14 @@ impl<'a> MetalRequestState<'a> {
                 MetalRequestStateInner::Qwen3(state)
             }
             MetalWeights::Qwen35(weights) => {
-                let driver =
-                    Qwen35StepDriver::new(weights, config, params, &prompt_tokens, max_new_tokens)?;
+                let driver = Qwen35StepDriver::new(
+                    weights,
+                    config,
+                    params,
+                    &prompt_tokens,
+                    max_new_tokens,
+                    dflash_runtime,
+                )?;
                 let state = ResumableRequestState::new(
                     driver,
                     prompt_tokens,
@@ -769,7 +775,7 @@ impl<'a> MetalRequestState<'a> {
     pub(crate) fn is_dflash_enabled(&self) -> bool {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => state.driver.dflash.is_some(),
-            _ => false,
+            MetalRequestStateInner::Qwen35(state) => state.driver.dflash.is_some(),
         }
     }
 
@@ -2274,6 +2280,7 @@ impl<'a> Qwen35StepDriver<'a> {
         params: &SamplingParams,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
+        dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
     ) -> Result<Self> {
         let MetalModelArch::Qwen35(arch) = &config.arch else {
             bail!("Qwen3.5 request state requires a Qwen3.5 config");
@@ -2322,6 +2329,27 @@ impl<'a> Qwen35StepDriver<'a> {
 
         let _ = prefill_len;
 
+        let dflash = if let Some((runtime, dflash_config)) = dflash_runtime {
+            Some(Qwen35DFlashState {
+                runtime,
+                config: dflash_config,
+                draft_state: dflash::ContiguousKvState::new(
+                    runtime.draft_num_hidden_layers(),
+                    runtime.draft_n_kv_heads(),
+                    runtime.draft_head_dim(),
+                    total_tokens_needed,
+                ),
+                target_hidden: None,
+                token_buffer: VecDeque::new(),
+                target_layer_ids: runtime.target_layer_ids().to_vec(),
+                acceptance_lengths: Vec::new(),
+                gdr_snapshot: None,
+                gdr_tapes: Vec::new(),
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             weights,
             config,
@@ -2330,7 +2358,7 @@ impl<'a> Qwen35StepDriver<'a> {
             kv_capacity: initial_cap,
             cache_len: 0,
             mode,
-            dflash: None,
+            dflash,
         })
     }
 
@@ -2517,9 +2545,15 @@ impl<'a> Qwen35StepDriver<'a> {
             return Ok(Vec::new());
         }
 
-        let mut replay =
-            Qwen35StepDriver::new(self.weights, self.config, &self.params, prompt_tokens, 1)
-                .context("build replay driver for Qwen3.5 prefix snapshots")?;
+        let mut replay = Qwen35StepDriver::new(
+            self.weights,
+            self.config,
+            &self.params,
+            prompt_tokens,
+            1,
+            None,
+        )
+        .context("build replay driver for Qwen3.5 prefix snapshots")?;
         let mut snapshots = Vec::with_capacity(prompt_tokens.len() / block_size);
 
         for chunk in prompt_tokens.chunks(block_size) {
