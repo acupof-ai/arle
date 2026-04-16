@@ -37,12 +37,11 @@ pub struct SchedulerConfig {
     /// Prefill chunk size cap when decode requests are active.
     /// Smaller values reduce decode latency at the cost of prefill throughput.
     pub decode_active_prefill_cap: usize,
-    /// GPU memory (bytes) reserved as headroom when auto-sizing KV cache.
-    pub gpu_reserved_bytes: usize,
+    /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
+    /// The remaining (1 - fraction) is headroom. Default 0.88.
+    pub mem_fraction_static: f64,
     /// Minimum sequence length per slot when auto-sizing KV cache.
     pub min_seq_len: usize,
-    /// GPU memory (bytes) reserved for KV pool headroom.
-    pub kv_pool_headroom_bytes: usize,
     /// Fallback KV pool budget (bytes) when GPU memory query fails.
     pub kv_pool_fallback_bytes: usize,
     /// Prefix-cache eviction high-water mark as a fraction of
@@ -93,9 +92,8 @@ impl Default for SchedulerConfig {
             max_waiting_requests: 256,
             preemption_mode: PreemptionMode::Recompute,
             decode_active_prefill_cap: 512,
-            gpu_reserved_bytes: 512 * 1024 * 1024,
+            mem_fraction_static: 0.88,
             min_seq_len: 256,
-            kv_pool_headroom_bytes: 4 * 1024 * 1024 * 1024,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
             // Defaults match the M3b shipped constants in
             // `scheduler/cuda/core.rs`. Tune via explicit field

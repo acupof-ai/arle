@@ -50,22 +50,12 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     decode_prefill_cap: usize,
 
-    /// GPU memory (MB) reserved at scheduler pool init time as a safety
-    /// margin on top of the weights + contiguous KV + pool budget. This is
-    /// the *pool-side* reserve, separate from `auto_num_slots`'s pre-load
-    /// reservation; reduce both flags together if you want to claw HBM
-    /// back from `auto_num_slots`.
-    #[arg(long, default_value_t = 512)]
-    gpu_reserved_mb: usize,
-
-    /// KV pool headroom (MB) carved out of the GPU budget before the
-    /// `TokenKVPool` is sized. Covers BatchDecodeBuffers (~750MB), CUDA
-    /// Graph captures (~500MB), FlashInfer workspace (~256MB), per-stream
-    /// scratch. Previous default 4096 was overly conservative (left ~5 GB
-    /// unused on L4, limited to 7 slots). Reduced to 2048 which still
-    /// provides ~500MB safety margin over measured peak.
-    #[arg(long, default_value_t = 2048)]
-    kv_pool_headroom_mb: usize,
+    /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
+    /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
+    /// FlashInfer workspace, and OS. Default 0.88 matches SGLang's auto-detect.
+    /// Increase to 0.92 on dedicated inference boxes; decrease to 0.80 if sharing GPU.
+    #[arg(long, default_value_t = 0.88)]
+    mem_fraction_static: f64,
 
     /// Minimum sequence length per slot when auto-sizing KV cache.
     #[arg(long, default_value_t = 256)]
@@ -113,8 +103,7 @@ async fn main() {
             model_path,
             args.max_seq_len,
             kv_pool_format,
-            args.gpu_reserved_mb,
-            args.kv_pool_headroom_mb,
+            args.mem_fraction_static,
         )
     });
 
@@ -138,8 +127,7 @@ async fn main() {
         },
         scheduler: SchedulerConfig {
             decode_active_prefill_cap: args.decode_prefill_cap,
-            gpu_reserved_bytes: args.gpu_reserved_mb.saturating_mul(1024 * 1024),
-            kv_pool_headroom_bytes: args.kv_pool_headroom_mb.saturating_mul(1024 * 1024),
+            mem_fraction_static: args.mem_fraction_static,
             min_seq_len: args.min_seq_len,
             kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
             ..SchedulerConfig::runtime_defaults(num_slots)
@@ -239,38 +227,24 @@ fn parse_kv_cache_mode(mode: &str) -> std::result::Result<(KVCacheDtype, KVForma
 /// `docs/experience/wins/2026-04-15-bench-hbm-peak-throughput.md` for the
 /// HBM inventory that surfaced this.
 ///
-/// **Reserve linking** (2026-04-15): instead of a 6 GB hardcoded headroom,
-/// the reserve is now derived from `--gpu-reserved-mb` + `--kv-pool-headroom-mb`
-/// + a 1 GB safety pad. Users who lower the headroom flags will see the
-/// extra HBM flow into more slots automatically.
+/// SGLang-compatible memory budget: `total_budget = gpu_total × mem_fraction_static`.
+/// KV budget = total_budget − weight_size. Single knob, no multi-parameter tuning.
 fn auto_num_slots(
     model_path: &str,
     max_seq_len: Option<usize>,
     kv_pool_format: KVFormat,
-    gpu_reserved_mb: usize,
-    kv_pool_headroom_mb: usize,
+    mem_fraction_static: f64,
 ) -> usize {
     use infer::backend::cuda::tensor::DeviceContext;
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;
     const CONTIGUOUS_CHUNK_SIZE: usize = 512;
-    // Safety pad on top of the user-controlled reserves: covers per-stream
-    // scratch and CUDA driver alloc fragmentation that the explicit budget
-    // numbers don't capture. Empirically observed peak HBM under saturating
-    // load is ~1.3 GB above the strict (weights + contig + pool) floor.
-    const SAFETY_PAD_BYTES: usize = 512 * 1024 * 1024; // 512 MB
     const MIN_SLOTS: usize = 4;
     const MAX_SLOTS: usize = 128;
 
-    let reserved_bytes = gpu_reserved_mb
-        .saturating_mul(1024 * 1024)
-        .saturating_add(kv_pool_headroom_mb.saturating_mul(1024 * 1024))
-        .saturating_add(SAFETY_PAD_BYTES);
-
     let seq_len = max_seq_len.unwrap_or(DEFAULT_SEQ_LEN);
 
-    // Estimate model weight size from safetensor files on disk
     let weight_bytes: u64 = std::fs::read_dir(Path::new(model_path))
         .ok()
         .map(|entries| {
@@ -282,8 +256,6 @@ fn auto_num_slots(
         })
         .unwrap_or(0);
 
-    // Ensure CUDA context is initialized before querying memory.
-    // DeviceContext::new() creates the cudarc CudaDevice which inits CUDA.
     let _ctx = match DeviceContext::new() {
         Ok(ctx) => ctx,
         Err(_) => {
@@ -292,7 +264,7 @@ fn auto_num_slots(
         }
     };
 
-    let (free_bytes, _total) = match DeviceContext::gpu_memory_info() {
+    let (_free_bytes, total_bytes) = match DeviceContext::gpu_memory_info() {
         Ok(info) => info,
         Err(_) => {
             info!("auto_num_slots: GPU memory query failed, using default 8 slots");
@@ -300,39 +272,29 @@ fn auto_num_slots(
         }
     };
 
-    // Available = GPU free - weights (estimated, not yet loaded) - reserved.
-    // The reserved value is now derived from CLI flags so the user can claw
-    // HBM back into more slots by lowering --kv-pool-headroom-mb.
-    let available = free_bytes
-        .saturating_sub(weight_bytes as usize)
-        .saturating_sub(reserved_bytes);
+    // SGLang formula: total_budget = gpu_total × fraction, kv_budget = total_budget − weights
+    let total_budget = (total_bytes as f64 * mem_fraction_static) as usize;
+    let kv_budget = total_budget.saturating_sub(weight_bytes as usize);
 
-    // Per-slot cost estimate: KV cache + recurrent state at seq_len tokens.
-    // Now dtype-aware: INT8/FP8 quant pools roughly halve the per-slot cost
-    // vs bf16 and produce ~2× the slot count at default flags.
     let per_slot_bytes =
         estimate_per_slot_bytes(model_path, seq_len, CONTIGUOUS_CHUNK_SIZE, kv_pool_format);
 
     let slots = if per_slot_bytes > 0 {
-        (available / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
+        (kv_budget / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
     } else {
         8
     };
 
+    let headroom_gb = (total_bytes as f64 * (1.0 - mem_fraction_static)) / 1e9;
     info!(
-        "auto_num_slots: gpu_free={:.1}GB, weights={:.1}GB, reserved={:.1}GB \
-         (gpu_reserved={:.1}GB + pool_headroom={:.1}GB + safety_pad=1.0GB), \
-         available={:.1}GB, per_slot={:.1}MB (seq_len={}, chunk_size={}, dtype={:?}), slots={}",
-        free_bytes as f64 / 1e9,
+        "auto_num_slots: gpu_total={:.1}GB, weights={:.1}GB, fraction={:.0}%, \
+         headroom={:.1}GB, kv_budget={:.1}GB, per_slot={:.1}MB, slots={}",
+        total_bytes as f64 / 1e9,
         weight_bytes as f64 / 1e9,
-        reserved_bytes as f64 / 1e9,
-        gpu_reserved_mb as f64 / 1024.0,
-        kv_pool_headroom_mb as f64 / 1024.0,
-        available as f64 / 1e9,
+        mem_fraction_static * 100.0,
+        headroom_gb,
+        kv_budget as f64 / 1e9,
         per_slot_bytes as f64 / 1e6,
-        seq_len,
-        CONTIGUOUS_CHUNK_SIZE,
-        kv_pool_format,
         slots,
     );
 
