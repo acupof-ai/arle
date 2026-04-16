@@ -254,6 +254,7 @@ fn auto_num_slots(
     use std::path::Path;
 
     const DEFAULT_SEQ_LEN: usize = 4096;
+    const CONTIGUOUS_CHUNK_SIZE: usize = 512;
     // Safety pad on top of the user-controlled reserves: covers per-stream
     // scratch and CUDA driver alloc fragmentation that the explicit budget
     // numbers don't capture. Empirically observed peak HBM under saturating
@@ -309,7 +310,8 @@ fn auto_num_slots(
     // Per-slot cost estimate: KV cache + recurrent state at seq_len tokens.
     // Now dtype-aware: INT8/FP8 quant pools roughly halve the per-slot cost
     // vs bf16 and produce ~2× the slot count at default flags.
-    let per_slot_bytes = estimate_per_slot_bytes(model_path, seq_len, kv_pool_format);
+    let per_slot_bytes =
+        estimate_per_slot_bytes(model_path, seq_len, CONTIGUOUS_CHUNK_SIZE, kv_pool_format);
 
     let slots = if per_slot_bytes > 0 {
         (available / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
@@ -320,7 +322,7 @@ fn auto_num_slots(
     info!(
         "auto_num_slots: gpu_free={:.1}GB, weights={:.1}GB, reserved={:.1}GB \
          (gpu_reserved={:.1}GB + pool_headroom={:.1}GB + safety_pad=1.0GB), \
-         available={:.1}GB, per_slot={:.1}MB (seq_len={}, dtype={:?}), slots={}",
+         available={:.1}GB, per_slot={:.1}MB (seq_len={}, chunk_size={}, dtype={:?}), slots={}",
         free_bytes as f64 / 1e9,
         weight_bytes as f64 / 1e9,
         reserved_bytes as f64 / 1e9,
@@ -329,6 +331,7 @@ fn auto_num_slots(
         available as f64 / 1e9,
         per_slot_bytes as f64 / 1e6,
         seq_len,
+        CONTIGUOUS_CHUNK_SIZE,
         kv_pool_format,
         slots,
     );
@@ -342,7 +345,12 @@ fn auto_num_slots(
 /// FP8 quant pools auto-size to the smaller per-token footprint instead of
 /// being charged as bf16. The recurrent state (Qwen3.5 hybrid models) is
 /// always f32 regardless of the KV format choice.
-fn estimate_per_slot_bytes(model_path: &str, seq_len: usize, kv_pool_format: KVFormat) -> usize {
+fn estimate_per_slot_bytes(
+    model_path: &str,
+    _seq_len: usize,
+    chunk_size: usize,
+    kv_pool_format: KVFormat,
+) -> usize {
     use std::path::Path;
 
     let config_path = Path::new(model_path).join("config.json");
@@ -369,7 +377,7 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize, kv_pool_format: KVF
     // KVFormat::pool_bytes_per_kv_head (BF16=2*head_dim, INT8=head_dim+4
     // including per-token f32 scale, FP8=head_dim, TurboQuant=packed+norms).
     let bytes_per_kv_head_side = kv_pool_format.pool_bytes_per_kv_head(head_dim);
-    let kv_bytes = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side * seq_len;
+    let kv_bytes = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side * chunk_size;
     // Paged pool memory is budgeted separately via --kv-pool-headroom-mb
     // (default 4GB). The previous 2× multiplier was double-counting the pool
     // share and limiting Qwen3-4B to 7 slots on L4 (should be ~14+).
