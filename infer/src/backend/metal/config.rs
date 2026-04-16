@@ -62,7 +62,7 @@ pub(super) enum MetalModelArch {
 
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
 #[derive(Debug, Clone)]
-pub(super) struct MetalModelConfig {
+pub(crate) struct MetalModelConfig {
     pub(super) hidden_size: usize,
     pub(super) num_attention_heads: usize,
     pub(super) num_key_value_heads: usize,

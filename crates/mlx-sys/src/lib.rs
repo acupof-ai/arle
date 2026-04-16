@@ -523,6 +523,14 @@ unsafe extern "C" {
         out_g: *mut *mut mlx_array,
         out_qkv: *mut *mut mlx_array,
     ) -> i32;
+    pub fn qwen35_read_and_clear_gdr_tapes(
+        model: *mut std::ffi::c_void,
+        out_tapes: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+        out_g: *mut *mut mlx_array,
+        out_qkv: *mut *mut mlx_array,
+        capacity: i32,
+    ) -> i32;
     pub fn qwen35_set_capture_layers(
         model: *mut std::ffi::c_void,
         layer_ids: *const i32,
