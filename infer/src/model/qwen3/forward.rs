@@ -316,7 +316,6 @@ impl ModelForward for Qwen3Model {
             &mut decode_ctx.argmax_host,
             batch_size,
         )?;
-        // Read back logprobs
         let lp_tmp = self
             .ctx
             .stream
