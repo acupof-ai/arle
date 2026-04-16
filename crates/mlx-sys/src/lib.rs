@@ -123,6 +123,21 @@ unsafe extern "C" {
 
     // === Quantized ===
 
+    pub fn mlx_fused_quantized_gated_mlp(
+        x: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        gate_s: *mut mlx_array,
+        gate_b: *mut mlx_array,
+        up_w: *mut mlx_array,
+        up_s: *mut mlx_array,
+        up_b: *mut mlx_array,
+        down_w: *mut mlx_array,
+        down_s: *mut mlx_array,
+        down_b: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+    ) -> *mut mlx_array;
+
     pub fn mlx_quantized_matmul(
         x: *mut mlx_array,
         w: *mut mlx_array,

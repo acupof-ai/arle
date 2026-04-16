@@ -231,6 +231,26 @@ mlx_array* mlx_quantized_matmul(mlx_array* x, mlx_array* w, mlx_array* scales,
         transpose, group_size, bits)));
 }
 
+// Fused quantized gated MLP: out = down(silu(gate(x)) * up(x))
+// All three projections are 4-bit quantized. The fusion lets MLX's graph
+// compiler merge intermediate kernels and avoid DRAM round-trips for the
+// [N, intermediate] activation buffer.
+mlx_array* mlx_fused_quantized_gated_mlp(
+    mlx_array* x,
+    mlx_array* gate_w, mlx_array* gate_s, mlx_array* gate_b,
+    mlx_array* up_w,   mlx_array* up_s,   mlx_array* up_b,
+    mlx_array* down_w, mlx_array* down_s, mlx_array* down_b,
+    int32_t group_size, int32_t bits) {
+    MLX_TRY_RETURN([&]() {
+        auto& xr = *to_arr(x);
+        auto gate = quantized_matmul(xr, *to_arr(gate_w), *to_arr(gate_s), *to_arr(gate_b), true, group_size, bits);
+        auto up   = quantized_matmul(xr, *to_arr(up_w),   *to_arr(up_s),   *to_arr(up_b),   true, group_size, bits);
+        // silu(gate) * up — single fused elementwise
+        auto h = multiply(multiply(gate, sigmoid(gate)), up);
+        return from_arr(quantized_matmul(h, *to_arr(down_w), *to_arr(down_s), *to_arr(down_b), true, group_size, bits));
+    }());
+}
+
 mlx_array* mlx_dequantize(mlx_array* w, mlx_array* scales, mlx_array* biases,
                           int32_t group_size, int32_t bits) {
     MLX_TRY_RETURN(from_arr(dequantize(*to_arr(w), *to_arr(scales), *to_arr(biases),
