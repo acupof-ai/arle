@@ -544,6 +544,10 @@ pub fn build_varlen_decode_mask(left_padding: &[i32], batch_cache_len: i32) -> M
     let zero = zeros(&[batch, key_len], Dtype::Float32);
     let mask = where_(&cond, &neg_inf, &zero);
     let mask = expand_dims(&expand_dims(&mask, 1), 1);
+    // MLX >= 0.32 requires the additive mask dtype to match/promote to the
+    // SDPA output dtype. Q/K/V are bf16 here, so f32 no longer auto-promotes
+    // — cast explicitly.
+    let mask = as_dtype(&mask, Dtype::Bfloat16);
     eval(&[&mask]);
     mask
 }
@@ -782,7 +786,10 @@ mod tests {
         let mask = build_varlen_decode_mask(&[2, 0], 3);
         assert_eq!(mask.shape(), &[2, 1, 1, 4]);
 
-        let values = mask.as_slice_f32();
+        // mask is bf16 now (see build_varlen_decode_mask); cast back to f32 for inspection.
+        let mask_f32 = as_dtype(&mask, Dtype::Float32);
+        eval(&[&mask_f32]);
+        let values = mask_f32.as_slice_f32();
         assert!(values[0].is_infinite() && values[0].is_sign_negative());
         assert!(values[1].is_infinite() && values[1].is_sign_negative());
         assert_eq!(values[2], 0.0);

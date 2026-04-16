@@ -20,8 +20,11 @@ pub(super) fn extend_kv_cache(cache: &mut MlxArray, n_kv_heads: i32, head_dim: i
         return;
     }
 
+    // Inherit the batch dim from the existing cache — in the packed-decode
+    // path this cache holds multiple rows stacked along axis 0.
+    let batch = cache.shape().first().copied().unwrap_or(1);
     let extra = zeros(
-        &[1, n_kv_heads, new_cap - current_cap, head_dim],
+        &[batch, n_kv_heads, new_cap - current_cap, head_dim],
         cache.dtype(),
     );
     *cache = concatenate_axis(&[cache.clone(), extra], 2);
