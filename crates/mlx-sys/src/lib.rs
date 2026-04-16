@@ -58,6 +58,7 @@ unsafe extern "C" {
     pub fn mlx_array_item_float32(a: *mut mlx_array) -> f32;
     /// Access the underlying data pointer (after eval). Caller must not free.
     pub fn mlx_array_data_float32(a: *mut mlx_array) -> *const f32;
+    pub fn mlx_array_data_int32(a: *mut mlx_array) -> *const i32;
     pub fn mlx_array_size(a: *mut mlx_array) -> usize;
 
     // === Binary ops ===
@@ -118,6 +119,7 @@ unsafe extern "C" {
 
     pub fn mlx_sum_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
     pub fn mlx_argmax(a: *mut mlx_array, keepdims: bool) -> *mut mlx_array;
+    pub fn mlx_argmax_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
 
     // === Quantized ===
 

@@ -67,6 +67,10 @@ const float* mlx_array_data_float32(mlx_array* a) {
     MLX_TRY_RETURN(to_arr(a)->data<float>());
 }
 
+const int32_t* mlx_array_data_int32(mlx_array* a) {
+    MLX_TRY_RETURN(to_arr(a)->data<int32_t>());
+}
+
 size_t mlx_array_size(mlx_array* a) {
     MLX_TRY_RETURN_VALUE(0, to_arr(a)->size());
 }
@@ -211,6 +215,10 @@ mlx_array* mlx_sum_axis(mlx_array* a, int32_t axis, bool keepdims) {
 
 mlx_array* mlx_argmax(mlx_array* a, bool keepdims) {
     MLX_TRY_RETURN(from_arr(argmax(*to_arr(a), keepdims)));
+}
+
+mlx_array* mlx_argmax_axis(mlx_array* a, int axis, bool keepdims) {
+    MLX_TRY_RETURN(from_arr(argmax(*to_arr(a), axis, keepdims)));
 }
 
 // === Quantized ===

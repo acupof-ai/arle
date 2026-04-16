@@ -931,6 +931,15 @@ fn sample_rows(logits: &MlxArray, params: &SamplingParams) -> Result<Vec<u32>> {
         shape.len() == 2,
         "expected rank-2 logits, got shape {shape:?}"
     );
+    // Fast path: greedy (temperature ≤ ε) — single batched argmax, one eval,
+    // one GPU→CPU transfer via .tolist() instead of N separate .item() calls.
+    if params.temperature <= 1e-6 || params.top_k == 1 {
+        let tokens = super::mlx::argmax_axis(logits, -1);
+        eval(&[&tokens]);
+        let flat: Vec<i32> = tokens.as_slice_i32();
+        return Ok(flat.iter().map(|&t| t as u32).collect());
+    }
+    // Slow path: temperature sampling (per-row, unavoidable for different random draws).
     let mut row_tokens = Vec::with_capacity(shape[0] as usize);
     for row in 0..shape[0] {
         let row_logits = slice(logits, &[row, 0], &[row + 1, shape[1]], &[1, 1]);
