@@ -59,16 +59,12 @@ struct Args {
     gpu_reserved_mb: usize,
 
     /// KV pool headroom (MB) carved out of the GPU budget before the
-    /// `TokenKVPool` is sized. Default 4096 MB covers BatchDecodeBuffers
-    /// (~750MB), CUDA Graph captures (~500MB), FlashInfer workspace
-    /// (~256MB), per-stream scratch, and a safety pad. **Auto-sizing
-    /// links to this flag**: lowering it (e.g. `--kv-pool-headroom-mb
-    /// 1024`) frees ~3 GB for additional slots when combined with
-    /// `--gpu-reserved-mb` ≪ default. On a 24 GB L4, the default values
-    /// intentionally leave ~5 GB of HBM unused for safety; tune both
-    /// flags down together when you trust your workload's peak
-    /// memory footprint.
-    #[arg(long, default_value_t = 4096)]
+    /// `TokenKVPool` is sized. Covers BatchDecodeBuffers (~750MB), CUDA
+    /// Graph captures (~500MB), FlashInfer workspace (~256MB), per-stream
+    /// scratch. Previous default 4096 was overly conservative (left ~5 GB
+    /// unused on L4, limited to 7 slots). Reduced to 2048 which still
+    /// provides ~500MB safety margin over measured peak.
+    #[arg(long, default_value_t = 2048)]
     kv_pool_headroom_mb: usize,
 
     /// Minimum sequence length per slot when auto-sizing KV cache.
@@ -262,7 +258,7 @@ fn auto_num_slots(
     // scratch and CUDA driver alloc fragmentation that the explicit budget
     // numbers don't capture. Empirically observed peak HBM under saturating
     // load is ~1.3 GB above the strict (weights + contig + pool) floor.
-    const SAFETY_PAD_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
+    const SAFETY_PAD_BYTES: usize = 512 * 1024 * 1024; // 512 MB
     const MIN_SLOTS: usize = 4;
     const MAX_SLOTS: usize = 128;
 
@@ -374,11 +370,9 @@ fn estimate_per_slot_bytes(model_path: &str, seq_len: usize, kv_pool_format: KVF
     // including per-token f32 scale, FP8=head_dim, TurboQuant=packed+norms).
     let bytes_per_kv_head_side = kv_pool_format.pool_bytes_per_kv_head(head_dim);
     let kv_bytes = 2 * kv_layers * num_kv_heads * bytes_per_kv_head_side * seq_len;
-    // Also account for paged KV pool share (roughly 1× contiguous cost per slot).
-    // The pool allocator buys this back later via --kv-pool-headroom-mb, but
-    // for the per-slot capacity estimate we charge 2× contiguous to stay
-    // conservative on the total slot footprint.
-    let kv_bytes = kv_bytes * 2;
+    // Paged pool memory is budgeted separately via --kv-pool-headroom-mb
+    // (default 4GB). The previous 2× multiplier was double-counting the pool
+    // share and limiting Qwen3-4B to 7 slots on L4 (should be ~14+).
 
     // Recurrent state (if hybrid): per linear layer, fixed size independent of seq_len
     let num_linear_layers = num_layers.saturating_sub(kv_layers);
