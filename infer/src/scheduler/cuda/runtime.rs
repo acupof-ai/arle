@@ -219,6 +219,18 @@ impl<M: ModelForward> Scheduler<M> {
                 let free = self.paged_kv_pool.free_count() as u64;
                 self.metrics.set_kv_gpu_blocks(free, total);
             }
+            // Throttled GPU memory query — at most once per second.
+            if self.last_mem_query.elapsed().as_secs() >= 1 {
+                self.last_mem_query = std::time::Instant::now();
+                if let Ok((free, total)) =
+                    crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
+                {
+                    let active = (total - free) as u64;
+                    self.peak_mem_bytes = self.peak_mem_bytes.max(active);
+                    self.metrics
+                        .set_memory_bytes(active, self.peak_mem_bytes, 0);
+                }
+            }
 
             let total_us = step_start.elapsed().as_micros();
             if total_us > 50_000 {

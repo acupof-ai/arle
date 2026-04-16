@@ -128,6 +128,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) step_timing_emit_us: f64,
     pub(super) step_timing_prefill_us: f64,
     pub(super) step_timing_total_us: f64,
+    /// Throttled GPU memory query — last poll time and peak high-water mark.
+    pub(super) last_mem_query: std::time::Instant,
+    pub(super) peak_mem_bytes: u64,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -369,6 +372,8 @@ impl<M: ModelForward> Scheduler<M> {
             step_timing_emit_us: 0.0,
             step_timing_prefill_us: 0.0,
             step_timing_total_us: 0.0,
+            last_mem_query: std::time::Instant::now(),
+            peak_mem_bytes: 0,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(
