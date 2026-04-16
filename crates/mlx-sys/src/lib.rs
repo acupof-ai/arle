@@ -483,6 +483,33 @@ unsafe extern "C" {
         scale: f32,
         mask: *mut mlx_array,
     ) -> *mut mlx_array;
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_gated_delta_with_tape(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state_in: *mut mlx_array,
+        t: i32,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+        out_tape: *mut *mut mlx_array,
+    );
+    pub fn mlx_tape_replay(
+        tape: *mut mlx_array,
+        k: *mut mlx_array,
+        g: *mut mlx_array,
+        state_in: *mut mlx_array,
+        steps: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_batched_sdpa_2pass(
+        queries: *mut mlx_array,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        scale: f32,
+        gqa_factor: i32,
+    ) -> *mut mlx_array;
 
     // === Random ===
 

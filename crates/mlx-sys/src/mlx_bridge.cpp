@@ -1,4 +1,337 @@
 #include "mlx_common.h"
+#include <stdexcept>
+
+namespace {
+
+void require_rank(const array& arr, int expected, const char* name) {
+    if (arr.ndim() != expected) {
+        throw std::invalid_argument(std::string(name) + " must have rank " + std::to_string(expected));
+    }
+}
+
+void require_dtype(const array& arr, Dtype expected, const char* name) {
+    if (arr.dtype() != expected) {
+        throw std::invalid_argument(std::string(name) + " has an unexpected dtype");
+    }
+}
+
+auto& gated_delta_tape_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gated_delta_tape",
+        {"q", "k", "v", "g", "beta", "state_in", "T"},
+        {"y", "state_out", "innovation_tape"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y, innovation_tape: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto tape_ = innovation_tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        for (int t = 0; t < T; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+                out += state[i] * q_[s_idx];
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+                tape_[dv_idx] = static_cast<InT>(delta);
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            tape_ += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
+auto& tape_replay_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "tape_replay",
+        {"tape", "k", "g", "state_in", "T"},
+        {"state_out"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // tape: [B, T, Hv, Dv]
+        auto tape_ = tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        // k: [B, T, Hk, Dk]
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+          auto delta = static_cast<float>(tape_[dv_idx]);
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            state[i] = state[i] + k_[s_idx] * delta;
+          }
+          for (int i = 0; i < n_per_t; ++i) {
+            state[i] = static_cast<float>(static_cast<InT>(state[i]));
+          }
+          tape_ += Hv * Dv;
+          k_ += Hk * Dk;
+          g_ += Hv;
+        }
+
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
+auto& batched_sdpa_2pass_partials_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "batched_sdpa_2pass_partials",
+        {
+            "queries",
+            "keys",
+            "values",
+            "gqa_factor",
+            "N",
+            "k_head_stride",
+            "k_seq_stride",
+            "v_head_stride",
+            "v_seq_stride",
+            "scale",
+            "blocks",
+        },
+        {"partials", "sums", "maxs"},
+        R"(
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = D / BD;
+        constexpr int v_per_thread = V / BD;
+
+        auto q_head_idx = threadgroup_position_in_grid.x;
+        auto b_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+        auto q_seq_idx = thread_position_in_threadgroup.z;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto Hq = threadgroups_per_grid.x;
+        auto hk_idx = q_head_idx / gqa_factor;
+        auto q_batch_head_idx = b_idx * Hq + q_head_idx;
+        auto o_offset = q_batch_head_idx * M_FIXED + q_seq_idx;
+
+        auto q_ = queries + (o_offset * D) + simd_lid * qk_per_thread;
+        auto k_ = keys + ((b_idx * Hk + hk_idx) * k_head_stride) + block_idx * k_seq_stride + simd_lid * qk_per_thread;
+        auto v_ = values + ((b_idx * Hk + hk_idx) * v_head_stride) + block_idx * v_seq_stride + simd_lid * v_per_thread;
+
+        partials += (o_offset * blocks + block_idx) * V + simd_lid * v_per_thread;
+        sums += o_offset * blocks + block_idx;
+        maxs += o_offset * blocks + block_idx;
+
+        thread float q[qk_per_thread];
+        thread float o[v_per_thread];
+        threadgroup InT tg_k[BD * qk_per_thread];
+        threadgroup InT tg_v[BD * v_per_thread];
+
+        for (int i = 0; i < qk_per_thread; ++i) {
+            q[i] = static_cast<float>(scale) * static_cast<float>(q_[i]);
+        }
+        for (int i = 0; i < v_per_thread; ++i) {
+            o[i] = 0.0f;
+        }
+
+        float max_score = Limits<float>::finite_min;
+        float sum_exp_score = 0.0f;
+
+        for (int n = block_idx; n < N; n += blocks) {
+            if (q_seq_idx == 0) {
+                for (int i = 0; i < qk_per_thread; ++i) {
+                    tg_k[simd_lid * qk_per_thread + i] = k_[i];
+                }
+                for (int i = 0; i < v_per_thread; ++i) {
+                    tg_v[simd_lid * v_per_thread + i] = v_[i];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            bool use_key = (n <= (N - M_FIXED + q_seq_idx));
+
+            if (use_key) {
+                float score = 0.0f;
+                for (int i = 0; i < qk_per_thread; ++i) {
+                    score += q[i] * static_cast<float>(tg_k[simd_lid * qk_per_thread + i]);
+                }
+                score = simd_sum(score);
+
+                float new_max = metal::max(max_score, score);
+                float factor = fast::exp(max_score - new_max);
+                float exp_score = fast::exp(score - new_max);
+
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+                for (int i = 0; i < v_per_thread; ++i) {
+                    o[i] = o[i] * factor + exp_score * static_cast<float>(tg_v[simd_lid * v_per_thread + i]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            k_ += blocks * int(k_seq_stride);
+            v_ += blocks * int(v_seq_stride);
+        }
+
+        if (simd_lid == 0) {
+            sums[0] = sum_exp_score;
+            maxs[0] = max_score;
+        }
+        for (int i = 0; i < v_per_thread; ++i) {
+            partials[i] = static_cast<InT>(o[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
+auto& batched_sdpa_2pass_reduce_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "batched_sdpa_2pass_reduce",
+        {"partials", "sums", "maxs", "blocks"},
+        {"out"},
+        R"(
+        constexpr int BN = 32;
+        constexpr int BD = 32;
+        constexpr int elem_per_thread = V / BD;
+
+        auto head_idx = threadgroup_position_in_grid.x;
+        auto q_seq_idx = threadgroup_position_in_grid.y;
+        auto simd_gid = simdgroup_index_in_threadgroup;
+        auto simd_lid = thread_index_in_simdgroup;
+
+        auto q_offset = head_idx * M_FIXED + q_seq_idx;
+        partials += (q_offset * blocks + simd_gid) * V + simd_lid * elem_per_thread;
+        sums += q_offset * blocks;
+        maxs += q_offset * blocks;
+        out += q_offset * V + simd_gid * elem_per_thread;
+
+        thread float o[elem_per_thread];
+        threadgroup float outputs[BN * BD];
+
+        for (int i = 0; i < elem_per_thread; ++i) {
+            o[i] = 0.0f;
+        }
+
+        float sum_exp_score = 0.0f;
+        float max_score = Limits<float>::finite_min;
+
+        for (int b = 0; b < blocks / BN; ++b) {
+            max_score = metal::max(max_score, maxs[simd_lid + BN * b]);
+        }
+        max_score = simd_max(max_score);
+
+        for (int b = 0; b < blocks / BN; ++b) {
+            float factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
+            sum_exp_score += factor * sums[simd_lid + BN * b];
+        }
+        sum_exp_score = simd_sum(sum_exp_score);
+
+        for (int b = 0; b < blocks / BN; ++b) {
+            float factor = fast::exp(maxs[simd_gid] - max_score);
+            for (int i = 0; i < elem_per_thread; ++i) {
+                o[i] += factor * static_cast<float>(partials[i]);
+            }
+            maxs += BN;
+            partials += BN * V;
+        }
+
+        for (int i = 0; i < elem_per_thread; ++i) {
+            outputs[simd_lid * BD + simd_gid] = o[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+            o[i] = sum_exp_score == 0.0f ? o[i] : (o[i] / sum_exp_score);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (simd_lid == 0) {
+            for (int i = 0; i < elem_per_thread; ++i) {
+                out[i] = static_cast<InT>(o[i]);
+            }
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -297,6 +630,264 @@ mlx_array* mlx_fast_sdpa_masked(mlx_array* q, mlx_array* k, mlx_array* v,
         return from_arr(fast::scaled_dot_product_attention(
             *to_arr(q), *to_arr(k), *to_arr(v), scale, "",
             *to_arr(mask_arr)));
+    }());
+}
+
+void mlx_gated_delta_with_tape(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g, mlx_array* beta,
+    mlx_array* state_in, int T,
+    mlx_array** out_y, mlx_array** out_state, mlx_array** out_tape) {
+    try {
+        mlx_clear_error();
+        if (!out_y || !out_state || !out_tape) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape output pointers must be non-null");
+        }
+
+        auto q_arr = contiguous(*to_arr(q));
+        auto k_arr = contiguous(*to_arr(k));
+        auto v_arr = contiguous(*to_arr(v));
+        auto g_arr = contiguous(*to_arr(g));
+        auto beta_arr = contiguous(*to_arr(beta));
+        auto state_arr = contiguous(*to_arr(state_in));
+
+        require_rank(q_arr, 4, "q");
+        require_rank(k_arr, 4, "k");
+        require_rank(v_arr, 4, "v");
+        require_rank(g_arr, 3, "g");
+        require_rank(beta_arr, 3, "beta");
+        require_rank(state_arr, 4, "state_in");
+        require_dtype(q_arr, bfloat16, "q");
+        require_dtype(k_arr, bfloat16, "k");
+        require_dtype(v_arr, bfloat16, "v");
+        require_dtype(g_arr, bfloat16, "g");
+        require_dtype(beta_arr, bfloat16, "beta");
+        require_dtype(state_arr, float32, "state_in");
+
+        int B = q_arr.shape(0);
+        int T_q = q_arr.shape(1);
+        int Hk = q_arr.shape(2);
+        int Dk = q_arr.shape(3);
+        int Hv = v_arr.shape(2);
+        int Dv = v_arr.shape(3);
+
+        if (T != T_q || T != k_arr.shape(1) || T != v_arr.shape(1) || T != g_arr.shape(1) || T != beta_arr.shape(1)) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape got mismatched sequence lengths");
+        }
+        if (B != k_arr.shape(0) || B != v_arr.shape(0) || B != g_arr.shape(0) || B != beta_arr.shape(0) || B != state_arr.shape(0)) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape got mismatched batch dimensions");
+        }
+        if (Hk != k_arr.shape(2) || Dk != k_arr.shape(3)) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape got mismatched q/k shapes");
+        }
+        if (Hv != g_arr.shape(2) || Hv != beta_arr.shape(2) || Hv != state_arr.shape(1) || Dv != state_arr.shape(2) || Dk != state_arr.shape(3)) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape got mismatched head/state shapes");
+        }
+        if (Hk <= 0 || Dk < 32 || (Dk % 32) != 0 || (Hv % Hk) != 0) {
+            throw std::invalid_argument("mlx_gated_delta_with_tape requires Dk multiple of 32 and Hv divisible by Hk");
+        }
+
+        std::vector<array> inputs = {q_arr, k_arr, v_arr, g_arr, beta_arr, state_arr, array(T)};
+        std::vector<Shape> out_shapes = {
+            Shape{B, T, Hv, Dv},
+            state_arr.shape(),
+            Shape{B, T, Hv, Dv},
+        };
+        std::vector<Dtype> out_dtypes = {bfloat16, float32, bfloat16};
+        std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+            {"Dk", fast::TemplateArg(Dk)},
+            {"Dv", fast::TemplateArg(Dv)},
+            {"Hk", fast::TemplateArg(Hk)},
+            {"Hv", fast::TemplateArg(Hv)},
+            {"InT", fast::TemplateArg(bfloat16)},
+            {"StT", fast::TemplateArg(float32)},
+        };
+
+        auto result = gated_delta_tape_kernel()(
+            inputs, out_shapes, out_dtypes,
+            std::make_tuple(32, Dv, B * Hv),
+            std::make_tuple(32, 4, 1),
+            tmpl,
+            std::nullopt,
+            false,
+            {});
+
+        *out_y = from_arr(std::move(result[0]));
+        *out_state = from_arr(std::move(result[1]));
+        *out_tape = from_arr(std::move(result[2]));
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        if (out_y) {
+            *out_y = nullptr;
+        }
+        if (out_state) {
+            *out_state = nullptr;
+        }
+        if (out_tape) {
+            *out_tape = nullptr;
+        }
+    }
+}
+
+mlx_array* mlx_tape_replay(
+    mlx_array* tape, mlx_array* k, mlx_array* g, mlx_array* state_in, int steps) {
+    MLX_TRY_RETURN([&]() {
+        auto tape_arr = contiguous(*to_arr(tape));
+        auto k_arr = contiguous(*to_arr(k));
+        auto g_arr = contiguous(*to_arr(g));
+        auto state_arr = contiguous(*to_arr(state_in));
+
+        require_rank(tape_arr, 4, "tape");
+        require_rank(k_arr, 4, "k");
+        require_rank(g_arr, 3, "g");
+        require_rank(state_arr, 4, "state_in");
+        require_dtype(tape_arr, bfloat16, "tape");
+        require_dtype(k_arr, bfloat16, "k");
+        require_dtype(g_arr, bfloat16, "g");
+        require_dtype(state_arr, float32, "state_in");
+
+        int B = tape_arr.shape(0);
+        int T = tape_arr.shape(1);
+        int Hv = tape_arr.shape(2);
+        int Dv = tape_arr.shape(3);
+        int Hk = k_arr.shape(2);
+        int Dk = k_arr.shape(3);
+
+        if (steps != T || steps != k_arr.shape(1) || steps != g_arr.shape(1)) {
+            throw std::invalid_argument("mlx_tape_replay got mismatched step counts");
+        }
+        if (B != k_arr.shape(0) || B != g_arr.shape(0) || B != state_arr.shape(0)) {
+            throw std::invalid_argument("mlx_tape_replay got mismatched batch dimensions");
+        }
+        if (Hv != g_arr.shape(2) || Hv != state_arr.shape(1) || Dv != state_arr.shape(2) || Dk != state_arr.shape(3)) {
+            throw std::invalid_argument("mlx_tape_replay got mismatched tape/state shapes");
+        }
+        if (Hk <= 0 || Dk < 32 || (Dk % 32) != 0 || (Hv % Hk) != 0) {
+            throw std::invalid_argument("mlx_tape_replay requires Dk multiple of 32 and Hv divisible by Hk");
+        }
+
+        std::vector<array> inputs = {tape_arr, k_arr, g_arr, state_arr, array(steps)};
+        std::vector<Shape> out_shapes = {state_arr.shape()};
+        std::vector<Dtype> out_dtypes = {float32};
+        std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+            {"Dk", fast::TemplateArg(Dk)},
+            {"Dv", fast::TemplateArg(Dv)},
+            {"Hk", fast::TemplateArg(Hk)},
+            {"Hv", fast::TemplateArg(Hv)},
+            {"InT", fast::TemplateArg(bfloat16)},
+            {"StT", fast::TemplateArg(float32)},
+        };
+
+        auto result = tape_replay_kernel()(
+            inputs, out_shapes, out_dtypes,
+            std::make_tuple(32, Dv, B * Hv),
+            std::make_tuple(32, 4, 1),
+            tmpl,
+            std::nullopt,
+            false,
+            {});
+
+        return from_arr(std::move(result[0]));
+    }());
+}
+
+mlx_array* mlx_batched_sdpa_2pass(
+    mlx_array* queries, mlx_array* keys, mlx_array* values,
+    float scale, int gqa_factor) {
+    MLX_TRY_RETURN([&]() {
+        constexpr int blocks = 128;
+
+        auto queries_arr = contiguous(*to_arr(queries));
+        auto keys_arr = contiguous(*to_arr(keys));
+        auto values_arr = contiguous(*to_arr(values));
+
+        require_rank(queries_arr, 4, "queries");
+        require_rank(keys_arr, 4, "keys");
+        require_rank(values_arr, 4, "values");
+        require_dtype(queries_arr, bfloat16, "queries");
+        require_dtype(keys_arr, bfloat16, "keys");
+        require_dtype(values_arr, bfloat16, "values");
+
+        int bsz = queries_arr.shape(0);
+        int Hq = queries_arr.shape(1);
+        int q_len = queries_arr.shape(2);
+        int D = queries_arr.shape(3);
+        int Hk = keys_arr.shape(1);
+        int N = keys_arr.shape(2);
+        int V = values_arr.shape(3);
+
+        if (bsz != keys_arr.shape(0) || bsz != values_arr.shape(0)) {
+            throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched batch dimensions");
+        }
+        if (Hk != values_arr.shape(1) || N != values_arr.shape(2)) {
+            throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched kv shapes");
+        }
+        if (q_len != 16) {
+            throw std::invalid_argument("mlx_batched_sdpa_2pass requires query length 16");
+        }
+        if ((D != 128 && D != 256) || D != V) {
+            throw std::invalid_argument("mlx_batched_sdpa_2pass requires D == V and D in {128, 256}");
+        }
+        if (Hk <= 0 || gqa_factor <= 0 || Hq != Hk * gqa_factor) {
+            throw std::invalid_argument("mlx_batched_sdpa_2pass got an invalid gqa_factor");
+        }
+
+        int k_head_stride = keys_arr.shape(2) * keys_arr.shape(3);
+        int k_seq_stride = keys_arr.shape(3);
+        int v_head_stride = values_arr.shape(2) * values_arr.shape(3);
+        int v_seq_stride = values_arr.shape(3);
+
+        std::vector<array> partial_inputs = {
+            queries_arr,
+            keys_arr,
+            values_arr,
+            array(gqa_factor),
+            array(N),
+            array(k_head_stride),
+            array(k_seq_stride),
+            array(v_head_stride),
+            array(v_seq_stride),
+            array(scale),
+            array(blocks),
+        };
+        Shape partial_shape{bsz * Hq, q_len, blocks, V};
+        Shape stats_shape{bsz * Hq, q_len, blocks};
+        std::vector<std::pair<std::string, fast::TemplateArg>> partial_tmpl = {
+            {"InT", fast::TemplateArg(bfloat16)},
+            {"D", fast::TemplateArg(D)},
+            {"V", fast::TemplateArg(V)},
+            {"Hk", fast::TemplateArg(Hk)},
+            {"M_FIXED", fast::TemplateArg(q_len)},
+        };
+
+        auto partials_result = batched_sdpa_2pass_partials_kernel()(
+            partial_inputs,
+            {partial_shape, stats_shape, stats_shape},
+            {bfloat16, float32, float32},
+            std::make_tuple(Hq * 32, bsz, blocks * q_len),
+            std::make_tuple(32, 1, q_len),
+            partial_tmpl,
+            std::nullopt,
+            false,
+            {});
+
+        std::vector<std::pair<std::string, fast::TemplateArg>> reduce_tmpl = {
+            {"InT", fast::TemplateArg(bfloat16)},
+            {"V", fast::TemplateArg(V)},
+            {"M_FIXED", fast::TemplateArg(q_len)},
+        };
+
+        auto out_result = batched_sdpa_2pass_reduce_kernel()(
+            {partials_result[0], partials_result[1], partials_result[2], array(blocks)},
+            {queries_arr.shape()},
+            {bfloat16},
+            std::make_tuple((bsz * Hq) * 1024, q_len, 1),
+            std::make_tuple(1024, 1, 1),
+            reduce_tmpl,
+            std::nullopt,
+            false,
+            {});
+
+        return from_arr(std::move(out_result[0]));
     }());
 }
 
