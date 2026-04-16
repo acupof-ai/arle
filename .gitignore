@@ -13,5 +13,5 @@ release/
 models/
 .DS_Store
 .context/
-vendor/
+/vendor/
 bench-output/
