@@ -49,21 +49,21 @@ __device__ __forceinline__ float rms_norm_head(
 // Requires shared memory buffer of HEAD_DIM floats, pre-filled with normed values
 __device__ __forceinline__ float apply_rope_half_split(
     float* smem,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
     int pos,
     int tid
 ) {
     int half_dim = HEAD_DIM / 2;
     float result;
     if (tid < half_dim) {
-        float cos_val = __bfloat162float(cos_cache[pos * HEAD_DIM + tid]);
-        float sin_val = __bfloat162float(sin_cache[pos * HEAD_DIM + tid]);
+        float cos_val = __bfloat162float(__ldg(cos_cache + pos * HEAD_DIM + tid));
+        float sin_val = __bfloat162float(__ldg(sin_cache + pos * HEAD_DIM + tid));
         result = smem[tid] * cos_val - smem[tid + half_dim] * sin_val;
     } else {
         int pair = tid - half_dim;
-        float cos_val = __bfloat162float(cos_cache[pos * HEAD_DIM + pair]);
-        float sin_val = __bfloat162float(sin_cache[pos * HEAD_DIM + pair]);
+        float cos_val = __bfloat162float(__ldg(cos_cache + pos * HEAD_DIM + pair));
+        float sin_val = __bfloat162float(__ldg(sin_cache + pos * HEAD_DIM + pair));
         result = smem[pair] * sin_val + smem[tid] * cos_val;
     }
     return result;
@@ -100,14 +100,15 @@ __global__ void decode_prep_paged_kernel(
     // ---- Process Q heads (gqa_ratio per KV head) ----
     __shared__ float smem_rope[HEAD_DIM];
 
-    float q_norm_w = __bfloat162float(q_norm_weight[tid]);
-    float k_norm_w = __bfloat162float(k_norm_weight[tid]);
+    float q_norm_w = __bfloat162float(__ldg(q_norm_weight + tid));
+    float k_norm_w = __bfloat162float(__ldg(k_norm_weight + tid));
 
+    #pragma unroll
     for (int g = 0; g < gqa_ratio; g++) {
         int q_head = kv_head_idx * gqa_ratio + g;
         int q_offset = batch_idx * num_qo_heads * HEAD_DIM + q_head * HEAD_DIM + tid;
 
-        float q_val = __bfloat162float(q_batch[q_offset]);
+        float q_val = __bfloat162float(__ldg(q_batch + q_offset));
         float q_normed = rms_norm_head(q_val, q_norm_w, rms_eps, tid);
 
         smem_rope[tid] = q_normed;
@@ -121,7 +122,7 @@ __global__ void decode_prep_paged_kernel(
 
     // ---- Process K: norm + rope ----
     int kv_offset = batch_idx * num_kv_heads * HEAD_DIM + kv_head_idx * HEAD_DIM + tid;
-    float k_val = __bfloat162float(k_batch[kv_offset]);
+    float k_val = __bfloat162float(__ldg(k_batch + kv_offset));
     float k_normed = rms_norm_head(k_val, k_norm_w, rms_eps, tid);
 
     smem_rope[tid] = k_normed;
@@ -130,7 +131,7 @@ __global__ void decode_prep_paged_kernel(
     float k_roped = apply_rope_half_split(smem_rope, cos_cache, sin_cache, pos, tid);
 
     // ---- Load V (raw, no norm/rope) ----
-    float v_val = __bfloat162float(v_batch[kv_offset]);
+    float v_val = __bfloat162float(__ldg(v_batch + kv_offset));
 
     // ---- Write K and V to paged cache ----
     // Find the correct page and offset within it
@@ -162,18 +163,18 @@ extern "C" {
 
 cudaError_t decode_prep_paged_cuda(
     __nv_bfloat16* q_batch,
-    const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* v_batch,
-    const __nv_bfloat16* q_norm_weight,
-    const __nv_bfloat16* k_norm_weight,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    const int* positions,
+    const __nv_bfloat16* __restrict__ k_batch,
+    const __nv_bfloat16* __restrict__ v_batch,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const int* __restrict__ positions,
     __nv_bfloat16* k_pool,
     __nv_bfloat16* v_pool,
-    const int* page_table,
-    const int* page_indptr,
-    const int* last_page_len,
+    const int* __restrict__ page_table,
+    const int* __restrict__ page_indptr,
+    const int* __restrict__ last_page_len,
     int num_qo_heads,
     int num_kv_heads,
     int page_size,

@@ -13,56 +13,96 @@
 #define GEMV_ROWS_PER_BLOCK 4
 #define GEMV_NUM_WARPS (GEMV_BLOCK / WARP_SIZE)
 
+__device__ __forceinline__ float bf16x4_dot(uint2 a_val, uint2 x_val) {
+  __nv_bfloat162 a_lo = *reinterpret_cast<__nv_bfloat162 *>(&a_val.x);
+  __nv_bfloat162 a_hi = *reinterpret_cast<__nv_bfloat162 *>(&a_val.y);
+  __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&x_val.x);
+  __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&x_val.y);
+  float sum = 0.0f;
+  sum += __bfloat162float(a_lo.x) * __bfloat162float(x_lo.x);
+  sum += __bfloat162float(a_lo.y) * __bfloat162float(x_lo.y);
+  sum += __bfloat162float(a_hi.x) * __bfloat162float(x_hi.x);
+  sum += __bfloat162float(a_hi.y) * __bfloat162float(x_hi.y);
+  return sum;
+}
+
+__device__ __forceinline__ float bf16x8_dot(uint4 a_val, uint4 x_val) {
+  float sum = 0.0f;
+  sum += bf16x4_dot(make_uint2(a_val.x, a_val.y), make_uint2(x_val.x, x_val.y));
+  sum += bf16x4_dot(make_uint2(a_val.z, a_val.w), make_uint2(x_val.z, x_val.w));
+  return sum;
+}
+
 __global__ void gemv_handwritten_kernel(
     const __nv_bfloat16 *__restrict__ A, // (M, K) row-major
     const __nv_bfloat16 *__restrict__ x, // (K,)
     __nv_bfloat16 *__restrict__ y,       // (M,)
     int M, int K) {
 
+  extern __shared__ char smem[];
+
   int row_base = blockIdx.x * GEMV_ROWS_PER_BLOCK;
   int tid = threadIdx.x;
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
+  __nv_bfloat16 *x_shared = reinterpret_cast<__nv_bfloat16 *>(smem);
 
-  // Vectorized BF16×4 path: process 4 elements per load
+  // Vectorized BF16×8 / BF16×4 paths with scalar fallback for remainder.
+  int K8 = K / 8;  // number of bf16x8 groups
   int K4 = K / 4;  // number of bf16x4 groups
   int K_tail = K - K4 * 4;  // remainder for scalar fallback
+  bool use_bf16x8 = (K % 8) == 0;
 
   float sums[GEMV_ROWS_PER_BLOCK];
   #pragma unroll
   for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) sums[r] = 0.0f;
 
-  // Cast to uint2 for 8-byte aligned loads (4× bf16)
-  const uint2 *x_vec = reinterpret_cast<const uint2 *>(x);
+  if (use_bf16x8) {
+    const uint4 *x_vec8 = reinterpret_cast<const uint4 *>(x);
+    uint4 *x_shared_vec8 = reinterpret_cast<uint4 *>(x_shared);
+    for (int k8 = tid; k8 < K8; k8 += GEMV_BLOCK) {
+      x_shared_vec8[k8] = x_vec8[k8];
+    }
+  } else {
+    const uint2 *x_vec4 = reinterpret_cast<const uint2 *>(x);
+    uint2 *x_shared_vec4 = reinterpret_cast<uint2 *>(x_shared);
+    for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
+      x_shared_vec4[k4] = x_vec4[k4];
+    }
+    if (K_tail > 0) {
+      int k_start = K4 * 4;
+      for (int k = k_start + tid; k < K; k += GEMV_BLOCK) {
+        x_shared[k] = x[k];
+      }
+    }
+  }
+  __syncthreads();
 
   #pragma unroll
   for (int r = 0; r < GEMV_ROWS_PER_BLOCK; r++) {
     int row = row_base + r;
     if (row < M) {
-      const uint2 *A_row_vec = reinterpret_cast<const uint2 *>(A + row * K);
       float sum = 0.0f;
 
-      // Main vectorized loop: 4 bf16 elements per iteration
-      for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
-        uint2 a_val = A_row_vec[k4];
-        uint2 x_val = x_vec[k4];
-        // Unpack 4× bf16 from two uint32
-        __nv_bfloat162 a_lo = *reinterpret_cast<__nv_bfloat162 *>(&a_val.x);
-        __nv_bfloat162 a_hi = *reinterpret_cast<__nv_bfloat162 *>(&a_val.y);
-        __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&x_val.x);
-        __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&x_val.y);
-        sum += __bfloat162float(a_lo.x) * __bfloat162float(x_lo.x);
-        sum += __bfloat162float(a_lo.y) * __bfloat162float(x_lo.y);
-        sum += __bfloat162float(a_hi.x) * __bfloat162float(x_hi.x);
-        sum += __bfloat162float(a_hi.y) * __bfloat162float(x_hi.y);
+      if (use_bf16x8) {
+        const uint4 *A_row_vec8 = reinterpret_cast<const uint4 *>(A + row * K);
+        const uint4 *x_shared_vec8 = reinterpret_cast<const uint4 *>(x_shared);
+        for (int k8 = tid; k8 < K8; k8 += GEMV_BLOCK) {
+          sum += bf16x8_dot(A_row_vec8[k8], x_shared_vec8[k8]);
+        }
+      } else {
+        const uint2 *A_row_vec4 = reinterpret_cast<const uint2 *>(A + row * K);
+        const uint2 *x_shared_vec4 = reinterpret_cast<const uint2 *>(x_shared);
+        for (int k4 = tid; k4 < K4; k4 += GEMV_BLOCK) {
+          sum += bf16x4_dot(A_row_vec4[k4], x_shared_vec4[k4]);
+        }
       }
 
-      // Scalar tail for K not divisible by 4
       if (K_tail > 0) {
         const __nv_bfloat16 *A_row = A + row * K;
         int k_start = K4 * 4;
         for (int k = k_start + tid; k < K; k += GEMV_BLOCK) {
-          sum += __bfloat162float(A_row[k]) * __bfloat162float(x[k]);
+          sum += __bfloat162float(A_row[k]) * __bfloat162float(x_shared[k]);
         }
       }
 
@@ -186,16 +226,18 @@ void gemv_batched_qkv_cuda(const __nv_bfloat16 *Wq, const __nv_bfloat16 *Wk, con
                            cudaStream_t stream) {
   int blocks_q = (Mq + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
   int blocks_k = (Mk + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+  size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16);
 
-  gemv_handwritten_kernel<<<blocks_q, GEMV_BLOCK, 0, stream>>>(Wq, x, q_out, Mq, K);
-  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, 0, stream>>>(Wk, x, k_out, Mk, K);
-  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, 0, stream>>>(Wv, x, v_out, Mk, K);
+  gemv_handwritten_kernel<<<blocks_q, GEMV_BLOCK, smem_bytes, stream>>>(Wq, x, q_out, Mq, K);
+  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, smem_bytes, stream>>>(Wk, x, k_out, Mk, K);
+  gemv_handwritten_kernel<<<blocks_k, GEMV_BLOCK, smem_bytes, stream>>>(Wv, x, v_out, Mk, K);
 }
 
 cudaError_t gemv_cuda(const __nv_bfloat16 *A, const __nv_bfloat16 *x, __nv_bfloat16 *y, int M, int K,
                cudaStream_t stream) {
   int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-  gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, 0, stream>>>(A, x, y, M, K);
+  size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16);
+  gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, smem_bytes, stream>>>(A, x, y, M, K);
     return cudaGetLastError();
 }
 

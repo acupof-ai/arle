@@ -268,38 +268,60 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   float inv_rms = s_inv_rms;
 
   // Pass 2: normalize and scale
-  const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
-  uint2 *out_vec = reinterpret_cast<uint2 *>(out_row);
+  int n8 = hidden_dim / 8;
+  const uint4 *x_vec8 = reinterpret_cast<const uint4 *>(x_row);
+  const uint4 *w_vec8 = reinterpret_cast<const uint4 *>(weight);
+  uint4 *out_vec8 = reinterpret_cast<uint4 *>(out_row);
 
   // Keep `x * inv_rms * weight` in fp32 throughout — round to bf16 once at
   // the final store. ggml/llama.cpp's `ggml_rms_norm` fuses the weight
   // multiply and stays in fp32 internally; our earlier "round to bf16 between
   // scale and weight" pattern loses ~0.4% per layer and compounds into
   // catastrophic drift by layer 5 when fed noisy (Q4_K) weights.
-  for (int i = tid; i < n4; i += NORM_BLOCK) {
-    uint2 xv = x_vec[i];
-    uint2 wv = w_vec[i];
-    __nv_bfloat162 x_lo = *reinterpret_cast<__nv_bfloat162 *>(&xv.x);
-    __nv_bfloat162 x_hi = *reinterpret_cast<__nv_bfloat162 *>(&xv.y);
-    __nv_bfloat162 w_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv.x);
-    __nv_bfloat162 w_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv.y);
+  for (int i = tid; i < n8; i += NORM_BLOCK) {
+    uint4 xv = __ldg(x_vec8 + i);
+    uint4 wv = __ldg(w_vec8 + i);
 
-    float n0 = __bfloat162float(x_lo.x) * inv_rms * __bfloat162float(w_lo.x);
-    float n1 = __bfloat162float(x_lo.y) * inv_rms * __bfloat162float(w_lo.y);
-    float n2 = __bfloat162float(x_hi.x) * inv_rms * __bfloat162float(w_hi.x);
-    float n3 = __bfloat162float(x_hi.y) * inv_rms * __bfloat162float(w_hi.y);
+    uint2 xv0 = make_uint2(xv.x, xv.y);
+    uint2 xv1 = make_uint2(xv.z, xv.w);
+    uint2 wv0 = make_uint2(wv.x, wv.y);
+    uint2 wv1 = make_uint2(wv.z, wv.w);
 
-    uint2 result;
-    __nv_bfloat162 r_lo, r_hi;
-    r_lo.x = __float2bfloat16(n0);
-    r_lo.y = __float2bfloat16(n1);
-    r_hi.x = __float2bfloat16(n2);
-    r_hi.y = __float2bfloat16(n3);
-    result.x = *reinterpret_cast<unsigned int *>(&r_lo);
-    result.y = *reinterpret_cast<unsigned int *>(&r_hi);
-    out_vec[i] = result;
+    __nv_bfloat162 x0_lo = *reinterpret_cast<__nv_bfloat162 *>(&xv0.x);
+    __nv_bfloat162 x0_hi = *reinterpret_cast<__nv_bfloat162 *>(&xv0.y);
+    __nv_bfloat162 x1_lo = *reinterpret_cast<__nv_bfloat162 *>(&xv1.x);
+    __nv_bfloat162 x1_hi = *reinterpret_cast<__nv_bfloat162 *>(&xv1.y);
+    __nv_bfloat162 w0_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv0.x);
+    __nv_bfloat162 w0_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv0.y);
+    __nv_bfloat162 w1_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv1.x);
+    __nv_bfloat162 w1_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv1.y);
+
+    float n0 = __bfloat162float(x0_lo.x) * inv_rms * __bfloat162float(w0_lo.x);
+    float n1 = __bfloat162float(x0_lo.y) * inv_rms * __bfloat162float(w0_lo.y);
+    float n2 = __bfloat162float(x0_hi.x) * inv_rms * __bfloat162float(w0_hi.x);
+    float n3 = __bfloat162float(x0_hi.y) * inv_rms * __bfloat162float(w0_hi.y);
+    float n4 = __bfloat162float(x1_lo.x) * inv_rms * __bfloat162float(w1_lo.x);
+    float n5 = __bfloat162float(x1_lo.y) * inv_rms * __bfloat162float(w1_lo.y);
+    float n6 = __bfloat162float(x1_hi.x) * inv_rms * __bfloat162float(w1_hi.x);
+    float n7 = __bfloat162float(x1_hi.y) * inv_rms * __bfloat162float(w1_hi.y);
+
+    uint4 result;
+    __nv_bfloat162 r0_lo, r0_hi, r1_lo, r1_hi;
+    r0_lo.x = __float2bfloat16(n0);
+    r0_lo.y = __float2bfloat16(n1);
+    r0_hi.x = __float2bfloat16(n2);
+    r0_hi.y = __float2bfloat16(n3);
+    r1_lo.x = __float2bfloat16(n4);
+    r1_lo.y = __float2bfloat16(n5);
+    r1_hi.x = __float2bfloat16(n6);
+    r1_hi.y = __float2bfloat16(n7);
+    result.x = *reinterpret_cast<unsigned int *>(&r0_lo);
+    result.y = *reinterpret_cast<unsigned int *>(&r0_hi);
+    result.z = *reinterpret_cast<unsigned int *>(&r1_lo);
+    result.w = *reinterpret_cast<unsigned int *>(&r1_hi);
+    out_vec8[i] = result;
   }
-  for (int i = n4 * 4 + tid; i < hidden_dim; i += NORM_BLOCK) {
+  for (int i = n8 * 8 + tid; i < hidden_dim; i += NORM_BLOCK) {
     float n = __bfloat162float(x_row[i]) * inv_rms * __bfloat162float(weight[i]);
     out_row[i] = __float2bfloat16(n);
   }
@@ -489,35 +511,56 @@ __global__ void fused_add_rms_norm_batched_kernel(
   float inv_rms = s_inv_rms;
 
   // Pass 2: Normalize and scale (read updated hidden, write out)
-  const uint2 *h_vec_r = reinterpret_cast<const uint2 *>(hidden_row);
-  const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
-  uint2 *out_vec = reinterpret_cast<uint2 *>(out_row);
+  int n8 = hidden_dim / 8;
+  const uint4 *h_vec_r8 = reinterpret_cast<const uint4 *>(hidden_row);
+  const uint4 *w_vec8 = reinterpret_cast<const uint4 *>(weight);
+  uint4 *out_vec8 = reinterpret_cast<uint4 *>(out_row);
 
-  for (int i = tid; i < n4; i += NORM_BLOCK) {
-    uint2 hv = h_vec_r[i];
-    uint2 wv = w_vec[i];
-    __nv_bfloat162 h_lo = *reinterpret_cast<__nv_bfloat162 *>(&hv.x);
-    __nv_bfloat162 h_hi = *reinterpret_cast<__nv_bfloat162 *>(&hv.y);
-    __nv_bfloat162 w_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv.x);
-    __nv_bfloat162 w_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv.y);
+  for (int i = tid; i < n8; i += NORM_BLOCK) {
+    uint4 hv = __ldg(h_vec_r8 + i);
+    uint4 wv = __ldg(w_vec8 + i);
 
-    __nv_bfloat16 n0 = __float2bfloat16(__bfloat162float(h_lo.x) * inv_rms);
-    __nv_bfloat16 n1 = __float2bfloat16(__bfloat162float(h_lo.y) * inv_rms);
-    __nv_bfloat16 n2 = __float2bfloat16(__bfloat162float(h_hi.x) * inv_rms);
-    __nv_bfloat16 n3 = __float2bfloat16(__bfloat162float(h_hi.y) * inv_rms);
+    uint2 hv0 = make_uint2(hv.x, hv.y);
+    uint2 hv1 = make_uint2(hv.z, hv.w);
+    uint2 wv0 = make_uint2(wv.x, wv.y);
+    uint2 wv1 = make_uint2(wv.z, wv.w);
 
-    uint2 result;
-    __nv_bfloat162 r_lo, r_hi;
-    r_lo.x = __float2bfloat16(__bfloat162float(n0) * __bfloat162float(w_lo.x));
-    r_lo.y = __float2bfloat16(__bfloat162float(n1) * __bfloat162float(w_lo.y));
-    r_hi.x = __float2bfloat16(__bfloat162float(n2) * __bfloat162float(w_hi.x));
-    r_hi.y = __float2bfloat16(__bfloat162float(n3) * __bfloat162float(w_hi.y));
-    result.x = *reinterpret_cast<unsigned int *>(&r_lo);
-    result.y = *reinterpret_cast<unsigned int *>(&r_hi);
-    out_vec[i] = result;
+    __nv_bfloat162 h0_lo = *reinterpret_cast<__nv_bfloat162 *>(&hv0.x);
+    __nv_bfloat162 h0_hi = *reinterpret_cast<__nv_bfloat162 *>(&hv0.y);
+    __nv_bfloat162 h1_lo = *reinterpret_cast<__nv_bfloat162 *>(&hv1.x);
+    __nv_bfloat162 h1_hi = *reinterpret_cast<__nv_bfloat162 *>(&hv1.y);
+    __nv_bfloat162 w0_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv0.x);
+    __nv_bfloat162 w0_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv0.y);
+    __nv_bfloat162 w1_lo = *reinterpret_cast<__nv_bfloat162 *>(&wv1.x);
+    __nv_bfloat162 w1_hi = *reinterpret_cast<__nv_bfloat162 *>(&wv1.y);
+
+    __nv_bfloat16 n0 = __float2bfloat16(__bfloat162float(h0_lo.x) * inv_rms);
+    __nv_bfloat16 n1 = __float2bfloat16(__bfloat162float(h0_lo.y) * inv_rms);
+    __nv_bfloat16 n2 = __float2bfloat16(__bfloat162float(h0_hi.x) * inv_rms);
+    __nv_bfloat16 n3 = __float2bfloat16(__bfloat162float(h0_hi.y) * inv_rms);
+    __nv_bfloat16 n4 = __float2bfloat16(__bfloat162float(h1_lo.x) * inv_rms);
+    __nv_bfloat16 n5 = __float2bfloat16(__bfloat162float(h1_lo.y) * inv_rms);
+    __nv_bfloat16 n6 = __float2bfloat16(__bfloat162float(h1_hi.x) * inv_rms);
+    __nv_bfloat16 n7 = __float2bfloat16(__bfloat162float(h1_hi.y) * inv_rms);
+
+    uint4 result;
+    __nv_bfloat162 r0_lo, r0_hi, r1_lo, r1_hi;
+    r0_lo.x = __float2bfloat16(__bfloat162float(n0) * __bfloat162float(w0_lo.x));
+    r0_lo.y = __float2bfloat16(__bfloat162float(n1) * __bfloat162float(w0_lo.y));
+    r0_hi.x = __float2bfloat16(__bfloat162float(n2) * __bfloat162float(w0_hi.x));
+    r0_hi.y = __float2bfloat16(__bfloat162float(n3) * __bfloat162float(w0_hi.y));
+    r1_lo.x = __float2bfloat16(__bfloat162float(n4) * __bfloat162float(w1_lo.x));
+    r1_lo.y = __float2bfloat16(__bfloat162float(n5) * __bfloat162float(w1_lo.y));
+    r1_hi.x = __float2bfloat16(__bfloat162float(n6) * __bfloat162float(w1_hi.x));
+    r1_hi.y = __float2bfloat16(__bfloat162float(n7) * __bfloat162float(w1_hi.y));
+    result.x = *reinterpret_cast<unsigned int *>(&r0_lo);
+    result.y = *reinterpret_cast<unsigned int *>(&r0_hi);
+    result.z = *reinterpret_cast<unsigned int *>(&r1_lo);
+    result.w = *reinterpret_cast<unsigned int *>(&r1_hi);
+    out_vec8[i] = result;
   }
   // Scalar tail
-  for (int i = n4 * 4 + tid; i < hidden_dim; i += NORM_BLOCK) {
+  for (int i = n8 * 8 + tid; i < hidden_dim; i += NORM_BLOCK) {
     __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(hidden_row[i]) * inv_rms);
     out_row[i] = __float2bfloat16(__bfloat162float(normed) * __bfloat162float(weight[i]));
   }
