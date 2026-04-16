@@ -207,11 +207,18 @@ pub fn load_model_components(
 pub fn spawn_scheduler_handle(
     components: LoadedModelComponents,
     runtime: ServerRuntimeConfig,
+    metrics: crate::metrics::ServerMetrics,
 ) -> Result<SchedulerHandle> {
     match components {
-        LoadedModelComponents::Qwen3(components) => spawn_scheduler_for_model(components, runtime),
-        LoadedModelComponents::Qwen35(components) => spawn_scheduler_for_model(components, runtime),
-        LoadedModelComponents::GLM4(components) => spawn_scheduler_for_model(components, runtime),
+        LoadedModelComponents::Qwen3(components) => {
+            spawn_scheduler_for_model(components, runtime, metrics)
+        }
+        LoadedModelComponents::Qwen35(components) => {
+            spawn_scheduler_for_model(components, runtime, metrics)
+        }
+        LoadedModelComponents::GLM4(components) => {
+            spawn_scheduler_for_model(components, runtime, metrics)
+        }
     }
 }
 
@@ -219,15 +226,17 @@ pub fn spawn_scheduler_handle(
 pub fn spawn_scheduler_handle_from_path(
     model_path: &str,
     runtime: ServerRuntimeConfig,
+    metrics: crate::metrics::ServerMetrics,
 ) -> Result<SchedulerHandle> {
     let components = load_model_components(model_path, runtime.engine)?;
-    spawn_scheduler_handle(components, runtime)
+    spawn_scheduler_handle(components, runtime, metrics)
 }
 
 #[cfg(feature = "cuda")]
 fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     components: ModelComponents<M>,
     runtime: ServerRuntimeConfig,
+    metrics: crate::metrics::ServerMetrics,
 ) -> Result<SchedulerHandle> {
     let ModelComponents {
         model_id,
@@ -249,6 +258,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         tokenizer,
         &model_id,
         seed,
+        metrics,
         scheduler,
         max_seq_len,
         kv_cache_dtype,

@@ -17,6 +17,8 @@ pub(crate) enum Phase {
 pub(crate) struct ActiveRequest {
     pub(crate) id: u64,
     pub(crate) slot_idx: usize,
+    pub(crate) admitted_at: std::time::Instant,
+    pub(crate) first_token_at: Option<std::time::Instant>,
     /// Original prompt string (kept for preemption re-queue).
     pub(crate) prompt: String,
     pub(crate) prompt_tokens: Vec<u32>,
@@ -243,6 +245,8 @@ mod tests {
         ActiveRequest {
             id: 1,
             slot_idx: 0,
+            admitted_at: std::time::Instant::now(),
+            first_token_at: None,
             prompt: prompt.to_string(),
             prompt_tokens,
             generated_tokens: Vec::new(),
