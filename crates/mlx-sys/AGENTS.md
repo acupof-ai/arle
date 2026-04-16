@@ -11,7 +11,8 @@ either side.
 crates/mlx-sys/
 ├── Cargo.toml           — build-deps: cmake, cc
 ├── build.rs             — MLX cmake build → C++ bridge cc build → link chain
-├── mlx/                 — CMakeLists.txt that FetchContent's MLX v0.31.1
+├── mlx/                 — thin CMake wrapper that points FetchContent at vendored sources
+├── vendor/              — pinned MLX / metal-cpp / fmt / json / gguflib source snapshots
 └── src/
     ├── lib.rs           — extern "C" declarations (no mlx-c intermediate)
     ├── mlx_bridge.cpp   — C++ wrappers for mlx::core API
@@ -45,7 +46,9 @@ crates/mlx-sys/
 
 ## Build chain (`build.rs`)
 
-1. **cmake** builds MLX from source via `FetchContent` (MLX v0.31.1).
+1. **cmake** builds MLX from source via the `mlx/` wrapper, but every
+   `FetchContent` dependency is overridden to a pinned local source tree under
+   `vendor/` and the build runs with `FETCHCONTENT_FULLY_DISCONNECTED=ON`.
    Flags: `MLX_BUILD_METAL=ON`, `MLX_BUILD_ACCELERATE=ON`, tests/examples/
    benchmarks/python OFF, `BUILD_SHARED_LIBS=OFF`, `CMAKE_CXX_STANDARD=17`.
 2. **cc** compiles `mlx_bridge.cpp` + `mlx_qwen35_model.cpp` as `libmlx_ffi.a`
