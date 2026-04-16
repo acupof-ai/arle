@@ -1,7 +1,10 @@
+use std::collections::VecDeque;
+
 use anyhow::{Context, Result, bail, ensure};
 
 use super::KV_CACHE_CHUNK;
 use super::config::{MetalModelArch, MetalModelConfig};
+use super::dflash::{self, MetalDflashRuntime};
 use super::forward::build_forward_graph;
 use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
@@ -572,18 +575,22 @@ impl<'a> MetalRequestState<'a> {
         params: &SamplingParams,
         use_kv_pool: bool,
         max_new_tokens: usize,
+        dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
     ) -> Result<Self> {
         validate_metal_sampling_params(params)?;
 
         let inner = match weights {
             MetalWeights::Qwen3(weights) => {
+                // DFlash needs direct KV cache access — disable pool when DFlash is active.
+                let effective_kv_pool = use_kv_pool && dflash_runtime.is_none();
                 let driver = Qwen3StepDriver::new(
                     weights,
                     config,
                     params,
-                    use_kv_pool,
+                    effective_kv_pool,
                     &prompt_tokens,
                     max_new_tokens,
+                    dflash_runtime,
                 )?;
                 let state = ResumableRequestState::new(
                     driver,
@@ -1708,6 +1715,27 @@ fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver
     false
 }
 
+/// Optional DFlash speculative-decode state attached to a `Qwen3StepDriver`.
+///
+/// When present, `decode_token` runs full DFlash speculative blocks and
+/// buffers the accepted tokens; the scheduler still sees one token per step.
+struct Qwen3DFlashState {
+    runtime: &'static MetalDflashRuntime,
+    config: &'static MetalModelConfig,
+    /// Draft model KV state — owned, separate from target.
+    draft_state: dflash::ContiguousKvState,
+    /// Target-layer hidden states from the last verified block. Bootstrapped
+    /// during prefill via `qwen3_forward_with_hidden_states`.
+    target_hidden: Option<MlxArray>,
+    /// Multi-token buffer: accepted tokens from the latest speculative block.
+    /// `decode_token` pops from here until empty, then runs a new block.
+    token_buffer: VecDeque<u32>,
+    /// Which target-model layers to capture hidden states from.
+    target_layer_ids: Vec<usize>,
+    // ── Metrics accumulators (flushed on request completion) ──
+    acceptance_lengths: Vec<usize>,
+}
+
 struct Qwen3StepDriver<'a> {
     weights: &'a StandardMetalWeights,
     sample_params: SamplingParams,
@@ -1723,6 +1751,9 @@ struct Qwen3StepDriver<'a> {
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
+    /// DFlash speculative decode state. When `Some`, `decode_token` runs
+    /// DFlash blocks; when `None`, standard single-token decode.
+    dflash: Option<Qwen3DFlashState>,
 }
 
 impl<'a> Qwen3StepDriver<'a> {
@@ -1733,6 +1764,7 @@ impl<'a> Qwen3StepDriver<'a> {
         use_kv_pool: bool,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
+        dflash_runtime: Option<(&'static MetalDflashRuntime, &'static MetalModelConfig)>,
     ) -> Result<Self> {
         let n_layers = config.num_hidden_layers;
         let n_heads = config.num_attention_heads as i32;
@@ -1794,6 +1826,26 @@ impl<'a> Qwen3StepDriver<'a> {
             attn_scale: 1.0f32 / (head_dim as f32).sqrt(),
             rope_base: config.rope_theta as f32,
             eps: config.rms_norm_eps as f32,
+            dflash: match dflash_runtime {
+                Some((runtime, static_config)) => {
+                    let draft_state = dflash::ContiguousKvState::new(
+                        runtime.draft_num_hidden_layers(),
+                        runtime.draft_n_kv_heads(),
+                        runtime.draft_head_dim(),
+                        prompt_tokens.len() + max_new_tokens,
+                    );
+                    Some(Qwen3DFlashState {
+                        runtime,
+                        config: static_config,
+                        draft_state,
+                        target_hidden: None,
+                        token_buffer: VecDeque::new(),
+                        target_layer_ids: runtime.target_layer_ids().to_vec(),
+                        acceptance_lengths: Vec::new(),
+                    })
+                }
+                None => None,
+            },
         })
     }
 

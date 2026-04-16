@@ -126,6 +126,22 @@ impl MetalDflashRuntime {
     pub(super) fn draft_model_id(&self) -> &str {
         &self.draft_model_id
     }
+
+    pub(super) fn target_layer_ids(&self) -> &[usize] {
+        &self.target_layer_ids
+    }
+
+    pub(super) fn draft_num_hidden_layers(&self) -> usize {
+        self.draft_config.num_hidden_layers
+    }
+
+    pub(super) fn draft_n_kv_heads(&self) -> i32 {
+        self.draft_config.num_key_value_heads as i32
+    }
+
+    pub(super) fn draft_head_dim(&self) -> i32 {
+        self.draft_config.head_dim as i32
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +286,7 @@ impl DFlashDraftWeights {
     }
 }
 
-struct ContiguousKvState {
+pub(super) struct ContiguousKvState {
     k_caches: Vec<MlxArray>,
     v_caches: Vec<MlxArray>,
     len: i32,
@@ -280,7 +296,12 @@ struct ContiguousKvState {
 }
 
 impl ContiguousKvState {
-    fn new(num_layers: usize, n_kv_heads: i32, head_dim: i32, initial_tokens: usize) -> Self {
+    pub(super) fn new(
+        num_layers: usize,
+        n_kv_heads: i32,
+        head_dim: i32,
+        initial_tokens: usize,
+    ) -> Self {
         let initial_cap = ((i32::try_from(initial_tokens).unwrap_or_default() + KV_CACHE_CHUNK
             - 1)
             / KV_CACHE_CHUNK
