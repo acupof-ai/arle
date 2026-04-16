@@ -1,8 +1,8 @@
-# SGLang Parity — Post cublasLt Autotune + Fused QKV
+# SGLang Parity — Post cublasLt Autotune + Fused QKV + GPU/CPU Overlap
 
 ## Context
 
-Benchmark comparison after implementing 4 optimizations (commit `cc81b65`):
+Benchmark comparison after implementing 5 optimizations (commits `cc81b65`, `faf5efd`):
 1. cublasLt autotune (benchmark top-8 heuristic algorithms, cache fastest)
 2. Workspace 4MB → 32MB (wider algorithm search space)
 3. Fused QKV decode_prep (eliminate split_qkv, -36 kernel launches/step)
@@ -18,14 +18,23 @@ Benchmark comparison after implementing 4 optimizations (commit `cc81b65`):
 - Bench: `scripts/bench_throughput.py`, synthetic prompts, greedy (temp=0),
   max_tokens=256, serial runs (one GPU)
 
-## Results — Decode Throughput Comparison
+## Results — Decode Throughput Comparison (post-overlap `faf5efd`)
 
 | Concurrency | pegainfer tok/s | SGLang tok/s | Parity | ITL pega (ms) | ITL sglang (ms) |
 |---|---|---|---|---|---|
-| **B=1** | 30.0 | 30.1 | **99.7%** | 33.3 | 33.0 |
-| **B=4** | 113.0 | 116.0 | **97.4%** | 34.8 | 34.2 |
-| **B=8** | 218.1 | 227.8 | **95.7%** | 35.3 | 34.8 |
-| **B=16** | 413.3 | 440.9 | **93.7%** | 35.8 | 35.9 |
+| **B=1** | 30.1 | 30.1 | **100.0%** | 33.2 | 33.0 |
+| **B=4** | 113.1 | 116.0 | **97.5%** | 34.8 | 34.2 |
+| **B=8** | 219.3 | 227.8 | **96.3%** | 35.1 | 34.8 |
+| **B=16** | 408.1 | 440.9 | **92.6%** | 36.3 | 35.9 |
+
+### Pre-overlap snapshot (autotune only, `cc81b65`)
+
+| Concurrency | pegainfer tok/s | Parity |
+|---|---|---|
+| B=1 | 30.0 | 99.7% |
+| B=4 | 113.0 | 97.4% |
+| B=8 | 218.1 | 95.7% |
+| B=16 | 413.3 | 93.7% |
 
 ## Previous Parity (pre-autotune, from session notes)
 
