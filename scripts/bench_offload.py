@@ -46,8 +46,8 @@ def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/usr/lib64-nvidia:/usr/local/cuda/lib64"
 
-    # Kill any existing server
-    subprocess.run(["pkill", "-9", "-f", "target/release/infer"], capture_output=True)
+    # Kill any existing server (killall is more portable than pkill in sandboxed envs)
+    subprocess.run(["killall", "-9", "infer"], capture_output=True)
     time.sleep(1)
 
     server = subprocess.Popen(
@@ -99,16 +99,12 @@ def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict
     server.terminate()
     server.wait()
     log = server.stdout.read().decode(errors="replace")
-    # Current tracing format: "Request N → slot M (prompt=P tokens, radix_hit=H, reusable_prefix=R, ...)"
-    # A radix_hit > 0 with reusable_prefix > 0 counts as a prefix hit.
-    kv_hits = len(re.findall(r"reusable_prefix=[1-9]\d*", log))
-    # "prefix HIT" appears in the prefill path for exact full prefix matches
-    kv_hits += len(re.findall(r"prefix HIT", log))
-    # Misses: radix_hit=0 or "not reusable"
-    kv_misses = len(re.findall(r"radix_hit=0", log))
-    kv_misses += len(re.findall(r"not reusable", log))
-    total_offloads = len(re.findall(r"offload:", log))
-    total_prefetches = len(re.findall(r"prefetch:", log))
+    # Prefill log format (prefill.rs):
+    #   "prefix MISS"           — no radix match at all
+    #   "prefix PARTIAL M/N"    — partial prefix reuse (M of N tokens)
+    #   "prefix HIT M/N"        — exact full prefix match
+    kv_hits = len(re.findall(r"prefix (HIT|PARTIAL)", log))
+    kv_misses = len(re.findall(r"prefix MISS", log))
 
     avg_time = sum(r["time_ms"] for r in results) / len(results)
     total_time = sum(r["time_ms"] for r in results)
@@ -120,8 +116,6 @@ def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict
         "total_time_ms": total_time,
         "kv_hits": kv_hits,
         "kv_misses": kv_misses,
-        "offloads": total_offloads,
-        "prefetches": total_prefetches,
     }
 
 
