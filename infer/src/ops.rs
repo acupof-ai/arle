@@ -27,7 +27,8 @@ pub(crate) use attention::{
     prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
 };
 pub use attention::{
-    flashinfer_run_layer, fused_attention_decode_batched_into, fused_attention_decode_into,
+    flashinfer_run_layer, flashinfer_tc_run_layer, fused_attention_decode_batched_into,
+    fused_attention_decode_into,
 };
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};

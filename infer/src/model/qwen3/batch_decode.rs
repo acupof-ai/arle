@@ -198,7 +198,7 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
         // Only BF16 uses FlashInfer plan. FP8/INT8 use our fused-dequant kernel
         // which doesn't need FlashInfer's work estimation.
         if kv_format == KVFormat::BF16 {
-            self.metadata.plan(
+            self.metadata.tc_plan(
                 ctx,
                 batch_size,
                 num_q_heads,
@@ -629,9 +629,10 @@ impl Qwen3Model {
                     )?;
                 }
                 KVFormat::BF16 => {
-                    ops::flashinfer_run_layer(
+                    ops::flashinfer_tc_run_layer(
                         &self.ctx,
                         &bufs.q_batch,
+                        &bufs.metadata.qo_indptr,
                         kv_pool,
                         layer_idx,
                         &bufs.metadata.kv_indptr,
