@@ -240,11 +240,13 @@ impl MetalBackend {
     }
 
     /// Return the DFlash runtime ref with `'static` lifetime.
+    ///
+    /// # Safety
     /// Only valid when called on a leaked `&'static MetalBackend` (scheduler
-    /// runtime thread). The borrow checker can't prove this at the call site,
-    /// so we use pointer-cast — safe because the backend IS leaked.
+    /// runtime thread — `Box::leak` at `runtime.rs:591`). The borrow checker
+    /// can't prove this at the call site, so we use pointer-cast.
     #[cfg(feature = "metal")]
-    pub fn dflash_runtime_static(
+    pub(crate) unsafe fn dflash_runtime_static(
         &self,
     ) -> Option<(
         &'static dflash::MetalDflashRuntime,

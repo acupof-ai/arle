@@ -49,7 +49,9 @@ impl ActiveMetalRequest {
         // Thread DFlash runtime into the request state so Qwen3StepDriver
         // can initialize speculative-decode state. Both refs are 'static
         // because the backend is leaked into the scheduler runtime thread.
-        let dflash_ref = backend.dflash_runtime_static();
+        // SAFETY: `backend` was leaked to `'static` at runtime.rs:591 before
+        // this function is called. The ptr-cast inside is sound.
+        let dflash_ref = unsafe { backend.dflash_runtime_static() };
         let request_state = backend.create_request_state_with_dflash(
             &prompt_tokens,
             &incoming.sampling,
@@ -756,6 +758,12 @@ fn refresh_waiting_prefix_hits(
     let req_ids: Vec<RequestId> = active
         .iter()
         .filter_map(|(req_id, request)| {
+            // DFlash requests own their own target_state KV, not the driver's
+            // k_caches/v_caches. Prefix cache import writes to the driver's
+            // caches, which DFlash never reads. Skip prefix lookup for DFlash.
+            if request.request_state.is_dflash_enabled() {
+                return None;
+            }
             (request.phase() == RuntimePhase::Prefill
                 && request.request_state.prompt_progress() == 0
                 && scheduler.request_phase(*req_id) == Some(SchedulerPhase::Waiting))
