@@ -264,7 +264,7 @@ fn auto_num_slots(
         }
     };
 
-    let (_free_bytes, total_bytes) = match DeviceContext::gpu_memory_info() {
+    let (free_bytes, total_bytes) = match DeviceContext::gpu_memory_info() {
         Ok(info) => info,
         Err(_) => {
             info!("auto_num_slots: GPU memory query failed, using default 8 slots");
@@ -272,9 +272,12 @@ fn auto_num_slots(
         }
     };
 
-    // SGLang formula: total_budget = gpu_total × fraction, kv_budget = total_budget − weights
+    // SGLang formula: total_budget = gpu_total × fraction, kv_budget = total_budget − weights.
+    // Cap by free_bytes so we don't over-admit on shared GPUs.
     let total_budget = (total_bytes as f64 * mem_fraction_static) as usize;
-    let kv_budget = total_budget.saturating_sub(weight_bytes as usize);
+    let kv_budget = total_budget
+        .min(free_bytes)
+        .saturating_sub(weight_bytes as usize);
 
     let per_slot_bytes =
         estimate_per_slot_bytes(model_path, seq_len, CONTIGUOUS_CHUNK_SIZE, kv_pool_format);

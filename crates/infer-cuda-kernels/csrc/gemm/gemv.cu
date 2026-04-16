@@ -39,7 +39,7 @@ __global__ void gemv_handwritten_kernel(
     __nv_bfloat16 *__restrict__ y,       // (M,)
     int M, int K) {
 
-  extern __shared__ char smem[];
+  extern __shared__ __align__(16) char smem[];
 
   int row_base = blockIdx.x * GEMV_ROWS_PER_BLOCK;
   int tid = threadIdx.x;

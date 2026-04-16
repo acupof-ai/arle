@@ -147,6 +147,9 @@ impl SchedulerConfig {
         if self.min_seq_len > 32768 {
             anyhow::bail!("min_seq_len must be ≤ 32768");
         }
+        if !(0.0 < self.mem_fraction_static && self.mem_fraction_static <= 1.0) {
+            anyhow::bail!("mem_fraction_static must be in (0, 1]");
+        }
         if !(0.0 < self.prefix_cache_high_water && self.prefix_cache_high_water < 1.0) {
             anyhow::bail!("prefix_cache_high_water must be in (0, 1)");
         }
