@@ -1,0 +1,197 @@
+{
+  "label": "kv-baseline-20260416",
+  "server": "http://localhost:8000",
+  "trace": "/content/workspace/agent-infer/scripts/data/agent_trace_default.jsonl",
+  "num_concurrent": 4,
+  "timestamp": "2026-04-16T06:39:17.675798+00:00",
+  "turns": [
+    {
+      "session_id": "agent-001",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 5142.33,
+      "ttft_ms": 49.24,
+      "itl_ms": 34.5,
+      "tokens_out": 144,
+      "finish_reason": "stop",
+      "error": null
+    },
+    {
+      "session_id": "agent-001",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9121.42,
+      "ttft_ms": 204.72,
+      "itl_ms": 34.78,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-001",
+      "turn_idx": 4,
+      "prompt_messages": 6,
+      "wall_ms": 9046.34,
+      "ttft_ms": 115.98,
+      "itl_ms": 34.7,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9075.26,
+      "ttft_ms": 125.99,
+      "itl_ms": 34.63,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9154.34,
+      "ttft_ms": 114.45,
+      "itl_ms": 34.85,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 4,
+      "prompt_messages": 6,
+      "wall_ms": 8901.03,
+      "ttft_ms": 131.63,
+      "itl_ms": 34.45,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-003",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9075.13,
+      "ttft_ms": 167.17,
+      "itl_ms": 34.61,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-003",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9167.49,
+      "ttft_ms": 112.8,
+      "itl_ms": 34.89,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-004",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9074.2,
+      "ttft_ms": 208.41,
+      "itl_ms": 34.6,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-004",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9121.96,
+      "ttft_ms": 112.69,
+      "itl_ms": 34.78,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-005",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9104.25,
+      "ttft_ms": 112.73,
+      "itl_ms": 34.71,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-005",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9167.25,
+      "ttft_ms": 164.42,
+      "itl_ms": 34.86,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-006",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9122.05,
+      "ttft_ms": 155.34,
+      "itl_ms": 34.76,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-006",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9165.81,
+      "ttft_ms": 219.86,
+      "itl_ms": 34.88,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    }
+  ],
+  "stats_before": {
+    "raw": "requests=0 active=0 waiting=0 tokens_out=0 kv_util=0.0% prefix_hit_rate=0.0% active_mem=0.0MB peak_mem=0.0MB cache_mem=0.0MB ttft_p50=\u2014 ttft_p99=\u2014 tpot_p50=\u2014",
+    "fields": {
+      "requests": "0",
+      "active": "0",
+      "waiting": "0",
+      "tokens_out": "0",
+      "kv_util": "0.0%",
+      "prefix_hit_rate": "0.0%",
+      "active_mem": "0.0MB",
+      "peak_mem": "0.0MB",
+      "cache_mem": "0.0MB",
+      "ttft_p50": "\u2014",
+      "ttft_p99": "\u2014",
+      "tpot_p50": "\u2014"
+    }
+  },
+  "stats_after": {
+    "raw": "requests=14 active=0 waiting=0 tokens_out=3472 kv_util=0.5% prefix_hit_rate=0.0% active_mem=0.0MB peak_mem=0.0MB cache_mem=0.0MB ttft_p50=0.1ms ttft_p99=0.2ms tpot_p50=50.0ms",
+    "fields": {
+      "requests": "14",
+      "active": "0",
+      "waiting": "0",
+      "tokens_out": "3472",
+      "kv_util": "0.5%",
+      "prefix_hit_rate": "0.0%",
+      "active_mem": "0.0MB",
+      "peak_mem": "0.0MB",
+      "cache_mem": "0.0MB",
+      "ttft_p50": "0.1ms",
+      "ttft_p99": "0.2ms",
+      "tpot_p50": "50.0ms"
+    }
+  }
+}
