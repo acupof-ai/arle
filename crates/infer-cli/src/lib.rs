@@ -1,6 +1,20 @@
 mod args;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod banner;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod download;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod hardware;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod hf_search;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod model_catalog;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod model_picker;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+mod startup;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::Instant;
@@ -10,10 +24,6 @@ use anyhow::Result;
 use args::Args;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use clap::Parser;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::hf_hub::resolve_model_source;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::logging::init_default;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
 
@@ -29,9 +39,13 @@ pub fn run() -> Result<()> {
 
     #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     {
-        init_default();
+        infer::logging::init_default();
         let args = Args::parse();
-        let model_source = resolve_model_source(args.model_path.as_deref())?;
+
+        // Interactive startup: hardware detection + model picker + download.
+        // Falls back to resolve_model_source() when non-interactive.
+        let model_source = startup::resolve_model_interactive(&args)?;
+
         log::info!("Loading model from: {}", model_source);
         let load_start = Instant::now();
         let mut engine = LoadedInferenceEngine::load(&model_source, !args.no_cuda_graph)?;
@@ -40,12 +54,10 @@ pub fn run() -> Result<()> {
         if let Some(max_kv) = args.max_gpu_kv {
             engine.set_max_gpu_kv(max_kv);
         }
-        log::info!(
-            "Model loaded in {:.1}s (backend={}, model={})",
-            load_start.elapsed().as_secs_f64(),
-            engine.backend_name(),
-            engine.model_id(),
-        );
+
+        let load_secs = load_start.elapsed().as_secs_f64();
+        banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
+
         repl::run_repl(
             &mut engine,
             &backend_name,
