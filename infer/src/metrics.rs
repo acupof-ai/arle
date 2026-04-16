@@ -46,8 +46,10 @@ pub struct Histogram {
 }
 
 /// Default latency buckets in seconds, covering 1ms … 60s.
+/// Finer granularity in the 10–100ms range where ITL/TPOT typically falls.
 pub const LATENCY_BUCKETS: &[f64] = &[
-    0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
+    0.001, 0.002, 0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.050, 0.075, 0.100,
+    0.150, 0.200, 0.300, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
 ];
 
 impl Histogram {
@@ -492,11 +494,11 @@ impl ServerMetrics {
         let ttft_p50 = histograms
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.50))
-            .map_or_else(|| "—".to_string(), |v| format!("{v:.1}ms"));
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
         let ttft_p99 = histograms
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.99))
-            .map_or_else(|| "—".to_string(), |v| format!("{v:.1}ms"));
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
         let tpot_p50 = histograms
             .as_ref()
             .and_then(|h| h.tpot.percentile(0.50))
