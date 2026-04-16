@@ -48,6 +48,7 @@ pub(super) struct StagedAdmission {
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
     pub(super) config: SchedulerConfig,
+    pub(super) metrics: crate::metrics::ServerMetrics,
     pub(super) model: M,
     pub(super) tokenizer: Tokenizer,
     /// Stable within one engine instance; real weight checksum upgrade is M5-era work.
@@ -214,12 +215,14 @@ impl<M: ModelForward> Scheduler<M> {
         model_id: &str,
         num_slots: usize,
         seed: u64,
+        metrics: crate::metrics::ServerMetrics,
     ) -> Result<(Self, SchedulerHandle)> {
         Self::with_config(
             model,
             tokenizer,
             model_id,
             seed,
+            metrics,
             SchedulerConfig::runtime_defaults(num_slots),
             None,
             crate::model::kv_cache::KVCacheDtype::BF16,
@@ -234,6 +237,7 @@ impl<M: ModelForward> Scheduler<M> {
         model_id: &str,
         num_slots: usize,
         seed: u64,
+        metrics: crate::metrics::ServerMetrics,
         max_seq_len_override: Option<usize>,
     ) -> Result<(Self, SchedulerHandle)> {
         Self::with_config(
@@ -241,6 +245,7 @@ impl<M: ModelForward> Scheduler<M> {
             tokenizer,
             model_id,
             seed,
+            metrics,
             SchedulerConfig::runtime_defaults(num_slots),
             max_seq_len_override,
             crate::model::kv_cache::KVCacheDtype::BF16,
@@ -254,6 +259,7 @@ impl<M: ModelForward> Scheduler<M> {
         tokenizer: Tokenizer,
         model_id: &str,
         seed: u64,
+        metrics: crate::metrics::ServerMetrics,
         config: SchedulerConfig,
         max_seq_len_override: Option<usize>,
         kv_cache_dtype: crate::model::kv_cache::KVCacheDtype,
@@ -328,6 +334,7 @@ impl<M: ModelForward> Scheduler<M> {
         let coordinator_thread = Some(coordinator.spawn("pegainfer-tiered-kv-coord"));
         let scheduler = Self {
             config: config.clone(),
+            metrics,
             model,
             tokenizer,
             model_fingerprint: blake3::hash(model_id.as_bytes()).as_bytes().to_vec(),

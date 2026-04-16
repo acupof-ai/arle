@@ -6,7 +6,7 @@ use infer::backend::cuda::bootstrap::{
     InferenceEngineOptions, ServerRuntimeConfig, detect_model_type,
     spawn_scheduler_handle_from_path,
 };
-use infer::http_server::build_app;
+use infer::http_server::build_app_with_metrics;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
@@ -154,8 +154,9 @@ async fn main() {
         kv_pool_format,
     };
 
-    let handle =
-        spawn_scheduler_handle_from_path(model_path, runtime).expect("Failed to create scheduler");
+    let metrics = infer::metrics::ServerMetrics::new(model_path);
+    let handle = spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone())
+        .expect("Failed to create scheduler");
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
@@ -163,7 +164,7 @@ async fn main() {
         handle.model_id()
     );
 
-    let app = build_app(handle);
+    let app = build_app_with_metrics(handle, metrics);
 
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);

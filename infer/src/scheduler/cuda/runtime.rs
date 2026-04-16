@@ -210,6 +210,15 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_t = std::time::Instant::now();
             self.cleanup();
             let clean_us = clean_t.elapsed().as_micros();
+            self.metrics.set_active(self.active.len() as u64);
+            self.metrics.set_waiting(self.waiting.len() as u64);
+            if self.paged_kv_pool.is_active() {
+                // Both in token units so kv_util = (total-free)/total is correct.
+                let total =
+                    (self.paged_kv_pool.max_total_pages * self.paged_kv_pool.page_size) as u64;
+                let free = self.paged_kv_pool.free_count() as u64;
+                self.metrics.set_kv_gpu_blocks(free, total);
+            }
 
             let total_us = step_start.elapsed().as_micros();
             if total_us > 50_000 {
@@ -377,6 +386,8 @@ impl<M: ModelForward> Scheduler<M> {
             self.active.push(ActiveRequest {
                 id,
                 slot_idx,
+                admitted_at: std::time::Instant::now(),
+                first_token_at: None,
                 prompt: incoming.prompt,
                 prompt_tokens,
                 generated_tokens: Vec::new(),
@@ -425,6 +436,23 @@ impl<M: ModelForward> Scheduler<M> {
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
+                let e2e_s = req.admitted_at.elapsed().as_secs_f64();
+                let ttft_s = req
+                    .first_token_at
+                    .map(|t| t.duration_since(req.admitted_at).as_secs_f64())
+                    .unwrap_or(e2e_s);
+                let tpot_s = if gen_tokens > 1 {
+                    (e2e_s - ttft_s).max(0.0) / (gen_tokens - 1) as f64
+                } else {
+                    0.0
+                };
+                self.metrics.record_request_completed(
+                    req.prompt_tokens.len() as u64,
+                    gen_tokens,
+                    ttft_s,
+                    tpot_s,
+                    e2e_s,
+                );
 
                 info!(
                     "Request {} done: {} tokens (active={}, waiting={})",

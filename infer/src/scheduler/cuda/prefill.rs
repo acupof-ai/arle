@@ -168,6 +168,8 @@ impl<M: ModelForward> Scheduler<M> {
 
             (effective, pool_prefix_len)
         };
+        let prefix_hit = effective.len() < prompt_len;
+        self.metrics.record_prefix_lookup(prefix_hit);
 
         if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
             match self.alloc_pool_tokens_with_retry(si, pool_prefix_len) {
@@ -306,6 +308,9 @@ impl<M: ModelForward> Scheduler<M> {
                 if self.active[idx].generated_tokens.len() >= self.active[idx].max_tokens {
                     self.active[idx].finish(FinishReason::Length, &self.tokenizer);
                 } else {
+                    if self.active[idx].first_token_at.is_none() {
+                        self.active[idx].first_token_at = Some(std::time::Instant::now());
+                    }
                     self.active[idx].phase = Phase::Decoding;
                 }
             }
