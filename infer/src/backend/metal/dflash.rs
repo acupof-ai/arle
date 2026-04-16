@@ -37,7 +37,7 @@ impl MetalDflashOptions {
     }
 }
 
-pub(super) struct MetalDflashRuntime {
+pub(crate) struct MetalDflashRuntime {
     block_size: usize,
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
@@ -47,7 +47,7 @@ pub(super) struct MetalDflashRuntime {
 }
 
 impl MetalDflashRuntime {
-    pub(super) fn load(
+    pub(crate) fn load(
         options: &MetalDflashOptions,
         target_config: &MetalModelConfig,
     ) -> Result<Self> {
@@ -123,35 +123,35 @@ impl MetalDflashRuntime {
         })
     }
 
-    pub(super) fn draft_model_id(&self) -> &str {
+    pub(crate) fn draft_model_id(&self) -> &str {
         &self.draft_model_id
     }
 
-    pub(super) fn target_layer_ids(&self) -> &[usize] {
+    pub(crate) fn target_layer_ids(&self) -> &[usize] {
         &self.target_layer_ids
     }
 
-    pub(super) fn draft_num_hidden_layers(&self) -> usize {
+    pub(crate) fn draft_num_hidden_layers(&self) -> usize {
         self.draft_config.num_hidden_layers
     }
 
-    pub(super) fn draft_n_kv_heads(&self) -> i32 {
+    pub(crate) fn draft_n_kv_heads(&self) -> i32 {
         self.draft_config.num_key_value_heads as i32
     }
 
-    pub(super) fn draft_head_dim(&self) -> i32 {
+    pub(crate) fn draft_head_dim(&self) -> i32 {
         self.draft_config.head_dim as i32
     }
 }
 
 impl MetalDflashRuntime {
-    pub(super) fn block_size(&self) -> usize {
+    pub(crate) fn block_size(&self) -> usize {
         self.block_size
     }
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct DFlashDraftConfig {
+pub(crate) struct DFlashDraftConfig {
     hidden_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
@@ -292,7 +292,7 @@ impl DFlashDraftWeights {
     }
 }
 
-pub(super) struct ContiguousKvState {
+pub(crate) struct ContiguousKvState {
     k_caches: Vec<MlxArray>,
     v_caches: Vec<MlxArray>,
     len: i32,
@@ -302,7 +302,7 @@ pub(super) struct ContiguousKvState {
 }
 
 impl ContiguousKvState {
-    pub(super) fn new(
+    pub(crate) fn new(
         num_layers: usize,
         n_kv_heads: i32,
         head_dim: i32,
@@ -330,7 +330,7 @@ impl ContiguousKvState {
         }
     }
 
-    pub(super) fn from_dtype(
+    pub(crate) fn from_dtype(
         num_layers: usize,
         n_kv_heads: i32,
         head_dim: i32,
@@ -380,7 +380,7 @@ impl ContiguousKvState {
     }
 }
 
-pub(super) fn metal_generate_dflash_qwen3(
+pub(crate) fn metal_generate_dflash_qwen3(
     runtime: &MetalDflashRuntime,
     input_ids: &[u32],
     weights: &StandardMetalWeights,
@@ -570,7 +570,7 @@ pub(super) fn metal_generate_dflash_qwen3(
 }
 
 /// Result of one DFlash speculative block (draft → verify → accept/reject).
-pub(super) struct DFlashBlockResult {
+pub(crate) struct DFlashBlockResult {
     pub accepted_tokens: Vec<u32>,
     pub updated_target_hidden: MlxArray,
     pub accepted_inputs: usize,
@@ -578,7 +578,7 @@ pub(super) struct DFlashBlockResult {
 
 /// Run one DFlash speculative block: draft N tokens, verify against target
 /// model, accept the longest matching prefix, trim rejected KV.
-pub(super) fn dflash_speculative_block(
+pub(crate) fn dflash_speculative_block(
     runtime: &MetalDflashRuntime,
     current_token: u32,
     target_hidden: &MlxArray,
@@ -657,7 +657,7 @@ pub(super) fn dflash_speculative_block(
 
 /// Public wrapper for the scheduler path — runs the full Qwen3 forward
 /// on `ContiguousKvState` and captures hidden states at target layers.
-pub(super) fn qwen3_forward_with_hidden_states_on_state(
+pub(crate) fn qwen3_forward_with_hidden_states_on_state(
     input_ids: &[u32],
     weights: &StandardMetalWeights,
     config: &MetalModelConfig,
