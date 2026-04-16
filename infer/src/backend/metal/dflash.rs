@@ -1,14 +1,14 @@
 use std::{collections::HashSet, path::Path, time::Instant};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 
 use super::{
     config::{MetalModelArch, MetalModelConfig, QuantConfig},
     forward::rust_transformer_layer,
-    generate::{MetalGenerateOutput, KV_CACHE_CHUNK},
+    generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{concatenate_axis, eval, rms_norm, slice, take_axis, zeros, MlxArray},
+    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
