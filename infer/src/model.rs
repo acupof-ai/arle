@@ -285,6 +285,27 @@ pub trait ModelForward: Send {
         Ok(None)
     }
 
+    /// Launch batched greedy sampling kernels (argmax + logprob) without sync.
+    /// GPU work is left in-flight. Call `sample_batch_greedy_readback()` after
+    /// CPU overlap completes.
+    fn sample_batch_greedy_launch(
+        &self,
+        _slot_indices: &[usize],
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Sync + readback after `sample_batch_greedy_launch()`.
+    /// Must only be called after launch returned `true`.
+    fn sample_batch_greedy_readback(
+        &self,
+        _slot_indices: &[usize],
+        _decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Prepare per-request sampling buffers when batched greedy sampling needs
     /// to fall back to `select_tokens_batch()`.
     ///

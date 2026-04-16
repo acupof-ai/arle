@@ -17,20 +17,20 @@ impl<M: ModelForward> Scheduler<M> {
             .active
             .iter()
             .any(|r| matches!(r.phase, Phase::Decoding));
-        let decode_us = if has_decode {
+        assert!(
+            self.pending_decode.is_none(),
+            "pending decode must be cleared before scheduler step"
+        );
+        let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            self.step_decode_batch();
+            self.step_decode_launch();
             t.elapsed().as_micros()
         } else {
             0
         };
 
-        // Phase 2: Flush deferred deltas (CPU tokenizer decode)
-        //
-        // Runs after decode batch returns. When GPU forward is fast
-        // (CUDA Graph replay), emit_delta dominates; when forward is
-        // slow, emit_delta would have overlapped with GPU compute if
-        // we split forward into launch + sync phases (future opt).
+        // Phase 2: Flush deferred deltas (CPU tokenizer decode) while the
+        // greedy sampling kernel is still in flight.
         let emit_t = std::time::Instant::now();
         {
             let Self {
@@ -46,7 +46,17 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
-        // Phase 3: Accept ALL new requests (prefix cache + start prefill)
+        // Phase 3: Readback decode results (sync + D2H + token mutation)
+        let readback_us = if has_decode && self.pending_decode.is_some() {
+            let t = std::time::Instant::now();
+            self.step_decode_readback();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+        let decode_us = decode_launch_us + readback_us;
+
+        // Phase 4: Accept ALL new requests (prefix cache + start prefill)
         // Process all new requests in one step to avoid multi-iteration admission delay.
         let new_t = std::time::Instant::now();
         loop {
@@ -59,7 +69,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 4: Prefill chunks — adaptive rate based on decode batch size.
+        // Phase 5: Prefill chunks — adaptive rate based on decode batch size.
         //
         // During ramp-up (few decodes), allow more prefills to reduce TTFT.
         // At high concurrency, limit prefills to protect decode ITL.

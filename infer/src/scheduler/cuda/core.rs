@@ -50,6 +50,17 @@ pub(super) struct StagedAdmission {
     pub(super) enqueued_at_clock: u64,
 }
 
+/// State preserved between decode launch and readback for GPU/CPU overlap.
+pub(super) struct PendingDecode {
+    pub decode_indices: Vec<usize>,
+    pub slot_indices: Vec<usize>,
+    pub all_greedy: bool,
+    /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
+    /// Distinct from `all_greedy` which tracks sampling policy, not launch state.
+    pub greedy_launched: bool,
+    pub sampling_params_greedy: Vec<bool>,
+}
+
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
     pub(super) config: SchedulerConfig,
@@ -136,6 +147,8 @@ pub struct Scheduler<M: ModelForward> {
     /// Throttled GPU memory query — last poll time and peak high-water mark.
     pub(super) last_mem_query: std::time::Instant,
     pub(super) peak_mem_bytes: u64,
+    /// Pending decode state for GPU/CPU overlap.
+    pub(super) pending_decode: Option<PendingDecode>,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -381,6 +394,7 @@ impl<M: ModelForward> Scheduler<M> {
             step_timing_total_us: 0.0,
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
+            pending_decode: None,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(

@@ -331,6 +331,54 @@ impl ModelForward for Qwen3Model {
         ))
     }
 
+    fn sample_batch_greedy_launch(
+        &self,
+        slot_indices: &[usize],
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        let logits = match decode_ctx.logits_batch.as_ref() {
+            Some(l) if l.seq_len > 0 => l,
+            _ => return Ok(false),
+        };
+        let batch_size = slot_indices.len();
+        crate::ops::argmax_batch_logprob_launch(
+            &self.ctx,
+            logits,
+            &mut decode_ctx.argmax_out,
+            &mut decode_ctx.logprobs_gpu,
+            batch_size,
+        )?;
+        Ok(true)
+    }
+
+    fn sample_batch_greedy_readback(
+        &self,
+        slot_indices: &[usize],
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<Option<Vec<u32>>> {
+        let batch_size = slot_indices.len();
+        self.ctx.sync()?;
+        crate::ops::argmax_batch_readback_into(
+            &self.ctx,
+            &decode_ctx.argmax_out,
+            &mut decode_ctx.argmax_host,
+            batch_size,
+        )?;
+        let lp_tmp = self
+            .ctx
+            .stream
+            .clone_dtoh(&decode_ctx.logprobs_gpu)
+            .map_err(|e| anyhow::anyhow!("D2H logprobs: {e}"))?;
+        decode_ctx.logprobs_host[..batch_size].copy_from_slice(&lp_tmp[..batch_size]);
+
+        Ok(Some(
+            decode_ctx.argmax_host[..batch_size]
+                .iter()
+                .map(|&x| x as u32)
+                .collect(),
+        ))
+    }
+
     fn prepare_batch_sampling_fallback(
         &self,
         states: &mut [Self::State],
