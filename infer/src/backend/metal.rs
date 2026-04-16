@@ -245,6 +245,25 @@ impl MetalBackend {
         input_ids: &[u32],
         params: &SamplingParams,
     ) -> Result<request_state::MetalRequestState<'_>> {
+        // DFlash runtime is not threaded here — only the scheduler runtime
+        // (which has a 'static backend ref) can pass it. The legacy serial
+        // runtime never calls create_request_state for DFlash.
+        self.create_request_state_with_dflash(input_ids, params, None)
+    }
+
+    /// Like `create_request_state` but accepts an explicit DFlash runtime
+    /// reference with `'static` lifetime. Called from the scheduler runtime
+    /// where the backend is leaked to `'static`.
+    #[cfg(feature = "metal")]
+    pub fn create_request_state_with_dflash(
+        &self,
+        input_ids: &[u32],
+        params: &SamplingParams,
+        dflash_runtime: Option<(
+            &'static dflash::MetalDflashRuntime,
+            &'static MetalModelConfig,
+        )>,
+    ) -> Result<request_state::MetalRequestState<'_>> {
         let config = self.config.as_ref().context("model not loaded")?;
         let weights = self.weights.as_ref().context("weights not loaded")?;
         let max_new_tokens = params.max_new_tokens.unwrap_or(512);
@@ -255,6 +274,7 @@ impl MetalBackend {
             params,
             self.kv_pool_enabled,
             max_new_tokens,
+            dflash_runtime,
         )
     }
 
