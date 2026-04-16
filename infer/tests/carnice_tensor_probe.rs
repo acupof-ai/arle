@@ -9,7 +9,7 @@ use half::f16;
 use infer::gguf::GgufFile;
 
 fn model_path() -> String {
-    std::env::var("PEGAINFER_CARNICE_PATH")
+    std::env::var("INFER_CARNICE_PATH")
         .unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
 }
 

@@ -84,9 +84,9 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 
 ## `build.rs` rules
 
-- **SM auto-detection order:** `PEGAINFER_CUDA_SM` → `CUDA_SM` → `nvidia-smi`
+- **SM auto-detection order:** `INFER_CUDA_SM` → `CUDA_SM` → `nvidia-smi`
   → fallback `sm_80` (A100). Always emit a `cargo:warning` on fallback.
-- **Triton AOT** is driven by `find_triton_python()` — order: `PEGAINFER_TRITON_PYTHON`
+- **Triton AOT** is driven by `find_triton_python()` — order: `INFER_TRITON_PYTHON`
   → `tools/triton/.venv/bin/python` → `./.venv/bin/python` → `python3` → `python`.
   Generated artifacts land under `OUT_DIR/triton/...`.
 - **Recursive `.cu` walk under `csrc/`.** nvcc is invoked with `-I csrc/` so

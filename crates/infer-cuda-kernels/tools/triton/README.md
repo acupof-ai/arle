@@ -34,7 +34,7 @@ uv pip install -p tools/triton/.venv/bin/python triton
 Then either point the build to that interpreter explicitly:
 
 ```bash
-export PEGAINFER_TRITON_PYTHON=$PWD/tools/triton/.venv/bin/python
+export INFER_TRITON_PYTHON=$PWD/tools/triton/.venv/bin/python
 ```
 
 or let `build.rs` auto-probe `tools/triton/.venv/bin/python` before trying `python3` / `python`.
@@ -42,10 +42,10 @@ or let `build.rs` auto-probe `tools/triton/.venv/bin/python` before trying `pyth
 If `nvidia-smi` is unavailable where you build, also set the target SM manually.
 
 ```bash
-export PEGAINFER_CUDA_SM=120
+export INFER_CUDA_SM=120
 ```
 
-`PEGAINFER_CUDA_SM` also drives the explicit Triton AOT compile target, so it is the default escape hatch when the build environment cannot query a live GPU.
+`INFER_CUDA_SM` also drives the explicit Triton AOT compile target, so it is the default escape hatch when the build environment cannot query a live GPU.
 
 ### Windows
 
@@ -54,7 +54,7 @@ Official Triton does not ship Windows wheels. Use [`triton-windows`](https://git
 ```powershell
 uv venv .venv --python 3.12
 uv pip install "triton-windows<3.7"
-$env:PEGAINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
+$env:INFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x"
 ```
 
@@ -91,10 +91,10 @@ cargo test --release add_and_add_inplace -- --nocapture
 ## Common failures
 
 - `Could not find a Python interpreter with Triton installed`
-  - Set `PEGAINFER_TRITON_PYTHON`, or bootstrap `tools/triton/.venv` with `uv`.
+  - Set `INFER_TRITON_PYTHON`, or bootstrap `tools/triton/.venv` with `uv`.
 - `GPU detection failed`
-  - Set `PEGAINFER_CUDA_SM` explicitly if `nvidia-smi` is not available during build.
+  - Set `INFER_CUDA_SM` explicitly if `nvidia-smi` is not available during build.
 - `Triton AOT generator failed`
-  - Re-run the build and inspect the generator stderr printed by `build.rs`; the generator accepts an explicit `cuda:<sm>:32` target derived from `PEGAINFER_CUDA_SM`.
+  - Re-run the build and inspect the generator stderr printed by `build.rs`; the generator accepts an explicit `cuda:<sm>:32` target derived from `INFER_CUDA_SM`.
 - `CUDA_ERROR_NO_BINARY_FOR_GPU` or similar runtime load errors
   - Rebuild on the target GPU environment; the generated Triton cubin is target-specific.

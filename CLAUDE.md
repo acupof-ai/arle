@@ -162,8 +162,8 @@ cargo test --release --test e2e_qwen35
 cargo test --release --no-default-features --features metal
 ```
 
-Env vars: `PEGAINFER_CUDA_SM` (SM override), `PEGAINFER_TRITON_PYTHON`
-(Triton AOT Python), `PEGAINFER_TEST_MODEL_PATH` (default `models/Qwen3-4B`).
+Env vars: `INFER_CUDA_SM` (SM override), `INFER_TRITON_PYTHON`
+(Triton AOT Python), `INFER_TEST_MODEL_PATH` (default `models/Qwen3-4B`).
 Full list: [`docs/environment.md`](docs/environment.md).
 
 ---

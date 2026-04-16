@@ -35,7 +35,7 @@ Verify:
 .venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-> build.rs auto-detects `.venv/bin/python` for Triton AOT compilation. Override with `PEGAINFER_TRITON_PYTHON` if needed.
+> build.rs auto-detects `.venv/bin/python` for Triton AOT compilation. Override with `INFER_TRITON_PYTHON` if needed.
 
 ## 3. Build
 

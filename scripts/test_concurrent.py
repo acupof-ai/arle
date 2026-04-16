@@ -432,7 +432,7 @@ async def test_stress(n: int = 20) -> None:
 
 async def main() -> None:
     print("=" * 70)
-    print("  PEGAINFER CONCURRENT REQUEST TEST SUITE")
+    print("  INFER CONCURRENT REQUEST TEST SUITE")
     print(f"  endpoint : {BASE_URL}")
     print(f"  model    : {MODEL}")
     print("=" * 70)

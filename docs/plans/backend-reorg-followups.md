@@ -109,7 +109,7 @@ re-export surface is the new lever.
 |---|---|---|
 | `a95de77` | 2026-03-31 | feat(graph): CUDA graph batch pool — CPU tracking + GPU capture stub |
 | `8fbbac7` | 2026-03-31 | chore(polish): code quality, docs, and CI |
-| `ad4fda8` | 2026-03-31 | refactor: rename pegainfer → infer |
+| `ad4fda8` | 2026-03-31 | refactor: rename infer → infer |
 | `9f64ddf` | 2026-04-13 | refactor(cuda): build backend/cuda house and relocate CUDA plumbing |
 
 **Author:** ckl (same as everything else in this repo). This is not legacy from a departed contributor — it is **your own scaffold**, written 2026-03-31 with explicit intent:

@@ -33,7 +33,7 @@ This doc assumes the CUDA host has already run the scheduler-side M2b gate in
 - [ ] `git rev-parse --abbrev-ref HEAD` points at the branch to validate.
 - [ ] `nvidia-smi` shows the target GPU.
 - [ ] `CUDA_HOME=/usr/local/cuda` (or the correct local CUDA path) exists.
-- [ ] `PEGAINFER_TEST_MODEL_PATH` points at a valid test model, or
+- [ ] `INFER_TEST_MODEL_PATH` points at a valid test model, or
       `models/Qwen3-4B` exists locally.
 - [ ] Any previous server on `:8000` is stopped.
 
@@ -77,8 +77,8 @@ Expected:
 ```bash
 CUDA_HOME=/usr/local/cuda cargo build --release
 cargo test --release
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e_qwen35
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e_qwen35
 cargo test --release --test greedy_consistency
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check

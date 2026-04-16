@@ -10,7 +10,7 @@ serially (one at a time) on a single L4 GPU with exclusive access.
 - **Commit:** c1956da (feat: wire ServerMetrics + optimize bench scripts)
 - **Build:** `cargo build --release -p infer` (default CUDA features)
 - **Server:** `./target/release/infer --model-path models/Qwen3-4B --port 8000`
-- **Env:** `PEGAINFER_CUDA_SM=89`
+- **Env:** `INFER_CUDA_SM=89`
 
 ## 1. guidellm sweep (canonical, prompt=4096 tokens, output=256 tokens)
 

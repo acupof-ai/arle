@@ -102,7 +102,7 @@ pub(crate) fn get_embeddings_batch(
 }
 
 /// Print first 8 and last 4 elements of a hidden-state buffer to stderr,
-/// gated by `PEGAINFER_DEBUG_DUMP=1`. Used to bisect forward-pass divergence
+/// gated by `INFER_DEBUG_DUMP=1`. Used to bisect forward-pass divergence
 /// between safetensors and GGUF load paths.
 pub(crate) fn debug_dump_hidden(
     ctx: &DeviceContext,
@@ -110,7 +110,7 @@ pub(crate) fn debug_dump_hidden(
     label: &str,
     hidden_dim: usize,
 ) {
-    if std::env::var("PEGAINFER_DEBUG_DUMP").is_err() {
+    if std::env::var("INFER_DEBUG_DUMP").is_err() {
         return;
     }
     use half::bf16;

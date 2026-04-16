@@ -439,7 +439,7 @@ fn fwht_cpu(data: &mut [f32]) {
 pub(crate) const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 
 pub(crate) fn resolve_rope_cache_len(config_hint: Option<usize>) -> usize {
-    let env_override = std::env::var("PEGAINFER_ROPE_CACHE_LEN")
+    let env_override = std::env::var("INFER_ROPE_CACHE_LEN")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&len| len > 0);
@@ -884,10 +884,10 @@ pub(crate) fn load_tensor_2d_gguf(
     let gguf_name = find_gguf_tensor_name(gguf, hf_name)?;
     let info = &gguf.tensors[&gguf_name];
 
-    // `PEGAINFER_FORCE_BF16_QUANT=1` skips all packed fast paths and forces the
+    // `INFER_FORCE_BF16_QUANT=1` skips all packed fast paths and forces the
     // BF16 dequant fallback. Kept behind an env var as a bisection tool for
     // "bug in native GPU kernel" vs "bug in downstream forward pass".
-    let force_bf16 = std::env::var("PEGAINFER_FORCE_BF16_QUANT").is_ok();
+    let force_bf16 = std::env::var("INFER_FORCE_BF16_QUANT").is_ok();
     if force_bf16 && info.shape.len() == 2 {
         return load_tensor_2d_gguf_bf16(ctx, gguf, hf_name);
     }

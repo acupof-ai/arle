@@ -66,7 +66,7 @@ huggingface-cli download Qwen/Qwen3-4B --local-dir models/Qwen3-4B
 
 # Build and run
 export CUDA_HOME=/usr/local/cuda
-export PEGAINFER_TRITON_PYTHON=.venv/bin/python
+export INFER_TRITON_PYTHON=.venv/bin/python
 cargo run --release
 ```
 
@@ -120,9 +120,9 @@ cargo run -p infer --no-default-features --features cpu,no-cuda --bin cpu_serve 
 | Variable | Description |
 |---|---|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
-| `PEGAINFER_TRITON_PYTHON` | Python with Triton for build-time AOT compilation |
-| `PEGAINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
-| `PEGAINFER_TEST_MODEL_PATH` | Override test model path (default: `models/Qwen3-4B`) |
+| `INFER_TRITON_PYTHON` | Python with Triton for build-time AOT compilation |
+| `INFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
+| `INFER_TEST_MODEL_PATH` | Override test model path (default: `models/Qwen3-4B`) |
 
 </details>
 
@@ -133,7 +133,7 @@ cargo run -p infer --no-default-features --features cpu,no-cuda --bin cpu_serve 
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x"
 uv venv .venv --python 3.12
 uv pip install "triton-windows<3.7"
-$env:PEGAINFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
+$env:INFER_TRITON_PYTHON = ".venv\Scripts\python.exe"
 cargo build --release
 cargo run --release --bin infer -- --model-path models/Qwen3-4B
 ```
@@ -205,7 +205,7 @@ cargo run --release --bin bench_serving
 cargo test --release
 
 # E2E greedy regression (GPU + model weights required)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
+INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --test e2e_qwen35
 ```
 
@@ -292,7 +292,7 @@ See [ROADMAP.md](../ROADMAP.md) for the full phased plan.
 
 ## Acknowledgments
 
-- [PegaInfer](https://github.com/pega-infer/pegainfer) — agent-infer 的 CUDA 推理核心基于 PegaInfer 构建，感谢其高性能 kernel 和模型实现。
+- [PegaInfer](https://github.com/pega-infer/infer) — agent-infer 的 CUDA 推理核心基于 PegaInfer 构建，感谢其高性能 kernel 和模型实现。
 
 ## License
 

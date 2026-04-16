@@ -228,7 +228,7 @@ cargo test -p infer --release --no-default-features --features no-cuda sessions
 cargo test -p infer --release --no-default-features --features no-cuda http_server
 
 # Integration test (needs the engine under test, so typically CUDA)
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
+INFER_TEST_MODEL_PATH=models/Qwen3-4B \
   cargo test --release --test session_http_routes
 
 # Full matrix

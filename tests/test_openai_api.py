@@ -7,7 +7,7 @@ running infer server are skipped when no server is available.
 
 Run:
     pytest tests/test_openai_api.py -v                   # mock only
-    PEGAINFER_URL=http://localhost:8000 pytest tests/test_openai_api.py -v  # + integration
+    INFER_URL=http://localhost:8000 pytest tests/test_openai_api.py -v  # + integration
 """
 
 import json
@@ -26,15 +26,15 @@ import pytest
 # Test configuration
 # ---------------------------------------------------------------------------
 
-PEGAINFER_URL = os.environ.get("PEGAINFER_URL", "")
-HAS_SERVER = bool(PEGAINFER_URL)
+INFER_URL = os.environ.get("INFER_URL", "")
+HAS_SERVER = bool(INFER_URL)
 
 skip_without_server = pytest.mark.skipif(
     not HAS_SERVER,
-    reason="PEGAINFER_URL not set — skipping integration tests",
+    reason="INFER_URL not set — skipping integration tests",
 )
 
-DEFAULT_MODEL = os.environ.get("PEGAINFER_MODEL", "Qwen3-8B")
+DEFAULT_MODEL = os.environ.get("INFER_MODEL", "Qwen3-8B")
 COMPLETIONS_PATH = "/v1/completions"
 CHAT_PATH = "/v1/chat/completions"
 
@@ -506,7 +506,7 @@ class TestIntegrationCompletions:
 
     @pytest.fixture(autouse=True)
     def server_url(self):
-        self.base_url = PEGAINFER_URL.rstrip("/")
+        self.base_url = INFER_URL.rstrip("/")
 
     def test_simple_completion(self):
         req = make_completions_request(
@@ -593,7 +593,7 @@ class TestIntegrationConcurrency:
 
     @pytest.fixture(autouse=True)
     def server_url(self):
-        self.base_url = PEGAINFER_URL.rstrip("/")
+        self.base_url = INFER_URL.rstrip("/")
 
     def test_two_concurrent_requests(self):
         import threading

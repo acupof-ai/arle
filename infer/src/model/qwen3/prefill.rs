@@ -21,7 +21,7 @@ struct PrefillBuffers {
     /// per-layer bf16 outputs accumulate into fp32 without compounding
     /// ~0.4% bf16 rounding noise at each residual add. Norm reads from here
     /// directly to avoid a further bf16 round-trip on the hidden state.
-    /// `None` unless `PEGAINFER_QWEN3_FP32_RESIDUAL=1` is set.
+    /// `None` unless `INFER_QWEN3_FP32_RESIDUAL=1` is set.
     residual_f32: Option<CudaSlice<f32>>,
     normed: HiddenStates,      // hidden_dim × seq_len (reused for normed2)
     q_batch: HiddenStates,     // q_dim × seq_len
@@ -43,7 +43,7 @@ impl PrefillBuffers {
         inter_dim: usize,
         seq_len: usize,
     ) -> Result<Self> {
-        let residual_f32 = if std::env::var("PEGAINFER_QWEN3_FP32_RESIDUAL").is_ok() {
+        let residual_f32 = if std::env::var("INFER_QWEN3_FP32_RESIDUAL").is_ok() {
             Some(
                 ctx.stream
                     .alloc_zeros::<f32>(hidden_dim * seq_len)

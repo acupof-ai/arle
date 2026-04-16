@@ -54,7 +54,7 @@ const CASES: &[Case] = &[
 ];
 
 fn model_path() -> String {
-    std::env::var("PEGAINFER_E2E_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
+    std::env::var("INFER_E2E_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
 }
 
 fn model_name(model_path: &str) -> String {

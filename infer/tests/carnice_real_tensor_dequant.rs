@@ -9,7 +9,7 @@
 //! any downstream garbage is NOT in the Q3_K/Q4_K path.
 //!
 //! Enable with:
-//!   PEGAINFER_CARNICE_PATH=/abs/path/to/models/Carnice-27b-GGUF \
+//!   INFER_CARNICE_PATH=/abs/path/to/models/Carnice-27b-GGUF \
 //!       cargo test --release --test carnice_real_tensor_dequant -- --nocapture --ignored
 
 #![cfg(feature = "cuda")]
@@ -19,7 +19,7 @@ use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
 use infer::gguf::GgufFile;
 
 fn model_path() -> String {
-    std::env::var("PEGAINFER_CARNICE_PATH")
+    std::env::var("INFER_CARNICE_PATH")
         .unwrap_or_else(|_| "models/Carnice-27b-GGUF".to_string())
 }
 

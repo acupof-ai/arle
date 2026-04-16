@@ -184,7 +184,7 @@ GEMV + MLP (cuBLAS + LM head + silu_mul) dominate at 91.6%. GDR is 2.8% after th
 Command used:
 
 ```bash
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+INFER_TRITON_PYTHON=./.venv/bin/python \
 nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node \
   --export=sqlite -o target/profiling/qwen35_decode_1x128_20260327 \
   cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
@@ -412,7 +412,7 @@ Trace note: this capture includes one warmup request plus one measured request, 
 Stable request bench:
 
 ```bash
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+INFER_TRITON_PYTHON=./.venv/bin/python \
 cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
   request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3
 ```
@@ -426,7 +426,7 @@ Result:
 `nsys` command used:
 
 ```bash
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+INFER_TRITON_PYTHON=./.venv/bin/python \
 nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node \
   --export=sqlite -o target/profiling/qwen35_prefill_2048_gdr \
   cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
@@ -467,7 +467,7 @@ Note: `cuMemcpyHtoDAsync_v2` dominates total API time in this whole-process trac
 Stable request bench:
 
 ```bash
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python \
+INFER_TRITON_PYTHON=./.venv/bin/python \
 cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B \
   request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3
 ```
@@ -481,8 +481,8 @@ Result:
 Correctness refresh:
 
 ```bash
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture
-PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture
+INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture
+INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture
 ```
 
 Result:
@@ -572,10 +572,10 @@ Initial attempt — state layout transpose for coalescing — had no measurable 
 3. **Pass fusion:** Merged 4 separate state passes into 2: decay+kv_mem (pass 1), rank-1 update+output (pass 2). Eliminated the shared-memory `smem_delta` round-trip.
 
 **Validated commands:**
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo bench --bench ops_bench -- gated_delta_rule_decode`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 3 --iters 5`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo bench --bench ops_bench -- gated_delta_rule_decode`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 3 --iters 5`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
 - `cargo test --release --test e2e -- --nocapture` (Qwen3 unaffected)
 
 **Results:**
@@ -594,10 +594,10 @@ Initial attempt — state layout transpose for coalescing — had no measurable 
 **Changes:** Added explicit chunk-wise scratch buffers, added Triton AOT stages for `gdr_prepare_qkv_gbeta`, `chunk_local_cumsum`, `chunk_scaled_dot_kkt`, `solve_tril_64`, `recompute_w_u`, `chunk_state`, and `chunk_o`, rewired the real Qwen3.5 prefill path to launch this pipeline per linear-attention layer, and fixed the main correctness bug in `gdr_chunk_state_qwen35_kernel`: `v_new` must be written back ungated and only the recurrent update should use the gated form. The chunk-wise solve/recompute/state/output kernels are adapted from FLA and now carry explicit source attribution in `tools/triton/gated_delta_rule_chunkwise_kernels.py`.
 
 **Validated commands:**
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo check --release`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo check --release`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test e2e_qwen35 -- --nocapture`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
 
 **Results:**
 - Prefill-heavy `(2048,1)`: TTFT avg `222.45ms`, p50 `222.55ms`, p99 `222.85ms`
@@ -617,10 +617,10 @@ Initial attempt — state layout transpose for coalescing — had no measurable 
 **Changes:** Added a temporary Triton fused-recurrent GDR prefill kernel and its AOT build wiring, exposed it through FFI, added batched `conv1d -> GDR -> gated_norm` operator plumbing in `ops.rs`, rewired `Qwen35Model` linear prefill to use that path, and added a standalone prefill microbench entry. This path was later superseded by the chunk-wise implementation in `#7`.
 
 **Validated commands:**
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 1 --iters 3`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
-- `PEGAINFER_TRITON_PYTHON=./.venv/bin/python nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite -o target/profiling/qwen35_prefill_2048_gdr cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 3`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 1 --output-len 128 --warmup 1 --iters 3`
+- `INFER_TRITON_PYTHON=./.venv/bin/python cargo test --release --test gen_test_data_35 -- --nocapture`
+- `INFER_TRITON_PYTHON=./.venv/bin/python nsys profile --force-overwrite=true --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite -o target/profiling/qwen35_prefill_2048_gdr cargo run --release --bin bench_serving -- --model-path models/Qwen3.5-4B request --prompt-len 2048 --output-len 1 --warmup 1 --iters 1`
 - `nsys stats --report cuda_gpu_kern_sum target/profiling/qwen35_prefill_2048_gdr.sqlite`
 - `nsys stats --report cuda_api_sum target/profiling/qwen35_prefill_2048_gdr.sqlite`
 

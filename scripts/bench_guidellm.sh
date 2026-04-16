@@ -15,7 +15,7 @@
 # Preconditions:
 #   * guidellm, curl, jq on PATH
 #   * infer HTTP server is already running at --target
-#     (start it with: scripts/start_pegainfer.sh)
+#     (start it with: scripts/start_infer.sh)
 #
 # Side effects:
 #   * Writes raw artefacts to bench-output/<date>-<label>[-runN]/
@@ -123,7 +123,7 @@ fi
 
 # ---- preflight: server is up -------------------------------------------------
 if ! curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; then
-    echo "error: server not running at $TARGET — start it with scripts/start_pegainfer.sh first" >&2
+    echo "error: server not running at $TARGET — start it with scripts/start_infer.sh first" >&2
     exit 2
 fi
 

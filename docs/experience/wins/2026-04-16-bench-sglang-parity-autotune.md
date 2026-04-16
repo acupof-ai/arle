@@ -12,15 +12,15 @@ Benchmark comparison after implementing 5 optimizations (commits `cc81b65`, `faf
 
 - GPU: NVIDIA L4 24GB
 - Model: Qwen3-4B BF16
-- pegainfer: 18 slots, `--mem-fraction-static 0.88`
+- infer: 18 slots, `--mem-fraction-static 0.88`
 - SGLang 0.5.10.post1: `--mem-fraction-static 0.88 --dtype bfloat16`
 - FlashInfer: 0.6.7.post3 (shared)
 - Bench: `scripts/bench_throughput.py`, synthetic prompts, greedy (temp=0),
   max_tokens=256, serial runs (one GPU)
 
-## Results — Final (overlap + prefill pipeline, `dbf111b`)
+## Results — Final (TC decode + all optimizations, `642b8b8`)
 
-| Concurrency | pegainfer tok/s | SGLang tok/s | Parity | ITL pega (ms) | ITL sglang (ms) |
+| Concurrency | infer tok/s | SGLang tok/s | Parity | ITL pega (ms) | ITL sglang (ms) |
 |---|---|---|---|---|---|
 | **B=1** | 30.1 | 30.1 | **100.0%** | 33.2 | 33.0 |
 | **B=4** | 114.2 | 115.9 | **98.5%** | 34.5 | 34.3 |
@@ -53,8 +53,8 @@ Benchmark comparison after implementing 5 optimizations (commits `cc81b65`, `faf
   bench tool / prompt distribution.
 - B=16: improved from 92.7% → 93.7% (+1.0pp). The cublasLt autotune and
   fused QKV decode_prep contribute here.
-- ITL at B=16: pegainfer 35.8ms vs SGLang 35.9ms — essentially identical per-token latency.
-  The throughput gap is from TTFT (pegainfer prefill is slower) + scheduling overhead.
+- ITL at B=16: infer 35.8ms vs SGLang 35.9ms — essentially identical per-token latency.
+  The throughput gap is from TTFT (infer prefill is slower) + scheduling overhead.
 
 ## Remaining Gap Sources (B=16, ~6.3%)
 

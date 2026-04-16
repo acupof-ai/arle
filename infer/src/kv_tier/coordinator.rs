@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn coordinator_shutdown_joins_thread_cleanly() {
         let (coordinator, handle, _events) = Coordinator::new(4);
-        let join_handle = coordinator.spawn("pegainfer-tiered-kv-coord-test");
+        let join_handle = coordinator.spawn("infer-tiered-kv-coord-test");
         handle.send(CoordinatorCommand::Shutdown).unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
