@@ -691,6 +691,12 @@ impl<'a> MetalRequestState<'a> {
             return Ok(None);
         }
 
+        // DFlash requests run multi-token speculative blocks per step — they
+        // cannot participate in cross-request single-token batched decode.
+        if states.iter().any(|s| s.is_dflash_enabled()) {
+            return Ok(None);
+        }
+
         match &mut states[0].inner {
             MetalRequestStateInner::Qwen3(_) => {
                 let mut qwen3_states = Vec::with_capacity(states.len());
@@ -760,6 +766,30 @@ impl<'a> MetalRequestState<'a> {
         match &self.inner {
             MetalRequestStateInner::Qwen35(state) if state.phase() == MetalRequestPhase::Decode => {
                 Some(state.driver.cache_len)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this request has DFlash speculative decode enabled.
+    pub(crate) fn is_dflash_enabled(&self) -> bool {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => state.driver.dflash.is_some(),
+            _ => false,
+        }
+    }
+
+    /// DFlash acceptance rate for this request (None if not DFlash-enabled or
+    /// no blocks have been executed yet).
+    pub(crate) fn dflash_acceptance_rate(&self) -> Option<f64> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => {
+                let d = state.driver.dflash.as_ref()?;
+                if d.acceptance_lengths.is_empty() {
+                    return None;
+                }
+                let sum: usize = d.acceptance_lengths.iter().sum();
+                Some(sum as f64 / d.acceptance_lengths.len() as f64)
             }
             _ => None,
         }
@@ -1719,9 +1749,14 @@ fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver
 ///
 /// When present, `decode_token` runs full DFlash speculative blocks and
 /// buffers the accepted tokens; the scheduler still sees one token per step.
+/// The DFlash state OWNS the target model's KV cache (`target_state`) instead
+/// of the driver's `k_caches`/`v_caches`, because `dflash_speculative_block`
+/// needs `&mut ContiguousKvState` for both target and draft.
 struct Qwen3DFlashState {
     runtime: &'static MetalDflashRuntime,
     config: &'static MetalModelConfig,
+    /// Target model KV state — owned by DFlash, replaces the driver's k/v caches.
+    target_state: dflash::ContiguousKvState,
     /// Draft model KV state — owned, separate from target.
     draft_state: dflash::ContiguousKvState,
     /// Target-layer hidden states from the last verified block. Bootstrapped
@@ -1828,15 +1863,20 @@ impl<'a> Qwen3StepDriver<'a> {
             eps: config.rms_norm_eps as f32,
             dflash: match dflash_runtime {
                 Some((runtime, static_config)) => {
+                    let total_cap = prompt_tokens.len() + max_new_tokens;
+                    let target_state = dflash::ContiguousKvState::from_dtype(
+                        n_layers, n_kv_heads, head_dim, total_cap, kv_dtype,
+                    );
                     let draft_state = dflash::ContiguousKvState::new(
                         runtime.draft_num_hidden_layers(),
                         runtime.draft_n_kv_heads(),
                         runtime.draft_head_dim(),
-                        prompt_tokens.len() + max_new_tokens,
+                        total_cap,
                     );
                     Some(Qwen3DFlashState {
                         runtime,
                         config: static_config,
+                        target_state,
                         draft_state,
                         target_hidden: None,
                         token_buffer: VecDeque::new(),
@@ -2040,7 +2080,81 @@ impl StepDriver for Qwen3StepDriver<'_> {
         }
     }
 
+    fn prefill_tokens(&mut self, tokens: &[u32], terminal_prompt: bool) -> Result<Option<u32>> {
+        // DFlash path: run the full prompt through qwen3_forward_with_hidden_states
+        // on the terminal chunk to capture target-layer hidden states for the
+        // first speculative block. The budget override in execute_prefill_chunk
+        // ensures the entire prompt arrives as one terminal chunk.
+        if terminal_prompt && self.dflash.is_some() {
+            let dflash = self.dflash.as_mut().unwrap();
+            let (norm_hidden, target_hidden) = dflash::qwen3_forward_with_hidden_states_on_state(
+                tokens,
+                self.weights,
+                dflash.config,
+                &dflash.target_layer_ids,
+                &mut dflash.target_state,
+            )?;
+            dflash.target_hidden = Some(target_hidden);
+            let logits = super::ops::linear(&norm_hidden, &self.weights.lm_head);
+            let sampled = gpu_sample_token(&logits, &self.sample_params);
+            eval(&[&sampled]);
+            return Ok(Some(sampled.item_i32() as u32));
+        }
+
+        // Default: per-token prefill
+        let mut emitted = None;
+        for (idx, &token) in tokens.iter().enumerate() {
+            let is_terminal = terminal_prompt && idx + 1 == tokens.len();
+            let sampled = self.prefill_token(token, is_terminal)?;
+            if is_terminal {
+                emitted = sampled;
+            } else if sampled.is_some() {
+                bail!("non-terminal prefill step unexpectedly emitted a sampled token");
+            }
+        }
+        Ok(emitted)
+    }
+
     fn decode_token(&mut self, token: u32) -> Result<u32> {
+        // ── DFlash speculative path ──────────────────────────────────────
+        if let Some(dflash) = self.dflash.as_mut() {
+            // 1. Drain buffer first — cheap, no GPU work.
+            if let Some(buffered) = dflash.token_buffer.pop_front() {
+                return Ok(buffered);
+            }
+
+            // 2. Buffer empty → run one full speculative block.
+            let target_hidden = dflash
+                .target_hidden
+                .take()
+                .context("DFlash decode_token: target_hidden not set (prefill incomplete?)")?;
+
+            let block = dflash::dflash_speculative_block(
+                dflash.runtime,
+                token,
+                &target_hidden,
+                self.weights,
+                dflash.config,
+                &self.sample_params,
+                &mut dflash.target_state,
+                &mut dflash.draft_state,
+            )?;
+
+            // 3. Update state.
+            dflash.acceptance_lengths.push(block.accepted_inputs);
+            dflash.target_hidden = Some(block.updated_target_hidden);
+
+            // 4. Push accepted tokens into buffer, pop the first one.
+            for &t in &block.accepted_tokens {
+                dflash.token_buffer.push_back(t);
+            }
+            return Ok(dflash
+                .token_buffer
+                .pop_front()
+                .context("DFlash speculative block produced zero tokens")?);
+        }
+
+        // ── Standard single-token path ───────────────────────────────────
         if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
             clear_metal_cache();
         }

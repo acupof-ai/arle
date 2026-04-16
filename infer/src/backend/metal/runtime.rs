@@ -46,7 +46,15 @@ impl ActiveMetalRequest {
     ) -> Result<(Vec<u32>, usize, Self)> {
         let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
         let max_tokens = incoming.max_tokens;
-        let request_state = backend.create_request_state(&prompt_tokens, &incoming.sampling)?;
+        // Thread DFlash runtime into the request state so Qwen3StepDriver
+        // can initialize speculative-decode state. Both refs are 'static
+        // because the backend is leaked into the scheduler runtime thread.
+        let dflash_ref = backend.dflash_runtime_static();
+        let request_state = backend.create_request_state_with_dflash(
+            &prompt_tokens,
+            &incoming.sampling,
+            dflash_ref,
+        )?;
         Ok((
             prompt_tokens.clone(),
             max_tokens,
@@ -563,12 +571,8 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
     max_waiting: usize,
     metrics: ServerMetrics,
 ) -> Result<SchedulerHandle> {
-    if options.dflash.is_some() {
-        bail!(
-            "the live Metal scheduler runtime does not support DFlash yet; use the serial runtime path instead"
-        );
-    }
-
+    // DFlash is now supported: Qwen3StepDriver's token-buffer pattern runs
+    // speculative blocks inside decode_token, transparent to the scheduler.
     let mut backend = MetalBackend::with_options(options);
     backend.load(Path::new(model_path))?;
 
@@ -876,12 +880,26 @@ fn admit_request(
 
 fn execute_prefill_chunk(
     req_id: RequestId,
-    budget: usize,
+    mut budget: usize,
     metrics: &ServerMetrics,
     prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
+    // DFlash requires full-prompt prefill in one shot because
+    // `qwen3_forward_with_hidden_states` captures hidden states for all
+    // positions — chunked KV-only prefill can't produce them. Override the
+    // scheduler's chunk budget to process the entire remaining prompt.
+    if let Some(request) = active.get(&req_id) {
+        if request.request_state.is_dflash_enabled() {
+            let remaining = request
+                .request_state
+                .prompt_len()
+                .saturating_sub(request.request_state.prompt_progress());
+            budget = budget.max(remaining);
+        }
+    }
+
     enum Outcome {
         Progress {
             emitted_token: Option<u32>,
