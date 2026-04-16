@@ -245,7 +245,7 @@ fn download_repo_assets_from_hub(model_id: &str, include_weights: bool) -> Resul
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn build_api() -> Result<Api> {
+pub fn build_api() -> Result<Api> {
     let mut builder = ApiBuilder::new();
 
     // Honour HF_TOKEN for private / gated models.

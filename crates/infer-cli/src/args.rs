@@ -24,6 +24,10 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
+    /// Skip interactive model selection (use auto-discovery)
+    #[arg(long, default_value_t = false)]
+    pub(crate) non_interactive: bool,
+
     /// Deprecated compatibility flag. Legacy contiguous CPU KV offload has
     /// been retired, so this value is ignored.
     #[arg(long)]
