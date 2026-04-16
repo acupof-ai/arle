@@ -83,6 +83,9 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             1 // High concurrency: protect decode latency
         };
+        // TODO(mixed-batch): once `PendingDecode` tracks a merged prefill
+        // request, exclude it here so Phase 2c does not run a duplicate prefill
+        // after the decode launch queued the mixed eager forward on the same stream.
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
             .take(max_prefills)

@@ -202,6 +202,10 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
+        // TODO(mixed-batch): probe `forward_mixed_batch(...)` here once a model
+        // implementation overrides the default `Ok(false)` path with a validated
+        // eager mixed decode+prefill forward. Keep the existing decode-only path
+        // unchanged until the model-side paged prefill prep is wired safely.
         let forward_result = self.model.forward_decode_batch(
             &token_ids,
             &mut self.states,

@@ -12,6 +12,7 @@ use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_F
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use log::info;
 
+use super::config::Config;
 use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::ModelForward;
@@ -22,6 +23,9 @@ use infer_cuda_kernels::kv_turboquant;
 use infer_cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
+
+#[allow(dead_code)]
+pub(crate) const MIXED_PREFILL_CAP: usize = 64;
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
@@ -75,11 +79,71 @@ pub struct BatchDecodeBuffers {
 
     /// CUDA Graph cache: index = batch_size - 1. Vec avoids HashMap overhead.
     graph_cache: Vec<Option<CudaGraph>>,
+
+    /// Lazily allocated eager-only buffers for mixed decode + prefill steps.
+    mixed: Option<MixedBatchBuffers>,
 }
 
 // SAFETY: BatchDecodeBuffers contains CudaGraph (CUgraphExec) which is !Send.
 // Invariant: exclusively accessed from the single scheduler inference thread.
 unsafe impl Send for BatchDecodeBuffers {}
+
+#[allow(dead_code)]
+pub(crate) struct MixedBatchBuffers {
+    hidden_out: HiddenStates,
+    normed: HiddenStates,
+    q_batch: HiddenStates,
+    k_batch: HiddenStates,
+    v_batch: HiddenStates,
+    qkv_batch: HiddenStates,
+    attn_output: HiddenStates,
+    o_buf: HiddenStates,
+    gate_up_out: HiddenStates,
+    act_out: HiddenStates,
+    logits: HiddenStates,
+    token_ids_gpu: CudaSlice<i32>,
+    metadata: FlashInferDecodeMetadata,
+    max_tokens: usize,
+}
+
+#[allow(dead_code)]
+impl MixedBatchBuffers {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        model_config: &Config,
+        max_batch_size: usize,
+        max_total_pages: usize,
+    ) -> Result<Self> {
+        let max_tokens = max_batch_size + MIXED_PREFILL_CAP;
+        let q_dim = model_config.num_attention_heads * model_config.head_dim;
+        let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
+
+        Ok(Self {
+            hidden_out: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
+            normed: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
+            q_batch: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
+            k_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
+            v_batch: HiddenStates::zeros(ctx, kv_dim, max_tokens)?,
+            qkv_batch: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, max_tokens)?,
+            attn_output: HiddenStates::zeros(ctx, q_dim, max_tokens)?,
+            o_buf: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
+            gate_up_out: HiddenStates::zeros(ctx, 2 * model_config.intermediate_size, max_tokens)?,
+            act_out: HiddenStates::zeros(ctx, model_config.intermediate_size, max_tokens)?,
+            logits: HiddenStates::zeros(ctx, model_config.vocab_size, max_tokens)?,
+            token_ids_gpu: ctx
+                .stream
+                .alloc_zeros(max_tokens)
+                .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
+            metadata: FlashInferDecodeMetadata::new(
+                ctx,
+                max_tokens,
+                max_total_pages + MIXED_PREFILL_CAP,
+                model_config.num_attention_heads,
+            )?,
+            max_tokens,
+        })
+    }
+}
 
 impl BatchDecodeBuffers {
     /// Allocate buffers for up to `max_batch_size` requests.
@@ -144,6 +208,7 @@ impl BatchDecodeBuffers {
 
             max_batch_size,
             graph_cache: (0..max_batch_size).map(|_| None).collect(),
+            mixed: None,
         })
     }
 
@@ -162,6 +227,23 @@ impl BatchDecodeBuffers {
         self.up_out.seq_len = batch_size;
         self.gate_up_out.seq_len = batch_size;
         self.act_out.seq_len = batch_size;
+    }
+
+    #[allow(dead_code)]
+    fn mixed_buffers_mut(
+        &mut self,
+        model: &Qwen3Model,
+        kv_pool: &PagedKVPool,
+    ) -> Result<&mut MixedBatchBuffers> {
+        if self.mixed.is_none() {
+            self.mixed = Some(MixedBatchBuffers::new(
+                &model.ctx,
+                &model.config,
+                self.max_batch_size,
+                kv_pool.max_total_pages,
+            )?);
+        }
+        Ok(self.mixed.as_mut().unwrap())
     }
 }
 
@@ -226,6 +308,26 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
 }
 
 impl Qwen3Model {
+    #[allow(dead_code)]
+    pub(crate) fn decode_batch_with_prefill(
+        &self,
+        _decode_tokens: &[u32],
+        _prefill_tokens: &[u32],
+        _states: &mut [Qwen3State],
+        _decode_slot_indices: &[usize],
+        _prefill_slot_idx: usize,
+        _prefill_start_pos: usize,
+        paged_kv_pool: &mut PagedKVPool,
+        bufs: &mut BatchDecodeBuffers,
+    ) -> Result<bool> {
+        let _mixed = bufs.mixed_buffers_mut(self, paged_kv_pool)?;
+        // TODO(mixed-batch): wire eager mixed decode+prefill once the Rust side
+        // exposes the paged multi-token prefill prep path with validated kernel
+        // argument ordering. Until then, fall back to the existing separate
+        // decode-only + prefill-only scheduler paths.
+        Ok(false)
+    }
+
     /// Batched decode: process B tokens from B different requests in one pass.
     ///
     /// Batched decode using contiguous (per-slot) KV cache.
