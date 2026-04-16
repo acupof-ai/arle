@@ -25,10 +25,11 @@ fn main() {
         );
     }
 
-    // Step 1: Build MLX from source using cmake.
-    // The wrapper at mlx/ still uses FetchContent, but every dependency is
-    // pinned to a repository-local source tree and network access is disabled.
-    let mlx_dst = cmake::Config::new("mlx")
+    // Step 1: Build MLX from the vendored source tree using cmake.
+    // The upstream MLX CMakeLists still references FetchContent, but every
+    // dependency is pinned to a repository-local source tree and network
+    // access is disabled.
+    let mlx_dst = cmake::Config::new(&mlx_vendor_dir)
         .define("MLX_BUILD_METAL", "ON")
         .define("MLX_BUILD_ACCELERATE", "ON")
         .define("MLX_BUILD_TESTS", "OFF")
@@ -38,10 +39,6 @@ fn main() {
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_CXX_STANDARD", "17")
         .define("FETCHCONTENT_FULLY_DISCONNECTED", "ON")
-        .define(
-            "FETCHCONTENT_SOURCE_DIR_MLX",
-            mlx_vendor_dir.as_os_str().to_string_lossy().as_ref(),
-        )
         .define(
             "FETCHCONTENT_SOURCE_DIR_METAL_CPP",
             metal_cpp_vendor_dir.as_os_str().to_string_lossy().as_ref(),
@@ -64,10 +61,8 @@ fn main() {
     let mlx_build = mlx_dst.join("build");
 
     // Find MLX include directories.
-    // MLX sources are vendored under this crate, while generated headers still
+    // MLX sources are vendored under this crate, while any generated headers
     // live in the cmake build tree.
-    let mlx_fetch_src = mlx_vendor_dir;
-    let mlx_fetch_build = mlx_build.join("_deps/mlx-build");
 
     // Step 2: Compile C++ bridge files with cc.
     cc::Build::new()
@@ -76,8 +71,8 @@ fn main() {
         .file("src/mlx_bridge.cpp")
         .file("src/mlx_qwen35_model.cpp")
         .include("src")
-        .include(&mlx_fetch_src)
-        .include(&mlx_fetch_build) // for generated headers
+        .include(&mlx_vendor_dir)
+        .include(&mlx_build) // for generated headers
         .flag("-Wno-deprecated-copy")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-sign-compare")
@@ -87,18 +82,11 @@ fn main() {
     // MLX builds as libmlx.a in the build directory.
     println!(
         "cargo:rustc-link-search=native={}",
-        mlx_fetch_build.join("lib").display()
+        mlx_dst.join("lib").display()
     );
-    // Also check directly in the build dir
-    println!(
-        "cargo:rustc-link-search=native={}",
-        mlx_fetch_build.display()
-    );
-    // And the top-level build/lib
-    println!(
-        "cargo:rustc-link-search=native={}",
-        mlx_build.join("lib").display()
-    );
+    // CMake's build tree places libmlx.a at the root build dir when MLX is
+    // built as the top-level project.
+    println!("cargo:rustc-link-search=native={}", mlx_build.display());
     println!("cargo:rustc-link-lib=static=mlx");
 
     // Step 4: Link the bridge static lib.
@@ -118,6 +106,5 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx_bridge.cpp");
     println!("cargo:rerun-if-changed=src/mlx_qwen35_model.cpp");
     println!("cargo:rerun-if-changed=src/mlx_common.h");
-    println!("cargo:rerun-if-changed=mlx/CMakeLists.txt");
     println!("cargo:rerun-if-changed=vendor");
 }
