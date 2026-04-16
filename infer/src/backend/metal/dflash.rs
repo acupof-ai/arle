@@ -1,14 +1,14 @@
 use std::{collections::HashSet, path::Path, time::Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use serde::Deserialize;
 
 use super::{
     config::{MetalModelArch, MetalModelConfig, QuantConfig},
     forward::rust_transformer_layer,
-    generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
+    generate::{MetalGenerateOutput, KV_CACHE_CHUNK},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
+    mlx::{concatenate_axis, eval, rms_norm, slice, take_axis, zeros, MlxArray},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
@@ -324,7 +324,7 @@ impl ContiguousKvState {
         }
     }
 
-    fn from_dtype(
+    pub(super) fn from_dtype(
         num_layers: usize,
         n_kv_heads: i32,
         head_dim: i32,
@@ -561,6 +561,104 @@ pub(super) fn metal_generate_dflash_qwen3(
         ttft_ms,
         total_time_ms,
     })
+}
+
+/// Result of one DFlash speculative block (draft → verify → accept/reject).
+pub(super) struct DFlashBlockResult {
+    pub accepted_tokens: Vec<u32>,
+    pub updated_target_hidden: MlxArray,
+    pub accepted_inputs: usize,
+}
+
+/// Run one DFlash speculative block: draft N tokens, verify against target
+/// model, accept the longest matching prefix, trim rejected KV.
+pub(super) fn dflash_speculative_block(
+    runtime: &MetalDflashRuntime,
+    current_token: u32,
+    target_hidden: &MlxArray,
+    weights: &StandardMetalWeights,
+    config: &MetalModelConfig,
+    params: &SamplingParams,
+    target_state: &mut ContiguousKvState,
+    draft_state: &mut ContiguousKvState,
+) -> Result<DFlashBlockResult> {
+    let mut block_tokens = vec![runtime.mask_token_id; runtime.block_size];
+    block_tokens[0] = current_token;
+    let noise_embedding = embed_tokens(&weights.embed_tokens, &block_tokens);
+    let draft_hidden = dflash_draft_forward(runtime, &noise_embedding, target_hidden, draft_state)?;
+    let block_hidden = slice(
+        &draft_hidden,
+        &[1, 0],
+        &[
+            i32::try_from(runtime.block_size).unwrap_or_default(),
+            i32::try_from(config.hidden_size).unwrap_or_default(),
+        ],
+        &[1, 1],
+    );
+    let draft_logits = linear(&block_hidden, &weights.lm_head);
+    let drafted_suffix = sample_rows(&draft_logits, params)?;
+    draft_state.trim(runtime.block_size);
+    for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
+        *dst = *src;
+    }
+    let (verifier_norm_hidden, verifier_hidden) = qwen3_forward_with_hidden_states(
+        &block_tokens,
+        weights,
+        config,
+        &runtime.target_layer_ids,
+        target_state,
+    )?;
+    let verifier_logits = linear(&verifier_norm_hidden, &weights.lm_head);
+    let posterior = sample_rows(&verifier_logits, params)?;
+    let matched = block_tokens
+        .iter()
+        .skip(1)
+        .zip(posterior.iter())
+        .take(runtime.block_size.saturating_sub(1))
+        .take_while(|(draft, target)| draft == target)
+        .count();
+    let accepted_inputs = matched + 1;
+    let posterior_token = *posterior
+        .get(matched)
+        .ok_or_else(|| anyhow!("DFlash verifier produced too few tokens"))?;
+    if accepted_inputs < runtime.block_size {
+        target_state.trim(runtime.block_size - accepted_inputs);
+    }
+    let updated_target_hidden = slice(
+        &verifier_hidden,
+        &[0, 0],
+        &[
+            i32::try_from(accepted_inputs).unwrap_or_default(),
+            i32::try_from(runtime.target_layer_ids.len() * config.hidden_size).unwrap_or_default(),
+        ],
+        &[1, 1],
+    );
+    let mut accepted_tokens = Vec::with_capacity(accepted_inputs);
+    for &token in block_tokens
+        .iter()
+        .skip(1)
+        .take(accepted_inputs.saturating_sub(1))
+    {
+        accepted_tokens.push(token);
+    }
+    accepted_tokens.push(posterior_token);
+    Ok(DFlashBlockResult {
+        accepted_tokens,
+        updated_target_hidden,
+        accepted_inputs,
+    })
+}
+
+/// Public wrapper for the scheduler path — runs the full Qwen3 forward
+/// on `ContiguousKvState` and captures hidden states at target layers.
+pub(super) fn qwen3_forward_with_hidden_states_on_state(
+    input_ids: &[u32],
+    weights: &StandardMetalWeights,
+    config: &MetalModelConfig,
+    target_layer_ids: &[usize],
+    state: &mut ContiguousKvState,
+) -> Result<(MlxArray, MlxArray)> {
+    qwen3_forward_with_hidden_states(input_ids, weights, config, target_layer_ids, state)
 }
 
 fn qwen3_forward_with_hidden_states(
