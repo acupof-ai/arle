@@ -1,13 +1,8 @@
 //! Metal-backed OpenAI-compatible inference server.
 //!
-//! Standard Metal serving now uses a live `MetalScheduler` runtime with
-//! chunked prefill and decode-priority interleaving on top of the request-state
-//! API.
-//!
-//! **Current limitation:** same-length Qwen3 / Qwen3.5 decode batches now have
-//! cross-request GPU paths, but variable-length decode batching is still
-//! missing and Metal DFlash still falls back to the legacy serial runtime
-//! because the scheduler runtime does not yet support speculative decode.
+//! All traffic goes through the live `MetalScheduler` runtime with chunked
+//! prefill, decode-priority interleaving, variable-length Qwen3.5 packed
+//! decode, and DFlash speculative decode (Qwen3, token-buffer pattern).
 
 #![cfg(feature = "metal")]
 
@@ -20,7 +15,6 @@ use infer::backend::metal::{
     MetalBackendOptions, MetalDflashOptions, MetalRuntimeLimits,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
-use infer::backend::runtime::spawn_metal_runtime_handle_from_path_with_options_and_metrics;
 use infer::http_server::{HttpServerConfig, build_app_with_config};
 use infer::logging;
 use infer::metrics::ServerMetrics;
@@ -36,7 +30,7 @@ const WARMUP_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Parser)]
 #[command(
     name = "metal_serve",
-    about = "Metal-backed OpenAI-compatible server (live Metal scheduler; DFlash stays serial)"
+    about = "Metal-backed OpenAI-compatible server (live Metal scheduler; DFlash on scheduler runtime)"
 )]
 struct Args {
     /// Model directory or HuggingFace model ID.
@@ -152,33 +146,23 @@ async fn main() -> Result<()> {
         .unwrap_or(&args.model_path)
         .to_string();
     let metrics = ServerMetrics::new(&model_id);
-    let handle: Arc<dyn RequestHandle> = if args.dflash_draft_model.is_some() {
-        info!("Metal DFlash currently uses the legacy serial runtime path");
-        Arc::new(
-            spawn_metal_runtime_handle_from_path_with_options_and_metrics(
-                &args.model_path,
-                backend_options.clone(),
-                args.max_waiting,
-                metrics.clone(),
-            )
-            .with_context(|| format!("failed to start Metal runtime for {}", args.model_path))?,
+    // Both DFlash and non-DFlash traffic now goes through the scheduler
+    // runtime. DFlash uses the token-buffer pattern inside Qwen3StepDriver
+    // (speculative blocks are transparent to the scheduler).
+    let handle: Arc<dyn RequestHandle> = Arc::new(
+        spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
+            &args.model_path,
+            backend_options,
+            args.max_waiting,
+            metrics.clone(),
         )
-    } else {
-        Arc::new(
-            spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
-                &args.model_path,
-                backend_options,
-                args.max_waiting,
-                metrics.clone(),
+        .with_context(|| {
+            format!(
+                "failed to start Metal scheduler runtime for {}",
+                args.model_path
             )
-            .with_context(|| {
-                format!(
-                    "failed to start Metal scheduler runtime for {}",
-                    args.model_path
-                )
-            })?,
-        )
-    };
+        })?,
+    );
 
     if let Some(draft_model) = &args.dflash_draft_model {
         info!(
