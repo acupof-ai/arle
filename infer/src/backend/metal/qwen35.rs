@@ -1001,6 +1001,112 @@ pub(super) fn qwen35_forward_step(
     linear(&final_norm, &weights.lm_head)
 }
 
+/// Like `qwen35_forward_step` but captures hidden states at specified layer indices.
+/// Used by DFlash to extract target context features for the draft model.
+pub(super) fn qwen35_forward_with_hidden_states(
+    input_ids: &[u32],
+    weights: &Qwen35MetalWeights,
+    config: &MetalModelConfig,
+    arch: &MetalQwen35ArchConfig,
+    k_caches: &mut [MlxArray],
+    v_caches: &mut [MlxArray],
+    recurrent: &mut MetalRecurrentState,
+    cache_len: i32,
+    target_layer_ids: &[usize],
+) -> (MlxArray, MlxArray) {
+    use std::collections::HashSet;
+    let selected: HashSet<usize> = target_layer_ids.iter().copied().collect();
+    let mut selected_hidden: Vec<MlxArray> = Vec::with_capacity(target_layer_ids.len());
+
+    // Process tokens one at a time (the attention/GDR helpers expect single-token input).
+    // Capture hidden states after each layer for selected layers.
+    let mut all_per_token_hidden: Vec<Vec<MlxArray>> = Vec::new();
+    let mut last_logits = MlxArray::scalar_f32(0.0);
+    let mut pos = cache_len;
+
+    for &token in input_ids {
+        let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
+        let mut x = take_axis(&weights.embed_tokens, &token_arr, 0);
+        let mut full_idx = 0usize;
+        let mut linear_idx = 0usize;
+        let mut token_hidden: Vec<MlxArray> = Vec::new();
+
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            let residual = x.clone();
+            let attn_out = match &layer.attention {
+                MetalQwen35Attention::Full(attn) => {
+                    let out = fused_full_attn_step(
+                        &x,
+                        &layer.input_layernorm,
+                        attn,
+                        config,
+                        arch,
+                        &mut k_caches[full_idx],
+                        &mut v_caches[full_idx],
+                        pos,
+                    );
+                    full_idx += 1;
+                    out
+                }
+                MetalQwen35Attention::Linear(attn) => {
+                    let out = fused_gdr_step(
+                        &x,
+                        &layer.input_layernorm,
+                        attn,
+                        recurrent,
+                        linear_idx,
+                        &arch.linear,
+                        config,
+                    );
+                    linear_idx += 1;
+                    out
+                }
+            };
+
+            x = add(&residual, &attn_out);
+            let residual2 = x.clone();
+            let xn = rms_norm_last_dim(
+                &x,
+                &layer.post_attention_layernorm,
+                config.rms_norm_eps as f32,
+                config.norm_weight_mode.uses_offset(),
+            );
+            let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
+            let fused_val = multiply(&silu(&gate_raw), &up);
+            let mlp = linear(&fused_val, &layer.down_proj);
+            x = add(&residual2, &mlp);
+
+            if selected.contains(&layer_idx) {
+                token_hidden.push(x.clone());
+            }
+        }
+
+        let final_norm = rms_norm_last_dim(
+            &x,
+            &weights.norm,
+            config.rms_norm_eps as f32,
+            config.norm_weight_mode.uses_offset(),
+        );
+        last_logits = linear(&final_norm, &weights.lm_head);
+        all_per_token_hidden.push(token_hidden);
+        pos += 1;
+    }
+
+    // Concatenate: for each target layer, stack all tokens along axis 0,
+    // then concatenate layers along axis 1.
+    let num_captured = target_layer_ids.len();
+    let mut layer_stacks: Vec<MlxArray> = Vec::with_capacity(num_captured);
+    for li in 0..num_captured {
+        let per_tok: Vec<MlxArray> = all_per_token_hidden
+            .iter()
+            .map(|th| th[li].clone())
+            .collect();
+        layer_stacks.push(concatenate_axis(&per_tok, 0));
+    }
+    let combined = concatenate_axis(&layer_stacks, 1);
+    (last_logits, combined)
+}
+
 // ── Qwen3.5 attention wrappers ───────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
