@@ -1430,6 +1430,13 @@ fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalReques
         tpot_s,
         e2e_s,
     );
+
+    // Flush DFlash speculative decode metrics if this was a DFlash request.
+    if let Some((blocks, accepted, drafted)) = request.request_state.dflash_block_stats() {
+        for i in 0..blocks {
+            metrics.record_dflash_block(accepted.get(i).copied().unwrap_or(0), drafted);
+        }
+    }
 }
 
 fn refresh_runtime_metrics(
