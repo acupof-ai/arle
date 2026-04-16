@@ -204,6 +204,14 @@ impl<M: ModelForward> Scheduler<M> {
             let assign_us = step_start.elapsed().as_micros();
 
             let step_t = std::time::Instant::now();
+            // FUTURE WORK (GPU/CPU overlap): `self.step()` already overlaps
+            // decode with `emit_delta`, but batched decode itself is still
+            // serial because `step_decode_batch()` runs
+            // `forward_decode_batch(...)` and then immediately
+            // `sample_batch_greedy(...)`, whose fast path launches argmax,
+            // `ctx.sync()`s, and reads tokens/logprobs back. Real overlap
+            // needs a `step_launch()` / `step_readback()` split at that
+            // boundary; loop reordering alone does not create it.
             self.step();
             let step_us = step_t.elapsed().as_micros();
 
