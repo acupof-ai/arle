@@ -1016,6 +1016,18 @@ fn execute_decode_batch(
         open.push((req_id, request));
     }
 
+    // Partition: DFlash requests use per-request speculative decode (they
+    // can't participate in single-token batched decode). Non-DFlash requests
+    // go through the normal batch path. This prevents one DFlash request
+    // from degrading the entire batch to serial execution.
+    let (dflash_requests, non_dflash): (Vec<_>, Vec<_>) = open
+        .into_iter()
+        .partition(|(_, request)| request.request_state.is_dflash_enabled());
+    for (req_id, request) in dflash_requests {
+        execute_decode_single(req_id, request, metrics, scheduler, active);
+    }
+    let mut open = non_dflash;
+
     let batch_result =
         match execute_qwen35_packed_decode_batch(&mut open, active, qwen35_decode_batch_cache) {
             Ok(Some(result)) => Some(result),

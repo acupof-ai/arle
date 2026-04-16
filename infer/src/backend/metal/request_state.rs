@@ -691,12 +691,6 @@ impl<'a> MetalRequestState<'a> {
             return Ok(None);
         }
 
-        // DFlash requests run multi-token speculative blocks per step — they
-        // cannot participate in cross-request single-token batched decode.
-        if states.iter().any(|s| s.is_dflash_enabled()) {
-            return Ok(None);
-        }
-
         match &mut states[0].inner {
             MetalRequestStateInner::Qwen3(_) => {
                 let mut qwen3_states = Vec::with_capacity(states.len());
@@ -1804,7 +1798,8 @@ struct Qwen3StepDriver<'a> {
     rope_base: f32,
     eps: f32,
     /// DFlash speculative decode state. When `Some`, `decode_token` runs
-    /// DFlash blocks; when `None`, standard single-token decode.
+    /// DFlash blocks and the driver's `k_caches`/`v_caches` are empty stubs
+    /// (all KV management goes through `dflash.target_state`).
     dflash: Option<Qwen3DFlashState>,
 }
 
@@ -1830,13 +1825,22 @@ impl<'a> Qwen3StepDriver<'a> {
             prompt_tokens.len().saturating_add(max_new_tokens),
         );
         let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
-        let cache_shape = [1i32, n_kv_heads, initial_cap, head_dim];
-        let k_caches: Vec<MlxArray> = (0..n_layers)
-            .map(|_| zeros(&cache_shape, kv_dtype))
-            .collect();
-        let v_caches: Vec<MlxArray> = (0..n_layers)
-            .map(|_| zeros(&cache_shape, kv_dtype))
-            .collect();
+        // When DFlash is enabled, the driver's k/v caches are unused —
+        // DFlash owns its own target_state ContiguousKvState. Skip the
+        // allocation to avoid wasting memory on empty cache tensors.
+        let is_dflash = dflash_runtime.is_some();
+        let (k_caches, v_caches) = if is_dflash {
+            (Vec::new(), Vec::new())
+        } else {
+            let cache_shape = [1i32, n_kv_heads, initial_cap, head_dim];
+            let k: Vec<MlxArray> = (0..n_layers)
+                .map(|_| zeros(&cache_shape, kv_dtype))
+                .collect();
+            let v: Vec<MlxArray> = (0..n_layers)
+                .map(|_| zeros(&cache_shape, kv_dtype))
+                .collect();
+            (k, v)
+        };
 
         Ok(Self {
             weights,
