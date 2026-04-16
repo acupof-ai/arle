@@ -344,6 +344,11 @@ pub trait ModelForward: Send {
         Ok(())
     }
 
+    /// Whether this model has a validated eager mixed decode+prefill path.
+    fn supports_mixed_batch(&self) -> bool {
+        false
+    }
+
     /// Mixed-batch forward: B decode tokens + C prefill tokens in one eager forward pass.
     /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if not supported.
     fn forward_mixed_batch(
