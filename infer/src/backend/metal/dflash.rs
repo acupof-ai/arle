@@ -956,6 +956,94 @@ fn sample_rows(logits: &MlxArray, params: &SamplingParams) -> Result<Vec<u32>> {
         .collect())
 }
 
+#[derive(Clone)]
+struct Qwen35GdrTape {
+    innovation_tape: MlxArray,
+    k: MlxArray,
+    g: MlxArray,
+    qkv: MlxArray,
+}
+
+struct Qwen35VerifyStateGuard {
+    raw: *mut std::ffi::c_void,
+}
+
+impl Drop for Qwen35VerifyStateGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::qwen35_set_tape_mode(self.raw, false);
+            mlx_sys::qwen35_set_capture_layers(self.raw, std::ptr::null(), 0);
+        }
+    }
+}
+
+fn drain_current_qwen35_gdr_tapes(
+    cpp_model: &super::qwen35::CppQwen35Model,
+    expected_tapes: usize,
+) -> Result<Vec<Qwen35GdrTape>> {
+    let tape_count = unsafe { mlx_sys::qwen35_get_tape_count(cpp_model.as_raw()) };
+    ensure!(
+        tape_count >= 0,
+        "Qwen3.5 DFlash returned negative tape count: {tape_count}"
+    );
+    ensure!(
+        tape_count as usize == expected_tapes,
+        "Qwen3.5 DFlash tape count mismatch: expected {expected_tapes}, got {tape_count}"
+    );
+
+    if tape_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let tape_count_usize = tape_count as usize;
+    let mut tape_ptrs = vec![std::ptr::null_mut(); tape_count_usize];
+    let mut k_ptrs = vec![std::ptr::null_mut(); tape_count_usize];
+    let mut g_ptrs = vec![std::ptr::null_mut(); tape_count_usize];
+    let mut qkv_ptrs = vec![std::ptr::null_mut(); tape_count_usize];
+    let drained_count = unsafe {
+        mlx_sys::qwen35_read_and_clear_gdr_tapes(
+            cpp_model.as_raw(),
+            tape_ptrs.as_mut_ptr(),
+            k_ptrs.as_mut_ptr(),
+            g_ptrs.as_mut_ptr(),
+            qkv_ptrs.as_mut_ptr(),
+            tape_count,
+        )
+    };
+    ensure!(
+        drained_count == tape_count,
+        "Qwen3.5 DFlash drained tape count mismatch: expected {tape_count}, got {drained_count}"
+    );
+
+    let mut tapes = Vec::with_capacity(expected_tapes);
+    for tape_idx in 0..tape_count_usize {
+        let tape_ptr = tape_ptrs[tape_idx];
+        let k_ptr = k_ptrs[tape_idx];
+        let g_ptr = g_ptrs[tape_idx];
+        let qkv_ptr = qkv_ptrs[tape_idx];
+        ensure!(
+            !tape_ptr.is_null() && !k_ptr.is_null() && !g_ptr.is_null() && !qkv_ptr.is_null(),
+            "Qwen3.5 DFlash failed to capture tape {tape_idx}"
+        );
+        tapes.push(Qwen35GdrTape {
+            innovation_tape: unsafe { MlxArray::from_raw(tape_ptr) },
+            k: unsafe { MlxArray::from_raw(k_ptr) },
+            g: unsafe { MlxArray::from_raw(g_ptr) },
+            qkv: unsafe { MlxArray::from_raw(qkv_ptr) },
+        });
+    }
+
+    Ok(tapes)
+}
+
+fn concat_step_arrays(arrays: &[MlxArray], axis: i32) -> MlxArray {
+    match arrays {
+        [] => unreachable!("concat_step_arrays requires at least one array"),
+        [single] => single.clone(),
+        _ => concatenate_axis(arrays, axis),
+    }
+}
+
 // ── Qwen3.5 DFlash speculative block ─────────────────────────────────────
 
 /// Qwen3.5 verify: run N tokens through the target C++ model with tape mode,
@@ -1023,9 +1111,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
             layer_ids_i32.len() as i32,
         );
     };
+    let _verify_state_guard = Qwen35VerifyStateGuard {
+        raw: cpp_model.as_raw(),
+    };
 
     let n_capture_layers = runtime.target_layer_ids.len();
+    let expected_tape_count = target_gdr_flat.len() / 2;
     let mut per_step_hidden: Vec<Vec<MlxArray>> = Vec::with_capacity(runtime.block_size);
+    let mut per_step_tapes: Vec<Vec<Qwen35GdrTape>> = Vec::with_capacity(runtime.block_size);
     let mut posterior_tokens = Vec::with_capacity(runtime.block_size);
     for (step, &tok) in block_tokens.iter().enumerate() {
         let token_arr = MlxArray::from_slice_i32(&[tok as i32], &[1]);
@@ -1048,13 +1141,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
             }
         }
         per_step_hidden.push(step_captures);
+        per_step_tapes.push(drain_current_qwen35_gdr_tapes(
+            cpp_model,
+            expected_tape_count,
+        )?);
         let sampled = super::sampling::gpu_sample_token(&logits, params);
         eval(&[&sampled]);
         posterior_tokens.push(sampled.item_i32() as u32);
     }
-
-    unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), false) };
-    unsafe { mlx_sys::qwen35_set_capture_layers(cpp_model.as_raw(), std::ptr::null(), 0) };
 
     // ── 4. Token matching ──
     let matched = block_tokens
@@ -1090,98 +1184,56 @@ pub(crate) fn qwen35_dflash_speculative_block(
                 if conv_idx < target_gdr_flat.len() && conv_idx < gdr_snapshot.len() {
                     target_gdr_flat[conv_idx] = gdr_snapshot[conv_idx].clone();
                 }
-                // Replay accepted steps using tape
+                // Replay accepted steps using the per-step tapes captured during verify.
                 let tape_idx = i / 2;
-                let tape_count = unsafe { mlx_sys::qwen35_get_tape_count(cpp_model.as_raw()) };
-                if (tape_idx as i32) < tape_count {
-                    let mut tape_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-                    let mut k_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-                    let mut g_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-                    let mut qkv_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-                    let rc = unsafe {
-                        mlx_sys::qwen35_get_tape(
-                            cpp_model.as_raw(),
-                            tape_idx as i32,
-                            &raw mut tape_ptr,
-                            &raw mut k_ptr,
-                            &raw mut g_ptr,
-                            &raw mut qkv_ptr,
+                let accepted_i32 = accepted_inputs as i32;
+                let mut accepted_tapes = Vec::with_capacity(accepted_inputs);
+                let mut accepted_k = Vec::with_capacity(accepted_inputs);
+                let mut accepted_g = Vec::with_capacity(accepted_inputs);
+                let mut accepted_qkv = Vec::with_capacity(accepted_inputs);
+                for step_tapes in per_step_tapes.iter().take(accepted_inputs) {
+                    let step_tape = step_tapes.get(tape_idx).cloned().ok_or_else(|| {
+                        anyhow!(
+                            "Qwen3.5 DFlash missing tape for GDR layer {tape_idx} during rollback"
                         )
-                    };
-                    if rc == 0 && !tape_ptr.is_null() {
-                        let tape_arr = unsafe { Arr::from_raw(tape_ptr) };
-                        let k_arr = unsafe { Arr::from_raw(k_ptr) };
-                        let g_arr = unsafe { Arr::from_raw(g_ptr) };
-                        // Slice tape to accepted steps
-                        let accepted_i32 = accepted_inputs as i32;
-                        let tape_shape = tape_arr.shape();
-                        if tape_shape.len() >= 2 && tape_shape[1] >= accepted_i32 {
-                            let tape_sliced = slice(
-                                &tape_arr,
-                                &[0, 0, 0, 0],
-                                &[tape_shape[0], accepted_i32, tape_shape[2], tape_shape[3]],
-                                &[1, 1, 1, 1],
-                            );
-                            let k_sliced = slice(
-                                &k_arr,
-                                &[0, 0, 0, 0],
-                                &[
-                                    k_arr.shape()[0],
-                                    accepted_i32,
-                                    k_arr.shape()[2],
-                                    k_arr.shape()[3],
-                                ],
-                                &[1, 1, 1, 1],
-                            );
-                            let g_sliced = slice(
-                                &g_arr,
-                                &[0, 0, 0],
-                                &[g_arr.shape()[0], accepted_i32, g_arr.shape()[2]],
-                                &[1, 1, 1],
-                            );
-                            let replayed = unsafe {
-                                Arr::from_raw_checked(mlx_sys::mlx_tape_replay(
-                                    tape_sliced.as_raw(),
-                                    k_sliced.as_raw(),
-                                    g_sliced.as_raw(),
-                                    target_gdr_flat[i].as_raw(),
-                                    accepted_i32,
-                                ))
-                            }?;
-                            target_gdr_flat[i] = replayed;
-                        }
-                        // Conv state rebuild: take last (conv_kernel-1) frames from accepted qkv
-                        let qkv_arr = unsafe { Arr::from_raw(qkv_ptr) };
-                        let conv_idx = i + 1; // conv_state follows gdr_state
-                        if conv_idx < target_gdr_flat.len() {
-                            let conv_state = &target_gdr_flat[conv_idx];
-                            let conv_kernel_minus_1 =
-                                conv_state.shape().get(1).copied().unwrap_or(3);
-                            let qkv_shape = qkv_arr.shape();
-                            if qkv_shape.len() >= 2 {
-                                let qkv_sliced = slice(
-                                    &qkv_arr,
-                                    &[0, 0, 0],
-                                    &[qkv_shape[0], accepted_i32, qkv_shape[2]],
-                                    &[1, 1, 1],
-                                );
-                                // Rebuild: concat old conv_state + accepted qkv, take last k-1
-                                let combined =
-                                    concatenate_axis(&[conv_state.clone(), qkv_sliced], 1);
-                                let combined_len = combined.shape()[1];
-                                if combined_len > conv_kernel_minus_1 {
-                                    let start = combined_len - conv_kernel_minus_1;
-                                    target_gdr_flat[conv_idx] = slice(
-                                        &combined,
-                                        &[0, start, 0],
-                                        &[combined.shape()[0], combined_len, combined.shape()[2]],
-                                        &[1, 1, 1],
-                                    );
-                                } else {
-                                    target_gdr_flat[conv_idx] = combined;
-                                }
-                            }
-                        }
+                    })?;
+                    accepted_tapes.push(step_tape.innovation_tape);
+                    accepted_k.push(step_tape.k);
+                    accepted_g.push(step_tape.g);
+                    accepted_qkv.push(step_tape.qkv);
+                }
+                let tape_arr = concat_step_arrays(&accepted_tapes, 1);
+                let k_arr = concat_step_arrays(&accepted_k, 1);
+                let g_arr = concat_step_arrays(&accepted_g, 1);
+                let replayed = unsafe {
+                    Arr::from_raw_checked(mlx_sys::mlx_tape_replay(
+                        tape_arr.as_raw(),
+                        k_arr.as_raw(),
+                        g_arr.as_raw(),
+                        target_gdr_flat[i].as_raw(),
+                        accepted_i32,
+                    ))
+                }?;
+                target_gdr_flat[i] = replayed;
+
+                // Conv state rebuild: take last (conv_kernel-1) accepted qkv frames.
+                let conv_idx = i + 1; // conv_state follows gdr_state
+                if conv_idx < target_gdr_flat.len() {
+                    let conv_state = &target_gdr_flat[conv_idx];
+                    let conv_kernel_minus_1 = conv_state.shape().get(1).copied().unwrap_or(3);
+                    let qkv_arr = concat_step_arrays(&accepted_qkv, 1);
+                    let combined = concatenate_axis(&[conv_state.clone(), qkv_arr], 1);
+                    let combined_len = combined.shape()[1];
+                    if combined_len > conv_kernel_minus_1 {
+                        let start = combined_len - conv_kernel_minus_1;
+                        target_gdr_flat[conv_idx] = slice(
+                            &combined,
+                            &[0, start, 0],
+                            &[combined.shape()[0], combined_len, combined.shape()[2]],
+                            &[1, 1, 1],
+                        );
+                    } else {
+                        target_gdr_flat[conv_idx] = combined;
                     }
                 }
             }

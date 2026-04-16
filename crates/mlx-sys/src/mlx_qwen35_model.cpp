@@ -678,12 +678,14 @@ struct Qwen35CompiledModel {
                     {});
                 y = std::move(result[0]);
                 gdr_state_out = std::move(result[1]);
-                // Record tape for rollback
+                // Record tape for rollback. tape_replay requires bf16 for
+                // g/k/tape, but compute_g_impl produces f32 because neg_exp_a
+                // is f32. Cast here so the tape kernel's dtype gate holds.
                 gdr_tapes.push_back({
-                    std::move(result[2]),  // innovation_tape
-                    contiguous(k),         // k
-                    contiguous(g_3d),      // g
-                    contiguous(qkv),       // qkv for conv rebuild
+                    std::move(result[2]),            // innovation_tape (bf16 from kernel)
+                    astype(contiguous(k), bfloat16), // k
+                    astype(contiguous(g_3d), bfloat16), // g (was f32)
+                    contiguous(qkv),                 // qkv for conv rebuild
                 });
             } else {
                 auto result = gated_delta_kernel()(
@@ -1130,6 +1132,11 @@ int32_t qwen35_compiled_step(
         m->current_cache_pos = cache_pos;
         m->current_batch_size = 1;
         m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->current_has_attn_mask = false;
+        m->current_attn_mask = array(0);
+        m->current_has_rope_offsets = false;
+        m->current_rope_offsets = array(0);
 
         // Build inputs vector
         std::vector<array> inputs;
@@ -1367,6 +1374,10 @@ int32_t qwen35_compiled_prefill(
         m->current_batch_size = 1;
         m->current_seq_len = prompt_len;
         m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
+        m->current_has_attn_mask = false;
+        m->current_attn_mask = array(0);
+        m->current_has_rope_offsets = false;
+        m->current_rope_offsets = array(0);
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -1610,6 +1621,35 @@ int32_t qwen35_get_tape(void* model, int32_t idx,
         *out_g = reinterpret_cast<mlx_array*>(new array(t.g));
         *out_qkv = reinterpret_cast<mlx_array*>(new array(t.qkv));
         return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t qwen35_read_and_clear_gdr_tapes(
+    void* model,
+    mlx_array** out_tapes,
+    mlx_array** out_k,
+    mlx_array** out_g,
+    mlx_array** out_qkv,
+    int32_t capacity
+) {
+    try {
+        auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+        auto tape_count = static_cast<int32_t>(m->gdr_tapes.size());
+        if (capacity < tape_count) {
+            throw std::runtime_error("gdr tape output buffer too small");
+        }
+        for (int32_t idx = 0; idx < tape_count; ++idx) {
+            auto& tape = m->gdr_tapes[idx];
+            out_tapes[idx] = reinterpret_cast<mlx_array*>(new array(tape.innovation_tape));
+            out_k[idx] = reinterpret_cast<mlx_array*>(new array(tape.k));
+            out_g[idx] = reinterpret_cast<mlx_array*>(new array(tape.g));
+            out_qkv[idx] = reinterpret_cast<mlx_array*>(new array(tape.qkv));
+        }
+        m->gdr_tapes.clear();
+        return tape_count;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
         return -1;

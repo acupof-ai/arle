@@ -1016,7 +1016,7 @@ pub(super) fn qwen35_forward_with_hidden_states(
 ) -> (MlxArray, MlxArray) {
     use std::collections::HashSet;
     let selected: HashSet<usize> = target_layer_ids.iter().copied().collect();
-    let mut selected_hidden: Vec<MlxArray> = Vec::with_capacity(target_layer_ids.len());
+    let _selected_hidden: Vec<MlxArray> = Vec::with_capacity(target_layer_ids.len());
 
     // Process tokens one at a time (the attention/GDR helpers expect single-token input).
     // Capture hidden states after each layer for selected layers.

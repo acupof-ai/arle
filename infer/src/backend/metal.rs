@@ -281,7 +281,7 @@ impl MetalBackend {
     /// reference with `'static` lifetime. Called from the scheduler runtime
     /// where the backend is leaked to `'static`.
     #[cfg(feature = "metal")]
-    pub fn create_request_state_with_dflash(
+    pub(crate) fn create_request_state_with_dflash(
         &self,
         input_ids: &[u32],
         params: &SamplingParams,
