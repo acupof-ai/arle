@@ -211,16 +211,21 @@ EVICTION_PROMPTS = [
     "<|im_start|>system\nYou are a detective.\n<|im_end|>\n<|im_start|>user\nHow do you solve a mystery?<|im_end|>\n<|im_start|>assistant\n",
 ]
 
-BASE_URL = "http://localhost:8200/v1/completions"
+_PORT = 8200
+_MODEL_PATH = "models/Qwen3-4B"
+
+
+def _base_url():
+    return f"http://localhost:{_PORT}/v1/completions"
 
 
 def send_completion(client: httpx.Client, prompt: str, max_tokens: int = 32) -> tuple[str, float]:
     """Send a completion request and return (response_text, elapsed_seconds)."""
     t0 = time.perf_counter()
     resp = client.post(
-        BASE_URL,
+        _base_url(),
         json={
-            "model": "Qwen3-8B",
+            "model": "default",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -234,28 +239,46 @@ def send_completion(client: httpx.Client, prompt: str, max_tokens: int = 32) -> 
     return text, elapsed
 
 
+def fetch_stats() -> dict | None:
+    try:
+        resp = httpx.get(f"http://localhost:{_PORT}/v1/stats", timeout=5)
+        if resp.status_code != 200:
+            return None
+        return {k: v for tok in resp.text.split() if "=" in tok for k, v in [tok.split("=", 1)]}
+    except Exception:
+        return None
+
+
 def main():
+    import argparse
+    global _PORT, _MODEL_PATH
+    p = argparse.ArgumentParser(description="KV cache long-prefix benchmark")
+    p.add_argument("--model-path", default=_MODEL_PATH)
+    p.add_argument("--port", type=int, default=_PORT)
+    args = p.parse_args()
+    _PORT = args.port
+    _MODEL_PATH = args.model_path
+
     print("=" * 70)
     print("KV CACHE PREFIX BENCHMARK")
     print("=" * 70)
 
-    # Estimate prefix length
     prefix_chars = len(PREFIX)
-    est_tokens = prefix_chars // 4  # rough estimate
-    print(f"\nPrefix length: {prefix_chars} chars (~{est_tokens} estimated tokens)")
+    est_tokens = prefix_chars // 4
+    print(f"\nModel: {_MODEL_PATH}  Port: {_PORT}")
+    print(f"Prefix length: {prefix_chars} chars (~{est_tokens} estimated tokens)")
     print(f"Number of queries: {len(USER_QUERIES)}")
     print(f"Max tokens per response: 32")
     print()
 
-    # Start the server
     print("Starting infer server...")
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/usr/lib64-nvidia:/usr/local/cuda/lib64"
     server = subprocess.Popen(
         [
             "./target/release/infer",
-            "--model-path", "models/Qwen3-8B",
-            "--port", "8200",
+            "--model-path", _MODEL_PATH,
+            "--port", str(_PORT),
             "--cuda-graph=false",
         ],
         env=env,
@@ -361,9 +384,14 @@ def main():
         speedup = eviction_times[i] / cache_times[i] if cache_times[i] > 0 else float('inf')
         print(f"  {i+1:<6} {eviction_times[i]*1000:>10.1f}ms {cache_times[i]*1000:>10.1f}ms {savings*1000:>10.1f}ms {speedup:>9.2f}x")
 
-    print()
+    # Server-side metrics
+    stats = fetch_stats()
+    if stats:
+        print(f"/v1/stats: prefix_hit_rate={stats.get('prefix_hit_rate','?')} "
+              f"kv_util={stats.get('kv_util','?')} "
+              f"ttft_p50={stats.get('ttft_p50','?')} tpot_p50={stats.get('tpot_p50','?')}")
 
-    # Cleanup
+    print()
     print("Shutting down server...")
     server.terminate()
     server.wait(timeout=10)
