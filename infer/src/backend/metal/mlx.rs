@@ -108,6 +108,14 @@ impl MlxArray {
     pub unsafe fn from_raw(raw: *mut mlx_sys::mlx_array) -> Self {
         mlx_array_from_raw_or_panic(raw, "MlxArray::from_raw")
     }
+    /// Like `from_raw` but returns `Result` instead of panicking on null.
+    pub unsafe fn from_raw_checked(raw: *mut mlx_sys::mlx_array) -> anyhow::Result<Self> {
+        if raw.is_null() {
+            check_mlx_error()?;
+            anyhow::bail!("MLX returned null array");
+        }
+        Ok(Self(raw))
+    }
     pub fn as_raw(&self) -> *mut mlx_sys::mlx_array {
         self.0
     }
