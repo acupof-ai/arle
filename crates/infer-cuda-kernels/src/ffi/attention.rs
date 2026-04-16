@@ -209,6 +209,32 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Fused QKV variant: reads Q/K/V from merged buffer, writes RoPE'd Q to
+    /// separate output. Eliminates the split_qkv kernel launch.
+    pub fn decode_prep_paged_fused_qkv_cuda(
+        qkv_batch: *const Half,
+        q_out: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        k_pool: *mut Half,
+        v_pool: *mut Half,
+        page_table: *const i32,
+        page_indptr: *const i32,
+        last_page_len: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        page_size: i32,
+        stride_page: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        qkv_stride: i32,
+        q_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn flashinfer_batch_decode_plan(
         float_workspace: *mut u8,
         float_workspace_bytes: usize,

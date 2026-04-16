@@ -200,4 +200,124 @@ cudaError_t decode_prep_paged_cuda(
     return cudaGetLastError();
 }
 
+// Fused QKV variant: reads Q/K/V from a single merged buffer [B, qkv_stride],
+// writes RoPE'd Q to a separate output buffer. Eliminates the split_qkv kernel.
+__global__ void decode_prep_paged_fused_qkv_kernel(
+    const __nv_bfloat16* __restrict__ qkv_batch,    // [B, qkv_stride] merged QKV
+    __nv_bfloat16* __restrict__ q_out,               // [B, num_qo_heads * head_dim] write
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const int* __restrict__ positions,
+    __nv_bfloat16* __restrict__ k_pool,
+    __nv_bfloat16* __restrict__ v_pool,
+    const int* __restrict__ page_table,
+    const int* __restrict__ page_indptr,
+    const int* __restrict__ last_page_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int page_size,
+    int stride_page,
+    float rms_eps,
+    int qkv_stride,
+    int q_dim
+) {
+    int kv_head_idx = blockIdx.x;
+    int batch_idx = blockIdx.y;
+    int tid = threadIdx.x;
+    int gqa_ratio = num_qo_heads / num_kv_heads;
+    int kv_dim = num_kv_heads * HEAD_DIM;
+
+    int pos = positions[batch_idx];
+    int qkv_row = batch_idx * qkv_stride;
+
+    __shared__ float smem_rope[HEAD_DIM];
+
+    float q_norm_w = __bfloat162float(__ldg(q_norm_weight + tid));
+    float k_norm_w = __bfloat162float(__ldg(k_norm_weight + tid));
+
+    #pragma unroll
+    for (int g = 0; g < gqa_ratio; g++) {
+        int q_head = kv_head_idx * gqa_ratio + g;
+        float q_val = __bfloat162float(__ldg(qkv_batch + qkv_row + q_head * HEAD_DIM + tid));
+        float q_normed = rms_norm_head(q_val, q_norm_w, rms_eps, tid);
+
+        smem_rope[tid] = q_normed;
+        __syncthreads();
+
+        float q_roped = apply_rope_half_split(smem_rope, cos_cache, sin_cache, pos, tid);
+        __syncthreads();
+
+        int q_out_offset = batch_idx * num_qo_heads * HEAD_DIM + q_head * HEAD_DIM + tid;
+        q_out[q_out_offset] = __float2bfloat16(q_roped);
+    }
+
+    float k_val = __bfloat162float(__ldg(qkv_batch + qkv_row + q_dim + kv_head_idx * HEAD_DIM + tid));
+    float k_normed = rms_norm_head(k_val, k_norm_w, rms_eps, tid);
+
+    smem_rope[tid] = k_normed;
+    __syncthreads();
+
+    float k_roped = apply_rope_half_split(smem_rope, cos_cache, sin_cache, pos, tid);
+
+    float v_val = __bfloat162float(__ldg(qkv_batch + qkv_row + q_dim + kv_dim + kv_head_idx * HEAD_DIM + tid));
+
+    int page_start = page_indptr[batch_idx];
+    int num_pages = page_indptr[batch_idx + 1] - page_start;
+    int last_len = last_page_len[batch_idx];
+    int last_page_idx = num_pages - 1;
+    int page_id = page_table[page_start + last_page_idx];
+    int token_in_page = last_len - 1;
+
+    int cache_offset = page_id * stride_page
+                     + kv_head_idx * page_size * HEAD_DIM
+                     + token_in_page * HEAD_DIM
+                     + tid;
+
+    k_pool[cache_offset] = __float2bfloat16(k_roped);
+    v_pool[cache_offset] = __float2bfloat16(v_val);
+}
+
+cudaError_t decode_prep_paged_fused_qkv_cuda(
+    const __nv_bfloat16* qkv_batch,
+    __nv_bfloat16* q_out,
+    const __nv_bfloat16* __restrict__ q_norm_weight,
+    const __nv_bfloat16* __restrict__ k_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const int* __restrict__ positions,
+    __nv_bfloat16* k_pool,
+    __nv_bfloat16* v_pool,
+    const int* __restrict__ page_table,
+    const int* __restrict__ page_indptr,
+    const int* __restrict__ last_page_len,
+    int num_qo_heads,
+    int num_kv_heads,
+    int page_size,
+    int stride_page,
+    int batch_size,
+    float rms_eps,
+    int qkv_stride,
+    int q_dim,
+    cudaStream_t stream
+) {
+    dim3 grid(num_kv_heads, batch_size);
+    int threads = HEAD_DIM;
+
+    decode_prep_paged_fused_qkv_kernel<<<grid, threads, 0, stream>>>(
+        qkv_batch, q_out,
+        q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache,
+        positions,
+        k_pool, v_pool,
+        page_table, page_indptr, last_page_len,
+        num_qo_heads, num_kv_heads,
+        page_size, stride_page,
+        rms_eps,
+        qkv_stride, q_dim
+    );
+    return cudaGetLastError();
+}
+
 } // extern "C"

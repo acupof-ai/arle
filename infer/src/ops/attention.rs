@@ -671,6 +671,72 @@ pub(crate) fn decode_prep_paged(
     Ok(())
 }
 
+/// Fused QKV variant of [`decode_prep_paged`]: reads Q/K/V from merged buffer
+/// `qkv_batch` [B, q_dim + 2*kv_dim] and writes RoPE'd Q to `q_out`.
+/// Eliminates the separate `split_qkv` kernel launch (saves 36 launches/step).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_prep_paged_fused_qkv(
+    ctx: &DeviceContext,
+    qkv_batch: &HiddenStates,
+    q_out: &mut HiddenStates,
+    nrp: &NormRopeParams,
+    positions: &CudaSlice<i32>,
+    paged: &PagedKVMeta,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+) -> Result<()> {
+    let batch_size = qkv_batch.seq_len;
+    let q_dim = num_qo_heads * 128; // HEAD_DIM = 128
+    let kv_dim = num_kv_heads * 128;
+    let qkv_stride = q_dim + 2 * kv_dim;
+    let stride_page = paged.kv_pool.kv_dim * paged.page_size;
+    let rms_eps = nrp.rms_eps;
+    let page_size = paged.page_size;
+
+    let (qkv_ptr, _g0) = qkv_batch.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _g1) = q_out.data.device_ptr_mut(&ctx.stream);
+    let (qn_ptr, _g2) = nrp.q_norm.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _g3) = nrp.k_norm.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _g4) = nrp.cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _g5) = nrp.sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _g6) = positions.device_ptr(&ctx.stream);
+    let (pt_ptr, _g7) = paged.kv_indices.device_ptr(&ctx.stream);
+    let (pi_ptr, _g8) = paged.kv_indptr.device_ptr(&ctx.stream);
+    let (lp_ptr, _g9) = paged.kv_last_page_len.device_ptr(&ctx.stream);
+
+    let k_pool_ptr = paged.kv_pool.k_ptr(paged.layer_idx, &ctx.stream);
+    let v_pool_ptr = paged.kv_pool.v_ptr(paged.layer_idx, &ctx.stream);
+
+    unsafe {
+        ffi::decode_prep_paged_fused_qkv_cuda(
+            qkv_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            k_pool_ptr as *mut ffi::Half,
+            v_pool_ptr as *mut ffi::Half,
+            pt_ptr as *const i32,
+            pi_ptr as *const i32,
+            lp_ptr as *const i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            page_size as i32,
+            stride_page as i32,
+            batch_size as i32,
+            rms_eps,
+            qkv_stride as i32,
+            q_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
+}
+
 /// FlashInfer run step only (GPU kernel). Call once per layer after a single plan call.
 #[allow(clippy::too_many_arguments)]
 pub fn flashinfer_run_layer(

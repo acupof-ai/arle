@@ -2,6 +2,7 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <unordered_map>
+#include <vector>
 
 // ============================================================================
 // Hand-written GEMV: y = A @ x (row-major matrix)
@@ -192,7 +193,7 @@ cublasLtHandle_t g_cublaslt_handle = nullptr;
 static void *g_cublas_workspace = nullptr;
 static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
 static void *g_cublaslt_workspace = nullptr;
-static constexpr size_t kWorkspaceBytes = 4 * 1024 * 1024;
+static constexpr size_t kWorkspaceBytes = 32 * 1024 * 1024;
 
 struct GemmKey {
   int M;
@@ -331,8 +332,8 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
                      Y, y_desc,
                      Y, y_desc,
                      &algo_it->second,
-                     g_gemm_graphsafe_mode ? nullptr : g_cublaslt_workspace,
-                     g_gemm_graphsafe_mode ? 0 : kWorkspaceBytes,
+                     g_cublaslt_workspace,
+                     kWorkspaceBytes,
                      stream) != CUBLAS_STATUS_SUCCESS) {
     cublasLtMatrixLayoutDestroy(y_desc);
     cublasLtMatrixLayoutDestroy(x_desc);
@@ -454,6 +455,149 @@ void attention_weighted_sum_cuda(const __nv_bfloat16 *weights, const __nv_bfloat
   int num_blocks = (head_dim + block_size - 1) / block_size;
   attention_weighted_sum_kernel<<<num_blocks, block_size, 0, stream>>>(
       weights, v_cache, out, seq_len, head_dim);
+}
+
+// Benchmark all cublasLt heuristic algorithms for (M,N,K) and cache the fastest.
+// Called during warmup before CUDA Graph capture.
+cudaError_t autotune_gemm_cuda(int M, int N, int K, cudaStream_t stream) {
+  if (g_cublaslt_handle == nullptr || g_cublaslt_workspace == nullptr)
+    return cudaErrorNotReady;
+
+  GemmKey key{M, N, K};
+
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t wl = nullptr, xl = nullptr, yl = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+  const float alpha = 1.0f, beta = 0.0f;
+
+  if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS)
+    return cudaErrorUnknown;
+
+  cublasOperation_t transa = CUBLAS_OP_T, transb = CUBLAS_OP_N;
+  cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
+  cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
+
+  cublasLtMatrixLayoutCreate(&wl, CUDA_R_16BF, K, M, K);
+  cublasLtMatrixLayoutCreate(&xl, CUDA_R_16BF, K, N, K);
+  cublasLtMatrixLayoutCreate(&yl, CUDA_R_16BF, M, N, M);
+
+  cublasLtMatmulPreferenceCreate(&pref);
+  cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                       &kWorkspaceBytes, sizeof(kWorkspaceBytes));
+
+  cublasLtMatmulHeuristicResult_t results[8];
+  int count = 0;
+  cublasLtMatmulAlgoGetHeuristic(g_cublaslt_handle, op, wl, xl, yl, yl,
+                                 pref, 8, results, &count);
+  cublasLtMatmulPreferenceDestroy(pref);
+
+  if (count <= 0) {
+    cublasLtMatrixLayoutDestroy(yl);
+    cublasLtMatrixLayoutDestroy(xl);
+    cublasLtMatrixLayoutDestroy(wl);
+    cublasLtMatmulDescDestroy(op);
+    return cudaErrorUnknown;
+  }
+
+  if (count == 1) {
+    g_algo_cache[key] = results[0].algo;
+    cublasLtMatrixLayoutDestroy(yl);
+    cublasLtMatrixLayoutDestroy(xl);
+    cublasLtMatrixLayoutDestroy(wl);
+    cublasLtMatmulDescDestroy(op);
+    return cudaSuccess;
+  }
+
+  // Allocate temp buffers for benchmarking
+  __nv_bfloat16 *d_W = nullptr, *d_X = nullptr, *d_Y = nullptr;
+  size_t w_bytes = (size_t)M * K * 2;
+  size_t x_bytes = (size_t)K * N * 2;
+  size_t y_bytes = (size_t)M * N * 2;
+
+  if (cudaMalloc(&d_W, w_bytes) != cudaSuccess ||
+      cudaMalloc(&d_X, x_bytes) != cudaSuccess ||
+      cudaMalloc(&d_Y, y_bytes) != cudaSuccess) {
+    if (d_W) cudaFree(d_W);
+    if (d_X) cudaFree(d_X);
+    if (d_Y) cudaFree(d_Y);
+    g_algo_cache[key] = results[0].algo;
+    cublasLtMatrixLayoutDestroy(yl);
+    cublasLtMatrixLayoutDestroy(xl);
+    cublasLtMatrixLayoutDestroy(wl);
+    cublasLtMatmulDescDestroy(op);
+    return cudaSuccess;
+  }
+  cudaMemsetAsync(d_W, 0, w_bytes, stream);
+  cudaMemsetAsync(d_X, 0, x_bytes, stream);
+
+  cudaEvent_t ev_start, ev_stop;
+  cudaEventCreate(&ev_start);
+  cudaEventCreate(&ev_stop);
+
+  float best_ms = 1e30f;
+  int best_idx = 0;
+
+  for (int i = 0; i < count; i++) {
+    bool failed = false;
+    // Warmup
+    for (int w = 0; w < 3; w++) {
+      if (cublasLtMatmul(g_cublaslt_handle, op, &alpha,
+                         d_W, wl, d_X, xl, &beta, d_Y, yl, d_Y, yl,
+                         &results[i].algo,
+                         g_cublaslt_workspace, kWorkspaceBytes,
+                         stream) != CUBLAS_STATUS_SUCCESS) {
+        failed = true;
+        break;
+      }
+    }
+    if (failed) continue;
+
+    // Timed iterations
+    cudaEventRecord(ev_start, stream);
+    for (int t = 0; t < 10; t++) {
+      cublasLtMatmul(g_cublaslt_handle, op, &alpha,
+                     d_W, wl, d_X, xl, &beta, d_Y, yl, d_Y, yl,
+                     &results[i].algo,
+                     g_cublaslt_workspace, kWorkspaceBytes,
+                     stream);
+    }
+    cudaEventRecord(ev_stop, stream);
+    cudaEventSynchronize(ev_stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, ev_start, ev_stop);
+    if (ms < best_ms) {
+      best_ms = ms;
+      best_idx = i;
+    }
+  }
+
+  g_algo_cache[key] = results[best_idx].algo;
+
+  cudaFree(d_W);
+  cudaFree(d_X);
+  cudaFree(d_Y);
+  cudaEventDestroy(ev_start);
+  cudaEventDestroy(ev_stop);
+  cublasLtMatrixLayoutDestroy(yl);
+  cublasLtMatrixLayoutDestroy(xl);
+  cublasLtMatrixLayoutDestroy(wl);
+  cublasLtMatmulDescDestroy(op);
+  return cudaSuccess;
+}
+
+// Autotune all GEMM shapes currently in the heuristic cache.
+// Replaces heuristic-selected algorithms with benchmarked optimal ones.
+void autotune_all_cached_gemms_cuda(cudaStream_t stream) {
+  std::vector<GemmKey> keys;
+  keys.reserve(g_algo_cache.size());
+  for (auto& kv : g_algo_cache) {
+    keys.push_back(kv.first);
+  }
+  for (auto& k : keys) {
+    g_algo_cache.erase(k);
+    autotune_gemm_cuda(k.M, k.N, k.K, stream);
+  }
 }
 
 } // extern "C"
