@@ -1064,23 +1064,23 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     /// Generate batch size schedule for CUDA Graph warmup.
-    /// Pattern: 1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 96, 128, ..., max_bs
+    ///
+    /// Warm up EVERY batch size from 1..=min(max_bs, 64). This eliminates
+    /// graph-miss eager fallbacks when the batch composition changes during
+    /// request transitions, which was the primary source of p99 ITL spikes
+    /// (100-150ms outliers at B=16).
+    ///
+    /// Beyond 64 we use a sparse schedule (step by 16) since the marginal
+    /// difference between B=65 and B=64 graphs is negligible.
     fn cuda_graph_batch_sizes(max_bs: usize) -> Vec<usize> {
         let mut sizes = Vec::new();
-        // Small sizes: 1, 2, 4, 8
-        for &bs in &[1, 2, 4, 8] {
-            if bs <= max_bs {
-                sizes.push(bs);
-            }
-        }
-        // From 12 to 32, step by 4 (covers common concurrency levels)
-        let mut bs = 12;
-        while bs <= 32.min(max_bs) {
+        // Dense: every size from 1 to min(64, max_bs)
+        let dense_limit = 64.min(max_bs);
+        for bs in 1..=dense_limit {
             sizes.push(bs);
-            bs += 4;
         }
-        // From 48 onward, step by 16
-        bs = 48;
+        // Sparse: from 80 onward, step by 16
+        let mut bs = 80;
         while bs <= max_bs {
             sizes.push(bs);
             bs += 16;
