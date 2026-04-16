@@ -15,6 +15,11 @@ use super::{
 };
 use crate::{hf_hub, sampler::SamplingParams};
 
+/// Draft KV cache sink size (attention-sink tokens kept at the start).
+const DRAFT_CACHE_SINK_SIZE: i32 = 64;
+/// Draft KV cache window size (recent tokens kept at the end).
+const DRAFT_CACHE_WINDOW_SIZE: i32 = 1024;
+
 #[derive(Clone, Debug)]
 pub struct MetalDflashOptions {
     pub draft_model: String,
@@ -299,6 +304,9 @@ pub(crate) struct ContiguousKvState {
     capacity: i32,
     n_kv_heads: i32,
     head_dim: i32,
+    /// Cumulative context position for RoPE (may diverge from `len` after
+    /// sink+window eviction compacts the physical cache).
+    rope_offset: i32,
 }
 
 impl ContiguousKvState {
@@ -327,6 +335,7 @@ impl ContiguousKvState {
             capacity: cache_shape[2],
             n_kv_heads,
             head_dim,
+            rope_offset: 0,
         }
     }
 
@@ -356,6 +365,7 @@ impl ContiguousKvState {
             capacity: cache_shape[2],
             n_kv_heads,
             head_dim,
+            rope_offset: 0,
         }
     }
 
@@ -374,9 +384,47 @@ impl ContiguousKvState {
     }
 
     fn trim(&mut self, num_tokens: usize) {
-        self.len = self
-            .len
-            .saturating_sub(i32::try_from(num_tokens).unwrap_or_default());
+        let delta = i32::try_from(num_tokens).unwrap_or_default();
+        self.len = self.len.saturating_sub(delta);
+        self.rope_offset = self.rope_offset.saturating_sub(delta);
+    }
+
+    /// Sink+window eviction for the draft cache. Keeps the first `sink_size`
+    /// entries and the last `window_size` entries, discarding the middle.
+    /// `rope_offset` is NOT changed — cached K/V retain their original RoPE.
+    fn apply_window(&mut self, sink_size: i32, window_size: i32) {
+        let max_len = sink_size + window_size;
+        if self.len <= max_len || max_len <= 0 {
+            return;
+        }
+        let window_start = self.len - window_size;
+        for layer in 0..self.k_caches.len() {
+            let k_win = slice(
+                &self.k_caches[layer],
+                &[0, 0, window_start, 0],
+                &[1, self.n_kv_heads, self.len, self.head_dim],
+                &[1, 1, 1, 1],
+            );
+            self.k_caches[layer] = super::mlx::slice_update(
+                &mut self.k_caches[layer],
+                &k_win,
+                &[0, 0, sink_size, 0],
+                &[1, self.n_kv_heads, max_len, self.head_dim],
+            );
+            let v_win = slice(
+                &self.v_caches[layer],
+                &[0, 0, window_start, 0],
+                &[1, self.n_kv_heads, self.len, self.head_dim],
+                &[1, 1, 1, 1],
+            );
+            self.v_caches[layer] = super::mlx::slice_update(
+                &mut self.v_caches[layer],
+                &v_win,
+                &[0, 0, sink_size, 0],
+                &[1, self.n_kv_heads, max_len, self.head_dim],
+            );
+        }
+        self.len = max_len;
     }
 }
 
@@ -468,6 +516,7 @@ pub(crate) fn metal_generate_dflash_qwen3(
         let draft_logits = linear(&block_hidden, &weights.lm_head);
         let drafted_suffix = sample_rows(&draft_logits, params)?;
         draft_state.trim(runtime.block_size);
+        draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
         for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
             *dst = *src;
         }
@@ -604,6 +653,7 @@ pub(crate) fn dflash_speculative_block(
     let draft_logits = linear(&block_hidden, &weights.lm_head);
     let drafted_suffix = sample_rows(&draft_logits, params)?;
     draft_state.trim(runtime.block_size);
+    draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
     for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
         *dst = *src;
     }
@@ -763,6 +813,7 @@ fn dflash_draft_forward(
     }
 
     state.len += context_len + seq;
+    state.rope_offset += context_len + seq;
     Ok(rms_norm(&hidden_states, &runtime.draft_weights.norm, eps))
 }
 
@@ -798,13 +849,20 @@ fn dflash_draft_layer_forward(
     let q = reshape(&q_raw, &[1, seq, n_heads, head_dim]);
     let q = rms_norm(&q, &layer.q_norm, eps);
     let q = transpose_axes(&q, &[0, 2, 1, 3]);
-    let q = rope(&q, head_dim, false, rope_base, 1.0, state.len + context_len);
+    let q = rope(
+        &q,
+        head_dim,
+        false,
+        rope_base,
+        1.0,
+        state.rope_offset + context_len,
+    );
 
     let total_len = context_len + seq;
     let k = reshape(&k_raw, &[1, total_len, n_kv_heads, head_dim]);
     let k = rms_norm(&k, &layer.k_norm, eps);
     let k = transpose_axes(&k, &[0, 2, 1, 3]);
-    let k = rope(&k, head_dim, false, rope_base, 1.0, state.len);
+    let k = rope(&k, head_dim, false, rope_base, 1.0, state.rope_offset);
 
     let v = reshape(&v_raw, &[1, total_len, n_kv_heads, head_dim]);
     let v = transpose_axes(&v, &[0, 2, 1, 3]);

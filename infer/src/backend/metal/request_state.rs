@@ -773,8 +773,9 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    /// DFlash acceptance rate for this request (None if not DFlash-enabled or
-    /// no blocks have been executed yet).
+    /// DFlash acceptance rate for this request: fraction of generated tokens
+    /// that came from draft predictions (matches reference metric).
+    /// Returns None if not DFlash-enabled or no blocks executed yet.
     pub(crate) fn dflash_acceptance_rate(&self) -> Option<f64> {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => {
@@ -782,8 +783,13 @@ impl<'a> MetalRequestState<'a> {
                 if d.acceptance_lengths.is_empty() {
                     return None;
                 }
-                let sum: usize = d.acceptance_lengths.iter().sum();
-                Some(sum as f64 / d.acceptance_lengths.len() as f64)
+                let total_accepted: usize = d.acceptance_lengths.iter().sum();
+                if total_accepted == 0 {
+                    return Some(0.0);
+                }
+                let blocks = d.acceptance_lengths.len();
+                let from_draft = total_accepted.saturating_sub(blocks);
+                Some(from_draft as f64 / total_accepted as f64)
             }
             _ => None,
         }

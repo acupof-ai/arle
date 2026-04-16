@@ -346,8 +346,29 @@ impl ServerMetrics {
             .fetch_add(block_size as u64, Ordering::Relaxed);
     }
 
-    /// DFlash acceptance rate: accepted tokens / total drafted tokens.
+    /// DFlash acceptance rate: fraction of generated tokens that came from draft
+    /// predictions (industry-standard speculative decode metric).
+    /// Formula: (accepted_inputs - blocks) / accepted_inputs
+    ///        = accepted_from_draft / total_generated
     pub fn dflash_acceptance_rate(&self) -> f64 {
+        let accepted = self
+            .inner
+            .dflash_accepted_tokens_total
+            .load(Ordering::Relaxed);
+        if accepted == 0 {
+            return 0.0;
+        }
+        let blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
+        // accepted = sum(matched + 1), blocks = N
+        // accepted_from_draft = accepted - blocks = sum(matched)
+        // rate = sum(matched) / sum(matched + 1)
+        let from_draft = accepted.saturating_sub(blocks);
+        from_draft as f64 / accepted as f64
+    }
+
+    /// DFlash utilization: fraction of total speculative capacity used.
+    /// Formula: sum(accepted_inputs) / sum(block_size)
+    pub fn dflash_utilization(&self) -> f64 {
         let drafted = self.inner.dflash_draft_tokens_total.load(Ordering::Relaxed);
         if drafted == 0 {
             return 0.0;
@@ -461,13 +482,24 @@ impl ServerMetrics {
         .unwrap();
 
         out.push_str(
-            "# HELP infer_dflash_acceptance_rate DFlash acceptance rate (accepted/drafted) [0,1].\n",
+            "# HELP infer_dflash_acceptance_rate DFlash acceptance rate: fraction of generated tokens from draft [0,1].\n",
         );
         out.push_str("# TYPE infer_dflash_acceptance_rate gauge\n");
         writeln!(
             out,
             "infer_dflash_acceptance_rate{{{labels}}} {:.4}",
             self.dflash_acceptance_rate()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_dflash_utilization DFlash speculative capacity utilization [0,1].\n",
+        );
+        out.push_str("# TYPE infer_dflash_utilization gauge\n");
+        writeln!(
+            out,
+            "infer_dflash_utilization{{{labels}}} {:.4}",
+            self.dflash_utilization()
         )
         .unwrap();
 
@@ -580,9 +612,10 @@ impl ServerMetrics {
         let dflash_blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
         let dflash_suffix = if dflash_blocks > 0 {
             format!(
-                " dflash_blocks={} dflash_accept_rate={:.1}%",
+                " dflash_blocks={} dflash_accept={:.1}% util={:.1}%",
                 dflash_blocks,
-                self.dflash_acceptance_rate() * 100.0
+                self.dflash_acceptance_rate() * 100.0,
+                self.dflash_utilization() * 100.0,
             )
         } else {
             String::new()
