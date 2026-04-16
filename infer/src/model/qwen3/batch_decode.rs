@@ -424,8 +424,25 @@ impl Qwen3Model {
         }
 
         // 2. QKV projection
+        // 3. Decode prep: QKV projection + QK-norm + RoPE + paged KV write
+        let nrp = ops::NormRopeParams {
+            q_norm: &layer.attention.q_norm,
+            k_norm: &layer.attention.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
+        let paged = ops::PagedKVMeta {
+            kv_pool,
+            layer_idx,
+            kv_indices: &bufs.metadata.kv_indices,
+            kv_indptr: &bufs.metadata.kv_indptr,
+            kv_last_page_len: &bufs.metadata.kv_last_page_len,
+            page_size,
+        };
+
         if layer.attention.q_proj.is_quantized() {
-            // Quantized: use 3 separate GEMVs (merged QKV concat doesn't work for quantized)
+            // Quantized: 3 separate GEMVs + original decode_prep
             ops::gemm_into(
                 &self.ctx,
                 &layer.attention.q_proj,
@@ -444,50 +461,36 @@ impl Qwen3Model {
                 &bufs.normed,
                 &mut bufs.v_batch,
             );
+            ops::decode_prep_paged(
+                &self.ctx,
+                &mut bufs.q_batch,
+                &bufs.k_batch,
+                &bufs.v_batch,
+                &nrp,
+                &bufs.metadata.positions,
+                &paged,
+                num_heads,
+                num_kv_heads,
+            )?;
         } else {
-            // BF16: single merged GEMM + split (3x fewer kernel launches)
+            // BF16: merged GEMM → fused QKV decode_prep (saves split_qkv launch)
             ops::gemm_into(
                 &self.ctx,
                 &layer.attention.qkv_proj,
                 &bufs.normed,
                 &mut bufs.qkv_batch,
             );
-            ops::split_qkv_batch(
+            ops::decode_prep_paged_fused_qkv(
                 &self.ctx,
                 &bufs.qkv_batch,
                 &mut bufs.q_batch,
-                &mut bufs.k_batch,
-                &mut bufs.v_batch,
+                &nrp,
+                &bufs.metadata.positions,
+                &paged,
+                num_heads,
+                num_kv_heads,
             )?;
         }
-
-        // 3. Decode prep: QK-norm + RoPE (in-place on Q) + paged KV write
-        let nrp = ops::NormRopeParams {
-            q_norm: &layer.attention.q_norm,
-            k_norm: &layer.attention.k_norm,
-            cos_cache: &self.cos_cache,
-            sin_cache: &self.sin_cache,
-            rms_eps: eps,
-        };
-        let paged = ops::PagedKVMeta {
-            kv_pool,
-            layer_idx,
-            kv_indices: &bufs.metadata.kv_indices,
-            kv_indptr: &bufs.metadata.kv_indptr,
-            kv_last_page_len: &bufs.metadata.kv_last_page_len,
-            page_size,
-        };
-        ops::decode_prep_paged(
-            &self.ctx,
-            &mut bufs.q_batch,
-            &bufs.k_batch,
-            &bufs.v_batch,
-            &nrp,
-            &bufs.metadata.positions,
-            &paged,
-            num_heads,
-            num_kv_heads,
-        )?;
 
         // 4. Attention dispatch — format-aware
         //

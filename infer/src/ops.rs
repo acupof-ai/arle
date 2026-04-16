@@ -23,8 +23,8 @@ mod tests;
 
 // pub re-exports
 pub(crate) use attention::{
-    decode_prep_paged, prefill_attention_batch, prefill_attention_hd256_batch,
-    prefill_attention_hd256_batch_with_scratch,
+    decode_prep_paged, decode_prep_paged_fused_qkv, prefill_attention_batch,
+    prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
 };
 pub use attention::{
     flashinfer_run_layer, fused_attention_decode_batched_into, fused_attention_decode_into,

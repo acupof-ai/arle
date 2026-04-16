@@ -872,6 +872,12 @@ impl<M: ModelForward> Scheduler<M> {
     /// Uses SGLang-style batch size schedule: 1, 2, 4, 8, 12, 16, 24, 32, 40, ...
     /// up to min(num_slots, 256). This covers the most common concurrent request
     /// counts without capturing every single size.
+    ///
+    /// Two-pass warmup:
+    /// 1. Pass 1 captures graphs with heuristic-selected cublasLt algorithms.
+    /// 2. `autotune_all_cached_gemms_cuda` benchmarks all heuristic candidates and
+    ///    replaces each shape's algo with the measured-fastest one.
+    /// 3. Pass 2 re-captures graphs with the autotuned algorithms.
     pub(super) fn warmup_cuda_graphs(&mut self) {
         let num_slots = self.states.len();
         if !self.paged_kv_pool.is_active() {
@@ -911,8 +917,69 @@ impl<M: ModelForward> Scheduler<M> {
 
         let dummy_tokens: Vec<u32> = vec![0; max_bs];
         let slot_indices: Vec<usize> = (0..max_bs).collect();
+
+        // Pass 1: capture graphs (populates cublasLt heuristic algo cache).
+        let captured = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+
+        // Autotune: benchmark all heuristic candidates, replace with measured best.
+        if captured > 0 {
+            info!(
+                "Autotuning cublasLt GEMM algorithms ({} shapes)...",
+                captured
+            );
+            let t_at = std::time::Instant::now();
+            unsafe {
+                infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
+                    self.model.device_context().stream.cu_stream(),
+                );
+            }
+            info!(
+                "cublasLt autotune done in {:.0}ms",
+                t_at.elapsed().as_secs_f64() * 1e3,
+            );
+
+            // Invalidate all graphs captured with heuristic algos.
+            {
+                use crate::model::DecodeContextOps;
+                let decode_ctx = self
+                    .decode_bufs
+                    .as_mut()
+                    .expect("invariant: decode_bufs initialized above");
+                for &bs in &warmup_sizes[..captured] {
+                    decode_ctx.invalidate_graph_cache(bs);
+                }
+            }
+
+            // Pass 2: re-capture with autotuned algorithms.
+            let recaptured = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+            info!(
+                "Re-captured {} graphs with autotuned GEMM algorithms",
+                recaptured,
+            );
+        }
+
+        for slot in 0..max_bs {
+            self.paged_kv_pool.free_slot(slot);
+            let _ = self.states[slot].reset();
+        }
+
+        info!(
+            "CUDA Graph warmup done in {:.0}ms ({} batch sizes, max {})",
+            t0.elapsed().as_secs_f64() * 1e3,
+            captured,
+            warmup_sizes.last().copied().unwrap_or(0),
+        );
+    }
+
+    /// Single pass of graph warmup: set up metadata and forward for each batch size.
+    fn warmup_graphs_pass(
+        &mut self,
+        warmup_sizes: &[usize],
+        dummy_tokens: &[u32],
+        slot_indices: &[usize],
+    ) -> usize {
         let mut captured = 0;
-        for &bs in &warmup_sizes {
+        for &bs in warmup_sizes {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
             let decode_ctx = self
@@ -920,7 +987,6 @@ impl<M: ModelForward> Scheduler<M> {
                 .as_mut()
                 .expect("invariant: decode_bufs initialized in warmup block above");
 
-            // Pre-decode: scheduler-level work via DecodeContextOps.
             {
                 use crate::model::DecodeContextOps;
                 let ctx = self.model.device_context();
@@ -980,18 +1046,7 @@ impl<M: ModelForward> Scheduler<M> {
             let _ = self.model.device_context().sync();
             captured += 1;
         }
-
-        for slot in 0..max_bs {
-            self.paged_kv_pool.free_slot(slot);
-            let _ = self.states[slot].reset();
-        }
-
-        info!(
-            "CUDA Graph warmup done in {:.0}ms ({} batch sizes captured, max {})",
-            t0.elapsed().as_secs_f64() * 1e3,
-            captured,
-            warmup_sizes.last().copied().unwrap_or(0),
-        );
+        captured
     }
 
     /// Generate batch size schedule for CUDA Graph warmup.
