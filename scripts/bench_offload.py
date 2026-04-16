@@ -16,7 +16,7 @@ import re
 import sys
 import os
 
-MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "infer/models/Qwen3-4B"
+MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen3-4B"
 
 # Shared long system prompt (simulates agent tool definitions + context)
 SYSTEM_PREFIX = (
@@ -51,7 +51,7 @@ def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict
     time.sleep(1)
 
     server = subprocess.Popen(
-        ["./infer/target/release/infer",
+        ["./target/release/infer",
          "--model-path", MODEL_PATH,
          "--port", "8100",
          "--cuda-graph=false"],
@@ -95,14 +95,20 @@ def run_queries(label: str, max_gpu_kv: int | None, evict_between: bool) -> dict
             "completion_tokens": data["usage"]["completion_tokens"],
         })
 
-    # Read server logs for offload/prefetch counts
+    # Read server logs for prefix-cache hits/misses
     server.terminate()
     server.wait()
     log = server.stdout.read().decode(errors="replace")
+    # Current tracing format: "Request N → slot M (prompt=P tokens, radix_hit=H, reusable_prefix=R, ...)"
+    # A radix_hit > 0 with reusable_prefix > 0 counts as a prefix hit.
+    kv_hits = len(re.findall(r"reusable_prefix=[1-9]\d*", log))
+    # "prefix HIT" appears in the prefill path for exact full prefix matches
+    kv_hits += len(re.findall(r"prefix HIT", log))
+    # Misses: radix_hit=0 or "not reusable"
+    kv_misses = len(re.findall(r"radix_hit=0", log))
+    kv_misses += len(re.findall(r"not reusable", log))
     total_offloads = len(re.findall(r"offload:", log))
     total_prefetches = len(re.findall(r"prefetch:", log))
-    kv_hits = len(re.findall(r"prefix cache HIT", log))
-    kv_misses = len(re.findall(r"prefix cache MISS", log))
 
     avg_time = sum(r["time_ms"] for r in results) / len(results)
     total_time = sum(r["time_ms"] for r in results)

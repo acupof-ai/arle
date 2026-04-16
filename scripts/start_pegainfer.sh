@@ -6,11 +6,11 @@
 #
 # Examples:
 #   ./scripts/start_infer.sh                                    # defaults
-#   ./scripts/start_infer.sh infer/models/Qwen3-4B 8000
+#   ./scripts/start_infer.sh models/Qwen3-4B 8000
 
 set -euo pipefail
 
-MODEL_PATH="${1:-infer/models/Qwen3-4B}"
+MODEL_PATH="${1:-models/Qwen3-4B}"
 PORT="${2:-8000}"
 
 echo "=== Starting Pegainfer ==="

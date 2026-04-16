@@ -253,15 +253,14 @@ def main():
     env["LD_LIBRARY_PATH"] = "/usr/lib64-nvidia:/usr/local/cuda/lib64"
     server = subprocess.Popen(
         [
-            "./infer/target/release/infer",
-            "--model-path", "infer/models/Qwen3-8B",
+            "./target/release/infer",
+            "--model-path", "models/Qwen3-8B",
             "--port", "8200",
             "--cuda-graph=false",
         ],
         env=env,
         stdout=open("/tmp/infer_bench.log", "w"),
         stderr=subprocess.STDOUT,
-        cwd="/root/agent-infer",
     )
 
     # Wait for server to be ready

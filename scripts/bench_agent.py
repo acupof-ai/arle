@@ -10,7 +10,7 @@ import json
 import re
 import sys
 
-MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "infer/models/Qwen3-4B"
+MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen3-4B"
 
 # Long agent prompt sequences - each is a multi-turn conversation
 BENCHMARK_PROMPTS = [
