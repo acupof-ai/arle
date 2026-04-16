@@ -169,6 +169,11 @@ struct MetricsInner {
     pub prefix_hits_total: AtomicU64,
     pub prefix_lookups_total: AtomicU64,
 
+    // DFlash speculative decode counters.
+    pub dflash_blocks_total: AtomicU64,
+    pub dflash_accepted_tokens_total: AtomicU64,
+    pub dflash_draft_tokens_total: AtomicU64,
+
     // Gauges (atomic).
     pub requests_active: AtomicU64,
     pub requests_waiting: AtomicU64,
@@ -195,6 +200,9 @@ impl ServerMetrics {
                 requests_failed_total: AtomicU64::new(0),
                 prefix_hits_total: AtomicU64::new(0),
                 prefix_lookups_total: AtomicU64::new(0),
+                dflash_blocks_total: AtomicU64::new(0),
+                dflash_accepted_tokens_total: AtomicU64::new(0),
+                dflash_draft_tokens_total: AtomicU64::new(0),
                 requests_active: AtomicU64::new(0),
                 requests_waiting: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
@@ -325,6 +333,31 @@ impl ServerMetrics {
         self.inner.prefix_hits_total.load(Ordering::Relaxed) as f64 / lookups as f64
     }
 
+    /// Record one DFlash speculative block execution.
+    pub fn record_dflash_block(&self, accepted_inputs: usize, block_size: usize) {
+        self.inner
+            .dflash_blocks_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .dflash_accepted_tokens_total
+            .fetch_add(accepted_inputs as u64, Ordering::Relaxed);
+        self.inner
+            .dflash_draft_tokens_total
+            .fetch_add(block_size as u64, Ordering::Relaxed);
+    }
+
+    /// DFlash acceptance rate: accepted tokens / total drafted tokens.
+    pub fn dflash_acceptance_rate(&self) -> f64 {
+        let drafted = self.inner.dflash_draft_tokens_total.load(Ordering::Relaxed);
+        if drafted == 0 {
+            return 0.0;
+        }
+        self.inner
+            .dflash_accepted_tokens_total
+            .load(Ordering::Relaxed) as f64
+            / drafted as f64
+    }
+
     // -----------------------------------------------------------------------
     // Prometheus text format rendering
     // -----------------------------------------------------------------------
@@ -401,6 +434,40 @@ impl ServerMetrics {
             out,
             "infer_prefix_hit_rate{{{labels}}} {:.4}",
             self.prefix_hit_rate()
+        )
+        .unwrap();
+
+        // DFlash speculative decode counters
+        out.push_str(
+            "# HELP infer_dflash_blocks_total Total DFlash speculative blocks executed.\n",
+        );
+        out.push_str("# TYPE infer_dflash_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_dflash_blocks_total{{{labels}}} {}",
+            self.inner.dflash_blocks_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_dflash_accepted_tokens_total Total tokens accepted from DFlash speculative blocks.\n");
+        out.push_str("# TYPE infer_dflash_accepted_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_dflash_accepted_tokens_total{{{labels}}} {}",
+            self.inner
+                .dflash_accepted_tokens_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_dflash_acceptance_rate DFlash acceptance rate (accepted/drafted) [0,1].\n",
+        );
+        out.push_str("# TYPE infer_dflash_acceptance_rate gauge\n");
+        writeln!(
+            out,
+            "infer_dflash_acceptance_rate{{{labels}}} {:.4}",
+            self.dflash_acceptance_rate()
         )
         .unwrap();
 
@@ -510,8 +577,19 @@ impl ServerMetrics {
         let cache_mb =
             self.inner.memory_cache_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
 
+        let dflash_blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
+        let dflash_suffix = if dflash_blocks > 0 {
+            format!(
+                " dflash_blocks={} dflash_accept_rate={:.1}%",
+                dflash_blocks,
+                self.dflash_acceptance_rate() * 100.0
+            )
+        } else {
+            String::new()
+        };
+
         format!(
-            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB ttft_p50={} ttft_p99={} tpot_p50={}",
+            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB ttft_p50={} ttft_p99={} tpot_p50={}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -524,6 +602,7 @@ impl ServerMetrics {
             ttft_p50,
             ttft_p99,
             tpot_p50,
+            dflash_suffix,
         )
     }
 }

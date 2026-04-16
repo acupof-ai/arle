@@ -795,6 +795,23 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    /// DFlash per-block acceptance lengths + block size for metrics flush.
+    /// Returns `(block_count, acceptance_lengths, block_size)` or `None` if
+    /// not a DFlash request.
+    pub(crate) fn dflash_block_stats(&self) -> Option<(usize, &[usize], usize)> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => {
+                let d = state.driver.dflash.as_ref()?;
+                Some((
+                    d.acceptance_lengths.len(),
+                    &d.acceptance_lengths,
+                    d.runtime.block_size(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn try_build_qwen35_packed_decode_batch(
         states: &mut [&mut MetalRequestState<'a>],
     ) -> Result<Option<Qwen35PackedDecodeBatch<'a>>> {

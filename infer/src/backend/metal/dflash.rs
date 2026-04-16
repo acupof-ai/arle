@@ -1,14 +1,14 @@
 use std::{collections::HashSet, path::Path, time::Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use serde::Deserialize;
 
 use super::{
     config::{MetalModelArch, MetalModelConfig, QuantConfig},
     forward::rust_transformer_layer,
-    generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
+    generate::{MetalGenerateOutput, KV_CACHE_CHUNK},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
+    mlx::{concatenate_axis, eval, rms_norm, slice, take_axis, zeros, MlxArray},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
@@ -141,6 +141,12 @@ impl MetalDflashRuntime {
 
     pub(super) fn draft_head_dim(&self) -> i32 {
         self.draft_config.head_dim as i32
+    }
+}
+
+impl MetalDflashRuntime {
+    pub(super) fn block_size(&self) -> usize {
+        self.block_size
     }
 }
 
