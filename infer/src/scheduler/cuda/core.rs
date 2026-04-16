@@ -279,9 +279,10 @@ impl<M: ModelForward> Scheduler<M> {
         let mut slot_owned_blocks = Vec::with_capacity(config.max_slots);
         for i in 0..config.max_slots {
             let mut state = model.create_state()?;
-            if let Some(max_seq) = effective_max_seq_len {
-                state.set_max_seq_len(max_seq);
-            }
+            // Contiguous KV only needs to hold a single prefill chunk; the
+            // paged pool carries the full effective sequence budget.
+            let contiguous_seq = config.prefill_chunk_size.max(256);
+            state.set_max_seq_len(contiguous_seq);
             state.set_kv_dtype(kv_cache_dtype);
             states.push(state);
             slot_materialized_prompt_lens.push(0);
@@ -290,7 +291,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let paged_kv_pool = {
-            let contiguous_max = effective_max_seq_len.unwrap_or(1024);
+            let contiguous_max = config.prefill_chunk_size.max(256);
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * contiguous_max * bytes_per_token;
             let headroom = config.kv_pool_headroom_bytes;
