@@ -511,7 +511,7 @@ unsafe extern "C" {
         gqa_factor: i32,
     ) -> *mut mlx_array;
 
-    // === Qwen3.5 DFlash tape mode ===
+    // === Qwen3.5 DFlash support ===
 
     pub fn qwen35_set_tape_mode(model: *mut std::ffi::c_void, enabled: bool);
     pub fn qwen35_get_tape_count(model: *mut std::ffi::c_void) -> i32;
@@ -522,6 +522,17 @@ unsafe extern "C" {
         out_k: *mut *mut mlx_array,
         out_g: *mut *mut mlx_array,
         out_qkv: *mut *mut mlx_array,
+    ) -> i32;
+    pub fn qwen35_set_capture_layers(
+        model: *mut std::ffi::c_void,
+        layer_ids: *const i32,
+        count: i32,
+    );
+    pub fn qwen35_get_captured_hidden_count(model: *mut std::ffi::c_void) -> i32;
+    pub fn qwen35_get_captured_hidden(
+        model: *mut std::ffi::c_void,
+        idx: i32,
+        out: *mut *mut mlx_array,
     ) -> i32;
 
     // === Random ===

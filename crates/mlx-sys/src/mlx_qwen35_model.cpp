@@ -445,10 +445,12 @@ struct Qwen35CompiledModel {
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
 
-    // ── DFlash tape mode ──────────────────────────────────────────────
-    // When enabled, gdr_step() records innovation tapes for each GDR layer
-    // (used for O(accepted) rollback during speculative decode rejection).
+    // ── DFlash support ────────────────────────────────────────────────
+    // When tape_mode is on, gdr_step() records innovation tapes for each GDR layer.
     bool tape_mode = false;
+    // When non-empty, forward() captures hidden states after the listed layers
+    // and appends them to the output vector (after logits + caches + gdr states).
+    std::vector<int> capture_layer_ids;
     // Per-GDR-layer tape recordings: (innovation_tape, k, g, qkv).
     // Populated during forward() when tape_mode=true, cleared at start of each step.
     struct GdrTapeEntry {
@@ -801,6 +803,8 @@ struct Qwen35CompiledModel {
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
         std::vector<array> new_conv_states(G, array(0));
+        std::vector<array> captured_hidden;
+        if (!capture_layer_ids.empty()) captured_hidden.reserve(capture_layer_ids.size());
         int full_idx = 0, gdr_idx = 0;
 
         for (int i = 0; i < (int)layers.size(); ++i) {
@@ -844,12 +848,20 @@ struct Qwen35CompiledModel {
             }
 
             // Keep key intermediates alive for GPU buffer reuse.
-            // Without this, C++ RAII destroys them immediately, causing MLX
-            // to release GPU buffers that could be reused next step.
             if (keep_intermediates) {
                 intermediates.push_back(xn);
                 intermediates.push_back(attn_out);
                 intermediates.push_back(xn2);
+            }
+
+            // DFlash: capture hidden states at specified layers.
+            if (!capture_layer_ids.empty()) {
+                for (int lid : capture_layer_ids) {
+                    if (lid == i) {
+                        captured_hidden.push_back(x);
+                        break;
+                    }
+                }
             }
         }
 
@@ -868,15 +880,16 @@ struct Qwen35CompiledModel {
             ? embed_as_linear.apply(final_x)
             : lm_head.apply(final_x);
 
-        // Build output
+        // Build output: [logits, kv_caches..., gdr_states..., captured_hidden...]
         std::vector<array> outputs;
-        outputs.reserve(1 + 2*F + 2*G);
+        outputs.reserve(1 + 2*F + 2*G + captured_hidden.size());
         outputs.push_back(std::move(logits));
         for (auto& kv : new_kv_caches) outputs.push_back(std::move(kv));
         for (int j = 0; j < G; ++j) {
             outputs.push_back(std::move(new_gdr_states[j]));
             outputs.push_back(std::move(new_conv_states[j]));
         }
+        for (auto& h : captured_hidden) outputs.push_back(std::move(h));
         return outputs;
     }
 
@@ -1596,6 +1609,41 @@ int32_t qwen35_get_tape(void* model, int32_t idx,
         *out_k = reinterpret_cast<mlx_array*>(new array(t.k));
         *out_g = reinterpret_cast<mlx_array*>(new array(t.g));
         *out_qkv = reinterpret_cast<mlx_array*>(new array(t.qkv));
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+// ── Hidden state capture API ─────────────────────────────────────────
+
+void qwen35_set_capture_layers(void* model, const int32_t* layer_ids, int32_t count) {
+    auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+    m->capture_layer_ids.clear();
+    if (layer_ids && count > 0) {
+        m->capture_layer_ids.assign(layer_ids, layer_ids + count);
+    }
+}
+
+int32_t qwen35_get_captured_hidden_count(void* model) {
+    auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+    int total_out = 1 + 2 * m->n_full_attn + 2 * m->n_gdr;
+    auto& outputs = m->prev_outputs;
+    if ((int)outputs.size() <= total_out) return 0;
+    return static_cast<int32_t>(outputs.size() - total_out);
+}
+
+/// Get a captured hidden state by index. Returns new array handle (caller must free).
+int32_t qwen35_get_captured_hidden(void* model, int32_t idx, mlx_array** out) {
+    try {
+        auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
+        int total_out = 1 + 2 * m->n_full_attn + 2 * m->n_gdr;
+        auto& outputs = m->prev_outputs;
+        int hi = total_out + idx;
+        if (hi < 0 || hi >= (int)outputs.size())
+            throw std::out_of_range("captured hidden index out of range");
+        *out = reinterpret_cast<mlx_array*>(new array(outputs[hi]));
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());

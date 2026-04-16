@@ -808,7 +808,14 @@ impl<'a> MetalRequestState<'a> {
                     d.runtime.block_size(),
                 ))
             }
-            _ => None,
+            MetalRequestStateInner::Qwen35(state) => {
+                let d = state.driver.dflash.as_ref()?;
+                Some((
+                    d.acceptance_lengths.len(),
+                    &d.acceptance_lengths,
+                    d.runtime.block_size(),
+                ))
+            }
         }
     }
 
@@ -2535,6 +2542,42 @@ impl StepDriver for Qwen35StepDriver<'_> {
     fn prefill_token(&mut self, token: u32, terminal_prompt: bool) -> Result<Option<u32>> {
         let logits = self.run_step(token)?;
         if terminal_prompt {
+            if let Some(ref mut dflash) = self.dflash {
+                if dflash.target_hidden.is_none() {
+                    if let MetalModelArch::Qwen35(arch) = &self.config.arch {
+                        let num_full = arch.num_full_attention_layers();
+                        let cs = [
+                            1i32,
+                            self.config.num_key_value_heads as i32,
+                            KV_CACHE_CHUNK,
+                            self.config.head_dim as i32,
+                        ];
+                        let mut tk: Vec<MlxArray> = (0..num_full)
+                            .map(|_| zeros(&cs, super::mlx::Dtype::Bfloat16))
+                            .collect();
+                        let mut tv: Vec<MlxArray> = (0..num_full)
+                            .map(|_| zeros(&cs, super::mlx::Dtype::Bfloat16))
+                            .collect();
+                        let mut tr = MetalRecurrentState::new(
+                            arch.num_linear_attention_layers(),
+                            &arch.linear,
+                        );
+                        let (_, th) = super::qwen35::qwen35_forward_with_hidden_states(
+                            &[token],
+                            self.weights,
+                            self.config,
+                            arch,
+                            &mut tk,
+                            &mut tv,
+                            &mut tr,
+                            self.cache_len - 1,
+                            &dflash.target_layer_ids,
+                        );
+                        eval(&[&th]);
+                        dflash.target_hidden = Some(th);
+                    }
+                }
+            }
             let sampled = gpu_sample_token(&logits, &self.params);
             eval(&[&sampled]);
             Ok(Some(sampled.item_i32() as u32))
@@ -2578,6 +2621,43 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 self.cache_len += tokens.len() as i32;
 
                 if terminal_prompt {
+                    if let Some(ref mut dflash) = self.dflash {
+                        if dflash.target_hidden.is_none() {
+                            if let MetalModelArch::Qwen35(arch) = &self.config.arch {
+                                let num_full = arch.num_full_attention_layers();
+                                let cs = [
+                                    1i32,
+                                    self.config.num_key_value_heads as i32,
+                                    (tokens.len() as i32 + KV_CACHE_CHUNK) / KV_CACHE_CHUNK
+                                        * KV_CACHE_CHUNK,
+                                    self.config.head_dim as i32,
+                                ];
+                                let mut tk: Vec<MlxArray> = (0..num_full)
+                                    .map(|_| zeros(&cs, super::mlx::Dtype::Bfloat16))
+                                    .collect();
+                                let mut tv: Vec<MlxArray> = (0..num_full)
+                                    .map(|_| zeros(&cs, super::mlx::Dtype::Bfloat16))
+                                    .collect();
+                                let mut tr = MetalRecurrentState::new(
+                                    arch.num_linear_attention_layers(),
+                                    &arch.linear,
+                                );
+                                let (_, th) = super::qwen35::qwen35_forward_with_hidden_states(
+                                    tokens,
+                                    self.weights,
+                                    self.config,
+                                    arch,
+                                    &mut tk,
+                                    &mut tv,
+                                    &mut tr,
+                                    0,
+                                    &dflash.target_layer_ids,
+                                );
+                                eval(&[&th]);
+                                dflash.target_hidden = Some(th);
+                            }
+                        }
+                    }
                     let sampled = gpu_sample_token(&logits, &self.params);
                     eval(&[&sampled]);
                     Ok(Some(sampled.item_i32() as u32))
@@ -2611,10 +2691,15 @@ impl StepDriver for Qwen35StepDriver<'_> {
 
             // 2. Buffer empty → run one full speculative block.
             if let Qwen35StepMode::Cpp(ref mut cpp_state) = self.mode {
-                let target_hidden = dflash
-                    .target_hidden
-                    .take()
-                    .context("Qwen3.5 DFlash decode_token: target_hidden not set")?;
+                let Some(target_hidden) = dflash.target_hidden.take() else {
+                    // First decode after prefill — target_hidden not captured yet.
+                    // Fall through to standard decode.
+                    drop(dflash);
+                    let logits = self.run_step(token)?;
+                    let sampled = gpu_sample_token(&logits, &self.params);
+                    eval(&[&sampled]);
+                    return Ok(sampled.item_i32() as u32);
+                };
 
                 let cpp_model = self
                     .weights
