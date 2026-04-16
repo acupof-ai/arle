@@ -29,8 +29,16 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        // Phase 2: Flush deferred deltas (CPU tokenizer decode) while the
-        // greedy sampling kernel is still in flight.
+        // Phase 2: Overlap window — GPU decode forward is in flight.
+        //
+        // Queue CPU work + prefill on the same stream while decode runs:
+        //   a) emit_delta (CPU tokenizer, no GPU dependency)
+        //   b) admit new requests (CPU)
+        //   c) prefill chunks — GPU kernels queued AFTER decode on same stream,
+        //      eliminating the dead time that existed when prefill ran after readback.
+        //      When step_prefill_chunk internally syncs (for sampling), that sync
+        //      catches both decode argmax AND prefill GPU work. The subsequent
+        //      decode readback sync becomes a no-op.
         let emit_t = std::time::Instant::now();
         {
             let Self {
@@ -46,18 +54,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
-        // Phase 3: Readback decode results (sync + D2H + token mutation)
-        let readback_us = if has_decode && self.pending_decode.is_some() {
-            let t = std::time::Instant::now();
-            self.step_decode_readback();
-            t.elapsed().as_micros()
-        } else {
-            0
-        };
-        let decode_us = decode_launch_us + readback_us;
-
-        // Phase 4: Accept ALL new requests (prefix cache + start prefill)
-        // Process all new requests in one step to avoid multi-iteration admission delay.
+        // Phase 2b: Accept new requests (CPU-only, no GPU)
         let new_t = std::time::Instant::now();
         loop {
             let new_idx =
@@ -69,11 +66,8 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 5: Prefill chunks — adaptive rate based on decode batch size.
-        //
-        // During ramp-up (few decodes), allow more prefills to reduce TTFT.
-        // At high concurrency, limit prefills to protect decode ITL.
-        // SGLang uses a similar adaptive policy.
+        // Phase 2c: Prefill chunks — queued on GPU stream while decode is in flight.
+        // Adaptive rate based on decode batch size.
         let prefill_t = std::time::Instant::now();
         let decode_count = self
             .active
@@ -94,12 +88,22 @@ impl<M: ModelForward> Scheduler<M> {
             .take(max_prefills)
             .collect();
         for idx in prefill_indices {
-            // Re-check phase since step_prefill_chunk may transition to Decoding/Finished
             if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
                 self.step_prefill_chunk(idx);
             }
         }
         let prefill_us = prefill_t.elapsed().as_micros();
+
+        // Phase 3: Readback decode results (sync + D2H + token mutation).
+        // If prefill already synced the stream, this sync is a no-op.
+        let readback_us = if has_decode && self.pending_decode.is_some() {
+            let t = std::time::Instant::now();
+            self.step_decode_readback();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+        let decode_us = decode_launch_us + readback_us;
 
         // Step timing — always tracked for /v1/stats and profiling.
         // EMA (exponential moving average) with α=0.1 smooths noise
