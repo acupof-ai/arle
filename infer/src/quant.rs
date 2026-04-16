@@ -303,9 +303,7 @@ struct RawModelConfig {
 ///
 /// Fast path — just looks at which files are present.
 pub fn detect_quant_format(model_path: &str) -> QuantFormat {
-    load_quant_meta(model_path)
-        .map(|m| m.format())
-        .unwrap_or(QuantFormat::None)
+    load_quant_meta(model_path).map_or(QuantFormat::None, |m| m.format())
 }
 
 /// Fully parse and return quantization metadata for a model directory.

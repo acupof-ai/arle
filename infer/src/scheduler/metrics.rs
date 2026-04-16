@@ -91,16 +91,14 @@ impl SchedulerMetrics {
             elapsed,
             steps: self.window_steps,
             decode_steps: self.window_decode_steps,
-            avg_decode_us: if self.window_decode_steps > 0 {
-                self.window_decode_us / self.window_decode_steps
-            } else {
-                0
-            },
-            avg_prefill_us: if self.total_prefill_chunks > 0 {
-                self.window_prefill_us / self.total_prefill_chunks
-            } else {
-                0
-            },
+            avg_decode_us: self
+                .window_decode_us
+                .checked_div(self.window_decode_steps)
+                .unwrap_or(0),
+            avg_prefill_us: self
+                .window_prefill_us
+                .checked_div(self.total_prefill_chunks)
+                .unwrap_or(0),
             tokens_generated: self.window_tokens_generated,
             tokens_prefilled: self.window_tokens_prefilled,
             gen_throughput: self.window_tokens_generated as f64 / elapsed.as_secs_f64(),

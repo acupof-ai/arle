@@ -24,7 +24,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Maximum wall-clock time allowed for a non-streaming request to complete.
 /// Streaming responses have natural per-chunk flow control and are not capped here.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+const RESPONSE_TIMEOUT: Duration = Duration::from_mins(5);
 
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
