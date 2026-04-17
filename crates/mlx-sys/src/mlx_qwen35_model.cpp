@@ -398,6 +398,32 @@ struct LayerWeights {
 // ── Model struct ───────────────────────────────────────────────────────────
 
 struct Qwen35CompiledModel {
+    struct GdrTapeEntry {
+        array innovation_tape = array(0);
+        array k = array(0);
+        array g = array(0);
+        array qkv = array(0);
+    };
+
+    struct ForwardContext {
+        int cache_pos = 0;
+        int seq_len = 1;
+        int batch_size = 1;
+        bool last_logits_only = false;
+        bool has_attn_mask = false;
+        array attn_mask = array(0);
+        bool has_rope_offsets = false;
+        array rope_offsets = array(0);
+        bool keep_intermediates = false;
+        bool record_tapes = false;
+        const std::vector<int>* capture_layer_ids = nullptr;
+    };
+
+    struct ForwardArtifacts {
+        std::vector<array> intermediates;
+        std::vector<GdrTapeEntry> gdr_tapes;
+    };
+
     // Weights
     array embed_tokens = array(0);  // dequantized bf16 for take() lookup
     array final_norm_w = array(0);
@@ -453,20 +479,21 @@ struct Qwen35CompiledModel {
     std::vector<int> capture_layer_ids;
     // Per-GDR-layer tape recordings: (innovation_tape, k, g, qkv).
     // Populated during forward() when tape_mode=true, cleared at start of each step.
-    struct GdrTapeEntry {
-        array innovation_tape = array(0);
-        array k = array(0);
-        array g = array(0);
-        array qkv = array(0);
-    };
     mutable std::vector<GdrTapeEntry> gdr_tapes;
 
-    bool keep_step_intermediates() const {
-        return current_seq_len == 1 || keep_prefill_intermediates();
+    bool keep_step_intermediates(int seq_len) const {
+        return seq_len == 1 || keep_prefill_intermediates();
     }
 
     bool use_separate_mlp_for_current_step(const GdrLayerWeights& lw) const {
         return lw.has_separate_mlp && use_qwen35_cpp_separate_mlp();
+    }
+
+    static bool contains_layer_id(const std::vector<int>* layer_ids, int layer_id) {
+        if (!layer_ids) {
+            return false;
+        }
+        return std::find(layer_ids->begin(), layer_ids->end(), layer_id) != layer_ids->end();
     }
 
     // ── Full attention decode step ─────────────────────────────────────
@@ -474,13 +501,15 @@ struct Qwen35CompiledModel {
     array full_attn_step(
         const array& x, const FullAttnLayerWeights& lw,
         const array& k_cache, const array& v_cache, int cache_pos,
+        const ForwardContext& ctx,
+        ForwardArtifacts* artifacts,
         array& new_k_cache, array& new_v_cache
     ) const {
-        int B = current_batch_size;
+        int B = ctx.batch_size;
         int nh = n_heads, nkv = n_kv_heads, hd = head_dim;
-        int S = current_seq_len;
+        int S = ctx.seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
-        bool keep_intermediates = keep_step_intermediates();
+        bool keep_intermediates = ctx.keep_intermediates && artifacts;
 
         auto q_proj_out = lw.q_proj.apply(x);
         auto k_raw = lw.k_proj.apply(x);
@@ -503,15 +532,15 @@ struct Qwen35CompiledModel {
         k = fast::rms_norm(k, lw.k_norm_w, rms_eps);
         k = transpose(k, {0, 2, 1, 3});
 
-        if (current_has_rope_offsets) {
+        if (ctx.has_rope_offsets) {
             // Array-offset path. Handles B>1 correctly AND carries per-row
             // logical positions for variable-length decode (each row's
             // offset = batch_cache_len - left_padding[row]).
-            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
-            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, current_rope_offsets);
+            q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
+            k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, ctx.rope_offsets);
         } else {
             // Scalar path. Only safe for B == 1 (prefill or single-request
-            // decode); batched decode callers MUST set current_rope_offsets.
+            // decode); batched decode callers MUST set rope_offsets.
             q = fast::rope(q, rotary_dim, false, rope_theta, 1.0f, cache_pos);
             k = fast::rope(k, rotary_dim, false, rope_theta, 1.0f, cache_pos);
         }
@@ -526,14 +555,14 @@ struct Qwen35CompiledModel {
         auto v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
 
         array attn_out(0);
-        if (current_has_attn_mask) {
+        if (ctx.has_attn_mask) {
             attn_out = fast::scaled_dot_product_attention(
                 q,
                 k_full,
                 v_full,
                 attn_scale,
                 "",
-                current_attn_mask);
+                ctx.attn_mask);
         } else {
             std::string mask_mode = (S > 1) ? "causal" : "";
             attn_out = fast::scaled_dot_product_attention(
@@ -555,6 +584,7 @@ struct Qwen35CompiledModel {
 
         // Keep intermediates alive for GPU buffer reuse
         if (keep_intermediates) {
+            auto& intermediates = artifacts->intermediates;
             intermediates.push_back(q);
             intermediates.push_back(k);
             intermediates.push_back(attn_out);
@@ -568,16 +598,18 @@ struct Qwen35CompiledModel {
     array gdr_step(
         const array& x, const GdrLayerWeights& lw,
         const array& gdr_state_in, const array& conv_state_in,
+        const ForwardContext& ctx,
+        ForwardArtifacts* artifacts,
         array& gdr_state_out, array& conv_state_out,
         const array& gdr_t_arr
     ) const {
-        int B = current_batch_size;
+        int B = ctx.batch_size;
         int hk = lw.num_key_heads, dk = lw.key_dim;
         int hv = lw.num_value_heads, dv = lw.value_dim;
         int q_dim = hk * dk, k_dim = q_dim, v_dim = hv * dv;
         int qkv_dim = q_dim + k_dim + v_dim;
-        int S = current_seq_len;
-        bool keep_intermediates = keep_step_intermediates();
+        int S = ctx.seq_len;
+        bool keep_intermediates = ctx.keep_intermediates && artifacts;
 
         auto x_3d = reshape(x, {B, S, hidden_size});
 
@@ -598,9 +630,15 @@ struct Qwen35CompiledModel {
             b_raw = ba_parts[0];
             a_raw = ba_parts[1];
             if (keep_intermediates) {
-                intermediates.push_back(qkvz); intermediates.push_back(ba);
-                for (auto& a : qkv_z) intermediates.push_back(a);
-                for (auto& a : ba_parts) intermediates.push_back(a);
+                auto& intermediates = artifacts->intermediates;
+                intermediates.push_back(qkvz);
+                intermediates.push_back(ba);
+                for (auto& a : qkv_z) {
+                    intermediates.push_back(a);
+                }
+                for (auto& a : ba_parts) {
+                    intermediates.push_back(a);
+                }
             }
         }
 
@@ -615,7 +653,10 @@ struct Qwen35CompiledModel {
         // Split conv output
         auto qkv_parts = split(conv_out, Shape{q_dim, q_dim + k_dim}, -1);
         if (keep_intermediates) {
-            for (auto& a : qkv_parts) intermediates.push_back(a);
+            auto& intermediates = artifacts->intermediates;
+            for (auto& a : qkv_parts) {
+                intermediates.push_back(a);
+            }
         }
         auto q_raw = reshape(qkv_parts[0], {B, S, hk, dk});
         auto k_raw = reshape(qkv_parts[1], {B, S, hk, dk});
@@ -662,7 +703,7 @@ struct Qwen35CompiledModel {
                 {"StT", fast::TemplateArg(float32)},
             };
 
-            if (tape_mode) {
+            if (ctx.record_tapes) {
                 // Tape-recording variant: same computation + records innovation_tape
                 std::vector<Shape> tape_out_shapes = {{B, S, hv, dv}, gdr_state_in.shape(), {B, S, hv, dv}};
                 std::vector<Dtype> tape_out_dtypes = {bfloat16, float32, bfloat16};
@@ -681,7 +722,7 @@ struct Qwen35CompiledModel {
                 // Record tape for rollback. tape_replay requires bf16 for
                 // g/k/tape, but compute_g_impl produces f32 because neg_exp_a
                 // is f32. Cast here so the tape kernel's dtype gate holds.
-                gdr_tapes.push_back({
+                artifacts->gdr_tapes.push_back({
                     std::move(result[2]),            // innovation_tape (bf16 from kernel)
                     astype(contiguous(k), bfloat16), // k
                     astype(contiguous(g_3d), bfloat16), // g (was f32)
@@ -702,6 +743,7 @@ struct Qwen35CompiledModel {
                 gdr_state_out = std::move(result[1]);
             }
             if (keep_intermediates) {
+                auto& intermediates = artifacts->intermediates;
                 intermediates.push_back(g_3d);
                 intermediates.push_back(beta_3d);
             }
@@ -737,7 +779,7 @@ struct Qwen35CompiledModel {
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
         if (keep_intermediates) {
-            auto& im = intermediates;
+            auto& im = artifacts->intermediates;
             im.push_back(x_3d);
             im.push_back(qkv); im.push_back(z_raw);
             im.push_back(b_raw); im.push_back(a_raw);
@@ -775,38 +817,37 @@ struct Qwen35CompiledModel {
 
     // ── Full forward pass ──────────────────────────────────────────────
     // inputs layout:
-    //   [0]        : token_id (int32 scalar)
-    //   [1]        : cache_pos (int32 scalar)
-    //   [2..2+2*F) : k_cache_i, v_cache_i for F full-attn layers
-    //   [2+2*F .. 2+2*F+2*G) : gdr_state_i, conv_state_i for G GDR layers
+    //   [0]        : token ids / token batch
+    //   [1..1+2*F) : k_cache_i, v_cache_i for F full-attn layers
+    //   [1+2*F .. 1+2*F+2*G) : gdr_state_i, conv_state_i for G GDR layers
     // outputs layout:
     //   [0]        : logits
     //   [1..1+2*F) : new k/v caches
     //   [1+2*F .. 1+2*F+2*G) : new gdr/conv states
 
-    std::vector<array> forward(const std::vector<array>& inputs) const {
-        // Clear intermediates from previous step (releases old GPU buffers)
-        intermediates.clear();
-        intermediates.reserve(current_seq_len == 1 ? 2048 : 128);
-        // Clear tapes from previous step (rebuilt if tape_mode is on)
-        gdr_tapes.clear();
-
+    std::vector<array> forward_impl(
+        const std::vector<array>& inputs,
+        const ForwardContext& ctx,
+        ForwardArtifacts* artifacts
+    ) const {
         auto token_id = inputs[0];
-        int cache_pos = current_cache_pos;
-        int B = current_batch_size;
-        int S = current_seq_len;  // 1 for decode, >1 for batch prefill
+        int cache_pos = ctx.cache_pos;
+        int B = ctx.batch_size;
+        int S = ctx.seq_len;  // 1 for decode, >1 for batch prefill
 
         int F = n_full_attn, G = n_gdr;
         auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
-        bool keep_intermediates = keep_step_intermediates();
-        current_gdr_t_arr = array(S);
+        bool keep_intermediates = ctx.keep_intermediates && artifacts;
+        auto gdr_t_arr = array(S);
 
         std::vector<array> new_kv_caches(2 * F, array(0));
         std::vector<array> new_gdr_states(G, array(0));
         std::vector<array> new_conv_states(G, array(0));
         std::vector<array> captured_hidden;
-        if (!capture_layer_ids.empty()) captured_hidden.reserve(capture_layer_ids.size());
+        if (ctx.capture_layer_ids && !ctx.capture_layer_ids->empty()) {
+            captured_hidden.reserve(ctx.capture_layer_ids->size());
+        }
         int full_idx = 0, gdr_idx = 0;
 
         for (int i = 0; i < (int)layers.size(); ++i) {
@@ -823,13 +864,17 @@ struct Qwen35CompiledModel {
                 int si = 1 + 2*F + 2*gdr_idx;
                 attn_out = gdr_step(xn, layer.gdr,
                     inputs[si], inputs[si+1],
-                    new_gdr_states[gdr_idx], new_conv_states[gdr_idx], current_gdr_t_arr);
+                    ctx,
+                    artifacts,
+                    new_gdr_states[gdr_idx], new_conv_states[gdr_idx], gdr_t_arr);
                 gdr_idx++;
             } else {
                 int si = 1 + 2*full_idx;
                 attn_out = full_attn_step(xn, layer.full,
                     inputs[si], inputs[si+1],
                     cache_pos,
+                    ctx,
+                    artifacts,
                     new_kv_caches[2*full_idx], new_kv_caches[2*full_idx+1]);
                 full_idx++;
             }
@@ -851,29 +896,25 @@ struct Qwen35CompiledModel {
 
             // Keep key intermediates alive for GPU buffer reuse.
             if (keep_intermediates) {
+                auto& intermediates = artifacts->intermediates;
                 intermediates.push_back(xn);
                 intermediates.push_back(attn_out);
                 intermediates.push_back(xn2);
             }
 
             // DFlash: capture hidden states at specified layers.
-            if (!capture_layer_ids.empty()) {
-                for (int lid : capture_layer_ids) {
-                    if (lid == i) {
-                        captured_hidden.push_back(x);
-                        break;
-                    }
-                }
+            if (contains_layer_id(ctx.capture_layer_ids, i)) {
+                captured_hidden.push_back(x);
             }
         }
 
         // Final norm + lm_head
         auto final_x = fast::rms_norm(x, final_norm_w, rms_eps);
-        if (current_last_logits_only && current_seq_len > 1) {
+        if (ctx.last_logits_only && ctx.seq_len > 1) {
             final_x = slice(
                 final_x,
-                {0, current_seq_len - 1, 0},
-                {B, current_seq_len, hidden_size}
+                {0, ctx.seq_len - 1, 0},
+                {B, ctx.seq_len, hidden_size}
             );
         }
         // Use quantized matmul for tied lm_head (same as mlx_lm's as_linear).
@@ -892,6 +933,34 @@ struct Qwen35CompiledModel {
             outputs.push_back(std::move(new_conv_states[j]));
         }
         for (auto& h : captured_hidden) outputs.push_back(std::move(h));
+        return outputs;
+    }
+
+    std::vector<array> forward(const std::vector<array>& inputs) const {
+        ForwardContext ctx;
+        ctx.cache_pos = current_cache_pos;
+        ctx.seq_len = current_seq_len;
+        ctx.batch_size = current_batch_size;
+        ctx.last_logits_only = current_last_logits_only;
+        ctx.has_attn_mask = current_has_attn_mask;
+        ctx.attn_mask = current_attn_mask;
+        ctx.has_rope_offsets = current_has_rope_offsets;
+        ctx.rope_offsets = current_rope_offsets;
+        ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
+        ctx.record_tapes = tape_mode;
+        ctx.capture_layer_ids = &capture_layer_ids;
+
+        ForwardArtifacts artifacts;
+        if (ctx.keep_intermediates) {
+            artifacts.intermediates.reserve(current_seq_len == 1 ? 2048 : 128);
+        }
+        if (ctx.record_tapes) {
+            artifacts.gdr_tapes.reserve(n_gdr);
+        }
+
+        auto outputs = forward_impl(inputs, ctx, &artifacts);
+        intermediates = std::move(artifacts.intermediates);
+        gdr_tapes = std::move(artifacts.gdr_tapes);
         return outputs;
     }
 
