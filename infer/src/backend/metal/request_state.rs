@@ -779,6 +779,28 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    /// Permanently disable DFlash speculative decode on this request.
+    /// Used by the scheduler runtime when concurrent sessions appear —
+    /// DFlash's serial per-request verify (~230ms/block) dominates step
+    /// latency and starves the packed batch, so ≥2 concurrent sessions
+    /// are always faster going through plain packed decode. The downgrade
+    /// is one-way: `target_hidden` capture requires fresh prefill, so we
+    /// don't try to resume DFlash later.
+    ///
+    /// Drops the per-request draft KV cache and any captured tapes,
+    /// freeing GPU memory. The main target KV cache (`cpp_state.kv_flat`)
+    /// is untouched — it's the same buffer packed decode will use.
+    pub(crate) fn disable_dflash(&mut self) {
+        match &mut self.inner {
+            MetalRequestStateInner::Qwen3(state) => {
+                state.driver.dflash = None;
+            }
+            MetalRequestStateInner::Qwen35(state) => {
+                state.driver.dflash = None;
+            }
+        }
+    }
+
     /// DFlash acceptance rate for this request: fraction of generated tokens
     /// that came from draft predictions (matches reference metric).
     /// Returns None if not DFlash-enabled or no blocks executed yet.

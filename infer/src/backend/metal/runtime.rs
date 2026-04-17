@@ -43,6 +43,7 @@ impl ActiveMetalRequest {
         backend: &'static MetalBackend,
         tokenizer: &'static Tokenizer,
         incoming: IncomingRequest,
+        enable_dflash: bool,
     ) -> Result<(Vec<u32>, usize, Self)> {
         let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
         let max_tokens = incoming.max_tokens;
@@ -51,7 +52,16 @@ impl ActiveMetalRequest {
         // because the backend is leaked into the scheduler runtime thread.
         // SAFETY: `backend` was leaked to `'static` at runtime.rs:591 before
         // this function is called. The ptr-cast inside is sound.
-        let dflash_ref = unsafe { backend.dflash_runtime_static() };
+        //
+        // `enable_dflash=false` (caller sees concurrent sessions already
+        // queued) skips the DFlash hidden-capture prefill too, saving the
+        // full-prompt single-shot prefill cost — the request would have
+        // been downgraded at the first decode step anyway.
+        let dflash_ref = if enable_dflash {
+            unsafe { backend.dflash_runtime_static() }
+        } else {
+            None
+        };
         let request_state = backend.create_request_state_with_dflash(
             &prompt_tokens,
             &incoming.sampling,
@@ -850,8 +860,12 @@ fn admit_request(
     }
 
     let priority = map_request_priority(incoming.priority);
+    // Only initialize DFlash when we're admitting a genuinely solo request.
+    // Any existing live session means this one would be downgraded at the
+    // first decode step anyway, so skip the DFlash-prefill cost upfront.
+    let enable_dflash = active.is_empty();
     let (prompt_tokens, max_tokens, mut request) =
-        match ActiveMetalRequest::from_incoming(backend, tokenizer, incoming) {
+        match ActiveMetalRequest::from_incoming(backend, tokenizer, incoming, enable_dflash) {
             Ok(request) => request,
             Err(err) => {
                 error!("Metal scheduler request init failed: {err:#}");
@@ -1016,10 +1030,24 @@ fn execute_decode_batch(
         open.push((req_id, request));
     }
 
-    // Partition: DFlash requests use per-request speculative decode (they
-    // can't participate in single-token batched decode). Non-DFlash requests
-    // go through the normal batch path. This prevents one DFlash request
-    // from degrading the entire batch to serial execution.
+    // Concurrency downgrade: with ≥2 open sessions, DFlash's per-request
+    // serial verify (~230ms/block, ~28% accept on Qwen3.5 4-bit today)
+    // is dominated by a batched single-token decode (~25ms for all rows).
+    // Permanently drop DFlash on every row in the multi-session case so
+    // they all join the packed batch. One-way: `target_hidden` capture
+    // needs a fresh prefill, so we don't try to resume DFlash when
+    // concurrency drops back to 1.
+    if open.len() >= 2 {
+        for (_, request) in open.iter_mut() {
+            if request.request_state.is_dflash_enabled() {
+                request.request_state.disable_dflash();
+            }
+        }
+    }
+
+    // Partition: DFlash requests (only possible when open.len() == 1 after
+    // the downgrade above) use per-request speculative decode. Non-DFlash
+    // requests go through the normal batch path.
     let (dflash_requests, non_dflash): (Vec<_>, Vec<_>) = open
         .into_iter()
         .partition(|(_, request)| request.request_state.is_dflash_enabled());
