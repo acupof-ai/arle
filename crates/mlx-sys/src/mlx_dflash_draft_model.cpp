@@ -133,9 +133,6 @@ struct DFlashDraftModel {
             throw std::runtime_error("DFlash draft forward expects rank-2 noise/target inputs");
         }
 
-        const int seq = hidden_states.shape(0);
-        const int context_len = target_hidden.shape(0);
-        const int total_len = seq + context_len;
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
         auto target_hidden_proj = fc.apply(target_hidden);
@@ -154,17 +151,17 @@ struct DFlashDraftModel {
             auto k_raw = layer.k_proj.apply(kv_states);
             auto v_raw = layer.v_proj.apply(kv_states);
 
-            auto q = reshape(q_raw, {1, seq, num_heads, head_dim});
+            auto q = reshape(q_raw, {1, -1, num_heads, head_dim});
             q = fast::rms_norm(q, layer.q_norm, rms_eps);
             q = transpose(q, {0, 2, 1, 3});
             q = fast::rope(q, head_dim, false, rope_theta, 1.0f, q_offset);
 
-            auto k = reshape(k_raw, {1, total_len, num_kv_heads, head_dim});
+            auto k = reshape(k_raw, {1, -1, num_kv_heads, head_dim});
             k = fast::rms_norm(k, layer.k_norm, rms_eps);
             k = transpose(k, {0, 2, 1, 3});
             k = fast::rope(k, head_dim, false, rope_theta, 1.0f, k_offset);
 
-            auto v = reshape(v_raw, {1, total_len, num_kv_heads, head_dim});
+            auto v = reshape(v_raw, {1, -1, num_kv_heads, head_dim});
             v = transpose(v, {0, 2, 1, 3});
 
             auto new_k_cache = concatenate({inputs[input_idx++], k}, 2);
@@ -177,7 +174,7 @@ struct DFlashDraftModel {
                 attn_scale,
                 "");
             attn = transpose(attn, {0, 2, 1, 3});
-            attn = reshape(attn, {seq, hidden_size});
+            attn = reshape(attn, {-1, num_heads * head_dim});
             attn = layer.o_proj.apply(attn);
             hidden_states = residual + attn;
 
