@@ -217,21 +217,61 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let slot_idx = self.active[idx].slot_idx;
-        let (effective_tokens, progress) = match &mut self.active[idx].phase {
+        // Snapshot chunk inputs as owned values so we can release the phase
+        // borrow before calling `&mut self` methods (alloc_pool_tokens_with_retry).
+        let (chunk_tokens, progress_val, total) = match &self.active[idx].phase {
             Phase::Prefilling {
                 effective_tokens,
                 progress,
-            } => (effective_tokens as &Vec<u32>, progress as &mut usize),
+            } => {
+                let total = effective_tokens.len();
+                let chunk_end = (*progress + chunk_size).min(total);
+                (
+                    effective_tokens[*progress..chunk_end].to_vec(),
+                    *progress,
+                    total,
+                )
+            }
             _ => return,
         };
+        let chunk_len = chunk_tokens.len();
+        let chunk_end = progress_val + chunk_len;
 
-        let total = effective_tokens.len();
-        let chunk_end = (*progress + chunk_size).min(total);
-        let chunk = &effective_tokens[*progress..chunk_end];
+        let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
 
-        let forward_result = self
-            .model
-            .forward_prefill(chunk, &mut self.states[slot_idx]);
+        let forward_result = if uses_paged {
+            // Paged prefill: pre-allocate pool pages for this chunk so the
+            // forward can write K/V directly through the page table. We pass a
+            // dummy CudaSlice for `new_token_indices` — Qwen3's paged
+            // implementation reads the page table from the pool itself.
+            match self.alloc_pool_tokens_with_retry(slot_idx, chunk_len) {
+                Err(e) => {
+                    let req_id = self.active[idx].id;
+                    error!(
+                        "Request {}: pool alloc for paged prefill failed: {}",
+                        req_id, e
+                    );
+                    self.active[idx].phase = Phase::Finished;
+                    return;
+                }
+                Ok(_new_pages) => {
+                    let ctx = self.model.device_context();
+                    match ctx.stream.clone_htod(&[0i32]) {
+                        Ok(dummy_indices) => self.model.forward_prefill_with_pool(
+                            &chunk_tokens,
+                            &mut self.states[slot_idx],
+                            &self.paged_kv_pool,
+                            slot_idx,
+                            &dummy_indices,
+                        ),
+                        Err(e) => Err(anyhow::anyhow!("dummy indices H2D failed: {e}")),
+                    }
+                }
+            }
+        } else {
+            self.model
+                .forward_prefill(&chunk_tokens, &mut self.states[slot_idx])
+        };
 
         if let Err(e) = forward_result {
             let req_id = self.active[idx].id;
@@ -242,7 +282,9 @@ impl<M: ModelForward> Scheduler<M> {
 
         let new_progress = chunk_end;
         if new_progress < total {
-            *progress = new_progress;
+            if let Phase::Prefilling { progress, .. } = &mut self.active[idx].phase {
+                *progress = new_progress;
+            }
             info!(
                 "Request {}: prefill chunk {}/{} tokens",
                 self.active[idx].id, new_progress, total
@@ -250,7 +292,9 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        if self.paged_kv_pool.is_active() {
+        // Post-forward KV migration (only when contiguous-KV prefill was used).
+        // Paged prefill already wrote K/V into the pool; nothing to migrate.
+        if !uses_paged && self.paged_kv_pool.is_active() {
             let pool_start = self.paged_kv_pool.seq_len(slot_idx);
             match self.alloc_pool_tokens_with_retry(slot_idx, total) {
                 Err(e) => {

@@ -876,6 +876,15 @@ impl<M: ModelForward> Scheduler<M> {
                 .filter(|req| matches!(req.phase, Phase::Decoding))
                 .count(),
         );
+        // When the model writes prefill K/V directly to the paged pool, there
+        // is no per-slot contiguous scratch to size the chunk against, so the
+        // `CONTIGUOUS_KV_TOKENS` cap does not apply and the configured
+        // `prefill_chunk_size` (default 4096) is the only upper bound.
+        let contiguous_cap = if self.model.prefill_uses_paged_pool() {
+            usize::MAX
+        } else {
+            CONTIGUOUS_KV_TOKENS
+        };
         DecodeAwareChunking {
             decode_active_chunk: self.config.decode_active_prefill_cap,
             idle_chunk: self.config.prefill_chunk_size,
@@ -883,7 +892,7 @@ impl<M: ModelForward> Scheduler<M> {
         .next_chunk_size(InferenceMode::Prefill, signals)
         .max(1)
         .min(self.config.prefill_chunk_size)
-        .min(CONTIGUOUS_KV_TOKENS) // Cap to contiguous buffer to prevent overflow
+        .min(contiguous_cap)
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.

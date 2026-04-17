@@ -5,6 +5,7 @@ use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
 use infer_cuda_kernels::TokenKVPool;
+use infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan;
 use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
@@ -134,17 +135,20 @@ impl Qwen3Model {
         Ok(hidden)
     }
 
-    /// Like `process_all_layers_batch`, but also scatter-writes K/V to the
-    /// token pool after each layer's QKV GEMM. The Triton prefill attention
-    /// kernel still reads from the contiguous cache (dual-write approach).
-    #[fastrace::trace(name = "process_all_layers_batch_with_pool")]
-    pub(super) fn process_all_layers_batch_with_pool(
+    /// Paged-KV prefill. Writes K/V directly to the paged pool via
+    /// page-table indirection and runs FlashInfer `BatchPrefillWithPagedKVCache`
+    /// for attention. No contiguous KV cache is touched; the scheduler must
+    /// skip `migrate_kv_range_to_paged` for this forward.
+    ///
+    /// Callable only when the scheduler has already pre-allocated pool pages
+    /// for the chunk (`pool.page_indices(slot)` covers `[0, start_pos+seq_len)`).
+    #[fastrace::trace(name = "process_all_layers_batch_paged")]
+    pub(super) fn process_all_layers_batch_paged(
         &self,
         mut hidden: HiddenStates,
         start_pos: usize,
-        kv_cache: &mut KVCache,
         pool: &TokenKVPool,
-        new_token_indices: &CudaSlice<i32>,
+        slot: usize,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
         let num_heads = self.config.num_attention_heads;
@@ -163,47 +167,54 @@ impl Qwen3Model {
             seq_len,
         )?;
 
+        // Per-forward GPU-resident page table (1 i32 per logical page in the
+        // slot). Uploaded once and reused across all 36 layers.
+        let pages_u32 = pool.page_indices(slot);
+        let pages_i32: Vec<i32> = pages_u32.iter().map(|&p| p as i32).collect();
+        let slot_page_indices: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&pages_i32)
+            .map_err(|e| anyhow::anyhow!("slot_page_indices H2D failed: {e}"))?;
+        let mut plan = BatchPrefillPagedPlan::new(&self.ctx, seq_len, num_heads)?;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_layer_batch_with_pool(
+            self.forward_layer_batch_paged(
                 layer_idx,
                 layer,
                 &mut hidden,
                 start_pos,
-                kv_cache,
                 &mut bufs,
                 pool,
-                new_token_indices,
+                &slot_page_indices,
+                &mut plan,
             )?;
-        }
-
-        // Increment sequence length AFTER all layers processed
-        for _ in 0..seq_len {
-            kv_cache.increment_seq_len();
         }
 
         Ok(hidden)
     }
 
-    /// Like `forward_layer_batch`, but scatter-writes K/V to the token pool
-    /// after QKV GEMM (before Triton attention). The contiguous cache write
-    /// still happens inside the Triton attention kernel.
+    /// Paged-KV variant of `forward_layer_batch`. Differences vs the contiguous
+    /// path:
+    ///  - No `kv_cache.init_if_needed` / `prepare_layer` / `commit_layer`.
+    ///  - Attention call writes K/V directly into the paged pool through the
+    ///    page-table indirection kernel + FlashInfer paged-prefill.
+    ///  - No `scatter_write_kv` dual-write step.
     #[allow(clippy::too_many_arguments)]
-    fn forward_layer_batch_with_pool(
+    fn forward_layer_batch_paged(
         &self,
         layer_idx: usize,
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
         start_pos: usize,
-        kv_cache: &mut KVCache,
         bufs: &mut PrefillBuffers,
         pool: &TokenKVPool,
-        new_token_indices: &CudaSlice<i32>,
+        slot_page_indices: &CudaSlice<i32>,
+        plan: &mut BatchPrefillPagedPlan,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
-
-        kv_cache.init_if_needed(&self.ctx, self.config.head_dim)?;
 
         crate::model::common::debug_dump_hidden(
             &self.ctx,
@@ -218,12 +229,6 @@ impl Qwen3Model {
             &layer.input_layernorm,
             self.config.rms_norm_eps,
             &mut bufs.normed,
-        );
-        crate::model::common::debug_dump_hidden(
-            &self.ctx,
-            &bufs.normed,
-            &format!("L{layer_idx} after-input-norm"),
-            self.config.hidden_size,
         );
 
         // 2. QKV projections
@@ -246,23 +251,8 @@ impl Qwen3Model {
             &mut bufs.v_batch,
         );
 
-        // 2b. Scatter-write K/V to token pool (dual-write path).
-        // The Triton attention kernel below will also write to contiguous cache.
-        if pool.is_active() {
-            ops::scatter_write_kv(
-                &self.ctx,
-                &bufs.k_batch,
-                &bufs.v_batch,
-                pool.k_ptr(layer_idx, &self.ctx.stream),
-                pool.v_ptr(layer_idx, &self.ctx.stream),
-                new_token_indices,
-                num_kv_heads,
-                head_dim,
-            )?;
-        }
-
-        // 3. FlashAttention-2 (Triton) — also writes to contiguous cache
-        let (k_cache_layer, v_cache_layer) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
+        // 3. Paged-KV attention: QK norm + RoPE + paged K/V write (page-table
+        //    indirection) + FlashInfer BatchPrefillWithPagedKVCache.
         let nrp = ops::NormRopeParams {
             q_norm: &layer.attention.q_norm,
             k_norm: &layer.attention.k_norm,
@@ -275,19 +265,24 @@ impl Qwen3Model {
             num_kv_heads,
             head_dim,
         };
-        ops::prefill_attention_batch(
+        let meta = ops::PagedPrefillMeta {
+            pool,
+            layer_idx,
+            slot_page_indices,
+            start_pos,
+            page_size: pool.page_size,
+        };
+        ops::prefill_attention_paged_batch(
             &self.ctx,
             &mut bufs.q_batch,
             &mut bufs.k_batch,
             &bufs.v_batch,
             &nrp,
-            k_cache_layer,
-            v_cache_layer,
+            &meta,
+            plan,
             &mut bufs.attn_output,
             &heads,
-            start_pos,
         )?;
-        kv_cache.commit_layer(&self.ctx, layer_idx, start_pos, hidden.seq_len)?;
 
         // 4-8: Same as forward_layer_batch (O proj, residual, MLP)
         ops::gemm_into(
