@@ -76,13 +76,17 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
 | Area | Owner |
 |------|-------|
 | Docs, planning, architecture, roadmaps | Claude |
-| Code execution (implement/refactor/tests) | **Codex** |
-| Code review of non-trivial diffs | **Codex** |
+| Code execution (implement/refactor/tests) | **Codex** (delegate) |
+| Code review of non-trivial diffs | **Claude runs `codex review`** |
 | Stuck-problem rescue | **Codex** (after 2 failed attempts) |
 
 - **Task-execution bias:** when a task is "write/change code", draft a brief
   (files, constraints, acceptance criteria) and delegate. Claude integrates
   and verifies — Claude does not hand-write substantial diffs.
+- **Code review is Claude-driven:** invoke `codex review --uncommitted` (or
+  `--commit <sha>` / `--base <branch>`) directly from the Bash tool and relay
+  the findings. Do NOT spawn a `codex:codex-rescue` agent for review. Reserve
+  agent delegation for execution tasks.
 - **2-strike rule:** two good-faith failed attempts → hand off. Brief must
   list what was tried, what was observed, why each attempt failed, so Codex
   picks a different angle.
