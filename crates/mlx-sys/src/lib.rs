@@ -426,6 +426,20 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_block_verify(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        block_size: i32,
+        cache_pos: i32,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+        out_logits: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+        out_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
 
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
     #[allow(clippy::too_many_arguments)]

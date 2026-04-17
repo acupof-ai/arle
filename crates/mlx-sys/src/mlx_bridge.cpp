@@ -135,9 +135,6 @@ auto& tape_replay_kernel() {
             state[i] = state[i] * g_[hv_idx];
             state[i] = state[i] + k_[s_idx] * delta;
           }
-          for (int i = 0; i < n_per_t; ++i) {
-            state[i] = static_cast<float>(static_cast<InT>(state[i]));
-          }
           tape_ += Hv * Dv;
           k_ += Hk * Dk;
           g_ += Hv;

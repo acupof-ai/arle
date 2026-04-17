@@ -706,6 +706,147 @@ mod tests {
     use super::*;
     use crate::test_support::metal_test_guard;
 
+    fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta_with_tape_raw(
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        g: &MlxArray,
+        beta: &MlxArray,
+        state_in: &MlxArray,
+        t: i32,
+    ) -> (MlxArray, MlxArray, MlxArray) {
+        let mut out_y = std::ptr::null_mut();
+        let mut out_state = std::ptr::null_mut();
+        let mut out_tape = std::ptr::null_mut();
+        unsafe {
+            mlx_sys::mlx_gated_delta_with_tape(
+                q.as_raw(),
+                k.as_raw(),
+                v.as_raw(),
+                g.as_raw(),
+                beta.as_raw(),
+                state_in.as_raw(),
+                t,
+                &raw mut out_y,
+                &raw mut out_state,
+                &raw mut out_tape,
+            );
+        }
+        let y = unsafe { MlxArray::from_raw_checked(out_y) }.expect("gated delta y");
+        let state = unsafe { MlxArray::from_raw_checked(out_state) }.expect("gated delta state");
+        let tape = unsafe { MlxArray::from_raw_checked(out_tape) }.expect("gated delta tape");
+        (y, state, tape)
+    }
+
+    fn tape_replay_raw(
+        tape: &MlxArray,
+        k: &MlxArray,
+        g: &MlxArray,
+        state_in: &MlxArray,
+        t: i32,
+    ) -> MlxArray {
+        unsafe {
+            MlxArray::from_raw_checked(mlx_sys::mlx_tape_replay(
+                tape.as_raw(),
+                k.as_raw(),
+                g.as_raw(),
+                state_in.as_raw(),
+                t,
+            ))
+        }
+        .expect("tape replay")
+    }
+
+    fn make_gdr_test_inputs() -> (MlxArray, MlxArray, MlxArray, MlxArray, MlxArray, MlxArray) {
+        use crate::backend::metal::mlx::{Dtype, as_dtype};
+
+        const T: usize = 3;
+        const DK: usize = 32;
+        const DV: usize = 4;
+
+        let q_data: Vec<f32> = (0..T * DK)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
+            .collect();
+        let k_data: Vec<f32> = (0..T * DK)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.04)
+            .collect();
+        let v_data: Vec<f32> = (0..T * DV).map(|i| ((i % 7) as f32 - 3.0) * 0.07).collect();
+        let g_data: Vec<f32> = vec![0.91, 0.73, 0.88];
+        let beta_data: Vec<f32> = vec![0.42, 0.57, 0.61];
+        let state_data: Vec<f32> = (0..DV * DK)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.03)
+            .collect();
+
+        let q = as_dtype(
+            &MlxArray::from_slice_f32(&q_data, &[1, T as i32, 1, DK as i32]),
+            Dtype::Bfloat16,
+        );
+        let k = as_dtype(
+            &MlxArray::from_slice_f32(&k_data, &[1, T as i32, 1, DK as i32]),
+            Dtype::Bfloat16,
+        );
+        let v = as_dtype(
+            &MlxArray::from_slice_f32(&v_data, &[1, T as i32, 1, DV as i32]),
+            Dtype::Bfloat16,
+        );
+        let g = as_dtype(
+            &MlxArray::from_slice_f32(&g_data, &[1, T as i32, 1]),
+            Dtype::Bfloat16,
+        );
+        let beta = as_dtype(
+            &MlxArray::from_slice_f32(&beta_data, &[1, T as i32, 1]),
+            Dtype::Bfloat16,
+        );
+        let state = MlxArray::from_slice_f32(&state_data, &[1, 1, DV as i32, DK as i32]);
+        (q, k, v, g, beta, state)
+    }
+
+    fn reference_tape_replay(
+        tape: &MlxArray,
+        k: &MlxArray,
+        g: &MlxArray,
+        state_in: &MlxArray,
+    ) -> Vec<f32> {
+        use crate::backend::metal::mlx::{Dtype, as_dtype, eval};
+
+        let tape_f32 = as_dtype(tape, Dtype::Float32);
+        let k_f32 = as_dtype(k, Dtype::Float32);
+        let g_f32 = as_dtype(g, Dtype::Float32);
+        eval(&[&tape_f32, &k_f32, &g_f32, state_in]);
+
+        let tape_vals = tape_f32.as_slice_f32();
+        let k_vals = k_f32.as_slice_f32();
+        let g_vals = g_f32.as_slice_f32();
+        let mut state = state_in.as_slice_f32().to_vec();
+
+        let shape = tape.shape();
+        let t = shape[1] as usize;
+        let dv = shape[3] as usize;
+        let dk = k.shape()[3] as usize;
+
+        for step in 0..t {
+            let g_step = g_vals[step];
+            for dv_idx in 0..dv {
+                let delta = tape_vals[step * dv + dv_idx];
+                for dk_idx in 0..dk {
+                    let state_idx = dv_idx * dk + dk_idx;
+                    let k_idx = step * dk + dk_idx;
+                    state[state_idx] = state[state_idx] * g_step + k_vals[k_idx] * delta;
+                }
+            }
+        }
+
+        state
+    }
+
     /// Smoke test: verify shapes through the conv1d step (v2 — standard conv1d).
     #[test]
     fn test_conv1d_step_shapes() {
@@ -795,6 +936,60 @@ mod tests {
         assert_eq!(state.conv_states.len(), 24);
         assert_eq!(state.states[0].shape(), &[1, 32, 128, 128]);
         assert_eq!(state.conv_states[0].shape(), &[1, 3, 8192]);
+    }
+
+    #[test]
+    fn test_gated_delta_parallel_matches_serial_state_update() {
+        let _guard = metal_test_guard();
+        use crate::backend::metal::mlx::{eval, slice};
+
+        let (q, k, v, g, beta, state_in) = make_gdr_test_inputs();
+        let (_, parallel_state, _) = gated_delta_with_tape_raw(&q, &k, &v, &g, &beta, &state_in, 3);
+
+        let mut serial_state = state_in.clone();
+        for step in 0..3i32 {
+            let q_step = slice(&q, &[0, step, 0, 0], &[1, step + 1, 1, 32], &[1, 1, 1, 1]);
+            let k_step = slice(&k, &[0, step, 0, 0], &[1, step + 1, 1, 32], &[1, 1, 1, 1]);
+            let v_step = slice(&v, &[0, step, 0, 0], &[1, step + 1, 1, 4], &[1, 1, 1, 1]);
+            let g_step = slice(&g, &[0, step, 0], &[1, step + 1, 1], &[1, 1, 1]);
+            let beta_step = slice(&beta, &[0, step, 0], &[1, step + 1, 1], &[1, 1, 1]);
+            let (_, next_state, _) = gated_delta_with_tape_raw(
+                &q_step,
+                &k_step,
+                &v_step,
+                &g_step,
+                &beta_step,
+                &serial_state,
+                1,
+            );
+            serial_state = next_state;
+        }
+
+        eval(&[&parallel_state, &serial_state]);
+        let diff = max_abs_diff(parallel_state.as_slice_f32(), serial_state.as_slice_f32());
+        assert!(
+            diff < 1e-5,
+            "parallel gated delta state drifted from serial replay by {diff}"
+        );
+    }
+
+    #[test]
+    fn test_tape_replay_matches_reference_fp32_state_update() {
+        let _guard = metal_test_guard();
+        use crate::backend::metal::mlx::eval;
+
+        let (q, k, v, g, beta, state_in) = make_gdr_test_inputs();
+        let (_, _state_out, tape) = gated_delta_with_tape_raw(&q, &k, &v, &g, &beta, &state_in, 3);
+        let replayed = tape_replay_raw(&tape, &k, &g, &state_in, 3);
+        let expected = reference_tape_replay(&tape, &k, &g, &state_in);
+
+        eval(&[&replayed]);
+        let actual = replayed.as_slice_f32();
+        let diff = max_abs_diff(actual, &expected);
+        assert!(
+            diff < 1e-5,
+            "tape replay drifted from reference fp32 state update by {diff}"
+        );
     }
 
     // ── Numerical tests ─────────────────────────────────────────────────────
