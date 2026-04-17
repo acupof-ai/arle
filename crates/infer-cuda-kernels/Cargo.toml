@@ -23,3 +23,8 @@ cc = "1.0"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "paged_prefill_parity"
+path = "tests/paged_prefill_parity.rs"
+harness = false
