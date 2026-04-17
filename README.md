@@ -118,15 +118,19 @@ cargo run --release -p infer --no-default-features --features metal,no-cuda --bi
 Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
 Metal scheduler runtime with chunked prefill and decode-priority interleave.
 It now has narrow same-length cross-request decode batching for Qwen3 and
-Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
-uses the legacy serial runtime path.
+Qwen3.5 (packed-batch concurrent decode fix landed 2026-04-16), but
+variable-length decode is still not batched and Metal DFlash runs each
+request serially through the legacy runtime path.
 For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
 `metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
 `--wired-limit-bytes` so MLX allocator behavior can be capped before model
 load.
 
-Metal DFlash remains available as an experimental Apple Silicon decode path
-for `Qwen3`.
+Metal DFlash remains available as an experimental Apple Silicon decode path.
+Qwen3 is the validated target. Qwen3.5 correctness landed 2026-04-17 but is
+currently a performance regression vs baseline (acceptance ~28%, serial
+across concurrent requests) — see
+[`docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md`](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 
 Quick example:
 

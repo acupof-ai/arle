@@ -16,6 +16,9 @@ crate:
 - `infer-agent`: agent session state, prompt assembly, tool-call recovery, and
   turn loop logic
 - `infer-cli`: REPL and CLI wiring for the `agent-infer` binary
+- `infer-cuda-kernels`: CUDA kernel layer — `csrc/` + Triton AOT + Rust FFI
+  (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`,
+  `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
 
 The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,

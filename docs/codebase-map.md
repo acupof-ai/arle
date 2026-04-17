@@ -24,6 +24,7 @@ Current workspace members:
 
 - `agent-infer`
 - `infer`
+- `crates/infer-cuda-kernels`
 - `crates/mlx-sys`
 - `crates/infer-agent`
 - `crates/infer-chat`
@@ -176,6 +177,7 @@ These crates remain independent after Route A:
 - `crates/infer-chat`: shared protocol parsing/formatting and OpenAI chat types
 - `crates/infer-cli`: CLI entry, arg parsing, REPL UX
 - `crates/infer-tools`: builtin tools, sandbox/tool execution, shared tool hooks
+- `crates/infer-cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend
 
 Current dependency direction:
@@ -194,6 +196,7 @@ infer-agent
 
 infer
   -> infer-chat
+  -> infer-cuda-kernels  (one-way; never the reverse)
   -> mlx-sys (feature = "metal")
 ```
 
