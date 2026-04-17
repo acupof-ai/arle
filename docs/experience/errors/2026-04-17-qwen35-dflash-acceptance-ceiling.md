@@ -73,10 +73,28 @@ Previous state (same hardware / quant / prompt):
 | 4× concurrent | 148.1            | 144.9                                |
 | 8× concurrent | 143.9            | 143.6                                |
 
-`47 × 3 ≈ 60%` of the Rust-path baseline, which matches the
-acceptance-weighted cost model: at ~28% acceptance and ~4× lower
-per-block overhead, speculative verify should break roughly even.
-Track-1 concurrent auto-downgrade keeps multi-slot throughput intact.
+Direct A/B against plain decode on the same binary (omit
+`--dflash-draft-model`):
+
+| Workload        | Plain decode | DFlash ON | DFlash delta |
+|-----------------|--------------|-----------|--------------|
+| single (run 1)  | 72.5         | 47.3      | −35%         |
+| single (run 2)  | 73.0         | 47.0      | −36%         |
+| single (run 3)  | 73.0         | 47.7      | −35%         |
+| 4× concurrent   | 159.0        | 154.5     | −3%          |
+| 8× concurrent   | 156.1        | 150.1     | −4%          |
+
+Important: the 3.5× is vs the broken DFlash baseline. **DFlash is
+still a −35% single-session regression vs plain decode on this quant.**
+Concurrent parity is from Track-1 auto-downgrade, not speculative wins.
+
+The speculative math still does not pencil out: at ~28% acceptance a
+16-token block nets ~4.5 tokens, so we need `T_S16 < 4.5 × T_S1`.
+Measured ratio is closer to `T_S16 ≈ 7 × T_S1` — the S=16 forward is
+only ~2.3× faster per-token than 16 S=1 forwards. The GDR
+linear-attention recurrence is sequential in the time axis, so the
+S=16 savings come entirely from the 8 full-attn layers; the 24 GDR
+layers still do per-step work inside the compiled block_verify.
 
 ## Rule
 
