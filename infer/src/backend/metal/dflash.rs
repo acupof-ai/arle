@@ -1060,6 +1060,9 @@ pub(crate) fn qwen35_dflash_speculative_block(
 ) -> Result<DFlashBlockResult> {
     use super::mlx::{MlxArray as Arr, eval};
 
+    let profile = std::env::var("QWEN35_DFLASH_PROFILE").is_ok();
+    let t_start = std::time::Instant::now();
+
     // ── 1. Draft forward (same as Qwen3 — draft model is pure transformer) ──
     let block_size_i32 =
         i32::try_from(runtime.block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
@@ -1083,9 +1086,11 @@ pub(crate) fn qwen35_dflash_speculative_block(
     for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
         *dst = *src;
     }
+    let t_draft = t_start.elapsed();
 
     // ── 2. Snapshot GDR states before verify ──
     let gdr_snapshot: Vec<Arr> = target_gdr_flat.to_vec();
+    let t_snapshot = t_start.elapsed();
 
     // ── 3. Enable tape mode + hidden capture, verify via C++ model ──
     unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true) };
@@ -1116,6 +1121,10 @@ pub(crate) fn qwen35_dflash_speculative_block(
         target_kv_flat,
         target_gdr_flat,
     )?;
+    if profile {
+        eval(&[&logits]);
+    }
+    let t_verify = t_start.elapsed();
     let block_tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
     let mut block_hidden: Vec<MlxArray> = Vec::with_capacity(n_cap.max(0) as usize);
@@ -1135,24 +1144,11 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let vocab = *logits_shape
         .get(2)
         .ok_or_else(|| anyhow!("Qwen3.5 DFlash verifier logits missing vocab dim"))?;
-    let mut sampled = Vec::with_capacity(runtime.block_size);
-    for pos in 0..runtime.block_size {
-        let pos_i32 = i32::try_from(pos).context("Qwen3.5 DFlash position does not fit i32")?;
-        let row_logits = slice(
-            &logits,
-            &[0, pos_i32, 0],
-            &[1, pos_i32 + 1, vocab],
-            &[1, 1, 1],
-        );
-        let row_logits = super::mlx::reshape(&row_logits, &[1, vocab]);
-        sampled.push(gpu_sample_token(&row_logits, params));
-    }
-    let sampled_refs: Vec<_> = sampled.iter().collect();
-    eval(&sampled_refs);
-    let posterior_tokens: Vec<u32> = sampled
-        .iter()
-        .map(|token| token.item_i32() as u32)
-        .collect();
+    // Batched posterior sample: one argmax over [block, vocab] + one eval +
+    // one GPU→CPU transfer. Avoids 16 per-row slice + item sync points.
+    let logits_rows = super::mlx::reshape(&logits, &[block_size_i32, vocab]);
+    let posterior_tokens = sample_rows(&logits_rows, params)?;
+    let t_sample = t_start.elapsed();
 
     // ── 4. Token matching ──
     let matched = block_tokens
@@ -1282,10 +1278,28 @@ pub(crate) fn qwen35_dflash_speculative_block(
     }
     accepted_tokens_out.push(posterior_token);
 
+    let t_rollback = t_start.elapsed();
+
     // Eval all modified state to materialize
     let mut to_eval: Vec<&Arr> = target_gdr_flat.iter().collect();
     to_eval.extend(target_kv_flat.iter());
     eval(&to_eval);
+    let t_total = t_start.elapsed();
+
+    if profile {
+        log::info!(
+            "qwen35_dflash: accept={}/{} draft={:.1}ms snapshot={:.1}ms verify={:.1}ms sample={:.1}ms rollback={:.1}ms eval={:.1}ms total={:.1}ms",
+            accepted_inputs,
+            runtime.block_size,
+            t_draft.as_secs_f32() * 1000.0,
+            (t_snapshot - t_draft).as_secs_f32() * 1000.0,
+            (t_verify - t_snapshot).as_secs_f32() * 1000.0,
+            (t_sample - t_verify).as_secs_f32() * 1000.0,
+            (t_rollback - t_sample).as_secs_f32() * 1000.0,
+            (t_total - t_rollback).as_secs_f32() * 1000.0,
+            t_total.as_secs_f32() * 1000.0,
+        );
+    }
 
     Ok(DFlashBlockResult {
         accepted_tokens: accepted_tokens_out,
