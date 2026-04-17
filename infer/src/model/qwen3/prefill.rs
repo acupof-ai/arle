@@ -176,7 +176,26 @@ impl Qwen3Model {
             .stream
             .clone_htod(&pages_i32)
             .map_err(|e| anyhow::anyhow!("slot_page_indices H2D failed: {e}"))?;
-        let mut plan = BatchPrefillPagedPlan::new(&self.ctx, seq_len, num_heads)?;
+
+        // Lazy-init the shared paged-prefill plan on first call and reuse
+        // across all subsequent prefills. Allocating a fresh 264MB
+        // FlashInferWorkspace per forward caused async-free backlog →
+        // foreign C++ exception under concurrent load. Matches sglang's
+        // single `workspace_buffer` pattern (`flashinfer_backend.py:260-292`).
+        let mut plan_guard = self
+            .paged_prefill_plan
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged_prefill_plan mutex poisoned"))?;
+        if plan_guard.is_none() {
+            // Size the plan for the maximum chunk we'll ever see (one
+            // prefill_chunk_size worth of tokens).
+            *plan_guard = Some(BatchPrefillPagedPlan::new(
+                &self.ctx,
+                seq_len.max(4096),
+                num_heads,
+            )?);
+        }
+        let plan = plan_guard.as_mut().expect("just initialized");
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_layer_batch_paged(
@@ -187,7 +206,7 @@ impl Qwen3Model {
                 &mut bufs,
                 pool,
                 &slot_page_indices,
-                &mut plan,
+                plan,
             )?;
         }
 

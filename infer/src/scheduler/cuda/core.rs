@@ -296,12 +296,25 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
 
+        // When the model writes prefill K/V directly to the paged pool, the
+        // per-slot contiguous scratch buffer is unused by prefill. Shrink it
+        // to the minimum that single-token decode / INT8 working buffers
+        // still require, and reclaim the freed bytes into the pool budget.
+        let model_uses_paged_prefill = model.prefill_uses_paged_pool();
+        let contiguous_tokens = if model_uses_paged_prefill {
+            // Single-token decode path still allocates per-slot contiguous
+            // K/V of this size; 1 page's worth is enough.
+            PREFIX_CACHE_BLOCK_SIZE
+        } else {
+            CONTIGUOUS_KV_TOKENS
+        };
+
         let mut states = Vec::with_capacity(config.max_slots);
         let mut slot_materialized_prompt_lens = Vec::with_capacity(config.max_slots);
         let mut slot_owned_blocks = Vec::with_capacity(config.max_slots);
         for i in 0..config.max_slots {
             let mut state = model.create_state()?;
-            state.set_max_seq_len(CONTIGUOUS_KV_TOKENS);
+            state.set_max_seq_len(contiguous_tokens);
             state.set_kv_dtype(kv_cache_dtype);
             states.push(state);
             slot_materialized_prompt_lens.push(0);
@@ -311,7 +324,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let paged_kv_pool = {
             let bytes_per_token = model.kv_cache_bytes_per_token();
-            let contiguous_cost = config.max_slots * CONTIGUOUS_KV_TOKENS * bytes_per_token;
+            let contiguous_cost = config.max_slots * contiguous_tokens * bytes_per_token;
             // SGLang-compatible: pool budget = free − contiguous − headroom.
             // Headroom is derived from mem_fraction_static via the auto-sizer;
             // here we just subtract contiguous cost from post-weight-load free memory.
