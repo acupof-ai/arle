@@ -1,5 +1,11 @@
 # Plan — paged-KV prefill (structural fix for `CONTIGUOUS_KV_TOKENS=512`)
 
+> **Partially superseded (2026-04-17):** Phase 1 (kernel FFI), Phase 2 (Rust
+> ops), and Phase 3a (Qwen3 scheduler wiring) are complete. Phase 3b (Qwen3.5),
+> 3c (GLM4), and Phase 4 (delete `CONTIGUOUS_KV_TOKENS`) are re-sequenced under
+> [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md) §Phase 1. Refer
+> there for ordering and acceptance.
+
 **Status:** revised after Codex review (`docs/reviews/2026-04-17-paged-prefill-codex-review.md`). Execution delegated to Codex per CLAUDE.md §Delegation.
 **Motivation doc:** `docs/experience/wins/2026-04-17-prefill-ttft-root-cause-contiguous-kv-cap.md`
 **Codex review:** `docs/reviews/2026-04-17-paged-prefill-codex-review.md`
