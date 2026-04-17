@@ -2827,13 +2827,30 @@ impl StepDriver for Qwen35StepDriver<'_> {
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
         // ── DFlash speculative path (Qwen3.5) ────────────────────────────
-        if let Some(dflash) = self.dflash.as_mut() {
-            // 1. Drain buffer first — cheap, no GPU work.
-            if let Some(buffered) = dflash.token_buffer.pop_front() {
-                return Ok(buffered);
-            }
+        // 1. Drain buffer first — cheap, no GPU work, short-lived borrow.
+        if let Some(dflash) = self.dflash.as_mut()
+            && let Some(buffered) = dflash.token_buffer.pop_front()
+        {
+            return Ok(buffered);
+        }
 
-            // 2. Buffer empty → run one full speculative block.
+        // 2. Grow the target KV cache BEFORE running the speculative block.
+        //    A prefix-snapshot import may have downsized kv_capacity to the
+        //    replay driver's smaller allocation (e.g. 256), and the DFlash
+        //    path otherwise bypasses run_step's ensure_capacity; once
+        //    cache_len + block_size exceeds kv_capacity the C++ step_block
+        //    produces a malformed slice_update and the forward dies with
+        //    "Shapes (1,4,16,256) and (1,4,N,256) cannot be broadcast".
+        if let Some(block_size) = self.dflash.as_ref().map(|d| d.runtime.block_size()) {
+            let block_size_i32 =
+                i32::try_from(block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
+            let needed_cap = self.cache_len + block_size_i32;
+            if needed_cap > self.kv_capacity {
+                self.ensure_capacity(needed_cap);
+            }
+        }
+
+        if let Some(dflash) = self.dflash.as_mut() {
             if let Qwen35StepMode::Cpp(ref mut cpp_state) = self.mode {
                 let Some(target_hidden) = dflash.target_hidden.take() else {
                     // First decode after prefill — target_hidden not captured yet.

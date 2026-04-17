@@ -1036,14 +1036,6 @@ fn drain_current_qwen35_gdr_tapes(
     Ok(tapes)
 }
 
-fn concat_step_arrays(arrays: &[MlxArray], axis: i32) -> MlxArray {
-    match arrays {
-        [] => unreachable!("concat_step_arrays requires at least one array"),
-        [single] => single.clone(),
-        _ => concatenate_axis(arrays, axis),
-    }
-}
-
 // ── Qwen3.5 DFlash speculative block ─────────────────────────────────────
 
 /// Qwen3.5 verify: run N tokens through the target C++ model with tape mode,
@@ -1069,20 +1061,22 @@ pub(crate) fn qwen35_dflash_speculative_block(
     use super::mlx::{MlxArray as Arr, eval};
 
     // ── 1. Draft forward (same as Qwen3 — draft model is pure transformer) ──
+    let block_size_i32 =
+        i32::try_from(runtime.block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
     let mut block_tokens = vec![runtime.mask_token_id; runtime.block_size];
     block_tokens[0] = current_token;
     let noise_embedding = embed_tokens(embed_table, &block_tokens);
     let draft_hidden = dflash_draft_forward(runtime, &noise_embedding, target_hidden, draft_state)?;
-    let block_hidden = slice(
+    let draft_block_hidden = slice(
         &draft_hidden,
         &[1, 0],
         &[
-            i32::try_from(runtime.block_size).unwrap_or_default(),
+            block_size_i32,
             i32::try_from(target_config.hidden_size).unwrap_or_default(),
         ],
         &[1, 1],
     );
-    let draft_logits = linear(&block_hidden, lm_head);
+    let draft_logits = linear(&draft_block_hidden, lm_head);
     let drafted_suffix = sample_rows(&draft_logits, params)?;
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
@@ -1091,12 +1085,8 @@ pub(crate) fn qwen35_dflash_speculative_block(
     }
 
     // ── 2. Snapshot GDR states before verify ──
-    let gdr_snapshot: Vec<Arr> = target_gdr_flat.iter().map(|a| a.clone()).collect();
+    let gdr_snapshot: Vec<Arr> = target_gdr_flat.to_vec();
 
-    log::info!(
-        "qwen35_dflash_speculative_block: starting draft+verify, block_size={}",
-        runtime.block_size
-    );
     // ── 3. Enable tape mode + hidden capture, verify via C++ model ──
     unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true) };
     let layer_ids_i32: Vec<i32> = runtime
@@ -1117,38 +1107,52 @@ pub(crate) fn qwen35_dflash_speculative_block(
 
     let n_capture_layers = runtime.target_layer_ids.len();
     let expected_tape_count = target_gdr_flat.len() / 2;
-    let mut per_step_hidden: Vec<Vec<MlxArray>> = Vec::with_capacity(runtime.block_size);
-    let mut per_step_tapes: Vec<Vec<Qwen35GdrTape>> = Vec::with_capacity(runtime.block_size);
-    let mut posterior_tokens = Vec::with_capacity(runtime.block_size);
-    for (step, &tok) in block_tokens.iter().enumerate() {
-        let token_arr = MlxArray::from_slice_i32(&[tok as i32], &[1]);
-        let logits = cpp_model.step(
-            &token_arr,
-            *target_cache_len + step as i32,
-            target_kv_flat,
-            target_gdr_flat,
-        )?;
-        // BUG1 fix: capture hidden immediately — next step() overwrites prev_outputs
-        let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
-        let mut step_captures = Vec::with_capacity(n_cap.max(0) as usize);
-        for ci in 0..n_cap {
-            let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-            let rc = unsafe {
-                mlx_sys::qwen35_get_captured_hidden(cpp_model.as_raw(), ci, &raw mut h_ptr)
-            };
-            if rc == 0 && !h_ptr.is_null() {
-                step_captures.push(unsafe { MlxArray::from_raw(h_ptr) });
-            }
+    let block_tokens_i32: Vec<i32> = block_tokens.iter().map(|&tok| tok as i32).collect();
+    let tokens_arr = MlxArray::from_slice_i32(&block_tokens_i32, &[block_size_i32]);
+    let logits = cpp_model.step_block(
+        &tokens_arr,
+        block_size_i32,
+        *target_cache_len,
+        target_kv_flat,
+        target_gdr_flat,
+    )?;
+    let block_tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
+    let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
+    let mut block_hidden: Vec<MlxArray> = Vec::with_capacity(n_cap.max(0) as usize);
+    for ci in 0..n_cap {
+        let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let rc =
+            unsafe { mlx_sys::qwen35_get_captured_hidden(cpp_model.as_raw(), ci, &raw mut h_ptr) };
+        if rc == 0 && !h_ptr.is_null() {
+            block_hidden.push(unsafe { MlxArray::from_raw(h_ptr) });
         }
-        per_step_hidden.push(step_captures);
-        per_step_tapes.push(drain_current_qwen35_gdr_tapes(
-            cpp_model,
-            expected_tape_count,
-        )?);
-        let sampled = super::sampling::gpu_sample_token(&logits, params);
-        eval(&[&sampled]);
-        posterior_tokens.push(sampled.item_i32() as u32);
     }
+    let logits_shape = logits.shape();
+    ensure!(
+        logits_shape.len() == 3 && logits_shape[0] == 1 && logits_shape[1] == block_size_i32,
+        "Qwen3.5 DFlash verifier logits shape mismatch: expected [1, {block_size_i32}, vocab], got {logits_shape:?}"
+    );
+    let vocab = *logits_shape
+        .get(2)
+        .ok_or_else(|| anyhow!("Qwen3.5 DFlash verifier logits missing vocab dim"))?;
+    let mut sampled = Vec::with_capacity(runtime.block_size);
+    for pos in 0..runtime.block_size {
+        let pos_i32 = i32::try_from(pos).context("Qwen3.5 DFlash position does not fit i32")?;
+        let row_logits = slice(
+            &logits,
+            &[0, pos_i32, 0],
+            &[1, pos_i32 + 1, vocab],
+            &[1, 1, 1],
+        );
+        let row_logits = super::mlx::reshape(&row_logits, &[1, vocab]);
+        sampled.push(gpu_sample_token(&row_logits, params));
+    }
+    let sampled_refs: Vec<_> = sampled.iter().collect();
+    eval(&sampled_refs);
+    let posterior_tokens: Vec<u32> = sampled
+        .iter()
+        .map(|token| token.item_i32() as u32)
+        .collect();
 
     // ── 4. Token matching ──
     let matched = block_tokens
@@ -1162,6 +1166,25 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let posterior_token = *posterior_tokens
         .get(matched)
         .ok_or_else(|| anyhow::anyhow!("Qwen3.5 DFlash verifier produced too few tokens"))?;
+    let accepted_i32 = i32::try_from(accepted_inputs)
+        .context("Qwen3.5 DFlash accepted_inputs does not fit i32")?;
+    let take_prefix = |arr: &Arr| {
+        let shape = arr.shape();
+        let mut stop = shape.to_vec();
+        if let Some(seq_dim) = stop.get_mut(1) {
+            *seq_dim = accepted_i32;
+        }
+        let start = vec![0; shape.len()];
+        let strides = vec![1; shape.len()];
+        slice(arr, &start, &stop, &strides)
+    };
+    log::debug!(
+        "qwen35_dflash: accepted={}/{} draft={:?} posterior={:?}",
+        accepted_inputs,
+        runtime.block_size,
+        &block_tokens[1..(matched + 2).min(block_tokens.len())],
+        &posterior_tokens[..(matched + 1).min(posterior_tokens.len())]
+    );
 
     // ── 5. Rollback rejected tokens ──
     let rejected = runtime.block_size - accepted_inputs;
@@ -1184,27 +1207,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
                 if conv_idx < target_gdr_flat.len() && conv_idx < gdr_snapshot.len() {
                     target_gdr_flat[conv_idx] = gdr_snapshot[conv_idx].clone();
                 }
-                // Replay accepted steps using the per-step tapes captured during verify.
+                // Replay accepted steps using the block tapes captured during verify.
                 let tape_idx = i / 2;
-                let accepted_i32 = accepted_inputs as i32;
-                let mut accepted_tapes = Vec::with_capacity(accepted_inputs);
-                let mut accepted_k = Vec::with_capacity(accepted_inputs);
-                let mut accepted_g = Vec::with_capacity(accepted_inputs);
-                let mut accepted_qkv = Vec::with_capacity(accepted_inputs);
-                for step_tapes in per_step_tapes.iter().take(accepted_inputs) {
-                    let step_tape = step_tapes.get(tape_idx).cloned().ok_or_else(|| {
-                        anyhow!(
-                            "Qwen3.5 DFlash missing tape for GDR layer {tape_idx} during rollback"
-                        )
-                    })?;
-                    accepted_tapes.push(step_tape.innovation_tape);
-                    accepted_k.push(step_tape.k);
-                    accepted_g.push(step_tape.g);
-                    accepted_qkv.push(step_tape.qkv);
-                }
-                let tape_arr = concat_step_arrays(&accepted_tapes, 1);
-                let k_arr = concat_step_arrays(&accepted_k, 1);
-                let g_arr = concat_step_arrays(&accepted_g, 1);
+                let block_tape = block_tapes.get(tape_idx).cloned().ok_or_else(|| {
+                    anyhow!("Qwen3.5 DFlash missing tape for GDR layer {tape_idx} during rollback")
+                })?;
+                let tape_arr = take_prefix(&block_tape.innovation_tape);
+                let k_arr = take_prefix(&block_tape.k);
+                let g_arr = take_prefix(&block_tape.g);
                 let replayed = unsafe {
                     Arr::from_raw_checked(mlx_sys::mlx_tape_replay(
                         tape_arr.as_raw(),
@@ -1221,7 +1231,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
                 if conv_idx < target_gdr_flat.len() {
                     let conv_state = &target_gdr_flat[conv_idx];
                     let conv_kernel_minus_1 = conv_state.shape().get(1).copied().unwrap_or(3);
-                    let qkv_arr = concat_step_arrays(&accepted_qkv, 1);
+                    let qkv_arr = take_prefix(&block_tape.qkv);
                     let combined = concatenate_axis(&[conv_state.clone(), qkv_arr], 1);
                     let combined_len = combined.shape()[1];
                     if combined_len > conv_kernel_minus_1 {
@@ -1245,40 +1255,22 @@ pub(crate) fn qwen35_dflash_speculative_block(
     *target_cache_len += accepted_inputs as i32;
 
     // ── 6. Build target_hidden from per-step captured hidden states ──
-    // Each step captured n_capture_layers hidden arrays, each [1, 1, hidden_size].
-    // Stack accepted steps per layer, then concatenate layers along hidden dim.
-    let updated_target_hidden =
-        if !per_step_hidden.is_empty() && per_step_hidden[0].len() == n_capture_layers {
-            let mut layer_stacks: Vec<Arr> = Vec::with_capacity(n_capture_layers);
-            for li in 0..n_capture_layers {
-                let per_tok: Vec<Arr> = per_step_hidden
-                    .iter()
-                    .take(accepted_inputs)
-                    .filter_map(|step| step.get(li).cloned())
-                    .collect();
-                if per_tok.is_empty() {
-                    layer_stacks.clear();
-                    break;
-                }
-                // Each element is [1, 1, hidden_size]. Reshape to [1, hidden_size] and stack.
-                let reshaped: Vec<Arr> = per_tok
-                    .iter()
-                    .map(|h| {
-                        let s = h.shape();
-                        let hdim = s.last().copied().unwrap_or(1);
-                        super::mlx::reshape(h, &[1, hdim])
-                    })
-                    .collect();
-                layer_stacks.push(concatenate_axis(&reshaped, 0));
-            }
-            if layer_stacks.len() == n_capture_layers {
-                concatenate_axis(&layer_stacks, 1)
-            } else {
-                target_hidden.clone()
-            }
-        } else {
-            target_hidden.clone()
-        };
+    // Each captured hidden array is [1, block_size, hidden_size].
+    // Slice the accepted prefix per layer, reshape to [accepted, hidden_size],
+    // then concatenate layers along hidden dim.
+    let updated_target_hidden = if n_capture_layers > 0 && block_hidden.len() == n_capture_layers {
+        let accepted_hidden: Vec<Arr> = block_hidden
+            .iter()
+            .map(|hidden| {
+                let accepted_hidden = take_prefix(hidden);
+                let hidden_size = accepted_hidden.shape().last().copied().unwrap_or(1);
+                super::mlx::reshape(&accepted_hidden, &[accepted_i32, hidden_size])
+            })
+            .collect();
+        concatenate_axis(&accepted_hidden, 1)
+    } else {
+        target_hidden.clone()
+    };
 
     let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
     for &tok in block_tokens
