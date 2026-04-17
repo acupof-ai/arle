@@ -4,7 +4,7 @@
 //! last_page_len) and the FlashInfer workspace. Extracted from
 //! `model::qwen3::batch_decode` so multiple model implementations can share it.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use super::ffi;
@@ -77,6 +77,355 @@ pub struct FlashInferWorkspace {
 // from the single inference thread (same thread that calls plan/run). No concurrent access.
 unsafe impl Send for FlashInferWorkspace {}
 
+fn alloc_host_buffer(bytes: usize, label: &str) -> Result<*mut u8> {
+    unsafe {
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let err = cudarc::driver::sys::cuMemAllocHost_v2(
+            &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
+            bytes,
+        );
+        if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow::anyhow!(
+                "cuMemAllocHost failed for {label}: {:?}",
+                err
+            ));
+        }
+        std::ptr::write_bytes(ptr, 0, bytes);
+        Ok(ptr)
+    }
+}
+
+fn free_host_buffer(ptr: &mut *mut u8) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemFreeHost((*ptr).cast::<std::ffi::c_void>());
+        }
+        *ptr = std::ptr::null_mut();
+    }
+}
+
+pub struct PlanBuf {
+    plan_info: *mut u8,
+}
+
+// SAFETY: plan_info is pinned host memory used from the same inference thread.
+unsafe impl Send for PlanBuf {}
+
+impl PlanBuf {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            plan_info: alloc_host_buffer(
+                FlashInferWorkspace::PLAN_INFO_BYTES,
+                "paged_prefill plan_info",
+            )?,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.plan_info
+    }
+}
+
+impl Drop for PlanBuf {
+    fn drop(&mut self) {
+        free_host_buffer(&mut self.plan_info);
+    }
+}
+
+pub struct BatchPrefillPagedPlan {
+    workspace: FlashInferWorkspace,
+    pub hd128: PlanBuf,
+    pub hd256: PlanBuf,
+}
+
+impl BatchPrefillPagedPlan {
+    pub fn new(ctx: &DeviceContext, max_total_qo_rows: usize, num_qo_heads: usize) -> Result<Self> {
+        Ok(Self {
+            workspace: FlashInferWorkspace::new(ctx, max_total_qo_rows, num_qo_heads)?,
+            hd128: PlanBuf::new()?,
+            hd256: PlanBuf::new()?,
+        })
+    }
+
+    fn plan_impl(
+        &mut self,
+        ctx: &DeviceContext,
+        plan_info: *mut u8,
+        qo_indptr: &[i32],
+        kv_indptr: &[i32],
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        plan_fn: unsafe extern "C" fn(
+            *mut u8,
+            usize,
+            *mut u8,
+            *mut u8,
+            usize,
+            *const i32,
+            *const i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            *mut u8,
+            cudarc::driver::sys::CUstream,
+        ) -> i32,
+        plan_name: &str,
+    ) -> Result<()> {
+        ensure!(
+            qo_indptr.len() == batch_size + 1,
+            "{plan_name}: qo_indptr len {} does not match batch_size {}",
+            qo_indptr.len(),
+            batch_size
+        );
+        ensure!(
+            kv_indptr.len() == batch_size + 1,
+            "{plan_name}: kv_indptr len {} does not match batch_size {}",
+            kv_indptr.len(),
+            batch_size
+        );
+        ensure!(qo_indptr[0] == 0, "{plan_name}: qo_indptr must start at 0");
+        ensure!(kv_indptr[0] == 0, "{plan_name}: kv_indptr must start at 0");
+
+        let (fw_ptr, _gfw) = self.workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = self.workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let ret = unsafe {
+            plan_fn(
+                fw_ptr as *mut u8,
+                self.workspace.float_workspace_bytes,
+                iw_ptr as *mut u8,
+                self.workspace.page_locked_workspace,
+                self.workspace.int_workspace_bytes,
+                qo_indptr.as_ptr(),
+                kv_indptr.as_ptr(),
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                head_dim as i32,
+                plan_info,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("{plan_name} failed with CUDA error {ret}"));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_impl(
+        &mut self,
+        ctx: &DeviceContext,
+        plan_info: *mut u8,
+        q_ptr: u64,
+        q_indptr_ptr: u64,
+        k_data_ptr: u64,
+        v_data_ptr: u64,
+        kv_indptr_ptr: u64,
+        kv_indices_ptr: u64,
+        kv_last_page_len_ptr: u64,
+        output_ptr: u64,
+        lse_ptr: Option<u64>,
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        run_fn: unsafe extern "C" fn(
+            *mut u8,
+            *mut u8,
+            *const u8,
+            *mut ffi::Half,
+            *const i32,
+            *mut ffi::Half,
+            *mut ffi::Half,
+            *const i32,
+            *const i32,
+            *const i32,
+            *mut ffi::Half,
+            *mut f32,
+            i32,
+            i32,
+            i32,
+            i32,
+            f32,
+            cudarc::driver::sys::CUstream,
+        ) -> i32,
+        run_name: &str,
+    ) -> Result<()> {
+        let (fw_ptr, _gfw) = self.workspace.float_workspace.device_ptr_mut(&ctx.stream);
+        let (iw_ptr, _giw) = self.workspace.int_workspace.device_ptr_mut(&ctx.stream);
+        let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let ret = unsafe {
+            run_fn(
+                fw_ptr as *mut u8,
+                iw_ptr as *mut u8,
+                plan_info.cast_const(),
+                q_ptr as *mut ffi::Half,
+                q_indptr_ptr as *const i32,
+                k_data_ptr as *mut ffi::Half,
+                v_data_ptr as *mut ffi::Half,
+                kv_indptr_ptr as *const i32,
+                kv_indices_ptr as *const i32,
+                kv_last_page_len_ptr as *const i32,
+                output_ptr as *mut ffi::Half,
+                lse_ptr.map_or(std::ptr::null_mut(), |ptr| ptr as *mut f32),
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                page_size as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+        };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("{run_name} failed with CUDA error {ret}"));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_hd128(
+        &mut self,
+        ctx: &DeviceContext,
+        qo_indptr: &[i32],
+        kv_indptr: &[i32],
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        let plan_info = self.hd128.as_ptr();
+        self.plan_impl(
+            ctx,
+            plan_info,
+            qo_indptr,
+            kv_indptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            128,
+            ffi::flashinfer_batch_prefill_paged_hd128_plan,
+            "flashinfer_batch_prefill_paged_hd128_plan",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_hd256(
+        &mut self,
+        ctx: &DeviceContext,
+        qo_indptr: &[i32],
+        kv_indptr: &[i32],
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        let plan_info = self.hd256.as_ptr();
+        self.plan_impl(
+            ctx,
+            plan_info,
+            qo_indptr,
+            kv_indptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            256,
+            ffi::flashinfer_batch_prefill_paged_hd256_plan,
+            "flashinfer_batch_prefill_paged_hd256_plan",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_hd128(
+        &mut self,
+        ctx: &DeviceContext,
+        q_ptr: u64,
+        q_indptr_ptr: u64,
+        k_data_ptr: u64,
+        v_data_ptr: u64,
+        kv_indptr_ptr: u64,
+        kv_indices_ptr: u64,
+        kv_last_page_len_ptr: u64,
+        output_ptr: u64,
+        lse_ptr: Option<u64>,
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        let plan_info = self.hd128.as_ptr();
+        self.run_impl(
+            ctx,
+            plan_info,
+            q_ptr,
+            q_indptr_ptr,
+            k_data_ptr,
+            v_data_ptr,
+            kv_indptr_ptr,
+            kv_indices_ptr,
+            kv_last_page_len_ptr,
+            output_ptr,
+            lse_ptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            128,
+            ffi::flashinfer_batch_prefill_paged_hd128_run,
+            "flashinfer_batch_prefill_paged_hd128_run",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_hd256(
+        &mut self,
+        ctx: &DeviceContext,
+        q_ptr: u64,
+        q_indptr_ptr: u64,
+        k_data_ptr: u64,
+        v_data_ptr: u64,
+        kv_indptr_ptr: u64,
+        kv_indices_ptr: u64,
+        kv_last_page_len_ptr: u64,
+        output_ptr: u64,
+        lse_ptr: Option<u64>,
+        batch_size: usize,
+        num_qo_heads: usize,
+        num_kv_heads: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        let plan_info = self.hd256.as_ptr();
+        self.run_impl(
+            ctx,
+            plan_info,
+            q_ptr,
+            q_indptr_ptr,
+            k_data_ptr,
+            v_data_ptr,
+            kv_indptr_ptr,
+            kv_indices_ptr,
+            kv_last_page_len_ptr,
+            output_ptr,
+            lse_ptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            256,
+            ffi::flashinfer_batch_prefill_paged_hd256_run,
+            "flashinfer_batch_prefill_paged_hd256_run",
+        )
+    }
+}
+
 impl FlashInferWorkspace {
     /// Default sizes matching FlashInfer's typical requirements.
     /// 256MB for split-KV temporaries (sglang uses 512MB but we need headroom).
@@ -100,41 +449,15 @@ impl FlashInferWorkspace {
             .alloc_zeros(Self::INT_WORKSPACE_BYTES)
             .map_err(|e| anyhow::anyhow!("FlashInfer int_workspace alloc failed: {e}"))?;
 
-        let plan_info = unsafe {
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let err = cudarc::driver::sys::cuMemAllocHost_v2(
-                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
-                Self::PLAN_INFO_BYTES,
-            );
-            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(anyhow::anyhow!(
-                    "cuMemAllocHost failed for plan_info: {:?}",
-                    err
-                ));
-            }
-            std::ptr::write_bytes(ptr, 0, Self::PLAN_INFO_BYTES);
-            ptr
-        };
+        let plan_info = alloc_host_buffer(Self::PLAN_INFO_BYTES, "plan_info")?;
 
         let lse: CudaSlice<f32> = ctx
             .stream
             .alloc_zeros(max_batch_size * num_qo_heads)
             .map_err(|e| anyhow::anyhow!("FlashInfer lse alloc failed: {e}"))?;
 
-        let page_locked_workspace = unsafe {
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let err = cudarc::driver::sys::cuMemAllocHost_v2(
-                &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
-                Self::PAGE_LOCKED_WORKSPACE_BYTES,
-            );
-            if err != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                return Err(anyhow::anyhow!(
-                    "cuMemAllocHost failed for page_locked_workspace: {:?}",
-                    err
-                ));
-            }
-            ptr
-        };
+        let page_locked_workspace =
+            alloc_host_buffer(Self::PAGE_LOCKED_WORKSPACE_BYTES, "page_locked_workspace")?;
 
         Ok(Self {
             float_workspace,
@@ -151,20 +474,8 @@ impl FlashInferWorkspace {
 
 impl Drop for FlashInferWorkspace {
     fn drop(&mut self) {
-        if !self.page_locked_workspace.is_null() {
-            unsafe {
-                let _ = cudarc::driver::sys::cuMemFreeHost(
-                    self.page_locked_workspace as *mut std::ffi::c_void,
-                );
-            }
-            self.page_locked_workspace = std::ptr::null_mut();
-        }
-        if !self.plan_info.is_null() {
-            unsafe {
-                let _ = cudarc::driver::sys::cuMemFreeHost(self.plan_info as *mut std::ffi::c_void);
-            }
-            self.plan_info = std::ptr::null_mut();
-        }
+        free_host_buffer(&mut self.page_locked_workspace);
+        free_host_buffer(&mut self.plan_info);
     }
 }
 
@@ -197,7 +508,7 @@ pub fn flashinfer_plan(
             num_kv_heads as i32,
             page_size as i32,
             head_dim as i32,
-            workspace.plan_info as *mut u8,
+            workspace.plan_info,
             ctx.stream.cu_stream(),
         )
     };
@@ -243,7 +554,7 @@ pub fn flashinfer_tc_plan(
             num_kv_heads as i32,
             page_size as i32,
             head_dim as i32,
-            workspace.plan_info as *mut u8,
+            workspace.plan_info,
             ctx.stream.cu_stream(),
         )
     };
@@ -284,7 +595,7 @@ pub fn flashinfer_plan_hd256(
             num_kv_heads as i32,
             page_size as i32,
             head_dim as i32,
-            workspace.plan_info as *mut u8,
+            workspace.plan_info,
             ctx.stream.cu_stream(),
         )
     };
