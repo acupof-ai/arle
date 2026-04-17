@@ -55,6 +55,13 @@ pub struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    /// Shared paged-prefill plan for `process_all_layers_batch_paged`. Lazy-
+    /// initialized on first call and reused across all subsequent prefills
+    /// so the 256MB+8MB FlashInferWorkspace is allocated exactly once per
+    /// model — matches sglang's `workspace_buffer` pattern and avoids the
+    /// async-free pressure that caused foreign C++ exceptions under load.
+    pub(super) paged_prefill_plan:
+        std::sync::Mutex<Option<infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
 }
 
 impl Qwen3Model {
@@ -239,6 +246,7 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
+            paged_prefill_plan: std::sync::Mutex::new(None),
         };
 
         if model.enable_cuda_graph {
@@ -435,6 +443,7 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
+            paged_prefill_plan: std::sync::Mutex::new(None),
         };
 
         if model.enable_cuda_graph {
