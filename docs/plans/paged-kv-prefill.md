@@ -238,6 +238,52 @@ is approved, covering Phase 1 end-to-end. Each subsequent phase = its
 own Codex brief, so Claude can integrate + verify bitwise parity
 between phases rather than delegating all at once.
 
+## Plan adjustments (post-commit, live log)
+
+### 2026-04-17 — `forward_prefill_with_pool` already exists as the integration hook (discovered during Phase 2 scouting)
+
+`ModelForward::forward_prefill_with_pool` at `infer/src/model.rs:262-272`
+is an already-declared trait method with a default impl that delegates
+to `forward_prefill`. Qwen3 (`model/qwen3/forward.rs:163-192`) and GLM4
+(`model/glm4/forward.rs:164-180`) already implement it via
+`process_all_layers_batch_with_pool` — **a dual-write path** that
+writes K/V to contiguous cache AND token pool.
+
+**But no caller exists yet**: scheduler only calls `forward_prefill`
+at `scheduler/cuda/prefill.rs:234`. The Qwen3/GLM4 dual-write
+implementations are dead code today.
+
+This reshapes Phase 3:
+- **Integration point**: rewrite `process_all_layers_batch_with_pool`
+  (in Qwen3 + GLM4) to call the new paged-prefill kernel
+  **paged-only** (drop the contiguous write). Qwen3.5 doesn't have
+  this method yet — it needs to be added, following the same pattern.
+- **Scheduler switch**: change `scheduler/cuda/prefill.rs:234` from
+  `forward_prefill(chunk, state)` to `forward_prefill_with_pool(chunk,
+  state, pool, slot_idx, new_token_indices)`. The `new_token_indices`
+  slice is already computed one level up (`prefill.rs:174-194` for
+  prefix-hit allocation, `prefill.rs:253-277` for post-forward
+  allocation — the latter moves BEFORE the forward call).
+- **Migration deletion**: `migrate_kv_range_to_paged` at
+  `scheduler/cuda/prefill.rs:264` becomes obsolete for the post-
+  forward path. The prefix-hit migration at `prefill.rs:181` stays
+  for now (separate issue; same-slot resurrection from contiguous KV —
+  Codex review §4).
+- This is **cleaner than the original plan** because it reuses an
+  existing trait contract; the plan's "new `prefill_attention_paged_batch`
+  Rust op" wrapper still exists but is called *from inside*
+  `process_all_layers_batch_with_pool`, not as a standalone alternative.
+
+### 2026-04-17 — Baseline number clarification
+
+Qwen3.5 sync TTFT p99 = **982.6 ms** (from
+`2026-04-17-bench-guidellm-qwen35-4b-infer-l4-p99.md:48`) measures a
+guidellm-sync workload (1 r/s, default prompt length). The 820ms
+figure in the timing-breakdown doc is from a **separate probe** at
+seq_len=4096 single-request streaming. Both measurements are valid
+at their respective workloads; plan acceptance targets use the 982.6ms
+sync number as the canonical guidellm baseline.
+
 ## Rule (pre-registered)
 
 This refactor requires **greedy-token-ID parity** with existing
