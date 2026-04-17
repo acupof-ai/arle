@@ -885,14 +885,22 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             CONTIGUOUS_KV_TOKENS
         };
-        DecodeAwareChunking {
+        let policy_chunk = DecodeAwareChunking {
             decode_active_chunk: self.config.decode_active_prefill_cap,
             idle_chunk: self.config.prefill_chunk_size,
         }
-        .next_chunk_size(InferenceMode::Prefill, signals)
-        .max(1)
-        .min(self.config.prefill_chunk_size)
-        .min(contiguous_cap)
+        .next_chunk_size(InferenceMode::Prefill, signals);
+        let out = policy_chunk
+            .max(1)
+            .min(self.config.prefill_chunk_size)
+            .min(contiguous_cap);
+        log::debug!(
+            "prefill_chunk_size: policy={policy_chunk} cap={contiguous_cap} cfg={} paged={} active_decodes={} => {out}",
+            self.config.prefill_chunk_size,
+            self.model.prefill_uses_paged_pool(),
+            signals.active_decodes,
+        );
+        out
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.
