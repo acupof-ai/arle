@@ -725,6 +725,7 @@ fn main() {
             if let Some(ref inc) = fi_include {
                 nvcc_args.extend([
                     format!("-I{}", inc),
+                    format!("-I{}/flashinfer", inc),
                     "-std=c++17".to_string(),
                     "--expt-relaxed-constexpr".to_string(),
                 ]);
