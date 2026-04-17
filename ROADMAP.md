@@ -8,7 +8,7 @@ Related docs:
 
 ---
 
-## Current State (2026-04-15)
+## Current State (2026-04-17)
 
 Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill (HD128) + Triton FA2 (HD256), FlashInfer batched decode attention, **Tiered KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 remote NIXL)** with radix-driven prefix reuse and page-level staging (`page_size=16` for BF16), token-level KV pool, continuous batching with chunked prefill (4096 tok), decode-priority scheduling, prefix-aware slot assignment with **recurrent state snapshot/restore for hybrid models**, merged QKV + gate-up GEMM (96 fewer launches/step), CUDA Graph batched decode (per batch size), top-k/p/temp/min-p/penalty sampling, batched sampling, OpenAI `/v1/completions` + `/v1/chat/completions` + `/v1/responses` (non-streaming) + `/v1/models` + SSE, Rust agent binary, Python async agent, Prometheus `/metrics` + `/v1/stats` endpoints, model architecture registry, radix-tree prefix cache (tier-aware `RadixNode` with fingerprint + session affinity), speculative decoding framework (CPU stubs) + Metal DFlash experimental path on Qwen3, tensor parallel config/sharding math (CPU stubs), **weight quantization W2/W4/W8 + Marlin W4 prefill + TurboQuant 3-bit**, **KV quantization FP8/INT8/TurboQuant 2-4 bit + fused-dequant attention**, **native Q4_K GPU kernel + GGUF loader (BF16/F16/Q8_0/Q4_K_M)**, **Metal backend with resumable request state (M0.2a)**, throughput benchmark suite.
 
@@ -24,6 +24,8 @@ Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill
 - **`infer-cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/infer-cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → infer-cuda-kernels`.
 - **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
 - **Metal M0.2a resumable request state**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving wiring (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
+- **Metal packed-batch concurrent decode fixed (2026-04-16)**: `extend_kv_cache` batch-dim bug that crashed the scheduler when packed cache rolled past `KV_CACHE_CHUNK` was repaired; varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA.
+- **Qwen3.5 DFlash correctness landed (2026-04-17)**: end-to-end DFlash tape + sticky-state reset + bf16 cast of `g`/`k` produces coherent deterministic output matching baseline. Currently a perf regression (~5× slower single-stream vs baseline; acceptance ~28%; serial across concurrent requests). Follow-ups: acceptance investigation and batch-axis packing over 16-token blocks. See [`docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md`](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 - **CPU offload retired**: the legacy contiguous `model/kv_cache.rs` CPU-offload surface (`k_host/v_host`, `OFFLOAD_BLOCK_SIZE=64`, `prefetch/offload` hooks) deleted in M3c (`c3f65f7`). `set_max_gpu_kv` remains as a compatibility no-op warning only.
 
 Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal scheduler-backed serving (M0.2b — still `BackendRuntimeHandle` today), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
@@ -526,7 +528,7 @@ Focus on performance, robustness, and Metal parity:
 8. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
    need: DraftEngine, KV rollback in PagedKvPool, SpeculativeScheduler, CUDA Graph 2-phase.
    Research: standard draft model (Qwen3-0.5B) first; EAGLE2 / DFlash-MLX as phase 2.
-   Metal DFlash experimental path on Qwen3 is shipped.
+   Metal DFlash experimental path on Qwen3 is shipped; Qwen3.5 DFlash now correct but a perf regression (see Recent Milestones).
    See [docs/research/speculative-decoding-feasibility.md](docs/research/speculative-decoding-feasibility.md)
 9. **1.4 Llama 3/4 Model** — most requested architecture (deferred)
 10. **1.5 DeepSeek-V3 / R1** — requires MLA (1.3) first
