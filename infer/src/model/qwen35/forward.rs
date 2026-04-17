@@ -10,6 +10,7 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
+use infer_cuda_kernels::TokenKVPool;
 use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 pub struct Qwen35State {
@@ -183,6 +184,32 @@ impl ModelForward for Qwen35Model {
             self.prefill_forward(tokens, &mut state.base.kv_cache, &mut state.recurrent_state)?;
         state.base.prefill_logits = Some(logits);
         Ok(())
+    }
+
+    fn forward_prefill_with_pool(
+        &self,
+        tokens: &[u32],
+        state: &mut Self::State,
+        pool: &TokenKVPool,
+        slot: usize,
+        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
+    ) -> Result<()> {
+        if tokens.len() == 1 {
+            // Single-token: fall back to decode fast-path (CUDA Graph).
+            // The decode path uses kv_cache, not the pool, so the caller must
+            // have routed through batch decode for paged correctness. This
+            // mirrors Qwen3's behavior.
+            self.forward_decode(tokens[0], state)?;
+            return Ok(());
+        }
+
+        let logits = self.prefill_forward_paged(tokens, pool, slot, &mut state.recurrent_state)?;
+        state.base.prefill_logits = Some(logits);
+        Ok(())
+    }
+
+    fn prefill_uses_paged_pool(&self) -> bool {
+        true
     }
 
     fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()> {
