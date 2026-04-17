@@ -221,6 +221,86 @@ unsafe extern "C" {
         out_result: *mut *mut mlx_array,
     );
 
+    // === Compiled DFlash draft model ===
+
+    pub fn dflash_draft_new() -> *mut std::ffi::c_void;
+    pub fn dflash_draft_free(model: *mut std::ffi::c_void);
+    pub fn dflash_draft_set_config(
+        model: *mut std::ffi::c_void,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        num_layers: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_draft_push_layer(
+        model: *mut std::ffi::c_void,
+        q_w: *mut mlx_array,
+        q_s: *mut mlx_array,
+        q_b: *mut mlx_array,
+        q_gs: i32,
+        q_bits: i32,
+        k_w: *mut mlx_array,
+        k_s: *mut mlx_array,
+        k_b: *mut mlx_array,
+        k_gs: i32,
+        k_bits: i32,
+        v_w: *mut mlx_array,
+        v_s: *mut mlx_array,
+        v_b: *mut mlx_array,
+        v_gs: i32,
+        v_bits: i32,
+        o_w: *mut mlx_array,
+        o_s: *mut mlx_array,
+        o_b: *mut mlx_array,
+        o_gs: i32,
+        o_bits: i32,
+        gate_w: *mut mlx_array,
+        gate_s: *mut mlx_array,
+        gate_b: *mut mlx_array,
+        gate_gs: i32,
+        gate_bits: i32,
+        up_w: *mut mlx_array,
+        up_s: *mut mlx_array,
+        up_b: *mut mlx_array,
+        up_gs: i32,
+        up_bits: i32,
+        down_w: *mut mlx_array,
+        down_s: *mut mlx_array,
+        down_b: *mut mlx_array,
+        down_gs: i32,
+        down_bits: i32,
+        input_norm: *mut mlx_array,
+        post_attn_norm: *mut mlx_array,
+        q_norm: *mut mlx_array,
+        k_norm: *mut mlx_array,
+    );
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_draft_set_fc_norms(
+        model: *mut std::ffi::c_void,
+        fc_w: *mut mlx_array,
+        fc_s: *mut mlx_array,
+        fc_b: *mut mlx_array,
+        fc_gs: i32,
+        fc_bits: i32,
+        hidden_norm: *mut mlx_array,
+        norm: *mut mlx_array,
+    );
+    pub fn dflash_draft_finalize(model: *mut std::ffi::c_void) -> i32;
+    pub fn dflash_draft_forward(
+        model: *mut std::ffi::c_void,
+        noise_embedding: *mut mlx_array,
+        target_hidden: *mut mlx_array,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        rope_offset: i32,
+        out_hidden: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+    ) -> i32;
+
     // === Compiled Qwen3.5 model ===
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;
