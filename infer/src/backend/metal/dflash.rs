@@ -1,4 +1,9 @@
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
@@ -19,6 +24,29 @@ use crate::{hf_hub, sampler::SamplingParams};
 const DRAFT_CACHE_SINK_SIZE: i32 = 64;
 /// Draft KV cache window size (recent tokens kept at the end).
 const DRAFT_CACHE_WINDOW_SIZE: i32 = 1024;
+
+#[derive(Default)]
+struct Qwen35BlockVerifyProfileWindow {
+    blocks: usize,
+    total_verify: Duration,
+}
+
+fn record_qwen35_block_verify_window(verify_time: Duration) {
+    static WINDOW: OnceLock<Mutex<Qwen35BlockVerifyProfileWindow>> = OnceLock::new();
+    let window = WINDOW.get_or_init(|| Mutex::new(Qwen35BlockVerifyProfileWindow::default()));
+    let mut state = window
+        .lock()
+        .expect("Qwen35 block_verify profile window poisoned");
+    state.blocks += 1;
+    state.total_verify += verify_time;
+    if state.blocks == 10 {
+        log::info!(
+            "qwen35_dflash: block_verify avg over 10 blocks = {:.1}ms",
+            state.total_verify.as_secs_f64() * 1000.0 / state.blocks as f64,
+        );
+        *state = Qwen35BlockVerifyProfileWindow::default();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MetalDflashOptions {
@@ -49,6 +77,7 @@ pub(crate) struct MetalDflashRuntime {
     draft_model_id: String,
     draft_config: DFlashDraftConfig,
     draft_weights: DFlashDraftWeights,
+    draft_cpp_model: Option<DFlashDraftCppModel>,
 }
 
 impl MetalDflashRuntime {
@@ -91,6 +120,7 @@ impl MetalDflashRuntime {
                     draft_model_dir.display()
                 )
             })?;
+        let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config);
         let default_block_size = draft_config.block_size.max(1);
         let requested_block_size = options
             .speculative_tokens
@@ -128,6 +158,7 @@ impl MetalDflashRuntime {
             draft_model_id: options.draft_model.clone(),
             draft_config,
             draft_weights,
+            draft_cpp_model,
         })
     }
 
@@ -240,6 +271,8 @@ struct DFlashDraftLayerWeights {
     post_attention_layernorm: MlxArray,
     q_norm: MlxArray,
     k_norm: MlxArray,
+    gate_proj: WeightTensor,
+    up_proj: WeightTensor,
     mlp_inputs: MlpInputProjection,
     down_proj: WeightTensor,
 }
@@ -274,7 +307,10 @@ impl DFlashDraftWeights {
                     up_dim,
                 }
             } else {
-                MlpInputProjection::Split { gate_proj, up_proj }
+                MlpInputProjection::Split {
+                    gate_proj: clone_weight_tensor(&gate_proj),
+                    up_proj: clone_weight_tensor(&up_proj),
+                }
             };
 
             layers.push(DFlashDraftLayerWeights {
@@ -286,6 +322,8 @@ impl DFlashDraftWeights {
                 post_attention_layernorm: get(&p("post_attention_layernorm.weight"))?,
                 q_norm: get(&p("self_attn.q_norm.weight"))?,
                 k_norm: get(&p("self_attn.k_norm.weight"))?,
+                gate_proj,
+                up_proj,
                 mlp_inputs,
                 down_proj: load_proj(&p("mlp.down_proj"))?,
             });
@@ -297,6 +335,204 @@ impl DFlashDraftWeights {
             hidden_norm: get("hidden_norm.weight")?,
             norm: get("norm.weight")?,
         })
+    }
+}
+
+fn clone_weight_tensor(weight: &WeightTensor) -> WeightTensor {
+    match weight {
+        WeightTensor::Dense(w) => WeightTensor::Dense(w.clone()),
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => WeightTensor::Quantized {
+            w: w.clone(),
+            scales: scales.clone(),
+            biases: biases.clone(),
+            group_size: *group_size,
+            bits: *bits,
+        },
+    }
+}
+
+fn extract_dflash_weight(
+    weight: &WeightTensor,
+) -> (
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    i32,
+    i32,
+) {
+    match weight {
+        WeightTensor::Dense(w) => (w.as_raw(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
+        WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        } => (
+            w.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            *group_size,
+            *bits,
+        ),
+    }
+}
+
+fn use_dflash_draft_cpp() -> bool {
+    matches!(std::env::var("DFLASH_DRAFT_CPP").as_deref(), Ok("1"))
+}
+
+struct DFlashDraftCppModel(*mut std::ffi::c_void);
+
+impl Drop for DFlashDraftCppModel {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::dflash_draft_free(self.0) }
+    }
+}
+
+unsafe impl Send for DFlashDraftCppModel {}
+
+impl DFlashDraftCppModel {
+    fn build(weights: &DFlashDraftWeights, config: &DFlashDraftConfig) -> Option<Self> {
+        let model = unsafe { mlx_sys::dflash_draft_new() };
+        if model.is_null() {
+            log::warn!("DFlash draft C++ model init failed; falling back to Rust path");
+            return None;
+        }
+
+        unsafe {
+            mlx_sys::dflash_draft_set_config(
+                model,
+                config.hidden_size as i32,
+                config.num_attention_heads as i32,
+                config.num_key_value_heads as i32,
+                config.head_dim as i32,
+                config.num_hidden_layers as i32,
+                config.rope_theta,
+                config.rms_norm_eps,
+            );
+        }
+
+        for layer in &weights.layers {
+            let q = extract_dflash_weight(&layer.q_proj);
+            let k = extract_dflash_weight(&layer.k_proj);
+            let v = extract_dflash_weight(&layer.v_proj);
+            let o = extract_dflash_weight(&layer.o_proj);
+            let gate = extract_dflash_weight(&layer.gate_proj);
+            let up = extract_dflash_weight(&layer.up_proj);
+            let down = extract_dflash_weight(&layer.down_proj);
+            unsafe {
+                mlx_sys::dflash_draft_push_layer(
+                    model,
+                    q.0,
+                    q.1,
+                    q.2,
+                    q.3,
+                    q.4,
+                    k.0,
+                    k.1,
+                    k.2,
+                    k.3,
+                    k.4,
+                    v.0,
+                    v.1,
+                    v.2,
+                    v.3,
+                    v.4,
+                    o.0,
+                    o.1,
+                    o.2,
+                    o.3,
+                    o.4,
+                    gate.0,
+                    gate.1,
+                    gate.2,
+                    gate.3,
+                    gate.4,
+                    up.0,
+                    up.1,
+                    up.2,
+                    up.3,
+                    up.4,
+                    down.0,
+                    down.1,
+                    down.2,
+                    down.3,
+                    down.4,
+                    layer.input_layernorm.as_raw(),
+                    layer.post_attention_layernorm.as_raw(),
+                    layer.q_norm.as_raw(),
+                    layer.k_norm.as_raw(),
+                );
+            }
+        }
+
+        let fc = extract_dflash_weight(&weights.fc);
+        unsafe {
+            mlx_sys::dflash_draft_set_fc_norms(
+                model,
+                fc.0,
+                fc.1,
+                fc.2,
+                fc.3,
+                fc.4,
+                weights.hidden_norm.as_raw(),
+                weights.norm.as_raw(),
+            );
+        }
+
+        let rc = unsafe { mlx_sys::dflash_draft_finalize(model) };
+        if rc != 0 {
+            log::warn!("DFlash draft C++ model finalize failed; falling back to Rust path");
+            unsafe { mlx_sys::dflash_draft_free(model) };
+            return None;
+        }
+
+        log::info!(
+            "Metal DFlash draft C++ model ready ({} layers compiled as one forward graph)",
+            config.num_hidden_layers
+        );
+        Some(Self(model))
+    }
+
+    fn forward(
+        &self,
+        noise_embedding: &MlxArray,
+        target_hidden: &MlxArray,
+        rope_offset: i32,
+        kv_flat: &mut [MlxArray],
+    ) -> Result<MlxArray> {
+        let n_kv = kv_flat.len() as i32;
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_flat.iter().map(MlxArray::as_raw).collect();
+        let mut out_hidden: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); kv_flat.len()];
+        let rc = unsafe {
+            mlx_sys::dflash_draft_forward(
+                self.0,
+                noise_embedding.as_raw(),
+                target_hidden.as_raw(),
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                rope_offset,
+                &raw mut out_hidden,
+                out_kv.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+        for (slot, ptr) in kv_flat.iter_mut().zip(out_kv.into_iter()) {
+            let old = std::mem::replace(slot, unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        Ok(unsafe { MlxArray::from_raw(out_hidden) })
     }
 }
 
@@ -384,6 +620,63 @@ impl ContiguousKvState {
             extend_kv_cache(cache, self.n_kv_heads, self.head_dim, new_capacity);
         }
         self.capacity = new_capacity;
+    }
+
+    fn active_kv_flat(&self) -> Vec<MlxArray> {
+        let mut flat = Vec::with_capacity(self.k_caches.len() * 2);
+        for layer_idx in 0..self.k_caches.len() {
+            flat.push(slice(
+                &self.k_caches[layer_idx],
+                &[0, 0, 0, 0],
+                &[1, self.n_kv_heads, self.len, self.head_dim],
+                &[1, 1, 1, 1],
+            ));
+            flat.push(slice(
+                &self.v_caches[layer_idx],
+                &[0, 0, 0, 0],
+                &[1, self.n_kv_heads, self.len, self.head_dim],
+                &[1, 1, 1, 1],
+            ));
+        }
+        flat
+    }
+
+    fn replace_active_kv_flat(&mut self, flat: Vec<MlxArray>) -> Result<()> {
+        ensure!(
+            flat.len() == self.k_caches.len() * 2,
+            "DFlash active KV replacement count mismatch: expected {}, got {}",
+            self.k_caches.len() * 2,
+            flat.len()
+        );
+        let mut iter = flat.into_iter();
+        let mut new_capacity = 0;
+        for layer_idx in 0..self.k_caches.len() {
+            let new_k = iter
+                .next()
+                .ok_or_else(|| anyhow!("missing DFlash K cache for layer {layer_idx}"))?;
+            let new_v = iter
+                .next()
+                .ok_or_else(|| anyhow!("missing DFlash V cache for layer {layer_idx}"))?;
+            let k_shape = new_k.shape();
+            let v_shape = new_v.shape();
+            ensure!(
+                k_shape.len() == 4
+                    && v_shape.len() == 4
+                    && k_shape[0] == 1
+                    && v_shape[0] == 1
+                    && k_shape[1] == self.n_kv_heads
+                    && v_shape[1] == self.n_kv_heads
+                    && k_shape[3] == self.head_dim
+                    && v_shape[3] == self.head_dim
+                    && k_shape[2] == v_shape[2],
+                "invalid DFlash KV cache shapes for layer {layer_idx}: k={k_shape:?}, v={v_shape:?}"
+            );
+            new_capacity = k_shape[2];
+            self.k_caches[layer_idx] = new_k;
+            self.v_caches[layer_idx] = new_v;
+        }
+        self.capacity = new_capacity;
+        Ok(())
     }
 
     fn trim(&mut self, num_tokens: usize) {
@@ -778,6 +1071,47 @@ fn dflash_draft_forward(
     target_hidden: &MlxArray,
     state: &mut ContiguousKvState,
 ) -> Result<MlxArray> {
+    if use_dflash_draft_cpp()
+        && let Some(cpp_model) = runtime.draft_cpp_model.as_ref()
+    {
+        return dflash_draft_forward_cpp(cpp_model, noise_embedding, target_hidden, state);
+    }
+    dflash_draft_forward_rust(runtime, noise_embedding, target_hidden, state)
+}
+
+fn dflash_draft_forward_cpp(
+    cpp_model: &DFlashDraftCppModel,
+    noise_embedding: &MlxArray,
+    target_hidden: &MlxArray,
+    state: &mut ContiguousKvState,
+) -> Result<MlxArray> {
+    let context_len = *target_hidden
+        .shape()
+        .first()
+        .ok_or_else(|| anyhow!("target_hidden must be rank-2"))?;
+    let seq = *noise_embedding
+        .shape()
+        .first()
+        .ok_or_else(|| anyhow!("noise_embedding must be rank-2"))?;
+    let mut kv_flat = state.active_kv_flat();
+    let hidden = cpp_model.forward(
+        noise_embedding,
+        target_hidden,
+        state.rope_offset,
+        &mut kv_flat,
+    )?;
+    state.replace_active_kv_flat(kv_flat)?;
+    state.len += context_len + seq;
+    state.rope_offset += context_len + seq;
+    Ok(hidden)
+}
+
+fn dflash_draft_forward_rust(
+    runtime: &MetalDflashRuntime,
+    noise_embedding: &MlxArray,
+    target_hidden: &MlxArray,
+    state: &mut ContiguousKvState,
+) -> Result<MlxArray> {
     let context_len = *target_hidden
         .shape()
         .first()
@@ -1125,6 +1459,9 @@ pub(crate) fn qwen35_dflash_speculative_block(
         eval(&[&logits]);
     }
     let t_verify = t_start.elapsed();
+    if profile {
+        record_qwen35_block_verify_window(t_verify - t_snapshot);
+    }
     let block_tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
     let mut block_hidden: Vec<MlxArray> = Vec::with_capacity(n_cap.max(0) as usize);
