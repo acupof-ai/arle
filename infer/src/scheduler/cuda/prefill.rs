@@ -18,6 +18,7 @@ fn is_prompt_prefix_of_cached_hit(prompt_len: usize, cached_len: usize, prefix_l
 /// Only full-prompt hits (`raw == prompt_len`) are safe for such models,
 /// because the exact-match branch in `step_new` routes through `state.reset()`
 /// + full re-prefill rather than `truncate_to + restore_prefix_snapshot`.
+///
 /// Any partial hit — including the exact-block-aligned `raw == cached < prompt_len`
 /// case — must downgrade. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
 fn should_downgrade_partial_hit_to_miss(

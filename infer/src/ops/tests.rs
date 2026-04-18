@@ -5,7 +5,6 @@ use half::bf16;
 use super::*;
 use infer_cuda_kernels::ffi;
 use infer_cuda_kernels::prelude::*;
-use infer_cuda_kernels::tensor::*;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
@@ -1187,7 +1186,7 @@ fn turboquant_lloyd_max_codebook_symmetry() {
             centroids.as_mut_ptr(),
             boundaries.as_mut_ptr(),
             num_levels as i32,
-            head_dim as i32,
+            head_dim,
             200,
         );
     }
@@ -1256,6 +1255,8 @@ fn turboquant_hadamard_signs_deterministic() {
 fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     // Roundtrip test: BF16 → TQ quantize → TQ dequantize → BF16
     // Verify reconstruction error is within expected bounds.
+    use infer_cuda_kernels::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
+
     let ctx = DeviceContext::new()?;
 
     let head_dim = 128usize;
@@ -1263,8 +1264,6 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     let kv_dim = num_kv_heads * head_dim;
     let batch_size = 8usize;
     let bits = 3u8;
-
-    use infer_cuda_kernels::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
 
     // Init TQ state (1 layer, Hadamard mode)
     let tq_state = TurboQuantLayerState::new(&ctx, 1, head_dim, bits, 42)?;
@@ -1286,11 +1285,11 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     // Allocate packed + norms buffers
     let packed_total = batch_size * num_kv_heads * packed_per_head;
     let norms_total = batch_size * num_kv_heads;
-    let mut packed: CudaSlice<u8> = ctx
+    let packed: CudaSlice<u8> = ctx
         .stream
         .alloc_zeros(packed_total)
         .map_err(|e| anyhow!("alloc packed: {e}"))?;
-    let mut norms: CudaSlice<u16> = ctx
+    let norms: CudaSlice<u16> = ctx
         .stream
         .alloc_zeros(norms_total)
         .map_err(|e| anyhow!("alloc norms: {e}"))?;
@@ -1300,7 +1299,7 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
         &ctx,
         {
             let (ptr, _g) = input.data.device_ptr(&ctx.stream);
-            ptr as u64
+            ptr
         },
         &packed,
         &norms,
@@ -1325,7 +1324,7 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
         &norms,
         {
             let (ptr, _g) = output.data.device_ptr_mut(&ctx.stream);
-            ptr as u64
+            ptr
         },
         &ctx.stream
             .clone_htod(&(0..batch_size as i32).collect::<Vec<_>>())
@@ -1400,7 +1399,7 @@ fn turboquant_cpu_reference_roundtrip() {
     let head_dim = 128usize;
     let bits = 3u8;
     let num_levels = 1usize << bits;
-    let effective_bits = 4usize; // bits==3 → 4-bit nibbles
+    let _effective_bits = 4usize; // bits==3 → 4-bit nibbles
 
     // 1. Compute codebook
     let mut centroids = vec![0.0f32; num_levels];
@@ -1426,7 +1425,7 @@ fn turboquant_cpu_reference_roundtrip() {
     // 3. Generate test vector
     let mut x = vec![0.0f32; head_dim];
     let mut seed = 12345u64;
-    for v in x.iter_mut() {
+    for v in &mut x {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -1458,7 +1457,7 @@ fn turboquant_cpu_reference_roundtrip() {
         h *= 2;
     }
     let scale = 1.0 / (n as f32).sqrt();
-    for v in y.iter_mut() {
+    for v in &mut y {
         *v *= scale;
     }
 
@@ -1490,7 +1489,7 @@ fn turboquant_cpu_reference_roundtrip() {
         }
         h *= 2;
     }
-    for v in y_hat.iter_mut() {
+    for v in &mut y_hat {
         *v *= scale;
     }
 

@@ -6,7 +6,6 @@
 
 #![cfg(feature = "cuda")]
 
-use half::bf16;
 use infer::gguf::GgufFile;
 
 fn path_4b() -> String {
@@ -30,7 +29,7 @@ fn check(label: &str, gguf: &GgufFile, name: &str, expected: &[(usize, f32)]) {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Qwen3-4B Q4K GGUF weights (set INFER_QWEN3_Q4K_PATH)"]
 fn dequant_matches_llama_cpp_ground_truth() {
     let gguf = GgufFile::open(&path_4b()).expect("open 4B gguf");
 

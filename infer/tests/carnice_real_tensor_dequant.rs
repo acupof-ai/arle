@@ -142,7 +142,7 @@ fn reorder_rows_bf16(
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Carnice model weights + CUDA"]
 fn carnice_real_q4k_matches_bf16_reference() {
     infer::logging::init_stderr("warn");
     let gguf_path = find_gguf(&model_path());

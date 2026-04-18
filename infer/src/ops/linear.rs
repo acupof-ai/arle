@@ -312,7 +312,8 @@ pub fn fused_mlp_into(
 /// fallback branch of `fused_mlp_into`:
 ///   * `act = silu(gate_proj(x)) * up_proj(x)`
 ///   * `out = down_proj(act)`
-/// with LoRA adds applied right after their respective base GEMVs (before the
+///
+/// LoRA adds applied right after their respective base GEMVs (before the
 /// SiLU for gate/up, after the base GEMV for down).
 ///
 /// `up_scratch` must be a caller-owned `DeviceVec` of length `intermediate_size`

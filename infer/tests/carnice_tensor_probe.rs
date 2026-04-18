@@ -23,7 +23,7 @@ fn find_gguf(dir: &str) -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Carnice GGUF weights (set INFER_CARNICE_PATH)"]
 fn probe_q4k_superblock() {
     let gguf_path = find_gguf(&model_path());
     let gguf = GgufFile::open(&gguf_path).expect("open gguf");
@@ -82,8 +82,8 @@ fn probe_q4k_superblock() {
 
     // Sanity stats on row 0
     let row0: Vec<f32> = bf16_data[0..ne0].iter().map(|v| v.to_f32()).collect();
-    let min = row0.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max = row0.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min = row0.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = row0.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean = row0.iter().sum::<f32>() / row0.len() as f32;
     let rms = (row0.iter().map(|v| v * v).sum::<f32>() / row0.len() as f32).sqrt();
     println!("row 0 stats: min={min:e}  max={max:e}  mean={mean:e}  rms={rms:e}");

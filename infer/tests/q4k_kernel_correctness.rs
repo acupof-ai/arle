@@ -256,7 +256,7 @@ fn dequant_q3k_superblock_cpu(sb: &[u8; 110]) -> [f32; 256] {
     let mut out = [0f32; 256];
     for j in 0..256 {
         let q2 = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
-        let hbit = ((hmask[j / 8] >> (j % 8)) & 1) as u8;
+        let hbit = (hmask[j / 8] >> (j % 8)) & 1;
         let q3 = q2 | (hbit << 2);
         let sc = scales[j / 16] as f32;
         out[j] = d * sc * (q3 as f32 - 4.0);
