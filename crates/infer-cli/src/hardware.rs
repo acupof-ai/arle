@@ -31,10 +31,11 @@ pub(crate) enum CompiledBackend {
 }
 
 impl CompiledBackend {
+    #[allow(clippy::needless_return)] // cfg arms are additive: cuda+metal both active needs explicit returns.
     pub(crate) fn detect() -> Self {
         #[cfg(feature = "cuda")]
         {
-            Self::Cuda
+            return Self::Cuda;
         }
         #[cfg(feature = "metal")]
         {
