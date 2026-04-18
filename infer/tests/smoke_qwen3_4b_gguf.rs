@@ -10,18 +10,14 @@
 use std::time::Instant;
 
 use infer::sampler::SamplingParams;
-use infer::server_engine::{
-    CompletionRequest, CompletionStreamDelta, InferenceEngine, InferenceEngineOptions,
-    LoadedInferenceEngine,
-};
-use tokio::sync::mpsc;
+use infer::server_engine::{InferenceEngine, InferenceEngineOptions, LoadedInferenceEngine};
 
 fn path() -> String {
     std::env::var("INFER_QWEN3_PATH").unwrap_or_else(|_| "models/Qwen3-4B-GGUF".to_string())
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Qwen3-4B GGUF weights + CUDA GPU"]
 fn qwen3_4b_gguf_generate() {
     infer::logging::init_stderr("info");
     let p = path();

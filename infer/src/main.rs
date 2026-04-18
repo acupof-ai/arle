@@ -247,29 +247,22 @@ fn auto_num_slots(
 
     let weight_bytes: u64 = std::fs::read_dir(Path::new(model_path))
         .ok()
-        .map(|entries| {
+        .map_or(0, |entries| {
             entries
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
                 .filter_map(|e| e.metadata().ok().map(|m| m.len()))
                 .sum()
-        })
-        .unwrap_or(0);
+        });
 
-    let _ctx = match DeviceContext::new() {
-        Ok(ctx) => ctx,
-        Err(_) => {
-            info!("auto_num_slots: CUDA init failed, using default 8 slots");
-            return 8;
-        }
+    let Ok(_ctx) = DeviceContext::new() else {
+        info!("auto_num_slots: CUDA init failed, using default 8 slots");
+        return 8;
     };
 
-    let (free_bytes, total_bytes) = match DeviceContext::gpu_memory_info() {
-        Ok(info) => info,
-        Err(_) => {
-            info!("auto_num_slots: GPU memory query failed, using default 8 slots");
-            return 8;
-        }
+    let Ok((free_bytes, total_bytes)) = DeviceContext::gpu_memory_info() else {
+        info!("auto_num_slots: GPU memory query failed, using default 8 slots");
+        return 8;
     };
 
     // SGLang formula: total_budget = gpu_total × fraction, kv_budget = total_budget − weights.

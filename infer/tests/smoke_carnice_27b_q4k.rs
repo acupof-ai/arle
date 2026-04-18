@@ -25,7 +25,7 @@ fn model_path() -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Carnice-27B Q4K GGUF weights + CUDA GPU"]
 fn carnice_27b_q4k_load_and_generate() {
     infer::logging::init_stderr("info");
     let path = model_path();
@@ -46,7 +46,7 @@ fn carnice_27b_q4k_load_and_generate() {
     let (free, total) = unsafe {
         let mut free: usize = 0;
         let mut total: usize = 0;
-        cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _);
+        cudarc::driver::sys::cuMemGetInfo_v2(&raw mut free, &raw mut total);
         (free, total)
     };
     let used_gb = (total - free) as f64 / (1 << 30) as f64;

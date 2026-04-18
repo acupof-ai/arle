@@ -15,8 +15,16 @@ fn model_path() -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires Carnice GGUF weights (set INFER_CARNICE_PATH)"]
 fn audit_carnice_dtypes() {
+    // Group (dtype, rank) → count, total bytes.
+    #[derive(Default, Debug)]
+    struct Stat {
+        count: usize,
+        bytes_packed: usize,
+        elems: usize,
+    }
+
     let dir = model_path();
     let mut gguf_path = String::new();
     for entry in std::fs::read_dir(&dir).expect("read dir") {
@@ -32,13 +40,6 @@ fn audit_carnice_dtypes() {
     let gguf = GgufFile::open(&gguf_path).expect("open gguf");
     println!("tensors: {}", gguf.tensors.len());
 
-    // Group (dtype, rank) → count, total bytes.
-    #[derive(Default, Debug)]
-    struct Stat {
-        count: usize,
-        bytes_packed: usize,
-        elems: usize,
-    }
     let mut groups: BTreeMap<String, Stat> = BTreeMap::new();
 
     for (name, info) in &gguf.tensors {

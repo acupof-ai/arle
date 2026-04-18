@@ -34,7 +34,7 @@ impl CompiledBackend {
     pub(crate) fn detect() -> Self {
         #[cfg(feature = "cuda")]
         {
-            return Self::Cuda;
+            Self::Cuda
         }
         #[cfg(feature = "metal")]
         {

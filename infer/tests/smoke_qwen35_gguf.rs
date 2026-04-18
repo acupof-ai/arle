@@ -5,7 +5,7 @@ use infer::server_engine::{
 };
 
 #[test]
-#[ignore]
+#[ignore = "requires Qwen3.5 GGUF weights + CUDA GPU (set INFER_Q35_PATH)"]
 fn qwen35_gguf_generate() {
     infer::logging::init_stderr("info");
     let p = std::env::var("INFER_Q35_PATH")
