@@ -591,7 +591,7 @@ Focus on performance, robustness, and Metal parity:
 | 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ✅ Done — M2a TinyLM CPU (`f183f80`); M2b Qwen3 hot-path LoRA + codex rounds 1–3 (`1e87b4f`…`b5377f6`) |
 | 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ✅ Done — TinyLM GRPO (`f86a9c7`) + PPO clip (`19b8e02`); 6 h Qwen+CUDA acceptance run remote-pending |
 | 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ✅ Done — M4.1–M4.8 infra shipped (multi-turn, stepwise return, verifiers, curriculum, task gen, /v1/train); 24 h hard-set pass@1 remote-pending |
-| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | Partial — M5.1 research + M5.3 matmul only (`a46fc00`, 3-shape parity ≤ 1e-3). Remaining M5.3 ops (add/mul_scalar/sum/log_softmax/gather/AdamW-Metal) + M5.4 Mac Qwen LoRA demo still pending. |
+| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | Partial — M5.1 research + M5.2 route (b) locked (own-tape + mlx-sys forward; see `a46fc00`) + M5.3 matmul only (3-shape parity ≤ 1e-3). Remaining M5.3 ops (add/mul_scalar/sum/log_softmax/gather/AdamW-Metal) + M5.4 Mac Qwen LoRA demo still pending. |
 
 ---
 
