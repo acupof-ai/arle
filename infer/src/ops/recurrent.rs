@@ -450,7 +450,6 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
     output: &mut HiddenStates,
     heads: &GdrHeadConfig,
 ) -> Result<()> {
-    let num_key_heads = heads.num_key_heads;
     let num_value_heads = heads.num_value_heads;
     let key_dim = heads.key_dim;
     let val_dim = heads.val_dim;
