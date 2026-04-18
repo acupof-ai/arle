@@ -10,12 +10,14 @@ use autograd::{
 };
 use thiserror::Error;
 use train::{
+    control::TrainingController,
     dataset::LcgRng,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
     lora::LoraConfig,
     model::{TinyLM, TinyLMConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     reward::{discounted_returns, group_normalize, returns_to_per_position},
+    server::bind_and_serve_on_thread,
     trainer::clip_grad_norm,
 };
 
@@ -49,6 +51,7 @@ struct CliArgs {
     eval_temperature: f32,
     backend: BackendChoice,
     save_path: Option<String>,
+    serve: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +102,7 @@ impl Default for CliArgs {
             eval_temperature: 0.3,
             backend: BackendChoice::Cpu,
             save_path: None,
+            serve: None,
         }
     }
 }
@@ -227,7 +231,29 @@ fn main() -> Result<(), CliError> {
     let mut last_kl = 0.0_f32;
     let loop_start = std::time::Instant::now();
 
+    let controller = TrainingController::new();
+    controller.update(|s| {
+        s.total_iters = args.iters;
+        s.started = true;
+    });
+    let _server_handle = if let Some(port) = args.serve {
+        let addr = format!("127.0.0.1:{port}");
+        eprintln!("[train_multi_turn] control plane listening on {addr}");
+        Some(
+            bind_and_serve_on_thread(Arc::clone(&controller), addr)
+                .map_err(|e| CliError::Custom(format!("train server bind failed: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let mut stopped_early = false;
     for iter in 0..args.iters {
+        if controller.should_stop() {
+            eprintln!("[train_multi_turn] stop requested at iter {iter}");
+            stopped_early = true;
+            break;
+        }
         let initial_prompt =
             build_prompt(args.prompt_len, separator, target_range, &mut prompt_rng);
         let mut episodes = Vec::with_capacity(args.group_size);
@@ -298,6 +324,28 @@ fn main() -> Result<(), CliError> {
              best_reward {best_reward:.4} mean_kl {last_kl:.4}"
         );
 
+        let wall_so_far = loop_start.elapsed().as_secs_f32();
+        controller.update(|s| {
+            s.iter = iter + 1;
+            s.mean_reward = mean_turn_reward;
+            s.best_reward = best_reward;
+            s.last_kl = last_kl;
+            s.last_loss = loss_value;
+            s.wall_secs = wall_so_far;
+        });
+
+        if controller.take_save_request() {
+            if let Some(path) = &args.save_path {
+                train::checkpoint::save(&policy, &config, &store, path)
+                    .map_err(|e| CliError::Custom(format!("checkpoint save failed: {e}")))?;
+                eprintln!("[train_multi_turn] save requested → flushed to {path}");
+            } else {
+                eprintln!(
+                    "[train_multi_turn] save requested but no --save-path configured; ignoring"
+                );
+            }
+        }
+
         if args.eval_every > 0 && (iter + 1).is_multiple_of(args.eval_every) {
             let mut eval_prompt_rng = LcgRng::seed(eval_prompt_seed);
             let mut eval_sample_rng = LcgRng::seed(eval_sample_seed ^ iter as u64);
@@ -346,6 +394,17 @@ fn main() -> Result<(), CliError> {
         train::checkpoint::save(&policy, &config, &store, path)
             .map_err(|e| CliError::Custom(format!("checkpoint save failed: {e}")))?;
         println!("checkpoint saved to {path}");
+    }
+
+    controller.update(|s| {
+        s.wall_secs = wall_secs;
+        s.finished = true;
+    });
+    if stopped_early {
+        eprintln!(
+            "[train_multi_turn] training stopped early at iter {}",
+            controller.snapshot().iter
+        );
     }
     Ok(())
 }
@@ -552,6 +611,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             }
             "--save-path" => {
                 args.save_path = Some(next_value(&mut iter, &flag)?);
+            }
+            "--serve" => {
+                args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
             _ => return Err(CliError::UnknownFlag(flag)),
         }
