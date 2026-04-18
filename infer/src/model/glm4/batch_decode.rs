@@ -43,7 +43,6 @@ pub struct BatchDecodeBuffers {
 
     embedding_out: HiddenStates,
     pub(super) logits_batch: Option<HiddenStates>,
-    logits_per_slot: Vec<DeviceVec>,
     pub(super) argmax_out: CudaSlice<i32>,
     pub(super) argmax_host: Vec<i32>,
 
@@ -98,7 +97,6 @@ impl BatchDecodeBuffers {
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None,
-            logits_per_slot: Vec::new(),
             argmax_out: ctx
                 .stream
                 .alloc_zeros(max_batch_size)
