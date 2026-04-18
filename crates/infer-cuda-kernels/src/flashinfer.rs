@@ -428,8 +428,9 @@ impl BatchPrefillPagedPlan {
 
 impl FlashInferWorkspace {
     /// Default sizes matching FlashInfer's typical requirements.
-    /// 256MB for split-KV temporaries (sglang uses 512MB but we need headroom).
-    const FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+    /// HD256 paged prefill split-KV on 4096-row chunks needs >256MiB on Ampere:
+    /// `batch_prefill_tmp_v` alone reaches 256MiB before `tmp_s` is allocated.
+    const FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
     const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;
