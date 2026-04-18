@@ -1,5 +1,8 @@
-use crate::{AutogradError, Result};
-use std::collections::HashSet;
+use crate::{
+    AutogradError, Result,
+    backend::{Backend, CpuBackend},
+};
+use std::{collections::HashSet, sync::Arc};
 
 pub type TensorId = usize;
 
@@ -36,13 +39,36 @@ impl GpuTensor {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TensorStore {
     pub tensors: Vec<Option<GpuTensor>>,
     pub free_ids: Vec<TensorId>,
+    backend: Arc<dyn Backend>,
+}
+
+impl Default for TensorStore {
+    fn default() -> Self {
+        Self::with_backend(Arc::new(CpuBackend))
+    }
 }
 
 impl TensorStore {
+    pub fn with_backend(backend: Arc<dyn Backend>) -> Self {
+        Self {
+            tensors: Vec::new(),
+            free_ids: Vec::new(),
+            backend,
+        }
+    }
+
+    pub fn backend(&self) -> &dyn Backend {
+        self.backend.as_ref()
+    }
+
+    pub fn set_backend(&mut self, backend: Arc<dyn Backend>) {
+        self.backend = backend;
+    }
+
     pub fn alloc(&mut self, tensor: GpuTensor) -> TensorId {
         if let Some(id) = self.free_ids.pop() {
             self.tensors[id] = Some(tensor);

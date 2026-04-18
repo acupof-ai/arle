@@ -3,9 +3,11 @@
 //! grpo_loss_per_position -> AdamW. Mirrors `train_grpo` but on interleaved
 //! agent/observation episodes instead of suffix-only rollouts.
 
-use std::{collections::HashSet, env, str::FromStr};
+use std::{collections::HashSet, env, str::FromStr, sync::Arc};
 
-use autograd::{AutogradError, Tape, TensorId, TensorStore, module::Module, optim::AdamW};
+use autograd::{
+    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
+};
 use thiserror::Error;
 use train::{
     dataset::LcgRng,
@@ -45,6 +47,26 @@ struct CliArgs {
     eval_every: usize,
     eval_prompts: usize,
     eval_temperature: f32,
+    backend: BackendChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendChoice {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl FromStr for BackendChoice {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cpu" => Ok(BackendChoice::Cpu),
+            "metal" => Ok(BackendChoice::Metal),
+            "cuda" => Ok(BackendChoice::Cuda),
+            _ => Err(format!("unknown backend: {s}")),
+        }
+    }
 }
 
 impl Default for CliArgs {
@@ -74,7 +96,32 @@ impl Default for CliArgs {
             eval_every: 0,
             eval_prompts: 16,
             eval_temperature: 0.3,
+            backend: BackendChoice::Cpu,
         }
+    }
+}
+
+fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
+    match choice {
+        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
+        #[cfg(feature = "metal")]
+        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
+        #[cfg(not(feature = "metal"))]
+        BackendChoice::Metal => Err(CliError::InvalidValue {
+            flag: "--backend".into(),
+            value: "metal (build with --features metal)".into(),
+        }),
+        #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+        BackendChoice::Cuda => {
+            let backend =
+                autograd::backend_cuda::CudaBackend::new(0).map_err(|e| CliError::Autograd(e))?;
+            Ok(Arc::new(backend))
+        }
+        #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
+        BackendChoice::Cuda => Err(CliError::InvalidValue {
+            flag: "--backend".into(),
+            value: "cuda (build with --features cuda and no no-cuda)".into(),
+        }),
     }
 }
 
@@ -134,7 +181,9 @@ fn main() -> Result<(), CliError> {
         });
     }
 
-    let mut store = TensorStore::default();
+    let backend = build_backend(args.backend)?;
+    eprintln!("[train_multi_turn] backend={:?}", backend.device());
+    let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
     let policy = TinyLM::new(config, &mut store)?;
     let params = policy.parameters();
@@ -470,6 +519,13 @@ fn parse_args() -> Result<CliArgs, CliError> {
             }
             "--eval-temperature" => {
                 args.eval_temperature = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--backend" => {
+                let value = next_value(&mut iter, &flag)?;
+                args.backend = value.parse().map_err(|_| CliError::InvalidValue {
+                    flag: flag.clone(),
+                    value,
+                })?;
             }
             _ => return Err(CliError::UnknownFlag(flag)),
         }

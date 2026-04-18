@@ -330,7 +330,7 @@ M0 Day 5:
 | — | M4.3 多 verifier（真实 math/code/tool） | ⏳ Pending | 合成 token 级占位已就绪；真实 verifier 需 tokenizer 对接 |
 | — | M4.4 Reward aggregation config | ✅ | WeightedEnsemble 已到位；权重 config 化 TBD |
 | — | M4.5–M4.8 curriculum / task gen / /v1/train / self-evolve | ⏳ Pending | |
-| — | M5 Metal 支线 | ⏳ Pending（与 M3/M4 并行） | |
+| 2026-04-18 | M5 Backend trait + Metal matmul + CUDA matmul (标记待验证) | ✅ | `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend`；Metal 对 CPU 参考 ≤1e-3（4 test 全过）；CUDA 路径 Mac typecheck 通过，等 GPU 机器验证；`train_multi_turn --backend metal` 端到端通过 |
 
 ---
 

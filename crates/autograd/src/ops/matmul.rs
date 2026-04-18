@@ -14,7 +14,7 @@ pub fn matmul(
 ) -> Result<TensorId> {
     let a_tensor = store.tensor(a)?.clone();
     let b_tensor = store.tensor(b)?.clone();
-    let (data, output_shape) = matmul_forward_data(
+    let (data, output_shape) = store.backend().matmul_forward(
         &a_tensor.data,
         &a_tensor.shape,
         &b_tensor.data,
@@ -156,80 +156,6 @@ pub(crate) fn matmul_backward(
     }
 
     Ok(grads)
-}
-
-fn matmul_forward_data(
-    a_data: &[f32],
-    a_shape: &[usize],
-    b_data: &[f32],
-    b_shape: &[usize],
-) -> Result<(Vec<f32>, Vec<usize>)> {
-    match (a_shape.len(), b_shape.len()) {
-        (2, 2) => {
-            let m = a_shape[0];
-            let k = a_shape[1];
-            if b_shape[0] != k {
-                return Err(AutogradError::ShapeMismatch {
-                    expected: vec![k],
-                    got: vec![b_shape[0]],
-                });
-            }
-            let n = b_shape[1];
-            let mut out = vec![0.0; m * n];
-            for row in 0..m {
-                for col in 0..n {
-                    let mut acc = 0.0;
-                    for inner in 0..k {
-                        acc += a_data[(row * k) + inner] * b_data[(inner * n) + col];
-                    }
-                    out[(row * n) + col] = acc;
-                }
-            }
-            Ok((out, vec![m, n]))
-        }
-        (3, 3) => {
-            let batch = a_shape[0];
-            if b_shape[0] != batch {
-                return Err(AutogradError::ShapeMismatch {
-                    expected: vec![batch],
-                    got: vec![b_shape[0]],
-                });
-            }
-            let m = a_shape[1];
-            let k = a_shape[2];
-            if b_shape[1] != k {
-                return Err(AutogradError::ShapeMismatch {
-                    expected: vec![k],
-                    got: vec![b_shape[1]],
-                });
-            }
-            let n = b_shape[2];
-            let mut out = vec![0.0; batch * m * n];
-            let a_batch_stride = m * k;
-            let b_batch_stride = k * n;
-            let out_batch_stride = m * n;
-            for batch_index in 0..batch {
-                let a_base = batch_index * a_batch_stride;
-                let b_base = batch_index * b_batch_stride;
-                let out_base = batch_index * out_batch_stride;
-                for row in 0..m {
-                    for col in 0..n {
-                        let mut acc = 0.0;
-                        for inner in 0..k {
-                            acc += a_data[a_base + (row * k) + inner]
-                                * b_data[b_base + (inner * n) + col];
-                        }
-                        out[out_base + (row * n) + col] = acc;
-                    }
-                }
-            }
-            Ok((out, vec![batch, m, n]))
-        }
-        _ => Err(AutogradError::InvalidRank {
-            expected: "both operands must be rank-2 or rank-3",
-            got: a_shape.len().max(b_shape.len()),
-        }),
-    }
 }
 
 fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {
