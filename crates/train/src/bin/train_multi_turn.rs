@@ -48,6 +48,7 @@ struct CliArgs {
     eval_prompts: usize,
     eval_temperature: f32,
     backend: BackendChoice,
+    save_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,7 @@ impl Default for CliArgs {
             eval_prompts: 16,
             eval_temperature: 0.3,
             backend: BackendChoice::Cpu,
+            save_path: None,
         }
     }
 }
@@ -135,6 +137,8 @@ enum CliError {
     MissingValue(String),
     #[error("invalid value for {flag}: {value}")]
     InvalidValue { flag: String, value: String },
+    #[error("{0}")]
+    Custom(String),
 }
 
 struct EchoSeparator(usize);
@@ -324,6 +328,12 @@ fn main() -> Result<(), CliError> {
 
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
+
+    if let Some(path) = &args.save_path {
+        train::checkpoint::save(&policy, &config, &store, path)
+            .map_err(|e| CliError::Custom(format!("checkpoint save failed: {e}")))?;
+        println!("checkpoint saved to {path}");
+    }
     Ok(())
 }
 
@@ -526,6 +536,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
                     flag: flag.clone(),
                     value,
                 })?;
+            }
+            "--save-path" => {
+                args.save_path = Some(next_value(&mut iter, &flag)?);
             }
             _ => return Err(CliError::UnknownFlag(flag)),
         }
