@@ -169,7 +169,14 @@ impl Qwen3Model {
 
         // Per-forward GPU-resident page table (1 i32 per logical page in the
         // slot). Uploaded once and reused across all 36 layers.
-        let pages_u32 = pool.page_indices(slot);
+        let all_pages = pool.page_indices(slot);
+        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
+        anyhow::ensure!(
+            all_pages.len() >= num_pages_needed,
+            "paged prefill: slot {slot} has {} pages, expected at least {num_pages_needed}",
+            all_pages.len()
+        );
+        let pages_u32 = &all_pages[..num_pages_needed];
         let pages_i32: Vec<i32> = pages_u32.iter().map(|&p| p as i32).collect();
         let slot_page_indices: CudaSlice<i32> = self
             .ctx
