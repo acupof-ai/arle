@@ -33,6 +33,120 @@ mod qbits {
     pub(super) const Q6K: usize = 66;
 }
 
+/// Additive LoRA GEMV: `y += B @ (A @ x)`.
+///
+/// The B matrix is expected to be pre-scaled at load time (see
+/// `model::qwen3::lora::upload_as_bf16` — it folds `scale = alpha / r`
+/// into B), so no runtime scalar multiply is needed here.
+///
+/// Shapes:
+///   * `a` — `[rank, in_features]`  (LoRA A)
+///   * `b` — `[out_features, rank]` (LoRA B, pre-scaled)
+///   * `x` — `[in_features]`
+///   * `y` — `[out_features]`  (accumulated, not overwritten)
+///
+/// Allocates two small temporaries (`tmp_a` size `rank`, `tmp_b` size
+/// `out_features`); `rank` is typically 8–64 so the alloc cost is
+/// negligible relative to the two GEMVs. Phase 2 will revisit if the
+/// decode path shows churn overhead in practice.
+pub fn apply_lora_gemv_add(
+    ctx: &DeviceContext,
+    a: &DeviceMatrix,
+    b: &DeviceMatrix,
+    x: &DeviceVec,
+    y: &mut DeviceVec,
+) -> Result<()> {
+    assert_eq!(a.cols, x.len, "lora A cols {} != x len {}", a.cols, x.len);
+    assert_eq!(b.rows, y.len, "lora B rows {} != y len {}", b.rows, y.len);
+    assert_eq!(
+        a.rows, b.cols,
+        "lora rank mismatch: A rows {} != B cols {}",
+        a.rows, b.cols
+    );
+
+    let rank = a.rows;
+    let mut tmp_a = DeviceVec::zeros(ctx, rank)?;
+    gemv(ctx, a, x, &mut tmp_a)?;
+
+    let mut tmp_b = DeviceVec::zeros(ctx, b.rows)?;
+    gemv(ctx, b, &tmp_a, &mut tmp_b)?;
+
+    let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::add_cuda(
+            y_ptr as *const ffi::Half,
+            tmp_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            y.len as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Additive LoRA GEMM: `Y += B @ (A @ X)`, batched across `seq_len`.
+///
+/// Mirrors `apply_lora_gemv_add` for the prefill path. Shapes:
+///   * `a` — `[rank, in_features]`
+///   * `b` — `[out_features, rank]` (pre-scaled)
+///   * `x` — `HiddenStates [in_features, seq_len]`
+///   * `y` — `HiddenStates [out_features, seq_len]` (accumulated)
+///
+/// Allocates `tmp_a` of shape `[rank, seq_len]` and `tmp_b` of shape
+/// `[out_features, seq_len]`.
+pub fn apply_lora_gemm_add(
+    ctx: &DeviceContext,
+    a: &DeviceMatrix,
+    b: &DeviceMatrix,
+    x: &HiddenStates,
+    y: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        a.cols, x.hidden_dim,
+        "lora A cols {} != x hidden_dim {}",
+        a.cols, x.hidden_dim
+    );
+    assert_eq!(
+        b.rows, y.hidden_dim,
+        "lora B rows {} != y hidden_dim {}",
+        b.rows, y.hidden_dim
+    );
+    assert_eq!(
+        a.rows, b.cols,
+        "lora rank mismatch: A rows {} != B cols {}",
+        a.rows, b.cols
+    );
+    assert_eq!(
+        x.seq_len, y.seq_len,
+        "lora gemm seq_len mismatch: x {} != y {}",
+        x.seq_len, y.seq_len
+    );
+
+    let rank = a.rows;
+    let mut tmp_a = HiddenStates::zeros(ctx, rank, x.seq_len)?;
+    gemm_into(ctx, a, x, &mut tmp_a);
+
+    let mut tmp_b = HiddenStates::zeros(ctx, b.rows, x.seq_len)?;
+    gemm_into(ctx, b, &tmp_a, &mut tmp_b);
+
+    let n = y.hidden_dim * y.seq_len;
+    let (tmp_ptr, _gt) = tmp_b.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::add_cuda(
+            y_ptr as *const ffi::Half,
+            tmp_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            n as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Matrix-vector multiplication: y = A @ x
 /// A: (M, K) row-major, x: (K,), y: (M,)
 /// Supports BF16, W8A16, W4A16, and W2A16 weights.
