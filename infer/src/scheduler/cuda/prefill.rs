@@ -28,14 +28,19 @@ impl<M: ModelForward> Scheduler<M> {
         let cached_prompt_len = self.active[idx].reusable_cached_prompt_len;
 
         // Hybrid models (e.g. Qwen3.5) cannot truncate recurrent state to an
-        // arbitrary prefix length. Downgrade partial hits to MISS; only full
-        // hits benefit from snapshot/restore.
+        // arbitrary prefix length. Downgrade any partial hit (radix match
+        // shorter than prompt) to MISS — only full-prompt hits benefit from
+        // snapshot/restore. The previous `raw < cached` guard left a hole at
+        // exact-block-aligned prompts where `raw == cached < prompt_len` fell
+        // through to the `truncate_to + restore_prefix_snapshot` branch at
+        // line 99, which zeroes recurrent state and depends on the snapshot
+        // being valid. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
         let (effective, pool_prefix_len) = {
             let req = &mut self.active[idx];
             let state = &mut self.states[si];
 
             let prefix_len = if raw_prefix_len > 0
-                && raw_prefix_len < cached_prompt_len
+                && raw_prefix_len < prompt_len
                 && !state.supports_partial_prefix()
             {
                 0
