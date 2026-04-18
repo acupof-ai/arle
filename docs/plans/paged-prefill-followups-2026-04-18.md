@@ -139,7 +139,7 @@ future `BlockFingerprint` lookups.
     CUDA box, but needs CUDA E2E re-run before merge to confirm no
     regression in prefill KV reuse.
 
-**Landed 2026-04-19** (`commit pending push`):
+**Landed 2026-04-19** (commits `a497289` + `265caa3` + `b912990`, pushed):
 
 - `prefix_cache.rs:598` — replaced the unconditional `break` after
   edge split with: if the caller still has an aligned block's worth
@@ -149,19 +149,31 @@ future `BlockFingerprint` lookups.
   continue the outer loop. Path-from-root to the new node is
   `match_len + (block_size - match_len) = block_size`, so block-id
   alignment holds.
-- Three new tests in `prefix_cache::tests`:
+- Six new tests in `prefix_cache::tests`:
   `split_on_first_block_inserts_remaining_blocks_as_sibling`,
   `split_on_later_block_inserts_divergent_block_under_shared`,
-  `split_with_short_tail_still_registers_aligned_block`.
+  `split_with_short_tail_still_registers_aligned_block`,
+  `reinsert_after_split_does_not_reuse_first_block_id` (Codex round-1
+  regression — short-edge block-bearing node confused full-match walk
+  advancement; fix in `265caa3` keys advancement on `block_id.is_some()`
+  rather than edge length),
+  `split_mid_block_via_shared_intermediate_registers_tail_block`,
+  `else_branch_mid_block_via_shared_intermediate_registers_tail_block`
+  (Codex round-2 regressions — walks through non-block-bearing shared
+  intermediates leave `pos` mid-block while `block_idx` stays at the
+  current block; fix in `b912990` computes boundaries from
+  `(block_idx+1)*block_size` in both the split and else branches).
 - Two pre-existing tests (`evict_prunes_orphan_tombstones_into_free_list`,
   `insert_reuses_reclaimed_tombstone_slots`) updated — they were
   silently asserting the old drop-the-divergent-block behavior. New
   assertions use the now-correct tree shape with two sibling branches
   under the shared tombstone and 3-node tombstone cascade on evict(2).
-- 47/47 prefix_cache tests + 293/293 infer lib tests pass under
+- 50/50 prefix_cache tests + 296/296 infer lib tests pass under
   `--no-default-features --features no-cuda`. CI clippy surface
   (`cd infer && cargo clippy --no-default-features --features
-  no-cuda --lib -- -D warnings`) clean.
+  no-cuda --lib -- -D warnings`) clean. `codex review --commit b912990`
+  clean (third review pass — round-1 and round-2 caught real bugs,
+  round-3 found none).
 - CUDA E2E re-run deferred to user — this is a prefix-sharing
   correctness fix, so worst-case regression is the pre-fix state
   (missed sharing), not corruption.
