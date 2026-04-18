@@ -349,6 +349,12 @@ impl Qwen3Model {
         if b == 0 || c == 0 {
             return Ok(false);
         }
+        // The fused mixed prefill+decode path does not apply LoRA adapters
+        // yet. Refuse it when LoRA is attached so the scheduler falls back
+        // to separate prefill and decode which do apply LoRA.
+        if self.lora.is_some() {
+            return Ok(false);
+        }
         if paged_kv_pool.format != KVFormat::BF16 || c > MIXED_PREFILL_CAP {
             return Ok(false);
         }
@@ -756,12 +762,41 @@ impl Qwen3Model {
         debug_assert!(batch_size >= 1);
         debug_assert!(batch_size <= bufs.max_batch_size);
 
-        // LoRA fallback: the graph body allocates `apply_lora_gemm_add` temp
-        // buffers per call, which CUDA Graph capture rejects. Until we
-        // pre-allocate LoRA scratch in `BatchDecodeBuffers` (phase 2+),
-        // route LoRA-attached decode through the contiguous per-slot path.
+        // LoRA path: keep the paged KV pool, but run eagerly (no graph
+        // capture) with split QKV and split gate/up GEMMs so adapters can
+        // be applied. `apply_lora_{gemv,gemm}_add` allocates small temp
+        // DeviceVecs which CUDA Graph capture rejects.
         if self.lora.is_some() {
-            return self.decode_batch_contiguous(tokens, states, slot_indices);
+            if matches!(paged_kv_pool.format, KVFormat::INT8 | KVFormat::FP8E4M3) {
+                let packed = paged_kv_pool.build_quantized_decode_indptr(slot_indices);
+                self.ctx
+                    .stream
+                    .memcpy_htod(&packed, &mut bufs.quantized_kv_meta)
+                    .map_err(|e| anyhow::anyhow!("H2D quantized_kv_meta: {e}"))?;
+            }
+            bufs.embedding_out.seq_len = batch_size;
+            if bufs.logits_batch.is_none() {
+                let vocab_size = self.output_projection().rows;
+                bufs.logits_batch = Some(HiddenStates::zeros(
+                    &self.ctx,
+                    vocab_size,
+                    bufs.max_batch_size,
+                )?);
+            }
+            self.decode_batch_lora_body(bufs, paged_kv_pool, batch_size)?;
+            if !skip_logit_scatter {
+                let logits = bufs.logits_batch.as_ref().unwrap();
+                for (b, &si) in slot_indices.iter().enumerate() {
+                    ops::extract_vec_into(
+                        &self.ctx,
+                        logits,
+                        b,
+                        &mut states[si].decode_bufs.logits,
+                    )?;
+                    states[si].base.prefill_logits = None;
+                }
+            }
+            return Ok(());
         }
 
         // NOTE: set_batch_size, upload_token_ids, update_metadata, and
@@ -836,6 +871,347 @@ impl Qwen3Model {
                 ops::extract_vec_into(&self.ctx, logits, b, &mut states[si].decode_bufs.logits)?;
                 states[si].base.prefill_logits = None;
             }
+        }
+
+        Ok(())
+    }
+
+    /// LoRA-aware batched decode body. Runs eagerly (no CUDA graph capture)
+    /// because `apply_lora_{gemv,gemm}_add` allocates per-call temps that
+    /// stream capture rejects. Forces the split-QKV + split gate/up layout
+    /// so per-projection LoRA adds can hit the right tensors.
+    fn decode_batch_lora_body(
+        &self,
+        bufs: &mut BatchDecodeBuffers,
+        kv_pool: &PagedKVPool,
+        batch_size: usize,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.token_ids_gpu,
+            &mut bufs.embedding_out,
+        )?;
+
+        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let hidden = unsafe { &mut *hidden_ptr };
+            let skip_input_norm = layer_idx > 0;
+            let next_input_norm = self
+                .layers
+                .get(layer_idx + 1)
+                .map(|next_layer| &next_layer.input_layernorm);
+            self.decode_batch_layer_inner_lora(
+                layer_idx,
+                layer,
+                hidden,
+                bufs,
+                kv_pool,
+                skip_input_norm,
+                next_input_norm,
+            )?;
+        }
+
+        let hidden = unsafe { &*hidden_ptr };
+        ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut bufs.normed);
+        let logits_buf = bufs.logits_batch.as_mut().unwrap();
+        logits_buf.seq_len = batch_size;
+        ops::gemm_into(
+            &self.ctx,
+            self.output_projection(),
+            &bufs.normed,
+            logits_buf,
+        );
+        Ok(())
+    }
+
+    /// LoRA-aware per-layer batched decode. Matches `decode_batch_layer_inner`
+    /// but always uses the split-QKV path (separate q/k/v gemms +
+    /// `decode_prep_paged`) and the split-gate/up MLP path so LoRA adds can
+    /// be injected between base projections and downstream ops.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_layer_inner_lora(
+        &self,
+        layer_idx: usize,
+        layer: &TransformerBlock,
+        hidden: &mut HiddenStates,
+        bufs: &mut BatchDecodeBuffers,
+        kv_pool: &PagedKVPool,
+        skip_input_norm: bool,
+        next_input_norm: Option<&DeviceVec>,
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let page_size = kv_pool.page_size;
+
+        if !skip_input_norm {
+            ops::rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            );
+        }
+
+        // Split QKV projections so LoRA adds can compose.
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.q_proj,
+            &bufs.normed,
+            &mut bufs.q_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.k_proj,
+            &bufs.normed,
+            &mut bufs.k_batch,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.v_proj,
+            &bufs.normed,
+            &mut bufs.v_batch,
+        );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.q_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
+            }
+            if let Some(ad) = ll.k_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.k_batch)?;
+            }
+            if let Some(ad) = ll.v_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.v_batch)?;
+            }
+        }
+
+        let nrp = ops::NormRopeParams {
+            q_norm: &layer.attention.q_norm,
+            k_norm: &layer.attention.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
+        let paged = ops::PagedKVMeta {
+            kv_pool,
+            layer_idx,
+            kv_indices: &bufs.metadata.kv_indices,
+            kv_indptr: &bufs.metadata.kv_indptr,
+            kv_last_page_len: &bufs.metadata.kv_last_page_len,
+            page_size,
+        };
+        ops::decode_prep_paged(
+            &self.ctx,
+            &mut bufs.q_batch,
+            &bufs.k_batch,
+            &bufs.v_batch,
+            &nrp,
+            &bufs.metadata.positions,
+            &paged,
+            num_heads,
+            num_kv_heads,
+        )?;
+
+        // Attention: reuse the non-LoRA attention dispatch by format.
+        {
+            let batch_size = bufs.q_batch.seq_len;
+            let stream = &self.ctx.stream;
+            match kv_pool.format {
+                KVFormat::FP8E4M3 => {
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_fp8(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_fp8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.quantized_kv_meta,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::INT8 => {
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.k_work_ptr(stream),
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    kv_quant::quantize_paged_kv_single(
+                        &self.ctx,
+                        kv_pool.v_work_ptr(stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.last_token_indices,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        batch_size,
+                    )?;
+                    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+                    kv_quant::decode_attention_int8(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        kv_pool.k_data_ptr(layer_idx, stream),
+                        kv_pool.v_data_ptr(layer_idx, stream),
+                        kv_pool.k_scales_ptr(layer_idx, stream),
+                        kv_pool.v_scales_ptr(layer_idx, stream),
+                        &bufs.metadata.kv_indices,
+                        &bufs.quantized_kv_meta,
+                        &mut bufs.attn_output,
+                        batch_size,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        kv_pool.kv_dim,
+                        sm_scale,
+                        kv_pool.int8_attn_workspace.as_ref().unwrap(),
+                        kv_pool.int8_attn_workspace_bytes,
+                    )?;
+                }
+                KVFormat::BF16 => {
+                    ops::flashinfer_tc_run_layer(
+                        &self.ctx,
+                        &bufs.q_batch,
+                        &bufs.metadata.qo_indptr,
+                        kv_pool,
+                        layer_idx,
+                        &bufs.metadata.kv_indptr,
+                        &bufs.metadata.kv_indices,
+                        &bufs.metadata.kv_last_page_len,
+                        &mut bufs.attn_output,
+                        &mut bufs.metadata.flashinfer_ws,
+                        num_heads,
+                        num_kv_heads,
+                        page_size,
+                        head_dim,
+                    )?;
+                }
+                KVFormat::TurboQuant { .. } => {
+                    anyhow::bail!(
+                        "LoRA + TurboQuant KV cache not supported — refuse earlier at load time"
+                    );
+                }
+            }
+        }
+
+        // O projection + LoRA.
+        ops::gemm_into(
+            &self.ctx,
+            &layer.attention.o_proj,
+            &bufs.attn_output,
+            &mut bufs.o_buf,
+        );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.o_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.attn_output,
+                    &mut bufs.o_buf,
+                )?;
+            }
+        }
+
+        ops::fused_add_rms_norm_batch_into(
+            &self.ctx,
+            hidden,
+            &bufs.o_buf,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut bufs.normed,
+        );
+
+        // Split gate + up MLP + LoRA + silu_mul + down + LoRA.
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.gate_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+        );
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.gate_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                )?;
+            }
+            if let Some(ad) = ll.up_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
+            }
+        }
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        ops::gemm_into(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.o_buf,
+        );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.down_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
+            }
+        }
+
+        if let Some(next_input_norm) = next_input_norm {
+            ops::fused_add_rms_norm_batch_into(
+                &self.ctx,
+                hidden,
+                &bufs.o_buf,
+                next_input_norm,
+                eps,
+                &mut bufs.normed,
+            );
+        } else {
+            ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            std::mem::swap(hidden, &mut bufs.hidden_out);
         }
 
         Ok(())
