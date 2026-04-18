@@ -52,8 +52,6 @@ pub struct BatchDecodeBuffers {
     embedding_out: HiddenStates,
     /// Batched logits buffer [max_batch_size, vocab_size] — avoids alloc in graph.
     pub(super) logits_batch: Option<HiddenStates>,
-    /// Pre-allocated per-slot logits buffers (unused, kept for future non-greedy).
-    logits_per_slot: Vec<DeviceVec>,
     /// Pre-allocated batch argmax output [max_batch_size] i32.
     pub(super) argmax_out: CudaSlice<i32>,
     /// Pre-allocated host buffer for batched argmax readback.
@@ -200,7 +198,6 @@ impl BatchDecodeBuffers {
 
             embedding_out: HiddenStates::zeros(ctx, hidden_dim, max_batch_size)?,
             logits_batch: None, // lazy-allocated on first use (needs vocab_size)
-            logits_per_slot: Vec::new(),
             argmax_out: ctx
                 .stream
                 .alloc_zeros(max_batch_size)

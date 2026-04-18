@@ -72,10 +72,6 @@ impl KVCache {
         }
     }
 
-    pub(crate) fn dtype(&self) -> KVCacheDtype {
-        self.dtype
-    }
-
     /// Set the maximum contiguous sequence length.
     /// Must be called before `init_if_needed()`.
     pub(crate) fn set_max_seq_len(&mut self, max_seq: usize) {
