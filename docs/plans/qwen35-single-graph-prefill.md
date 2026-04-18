@@ -1,5 +1,12 @@
 # Qwen3.5 full-forward CUDA Graph prefill — Plan
 
+> **Superseded (2026-04-17):** re-sequenced under
+> [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md) §Phase 5. Requires
+> the Phase 1 paged-prefill migration first; capturing the full forward over
+> contiguous-KV buffers was blocking on the same 512-token cap this master
+> plan removes. Keep this doc for the graph-capture design detail; ordering
+> and acceptance move to the master plan.
+
 ## Status
 
 Active plan as of 2026-04-17. Targets the ~46% peak-throughput gap and
