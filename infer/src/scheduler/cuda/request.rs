@@ -83,9 +83,8 @@ impl ActiveRequest {
 
         let overlap = 4;
         let safe_point = self.decoded_token_count.saturating_sub(overlap);
-        let new_text = match tokenizer.decode(&self.generated_tokens[safe_point..]) {
-            Ok(t) => t,
-            Err(_) => return,
+        let Ok(new_text) = tokenizer.decode(&self.generated_tokens[safe_point..]) else {
+            return;
         };
 
         if safe_point > 0 {

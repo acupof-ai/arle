@@ -123,9 +123,8 @@ impl RecurrentState {
     /// Called on full prefix cache hit to revert decode-token contamination.
     /// The live state is overwritten with the clean post-prefill snapshot.
     pub(crate) fn restore_snapshot(&mut self, ctx: &DeviceContext) -> Result<bool> {
-        let snap = match &self.snapshot {
-            Some(s) => s,
-            None => return Ok(false),
+        let Some(snap) = &self.snapshot else {
+            return Ok(false);
         };
         for (i, snap_layer) in snap.layers.iter().enumerate() {
             ctx.stream

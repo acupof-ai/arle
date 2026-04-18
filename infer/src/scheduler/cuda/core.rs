@@ -1189,10 +1189,10 @@ impl<M: ModelForward> Drop for Scheduler<M> {
         // sufficient to unwedge `run_once`; we do both for safety.
         let (dummy_coord, dummy_handle, dummy_events) = crate::kv_tier::Coordinator::new(1);
         drop(dummy_coord);
-        let _old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
-        let _old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);
-        drop(_old_handle);
-        drop(_old_events);
+        let old_handle = std::mem::replace(&mut self.coordinator_handle, dummy_handle);
+        let old_events = std::mem::replace(&mut self.coordinator_events, dummy_events);
+        drop(old_handle);
+        drop(old_events);
         if let Some(thread) = self.coordinator_thread.take() {
             match thread.join() {
                 Ok(Ok(())) => {}

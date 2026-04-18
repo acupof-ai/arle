@@ -123,7 +123,7 @@ impl Config {
                 // GLM-4 commonly uses token 151329 (<|endoftext|>) and
                 // 151336 (<|user|>) / 151338 (<|assistant|>) as stop tokens.
                 // Without generation_config.json, default to the standard EOS.
-                Ok(vec![151329, 151336, 151338])
+                Ok(vec![151_329, 151_336, 151_338])
             }
             Err(err) => Err(err.into()),
         }

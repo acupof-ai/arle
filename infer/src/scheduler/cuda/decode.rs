@@ -529,9 +529,8 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn step_decode_readback(&mut self) {
-        let pending = match self.pending_decode.take() {
-            Some(pending) => pending,
-            None => return,
+        let Some(pending) = self.pending_decode.take() else {
+            return;
         };
         let decode_ctx = self.decode_bufs.as_mut().unwrap();
 
