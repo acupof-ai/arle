@@ -1,5 +1,11 @@
 # FlashInfer planned-prefill — Plan
 
+> **Superseded (2026-04-17):** the shared `BatchPrefillPagedPlan` landed in
+> `infer/src/model/qwen3/prefill.rs` already realizes the plan-reuse win this
+> doc proposed (one Plan() per model, not per forward). Any further
+> planned-prefill work is tracked under
+> [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md) §Phase 5.
+
 ## Status
 
 Active plan as of 2026-04-17. Targets the 100ms single-request-TTFT gap
