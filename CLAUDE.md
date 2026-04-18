@@ -95,6 +95,12 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
 
 ### Benchmarks
 
+- **Spec — always read first:**
+  [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md) — mandatory
+  report sections (Goal · Hypothesis · Params · Env · Results · Problems ·
+  Learnings), goal taxonomy, watch-list during runs, and **auto-iteration
+  rules** (§7: when to loop, when to stop, information-volume triggers).
+  Applies to both benchmarks and traces.
 - Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
   using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
