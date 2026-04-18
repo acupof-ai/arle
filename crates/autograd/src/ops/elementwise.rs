@@ -6,19 +6,22 @@ use crate::{
     tensor::{GpuTensor, TensorId, TensorStore},
 };
 
-pub fn add(
-    a: TensorId,
-    b: TensorId,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
+pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let (a_data, a_shape, a_requires_grad) = {
         let tensor = store.tensor(a)?;
-        (tensor.data.clone(), tensor.shape.clone(), tensor.requires_grad)
+        (
+            tensor.data.clone(),
+            tensor.shape.clone(),
+            tensor.requires_grad,
+        )
     };
     let (b_data, b_shape, b_requires_grad) = {
         let tensor = store.tensor(b)?;
-        (tensor.data.clone(), tensor.shape.clone(), tensor.requires_grad)
+        (
+            tensor.data.clone(),
+            tensor.shape.clone(),
+            tensor.requires_grad,
+        )
     };
     if a_shape != b_shape {
         return Err(AutogradError::ShapeMismatch {
@@ -47,19 +50,22 @@ pub fn add(
     Ok(output_id)
 }
 
-pub fn mul(
-    a: TensorId,
-    b: TensorId,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
+pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let (a_data, a_shape, a_requires_grad) = {
         let tensor = store.tensor(a)?;
-        (tensor.data.clone(), tensor.shape.clone(), tensor.requires_grad)
+        (
+            tensor.data.clone(),
+            tensor.shape.clone(),
+            tensor.requires_grad,
+        )
     };
     let (b_data, b_shape, b_requires_grad) = {
         let tensor = store.tensor(b)?;
-        (tensor.data.clone(), tensor.shape.clone(), tensor.requires_grad)
+        (
+            tensor.data.clone(),
+            tensor.shape.clone(),
+            tensor.requires_grad,
+        )
     };
     if a_shape != b_shape {
         return Err(AutogradError::ShapeMismatch {
@@ -96,7 +102,11 @@ pub fn mul_scalar(
 ) -> Result<TensorId> {
     let (input_data, input_shape, requires_grad) = {
         let tensor = store.tensor(a)?;
-        (tensor.data.clone(), tensor.shape.clone(), tensor.requires_grad)
+        (
+            tensor.data.clone(),
+            tensor.shape.clone(),
+            tensor.requires_grad,
+        )
     };
 
     let data = input_data.iter().map(|value| value * k).collect();
@@ -144,7 +154,9 @@ pub(crate) fn mul_backward(
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
     let SavedContext::Tensors(saved) = &entry.saved else {
-        return Err(AutogradError::TapeInvariant("mul backward missing saved tensors"));
+        return Err(AutogradError::TapeInvariant(
+            "mul backward missing saved tensors",
+        ));
     };
     let a = *saved
         .first()
