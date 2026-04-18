@@ -765,6 +765,25 @@ mod tests {
         .expect("tape replay")
     }
 
+    fn tape_replay_varlen_raw(
+        tape: &MlxArray,
+        k: &MlxArray,
+        g: &MlxArray,
+        state_in: &MlxArray,
+        steps: &MlxArray,
+    ) -> MlxArray {
+        unsafe {
+            MlxArray::from_raw_checked(mlx_sys::mlx_tape_replay_varlen(
+                tape.as_raw(),
+                k.as_raw(),
+                g.as_raw(),
+                state_in.as_raw(),
+                steps.as_raw(),
+            ))
+        }
+        .expect("tape replay varlen")
+    }
+
     fn make_gdr_test_inputs() -> (MlxArray, MlxArray, MlxArray, MlxArray, MlxArray, MlxArray) {
         use crate::backend::metal::mlx::{Dtype, as_dtype};
 
@@ -990,6 +1009,86 @@ mod tests {
             diff < 1e-5,
             "tape replay drifted from reference fp32 state update by {diff}"
         );
+    }
+
+    #[test]
+    fn test_tape_replay_varlen_matches_scalar() {
+        let _guard = metal_test_guard();
+        use crate::backend::metal::mlx::{Dtype, as_dtype, eval, slice};
+
+        const B: i32 = 3;
+        const T_PADDED: i32 = 3;
+        const DK: i32 = 32;
+        const DV: i32 = 4;
+
+        let tape_data: Vec<f32> = (0..(B * T_PADDED * DV) as usize)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.031)
+            .collect();
+        let k_data: Vec<f32> = (0..(B * T_PADDED * DK) as usize)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.027)
+            .collect();
+        let g_data: Vec<f32> = (0..(B * T_PADDED) as usize)
+            .map(|i| 0.55 + (i % 7) as f32 * 0.05)
+            .collect();
+        let state_data: Vec<f32> = (0..(B * DV * DK) as usize)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.02)
+            .collect();
+        let steps_data = [1, 2, 3];
+
+        let tape = as_dtype(
+            &MlxArray::from_slice_f32(&tape_data, &[B, T_PADDED, 1, DV]),
+            Dtype::Bfloat16,
+        );
+        let k = as_dtype(
+            &MlxArray::from_slice_f32(&k_data, &[B, T_PADDED, 1, DK]),
+            Dtype::Bfloat16,
+        );
+        let g = as_dtype(
+            &MlxArray::from_slice_f32(&g_data, &[B, T_PADDED, 1]),
+            Dtype::Bfloat16,
+        );
+        let state_in = MlxArray::from_slice_f32(&state_data, &[B, 1, DV, DK]);
+        let steps = MlxArray::from_slice_i32(&steps_data, &[B]);
+
+        let replayed_varlen = tape_replay_varlen_raw(&tape, &k, &g, &state_in, &steps);
+
+        for (row_idx, &step_count) in steps_data.iter().enumerate() {
+            let row = row_idx as i32;
+            let tape_prefix = slice(
+                &tape,
+                &[row, 0, 0, 0],
+                &[row + 1, step_count, 1, DV],
+                &[1, 1, 1, 1],
+            );
+            let k_prefix = slice(
+                &k,
+                &[row, 0, 0, 0],
+                &[row + 1, step_count, 1, DK],
+                &[1, 1, 1, 1],
+            );
+            let g_prefix = slice(&g, &[row, 0, 0], &[row + 1, step_count, 1], &[1, 1, 1]);
+            let state_row = slice(
+                &state_in,
+                &[row, 0, 0, 0],
+                &[row + 1, 1, DV, DK],
+                &[1, 1, 1, 1],
+            );
+            let expected =
+                tape_replay_raw(&tape_prefix, &k_prefix, &g_prefix, &state_row, step_count);
+            let actual = slice(
+                &replayed_varlen,
+                &[row, 0, 0, 0],
+                &[row + 1, 1, DV, DK],
+                &[1, 1, 1, 1],
+            );
+
+            eval(&[&expected, &actual]);
+            let diff = max_abs_diff(actual.as_slice_f32(), expected.as_slice_f32());
+            assert!(
+                diff < 1e-5,
+                "varlen tape replay row {row_idx} drifted from scalar replay by {diff}"
+            );
+        }
     }
 
     // ── Numerical tests ─────────────────────────────────────────────────────

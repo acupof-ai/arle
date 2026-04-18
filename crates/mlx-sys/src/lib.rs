@@ -601,6 +601,13 @@ unsafe extern "C" {
         state_in: *mut mlx_array,
         steps: i32,
     ) -> *mut mlx_array;
+    pub fn mlx_tape_replay_varlen(
+        tape: *mut mlx_array,
+        k: *mut mlx_array,
+        g: *mut mlx_array,
+        state_in: *mut mlx_array,
+        steps: *mut mlx_array,
+    ) -> *mut mlx_array;
     pub fn mlx_batched_sdpa_2pass(
         queries: *mut mlx_array,
         keys: *mut mlx_array,

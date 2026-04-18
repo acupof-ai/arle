@@ -151,6 +151,67 @@ auto& tape_replay_kernel() {
     return kernel;
 }
 
+auto& tape_replay_varlen_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "tape_replay_varlen",
+        {"tape", "k", "g", "state_in", "steps", "T", "B"},
+        {"state_out"},
+        R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        if (b_idx >= B) {
+          return;
+        }
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        auto T_b = steps[b_idx];
+        constexpr int n_per_t = Dk / 32;
+
+        // tape: [B, T, Hv, Dv]
+        auto tape_ = tape + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        // k: [B, T, Hk, Dk]
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+
+        for (int t = 0; t < T_b; ++t) {
+          auto delta = static_cast<float>(tape_[dv_idx]);
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            state[i] = state[i] + k_[s_idx] * delta;
+          }
+          tape_ += Hv * Dv;
+          k_ += Hk * Dk;
+          g_ += Hv;
+        }
+
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
 auto& batched_sdpa_2pass_partials_kernel() {
     static auto kernel = fast::metal_kernel(
         "batched_sdpa_2pass_partials",
@@ -775,6 +836,71 @@ mlx_array* mlx_tape_replay(
         };
 
         auto result = tape_replay_kernel()(
+            inputs, out_shapes, out_dtypes,
+            std::make_tuple(32, Dv, B * Hv),
+            std::make_tuple(32, 4, 1),
+            tmpl,
+            std::nullopt,
+            false,
+            {});
+
+        return from_arr(std::move(result[0]));
+    }());
+}
+
+mlx_array* mlx_tape_replay_varlen(
+    mlx_array* tape, mlx_array* k, mlx_array* g, mlx_array* state_in, mlx_array* steps_arr) {
+    MLX_TRY_RETURN([&]() {
+        auto tape_arr = contiguous(*to_arr(tape));
+        auto k_arr = contiguous(*to_arr(k));
+        auto g_arr = contiguous(*to_arr(g));
+        auto state_arr = contiguous(*to_arr(state_in));
+        auto steps = contiguous(*to_arr(steps_arr));
+
+        require_rank(tape_arr, 4, "tape");
+        require_rank(k_arr, 4, "k");
+        require_rank(g_arr, 3, "g");
+        require_rank(state_arr, 4, "state_in");
+        require_rank(steps, 1, "steps");
+        require_dtype(tape_arr, bfloat16, "tape");
+        require_dtype(k_arr, bfloat16, "k");
+        require_dtype(g_arr, bfloat16, "g");
+        require_dtype(state_arr, float32, "state_in");
+        require_dtype(steps, int32, "steps");
+
+        int B = tape_arr.shape(0);
+        int T_padded = tape_arr.shape(1);
+        int Hv = tape_arr.shape(2);
+        int Dv = tape_arr.shape(3);
+        int Hk = k_arr.shape(2);
+        int Dk = k_arr.shape(3);
+
+        if (T_padded != k_arr.shape(1) || T_padded != g_arr.shape(1)) {
+            throw std::invalid_argument("mlx_tape_replay_varlen got mismatched step counts");
+        }
+        if (B != k_arr.shape(0) || B != g_arr.shape(0) || B != state_arr.shape(0) || B != steps.shape(0)) {
+            throw std::invalid_argument("mlx_tape_replay_varlen got mismatched batch dimensions");
+        }
+        if (Hv != g_arr.shape(2) || Hv != state_arr.shape(1) || Dv != state_arr.shape(2) || Dk != state_arr.shape(3)) {
+            throw std::invalid_argument("mlx_tape_replay_varlen got mismatched tape/state shapes");
+        }
+        if (Hk <= 0 || Dk < 32 || (Dk % 32) != 0 || (Hv % Hk) != 0) {
+            throw std::invalid_argument("mlx_tape_replay_varlen requires Dk multiple of 32 and Hv divisible by Hk");
+        }
+
+        std::vector<array> inputs = {tape_arr, k_arr, g_arr, state_arr, steps, array(T_padded), array(B)};
+        std::vector<Shape> out_shapes = {state_arr.shape()};
+        std::vector<Dtype> out_dtypes = {float32};
+        std::vector<std::pair<std::string, fast::TemplateArg>> tmpl = {
+            {"Dk", fast::TemplateArg(Dk)},
+            {"Dv", fast::TemplateArg(Dv)},
+            {"Hk", fast::TemplateArg(Hk)},
+            {"Hv", fast::TemplateArg(Hv)},
+            {"InT", fast::TemplateArg(bfloat16)},
+            {"StT", fast::TemplateArg(float32)},
+        };
+
+        auto result = tape_replay_varlen_kernel()(
             inputs, out_shapes, out_dtypes,
             std::make_tuple(32, Dv, B * Hv),
             std::make_tuple(32, 4, 1),
