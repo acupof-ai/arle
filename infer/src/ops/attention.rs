@@ -39,6 +39,15 @@ pub(crate) struct HeadConfig {
     pub head_dim: usize,
 }
 
+/// FlashInfer paged-decode head configuration (HD128, HD256, tensor-core prefill).
+/// Groups the 4-tuple shared by every `flashinfer_*_run_layer` wrapper.
+pub struct FlashInferHeadConfig {
+    pub num_qo_heads: usize,
+    pub num_kv_heads: usize,
+    pub page_size: usize,
+    pub head_dim: usize,
+}
+
 /// Paged KV metadata for batched decode.
 pub(crate) struct PagedKVMeta<'a> {
     pub kv_pool: &'a PagedKVPool,
@@ -1141,7 +1150,6 @@ pub(crate) fn decode_prep_paged_fused_qkv(
 }
 
 /// FlashInfer run step only (GPU kernel). Call once per layer after a single plan call.
-#[allow(clippy::too_many_arguments)]
 pub fn flashinfer_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1152,13 +1160,10 @@ pub fn flashinfer_run_layer(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1186,10 +1191,10 @@ pub fn flashinfer_run_layer(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
+            heads.head_dim as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )
@@ -1204,7 +1209,6 @@ pub fn flashinfer_run_layer(
 }
 
 /// FlashInfer tensor-core run step only (GPU kernel). Call once per layer after a single plan call.
-#[allow(clippy::too_many_arguments)]
 pub fn flashinfer_tc_run_layer(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1216,13 +1220,10 @@ pub fn flashinfer_tc_run_layer(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1252,9 +1253,9 @@ pub fn flashinfer_tc_run_layer(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )
@@ -1368,7 +1369,6 @@ pub(crate) fn attention_gate_paged_hd256(
 }
 
 /// FlashInfer HD256 run-layer: uses the pre-computed plan to run attention for one layer.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn flashinfer_run_layer_hd256(
     ctx: &DeviceContext,
     q_batch: &HiddenStates,
@@ -1379,13 +1379,10 @@ pub(crate) fn flashinfer_run_layer_hd256(
     kv_last_page_len_gpu: &CudaSlice<i32>,
     output: &mut HiddenStates,
     workspace: &mut FlashInferWorkspace,
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    page_size: usize,
-    head_dim: usize,
+    heads: &FlashInferHeadConfig,
 ) -> Result<()> {
     let batch_size = q_batch.seq_len;
-    let sm_scale = 1.0 / (head_dim as f32).sqrt();
+    let sm_scale = 1.0 / (heads.head_dim as f32).sqrt();
 
     let (fw_ptr, _gfw) = workspace.float_workspace.device_ptr_mut(&ctx.stream);
     let (iw_ptr, _giw) = workspace.int_workspace.device_ptr_mut(&ctx.stream);
@@ -1413,10 +1410,10 @@ pub(crate) fn flashinfer_run_layer_hd256(
             o_ptr as *mut ffi::Half,
             lse_ptr as *mut f32,
             batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            page_size as i32,
-            head_dim as i32,
+            heads.num_qo_heads as i32,
+            heads.num_kv_heads as i32,
+            heads.page_size as i32,
+            heads.head_dim as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )

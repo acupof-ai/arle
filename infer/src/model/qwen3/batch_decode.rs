@@ -1118,10 +1118,12 @@ impl Qwen3Model {
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn_output,
                         &mut bufs.metadata.flashinfer_ws,
-                        num_heads,
-                        num_kv_heads,
-                        page_size,
-                        head_dim,
+                        &ops::FlashInferHeadConfig {
+                            num_qo_heads: num_heads,
+                            num_kv_heads,
+                            page_size,
+                            head_dim,
+                        },
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
@@ -1521,10 +1523,12 @@ impl Qwen3Model {
                         &bufs.metadata.kv_last_page_len,
                         &mut bufs.attn_output,
                         &mut bufs.metadata.flashinfer_ws,
-                        num_heads,
-                        num_kv_heads,
-                        page_size,
-                        head_dim,
+                        &ops::FlashInferHeadConfig {
+                            num_qo_heads: num_heads,
+                            num_kv_heads,
+                            page_size,
+                            head_dim,
+                        },
                     )?;
                 }
                 KVFormat::TurboQuant { .. } => {
