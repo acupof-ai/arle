@@ -932,6 +932,10 @@ impl<M: ModelForward> Scheduler<M> {
         if !self.paged_kv_pool.is_active() {
             return;
         }
+        if !self.model.supports_cuda_graph_decode() {
+            info!("CUDA Graph warmup skipped: model runs eager decode (e.g. LoRA)");
+            return;
+        }
 
         let max_bs = num_slots.min(256);
         let warmup_sizes = Self::cuda_graph_batch_sizes(max_bs);
