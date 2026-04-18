@@ -1319,16 +1319,16 @@ mod tests {
 
         let created_pos = payload
             .find("event: response.created")
-            .expect(&format!("missing created event: {payload}"));
+            .unwrap_or_else(|| panic!("missing created event: {payload}"));
         let delta_pos = payload
             .find("event: response.output_text.delta")
-            .expect(&format!("missing delta event: {payload}"));
+            .unwrap_or_else(|| panic!("missing delta event: {payload}"));
         let completed_pos = payload
             .find("event: response.completed")
-            .expect(&format!("missing completed event: {payload}"));
+            .unwrap_or_else(|| panic!("missing completed event: {payload}"));
         let done_pos = payload
             .find("[DONE]")
-            .expect(&format!("missing terminal done event: {payload}"));
+            .unwrap_or_else(|| panic!("missing terminal done event: {payload}"));
 
         assert!(
             created_pos < delta_pos && delta_pos < completed_pos && completed_pos < done_pos,

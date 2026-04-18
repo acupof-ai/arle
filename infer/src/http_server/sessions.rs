@@ -473,7 +473,7 @@ mod tests {
     }
 
     impl InferenceEngine for MockEngine {
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "mock-engine"
         }
 

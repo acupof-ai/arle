@@ -1193,7 +1193,7 @@ mod tests {
 
         // Access the second sequence to make it more recently used.
         let _ = cache.lookup(&[5, 6, 7, 8]);
-        let _ = cache.release(&bids(&[20])); // release so ref_count drops
+        let () = cache.release(&bids(&[20])); // release so ref_count drops
 
         // After insert, ref_count is 0 by default.
         // First lookup incremented ref on block 10. Release it.
