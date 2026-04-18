@@ -60,7 +60,16 @@ extern "C" int flashinfer_batch_prefill_paged_hd128_plan(
         HEAD_DIM,
         HEAD_DIM,
         static_cast<uint32_t>(page_size),
-        /*enable_cuda_graph=*/true,
+        // We do not CUDA-graph-capture the prefill path (only decode is
+        // captured), so pass false here. This is what sglang does in its
+        // normal-execution wrapper construction. Keeping it true inflates
+        // FlashInfer's `padded_batch_size` from `new_batch_size`
+        // (~total_num_tiles_q) up to `max(max_batch_size_if_split,
+        // total_num_tiles_q)`, which for L4+10 slots blew past the
+        // 512 MiB float_workspace on `batch_prefill_tmp_v` alone. With
+        // `enable_cuda_graph=false`, padded_batch_size tracks the real
+        // workload and ~128 MiB is sufficient.
+        /*enable_cuda_graph=*/false,
         /*sizeof_dtype_o=*/static_cast<uint32_t>(sizeof(DType)),
         /*window_left=*/-1,
         /*fixed_split_size=*/-1,

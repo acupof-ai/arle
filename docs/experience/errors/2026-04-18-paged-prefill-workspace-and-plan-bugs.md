@@ -67,8 +67,54 @@ classifies the hit as MISS and does a full recompute, but the paged-pool
 seq_len from the prior request carries forward and the next
 `alloc_pool_tokens_with_retry` hits the poisoned state. Reverting
 `prefill_uses_paged_pool() → false` for Qwen3.5 sidesteps this until the
-scheduler change lands. Qwen3 tested OK on isolated requests but was not
-confirmed clean under the full sweep.
+scheduler change lands.
+
+### 5th issue — `enable_cuda_graph=true` inflates FlashInfer workspace
+
+Confirmed via FlashInfer source (`scheduler.cuh`): `PrefillPlan` picks
+`padded_batch_size = new_batch_size` when `enable_cuda_graph=false`,
+but `max(max_batch_size_if_split, total_num_tiles_q)` when true —
+the latter is meant for CUDA-graph-captured prefill where the shape
+must be stable across invocations. We never graph-capture prefill
+(only decode), so keeping the flag `true` was blowing
+`batch_prefill_tmp_v = num_qo_heads × padded_batch_size × cta_tile_q × head_dim × sizeof(float)`
+past the 512 MiB workspace.
+
+**Fix:** flip `enable_cuda_graph=true` → `false` in both
+`flashinfer_prefill_paged{,_hd256}.cu` plan calls. This is what
+sglang does in its non-graph wrappers
+([sglang/flashinfer_backend.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/layers/attention)).
+
+With that flip in, a single-request paged prefill on a 4096-token
+prompt completes cleanly and the HD128 workspace can go back to
+the 256 MiB default.
+
+### 6th issue — concurrent paged prefill still poisons the CUDA context
+
+With fixes 1–5 applied, Qwen3 paged prefill works for sequential
+requests (3× 4096-token `/v1/completions` calls in a row succeed)
+but the guidellm sweep's concurrent 10-slot load crashes the
+scheduler thread on the very first batch:
+
+```
+thread '<unnamed>' panicked at infer/src/ops/linear.rs:513:14:
+gemm_cuda failed: DriverError(CUDA_ERROR_UNKNOWN, "unknown error")
+```
+
+`CUDA_ERROR_UNKNOWN` inside `gemm_cuda` on the scheduler thread means
+the CUDA context is already poisoned by an earlier operation —
+classic OOB-from-a-prior-kernel symptom. Candidates for that OOB:
+
+- Paged-prep kernel reads past the `slot_page_indices` buffer when
+  `page_indices(slot).len()` > `num_pages` (residual pages from pool
+  reuse), and the stale tail page IDs point into unmapped regions.
+- Page-table H2D upload (`clone_htod`) has an async-drop / reuse
+  race we haven't ruled out at the Rust side.
+- cuBLAS workspace pressure in the next GEMM call (less likely —
+  memory fraction is well under budget).
+
+This is what keeps both Qwen3 and Qwen3.5 on the contiguous path for
+now. Tracking as Phase 1C.
 
 ## Fixes
 

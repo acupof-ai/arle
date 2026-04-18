@@ -139,17 +139,13 @@ pub struct BatchPrefillPagedPlan {
 }
 
 impl BatchPrefillPagedPlan {
-    /// HD128 paged prefill plan. Uses 512 MiB float workspace — the 256 MiB
-    /// default overflows `batch_prefill_tmp_s` under concurrent-sweep
-    /// load (observed 2026-04-18 on L4 with 10-slot Qwen3-4B).
+    /// HD128 paged prefill plan. Uses the default 256 MiB float workspace —
+    /// sufficient now that `enable_cuda_graph=false` keeps FlashInfer's
+    /// `padded_batch_size` at ~`total_num_tiles_q` (no graph-capture pad).
+    /// See `flashinfer_prefill_paged.cu` for the sizing rationale.
     pub fn new(ctx: &DeviceContext, max_total_qo_rows: usize, num_qo_heads: usize) -> Result<Self> {
         Ok(Self {
-            workspace: FlashInferWorkspace::new_with_float_bytes(
-                ctx,
-                max_total_qo_rows,
-                num_qo_heads,
-                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
-            )?,
+            workspace: FlashInferWorkspace::new(ctx, max_total_qo_rows, num_qo_heads)?,
             hd128: PlanBuf::new()?,
             hd256: PlanBuf::new()?,
         })

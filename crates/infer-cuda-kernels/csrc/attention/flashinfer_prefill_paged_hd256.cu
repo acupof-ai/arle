@@ -60,7 +60,10 @@ extern "C" int flashinfer_batch_prefill_paged_hd256_plan(
         HEAD_DIM,
         HEAD_DIM,
         static_cast<uint32_t>(page_size),
-        /*enable_cuda_graph=*/true,
+        // See `flashinfer_prefill_paged.cu` for the detailed rationale.
+        // We do not CUDA-graph-capture prefill; keeping this true makes
+        // FlashInfer reserve workspace for an inflated padded_batch_size.
+        /*enable_cuda_graph=*/false,
         /*sizeof_dtype_o=*/static_cast<uint32_t>(sizeof(DType)),
         /*window_left=*/-1,
         /*fixed_split_size=*/-1,
