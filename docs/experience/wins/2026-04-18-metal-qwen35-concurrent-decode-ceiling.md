@@ -120,6 +120,53 @@ Remaining gap to mlx_lm at c=1 (~12 tok/s) must be tokenizer/HTTP/
 scheduler overhead outside `decode_token`'s scope — a single-prompt
 bench against `metal_generate_qwen35` directly would disambiguate.
 
+### P0d: rate-limit scheduler MLX memory FFI (commit `db729d7`)
+
+Direct `metal_bench` vs mlx_lm on the same M4 Max:
+
+```
+./target/release/metal_bench --model mlx-community/Qwen3.5-4B-MLX-4bit \
+  --prompt-tokens 20 --generation-tokens 128 --warmup 2 --runs 3
+→ 84.2 tok/s mean | 84.4 p50 | 84.7 p99
+```
+
+Matches mlx_lm 84.4 — the direct path has zero gap. **All the c=1
+HTTP gap is in the scheduler path, not the decode internals.**
+
+Micro-bench of `IncrementalDecoder::step()` (HF tokenizers
+`DecodeStream::step`) on the Qwen3.5 tokenizer: **0.6-0.7 us/tok**,
+~0.09 ms per 128-token gen. Tokenizer is NOT the bottleneck.
+
+Grepping the scheduler loop: `refresh_runtime_metrics` fires 3 MLX
+C++ FFI allocator queries (`mlx_get_active/peak/cache_memory`), and the
+`run_metal_scheduler_runtime` loop calls it twice per tick — once before
+`scheduler.step()`, once after. Each query goes through the MLX
+allocator's internal mutex. At c=1 decode that's 6 cross-FFI
+lock-acquire round-trips per token.
+
+Fix: guard `refresh_runtime_metrics` with a 40 ms interval (Prometheus
+scrape cadence is seconds; 40 ms is plenty). Admission events still
+fire an unconditional refresh so first-scrape latency is unchanged.
+
+| C | pre P0d | post P0d | Δ |
+|---:|---:|---:|---:|
+| 1 | 72.3 | 74.1 | **+2.5%** |
+| 2 | 114.0 | 122.3 | **+7.3%** |
+| 4 | 137.6 | 145.8 | **+6.0%** |
+| 8 | 143.3 | 145.6 | +1.6% (noise band) |
+
+Biggest gain at c=2-4 where the scheduler tick sits on the critical
+path between GPU batch dispatches — at c=1 decode is already dominated
+by GPU forward latency (so saving CPU scheduler time only shaves the
+small pre-queue gap), and at c=8 the tick is busy enough with
+8 requests' per-tick bookkeeping that metrics FFI is a smaller fraction
+of it.
+
+Remaining c=1 gap to mlx_lm: 84.4 − 74.1 = 10.3 tok/s (~1.6 ms/step).
+Still in scheduler + HTTP path: mpsc delta_tx send, active HashMap
+remove+insert per tick, StopChunkProcessor string push, emit_event
+through the scheduler's event sink, delta_tx.is_closed probe.
+
 ## Root cause of the B-linear term
 
 The old sampling path called `argmax(logits)` (flat, wrong for B>1) so
