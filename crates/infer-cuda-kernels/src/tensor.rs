@@ -518,7 +518,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q6_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q6_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 210 / 256;
         assert_eq!(
             packed_bytes.len(),
@@ -573,7 +576,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q3_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q3_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 55 / 128; // (cols/256) * 110 per row
         assert_eq!(
             packed_bytes.len(),
@@ -633,7 +639,10 @@ impl DeviceMatrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self> {
-        assert!(cols % 256 == 0, "Q4_K requires cols % 256 == 0, got {cols}");
+        assert!(
+            cols.is_multiple_of(256),
+            "Q4_K requires cols % 256 == 0, got {cols}"
+        );
         let expected = rows * cols * 9 / 16; // (cols/256) * 144 per row
         assert_eq!(
             packed_bytes.len(),
@@ -807,7 +816,7 @@ impl DeviceMatrix {
         let k = self.cols; // input dim
 
         // Skip if dimensions not Marlin-compatible (need K%16==0, N%64==0)
-        if k % 16 != 0 || n % 64 != 0 {
+        if !k.is_multiple_of(16) || !n.is_multiple_of(64) {
             log::warn!("Marlin repack skipped: [{n}x{k}] not tile-aligned (need K%16==0, N%64==0)");
             return Ok(());
         }

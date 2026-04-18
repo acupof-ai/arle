@@ -41,7 +41,7 @@ fn save_then_load_restores_exact_parameter_values() {
 
     let config = tiny_config();
     let mut store = TensorStore::default();
-    let model = TinyLM::new(config.clone(), &mut store).expect("model");
+    let model = TinyLM::new(config, &mut store).expect("model");
 
     // Put known values into the live model and snapshot.
     perturb_params(&mut store, &model, 0.125);
@@ -72,7 +72,7 @@ fn config_is_readable_standalone() {
     ));
     let config = tiny_config();
     let mut store = TensorStore::default();
-    let model = TinyLM::new(config.clone(), &mut store).expect("model");
+    let model = TinyLM::new(config, &mut store).expect("model");
     checkpoint::save(&model, &config, &store, &tmp).expect("save");
 
     let read_back = checkpoint::read_config(&tmp).expect("read config");
