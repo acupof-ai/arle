@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use infer::backend::metal::MetalRuntimeLimits;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,10 @@ struct Cli {
     /// Exact number of generated tokens to benchmark.
     #[arg(long, visible_alias = "max-tokens", default_value_t = 256)]
     generation_tokens: usize,
+
+    /// Drive decode via Qwen35StepDriver per-step FFI path (matches HTTP server) instead of cpp_model.generate. Qwen3.5 only.
+    #[arg(long, default_value_t = false)]
+    use_step_driver: bool,
 
     /// Number of warmup runs (excluded from statistics).
     #[arg(long, default_value_t = 3)]
@@ -100,6 +104,10 @@ struct Cli {
     /// Defaults to the draft config; lower values can reduce throughput.
     #[arg(long)]
     speculative_tokens: Option<usize>,
+
+    /// Ignore EOS in --use-step-driver mode and continue until --generation-tokens.
+    #[arg(long, default_value_t = false)]
+    ignore_eos: bool,
 }
 
 impl Cli {
@@ -120,10 +128,19 @@ impl Cli {
             wired_limit_bytes: self.wired_limit_bytes,
         }
     }
+
+    fn effective_ignore_eos(&self) -> bool {
+        if self.use_step_driver {
+            self.ignore_eos
+        } else {
+            true
+        }
+    }
 }
 
 struct Run {
     total_time_ms: f64,
+    decode_elapsed_s: f64,
     prompt_tokens: usize,
     tokens: usize,
     prompt_tps: f64,
@@ -329,14 +346,17 @@ fn main() -> Result<()> {
 #[cfg(feature = "metal")]
 fn run_bench() -> Result<()> {
     use infer::backend::InferenceBackend;
-    use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
+    use infer::backend::metal::{
+        MetalBackend, MetalBackendOptions, MetalDflashOptions, request_state::MetalRequestPhase,
+        scheduler::MetalSchedulerConfig,
+    };
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();
 
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
-        ignore_eos: true,
+        ignore_eos: cli.effective_ignore_eos(),
         max_new_tokens: Some(cli.generation_tokens),
         ..Default::default()
     };
@@ -371,53 +391,100 @@ fn run_bench() -> Result<()> {
 
     let prompt_ids = backend.benchmark_prompt_ids(cli.prompt_tokens)?;
 
+    if cli.use_step_driver {
+        anyhow::ensure!(
+            cli.generation_tokens > 0,
+            "--use-step-driver requires --generation-tokens >= 1"
+        );
+        let request_state = backend.create_request_state(&prompt_ids, &params)?;
+        if !request_state.is_qwen35() {
+            bail!("--use-step-driver requires Qwen3.5 model");
+        }
+    }
+
+    let step_driver_prefill_budget = MetalSchedulerConfig::default().prefill_chunk_size;
+
     // ── Warmup ───────────────────────────────────────────────────────────────
     if !cli.json {
         eprintln!("Warmup ({} runs)…", cli.warmup);
     }
     for _ in 0..cli.warmup {
-        backend.generate_from_token_ids(&prompt_ids, &params)?;
+        if cli.use_step_driver {
+            run_step_driver_once(
+                &backend,
+                &prompt_ids,
+                &params,
+                cli.generation_tokens,
+                step_driver_prefill_budget,
+                MetalRequestPhase::Prefill,
+            )?;
+        } else {
+            backend.generate_from_token_ids(&prompt_ids, &params)?;
+        }
     }
 
     // ── Timed runs ───────────────────────────────────────────────────────────
     let mut runs: Vec<Run> = Vec::with_capacity(cli.runs);
 
     for i in 0..cli.runs {
-        let result = backend.generate_from_token_ids(&prompt_ids, &params)?;
-        if result.finish_reason != "length" || result.completion_tokens != cli.generation_tokens {
-            anyhow::bail!(
-                "benchmark invariant failed on run {}: finish_reason={}, completion_tokens={}, expected={}",
-                i + 1,
-                result.finish_reason,
-                result.completion_tokens,
+        let run = if cli.use_step_driver {
+            run_step_driver_once(
+                &backend,
+                &prompt_ids,
+                &params,
                 cli.generation_tokens,
-            );
-        }
-        let e2e_tps = result.completion_tokens as f64 / (result.total_time_ms / 1000.0).max(1e-9);
+                step_driver_prefill_budget,
+                MetalRequestPhase::Prefill,
+            )?
+        } else {
+            let result = backend.generate_from_token_ids(&prompt_ids, &params)?;
+            if result.finish_reason != "length" || result.completion_tokens != cli.generation_tokens
+            {
+                anyhow::bail!(
+                    "benchmark invariant failed on run {}: finish_reason={}, completion_tokens={}, expected={}",
+                    i + 1,
+                    result.finish_reason,
+                    result.completion_tokens,
+                    cli.generation_tokens,
+                );
+            }
+            let decode_elapsed_s =
+                ((result.total_time_ms - result.ttft_ms).max(0.0) / 1000.0).max(1e-9);
+            let e2e_tps =
+                result.completion_tokens as f64 / (result.total_time_ms / 1000.0).max(1e-9);
+            Run {
+                total_time_ms: result.total_time_ms,
+                decode_elapsed_s,
+                prompt_tokens: result.prompt_tokens,
+                tokens: result.completion_tokens,
+                prompt_tps: result.prompt_tps,
+                generation_tps: result.generation_tps,
+                ttft_ms: result.ttft_ms,
+                e2e_tps,
+            }
+        };
 
         if cli.profile || !cli.json {
             eprintln!(
                 "  run {:2}: prompt {:3} tok @ {:6.1} tok/s  gen {:4} tok @ {:6.1} tok/s  repo-e2e {:6.1} tok/s  ttft {:6.1}ms  total {:6.1}ms",
                 i + 1,
-                result.prompt_tokens,
-                result.prompt_tps,
-                result.completion_tokens,
-                result.generation_tps,
-                e2e_tps,
-                result.ttft_ms,
-                result.total_time_ms,
+                run.prompt_tokens,
+                run.prompt_tps,
+                run.tokens,
+                run.generation_tps,
+                run.e2e_tps,
+                run.ttft_ms,
+                run.total_time_ms,
             );
+            if cli.use_step_driver {
+                eprintln!(
+                    "    [step-driver] decode tok/s = {} / {:.3}s = {:.1}",
+                    run.tokens, run.decode_elapsed_s, run.generation_tps,
+                );
+            }
         }
 
-        runs.push(Run {
-            total_time_ms: result.total_time_ms,
-            prompt_tokens: result.prompt_tokens,
-            tokens: result.completion_tokens,
-            prompt_tps: result.prompt_tps,
-            generation_tps: result.generation_tps,
-            ttft_ms: result.ttft_ms,
-            e2e_tps,
-        });
+        runs.push(run);
     }
 
     // ── Statistics ───────────────────────────────────────────────────────────
@@ -459,26 +526,27 @@ fn run_bench() -> Result<()> {
 
     // ── Output ───────────────────────────────────────────────────────────────
     if cli.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "model": cli.model,
-                "quantization": quant_hint,
-                "prompt_tokens_requested": cli.prompt_tokens,
-                "generation_tokens_requested": cli.generation_tokens,
-                "warmup_runs": cli.warmup,
-                "timed_runs": cli.runs,
-                "load_ms": load_ms,
-                "prompt_tokens": prompt_tokens,
-                "avg_tokens": avg_tokens,
-                "prompt_tps": { "mean": mean_prompt_tps, "p50": p50_prompt_tps, "p99": p99_prompt_tps },
-                "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
-                "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
-                "total_time_ms": { "mean": mean_total_time_ms, "p50": p50_total_time_ms, "p99": p99_total_time_ms },
-                "repo_e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
-                "peak_rss_mb": peak_mb,
-            })
-        );
+        let mut payload = serde_json::json!({
+            "model": cli.model,
+            "quantization": quant_hint,
+            "prompt_tokens_requested": cli.prompt_tokens,
+            "generation_tokens_requested": cli.generation_tokens,
+            "warmup_runs": cli.warmup,
+            "timed_runs": cli.runs,
+            "load_ms": load_ms,
+            "prompt_tokens": prompt_tokens,
+            "avg_tokens": avg_tokens,
+            "prompt_tps": { "mean": mean_prompt_tps, "p50": p50_prompt_tps, "p99": p99_prompt_tps },
+            "generation_tps": { "mean": mean_generation_tps, "p50": p50_generation_tps, "p99": p99_generation_tps },
+            "ttft_ms": { "mean": mean_ttft_ms, "p50": p50_ttft_ms, "p99": p99_ttft_ms },
+            "total_time_ms": { "mean": mean_total_time_ms, "p50": p50_total_time_ms, "p99": p99_total_time_ms },
+            "repo_e2e_tps": { "mean": mean_e2e_tps, "p50": p50_e2e_tps, "p99": p99_e2e_tps },
+            "peak_rss_mb": peak_mb,
+        });
+        if cli.use_step_driver {
+            payload["mode"] = serde_json::Value::String("step-driver".to_string());
+        }
+        println!("{payload}");
     } else {
         println!();
         println!("=== Metal Benchmark: {} [{}] ===", cli.model, quant_hint);
@@ -488,9 +556,15 @@ fn run_bench() -> Result<()> {
         println!(
             "  Prompt speed    : {mean_prompt_tps:.1} tok/s mean  |  {p50_prompt_tps:.1} p50  |  {p99_prompt_tps:.1} p99"
         );
-        println!(
-            "  Generation      : {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
-        );
+        if cli.use_step_driver {
+            println!(
+                "  [step-driver] Generation: {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
+            );
+        } else {
+            println!(
+                "  Generation      : {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
+            );
+        }
         println!(
             "  TTFT            : {mean_ttft_ms:.0}ms mean  |  {p50_ttft_ms:.0}ms p50  |  {p99_ttft_ms:.0}ms p99"
         );
@@ -601,6 +675,103 @@ fn run_bench() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn run_step_driver_once(
+    backend: &infer::backend::metal::MetalBackend,
+    prompt_ids: &[u32],
+    params: &infer::sampler::SamplingParams,
+    expected_generation_tokens: usize,
+    prefill_budget: usize,
+    expected_prefill_phase: infer::backend::metal::request_state::MetalRequestPhase,
+) -> Result<Run> {
+    use infer::backend::metal::request_state::MetalRequestPhase;
+
+    let mut request_state = backend.create_request_state(prompt_ids, params)?;
+    if !request_state.is_qwen35() {
+        bail!("--use-step-driver requires Qwen3.5 model");
+    }
+    anyhow::ensure!(
+        request_state.phase() == expected_prefill_phase,
+        "step-driver benchmark expected {:?} phase, got {:?}",
+        expected_prefill_phase,
+        request_state.phase()
+    );
+
+    let started_at = Instant::now();
+    while request_state.phase() == MetalRequestPhase::Prefill {
+        let result = request_state.prefill_chunk(prefill_budget)?;
+        anyhow::ensure!(
+            result.processed_tokens > 0,
+            "step-driver prefill made no forward progress"
+        );
+    }
+
+    let ttft_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let decode_started = request_state.phase() == MetalRequestPhase::Decode;
+    let decode_t0 = Instant::now();
+    while request_state.phase() == MetalRequestPhase::Decode {
+        request_state
+            .decode_step()?
+            .context("step-driver decode_step did not emit a token")?;
+    }
+    let total_time_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let decode_elapsed_s = if decode_started {
+        decode_t0.elapsed().as_secs_f64()
+    } else {
+        0.0
+    };
+
+    let finish_reason = request_state.finish_reason().unwrap_or("unknown");
+    if params.ignore_eos {
+        anyhow::ensure!(
+            finish_reason == "length"
+                && request_state.generated_tokens() == expected_generation_tokens,
+            "step-driver invariant failed: finish_reason={}, completion_tokens={}, expected={}",
+            finish_reason,
+            request_state.generated_tokens(),
+            expected_generation_tokens,
+        );
+    } else {
+        anyhow::ensure!(
+            matches!(finish_reason, "length" | "stop"),
+            "step-driver invariant failed: unexpected finish_reason={finish_reason}",
+        );
+        anyhow::ensure!(
+            request_state.generated_tokens() <= expected_generation_tokens,
+            "step-driver invariant failed: completion_tokens={} exceeded expected={}",
+            request_state.generated_tokens(),
+            expected_generation_tokens,
+        );
+    }
+
+    let prompt_tps = if ttft_ms > 0.0 && !prompt_ids.is_empty() {
+        prompt_ids.len() as f64 / (ttft_ms / 1000.0).max(1e-9)
+    } else {
+        0.0
+    };
+    let generation_tps = if request_state.generated_tokens() > 0 && decode_elapsed_s > 0.0 {
+        request_state.generated_tokens() as f64 / decode_elapsed_s
+    } else {
+        0.0
+    };
+    let e2e_tps = if request_state.generated_tokens() > 0 {
+        request_state.generated_tokens() as f64 / (total_time_ms / 1000.0).max(1e-9)
+    } else {
+        0.0
+    };
+
+    Ok(Run {
+        total_time_ms,
+        decode_elapsed_s,
+        prompt_tokens: prompt_ids.len(),
+        tokens: request_state.generated_tokens(),
+        prompt_tps,
+        generation_tps,
+        ttft_ms,
+        e2e_tps,
+    })
 }
 
 /// Nearest-rank percentile over a *sorted* slice.
