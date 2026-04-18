@@ -50,31 +50,85 @@ one request.  On a multi-request scheduler tick, each slot still runs
 its own verify forward — no cross-request batching for the speculative
 path.
 
-**Approach**: extend the mlx-lm `BatchKVCache` varlen pattern (already
-used by the scheduler for plain decode —
-`infer/src/backend/metal/AGENTS.md` §7) to verify.
+**Blocking prerequisite — DFlash on scheduler runtime**:
+DFlash today runs exclusively on the **legacy serial runtime**
+(`backend/runtime.rs`, single-request loop), not the hot-path scheduler
+runtime (`backend/metal/runtime.rs::run_metal_scheduler_runtime`).
+See `backend/metal/AGENTS.md` invariant #6.  Until DFlash slot ownership
+is modeled in the scheduler, "B>1 verify" has no consumer:
+`request_state.rs:2871` is only reached from single-session
+`decode_step`, never from `decode_qwen35_packed_batch` (line 1453).
+Layer 2 therefore decomposes into four sub-pieces that **must land in
+order**:
 
-- Pack B requests' draft blocks into one `[B, S_padded]` token tensor
-  with left-padding + additive causal mask + per-row RoPE offsets.
-- Tape shape becomes `[B, S_padded, Hv, Dv]`; slice each row by its
-  own `accepted_inputs[b]` before replay.
-- Replay kernel must accept per-batch `steps[b]` — upgrade
-  `mlx_tape_replay` to take `steps: array(B)` (Metal kernel already
-  iterates `for (int t = 0; t < T; ++t)`, needs a per-row T bound).
+**2a — varlen `mlx_tape_replay_varlen` kernel** (in flight, 2026-04-18)
+- Kernel + FFI accept `steps: mlx_array([B], int32)` instead of scalar
+  `int steps`.  Keeps scalar `mlx_tape_replay` alongside for the
+  single-row callsite.
+- Unblocks (but does not depend on) 2b/2c/2d.
+- Acceptance: gdr.rs `test_tape_replay_varlen_matches_scalar` passes;
+  bit-identical output when per-row steps are uniform.
 
-**Trip wires**:
-- Per-row RoPE offsets for verify positions (`cache_pos[b] + 0 ..
-  cache_pos[b] + S`).  The existing varlen RoPE path in `forward.rs`
-  handles a single offset per row — verify needs a per-row *range*
-  which for contiguous S tokens collapses to broadcasting
-  `cache_pos[b]` and letting the kernel offset each column.  Verify
-  that the existing `fast::rope` array-offset path handles this.
-- Partial-accept mask rebuild between verify and next prefill: rows
-  with different `accepted_inputs[b]` need different trim amounts in
-  both KV (full-attn) and GDR state (replay with per-row `steps[b]`).
+**2b — `qwen35_compiled_verify_block_batched` C++ FFI**
+- New C++ FFI mirroring `qwen35_compiled_verify_block` but accepting
+  `[B, S_padded]` tokens, `attn_mask: [B, 1, S_padded, key_len]`
+  additive, `rope_offsets: int32[B]`, per-row `cache_lens: int32[B]`.
+- Reuses the `step_batch_packed` plumbing
+  (`crates/mlx-sys/src/mlx_qwen35_model.cpp`) that already lands
+  varlen plain-decode with per-row RoPE offsets.
+- Emits logits `[B, S_padded, V]`, GDR tapes `[B, S_padded, Hv, Dv]`
+  (one set per GDR layer), capture hidden `[B, S_padded, H]`.
+- Acceptance: `cargo test --release --features metal -- --test-threads=1
+  qwen35_compiled_verify_block_batched` — B=1 run is bit-identical to
+  existing `qwen35_compiled_verify_block`.
 
-**Acceptance**: `guidellm` sweep at concurrency ≥ 8 shows ≥ 2×
-throughput over Layer 1 on mixed-length prompts.
+**2c — DFlash scheduler runtime integration**
+- Currently `decode_qwen35_packed_batch` (`request_state.rs:1453`)
+  handles plain packed decode but not DFlash.
+- Teach `MetalScheduler::step()` (`scheduler.rs`) about a
+  `DFlashVerifyBatch` decision variant that packs all active DFlash
+  slots' draft blocks into one tick.
+- Each slot still runs its own draft forward (CPU-batchable since
+  draft model is small).
+- Invariant #6 gets flipped: DFlash moves off the legacy serial runtime
+  onto the scheduler runtime.  Legacy runtime stays only as a fallback
+  for single-session no-concurrency.
+- Acceptance: `metal_serve --dflash-draft-model …` with concurrency 4
+  no longer auto-downgrades DFlash to packed decode at `open.len() >= 2`
+  (the Track-1 escape hatch from
+  `wins/2026-04-17-metal-qwen35-dflash-block-verify.md` is no longer
+  needed for correctness — we keep it only as a configurable toggle).
+
+**2d — Layer 2 wire-up**
+- `qwen35_dflash_speculative_block` grows a batched sibling or replaces
+  its inner verify call with a batched one when `B > 1`.
+- Tape replay uses `mlx_tape_replay_varlen` with per-row
+  `accepted_inputs[b]`.
+- Partial-accept rollback is per-row: KV trim + GDR state restore
+  happen row-by-row.
+- Acceptance: `guidellm` sweep at concurrency ≥ 8 shows ≥ 2× throughput
+  over Layer 1 on mixed-length prompts.
+
+**Trip wires** (carry forward from the original plan + new discoveries):
+- Per-row RoPE offsets for verify positions: the existing varlen RoPE
+  path (`fast::rope` with int32[B] offsets) works for S=1 plain decode;
+  confirm it handles S>1 where each column within a row needs a
+  different absolute position (`cache_lens[b] + s`).  If `fast::rope`'s
+  array-offset signature only accepts scalar-per-row (no per-column
+  offset), the kernel path may need a broadcast trick: feed
+  `base_offsets[b]` and let the kernel's internal `t_axis` add the
+  column index — verify in isolation before 2b.
+- GDR state shape under B>1: today `target_gdr_flat` is flat-indexed
+  per-layer.  Packed version needs `[B, Hv, Dv, Dk]` rooted at the
+  batch axis.  `qwen35_set_tape_mode` / `qwen35_set_capture_layers`
+  toggle applies to the whole C++ model — capture is all-rows or no-rows,
+  which is fine since every DFlash slot needs tapes.
+- Single-session single-request workloads get **nothing** from Layer 2
+  (B=1 already).  The single-session regression on Qwen3.5-4B-4bit
+  documented in `wins/2026-04-17-metal-qwen35-dflash-block-verify.md`
+  is out of scope for this layer; it requires attacking the GDR
+  time-axis recurrence directly (Layer 3 candidate, or orthogonal
+  algorithmic work on `gated_delta_tape_kernel`).
 
 ### Layer 3 — cross-slot speculative scheduling (planned)
 
@@ -117,5 +171,8 @@ Steady-state throughput under concurrency 16 ≥ 1.5× Layer 2.
 | Layer | ETA | Owner |
 |-------|-----|-------|
 | 1 (intra-request single forward) | **Done 2026-04-17** | Claude |
-| 2 (cross-request packed verify) | Next available slot, after Layer 1 Mac benchmarks | TBD |
-| 3 (cross-slot scheduling) | After Layer 2 | TBD |
+| 2a (varlen `mlx_tape_replay`) | **In flight 2026-04-18** | Codex |
+| 2b (`verify_block_batched` FFI) | After 2a | Codex |
+| 2c (DFlash scheduler integration) | After 2b | Claude (direction) + Codex (impl) |
+| 2d (packed verify wire-up) | After 2c | Codex |
+| 3 (cross-slot scheduling) | After 2d; may collapse into 2c | TBD |
