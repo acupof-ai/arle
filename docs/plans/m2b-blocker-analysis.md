@@ -39,9 +39,18 @@ Cost: ~2 days. Ships the hook but does not close the train↔infer loop. Deferre
 
 Cost: 0 days. Lets research/agent-loop work proceed. Best if the immediate goal is "self-evolving agent prototype" not "Qwen3 RL".
 
-## Recommendation
+### (b′) Merge-time utility — **added 2026-04-18 after industry survey**
 
-Take **(a)**. The plan's sequencing already names M1 CUDA before M2 hook for this exact reason; we over-indexed on M0 → M2a (both CPU-only) and skipped the CUDA ramp. Filling M1.2 + M1.8 next is the shortest path to the stated M4 goal. Alternatively (c) if ckl would rather demonstrate multi-turn tool RL on TinyLM first and treat CUDA as deferred.
+- Small CLI / binary that takes `(base_weights_path, lora_adapter_path, out_path)`, computes `W' = W + alpha/rank · B @ A` per-layer in fp32, and writes a new checkpoint. Merge happens **before** the usual Qwen3 load path — zero changes to `infer/src/ops/linear.rs` or any model file.
+- Matches the **llama.cpp default** and the mistral.rs "bake-in" path. See `docs/research/2026-04-18-lora-inference-patterns.md` for the survey: llama.cpp merges into GGUF, mistral.rs supports dynamic swap only because they target multi-tenant serving, vLLM needs Punica SGMV only at thousands-of-adapter scale. For a single-researcher self-evolve loop, dynamic swap is not on the path.
+
+Cost: ~1 day, zero risk to the hot path. Doesn't unlock the train↔infer gradient loop (that's still option (a)) but it does ship "Qwen3 + externally-trained LoRA works" with no GPU verification needed from ckl.
+
+## Recommendation (updated 2026-04-18)
+
+Original recommendation was **(a)**. After the industry survey (llama.cpp merges by default, mistral.rs runtime hook exists but adds overhead, Punica is multi-tenant-only), **(b′)** is the pragmatic first move: it ships the user-visible feature without touching the hot path, and leaves (a) fully open for when the project actually needs real-time train↔infer gradient flow.
+
+Pick **(b′)** if the near-term goal is "a Qwen3 binary that can consume a LoRA someone else trained." Pick **(a)** if the goal is "RL-train a Qwen3 LoRA and immediately serve it in the same process." The project's current stated goal is the former.
 
 ## Decision pending
 
