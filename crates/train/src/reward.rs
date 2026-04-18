@@ -5,6 +5,25 @@
 //! Episode's `response_mask` / `turn_boundaries`. Positions outside agent
 //! turns receive 0.
 
+/// Subtract `penalty` from each turn flagged as a failure (malformed tool
+/// call, parse error, etc.) before MC discounting. Preserves vector length;
+/// positions with `failures[i] == false` pass through unchanged. `penalty`
+/// is expected to be non-negative — it is subtracted regardless of sign.
+pub fn apply_turn_penalty(per_turn_rewards: &[f32], failures: &[bool], penalty: f32) -> Vec<f32> {
+    assert_eq!(
+        per_turn_rewards.len(),
+        failures.len(),
+        "rewards len {} != failures len {}",
+        per_turn_rewards.len(),
+        failures.len(),
+    );
+    per_turn_rewards
+        .iter()
+        .zip(failures.iter())
+        .map(|(reward, failed)| if *failed { *reward - penalty } else { *reward })
+        .collect()
+}
+
 /// Monte-Carlo return at each turn: `G_t = Σ_{k ≥ t} γ^{k - t} · r_k`.
 pub fn discounted_returns(per_turn_rewards: &[f32], gamma: f32) -> Vec<f32> {
     let mut returns = vec![0.0f32; per_turn_rewards.len()];

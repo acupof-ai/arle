@@ -4,7 +4,7 @@ use train::{
     grpo::{GrpoConfig, grpo_loss_per_position},
     model::{TinyLM, TinyLMConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
-    reward::{discounted_returns, group_normalize, returns_to_per_position},
+    reward::{apply_turn_penalty, discounted_returns, group_normalize, returns_to_per_position},
 };
 
 #[test]
@@ -24,6 +24,22 @@ fn discounted_returns_with_gamma() {
             "got {actual} expected {expected}"
         );
     }
+}
+
+#[test]
+fn apply_turn_penalty_subtracts_on_failure_flags() {
+    let rewards = vec![1.0, 0.5, 0.2];
+    let failures = vec![false, true, false];
+    let penalized = apply_turn_penalty(&rewards, &failures, 0.1);
+    assert_eq!(penalized, vec![1.0, 0.4, 0.2]);
+}
+
+#[test]
+fn apply_turn_penalty_noop_when_no_failures() {
+    let rewards = vec![1.0, 2.0, 3.0];
+    let failures = vec![false, false, false];
+    let penalized = apply_turn_penalty(&rewards, &failures, 5.0);
+    assert_eq!(penalized, rewards);
 }
 
 #[test]
