@@ -225,6 +225,7 @@ fn main() -> Result<(), CliError> {
     let mut reward_trajectory = Vec::with_capacity(args.iters);
     let mut best_reward = 0.0_f32;
     let mut last_kl = 0.0_f32;
+    let loop_start = std::time::Instant::now();
 
     for iter in 0..args.iters {
         let initial_prompt =
@@ -326,8 +327,20 @@ fn main() -> Result<(), CliError> {
         }
     }
 
+    let wall_secs = loop_start.elapsed().as_secs_f32();
+    let total_episodes = args.iters * args.group_size;
+    let tokens_per_episode = seq_len;
+    let total_tokens = total_episodes * tokens_per_episode;
+    let iter_per_sec = args.iters as f32 / wall_secs.max(1e-6);
+    let episodes_per_sec = total_episodes as f32 / wall_secs.max(1e-6);
+    let tokens_per_sec = total_tokens as f32 / wall_secs.max(1e-6);
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
+    println!(
+        "bench: wall {wall_secs:.2}s | iter/s {iter_per_sec:.2} | episode/s {episodes_per_sec:.2} \
+         | token/s {tokens_per_sec:.1} | seq_len {seq_len} | group {group}",
+        group = args.group_size,
+    );
 
     if let Some(path) = &args.save_path {
         train::checkpoint::save(&policy, &config, &store, path)
