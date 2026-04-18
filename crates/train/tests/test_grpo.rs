@@ -3,11 +3,37 @@ use std::{collections::HashSet, time::Instant};
 use autograd::{Tape, TensorId, TensorStore, module::Module, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
-    grpo::{GrpoConfig, group_advantages, grpo_loss},
+    grpo::{GrpoConfig, group_advantages, grpo_loss, ppo_active_mask},
     model::{TinyLM, TinyLMConfig},
     rollout::{Trajectory, rollout_group},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
+
+#[test]
+fn ppo_active_mask_zeros_out_clipped_positions() {
+    // ratio = exp(new_lp - old_lp); eps = 0.2 → active window [0.8, 1.2]
+    let new_log_probs = vec![
+        0.0,            // ratio = 1.0 (inside)
+        (1.5_f32).ln(), // ratio = 1.5 (above upper)
+        (0.5_f32).ln(), // ratio = 0.5 (below lower)
+        0.0,            // ratio = 1.0 (inside) but response_mask = 0
+        (1.5_f32).ln(), // ratio = 1.5, adv < 0 → NOT clipped (helpful direction)
+        (0.5_f32).ln(), // ratio = 0.5, adv < 0 → clipped (hurts)
+    ];
+    let old_log_probs = vec![0.0; 6];
+    let advantages = vec![1.0, 1.0, 1.0, 1.0, -1.0, -1.0];
+    let response_mask = vec![1.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+
+    let mask = ppo_active_mask(
+        &new_log_probs,
+        &old_log_probs,
+        &advantages,
+        &response_mask,
+        0.2,
+    );
+
+    assert_eq!(mask, vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+}
 
 #[test]
 fn group_advantages_normalizes_per_group() {

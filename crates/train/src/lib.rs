@@ -12,3 +12,5 @@ pub mod rollout;
 pub mod sampling;
 #[path = "trainer.rs"]
 pub mod trainer;
+#[path = "verifier.rs"]
+pub mod verifier;
