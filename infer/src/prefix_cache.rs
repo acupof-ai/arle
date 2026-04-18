@@ -540,8 +540,19 @@ impl RadixCache {
                     self.nodes[child_idx].last_access = now;
                     pos += match_len;
 
-                    // Update block_id if child has the right size.
-                    if child_tokens.len() == self.block_size && block_idx < blocks.len() {
+                    // Advance block_idx when walking through a block-bearing
+                    // node — regardless of this edge's token length.
+                    //
+                    // Block-bearing nodes may carry a short edge when the
+                    // node was created under an edge split: the block_id
+                    // represents block_size tokens on the path *through* the
+                    // node from the last block boundary, not the node's own
+                    // edge length. The older guard (`child_tokens.len() ==
+                    // block_size`) under-counted those walks and reused the
+                    // caller's `blocks[0]` for downstream blocks, corrupting
+                    // `block_index`. Checking block_id presence covers both
+                    // full-size and post-split short-edge block-bearing nodes.
+                    if self.nodes[child_idx].block_id.is_some() && block_idx < blocks.len() {
                         let new_bid = blocks[block_idx];
                         if let Some(old_bid) = self.nodes[child_idx].block_id
                             && old_bid != new_bid
@@ -1453,6 +1464,26 @@ mod tests {
         let (len_new, blocks_new) = cache.lookup(&[1, 2, 3, 4, 5, 6, 9, 10]);
         assert_eq!(len_new, 8);
         assert_eq!(blocks_new, bids(&[10, 99]));
+    }
+
+    #[test]
+    fn reinsert_after_split_does_not_reuse_first_block_id() {
+        // Codex-caught P1 regression (2026-04-19): the initial split fix
+        // created short-edge block-bearing nodes, and the full-match branch
+        // only advanced block_idx when child.tokens.len() == block_size,
+        // causing subsequent walks through the short edge to reuse
+        // blocks[0] for the second block. Lookup then returned [100, 100]
+        // instead of [100, 300].
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+
+        let inserted = cache.insert(&[1, 5, 6, 7, 12, 13, 14, 15], &bids(&[100, 300]));
+        assert_eq!(inserted, 8);
+
+        let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 12, 13, 14, 15]);
+        assert_eq!(len, 8);
+        assert_eq!(blocks, bids(&[100, 300]));
     }
 
     #[test]
