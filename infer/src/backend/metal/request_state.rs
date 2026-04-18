@@ -8,7 +8,7 @@ use super::dflash::{self, MetalDflashRuntime};
 use super::forward::build_forward_graph;
 use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
-use super::mlx::{MlxArray, concatenate_axis, eval, slice, take_axis, zeros};
+use super::mlx::{MlxArray, async_eval, concatenate_axis, eval, slice, take_axis, zeros};
 use super::ops::{clear_metal_cache, extend_kv_cache};
 use super::qwen35::{CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step};
 use super::sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params};
@@ -1545,7 +1545,7 @@ fn decode_qwen35_packed_batch<'a>(
     eval_refs.push(&logits);
     eval_refs.extend(batch.packed_kv_flat.iter());
     eval_refs.extend(batch.packed_gdr_flat.iter());
-    eval(&eval_refs);
+    async_eval(&eval_refs);
 
     let logits_shape = logits.shape().to_vec();
     ensure!(
@@ -2475,7 +2475,7 @@ impl<'a> Qwen35StepDriver<'a> {
         step_outputs.push(&logits);
         step_outputs.extend(state.kv_flat.iter());
         step_outputs.extend(state.gdr_flat.iter());
-        eval(&step_outputs);
+        async_eval(&step_outputs);
         Ok(logits)
     }
 
@@ -2509,7 +2509,7 @@ impl<'a> Qwen35StepDriver<'a> {
         step_outputs.extend(state.v_caches.iter());
         step_outputs.extend(state.recurrent.states.iter());
         step_outputs.extend(state.recurrent.conv_states.iter());
-        eval(&step_outputs);
+        async_eval(&step_outputs);
 
         state.recurrent.seq_len = (cache_len + 1) as usize;
         logits
@@ -2865,7 +2865,6 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     let _ = dflash;
                     let logits = self.run_step(token)?;
                     let sampled = gpu_sample_token(&logits, &self.params);
-                    eval(&[&sampled]);
                     return Ok(sampled.item_i32() as u32);
                 };
 
@@ -2910,7 +2909,6 @@ impl StepDriver for Qwen35StepDriver<'_> {
         }
         let logits = self.run_step(token)?;
         let sampled = gpu_sample_token(&logits, &self.params);
-        eval(&[&sampled]);
         Ok(sampled.item_i32() as u32)
     }
 }
