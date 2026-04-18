@@ -644,14 +644,18 @@ impl Qwen35Model {
                         &bufs.qkv_conv,
                         &bufs.b_proj,
                         &bufs.a_proj,
-                        &attn.dt_bias,
-                        &attn.a_log,
+                        &ops::GdrWeights {
+                            dt_bias: &attn.dt_bias,
+                            a_log: &attn.a_log,
+                        },
                         &mut layer_state.state,
                         &mut bufs.gdr_out,
-                        c.linear_num_key_heads,
-                        c.linear_num_value_heads,
-                        c.linear_key_head_dim,
-                        c.linear_value_head_dim,
+                        &ops::GdrHeadConfig {
+                            num_key_heads: c.linear_num_key_heads,
+                            num_value_heads: c.linear_num_value_heads,
+                            key_dim: c.linear_key_head_dim,
+                            val_dim: c.linear_value_head_dim,
+                        },
                     )?;
 
                     // Gated RMSNorm
