@@ -89,6 +89,37 @@ kernel-compute ceiling is unaffected because the saved CPU-GPU round-trip
 overlaps with GPU work that's already the critical path at concurrent
 batch sizes.
 
+### P0c: cross-step pipelining in decode_token (commit `5593448`)
+
+`metal_generate_qwen35` (single-prompt path) already did mlx_lm-style
+double-buffered decode (`qwen35.rs:886-910`). The HTTP scheduler path
+via `Qwen35StepDriver::decode_token` did not — each call sampled+blocked
+synchronously, leaving GPU idle while the scheduler did bookkeeping.
+
+Fix: add `pending_sampled: Option<MlxArray>` to `Qwen35StepDriver`;
+after computing the result token, pre-queue step N+1 using `result` as
+input and stash the lazy sampled. Next call's consuming branch blocks
+on `pending_sampled.item_i32()` and skips the forward (already done).
+Pre-queue gated on `!dflash && cache_len + 2 <= kv_capacity` (so no KV
+extend mid-pending). Invalidate `pending_sampled = None` on DFlash
+entry, `prefill_tokens`, and `import_prefix_snapshot`.
+
+| C | pre P0c | post P0c | Δ |
+|---:|---:|---:|---:|
+| 1 | 70.3 | 72.1 | **+2.6%** |
+| 2 | 120.0 | 124.3 | **+3.6%** |
+| 4 | 143.2 | 146.1 | **+2.0%** |
+| 8 | 142.0 | 147.0 | **+3.5%** — breaks 145 ceiling |
+
+Surprise: c=8 broke the prior "GDR compute-bound" ceiling. At compute-
+bound regime, the remaining 3-4 tok/s was CPU-side scheduler-idle gaps
+between kernel dispatches. Keeping the GPU command queue always-fuller
+(one step ahead) tightened kernel back-to-back timing.
+
+Remaining gap to mlx_lm at c=1 (~12 tok/s) must be tokenizer/HTTP/
+scheduler overhead outside `decode_token`'s scope — a single-prompt
+bench against `metal_generate_qwen35` directly would disambiguate.
+
 ## Root cause of the B-linear term
 
 The old sampling path called `argmax(logits)` (flat, wrong for B>1) so
