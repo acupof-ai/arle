@@ -16,6 +16,8 @@ pub mod reward;
 pub mod rollout;
 #[path = "sampling.rs"]
 pub mod sampling;
+#[path = "task_gen.rs"]
+pub mod task_gen;
 #[path = "trainer.rs"]
 pub mod trainer;
 #[path = "verifier.rs"]
