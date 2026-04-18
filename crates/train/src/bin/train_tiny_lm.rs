@@ -4,6 +4,7 @@ use autograd::{AutogradError, Tape, TensorId, TensorStore, module::Module, optim
 use thiserror::Error;
 use train::{
     dataset::{BytesDataset, CopyDataset, Dataset},
+    lora::LoraConfig,
     model::{TinyLM, TinyLMConfig},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
@@ -23,6 +24,8 @@ struct CliArgs {
     lr: f32,
     log_every: usize,
     grad_clip: Option<f32>,
+    lora_rank: usize,
+    lora_alpha: f32,
 }
 
 impl Default for CliArgs {
@@ -35,6 +38,8 @@ impl Default for CliArgs {
             lr: 3.0e-4,
             log_every: 10,
             grad_clip: Some(1.0),
+            lora_rank: 0,
+            lora_alpha: 0.0,
         }
     }
 }
@@ -53,7 +58,18 @@ enum CliError {
 
 fn main() -> Result<(), CliError> {
     let args = parse_args()?;
-    let config = TinyLMConfig::default();
+    let mut config = TinyLMConfig::default();
+    if args.lora_rank > 0 {
+        let alpha = if args.lora_alpha > 0.0 {
+            args.lora_alpha
+        } else {
+            (2 * args.lora_rank) as f32
+        };
+        config.lora = Some(LoraConfig {
+            rank: args.lora_rank,
+            alpha,
+        });
+    }
     if args.seq > config.max_seq_len {
         return Err(CliError::Autograd(AutogradError::ShapeMismatch {
             expected: vec![config.max_seq_len],
@@ -65,15 +81,27 @@ fn main() -> Result<(), CliError> {
     let mut tape = Tape::new();
     let model = TinyLM::new(config, &mut store)?;
     let params = model.parameters();
+    let base_params = model.base_parameter_ids();
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
     let mut dataset = build_dataset(args.dataset, args.batch, args.seq);
 
-    let param_count = model.parameter_count(&store);
-    println!(
-        "params: {} ({:.2}M)",
-        param_count,
-        param_count as f64 / 1_000_000.0
-    );
+    if let Some(lora) = config.lora {
+        let base_count = count_parameters(&base_params, &store);
+        let trainable_count = count_parameters(&params, &store);
+        println!(
+            "base params: {:.2}M | trainable params: {:.2}M (LoRA rank={})",
+            base_count as f64 / 1_000_000.0,
+            trainable_count as f64 / 1_000_000.0,
+            lora.rank
+        );
+    } else {
+        let param_count = model.parameter_count(&store);
+        println!(
+            "params: {} ({:.2}M)",
+            param_count,
+            param_count as f64 / 1_000_000.0
+        );
+    }
 
     let mut final_loss = f32::INFINITY;
     for step in 0..args.steps {
@@ -96,7 +124,7 @@ fn main() -> Result<(), CliError> {
 
         tape.entries.clear();
         tape.set_enabled(true);
-        let keep = retained_ids(&params, &store);
+        let keep = retained_ids(&params, &base_params, &store);
         store.retain_ids(&keep);
 
         if step % args.log_every == 0 || step + 1 == args.steps {
@@ -129,6 +157,12 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--lr" => args.lr = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--log-every" => {
                 args.log_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--lora-rank" => {
+                args.lora_rank = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--lora-alpha" => {
+                args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--grad-clip" => {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
@@ -163,9 +197,20 @@ fn build_dataset(kind: DatasetKind, batch: usize, seq: usize) -> Box<dyn Dataset
     }
 }
 
-fn retained_ids(params: &[TensorId], store: &TensorStore) -> HashSet<TensorId> {
-    let mut keep = HashSet::with_capacity(params.len() * 2);
-    for &param_id in params {
+fn count_parameters(params: &[TensorId], store: &TensorStore) -> usize {
+    params
+        .iter()
+        .map(|&id| store.get(id).map_or(0, |tensor| tensor.size))
+        .sum()
+}
+
+fn retained_ids(
+    params: &[TensorId],
+    base_params: &[TensorId],
+    store: &TensorStore,
+) -> HashSet<TensorId> {
+    let mut keep = HashSet::with_capacity((params.len() + base_params.len()) * 2);
+    for &param_id in params.iter().chain(base_params.iter()) {
         keep.insert(param_id);
         if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
             keep.insert(grad_id);
