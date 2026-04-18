@@ -1,4 +1,5 @@
 use crate::{AutogradError, Result};
+use std::collections::HashSet;
 
 pub type TensorId = usize;
 
@@ -64,6 +65,16 @@ impl TensorStore {
         *slot = None;
         self.free_ids.push(id);
         Ok(())
+    }
+
+    pub fn retain_ids(&mut self, keep: &HashSet<TensorId>) {
+        for (id, slot) in self.tensors.iter_mut().enumerate() {
+            if keep.contains(&id) || slot.is_none() {
+                continue;
+            }
+            *slot = None;
+            self.free_ids.push(id);
+        }
     }
 
     pub fn get(&self, id: TensorId) -> Option<&GpuTensor> {

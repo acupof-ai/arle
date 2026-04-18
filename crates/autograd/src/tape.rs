@@ -40,6 +40,9 @@ pub enum SavedContext {
     GeluCtx {
         x: TensorId,
     },
+    ReshapeCtx {
+        input_shape: Vec<usize>,
+    },
     TransposeCtx {
         axis1: usize,
         axis2: usize,
@@ -67,6 +70,7 @@ pub enum BackwardOp {
     Mean,
     RMSNorm,
     Gelu,
+    Reshape,
     Transpose,
     AddBroadcast,
     Embedding,
@@ -167,6 +171,7 @@ impl Tape {
                     BackwardOp::Mean => ops::mean_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Transpose => {
                         ops::transpose_backward(&entry, output_grad_id, store)?
                     }

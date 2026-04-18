@@ -1,5 +1,9 @@
 [workspace]
-members = [".", "infer", "crates/autograd", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-cuda-kernels", "crates/infer-tools", "crates/mlx-sys"]
+members = [".", "infer", "crates/autograd", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-cuda-kernels", "crates/infer-tools", "crates/mlx-sys", "crates/train"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
 
 # Workspace-wide lint posture. Only universally-agreed lints live here; crates
 # that want stricter pedantic enforcement (currently only `infer`) opt in via
@@ -26,6 +30,7 @@ unsafe_op_in_unsafe_fn = "warn"
 blake3 = { version = "1", default-features = false, features = ["std"] }
 libm = { version = "0.2" }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
+thiserror = "2"
 
 [package]
 name = "agent-infer"
