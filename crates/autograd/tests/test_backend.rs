@@ -1,0 +1,125 @@
+//! Backend matmul parity tests. The CPU reference is authoritative; each
+//! gated backend must match it to within `1e-3` relative tolerance on the
+//! three shapes we actually hit in TinyLM training: small 2D, square 2D,
+//! and batched rank-3.
+
+use autograd::{
+    CpuBackend,
+    backend::{Backend, cpu_matmul_forward},
+};
+
+fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
+    let size: usize = shape.iter().product();
+    let mut out = Vec::with_capacity(size);
+    let mut s = seed;
+    for i in 0..size {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let normalised = ((s >> 32) as u32 as f32) / (u32::MAX as f32);
+        out.push((normalised - 0.5) * 2.0 + (i as f32) * 1e-4);
+    }
+    out
+}
+
+fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+    for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+        let denom = b.abs().max(1.0);
+        let rel = (a - b).abs() / denom;
+        assert!(rel <= tol, "{label}: idx {i} got {a} want {b} rel {rel}",);
+    }
+}
+
+#[test]
+fn cpu_backend_matches_reference_2d() {
+    let backend = CpuBackend;
+    let a = make_rows(&[8, 16], 1);
+    let b = make_rows(&[16, 32], 2);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[8, 16], &b, &[16, 32])
+        .expect("cpu matmul");
+    let (want, want_shape) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
+    assert_eq!(got_shape, want_shape);
+    assert_close(&got, &want, 1e-6, "cpu 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_matches_cpu_small_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let a = make_rows(&[8, 16], 11);
+    let b = make_rows(&[16, 32], 22);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[8, 16], &b, &[16, 32])
+        .expect("metal matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
+    assert_eq!(got_shape, vec![8, 32]);
+    assert_close(&got, &want, 1e-3, "metal 2d small");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_matches_cpu_square_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 64], 33);
+    let b = make_rows(&[64, 64], 44);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[4, 64], &b, &[64, 64])
+        .expect("metal matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[4, 64], &b, &[64, 64]).expect("ref");
+    assert_eq!(got_shape, vec![4, 64]);
+    assert_close(&got, &want, 1e-3, "metal 2d square");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_matches_cpu_batched_3d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let a = make_rows(&[3, 8, 16], 55);
+    let b = make_rows(&[3, 16, 32], 66);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32])
+        .expect("metal matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32]).expect("ref");
+    assert_eq!(got_shape, vec![3, 8, 32]);
+    assert_close(&got, &want, 1e-3, "metal 3d batched");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_matches_cpu_small_2d() {
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[8, 16], 11);
+    let b = make_rows(&[16, 32], 22);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[8, 16], &b, &[16, 32])
+        .expect("cuda matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
+    assert_eq!(got_shape, vec![8, 32]);
+    assert_close(&got, &want, 1e-3, "cuda 2d small");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_matches_cpu_batched_3d() {
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[3, 8, 16], 55);
+    let b = make_rows(&[3, 16, 32], 66);
+    let (got, got_shape) = backend
+        .matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32])
+        .expect("cuda matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32]).expect("ref");
+    assert_eq!(got_shape, vec![3, 8, 32]);
+    assert_close(&got, &want, 1e-3, "cuda 3d batched");
+}

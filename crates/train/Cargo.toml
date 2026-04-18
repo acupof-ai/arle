@@ -5,10 +5,12 @@ edition.workspace = true
 
 [features]
 default = []
-no-cuda = []
+no-cuda = ["autograd/no-cuda"]
+metal = ["autograd/metal"]
+cuda = ["autograd/cuda"]
 
 [dependencies]
-autograd = { path = "../autograd" }
+autograd = { path = "../autograd", default-features = false }
 thiserror = { workspace = true }
 
 [[bin]]

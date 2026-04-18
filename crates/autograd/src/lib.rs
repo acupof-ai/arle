@@ -1,3 +1,11 @@
+#[path = "backend.rs"]
+pub mod backend;
+#[cfg(feature = "cuda")]
+#[path = "backend_cuda.rs"]
+pub mod backend_cuda;
+#[cfg(feature = "metal")]
+#[path = "backend_metal.rs"]
+pub mod backend_metal;
 #[path = "module.rs"]
 pub mod module;
 #[path = "ops.rs"]
@@ -9,6 +17,7 @@ pub mod tape;
 #[path = "tensor.rs"]
 pub mod tensor;
 
+pub use backend::{Backend, CpuBackend, Device};
 pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
 pub use tensor::{GpuTensor, TensorId, TensorStore};
 
