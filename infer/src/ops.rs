@@ -41,7 +41,7 @@ pub use norm::{
     fused_add_rms_norm_into, fused_add_rms_norm_offset_into, rms_norm_batch_offset_into,
     rms_norm_gated_into, rms_norm_into, rms_norm_offset_into,
 };
-pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
+pub use recurrent::{GdrHeadConfig, GdrWeights, gated_delta_rule_prefill_chunkwise_into};
 pub use sampling::{
     argmax, argmax_with_logprob, gpu_sample, gpu_sample_into, gpu_sample_launch,
     gpu_sample_readback,
@@ -64,8 +64,8 @@ pub(crate) use norm::{
     rms_norm_batch_f32_in_into, rms_norm_batch_into, rms_norm_gated_batch_into,
 };
 pub(crate) use recurrent::{
-    GdrHeadConfig, GdrWeights, conv1d_decode_batch_into, conv1d_prefill_batch_into,
-    gated_delta_rule_decode_into, gdr_decode_batch_into,
+    conv1d_decode_batch_into, conv1d_prefill_batch_into, gated_delta_rule_decode_into,
+    gdr_decode_batch_into,
 };
 pub(crate) use sampling::{
     argmax_batch_launch, argmax_batch_logprob_launch, argmax_batch_readback_into,

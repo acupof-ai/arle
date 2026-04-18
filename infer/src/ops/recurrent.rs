@@ -6,13 +6,13 @@ use infer_cuda_kernels::ffi;
 use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// GDR (gated delta rule) shared weights: `dt_bias` + `a_log` are reused across every GDR layer.
-pub(crate) struct GdrWeights<'a> {
+pub struct GdrWeights<'a> {
     pub dt_bias: &'a DeviceVec,
     pub a_log: &'a CudaSlice<f32>,
 }
 
 /// GDR head configuration: linear-attention head counts and per-head dims.
-pub(crate) struct GdrHeadConfig {
+pub struct GdrHeadConfig {
     pub num_key_heads: usize,
     pub num_value_heads: usize,
     pub key_dim: usize,
@@ -191,27 +191,24 @@ pub(crate) fn conv1d_prefill_batch_into(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gated_delta_rule_prefill_chunk_prepare_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
     b_proj: &HiddenStates,
     a_proj: &HiddenStates,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
+    weights: &GdrWeights<'_>,
     q_out: &mut HiddenStates,
     k_out: &mut HiddenStates,
     v_out: &mut HiddenStates,
     g_out: &mut CudaSlice<f32>,
     beta_out: &mut CudaSlice<f32>,
-    num_key_heads: usize,
-    num_value_heads: usize,
+    heads: &GdrHeadConfig,
 ) -> Result<()> {
     let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
     let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = weights.a_log.device_ptr(&ctx.stream);
     let (q_out_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
     let (k_out_ptr, _gko) = k_out.data.device_ptr_mut(&ctx.stream);
     let (v_out_ptr, _gvo) = v_out.data.device_ptr_mut(&ctx.stream);
@@ -230,8 +227,8 @@ fn gated_delta_rule_prefill_chunk_prepare_into(
             v_out_ptr as *mut ffi::Half,
             g_out_ptr as *mut f32,
             beta_out_ptr as *mut f32,
-            num_key_heads as i32,
-            num_value_heads as i32,
+            heads.num_key_heads as i32,
+            heads.num_value_heads as i32,
             qkv.hidden_dim as i32,
             qkv.seq_len as i32,
             ctx.stream.cu_stream(),
@@ -442,22 +439,22 @@ fn gated_delta_rule_prefill_chunk_o_stage_into(
 ///
 /// The chunk-wise path is an explicit multi-stage operator with pre-allocated
 /// scratch instead of one opaque kernel launch.
-#[allow(clippy::too_many_arguments)]
 pub fn gated_delta_rule_prefill_chunkwise_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
     b_proj: &HiddenStates,
     a_proj: &HiddenStates,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
+    weights: &GdrWeights<'_>,
     state: &mut CudaSlice<f32>,
     scratch: &mut GdrChunkwiseScratch35,
     output: &mut HiddenStates,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
+    heads: &GdrHeadConfig,
 ) -> Result<()> {
+    let num_key_heads = heads.num_key_heads;
+    let num_value_heads = heads.num_value_heads;
+    let key_dim = heads.key_dim;
+    let val_dim = heads.val_dim;
+
     assert_eq!(scratch.q_expanded.seq_len, qkv.seq_len);
     assert_eq!(scratch.k_expanded.seq_len, qkv.seq_len);
     assert_eq!(scratch.v_raw.seq_len, qkv.seq_len);
@@ -487,15 +484,13 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         qkv,
         b_proj,
         a_proj,
-        dt_bias,
-        a_log,
+        weights,
         &mut scratch.q_expanded,
         &mut scratch.k_expanded,
         &mut scratch.v_raw,
         &mut scratch.g_cumsum,
         &mut scratch.beta,
-        num_key_heads,
-        num_value_heads,
+        heads,
     )?;
     gated_delta_rule_prefill_chunk_cumsum_inplace(
         ctx,

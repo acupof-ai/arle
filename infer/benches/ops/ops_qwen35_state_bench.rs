@@ -61,15 +61,19 @@ pub(crate) fn bench_qwen35_state_ops(c: &mut Criterion) {
                         &qkv,
                         &b_proj,
                         &a_proj,
-                        &dt_bias,
-                        &a_log,
+                        &ops::GdrWeights {
+                            dt_bias: &dt_bias,
+                            a_log: &a_log,
+                        },
                         &mut state,
                         &mut scratch,
                         &mut recurrent_out,
-                        QWEN35_4B_LINEAR_K_HEADS,
-                        QWEN35_4B_LINEAR_V_HEADS,
-                        QWEN35_4B_LINEAR_K_DIM,
-                        QWEN35_4B_LINEAR_V_DIM,
+                        &ops::GdrHeadConfig {
+                            num_key_heads: QWEN35_4B_LINEAR_K_HEADS,
+                            num_value_heads: QWEN35_4B_LINEAR_V_HEADS,
+                            key_dim: QWEN35_4B_LINEAR_K_DIM,
+                            val_dim: QWEN35_4B_LINEAR_V_DIM,
+                        },
                     )
                     .expect("gated_delta_rule_prefill_chunkwise_into failed");
                 });
