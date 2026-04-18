@@ -11,6 +11,9 @@ mod decode;
 mod decode_buffers;
 #[path = "qwen3/forward.rs"]
 mod forward;
+#[cfg(feature = "cuda")]
+#[path = "qwen3/lora.rs"]
+pub mod lora;
 #[path = "qwen3/prefill.rs"]
 mod prefill;
 #[path = "qwen3/weights.rs"]
