@@ -113,6 +113,172 @@ impl Verifier for PaletteVerifier {
     }
 }
 
+/// Rewards a response that is strictly increasing — a code-style "output
+/// is monotonically sorted" property test. Response tokens equal to the
+/// sentinel (prompt's last token) are skipped so separators don't break
+/// the run.
+pub struct MonotonicVerifier;
+
+impl Verifier for MonotonicVerifier {
+    fn verify(&self, _prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]) -> f32 {
+        let mut prev: Option<usize> = None;
+        let mut correct = 0usize;
+        let mut total = 0usize;
+        for (position, masked) in response_mask.iter().enumerate() {
+            if !*masked {
+                continue;
+            }
+            total += 1;
+            let value = full_ids[position];
+            let ok = match prev {
+                Some(last) => value > last,
+                None => true,
+            };
+            if ok {
+                correct += 1;
+                prev = Some(value);
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            correct as f32 / total as f32
+        }
+    }
+}
+
+/// Rewards presence of a specific sentinel token in the response — a
+/// tool-success proxy. Real tool integration would replace this with a
+/// checker over the decoded tool-call payload; the sentinel stand-in
+/// lets the ensemble be tested today.
+pub struct ToolSuccessVerifier {
+    sentinel: usize,
+}
+
+impl ToolSuccessVerifier {
+    pub fn new(sentinel: usize) -> Self {
+        Self { sentinel }
+    }
+}
+
+impl Verifier for ToolSuccessVerifier {
+    fn verify(&self, _prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]) -> f32 {
+        let mut any_response = false;
+        for (position, masked) in response_mask.iter().enumerate() {
+            if !*masked {
+                continue;
+            }
+            any_response = true;
+            if full_ids[position] == self.sentinel {
+                return 1.0;
+            }
+        }
+        if any_response { 0.0 } else { 0.0 }
+    }
+}
+
+/// Rewards a response that encodes the correct answer to a tiny
+/// arithmetic expression embedded in the prompt. Prompt layout:
+/// `[a_digits..., op_token, b_digits..., eq_token]`. `op_token` selects
+/// sum (==`op_plus`) or product (==`op_times`); `eq_token` terminates
+/// the expression. The verifier decodes `a` and `b` from digit tokens
+/// (values `0..base`), computes the expected result, and compares it
+/// digit-wise against the response.
+///
+/// Tokenizer-free by construction. Intended as a math-verifier
+/// *archetype*: the decoder can be swapped out for a real one once a
+/// tokenizer is wired in; the surrounding ensemble + reward-config
+/// machinery needs no change.
+pub struct ArithmeticVerifier {
+    pub base: usize,
+    pub op_plus: usize,
+    pub op_times: usize,
+    pub eq_token: usize,
+    pub answer_len: usize,
+}
+
+impl ArithmeticVerifier {
+    pub fn new(
+        base: usize,
+        op_plus: usize,
+        op_times: usize,
+        eq_token: usize,
+        answer_len: usize,
+    ) -> Self {
+        assert!(base >= 2, "arithmetic base must be ≥2");
+        assert!(answer_len >= 1, "answer_len must be ≥1");
+        Self {
+            base,
+            op_plus,
+            op_times,
+            eq_token,
+            answer_len,
+        }
+    }
+
+    fn decode(&self, tokens: &[usize]) -> Option<(u64, u64, bool)> {
+        let op_pos = tokens
+            .iter()
+            .position(|t| *t == self.op_plus || *t == self.op_times)?;
+        let eq_pos = tokens.iter().position(|t| *t == self.eq_token)?;
+        if eq_pos <= op_pos + 1 {
+            return None;
+        }
+        let a = digits_to_value(&tokens[..op_pos], self.base)?;
+        let b = digits_to_value(&tokens[op_pos + 1..eq_pos], self.base)?;
+        let is_plus = tokens[op_pos] == self.op_plus;
+        Some((a, b, is_plus))
+    }
+
+    fn expected_answer(&self, a: u64, b: u64, is_plus: bool) -> u64 {
+        if is_plus { a + b } else { a * b }
+    }
+}
+
+impl Verifier for ArithmeticVerifier {
+    fn verify(&self, prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]) -> f32 {
+        let Some((a, b, is_plus)) = self.decode(prompt_ids) else {
+            return 0.0;
+        };
+        let expected = self.expected_answer(a, b, is_plus);
+
+        // Collect response tokens in order.
+        let mut response: Vec<usize> = Vec::new();
+        for (position, masked) in response_mask.iter().enumerate() {
+            if *masked {
+                response.push(full_ids[position]);
+            }
+        }
+        if response.is_empty() {
+            return 0.0;
+        }
+
+        // Use the first `answer_len` tokens (padding with zeros if short).
+        let mut answer_digits = vec![0usize; self.answer_len];
+        for (i, token) in response.iter().take(self.answer_len).enumerate() {
+            answer_digits[i] = *token;
+        }
+        let Some(answer) = digits_to_value(&answer_digits, self.base) else {
+            return 0.0;
+        };
+        if answer == expected { 1.0 } else { 0.0 }
+    }
+}
+
+fn digits_to_value(tokens: &[usize], base: usize) -> Option<u64> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for token in tokens {
+        if *token >= base {
+            return None;
+        }
+        value = value.checked_mul(base as u64)?.checked_add(*token as u64)?;
+    }
+    Some(value)
+}
+
 pub struct WeightedEnsemble {
     members: Vec<(f32, Box<dyn Verifier + Send + Sync>)>,
 }
@@ -141,6 +307,23 @@ impl WeightedEnsemble {
                 VerifierKind::Palette { allowed_tokens } => {
                     Box::new(PaletteVerifier::new(vocab_size, allowed_tokens))
                 }
+                VerifierKind::Monotonic => Box::new(MonotonicVerifier),
+                VerifierKind::ToolSuccess { sentinel } => {
+                    Box::new(ToolSuccessVerifier::new(*sentinel))
+                }
+                VerifierKind::Arithmetic {
+                    base,
+                    op_plus,
+                    op_times,
+                    eq_token,
+                    answer_len,
+                } => Box::new(ArithmeticVerifier::new(
+                    *base,
+                    *op_plus,
+                    *op_times,
+                    *eq_token,
+                    *answer_len,
+                )),
             };
             ensemble.members.push((entry.weight, verifier));
         }
@@ -162,7 +345,20 @@ pub struct RewardMember {
 pub enum VerifierKind {
     Copy,
     ReverseCopy,
-    Palette { allowed_tokens: Vec<usize> },
+    Palette {
+        allowed_tokens: Vec<usize>,
+    },
+    Monotonic,
+    ToolSuccess {
+        sentinel: usize,
+    },
+    Arithmetic {
+        base: usize,
+        op_plus: usize,
+        op_times: usize,
+        eq_token: usize,
+        answer_len: usize,
+    },
 }
 
 /// Config-driven reward aggregation. `members` is ordered; the final
