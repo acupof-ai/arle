@@ -475,6 +475,10 @@ struct Qwen35CompiledModel {
     // This mimics Python's lazy GC behavior where intermediates survive until
     // the next GC cycle, allowing MLX to reuse GPU buffers efficiently.
     std::vector<array> prev_outputs;
+    // Session state for FFI-cost-amortized single-request decode.
+    std::vector<array> session_kv_caches;   // [k0, v0, k1, v1, ...]
+    std::vector<array> session_gdr_states;  // [gdr0, conv0, gdr1, conv1, ...]
+    bool session_active = false;
     // Collect ALL intermediate arrays during forward() to keep them alive.
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
@@ -1309,6 +1313,144 @@ int32_t qwen35_compiled_step(
         for (int i = 0; i < n_gdr; ++i)
             out_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
 
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t qwen35_session_begin(
+    void* model,
+    mlx_array** kv_caches, int32_t n_kv,
+    mlx_array** gdr_states, int32_t n_gdr
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (m->session_active) {
+            throw std::runtime_error("qwen35_session_begin requires an inactive session");
+        }
+        if (n_kv < 0 || n_gdr < 0) {
+            throw std::runtime_error("qwen35_session_begin received negative cache counts");
+        }
+
+        std::vector<array> session_kv_caches;
+        std::vector<array> session_gdr_states;
+        session_kv_caches.reserve(n_kv);
+        session_gdr_states.reserve(n_gdr);
+        for (int i = 0; i < n_kv; ++i) {
+            session_kv_caches.push_back(*to_arr(kv_caches[i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            session_gdr_states.push_back(*to_arr(gdr_states[i]));
+        }
+
+        m->session_kv_caches = std::move(session_kv_caches);
+        m->session_gdr_states = std::move(session_gdr_states);
+        m->session_active = true;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->session_kv_caches.clear();
+        m->session_gdr_states.clear();
+        m->session_active = false;
+        return -1;
+    }
+}
+
+int32_t qwen35_session_end(
+    void* model,
+    mlx_array** out_kv_caches, int32_t n_kv,
+    mlx_array** out_gdr_states, int32_t n_gdr
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (!m->session_active) {
+            throw std::runtime_error("qwen35_session_end requires an active session");
+        }
+        if (n_kv < 0 || n_gdr < 0) {
+            throw std::runtime_error("qwen35_session_end received negative cache counts");
+        }
+        if (static_cast<int32_t>(m->session_kv_caches.size()) != n_kv ||
+            static_cast<int32_t>(m->session_gdr_states.size()) != n_gdr) {
+            throw std::runtime_error("qwen35_session_end cache counts do not match the active session");
+        }
+
+        for (int i = 0; i < n_kv; ++i) {
+            out_kv_caches[i] = from_arr(std::move(m->session_kv_caches[i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            out_gdr_states[i] = from_arr(std::move(m->session_gdr_states[i]));
+        }
+
+        m->session_kv_caches.clear();
+        m->session_gdr_states.clear();
+        m->session_active = false;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->session_kv_caches.clear();
+        m->session_gdr_states.clear();
+        m->session_active = false;
+        return -1;
+    }
+}
+
+int32_t qwen35_compiled_step_session(
+    void* model,
+    mlx_array* token_id,
+    int32_t cache_pos,
+    mlx_array** out_logits
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (!m->session_active) {
+            throw std::runtime_error("qwen35_compiled_step_session requires an active session");
+        }
+
+        const int32_t n_kv = static_cast<int32_t>(m->session_kv_caches.size());
+        const int32_t n_gdr = static_cast<int32_t>(m->session_gdr_states.size());
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_id));
+        for (const auto& kv : m->session_kv_caches) {
+            inputs.push_back(kv);
+        }
+        for (const auto& gdr : m->session_gdr_states) {
+            inputs.push_back(gdr);
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        std::vector<array> next_kv_caches;
+        std::vector<array> next_gdr_states;
+        next_kv_caches.reserve(n_kv);
+        next_gdr_states.reserve(n_gdr);
+        for (int i = 0; i < n_kv; ++i) {
+            next_kv_caches.push_back(std::move(outputs[1 + i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            next_gdr_states.push_back(std::move(outputs[1 + n_kv + i]));
+        }
+
+        auto* logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv_caches);
+        m->session_gdr_states = std::move(next_gdr_states);
+        *out_logits = logits;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());

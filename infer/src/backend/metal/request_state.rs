@@ -494,7 +494,8 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
                 "Qwen3.5 packed batch admit_rows requires matching model handles"
             );
 
-            qwen35.driver.ensure_capacity(self.kv_capacity);
+            qwen35.driver.ensure_cpp_session_drained()?;
+            qwen35.driver.ensure_capacity(self.kv_capacity)?;
             qwen35.driver.kv_capacity = self.kv_capacity;
             let left_pad = self.batch_cache_len - qwen35.driver.cache_len;
             ensure!(
@@ -1271,6 +1272,10 @@ fn try_build_qwen35_packed_decode_batch<'a>(
         "try_build_qwen35_packed_decode_batch requires at least one request state"
     );
 
+    for state in states.iter_mut() {
+        state.driver.ensure_cpp_session_drained()?;
+    }
+
     let first = &states[0].driver;
     let weights = first.weights;
     let config = first.config;
@@ -1333,7 +1338,7 @@ fn try_build_qwen35_packed_decode_batch<'a>(
     // Normalize every state's own storage up to target_kv_capacity before we
     // read its KV arrays — concatenate_axis requires identical trailing shapes.
     for state in states.iter_mut() {
-        state.driver.ensure_capacity(target_kv_capacity);
+        state.driver.ensure_capacity(target_kv_capacity)?;
         state.driver.kv_capacity = target_kv_capacity;
     }
 
@@ -1416,6 +1421,7 @@ fn sync_qwen35_packed_decode_batch<'a>(
             batch.matches_driver(&state.driver),
             "sync_qwen35_packed_decode_batch state mismatch at row {row_idx}"
         );
+        state.driver.ensure_cpp_session_drained()?;
         let row = i32::try_from(row_idx).context("sync_qwen35_packed_decode_batch row overflow")?;
         let left_pad = batch.left_padding[row_idx];
         match &mut state.driver.mode {
@@ -1616,6 +1622,10 @@ fn decode_qwen35_batch(
         "decode_qwen35_batch requires at least one request state"
     );
 
+    for state in states.iter_mut() {
+        state.driver.ensure_cpp_session_drained()?;
+    }
+
     let batch = i32::try_from(states.len()).context("decode_qwen35_batch batch size overflow")?;
     let first = &states[0].driver;
     let weights = first.weights;
@@ -1650,7 +1660,7 @@ fn decode_qwen35_batch(
     }
 
     for state in states.iter_mut() {
-        state.driver.ensure_capacity(state.driver.cache_len + 1);
+        state.driver.ensure_capacity(state.driver.cache_len + 1)?;
     }
 
     let input_tokens: Vec<u32> = states
@@ -2284,12 +2294,31 @@ struct Qwen35DFlashState {
 struct Qwen35CppState {
     kv_flat: Vec<MlxArray>,
     gdr_flat: Vec<MlxArray>,
+    session_active: bool,
+    n_kv: usize,
+    n_gdr: usize,
 }
 
 struct Qwen35RustState {
     k_caches: Vec<MlxArray>,
     v_caches: Vec<MlxArray>,
     recurrent: MetalRecurrentState,
+}
+
+impl Qwen35CppState {
+    fn ensure_caches_drained(&mut self, cpp_model: &CppQwen35Model) -> Result<()> {
+        if !self.session_active {
+            return Ok(());
+        }
+
+        let (kv_flat, gdr_flat) = cpp_model.end_session(self.n_kv, self.n_gdr)?;
+        self.kv_flat = kv_flat;
+        self.gdr_flat = gdr_flat;
+        self.session_active = false;
+        self.n_kv = 0;
+        self.n_gdr = 0;
+        Ok(())
+    }
 }
 
 enum Qwen35StepMode {
@@ -2397,7 +2426,13 @@ impl<'a> Qwen35StepDriver<'a> {
                 .zip(recurrent.conv_states.iter())
                 .flat_map(|(s, c)| [s.clone(), c.clone()])
                 .collect();
-            Qwen35StepMode::Cpp(Qwen35CppState { kv_flat, gdr_flat })
+            Qwen35StepMode::Cpp(Qwen35CppState {
+                kv_flat,
+                gdr_flat,
+                session_active: false,
+                n_kv: 0,
+                n_gdr: 0,
+            })
         } else {
             Qwen35StepMode::Rust(Qwen35RustState {
                 k_caches,
@@ -2443,7 +2478,7 @@ impl<'a> Qwen35StepDriver<'a> {
     }
 
     fn run_step(&mut self, token: u32) -> Result<MlxArray> {
-        self.ensure_capacity(self.cache_len + 1);
+        self.ensure_capacity(self.cache_len + 1)?;
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let logits = self.run_step_with_token(&token_arr)?;
         self.cache_len += 1;
@@ -2464,6 +2499,18 @@ impl<'a> Qwen35StepDriver<'a> {
         Ok(logits)
     }
 
+    fn ensure_cpp_session_drained(&mut self) -> Result<()> {
+        let cpp_model = self
+            .weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 C++ step path missing compiled model")?;
+        match &mut self.mode {
+            Qwen35StepMode::Cpp(state) => state.ensure_caches_drained(cpp_model),
+            Qwen35StepMode::Rust(_) => Ok(()),
+        }
+    }
+
     fn run_cpp_step(
         weights: &Qwen35MetalWeights,
         cache_len: i32,
@@ -2474,18 +2521,16 @@ impl<'a> Qwen35StepDriver<'a> {
             .cpp_model
             .as_ref()
             .context("Qwen3.5 C++ step path missing compiled model")?;
-        let logits = cpp_model.step(
-            token_arr,
-            cache_len,
-            &mut state.kv_flat,
-            &mut state.gdr_flat,
-        )?;
-        let mut step_outputs: Vec<&MlxArray> =
-            Vec::with_capacity(1 + state.kv_flat.len() + state.gdr_flat.len());
-        step_outputs.push(&logits);
-        step_outputs.extend(state.kv_flat.iter());
-        step_outputs.extend(state.gdr_flat.iter());
-        async_eval(&step_outputs);
+        if !state.session_active {
+            cpp_model.begin_session(&state.kv_flat, &state.gdr_flat)?;
+            state.n_kv = state.kv_flat.len();
+            state.n_gdr = state.gdr_flat.len();
+            state.kv_flat.clear();
+            state.gdr_flat.clear();
+            state.session_active = true;
+        }
+        let logits = cpp_model.step_session(token_arr, cache_len)?;
+        async_eval(&[&logits]);
         Ok(logits)
     }
 
@@ -2525,11 +2570,17 @@ impl<'a> Qwen35StepDriver<'a> {
         logits
     }
 
-    fn ensure_capacity(&mut self, needed_tokens: i32) {
+    fn ensure_capacity(&mut self, needed_tokens: i32) -> Result<()> {
         while needed_tokens > self.kv_capacity {
             let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
             match &mut self.mode {
                 Qwen35StepMode::Cpp(state) => {
+                    let cpp_model = self
+                        .weights
+                        .cpp_model
+                        .as_ref()
+                        .context("Qwen3.5 C++ step path missing compiled model")?;
+                    state.ensure_caches_drained(cpp_model)?;
                     for li in 0..(state.kv_flat.len() / 2) {
                         extend_kv_cache(
                             &mut state.kv_flat[2 * li],
@@ -2564,6 +2615,7 @@ impl<'a> Qwen35StepDriver<'a> {
             }
             self.kv_capacity = new_cap;
         }
+        Ok(())
     }
 
     fn import_prefix_snapshot(&mut self, snapshot: &Qwen35PrefixSnapshot) -> Result<()> {
@@ -2577,6 +2629,7 @@ impl<'a> Qwen35StepDriver<'a> {
             snapshot.kv_capacity,
             snapshot.cache_len
         );
+        self.ensure_cpp_session_drained()?;
         match &mut self.mode {
             Qwen35StepMode::Cpp(state) => {
                 state.kv_flat = snapshot.kv_flat.clone();
@@ -2592,12 +2645,13 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
-    fn export_current_cpp_snapshot(&self, token_ids: Vec<u32>) -> Result<Qwen35PrefixSnapshot> {
+    fn export_current_cpp_snapshot(&mut self, token_ids: Vec<u32>) -> Result<Qwen35PrefixSnapshot> {
         let cache_len = self.cache_len;
         ensure!(
             cache_len > 0,
             "Qwen3.5 prefix export requires a non-empty cache"
         );
+        self.ensure_cpp_session_drained()?;
         match &self.mode {
             Qwen35StepMode::Cpp(state) => Ok(Qwen35PrefixSnapshot {
                 token_ids,
@@ -2763,7 +2817,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
 
         let use_cpp_batch_prefill = matches!(self.mode, Qwen35StepMode::Cpp(_)) && tokens.len() > 1;
         if use_cpp_batch_prefill {
-            self.ensure_capacity(self.cache_len + tokens.len() as i32);
+            self.ensure_capacity(self.cache_len + tokens.len() as i32)?;
         }
 
         match &mut self.mode {
@@ -2775,6 +2829,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .cpp_model
                     .as_ref()
                     .context("Qwen3.5 C++ prefill path missing compiled model")?;
+                state.ensure_caches_drained(cpp_model)?;
                 // DFlash: enable hidden state capture during prefill
                 if let Some(ref dflash) = self.dflash {
                     let ids: Vec<i32> = dflash
@@ -2869,7 +2924,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 i32::try_from(block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
             let needed_cap = self.cache_len + block_size_i32;
             if needed_cap > self.kv_capacity {
-                self.ensure_capacity(needed_cap);
+                self.ensure_capacity(needed_cap)?;
             }
         }
 
@@ -2889,6 +2944,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .cpp_model
                     .as_ref()
                     .context("Qwen3.5 DFlash requires C++ compiled model")?;
+                cpp_state.ensure_caches_drained(cpp_model)?;
 
                 let block = dflash::qwen35_dflash_speculative_block(
                     dflash.runtime,
@@ -2941,7 +2997,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 clear_metal_cache();
             }
             let result_arr = MlxArray::from_slice_i32(&[result as i32], &[1]);
-            self.ensure_capacity(self.cache_len + 1);
+            self.ensure_capacity(self.cache_len + 1)?;
             let next_logits = self.run_step_with_token(&result_arr)?;
             let next_sampled = gpu_sample_token(&next_logits, &self.params);
             async_eval(&[&next_sampled]);
@@ -2949,6 +3005,11 @@ impl StepDriver for Qwen35StepDriver<'_> {
         }
 
         Ok(result)
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        self.pending_sampled = None;
+        self.ensure_cpp_session_drained()
     }
 }
 
