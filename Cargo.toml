@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "infer", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-cuda-kernels", "crates/infer-tools", "crates/mlx-sys"]
+members = [".", "infer", "crates/autograd", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-cuda-kernels", "crates/infer-tools", "crates/mlx-sys"]
 
 # Workspace-wide lint posture. Only universally-agreed lints live here; crates
 # that want stricter pedantic enforcement (currently only `infer`) opt in via
