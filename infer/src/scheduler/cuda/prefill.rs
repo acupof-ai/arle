@@ -12,6 +12,22 @@ fn is_prompt_prefix_of_cached_hit(prompt_len: usize, cached_len: usize, prefix_l
     is_full_prompt_reuse_hit(prompt_len, prefix_len) && prefix_len < cached_len
 }
 
+/// Returns true when the radix hit should be downgraded to MISS for a model
+/// that cannot truncate state to an arbitrary prefix (e.g. Qwen3.5 hybrid).
+///
+/// Only full-prompt hits (`raw == prompt_len`) are safe for such models,
+/// because the exact-match branch in `step_new` routes through `state.reset()`
+/// + full re-prefill rather than `truncate_to + restore_prefix_snapshot`.
+/// Any partial hit — including the exact-block-aligned `raw == cached < prompt_len`
+/// case — must downgrade. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
+fn should_downgrade_partial_hit_to_miss(
+    raw_prefix_len: usize,
+    prompt_len: usize,
+    supports_partial_prefix: bool,
+) -> bool {
+    raw_prefix_len > 0 && raw_prefix_len < prompt_len && !supports_partial_prefix
+}
+
 impl<M: ModelForward> Scheduler<M> {
     /// Compute prefix cache for a new request and begin chunked prefill.
     pub(super) fn step_new(&mut self, idx: usize) {
@@ -39,10 +55,11 @@ impl<M: ModelForward> Scheduler<M> {
             let req = &mut self.active[idx];
             let state = &mut self.states[si];
 
-            let prefix_len = if raw_prefix_len > 0
-                && raw_prefix_len < prompt_len
-                && !state.supports_partial_prefix()
-            {
+            let prefix_len = if should_downgrade_partial_hit_to_miss(
+                raw_prefix_len,
+                prompt_len,
+                state.supports_partial_prefix(),
+            ) {
                 0
             } else {
                 raw_prefix_len
@@ -378,6 +395,7 @@ impl<M: ModelForward> Scheduler<M> {
 mod tests {
     use super::{
         is_exact_full_prefix_hit, is_full_prompt_reuse_hit, is_prompt_prefix_of_cached_hit,
+        should_downgrade_partial_hit_to_miss,
     };
 
     #[test]
@@ -402,5 +420,44 @@ mod tests {
         assert!(!is_prompt_prefix_of_cached_hit(4, 4, 4));
         assert!(!is_prompt_prefix_of_cached_hit(4, 6, 3));
         assert!(!is_prompt_prefix_of_cached_hit(4, 3, 3));
+    }
+
+    #[test]
+    fn hybrid_downgrade_fires_on_every_partial_hit() {
+        // Non-hybrid models: never downgrade, even on partial hits.
+        assert!(!should_downgrade_partial_hit_to_miss(4, 10, true));
+        assert!(!should_downgrade_partial_hit_to_miss(10, 10, true));
+
+        // Hybrid models: downgrade whenever the radix match is shorter than
+        // the prompt. This is the safety invariant the fix locks in —
+        // covers both `raw < cached` (common, block-remainder gap) and the
+        // previously-slipped-through `raw == cached < prompt_len` case.
+        for raw in 1..10 {
+            for prompt in (raw + 1)..=16 {
+                assert!(
+                    should_downgrade_partial_hit_to_miss(raw, prompt, false),
+                    "hybrid must downgrade when raw={raw} < prompt={prompt}",
+                );
+            }
+        }
+
+        // Full-prompt hit (`raw == prompt`) is the ONLY case safe for hybrid:
+        // routes through the exact-match branch (state.reset + full re-prefill).
+        for n in 1..=16 {
+            assert!(
+                !should_downgrade_partial_hit_to_miss(n, n, false),
+                "hybrid must NOT downgrade full-prompt hits (raw == prompt == {n})",
+            );
+        }
+
+        // Empty radix hit: nothing to downgrade (already effective MISS).
+        assert!(!should_downgrade_partial_hit_to_miss(0, 16, false));
+        assert!(!should_downgrade_partial_hit_to_miss(0, 0, false));
+
+        // Exact-block-aligned partial hit — the slip-through the fix closes.
+        // Pre-fix condition `raw < cached` missed this when cached was also
+        // block-aligned equal to raw; the new `raw < prompt_len` check fires.
+        assert!(should_downgrade_partial_hit_to_miss(16, 32, false));
+        assert!(should_downgrade_partial_hit_to_miss(32, 48, false));
     }
 }
