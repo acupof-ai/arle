@@ -364,6 +364,14 @@ pub trait ModelForward: Send {
         false
     }
 
+    /// Whether batched decode for this model can be replayed via a captured
+    /// CUDA Graph. Returns `false` when the model forces an eager decode
+    /// path (e.g. LoRA adapters allocate per-call temps which stream
+    /// capture rejects). Scheduler skips warmup/autotune in that case.
+    fn supports_cuda_graph_decode(&self) -> bool {
+        true
+    }
+
     /// Mixed-batch forward: B decode tokens + C prefill tokens in one eager forward pass.
     /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if not supported.
     fn forward_mixed_batch(
