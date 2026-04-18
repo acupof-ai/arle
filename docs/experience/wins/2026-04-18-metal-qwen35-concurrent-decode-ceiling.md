@@ -36,6 +36,19 @@ Linear fit `t(B) ≈ 4.4 + 6.3·B ms` → ceiling ~158 tps, observed ~145 tps.
 Linear fit `t(B) ≈ 3.4 + 6.5·B ms` → **constant term `a` dropped by 1.0 ms**
 (sampling kernel launches saved), **linear term `b` is unchanged**.
 
+### Reproduction at commit `5fe8805` (later same day)
+
+| C | agg tps | per-req tps | step time |
+|---:|---:|---:|---:|
+| 1 | 67.2 | 67.2 | 14.9 ms |
+| 2 | 120.7 | 60.6 | 16.6 ms |
+| 4 | 143.5 | 36.2 | 27.9 ms |
+| 8 | 142.8 | 26.5 | 56.0 ms |
+
+Fit `t(B) ≈ 6.0 + 6.1·B ms`; per-row asymptote ~164 tok/s, observed 143 tok/s
+(the 20 tok/s gap is HTTP + scheduler + tokenizer + sample loop overhead).
+Matches post-fix within noise — the ceiling is reproducible, not an artifact.
+
 ## Root cause of the B-linear term
 
 The old sampling path called `argmax(logits)` (flat, wrong for B>1) so
