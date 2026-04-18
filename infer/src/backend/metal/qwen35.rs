@@ -1654,7 +1654,9 @@ mod tests {
     #[test]
     fn verify_block_batched_matches_verify_block_for_b1() -> Result<()> {
         let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
-            eprintln!("QWEN35_MODEL_PATH unset; skipping verify_block_batched B=1 equivalence test");
+            eprintln!(
+                "QWEN35_MODEL_PATH unset; skipping verify_block_batched B=1 equivalence test"
+            );
             return Ok(());
         };
         let _guard = metal_test_guard();
@@ -1699,8 +1701,10 @@ mod tests {
             .collect();
 
         let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens, &[prompt_len]);
-        let prompt_logits = cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
-        let mut prompt_refs: Vec<&MlxArray> = Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+        let prompt_logits =
+            cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+        let mut prompt_refs: Vec<&MlxArray> =
+            Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
         prompt_refs.push(&prompt_logits);
         prompt_refs.extend(kv_flat.iter());
         prompt_refs.extend(gdr_flat.iter());
