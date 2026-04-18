@@ -47,7 +47,7 @@ throughput sweep iteration, compare to the contig baseline. If
 times differ materially → Hypothesis B (kernel indirection cost).
 Pick fix based on which dominates.
 
-## 2. `prefix_cache.insert` warnings under bench
+## 2. `prefix_cache.insert` warnings under bench ✅ resolved 2026-04-19
 
 **Symptom:** `WARN prefix_cache.insert: expected 4096 tokens, got 0`
 (occasional) or `got 4080` (common) fires on every bench request.
@@ -138,6 +138,33 @@ future `BlockFingerprint` lookups.
   - Pure prefix_cache change, no GPU. Safe to attempt without a
     CUDA box, but needs CUDA E2E re-run before merge to confirm no
     regression in prefill KV reuse.
+
+**Landed 2026-04-19** (`commit pending push`):
+
+- `prefix_cache.rs:598` — replaced the unconditional `break` after
+  edge split with: if the caller still has an aligned block's worth
+  of tokens (`pos + block_size <= tokens.len()` and `block_idx <
+  blocks.len()`), place `blocks[block_idx]` as a new child node of
+  `shared_idx` covering `tokens[pos+match_len..pos+block_size]`, then
+  continue the outer loop. Path-from-root to the new node is
+  `match_len + (block_size - match_len) = block_size`, so block-id
+  alignment holds.
+- Three new tests in `prefix_cache::tests`:
+  `split_on_first_block_inserts_remaining_blocks_as_sibling`,
+  `split_on_later_block_inserts_divergent_block_under_shared`,
+  `split_with_short_tail_still_registers_aligned_block`.
+- Two pre-existing tests (`evict_prunes_orphan_tombstones_into_free_list`,
+  `insert_reuses_reclaimed_tombstone_slots`) updated — they were
+  silently asserting the old drop-the-divergent-block behavior. New
+  assertions use the now-correct tree shape with two sibling branches
+  under the shared tombstone and 3-node tombstone cascade on evict(2).
+- 47/47 prefix_cache tests + 293/293 infer lib tests pass under
+  `--no-default-features --features no-cuda`. CI clippy surface
+  (`cd infer && cargo clippy --no-default-features --features
+  no-cuda --lib -- -D warnings`) clean.
+- CUDA E2E re-run deferred to user — this is a prefix-sharing
+  correctness fix, so worst-case regression is the pre-fix state
+  (missed sharing), not corruption.
 
 ## 3. Qwen3.5 re-enable
 
