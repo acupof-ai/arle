@@ -66,10 +66,14 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    — don't mix them.
 6. **DFlash (speculative decode) is experimental and optional.** Guarded by
    `MetalDflashOptions`; empty draft model = feature off. See
-   `docs/resources/metal-dflash.md` for user-facing flags. DFlash still runs
-   on the **legacy serial runtime** (`backend/runtime.rs` — the non-scheduler
-   path) because the scheduler runtime does not yet understand DFlash slot
-   ownership.
+   `docs/resources/metal-dflash.md` for user-facing flags. DFlash dispatches
+   from the scheduler runtime via `execute_decode_single`
+   (`runtime.rs:1051-1056`) — one row at a time. When a multi-row tick has
+   `open.len() >= 2`, the scheduler permanently disables DFlash on every row
+   so they all join the packed batch (`runtime.rs:1040-1045`); this is a
+   policy choice, not a wiring gap, and the Layer 2 verify-batch plan
+   (`docs/plans/metal-dflash-qwen35-verify-batch.md`) lifts it once packed
+   speculative verify lands.
 7. **Variable-length decode uses left-padding + additive mask + per-row
    RoPE offsets** (mlx-lm `BatchKVCache` pattern).
    `Qwen35PackedDecodeBatch` carries a shared `batch_cache_len` cursor
