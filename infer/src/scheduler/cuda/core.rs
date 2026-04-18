@@ -296,12 +296,25 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
 
+        // When the model writes prefill K/V directly to the paged pool, the
+        // per-slot contiguous scratch buffer is unused by prefill. Shrink it
+        // to the minimum that single-token decode / INT8 working buffers
+        // still require, and reclaim the freed bytes into the pool budget.
+        let model_uses_paged_prefill = model.prefill_uses_paged_pool();
+        let contiguous_tokens = if model_uses_paged_prefill {
+            // Single-token decode path still allocates per-slot contiguous
+            // K/V of this size; 1 page's worth is enough.
+            PREFIX_CACHE_BLOCK_SIZE
+        } else {
+            CONTIGUOUS_KV_TOKENS
+        };
+
         let mut states = Vec::with_capacity(config.max_slots);
         let mut slot_materialized_prompt_lens = Vec::with_capacity(config.max_slots);
         let mut slot_owned_blocks = Vec::with_capacity(config.max_slots);
         for i in 0..config.max_slots {
             let mut state = model.create_state()?;
-            state.set_max_seq_len(CONTIGUOUS_KV_TOKENS);
+            state.set_max_seq_len(contiguous_tokens);
             state.set_kv_dtype(kv_cache_dtype);
             states.push(state);
             slot_materialized_prompt_lens.push(0);
@@ -311,7 +324,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let paged_kv_pool = {
             let bytes_per_token = model.kv_cache_bytes_per_token();
-            let contiguous_cost = config.max_slots * CONTIGUOUS_KV_TOKENS * bytes_per_token;
+            let contiguous_cost = config.max_slots * contiguous_tokens * bytes_per_token;
             // SGLang-compatible: pool budget = free − contiguous − headroom.
             // Headroom is derived from mem_fraction_static via the auto-sizer;
             // here we just subtract contiguous cost from post-weight-load free memory.
@@ -876,14 +889,31 @@ impl<M: ModelForward> Scheduler<M> {
                 .filter(|req| matches!(req.phase, Phase::Decoding))
                 .count(),
         );
-        DecodeAwareChunking {
+        // When the model writes prefill K/V directly to the paged pool, there
+        // is no per-slot contiguous scratch to size the chunk against, so the
+        // `CONTIGUOUS_KV_TOKENS` cap does not apply and the configured
+        // `prefill_chunk_size` (default 4096) is the only upper bound.
+        let contiguous_cap = if self.model.prefill_uses_paged_pool() {
+            usize::MAX
+        } else {
+            CONTIGUOUS_KV_TOKENS
+        };
+        let policy_chunk = DecodeAwareChunking {
             decode_active_chunk: self.config.decode_active_prefill_cap,
             idle_chunk: self.config.prefill_chunk_size,
         }
-        .next_chunk_size(InferenceMode::Prefill, signals)
-        .max(1)
-        .min(self.config.prefill_chunk_size)
-        .min(CONTIGUOUS_KV_TOKENS) // Cap to contiguous buffer to prevent overflow
+        .next_chunk_size(InferenceMode::Prefill, signals);
+        let out = policy_chunk
+            .max(1)
+            .min(self.config.prefill_chunk_size)
+            .min(contiguous_cap);
+        log::debug!(
+            "prefill_chunk_size: policy={policy_chunk} cap={contiguous_cap} cfg={} paged={} active_decodes={} => {out}",
+            self.config.prefill_chunk_size,
+            self.model.prefill_uses_paged_pool(),
+            signals.active_decodes,
+        );
+        out
     }
 
     /// Pre-capture CUDA Graphs for batched decode at common batch sizes.

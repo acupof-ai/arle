@@ -25,6 +25,7 @@ mod tests;
 pub(crate) use attention::{
     decode_prep_paged, decode_prep_paged_fused_qkv, prefill_attention_batch,
     prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
+    prefill_attention_hd256_paged_batch, prefill_attention_paged_batch,
 };
 pub use attention::{
     flashinfer_run_layer, flashinfer_tc_run_layer, fused_attention_decode_batched_into,
@@ -48,8 +49,8 @@ pub use sampling::{
 #[cfg(test)]
 pub(crate) use attention::flash_attention_prefill_hd256_into;
 pub(crate) use attention::{
-    HeadConfig, NormRopeParams, PagedKVMeta, attention_gate_paged_hd256, decode_prep_paged_hd256,
-    flashinfer_run_layer_hd256,
+    HeadConfig, NormRopeParams, PagedKVMeta, PagedPrefillMeta, attention_gate_paged_hd256,
+    decode_prep_paged_hd256, flashinfer_run_layer_hd256,
 };
 pub(crate) use elementwise::{
     add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into,

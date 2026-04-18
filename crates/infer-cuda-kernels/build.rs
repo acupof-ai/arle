@@ -725,6 +725,7 @@ fn main() {
             if let Some(ref inc) = fi_include {
                 nvcc_args.extend([
                     format!("-I{}", inc),
+                    format!("-I{}/flashinfer", inc),
                     "-std=c++17".to_string(),
                     "--expt-relaxed-constexpr".to_string(),
                 ]);
@@ -773,6 +774,11 @@ fn main() {
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    } else if !cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 
     println!("cargo:rerun-if-changed=csrc/");
     println!("cargo:rerun-if-changed=build.rs");

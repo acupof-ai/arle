@@ -165,30 +165,36 @@ impl ModelForward for Qwen3Model {
         tokens: &[u32],
         state: &mut Self::State,
         pool: &TokenKVPool,
-        _slot: usize,
-        new_token_indices: &cudarc::driver::CudaSlice<i32>,
+        slot: usize,
+        _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         if tokens.len() == 1 {
             // Single-token: use standard decode path (CUDA Graph).
-            // No pool scatter-write needed — decode path writes to pool via
-            // decode_prep_paged kernel.
             self.forward_decode(tokens[0], state)?;
-        } else {
-            let start_pos = state.base.kv_cache.len();
-            let hidden = self.get_embeddings_batch(tokens)?;
-            // Dual-write: writes K/V to both contiguous cache AND token pool.
-            let hidden = self.process_all_layers_batch_with_pool(
-                hidden,
-                start_pos,
-                &mut state.base.kv_cache,
-                pool,
-                new_token_indices,
-            )?;
-            let logits = self.compute_logits_batch(&hidden)?;
-            state.base.prefill_logits = Some(logits);
+            return Ok(());
         }
 
+        // Paged prefill. The scheduler has already allocated pool pages for
+        // these tokens (pool.seq_len(slot) already includes them), so
+        // start_pos is the logical position of the first new token.
+        let pool_seq_len = pool.seq_len(slot);
+        anyhow::ensure!(
+            pool_seq_len >= tokens.len(),
+            "paged prefill: pool seq_len {pool_seq_len} < chunk len {}",
+            tokens.len()
+        );
+        let start_pos = pool_seq_len - tokens.len();
+
+        let hidden = self.get_embeddings_batch(tokens)?;
+        let hidden = self.process_all_layers_batch_paged(hidden, start_pos, pool, slot)?;
+        let logits = self.compute_logits_batch(&hidden)?;
+        state.base.prefill_logits = Some(logits);
+
         Ok(())
+    }
+
+    fn prefill_uses_paged_pool(&self) -> bool {
+        true
     }
 
     fn select_token(

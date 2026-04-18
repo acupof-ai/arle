@@ -13,12 +13,10 @@
 //!   qwen35_compiled_step(model, token, caches_in, caches_out)
 //!   qwen35_compiled_free(model)
 
-#include "mlx_bridge.h"
+#include "mlx_common.h"
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
-
-using namespace mlx::core;
 
 namespace {
 
@@ -1476,14 +1474,22 @@ int32_t qwen35_compiled_prefill(
     }
 }
 
-int32_t qwen35_compiled_block_verify(
+// ── DFlash speculative verify — parallel forward over a draft block ───────
+// Same forward path as prefill (current_seq_len = block_size) but always
+// returns all-position logits (current_last_logits_only = false). DFlash
+// needs logits for every drafted token to compute greedy acceptance.
+// Respects model-level tape_mode / capture_layer_ids so one call emits
+// per-step GDR tapes [1, block_size, hv, dv] and captured hidden
+// [1, block_size, hidden] for the whole block.
+
+int32_t qwen35_compiled_verify_block(
     void* model,
-    mlx_array* token_ids,    // int32 vector [block_size]
+    mlx_array* token_ids,    // int32 [block_size]
     int32_t block_size,
     int32_t cache_pos,
     mlx_array** kv_caches, int32_t n_kv,
     mlx_array** gdr_states, int32_t n_gdr,
-    mlx_array** out_logits,
+    mlx_array** out_logits,  // [1, block_size, vocab]
     mlx_array** out_kv_caches,
     mlx_array** out_gdr_states
 ) {

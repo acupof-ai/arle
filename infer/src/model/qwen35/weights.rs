@@ -72,6 +72,12 @@ pub struct Qwen35Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    /// Shared HD256 paged-prefill plan for `process_all_layers_batch_paged_35`.
+    /// Lazy-initialized on first call and reused across the 8 full-attn layers
+    /// and across all subsequent prefills — matches sglang's single
+    /// `workspace_buffer` pattern. See qwen3 `paged_prefill_plan` for rationale.
+    pub(super) paged_prefill_plan_hd256:
+        std::sync::Mutex<Option<infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
 }
 
 impl Qwen35Model {
@@ -297,6 +303,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph,
+            paged_prefill_plan_hd256: std::sync::Mutex::new(None),
         })
     }
 
@@ -717,6 +724,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph,
+            paged_prefill_plan_hd256: std::sync::Mutex::new(None),
         })
     }
 }

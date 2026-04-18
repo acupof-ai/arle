@@ -559,7 +559,13 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
-    pub(super) fn step_block(
+    /// DFlash verify: parallel forward over a draft block, returning all-position
+    /// logits `[1, block_size, vocab]`. Mirrors `prefill` but forces
+    /// `last_logits_only = false` so the caller can sample every position in the
+    /// draft in a single pass. Tape/hidden capture flags on the model are
+    /// respected — one call emits the full per-step GDR innovation tape and the
+    /// full hidden-state capture for the block.
+    pub(super) fn verify_block(
         &self,
         tokens: &MlxArray,
         block_size: i32,
@@ -580,7 +586,7 @@ impl CppQwen35Model {
         let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
 
         let rc = unsafe {
-            mlx_sys::qwen35_compiled_block_verify(
+            mlx_sys::qwen35_compiled_verify_block(
                 self.0,
                 tokens.as_raw(),
                 block_size,
