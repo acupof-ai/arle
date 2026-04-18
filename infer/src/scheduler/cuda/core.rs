@@ -58,9 +58,7 @@ pub(super) struct StagedAdmission {
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
-    pub all_greedy: bool,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
-    /// Distinct from `all_greedy` which tracks sampling policy, not launch state.
     pub greedy_launched: bool,
     pub sampling_params_greedy: Vec<bool>,
     pub mixed_prefill_request_idx: Option<usize>,
