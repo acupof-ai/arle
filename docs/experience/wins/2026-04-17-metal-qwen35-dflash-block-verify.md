@@ -17,14 +17,14 @@ to parity.
 `cpp_model.step(S=1)` calls per block. The reference `dflash-mlx` runs
 verify as one `S=16` forward. We already had all the primitives.
 
-1. New FFI `qwen35_compiled_block_verify` (C++): runs the compiled
+1. New FFI `qwen35_compiled_verify_block` (C++): runs the compiled
    model with `current_seq_len = block_size`,
    `current_last_logits_only = false`. Single forward, single
    `eval`, per-layer tape/KV update amortized.
-2. New Rust wrapper `Qwen35StepDriver::step_block` threads the block
+2. New Rust wrapper `CppQwen35Model::verify_block` threads the block
    through the existing flat-KV contract.
 3. `qwen35_dflash_speculative_block` swapped its per-token loop for
-   one `step_block` call, then reused existing tape/snapshot rollback
+   one `verify_block` call, then reused existing tape/snapshot rollback
    on partial reject.
 4. **kv_flat capacity fix** (`request_state.rs::decode_token`): the
    live-prefix import path downsizes `kv_capacity` to the replay
@@ -36,10 +36,10 @@ verify as one `S=16` forward. We already had all the primitives.
    broadcast` once `cache_len + block_size > 256`.
 
 Files touched:
-- `crates/mlx-sys/src/mlx_qwen35_model.cpp` — `qwen35_compiled_block_verify`
+- `crates/mlx-sys/src/mlx_qwen35_model.cpp` — `qwen35_compiled_verify_block`
 - `crates/mlx-sys/src/lib.rs` — FFI decl
-- `infer/src/backend/metal/qwen35.rs` — `step_block` wrapper
-- `infer/src/backend/metal/dflash.rs` — swap step loop for block_verify
+- `infer/src/backend/metal/qwen35.rs` — `verify_block` wrapper
+- `infer/src/backend/metal/dflash.rs` — swap step loop for verify_block
 - `infer/src/backend/metal/request_state.rs` — capacity growth on DFlash decode
 
 ## Bench (M4 Max, Metal, Qwen3.5-4B-4bit, 256 completion tokens)
@@ -110,7 +110,7 @@ also gate DFlash off for `open.len() == 1` on this quant.
 
 ## Follow-ups
 
-- Profile `qwen35_compiled_block_verify` with MLX instruments to
+- Profile `qwen35_compiled_verify_block` with MLX instruments to
   locate the GDR sequential bottleneck inside S=16. If every GDR
   layer still does 16 `gated_delta_step` calls, the S=16 savings
   come only from the 8 full-attn layers (24 GDR layers unchanged).

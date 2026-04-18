@@ -1,5 +1,15 @@
 # Qwen3.5 DFlash "acceptance ceiling" was a verify-cost misdiagnosis
 
+> **Superseded 2026-04-18.** The canonical post-mortem for the serial-loop bug
+> is [`2026-04-17-metal-dflash-qwen35-verify-serial-loop.md`](2026-04-17-metal-dflash-qwen35-verify-serial-loop.md).
+> The batched-verify roadmap lives in
+> [`../../plans/metal-dflash-qwen35-verify-batch.md`](../../plans/metal-dflash-qwen35-verify-batch.md).
+> Keep this file as the lesson-learned about premature "we need custom kernels"
+> conclusions; read the canonical post-mortem for the actual fix and naming.
+> After the merge on `main`, the FFI is `qwen35_compiled_verify_block` and the
+> Rust wrapper is `CppQwen35Model::verify_block` — the `_block_verify` / `step_block`
+> names from the body of this doc refer to an earlier draft that did not land.
+
 ## Context
 
 Track 2 of the Qwen3.5 DFlash plan: lift single-session throughput out
