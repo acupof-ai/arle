@@ -320,20 +320,26 @@ remains correct (alloc 0, later alloc prompt_len, migrate [0..prompt_len]).
 
 **Acceptance test plan:**
 
-- Add a unit test in `prefill::tests` that constructs the condition
+- ✅ Add a unit test in `prefill::tests` that constructs the condition
   vector `(raw, cached, prompt)` with `!supports_partial_prefix` and
-  asserts `prefix_len == 0` for every `(raw, cached, prompt)` where
-  `raw > 0 && raw <= cached && prompt > raw`. (Pure logic, no GPU.)
-- Re-enable `prefill_uses_paged_pool() = true` for Qwen3.5 in
-  `model/qwen35/forward.rs:211` and run the guidellm sweep. Crash
-  disappears with candidate A alone → alignment slip-through was
-  the bug. Crash persists → investigate the two other candidate
-  sites listed above (contig KV state after `truncate_to`, or
-  eviction racing with the still-in-flight assignment).
-- Capture `RUST_LOG=debug,infer::scheduler=trace` from the first
-  crashing request in the sweep; the "prefix HIT" / "prefix PARTIAL"
-  / "prefix MISS" log lines from prefill.rs pinpoint which branch
-  was taken, narrowing the candidate site without another rebuild.
+  asserts `prefix_len == 0` for every partial hit. Landed 2026-04-19
+  as commit `33c066a` — predicate extracted to
+  `should_downgrade_partial_hit_to_miss`, test sweeps hybrid/non-hybrid
+  × partial/full/empty-hit × block-aligned-slip-through. Pure logic,
+  no GPU.
+- ✅ Fix landed 2026-04-19 as commit `ce09ffa` — MISS downgrade
+  condition widened from `raw < cached` to `raw < prompt_len`.
+- **Pending user (CUDA box):** Re-enable `prefill_uses_paged_pool() = true`
+  for Qwen3.5 in `model/qwen35/forward.rs:211` and run the guidellm
+  sweep. Crash disappears with candidate A alone → alignment
+  slip-through was the bug. Crash persists → investigate the two other
+  candidate sites listed above (contig KV state after `truncate_to`,
+  or eviction racing with the still-in-flight assignment).
+- **Pending user (CUDA box):** Capture
+  `RUST_LOG=debug,infer::scheduler=trace` from the first crashing
+  request in the sweep; the "prefix HIT" / "prefix PARTIAL" / "prefix
+  MISS" log lines from prefill.rs pinpoint which branch was taken,
+  narrowing the candidate site without another rebuild.
 
 ## 4. Audit §(c) eviction race — formal closure
 
