@@ -14,7 +14,10 @@ Today this implementation is intended for:
 
 - Apple Silicon
 - `--features metal,no-cuda`
-- `Qwen3` targets only
+- `Qwen3` targets (production-validated: 5.9× on M4 Pro, Qwen3-4B bf16)
+- `Qwen3.5` targets (runs, but single-session 4-bit is a −35% regression vs
+  plain decode; concurrent is parity via auto-downgrade — see
+  [`../experience/wins/2026-04-17-metal-qwen35-dflash-block-verify.md`](../experience/wins/2026-04-17-metal-qwen35-dflash-block-verify.md))
 
 It is not a generic speculative-decoding surface yet.
 
@@ -27,7 +30,7 @@ Parameter reference:
 Supported now:
 
 - Backend: Metal
-- Model family: `Qwen3`
+- Model families: `Qwen3`, `Qwen3.5` (hybrid GDR + full-attn)
 - Entry points:
   - `metal_request`
   - `metal_bench`
@@ -35,9 +38,10 @@ Supported now:
 
 Not supported yet:
 
-- `Qwen3.5`
 - CUDA server scheduler integration
 - Claims of universal speedup on every workload
+- `Qwen3.5-4B-4bit` single-session as a net win (regression, see
+  caveat above)
 
 Important limitation:
 
@@ -168,8 +172,15 @@ Do not assume it helps when:
 
 ## Known limitations
 
-- `Qwen3.5` is intentionally rejected today because recurrent rollback is not
-  integrated into the Metal DFlash path yet.
+- `Qwen3.5-4B-4bit` single-session DFlash is −35% vs plain decode. The
+  root cause is verify-cost ratio (`T_S16 ≈ 7 × T_S1` but speculative math
+  needs `T_S16 < 4.5 × T_S1` at the measured ~28% acceptance). GDR linear-
+  attention layers still do per-step work inside the S=16 forward; closing
+  this is tracked in
+  [`../plans/metal-dflash-qwen35-verify-batch.md`](../plans/metal-dflash-qwen35-verify-batch.md)
+  Layer 2 (cross-request packed verify) and Layer 3 (cross-slot scheduling).
+  Concurrent workloads on `Qwen3.5` auto-downgrade to packed decode when
+  `open.len() >= 2`, so concurrency numbers are safe.
 - The current implementation is validated on `Qwen3-4B`; larger `Qwen3`
   targets may work, but should be benchmarked explicitly before making claims.
 - Draft-model checkpoints may not ship tokenizer files; this is expected. The
@@ -187,6 +198,6 @@ If throughput is poor:
 
 If the backend refuses to load:
 
-1. Check that the target model is `Qwen3`, not `Qwen3.5`.
+1. Check that the target model is `Qwen3` or `Qwen3.5`.
 2. Check that the draft hidden size matches the target hidden size.
 3. Rebuild with `--no-default-features --features metal,no-cuda`.
