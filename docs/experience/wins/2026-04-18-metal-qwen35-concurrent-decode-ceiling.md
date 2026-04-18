@@ -339,3 +339,29 @@ struct, not the underlying shared_ptr data — ~0.1-0.2 µs each. Total
 ~6%) that chasing it without a CPU profile (samply / Instruments) is
 speculation. Deferring until a profile or a decision on C++ session API
 (qwen35_session_begin/step/end) landing.
+
+---
+
+## 2026-04-18 later — cross-profile comparison with mlx_lm baseline
+
+Captured `samply --rate 1000` profiles of both stacks running Qwen3.5-4B-MLX-4bit, 128-token decode, c=1. Symbolicated leaf frames via `atos` on `libsystem_kernel.dylib`.
+
+| Hotspot | mlx_lm Python thread | Our Rust worker (T27) |
+|---------|----------------------|------------------------|
+| `mach_vm_protect` | 12.4% | **58.3%** |
+| `__fcntl` | 18.0% | — |
+| `host_get_special_port` | 4.3% | — |
+| `mach_get_times` (worker) | 1.8% | 0.7% |
+| `malloc` family | — | ~5% |
+
+**Finding:** our Rust worker spends ~4.7× more of its CPU in kernel-level VM protection syscalls than mlx_lm's Python path. Both GPU-completion threads in both stacks spend ~91-95% in `mach_get_times` (expected Metal framework polling, ignore).
+
+**Hypothesis:** `CppQwen35Model::step` (`infer/src/backend/metal/qwen35.rs:343-392`) creates/destroys ~65 `MlxArray` wrappers per token via `std::mem::replace(&mut kv_caches[i], MlxArray::from_raw(ptr))` + `drop(old)`. Each wrap/unwrap touches MLX's allocator (likely a `mach_vm_protect` to flip buffer permissions for unified-memory CPU↔GPU access). mlx_lm keeps all cache arrays in Python `ArraysCache` lists for session lifetime (see `cache.py:594-652`), so no per-step wrap/unwrap.
+
+**Next step (not this cycle):** add C++ session API `qwen35_session_begin/step/end` that holds caches in `std::vector<array>` locally. Mirrors existing `qwen35_compiled_generate` pattern (`mlx_qwen35_model.cpp:1703-1881`) but stateful. Estimated ~230 LOC (150 C++ + 80 Rust). Expected close ≥70% of 5 tok/s gap.
+
+**Profile artifacts:**
+- `/tmp/qwen35_c1.json.gz` — metal_serve c=1 HTTP decode (Thread 27 is Rust worker)
+- `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate single-decode (Thread 1 is Python main)
+
+**2-strike status:** stopping loop iteration here. Previous attempts (P0e reorder, refcount recompute, leaf-only profiling) each added incremental knowledge; this cycle produced the first quantitative comparison that names the gap's cause. Implementing the session API is a ~230 LOC refactor outside one loop's scope.
