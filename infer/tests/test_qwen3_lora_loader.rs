@@ -13,9 +13,19 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 
-use infer::backend::cuda::tensor::DeviceContext;
+use half::bf16;
+use infer::backend::cuda::tensor::{DeviceContext, DeviceMatrix};
 use infer::model::qwen3::lora::load_peft_lora;
 use safetensors::tensor::{Dtype, View};
+
+/// Copy a `DeviceMatrix` (bf16 on device) back to host and return as
+/// f32. Used to assert that upload + scaling landed the right values on
+/// the GPU, not just the right metadata.
+fn matrix_to_host_f32(ctx: &DeviceContext, m: &DeviceMatrix) -> Vec<f32> {
+    let host_bf16: Vec<bf16> = ctx.stream.clone_dtoh(&m.data).expect("D2H copy failed");
+    ctx.sync().expect("CUDA sync failed");
+    host_bf16.iter().map(|v| v.to_f32()).collect()
+}
 
 struct F32Tensor {
     shape: Vec<usize>,
@@ -137,6 +147,34 @@ fn loads_synthetic_peft_adapter() {
     assert!(l0.v_proj.is_none(), "v_proj should be absent");
     assert!(l0.gate_proj.is_none(), "layer 0 gate_proj should be absent");
 
+    // Read A and B back from the device and verify values. This is the
+    // part that catches silent f32→bf16 miscompilation or a missing/wrong
+    // scale pre-bake: bf16(0.125) round-trips exactly, and
+    // bf16(0.25 * 2.0) = bf16(0.5) also round-trips exactly, so the
+    // expected host bytes are deterministic across hardware.
+    let a_host = matrix_to_host_f32(&ctx, &qp.a);
+    assert_eq!(a_host.len(), r * q_in);
+    for (i, v) in a_host.iter().enumerate() {
+        assert!(
+            (v - 0.125).abs() < 1e-6,
+            "q_proj.a[{}] = {}, want 0.125 (f32 fill → bf16 upload should be exact)",
+            i,
+            v,
+        );
+    }
+    let b_host = matrix_to_host_f32(&ctx, &qp.b);
+    assert_eq!(b_host.len(), q_out * r);
+    let b_expected = 0.25f32 * expected_scale;
+    for (i, v) in b_host.iter().enumerate() {
+        assert!(
+            (v - b_expected).abs() < 1e-6,
+            "q_proj.b[{}] = {}, want {} (B must carry the pre-baked scale alpha/r)",
+            i,
+            v,
+            b_expected,
+        );
+    }
+
     // Layer 1: gate_proj only.
     let l1 = &bundle.layers[1];
     assert!(l1.q_proj.is_none(), "layer 1 q_proj should be absent");
@@ -149,6 +187,28 @@ fn loads_synthetic_peft_adapter() {
     assert_eq!(gp.b.rows, gate_out);
     assert_eq!(gp.b.cols, r);
     assert!((gp.scale - expected_scale).abs() < 1e-6);
+    // Negative value on the MLP branch — catches sign errors in the
+    // f32→bf16 conversion path.
+    let ga_host = matrix_to_host_f32(&ctx, &gp.a);
+    for (i, v) in ga_host.iter().enumerate() {
+        assert!(
+            (v - (-0.5)).abs() < 1e-6,
+            "gate_proj.a[{}] = {}, want -0.5",
+            i,
+            v,
+        );
+    }
+    let gb_host = matrix_to_host_f32(&ctx, &gp.b);
+    let gb_expected = 0.75f32 * expected_scale;
+    for (i, v) in gb_host.iter().enumerate() {
+        assert!(
+            (v - gb_expected).abs() < 1e-6,
+            "gate_proj.b[{}] = {}, want {}",
+            i,
+            v,
+            gb_expected,
+        );
+    }
 
     // Layers 2, 3: fully empty.
     for layer_idx in 2..num_layers {
