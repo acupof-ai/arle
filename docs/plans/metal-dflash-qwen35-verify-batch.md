@@ -1,7 +1,10 @@
 # Metal DFlash Qwen3.5 — batched verify roadmap
 
-**Status**: Layer 1 landed 2026-04-17 (single-forward intra-request
-verify).  Layer 2 / Layer 3 pending benchmarks.
+**Status**: Layer 1 landed 2026-04-17. Layer 2a (`mlx_tape_replay_varlen`)
+landed 2026-04-18 (FFI at `crates/mlx-sys/src/lib.rs:621`, kernel at
+`mlx_bridge.cpp:154`). Layer 2b–2d still pending. See port-vs-reference
+snapshot:
+[`docs/experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md`](../experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md).
 **Scope**: Apple Silicon Metal backend, Qwen3.5-4B hybrid model,
 `qwen35_dflash_speculative_block`.
 
@@ -65,13 +68,15 @@ Layer 2 flips that policy by making packed verify cheap enough to keep
 DFlash on under concurrency.  Decomposes into four sub-pieces that
 **must land in order**:
 
-**2a — varlen `mlx_tape_replay_varlen` kernel** (in flight, 2026-04-18)
+**2a — varlen `mlx_tape_replay_varlen` kernel** ✅ landed 2026-04-18
 - Kernel + FFI accept `steps: mlx_array([B], int32)` instead of scalar
-  `int steps`.  Keeps scalar `mlx_tape_replay` alongside for the
+  `int steps`.  Scalar `mlx_tape_replay` kept alongside for the
   single-row callsite.
-- Unblocks (but does not depend on) 2b/2c/2d.
-- Acceptance: gdr.rs `test_tape_replay_varlen_matches_scalar` passes;
-  bit-identical output when per-row steps are uniform.
+- Implementation: `mlx_bridge.cpp:154` (`tape_replay_varlen_kernel`),
+  `lib.rs:621` (`mlx_tape_replay_varlen` FFI).
+- Beyond reference (`bstnxbt/dflash-mlx`) — reference assumes single
+  request and has no varlen variant.
+- Unblocks 2b/2c/2d.
 
 **2b — `qwen35_compiled_verify_block_batched` C++ FFI**
 - New C++ FFI mirroring `qwen35_compiled_verify_block` but accepting
@@ -181,7 +186,7 @@ Steady-state throughput under concurrency 16 ≥ 1.5× Layer 2.
 | Layer | ETA | Owner |
 |-------|-----|-------|
 | 1 (intra-request single forward) | **Done 2026-04-17** | Claude |
-| 2a (varlen `mlx_tape_replay`) | **In flight 2026-04-18** | Codex |
+| 2a (varlen `mlx_tape_replay`) | **Done 2026-04-18** | Codex |
 | 2b (`verify_block_batched` FFI) | After 2a | Codex |
 | 2c (DFlash scheduler integration) | After 2b | Claude (direction) + Codex (impl) |
 | 2d (packed verify wire-up) | After 2c | Codex |
