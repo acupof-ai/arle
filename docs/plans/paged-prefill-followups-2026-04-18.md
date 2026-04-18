@@ -72,6 +72,73 @@ it's just "walked into an existing child that diverges one block in",
 the warning is noise and should be downgraded to `debug!` or
 reworded.
 
+**Findings (2026-04-19, code-read only — no bench rerun):**
+
+Both warnings fire on the **same code path**: the partial-edge-split
+branch at `prefix_cache.rs:558-598`. When a walk descends into an
+existing child edge and `match_len < child_tokens.len()`, the code:
+
+1. Creates a shared intermediate node holding `child_tokens[..match_len]`.
+2. Rewires the original child as the shared node's child (suffix).
+3. **`break`s without advancing `block_idx`** — see comment at
+   `prefix_cache.rs:597` "Don't advance block_idx — the shared node
+   has < block_size tokens."
+
+So `block_idx * block_size` is whatever was accumulated on full-edge
+matches before the split. Translation:
+
+- `got 4080` (block_size=16) = 255 whole-block matches, split fires on
+  block 256. Shared BOS/chat-template + 255 common blocks, then the
+  256th block diverges.
+- `got 0` = split fires on block 1. Root already has a child for
+  `tokens[0]` (shared first token, e.g. BOS), but the existing edge's
+  bytes diverge from our tokens somewhere in positions 1..block_size.
+  The shared intermediate ends up with <block_size tokens, no block_id,
+  and the break leaves our request's blocks **unregistered**.
+
+So neither case is a concurrent-insert bug. Both are "existing subtree
+diverged mid-edge → split left our blocks un-registered."
+
+**Is this a correctness bug?** No corruption — the caller at
+`scheduler/cuda/core.rs:639` early-`return`s, so the slot's blocks
+simply aren't pinned via `retain_pages`. They're freed when the slot
+is freed. But it IS missed sharing.
+
+**Why the fix is non-trivial** (not just "fall through to else"):
+
+The radix `insert` contract ties each `blocks[i]` to
+`tokens[i*block_size .. (i+1)*block_size]`. A partial split at
+`match_len` leaves `pos = match_len < block_size`. Naively falling
+through to the `else` branch would make its first edge cover
+`tokens[match_len .. match_len + block_size]` — but that window is
+not a caller-provided block; the caller's block 0 was
+`tokens[0..block_size]`. Assigning `blocks[0]` to a misaligned
+window would register a wrong token→block_id mapping and poison
+future `BlockFingerprint` lookups.
+
+**Recommendation:**
+- **Don't** just downgrade to `debug!` — the warning flags genuine
+  missed cache sharing, not harmless noise.
+- **Don't** land a drive-by "continue after split" fix — block-id
+  alignment makes it non-local.
+- The minimum safe fix: after a mid-block partial split, advance
+  `pos` to the next block boundary (`block_size.ceil(match_len)`),
+  set `node_idx = shared_idx`, jump `block_idx` accordingly (which
+  also means **skipping** the partial first block's block_id; that
+  block won't be shared), then continue the outer loop so the
+  remaining aligned blocks land as a new subtree rooted at the
+  shared intermediate. Needs:
+  - Unit tests covering both scenarios (`got 0` = split at token 1,
+    `got 4080` = split at block 256) and verifying (a) `inserted ==
+    floor_block(publishable_prompt.len())` not 0, (b) both the
+    existing suffix and the new subtree are reachable from the
+    shared intermediate, (c) no block_id in `block_index` points
+    at a node whose token span doesn't match the underlying pool
+    block.
+  - Pure prefix_cache change, no GPU. Safe to attempt without a
+    CUDA box, but needs CUDA E2E re-run before merge to confirm no
+    regression in prefill KV reuse.
+
 ## 3. Qwen3.5 re-enable
 
 Qwen3.5 stays at `prefill_uses_paged_pool() = false`. The plan-hoist
