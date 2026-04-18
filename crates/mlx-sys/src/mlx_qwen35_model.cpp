@@ -1407,6 +1407,66 @@ int32_t qwen35_compiled_prefill(
     }
 }
 
+// ── DFlash speculative verify — parallel forward over a draft block ───────
+// Same forward path as prefill (current_seq_len = block_size) but always
+// returns all-position logits (current_last_logits_only = false). DFlash
+// needs logits for every drafted token to compute greedy acceptance.
+// Respects model-level tape_mode / capture_layer_ids so one call emits
+// per-step GDR tapes [1, block_size, hv, dv] and captured hidden
+// [1, block_size, hidden] for the whole block.
+
+int32_t qwen35_compiled_verify_block(
+    void* model,
+    mlx_array* token_ids,    // int32 [block_size]
+    int32_t block_size,
+    int32_t cache_pos,
+    mlx_array** kv_caches, int32_t n_kv,
+    mlx_array** gdr_states, int32_t n_gdr,
+    mlx_array** out_logits,  // [1, block_size, vocab]
+    mlx_array** out_kv_caches,
+    mlx_array** out_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = block_size;
+        m->current_last_logits_only = false;
+        m->current_has_attn_mask = false;
+        m->current_attn_mask = array(0);
+        m->current_has_rope_offsets = false;
+        m->current_rope_offsets = array(0);
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(kv_caches[i]));
+        for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(gdr_states[i]));
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+        for (int i = 0; i < n_kv; ++i)
+            out_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
+        for (int i = 0; i < n_gdr; ++i)
+            out_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
+
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        return -1;
+    }
+}
+
 // ── Full decode loop in C++ ────────────────────────────────────────────────
 // Keeps ALL intermediate arrays alive within the loop body, matching
 // Python's behavior where locals survive until the next loop iteration.
