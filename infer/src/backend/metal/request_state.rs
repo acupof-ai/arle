@@ -654,6 +654,10 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub fn is_qwen35(&self) -> bool {
+        matches!(self.inner, MetalRequestStateInner::Qwen35(_))
+    }
+
     pub fn finish_reason(&self) -> Option<&'static str> {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => state.finish_reason(),
