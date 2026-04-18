@@ -124,8 +124,8 @@ impl<M: ModelForward> Scheduler<M> {
         // EMA (exponential moving average) with α=0.1 smooths noise
         // while responding quickly to sustained changes.
         let total_us = decode_us + emit_us + new_us + prefill_us;
-        const ALPHA: f64 = 0.1;
         let update_ema = |ema: &mut f64, val: u128| {
+            const ALPHA: f64 = 0.1;
             let v = val as f64;
             if *ema == 0.0 {
                 *ema = v;

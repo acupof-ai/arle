@@ -110,10 +110,10 @@ pub(crate) fn debug_dump_hidden(
     label: &str,
     hidden_dim: usize,
 ) {
+    use half::bf16;
     if std::env::var("INFER_DEBUG_DUMP").is_err() {
         return;
     }
-    use half::bf16;
     let last_idx = hidden.seq_len.saturating_sub(1);
     let view = hidden
         .data
