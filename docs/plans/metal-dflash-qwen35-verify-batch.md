@@ -125,14 +125,21 @@ DFlash on under concurrency.  Decomposes into four sub-pieces that
   over Layer 1 on mixed-length prompts.
 
 **Trip wires** (carry forward from the original plan + new discoveries):
-- Per-row RoPE offsets for verify positions: the existing varlen RoPE
-  path (`fast::rope` with int32[B] offsets) works for S=1 plain decode;
-  confirm it handles S>1 where each column within a row needs a
-  different absolute position (`cache_lens[b] + s`).  If `fast::rope`'s
-  array-offset signature only accepts scalar-per-row (no per-column
-  offset), the kernel path may need a broadcast trick: feed
-  `base_offsets[b]` and let the kernel's internal `t_axis` add the
-  column index — verify in isolation before 2b.
+- ✅ **Per-row RoPE offsets for verify positions — resolved 2026-04-19
+  via MLX upstream source (`mlx/fast.cpp`).** The array overload
+  `fast::rope(x, dims, traditional, base, scale, offset)` validates
+  `offset` as a 1-D tensor of length B (scalar-per-row); internally it
+  computes `position[b,s] = (offset[b] + s) * scale` by broadcasting
+  `arange(S)` against `offset[B]`. So passing `int32[B]` where
+  `rope_offsets[b] = cache_lens[b]` is sufficient for S>1 — no
+  per-column offset plumbing needed, and no broadcast-trick workaround
+  required. The existing B=1 S=1 callsite at
+  `mlx_qwen35_model.cpp:560-561` already uses this signature; Layer 2b
+  just reuses it with S=S_padded. Documented signature:
+  `MLX_API array rope(const array& x, int dims, bool traditional,
+  std::optional<float> base, float scale, const array& offset,
+  const std::optional<array>& freqs, StreamOrDevice s);` — source at
+  [ml-explore/mlx@main/mlx/fast.h](https://github.com/ml-explore/mlx/blob/main/mlx/fast.h).
 - GDR state shape under B>1: today `target_gdr_flat` is flat-indexed
   per-layer.  Packed version needs `[B, Hv, Dv, Dk]` rooted at the
   batch axis.  `qwen35_set_tape_mode` / `qwen35_set_capture_layers`
