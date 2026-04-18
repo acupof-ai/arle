@@ -577,12 +577,12 @@ Focus on performance, robustness, and Metal parity:
 | 0.6 Model Registry | ✅ Config parsing | ✅ Done |
 | 0.7 Benchmarks | ✅ Mock HTTP server | ✅ Done |
 | 1.x–5.x | ❌ GPU required | 5.1 ✅ Done |
-| 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ⏳ Pending |
-| 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ⏳ Pending |
-| 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ⏳ Pending |
-| 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ⏳ Pending |
-| 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ⏳ Pending |
-| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | ⏳ Pending (parallel) |
+| 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ✅ Done (`ef95994`) |
+| 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ✅ Done CPU (`318cbf4`); CUDA cuBLAS path pending remote verify |
+| 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ✅ Done — M2a TinyLM CPU (`f183f80`); M2b Qwen3 hot-path LoRA + codex rounds 1–3 (`1e87b4f`…`b5377f6`) |
+| 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ✅ Done — TinyLM GRPO (`f86a9c7`) + PPO clip (`19b8e02`); 6 h Qwen+CUDA acceptance run remote-pending |
+| 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ✅ Done — M4.1–M4.8 infra shipped (multi-turn, stepwise return, verifiers, curriculum, task gen, /v1/train); 24 h hard-set pass@1 remote-pending |
+| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | ✅ Done (`a46fc00`) — Backend trait + Metal matmul; 3-shape parity ≤ 1e-3 |
 
 ---
 
