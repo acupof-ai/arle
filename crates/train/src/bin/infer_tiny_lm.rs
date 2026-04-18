@@ -143,7 +143,7 @@ fn main() -> Result<(), CliError> {
         config.max_seq_len,
     );
 
-    let policy = TinyLM::new(config.clone(), &mut store)?;
+    let policy = TinyLM::new(config, &mut store)?;
     train::checkpoint::load(&policy, &mut store, &args.load_path)?;
     println!("loaded checkpoint from {}", args.load_path);
 
