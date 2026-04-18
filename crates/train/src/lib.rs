@@ -1,8 +1,14 @@
 #[path = "dataset.rs"]
 pub mod dataset;
+#[path = "grpo.rs"]
+pub mod grpo;
 #[path = "lora.rs"]
 pub mod lora;
 #[path = "model.rs"]
 pub mod model;
+#[path = "rollout.rs"]
+pub mod rollout;
+#[path = "sampling.rs"]
+pub mod sampling;
 #[path = "trainer.rs"]
 pub mod trainer;

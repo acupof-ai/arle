@@ -10,6 +10,27 @@ use crate::{
 const INV_SQRT_2: f32 = 0.707_106_77;
 const INV_SQRT_2PI: f32 = 0.398_942_3;
 
+pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    let input = store.tensor(x)?.clone();
+    let output = input.data.iter().map(|&value| value.exp()).collect();
+    let output_id = store.alloc(GpuTensor::new(
+        output,
+        input.shape.clone(),
+        input.requires_grad,
+    )?);
+
+    if input.requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Exp,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::Tensor(output_id),
+        });
+    }
+
+    Ok(output_id)
+}
+
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let output = input
@@ -33,6 +54,44 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
     }
 
     Ok(output_id)
+}
+
+pub(crate) fn exp_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let x = *entry
+        .input_ids
+        .first()
+        .ok_or(AutogradError::TapeInvariant("exp missing input"))?;
+    if !store.tensor(x)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+
+    let SavedContext::Tensor(y_id) = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "exp backward missing saved output",
+        ));
+    };
+
+    let output = store.tensor(y_id)?.clone();
+    let upstream = store.tensor(output_grad_id)?.clone();
+    if output.shape != upstream.shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: output.shape,
+            got: upstream.shape,
+        });
+    }
+
+    let grad = output
+        .data
+        .iter()
+        .zip(upstream.data.iter())
+        .map(|(&y, &grad_out)| grad_out * y)
+        .collect();
+    let grad_id = store.alloc(GpuTensor::new(grad, output.shape, false)?);
+    Ok(smallvec![(x, grad_id)])
 }
 
 pub(crate) fn gelu_backward(

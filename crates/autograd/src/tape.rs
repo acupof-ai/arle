@@ -62,6 +62,7 @@ pub enum BackwardOp {
     Add,
     Mul,
     MulScalar,
+    Exp,
     Sum,
     Matmul,
     Softmax,
@@ -159,6 +160,7 @@ impl Tape {
                     BackwardOp::MulScalar => {
                         ops::mul_scalar_backward(&entry, output_grad_id, store)?
                     }
+                    BackwardOp::Exp => ops::exp_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Sum => ops::sum_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Matmul => ops::matmul_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Softmax => ops::softmax_backward(&entry, output_grad_id, store)?,

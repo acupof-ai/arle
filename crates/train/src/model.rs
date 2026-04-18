@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use autograd::{
     AutogradError, GpuTensor, Result, Tape, TensorId, TensorStore,
     module::{Linear, Module},
@@ -260,6 +262,44 @@ impl TinyLM {
             params.extend(block.base_parameters());
         }
         params
+    }
+
+    pub fn all_parameter_ids(&self) -> Vec<TensorId> {
+        let mut params = Vec::new();
+        let mut seen = HashSet::new();
+        for id in self
+            .base_parameter_ids()
+            .into_iter()
+            .chain(self.parameters())
+        {
+            if seen.insert(id) {
+                params.push(id);
+            }
+        }
+        params
+    }
+
+    pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
+        let cloned = Self::new(self.config, store).expect("clone_frozen should preserve config");
+        let source_ids = self.all_parameter_ids();
+        let target_ids = cloned.all_parameter_ids();
+        assert_eq!(
+            source_ids.len(),
+            target_ids.len(),
+            "clone_frozen parameter topology drifted",
+        );
+
+        for (source_id, target_id) in source_ids.into_iter().zip(target_ids) {
+            let mut replacement = store
+                .get(source_id)
+                .cloned()
+                .expect("source parameter should remain readable");
+            replacement.requires_grad = false;
+            replacement.grad = None;
+            store.tensors[target_id] = Some(replacement);
+        }
+
+        cloned
     }
 
     pub fn forward(
