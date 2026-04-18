@@ -25,26 +25,134 @@ const DRAFT_CACHE_SINK_SIZE: i32 = 64;
 /// Draft KV cache window size (recent tokens kept at the end).
 const DRAFT_CACHE_WINDOW_SIZE: i32 = 1024;
 
+/// Rolling aggregate profile over N blocks. Captures the full phase
+/// breakdown + K-histogram so we can read the real bottleneck instead of
+/// guessing from single-block samples.
 #[derive(Default)]
-struct Qwen35BlockVerifyProfileWindow {
+struct Qwen35BlockProfileWindow {
     blocks: usize,
-    total_verify: Duration,
+    block_size: usize,
+    draft: Vec<Duration>,
+    verify: Vec<Duration>,
+    sample: Vec<Duration>,
+    rollback: Vec<Duration>,
+    eval: Vec<Duration>,
+    total: Vec<Duration>,
+    k_hist: Vec<usize>, // k_hist[k] = #blocks that accepted exactly k
+    k_total: usize,     // sum of all accepted K (for mean)
+    /// Per-position agreement: pos_match[i] = #blocks where draft[i+1] == posterior[i]
+    /// computed over ALL block_size-1 draft positions, NOT short-circuited at
+    /// first mismatch. High K=0 with non-trivial pos_match[5..10] means draft
+    /// recovers after early mismatch (sticky-drift bug). Low pos_match[0]
+    /// means the very first draft step is off (draft forward / rope / cache bug).
+    pos_match: Vec<usize>,
 }
 
-fn record_qwen35_block_verify_window(verify_time: Duration) {
-    static WINDOW: OnceLock<Mutex<Qwen35BlockVerifyProfileWindow>> = OnceLock::new();
-    let window = WINDOW.get_or_init(|| Mutex::new(Qwen35BlockVerifyProfileWindow::default()));
-    let mut state = window
-        .lock()
-        .expect("Qwen35 block_verify profile window poisoned");
+impl Qwen35BlockProfileWindow {
+    fn reset(&mut self, block_size: usize) {
+        self.blocks = 0;
+        self.block_size = block_size;
+        self.draft.clear();
+        self.verify.clear();
+        self.sample.clear();
+        self.rollback.clear();
+        self.eval.clear();
+        self.total.clear();
+        self.k_hist.clear();
+        self.k_hist.resize(block_size + 1, 0);
+        self.k_total = 0;
+        self.pos_match.clear();
+        self.pos_match.resize(block_size.saturating_sub(1), 0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_qwen35_block_profile(
+    block_size: usize,
+    accepted_k: usize,
+    draft: Duration,
+    verify: Duration,
+    sample: Duration,
+    rollback: Duration,
+    eval: Duration,
+    total: Duration,
+    per_pos_match: &[bool],
+) {
+    static WINDOW: OnceLock<Mutex<Qwen35BlockProfileWindow>> = OnceLock::new();
+    let window = WINDOW.get_or_init(|| Mutex::new(Qwen35BlockProfileWindow::default()));
+    let mut state = window.lock().expect("Qwen35 block profile window poisoned");
+    if state.blocks == 0 {
+        state.reset(block_size);
+    }
     state.blocks += 1;
-    state.total_verify += verify_time;
-    if state.blocks == 10 {
+    state.draft.push(draft);
+    state.verify.push(verify);
+    state.sample.push(sample);
+    state.rollback.push(rollback);
+    state.eval.push(eval);
+    state.total.push(total);
+    if accepted_k < state.k_hist.len() {
+        state.k_hist[accepted_k] += 1;
+    }
+    state.k_total += accepted_k;
+    for (i, &hit) in per_pos_match.iter().take(state.pos_match.len()).enumerate() {
+        if hit {
+            state.pos_match[i] += 1;
+        }
+    }
+
+    const WINDOW_BLOCKS: usize = 50;
+    if state.blocks >= WINDOW_BLOCKS {
+        let mean = |v: &[Duration]| -> f64 {
+            v.iter().map(|d| d.as_secs_f64()).sum::<f64>() / v.len() as f64 * 1000.0
+        };
+        let quantile = |v: &mut Vec<Duration>, q: f64| -> f64 {
+            v.sort();
+            let idx = ((v.len() - 1) as f64 * q) as usize;
+            v[idx].as_secs_f64() * 1000.0
+        };
+        let mut draft_v = state.draft.clone();
+        let mut verify_v = state.verify.clone();
+        let mut total_v = state.total.clone();
+        let mean_k = state.k_total as f64 / state.blocks as f64;
+        let mean_total_ms = mean(&state.total);
+        let effective_tok_s = 1000.0 * mean_k / mean_total_ms;
+
+        let mut hist_s = String::new();
+        for (k, count) in state.k_hist.iter().enumerate() {
+            if *count > 0 {
+                let pct = 100.0 * *count as f64 / state.blocks as f64;
+                hist_s.push_str(&format!(" K{k}:{count}({pct:.0}%)"));
+            }
+        }
+
         log::info!(
-            "qwen35_dflash: block_verify avg over 10 blocks = {:.1}ms",
-            state.total_verify.as_secs_f64() * 1000.0 / state.blocks as f64,
+            "qwen35_dflash[agg {} blocks]: draft μ={:.1}ms p90={:.1}ms | verify μ={:.1}ms p90={:.1}ms | sample μ={:.1}ms | rollback μ={:.1}ms | eval μ={:.1}ms | total μ={:.1}ms p90={:.1}ms | K̄={:.2}/{} | eff={:.1} tok/s",
+            state.blocks,
+            mean(&state.draft),
+            quantile(&mut draft_v, 0.90),
+            mean(&state.verify),
+            quantile(&mut verify_v, 0.90),
+            mean(&state.sample),
+            mean(&state.rollback),
+            mean(&state.eval),
+            mean_total_ms,
+            quantile(&mut total_v, 0.90),
+            mean_k,
+            state.block_size,
+            effective_tok_s,
         );
-        *state = Qwen35BlockVerifyProfileWindow::default();
+        log::info!("qwen35_dflash[agg K-hist]:{hist_s}");
+        // Per-position draft↔target agreement (not short-circuited at first
+        // mismatch). Reads the shape of the acceptance curve: flat-low means
+        // the very first draft step is off; high-then-cliff means drift accrues.
+        let mut pos_s = String::new();
+        for (i, hits) in state.pos_match.iter().enumerate() {
+            let pct = 100.0 * *hits as f64 / state.blocks as f64;
+            pos_s.push_str(&format!(" p{}:{:.0}%", i + 1, pct));
+        }
+        log::info!("qwen35_dflash[agg pos-agree]:{pos_s}");
+        state.reset(block_size);
     }
 }
 
@@ -78,6 +186,11 @@ pub(crate) struct MetalDflashRuntime {
     draft_config: DFlashDraftConfig,
     draft_weights: DFlashDraftWeights,
     draft_cpp_model: Option<DFlashDraftCppModel>,
+    /// Attention mask mode inside the draft block's self-attention ("causal" or "none").
+    /// Matches dflash-mlx api.py auto-select: causal for Qwen3.5 hybrid, none for
+    /// Qwen3. `DFLASH_DRAFT_MASK=causal|none` overrides. Reference benches show
+    /// causal beats none on Qwen3.5 (K̄ 6.10 vs 5.37).
+    draft_attention_mask: String,
 }
 
 impl MetalDflashRuntime {
@@ -144,10 +257,23 @@ impl MetalDflashRuntime {
         }
         let block_size = requested_block_size.min(default_block_size);
 
+        // Reference dflash-mlx picks "causal" for Qwen3.5 (K̄=6.10 vs
+        // none=5.37). Our measured K̄ inverts that (none=4.54 > causal=3.60),
+        // likely an MLX-C / fast_sdpa causal-with-q_len<k_len discrepancy
+        // still to root-cause. Default "none" until fixed;
+        // DFLASH_DRAFT_MASK=causal forces causal for investigation.
+        let auto_mask = "none";
+        let draft_attention_mask = std::env::var("DFLASH_DRAFT_MASK")
+            .ok()
+            .map(|v| v.to_lowercase())
+            .filter(|v| v == "causal" || v == "none")
+            .unwrap_or_else(|| auto_mask.to_string());
+
         log::info!(
-            "Metal DFlash enabled: draft='{}', block_size={}, target_layers={:?}",
+            "Metal DFlash enabled: draft='{}', block_size={}, draft_attention_mask={}, target_layers={:?}",
             options.draft_model,
             block_size,
+            draft_attention_mask,
             draft_config.target_layer_ids
         );
 
@@ -159,6 +285,7 @@ impl MetalDflashRuntime {
             draft_config,
             draft_weights,
             draft_cpp_model,
+            draft_attention_mask,
         })
     }
 
@@ -1133,6 +1260,7 @@ fn dflash_draft_forward_rust(
     let target_hidden = rms_norm(&target_hidden, &runtime.draft_weights.hidden_norm, eps);
     let mut hidden_states = noise_embedding.clone();
 
+    let mask_mode = runtime.draft_attention_mask.as_str();
     for (layer_idx, layer) in runtime.draft_weights.layers.iter().enumerate() {
         hidden_states = dflash_draft_layer_forward(
             &hidden_states,
@@ -1146,6 +1274,7 @@ fn dflash_draft_forward_rust(
             attn_scale,
             rope_base,
             eps,
+            mask_mode,
         );
     }
 
@@ -1167,6 +1296,7 @@ fn dflash_draft_layer_forward(
     attn_scale: f32,
     rope_base: f32,
     eps: f32,
+    mask_mode: &str,
 ) -> MlxArray {
     use super::mlx::{
         add, multiply, reshape, rope, scaled_dot_product_attention, silu, slice_update,
@@ -1231,7 +1361,17 @@ fn dflash_draft_layer_forward(
         &[1, 1, 1, 1],
     );
 
-    let attn = scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, None);
+    // Reference dflash-mlx (draft.py:149): causal when `mask_mode == "causal"`
+    // and query_len > 1. Our draft block always has query_len = seq = block_size
+    // which is >1 in practice. Pass `None` for "none" so the SDPA wrapper sees
+    // an empty mask string (= no mask, full bidirectional within the Q range
+    // against all K positions).
+    let sdpa_mask = if mask_mode == "causal" {
+        Some("causal")
+    } else {
+        None
+    };
+    let attn = scaled_dot_product_attention(&q, &k_full, &v_full, attn_scale, sdpa_mask);
     let attn = transpose_axes(&attn, &[0, 2, 1, 3]);
     let attn = reshape(&attn, &[seq, n_heads * head_dim]);
     let attn = linear(&attn, &layer.o_proj);
@@ -1459,9 +1599,6 @@ pub(crate) fn qwen35_dflash_speculative_block(
         eval(&[&logits]);
     }
     let t_verify = t_start.elapsed();
-    if profile {
-        record_qwen35_block_verify_window(t_verify - t_snapshot);
-    }
     let block_tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
     let mut block_hidden: Vec<MlxArray> = Vec::with_capacity(n_cap.max(0) as usize);
@@ -1488,13 +1625,17 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_sample = t_start.elapsed();
 
     // ── 4. Token matching ──
-    let matched = block_tokens
+    // Full per-position agreement (no early-stop) — feeds the diagnostic
+    // window so we can see whether rejections are concentrated at the first
+    // draft step or spread across the block.
+    let per_pos_match: Vec<bool> = block_tokens
         .iter()
         .skip(1)
         .zip(posterior_tokens.iter())
         .take(runtime.block_size.saturating_sub(1))
-        .take_while(|(draft, target)| draft == target)
-        .count();
+        .map(|(draft, target)| draft == target)
+        .collect();
+    let matched = per_pos_match.iter().take_while(|hit| **hit).count();
     let accepted_inputs = matched + 1;
     let posterior_token = *posterior_tokens
         .get(matched)
@@ -1624,7 +1765,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_total = t_start.elapsed();
 
     if profile {
-        log::info!(
+        log::debug!(
             "qwen35_dflash: accept={}/{} draft={:.1}ms snapshot={:.1}ms verify={:.1}ms sample={:.1}ms rollback={:.1}ms eval={:.1}ms total={:.1}ms",
             accepted_inputs,
             runtime.block_size,
@@ -1635,6 +1776,17 @@ pub(crate) fn qwen35_dflash_speculative_block(
             (t_rollback - t_sample).as_secs_f32() * 1000.0,
             (t_total - t_rollback).as_secs_f32() * 1000.0,
             t_total.as_secs_f32() * 1000.0,
+        );
+        record_qwen35_block_profile(
+            runtime.block_size,
+            accepted_inputs,
+            t_draft,
+            t_verify - t_snapshot,
+            t_sample - t_verify,
+            t_rollback - t_sample,
+            t_total - t_rollback,
+            t_total,
+            &per_pos_match,
         );
     }
 
