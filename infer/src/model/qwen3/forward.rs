@@ -194,20 +194,7 @@ impl ModelForward for Qwen3Model {
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
-        // Phase 3a (commit 9821cb2) migrated Qwen3 prefill onto the paged
-        // path. With the FlashInfer workspace + FFI fixes in
-        // 190baf4/f08d265/927c390 and the `enable_cuda_graph=false` plan
-        // flip, a sequential paged prefill on a 4k-token prompt completes
-        // cleanly. Under the guidellm sweep's **concurrent** 10-slot load,
-        // however, the scheduler thread still panics with `gemm_cuda:
-        // CUDA_ERROR_UNKNOWN` inside the very first batch — the CUDA
-        // context gets poisoned by an as-yet-unidentified OOB somewhere in
-        // the paged forward pipeline (prep kernel, indptr upload, pool
-        // alloc path, or cuBLAS workspace pressure). Keep the contiguous
-        // path (2026-04-17 baseline shape) until the concurrency issue is
-        // root-caused. Tracking: `docs/plans/p99-unified-mixed-batch.md`
-        // §Phase 1C.
-        false
+        true
     }
 
     fn select_token(

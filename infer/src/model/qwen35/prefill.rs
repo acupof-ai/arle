@@ -286,7 +286,19 @@ impl Qwen35Model {
 
         // Per-forward GPU-resident page table (1 i32 per logical page in the
         // slot). Uploaded once and reused across all 8 full-attn layers.
-        let pages_u32 = pool.page_indices(slot);
+        // Slice the page table down to exactly `num_pages_needed` — reused
+        // slots can carry stale tail pages from the prior request, and the
+        // prep kernel's `page_table[pos/page_size]` indexing would otherwise
+        // read past the valid region under concurrent load. Mirrors the
+        // Qwen3 fix.
+        let all_pages = pool.page_indices(slot);
+        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
+        anyhow::ensure!(
+            all_pages.len() >= num_pages_needed,
+            "paged prefill: slot {slot} has {} pages, expected at least {num_pages_needed}",
+            all_pages.len()
+        );
+        let pages_u32 = &all_pages[..num_pages_needed];
         let pages_i32: Vec<i32> = pages_u32.iter().map(|&p| p as i32).collect();
         let slot_page_indices: CudaSlice<i32> = self
             .ctx
