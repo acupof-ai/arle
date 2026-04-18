@@ -111,11 +111,11 @@ pub fn load_peft_lora(
 
     let r = cfg
         .get("r")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| anyhow!("adapter_config.json missing `r`"))? as usize;
     let lora_alpha =
         cfg.get("lora_alpha")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .ok_or_else(|| anyhow!("adapter_config.json missing `lora_alpha`"))? as f32;
     if r == 0 {
         return Err(anyhow!("adapter_config.json has r=0 (invalid)"));

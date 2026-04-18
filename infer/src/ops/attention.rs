@@ -1180,7 +1180,7 @@ pub fn flashinfer_run_layer(
         ffi::flashinfer_batch_decode_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *const ffi::Half,
             k_pool_ptr as *const ffi::Half,
             v_pool_ptr as *const ffi::Half,
@@ -1245,7 +1245,7 @@ pub fn flashinfer_tc_run_layer(
         ffi::flashinfer_tc_decode_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *mut ffi::Half,
             qoi_ptr as *mut i32,
             k_pool_ptr as *mut ffi::Half,
@@ -1407,7 +1407,7 @@ pub(crate) fn flashinfer_run_layer_hd256(
         ffi::flashinfer_batch_decode_hd256_run(
             fw_ptr as *mut u8,
             iw_ptr as *mut u8,
-            workspace.plan_info as *const u8,
+            workspace.plan_info.cast_const(),
             q_ptr as *const ffi::Half,
             k_pool_ptr as *const ffi::Half,
             v_pool_ptr as *const ffi::Half,

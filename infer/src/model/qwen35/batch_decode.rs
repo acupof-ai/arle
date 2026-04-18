@@ -277,7 +277,7 @@ impl BatchDecodeBuffers35 {
                 let num_groups = if num_linear_layers > 0 {
                     // Groups of consecutive linear layers between full attention layers
                     // For interval=4: groups = num_hidden_layers / interval
-                    (num_linear_layers + 2) / 3 // ceil(num_linear_layers / 3)
+                    num_linear_layers.div_ceil(3) // ceil(num_linear_layers / 3)
                 } else {
                     0
                 };
@@ -426,8 +426,8 @@ impl Qwen35Model {
                         let (conv_ptr, _) =
                             layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
                         let (gdr_ptr, _) = layer_state.state.device_ptr_mut(&self.ctx.stream);
-                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr as u64;
-                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr as u64;
+                        bufs.recurrent.conv_state_ptrs_host[b] = conv_ptr;
+                        bufs.recurrent.gdr_state_ptrs_host[b] = gdr_ptr;
                     }
                     self.ctx
                         .stream
@@ -491,7 +491,7 @@ impl Qwen35Model {
             &mut bufs.common.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.common.embedding_out;
 
         // Process layers in groups: each group is consecutive linear layers
         // followed by one full attention layer. Linear groups are graph-captured.
@@ -592,7 +592,7 @@ impl Qwen35Model {
         }
 
         // Run the linear layers
-        let hidden_ptr = &mut bufs.common.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.common.embedding_out;
         let mut li = linear_idx_start;
         for layer in &self.layers[layer_start..layer_end] {
             if let LayerKind::LinearAttention(attn) = &layer.attn {
@@ -965,11 +965,11 @@ impl Qwen35Model {
                     use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.attn.q_batch.data.device_ptr(stream);
-                        p as u64
+                        p
                     };
                     let q_rot_ptr = {
                         let (p, _g) = bufs.attn.q_rot.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
@@ -984,7 +984,7 @@ impl Qwen35Model {
                     // Step 2: Fused attention
                     let attn_ptr = {
                         let (p, _g) = bufs.attn.attn_output.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,

@@ -427,7 +427,7 @@ impl Qwen3Model {
             .map(|&idx| idx as i32)
             .collect();
 
-        let hidden_ptr = &mut mixed.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -596,7 +596,7 @@ impl Qwen3Model {
                     ffi::flashinfer_tc_decode_run(
                         fw_ptr as *mut u8,
                         iw_ptr as *mut u8,
-                        mixed.metadata.flashinfer_ws.plan_info as *const u8,
+                        mixed.metadata.flashinfer_ws.plan_info.cast_const(),
                         q_ptr as *const ffi::Half,
                         qoi_ptr as *const i32,
                         k_pool_ptr as *const ffi::Half,
@@ -895,7 +895,7 @@ impl Qwen3Model {
             &mut bufs.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.embedding_out;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -1239,7 +1239,7 @@ impl Qwen3Model {
         // Use embedding_out as the initial hidden state. The layer loop
         // ping-pongs between embedding_out and hidden_out via swap.
         // We use a raw pointer to avoid borrow conflicts with bufs.
-        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.embedding_out;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // SAFETY: hidden_ptr points to bufs.embedding_out. The layer
@@ -1538,11 +1538,11 @@ impl Qwen3Model {
                     use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.q_batch.data.device_ptr(stream);
-                        p as u64
+                        p
                     };
                     let q_rot_ptr = {
                         let (p, _g) = bufs.q_rot.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
@@ -1557,7 +1557,7 @@ impl Qwen3Model {
                     // Step 2: Fused attention: score from packed K, dequant V in-kernel
                     let attn_ptr = {
                         let (p, _g) = bufs.attn_output.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,

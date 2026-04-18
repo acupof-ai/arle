@@ -101,7 +101,7 @@ impl HostPinnedPool {
             // error.
             let status = unsafe {
                 cudarc::driver::sys::cuMemAllocHost_v2(
-                    &mut ptr as *mut *mut u8 as *mut *mut std::ffi::c_void,
+                    (&raw mut ptr).cast::<*mut std::ffi::c_void>(),
                     capacity_bytes,
                 )
             };
@@ -295,8 +295,9 @@ impl Drop for HostPinnedPool {
                     // FlashInfer workspace pattern — a failure here
                     // during shutdown is unrecoverable anyway.
                     unsafe {
-                        let _ =
-                            cudarc::driver::sys::cuMemFreeHost(*base_ptr as *mut std::ffi::c_void);
+                        let _ = cudarc::driver::sys::cuMemFreeHost(
+                            (*base_ptr).cast::<std::ffi::c_void>(),
+                        );
                     }
                     *base_ptr = std::ptr::null_mut();
                 }

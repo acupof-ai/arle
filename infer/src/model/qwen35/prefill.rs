@@ -340,7 +340,7 @@ impl Qwen35Model {
         let mut full_idx = 0usize;
         let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
 
-        for layer in self.layers.iter() {
+        for layer in &self.layers {
             hidden_batch = self.prefill_layer_paged(
                 layer,
                 &hidden_batch,

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, RequestPriority,
+    Scheduler, error, info, warn,
+};
 use crate::model::kv_cache::KVFormat;
 use crate::scheduler::cuda::core::PendingDecode;
 
@@ -33,18 +36,15 @@ impl<M: ModelForward> Scheduler<M> {
         let mut token_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
         let mut valid_decode_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
         for &i in &decode_indices {
-            match self.active[i].generated_tokens.last() {
-                Some(&tok) => {
-                    token_ids.push(tok);
-                    valid_decode_indices.push(i);
-                }
-                None => {
-                    error!(
-                        "Request {}: Decoding state with no generated tokens - dropping",
-                        self.active[i].id
-                    );
-                    self.active[i].phase = Phase::Finished;
-                }
+            if let Some(&tok) = self.active[i].generated_tokens.last() {
+                token_ids.push(tok);
+                valid_decode_indices.push(i);
+            } else {
+                error!(
+                    "Request {}: Decoding state with no generated tokens - dropping",
+                    self.active[i].id
+                );
+                self.active[i].phase = Phase::Finished;
             }
         }
         let mut decode_indices = valid_decode_indices;
@@ -289,18 +289,15 @@ impl<M: ModelForward> Scheduler<M> {
         let mut token_ids: Vec<u32> = Vec::with_capacity(decode_indices.len());
         let mut valid_decode_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
         for &i in &decode_indices {
-            match self.active[i].generated_tokens.last() {
-                Some(&tok) => {
-                    token_ids.push(tok);
-                    valid_decode_indices.push(i);
-                }
-                None => {
-                    error!(
-                        "Request {}: Decoding state with no generated tokens - dropping",
-                        self.active[i].id
-                    );
-                    self.active[i].phase = Phase::Finished;
-                }
+            if let Some(&tok) = self.active[i].generated_tokens.last() {
+                token_ids.push(tok);
+                valid_decode_indices.push(i);
+            } else {
+                error!(
+                    "Request {}: Decoding state with no generated tokens - dropping",
+                    self.active[i].id
+                );
+                self.active[i].phase = Phase::Finished;
             }
         }
         let mut decode_indices = valid_decode_indices;
