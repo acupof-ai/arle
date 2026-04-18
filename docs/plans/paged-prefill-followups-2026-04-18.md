@@ -214,12 +214,18 @@ let prefix_len = if raw_prefix_len > 0
 
 The `!supports_partial_prefix` downgrade is **conditional on
 `raw < cached`** — it only triggers when the radix matched *less*
-than the slot has materialized (e.g. the slot advanced past the
-publish via decode). It does **not** trigger when `raw == cached <
-prompt_len` — the same-slot-reuse shape that `best_reusable_slot_for_radix_hit`
-produces by construction (it accepts when `cached_prompt_len >=
-reusable_prefix_len`, and under a clean cleanup → publish → reuse
-cycle, equality is the common case).
+than the slot has materialized. In practice this is the common
+case, because `best_reusable_slot_for_radix_hit` produces
+`reusable_prefix_len = (idx+1) * block_size` (block-aligned) while
+`cached_prompt_len = slot_materialized_prompt_lens[slot_idx]` is
+the unrounded prompt length. Any prompt whose length isn't an exact
+block-multiple lands in `raw < cached` with the block-remainder
+gap. So the downgrade usually DOES fire for Qwen3.5 under same-slot
+reuse.
+
+The narrow slip-through is when `prompt_len` happens to be exactly
+block-aligned, so `cached_prompt_len == reusable_prefix_len` and
+the `raw < cached` check fails.
 
 **Pool state is correct across all three MISS / reuse branches.**
 `cleanup() → free_slot()` clears `page_indices[S] = []` and
@@ -271,7 +277,28 @@ The crash under sweep load probably has a step where one of the
 two failure modes fires — hence "only reproduces under concrete
 sweep load."
 
-**Refined fix hypothesis** (supersedes "free_slot before alloc"):
+**Probability assessment:** the exact-block-alignment slip-through
+is narrow (most guidellm prompts aren't block-aligned), so this
+may not be the primary crash site. Two other candidate sites to
+check if the hypothesis below doesn't repro:
+
+- **Contig→paged migration after `truncate_to`**: when the line 99
+  branch runs, `migrate_kv_range_to_paged(ctx, pool, S, 0, L)` at
+  `prefill.rs:181-187` reads contig positions [0..L]. After R1's
+  `truncate_to(L)`, is the contig KV actually still populated at
+  [0..L] for a hybrid model, or did the recurrent reset perturb
+  shared storage? Worth checking `Qwen35State::truncate_to` and
+  the base's truncate semantics for KV tensors.
+- **Paged pool alloc under pressure** with retained-but-orphaned
+  pages: `alloc_pool_tokens_with_retry` may evict prefix cache to
+  free pages. If the slot's *own* previously-published pages get
+  evicted mid-assignment (unlikely per item 9 in AGENTS.md but
+  worth verifying under the path where the slot hasn't re-entered
+  active state yet), the alloc succeeds but the subsequent migrate
+  targets the wrong pages.
+
+**Refined fix hypothesis (candidate A — narrow)** (supersedes
+"free_slot before alloc"):
 
 Extend the MISS downgrade condition at `prefill.rs:37-44` from
 `raw < cached` to `raw <= cached && prefix_len < prompt_len`:
@@ -299,8 +326,14 @@ remains correct (alloc 0, later alloc prompt_len, migrate [0..prompt_len]).
   `raw > 0 && raw <= cached && prompt > raw`. (Pure logic, no GPU.)
 - Re-enable `prefill_uses_paged_pool() = true` for Qwen3.5 in
   `model/qwen35/forward.rs:211` and run the guidellm sweep. Crash
-  disappears → hypothesis confirmed. Crash persists → look at
-  contig→paged migration path for partial same-slot reuse.
+  disappears with candidate A alone → alignment slip-through was
+  the bug. Crash persists → investigate the two other candidate
+  sites listed above (contig KV state after `truncate_to`, or
+  eviction racing with the still-in-flight assignment).
+- Capture `RUST_LOG=debug,infer::scheduler=trace` from the first
+  crashing request in the sweep; the "prefix HIT" / "prefix PARTIAL"
+  / "prefix MISS" log lines from prefill.rs pinpoint which branch
+  was taken, narrowing the candidate site without another rebuild.
 
 ## 4. Audit §(c) eviction race — formal closure
 
