@@ -77,8 +77,6 @@ pub fn grpo_loss(
             got: advantages.len(),
         });
     }
-    let _ = cfg.clip_eps;
-
     let batch = trajectories.len();
     let seq_len = trajectories[0].full_ids.len();
     validate_trajectories(trajectories, seq_len, config.max_seq_len)?;
@@ -95,9 +93,23 @@ pub fn grpo_loss(
     let ratio_input = add(new_lp_id, old_lp_delta, store, tape)?;
     let ratio = exp(ratio_input, store, tape)?;
 
+    // PPO-clip active mask (host-space, detached). min(r*A, clip(r)*A) has
+    // zero gradient wherever the clipped branch is binding, so we equivalently
+    // multiply the unclipped surrogate by an indicator that blocks gradient
+    // flow on clipped elements. Clipping condition: A>=0 & r>1+eps, or A<0 & r<1-eps.
+    let new_lp_values = store.to_host(new_lp_id)?;
+    let active_mask_values = ppo_active_mask(
+        &new_lp_values,
+        &batch_data.old_log_probs,
+        &batch_data.advantages,
+        &batch_data.mask,
+        cfg.clip_eps,
+    );
+
     let adv_tensor = store.from_slice(&batch_data.advantages, &[batch, seq_len])?;
     let mask_tensor = store.from_slice(&batch_data.mask, &[batch, seq_len])?;
-    let masked_adv = mul(adv_tensor, mask_tensor, store, tape)?;
+    let active_tensor = store.from_slice(&active_mask_values, &[batch, seq_len])?;
+    let masked_adv = mul(adv_tensor, active_tensor, store, tape)?;
     let masked_pg = mul(ratio, masked_adv, store, tape)?;
     let loss_pg = mul_scalar(
         sum(masked_pg, store, tape)?,
@@ -117,8 +129,36 @@ pub fn grpo_loss(
         tape,
     )?;
 
-    // PPO clipping is intentionally deferred for M4; M3 uses the unclipped GRPO ratio.
     add(loss_pg, kl_term, store, tape)
+}
+
+pub fn ppo_active_mask(
+    new_log_probs: &[f32],
+    old_log_probs: &[f32],
+    advantages: &[f32],
+    response_mask: &[f32],
+    clip_eps: f32,
+) -> Vec<f32> {
+    let upper = 1.0 + clip_eps;
+    let lower = 1.0 - clip_eps;
+    new_log_probs
+        .iter()
+        .zip(old_log_probs.iter())
+        .zip(advantages.iter())
+        .zip(response_mask.iter())
+        .map(|(((new_lp, old_lp), adv), resp)| {
+            if *resp <= 0.0 {
+                return 0.0;
+            }
+            let ratio = (new_lp - old_lp).exp();
+            let clipped = if *adv >= 0.0 {
+                ratio > upper
+            } else {
+                ratio < lower
+            };
+            if clipped { 0.0 } else { 1.0 }
+        })
+        .collect()
 }
 
 pub fn mean_sampled_kl(
