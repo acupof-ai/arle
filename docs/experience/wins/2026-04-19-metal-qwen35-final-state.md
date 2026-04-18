@@ -41,6 +41,7 @@ don't redo the same investigations.
 | Intermediate-preservation in `qwen35_compiled_step_session` (mirror `qwen35_compiled_generate` pattern) | **Tried, FALSIFIED.** No improvement; possibly slight regression. The "5ms/step" comment in `qwen35_compiled_generate` is historical — pre-async_eval | memory Iter 10 |
 | c=8 regressed from 145 → 136.9 | **NOISE.** Fresh re-bench (Iter 11) shows 162.9, BETTER than original 145 | memory Iter 11 |
 | Scheduler tick fast-paths (`refresh_waiting_prefix_hits`, `reap_closed_clients`) | **Sub-1% contribution.** 78 ticks/sec × ~5 µs/call. Not worth a patch | this entry |
+| Longer-generation c=1 amortizes TTFT and closes HTTP↔StepDriver gap | **FALSIFIED.** c=1 throughput flat at 71 tok/s across max_tokens=128/256/512 (ITL p50 = 12.9 / 13.9 / 13.9 ms). The gap is a constant per-step overhead, not TTFT-dominated. ITL grows ~1 ms from 128→256 tok — linear-in-pos cost of 8 full-attn layers, not scheduler tick | this entry |
 
 ## Sized ceilings for remaining unattempted work
 
