@@ -460,6 +460,26 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
+    pub fn qwen35_session_begin(
+        model: *mut std::ffi::c_void,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+    ) -> i32;
+    pub fn qwen35_session_end(
+        model: *mut std::ffi::c_void,
+        out_kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        out_gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+    ) -> i32;
+    pub fn qwen35_compiled_step_session(
+        model: *mut std::ffi::c_void,
+        token_id: *mut mlx_array,
+        cache_pos: i32,
+        out_logits: *mut *mut mlx_array,
+    ) -> i32;
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_step_batch(
         model: *mut std::ffi::c_void,

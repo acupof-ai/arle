@@ -340,6 +340,89 @@ impl CppQwen35Model {
     }
 
     /// Run one decode step. Returns logits. Updates caches in place.
+    pub(super) fn begin_session(
+        &self,
+        kv_caches: &[MlxArray],
+        gdr_states: &[MlxArray],
+    ) -> Result<()> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let rc = unsafe {
+            mlx_sys::qwen35_session_begin(
+                self.0,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn end_session(
+        &self,
+        n_kv: usize,
+        n_gdr: usize,
+    ) -> Result<(Vec<MlxArray>, Vec<MlxArray>)> {
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_session_end(
+                self.0,
+                out_kv.as_mut_ptr(),
+                n_kv as i32,
+                out_gdr.as_mut_ptr(),
+                n_gdr as i32,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        let kv_caches = out_kv
+            .into_iter()
+            .map(|ptr| unsafe { MlxArray::from_raw(ptr) })
+            .collect();
+        let gdr_states = out_gdr
+            .into_iter()
+            .map(|ptr| unsafe { MlxArray::from_raw(ptr) })
+            .collect();
+        Ok((kv_caches, gdr_states))
+    }
+
+    pub(super) fn step_session(&self, token: &MlxArray, cache_pos: i32) -> Result<MlxArray> {
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_step_session(
+                self.0,
+                token.as_raw(),
+                cache_pos,
+                &raw mut out_logits,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    /// Run one decode step. Returns logits. Updates caches in place.
     pub(super) fn step(
         &self,
         token: &MlxArray,
