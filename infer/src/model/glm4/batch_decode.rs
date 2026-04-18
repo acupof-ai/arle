@@ -6,10 +6,10 @@
 //! and no Q/K normalization is applied.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
 use cudarc::driver::safe::CudaGraph;
 use cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 use cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use log::info;
 
 use super::config::Config;
@@ -557,7 +557,6 @@ impl GLM4Model {
                     let sm_scale = 1.0 / (head_dim as f32).sqrt();
 
                     // Step 1: Rotate Q → Q_rot (sign flip + FWHT)
-                    use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.q_batch.data.device_ptr(stream);
                         p
