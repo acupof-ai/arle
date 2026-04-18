@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    ActiveRequest, ModelForward, Ordering, Phase, STATS_LOG_INTERVAL, Scheduler, error, info, warn,
+};
 use crate::prefix_cache::BlockMetadataUpdate;
 
 fn best_reusable_slot_for_radix_hit(
@@ -38,10 +40,12 @@ impl<M: ModelForward> Scheduler<M> {
     fn drain_coordinator_events(&mut self) {
         loop {
             match self.coordinator_events.try_recv() {
-                Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
-                | Ok(crate::kv_tier::CoordinatorEvent::StagingQueued { .. })
-                | Ok(crate::kv_tier::CoordinatorEvent::SpillQueued { .. })
-                | Ok(crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. }) => {}
+                Ok(
+                    crate::kv_tier::CoordinatorEvent::CommandQueued(_)
+                    | crate::kv_tier::CoordinatorEvent::StagingQueued { .. }
+                    | crate::kv_tier::CoordinatorEvent::SpillQueued { .. }
+                    | crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. },
+                ) => {}
                 Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
                     let Some(staged) = self.stage_waiting.remove(&ticket) else {
                         log::debug!(
@@ -108,13 +112,13 @@ impl<M: ModelForward> Scheduler<M> {
                     // (same reasoning as the completion path above —
                     // the re-admission might still hit the prefix).
                     let pending = std::mem::take(&mut self.stage_waiting);
-                    if !pending.is_empty() {
+                    if pending.is_empty() {
+                        error!("Coordinator event channel disconnected");
+                    } else {
                         error!(
                             "Coordinator event channel disconnected; cold-requeuing {} staged admissions",
                             pending.len()
                         );
-                    } else {
-                        error!("Coordinator event channel disconnected");
                     }
                     // Same `waiting_count` semantics as the completion
                     // path: re-queuing into `self.waiting.push_front`
@@ -187,15 +191,12 @@ impl<M: ModelForward> Scheduler<M> {
             self.drain_coordinator_events();
 
             if self.active.is_empty() && self.waiting.is_empty() && self.stage_waiting.is_empty() {
-                match self.request_rx.blocking_recv() {
-                    Some(req) => {
-                        self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                        self.waiting.push_back(req);
-                    }
-                    None => {
-                        info!("Scheduler shutting down: all handles dropped");
-                        break;
-                    }
+                if let Some(req) = self.request_rx.blocking_recv() {
+                    self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+                    self.waiting.push_back(req);
+                } else {
+                    info!("Scheduler shutting down: all handles dropped");
+                    break;
                 }
             }
 
@@ -459,8 +460,7 @@ impl<M: ModelForward> Scheduler<M> {
                 let e2e_s = req.admitted_at.elapsed().as_secs_f64();
                 let ttft_s = req
                     .first_token_at
-                    .map(|t| t.duration_since(req.admitted_at).as_secs_f64())
-                    .unwrap_or(e2e_s);
+                    .map_or(e2e_s, |t| t.duration_since(req.admitted_at).as_secs_f64());
                 let tpot_s = if gen_tokens > 1 {
                     (e2e_s - ttft_s).max(0.0) / (gen_tokens - 1) as f64
                 } else {
@@ -482,7 +482,7 @@ impl<M: ModelForward> Scheduler<M> {
                     self.waiting.len()
                 );
 
-                if self.total_completed % STATS_LOG_INTERVAL == 0 {
+                if self.total_completed.is_multiple_of(STATS_LOG_INTERVAL) {
                     info!(
                         "Scheduler stats: completed={}, generated_tokens={}, active={}, waiting={}",
                         self.total_completed,

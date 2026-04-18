@@ -285,7 +285,7 @@ pub(crate) fn gpu_sample_launch_raw(
 ) -> Result<()> {
     unsafe {
         launch_sample_kernel_inner(
-            logits_ptr.as_ptr() as *const ffi::Half,
+            logits_ptr.as_ptr().cast::<ffi::Half>(),
             logits_len as i32,
             probs_ptr.as_mut_ptr(),
             out_ptr.as_mut_ptr(),

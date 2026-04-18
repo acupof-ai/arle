@@ -131,7 +131,7 @@ impl DraftModel for DraftEngine {
             let (token, logprob) =
                 model.select_token_with_logprob(&mut state, &self.sampling, &mut rng)?;
             tokens.push(token);
-            draft_probs.push(logprob.map(|lp| lp.exp()).unwrap_or(0.0));
+            draft_probs.push(logprob.map_or(0.0, f32::exp));
 
             if model.is_stop_token(token) {
                 break;

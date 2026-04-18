@@ -134,8 +134,8 @@ pub(crate) fn debug_dump_hidden(
         .skip(tail_start)
         .map(|v| format!("{v:+.5}"))
         .collect();
-    let max = f32s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min = f32s.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = f32s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = f32s.iter().copied().fold(f32::INFINITY, f32::min);
     let nan = f32s.iter().any(|v| v.is_nan());
     let inf = f32s.iter().any(|v| v.is_infinite());
     let rms = (f32s.iter().map(|v| v * v).sum::<f32>() / hidden_dim as f32).sqrt();

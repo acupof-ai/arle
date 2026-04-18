@@ -316,7 +316,7 @@ impl GLM4Model {
             &mut bufs.embedding_out,
         )?;
 
-        let hidden_ptr = &mut bufs.embedding_out as *mut HiddenStates;
+        let hidden_ptr = &raw mut bufs.embedding_out;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -560,11 +560,11 @@ impl GLM4Model {
                     use cudarc::driver::{DevicePtr, DevicePtrMut};
                     let q_ptr = {
                         let (p, _g) = bufs.q_batch.data.device_ptr(stream);
-                        p as u64
+                        p
                     };
                     let q_rot_ptr = {
                         let (p, _g) = bufs.q_rot.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_rotate_query(
                         &self.ctx,
@@ -579,7 +579,7 @@ impl GLM4Model {
                     // Step 2: Fused attention
                     let attn_ptr = {
                         let (p, _g) = bufs.attn_output.data.device_ptr_mut(stream);
-                        p as u64
+                        p
                     };
                     kv_turboquant::turboquant_fused_decode_attention(
                         &self.ctx,

@@ -1,4 +1,4 @@
-use super::*;
+use super::{CompletionStreamDelta, FinishReason, TokenUsage, Tokenizer, mpsc};
 
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
@@ -127,7 +127,6 @@ impl ActiveRequest {
                     self.sent_len = stop_pos;
                     self.phase = Phase::Finished;
                     self.send_finish(FinishReason::Stop);
-                    return;
                 }
                 StopCheckResult::NoStop { safe_len } => {
                     if safe_len > self.sent_len {
@@ -227,7 +226,11 @@ pub(crate) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckRes
             return StopCheckResult::StopFound { stop_pos: pos };
         }
     }
-    let max_stop_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
+    let max_stop_len = stops
+        .iter()
+        .map(std::string::String::len)
+        .max()
+        .unwrap_or(0);
     let raw_safe = text.len().saturating_sub(max_stop_len);
     // Snap to a char boundary so slicing never panics on multi-byte chars.
     let safe_len = text.floor_char_boundary(raw_safe);

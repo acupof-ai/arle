@@ -1,4 +1,4 @@
-use super::*;
+use super::{ModelForward, Phase, Scheduler, info};
 
 impl<M: ModelForward> Scheduler<M> {
     pub(super) fn step(&mut self) {

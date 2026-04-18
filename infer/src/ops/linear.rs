@@ -177,7 +177,7 @@ pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut Device
         let sptr = qs_ptr as *const ffi::Half;
 
         unsafe {
-            use qbits::*;
+            use qbits::{Q3K, Q4K, Q6K, W2, W4};
             let res = match a.quant_bits {
                 Q3K => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
                 Q4K => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
@@ -437,7 +437,7 @@ pub(crate) fn gemm_into(
         // Marlin workspace (lock buffer)
         let sms = ctx.sm_count() as i32;
         let ws_size = unsafe { ffi::marlin_workspace_size(n as i32, sms) };
-        let ws_elems = (ws_size + 3) / 4; // round up to i32 count
+        let ws_elems = ws_size.div_ceil(4); // round up to i32 count
         let mut workspace: CudaSlice<i32> = ctx
             .stream
             .alloc_zeros(ws_elems)
@@ -507,7 +507,7 @@ pub(crate) fn gemm_into(
         } else {
             weight.tq_bits as usize
         };
-        let packed_cols = ((weight.cols * effective_bits + 7) / 8) as i32;
+        let packed_cols = (weight.cols * effective_bits).div_ceil(8) as i32;
         let bits = weight.tq_bits as i32;
         let stream = ctx.stream.cu_stream();
 
@@ -626,7 +626,7 @@ pub(crate) fn gemm_into(
                     _ => unreachable!(),
                 };
                 dq.result().expect("qxk_dequant_chunk_cuda failed");
-                ffi::gemm_cuda(tile as *const ffi::Half, xptr, yptr, n, b, k, stream)
+                ffi::gemm_cuda(tile.cast_const(), xptr, yptr, n, b, k, stream)
                     .result()
                     .expect("QxK prefill cuBLAS GEMM failed");
             }
@@ -635,7 +635,7 @@ pub(crate) fn gemm_into(
 
         // GEMV path for everything else (decode or batched).
         unsafe {
-            use qbits::*;
+            use qbits::{Q3K, Q4K, Q6K, W2, W4};
             let res = match (b == 1, weight.quant_bits) {
                 (true, Q3K) => ffi::q3k_gemv_cuda(wptr, xptr, yptr, n, k, stream),
                 (true, Q4K) => ffi::q4k_gemv_cuda(wptr, xptr, yptr, n, k, stream),

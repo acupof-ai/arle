@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use super::*;
+use super::{
+    ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
+    Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
+    error, info, mpsc, warn,
+};
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
@@ -547,7 +551,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .to_vec()
             })
             .collect();
-        let required_pages = block_pages.iter().map(|pages| pages.len()).sum::<usize>();
+        let required_pages = block_pages.iter().map(std::vec::Vec::len).sum::<usize>();
         let retained_pages = self.paged_kv_pool.retained_count();
         let total_pages = self.paged_kv_pool.max_total_pages;
         let retain_cap_fraction = self.config.prefix_cache_retain_hard_cap;
@@ -585,21 +589,20 @@ impl<M: ModelForward> Scheduler<M> {
         // but not to the disk format), publish silently with no
         // fingerprints — persistence is not available for that
         // format yet. Warn once per publish so operators notice.
-        let kv_format_tag = match self.paged_kv_pool.format.stable_tag() {
-            Some(tag) => tag,
-            None => {
-                warn!(
-                    "prefix_cache publish: live KV format has no stable_tag assignment; \
-                     fingerprints skipped for slot {} (format = {:?})",
-                    slot_idx, self.paged_kv_pool.format,
-                );
-                // Zero = "unset"; persistence code refuses format 0
-                // at load time, so this can never drive a cross-format
-                // reload. Still stamp fingerprints because Tier C's
-                // O(1) block_index and M4c's reconcile both want a
-                // non-zero fingerprint on each published node.
-                0
-            }
+        let kv_format_tag = if let Some(tag) = self.paged_kv_pool.format.stable_tag() {
+            tag
+        } else {
+            warn!(
+                "prefix_cache publish: live KV format has no stable_tag assignment; \
+                 fingerprints skipped for slot {} (format = {:?})",
+                slot_idx, self.paged_kv_pool.format,
+            );
+            // Zero = "unset"; persistence code refuses format 0
+            // at load time, so this can never drive a cross-format
+            // reload. Still stamp fingerprints because Tier C's
+            // O(1) block_index and M4c's reconcile both want a
+            // non-zero fingerprint on each published node.
+            0
         };
         let mut parent_fingerprint: Option<BlockFingerprint> = None;
         let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(num_blocks);
@@ -698,7 +701,7 @@ impl<M: ModelForward> Scheduler<M> {
                             warn!(
                                 "page lifecycle unknown page {} during publish: {}",
                                 page, err
-                            )
+                            );
                         }
                     }
                 }

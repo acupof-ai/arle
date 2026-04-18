@@ -85,7 +85,7 @@ pub(crate) fn mmap_shards(shard_paths: &[String]) -> Result<Vec<Mmap>> {
 fn shape_label_1d(name: &str, shape: &[usize]) -> &'static str {
     let dims: String = shape
         .iter()
-        .map(|d| d.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let short = name.rsplit('.').next().unwrap_or(name);
@@ -307,10 +307,7 @@ pub(crate) fn load_tensor_2d_maybe_quantized(
             .map_err(|e| anyhow::anyhow!("H2D centroids failed: {}", e))?;
 
         let scales_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                scales.as_ptr().cast::<u8>(),
-                scales.len() * std::mem::size_of::<half::f16>(),
-            )
+            std::slice::from_raw_parts(scales.as_ptr().cast::<u8>(), std::mem::size_of_val(scales))
         };
 
         log::info!(
