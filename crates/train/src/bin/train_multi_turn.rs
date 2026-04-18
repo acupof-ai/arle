@@ -42,6 +42,9 @@ struct CliArgs {
     n_heads: usize,
     d_head: usize,
     d_ff: usize,
+    eval_every: usize,
+    eval_prompts: usize,
+    eval_temperature: f32,
 }
 
 impl Default for CliArgs {
@@ -68,6 +71,9 @@ impl Default for CliArgs {
             n_heads: 2,
             d_head: 32,
             d_ff: 128,
+            eval_every: 0,
+            eval_prompts: 16,
+            eval_temperature: 0.3,
         }
     }
 }
@@ -136,6 +142,8 @@ fn main() -> Result<(), CliError> {
     let ref_model = policy.clone_frozen(&mut store);
     let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4D55_4C54_5455_524E);
     let mut sample_rng = LcgRng::seed(args.seed.wrapping_add(17));
+    let eval_prompt_seed = args.seed ^ 0x4556_414C_5F50_524D;
+    let eval_sample_seed = args.seed ^ 0x4556_414C_5350_4C52;
 
     let separator = (config.vocab_size - 1).min(31);
     let env = EchoSeparator(separator);
@@ -235,11 +243,98 @@ fn main() -> Result<(), CliError> {
             "mt iter {iter}: loss {loss_value:.4} mean_reward {mean_turn_reward:.4} \
              best_reward {best_reward:.4} mean_kl {last_kl:.4}"
         );
+
+        if args.eval_every > 0 && (iter + 1).is_multiple_of(args.eval_every) {
+            let mut eval_prompt_rng = LcgRng::seed(eval_prompt_seed);
+            let mut eval_sample_rng = LcgRng::seed(eval_sample_seed ^ iter as u64);
+            let (eval_reward, eval_passrate) = run_eval(
+                &policy,
+                &ref_model,
+                &config,
+                args.eval_prompts,
+                args.prompt_len,
+                separator,
+                target_range,
+                &turns,
+                &env,
+                args.eval_temperature,
+                &mut eval_prompt_rng,
+                &mut eval_sample_rng,
+                &mut store,
+                &mut tape,
+            )?;
+            let keep = retained_ids(&[&policy, &ref_model], &store);
+            store.retain_ids(&keep);
+            println!(
+                "eval @ iter {iter}: mean_reward {eval_reward:.4} pass@1 {eval_passrate:.4} \
+                 (prompts={}, temperature={:.2})",
+                args.eval_prompts, args.eval_temperature
+            );
+        }
     }
 
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_eval(
+    policy: &TinyLM,
+    ref_model: &TinyLM,
+    config: &TinyLMConfig,
+    n_prompts: usize,
+    prompt_len: usize,
+    separator: usize,
+    target_range: usize,
+    turns: &[TurnSpec],
+    env: &EchoSeparator,
+    temperature: f32,
+    prompt_rng: &mut LcgRng,
+    sample_rng: &mut LcgRng,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<(f32, f32), CliError> {
+    if n_prompts == 0 {
+        return Ok((0.0, 0.0));
+    }
+    let mut total_reward = 0.0_f32;
+    let mut total_turns = 0.0_f32;
+    let mut pass_count = 0.0_f32;
+    for _ in 0..n_prompts {
+        let initial_prompt = build_prompt(prompt_len, separator, target_range, prompt_rng);
+        let episode = rollout_episode(
+            policy,
+            ref_model,
+            config,
+            &initial_prompt,
+            turns,
+            env,
+            temperature,
+            sample_rng,
+            &|_: &Episode| 0.0,
+            store,
+            tape,
+        )?;
+        let per_turn = compute_per_turn_rewards(&episode, &initial_prompt);
+        let n_turns = per_turn.len();
+        if n_turns == 0 {
+            continue;
+        }
+        let episode_mean: f32 = per_turn.iter().sum::<f32>() / n_turns as f32;
+        total_reward += episode_mean * n_turns as f32;
+        total_turns += n_turns as f32;
+        if episode_mean >= 1.0 - 1.0e-4 {
+            pass_count += 1.0;
+        }
+    }
+    let mean_reward = if total_turns > 0.0 {
+        total_reward / total_turns
+    } else {
+        0.0
+    };
+    let pass_rate = pass_count / n_prompts as f32;
+    Ok((mean_reward, pass_rate))
 }
 
 fn compute_per_turn_rewards(episode: &Episode, initial_prompt: &[usize]) -> Vec<f32> {
@@ -367,6 +462,15 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--n-heads" => args.n_heads = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--d-head" => args.d_head = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--d-ff" => args.d_ff = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--eval-every" => {
+                args.eval_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--eval-prompts" => {
+                args.eval_prompts = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--eval-temperature" => {
+                args.eval_temperature = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             _ => return Err(CliError::UnknownFlag(flag)),
         }
     }
