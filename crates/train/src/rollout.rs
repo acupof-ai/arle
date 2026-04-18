@@ -38,12 +38,12 @@ pub fn rollout_group(
     validate_prompt_batch(prompts, seq_len, config.max_seq_len)?;
     let response_mask = response_mask(seq_len)?;
     let batch = prompts.len() * group_size;
-    let mut flat_prompts = Vec::with_capacity(batch * seq_len);
     let mut repeated_prompts = Vec::with_capacity(batch);
+    let mut flat_full_ids = Vec::with_capacity(batch * seq_len);
     for prompt in prompts {
         for _ in 0..group_size {
-            flat_prompts.extend_from_slice(prompt);
             repeated_prompts.push(prompt.clone());
+            flat_full_ids.extend_from_slice(prompt);
         }
     }
 
@@ -51,43 +51,54 @@ pub fn rollout_group(
     let trajectories = (|| {
         tape.set_enabled(false);
 
-        let logits_id = policy.forward(&flat_prompts, batch, seq_len, store, tape)?;
-        let logits = store.to_host(logits_id)?;
-        let (sampled_ids, sampled_log_probs) = sample_categorical(
-            &logits,
-            (batch, seq_len),
-            config.vocab_size,
-            temperature,
-            rng,
-        );
-
         let mut trajectories = Vec::with_capacity(batch);
         let mut full_batch = Vec::with_capacity(batch * seq_len);
-        for (row, prompt_ids) in repeated_prompts.iter().enumerate() {
-            let mut full_ids = prompt_ids.clone();
-            let mut old_log_probs = vec![0.0; seq_len];
-
-            for position in 0..seq_len {
-                if !response_mask[position] {
-                    continue;
-                }
-
-                // Causal next-token LM alignment: logits at position t - 1 predict token t.
-                let prediction_index = (row * seq_len) + (position - 1);
-                full_ids[position] = sampled_ids[prediction_index];
-                old_log_probs[position] = sampled_log_probs[prediction_index];
-            }
-
-            full_batch.extend_from_slice(&full_ids);
+        for prompt_ids in &repeated_prompts {
             trajectories.push(Trajectory {
                 prompt_ids: prompt_ids.clone(),
                 response_mask: response_mask.clone(),
-                full_ids,
-                old_log_probs,
+                full_ids: prompt_ids.clone(),
+                old_log_probs: vec![0.0; seq_len],
                 ref_log_probs: vec![0.0; seq_len],
                 reward: 0.0,
             });
         }
+
+        for (position, masked) in response_mask.iter().enumerate() {
+            if !*masked {
+                continue;
+            }
+
+            let logits_id = policy.forward(&flat_full_ids, batch, seq_len, store, tape)?;
+            let logits = store.to_host(logits_id)?;
+            let mut step_logits = Vec::with_capacity(batch * config.vocab_size);
+            for row in 0..batch {
+                let logits_row = row * seq_len + (position - 1);
+                let logits_base = logits_row * config.vocab_size;
+                step_logits
+                    .extend_from_slice(&logits[logits_base..logits_base + config.vocab_size]);
+            }
+
+            // Causal next-token LM alignment: logits at position t - 1 predict token t.
+            let (sampled_ids, sampled_log_probs) = sample_categorical(
+                &step_logits,
+                (batch, 1),
+                config.vocab_size,
+                temperature,
+                rng,
+            );
+            for row in 0..batch {
+                let flat_index = row * seq_len + position;
+                flat_full_ids[flat_index] = sampled_ids[row];
+                trajectories[row].full_ids[position] = sampled_ids[row];
+                trajectories[row].old_log_probs[position] = sampled_log_probs[row];
+            }
+
+            let keep = retained_ids(policy, ref_model, store);
+            store.retain_ids(&keep);
+        }
+
+        full_batch.extend_from_slice(&flat_full_ids);
 
         let ref_logits_id = ref_model.forward(&full_batch, batch, seq_len, store, tape)?;
         let ref_logits = store.to_host(ref_logits_id)?;
