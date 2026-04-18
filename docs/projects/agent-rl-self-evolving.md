@@ -32,6 +32,19 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 ### 1.3 认知目标（非交付物，但是本项目的显式动机）
 从零写 autograd + AdamW + GRPO，把"LLM 训练到底怎么跑"吃到骨子里。ckl 主动声明：**认知增强 > 抄现成**。本项目的代码质量门槛是"让明年的自己读起来比 PyTorch 源码更懂"。
 
+### 1.4 单进程是护城河，不是临时手段（autoplan 2026-04-18 强化）
+
+> 背景：2026-04-18 的 `/autoplan` CEO 评审中，两路外部声音（Claude subagent + Codex outside-voice）都指出 §2 行 3"单进程"被 §1.2 称为"结构性优势"但缺乏明确防御性论证。下面是补上的明确论证。
+
+**为什么单进程不只是 MVP 的实施选择，而是护城河本身**：
+
+1. **`Arc<BaseWeights>` 零拷贝共权重**：训练 worker 和推理 worker 看到的是同一块 GPU buffer，没有 NCCL all-gather、没有共享内存映射、没有 IPC 字节复制。同行 verl/SGLang 用 server mode 解耦后必须再用 NCCL 把权重同步回 trainer——一次 4B 模型 BF16 weight sync 走 NCCL 是 ~8 GB；我们这一步是 0 字节。
+2. **LoRA 热切是指针 swap，不是 RPC**：`Arc<RwLock<LoRADelta>>` double-buffer 的 hot-swap 路径长度是一次原子指针交换。跨进程的等价物是 RPC + 验证 + 失败回滚 + 状态机。
+3. **没有 weight-sync tax 的认知收益**：跨进程方案要求 trainer 与 rollout 都必须知道权重 schema、版本、对齐策略、同步周期。同进程方案中这些全部消失，于是 ckl 可以把脑容量花在 GRPO 本身和 autograd 数值正确性上。
+4. **不抢"第二个 veRL"的赛道**：veRL/ProRL/SFR-RL 已在做跨进程 + 多租户 + Python 生态。我们的差异化窗口是"**单机内最简洁、Rust 原生、零 Python 热路径**"。一旦把"federable on demand"挂在口边，就把自己挤进它们已经赢的赛道里。
+
+**因此**：§2 行 3"单进程"的状态从"被锁定的 MVP 实施细节"上升为"**项目身份的一部分**"。任何后续提案要把它改成"可联邦"或"可跨进程"，必须先证明 §6.1 中至少一条触发条件已经被 M3 的真实运行数据满足。
+
 ---
 
 ## 2. 锁定范围（v3，2026-04-18）
@@ -182,6 +195,28 @@ crates/
 | GRPO 实现错误导致 reward 上升但是 reward hack | 高 | 每个 M 保留 held-out verifier，且人工抽检 trajectory |
 | Metal MLX autograd 和 CUDA autograd 实现偏离 | 中 | 同一个 `BackwardOp` enum，实现在 `ops::*` 下分 `#[cfg(feature="cuda")]` / `#[cfg(feature="metal")]`；tape 本身共用 |
 | 从零写训练栈"认知得到但交付延误" | 中 | M0 + M1 严格时间盒（< 3 周）；如果 spike 阶段就深陷 autograd 坑，退路是 **M1.5 回退用 candle 做 autograd 壳**，但 ckl 2026-04-18 明确否决该退路 |
+
+### 6.1 跨进程重审触发条件（autoplan 2026-04-18 新增）
+
+§1.4 把"单进程"上升为项目身份。下面是**唯一允许重审该决策的入口**——不是"以后看看"，而是 M3 6 小时闭环跑出真实数据后，对照下面任何一条触发：
+
+| 触发条件 | 测量方法 | 阈值 |
+|---|---|---|
+| **T1**：Rollout 与 Trainer 在同卡上互相饿死，简单交替策略救不回来 | M3 闭环跑 6h，记录 `nvidia-smi dmon -s u` 利用率时序，统计 `<30%` 的窗口占比 | `>20%` 时间窗口 GPU 利用率 < 30% |
+| **T2**：单卡显存压力强迫 trainer 频繁 offload，offload 本身成为瓶颈 | M3 reward 上升曲线 vs 同等 LoRA rank 在 verl/SGLang 多卡基线 | 我们到达相同 reward 的墙钟时间 > verl 基线 × 2 |
+| **T3**：LoRA double-buffer 热切撞上读侧并发，热切延迟 > 推理 SLO | rollout 推理侧 P99 latency 抖动包络 vs 无热切对照 | 热切引入的 P99 抖动 > 50ms 且无法用更细 lock 解决 |
+| **T4**：同行（verl/ProRL/SFR-RL）在我们 M3 之前发布"Rust agent rollout backend"接入 | 季度 OSS 扫描 | 出现且活跃维护 → 重新评估"做 substrate 而不是端到端栈"的取舍 |
+| **T5**：真实 paying 用户出现，且要求多租户隔离 | 商业事件 | N=1 且需求明确 → 重审，但仍可能选择"换签到位用户、不改架构" |
+
+**未触发任何条件之前的纪律**：
+- 任何 PR / 提案中出现 `KvHandleRef`、`#[async_trait] Verifier`、`schema_version` 等"为跨进程预留接口"的字样，**默认拒绝**，除非引用本节并指出哪一条触发条件已满足。
+- 触发条件的"测量数据"必须真实采自 M3 跑，不接受"我感觉""推断""同行经验"。这是对 `feedback_no_speculative_interface_shaping.md` 的硬性应用。
+
+**触发后的处理路径**（不是预先设计，但写下来避免临时慌乱）：
+- T1/T3 → 工程层优化先（chunked rollout、更细粒度 LoRA lock），仍不行再考虑跨进程。
+- T2 → 优先 LoRA rank ↓ / 量化 base 释放显存，再考虑分布式。
+- T4 → 重新评估"端到端 vs substrate"的战略选择，可能写新项目文档而不是改本文档。
+- T5 → 商业问题，单独 ROADMAP 决策，不在本项目作用域。
 
 ---
 
