@@ -957,75 +957,89 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let t0 = std::time::Instant::now();
 
-        for slot in 0..max_bs {
-            if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
-                error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
-                return;
-            }
-        }
+        // Track how many slots we actually allocated so any early exit below
+        // still frees them in the cleanup loop. Previously, a failing
+        // `alloc_tokens` or `create_decode_context` would `return` with slots
+        // still holding warmup tokens — `free_slots()` would then consider
+        // them free while the pool still had dirty state, and the first real
+        // request could inherit stale paged-KV entries.
+        let mut allocated: usize = 0;
+        let mut warmed: usize = 0;
 
-        // Lazy-init decode context before warmup.
-        if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
-                Ok(ctx) => self.decode_bufs = Some(ctx),
-                Err(e) => {
-                    error!("Warmup: failed to create decode context: {}", e);
-                    return;
+        'warmup: {
+            for slot in 0..max_bs {
+                if let Err(e) = self.paged_kv_pool.alloc_tokens(slot, 1) {
+                    error!("Warmup: pool alloc for slot {} failed: {}", slot, e);
+                    break 'warmup;
                 }
+                allocated = slot + 1;
             }
-        }
 
-        let dummy_tokens: Vec<u32> = vec![0; max_bs];
-        let slot_indices: Vec<usize> = (0..max_bs).collect();
-
-        // Pass 1: drive forward for each warmup batch size. Populates the
-        // cublasLt heuristic algo cache for all GEMM shapes used by decode.
-        // In graph-capture mode, also captures a graph per batch size.
-        let warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
-
-        // Autotune: benchmark all heuristic candidates, replace with measured best.
-        // Runs regardless of graph mode so eager LoRA decode lands on the same
-        // tuned algorithms as graph-mode decode.
-        if warmed > 0 {
-            info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
-            let t_at = std::time::Instant::now();
-            unsafe {
-                infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
-                    self.model.device_context().stream.cu_stream(),
-                );
-            }
-            info!(
-                "cublasLt autotune done in {:.0}ms",
-                t_at.elapsed().as_secs_f64() * 1e3,
-            );
-
-            if graph_capture_enabled {
-                // Invalidate graphs captured with heuristic algos.
+            // Lazy-init decode context before warmup.
+            if self.decode_bufs.is_none() {
+                match self
+                    .model
+                    .create_decode_context(self.states.len(), &self.paged_kv_pool)
                 {
-                    use crate::model::DecodeContextOps;
-                    let decode_ctx = self
-                        .decode_bufs
-                        .as_mut()
-                        .expect("invariant: decode_bufs initialized above");
-                    for &bs in &warmup_sizes[..warmed] {
-                        decode_ctx.invalidate_graph_cache(bs);
+                    Ok(ctx) => self.decode_bufs = Some(ctx),
+                    Err(e) => {
+                        error!("Warmup: failed to create decode context: {}", e);
+                        break 'warmup;
                     }
                 }
+            }
 
-                // Pass 2: re-capture with autotuned algorithms.
-                let recaptured =
-                    self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+            let dummy_tokens: Vec<u32> = vec![0; max_bs];
+            let slot_indices: Vec<usize> = (0..max_bs).collect();
+
+            // Pass 1: drive forward for each warmup batch size. Populates the
+            // cublasLt heuristic algo cache for all GEMM shapes used by decode.
+            // In graph-capture mode, also captures a graph per batch size.
+            warmed = self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+
+            // Autotune: benchmark all heuristic candidates, replace with measured best.
+            // Runs regardless of graph mode so eager LoRA decode lands on the same
+            // tuned algorithms as graph-mode decode.
+            if warmed > 0 {
+                info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
+                let t_at = std::time::Instant::now();
+                unsafe {
+                    infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
+                        self.model.device_context().stream.cu_stream(),
+                    );
+                }
                 info!(
-                    "Re-captured {} graphs with autotuned GEMM algorithms",
-                    recaptured,
+                    "cublasLt autotune done in {:.0}ms",
+                    t_at.elapsed().as_secs_f64() * 1e3,
                 );
+
+                if graph_capture_enabled {
+                    // Invalidate graphs captured with heuristic algos.
+                    {
+                        use crate::model::DecodeContextOps;
+                        let decode_ctx = self
+                            .decode_bufs
+                            .as_mut()
+                            .expect("invariant: decode_bufs initialized above");
+                        for &bs in &warmup_sizes[..warmed] {
+                            decode_ctx.invalidate_graph_cache(bs);
+                        }
+                    }
+
+                    // Pass 2: re-capture with autotuned algorithms.
+                    let recaptured =
+                        self.warmup_graphs_pass(&warmup_sizes, &dummy_tokens, &slot_indices);
+                    info!(
+                        "Re-captured {} graphs with autotuned GEMM algorithms",
+                        recaptured,
+                    );
+                }
             }
         }
 
-        for slot in 0..max_bs {
+        // Always reached: frees any slots the warmup body allocated, whether
+        // the body ran to completion or bailed on an error above.
+        for slot in 0..allocated {
             self.paged_kv_pool.free_slot(slot);
             let _ = self.states[slot].reset();
         }
