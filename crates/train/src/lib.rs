@@ -1,5 +1,7 @@
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
+#[path = "control.rs"]
+pub mod control;
 #[path = "curriculum.rs"]
 pub mod curriculum;
 #[path = "dataset.rs"]
@@ -18,6 +20,8 @@ pub mod reward;
 pub mod rollout;
 #[path = "sampling.rs"]
 pub mod sampling;
+#[path = "server.rs"]
+pub mod server;
 #[path = "task_gen.rs"]
 pub mod task_gen;
 #[path = "trainer.rs"]
