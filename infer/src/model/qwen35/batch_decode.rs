@@ -698,14 +698,18 @@ impl Qwen35Model {
             &bufs.recurrent.qkv_conv_batch,
             &bufs.recurrent.b_batch,
             &bufs.recurrent.a_batch,
-            &attn.dt_bias,
-            &attn.a_log,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
             &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
             &mut bufs.recurrent.gdr_out_batch,
-            c.linear_num_key_heads,
-            c.linear_num_value_heads,
-            c.linear_key_head_dim,
-            c.linear_value_head_dim,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
             batch_size,
         )?;
 
@@ -1099,14 +1103,18 @@ impl Qwen35Model {
                 &bufs.recurrent.qkv_conv_batch,
                 &bufs.recurrent.b_batch,
                 &bufs.recurrent.a_batch,
-                &attn.dt_bias,
-                &attn.a_log,
+                &ops::GdrWeights {
+                    dt_bias: &attn.dt_bias,
+                    a_log: &attn.a_log,
+                },
                 &mut bufs.recurrent.gdr_state_ptrs_per_layer[linear_idx],
                 &mut bufs.recurrent.gdr_out_batch,
-                c.linear_num_key_heads,
-                c.linear_num_value_heads,
-                c.linear_key_head_dim,
-                c.linear_value_head_dim,
+                &ops::GdrHeadConfig {
+                    num_key_heads: c.linear_num_key_heads,
+                    num_value_heads: c.linear_num_value_heads,
+                    key_dim: c.linear_key_head_dim,
+                    val_dim: c.linear_value_head_dim,
+                },
                 batch_size,
             )?;
         }

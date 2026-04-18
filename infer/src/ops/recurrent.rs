@@ -5,23 +5,32 @@ use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
 use infer_cuda_kernels::ffi;
 use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
+/// GDR (gated delta rule) shared weights: `dt_bias` + `a_log` are reused across every GDR layer.
+pub(crate) struct GdrWeights<'a> {
+    pub dt_bias: &'a DeviceVec,
+    pub a_log: &'a CudaSlice<f32>,
+}
+
+/// GDR head configuration: linear-attention head counts and per-head dims.
+pub(crate) struct GdrHeadConfig {
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
+    pub key_dim: usize,
+    pub val_dim: usize,
+}
+
 /// Gated delta rule recurrent decode (single step, seq_len=1).
 /// Fused CUDA kernel: L2-norm q/k, compute g/beta, decay + rank-1 state update, output.
 /// ~15μs/layer on RTX 5070 Ti vs ~33μs for the 7-stage chunk-wise pipeline.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_rule_decode_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
     b_proj: &HiddenStates,
     a_proj: &HiddenStates,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
+    weights: &GdrWeights<'_>,
     state: &mut CudaSlice<f32>,
     output: &mut HiddenStates,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
+    heads: &GdrHeadConfig,
 ) -> Result<()> {
     debug_assert_eq!(qkv.seq_len, 1);
     debug_assert_eq!(b_proj.seq_len, 1);
@@ -31,8 +40,8 @@ pub(crate) fn gated_delta_rule_decode_into(
     let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
     let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = weights.a_log.device_ptr(&ctx.stream);
     let (s_ptr, _gs) = state.device_ptr_mut(&ctx.stream);
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
 
@@ -45,10 +54,10 @@ pub(crate) fn gated_delta_rule_decode_into(
             alog_ptr as *const f32,
             s_ptr as *mut f32,
             o_ptr as *mut ffi::Half,
-            num_key_heads as i32,
-            num_value_heads as i32,
-            key_dim as i32,
-            val_dim as i32,
+            heads.num_key_heads as i32,
+            heads.num_value_heads as i32,
+            heads.key_dim as i32,
+            heads.val_dim as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
@@ -104,27 +113,22 @@ pub(crate) fn conv1d_decode_batch_into(
 /// Batched GDR decode: process B requests' recurrent state update in one kernel launch.
 ///
 /// Per-request recurrent states are accessed via device pointer array.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn gdr_decode_batch_into(
     ctx: &DeviceContext,
     qkv_batch: &HiddenStates,
     b_proj_batch: &HiddenStates,
     a_proj_batch: &HiddenStates,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
+    weights: &GdrWeights<'_>,
     state_ptrs: &mut CudaSlice<u64>, // device array of pointers to per-request states (f32)
     output_batch: &mut HiddenStates,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
+    heads: &GdrHeadConfig,
     batch_size: usize,
 ) -> Result<()> {
     let (qkv_ptr, _gq) = qkv_batch.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b_proj_batch.data.device_ptr(&ctx.stream);
     let (a_ptr, _ga) = a_proj_batch.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = weights.a_log.device_ptr(&ctx.stream);
     let (sp_ptr, _gsp) = state_ptrs.device_ptr_mut(&ctx.stream);
     let (o_ptr, _go) = output_batch.data.device_ptr_mut(&ctx.stream);
 
@@ -137,10 +141,10 @@ pub(crate) fn gdr_decode_batch_into(
             alog_ptr as *const f32,
             sp_ptr as *mut *mut f32,
             o_ptr as *mut ffi::Half,
-            num_key_heads as i32,
-            num_value_heads as i32,
-            key_dim as i32,
-            val_dim as i32,
+            heads.num_key_heads as i32,
+            heads.num_value_heads as i32,
+            heads.key_dim as i32,
+            heads.val_dim as i32,
             batch_size as i32,
             ctx.stream.cu_stream(),
         )
