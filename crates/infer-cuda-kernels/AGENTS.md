@@ -104,6 +104,12 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
   (`common.cuh`) at `csrc/common.cuh`, included by every subdir.
 - Group new kernels by the closest existing subdir (`attention/`, `gemm/`,
   `kv/`, `quant/`, `misc/`). Don't create a new subdir for fewer than 3 files.
+- `csrc/attention/flashinfer_prefill_paged.cu` is the HD128 paged-prefill
+  FlashInfer wrapper (`PrefillPlan` + `BatchPrefillWithPagedKVCacheDispatched`).
+- `csrc/attention/flashinfer_prefill_paged_hd256.cu` is the HD256 paged-prefill
+  FlashInfer wrapper used for Qwen3.5 full-attention parity.
+- `csrc/attention/prefill_attention_paged_prep.cu` holds the paged-only
+  prefill prep kernels that do QK norm + RoPE and write K/V directly into HND pages.
 - When optimizing, check the heat map in
   `docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md` first.
 

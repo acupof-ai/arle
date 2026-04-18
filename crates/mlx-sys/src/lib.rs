@@ -506,8 +506,12 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
+    /// DFlash verify: parallel forward over a draft block, returning all-position
+    /// logits [1, block_size, vocab]. Respects model-level tape_mode and capture
+    /// layers — one call emits per-step GDR tapes and captured hidden for the
+    /// entire block, replacing the previous 16 × seq_len=1 sequential verify loop.
     #[allow(clippy::too_many_arguments)]
-    pub fn qwen35_compiled_block_verify(
+    pub fn qwen35_compiled_verify_block(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,
         block_size: i32,

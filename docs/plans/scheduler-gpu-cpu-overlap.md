@@ -1,5 +1,11 @@
 # Scheduler GPU/CPU Overlap — Deferred Future Work
 
+> **Superseded (2026-04-17):** the launch/readback split is already in tree
+> (`infer/src/scheduler/cuda/execution.rs:step()` Phase 1 `step_decode_launch`
+> → Phase 2 CPU overlap → Phase 3 `step_decode_readback`). Any further
+> scheduler restructuring rolls into
+> [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md) §Phase 2/3.
+
 ## Status
 
 Deferred on 2026-04-16. This note records the current analysis so the

@@ -248,17 +248,17 @@ pub trait ModelForward: Send {
 
     /// Optional future prefill fast path that scatter-writes K/V to the token pool.
     ///
-    /// The current CUDA scheduler still calls `forward_prefill()` and then migrates
-    /// contiguous KV into the paged pool via `GenerationStateBase::migrate_kv_range_to_paged()`.
-    /// That incremental migration path is the active production path for
-    /// BF16/FP8/INT8/TurboQuant prefill.
-    ///
-    /// The default implementation just calls `forward_prefill()` (no pool write).
-    /// Override in model implementations that support a direct dual-write path if that
-    /// path is later wired into the scheduler.
+    /// When `prefill_uses_paged_pool()` returns true, the scheduler pre-allocates
+    /// pool pages for the chunk BEFORE the forward call and routes prefill through
+    /// this method instead of `forward_prefill()`. The implementation writes K/V
+    /// directly into the paged pool via page-table indirection — no contiguous
+    /// KV cache is touched and the scheduler skips `migrate_kv_range_to_paged`
+    /// afterward.
     ///
     /// `new_token_indices` are the physical pool indices (on GPU) allocated for
-    /// this chunk's tokens. The slice has length `tokens.len()`.
+    /// this chunk's tokens. The slice has length `tokens.len()`. Implementations
+    /// that don't need per-token indices (e.g. paged-prefill variants that read
+    /// the page table from the pool itself) may ignore it.
     fn forward_prefill_with_pool(
         &self,
         tokens: &[u32],
@@ -269,6 +269,21 @@ pub trait ModelForward: Send {
     ) -> Result<()> {
         // Default: just call forward_prefill() (no pool write)
         self.forward_prefill(tokens, state)
+    }
+
+    /// Returns true when this model's `forward_prefill_with_pool` writes K/V
+    /// directly to the paged pool. The scheduler uses this to:
+    ///  - route prefill through `forward_prefill_with_pool` instead of
+    ///    `forward_prefill`,
+    ///  - pre-allocate pool pages BEFORE the forward call (so the forward can
+    ///    write into them via page-table indirection),
+    ///  - skip the post-forward `migrate_kv_range_to_paged` step,
+    ///  - lift the `CONTIGUOUS_KV_TOKENS` chunk-size cap (the contiguous
+    ///    scratch is not used by this model's prefill).
+    ///
+    /// Default: false (contiguous-KV + migrate path, still the majority).
+    fn prefill_uses_paged_pool(&self) -> bool {
+        false
     }
 
     /// Fast-path batched greedy sampling on internal contiguous logits.

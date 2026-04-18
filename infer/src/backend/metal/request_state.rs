@@ -2838,7 +2838,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
         //    A prefix-snapshot import may have downsized kv_capacity to the
         //    replay driver's smaller allocation (e.g. 256), and the DFlash
         //    path otherwise bypasses run_step's ensure_capacity; once
-        //    cache_len + block_size exceeds kv_capacity the C++ step_block
+        //    cache_len + block_size exceeds kv_capacity the C++ verify_block
         //    produces a malformed slice_update and the forward dies with
         //    "Shapes (1,4,16,256) and (1,4,N,256) cannot be broadcast".
         if let Some(block_size) = self.dflash.as_ref().map(|d| d.runtime.block_size()) {

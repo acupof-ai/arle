@@ -9,7 +9,54 @@
   <a href="https://github.com/cklxx/agent-infer/releases"><img src="https://img.shields.io/github/v/release/cklxx/agent-infer?include_prereleases" alt="Release"></a>
 </p>
 
+<p align="center">
+  <a href="#-latest-updates">News</a> ·
+  <a href="#-status-at-a-glance">Status</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#api">API</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
 ---
+
+## 📰 Latest Updates
+
+<!-- Keep this list short (last ~4 weeks). Older entries roll into CHANGELOG.md. -->
+
+- **2026-04-17** — Qwen3.5 DFlash correctness landed on Metal (GDR tape drain + sticky-state reset + bf16 cast of `g`/`k`). Output matches greedy baseline; single-stream is currently a **~5× regression** (acceptance ~28%, serial across sessions) — see [bench note](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
+- **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
+- **2026-04-15** — [`infer-cuda-kernels`](crates/infer-cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → infer-cuda-kernels`.
+- **2026-04-15** — Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c shipped locally and remote-accepted on L4. Radix selector flip, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract.
+- **2026-04-15** — Metal M0.2a resumable request state for Qwen3 + Qwen3.5 (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
+- **Early April 2026** — Qwen3-8B at SGLang parity (TTFT 2.5× faster); Qwen3.5-4B scheduler + FlashInfer HD256 batched decode (+14% over SGLang at C=4); TurboQuant 3-bit KV + weights; GPTQ/AWQ W4 production-ready with Marlin prefill; FP8/INT8 KV with fused-dequant decode; native Q4_K GPU kernel (`q4k_gemv_kernel`) fits Carnice-27B on L4-24GB.
+
+Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
+
+## 🚦 Status at a glance
+
+| Area | Status | Notes |
+|------|--------|-------|
+| CUDA / Linux — Qwen3 / Qwen3.5 / GLM4 | **Supported** | Primary serving path. |
+| Metal / Apple Silicon — Qwen3 / Qwen3.5 | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length decode not yet batched. |
+| Metal DFlash (Qwen3) | **Experimental** | Validated; benchmark before use. |
+| Metal DFlash (Qwen3.5) | **Experimental — perf regression** | Correct output; ~5× slower than baseline. |
+| CPU-only / `no-cuda` | **Development only** | Smoke tests, request-path validation. Not a production target. |
+| `/v1/completions`, `/v1/chat/completions`, `/v1/models` | **Stable** | OpenAI-compatible. |
+| `/v1/responses` | **Beta** | Non-streaming + SSE `output_text.delta`. |
+| FP8 / INT8 / TurboQuant KV, GPTQ/AWQ W4, Q4_K GGUF | **Beta** (CUDA) | Quantized KV is CUDA-only today. |
+
+Authoritative matrix: [docs/support-matrix.md](docs/support-matrix.md) ·
+Stability policy: [docs/stability-policy.md](docs/stability-policy.md)
+
+---
+
+<!--
+  Everything below is stable reference material: features, install, API,
+  architecture, development workflow. It changes only on architectural or
+  API-level shifts. Fresh project state lives in the two sections above.
+-->
 
 ## Why agent-infer?
 
@@ -29,10 +76,12 @@ agent-infer treats this as the core problem:
 
 ---
 
-## Performance (Qwen3-4B, A100-SXM4-40GB)
+## Performance
 
-| Concurrency | Throughput | vs SGLang v0.5.9 | TTFT | vs SGLang |
-|:-----------:|:----------:|:-----------------:|:----:|:---------:|
+Qwen3-4B on A100-SXM4-40GB vs SGLang v0.5.9:
+
+| Concurrency | Throughput | vs SGLang | TTFT | vs SGLang |
+|:-----------:|:----------:|:---------:|:----:|:---------:|
 | 1 | 119.5 tok/s | 0.99x | **8.6ms** | **4.6x faster** |
 | 4 | 414.8 tok/s | 0.99x | **53.1ms** | **2.6x faster** |
 | 8 | 811 tok/s | 0.92x | **68.7ms** | **1.1x faster** |
@@ -65,6 +114,9 @@ scales with the new user message length, not total context length._
 | 6 | Batched argmax + skip D2D scatter | **811 tok/s** | +7% |
 
 </details>
+
+Latest bench snapshots: [docs/experience/wins/](docs/experience/wins/) ·
+Run your own: [docs/plans/guidellm-integration.md](docs/plans/guidellm-integration.md)
 
 ---
 
@@ -115,20 +167,12 @@ cargo run --release -p infer --no-default-features --features metal,no-cuda --bi
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-Current status: standard `metal_serve` on Qwen3/Qwen3.5 now runs through a live
-Metal scheduler runtime with chunked prefill and decode-priority interleave.
-It now has narrow same-length cross-request decode batching for Qwen3 and
-Qwen3.5, but variable-length decode is still not batched and Metal DFlash still
-uses the legacy serial runtime path.
 For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
 `metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
 `--wired-limit-bytes` so MLX allocator behavior can be capped before model
 load.
 
-Metal DFlash remains available as an experimental Apple Silicon decode path
-for `Qwen3`.
-
-Quick example:
+Metal DFlash is available as an experimental Apple Silicon decode path:
 
 ```bash
 cargo run -p infer --bin metal_request --release --no-default-features --features metal,no-cuda -- \
@@ -139,83 +183,9 @@ cargo run -p infer --bin metal_request --release --no-default-features --feature
 ```
 
 For full usage, limits, and benchmark workflow, see
-[docs/resources/metal-dflash.md](docs/resources/metal-dflash.md).
-
----
-
-## Stability and Support
-
-`agent-infer` uses explicit stability and support rules.
-
-- **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
-  `GET /v1/models`), `GET /metrics`, `GET /v1/stats`, and the main documented
-  build/test workflows.
-- **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
-  behavior, Metal serving path, GGUF loading, benchmark tooling.
-- **Experimental**: fast-moving quantization paths, speculative decoding,
-  tensor-parallel scaffolding, Metal DFlash, and undocumented flags or
-  environment variables.
-
-Current support should be read conservatively:
-
-- **CUDA on Linux** is the primary supported serving path.
-- **Metal on Apple Silicon** is usable, but not yet equivalent to the CUDA
-  scheduler runtime. Standard `metal_serve` now uses a live Metal scheduler
-  runtime and the repo now ships `scripts/start_metal_serve.sh` as the
-  canonical first-time Apple bring-up path, but batched decode / prefix-reuse
-  parity is still pending.
-- **CPU-only / `no-cuda`** now includes a development-oriented CPU backend for
-  local smoke tests and request-path validation, but it is still not a
-  production inference target.
-
-Governance references:
-
-- [docs/stability-policy.md](docs/stability-policy.md)
-- [docs/support-matrix.md](docs/support-matrix.md)
-- [docs/compatibility.md](docs/compatibility.md)
-- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
-- [docs/release-checklist.md](docs/release-checklist.md)
-- [docs/environment.md](docs/environment.md)
-
----
-
-## Architecture
-
-Workspace split summary:
-
-- `agent-infer` is now a thin binary wrapper.
-- `infer-cli` owns the REPL/CLI flow.
-- `infer-agent` owns conversation state, tool-call recovery, and the agent turn loop.
-- `infer-tools` and `infer-chat` are reusable tool execution helpers and protocol types.
-- `infer` continues to own the HTTP server, scheduler, runtime, and backend
-  implementations. `infer::server_engine::{InferenceEngine, LoadedInferenceEngine,
-  CompletionRequest, CompletionOutput}` is the single engine contract used by
-  both the HTTP server and the agent CLI.
-
-See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
-for the current package boundaries.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  HTTP API  (/v1/completions, /v1/chat/completions, /v1/models, /v1/responses)  │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│  Scheduler  (decode-priority, chunked prefill)           │
-│  ┌──────────────┐  ┌─────────────┐  ┌────────────────┐  │
-│  │ Prefix Cache │  │ Token KV    │  │ Block Manager  │  │
-│  │ (radix tree) │  │ Pool (p=1)  │  │ (CoW paging)   │  │
-│  └──────────────┘  └─────────────┘  └────────────────┘  │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│  ModelForward trait                                       │
-│  Qwen3 (GQA) · Qwen3.5 (Hybrid recurrent + attention)   │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-      FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
-         (CUDA C + Triton AOT, crates/infer-cuda-kernels/)
-```
+[docs/resources/metal-dflash.md](docs/resources/metal-dflash.md). For the
+current DFlash correctness/perf state on Qwen3.5, see
+[§Latest Updates](#-latest-updates) above.
 
 ---
 
@@ -283,8 +253,8 @@ curl http://localhost:8000/v1/responses \
 </details>
 
 Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats`
-(human-readable). On Metal, these now expose live queue / latency / MLX memory
-stats from the running runtime, not just a detached placeholder metrics object.
+(human-readable). On Metal, these expose live queue / latency / MLX memory
+stats from the running runtime.
 
 ---
 
@@ -314,7 +284,7 @@ KV prefix cache reuses the full prior-turn KV in place for every subsequent
 turn of a session — only the new user message (and any tool-result content)
 runs prefill (slot-sticky match; cross-session reuse via radix tree lands in
 the tiered-kv-cache M1 milestone).
-On macOS, tool execution now uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
+On macOS, tool execution uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
 
 On Apple Silicon, build the same CLI against the Metal backend:
 
@@ -323,11 +293,6 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-For OpenAI-compatible HTTP serving on Apple Silicon, use the canonical
-`./scripts/start_metal_serve.sh` wrapper — see
-[§Metal on Apple Silicon](#metal-on-apple-silicon) above for the full flag
-reference and `metal_request` / `metal_bench` companions.
-
 The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
 
 - `/help` for command help
@@ -335,6 +300,71 @@ The CLI keeps conversation history across turns, stores line history in `~/.agen
 - `/tools` to inspect built-in tools
 - `/model` and `/stats` to inspect the loaded runtime
 - `/save <path>` and `/load <path>` to persist or resume a session as JSON
+
+---
+
+## Architecture
+
+Workspace split:
+
+- `agent-infer` — thin binary wrapper
+- `infer-cli` — REPL / CLI flow
+- `infer-agent` — conversation state, tool-call recovery, agent turn loop
+- `infer-tools` / `infer-chat` — tool execution helpers and protocol types
+- `infer` — HTTP server, scheduler, runtime, backend implementations; owns the single `InferenceEngine` contract
+- `infer-cuda-kernels` — extracted CUDA kernel layer (csrc/, Triton AOT, Rust FFI). One-way dep: `infer → infer-cuda-kernels`.
+- `mlx-sys` — MLX C++ bridge for the Metal backend
+
+See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
+for the current package boundaries.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  HTTP API  (/v1/completions, /v1/chat/completions, /v1/models, /v1/responses)  │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  Scheduler  (decode-priority, chunked prefill)           │
+│  ┌──────────────┐  ┌─────────────┐  ┌────────────────┐  │
+│  │ Prefix Cache │  │ Token KV    │  │ Block Manager  │  │
+│  │ (radix tree) │  │ Pool (p=1)  │  │ (CoW paging)   │  │
+│  └──────────────┘  └─────────────┘  └────────────────┘  │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  ModelForward trait                                       │
+│  Qwen3 (GQA) · Qwen3.5 (Hybrid recurrent + attention)   │
+└────────────────────────┬─────────────────────────────────┘
+                         ▼
+      FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
+         (CUDA C + Triton AOT, crates/infer-cuda-kernels/)
+```
+
+---
+
+## Stability and Support
+
+`agent-infer` uses explicit stability tiers:
+
+- **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
+  `GET /v1/models`), `GET /metrics`, `GET /v1/stats`, and the main documented
+  build/test workflows.
+- **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
+  behavior, Metal serving path, GGUF loading, benchmark tooling.
+- **Experimental**: fast-moving quantization paths, speculative decoding,
+  tensor-parallel scaffolding, Metal DFlash, and undocumented flags or
+  environment variables.
+
+Current project state lives in [§Status at a glance](#-status-at-a-glance) above
+and in the authoritative [docs/support-matrix.md](docs/support-matrix.md).
+
+Governance references:
+
+- [docs/stability-policy.md](docs/stability-policy.md)
+- [docs/compatibility.md](docs/compatibility.md)
+- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md)
+- [docs/release-checklist.md](docs/release-checklist.md)
+- [docs/environment.md](docs/environment.md)
 
 ---
 
@@ -368,8 +398,6 @@ Before opening a PR, read:
   reference
 
 For release work, also use [docs/release-checklist.md](docs/release-checklist.md).
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 
 ---
 
