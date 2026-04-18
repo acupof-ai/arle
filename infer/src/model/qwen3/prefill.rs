@@ -294,6 +294,17 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v_batch,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.q_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
+            }
+            if let Some(ad) = ll.k_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.k_batch)?;
+            }
+            if let Some(ad) = ll.v_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.v_batch)?;
+            }
+        }
 
         // 3. Paged-KV attention: QK norm + RoPE + paged K/V write (page-table
         //    indirection) + FlashInfer BatchPrefillWithPagedKVCache.
@@ -335,6 +346,17 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.o_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.attn_output,
+                    &mut bufs.o_buf,
+                )?;
+            }
+        }
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
@@ -365,6 +387,20 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.up_out,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.gate_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                )?;
+            }
+            if let Some(ad) = ll.up_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
+            }
+        }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
@@ -372,6 +408,11 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.down_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
+            }
+        }
 
         ops::add_batch_into(&self.ctx, hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
         std::mem::swap(hidden, &mut bufs.hidden_out);
@@ -463,6 +504,17 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v_batch,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.q_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q_batch)?;
+            }
+            if let Some(ad) = ll.k_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.k_batch)?;
+            }
+            if let Some(ad) = ll.v_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.v_batch)?;
+            }
+        }
         crate::model::common::debug_dump_hidden(
             &self.ctx,
             &bufs.q_batch,
@@ -530,6 +582,17 @@ impl Qwen3Model {
             &bufs.attn_output,
             &mut bufs.o_buf,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.o_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.attn_output,
+                    &mut bufs.o_buf,
+                )?;
+            }
+        }
         crate::model::common::debug_dump_hidden(
             &self.ctx,
             &bufs.o_buf,
@@ -588,6 +651,20 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.up_out,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.gate_proj.as_ref() {
+                ops::apply_lora_gemm_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.normed,
+                    &mut bufs.gate_out,
+                )?;
+            }
+            if let Some(ad) = ll.up_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.up_out)?;
+            }
+        }
         ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
         ops::gemm_into(
             &self.ctx,
@@ -595,6 +672,11 @@ impl Qwen3Model {
             &bufs.act_out,
             &mut bufs.o_buf,
         );
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.down_proj.as_ref() {
+                ops::apply_lora_gemm_add(&self.ctx, &ad.a, &ad.b, &bufs.act_out, &mut bufs.o_buf)?;
+            }
+        }
 
         // 8. Residual add: attn_residual + mlp_out.
         if let Some(ref mut r) = bufs.residual_f32 {

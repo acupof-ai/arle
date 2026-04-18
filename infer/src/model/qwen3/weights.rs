@@ -62,6 +62,11 @@ pub struct Qwen3Model {
     /// async-free pressure that caused foreign C++ exceptions under load.
     pub(super) paged_prefill_plan:
         std::sync::Mutex<Option<infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
+    /// Optional PEFT LoRA bundle. `None` = no adapter, forward uses base
+    /// weights verbatim. When `Some`, every projection site in prefill /
+    /// decode / batch_decode checks `lora.layers[layer_idx].<module>` and
+    /// adds the LoRA delta on top via `ops::apply_lora_{gemv,gemm}_add`.
+    pub(super) lora: Option<super::lora::Qwen3LoRA>,
 }
 
 impl Qwen3Model {
@@ -247,6 +252,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             paged_prefill_plan: std::sync::Mutex::new(None),
+            lora: None,
         };
 
         if model.enable_cuda_graph {
@@ -326,6 +332,46 @@ impl Qwen3Model {
 
         self.ctx.sync()?;
         Ok(())
+    }
+
+    /// Attach a loaded `Qwen3LoRA` bundle to this model. Returns `self`
+    /// with the adapter set; previous adapter (if any) is dropped.
+    pub fn with_lora(mut self, lora: super::lora::Qwen3LoRA) -> Self {
+        self.lora = Some(lora);
+        self
+    }
+
+    /// Load a PEFT LoRA adapter directory and attach it. Convenience wrapper
+    /// around `lora::load_peft_lora` + `with_lora` for the common CLI path.
+    ///
+    /// Refuses when the base weights use a format the LoRA path cannot
+    /// compose cleanly against: Marlin-packed W4 and TurboQuant formats
+    /// lose the row-major BF16 layout `apply_lora_gemm_add` relies on.
+    pub fn load_and_attach_lora(self, lora_path: &str) -> Result<Self> {
+        if let Some(layer0) = self.layers.first() {
+            let qproj = &layer0.attention.q_proj;
+            if qproj.has_marlin() {
+                anyhow::bail!(
+                    "LoRA refuses to attach: base weights are Marlin-packed W4; \
+                     LoRA currently requires BF16 or uniform INT{{2,4,8}} base weights"
+                );
+            }
+            if qproj.has_tq() {
+                anyhow::bail!(
+                    "LoRA refuses to attach: base weights are TurboQuant; \
+                     LoRA currently requires BF16 or uniform INT{{2,4,8}} base weights"
+                );
+            }
+        }
+        let num_layers = self.config.num_hidden_layers;
+        let lora = super::lora::load_peft_lora(&self.ctx, lora_path, num_layers)?;
+        Ok(self.with_lora(lora))
+    }
+
+    /// Per-layer LoRA slot accessor. Returns `None` when no adapter was
+    /// attached or when `layer_idx` is beyond the adapter's coverage.
+    pub(super) fn layer_lora(&self, layer_idx: usize) -> Option<&super::lora::LayerLoRA> {
+        self.lora.as_ref().and_then(|l| l.layers.get(layer_idx))
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
@@ -444,6 +490,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             paged_prefill_plan: std::sync::Mutex::new(None),
+            lora: None,
         };
 
         if model.enable_cuda_graph {

@@ -114,6 +114,17 @@ impl Qwen3Model {
             &bufs.normed,
             &mut bufs.v,
         )?;
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.q_proj.as_ref() {
+                ops::apply_lora_gemv_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.q)?;
+            }
+            if let Some(ad) = ll.k_proj.as_ref() {
+                ops::apply_lora_gemv_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.k)?;
+            }
+            if let Some(ad) = ll.v_proj.as_ref() {
+                ops::apply_lora_gemv_add(&self.ctx, &ad.a, &ad.b, &bufs.normed, &mut bufs.v)?;
+            }
+        }
 
         let pos = kv_cache.len();
         let (k_cache, v_cache) = kv_cache.prepare_layer(&self.ctx, layer_idx)?;
@@ -145,6 +156,17 @@ impl Qwen3Model {
             &bufs.attn_out,
             &mut bufs.attn_proj,
         )?;
+        if let Some(ll) = self.layer_lora(layer_idx) {
+            if let Some(ad) = ll.o_proj.as_ref() {
+                ops::apply_lora_gemv_add(
+                    &self.ctx,
+                    &ad.a,
+                    &ad.b,
+                    &bufs.attn_out,
+                    &mut bufs.attn_proj,
+                )?;
+            }
+        }
 
         ops::fused_add_rms_norm_into(
             &self.ctx,
@@ -155,15 +177,36 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        ops::fused_mlp_into(
-            &self.ctx,
-            &bufs.normed,
-            &layer.mlp.gate_proj,
-            &layer.mlp.up_proj,
-            &layer.mlp.down_proj,
-            &mut bufs.mlp_act,
-            &mut bufs.mlp_out,
-        )?;
+        let mlp_lora = self.layer_lora(layer_idx).and_then(|ll| {
+            let touches_mlp =
+                ll.gate_proj.is_some() || ll.up_proj.is_some() || ll.down_proj.is_some();
+            if touches_mlp { Some(ll) } else { None }
+        });
+        if let Some(ll) = mlp_lora {
+            ops::mlp_decode_with_lora_into(
+                &self.ctx,
+                &bufs.normed,
+                &layer.mlp.gate_proj,
+                &layer.mlp.up_proj,
+                &layer.mlp.down_proj,
+                ll.gate_proj.as_ref().map(|ad| (&ad.a, &ad.b)),
+                ll.up_proj.as_ref().map(|ad| (&ad.a, &ad.b)),
+                ll.down_proj.as_ref().map(|ad| (&ad.a, &ad.b)),
+                &mut bufs.mlp_act,
+                &mut bufs.mlp_up_scratch,
+                &mut bufs.mlp_out,
+            )?;
+        } else {
+            ops::fused_mlp_into(
+                &self.ctx,
+                &bufs.normed,
+                &layer.mlp.gate_proj,
+                &layer.mlp.up_proj,
+                &layer.mlp.down_proj,
+                &mut bufs.mlp_act,
+                &mut bufs.mlp_out,
+            )?;
+        }
 
         Ok(())
     }

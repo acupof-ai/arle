@@ -156,12 +156,19 @@ pub fn load_qwen3_components(
     options: InferenceEngineOptions,
 ) -> Result<ModelComponents<Qwen3Model>> {
     load_model_with(model_path, options, |model_path, options| {
-        Qwen3Model::from_safetensors_with_runtime(
+        let model = Qwen3Model::from_safetensors_with_runtime(
             model_path,
             ModelRuntimeConfig {
                 enable_cuda_graph: options.enable_cuda_graph,
             },
-        )
+        )?;
+        match std::env::var("INFER_LORA_PATH") {
+            Ok(lora_path) if !lora_path.trim().is_empty() => {
+                log::info!("Attaching LoRA adapter from {}", lora_path);
+                model.load_and_attach_lora(&lora_path)
+            }
+            _ => Ok(model),
+        }
     })
 }
 

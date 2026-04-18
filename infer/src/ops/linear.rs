@@ -305,6 +305,71 @@ pub fn fused_mlp_into(
     Ok(())
 }
 
+/// Unfused decode-path MLP with optional LoRA adapters on any of gate/up/down.
+///
+/// Used when LoRA is active on one or more of gate_proj / up_proj / down_proj,
+/// since the fused kernel has no LoRA hook. Numerically matches the quantized
+/// fallback branch of `fused_mlp_into`:
+///   * `act = silu(gate_proj(x)) * up_proj(x)`
+///   * `out = down_proj(act)`
+/// with LoRA adds applied right after their respective base GEMVs (before the
+/// SiLU for gate/up, after the base GEMV for down).
+///
+/// `up_scratch` must be a caller-owned `DeviceVec` of length `intermediate_size`
+/// (see `DecodeBuffers::mlp_up_scratch`).
+pub fn mlp_decode_with_lora_into(
+    ctx: &DeviceContext,
+    x: &DeviceVec,
+    gate_proj: &DeviceMatrix,
+    up_proj: &DeviceMatrix,
+    down_proj: &DeviceMatrix,
+    lora_gate: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    lora_up: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    lora_down: Option<(&DeviceMatrix, &DeviceMatrix)>,
+    act: &mut DeviceVec,
+    up_scratch: &mut DeviceVec,
+    out: &mut DeviceVec,
+) -> Result<()> {
+    let intermediate_size = gate_proj.rows;
+    assert_eq!(
+        up_scratch.len, intermediate_size,
+        "up_scratch len {} != intermediate_size {}",
+        up_scratch.len, intermediate_size
+    );
+
+    gemv(ctx, gate_proj, x, act)?;
+    if let Some((a, b)) = lora_gate {
+        apply_lora_gemv_add(ctx, a, b, x, act)?;
+    }
+    gemv(ctx, up_proj, x, up_scratch)?;
+    if let Some((a, b)) = lora_up {
+        apply_lora_gemv_add(ctx, a, b, x, up_scratch)?;
+    }
+
+    // silu(gate) * up → act (in-place)
+    {
+        let (act_ptr, _ga) = act.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _gu) = up_scratch.data.device_ptr(&ctx.stream);
+        unsafe {
+            ffi::silu_mul_triton_aot_cuda(
+                act_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                act_ptr as *mut ffi::Half,
+                intermediate_size as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+
+    gemv(ctx, down_proj, act, out)?;
+    if let Some((a, b)) = lora_down {
+        apply_lora_gemv_add(ctx, a, b, act, out)?;
+    }
+
+    Ok(())
+}
+
 /// GEMM: Y = weight @ X (batched linear projection)
 /// weight: [out_dim, in_dim] row-major, X: HiddenStates [in_dim, seq_len], Y: HiddenStates [out_dim, seq_len]
 pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Result<HiddenStates> {
