@@ -163,9 +163,51 @@ small pre-queue gap), and at c=8 the tick is busy enough with
 of it.
 
 Remaining c=1 gap to mlx_lm: 84.4 − 74.1 = 10.3 tok/s (~1.6 ms/step).
-Still in scheduler + HTTP path: mpsc delta_tx send, active HashMap
-remove+insert per tick, StopChunkProcessor string push, emit_event
-through the scheduler's event sink, delta_tx.is_closed probe.
+
+### P0e attempt — decode_token pipeline reorder (REVERTED)
+
+Tried reordering `Qwen35StepDriver::decode_token` to match the C++
+`qwen35_compiled_generate` pattern: kick step N+1 using the lazy
+`sampled` MlxArray as input, *then* `item_i32()` on the previous step's
+sampled. Replaced the per-step
+`MlxArray::from_slice_i32(&[result as i32], &[1])` heap+Metal-buffer
+alloc with a metadata-only `reshape(&sampled, &[1])`.
+
+**Result: within noise (74→76 c=1 mean, 71-77 range). Reverted.**
+
+Why it didn't help: the pre-existing `pending_sampled` pipelining
+already interleaves CPU graph-build with GPU exec across `decode_token`
+calls — by the time the next call enters, GPU step N is already done, so
+`item_i32()` returns fast regardless of ordering. And
+`from_slice_i32(&[i32], &[1])` is cheap (small lazy alloc, no Metal
+buffer copy until eval).
+
+### Better hypothesis for the c=1 HTTP gap
+
+The likely culprit is **MlxArray refcount churn at the Rust↔C++
+boundary during `cpp_model.step()`**. Each step replaces 16 KV cache
+wrappers (8 full-attn × k+v) and 48 GDR state wrappers (24 × state+conv)
+with freshly-constructed `MlxArray`s from raw `*mut mlx_array` pointers
+(`qwen35.rs:382-389`). Each swap = `Drop` (refcount decrement, possible
+Metal buffer free) + `from_raw` (wrap). 64 swaps/step × ~20 µs each
+≈ 1.2 ms/step, matching the observed gap within noise.
+
+The C++ `qwen35_compiled_generate` path never pays this — the caches
+live in a `std::vector<array>` for the whole decode loop and are
+`std::move`d between iterations. That's why direct `metal_bench`
+matches mlx_lm at 84 tok/s while HTTP is stuck at 74.
+
+**Fix options (neither attempted — out of 2-strike scope for this
+loop):**
+1. Change Rust cache storage to raw `Vec<*mut mlx_array>` and pass
+   pointers directly to FFI without wrapping/unwrapping each step.
+   Affects `Qwen35CppState::kv_flat`/`gdr_flat` ownership model.
+2. Move the decode loop into C++ behind a "session" API
+   (`qwen35_session_begin` + `qwen35_session_step` + `_end`), letting
+   caches stay in C++ between step calls. Architecturally cleanest.
+
+Both touch the mlx-sys FFI shape and the request_state lifecycle —
+non-trivial refactor, budget a day.
 
 ## Root cause of the B-linear term
 
