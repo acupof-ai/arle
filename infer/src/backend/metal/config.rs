@@ -322,7 +322,7 @@ mod tests {
                 assert_eq!(arch.num_full_attention_layers(), 1);
                 assert_eq!(arch.num_linear_attention_layers(), 1);
             }
-            other => panic!("expected Qwen3.5 config, got {other:?}"),
+            MetalModelArch::Qwen3 => panic!("expected Qwen3.5 config, got Qwen3"),
         }
     }
 

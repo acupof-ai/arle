@@ -338,6 +338,7 @@ impl EvictionPolicy for SessionBiasedLru {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact-equality asserts against constants (f32::INFINITY, literal defaults)
 mod tests {
     use super::*;
 
