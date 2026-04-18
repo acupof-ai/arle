@@ -29,12 +29,12 @@ Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill
 - **Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c locally shipped and remote-accepted on L4 (2026-04-15)**: scheduler selector flip to radix, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract + page-lifecycle state machine, legacy contiguous CPU KV offload retired. See `docs/projects/tiered-kv-cache.md`.
 - **`infer-cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/infer-cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → infer-cuda-kernels`.
 - **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
-- **Metal M0.2a resumable request state**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving wiring (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
+- **Metal M0.2a resumable request state + M0.2b scheduler-backed serving**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup); `metal_serve` now routes through `SchedulerHandle` via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics` (`infer/src/backend/metal/runtime.rs:580`). M0.2 throughput exit still pending variable-length decode + per-step batch-state rebuild cost work — see [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
 - **Metal packed-batch concurrent decode fixed (2026-04-16)**: `extend_kv_cache` batch-dim bug that crashed the scheduler when packed cache rolled past `KV_CACHE_CHUNK` was repaired; varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA.
 - **Qwen3.5 DFlash correctness landed (2026-04-17)**: end-to-end DFlash tape + sticky-state reset + bf16 cast of `g`/`k` produces coherent deterministic output matching baseline. Currently a perf regression (~5× slower single-stream vs baseline; acceptance ~28%; serial across concurrent requests). Follow-ups: acceptance investigation and batch-axis packing over 16-token blocks. See [`docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md`](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 - **CPU offload retired**: the legacy contiguous `model/kv_cache.rs` CPU-offload surface (`k_host/v_host`, `OFFLOAD_BLOCK_SIZE=64`, `prefetch/offload` hooks) deleted in M3c (`c3f65f7`). `set_max_gpu_kv` remains as a compatibility no-op warning only.
 
-Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal scheduler-backed serving (M0.2b — still `BackendRuntimeHandle` today), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
+Missing: multi-architecture GPU inference (Llama/DeepSeek/Mistral/Gemma/Phi — detection shipped in `model_registry.rs`, per-model forward not wired), MLA attention, tensor parallel communication (NCCL), speculative decoding GPU integration (CPU framework only), FlashAttention-3 (H100), Metal M0.2 throughput exit (scheduler-backed `metal_serve` shipped; pending variable-length decode + per-step batch-state rebuild cost work), Qwen3.5 CUDA batched prefill, scheduler preemption with KV swap.
 
 ---
 
@@ -527,9 +527,11 @@ Focus on performance, robustness, and Metal parity:
 4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
 5. ~~**Tiered KV Cache M0–M3**~~ — ✅ M2b+M0.3+M3a+M3b+M3c locally + L4 remote-accepted.
    Next: M3b runtime promotion path, M4 disk persistence + session save/load.
-6. **Metal M0.2b scheduler-backed serving** — `metal_serve` still goes through `BackendRuntimeHandle`;
-   M0.2a request state is landed but the scheduler wire-up + observability exit (M0.3/M0.4) are
-   still the hard blocker. See [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
+6. **Metal M0.2 throughput exit** — `metal_serve` routes through `SchedulerHandle` (M0.2b shipped
+   via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics`); M0.2a/c/d also landed
+   locally. Throughput exit still gated on variable-length decode + per-step batch-state rebuild
+   cost. Observability exit (M0.3/M0.4) tracks separately. See
+   [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
 7. **Qwen3.5 batched prefill** — prefill multiple requests in one forward pass (CUDA)
 8. **4.2 Speculative Decoding GPU integration** — `speculative.rs` CPU framework ✅ done;
    need: DraftEngine, KV rollback in PagedKvPool, SpeculativeScheduler, CUDA Graph 2-phase.
