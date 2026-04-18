@@ -1,7 +1,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 
 #include <flashinfer/attention/default_prefill_params.cuh>
 #include <flashinfer/attention/prefill.cuh>
@@ -38,38 +40,46 @@ extern "C" int flashinfer_batch_prefill_paged_hd128_plan(
     cudaStream_t stream) {
   (void)head_dim;
 
-  flashinfer::PrefillPlanInfo plan_info;
-  uint32_t total_num_rows = static_cast<uint32_t>(qo_indptr_h[batch_size]);
+  try {
+    flashinfer::PrefillPlanInfo plan_info;
+    uint32_t total_num_rows = static_cast<uint32_t>(qo_indptr_h[batch_size]);
 
-  cudaError_t err = flashinfer::PrefillPlan<IdType>(
-      float_workspace,
-      float_workspace_bytes,
-      int_workspace,
-      page_locked_workspace,
-      int_workspace_bytes,
-      plan_info,
-      qo_indptr_h,
-      kv_indptr_h,
-      total_num_rows,
-      static_cast<uint32_t>(batch_size),
-      static_cast<uint32_t>(num_qo_heads),
-      static_cast<uint32_t>(num_kv_heads),
-      HEAD_DIM,
-      HEAD_DIM,
-      static_cast<uint32_t>(page_size),
-      /*enable_cuda_graph=*/true,
-      /*sizeof_dtype_o=*/static_cast<uint32_t>(sizeof(DType)),
-      /*window_left=*/-1,
-      /*fixed_split_size=*/-1,
-      /*disable_split_kv=*/false,
-      /*num_colocated_ctas=*/0,
-      stream);
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
+    cudaError_t err = flashinfer::PrefillPlan<IdType>(
+        float_workspace,
+        float_workspace_bytes,
+        int_workspace,
+        page_locked_workspace,
+        int_workspace_bytes,
+        plan_info,
+        qo_indptr_h,
+        kv_indptr_h,
+        total_num_rows,
+        static_cast<uint32_t>(batch_size),
+        static_cast<uint32_t>(num_qo_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        HEAD_DIM,
+        HEAD_DIM,
+        static_cast<uint32_t>(page_size),
+        /*enable_cuda_graph=*/true,
+        /*sizeof_dtype_o=*/static_cast<uint32_t>(sizeof(DType)),
+        /*window_left=*/-1,
+        /*fixed_split_size=*/-1,
+        /*disable_split_kv=*/false,
+        /*num_colocated_ctas=*/0,
+        stream);
+    if (err != cudaSuccess) {
+      return static_cast<int>(err);
+    }
+
+    std::memcpy(plan_info_out, &plan_info, sizeof(flashinfer::PrefillPlanInfo));
+    return 0;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "flashinfer_batch_prefill_paged_hd128_plan threw: %s\n", e.what());
+    return -1;
+  } catch (...) {
+    std::fprintf(stderr, "flashinfer_batch_prefill_paged_hd128_plan threw unknown\n");
+    return -1;
   }
-
-  std::memcpy(plan_info_out, &plan_info, sizeof(flashinfer::PrefillPlanInfo));
-  return 0;
 }
 
 extern "C" int flashinfer_batch_prefill_paged_hd128_run(
@@ -91,74 +101,82 @@ extern "C" int flashinfer_batch_prefill_paged_hd128_run(
     int page_size,
     float sm_scale,
     cudaStream_t stream) {
-  flashinfer::PrefillPlanInfo plan_info;
-  std::memcpy(&plan_info, plan_info_ptr, sizeof(flashinfer::PrefillPlanInfo));
+  try {
+    flashinfer::PrefillPlanInfo plan_info;
+    std::memcpy(&plan_info, plan_info_ptr, sizeof(flashinfer::PrefillPlanInfo));
 
-  flashinfer::paged_kv_t<DType, IdType> paged_kv(
-      static_cast<uint32_t>(num_kv_heads),
-      static_cast<uint32_t>(page_size),
-      HEAD_DIM,
-      static_cast<uint32_t>(batch_size),
-      flashinfer::QKVLayout::kHND,
-      k_data,
-      v_data,
-      kv_indices,
-      kv_indptr,
-      kv_last_page_len,
-      /*rope_pos_offset=*/nullptr);
+    flashinfer::paged_kv_t<DType, IdType> paged_kv(
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(page_size),
+        HEAD_DIM,
+        static_cast<uint32_t>(batch_size),
+        flashinfer::QKVLayout::kHND,
+        k_data,
+        v_data,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        /*rope_pos_offset=*/nullptr);
 
-  Params params(
-      /*q=*/q,
-      /*paged_kv=*/paged_kv,
-      /*custom_mask=*/nullptr,
-      /*q_indptr=*/q_indptr,
-      /*mask_indptr=*/nullptr,
-      /*q_rope_offset=*/nullptr,
-      /*o=*/o,
-      /*lse=*/lse,
-      /*alibi_slopes=*/nullptr,
-      /*num_qo_heads=*/static_cast<uint32_t>(num_qo_heads),
-      /*q_stride_n=*/static_cast<IdType>(num_qo_heads * HEAD_DIM),
-      /*q_stride_h=*/static_cast<IdType>(HEAD_DIM),
-      /*window_left=*/-1,
-      /*logits_soft_cap=*/0.0f,
-      /*sm_scale=*/sm_scale,
-      /*rope_scale=*/1.0f,
-      /*rope_theta=*/1e4f);
+    Params params(
+        /*q=*/q,
+        /*paged_kv=*/paged_kv,
+        /*custom_mask=*/nullptr,
+        /*q_indptr=*/q_indptr,
+        /*mask_indptr=*/nullptr,
+        /*q_rope_offset=*/nullptr,
+        /*o=*/o,
+        /*lse=*/lse,
+        /*alibi_slopes=*/nullptr,
+        /*num_qo_heads=*/static_cast<uint32_t>(num_qo_heads),
+        /*q_stride_n=*/static_cast<IdType>(num_qo_heads * HEAD_DIM),
+        /*q_stride_h=*/static_cast<IdType>(HEAD_DIM),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        /*sm_scale=*/sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e4f);
 
-  params.padded_batch_size = plan_info.padded_batch_size;
-  params.max_total_num_rows = plan_info.total_num_rows;
-  params.partition_kv = plan_info.split_kv;
-  params.request_indices =
-      flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
-  params.qo_tile_indices =
-      flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.qo_tile_indices_offset);
-  params.kv_tile_indices =
-      flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
-  params.o_indptr =
-      flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
-  params.kv_chunk_size_ptr =
-      flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
+    params.padded_batch_size = plan_info.padded_batch_size;
+    params.max_total_num_rows = plan_info.total_num_rows;
+    // FlashInfer reads `total_num_rows` from device memory when the plan
+    // was created with `enable_cuda_graph=true`; without this pointer wire
+    // the dispatched kernel does OOB reads on the Q tensor.
+    if (plan_info.enable_cuda_graph) {
+      params.total_num_rows =
+          flashinfer::GetPtrFromBaseOffset<uint32_t>(int_workspace, plan_info.total_num_rows_offset);
+    }
+    params.partition_kv = plan_info.split_kv;
+    params.request_indices =
+        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
+    params.qo_tile_indices =
+        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices =
+        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
+    params.o_indptr =
+        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr =
+        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
 
-  if (plan_info.split_kv) {
-    params.merge_indptr =
-        flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.merge_indptr_offset);
-    params.block_valid_mask =
-        flashinfer::GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
-  } else {
-    params.merge_indptr = nullptr;
-    params.block_valid_mask = nullptr;
-  }
+    if (plan_info.split_kv) {
+      params.merge_indptr =
+          flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.merge_indptr_offset);
+      params.block_valid_mask =
+          flashinfer::GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
+    } else {
+      params.merge_indptr = nullptr;
+      params.block_valid_mask = nullptr;
+    }
 
-  DType* tmp_v = nullptr;
-  float* tmp_s = nullptr;
-  if (plan_info.split_kv) {
-    tmp_v = flashinfer::GetPtrFromBaseOffset<DType>(float_workspace, plan_info.v_offset);
-    tmp_s = flashinfer::GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
-  }
+    DType* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    if (plan_info.split_kv) {
+      tmp_v = flashinfer::GetPtrFromBaseOffset<DType>(float_workspace, plan_info.v_offset);
+      tmp_s = flashinfer::GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
+    }
 
-  cudaError_t err;
-  uint32_t cta_tile_q = plan_info.cta_tile_q;
+    cudaError_t err;
+    uint32_t cta_tile_q = plan_info.cta_tile_q;
 
 #define DISPATCH_BATCH_PREFILL_PAGED_HD128(CTQ)                                      \
   err = flashinfer::BatchPrefillWithPagedKVCacheDispatched<CTQ,                      \
@@ -171,25 +189,32 @@ extern "C" int flashinfer_batch_prefill_paged_hd128_run(
                                                            Params>(                  \
       params, tmp_v, tmp_s, /*enable_pdl=*/false, stream)
 
-  switch (cta_tile_q) {
-    case 16:
-      DISPATCH_BATCH_PREFILL_PAGED_HD128(16);
-      break;
-    case 32:
-      DISPATCH_BATCH_PREFILL_PAGED_HD128(32);
-      break;
-    case 64:
-      DISPATCH_BATCH_PREFILL_PAGED_HD128(64);
-      break;
-    case 128:
-      DISPATCH_BATCH_PREFILL_PAGED_HD128(128);
-      break;
-    default:
-      DISPATCH_BATCH_PREFILL_PAGED_HD128(16);
-      break;
-  }
+    switch (cta_tile_q) {
+      case 16:
+        DISPATCH_BATCH_PREFILL_PAGED_HD128(16);
+        break;
+      case 32:
+        DISPATCH_BATCH_PREFILL_PAGED_HD128(32);
+        break;
+      case 64:
+        DISPATCH_BATCH_PREFILL_PAGED_HD128(64);
+        break;
+      case 128:
+        DISPATCH_BATCH_PREFILL_PAGED_HD128(128);
+        break;
+      default:
+        DISPATCH_BATCH_PREFILL_PAGED_HD128(16);
+        break;
+    }
 
 #undef DISPATCH_BATCH_PREFILL_PAGED_HD128
 
-  return static_cast<int>(err);
+    return static_cast<int>(err);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "flashinfer_batch_prefill_paged_hd128_run threw: %s\n", e.what());
+    return -1;
+  } catch (...) {
+    std::fprintf(stderr, "flashinfer_batch_prefill_paged_hd128_run threw unknown\n");
+    return -1;
+  }
 }

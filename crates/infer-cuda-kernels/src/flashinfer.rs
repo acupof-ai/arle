@@ -139,9 +139,36 @@ pub struct BatchPrefillPagedPlan {
 }
 
 impl BatchPrefillPagedPlan {
+    /// HD128 paged prefill plan. Uses 512 MiB float workspace — the 256 MiB
+    /// default overflows `batch_prefill_tmp_s` under concurrent-sweep
+    /// load (observed 2026-04-18 on L4 with 10-slot Qwen3-4B).
     pub fn new(ctx: &DeviceContext, max_total_qo_rows: usize, num_qo_heads: usize) -> Result<Self> {
         Ok(Self {
-            workspace: FlashInferWorkspace::new(ctx, max_total_qo_rows, num_qo_heads)?,
+            workspace: FlashInferWorkspace::new_with_float_bytes(
+                ctx,
+                max_total_qo_rows,
+                num_qo_heads,
+                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
+            )?,
+            hd128: PlanBuf::new()?,
+            hd256: PlanBuf::new()?,
+        })
+    }
+
+    /// HD256 paged prefill plan — 4096-row split-KV needs 512 MiB float
+    /// workspace on Ampere. Used by Qwen3.5's full-attn layers.
+    pub fn new_hd256(
+        ctx: &DeviceContext,
+        max_total_qo_rows: usize,
+        num_qo_heads: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            workspace: FlashInferWorkspace::new_with_float_bytes(
+                ctx,
+                max_total_qo_rows,
+                num_qo_heads,
+                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
+            )?,
             hd128: PlanBuf::new()?,
             hd256: PlanBuf::new()?,
         })
@@ -427,22 +454,40 @@ impl BatchPrefillPagedPlan {
 }
 
 impl FlashInferWorkspace {
-    /// Default sizes matching FlashInfer's typical requirements.
-    /// HD256 paged prefill split-KV on 4096-row chunks needs >256MiB on Ampere:
-    /// `batch_prefill_tmp_v` alone reaches 256MiB before `tmp_s` is allocated.
-    const FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+    /// Default float workspace. Sized for HD128 prefill/decode on L4 — the
+    /// size we originally shipped. HD256 paged prefill split-KV on 4096-row
+    /// chunks needs ≥512 MiB on Ampere (`batch_prefill_tmp_v` alone hits
+    /// 256 MiB before `tmp_s` is allocated); callers on that path build the
+    /// workspace via `new_with_float_bytes` instead.
+    pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+    pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
     const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;
 
-    /// Allocate FlashInfer workspace buffers.
-    ///
-    /// `max_batch_size` controls the LSE buffer size.
-    /// `num_qo_heads` is needed for LSE dimensioning.
+    /// Allocate FlashInfer workspace buffers with the default 256 MiB float
+    /// workspace. Use `new_with_float_bytes` for HD256 paths.
     pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
+        Self::new_with_float_bytes(
+            ctx,
+            max_batch_size,
+            num_qo_heads,
+            Self::DEFAULT_FLOAT_WORKSPACE_BYTES,
+        )
+    }
+
+    /// Allocate FlashInfer workspace buffers with a caller-chosen float
+    /// workspace size. HD256 paged prefill needs 512 MiB; HD128 callers can
+    /// stay on `DEFAULT_FLOAT_WORKSPACE_BYTES`.
+    pub fn new_with_float_bytes(
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        num_qo_heads: usize,
+        float_workspace_bytes: usize,
+    ) -> Result<Self> {
         let float_workspace: CudaSlice<u8> = ctx
             .stream
-            .alloc_zeros(Self::FLOAT_WORKSPACE_BYTES)
+            .alloc_zeros(float_workspace_bytes)
             .map_err(|e| anyhow::anyhow!("FlashInfer float_workspace alloc failed: {e}"))?;
 
         let int_workspace: CudaSlice<u8> = ctx
@@ -462,7 +507,7 @@ impl FlashInferWorkspace {
 
         Ok(Self {
             float_workspace,
-            float_workspace_bytes: Self::FLOAT_WORKSPACE_BYTES,
+            float_workspace_bytes,
             int_workspace,
             int_workspace_bytes: Self::INT_WORKSPACE_BYTES,
             page_locked_workspace,

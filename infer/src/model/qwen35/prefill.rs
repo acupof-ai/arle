@@ -302,7 +302,7 @@ impl Qwen35Model {
             .lock()
             .map_err(|_| anyhow::anyhow!("paged_prefill_plan_hd256 mutex poisoned"))?;
         if plan_guard.is_none() {
-            *plan_guard = Some(BatchPrefillPagedPlan::new(
+            *plan_guard = Some(BatchPrefillPagedPlan::new_hd256(
                 &self.ctx,
                 seq_len.max(4096),
                 c.num_attention_heads,
