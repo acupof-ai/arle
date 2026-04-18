@@ -443,8 +443,8 @@ impl Qwen35Model {
         enable_cuda_graph: bool,
     ) -> Result<Self> {
         use crate::weight_loader::{
-            load_tensor_1d_gguf, load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder,
-            load_tensor_2d_gguf, load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
+            load_tensor_1d_gguf_offset_norm, load_tensor_1d_gguf_v_reorder, load_tensor_2d_gguf,
+            load_tensor_2d_gguf_bf16, load_tensor_2d_gguf_v_reorder_cols,
             load_tensor_2d_gguf_v_reorder_rows, precompute_rope, reverse_v_reorder_f32,
             reverse_v_reorder_rows,
         };
@@ -636,7 +636,7 @@ impl Qwen35Model {
                             )?;
                             let raw = gguf.read_tensor_raw(&gguf_name)?;
                             let info = &gguf.tensors[&gguf_name];
-                            let mut f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
+                            let f32s: Vec<f32> = if info.dtype == crate::gguf::GgmlType::F32 {
                                 unsafe {
                                     std::slice::from_raw_parts(
                                         raw.as_ptr().cast::<f32>(),
