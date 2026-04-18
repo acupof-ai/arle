@@ -207,9 +207,12 @@ pub fn load_peft_lora(
             ));
         }
 
-        let a = upload_as_bf16(ctx, &a_view, a_shape[0], a_shape[1])
+        let a = upload_as_bf16(ctx, &a_view, a_shape[0], a_shape[1], None)
             .with_context(|| format!("lora: layer {} {:?} A", layer_idx, module))?;
-        let b = upload_as_bf16(ctx, &b_view, b_shape[0], b_shape[1])
+        // B is pre-scaled by `scale = lora_alpha / r` at load time so the
+        // hot path can emit `y += B_scaled @ (A @ x)` without a runtime
+        // axpy. Adapter.scale retains the original value for diagnostics.
+        let b = upload_as_bf16(ctx, &b_view, b_shape[0], b_shape[1], Some(scale))
             .with_context(|| format!("lora: layer {} {:?} B", layer_idx, module))?;
         let adapter = LoRAAdapter { a, b, scale };
         match module {
@@ -307,11 +310,18 @@ fn parse_peft_key(name: &str) -> Option<(usize, LoraModule, Which)> {
 /// Upload a 2D safetensors view as a bf16 `DeviceMatrix`, converting
 /// from f32 if needed. PEFT adapters default to f32 on disk; we convert
 /// once at load time so the inference path only deals with bf16.
+///
+/// When `scale` is `Some`, each element is multiplied by it before the
+/// bf16 rounding step — used on the B matrix so the forward path avoids
+/// a runtime scalar multiply. For BF16-on-disk sources, scaling requires
+/// a host-side f32 round-trip (bf16 → f32 → scale → bf16) which is a
+/// small one-time cost at load.
 fn upload_as_bf16(
     ctx: &DeviceContext,
     view: &TensorView<'_>,
     rows: usize,
     cols: usize,
+    scale: Option<f32>,
 ) -> Result<DeviceMatrix> {
     let bytes = view.data();
     let expected_elems = rows * cols;
@@ -324,7 +334,19 @@ fn upload_as_bf16(
                     bytes.len()
                 ));
             }
-            DeviceMatrix::from_safetensors(ctx, bytes, rows, cols)
+            match scale {
+                None => DeviceMatrix::from_safetensors(ctx, bytes, rows, cols),
+                Some(s) => {
+                    let bf16_src: &[bf16] = unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr().cast::<bf16>(), expected_elems)
+                    };
+                    let scaled: Vec<bf16> = bf16_src
+                        .iter()
+                        .map(|x| bf16::from_f32(x.to_f32() * s))
+                        .collect();
+                    DeviceMatrix::from_host(ctx, &scaled, rows, cols)
+                }
+            }
         }
         Dtype::F32 => {
             if bytes.len() != expected_elems * 4 {
@@ -338,7 +360,8 @@ fn upload_as_bf16(
             // Rust targets; same assumption as `DeviceMatrix::from_safetensors`).
             let f32_slice: &[f32] =
                 unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), expected_elems) };
-            let bf16_host: Vec<bf16> = f32_slice.iter().map(|x| bf16::from_f32(*x)).collect();
+            let s = scale.unwrap_or(1.0);
+            let bf16_host: Vec<bf16> = f32_slice.iter().map(|x| bf16::from_f32(x * s)).collect();
             DeviceMatrix::from_host(ctx, &bf16_host, rows, cols)
         }
         other => Err(anyhow!(
