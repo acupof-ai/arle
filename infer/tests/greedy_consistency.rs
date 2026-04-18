@@ -10,6 +10,7 @@ use std::time::Instant;
 use log::info;
 use tokio::sync::mpsc;
 
+use infer::metrics::ServerMetrics;
 use infer::model::{ModelRuntimeConfig, Qwen3Model};
 use infer::sampler::SamplingParams;
 use infer::scheduler::{IncomingRequest, RequestPriority, Scheduler};
@@ -74,9 +75,16 @@ fn run_solo(prompt: &str, max_tokens: usize, model_path: &str) -> String {
     .expect("Failed to load model");
     let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
 
-    let (scheduler, handle) =
-        Scheduler::with_max_seq_len(model, tokenizer, "test", 4, 42, Some(512))
-            .expect("Failed to create scheduler");
+    let (scheduler, handle) = Scheduler::with_max_seq_len(
+        model,
+        tokenizer,
+        "test",
+        4,
+        42,
+        ServerMetrics::new("test"),
+        Some(512),
+    )
+    .expect("Failed to create scheduler");
 
     let scheduler_thread = std::thread::spawn(move || scheduler.run());
 
@@ -107,9 +115,16 @@ fn run_concurrent(
     let tokenizer = Tokenizer::from_file(model_path).expect("Failed to load tokenizer");
 
     let num_slots = 1 + filler_prompts.len();
-    let (scheduler, handle) =
-        Scheduler::with_max_seq_len(model, tokenizer, "test", num_slots, 42, Some(512))
-            .expect("Failed to create scheduler");
+    let (scheduler, handle) = Scheduler::with_max_seq_len(
+        model,
+        tokenizer,
+        "test",
+        num_slots,
+        42,
+        ServerMetrics::new("test"),
+        Some(512),
+    )
+    .expect("Failed to create scheduler");
 
     let scheduler_thread = std::thread::spawn(move || scheduler.run());
 
