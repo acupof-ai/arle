@@ -1,0 +1,124 @@
+# Metal Qwen3.5-4B-4bit concurrent decode — ceiling characterization + P0 landing
+
+**Date**: 2026-04-18
+**Machine**: Apple M4 Max (40 GPU cores, ~400 GB/s UMA)
+**Model**: `mlx-community/Qwen3.5-4B-MLX-4bit` (24 GDR + 8 full-attn layers)
+**Commit landed**: `e22aebc` — `feat(qwen35): real batched sampling on Metal packed decode`
+
+## Context
+
+Concurrent bench on `metal_serve` against `/v1/completions` (128 tokens/req,
+temp=0, ~40-token prompt) across concurrency 1/2/4/8. Plain packed decode,
+no DFlash (DFlash auto-disables at `open.len() >= 2` today).
+
+## Bench
+
+### Pre-fix (before batched sampling)
+
+| C | agg tps | per-req tps | step time |
+|---:|---:|---:|---:|
+| 1 | 63.6 | 63.6 | 15.7 ms |
+| 2 | 117.8 | 59.2 | 17.0 ms |
+| 4 | 144.5 | 36.4 | 27.8 ms |
+| 8 | 145.6 | 26.9 | 55.0 ms |
+
+Linear fit `t(B) ≈ 4.4 + 6.3·B ms` → ceiling ~158 tps, observed ~145 tps.
+
+### Post-fix (batched sampling)
+
+| C | agg tps | per-req tps | step time | Δ vs pre |
+|---:|---:|---:|---:|---:|
+| 1 | 68.1 | 68.1 | 14.7 ms | +7.1% |
+| 2 | 121.9 | 61.2 | 16.4 ms | +3.5% |
+| 4 | 144.3 | 36.3 | 27.7 ms | ±0 |
+| 8 | 144.4 | 26.8 | 55.4 ms | ±0 |
+
+Linear fit `t(B) ≈ 3.4 + 6.5·B ms` → **constant term `a` dropped by 1.0 ms**
+(sampling kernel launches saved), **linear term `b` is unchanged**.
+
+## Root cause of the B-linear term
+
+The old sampling path called `argmax(logits)` (flat, wrong for B>1) so
+`qwen35_can_batch_sample` was pinned to `false`, forcing a per-row loop at
+`request_state.rs:1578-1591` — B `slice_row` + B `gpu_sample_token` kernel
+dispatches per step. Fix: new `gpu_sample_token_batched` using
+`argmax_axis(-1)` / `random_categorical(-1)`, plus same-params gate on the
+batched path. Equivalence test against the scalar path at B=4 passes
+token-for-token (`qwen35.rs::packed_decode_batched_sampling_matches_scalar_sampling_for_b4`).
+
+**But the fix only hit the constant term.** The 6.5 ms/row linear term
+survives. Mapped in two explorer sweeps (Rust-side + C++-side). Scalar
+fast path (plain packed decode, `has_cache_pos_arr=false`) does NOT enter
+the per-row `slice_update` loop at `mlx_qwen35_model.cpp:586-630`
+(that's gated on Layer 2 verify). So the linear scaling is not kernel-launch
+overhead — it's **compute inside `gated_delta_step`**.
+
+## The true ceiling: GDR recurrent kernel
+
+Our `gated_delta_step` kernel grid is `(32, Dv, B·Hv)` with threadgroup
+`(32, 4, 1)` — **identical to the `bstnxbt/dflash-mlx` reference
+implementation's kernel** (confirmed via web read). So there's no easy
+grid-tuning win. The kernel's work is algorithmically `O(B · Hv · Dv · Dk)`
+per layer, and we run it across **24 GDR layers per step**. That work
+scales linearly in B and is fundamental to the gated-delta recurrence.
+
+On M4 Max the kernel should have plenty of parallelism (64 thread groups
+at B=8, 40 GPU cores), so it's likely not occupancy-limited — more likely
+memory-bandwidth or dispatch overhead across the 24 layers. **Needs
+Xcode Metal GPU capture to confirm**, which is out of scope for the
+Claude Code loop.
+
+## The real next lever: compile GDR+MLP sublayers
+
+`mlx_qwen35_model.cpp:1061-1068`:
+
+```
+// NOTE: mx::compile() cannot handle position-dependent KV cache slicing
+// (cache_pos changes each step, forcing re-trace). For now, skip JIT
+// compilation and run the C++ forward directly. This still eliminates
+// most Rust/FFI overhead.
+//
+// Future: compile individual GDR+MLP sublayers (no position deps) while
+// keeping full-attention layers uncompiled.
+is_compiled = false;
+```
+
+This is the real attack surface. The full-attn sublayers are
+position-dependent (they slice KV caches by `cache_pos`), but the 24 GDR
+sublayers and all 32 MLP sublayers have no position dependency — their
+inputs are just `(hidden, layer_weights, gdr_state)` and their outputs
+feed back into `hidden` / `gdr_state`. `mx::compile` with shapeless mode
+should fuse each sublayer's ~20 MLX ops into one compiled graph per
+sublayer. Estimated impact: fewer Metal kernel launches per step (today
+probably 600+; compiled would be ~50-100), likely moves both `a` and `b`.
+
+## Classification of remaining levers
+
+| Lever | Moves constant `a` | Moves linear `b` | Effort | Notes |
+|---|---|---|---|---|
+| P0 batched sampling | **−1.0 ms** ✓ | no | landed | e22aebc |
+| P1 cache `cols` in mask | −0.2 ms est | no | S | zero-risk |
+| P2 reuse rope_offsets | −0.1 ms est | no | S | zero-risk |
+| **Compile GDR+MLP sublayers** | **−?** | **−?** | M-L | **next big lever** |
+| GDR kernel-level fusion | no | −? | L | needs profiling first |
+| Algorithmic GDR change | — | — | XL | out of scope |
+
+## What Worked
+
+- Mapping the cost surface with two targeted explorer sweeps (Rust +
+  C++) before touching code. Saved an attempt on the wrong layer (the
+  per-row `slice_update` loop turned out to be gated on Layer 2 verify,
+  not plain decode).
+- Web-checking against `bstnxbt/dflash-mlx` confirmed our GDR kernel
+  geometry is canonical. Prevented a speculative re-tune.
+- B=4 equivalence test token-for-token against the scalar path gave
+  confidence the batched sampler wasn't silently changing outputs.
+
+## Rule
+
+For Qwen3.5-style hybrid linear-attn models on Metal: when concurrent
+decode plateaus, **check what fraction of the step time is kernel-launch
+overhead vs. kernel compute before optimizing**. Our P0 optimized the
+kernel-launch term; moving the plateau requires attacking the
+un-compiled-forward (many small kernels) or the GDR kernel itself
+(compute-linear in B).
