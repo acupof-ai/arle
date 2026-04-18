@@ -365,3 +365,28 @@ Captured `samply --rate 1000` profiles of both stacks running Qwen3.5-4B-MLX-4bi
 - `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate single-decode (Thread 1 is Python main)
 
 **2-strike status:** stopping loop iteration here. Previous attempts (P0e reorder, refcount recompute, leaf-only profiling) each added incremental knowledge; this cycle produced the first quantitative comparison that names the gap's cause. Implementing the session API is a ~230 LOC refactor outside one loop's scope.
+
+---
+
+## 2026-04-18 later (iter 3) — control profile: direct metal_bench path
+
+Added a third profile for triangulation: `target/release/metal_bench` single-prompt path = `cpp_model.generate()` direct C++ decode loop (no Rust FFI per step). This isolates the FFI-boundary contribution vs the C++ code-path contribution.
+
+| path | tok/s | `mach_vm_protect` share |
+|------|-------|-------------------------|
+| mlx_lm Python (`mlx_lm.generate`) | 84.4 | 12.4% |
+| **metal_bench (direct C++ generate)** | **84.0** | **44.1%** |
+| metal_serve (Rust FFI per-step) | 78.9 | 58.3% |
+
+**Revised hypothesis breakdown:**
+- **~30% of the 5 tok/s gap** (14 pp: 58.3% → 44.1%) = FFI wrapper churn at `CppQwen35Model::step`. Addressable via session API refactor (~230 LOC, keeps caches in C++ `std::vector<array>` for session lifetime).
+- **~70% of the gap** (32 pp: 44.1% → 12.4%) = C++ step code emits more MLX ops / more VM-protection than mlx_lm's Python step. NOT addressable by session API. Needs op-sequence diff between `mlx_qwen35_model.cpp::qwen35_compiled_step` and `mlx_lm/models/qwen3_5.py::Model.__call__`.
+
+**Revised action priorities:**
+1. **Session API** (~1.5 tok/s recovery): still worth doing, bigger win under concurrency.
+2. **Op trace diff** (~3.5 tok/s recovery): the real lever for c=1 parity. Instrument both paths to log MLX op sequence per token. Candidates for extra ops on our side: broadcast_to that Python avoids via implicit broadcasting, explicit reshape where Python uses stride-view, temp scratch arrays in quantized matmul path.
+
+**Profile artifacts (session handoff):**
+- `/tmp/qwen35_c1.json.gz` — metal_serve HTTP c=1
+- `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate
+- `/tmp/metal_bench_c1.json.gz` — metal_bench direct
