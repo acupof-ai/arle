@@ -6,6 +6,8 @@ pub mod grpo;
 pub mod lora;
 #[path = "model.rs"]
 pub mod model;
+#[path = "multi_turn.rs"]
+pub mod multi_turn;
 #[path = "rollout.rs"]
 pub mod rollout;
 #[path = "sampling.rs"]
