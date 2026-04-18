@@ -204,6 +204,24 @@ impl Qwen3Model {
         }
         let plan = plan_guard.as_mut().expect("just initialized");
 
+        // Structural invariant: plan ONCE per forward, not per layer.
+        // All 36 layers share the same (batch_size, qo_len, kv_len,
+        // num_heads, page_size) shape, so one plan call covers them all.
+        // Calling plan per layer overwrites `page_locked_workspace`
+        // (host pinned) while a prior layer's `cudaMemcpyAsync` is still
+        // queued on the compute stream — classic async-memcpy data race
+        // that corrupts FlashInfer's `int_workspace` and poisons the
+        // CUDA context under bench concurrency.
+        let mut fwd = crate::ops::PagedPrefillForward::new_hd128(
+            &self.ctx,
+            plan,
+            seq_len,
+            start_pos,
+            num_heads,
+            num_kv_heads,
+            pool.page_size,
+        )?;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_layer_batch_paged(
                 layer_idx,
@@ -213,7 +231,7 @@ impl Qwen3Model {
                 &mut bufs,
                 pool,
                 &slot_page_indices,
-                plan,
+                &mut fwd,
             )?;
         }
 
@@ -236,7 +254,7 @@ impl Qwen3Model {
         bufs: &mut PrefillBuffers,
         pool: &TokenKVPool,
         slot_page_indices: &CudaSlice<i32>,
-        plan: &mut BatchPrefillPagedPlan,
+        fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -305,7 +323,7 @@ impl Qwen3Model {
             &bufs.v_batch,
             &nrp,
             &meta,
-            plan,
+            fwd,
             &mut bufs.attn_output,
             &heads,
         )?;

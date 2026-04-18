@@ -322,6 +322,20 @@ impl Qwen35Model {
         }
         let plan = plan_guard.as_mut().expect("just initialized");
 
+        // Structural invariant: plan ONCE per forward, not per layer.
+        // All 8 full-attn layers share identical (batch_size, qo_len,
+        // kv_len, num_heads, page_size). See `PagedPrefillForward` docs
+        // for why per-layer plan calls race on the host pinned buffer.
+        let mut fwd = crate::ops::PagedPrefillForward::new_hd256(
+            &self.ctx,
+            plan,
+            seq_len,
+            start_pos,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            pool.page_size,
+        )?;
+
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
         let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
@@ -336,7 +350,7 @@ impl Qwen35Model {
                 pool,
                 &slot_page_indices,
                 start_pos,
-                plan,
+                &mut fwd,
                 recurrent,
             )?;
         }
@@ -366,7 +380,7 @@ impl Qwen35Model {
         pool: &TokenKVPool,
         slot_page_indices: &CudaSlice<i32>,
         start_pos: usize,
-        plan: &mut BatchPrefillPagedPlan,
+        fwd: &mut crate::ops::PagedPrefillForward,
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
         let c = &self.config;
@@ -386,7 +400,7 @@ impl Qwen35Model {
                 pool,
                 slot_page_indices,
                 start_pos,
-                plan,
+                fwd,
                 seq_len,
             )?,
             LayerKind::LinearAttention(attn) => self.prefill_linear_attention(
@@ -423,7 +437,7 @@ impl Qwen35Model {
         pool: &TokenKVPool,
         slot_page_indices: &CudaSlice<i32>,
         start_pos: usize,
-        plan: &mut BatchPrefillPagedPlan,
+        fwd: &mut crate::ops::PagedPrefillForward,
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
@@ -457,7 +471,7 @@ impl Qwen35Model {
             &v_batch,
             &nrp,
             &meta,
-            plan,
+            fwd,
             &mut q_prepped,
             &mut attn_out_batch,
             c.num_attention_heads,
