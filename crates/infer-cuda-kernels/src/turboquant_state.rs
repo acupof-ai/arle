@@ -20,22 +20,17 @@ use crate::tensor::DeviceContext;
 /// Packed bytes per head for a given head_dim and bit width.
 pub fn packed_bytes_per_head(head_dim: usize, bits: u8) -> usize {
     let effective_bits = if bits == 3 { 4 } else { bits as usize };
-    (head_dim * effective_bits + 7) / 8
+    (head_dim * effective_bits).div_ceil(8)
 }
 
 /// Rotation mode for TurboQuant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RotationMode {
     /// Full random orthogonal matrix (D×D matmul, O(D²)).
     Full,
     /// Randomized Hadamard: sign flip + FWHT (O(D log D)). Default.
+    #[default]
     Hadamard,
-}
-
-impl Default for RotationMode {
-    fn default() -> Self {
-        Self::Hadamard
-    }
 }
 
 /// Shared codebook (centroids + boundaries) for a given (head_dim, bits) pair.

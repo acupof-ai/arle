@@ -585,6 +585,7 @@ fn main() {
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::exit)] // harness-style binary test; exit signals CI failure
 fn run_named(name: &str, test_fn: fn() -> anyhow::Result<()>) {
     match test_fn() {
         Ok(()) => {

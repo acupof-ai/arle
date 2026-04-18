@@ -695,10 +695,10 @@ impl TokenKVPool {
     pub fn k_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         if self.format.needs_work_buffer() {
             let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
-            ptr as u64
+            ptr
         } else {
             let (ptr, _guard) = self.k_data[layer].device_ptr(stream);
-            ptr as u64
+            ptr
         }
     }
 
@@ -706,47 +706,47 @@ impl TokenKVPool {
     pub fn v_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         if self.format.needs_work_buffer() {
             let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
-            ptr as u64
+            ptr
         } else {
             let (ptr, _guard) = self.v_data[layer].device_ptr(stream);
-            ptr as u64
+            ptr
         }
     }
 
     /// Quantized K data pointer for a layer (read by attention kernels).
     pub fn k_data_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_data[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// Quantized V data pointer for a layer (read by attention kernels).
     pub fn v_data_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_data[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// K scales device pointer for a layer (INT8 only).
     pub fn k_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_scales[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// V scales device pointer for a layer (INT8 only).
     pub fn v_scales_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_scales[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// K norms device pointer for a layer (TurboQuant only).
     pub fn k_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_norms[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// V norms device pointer for a layer (TurboQuant only).
     pub fn v_norms_ptr(&self, layer: usize, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_norms[layer].device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// K norms CudaSlice ref for a layer (TurboQuant only).
@@ -772,13 +772,13 @@ impl TokenKVPool {
     /// K working buffer pointer (bf16, shared across layers).
     pub fn k_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.k_work.as_ref().expect("k_work").device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// V working buffer pointer (bf16, shared across layers).
     pub fn v_work_ptr(&self, stream: &cudarc::driver::CudaStream) -> u64 {
         let (ptr, _guard) = self.v_work.as_ref().expect("v_work").device_ptr(stream);
-        ptr as u64
+        ptr
     }
 
     /// Build FlashInfer-compatible metadata for a batch of slots.
