@@ -49,8 +49,8 @@ pub use sampling::{
 #[cfg(test)]
 pub(crate) use attention::flash_attention_prefill_hd256_into;
 pub(crate) use attention::{
-    HeadConfig, NormRopeParams, PagedKVMeta, PagedPrefillMeta, attention_gate_paged_hd256,
-    decode_prep_paged_hd256, flashinfer_run_layer_hd256,
+    HeadConfig, NormRopeParams, PagedKVMeta, PagedPrefillForward, PagedPrefillMeta,
+    attention_gate_paged_hd256, decode_prep_paged_hd256, flashinfer_run_layer_hd256,
 };
 pub(crate) use elementwise::{
     add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into,

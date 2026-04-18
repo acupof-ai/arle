@@ -194,19 +194,7 @@ impl ModelForward for Qwen3Model {
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
-        // Phase 3a is disabled at this flag. Five kernel-level fixes landed
-        // on main (190baf4/f08d265/927c390/7e198a9/96b1a9f) but the
-        // concurrent-bench path still crashes with `gemm_cuda:
-        // CUDA_ERROR_UNKNOWN` on a 4096+small-tail chunk pair. Direct
-        // 10-way concurrent curls pass (they share a prefix so radix
-        // collapses 9 of the 10 into decode-only), but guidellm's
-        // sweep sends distinct prompts and the crash reproduces
-        // reliably. Root cause is likely in the scheduler<->pool
-        // lifecycle around radix retain/release vs. in-flight slot
-        // prefill, not in the kernels themselves — patching kernels
-        // has not closed it. See the architecture audit in
-        // `docs/plans/paged-prefill-lifecycle-audit-2026-04-18.md`.
-        false
+        true
     }
 
     fn select_token(
