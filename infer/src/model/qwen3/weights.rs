@@ -181,14 +181,7 @@ impl Qwen3Model {
                     let q_proj = load_linear(&format!("{}.self_attn.q_proj.weight", prefix))?;
                     let k_proj = load_linear(&format!("{}.self_attn.k_proj.weight", prefix))?;
                     let v_proj = load_linear(&format!("{}.self_attn.v_proj.weight", prefix))?;
-                    let qkv_proj = if q_proj.is_quantized() {
-                        // Can't concat quantized matrices — use q_proj as placeholder.
-                        // Batched decode uses individual Q/K/V projections anyway.
-                        // TODO: merged quantized QKV for prefill
-                        DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?
-                    } else {
-                        DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?
-                    };
+                    let qkv_proj = DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?;
                     Attention {
                         q_proj,
                         k_proj,
