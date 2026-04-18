@@ -81,16 +81,28 @@ fn loads_synthetic_peft_adapter() {
     let gate_in = 16usize;
     let gate_out = 32usize;
 
-    // Index-dependent fills. `f_a(i,j) = (cols*i + j) / 128` and similar
-    // have unique values per (i, j), so a transpose, wrong leading
-    // dimension, or per-row duplication would visibly fail readback.
-    // Every value is k / 128 with 0 ≤ k < 256, so bf16 round-trips exact.
+    // Index-dependent fills. Each (i, j) maps to a unique value so a
+    // transpose, wrong leading dimension, or per-row duplication visibly
+    // fails readback. A and B within the same projection use disjoint
+    // value ranges — that way a wrong-source bug (e.g. A's staging
+    // buffer accidentally reused when materializing B) is also caught,
+    // not just layout corruption. Every value is k / 128 with
+    // 0 ≤ k ≤ 255, so bf16 round-trips are exact (8-bit mantissa).
     let q_a_vals: Vec<f32> = (0..r * q_in).map(|idx| (idx as f32) / 128.0).collect();
-    let q_b_vals: Vec<f32> = (0..q_out * r).map(|idx| (idx as f32) / 128.0).collect();
+    // q_b lives in [0.5, 1.5) — disjoint from q_a's [0.0, 1.0).
+    let q_b_vals: Vec<f32> = (0..q_out * r)
+        .map(|idx| 0.5 + (idx as f32) / 128.0)
+        .collect();
+    // gate_a is strictly non-positive; gate_b is strictly non-negative
+    // and uses a different denominator — distinguishable by sign at
+    // every non-zero index and by magnitude even at idx=0 (both zero,
+    // but then so would a uniform-zero aliasing bug).
     let gate_a_vals: Vec<f32> = (0..r * gate_in)
         .map(|idx| -((idx as f32) / 128.0))
         .collect();
-    let gate_b_vals: Vec<f32> = (0..gate_out * r).map(|idx| (idx as f32) / 128.0).collect();
+    // gate_b has gate_out*r = 256 entries; idx/256 keeps the numerator
+    // within 8 bits so every value round-trips bf16 exact.
+    let gate_b_vals: Vec<f32> = (0..gate_out * r).map(|idx| (idx as f32) / 256.0).collect();
 
     let q_a = F32Tensor::new(vec![r, q_in], q_a_vals.clone());
     let q_b = F32Tensor::new(vec![q_out, r], q_b_vals.clone());
