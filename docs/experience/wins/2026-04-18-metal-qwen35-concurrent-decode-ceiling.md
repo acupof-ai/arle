@@ -49,6 +49,46 @@ Fit `t(B) ≈ 6.0 + 6.1·B ms`; per-row asymptote ~164 tok/s, observed 143 tok/s
 (the 20 tok/s gap is HTTP + scheduler + tokenizer + sample loop overhead).
 Matches post-fix within noise — the ceiling is reproducible, not an artifact.
 
+### mlx_lm baseline — upper bound at B=1
+
+`mlx_lm.generate --model mlx-community/Qwen3.5-4B-MLX-4bit --temp 0.0
+--max-tokens 128` on the same prompt on the same M4 Max:
+
+```
+Generation: 128 tokens, 84.363 tokens-per-sec
+```
+
+**84.4 tok/s at B=1** → 11.85 ms/step.
+Ours at commit `5fe8805` hits 67.2 tok/s (14.9 ms/step) — **3.0 ms/step
+headroom**. Not kernel-bound; something in the server path that mlx_lm
+avoids.
+
+### P0b: drop redundant eval per step (commit `de7b687`)
+
+Tracing the single-row hot path (`request_state.rs:2438` `run_cpp_step`
++ `:2907` `decode_token` Qwen3.5 standard branch) found **two synchronous
+`eval`s per step**:
+
+1. `eval(&step_outputs)` inside `run_cpp_step` — cache arrays + logits
+2. `eval(&[&sampled])` inside `decode_token` — argmax result
+
+mlx_lm only syncs once per step (via `.item()` auto-eval) after
+`async_eval`. Fix: swap the inner `eval` for `async_eval`, drop the outer
+`eval(&[&sampled])` since `item_i32()` auto-evals the dependency chain.
+Same pattern applied to `run_rust_step` and the packed-decode batch path.
+
+| C | pre P0b | post P0b | Δ |
+|---:|---:|---:|---:|
+| 1 | 67.2 | 70.3 | **+4.6%** |
+| 2 | 120.7 | 120.0 | ±0 (noise) |
+| 4 | 143.5 | 143.2 | ±0 |
+| 8 | 142.8 | 142.0 | ±0 |
+
+c=1 closed ~1/3 of the 14 tok/s gap to mlx_lm. c≥2 unchanged — the
+kernel-compute ceiling is unaffected because the saved CPU-GPU round-trip
+overlaps with GPU work that's already the critical path at concurrent
+batch sizes.
+
 ## Root cause of the B-linear term
 
 The old sampling path called `argmax(logits)` (flat, wrong for B>1) so
