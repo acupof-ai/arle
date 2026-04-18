@@ -19,7 +19,7 @@ pub mod reduce;
 #[path = "ops/softmax.rs"]
 pub mod softmax;
 
-pub use activation::gelu;
+pub use activation::{exp, gelu};
 pub use broadcast::add_broadcast;
 pub use elementwise::{add, mul, mul_scalar};
 pub use embed::embedding;
@@ -30,7 +30,7 @@ pub use norm::rmsnorm;
 pub use reduce::{mean, sum};
 pub use softmax::{log_softmax, softmax};
 
-pub(crate) use activation::gelu_backward;
+pub(crate) use activation::{exp_backward, gelu_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;

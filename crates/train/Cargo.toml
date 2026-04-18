@@ -15,5 +15,9 @@ thiserror = { workspace = true }
 name = "train_tiny_lm"
 path = "src/bin/train_tiny_lm.rs"
 
+[[bin]]
+name = "train_grpo"
+path = "src/bin/train_grpo.rs"
+
 [lints]
 workspace = true
