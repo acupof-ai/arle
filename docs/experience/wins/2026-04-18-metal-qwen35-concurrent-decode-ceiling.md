@@ -295,3 +295,47 @@ overhead vs. kernel compute before optimizing**. Our P0 optimized the
 kernel-launch term; moving the plateau requires attacking the
 un-compiled-forward (many small kernels) or the GDR kernel itself
 (compute-linear in B).
+
+---
+
+## 2026-04-18 late — c=1 baseline refresh (HEAD d07c46c)
+
+Fresh 10-trial HTTP bench against warm `metal_serve`, 128 tokens/req, temp=0,
+snapshot hash `32f3e8ecf65426fc3306969496342d504bfa13f3`:
+
+| C | tok/s mean | p50 | min-max | σ |
+|---|---|---|---|---|
+| 1 | 78.9 | 78.9 | 78.3–79.5 | ±0.6 |
+| 2 | 114.5 | 114.8 | 112.8–116.0 | ±1.6 |
+| 4 | 142.5 | 145.4 | 131.9–149.4 | ±8.7 |
+| 8 | 136.9 | 135.8 | 133.5–143.7 | ±5.1 |
+
+`metal_bench` direct path 8-run mean: 84.0 tok/s (p50=84.2, p99=84.7, very stable).
+
+**c=1 HTTP gap is ~5 tok/s (0.75 ms/step)**, not 10 tok/s as earlier memory
+asserted. The 74.1 figure recorded during P0d landing was inside a wider noise
+band than it looked — subsequent P0-series landings and/or lower background
+load closed most of the visible gap without a dedicated fix.
+
+c=4 bimodality (131.9–149.4) and c=8 regression (145 → 137) are new — worth
+another 20-trial bench under a controlled load before ascribing to the code
+state. Likely thermal or MLX allocator cache behavior over longer runs.
+
+### P0e reprise investigation (no new code)
+
+Re-read mlx_lm `models/qwen3_5.py` (531 LOC) and `models/cache.py`:
+- No `@mx.compile` decorators, no `async_eval`, no custom cache type.
+- GDR layer uses `ArraysCache(size=2)` — `cache[0]`=conv_state, `cache[1]`=GDR
+  recurrent state, both overwritten via Python `__setitem__` each step.
+- `generate.py` pipelining structurally identical to our P0c cross-step
+  double-buffering.
+
+Recomputed refcount-churn estimate: `cpp_model.step()` does ~65 `to_arr` +
+~65 `from_arr` per call. Each is a heap alloc/free of the mlx_array wrapper
+struct, not the underlying shared_ptr data — ~0.1-0.2 µs each. Total
+~13 µs/step, not the 1.2 ms figure the earlier memory asserted.
+
+**Conclusion for this session:** the c=1 gap is now small enough (~5 tok/s,
+~6%) that chasing it without a CPU profile (samply / Instruments) is
+speculation. Deferring until a profile or a decision on C++ session API
+(qwen35_session_begin/step/end) landing.
