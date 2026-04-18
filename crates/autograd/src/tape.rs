@@ -3,8 +3,7 @@ use std::collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::{
-    AutogradError, Result,
-    ops,
+    AutogradError, Result, ops,
     tensor::{TensorId, TensorStore},
 };
 
@@ -15,6 +14,44 @@ pub enum SavedContext {
     Tensors(SmallVec<[TensorId; 4]>),
     TensorAndScalar(TensorId, f32),
     Shape(Vec<usize>),
+    MatmulCtx {
+        a: TensorId,
+        b: TensorId,
+    },
+    SoftmaxCtx {
+        y: TensorId,
+    },
+    LogSoftmaxCtx {
+        y: TensorId,
+    },
+    GatherCtx {
+        indices: Vec<usize>,
+        src_shape: Vec<usize>,
+    },
+    MeanCtx {
+        input: TensorId,
+        numel: usize,
+    },
+    RMSNormCtx {
+        x: TensorId,
+        weight: TensorId,
+        inv_rms: Vec<f32>,
+    },
+    GeluCtx {
+        x: TensorId,
+    },
+    TransposeCtx {
+        axis1: usize,
+        axis2: usize,
+    },
+    AddBroadcastCtx {
+        a_shape: Vec<usize>,
+        b_shape: Vec<usize>,
+    },
+    EmbeddingCtx {
+        indices: Vec<usize>,
+        table_shape: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +60,16 @@ pub enum BackwardOp {
     Mul,
     MulScalar,
     Sum,
+    Matmul,
+    Softmax,
+    LogSoftmax,
+    Gather,
+    Mean,
+    RMSNorm,
+    Gelu,
+    Transpose,
+    AddBroadcast,
+    Embedding,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +135,10 @@ impl Tape {
             let mut grads = HashMap::new();
             let loss_grad_id = store.fill_like(loss_id, 1.0)?;
             grads.insert(loss_id, loss_grad_id);
-            if store.get(loss_id).is_some_and(|tensor| tensor.requires_grad) {
+            if store
+                .get(loss_id)
+                .is_some_and(|tensor| tensor.requires_grad)
+            {
                 store.accumulate_grad(loss_id, loss_grad_id)?;
             }
 
@@ -102,8 +152,30 @@ impl Tape {
                 let input_grads = match entry.op {
                     BackwardOp::Add => ops::add_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Mul => ops::mul_backward(&entry, output_grad_id, store)?,
-                    BackwardOp::MulScalar => ops::mul_scalar_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::MulScalar => {
+                        ops::mul_scalar_backward(&entry, output_grad_id, store)?
+                    }
                     BackwardOp::Sum => ops::sum_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Matmul => ops::matmul_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Softmax => ops::softmax_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::LogSoftmax => {
+                        ops::log_softmax_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::Gather => {
+                        ops::gather_last_dim_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::Mean => ops::mean_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Transpose => {
+                        ops::transpose_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::AddBroadcast => {
+                        ops::add_broadcast_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::Embedding => {
+                        ops::embedding_backward(&entry, output_grad_id, store)?
+                    }
                 };
 
                 for (input_id, grad_id) in input_grads {
@@ -178,7 +250,10 @@ fn merge_grad(
         grads.insert(tensor_id, cloned_grad_id);
     }
 
-    if store.get(tensor_id).is_some_and(|tensor| tensor.requires_grad) {
+    if store
+        .get(tensor_id)
+        .is_some_and(|tensor| tensor.requires_grad)
+    {
         store.accumulate_grad(tensor_id, new_grad_id)?;
     }
 
@@ -193,8 +268,7 @@ mod tests {
     #[test]
     fn backward_on_empty_tape_does_not_panic() {
         let mut store = TensorStore::default();
-        let loss = store
-            .alloc(GpuTensor::new(vec![5.0], Vec::new(), true).expect("create scalar"));
+        let loss = store.alloc(GpuTensor::new(vec![5.0], Vec::new(), true).expect("create scalar"));
         let mut tape = Tape::new();
 
         let grads = tape.backward(loss, &mut store).expect("backward succeeds");
