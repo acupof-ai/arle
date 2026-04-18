@@ -11,6 +11,14 @@ use mlx_sys::{
     mlx_array_size, mlx_eval, mlx_matmul,
 };
 use std::ffi::c_void;
+use std::sync::Mutex;
+
+// MLX's default stream/device is process-global and its C++ allocator is
+// not re-entrant across threads. Concurrent `mlx_matmul` calls (e.g.
+// default `cargo test` parallelism) SEGV the interpreter. A static
+// mutex here is coarse but correct — training is single-threaded, and
+// the lock is held only for the duration of one matmul FFI round-trip.
+static MLX_GUARD: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetalBackend;
@@ -62,6 +70,8 @@ impl Backend for MetalBackend {
 
         let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
         let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
 
         // Safety: all pointers are produced by mlx_array_from_data / mlx_matmul
         // and freed on every path. Host slices outlive the from_data call,
