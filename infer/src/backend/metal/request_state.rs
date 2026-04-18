@@ -11,7 +11,7 @@ use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, concatenate_axis, eval, slice, take_axis, zeros};
 use super::ops::{clear_metal_cache, extend_kv_cache};
 use super::qwen35::{CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step};
-use super::sampling::{gpu_sample_token, validate_metal_sampling_params};
+use super::sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params};
 use super::weights::{MetalWeights, StandardMetalWeights};
 use crate::sampler::SamplingParams;
 
@@ -1560,20 +1560,16 @@ fn decode_qwen35_packed_batch<'a>(
     batch.batch_cache_len += 1;
 
     let sampled_tokens = if qwen35_can_batch_sample(states) {
-        let sampled = gpu_sample_token(&logits, &states[0].driver.params);
-        let sampled = super::mlx::contiguous(&super::mlx::reshape(
-            &sampled,
-            &[i32::try_from(states.len())
-                .context("decode_qwen35_packed_batch reshape overflow")?],
-        ));
+        let sampled = gpu_sample_token_batched(&logits, &states[0].driver.params);
         eval(&[&sampled]);
-        (0..states.len())
-            .map(|row_idx| {
-                let row =
-                    i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
-                Ok(slice_row(&sampled, row).item_i32() as u32)
-            })
-            .collect::<Result<Vec<_>>>()?
+        let sampled_i32 = sampled.as_slice_i32();
+        ensure!(
+            sampled_i32.len() == states.len(),
+            "decode_qwen35_packed_batch expected {} sampled tokens, got {}",
+            states.len(),
+            sampled_i32.len()
+        );
+        sampled_i32.into_iter().map(|token| token as u32).collect()
     } else {
         let mut sampled_arrays = Vec::with_capacity(states.len());
         for row_idx in 0..states.len() {
@@ -1791,11 +1787,22 @@ fn slice_row(array: &MlxArray, row: i32) -> MlxArray {
 }
 
 fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver<'_>>]) -> bool {
-    let _ = states;
-    // `gpu_sample_token` is still a scalar path on Metal. Do not treat it as a
-    // batched sampler until the MLX bridge exposes a real batched sampling
-    // kernel/result shape.
-    false
+    let Some((first, rest)) = states.split_first() else {
+        return false;
+    };
+    rest.iter()
+        .all(|state| same_sampling_params(&first.driver.params, &state.driver.params))
+}
+
+fn same_sampling_params(a: &SamplingParams, b: &SamplingParams) -> bool {
+    a.temperature == b.temperature
+        && a.top_k == b.top_k
+        && a.top_p == b.top_p
+        && a.min_p == b.min_p
+        && a.repetition_penalty == b.repetition_penalty
+        && a.frequency_penalty == b.frequency_penalty
+        && a.presence_penalty == b.presence_penalty
+        && a.seed == b.seed
 }
 
 /// Optional DFlash speculative-decode state attached to a `Qwen3StepDriver`.

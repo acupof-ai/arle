@@ -53,6 +53,17 @@ pub(super) fn gpu_sample_token(logits: &MlxArray, params: &SamplingParams) -> Ml
 }
 
 #[cfg(feature = "metal")]
+pub(super) fn gpu_sample_token_batched(logits: &MlxArray, params: &SamplingParams) -> MlxArray {
+    if params.temperature <= 1e-6 || params.top_k == 1 {
+        return super::mlx::argmax_axis(logits, -1);
+    }
+
+    let inv_t = MlxArray::scalar_f32(1.0f32 / params.temperature);
+    let scaled = super::mlx::multiply(logits, &inv_t);
+    super::mlx::categorical(&scaled)
+}
+
+#[cfg(feature = "metal")]
 fn greedy_sample_token(logits: &MlxArray) -> MlxArray {
     super::mlx::argmax(logits)
 }
