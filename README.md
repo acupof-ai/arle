@@ -25,7 +25,8 @@
 
 <!-- Keep this list short (last ~4 weeks). Older entries roll into CHANGELOG.md. -->
 
-- **2026-04-17** — Qwen3.5 DFlash correctness landed on Metal (GDR tape drain + sticky-state reset + bf16 cast of `g`/`k`). Output matches greedy baseline; single-stream is currently a **~5× regression** (acceptance ~28%, serial across sessions) — see [bench note](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
+- **2026-04-18** — Metal DFlash Layer 2 batched-verify primitives landed: `mlx_tape_replay_varlen` (per-row step counts) and `qwen35_compiled_verify_block_batched` (B>1 single-forward verify, B=1 path bit-identical to the scalar verify against real Qwen3.5-4B-4bit weights). Unblocks Layer 2c — lifting the `open.len() >= 2` DFlash auto-downgrade. Concurrent bench on M4 Max + Qwen3.5-4B-4bit: c=1 27.4 tok/s (DFlash) vs 63.6 tok/s (plain); c≥2 silently flips to packed decode and plateaus at ~145 tok/s regardless of DFlash flag. Step-time fit `t(B) ≈ 4.4 + 6.3·B ms` — per-row GDR recurrent work, not scheduler/HTTP, is the current ceiling.
+- **2026-04-17** — Qwen3.5 DFlash intra-request verify collapsed to a single forward at `seq_len = block_size` (Layer 1). Output matches greedy baseline; single-stream 4-bit is still a structural regression vs plain decode on M4 Max — see [verify-batch plan](docs/plans/metal-dflash-qwen35-verify-batch.md) and [bench note](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 - **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
 - **2026-04-15** — [`infer-cuda-kernels`](crates/infer-cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → infer-cuda-kernels`.
 - **2026-04-15** — Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c shipped locally and remote-accepted on L4. Radix selector flip, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract.
@@ -41,7 +42,7 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 | CUDA / Linux — Qwen3 / Qwen3.5 / GLM4 | **Supported** | Primary serving path. |
 | Metal / Apple Silicon — Qwen3 / Qwen3.5 | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length decode not yet batched. |
 | Metal DFlash (Qwen3) | **Experimental** | Validated; benchmark before use. |
-| Metal DFlash (Qwen3.5) | **Experimental — perf regression** | Correct output; ~5× slower than baseline. |
+| Metal DFlash (Qwen3.5) | **Experimental — single-session regression** | Correct output; 4-bit single-session ~40% of plain decode on M4 Max. Auto-disabled at concurrency ≥ 2 pending Layer 2c. |
 | CPU-only / `no-cuda` | **Development only** | Smoke tests, request-path validation. Not a production target. |
 | `/v1/completions`, `/v1/chat/completions`, `/v1/models` | **Stable** | OpenAI-compatible. |
 | `/v1/responses` | **Beta** | Non-streaming + SSE `output_text.delta`. |
