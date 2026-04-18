@@ -36,6 +36,11 @@ pub(crate) struct DecodeBuffers {
     pub(crate) attn_proj: DeviceVec,
     /// Fused MLP intermediate activation (intermediate_size)
     pub(crate) mlp_act: DeviceVec,
+    /// Scratch buffer for `up_proj` output when the unfused LoRA decode MLP
+    /// path is used (size `intermediate_size`). Unused when no LoRA adapter
+    /// touches the MLP; still allocated up-front to preserve zero-alloc on
+    /// the hot path once LoRA is attached.
+    pub(crate) mlp_up_scratch: DeviceVec,
     /// Fused MLP output (hidden_size)
     pub(crate) mlp_out: DeviceVec,
     /// Current hidden state, persists across layers (hidden_size)
@@ -93,6 +98,7 @@ impl DecodeBuffers {
             attn_out: DeviceVec::zeros(ctx, q_dim)?,
             attn_proj: DeviceVec::zeros(ctx, h)?,
             mlp_act: DeviceVec::zeros(ctx, config.intermediate_size)?,
+            mlp_up_scratch: DeviceVec::zeros(ctx, config.intermediate_size)?,
             mlp_out: DeviceVec::zeros(ctx, h)?,
             hidden: DeviceVec::zeros(ctx, h)?,
             logits,

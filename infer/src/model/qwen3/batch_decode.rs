@@ -756,6 +756,14 @@ impl Qwen3Model {
         debug_assert!(batch_size >= 1);
         debug_assert!(batch_size <= bufs.max_batch_size);
 
+        // LoRA fallback: the graph body allocates `apply_lora_gemm_add` temp
+        // buffers per call, which CUDA Graph capture rejects. Until we
+        // pre-allocate LoRA scratch in `BatchDecodeBuffers` (phase 2+),
+        // route LoRA-attached decode through the contiguous per-slot path.
+        if self.lora.is_some() {
+            return self.decode_batch_contiguous(tokens, states, slot_indices);
+        }
+
         // NOTE: set_batch_size, upload_token_ids, update_metadata, and
         // plan_attention are now called by the scheduler via DecodeContextOps
         // before this method is invoked.

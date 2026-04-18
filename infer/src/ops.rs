@@ -34,7 +34,9 @@ pub use attention::{
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};
 pub use kv_ops::scatter_write_kv;
-pub use linear::{apply_lora_gemm_add, apply_lora_gemv_add, fused_mlp_into, gemm, gemv};
+pub use linear::{
+    apply_lora_gemm_add, apply_lora_gemv_add, fused_mlp_into, gemm, gemv, mlp_decode_with_lora_into,
+};
 pub use norm::{
     fused_add_rms_norm_into, fused_add_rms_norm_offset_into, rms_norm_batch_offset_into,
     rms_norm_gated_into, rms_norm_into, rms_norm_offset_into,
