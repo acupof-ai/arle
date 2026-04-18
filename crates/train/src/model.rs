@@ -1,13 +1,15 @@
 use autograd::{
     AutogradError, GpuTensor, Result, Tape, TensorId, TensorStore,
-    module::Module,
+    module::{Linear, Module},
     ops::{
         add, add_broadcast, embedding, gelu, matmul, mul_scalar, reshape, rmsnorm, softmax,
         transpose,
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::lora::{LoraConfig, LoraLinear};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TinyLMConfig {
     pub vocab_size: usize,
     pub d_model: usize,
@@ -16,6 +18,7 @@ pub struct TinyLMConfig {
     pub d_head: usize,
     pub d_ff: usize,
     pub max_seq_len: usize,
+    pub lora: Option<LoraConfig>,
 }
 
 impl Default for TinyLMConfig {
@@ -28,67 +31,93 @@ impl Default for TinyLMConfig {
             d_head: 64,
             d_ff: 1024,
             max_seq_len: 128,
+            lora: None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct LinearNoBias {
-    weight: TensorId,
+enum MaybeLora {
+    Plain(Linear),
+    Lora(LoraLinear),
 }
 
-impl LinearNoBias {
+impl MaybeLora {
     fn new(
         in_features: usize,
         out_features: usize,
-        salt: u32,
+        with_bias: bool,
+        lora: Option<LoraConfig>,
         store: &mut TensorStore,
-    ) -> Result<Self> {
-        let bound = 1.0 / (in_features as f32).sqrt();
-        let mut state = 0x9E37_79B9_u32 ^ ((in_features as u32) << 16) ^ out_features as u32 ^ salt;
-        let weight_data = (0..out_features * in_features)
-            .map(|_| sample_uniform(&mut state, bound))
-            .collect::<Vec<_>>();
-        let weight = store.alloc(GpuTensor::new(
-            weight_data,
-            vec![out_features, in_features],
-            true,
-        )?);
-        Ok(Self { weight })
+    ) -> Self {
+        match lora {
+            Some(cfg) => Self::Lora(LoraLinear::new(
+                in_features,
+                out_features,
+                with_bias,
+                &cfg,
+                store,
+            )),
+            None => Self::Plain(Linear::new(in_features, out_features, with_bias, store)),
+        }
     }
 
     fn forward(&self, x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-        linear_last_dim(x, self.weight, store, tape)
+        match self {
+            Self::Plain(linear) => linear.forward(x, store, tape),
+            Self::Lora(linear) => linear.forward(x, store, tape),
+        }
     }
 
     fn parameters(&self) -> Vec<TensorId> {
-        vec![self.weight]
+        match self {
+            Self::Plain(linear) => linear.parameters(),
+            Self::Lora(linear) => linear.trainable_parameters(),
+        }
+    }
+
+    fn base_parameters(&self) -> Vec<TensorId> {
+        match self {
+            Self::Plain(linear) => linear.parameters(),
+            Self::Lora(linear) => linear.base_parameters(),
+        }
+    }
+
+    fn freeze_base(&self, store: &mut TensorStore) {
+        match self {
+            Self::Plain(linear) => linear.freeze(store),
+            Self::Lora(linear) => linear.freeze_base(store),
+        }
+    }
+
+    fn is_lora(&self) -> bool {
+        matches!(self, Self::Lora(_))
     }
 }
 
 #[derive(Debug, Clone)]
 struct Block {
     attn_norm_weight: TensorId,
-    wq: LinearNoBias,
-    wk: LinearNoBias,
-    wv: LinearNoBias,
-    wo: LinearNoBias,
+    wq: MaybeLora,
+    wk: MaybeLora,
+    wv: MaybeLora,
+    wo: MaybeLora,
     ffn_norm_weight: TensorId,
-    w1: LinearNoBias,
-    w2: LinearNoBias,
+    w1: MaybeLora,
+    w2: MaybeLora,
 }
 
 impl Block {
-    fn new(index: usize, config: TinyLMConfig, store: &mut TensorStore) -> Result<Self> {
+    fn new(config: TinyLMConfig, store: &mut TensorStore) -> Result<Self> {
         Ok(Self {
             attn_norm_weight: ones_parameter(&[config.d_model], store)?,
-            wq: LinearNoBias::new(config.d_model, config.d_model, block_salt(index, 1), store)?,
-            wk: LinearNoBias::new(config.d_model, config.d_model, block_salt(index, 2), store)?,
-            wv: LinearNoBias::new(config.d_model, config.d_model, block_salt(index, 3), store)?,
-            wo: LinearNoBias::new(config.d_model, config.d_model, block_salt(index, 4), store)?,
+            wq: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
+            wk: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
+            wv: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
+            wo: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
             ffn_norm_weight: ones_parameter(&[config.d_model], store)?,
-            w1: LinearNoBias::new(config.d_model, config.d_ff, block_salt(index, 5), store)?,
-            w2: LinearNoBias::new(config.d_ff, config.d_model, block_salt(index, 6), store)?,
+            w1: MaybeLora::new(config.d_model, config.d_ff, false, config.lora, store),
+            w2: MaybeLora::new(config.d_ff, config.d_model, false, config.lora, store),
         })
     }
 
@@ -126,7 +155,11 @@ impl Block {
     }
 
     fn parameters(&self) -> Vec<TensorId> {
-        let mut params = vec![self.attn_norm_weight, self.ffn_norm_weight];
+        let mut params = Vec::new();
+        if !self.wq.is_lora() {
+            params.push(self.attn_norm_weight);
+            params.push(self.ffn_norm_weight);
+        }
         params.extend(self.wq.parameters());
         params.extend(self.wk.parameters());
         params.extend(self.wv.parameters());
@@ -134,6 +167,28 @@ impl Block {
         params.extend(self.w1.parameters());
         params.extend(self.w2.parameters());
         params
+    }
+
+    fn base_parameters(&self) -> Vec<TensorId> {
+        let mut params = vec![self.attn_norm_weight, self.ffn_norm_weight];
+        params.extend(self.wq.base_parameters());
+        params.extend(self.wk.base_parameters());
+        params.extend(self.wv.base_parameters());
+        params.extend(self.wo.base_parameters());
+        params.extend(self.w1.base_parameters());
+        params.extend(self.w2.base_parameters());
+        params
+    }
+
+    fn freeze_base(&self, store: &mut TensorStore) {
+        freeze_parameter(self.attn_norm_weight, store);
+        freeze_parameter(self.ffn_norm_weight, store);
+        self.wq.freeze_base(store);
+        self.wk.freeze_base(store);
+        self.wv.freeze_base(store);
+        self.wo.freeze_base(store);
+        self.w1.freeze_base(store);
+        self.w2.freeze_base(store);
     }
 }
 
@@ -164,8 +219,19 @@ impl TinyLM {
         )?;
 
         let mut blocks = Vec::with_capacity(config.n_layers);
-        for index in 0..config.n_layers {
-            blocks.push(Block::new(index, config, store)?);
+        for _ in 0..config.n_layers {
+            blocks.push(Block::new(config, store)?);
+        }
+
+        let final_norm_weight = ones_parameter(&[config.d_model], store)?;
+
+        if config.lora.is_some() {
+            freeze_parameter(token_embed, store);
+            freeze_parameter(pos_embed, store);
+            freeze_parameter(final_norm_weight, store);
+            for block in &blocks {
+                block.freeze_base(store);
+            }
         }
 
         Ok(Self {
@@ -173,7 +239,7 @@ impl TinyLM {
             token_embed,
             pos_embed,
             blocks,
-            final_norm_weight: ones_parameter(&[config.d_model], store)?,
+            final_norm_weight,
         })
     }
 
@@ -186,6 +252,14 @@ impl TinyLM {
             .iter()
             .map(|&id| store.get(id).map_or(0, |tensor| tensor.size))
             .sum()
+    }
+
+    pub fn base_parameter_ids(&self) -> Vec<TensorId> {
+        let mut params = vec![self.token_embed, self.pos_embed, self.final_norm_weight];
+        for block in &self.blocks {
+            params.extend(block.base_parameters());
+        }
+        params
     }
 
     pub fn forward(
@@ -234,7 +308,12 @@ impl TinyLM {
 
 impl Module for TinyLM {
     fn parameters(&self) -> Vec<TensorId> {
-        let mut params = vec![self.token_embed, self.pos_embed, self.final_norm_weight];
+        let mut params = Vec::new();
+        if self.config.lora.is_none() {
+            params.push(self.token_embed);
+            params.push(self.pos_embed);
+            params.push(self.final_norm_weight);
+        }
         for block in &self.blocks {
             params.extend(block.parameters());
         }
@@ -256,6 +335,14 @@ fn validate_config(config: TinyLMConfig) -> Result<()> {
             got: 0,
         });
     }
+    if let Some(lora) = config.lora
+        && lora.rank == 0
+    {
+        return Err(AutogradError::InvalidRank {
+            expected: "positive LoRA rank",
+            got: 0,
+        });
+    }
     Ok(())
 }
 
@@ -273,48 +360,6 @@ fn embedding_reshape(
         .shape[1];
     let embedded = embedding(table, indices, store, tape)?;
     reshape(embedded, &[batch, seq_len, hidden], store, tape)
-}
-
-fn linear_last_dim(
-    x: TensorId,
-    weight: TensorId,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    let input_shape = store
-        .get(x)
-        .ok_or(AutogradError::InvalidTensorId(x))?
-        .shape
-        .clone();
-    let in_features = *input_shape.last().ok_or(AutogradError::InvalidRank {
-        expected: "at least 1",
-        got: 0,
-    })?;
-    let weight_shape = store
-        .get(weight)
-        .ok_or(AutogradError::InvalidTensorId(weight))?
-        .shape
-        .clone();
-    if weight_shape.len() != 2 {
-        return Err(AutogradError::InvalidRank {
-            expected: "2",
-            got: weight_shape.len(),
-        });
-    }
-    if weight_shape[1] != in_features {
-        return Err(AutogradError::ShapeMismatch {
-            expected: vec![weight_shape[1]],
-            got: vec![in_features],
-        });
-    }
-
-    let prefix_elems = input_shape.iter().product::<usize>() / in_features;
-    let mut output_shape = input_shape[..input_shape.len() - 1].to_vec();
-    output_shape.push(weight_shape[0]);
-    let flat_x = reshape(x, &[prefix_elems, in_features], store, tape)?;
-    let weight_t = transpose(weight, 0, 1, store, tape)?;
-    let flat_y = matmul(flat_x, weight_t, store, tape)?;
-    reshape(flat_y, &output_shape, store, tape)
 }
 
 fn split_heads(
@@ -451,6 +496,9 @@ fn sample_uniform(state: &mut u32, bound: f32) -> f32 {
     ((unit * 2.0) - 1.0) * bound
 }
 
-fn block_salt(index: usize, salt: u32) -> u32 {
-    ((index as u32) << 8) ^ salt
+fn freeze_parameter(id: TensorId, store: &mut TensorStore) {
+    store
+        .get_mut(id)
+        .expect("parameter must exist while freezing")
+        .requires_grad = false;
 }

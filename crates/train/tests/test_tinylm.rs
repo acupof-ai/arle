@@ -17,6 +17,7 @@ fn tiny_lm_copy_loss_drops_over_three_steps() {
         d_head: 8,
         d_ff: 32,
         max_seq_len: 4,
+        lora: None,
     };
 
     let mut store = TensorStore::default();

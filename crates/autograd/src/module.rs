@@ -1,6 +1,6 @@
 use crate::{
     AutogradError, Result,
-    ops::{add_broadcast, matmul, transpose},
+    ops::{add_broadcast, matmul, reshape, transpose},
     tensor::{GpuTensor, TensorId, TensorStore},
 };
 
@@ -97,12 +97,30 @@ impl Linear {
             }
         }
 
+        let prefix_elems = x_shape.iter().product::<usize>() / self.in_features;
+        let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
+        output_shape.push(self.out_features);
+        let flat_x = reshape(x, &[prefix_elems, self.in_features], store, tape)?;
         let weight_t = transpose(self.w, 0, 1, store, tape)?;
-        let output = matmul(x, weight_t, store, tape)?;
+        let output = matmul(flat_x, weight_t, store, tape)?;
+        let output = reshape(output, &output_shape, store, tape)?;
         if let Some(bias_id) = self.b {
             add_broadcast(output, bias_id, store, tape)
         } else {
             Ok(output)
+        }
+    }
+
+    pub fn freeze(&self, store: &mut TensorStore) {
+        store
+            .get_mut(self.w)
+            .expect("linear weight must exist while freezing")
+            .requires_grad = false;
+        if let Some(bias_id) = self.b {
+            store
+                .get_mut(bias_id)
+                .expect("linear bias must exist while freezing")
+                .requires_grad = false;
         }
     }
 }
@@ -142,6 +160,27 @@ mod tests {
         let y = linear.forward(x, &mut store, &mut tape)?;
 
         assert_eq!(store.to_host(y)?, vec![-1.25, 5.0, -2.25, 12.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_forward_projects_last_dim_for_rank_three_inputs() -> Result<()> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let linear = Linear::new(2, 3, true, &mut store);
+
+        store.tensor_mut(linear.w)?.data = vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+            1.0, 1.0,
+        ];
+        let bias_id = linear.b.expect("bias exists");
+        store.tensor_mut(bias_id)?.data = vec![0.5, -0.5, 1.0];
+
+        let x = store.from_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2])?;
+        let y = linear.forward(x, &mut store, &mut tape)?;
+
+        assert_eq!(store.to_host(y)?, vec![1.5, 1.5, 4.0, 3.5, 3.5, 8.0]);
         Ok(())
     }
 }
