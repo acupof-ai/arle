@@ -227,8 +227,8 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 |---|---|---|
 | M5.1 | ✅ 2026-04-18 调研完成：`mlx::core::grad` 存在但 mlx-sys bridge 只暴露 forward | 结论见下方 M5.2 |
 | M5.2 | ✅ 2026-04-18 路线锁定 = **(b)**：在我们的 tape 上用 mlx-sys forward 调 MLX op，bwd 公式自己写，和 CUDA 同 tape。commit `a46fc00` 落地 `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend`（per-call upload/compute/download） | 选 (b) 的原因：一致性 > 便利；和 CUDA 同 tape |
-| M5.3 | ⚠️ 部分完成：matmul 已上 Metal（3-shape 对拍 ≤ 1e-3，commit `a46fc00`）；add/mul_scalar/sum/log_softmax/gather/AdamW 仍走 CPU（`Backend::matmul_forward` 是 trait 里唯一方法） | 每个剩余 op 数值对拍 CPU f64 参考 ≤ 1e-3 |
-| M5.4 | ⏳ 未开工：Mac 上跑 M2 的合成 supervised fine-tune，Qwen 1.5B，LoRA rank=8 | loss 曲线形状和 CUDA 一致 |
+| M5.3 | ⚠️ 部分完成：matmul 已上 Metal（3-shape 对拍 ≤ 1e-3，commit `a46fc00`）；add/mul_scalar/sum/log_softmax/gather/AdamW 仍走 CPU（`Backend::matmul_forward` 是 trait 里唯一方法） | 每个剩余 op 数值对拍 CPU f64 参考 ≤ 1e-3。**注 2026-04-19**：`docs/experience/wins/2026-04-18-bench-train-multi-turn.md` 实测 TinyLM 尺度下 Metal matmul 比 CPU 慢 1.9×（per-call FFI + 图构造开销主导），只有 d_model≥256 才领先 1.4×。扩展剩余 op 到 Metal 之前需要先决定：是否直接上 device-resident tensor 消除 per-call upload/download，否则 M5.3 扩展 + M5.4 demo 都会被相同 FFI 瓶颈限制。优先级重排讨论再启动。 |
+| M5.4 | ⏳ 未开工：Mac 上跑 M2 的合成 supervised fine-tune，Qwen 1.5B，LoRA rank=8。**注 2026-04-19**：前置于 M5.3 完整扩展 + device-resident tensor 决定，同上。 | loss 曲线形状和 CUDA 一致 |
 
 ### 7.3 验收门槛
 
