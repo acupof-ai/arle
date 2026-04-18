@@ -118,7 +118,7 @@ pub(crate) fn debug_dump_hidden(
     let view = hidden
         .data
         .slice(last_idx * hidden_dim..last_idx * hidden_dim + hidden_dim);
-    let buf: Vec<bf16> = match ctx.stream.memcpy_dtov(&view) {
+    let buf: Vec<bf16> = match ctx.stream.clone_dtoh(&view) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[debug-dump] {label}: copy failed: {e}");
