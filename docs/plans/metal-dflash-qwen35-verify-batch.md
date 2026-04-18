@@ -50,16 +50,20 @@ one request.  On a multi-request scheduler tick, each slot still runs
 its own verify forward — no cross-request batching for the speculative
 path.
 
-**Blocking prerequisite — DFlash on scheduler runtime**:
-DFlash today runs exclusively on the **legacy serial runtime**
-(`backend/runtime.rs`, single-request loop), not the hot-path scheduler
-runtime (`backend/metal/runtime.rs::run_metal_scheduler_runtime`).
-See `backend/metal/AGENTS.md` invariant #6.  Until DFlash slot ownership
-is modeled in the scheduler, "B>1 verify" has no consumer:
-`request_state.rs:2871` is only reached from single-session
-`decode_step`, never from `decode_qwen35_packed_batch` (line 1453).
-Layer 2 therefore decomposes into four sub-pieces that **must land in
-order**:
+**Scheduler wiring — already done, just downgraded**:
+DFlash already dispatches from the scheduler runtime
+(`backend/metal/runtime.rs::execute_decode_batch:1040-1056`), not a
+separate runtime.  The "legacy serial runtime" phrasing in
+`backend/metal/AGENTS.md` invariant #6 is outdated — DFlash runs via
+`execute_decode_single` **inside** `run_metal_scheduler_runtime`.  What
+actively blocks B>1 verify today is a **policy choice**, not missing
+wiring: when `open.len() >= 2` the scheduler **permanently** disables
+DFlash on every row (`runtime.rs:1040-1045`) so speculative rows join
+the packed decode path.  Rationale at the time: per-request serial
+verify was 230 ms/block at 28% accept, worse than 25 ms packed decode.
+Layer 2 flips that policy by making packed verify cheap enough to keep
+DFlash on under concurrency.  Decomposes into four sub-pieces that
+**must land in order**:
 
 **2a — varlen `mlx_tape_replay_varlen` kernel** (in flight, 2026-04-18)
 - Kernel + FFI accept `steps: mlx_array([B], int32)` instead of scalar
@@ -82,22 +86,28 @@ order**:
   qwen35_compiled_verify_block_batched` — B=1 run is bit-identical to
   existing `qwen35_compiled_verify_block`.
 
-**2c — DFlash scheduler runtime integration**
-- Currently `decode_qwen35_packed_batch` (`request_state.rs:1453`)
-  handles plain packed decode but not DFlash.
-- Teach `MetalScheduler::step()` (`scheduler.rs`) about a
-  `DFlashVerifyBatch` decision variant that packs all active DFlash
-  slots' draft blocks into one tick.
-- Each slot still runs its own draft forward (CPU-batchable since
-  draft model is small).
-- Invariant #6 gets flipped: DFlash moves off the legacy serial runtime
-  onto the scheduler runtime.  Legacy runtime stays only as a fallback
-  for single-session no-concurrency.
+**2c — Lift the `open.len() >= 2` downgrade + packed verify dispatch**
+- Remove (or gate behind a config toggle) the permanent DFlash disable
+  at `runtime.rs:1040-1045` so DFlash rows survive into a multi-row tick.
+- Add a DFlash-speculative dispatch variant to
+  `execute_qwen35_packed_decode_batch` — when every open row has DFlash
+  enabled, each row runs its own draft forward (CPU-batchable since the
+  draft model is small), then all B draft blocks pack into one
+  `qwen35_compiled_verify_block_batched` call (Layer 2b).
+- Mixed-mode (some DFlash rows, some plain-decode rows): cleanest route
+  is to run the two groups in parallel via MLX lazy eval — DFlash rows
+  through the batched verify, plain rows through the existing
+  `step_batch_packed`.  Alternative: auto-enroll plain rows with a
+  stub draft (all-mask tokens) so everyone rides the same forward; only
+  viable if acceptance-cost tradeoff holds under zero accept.  Pick
+  after Layer 2b benchmarks show the per-row verify cost.
+- Per-row rollback: `qwen35_rollback_to_accepted` already loops per GDR
+  pair; swap its scalar `mlx_tape_replay` for `mlx_tape_replay_varlen`
+  (Layer 2a) and thread `accepted_inputs: Vec<usize>` through.
 - Acceptance: `metal_serve --dflash-draft-model …` with concurrency 4
-  no longer auto-downgrades DFlash to packed decode at `open.len() >= 2`
-  (the Track-1 escape hatch from
-  `wins/2026-04-17-metal-qwen35-dflash-block-verify.md` is no longer
-  needed for correctness — we keep it only as a configurable toggle).
+  keeps DFlash on; the Track-1 auto-downgrade becomes a configurable
+  opt-in fallback (e.g. `--dflash-concurrency-off`) instead of the
+  default hard-off.
 
 **2d — Layer 2 wire-up**
 - `qwen35_dflash_speculative_block` grows a batched sibling or replaces
