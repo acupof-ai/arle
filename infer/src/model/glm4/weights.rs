@@ -256,7 +256,6 @@ impl GLM4Model {
         let mut embed_out = DeviceVec::zeros(&self.ctx, hidden_size)?;
         ops::embedding_decode_into(&self.ctx, &self.embed_tokens, &decode_meta, &mut embed_out)?;
 
-        let _layer0 = &self.layers[0];
         let q = DeviceVec::zeros(&self.ctx, q_dim)?;
         let k = DeviceVec::zeros(&self.ctx, kv_dim)?;
         let v = DeviceVec::zeros(&self.ctx, kv_dim)?;
