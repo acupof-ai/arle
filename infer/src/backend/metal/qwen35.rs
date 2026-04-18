@@ -1581,3 +1581,176 @@ fn load_conv1d_weight(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use super::*;
+    use crate::backend::metal::{
+        config::load_metal_config,
+        gdr::MetalRecurrentState,
+        mlx::{Dtype, as_dtype, eval, zeros},
+    };
+    use crate::test_support::metal_test_guard;
+
+    fn verify_block_batched_b1(
+        cpp_model: &CppQwen35Model,
+        tokens: &MlxArray,
+        batch_size: i32,
+        block_size: i32,
+        cache_pos_arr: &MlxArray,
+        kv_caches: &mut [MlxArray],
+        gdr_states: &mut [MlxArray],
+        rope_offsets: &MlxArray,
+    ) -> Result<MlxArray> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_batched(
+                cpp_model.as_raw(),
+                tokens.as_raw(),
+                batch_size,
+                block_size,
+                cache_pos_arr.as_raw(),
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                std::ptr::null_mut(),
+                rope_offsets.as_raw(),
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    #[test]
+    fn verify_block_batched_matches_verify_block_for_b1() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!("QWEN35_MODEL_PATH unset; skipping verify_block_batched B=1 equivalence test");
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 compiled C++ model unavailable")?;
+
+        let prompt_tokens = [1_i32, 2, 3, 4];
+        let block_tokens = [5_i32, 6];
+        let prompt_len = prompt_tokens.len() as i32;
+        let block_size = block_tokens.len() as i32;
+        let kv_capacity = prompt_len + block_size + 4;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let mut kv_flat: Vec<MlxArray> = (0..num_full_layers)
+            .flat_map(|_| {
+                [
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                ]
+            })
+            .collect();
+        let recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let mut gdr_flat: Vec<MlxArray> = recurrent
+            .states
+            .iter()
+            .zip(recurrent.conv_states.iter())
+            .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+            .collect();
+
+        let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens, &[prompt_len]);
+        let prompt_logits = cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+        let mut prompt_refs: Vec<&MlxArray> = Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+        prompt_refs.push(&prompt_logits);
+        prompt_refs.extend(kv_flat.iter());
+        prompt_refs.extend(gdr_flat.iter());
+        eval(&prompt_refs);
+
+        let cache_pos = prompt_len;
+        let mut verify_kv = kv_flat.clone();
+        let mut verify_gdr = gdr_flat.clone();
+        let verify_tokens = MlxArray::from_slice_i32(&block_tokens, &[block_size]);
+        let verify_logits = cpp_model.verify_block(
+            &verify_tokens,
+            block_size,
+            cache_pos,
+            &mut verify_kv,
+            &mut verify_gdr,
+        )?;
+
+        let mut batched_kv = kv_flat.clone();
+        let mut batched_gdr = gdr_flat.clone();
+        let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
+        let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
+        let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
+        let batched_logits = verify_block_batched_b1(
+            cpp_model,
+            &batched_tokens,
+            1,
+            block_size,
+            &cache_pos_arr,
+            &mut batched_kv,
+            &mut batched_gdr,
+            &rope_offsets,
+        )?;
+
+        let verify_logits_f32 = as_dtype(&verify_logits, Dtype::Float32);
+        let batched_logits_f32 = as_dtype(&batched_logits, Dtype::Float32);
+        eval(&[&verify_logits_f32, &batched_logits_f32]);
+
+        assert_eq!(verify_logits_f32.shape(), batched_logits_f32.shape());
+        for (idx, (lhs, rhs)) in verify_logits_f32
+            .as_slice_f32()
+            .iter()
+            .zip(batched_logits_f32.as_slice_f32().iter())
+            .enumerate()
+        {
+            assert!(
+                (lhs - rhs).abs() < 1e-3,
+                "logit[{idx}] mismatch: {lhs} vs {rhs}"
+            );
+        }
+
+        Ok(())
+    }
+}

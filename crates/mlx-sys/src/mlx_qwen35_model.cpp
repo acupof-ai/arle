@@ -410,6 +410,8 @@ struct Qwen35CompiledModel {
         bool last_logits_only = false;
         bool has_attn_mask = false;
         array attn_mask = array(0);
+        bool has_cache_pos_arr = false;
+        array cache_pos_arr = array(0);
         bool has_rope_offsets = false;
         array rope_offsets = array(0);
         bool keep_intermediates = false;
@@ -451,6 +453,14 @@ struct Qwen35CompiledModel {
     mutable array current_gdr_t_arr = array(1);
     mutable array current_attn_mask = array(0);
     mutable bool current_has_attn_mask = false;
+    // Batched verify can carry a per-row physical KV write position.
+    //
+    // RoPE offsets already encode each row's logical token positions, but
+    // `cache_pos` is also used to select the KV slice-update window. Route 2
+    // therefore threads an int32[B] cache_pos array through the forward
+    // context and uses it only when the batched verify entrypoint requests it.
+    mutable array current_cache_pos_arr = array(0);
+    mutable bool current_has_cache_pos_arr = false;
     // Per-row RoPE offsets (int32 array of length batch_size).
     //
     // Workaround for MLX 0.31.1: `fast::rope(..., int offset)` on a
@@ -492,6 +502,15 @@ struct Qwen35CompiledModel {
             return false;
         }
         return std::find(layer_ids->begin(), layer_ids->end(), layer_id) != layer_ids->end();
+    }
+
+    void clear_optional_batch_inputs() {
+        current_attn_mask = array(0);
+        current_has_attn_mask = false;
+        current_cache_pos_arr = array(0);
+        current_has_cache_pos_arr = false;
+        current_rope_offsets = array(0);
+        current_has_rope_offsets = false;
     }
 
     // ── Full attention decode step ─────────────────────────────────────
@@ -546,11 +565,76 @@ struct Qwen35CompiledModel {
         auto v = reshape(v_raw, {B, S, nkv, hd});
         v = transpose(v, {0, 2, 1, 3});
 
-        int end = cache_pos + S;
-        new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
-        new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
-        auto k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
-        auto v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
+        array k_full(0), v_full(0);
+        if (ctx.has_cache_pos_arr) {
+            // Batched verify can mix rows with different physical KV cursors.
+            // RoPE still comes from ctx.rope_offsets; cache_pos_arr is only for
+            // where each row writes into the packed KV cache.
+            eval(ctx.cache_pos_arr);
+            const int32_t* cache_pos_data = ctx.cache_pos_arr.data<int32_t>();
+
+            std::vector<array> new_k_rows;
+            std::vector<array> new_v_rows;
+            std::vector<array> k_full_rows;
+            std::vector<array> v_full_rows;
+            new_k_rows.reserve(B);
+            new_v_rows.reserve(B);
+            k_full_rows.reserve(B);
+            v_full_rows.reserve(B);
+
+            int key_len = 0;
+            for (int b = 0; b < B; ++b) {
+                int row_cache_pos = cache_pos_data[b];
+                int row_end = row_cache_pos + S;
+                key_len = std::max(key_len, row_end);
+
+                auto k_cache_row = slice(k_cache, {b, 0, 0, 0}, {b + 1, nkv, k_cache.shape(2), hd});
+                auto v_cache_row = slice(v_cache, {b, 0, 0, 0}, {b + 1, nkv, v_cache.shape(2), hd});
+                auto k_row = slice(k, {b, 0, 0, 0}, {b + 1, nkv, S, hd});
+                auto v_row = slice(v, {b, 0, 0, 0}, {b + 1, nkv, S, hd});
+
+                auto new_k_row = slice_update(
+                    k_cache_row,
+                    k_row,
+                    {0, 0, row_cache_pos, 0},
+                    {1, nkv, row_end, hd});
+                auto new_v_row = slice_update(
+                    v_cache_row,
+                    v_row,
+                    {0, 0, row_cache_pos, 0},
+                    {1, nkv, row_end, hd});
+                new_k_rows.push_back(new_k_row);
+                new_v_rows.push_back(new_v_row);
+            }
+
+            if (ctx.has_attn_mask) {
+                key_len = ctx.attn_mask.shape(3);
+            } else {
+                for (int b = 0; b < B; ++b) {
+                    int row_end = cache_pos_data[b] + S;
+                    if (row_end != key_len) {
+                        throw std::runtime_error(
+                            "qwen35 batched verify requires attn_mask when cache_pos_arr differs across rows");
+                    }
+                }
+            }
+
+            for (int b = 0; b < B; ++b) {
+                k_full_rows.push_back(slice(new_k_rows[b], {0, 0, 0, 0}, {1, nkv, key_len, hd}));
+                v_full_rows.push_back(slice(new_v_rows[b], {0, 0, 0, 0}, {1, nkv, key_len, hd}));
+            }
+
+            new_k_cache = concatenate(new_k_rows, 0);
+            new_v_cache = concatenate(new_v_rows, 0);
+            k_full = concatenate(k_full_rows, 0);
+            v_full = concatenate(v_full_rows, 0);
+        } else {
+            int end = cache_pos + S;
+            new_k_cache = slice_update(k_cache, k, {0,0,cache_pos,0}, {B,nkv,end,hd});
+            new_v_cache = slice_update(v_cache, v, {0,0,cache_pos,0}, {B,nkv,end,hd});
+            k_full = slice(new_k_cache, {0,0,0,0}, {B,nkv,end,hd});
+            v_full = slice(new_v_cache, {0,0,0,0}, {B,nkv,end,hd});
+        }
 
         array attn_out(0);
         if (ctx.has_attn_mask) {
@@ -942,6 +1026,8 @@ struct Qwen35CompiledModel {
         ctx.last_logits_only = current_last_logits_only;
         ctx.has_attn_mask = current_has_attn_mask;
         ctx.attn_mask = current_attn_mask;
+        ctx.has_cache_pos_arr = current_has_cache_pos_arr;
+        ctx.cache_pos_arr = current_cache_pos_arr;
         ctx.has_rope_offsets = current_has_rope_offsets;
         ctx.rope_offsets = current_rope_offsets;
         ctx.keep_intermediates = keep_step_intermediates(current_seq_len);
@@ -1200,10 +1286,7 @@ int32_t qwen35_compiled_step(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
-        m->current_has_attn_mask = false;
-        m->current_attn_mask = array(0);
-        m->current_has_rope_offsets = false;
-        m->current_rope_offsets = array(0);
+        m->clear_optional_batch_inputs();
 
         // Build inputs vector
         std::vector<array> inputs;
@@ -1265,6 +1348,8 @@ int32_t qwen35_compiled_step_batch(
         } else {
             m->current_attn_mask = array(0);
         }
+        m->current_has_cache_pos_arr = false;
+        m->current_cache_pos_arr = array(0);
         m->current_has_rope_offsets = rope_offsets != nullptr;
         if (m->current_has_rope_offsets) {
             m->current_rope_offsets = *to_arr(rope_offsets);
@@ -1324,18 +1409,12 @@ int32_t qwen35_compiled_step_batch(
             }
         }
 
-        m->current_attn_mask = array(0);
-        m->current_has_attn_mask = false;
-        m->current_rope_offsets = array(0);
-        m->current_has_rope_offsets = false;
+        m->clear_optional_batch_inputs();
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
-        m->current_attn_mask = array(0);
-        m->current_has_attn_mask = false;
-        m->current_rope_offsets = array(0);
-        m->current_has_rope_offsets = false;
+        m->clear_optional_batch_inputs();
         m->current_batch_size = 1;
         return -1;
     }
@@ -1373,6 +1452,8 @@ int32_t qwen35_compiled_step_batch_packed(
         } else {
             m->current_attn_mask = array(0);
         }
+        m->current_has_cache_pos_arr = false;
+        m->current_cache_pos_arr = array(0);
         m->current_has_rope_offsets = rope_offsets != nullptr;
         if (m->current_has_rope_offsets) {
             m->current_rope_offsets = *to_arr(rope_offsets);
@@ -1405,18 +1486,12 @@ int32_t qwen35_compiled_step_batch_packed(
             out_packed_gdr_states[gdr_idx] = from_arr(std::move(outputs[1 + n_kv + gdr_idx]));
         }
 
-        m->current_attn_mask = array(0);
-        m->current_has_attn_mask = false;
-        m->current_rope_offsets = array(0);
-        m->current_has_rope_offsets = false;
+        m->clear_optional_batch_inputs();
         m->current_batch_size = 1;
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
-        m->current_attn_mask = array(0);
-        m->current_has_attn_mask = false;
-        m->current_rope_offsets = array(0);
-        m->current_has_rope_offsets = false;
+        m->clear_optional_batch_inputs();
         m->current_batch_size = 1;
         return -1;
     }
@@ -1441,10 +1516,7 @@ int32_t qwen35_compiled_prefill(
         m->current_batch_size = 1;
         m->current_seq_len = prompt_len;
         m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
-        m->current_has_attn_mask = false;
-        m->current_attn_mask = array(0);
-        m->current_has_rope_offsets = false;
-        m->current_rope_offsets = array(0);
+        m->clear_optional_batch_inputs();
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -1464,12 +1536,14 @@ int32_t qwen35_compiled_prefill(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
         return -1;
     }
 }
@@ -1501,10 +1575,7 @@ int32_t qwen35_compiled_verify_block(
         m->current_batch_size = 1;
         m->current_seq_len = block_size;
         m->current_last_logits_only = false;
-        m->current_has_attn_mask = false;
-        m->current_attn_mask = array(0);
-        m->current_has_rope_offsets = false;
-        m->current_rope_offsets = array(0);
+        m->clear_optional_batch_inputs();
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -1524,12 +1595,101 @@ int32_t qwen35_compiled_verify_block(
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
         m->current_batch_size = 1;
         m->current_seq_len = 1;
         m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return -1;
+    }
+}
+
+int32_t qwen35_compiled_verify_block_batched(
+    void* model,
+    mlx_array* token_ids,           // int32 [B, block_size]
+    int32_t batch_size,
+    int32_t block_size,
+    mlx_array* cache_pos_arr,       // int32 [B] per-row cache_pos
+    mlx_array** packed_kv_caches, int32_t n_kv,
+    mlx_array** packed_gdr_states, int32_t n_gdr,
+    mlx_array* attn_mask,           // additive [B, 1, block_size, key_len], nullable
+    mlx_array* rope_offsets,        // int32 [B] per-row RoPE base offset
+    mlx_array** out_logits,         // [B, block_size, vocab]
+    mlx_array** out_packed_kv_caches,
+    mlx_array** out_packed_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched requires batch_size > 0");
+        }
+        if (block_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched requires block_size > 0");
+        }
+        if (cache_pos_arr == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched requires cache_pos_arr");
+        }
+        if (rope_offsets == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched requires rope_offsets");
+        }
+
+        // Route 2: physical KV slot indexing is per row for batched verify, so
+        // keep the scalar cache_pos at 0 and read the actual write windows from
+        // current_cache_pos_arr inside full_attn_step.
+        m->current_cache_pos = 0;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = block_size;
+        m->current_last_logits_only = false;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
+        m->current_has_cache_pos_arr = true;
+        m->current_cache_pos_arr = *to_arr(cache_pos_arr);
+        m->current_has_rope_offsets = true;
+        m->current_rope_offsets = *to_arr(rope_offsets);
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(packed_kv_caches[i]));
+        for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(packed_gdr_states[i]));
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        *out_logits = from_arr(std::move(outputs[0]));
+        for (int i = 0; i < n_kv; ++i) {
+            out_packed_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            out_packed_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
+        }
+
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
         return -1;
     }
 }
