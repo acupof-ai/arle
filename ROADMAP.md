@@ -1,9 +1,15 @@
 # agent-infer Roadmap
 
-Target: **production-grade LLM inference engine** on par with sglang (excluding KV-affinity routing).
+**Two parallel main lines as of 2026-04-18**:
+
+1. **Inference engine** (historical main line) — production-grade LLM inference on par with sglang (excluding KV-affinity routing). Phases 0–5 below.
+2. **Agent RL 训推一体 · 自进化栈** (new core main line) — Phase 6. Single-node, same-process train+inference, Rust-native autograd written from scratch, LoRA+GRPO, self-evolving agent via multi-verifier reward. See [docs/projects/agent-rl-self-evolving.md](docs/projects/agent-rl-self-evolving.md).
 
 Related docs:
 
+- [docs/projects/agent-rl-self-evolving.md](docs/projects/agent-rl-self-evolving.md) — **Phase 6 project spine** · architecture, scope lock, milestones, risks
+- [docs/plans/rust-agent-rl-single-node.md](docs/plans/rust-agent-rl-single-node.md) — **Phase 6 execution plan** · M0–M5 with daily-grain tasks + acceptance gates
+- [docs/research/mni-ml-framework-notes.md](docs/research/mni-ml-framework-notes.md) — mni-ml/framework reference analysis (the from-scratch autograd template)
 - [docs/projects/xma-future-research.md](docs/projects/xma-future-research.md) — external research note on XMA / accelerated-model-architectures and what it implies for future architecture work
 
 ---
@@ -566,3 +572,116 @@ Focus on performance, robustness, and Metal parity:
 | 0.6 Model Registry | ✅ Config parsing | ✅ Done |
 | 0.7 Benchmarks | ✅ Mock HTTP server | ✅ Done |
 | 1.x–5.x | ❌ GPU required | 5.1 ✅ Done |
+| 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ⏳ Pending |
+| 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ⏳ Pending |
+| 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ⏳ Pending |
+| 6.3 M3 GRPO closed loop | ❌ needs CUDA, ~1 h | ⏳ Pending |
+| 6.4 M4 agent self-evolution | ❌ needs CUDA, ~24 h | ⏳ Pending |
+| 6.5 M5 Metal parity | ⚠️ Mac-local dev path | ⏳ Pending (parallel) |
+
+---
+
+## Phase 6 — Agent RL 训推一体 · 自进化栈（NEW CORE MAIN LINE, 2026-04-18）
+
+**Scope lock** (v3, 2026-04-18): 单机 / CUDA first / LoRA-only / GRPO / 同进程训推 / 训练端从零写。
+Project spine: [docs/projects/agent-rl-self-evolving.md](docs/projects/agent-rl-self-evolving.md).
+Execution plan: [docs/plans/rust-agent-rl-single-node.md](docs/plans/rust-agent-rl-single-node.md).
+Reference analysis: [docs/research/mni-ml-framework-notes.md](docs/research/mni-ml-framework-notes.md).
+
+**Motivation**: agent-infer has been a pure inference engine. Continuing down that road makes us a commodity rollout backend behind Python+Megatron training stacks. Phase 6 is the deliberate move to **训推一体** — a single-node, same-process Rust RL trainer + inference engine that self-evolves via agent tool use and multi-verifier rewards. Rust's structural advantage here (no GIL, `Arc`-shared weights, no NCCL IPC tax) is only realized if we stay single-process; this phase commits to that shape.
+
+**Non-goals (explicit)**: distributed training (DDP/ZeRO/TP/PP), full-parameter training, PPO with critic, Python dependency, multi-backend abstraction layer, general-purpose autograd. Each of these is rejected in favor of the LoRA+GRPO+single-process minimum that produces a working self-evolving agent.
+
+### 6.0 Autograd Crate — from scratch (`crates/autograd/`)
+
+**Files**: new workspace crate.
+**Reference**: structural (not copied) from [mni-ml/framework](https://github.com/mni-ml/framework) — see [docs/research/mni-ml-framework-notes.md](docs/research/mni-ml-framework-notes.md) for the LOC-level map, borrowed abstractions (TensorId+Store, SavedContext enum, BackwardOp dispatch), and the pruning list.
+
+Core design (locked):
+- `TensorId = usize` + `TensorStore: Vec<Option<GpuTensor>>` + free-list slot recycle — no `Arc<Tensor>`, no `Rc<RefCell>`
+- `SavedContext` as enum (variants per op), `BackwardOp` as enum, `dispatch_backward` as big match — no `Box<dyn Any>`, no trait objects
+- `Tape::backward()`: DFS relevant set + post-order topo + `HashMap<TensorId, TensorId>` grad accumulation
+- Optimizer state (Adam m/v) embedded in `GpuTensor` itself — no separate optimizer state map
+- Double path `#[cfg(feature = "cuda")]` / `#[cfg(any(feature = "cpu", feature = "webgpu"))]` in every op file; CPU path is the grad-check oracle
+
+**Op set (locked to LoRA+GRPO minimum)**: `add`, `mul`, `mul_scalar`, `matmul` (cuBLAS SGEMM), `sum`, `mean`, `log_softmax`, `gather`, plus `AdamW` step. ~7 ops + optimizer. Conv / pool / full-attention-bwd / embedding-bwd / dropout are all out of scope.
+
+**M0 (3–5 d)**: Tape + add/mul/mul_scalar/sum on CPU. `y = ((a+b)*3).sum(); y.backward()` passes hand-derived assertion.
+**M1 (10–14 d)**: matmul (CPU ref + CUDA cuBLAS), log_softmax, gather, mean, Module/Parameter trait, AdamW (CPU + CUDA fused). Grad-check every op (CPU f64 oracle vs CUDA f32 ≤ 1e-3). Toy 2-layer MLP converges on both paths.
+
+---
+
+### 6.1 Train Crate — LoRA + GRPO + rollout loop (`crates/train/`)
+
+**Files**: new workspace crate. Depends on `autograd` + `infer`.
+
+**M2 — LoRA graft (14 d)**:
+- `LoRAAdapter { A: Parameter, B: Parameter, rank, alpha }`, forward `B @ (A @ x) * scale`
+- Hook into `infer/src/ops/linear.rs`: optional `lora: Option<&LoRAAdapter>` arg; base path unchanged (zero overhead when `None`), LoRA path runs independent cuBLAS small GEMMs and sums
+- `Arc<BaseWeights>` frozen-view tensors in autograd (no clone, no tape participation) — hard memory ceiling: Qwen3 4B + LoRA rank=8 ≤ 1.05× base memory
+- Double-buffer `Arc<RwLock<LoRAAdapters>>` hot-swap; atomic pointer swap on finish-of-step
+- Supervised fine-tune on synthetic (prompt, target) pairs proves the plumbing before RL
+
+**M3 — GRPO closed loop (21 d)**:
+- Trajectory struct: `{ prompt_ids, response_ids, step_logprobs, reward }`
+- Scheduler emits trajectories on a `tokio::mpsc` channel on request-complete (< 1% inference throughput regression)
+- Group advantage: G samples per prompt → `A_i = (r_i - mean) / std`
+- GRPO loss with ratio clip + KL to reference policy (ref = LoRA-off base, ref logp frozen at rollout time)
+- Alternating rollout↔train main loop (N=16 prompts × G=4 → GRPO K=4 steps → hot-swap → next)
+- First verifier: GSM8K-like math exact-match
+- Acceptance: 6h stable, held-out pass@1 ≥ base + 15%, not reward-hacking (human spot-check 20 samples → ≥15 coherent)
+
+**M4 — Agent self-evolution MVP (4–6 w)**:
+- Multi-turn agent trajectory via `infer-agent` tool loop; step-wise logp on action tokens
+- Stepwise reward assignment (γ discount + tool-failure penalty)
+- Multi-verifier: math + code (Rust-native pytest-like) + tool-use success rate
+- Basic curriculum: difficulty buckets; retire easy tasks when pass@1 > 0.8; introduce harder ones
+- Templated self-play task generator (verifier-grounded only — no ungrounded tasks accepted)
+- Acceptance: 24h run, base-unsolvable hard-set pass@1 from P0 → P24 ≥ 1.3·P0 and absolute ≥ 0.3
+
+**M5 — Metal parity (parallel to M3/M4)**:
+- Same `BackwardOp` tape, Metal op implementations via `mlx-sys` forward + hand-written bwd formulas
+- Mac M4 Pro runs Qwen 1.5B LoRA supervised fine-tune, loss shape matches CUDA
+- Three-way grad-check (CPU f64 / CUDA f32 / Metal f32) mutual parity ≤ 1e-3
+
+---
+
+### 6.2 Scheduler & Model Integration Points
+
+| Integration | Module | Change |
+|---|---|---|
+| Trajectory emit | `infer/src/scheduler/` | Add mpsc channel; emit on `RequestOutcome::Finished` |
+| LoRA hook | `infer/src/ops/linear.rs` | `Option<&LoRAAdapter>` argument; default `None` is zero-cost |
+| Base weights share | `infer/src/backend/cuda/` | Expose `Arc<CudaDevice>` + frozen view tensors |
+| Agent callback | `infer-agent/` | Trajectory callback on tool loop steps |
+| Train control plane | `infer/src/http_server/train.rs` (new, M4) | `/v1/train/{start,stop,status,checkpoint}` |
+
+---
+
+### 6.3 Acceptance — every milestone must clear
+
+1. `cargo test --workspace --release` — zero regression on existing tests
+2. `cargo clippy --workspace -- -D warnings` — clean
+3. Grad-check for every new op: CPU f64 oracle vs CUDA f32 rel-err ≤ 1e-3
+4. No half-states (`feedback_no_half_states.md`): crate ships whole or not at all
+5. Experience entry in `docs/experience/{wins,errors}/YYYY-MM-DD-agent-rl-m<N>-*.md`
+6. Progress log row appended in [plan doc §11](docs/plans/rust-agent-rl-single-node.md#11-progress-log)
+
+---
+
+### 6.4 Dependency Graph
+
+```
+Phase 6 (Agent RL) — NEW MAIN LINE
+  6.0 M0 autograd skeleton          → depends on nothing (CPU only)
+  6.1 M1 core op suite              → depends on 6.0
+  6.2 M2 LoRA graft                 → depends on 6.1 + infer linear path (already exists)
+  6.3 M3 GRPO closed loop           → depends on 6.2 + scheduler trajectory emit
+  6.4 M4 agent self-evolution MVP   → depends on 6.3 + infer-agent (already exists)
+  6.5 M5 Metal parity               → depends on 6.1 + mlx-sys bridge (already exists);
+                                      can run parallel to 6.3/6.4
+```
+
+Phase 6 does **not** depend on Phase 1/3/4/5 advances — it's orthogonal to "more inference features". Phase 2 (quantization) already shipped so LoRA on Q4/Q8 base is possible post-M2 if needed.
+
+---
