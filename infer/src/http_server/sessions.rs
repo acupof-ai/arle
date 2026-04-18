@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(loaded.report.tombstoned, 1);
         assert_eq!(loaded.kv_payloads.len(), 1);
         assert_eq!(loaded.kv_payloads.get(&fp_a), Some(&b"payload-a".to_vec()));
-        assert!(loaded.kv_payloads.get(&fp_b).is_none());
+        assert!(!loaded.kv_payloads.contains_key(&fp_b));
 
         let (matched_len, blocks) = loaded.radix.lookup(&tokens);
         assert_eq!(matched_len, 4);

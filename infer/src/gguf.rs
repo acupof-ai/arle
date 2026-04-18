@@ -1153,9 +1153,7 @@ mod tests {
         let mut block = Vec::new();
         block.extend_from_slice(&scale_bytes);
         // Pack: lo=8 (→0 after -8 offset), hi=9 (→1 after -8)
-        for _ in 0..16 {
-            block.push(0x98); // hi=9, lo=8
-        }
+        block.extend(std::iter::repeat_n(0x98u8, 16)); // hi=9, lo=8 × 16 bytes
 
         let result = dequant_q4_0(&block, 32);
         assert_eq!(result.len(), 32);

@@ -341,6 +341,7 @@ impl SchedulerHandle {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact-equality asserts against literal defaults (0.50, 0.75, 0.90, ...)
 mod tests {
     use super::*;
 
