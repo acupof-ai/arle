@@ -402,9 +402,6 @@ pub(crate) struct PagedPrefillForward<'a> {
     pub kv_last_page_len_dev: CudaSlice<i32>,
     pub seq_len: usize,
     pub start_pos: usize,
-    pub num_pages: usize,
-    pub num_q_heads: usize,
-    pub num_kv_heads: usize,
     pub page_size: usize,
 }
 
@@ -515,9 +512,6 @@ impl<'a> PagedPrefillForward<'a> {
             kv_last_page_len_dev,
             seq_len,
             start_pos,
-            num_pages,
-            num_q_heads,
-            num_kv_heads,
             page_size,
         })
     }
