@@ -390,3 +390,26 @@ Added a third profile for triangulation: `target/release/metal_bench` single-pro
 - `/tmp/qwen35_c1.json.gz` — metal_serve HTTP c=1
 - `/tmp/mlx_lm_c1.json.gz` — mlx_lm.generate
 - `/tmp/metal_bench_c1.json.gz` — metal_bench direct
+
+---
+
+## 2026-04-18 later (iter 4) — prior hypothesis correction
+
+Re-examining iter 3 findings: the 44% vs 12% `mach_vm_protect` gap between metal_bench and mlx_lm **does not cost tok/s** — both hit ~84 tok/s. `samply` sample-share measures CPU time, not critical-path time; vm_protect happens on Metal driver threads in parallel with GPU compute.
+
+**Corrected picture:**
+
+| Path | tok/s | Status |
+|------|-------|--------|
+| mlx_lm | 84.4 | baseline |
+| metal_bench (direct C++ generate) | 84.0 | **parity ✓** |
+| metal_serve HTTP c=1 | 78.9 | –5 tok/s gap (6%) |
+
+**All 5 tok/s of c=1 gap sits in the Rust FFI + scheduler layer.** The C++ model code path has full mlx_lm parity. Prior iter-3 conclusion that "70% of gap is in C++ step code" was an artifact of using `mach_vm_protect` share as a throughput-bottleneck proxy — it isn't one. vm_protect CPU time parallelizes with GPU compute.
+
+**Revised action plan:**
+1. **Session API refactor** — primary lever, expected to close most of the 5 tok/s gap. Scope: ~230 LOC (C++ stateful API `qwen35_session_begin/step/end` holding caches in `std::vector<array>` + Rust driver using it directly, no per-step `MlxArray` wrapper swap).
+2. **Scheduler tick overhead** — secondary lever. If session API closes <3 tok/s, the remainder is in Tokio scheduler / prefix-hit HashMap / mpsc / streaming. Requires separate profile.
+3. **Cancel**: op-sequence diff against mlx_lm Python. Our C++ is already at parity.
+
+**Rule:** `samply --rate 1000` without full stacks can only say "CPU spent time here", not "throughput is limited by this." Comparing sample shares across different runtimes is unsafe unless you verify the shared bottleneck is on the CPU critical path.
