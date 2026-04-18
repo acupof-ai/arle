@@ -131,7 +131,7 @@ mod tests {
         assert!(matches!(err, TransportError::Registration(_)));
 
         let mut byte = 0_u8;
-        let err = unsafe { transport.register(&mut byte, 0, MemKind::Vram { device: 0 }) }
+        let err = unsafe { transport.register(&raw mut byte, 0, MemKind::Vram { device: 0 }) }
             .expect_err("zero-length registrations must be rejected");
         assert!(matches!(err, TransportError::Registration(_)));
     }
