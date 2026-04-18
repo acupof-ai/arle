@@ -319,11 +319,17 @@ M0 Day 5:
 | 日期 | 里程碑 | 状态 | 备注 |
 |---|---|---|---|
 | 2026-04-18 | Plan + project doc + research note 提交 | ✅ | 锁定 scope v3；准备开工 M0 |
-| — | M0 Autograd 起手式 | ⏳ Pending | |
-| — | M1 核心 op 完整 | ⏳ Pending | |
-| — | M2 LoRA 合入 | ⏳ Pending | |
-| — | M3 GRPO 闭环 | ⏳ Pending | |
-| — | M4 Agent 自进化 MVP | ⏳ Pending | |
+| 2026-04-18 | M0–M1 Autograd + 核心 op + AdamW | ✅ | TinyLM (~8.4M) CPU SFT 收敛到位 |
+| 2026-04-18 | M2a LoRA on TinyLM (self-contained) | ✅ | frozen base + rank-r adapters, grad 仅流向 A/B |
+| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ⛔ Blocker | 见 [`docs/plans/m2b-blocker-analysis.md`](m2b-blocker-analysis.md)（train CPU TensorStore vs infer cudarc DeviceMatrix 不共享）|
+| 2026-04-18 | M3 GRPO 单 verifier 闭环 | ✅ | rollout_group + group_advantages + PPO-clip surrogate |
+| 2026-04-18 | M3.5 PPO clip + multi-verifier scaffolding | ✅ | host-space active-mask；Copy/ReverseCopy/Palette/WeightedEnsemble |
+| 2026-04-18 | M4.1 Multi-turn episode scaffolding | ✅ | Episode / TurnSpec / Environment / rollout_episode |
+| 2026-04-18 | M4.2 Stepwise returns wired through GRPO | ✅ | discounted_returns + group_normalize + returns_to_per_position + `grpo_loss_per_position` |
+| 2026-04-18 | `train_multi_turn` 二进制 (stepwise RL loop) | ✅ | smoke: mean_reward 0.09 → 0.31 over 30 iters (vocab=16, 2 turns × 2 agent tokens, group=8) |
+| — | M4.3 多 verifier（真实 math/code/tool） | ⏳ Pending | 合成 token 级占位已就绪；真实 verifier 需 tokenizer 对接 |
+| — | M4.4 Reward aggregation config | ✅ | WeightedEnsemble 已到位；权重 config 化 TBD |
+| — | M4.5–M4.8 curriculum / task gen / /v1/train / self-evolve | ⏳ Pending | |
 | — | M5 Metal 支线 | ⏳ Pending（与 M3/M4 并行） | |
 
 ---
