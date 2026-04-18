@@ -195,6 +195,113 @@ the model can't reuse, explicitly `free_slot(slot)` before calling
 `alloc_pool_tokens_with_retry`. Requires a test harness because the
 crash only reproduces under concrete sweep load.
 
+**Findings (2026-04-19, code-read only — CUDA repro still pending):**
+
+Traced the lifecycle end-to-end. The plan's original symptom
+description ("MISS on radix hits but leaves pool seq_len advanced")
+doesn't match what the code actually does. The real picture is more
+specific; refining the hypothesis below so the next GPU session has
+a sharper target.
+
+**What the MISS downgrade actually covers** (`prefill.rs:37-44`):
+
+```rust
+let prefix_len = if raw_prefix_len > 0
+    && raw_prefix_len < cached_prompt_len
+    && !state.supports_partial_prefix()
+{ 0 } else { raw_prefix_len };
+```
+
+The `!supports_partial_prefix` downgrade is **conditional on
+`raw < cached`** — it only triggers when the radix matched *less*
+than the slot has materialized (e.g. the slot advanced past the
+publish via decode). It does **not** trigger when `raw == cached <
+prompt_len` — the same-slot-reuse shape that `best_reusable_slot_for_radix_hit`
+produces by construction (it accepts when `cached_prompt_len >=
+reusable_prefix_len`, and under a clean cleanup → publish → reuse
+cycle, equality is the common case).
+
+**Pool state is correct across all three MISS / reuse branches.**
+`cleanup() → free_slot()` clears `page_indices[S] = []` and
+`seq_lens[S] = 0`. The subsequent `step_new` either (a) skips pool
+alloc (pool_prefix_len=0), or (b) allocates fresh pages and migrates
+contig → paged from offset 0 or offset L as appropriate. So the
+"inconsistent page_indices vs seq_len" framing is incorrect at the
+pool layer — pool state is consistent. Which means the
+recompute-path bug, if present, is at the **model state** layer,
+not the pool.
+
+**The actual hole: hybrid recurrent state under `raw == cached < prompt_len`.**
+
+When `raw == cached == L < prompt_len` (radix matched exactly what the
+slot materialized, prompt has more tokens beyond), execution falls
+to `prefill.rs:99`:
+
+```rust
+} else if prefix_len > 0 && prefix_len == cached_prompt_len {
+    state.truncate_to(prefix_len)?;       // Qwen35: zeroes recurrent_state
+    state.restore_prefix_snapshot()?;      // restore recurrent_state from snapshot
+    // ...
+}
+```
+
+`Qwen35State::truncate_to` (`model/qwen35/forward.rs:53-60`)
+**unconditionally zeroes** the recurrent state, with the comment
+"The scheduler should avoid partial prefix hits for hybrid models"
+— but the scheduler's guard at line 37-44 doesn't cover this
+`raw == cached` path. The recovery depends on
+`restore_prefix_snapshot()` returning `Ok(true)` with a valid
+snapshot. Two failure modes:
+
+1. **`Ok(false)` (no snapshot)**: line 122-125 logs "prefix HIT" and
+   silently continues with recurrent state at zeros. Chunked prefill
+   then advances recurrent state on `tokens[L..prompt_len]` starting
+   from zeros, not from the correct state-at-L. Garbage output or
+   downstream kernel OOB if intermediate state shapes depend on the
+   accumulated time axis.
+2. **Stale snapshot**: if R1's snapshot was taken, then something
+   else overwrote the recurrent state before R2's restore, the
+   snapshot could be inconsistent with `cached_prompt_len`. Harder
+   to reach but possible.
+
+Under the happy path (R1 completed prefill cleanly, snapshot saved
+at line 327, nothing clobbered it between R1 cleanup and R2
+assign), the restore succeeds and this branch behaves correctly.
+The crash under sweep load probably has a step where one of the
+two failure modes fires — hence "only reproduces under concrete
+sweep load."
+
+**Refined fix hypothesis** (supersedes "free_slot before alloc"):
+
+Extend the MISS downgrade condition at `prefill.rs:37-44` from
+`raw < cached` to `raw <= cached && prefix_len < prompt_len`:
+
+```rust
+let prefix_len = if raw_prefix_len > 0
+    && raw_prefix_len < prompt_len
+    && !state.supports_partial_prefix()
+{ 0 } else { raw_prefix_len };
+```
+
+Rationale: for hybrid models, the only safe same-slot reuse is
+`raw_prefix_len == prompt_len` (full match → exact branch at line
+51, which already handles hybrid via `state.reset()` + full
+re-prefill). Any partial case — including `raw == cached < prompt_len`
+— risks the recurrent-state-from-snapshot path. Downgrading to MISS
+avoids the truncate_to + restore dance entirely; the pool path
+remains correct (alloc 0, later alloc prompt_len, migrate [0..prompt_len]).
+
+**Acceptance test plan:**
+
+- Add a unit test in `prefill::tests` that constructs the condition
+  vector `(raw, cached, prompt)` with `!supports_partial_prefix` and
+  asserts `prefix_len == 0` for every `(raw, cached, prompt)` where
+  `raw > 0 && raw <= cached && prompt > raw`. (Pure logic, no GPU.)
+- Re-enable `prefill_uses_paged_pool() = true` for Qwen3.5 in
+  `model/qwen35/forward.rs:211` and run the guidellm sweep. Crash
+  disappears → hypothesis confirmed. Crash persists → look at
+  contig→paged migration path for partial same-slot reuse.
+
 ## 4. Audit §(c) eviction race — formal closure
 
 Codex's static analysis ruled out mid-request eviction of active-slot
