@@ -140,11 +140,20 @@ DFlash on under concurrency.  Decomposes into four sub-pieces that
   std::optional<float> base, float scale, const array& offset,
   const std::optional<array>& freqs, StreamOrDevice s);` — source at
   [ml-explore/mlx@main/mlx/fast.h](https://github.com/ml-explore/mlx/blob/main/mlx/fast.h).
-- GDR state shape under B>1: today `target_gdr_flat` is flat-indexed
-  per-layer.  Packed version needs `[B, Hv, Dv, Dk]` rooted at the
-  batch axis.  `qwen35_set_tape_mode` / `qwen35_set_capture_layers`
-  toggle applies to the whole C++ model — capture is all-rows or no-rows,
-  which is fine since every DFlash slot needs tapes.
+- ✅ **GDR state shape under B>1 — resolved 2026-04-19 via code read.**
+  `gdr_step` (`mlx_qwen35_model.cpp:684-864`) already threads
+  `int B = ctx.batch_size` end-to-end: state-in/state-out are 4-D
+  `[B, hv, dv, dk]` and the kernel path `s_decayed + delta * k_4d`
+  (line 854) operates batch-wise. The FFI carries GDR states as
+  `mlx_array** gdr_states, int32_t n_gdr` — one tensor per *layer*,
+  not per (row, layer). So Layer 2b's Rust-side packing is: for each
+  GDR layer `g`, `mx::stack` the B per-row states at axis 0 to produce
+  a single `[B, hv, dv, dk]` tensor, pass the array-of-pointers with
+  `n_gdr` unchanged. Partial-accept rollback (per-row) unstacks via
+  `mx::split` along axis 0. `qwen35_set_tape_mode` /
+  `qwen35_set_capture_layers` toggle applies to the whole C++ model —
+  capture is all-rows or no-rows, which is fine since every DFlash
+  slot needs tapes.
 - Single-session single-request workloads get **nothing** from Layer 2
   (B=1 already).  The single-session regression on Qwen3.5-4B-4bit
   documented in `wins/2026-04-17-metal-qwen35-dflash-block-verify.md`
