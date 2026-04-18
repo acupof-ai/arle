@@ -1587,6 +1587,7 @@ mod tests {
     use std::{env, path::PathBuf};
 
     use super::*;
+    use crate::backend::metal::sampling::gpu_sample_token_batched;
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
@@ -1649,6 +1650,15 @@ mod tests {
         }
 
         Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    fn slice_row_for_sampling(array: &MlxArray, row: i32) -> MlxArray {
+        let mut start = vec![0; array.shape().len()];
+        let mut end = array.shape().to_vec();
+        let strides = vec![1; array.shape().len()];
+        start[0] = row;
+        end[0] = row + 1;
+        slice(array, &start, &end, &strides)
     }
 
     #[test]
@@ -1754,6 +1764,149 @@ mod tests {
                 "logit[{idx}] mismatch: {lhs} vs {rhs}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn packed_decode_batched_sampling_matches_scalar_sampling_for_b4() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!(
+                "QWEN35_MODEL_PATH unset; skipping packed decode batched sampling B=4 equivalence test"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 compiled C++ model unavailable")?;
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let prompt_rows = [
+            [1_i32, 2, 3, 4],
+            [5_i32, 6, 7, 8],
+            [9_i32, 10, 11, 12],
+            [13_i32, 14, 15, 16],
+        ];
+        let batch_size = i32::try_from(prompt_rows.len()).expect("batch size fits in i32");
+        let prompt_len = i32::try_from(prompt_rows[0].len()).expect("prompt len fits in i32");
+        let kv_capacity = prompt_len + KV_CACHE_CHUNK;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let mut per_row_kv = Vec::with_capacity(prompt_rows.len());
+        let mut per_row_gdr = Vec::with_capacity(prompt_rows.len());
+        let mut decode_inputs = Vec::with_capacity(prompt_rows.len());
+
+        for prompt_tokens in prompt_rows {
+            let mut kv_flat: Vec<MlxArray> = (0..num_full_layers)
+                .flat_map(|_| {
+                    [
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                    ]
+                })
+                .collect();
+            let recurrent =
+                MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+            let mut gdr_flat: Vec<MlxArray> = recurrent
+                .states
+                .iter()
+                .zip(recurrent.conv_states.iter())
+                .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+                .collect();
+
+            let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens, &[prompt_len]);
+            let prompt_logits =
+                cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+            let mut prompt_refs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            prompt_refs.push(&prompt_logits);
+            prompt_refs.extend(kv_flat.iter());
+            prompt_refs.extend(gdr_flat.iter());
+            eval(&prompt_refs);
+
+            let decode_input = gpu_sample_token(&prompt_logits, &params);
+            eval(&[&decode_input]);
+            decode_inputs.push(decode_input.item_i32());
+            per_row_kv.push(kv_flat);
+            per_row_gdr.push(gdr_flat);
+        }
+
+        let n_kv = i32::try_from(per_row_kv[0].len()).expect("kv len fits in i32");
+        let n_gdr = i32::try_from(per_row_gdr[0].len()).expect("gdr len fits in i32");
+        let mut packed_kv = Vec::with_capacity(n_kv as usize);
+        for kv_idx in 0..n_kv as usize {
+            let stacked: Vec<MlxArray> = per_row_kv
+                .iter()
+                .map(|row_kv| row_kv[kv_idx].clone())
+                .collect();
+            packed_kv.push(concatenate_axis(&stacked, 0));
+        }
+        let mut packed_gdr = Vec::with_capacity(n_gdr as usize);
+        for gdr_idx in 0..n_gdr as usize {
+            let stacked: Vec<MlxArray> = per_row_gdr
+                .iter()
+                .map(|row_gdr| row_gdr[gdr_idx].clone())
+                .collect();
+            packed_gdr.push(concatenate_axis(&stacked, 0));
+        }
+
+        let decode_tokens = MlxArray::from_slice_i32(&decode_inputs, &[batch_size]);
+        let rope_offsets = MlxArray::from_slice_i32(
+            &vec![prompt_len; usize::try_from(batch_size).expect("batch size fits in usize")],
+            &[batch_size],
+        );
+        let batched_logits = cpp_model.step_batch_packed(
+            &decode_tokens,
+            batch_size,
+            prompt_len,
+            &mut packed_kv,
+            n_kv,
+            &mut packed_gdr,
+            n_gdr,
+            None,
+            Some(&rope_offsets),
+        )?;
+        let mut decode_refs: Vec<&MlxArray> =
+            Vec::with_capacity(1 + packed_kv.len() + packed_gdr.len());
+        decode_refs.push(&batched_logits);
+        decode_refs.extend(packed_kv.iter());
+        decode_refs.extend(packed_gdr.iter());
+        eval(&decode_refs);
+
+        let batched_sampled = gpu_sample_token_batched(&batched_logits, &params);
+        eval(&[&batched_sampled]);
+        let batched_tokens = batched_sampled.as_slice_i32();
+
+        let mut scalar_sampled = Vec::with_capacity(prompt_rows.len());
+        for row_idx in 0..batch_size {
+            let row_logits = slice_row_for_sampling(&batched_logits, row_idx);
+            scalar_sampled.push(gpu_sample_token(&row_logits, &params));
+        }
+        let scalar_refs: Vec<&MlxArray> = scalar_sampled.iter().collect();
+        eval(&scalar_refs);
+        let scalar_tokens: Vec<i32> = scalar_sampled
+            .iter()
+            .map(|sampled| sampled.item_i32())
+            .collect();
+
+        assert_eq!(batched_tokens, scalar_tokens);
 
         Ok(())
     }
