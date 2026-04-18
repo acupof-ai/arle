@@ -256,7 +256,6 @@ impl<M: ModelForward> Scheduler<M> {
         self.pending_decode = Some(PendingDecode {
             decode_indices,
             slot_indices,
-            all_greedy,
             greedy_launched,
             sampling_params_greedy,
             mixed_prefill_request_idx: Some(prefill_idx),
@@ -517,7 +516,6 @@ impl<M: ModelForward> Scheduler<M> {
         self.pending_decode = Some(PendingDecode {
             decode_indices,
             slot_indices,
-            all_greedy,
             greedy_launched,
             sampling_params_greedy: sampling_params
                 .iter()
