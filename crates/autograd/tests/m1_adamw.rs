@@ -15,10 +15,10 @@ fn adamw_matches_reference_update_for_ten_steps() {
 
     let mut optim = AdamW::new(0.01, (0.9, 0.999), 1e-8, 0.05);
 
-    let mut reference = vec![0.25_f32, -0.5, 1.5];
-    let grad_values = vec![0.1_f32, -0.2, 0.3];
-    let mut m = vec![0.0_f32; 3];
-    let mut v = vec![0.0_f32; 3];
+    let mut reference = [0.25_f32, -0.5, 1.5];
+    let grad_values = [0.1_f32, -0.2, 0.3];
+    let mut m = [0.0_f32; 3];
+    let mut v = [0.0_f32; 3];
 
     for step in 1..=10 {
         optim.step(&[param], &mut store);

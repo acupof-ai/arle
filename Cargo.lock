@@ -3692,6 +3692,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "train"
+version = "0.1.0"
+dependencies = [
+ "autograd",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

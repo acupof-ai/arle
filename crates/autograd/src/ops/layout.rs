@@ -6,6 +6,39 @@ use crate::{
     tensor::{GpuTensor, TensorId, TensorStore},
 };
 
+pub fn reshape(
+    x: TensorId,
+    shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let input = store.tensor(x)?.clone();
+    if shape_numel(shape) != input.size {
+        return Err(AutogradError::ShapeMismatch {
+            expected: input.shape,
+            got: shape.to_vec(),
+        });
+    }
+
+    let output_id = store.alloc(GpuTensor::new(
+        input.data,
+        shape.to_vec(),
+        input.requires_grad,
+    )?);
+    if input.requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Reshape,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::ReshapeCtx {
+                input_shape: input.shape,
+            },
+        });
+    }
+
+    Ok(output_id)
+}
+
 pub fn transpose(
     x: TensorId,
     axis1: usize,
@@ -27,6 +60,36 @@ pub fn transpose(
     }
 
     Ok(output_id)
+}
+
+pub(crate) fn reshape_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let x = *entry
+        .input_ids
+        .first()
+        .ok_or(AutogradError::TapeInvariant("reshape missing input"))?;
+    if !store.tensor(x)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+
+    let SavedContext::ReshapeCtx { input_shape } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "reshape backward missing saved shape",
+        ));
+    };
+    let upstream = store.tensor(output_grad_id)?.clone();
+    if shape_numel(&input_shape) != upstream.size {
+        return Err(AutogradError::ShapeMismatch {
+            expected: input_shape,
+            got: upstream.shape,
+        });
+    }
+
+    let grad_id = store.alloc(GpuTensor::new(upstream.data, input_shape, false)?);
+    Ok(smallvec![(x, grad_id)])
 }
 
 pub(crate) fn transpose_backward(
@@ -113,4 +176,12 @@ fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize> {
         linear /= dim;
     }
     coords
+}
+
+fn shape_numel(shape: &[usize]) -> usize {
+    if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
+    }
 }

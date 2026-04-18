@@ -3,6 +3,10 @@ name = "autograd"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+no-cuda = []
+
 [dependencies]
 libm.workspace = true
 smallvec = "1"

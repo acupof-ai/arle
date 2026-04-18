@@ -1,0 +1,19 @@
+[package]
+name = "train"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+no-cuda = []
+
+[dependencies]
+autograd = { path = "../autograd" }
+thiserror = { workspace = true }
+
+[[bin]]
+name = "train_tiny_lm"
+path = "src/bin/train_tiny_lm.rs"
+
+[lints]
+workspace = true
