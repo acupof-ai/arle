@@ -73,15 +73,29 @@ fn loads_synthetic_peft_adapter() {
     // the attention branch (self_attn.<m>) and the MLP branch (mlp.<m>)
     // in `parse_peft_key`, and leaves several slots empty so the
     // Option<LoRAAdapter>-per-slot invariant is visible.
-    let q_in = 64usize;
-    let q_out = 64usize;
-    let gate_in = 64usize;
-    let gate_out = 128usize;
+    //
+    // Shapes are small enough that every synthetic element stays inside
+    // bf16's 8-bit mantissa (so a 1e-6 tolerance holds on the readback).
+    let q_in = 16usize;
+    let q_out = 16usize;
+    let gate_in = 16usize;
+    let gate_out = 32usize;
 
-    let q_a = F32Tensor::new(vec![r, q_in], vec![0.125f32; r * q_in]);
-    let q_b = F32Tensor::new(vec![q_out, r], vec![0.25f32; q_out * r]);
-    let gate_a = F32Tensor::new(vec![r, gate_in], vec![-0.5f32; r * gate_in]);
-    let gate_b = F32Tensor::new(vec![gate_out, r], vec![0.75f32; gate_out * r]);
+    // Index-dependent fills. `f_a(i,j) = (cols*i + j) / 128` and similar
+    // have unique values per (i, j), so a transpose, wrong leading
+    // dimension, or per-row duplication would visibly fail readback.
+    // Every value is k / 128 with 0 ≤ k < 256, so bf16 round-trips exact.
+    let q_a_vals: Vec<f32> = (0..r * q_in).map(|idx| (idx as f32) / 128.0).collect();
+    let q_b_vals: Vec<f32> = (0..q_out * r).map(|idx| (idx as f32) / 128.0).collect();
+    let gate_a_vals: Vec<f32> = (0..r * gate_in)
+        .map(|idx| -((idx as f32) / 128.0))
+        .collect();
+    let gate_b_vals: Vec<f32> = (0..gate_out * r).map(|idx| (idx as f32) / 128.0).collect();
+
+    let q_a = F32Tensor::new(vec![r, q_in], q_a_vals.clone());
+    let q_b = F32Tensor::new(vec![q_out, r], q_b_vals.clone());
+    let gate_a = F32Tensor::new(vec![r, gate_in], gate_a_vals.clone());
+    let gate_b = F32Tensor::new(vec![gate_out, r], gate_b_vals.clone());
 
     // BTreeMap so iteration order is stable for the safetensors header.
     // Keys use the `base_model.model.model.` double-prefix convention
@@ -147,31 +161,34 @@ fn loads_synthetic_peft_adapter() {
     assert!(l0.v_proj.is_none(), "v_proj should be absent");
     assert!(l0.gate_proj.is_none(), "layer 0 gate_proj should be absent");
 
-    // Read A and B back from the device and verify values. This is the
-    // part that catches silent f32→bf16 miscompilation or a missing/wrong
-    // scale pre-bake: bf16(0.125) round-trips exactly, and
-    // bf16(0.25 * 2.0) = bf16(0.5) also round-trips exactly, so the
-    // expected host bytes are deterministic across hardware.
+    // Read A and B back from the device and verify values element-by-
+    // element against the index-dependent host fills. This catches:
+    //  - layout bugs (transpose, wrong leading dimension, row duplication)
+    //    because every (i, j) maps to a unique expected value;
+    //  - f32→bf16 corruption, because every synthetic value is bf16-exact;
+    //  - a dropped B-scale pre-bake, because B_device == B_host * alpha/r.
     let a_host = matrix_to_host_f32(&ctx, &qp.a);
     assert_eq!(a_host.len(), r * q_in);
-    for (i, v) in a_host.iter().enumerate() {
+    for (idx, got) in a_host.iter().enumerate() {
+        let want = q_a_vals[idx];
         assert!(
-            (v - 0.125).abs() < 1e-6,
-            "q_proj.a[{}] = {}, want 0.125 (f32 fill → bf16 upload should be exact)",
-            i,
-            v,
+            (got - want).abs() < 1e-6,
+            "q_proj.a[{}] = {}, want {} (host fill should survive f32→bf16 upload)",
+            idx,
+            got,
+            want,
         );
     }
     let b_host = matrix_to_host_f32(&ctx, &qp.b);
     assert_eq!(b_host.len(), q_out * r);
-    let b_expected = 0.25f32 * expected_scale;
-    for (i, v) in b_host.iter().enumerate() {
+    for (idx, got) in b_host.iter().enumerate() {
+        let want = q_b_vals[idx] * expected_scale;
         assert!(
-            (v - b_expected).abs() < 1e-6,
-            "q_proj.b[{}] = {}, want {} (B must carry the pre-baked scale alpha/r)",
-            i,
-            v,
-            b_expected,
+            (got - want).abs() < 1e-6,
+            "q_proj.b[{}] = {}, want {} (B must carry pre-baked scale alpha/r)",
+            idx,
+            got,
+            want,
         );
     }
 
@@ -187,26 +204,28 @@ fn loads_synthetic_peft_adapter() {
     assert_eq!(gp.b.rows, gate_out);
     assert_eq!(gp.b.cols, r);
     assert!((gp.scale - expected_scale).abs() < 1e-6);
-    // Negative value on the MLP branch — catches sign errors in the
-    // f32→bf16 conversion path.
+    // Negative, index-dependent fill on the MLP branch — catches sign
+    // errors and layout bugs in the f32→bf16 conversion path.
     let ga_host = matrix_to_host_f32(&ctx, &gp.a);
-    for (i, v) in ga_host.iter().enumerate() {
+    for (idx, got) in ga_host.iter().enumerate() {
+        let want = gate_a_vals[idx];
         assert!(
-            (v - (-0.5)).abs() < 1e-6,
-            "gate_proj.a[{}] = {}, want -0.5",
-            i,
-            v,
+            (got - want).abs() < 1e-6,
+            "gate_proj.a[{}] = {}, want {}",
+            idx,
+            got,
+            want,
         );
     }
     let gb_host = matrix_to_host_f32(&ctx, &gp.b);
-    let gb_expected = 0.75f32 * expected_scale;
-    for (i, v) in gb_host.iter().enumerate() {
+    for (idx, got) in gb_host.iter().enumerate() {
+        let want = gate_b_vals[idx] * expected_scale;
         assert!(
-            (v - gb_expected).abs() < 1e-6,
+            (got - want).abs() < 1e-6,
             "gate_proj.b[{}] = {}, want {}",
-            i,
-            v,
-            gb_expected,
+            idx,
+            got,
+            want,
         );
     }
 
