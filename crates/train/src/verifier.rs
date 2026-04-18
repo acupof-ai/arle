@@ -163,17 +163,15 @@ impl ToolSuccessVerifier {
 
 impl Verifier for ToolSuccessVerifier {
     fn verify(&self, _prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]) -> f32 {
-        let mut any_response = false;
         for (position, masked) in response_mask.iter().enumerate() {
             if !*masked {
                 continue;
             }
-            any_response = true;
             if full_ids[position] == self.sentinel {
                 return 1.0;
             }
         }
-        if any_response { 0.0 } else { 0.0 }
+        0.0
     }
 }
 
