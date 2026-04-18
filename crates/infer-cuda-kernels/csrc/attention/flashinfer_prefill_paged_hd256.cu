@@ -141,6 +141,10 @@ extern "C" int flashinfer_batch_prefill_paged_hd256_run(
 
     params.padded_batch_size = plan_info.padded_batch_size;
     params.max_total_num_rows = plan_info.total_num_rows;
+    if (plan_info.enable_cuda_graph) {
+      params.total_num_rows =
+          flashinfer::GetPtrFromBaseOffset<uint32_t>(int_workspace, plan_info.total_num_rows_offset);
+    }
     params.partition_kv = plan_info.split_kv;
     params.request_indices =
         flashinfer::GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
