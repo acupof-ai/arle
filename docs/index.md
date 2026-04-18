@@ -56,6 +56,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [support-matrix.md](support-matrix.md) | Governance | Current backend / platform / model / quantization support levels |
 | [compatibility.md](compatibility.md) | Governance | Breaking-change, deprecation, migration policy |
 | [perf-and-correctness-gates.md](perf-and-correctness-gates.md) | Governance | Minimum validation expectations for correctness and performance-sensitive changes |
+| [bench-and-trace-spec.md](bench-and-trace-spec.md) | Governance | Bench & trace reporting spec: required sections, watch-list, auto-iteration rules |
 | [release-checklist.md](release-checklist.md) | Governance | Repeatable release checklist: docs, validation, artifacts, compatibility |
 | [from-zero-to-inference-engine.md](from-zero-to-inference-engine.md) | Tutorial | Walkthrough: from zero to inference engine |
 | [gpu-benchmark-a100.md](gpu-benchmark-a100.md) | Reference | A100 GPU benchmark methodology and results |
