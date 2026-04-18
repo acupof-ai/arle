@@ -8,6 +8,8 @@ pub mod lora;
 pub mod model;
 #[path = "multi_turn.rs"]
 pub mod multi_turn;
+#[path = "reward.rs"]
+pub mod reward;
 #[path = "rollout.rs"]
 pub mod rollout;
 #[path = "sampling.rs"]
