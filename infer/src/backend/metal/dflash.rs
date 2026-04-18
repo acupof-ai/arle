@@ -114,9 +114,12 @@ fn record_qwen35_block_profile(
         let mut draft_v = state.draft.clone();
         let mut verify_v = state.verify.clone();
         let mut total_v = state.total.clone();
+        // mean_k = mean matched draft prefix (0..block_size-1). Effective
+        // tokens produced per block = matched + 1 posterior token.
         let mean_k = state.k_total as f64 / state.blocks as f64;
         let mean_total_ms = mean(&state.total);
-        let effective_tok_s = 1000.0 * mean_k / mean_total_ms;
+        let mean_tokens_per_block = mean_k + 1.0;
+        let effective_tok_s = 1000.0 * mean_tokens_per_block / mean_total_ms;
 
         let mut hist_s = String::new();
         for (k, count) in state.k_hist.iter().enumerate() {
@@ -127,7 +130,7 @@ fn record_qwen35_block_profile(
         }
 
         log::info!(
-            "qwen35_dflash[agg {} blocks]: draft μ={:.1}ms p90={:.1}ms | verify μ={:.1}ms p90={:.1}ms | sample μ={:.1}ms | rollback μ={:.1}ms | eval μ={:.1}ms | total μ={:.1}ms p90={:.1}ms | K̄={:.2}/{} | eff={:.1} tok/s",
+            "qwen35_dflash[agg {} blocks]: draft μ={:.1}ms p90={:.1}ms | verify μ={:.1}ms p90={:.1}ms | sample μ={:.1}ms | rollback μ={:.1}ms | eval μ={:.1}ms | total μ={:.1}ms p90={:.1}ms | matched K̄={:.2}/{} | tok/block={:.2} | eff={:.1} tok/s",
             state.blocks,
             mean(&state.draft),
             quantile(&mut draft_v, 0.90),
@@ -139,7 +142,8 @@ fn record_qwen35_block_profile(
             mean_total_ms,
             quantile(&mut total_v, 0.90),
             mean_k,
-            state.block_size,
+            state.block_size.saturating_sub(1),
+            mean_tokens_per_block,
             effective_tok_s,
         );
         log::info!("qwen35_dflash[agg K-hist]:{hist_s}");
@@ -186,10 +190,12 @@ pub(crate) struct MetalDflashRuntime {
     draft_config: DFlashDraftConfig,
     draft_weights: DFlashDraftWeights,
     draft_cpp_model: Option<DFlashDraftCppModel>,
-    /// Attention mask mode inside the draft block's self-attention ("causal" or "none").
-    /// Matches dflash-mlx api.py auto-select: causal for Qwen3.5 hybrid, none for
-    /// Qwen3. `DFLASH_DRAFT_MASK=causal|none` overrides. Reference benches show
-    /// causal beats none on Qwen3.5 (K̄ 6.10 vs 5.37).
+    /// Debug-only SDPA mask mode for the draft block self-attention
+    /// ("none" or "causal"). Reference dflash-mlx always passes mask=None
+    /// (see dflash_mlx/model.py `DFlashAttention.__call__`); "none" is the
+    /// production setting. `DFLASH_DRAFT_MASK=causal` forces the Rust
+    /// draft forward (the compiled C++ graph has no causal branch) so the
+    /// empirical causal-vs-none gap can be reproduced on demand.
     draft_attention_mask: String,
 }
 
@@ -257,11 +263,10 @@ impl MetalDflashRuntime {
         }
         let block_size = requested_block_size.min(default_block_size);
 
-        // Reference dflash-mlx picks "causal" for Qwen3.5 (K̄=6.10 vs
-        // none=5.37). Our measured K̄ inverts that (none=4.54 > causal=3.60),
-        // likely an MLX-C / fast_sdpa causal-with-q_len<k_len discrepancy
-        // still to root-cause. Default "none" until fixed;
-        // DFLASH_DRAFT_MASK=causal forces causal for investigation.
+        // Reference dflash-mlx draft SDPA always passes mask=None
+        // (dflash_mlx/model.py DFlashAttention); causal is not part of the
+        // published config. `DFLASH_DRAFT_MASK=causal` exists for debug
+        // only and matches the empirical K̄=3.60 vs none=4.54 gap.
         let auto_mask = "none";
         let draft_attention_mask = std::env::var("DFLASH_DRAFT_MASK")
             .ok()
@@ -1198,8 +1203,13 @@ fn dflash_draft_forward(
     target_hidden: &MlxArray,
     state: &mut ContiguousKvState,
 ) -> Result<MlxArray> {
+    // Compiled MLX graph is built with mask=None (matches reference
+    // dflash-mlx: draft SDPA always mask=None). If the operator explicitly
+    // requested `causal`, route to the Rust path — the C++ graph has no
+    // causal-mask branch and silently dropping the override would be a lie.
     if use_dflash_draft_cpp()
         && let Some(cpp_model) = runtime.draft_cpp_model.as_ref()
+        && runtime.draft_attention_mask != "causal"
     {
         return dflash_draft_forward_cpp(cpp_model, noise_embedding, target_hidden, state);
     }
@@ -1777,9 +1787,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
             (t_total - t_rollback).as_secs_f32() * 1000.0,
             t_total.as_secs_f32() * 1000.0,
         );
+        // `matched` = number of draft positions that agreed with the
+        // posterior (0..block_size-1). `accepted_inputs = matched + 1`
+        // includes the mandatory posterior token. The aggregate K-histogram
+        // tracks matched so K=0 buckets are reachable and K̄ is directly
+        // comparable to the reference's "Accepted Length − 1" metric.
         record_qwen35_block_profile(
             runtime.block_size,
-            accepted_inputs,
+            matched,
             t_draft,
             t_verify - t_snapshot,
             t_sample - t_verify,
