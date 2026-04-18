@@ -1,6 +1,6 @@
 # M2b (LoRA → Qwen3 infer hook) — dependency blocker
 
-**Status**: Blocked · **Opened**: 2026-04-18 · **Owner**: ckl
+**Status**: Resolved (option **b**) · **Opened**: 2026-04-18 · **Resolved**: 2026-04-18 · **Owner**: ckl
 
 ## Finding
 
@@ -55,3 +55,15 @@ Pick **(b′)** if the near-term goal is "a Qwen3 binary that can consume a LoRA
 ## Decision pending
 
 Requires user input before coding. Cron loop should not auto-start M2b against the blocker.
+
+## Resolution (2026-04-18)
+
+Shipped option **(b)**: CUDA-native `LoRAAdapter { a: DeviceMatrix, b: DeviceMatrix, scale: f32 }` lives in `infer/src/model/qwen3/lora.rs` — not in `train::autograd`. Three commit waves:
+
+1. `cbe9cba` phase1 — PEFT `adapter_config.json` + `adapter_model.safetensors` loader, f32→bf16 upload, B pre-scaled by `alpha/r` at load time.
+2. `adf205a` phase2a — additive `apply_lora_gemv_add` / `apply_lora_gemm_add` (one cuBLAS small GEMM per projection, summed into base output).
+3. `1e87b4f` phase2b — wired into prefill + decode hot paths of `infer/src/model/qwen3/forward.rs`.
+
+Review-driven hardening (`146874e` → `09e3685`): LoRA active ⇒ `supports_cuda_graph_decode=false` (eager decode only, because `apply_lora_*_add` allocates per-call temp DeviceVecs that CUDA Graph capture rejects); warmup still runs the autotune pass so cublasLt cache is populated; paged-KV slots are freed on every warmup exit path; synthetic-safetensors integration test at `infer/tests/test_qwen3_lora_loader.rs` validates loader end-to-end (bf16-exact index-dependent fills, disjoint A/B value ranges, scale pre-bake).
+
+Option (a) — autograd CUDA path + in-process train↔infer gradient flow — remains the correct next step when the project actually needs online LoRA training against Qwen3. This resolution only closes "consume a pre-trained LoRA on Qwen3."
