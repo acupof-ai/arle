@@ -1,12 +1,13 @@
 # Doc index
 
-Last refreshed: 2026-04-15 (post Metal Qwen3/Qwen3.5 live prefix reuse + `/v1/responses` SSE parity + Apple one-command bring-up + Metal runtime memory-limit controls + Metal Qwen3/Qwen3.5 same-length batch decode + tiered-KV M2b + M0.3 + M3a + M3b + M3c **L4 remote acceptance**).
+Last refreshed: 2026-04-18 (**Phase 6 Agent RL 训推一体 main line opened** — project spine + execution plan + mni-ml reference analysis; ROADMAP §Phase 6 is new core main line alongside the inference engine roadmap).
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
 | Path | Status | TL;DR |
 | --- | --- | --- |
 | **Projects** | | |
+| [projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md) | **Active — NEW CORE MAIN LINE (2026-04-18)** | Phase 6 spine: 单机 Rust agent RL 训推一体 + 自进化栈. CUDA first, LoRA-only, GRPO, same-process train+infer, autograd written from scratch (ref: mni-ml/framework). Lock v3. M0 pending |
 | [projects/tiered-kv-cache.md](projects/tiered-kv-cache.md) | **Active — M2b + M0.3 + M3a + M3b + M3c + Tier A/B/C accepted on L4 2026-04-15; M4 a/b/c/d local landed 2026-04-16** | Hierarchical KV cache (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL). Scheduler selector flip, BF16 `page_size=16`, host-tier skeleton, staged-lookup/page-lifecycle contract, plannerless runtime wiring, Tier A/B/C runtime promotion, and M4 BLAKE3 fingerprint + DiskStore postcard + `RadixCache::reconcile` + pure-Rust session save/load module all shipped; remote CUDA acceptance for M4 + real async staged completion / promotion + HTTP route wrappers still pending |
 | [projects/agent-first-architecture.md](projects/agent-first-architecture.md) | Active | Priority ledger for agent-grade serving — radix wiring, session routing, constrained decoding, speculative decoding. P-labels superseded by tiered-kv M-milestones |
 | [projects/kv-quantization-long-context.md](projects/kv-quantization-long-context.md) | **Partially shipped** | TurboQuant Phases 1–3 (KV + weight + fused decode attention) shipped via [`turboquant-integration.md`](plans/turboquant-integration.md); FP8-native FlashInfer track deferred |
@@ -14,6 +15,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [projects/qwen35-batched-decode.md](projects/qwen35-batched-decode.md) | Done | Qwen3.5 batched decode: FlashInfer HD256 + scheduler integration. Historical record |
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research radar | Observations on accelerated-model-architecture repos (training/experimental, not serving) |
 | **Plans** | | |
+| [plans/rust-agent-rl-single-node.md](plans/rust-agent-rl-single-node.md) | **Active — opened 2026-04-18** | Phase 6 execution plan. M0 autograd skeleton → M1 core ops → M2 LoRA graft → M3 GRPO closed loop → M4 agent self-evolve → M5 Metal parity. Daily-grain tasks + acceptance gates. M0 pending |
 | [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | Active | Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes, milestone-by-milestone |
 | [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m2b-remote.md` |
 | [plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md](plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md` |
@@ -31,6 +33,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [plans/kv-quant-remote-validation.md](plans/kv-quant-remote-validation.md) | Active | Validation checklist for the suffix-only KV migration patch (BF16/FP8/INT8/TQ3); no recorded results yet |
 | [plans/backend-reorg-followups.md](plans/backend-reorg-followups.md) | Tracker | Round 2 backend reorg follow-ups: F1 done (`19a433d`), F2 parked (Option B), F3 done (`4b493c8`), Round 3 reverted by Route-A |
 | **Research** | | |
+| [research/mni-ml-framework-notes.md](research/mni-ml-framework-notes.md) | **Reference analysis (2026-04-18)** | mni-ml/framework dissection: structural map, LOC table, abstractions worth borrowing (TensorId+Store, SavedContext enum, BackwardOp dispatch, embedded optimizer state), pruning list for our LoRA-only scope. Underpins Phase 6 from-scratch autograd |
 | [research/speculative-decoding-feasibility.md](research/speculative-decoding-feasibility.md) | Feasibility | Draft model, EAGLE/EAGLE3, Medusa, MTP — phased integration plan, draft model first |
 | [research/dflash-metal-feasibility.md](research/dflash-metal-feasibility.md) | Feasibility | DFlash (speculative) on Metal: feasible, medium priority. Now partially shipped via the experimental Metal DFlash path |
 | [research/kv-quantization-metal.md](research/kv-quantization-metal.md) | Feasibility | KV quant on Metal deprioritized: MLX has no FP8 dtype, BF16-only; defer until C>4 with long contexts |
