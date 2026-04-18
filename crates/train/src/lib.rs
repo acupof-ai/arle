@@ -1,3 +1,5 @@
+#[path = "curriculum.rs"]
+pub mod curriculum;
 #[path = "dataset.rs"]
 pub mod dataset;
 #[path = "grpo.rs"]
