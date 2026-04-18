@@ -1,5 +1,6 @@
 use train::verifier::{
-    CopyVerifier, PaletteVerifier, ReverseCopyVerifier, Verifier, WeightedEnsemble,
+    CopyVerifier, PaletteVerifier, ReverseCopyVerifier, RewardConfig, Verifier, VerifierKind,
+    WeightedEnsemble,
 };
 
 fn with_mask(prompt_ids: Vec<usize>, full_ids: Vec<usize>) -> (Vec<usize>, Vec<usize>, Vec<bool>) {
@@ -65,4 +66,39 @@ fn empty_response_mask_returns_zero() {
         PaletteVerifier::new(256, &[1]).verify(&prompt_ids, &full_ids, &mask),
         0.0
     );
+}
+
+#[test]
+fn reward_config_matches_fluent_builder() {
+    let (prompt_ids, full_ids, mask) =
+        with_mask(vec![1, 2, 3, 255, 0, 0, 0], vec![1, 2, 3, 255, 1, 2, 3]);
+
+    let fluent = WeightedEnsemble::new()
+        .with(0.75, CopyVerifier)
+        .with(0.25, PaletteVerifier::new(256, &[1, 2, 3]));
+
+    let config = RewardConfig::new().push(0.75, VerifierKind::Copy).push(
+        0.25,
+        VerifierKind::Palette {
+            allowed_tokens: vec![1, 2, 3],
+        },
+    );
+    let from_config = WeightedEnsemble::from_config(&config, 256);
+
+    let fluent_reward = fluent.verify(&prompt_ids, &full_ids, &mask);
+    let config_reward = from_config.verify(&prompt_ids, &full_ids, &mask);
+    assert!(
+        (fluent_reward - config_reward).abs() < 1e-6,
+        "fluent {fluent_reward} != config {config_reward}",
+    );
+}
+
+#[test]
+fn reward_config_supports_reverse_copy() {
+    let (prompt_ids, full_ids, mask) =
+        with_mask(vec![1, 2, 3, 255, 0, 0, 0], vec![1, 2, 3, 255, 3, 2, 1]);
+    let config = RewardConfig::new().push(1.0, VerifierKind::ReverseCopy);
+    let ensemble = WeightedEnsemble::from_config(&config, 256);
+    let reward = ensemble.verify(&prompt_ids, &full_ids, &mask);
+    assert!((reward - 1.0).abs() < 1e-6, "got {reward}");
 }

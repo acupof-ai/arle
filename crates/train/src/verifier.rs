@@ -128,6 +128,60 @@ impl WeightedEnsemble {
         self.members.push((weight, Box::new(verifier)));
         self
     }
+
+    /// Build a `WeightedEnsemble` from a declarative config. Lets callers
+    /// express the reward mix as data (CLI flag, TOML, JSON) instead of
+    /// hand-wiring `.with(weight, verifier)` chains in code.
+    pub fn from_config(config: &RewardConfig, vocab_size: usize) -> Self {
+        let mut ensemble = Self::new();
+        for entry in &config.members {
+            let verifier: Box<dyn Verifier + Send + Sync> = match &entry.kind {
+                VerifierKind::Copy => Box::new(CopyVerifier),
+                VerifierKind::ReverseCopy => Box::new(ReverseCopyVerifier),
+                VerifierKind::Palette { allowed_tokens } => {
+                    Box::new(PaletteVerifier::new(vocab_size, allowed_tokens))
+                }
+            };
+            ensemble.members.push((entry.weight, verifier));
+        }
+        ensemble
+    }
+}
+
+/// Declarative description of a single verifier slot in a reward mix.
+#[derive(Debug, Clone)]
+pub struct RewardMember {
+    pub weight: f32,
+    pub kind: VerifierKind,
+}
+
+/// Tagged union of the built-in verifiers. Extend this as new verifiers
+/// land (math, code, tool-success) so `RewardConfig` stays the single
+/// construction surface.
+#[derive(Debug, Clone)]
+pub enum VerifierKind {
+    Copy,
+    ReverseCopy,
+    Palette { allowed_tokens: Vec<usize> },
+}
+
+/// Config-driven reward aggregation. `members` is ordered; the final
+/// reward is `Σ weight_i · verifier_i`, matching `WeightedEnsemble`'s
+/// fluent-builder semantics exactly.
+#[derive(Debug, Clone, Default)]
+pub struct RewardConfig {
+    pub members: Vec<RewardMember>,
+}
+
+impl RewardConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(mut self, weight: f32, kind: VerifierKind) -> Self {
+        self.members.push(RewardMember { weight, kind });
+        self
+    }
 }
 
 impl Default for WeightedEnsemble {
