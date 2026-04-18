@@ -576,7 +576,16 @@ Focus on performance, robustness, and Metal parity:
 | 0.5 Scheduler++ | ✅ Mock ModelForward | ✅ Done |
 | 0.6 Model Registry | ✅ Config parsing | ✅ Done |
 | 0.7 Benchmarks | ✅ Mock HTTP server | ✅ Done |
-| 1.x–5.x | ❌ GPU required | 5.1 ✅ Done |
+| 1.1 PagedAttention | ❌ GPU required | ✅ Shipped |
+| 1.2 FlashAttention-3 | ❌ GPU required | ⏳ Pending (H100) |
+| 1.3–1.8 Multi-arch models | ❌ GPU required | Detection shipped; per-model forward pending (Llama/DeepSeek/Mistral/Gemma/Phi) |
+| 2.1–2.5 Quantization | ⚠️ Config parse CPU; kernels GPU | ✅ GPTQ/AWQ/FP8/INT8/TurboQuant/GGUF+Q4_K shipped |
+| 3.x Tensor Parallel | ❌ GPU + multi-GPU | ⏳ Pending |
+| 4.1 Beam Search | ✅ CPU | ⏳ Pending |
+| 4.2 Speculative Decoding | ⚠️ CPU framework + GPU integration | CPU framework ✅; GPU integration ⏳ |
+| 4.3 Structured Output | ✅ CPU | ⏳ Pending |
+| 5.1 CUDA Graph | ❌ GPU required | ✅ Shipped |
+| 5.2–5.4 Perf opt | ❌ GPU required | Overlap scheduling ✅; others ⏳ |
 | 6.0 M0 autograd skeleton | ✅ CPU-only tape + add/mul/sum + grad_check | ✅ Done (`ef95994`) |
 | 6.1 M1 core op suite | ⚠️ CPU for grad-check oracle; CUDA for cuBLAS | ✅ Done CPU (`318cbf4`); CUDA cuBLAS path pending remote verify |
 | 6.2 M2 LoRA graft | ❌ needs Qwen weights + CUDA | ✅ Done — M2a TinyLM CPU (`f183f80`); M2b Qwen3 hot-path LoRA + codex rounds 1–3 (`1e87b4f`…`b5377f6`) |
