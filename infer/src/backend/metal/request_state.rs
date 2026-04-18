@@ -2303,6 +2303,8 @@ struct Qwen35StepDriver<'a> {
     mode: Qwen35StepMode,
     /// DFlash speculative decode state (None = standard decode).
     dflash: Option<Qwen35DFlashState>,
+    /// Pre-queued sampled token (lazy MlxArray) from the step ahead.
+    pending_sampled: Option<MlxArray>,
 }
 
 fn capture_qwen35_hidden_from_cpp_outputs(
@@ -2432,25 +2434,29 @@ impl<'a> Qwen35StepDriver<'a> {
             cache_len: 0,
             mode,
             dflash,
+            pending_sampled: None,
         })
     }
 
     fn run_step(&mut self, token: u32) -> Result<MlxArray> {
         self.ensure_capacity(self.cache_len + 1);
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
+        let logits = self.run_step_with_token(&token_arr)?;
+        self.cache_len += 1;
+        Ok(logits)
+    }
+
+    fn run_step_with_token(&mut self, token_arr: &MlxArray) -> Result<MlxArray> {
         let weights = self.weights;
         let config = self.config;
         let arch = self.arch;
         let cache_len = self.cache_len;
         let logits = match &mut self.mode {
-            Qwen35StepMode::Cpp(state) => {
-                Self::run_cpp_step(weights, cache_len, &token_arr, state)?
-            }
+            Qwen35StepMode::Cpp(state) => Self::run_cpp_step(weights, cache_len, token_arr, state)?,
             Qwen35StepMode::Rust(state) => {
-                Self::run_rust_step(weights, config, arch, cache_len, &token_arr, state)
+                Self::run_rust_step(weights, config, arch, cache_len, token_arr, state)
             }
         };
-        self.cache_len += 1;
         Ok(logits)
     }
 
@@ -2573,6 +2579,7 @@ impl<'a> Qwen35StepDriver<'a> {
                 state.gdr_flat = snapshot.gdr_flat.clone();
                 self.kv_capacity = snapshot.kv_capacity;
                 self.cache_len = snapshot.cache_len;
+                self.pending_sampled = None;
                 Ok(())
             }
             Qwen35StepMode::Rust(_) => {
@@ -2748,6 +2755,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
         if tokens.is_empty() {
             return Ok(None);
         }
+        self.pending_sampled = None;
 
         let use_cpp_batch_prefill = matches!(self.mode, Qwen35StepMode::Cpp(_)) && tokens.len() > 1;
         if use_cpp_batch_prefill {
@@ -2833,6 +2841,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
+        if self.dflash.is_some() {
+            self.pending_sampled = None;
+        }
+
         // ── DFlash speculative path (Qwen3.5) ────────────────────────────
         // 1. Drain buffer first — cheap, no GPU work, short-lived borrow.
         if let Some(dflash) = self.dflash.as_mut()
@@ -2904,12 +2916,35 @@ impl StepDriver for Qwen35StepDriver<'_> {
         }
 
         // ── Standard single-token decode ─────────────────────────────────
-        if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-            clear_metal_cache();
+        let can_prequeue = self.dflash.is_none() && self.cache_len + 2 <= self.kv_capacity;
+        let result = if let Some(sampled) = self.pending_sampled.take() {
+            let result = sampled.item_i32() as u32;
+            // Commit the step that was already pre-queued on the previous call.
+            self.cache_len += 1;
+            result
+        } else {
+            if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
+                clear_metal_cache();
+            }
+            let logits = self.run_step(token)?;
+            let sampled = gpu_sample_token(&logits, &self.params);
+            async_eval(&[&sampled]);
+            sampled.item_i32() as u32
+        };
+
+        if can_prequeue {
+            if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
+                clear_metal_cache();
+            }
+            let result_arr = MlxArray::from_slice_i32(&[result as i32], &[1]);
+            self.ensure_capacity(self.cache_len + 1);
+            let next_logits = self.run_step_with_token(&result_arr)?;
+            let next_sampled = gpu_sample_token(&next_logits, &self.params);
+            async_eval(&[&next_sampled]);
+            self.pending_sampled = Some(next_sampled);
         }
-        let logits = self.run_step(token)?;
-        let sampled = gpu_sample_token(&logits, &self.params);
-        Ok(sampled.item_i32() as u32)
+
+        Ok(result)
     }
 }
 
