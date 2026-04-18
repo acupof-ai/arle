@@ -3,7 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{error, info, warn};
@@ -665,6 +665,12 @@ fn run_metal_scheduler_runtime(
     let mut active = HashMap::<RequestId, ActiveMetalRequest>::new();
     let mut qwen35_decode_batch_cache: Option<CachedQwen35DecodeBatch> = None;
     let mut request_rx_closed = false;
+    // Rate-limit MLX allocator FFI queries — each `refresh_runtime_metrics`
+    // call issues 3 cross-FFI allocator queries; at c=1 decode this was
+    // firing twice per step and cost ~2 ms/step (HTTP 72 tok/s vs direct
+    // path 84 tok/s). Prom scrape cadence is seconds, 40 ms here is plenty.
+    const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
+    let mut last_metrics_refresh: Option<Instant> = None;
 
     info!("Metal scheduler runtime started");
 
@@ -682,7 +688,14 @@ fn run_metal_scheduler_runtime(
         );
         reap_closed_clients(&mut scheduler, &mut active);
         refresh_waiting_prefix_hits(&metrics, &mut prefix_runtime, &mut scheduler, &mut active);
-        refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
+        maybe_refresh_runtime_metrics(
+            &metrics,
+            &handle,
+            &scheduler,
+            &active,
+            &mut last_metrics_refresh,
+            METRICS_REFRESH_INTERVAL,
+        );
 
         if request_rx_closed && active.is_empty() && scheduler.waiting_len() == 0 {
             info!("Metal scheduler runtime shutting down: all handles dropped");
@@ -702,7 +715,10 @@ fn run_metal_scheduler_runtime(
                         &mut scheduler,
                         &mut active,
                     );
+                    // Admission is rare enough that an unconditional refresh
+                    // is fine — helps the first metrics scrape after idle.
                     refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
+                    last_metrics_refresh = Some(Instant::now());
                 }
                 None => {
                     request_rx_closed = true;
@@ -749,10 +765,35 @@ fn run_metal_scheduler_runtime(
             }
         }
 
-        refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
+        maybe_refresh_runtime_metrics(
+            &metrics,
+            &handle,
+            &scheduler,
+            &active,
+            &mut last_metrics_refresh,
+            METRICS_REFRESH_INTERVAL,
+        );
     }
 
     Ok(())
+}
+
+fn maybe_refresh_runtime_metrics(
+    metrics: &ServerMetrics,
+    handle: &SchedulerHandle,
+    scheduler: &MetalScheduler,
+    active: &HashMap<RequestId, ActiveMetalRequest>,
+    last: &mut Option<Instant>,
+    interval: Duration,
+) {
+    let now = Instant::now();
+    if let Some(prev) = *last {
+        if now.duration_since(prev) < interval {
+            return;
+        }
+    }
+    refresh_runtime_metrics(metrics, handle, scheduler, active);
+    *last = Some(now);
 }
 
 fn refresh_waiting_prefix_hits(

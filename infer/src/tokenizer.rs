@@ -220,4 +220,57 @@ mod tests {
 
         assert_eq!(streamed, tokenizer.decode(&ids).unwrap());
     }
+
+    // Attributes HTTP-server per-token cost vs the once-at-end batch decode
+    // used by `metal_bench`. See docs/experience/wins/2026-04-18-*.
+    const QWEN35_TOKENIZER_DIR: &str = "/path/to/.cache/huggingface/hub/models--mlx-community--Qwen3.5-4B-MLX-4bit/snapshots/32f3e8ecf65426fc3306969496342d504bfa13f3";
+
+    #[test]
+    #[ignore = "micro-bench; requires Qwen3.5-4B tokenizer in HF cache"]
+    fn bench_incremental_decoder_step() {
+        use std::time::Instant;
+
+        let tokenizer = Tokenizer::from_file(QWEN35_TOKENIZER_DIR).unwrap();
+
+        let prompt = "The quick brown fox jumps over the lazy dog. Large language \
+                      models excel at next-token prediction, and the per-step tokenizer \
+                      decoding cost can dominate when the GPU forward is already optimized. \
+                      We measure it here to see how bad the HTTP per-token decode is.";
+        let ids = tokenizer.encode(prompt).unwrap();
+        assert!(ids.len() >= 32, "got {} ids", ids.len());
+
+        let run = |label: &str, ids: &[u32]| {
+            let mut dec = tokenizer.incremental_decoder();
+            let t0 = Instant::now();
+            for &id in ids {
+                let _ = dec.step(id).unwrap();
+            }
+            let dt_us = t0.elapsed().as_micros();
+            let n = ids.len();
+            eprintln!(
+                "{label:8}: {n:3} tokens in {dt_us:6} us → {:6.1} us/tok  ({:5.2} ms per 128-tok gen)",
+                dt_us as f64 / n as f64,
+                (dt_us as f64 / n as f64) * 128.0 / 1000.0,
+            );
+        };
+
+        run("warm 1", &ids);
+        run("warm 2", &ids);
+        run("TIMED", &ids);
+        run("TIMED", &ids);
+        run("TIMED", &ids);
+        run("TIMED", &ids);
+        run("TIMED", &ids);
+
+        let t0 = Instant::now();
+        let _s = tokenizer.decode(&ids).unwrap();
+        let dt_us = t0.elapsed().as_micros();
+        eprintln!(
+            "batch  : {:3} tokens in {:6} us total ({:.1} us/tok, {:.2} ms per 128-tok gen)",
+            ids.len(),
+            dt_us,
+            dt_us as f64 / ids.len() as f64,
+            (dt_us as f64 / ids.len() as f64) * 128.0 / 1000.0,
+        );
+    }
 }
