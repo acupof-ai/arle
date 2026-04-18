@@ -1,3 +1,5 @@
+#[path = "checkpoint.rs"]
+pub mod checkpoint;
 #[path = "curriculum.rs"]
 pub mod curriculum;
 #[path = "dataset.rs"]
