@@ -194,7 +194,17 @@ impl ModelForward for Qwen3Model {
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
-        true
+        // Phase 3a (commit 9821cb2) migrated Qwen3 prefill to the paged path,
+        // but under the guidellm sweep with 10 slots and 4096-token prompts
+        // FlashInfer's `PrefillPlan` throws `Buffer overflow when allocating
+        // batch_prefill_tmp_s` even with the HD128 float_workspace lifted to
+        // 512 MiB. The C++ throw is now caught (commit 927c390) so requests
+        // fail with a CUDA error -1 instead of aborting the process, but a
+        // hot loop of thousands of failures still wastes GPU time. Revert to
+        // the contiguous+scatter path (same as 2026-04-17 baseline) while
+        // the workspace-sizing and slot-reuse bugs are being untangled.
+        // Tracking: `docs/plans/p99-unified-mixed-batch.md` §Phase 1C.
+        false
     }
 
     fn select_token(
