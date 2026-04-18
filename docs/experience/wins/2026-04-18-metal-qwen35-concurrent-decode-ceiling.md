@@ -97,10 +97,10 @@ probably 600+; compiled would be ~50-100), likely moves both `a` and `b`.
 | Lever | Moves constant `a` | Moves linear `b` | Effort | Notes |
 |---|---|---|---|---|
 | P0 batched sampling | **−1.0 ms** ✓ | no | landed | e22aebc |
-| P1 cache `cols` in mask | −0.2 ms est | no | S | zero-risk |
-| P2 reuse rope_offsets | −0.1 ms est | no | S | zero-risk |
-| **Compile GDR+MLP sublayers** | **−?** | **−?** | M-L | **next big lever** |
-| GDR kernel-level fusion | no | −? | L | needs profiling first |
+| P1 cache `cols` in mask | 0 for uniform-length | no | S | `needs_mask` already short-circuits when all `left_padding == 0`; only bites mixed-length traffic. Skip until mixed-length bench exists. |
+| P2 reuse rope_offsets | ~0 | no | S | 32 bytes + `from_slice_i32` is already sub-µs. Replacing with a kernel-dispatched `add` would likely regress. Skip. |
+| Compile full forward | 0 | 0 | — | **already happening**: `fast::rms_norm`, `silu`, `swiglu`, `mlp` are `mlx::core::compile(shapeless)` compiled (see `mlx_qwen35_model.cpp:254-333`). Outer layer loop is pure graph construction that MLX lazy-evaluates. |
+| GDR kernel-level fusion | no | −? | L | **needs Metal GPU capture data first** — without `ncu`-equivalent numbers we can't tell if kernel is compute/memory/launch bound. |
 | Algorithmic GDR change | — | — | XL | out of scope |
 
 ## What Worked
