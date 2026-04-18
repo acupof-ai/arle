@@ -63,14 +63,8 @@ fn main() -> Result<(), CliError> {
     validate_args(&args)?;
 
     let mut config = TinyLMConfig {
-        vocab_size: 256,
-        d_model: 64,
-        n_layers: 2,
-        n_heads: 2,
-        d_head: 32,
-        d_ff: 128,
         max_seq_len: args.seq,
-        lora: None,
+        ..TinyLMConfig::default()
     };
     if args.lora_rank > 0 {
         let alpha = if args.lora_alpha > 0.0 {
@@ -147,6 +141,7 @@ fn main() -> Result<(), CliError> {
     };
     let mut reward_trajectory = Vec::with_capacity(args.grpo_iters);
     let mut last_kl = 0.0_f32;
+    let mut best_mean_reward = baseline_reward;
 
     for iter in 0..args.grpo_iters {
         let prompts = build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut prompt_rng);
@@ -194,8 +189,9 @@ fn main() -> Result<(), CliError> {
         store.retain_ids(&keep);
 
         reward_trajectory.push(mean_reward);
+        best_mean_reward = best_mean_reward.max(mean_reward);
         println!(
-            "grpo iter {iter}: loss {loss_value:.4} mean_reward {mean_reward:.4} mean_kl {last_kl:.4}"
+            "grpo iter {iter}: loss {loss_value:.4} mean_reward {mean_reward:.4} best_mean_reward {best_mean_reward:.4} mean_kl {last_kl:.4}"
         );
     }
 
