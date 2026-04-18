@@ -50,6 +50,16 @@ works with any backend. Load before editing any scheduler internals.
    slot can reuse a radix block's contiguous state. Cross-slot page aliasing
    is intentionally unsupported — M2b closed that door deliberately
    (`docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md`).
+9. **Eviction never touches pages backing an active slot.** Radix eviction
+   only frees pages whose `block_owner_slots` entry is either missing (the
+   slot has already been freed) or points at a slot currently in `Idle`
+   state. The eviction path confirms this before calling
+   `release_pages`. Mid-request eviction would corrupt a running decode
+   — if you add a new eviction trigger (e.g. tier-demotion under pool
+   pressure), preserve this gate. Verified statically at the
+   paged-prefill lifecycle audit (2026-04-18); no property test locks
+   it in yet (backlog item §4 in
+   `docs/plans/paged-prefill-followups-2026-04-18.md`).
 
 ## Common mistakes
 

@@ -208,6 +208,11 @@ against a future change making it untrue.
 **Next action:** low priority. Note the invariant in
 `infer/src/scheduler/cuda/AGENTS.md` and leave tests as backlog.
 
+**Landed 2026-04-19 (partial):** invariant recorded as
+`infer/src/scheduler/AGENTS.md` item 9 (paths live at `scheduler/` not
+`scheduler/cuda/` — updated to the actual location). Property test
+still a backlog item.
+
 ## Ordering
 
 1 blocks any end-to-end throughput claim. 2 is likely a nop/log-
