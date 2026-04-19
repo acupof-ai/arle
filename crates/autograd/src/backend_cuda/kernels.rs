@@ -16,6 +16,8 @@ const RMS_NORM_CU: &str = include_str!("kernels/rms_norm.cu");
 const EMBEDDING_CU: &str = include_str!("kernels/embedding.cu");
 #[cfg(not(feature = "no-cuda"))]
 const REDUCE_CU: &str = include_str!("kernels/reduce.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ROPE_CU: &str = include_str!("kernels/rope.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -32,6 +34,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "embedding_f32",
     "sum_last_axis_f32",
     "mean_last_axis_f32",
+    "rope_f32",
 ];
 
 #[derive(Debug)]
@@ -174,6 +177,7 @@ fn concat_sources() -> String {
         RMS_NORM_CU,
         EMBEDDING_CU,
         REDUCE_CU,
+        ROPE_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

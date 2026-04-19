@@ -9,7 +9,8 @@ use autograd::{
         Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gelu_forward,
         cpu_log_softmax_forward_last_axis, cpu_matmul_forward, cpu_mean_last_axis_forward,
         cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward, cpu_rms_norm_forward,
-        cpu_silu_forward, cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
+        cpu_rope_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
+        cpu_sum_last_axis_forward,
     },
 };
 
@@ -29,6 +30,7 @@ fn _touch_refs() {
     let _ = cpu_embedding_forward;
     let _ = cpu_sum_last_axis_forward;
     let _ = cpu_mean_last_axis_forward;
+    let _ = cpu_rope_forward;
 }
 
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
@@ -395,6 +397,43 @@ fn cpu_sum_and_mean_last_axis() {
     assert_eq!(mean, vec![3.0, 30.0]);
 }
 
+#[test]
+fn cpu_rope_matches_ops() {
+    // Cross-check the Backend trait default (`cpu_rope_forward`) against the
+    // original `ops::rope::rope` implementation on a small Qwen3-shaped input.
+    use autograd::Tape;
+    use autograd::TensorStore;
+    use autograd::ops;
+    use autograd::tensor::Tensor;
+    let batch = 2_usize;
+    let heads = 3_usize;
+    let seq = 4_usize;
+    let head_dim = 8_usize;
+    let half_dim = head_dim / 2;
+    let shape = &[batch, heads, seq, head_dim];
+    let x = make_rows(shape, 91);
+    let mut cos = Vec::with_capacity(seq * half_dim);
+    let mut sin = Vec::with_capacity(seq * half_dim);
+    for t in 0..seq {
+        for i in 0..half_dim {
+            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+    }
+    let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
+
+    // Route through ops::rope::rope so we catch any drift between the two.
+    let mut store = TensorStore::default();
+    let x_id = store.alloc(Tensor::new(x.clone(), shape.to_vec(), false).unwrap());
+    let cos_id = store.alloc(Tensor::new(cos.clone(), vec![seq, half_dim], false).unwrap());
+    let sin_id = store.alloc(Tensor::new(sin.clone(), vec![seq, half_dim], false).unwrap());
+    let mut tape = Tape::default();
+    let out_id = ops::rope::rope(x_id, cos_id, sin_id, &mut store, &mut tape).unwrap();
+    let ops_out = store.get(out_id).unwrap().data.clone();
+    assert_close(&want, &ops_out, 1e-6, "cpu_rope vs ops::rope");
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // CUDA parity tests — PENDING REMOTE CUDA VERIFICATION. Compile on Mac
 // under `--features cuda,no-cuda`; run on a real GPU box with
@@ -535,4 +574,33 @@ fn cuda_backend_mean_last_axis_matches_cpu() {
         .expect("cuda mean");
     let want = cpu_mean_last_axis_forward(&x, shape).unwrap();
     assert_close(&got, &want, 1e-5, "cuda mean");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_rope_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let batch = 2_usize;
+    let heads = 4_usize;
+    let seq = 16_usize;
+    let head_dim = 64_usize;
+    let half_dim = head_dim / 2;
+    let shape = &[batch, heads, seq, head_dim];
+    let x = make_rows(shape, 55);
+    let mut cos = Vec::with_capacity(seq * half_dim);
+    let mut sin = Vec::with_capacity(seq * half_dim);
+    for t in 0..seq {
+        for i in 0..half_dim {
+            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+    }
+    let got = backend
+        .rope_forward(&x, shape, &cos, &sin)
+        .expect("cuda rope");
+    let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda rope");
 }

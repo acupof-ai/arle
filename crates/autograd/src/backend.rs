@@ -237,6 +237,19 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     fn mean_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         cpu_mean_last_axis_forward(x, shape)
     }
+
+    /// Rotary position embedding (NeoX / `rotate_half` layout, matches Qwen3).
+    /// `x` is `[batch, heads, seq, head_dim]`; `cos`/`sin` are `[seq, head_dim/2]`.
+    /// Returns the rotated tensor with the same shape as `x`.
+    fn rope_forward(
+        &self,
+        x: &[f32],
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<Vec<f32>> {
+        cpu_rope_forward(x, x_shape, cos, sin)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -615,6 +628,67 @@ pub fn cpu_mean_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>
     let inv = 1.0_f32 / last_dim as f32;
     for v in out.iter_mut() {
         *v *= inv;
+    }
+    Ok(out)
+}
+
+/// CPU reference for NeoX RoPE (matches `ops::rope::rope` — element `i` pairs
+/// with `i + half_dim`). `x_shape = [batch, heads, seq, head_dim]`; `cos`/`sin`
+/// are `[seq, half_dim]` row-major.
+pub fn cpu_rope_forward(
+    x: &[f32],
+    x_shape: &[usize],
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<Vec<f32>> {
+    use crate::AutogradError;
+    if x_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: x_shape.len(),
+        });
+    }
+    let batch = x_shape[0];
+    let heads = x_shape[1];
+    let seq = x_shape[2];
+    let head_dim = x_shape[3];
+    if !head_dim.is_multiple_of(2) {
+        return Err(AutogradError::InvalidRank {
+            expected: "even head dim",
+            got: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    let expected_x = batch * heads * seq * head_dim;
+    if x.len() != expected_x {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_x],
+            got: vec![x.len()],
+        });
+    }
+    let expected_cache = seq * half_dim;
+    if cos.len() != expected_cache || sin.len() != expected_cache {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_cache],
+            got: vec![cos.len().min(sin.len())],
+        });
+    }
+    let mut out = vec![0.0_f32; expected_x];
+    for b in 0..batch {
+        for h in 0..heads {
+            for t in 0..seq {
+                let rope_base = t * half_dim;
+                let base = (((b * heads) + h) * seq + t) * head_dim;
+                for i in 0..half_dim {
+                    let x0 = x[base + i];
+                    let x1 = x[base + i + half_dim];
+                    let c = cos[rope_base + i];
+                    let s = sin[rope_base + i];
+                    out[base + i] = (x0 * c) - (x1 * s);
+                    out[base + i + half_dim] = (x1 * c) + (x0 * s);
+                }
+            }
+        }
     }
     Ok(out)
 }
