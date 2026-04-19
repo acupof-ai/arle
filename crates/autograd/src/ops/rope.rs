@@ -30,13 +30,16 @@ pub fn rope(
             for token_idx in 0..seq_len {
                 let rope_base = token_idx * half_dim;
                 let x_base = (((batch_idx * heads + head_idx) * seq_len) + token_idx) * head_dim;
+                // NeoX / `rotate_half` layout: pair element `i` with element
+                // `i + half_dim`. This matches Qwen3 HF weights + the infer-side
+                // `precompute_rope` (infer/src/weight_loader.rs:450).
                 for pair_idx in 0..half_dim {
-                    let x0 = x_tensor.data[x_base + (2 * pair_idx)];
-                    let x1 = x_tensor.data[x_base + (2 * pair_idx) + 1];
+                    let x0 = x_tensor.data[x_base + pair_idx];
+                    let x1 = x_tensor.data[x_base + pair_idx + half_dim];
                     let cos_value = cos_tensor.data[rope_base + pair_idx];
                     let sin_value = sin_tensor.data[rope_base + pair_idx];
-                    output[x_base + (2 * pair_idx)] = (x0 * cos_value) - (x1 * sin_value);
-                    output[x_base + (2 * pair_idx) + 1] = (x1 * cos_value) + (x0 * sin_value);
+                    output[x_base + pair_idx] = (x0 * cos_value) - (x1 * sin_value);
+                    output[x_base + pair_idx + half_dim] = (x1 * cos_value) + (x0 * sin_value);
                 }
             }
         }
@@ -104,12 +107,12 @@ pub(crate) fn rope_backward(
                 let rope_base = token_idx * half_dim;
                 let grad_base = (((batch_idx * heads + head_idx) * seq_len) + token_idx) * head_dim;
                 for pair_idx in 0..half_dim {
-                    let grad0 = upstream.data[grad_base + (2 * pair_idx)];
-                    let grad1 = upstream.data[grad_base + (2 * pair_idx) + 1];
+                    let grad0 = upstream.data[grad_base + pair_idx];
+                    let grad1 = upstream.data[grad_base + pair_idx + half_dim];
                     let cos_value = cos_tensor.data[rope_base + pair_idx];
                     let sin_value = sin_tensor.data[rope_base + pair_idx];
-                    grad_x[grad_base + (2 * pair_idx)] = (grad0 * cos_value) + (grad1 * sin_value);
-                    grad_x[grad_base + (2 * pair_idx) + 1] =
+                    grad_x[grad_base + pair_idx] = (grad0 * cos_value) + (grad1 * sin_value);
+                    grad_x[grad_base + pair_idx + half_dim] =
                         (grad1 * cos_value) - (grad0 * sin_value);
                 }
             }
