@@ -8,22 +8,10 @@ use crate::{
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
-    let last_dim = last_dim(&input.shape)?;
-    let rows = input.size / last_dim;
-    let mut output = vec![0.0; input.size];
-
-    for row in 0..rows {
-        let base = row * last_dim;
-        let slice = &input.data[base..base + last_dim];
-        let max_value = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let denom = slice
-            .iter()
-            .map(|value| (*value - max_value).exp())
-            .sum::<f32>();
-        for col in 0..last_dim {
-            output[base + col] = (slice[col] - max_value).exp() / denom;
-        }
-    }
+    let _ = last_dim(&input.shape)?;
+    let output = store
+        .backend()
+        .softmax_forward_last_axis(&input.data, &input.shape)?;
 
     let output_id = store.alloc(Tensor::new(
         output,
@@ -44,23 +32,10 @@ pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<
 
 pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
-    let last_dim = last_dim(&input.shape)?;
-    let rows = input.size / last_dim;
-    let mut output = vec![0.0; input.size];
-
-    for row in 0..rows {
-        let base = row * last_dim;
-        let slice = &input.data[base..base + last_dim];
-        let max_value = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let denom = slice
-            .iter()
-            .map(|value| (*value - max_value).exp())
-            .sum::<f32>();
-        let log_denom = denom.ln();
-        for col in 0..last_dim {
-            output[base + col] = (slice[col] - max_value) - log_denom;
-        }
-    }
+    let _ = last_dim(&input.shape)?;
+    let output = store
+        .backend()
+        .log_softmax_forward_last_axis(&input.data, &input.shape)?;
 
     let output_id = store.alloc(Tensor::new(
         output,
