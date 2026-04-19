@@ -229,21 +229,28 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 330 filtered out; fi
   updates from batched decode into each request's per-row KV state —
   bypassing it (as an earlier attempted fix did) leaves the singleton
   survivor decoding on stale caches. The original unconditional invalidate
-  is correct; no fix needed. The [P2] finding below is still open and
-  deferred to bench-enablement (#13). It only triggers when
-  `metal_dflash_concurrency_off=false`; default-`true` production paths
-  are unaffected.
+  is correct; no fix needed. The [P2] finding below was only reachable
+  when `metal_dflash_concurrency_off=false`; default-`true` production
+  paths were unaffected.
   1. [P2] **All-or-nothing DFlash demotion on buffered-speculative
-     rows** (`request_state.rs:1704-1713`). The eligibility gate returns
-     `Ok(None)` as soon as any row has `!dflash.token_buffer.is_empty()`
-     or missing `target_hidden`, which demotes the whole bucket to
+     rows** (`request_state.rs:1704-1713`). The eligibility gate returned
+     `Ok(None)` as soon as any row had `!dflash.token_buffer.is_empty()`
+     or missing `target_hidden`, which demoted the whole bucket to
      scalar `execute_decode_single`. After a successful speculative
-     block (`accepted_inputs > 1` with tail kept), that row carries a
+     block (`accepted_inputs > 1` with tail kept), that row carried a
      non-empty buffer on the next tick, so in practice any mixed-
-     acceptance pattern collapses the bucket. **Fix:** per-row filter
-     that carves the ready subset (empty buffer + captured
-     target_hidden) and dispatches only that subset to the batched
-     path, sending the stale rows through `execute_decode_single`.
+     acceptance pattern collapsed the bucket. **Fixed in follow-up
+     commit FIXME-commit-sha**: the function now partitions rows into a
+     ready subset (empty buffer + captured `target_hidden` + cross-row
+     shape/handle agreement with the first ready row) and a stale
+     subset; the batched kernel runs on the ready subset iff `len >= 2`,
+     and the caller in
+     `runtime.rs::execute_qwen35_dflash_packed_batch` routes stale rows
+     through `execute_decode_single`. The new return type is
+     `Option<DflashBatchOutcome { ready_indices, tokens }>`; see
+     `request_state.rs` for the helper predicates
+     `row_passes_dflash_batch_per_row_predicates` and
+     `rows_agree_on_dflash_batch_cross_row_predicates`.
 - **Single-row DFlash still serializes.** The dispatcher requires
   `dflash_rows.len() >= 2` to batch; one DFlash row falls through to
   `execute_decode_single` (per-row). The batched-stack overhead isn't

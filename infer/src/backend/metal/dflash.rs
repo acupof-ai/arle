@@ -3243,15 +3243,21 @@ mod tests {
         eprintln!("qwen35_dflash_packed_batch_b2_matches_scalar_runs batched_prefill_done");
 
         let mut states: Vec<&mut MetalRequestState<'static>> = vec![&mut state_a, &mut state_b];
-        let sampled = MetalRequestState::try_decode_qwen35_dflash_speculative_batch(&mut states)?
+        let outcome = MetalRequestState::try_decode_qwen35_dflash_speculative_batch(&mut states)?
             .context(
             "wrapper returned Ok(None) despite satisfying eligibility preconditions",
         )?;
         ensure!(
-            sampled.len() == 2,
+            outcome.tokens.len() == 2,
             "wrapper returned {} first tokens, expected 2",
-            sampled.len()
+            outcome.tokens.len()
         );
+        ensure!(
+            outcome.ready_indices == vec![0, 1],
+            "wrapper routed rows {:?}, expected [0, 1]",
+            outcome.ready_indices
+        );
+        let sampled = outcome.tokens;
         eprintln!(
             "qwen35_dflash_packed_batch_b2_matches_scalar_runs batched_first_tokens=[{}, {}]",
             sampled[0], sampled[1]
