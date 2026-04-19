@@ -329,6 +329,7 @@ impl Qwen3Model {
 
     /// Attach a loaded `Qwen3LoRA` bundle to this model. Returns `self`
     /// with the adapter set; previous adapter (if any) is dropped.
+    #[must_use]
     pub fn with_lora(mut self, lora: super::lora::Qwen3LoRA) -> Self {
         self.lora = Some(lora);
         self
@@ -368,7 +369,7 @@ impl Qwen3Model {
     }
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
-        common::output_projection(&self.lm_head, &self.embed_tokens)
+        common::output_projection(self.lm_head.as_ref(), &self.embed_tokens)
     }
 
     /// Load from a GGUF file — dequantizes all tensors to BF16 at load time.

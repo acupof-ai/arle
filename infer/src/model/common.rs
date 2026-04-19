@@ -180,10 +180,10 @@ pub(crate) fn compute_logits_batch(
 /// Return the output projection matrix: separate LM head if present, otherwise
 /// tied embeddings.
 pub(crate) fn output_projection<'a>(
-    lm_head: &'a Option<DeviceMatrix>,
+    lm_head: Option<&'a DeviceMatrix>,
     embed_tokens: &'a DeviceMatrix,
 ) -> &'a DeviceMatrix {
-    lm_head.as_ref().unwrap_or(embed_tokens)
+    lm_head.unwrap_or(embed_tokens)
 }
 
 // ─── Weight loading ──────────────────────────────────────────────────────────
