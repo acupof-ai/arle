@@ -307,6 +307,19 @@ unsafe extern "C" {
         out_hidden: *mut *mut mlx_array,
         out_kv_caches: *mut *mut mlx_array,
     ) -> i32;
+    pub fn dflash_draft_forward_batched(
+        model: *mut std::ffi::c_void,
+        noise_embedding: *mut mlx_array,
+        target_hidden: *mut mlx_array,
+        batch_size: i32,
+        q_offsets: *mut mlx_array,
+        k_offsets: *mut mlx_array,
+        kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        attn_mask: *mut mlx_array,
+        out_hidden: *mut *mut mlx_array,
+        out_kv_caches: *mut *mut mlx_array,
+    ) -> i32;
 
     // === Compiled Qwen3.5 model ===
 

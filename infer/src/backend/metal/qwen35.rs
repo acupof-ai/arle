@@ -700,6 +700,89 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// Batched DFlash verify: run `block_size` draft tokens for `batch_size`
+    /// rows in a single forward. Mirrors `verify_block` but feeds the packed
+    /// KV/GDR states and per-row `cache_pos_arr` / `rope_offsets` that
+    /// `step_batch_packed` already uses for plain-decode.
+    ///
+    /// Shapes:
+    /// - `tokens`: int32 `[B, block_size]`.
+    /// - `cache_pos_arr`: int32 `[B]` — per-row physical KV write start.
+    /// - `rope_offsets`: int32 `[B]` — per-row RoPE base offset (typically
+    ///   equal to `cache_pos_arr[b]` when left-padding is not used).
+    /// - `attn_mask`: optional additive `[B, 1, block_size, key_len]`. Pass
+    ///   `None` when every row's left-pad is zero (e.g. fresh DFlash slot
+    ///   with equal cache lengths).
+    /// - `packed_kv_caches`: slice of layer tensors `[B, n_kv_heads, kv_cap,
+    ///   head_dim]` — updated in place.
+    /// - `packed_gdr_states`: `[state_0, conv_0, state_1, conv_1, …]` with
+    ///   `[B, Hv, Dv, Dk]` state and `[B, conv_kernel-1, …]` conv slabs —
+    ///   updated in place.
+    ///
+    /// Returns logits `[B, block_size, vocab]`. Tape and hidden-state
+    /// capture settings on the underlying C++ model are respected; each
+    /// tape entry becomes `[B, block_size, …]`.
+    pub(super) fn verify_block_batched(
+        &self,
+        tokens: &MlxArray,
+        batch_size: i32,
+        block_size: i32,
+        cache_pos_arr: &MlxArray,
+        packed_kv_caches: &mut [MlxArray],
+        packed_gdr_states: &mut [MlxArray],
+        attn_mask: Option<&MlxArray>,
+        rope_offsets: &MlxArray,
+    ) -> Result<MlxArray> {
+        let n_kv = packed_kv_caches.len() as i32;
+        let n_gdr = packed_gdr_states.len() as i32;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_batched(
+                self.0,
+                tokens.as_raw(),
+                batch_size,
+                block_size,
+                cache_pos_arr.as_raw(),
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
+                rope_offsets.as_raw(),
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old =
+                std::mem::replace(&mut packed_kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut packed_gdr_states[i], unsafe {
+                MlxArray::from_raw(ptr)
+            });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
     #[allow(clippy::items_after_statements)]
     pub(crate) fn generate(
@@ -1678,63 +1761,6 @@ mod tests {
     };
     use crate::test_support::metal_test_guard;
 
-    fn verify_block_batched_b1(
-        cpp_model: &CppQwen35Model,
-        tokens: &MlxArray,
-        batch_size: i32,
-        block_size: i32,
-        cache_pos_arr: &MlxArray,
-        kv_caches: &mut [MlxArray],
-        gdr_states: &mut [MlxArray],
-        rope_offsets: &MlxArray,
-    ) -> Result<MlxArray> {
-        let n_kv = kv_caches.len() as i32;
-        let n_gdr = gdr_states.len() as i32;
-
-        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            kv_caches.iter().map(MlxArray::as_raw).collect();
-        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            gdr_states.iter().map(MlxArray::as_raw).collect();
-
-        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
-        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
-
-        let rc = unsafe {
-            mlx_sys::qwen35_compiled_verify_block_batched(
-                cpp_model.as_raw(),
-                tokens.as_raw(),
-                batch_size,
-                block_size,
-                cache_pos_arr.as_raw(),
-                kv_ptrs.as_mut_ptr(),
-                n_kv,
-                gdr_ptrs.as_mut_ptr(),
-                n_gdr,
-                std::ptr::null_mut(),
-                rope_offsets.as_raw(),
-                &raw mut out_logits,
-                out_kv.as_mut_ptr(),
-                out_gdr.as_mut_ptr(),
-            )
-        };
-
-        if rc != 0 {
-            return Err(super::super::mlx::check_mlx_error().unwrap_err());
-        }
-
-        for (i, ptr) in out_kv.into_iter().enumerate() {
-            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
-            drop(old);
-        }
-        for (i, ptr) in out_gdr.into_iter().enumerate() {
-            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
-            drop(old);
-        }
-
-        Ok(unsafe { MlxArray::from_raw(out_logits) })
-    }
-
     fn slice_row_for_sampling(array: &MlxArray, row: i32) -> MlxArray {
         let mut start = vec![0; array.shape().len()];
         let mut end = array.shape().to_vec();
@@ -1820,14 +1846,14 @@ mod tests {
         let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
         let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
-        let batched_logits = verify_block_batched_b1(
-            cpp_model,
+        let batched_logits = cpp_model.verify_block_batched(
             &batched_tokens,
             1,
             block_size,
             &cache_pos_arr,
             &mut batched_kv,
             &mut batched_gdr,
+            None,
             &rope_offsets,
         )?;
 
@@ -1846,6 +1872,191 @@ mod tests {
                 (lhs - rhs).abs() < 1e-3,
                 "logit[{idx}] mismatch: {lhs} vs {rhs}"
             );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_block_batched_matches_independent_verify_block_for_b2() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!(
+                "QWEN35_MODEL_PATH unset; skipping verify_block_batched B=2 equivalence test"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 compiled C++ model unavailable")?;
+
+        // Two independent rows with DIFFERENT prompts but the SAME prompt
+        // length (so both sit at `cache_pos = prompt_len` after prefill and
+        // no left-padding / attention-mask plumbing is exercised at this
+        // layer — that's the 2c.4 scheduler's job). Different tokens ensure
+        // the per-row GDR state actually diverges, catching any accidental
+        // cross-row leak in the batched verify.
+        let row_prompts: [[i32; 4]; 2] = [[1, 2, 3, 4], [5, 6, 7, 8]];
+        let row_blocks: [[i32; 2]; 2] = [[11, 12], [13, 14]];
+        let prompt_len = row_prompts[0].len() as i32;
+        let block_size = row_blocks[0].len() as i32;
+        let kv_capacity = prompt_len + block_size + 4;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let mut per_row_kv_after_verify: Vec<Vec<MlxArray>> = Vec::with_capacity(2);
+        let mut per_row_gdr_after_verify: Vec<Vec<MlxArray>> = Vec::with_capacity(2);
+        let mut per_row_verify_logits: Vec<MlxArray> = Vec::with_capacity(2);
+
+        // Also capture the post-prefill (pre-verify) state per row — we'll
+        // stack these as the starting point for the batched verify call.
+        let mut per_row_kv_pre_verify: Vec<Vec<MlxArray>> = Vec::with_capacity(2);
+        let mut per_row_gdr_pre_verify: Vec<Vec<MlxArray>> = Vec::with_capacity(2);
+
+        for (prompt_tokens, block_tokens) in row_prompts.iter().zip(row_blocks.iter()) {
+            let mut kv_flat: Vec<MlxArray> = (0..num_full_layers)
+                .flat_map(|_| {
+                    [
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                    ]
+                })
+                .collect();
+            let recurrent =
+                MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+            let mut gdr_flat: Vec<MlxArray> = recurrent
+                .states
+                .iter()
+                .zip(recurrent.conv_states.iter())
+                .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+                .collect();
+
+            let prompt_arr = MlxArray::from_slice_i32(prompt_tokens, &[prompt_len]);
+            let prompt_logits =
+                cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+            let mut prompt_refs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            prompt_refs.push(&prompt_logits);
+            prompt_refs.extend(kv_flat.iter());
+            prompt_refs.extend(gdr_flat.iter());
+            eval(&prompt_refs);
+
+            per_row_kv_pre_verify.push(kv_flat.clone());
+            per_row_gdr_pre_verify.push(gdr_flat.clone());
+
+            let verify_tokens = MlxArray::from_slice_i32(block_tokens, &[block_size]);
+            let mut verify_kv = kv_flat;
+            let mut verify_gdr = gdr_flat;
+            let verify_logits = cpp_model.verify_block(
+                &verify_tokens,
+                block_size,
+                prompt_len,
+                &mut verify_kv,
+                &mut verify_gdr,
+            )?;
+            let mut verify_refs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + verify_kv.len() + verify_gdr.len());
+            verify_refs.push(&verify_logits);
+            verify_refs.extend(verify_kv.iter());
+            verify_refs.extend(verify_gdr.iter());
+            eval(&verify_refs);
+
+            per_row_verify_logits.push(verify_logits);
+            per_row_kv_after_verify.push(verify_kv);
+            per_row_gdr_after_verify.push(verify_gdr);
+        }
+
+        // Stack the pre-verify per-row states along batch axis for the
+        // batched verify call.
+        let n_kv = per_row_kv_pre_verify[0].len();
+        let n_gdr = per_row_gdr_pre_verify[0].len();
+        let mut packed_kv: Vec<MlxArray> = Vec::with_capacity(n_kv);
+        for kv_idx in 0..n_kv {
+            let stacked: Vec<MlxArray> = per_row_kv_pre_verify
+                .iter()
+                .map(|row_kv| row_kv[kv_idx].clone())
+                .collect();
+            packed_kv.push(concatenate_axis(&stacked, 0));
+        }
+        let mut packed_gdr: Vec<MlxArray> = Vec::with_capacity(n_gdr);
+        for gdr_idx in 0..n_gdr {
+            let stacked: Vec<MlxArray> = per_row_gdr_pre_verify
+                .iter()
+                .map(|row_gdr| row_gdr[gdr_idx].clone())
+                .collect();
+            packed_gdr.push(concatenate_axis(&stacked, 0));
+        }
+
+        let batched_block_tokens: Vec<i32> = row_blocks.iter().flatten().copied().collect();
+        let batched_tokens = MlxArray::from_slice_i32(&batched_block_tokens, &[2, block_size]);
+        let cache_pos_arr = MlxArray::from_slice_i32(&[prompt_len, prompt_len], &[2]);
+        let rope_offsets = MlxArray::from_slice_i32(&[prompt_len, prompt_len], &[2]);
+
+        let batched_logits = cpp_model.verify_block_batched(
+            &batched_tokens,
+            2,
+            block_size,
+            &cache_pos_arr,
+            &mut packed_kv,
+            &mut packed_gdr,
+            None,
+            &rope_offsets,
+        )?;
+
+        let batched_logits_f32 = as_dtype(&batched_logits, Dtype::Float32);
+        let mut eval_refs: Vec<&MlxArray> =
+            Vec::with_capacity(1 + packed_kv.len() + packed_gdr.len());
+        eval_refs.push(&batched_logits_f32);
+        eval_refs.extend(packed_kv.iter());
+        eval_refs.extend(packed_gdr.iter());
+        eval(&eval_refs);
+
+        assert_eq!(
+            batched_logits_f32.shape(),
+            &[2, block_size, config.vocab_size as i32]
+        );
+
+        let vocab = config.vocab_size;
+        let batched_slice = batched_logits_f32.as_slice_f32();
+        assert_eq!(
+            batched_slice.len(),
+            2 * (block_size as usize) * vocab,
+            "batched logits elem count mismatch"
+        );
+
+        for (row_idx, scalar_logits) in per_row_verify_logits.iter().enumerate() {
+            let scalar_f32 = as_dtype(scalar_logits, Dtype::Float32);
+            eval(&[&scalar_f32]);
+            let scalar_slice = scalar_f32.as_slice_f32();
+            let expected_len = (block_size as usize) * vocab;
+            assert_eq!(
+                scalar_slice.len(),
+                expected_len,
+                "scalar row {row_idx} logits len mismatch"
+            );
+            let offset = row_idx * expected_len;
+            for (pos, (lhs, rhs)) in scalar_slice
+                .iter()
+                .zip(batched_slice[offset..offset + expected_len].iter())
+                .enumerate()
+            {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "row {row_idx} logit[{pos}] mismatch: scalar={lhs} batched={rhs}"
+                );
+            }
         }
 
         Ok(())

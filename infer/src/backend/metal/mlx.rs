@@ -551,6 +551,72 @@ pub fn build_varlen_decode_mask(left_padding: &[i32], batch_cache_len: i32) -> M
     eval(&[&mask]);
     mask
 }
+
+/// Build the additive `[B, 1, block_size, key_len]` SDPA mask for a packed
+/// DFlash verify forward where each row may have a different left-pad and the
+/// `block_size` verify positions extend the packed cache.
+///
+/// `key_len = batch_cache_len + block_size`. Cell `[b, 0, q, k]` = `-inf` iff
+///   - `k < left_padding[b]` (left-pad column), OR
+///   - `(k - batch_cache_len) > q` (causal mask within the verify block —
+///     position `q` may attend to verify-cols `0..=q` but not `q+1..`).
+///
+/// The two conditions compose via additive sum: `-inf + 0 = -inf`,
+/// `-inf + -inf = -inf`, `0 + 0 = 0`. Cast to bf16 to match Q/K/V dtype
+/// (mirrors `build_varlen_decode_mask`).
+pub fn build_varlen_verify_mask(
+    left_padding: &[i32],
+    block_size: i32,
+    batch_cache_len: i32,
+) -> MlxArray {
+    debug_assert!(!left_padding.is_empty());
+    debug_assert!(block_size > 0);
+    debug_assert!(batch_cache_len >= 0);
+    debug_assert!(i32::try_from(left_padding.len()).is_ok());
+    debug_assert!(
+        left_padding
+            .iter()
+            .all(|&padding| (0..=batch_cache_len).contains(&padding))
+    );
+
+    let batch = left_padding.len() as i32;
+    let key_len = batch_cache_len + block_size;
+
+    // Broadcasted key-column index `[B, 1, block_size, key_len]`.
+    let cols_data: Vec<f32> = (0..key_len).map(|col| col as f32).collect();
+    let cols = MlxArray::from_slice_f32(&cols_data, &[1, 1, 1, key_len]);
+    let cols_b = broadcast_to(&cols, &[batch, 1, block_size, key_len]);
+
+    // Per-row left-pad threshold `[B, 1, block_size, key_len]`.
+    let pad_data: Vec<f32> = left_padding.iter().map(|&padding| padding as f32).collect();
+    let pad = MlxArray::from_slice_f32(&pad_data, &[batch, 1, 1, 1]);
+    let pad_b = broadcast_to(&pad, &[batch, 1, block_size, key_len]);
+    let cond_pad = greater(&pad_b, &cols_b);
+
+    // `delta = cols - batch_cache_len`; causal cond is `delta > q_idx`.
+    // For `cols < batch_cache_len`, `delta < 0` while `q_idx >= 0`, so the
+    // condition is automatically false — we don't need a separate
+    // `cols >= batch_cache_len` clause.
+    let bcl = MlxArray::from_slice_f32(&[batch_cache_len as f32], &[1, 1, 1, 1]);
+    let bcl_b = broadcast_to(&bcl, &[batch, 1, block_size, key_len]);
+    let delta = subtract(&cols_b, &bcl_b);
+
+    let q_data: Vec<f32> = (0..block_size).map(|q| q as f32).collect();
+    let q_idx = MlxArray::from_slice_f32(&q_data, &[1, 1, block_size, 1]);
+    let q_idx_b = broadcast_to(&q_idx, &[batch, 1, block_size, key_len]);
+    let cond_causal = greater(&delta, &q_idx_b);
+
+    // Additive composition: `-inf + 0 = -inf`, `-inf + -inf = -inf`, `0 = 0`.
+    let neg_inf = MlxArray::scalar_f32(f32::NEG_INFINITY);
+    let neg_inf_b = broadcast_to(&neg_inf, &[batch, 1, block_size, key_len]);
+    let zero_b = zeros(&[batch, 1, block_size, key_len], Dtype::Float32);
+    let pad_term = where_(&cond_pad, &neg_inf_b, &zero_b);
+    let causal_term = where_(&cond_causal, &neg_inf_b, &zero_b);
+    let mask = add(&pad_term, &causal_term);
+    let mask = as_dtype(&mask, Dtype::Bfloat16);
+    eval(&[&mask]);
+    mask
+}
 pub fn scaled_dot_product_attention(
     q: &MlxArray,
     k: &MlxArray,
@@ -794,6 +860,64 @@ mod tests {
         assert!(values[1].is_infinite() && values[1].is_sign_negative());
         assert_eq!(values[2], 0.0);
         assert_eq!(values[4], 0.0);
+    }
+
+    #[test]
+    fn build_varlen_verify_mask_b2_matches_reference() {
+        let _guard = metal_test_guard();
+
+        let left_padding = [0_i32, 2];
+        let block_size = 4_i32;
+        let batch_cache_len = 5_i32;
+        let key_len = batch_cache_len + block_size; // 9
+        let batch = left_padding.len() as i32;
+
+        let mask = build_varlen_verify_mask(&left_padding, block_size, batch_cache_len);
+        assert_eq!(mask.shape(), &[batch, 1, block_size, key_len]);
+
+        let mask_f32 = as_dtype(&mask, Dtype::Float32);
+        eval(&[&mask_f32]);
+        let actual = mask_f32.as_slice_f32();
+
+        // Build expected mask in row-major layout `[B, 1, block_size, key_len]`.
+        let mut expected: Vec<f32> = Vec::with_capacity(actual.len());
+        for b in 0..batch {
+            let pad = left_padding[b as usize];
+            for q in 0..block_size {
+                for k in 0..key_len {
+                    let pad_block = k < pad;
+                    let causal_future = k >= batch_cache_len && (k - batch_cache_len) > q;
+                    let masked = pad_block || causal_future;
+                    expected.push(if masked { f32::NEG_INFINITY } else { 0.0 });
+                }
+            }
+        }
+
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "mask len mismatch: got {}, expected {}",
+            actual.len(),
+            expected.len()
+        );
+
+        let mut max_abs_delta = 0.0_f32;
+        for (idx, (lhs, rhs)) in actual.iter().zip(expected.iter()).enumerate() {
+            // Treat both being `-inf` as exact match.
+            if lhs.is_infinite()
+                && rhs.is_infinite()
+                && lhs.is_sign_negative() == rhs.is_sign_negative()
+            {
+                continue;
+            }
+            let delta = (lhs - rhs).abs();
+            assert_eq!(
+                delta, 0.0,
+                "mismatch at flat idx {idx}: got {lhs}, expected {rhs}"
+            );
+            max_abs_delta = max_abs_delta.max(delta);
+        }
+        assert_eq!(max_abs_delta, 0.0);
     }
 
     // MLX 0.31.1: `fast::rope(..., int offset)` on a `[B, H, S=1, D]` tensor
