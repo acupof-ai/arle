@@ -12,7 +12,10 @@
 //! of the output buffer matches the row-major layout we want on host.
 //! Batched (rank-3) uses `sgemm_strided_batched` with the same swap.
 
-use crate::{AutogradError, Result, backend::Backend, backend::Device};
+use crate::{
+    AutogradError, Result,
+    backend::{Backend, Device, DeviceHandle},
+};
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{CudaContext, CudaStream};
@@ -50,6 +53,18 @@ impl CudaBackend {
 impl Backend for CudaBackend {
     fn device(&self) -> Device {
         Device::Cuda
+    }
+
+    fn upload(&self, _host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
+        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
+    }
+
+    fn readback(&self, _handle: &DeviceHandle) -> Result<Vec<f32>> {
+        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
+    }
+
+    fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
+        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
     }
 
     fn matmul_forward(

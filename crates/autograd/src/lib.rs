@@ -17,7 +17,9 @@ pub mod tape;
 #[path = "tensor.rs"]
 pub mod tensor;
 
-pub use backend::{Backend, CpuBackend, Device};
+#[cfg(feature = "metal")]
+pub use backend::MlxHandle;
+pub use backend::{Backend, CpuBackend, Device, DeviceHandle};
 pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
 pub use tensor::{GpuTensor, TensorId, TensorStore};
 
