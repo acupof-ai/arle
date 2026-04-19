@@ -16,7 +16,7 @@
 //! | `infer_ttft_seconds` | histogram | Time-to-first-token latency |
 //! | `infer_tpot_seconds` | histogram | Time-per-output-token latency |
 //! | `infer_e2e_seconds` | histogram | End-to-end request latency |
-//! | `infer_kv_gpu_utilization` | gauge | GPU KV cache utilization [0,1] |
+//! | `infer_kv_gpu_utilization` | gauge | GPU KV cache utilization (0–1) |
 //! | `infer_kv_gpu_blocks_free` | gauge | Free GPU KV blocks |
 //! | `infer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
 //! | `infer_prefix_hits_total` | counter | Prefix-cache lookup hits |

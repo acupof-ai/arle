@@ -1,6 +1,6 @@
 //! Metal paged KV cache pool — token-level KV storage for Apple Silicon.
 //!
-//! Mirrors the design of [`TokenKVPool`](crate::backend::cuda::paged_kv::TokenKVPool) (CUDA)
+//! Mirrors the design of `TokenKVPool` (CUDA, in `infer-cuda-kernels::paged_kv`)
 //! but uses MLX `Array` tensors on Metal unified memory instead of `CudaSlice`
 //! buffers.
 //!

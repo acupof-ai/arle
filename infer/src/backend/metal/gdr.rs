@@ -6,7 +6,7 @@
 //! # GDR decode step (per layer, seq=1)
 //!
 //! 1. Project input to get q, k, v, z, beta, alpha
-//! 2. Conv1d on [q,k,v] with causal kernel (size 4), SiLU activation
+//! 2. Conv1d on `[q, k, v]` with causal kernel (size 4), SiLU activation
 //! 3. RMS-normalize q and k
 //! 4. Compute gate g = exp(-exp(A_log) * softplus(alpha + dt_bias))
 //! 5. Compute beta = sigmoid(beta_raw)
@@ -100,11 +100,11 @@ pub struct MetalLinearAttnWeights {
     pub ba_num_heads: i32,
     /// Depthwise conv1d weight: [qkv_dim, kernel_size, 1] bf16.
     pub conv1d_weight: MlxArray,
-    /// Per-head dt bias: [num_value_heads] bf16.
+    /// Per-head dt bias: `[num_value_heads]` bf16.
     pub dt_bias: MlxArray,
-    /// Per-head log-decay: [num_value_heads] f32.
+    /// Per-head log-decay: `[num_value_heads]` f32.
     pub a_log: MlxArray,
-    /// RMSNorm weight (per head_dim, broadcast across heads): [value_dim] bf16.
+    /// RMSNorm weight (per head_dim, broadcast across heads): `[value_dim]` bf16.
     pub norm_weight: MlxArray,
     /// Output projection: [hidden_size, z_dim].
     pub out_proj: WeightTensor,

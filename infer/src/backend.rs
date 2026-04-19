@@ -4,7 +4,7 @@
 //! allowing the scheduler and HTTP server to be backend-agnostic.
 //!
 //! Concrete backend implementations live under this module:
-//! - [`cpu`]   — development-only CPU backend (feature `cpu`).
+//! - `cpu`   — development-only CPU backend (feature `cpu`).
 //! - [`cuda`]  — NVIDIA/cudarc backend (feature `cuda`).
 //! - [`metal`] — Apple Silicon MLX-backed backend (feature `metal`).
 //! - [`runtime`] — cross-backend serial runtime handle used by the Metal
@@ -29,8 +29,9 @@ use crate::sampler::SamplingParams;
 /// A single-request, synchronous inference backend.
 ///
 /// Implementors load model weights once, then answer repeated `generate` calls.
-/// For multi-request batching use the [`crate::scheduler::Scheduler`] on top
-/// of the CUDA path; the Metal backend currently supports one request at a time.
+/// For multi-request batching use the CUDA-path `Scheduler` (under
+/// `crate::scheduler`) on top of the CUDA path; the Metal backend currently
+/// supports one request at a time.
 ///
 /// Backends must be movable across threads (`Send`) because runtimes may hand
 /// ownership to a dedicated worker thread. They are not required to be `Sync`:
@@ -40,7 +41,7 @@ pub trait InferenceBackend: Send {
     /// Load model weights and tokenizer from `model_path` (a local directory
     /// containing `config.json`, `tokenizer.json`, and `.safetensors` files).
     ///
-    /// Called once at startup. Must be called before [`generate`].
+    /// Called once at startup. Must be called before [`Self::generate`].
     fn load(&mut self, model_path: &Path) -> Result<()>;
 
     /// Run a single completion and return the generated text.
