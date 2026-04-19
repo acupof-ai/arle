@@ -68,41 +68,46 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 - Pre-push type check on Mac without nvcc:
   `cargo check -p infer --no-default-features --features cuda,no-cuda`.
 
-### Delegation (subagents execute, Codex reviews, parallel by default)
+### Delegation (general-purpose subagents execute, Codex reviews, parallel by default)
 
-Claude = **direction + integration**. Execution runs through **subagents**
-(Agent tool: `general-purpose`, `Explore`, `Plan`, `codex:codex-rescue`).
-Review runs through **`codex review`** at the Bash tool. Reserve direct
-hand-written diffs for edits ≤ ~3 files / trivial mechanical changes.
+Claude = **direction + integration**. Execution runs through **`general-purpose`
+subagents** (Agent tool). Research/mapping runs through **`Explore`**; large
+cross-cutting plans through **`Plan`**. Review runs through **`codex review`
+at the Bash tool** — a shell command, not a subagent.
+
+**DO NOT use `codex:codex-rescue` or `mcp__openmax__execute_with_codex` for
+execution** — both hang ("codex 会卡死", observed 2026-04-19). See
+`memory/feedback_codex_subagent_hangs.md`. The review-via-Bash path is
+unaffected.
+
+Reserve direct hand-written diffs for edits ≤ ~3 files / trivial mechanical
+changes.
 
 | Area | Owner |
 |------|-------|
 | Docs, planning, architecture, roadmaps | Claude |
-| Code execution (implement/refactor/tests) | **Subagent** (delegate via Agent tool) |
-| Code review of non-trivial diffs | **Claude runs `codex review`** |
-| Broad codebase exploration | **Explore / general-purpose subagent** |
-| Implementation planning spanning >5 files | **Plan subagent** |
-| Stuck-problem rescue (2-strike hand-off) | **`codex:codex-rescue` subagent** |
+| Code execution (implement/refactor/tests) | **`general-purpose` subagent** (delegate via Agent tool) |
+| Broad codebase exploration / scope mapping | **`Explore` subagent** |
+| Implementation planning spanning >5 files | **`Plan` subagent** |
+| Code review of non-trivial diffs | **Claude runs `codex review` at Bash** |
+| Stuck-problem rescue (2-strike hand-off) | **`general-purpose` with full context** |
 
 - **Parallelize by default.** When multiple delegated tasks are independent
   (different files, different layers, research + execution), fire them in a
   **single message with multiple Agent tool uses** so they run concurrently.
   Serial delegation is reserved for genuinely data-dependent steps.
 - **Execution bias:** when a task is "write/change code", draft a brief
-  (files, constraints, acceptance criteria) and delegate to a subagent.
-  Claude integrates and verifies — Claude does not hand-write substantial
-  diffs. Reach Codex via `subagent_type: "codex:codex-rescue"` or
-  `mcp__openmax__execute_with_codex` when the task specifically benefits
-  from Codex's strengths (complex refactors, unfamiliar codebases); use
-  `general-purpose` for routine implementation work.
-- **Code review is Claude-driven via Codex CLI:** invoke
+  (files, constraints, acceptance criteria) and delegate to a `general-purpose`
+  subagent. Claude integrates and verifies — Claude does not hand-write
+  substantial diffs.
+- **Code review is Claude-driven via Codex CLI at Bash:** invoke
   `codex review --uncommitted` (or `--commit <sha>` / `--base <branch>`)
-  directly from the Bash tool and relay the findings. Do NOT spawn a
-  `codex:codex-rescue` agent for review — review is a shell command, not
-  a delegation.
-- **2-strike rule:** two good-faith failed attempts → hand off to Codex.
-  Brief must list what was tried, what was observed, why each attempt
-  failed, so Codex picks a different angle.
+  directly from the Bash tool and relay the findings. This is a shell
+  command — unlike the Codex subagent path, it does not hang.
+- **2-strike rule:** two good-faith failed subagent attempts → either
+  hand-write the diff yourself (if small) or re-brief a fresh `general-purpose`
+  agent with explicit notes on what the prior attempts tried and why they
+  failed.
 - **Claude always owns:** planning docs, experience entries, roadmap edits,
   user-facing explanations, final integration after subagents report back,
   and the `codex review` pass before commit on non-trivial diffs.
