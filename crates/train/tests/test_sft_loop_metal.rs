@@ -72,26 +72,59 @@ fn sft_loop_metal_trains_and_bf16_roundtrips() -> TestResult {
     let path = dir.path().join("model.safetensors");
     registry.save_from_bf16(&mut store, &path)?;
 
+    // Guard against save_from_bf16 ever regressing to F32: inspect the raw
+    // dtype of every tensor on disk. `load_into` widens all float dtypes, so
+    // a dtype regression would otherwise be invisible at this layer but
+    // would break infer-cli, which casts raw bytes as &[bf16].
+    assert_on_disk_dtype_is_bf16(&path)?;
+
     let mut loaded_store = TensorStore::default();
     let loaded_model = Qwen3Model::new(&cfg, &mut loaded_store)?;
     let mut loaded_registry = build_registry(&loaded_model);
     loaded_registry.load_into(&mut loaded_store, &path)?;
 
+    // Check every parameter, not just the embedding — a freshly initialized
+    // `loaded_store` could otherwise mask a missing or corrupted tensor in
+    // build_registry/save_from_bf16.
     let source_map = model.param_name_map();
     let loaded_map = loaded_model.param_name_map();
-    let probe_key = "model.embed_tokens.weight";
-    let source = store.to_host(*source_map.get(probe_key).expect("source embed"))?;
-    let loaded = loaded_store.to_host(*loaded_map.get(probe_key).expect("loaded embed"))?;
-    assert_eq!(source.len(), loaded.len());
-    for (&left, &right) in source.iter().zip(loaded.iter()) {
-        let abs_err = (left - right).abs();
-        let rel_err = abs_err / left.abs().max(1.0e-6);
-        assert!(
-            rel_err <= 1.0e-2,
-            "bf16 roundtrip drift too large: left={left} right={right} rel={rel_err}"
-        );
+    assert_eq!(source_map.len(), loaded_map.len());
+    for (name, &source_id) in source_map.iter() {
+        let loaded_id = *loaded_map
+            .get(name)
+            .unwrap_or_else(|| panic!("loaded registry missing tensor '{name}'"));
+        let source = store.to_host(source_id)?;
+        let loaded = loaded_store.to_host(loaded_id)?;
+        assert_eq!(source.len(), loaded.len(), "len mismatch for '{name}'");
+        for (i, (&left, &right)) in source.iter().zip(loaded.iter()).enumerate() {
+            let abs_err = (left - right).abs();
+            let rel_err = abs_err / left.abs().max(1.0e-6);
+            assert!(
+                rel_err <= 1.0e-2,
+                "bf16 roundtrip drift for '{name}' index {i}: \
+                 left={left} right={right} rel={rel_err}"
+            );
+        }
     }
 
+    Ok(())
+}
+
+fn assert_on_disk_dtype_is_bf16(path: &std::path::Path) -> TestResult {
+    use safetensors::{Dtype, SafeTensors};
+    let bytes = std::fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let names = tensors.names();
+    assert!(!names.is_empty(), "saved file has no tensors");
+    for name in &names {
+        let view = tensors.tensor(name)?;
+        assert_eq!(
+            view.dtype(),
+            Dtype::BF16,
+            "tensor '{name}' on disk is {:?}, expected BF16 — save_from_bf16 may have regressed",
+            view.dtype()
+        );
+    }
     Ok(())
 }
 
