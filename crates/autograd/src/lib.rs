@@ -12,6 +12,9 @@ pub mod module;
 pub mod ops;
 #[path = "optim.rs"]
 pub mod optim;
+#[cfg(feature = "safetensors")]
+#[path = "safetensors_io.rs"]
+pub mod safetensors_io;
 #[path = "tape.rs"]
 pub mod tape;
 #[path = "tensor.rs"]
@@ -20,6 +23,8 @@ pub mod tensor;
 #[cfg(feature = "metal")]
 pub use backend::MlxHandle;
 pub use backend::{Backend, CpuBackend, Device, DeviceHandle};
+#[cfg(feature = "safetensors")]
+pub use safetensors_io::SafetensorsRegistry;
 pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
 pub use tensor::{GpuTensor, TensorId, TensorStore};
 

@@ -12,18 +12,25 @@ metal = ["dep:mlx-sys"]
 # CUDA backend via cudarc cuBLAS SGEMM. Same per-call upload/download model.
 # PENDING REMOTE CUDA VERIFICATION — user validates on GPU box.
 cuda = ["dep:cudarc"]
+safetensors = ["dep:safetensors", "dep:memmap2", "dep:half"]
 
 [dependencies]
-libm.workspace = true
-smallvec = "1"
-thiserror = "2"
-mlx-sys = { path = "../mlx-sys", optional = true }
 cudarc = { version = "0.18", features = [
     "cuda-version-from-build-system",
     "cublas",
     "cuda-12080",
     "nvrtc",
 ], optional = true }
+half = { version = "2", optional = true }
+libm.workspace = true
+memmap2 = { workspace = true, optional = true }
+mlx-sys = { path = "../mlx-sys", optional = true }
+safetensors = { workspace = true, optional = true }
+smallvec = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
