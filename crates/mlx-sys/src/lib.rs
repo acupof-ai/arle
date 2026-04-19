@@ -77,6 +77,9 @@ unsafe extern "C" {
     pub fn mlx_sqrt(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_reciprocal(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_sigmoid(a: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_tanh(a: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_erf(a: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_log(a: *mut mlx_array) -> *mut mlx_array;
 
     // === Shape ops ===
 
@@ -118,6 +121,10 @@ unsafe extern "C" {
     // === Reduction ===
 
     pub fn mlx_sum_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
+    pub fn mlx_mean_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
+    pub fn mlx_max_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
+    pub fn mlx_logsumexp_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
+    pub fn mlx_softmax_axis(a: *mut mlx_array, axis: i32, precise: bool) -> *mut mlx_array;
     pub fn mlx_argmax(a: *mut mlx_array, keepdims: bool) -> *mut mlx_array;
     pub fn mlx_argmax_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
 
