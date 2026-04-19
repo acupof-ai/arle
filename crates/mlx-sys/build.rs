@@ -79,6 +79,18 @@ fn main() {
         .flag("-Wno-sign-compare")
         .compile("mlx_ffi");
 
+    // Step 2b: Compile the Objective-C++ Metal capture hook separately as its
+    // own static lib. Keeping it out of the C++17 `mlx_ffi` build avoids
+    // forcing `-x objective-c++` onto MLX sources. This file is env-gated and
+    // costs a single relaxed atomic load on the hot path when disabled.
+    cc::Build::new()
+        .cpp(true)
+        .file("src/mlx_metal_capture.mm")
+        .flag("-fobjc-arc")
+        .flag("-std=c++17")
+        .flag("-Wno-unused-parameter")
+        .compile("mlx_metal_capture");
+
     // Step 3: Link MLX static library.
     // MLX builds as libmlx.a in the build directory.
     println!(
@@ -90,9 +102,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", mlx_build.display());
     println!("cargo:rustc-link-lib=static=mlx");
 
-    // Step 4: Link the bridge static lib.
+    // Step 4: Link the bridge static libs.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=mlx_ffi");
+    println!("cargo:rustc-link-lib=static=mlx_metal_capture");
 
     // Step 5: Link macOS frameworks.
     println!("cargo:rustc-link-lib=framework=Metal");
@@ -107,6 +120,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx_bridge.cpp");
     println!("cargo:rerun-if-changed=src/mlx_dflash_draft_model.cpp");
     println!("cargo:rerun-if-changed=src/mlx_qwen35_model.cpp");
+    println!("cargo:rerun-if-changed=src/mlx_metal_capture.mm");
     println!("cargo:rerun-if-changed=src/mlx_common.h");
     println!("cargo:rerun-if-changed=vendor");
 }
