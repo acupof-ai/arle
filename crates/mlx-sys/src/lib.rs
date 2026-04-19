@@ -118,6 +118,19 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
     pub fn mlx_where(cond: *mut mlx_array, a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
 
+    /// Scatter-add into a zero-initialized `[vocab, feature_dim]` output.
+    /// For each i in 0..prefix_rows, adds `updates_data[i*feature_dim..][..feature_dim]`
+    /// into row `indices_data[i]`. Indices must already be in-bounds (the
+    /// caller is responsible for OOB/negative filtering — the C++ helper
+    /// does NOT sanitize).
+    pub fn mlx_scatter_add_rows_f32(
+        updates_data: *const f32,
+        indices_data: *const i32,
+        prefix_rows: i32,
+        feature_dim: i32,
+        vocab: i32,
+    ) -> *mut mlx_array;
+
     // === Reduction ===
 
     pub fn mlx_sum_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;

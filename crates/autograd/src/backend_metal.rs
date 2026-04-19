@@ -7,13 +7,14 @@
 
 use crate::{
     AutogradError, Result,
-    backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape},
+    backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape, validate_broadcast},
 };
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
     mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval, mlx_exp,
     mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative,
-    mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh,
+    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract, mlx_sum_axis,
+    mlx_take_axis, mlx_tanh,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -223,6 +224,16 @@ impl Backend for MetalBackend {
         mlx_unary_flat(a, UnaryOp::MulScalar(s))
     }
 
+    fn add_broadcast_forward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+    ) -> Result<Vec<f32>> {
+        mlx_add_broadcast(a, a_shape, b, b_shape)
+    }
+
     fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         mlx_unary_flat(a, UnaryOp::Exp)
     }
@@ -284,6 +295,17 @@ impl Backend for MetalBackend {
         ids: &[i32],
     ) -> Result<Vec<f32>> {
         mlx_gather_last_dim(src, src_shape, ids)
+    }
+
+    fn scatter_add_rows_forward(
+        &self,
+        upstream: &[f32],
+        prefix_rows: usize,
+        feature_dim: usize,
+        indices: &[i32],
+        vocab: usize,
+    ) -> Result<Vec<f32>> {
+        mlx_scatter_add_rows(upstream, prefix_rows, feature_dim, indices, vocab)
     }
 }
 
@@ -602,6 +624,96 @@ fn mlx_binary_flat(a: &[f32], b: &[f32], op: BinaryOp) -> Result<Vec<f32>> {
         if host.len() != n {
             return Err(AutogradError::ShapeMismatch {
                 expected: vec![n],
+                got: vec![host.len()],
+            });
+        }
+        Ok(host)
+    }
+}
+
+// Right-aligned broadcast-add via MLX's native NumPy-style broadcasting:
+// `mlx_add(a, b)` accepts operands with different but right-broadcast-compatible
+// shapes and returns an array with the broadcast shape — which, for our
+// contract (b_shape.len() <= a_shape.len() and each b-axis is 1 or matches),
+// equals `a_shape`. No explicit reshape is required on the host side.
+fn mlx_add_broadcast(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<Vec<f32>> {
+    validate_broadcast(a_shape, b_shape)?;
+    let a_size: usize = if a_shape.is_empty() {
+        1
+    } else {
+        a_shape.iter().product()
+    };
+    let b_size: usize = if b_shape.is_empty() {
+        1
+    } else {
+        b_shape.iter().product()
+    };
+    if a.len() != a_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: a_size,
+        });
+    }
+    if b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+
+    let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+    let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: host slices `a`/`b` outlive the FFI call (MLX copies from
+    // them). Every MLX array we allocate is freed on every return path.
+    unsafe {
+        let a_arr = mlx_array_from_data(
+            a.as_ptr() as *const c_void,
+            a_shape_i32.as_ptr(),
+            a_shape_i32.len() as i32,
+            MLX_FLOAT32,
+        );
+        if a_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null",
+            ));
+        }
+        let b_arr = mlx_array_from_data(
+            b.as_ptr() as *const c_void,
+            b_shape_i32.as_ptr(),
+            b_shape_i32.len() as i32,
+            MLX_FLOAT32,
+        );
+        if b_arr.is_null() {
+            mlx_array_free(a_arr);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null",
+            ));
+        }
+        let out_arr = mlx_add(a_arr, b_arr);
+        if out_arr.is_null() {
+            mlx_array_free(a_arr);
+            mlx_array_free(b_arr);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_add returned null (broadcast)",
+            ));
+        }
+        let host = eval_and_readback(out_arr)?;
+        mlx_array_free(a_arr);
+        mlx_array_free(b_arr);
+        mlx_array_free(out_arr);
+
+        if host.len() != a_size {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![a_size],
                 got: vec![host.len()],
             });
         }
@@ -1112,6 +1224,105 @@ fn mlx_gather_last_dim(src: &[f32], src_shape: &[usize], ids: &[i32]) -> Result<
         if host.len() != prefix {
             return Err(AutogradError::ShapeMismatch {
                 expected: vec![prefix],
+                got: vec![host.len()],
+            });
+        }
+        Ok(host)
+    }
+}
+
+// Scatter-add `prefix_rows` feature vectors into a zero-initialized
+// `[vocab, feature_dim]` output buffer. Matches `cpu_scatter_add_rows_forward`
+// semantics: negative or OOB indices are silently skipped; aliased indices
+// accumulate via MLX's `scatter_add` (atomic/additive, not overwrite).
+//
+// OOB/negative filtering happens host-side here — the C++ helper assumes
+// pre-sanitized in-range indices. This mirrors `mlx_embedding`'s approach,
+// with the difference that we drop invalid rows entirely (no row_mask) since
+// scatter_add would still fault on an OOB destination.
+fn mlx_scatter_add_rows(
+    upstream: &[f32],
+    prefix_rows: usize,
+    feature_dim: usize,
+    indices: &[i32],
+    vocab: usize,
+) -> Result<Vec<f32>> {
+    let expected_upstream = prefix_rows * feature_dim;
+    if upstream.len() != expected_upstream {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_upstream],
+            got: vec![upstream.len()],
+        });
+    }
+    if indices.len() != prefix_rows {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix_rows,
+            got: indices.len(),
+        });
+    }
+    let out_len = vocab * feature_dim;
+
+    // Fast paths: empty output or empty work → return zeros without touching
+    // MLX. Vocab==0 means the caller has nothing to accumulate into.
+    if out_len == 0 {
+        return Ok(Vec::new());
+    }
+    if prefix_rows == 0 || feature_dim == 0 {
+        return Ok(vec![0.0_f32; out_len]);
+    }
+
+    // Filter OOB/negative indices host-side; collect compact (updates, indices)
+    // pairs so the FFI path sees only in-range entries.
+    let mut safe_indices: Vec<i32> = Vec::with_capacity(prefix_rows);
+    let mut safe_updates: Vec<f32> = Vec::with_capacity(expected_upstream);
+    for (row, &id) in indices.iter().enumerate() {
+        if id < 0 || (id as usize) >= vocab {
+            continue;
+        }
+        safe_indices.push(id);
+        let src_base = row * feature_dim;
+        safe_updates.extend_from_slice(&upstream[src_base..src_base + feature_dim]);
+    }
+
+    // Everything filtered → result is all zeros.
+    if safe_indices.is_empty() {
+        return Ok(vec![0.0_f32; out_len]);
+    }
+
+    let n_valid = safe_indices.len() as i32;
+    let feature_i32 = feature_dim as i32;
+    let vocab_i32 = vocab as i32;
+
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `safe_updates` and `safe_indices` outlive the FFI call (the
+    // C++ helper memcpy's into its own allocator-backed buffers). The
+    // returned array is uniquely owned here and freed on every return path.
+    unsafe {
+        let out_arr = mlx_scatter_add_rows_f32(
+            safe_updates.as_ptr(),
+            safe_indices.as_ptr(),
+            n_valid,
+            feature_i32,
+            vocab_i32,
+        );
+        if out_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_scatter_add_rows_f32 returned null",
+            ));
+        }
+        let host = match eval_and_readback(out_arr) {
+            Ok(h) => h,
+            Err(e) => {
+                mlx_array_free(out_arr);
+                return Err(e);
+            }
+        };
+        mlx_array_free(out_arr);
+
+        if host.len() != out_len {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![out_len],
                 got: vec![host.len()],
             });
         }

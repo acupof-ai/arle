@@ -14,7 +14,7 @@
 #[cfg(not(feature = "no-cuda"))]
 use crate::{
     AutogradError,
-    backend::{CudaStorage, matmul_output_shape},
+    backend::{CudaStorage, matmul_output_shape, validate_broadcast},
 };
 use crate::{
     Result,
@@ -436,6 +436,24 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_scalar_1d(self, a, s, "mul_scalar_f32")
+        }
+    }
+
+    fn add_broadcast_forward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, a_shape, b, b_shape);
+            todo!("GPU required: cuda add_broadcast is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_add_broadcast(self, a, a_shape, b, b_shape)
         }
     }
 
@@ -1145,6 +1163,101 @@ fn cuda_scatter_add_rows(
         },
     )?;
     cuda_download(backend, &d_out, out_len)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_add_broadcast(
+    backend: &CudaBackend,
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<Vec<f32>> {
+    validate_broadcast(a_shape, b_shape)?;
+    let total: usize = if a_shape.is_empty() {
+        1
+    } else {
+        a_shape.iter().product()
+    };
+    let b_size: usize = if b_shape.is_empty() {
+        1
+    } else {
+        b_shape.iter().product()
+    };
+    if a.len() != total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: total,
+        });
+    }
+    if b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+
+    // Build right-aligned b-strides of length `out_rank`: 0 on broadcast axes
+    // (axis missing from b_shape or b_shape dim == 1), contiguous otherwise.
+    let out_rank = a_shape.len();
+    let rank_offset = out_rank - b_shape.len();
+    let mut b_strides = vec![0_i32; out_rank];
+    let mut stride: i32 = 1;
+    for i in (0..b_shape.len()).rev() {
+        let dim = b_shape[i];
+        if dim == 1 {
+            b_strides[rank_offset + i] = 0;
+        } else {
+            b_strides[rank_offset + i] = stride;
+        }
+        // Advance stride regardless so the row-major layout over the b buffer
+        // is consistent — broadcast axes still occupy 1 slot in b.
+        stride = stride.saturating_mul(dim as i32);
+    }
+
+    let out_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+
+    let d_a = backend.upload_slice(a, a_shape)?;
+    let d_b = backend
+        .stream
+        .clone_htod(b)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_out_shape = backend
+        .stream
+        .clone_htod(&out_shape_i32)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_b_strides = backend
+        .stream
+        .clone_htod(&b_strides)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let out_rank_i32 = i32::try_from(out_rank)
+        .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast rank exceeds i32"))?;
+    let total_i32 = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast total exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("add_broadcast_f32")?,
+        total,
+        |builder| {
+            builder
+                .arg(&d_a)
+                .arg(&d_b)
+                .arg(&mut d_out)
+                .arg(&d_out_shape)
+                .arg(&d_b_strides)
+                .arg(&out_rank_i32)
+                .arg(&total_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, total)
 }
 
 #[cfg(not(feature = "no-cuda"))]

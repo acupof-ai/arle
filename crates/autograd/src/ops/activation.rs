@@ -12,7 +12,7 @@ const INV_SQRT_2PI: f32 = 0.398_942_3;
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
-    let output = input.data.iter().map(|&value| value.exp()).collect();
+    let output = store.backend().exp_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
@@ -105,12 +105,7 @@ pub(crate) fn exp_backward(
         });
     }
 
-    let grad = output
-        .data
-        .iter()
-        .zip(upstream.data.iter())
-        .map(|(&y, &grad_out)| grad_out * y)
-        .collect();
+    let grad = store.backend().mul_forward(&output.data, &upstream.data)?;
     let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }

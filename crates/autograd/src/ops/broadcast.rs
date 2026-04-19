@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::broadcast_offset,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -14,13 +15,13 @@ pub fn add_broadcast(
 ) -> Result<TensorId> {
     let a_tensor = store.tensor(a)?.clone();
     let b_tensor = store.tensor(b)?.clone();
-    validate_broadcast(&a_tensor.shape, &b_tensor.shape)?;
 
-    let mut output = vec![0.0; a_tensor.size];
-    for (index, slot) in output.iter_mut().enumerate() {
-        *slot = a_tensor.data[index]
-            + b_tensor.data[broadcast_offset(index, &a_tensor.shape, &b_tensor.shape)];
-    }
+    let output = store.backend().add_broadcast_forward(
+        &a_tensor.data,
+        &a_tensor.shape,
+        &b_tensor.data,
+        &b_tensor.shape,
+    )?;
 
     let requires_grad = a_tensor.requires_grad || b_tensor.requires_grad;
     let output_id = store.alloc(Tensor::new(output, a_tensor.shape.clone(), requires_grad)?);
@@ -96,74 +97,4 @@ impl OutputShapeExt for TapeEntry {
     fn output_id_shape(&self, store: &TensorStore) -> Result<Vec<usize>> {
         Ok(store.tensor(self.output_id)?.shape.clone())
     }
-}
-
-fn validate_broadcast(a_shape: &[usize], b_shape: &[usize]) -> Result<()> {
-    if b_shape.len() > a_shape.len() {
-        return Err(AutogradError::ShapeMismatch {
-            expected: a_shape.to_vec(),
-            got: b_shape.to_vec(),
-        });
-    }
-
-    let rank_offset = a_shape.len() - b_shape.len();
-    for (index, &dim) in b_shape.iter().enumerate() {
-        let target = a_shape[rank_offset + index];
-        if dim != 1 && dim != target {
-            return Err(AutogradError::ShapeMismatch {
-                expected: a_shape.to_vec(),
-                got: b_shape.to_vec(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn broadcast_offset(out_index: usize, out_shape: &[usize], b_shape: &[usize]) -> usize {
-    if b_shape.is_empty() {
-        return 0;
-    }
-
-    let coords = linear_to_coords(out_index, out_shape);
-    let rank_offset = out_shape.len() - b_shape.len();
-    let b_strides = contiguous_strides(b_shape);
-    let mut offset = 0usize;
-    for (index, stride) in b_strides.iter().enumerate() {
-        let coord = if b_shape[index] == 1 {
-            0
-        } else {
-            coords[rank_offset + index]
-        };
-        offset += coord * stride;
-    }
-    offset
-}
-
-fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-    if shape.is_empty() {
-        return Vec::new();
-    }
-
-    let mut strides = vec![0; shape.len()];
-    let mut stride = 1usize;
-    for (index, dim) in shape.iter().enumerate().rev() {
-        strides[index] = stride;
-        stride *= *dim;
-    }
-    strides
-}
-
-fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize> {
-    if shape.is_empty() {
-        return Vec::new();
-    }
-
-    let mut coords = vec![0; shape.len()];
-    for index in (0..shape.len()).rev() {
-        let dim = shape[index];
-        coords[index] = linear % dim;
-        linear /= dim;
-    }
-    coords
 }

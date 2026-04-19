@@ -22,6 +22,8 @@ const ROPE_CU: &str = include_str!("kernels/rope.cu");
 const GATHER_CU: &str = include_str!("kernels/gather.cu");
 #[cfg(not(feature = "no-cuda"))]
 const SCATTER_ADD_CU: &str = include_str!("kernels/scatter_add.cu");
+#[cfg(not(feature = "no-cuda"))]
+const ADD_BROADCAST_CU: &str = include_str!("kernels/add_broadcast.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -41,6 +43,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "rope_f32",
     "gather_last_dim_f32",
     "scatter_add_rows_f32",
+    "add_broadcast_f32",
 ];
 
 #[derive(Debug)]
@@ -186,6 +189,7 @@ fn concat_sources() -> String {
         ROPE_CU,
         GATHER_CU,
         SCATTER_ADD_CU,
+        ADD_BROADCAST_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');
