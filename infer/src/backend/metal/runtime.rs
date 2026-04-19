@@ -904,10 +904,12 @@ fn admit_request(
     }
 
     let priority = map_request_priority(incoming.priority);
-    // Only initialize DFlash when we're admitting a genuinely solo request.
-    // Any existing live session means this one would be downgraded at the
-    // first decode step anyway, so skip the DFlash-prefill cost upfront.
-    let enable_dflash = active.is_empty();
+    // Always initialize DFlash when the backend has a draft model loaded;
+    // `from_incoming` gates this on `backend.dflash_runtime_static()` so
+    // requests without a draft simply get `dflash_ref = None`. Concurrent
+    // DFlash rows are now handled via `execute_qwen35_dflash_packed_batch`
+    // (default-on, see `MetalSchedulerConfig::metal_dflash_concurrency_off`).
+    let enable_dflash = true;
     let (prompt_tokens, max_tokens, mut request) =
         match ActiveMetalRequest::from_incoming(backend, tokenizer, incoming, enable_dflash) {
             Ok(request) => request,
@@ -1075,38 +1077,28 @@ fn execute_decode_batch(
         open.push((req_id, request));
     }
 
-    // Legacy concurrency downgrade (opt-in via `metal_dflash_concurrency_off`):
-    // with ≥2 open sessions, DFlash's per-request serial verify (~230ms/block,
-    // ~28% accept on Qwen3.5 4-bit today) is dominated by a batched
-    // single-token decode (~25ms for all rows). Permanently drop DFlash on
-    // every row in the multi-session case so they all join the packed batch.
-    // One-way: `target_hidden` capture needs a fresh prefill, so we don't try
-    // to resume DFlash when concurrency drops back to 1.
-    //
-    // Opt-in (flag=false): DFlash rows batch through
+    // Default path (flag=false): DFlash rows batch through
     // `execute_qwen35_dflash_packed_batch` when ≥2 DFlash rows are open;
     // plain rows batch through `execute_qwen35_packed_decode_batch`; a lone
     // DFlash row falls through to `execute_decode_single`. The two buckets
     // run sequentially (no async fan-out) — mixed-mode parallelism is
     // deferred to Phase 2b.
     //
-    // Default is `true` because `admit_request` only enables DFlash for
-    // solo admissions (`active.is_empty()`), so the opt-in path is
-    // unreachable in production without also lifting admission.
-    // The round-3 codex findings on this partitioner have both been
-    // addressed:
+    // Legacy downgrade (flag=true): with ≥2 open sessions, permanently drop
+    // DFlash on every row so they all join the packed plain batch. One-way:
+    // `target_hidden` capture needs a fresh prefill, so we don't try to
+    // resume DFlash when concurrency drops back to 1. Kept as a kill-switch
+    // for the 2026-04-19 concurrent-DFlash flip.
+    //
+    // Round-3 codex findings on the partitioner are both closed:
     //   - [P2] "all-or-nothing DFlash demotion on buffered-speculative
-    //     rows" is fixed at
-    //     `request_state.rs::try_decode_qwen35_dflash_speculative_batch`:
-    //     the function now partitions into a ready subset (batched) and a
-    //     stale subset (scalar), so a non-empty `token_buffer` on one row
-    //     no longer demotes the whole bucket.
-    //   - [P1] "plain-decode cache rollback on singleton fallback" was
-    //     retracted by a follow-up codex review — the `invalidate_*` sync
-    //     on the `Ok(None)` arm is the ONLY path that propagates
-    //     `packed_kv_flat`/`packed_gdr_flat` updates into per-request
-    //     state; dropping it would starve the singleton fallback of
-    //     current KV.
+    //     rows" — fixed at
+    //     `request_state.rs::try_decode_qwen35_dflash_speculative_batch`
+    //     (majority-equivalence-class per-row partition).
+    //   - [P1] "plain-decode cache rollback on singleton fallback" —
+    //     retracted; the `invalidate_*` sync on the `Ok(None)` arm is the
+    //     only path that propagates `packed_kv_flat`/`packed_gdr_flat`
+    //     updates into per-request state.
     if open.len() >= 2 && dflash_concurrency_off {
         for (_, request) in open.iter_mut() {
             if request.request_state.is_dflash_enabled() {
