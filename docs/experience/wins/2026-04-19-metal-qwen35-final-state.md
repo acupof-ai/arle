@@ -1,5 +1,15 @@
 # Metal Qwen3.5-4B-4bit decode optimization — final state at /loop ceiling
 
+> **STATUS: ARCHIVED 2026-04-19.** Project shipped & closed. All five
+> options in the stale /loop prompt are fully explored. Two 2026-04-19
+> post-archival claims (`tg_y=2` at c=3, then at c=5) were both retracted
+> under matched A/B — see
+> [`docs/experience/errors/2026-04-19-tgy-valley-reproduction-failure.md`](../errors/2026-04-19-tgy-valley-reproduction-failure.md).
+> **Do not re-enter the /loop with this prompt.** Next non-trivial upside
+> requires Xcode Metal capture of the GDR kernel (out of /loop scope) or
+> the M5.3a device-resident-tensor architecture work
+> ([`docs/plans/m5.3-device-resident-tensor.md`](../../plans/m5.3-device-resident-tensor.md)).
+
 **Date**: 2026-04-19
 **Machine**: Apple M4 Max (40 GPU cores, ~400 GB/s UMA)
 **Model**: `mlx-community/Qwen3.5-4B-MLX-4bit` (24 GDR + 8 full-attn layers)
