@@ -1093,12 +1093,16 @@ fn execute_decode_batch(
     // Default is `true` because (a) `admit_request` only enables DFlash for
     // solo admissions (`active.is_empty()`), so the opt-in path is
     // unreachable in production without also lifting admission, and
-    // (b) two known issues logged at
+    // (b) a known issue logged at
     // `docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2c4-concurrent-dflash-b2-bit-ident.md`
-    // §"round-3 codex findings" must be resolved before bench-enabling:
-    // plain-cache rollback on singleton fallback (fix here) and all-or-
-    // nothing DFlash demotion on buffered-speculative rows (fix at
+    // §"round-3 codex findings" still blocks bench-enabling: all-or-nothing
+    // DFlash demotion on buffered-speculative rows (fix at
     // `request_state.rs::try_decode_qwen35_dflash_speculative_batch`).
+    // The companion "plain-decode cache rollback" finding was retracted
+    // by a follow-up codex review — the `invalidate_*` sync on the
+    // `Ok(None)` arm is the ONLY path that propagates
+    // `packed_kv_flat`/`packed_gdr_flat` updates into per-request state;
+    // dropping it would starve the singleton fallback of current KV.
     if open.len() >= 2 && dflash_concurrency_off {
         for (_, request) in open.iter_mut() {
             if request.request_state.is_dflash_enabled() {
