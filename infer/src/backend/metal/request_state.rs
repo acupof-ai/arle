@@ -927,6 +927,43 @@ impl<'a> MetalRequestState<'a> {
         sync_qwen35_packed_decode_batch(&mut qwen35_states, batch)
     }
 
+    /// Phase-2B batched DFlash speculative decode.
+    ///
+    /// Runs one `qwen35_dflash_speculative_block_batched` call across all rows
+    /// in `states`, fanning the per-row outputs (sampled tokens, cache_pos,
+    /// KV/GDR, updated `target_hidden`) back into each `MetalRequestState`.
+    /// Returns the first accepted token per row; remaining accepted tokens get
+    /// pushed into each row's `token_buffer` for subsequent scalar drain.
+    ///
+    /// Returns `Ok(None)` when the batch is not eligible — caller falls back
+    /// to per-row `execute_decode_single`. Eligibility gates:
+    ///   - All rows Qwen3.5 in Decode phase, Cpp mode, DFlash enabled.
+    ///   - All rows have a captured `target_hidden` (post-prefill).
+    ///   - All rows have an empty `token_buffer` (otherwise draining logic
+    ///     would diverge from the scalar path mid-block).
+    ///   - All rows share `cache_len` (Phase 2B = same-length-only; varlen
+    ///     via per-row `left_padding` is deferred).
+    ///   - All rows carry a committed `last_token` (post-prefill invariant).
+    pub(crate) fn try_decode_qwen35_dflash_speculative_batch(
+        states: &mut [&mut MetalRequestState<'a>],
+    ) -> Result<Option<Vec<u32>>> {
+        if states.len() < 2 {
+            return Ok(None);
+        }
+
+        let mut qwen35_states: Vec<&mut ResumableRequestState<Qwen35StepDriver<'a>>> =
+            Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let state_ref: &mut MetalRequestState<'a> = state;
+            match &mut state_ref.inner {
+                MetalRequestStateInner::Qwen35(qwen35) => qwen35_states.push(qwen35),
+                MetalRequestStateInner::Qwen3(_) => return Ok(None),
+            }
+        }
+
+        try_decode_qwen35_dflash_speculative_batch(&mut qwen35_states)
+    }
+
     pub fn cancel(&mut self) -> Result<()> {
         match &mut self.inner {
             MetalRequestStateInner::Qwen3(state) => state.cancel(),
@@ -1612,6 +1649,316 @@ fn decode_qwen35_packed_batch<'a>(
     }
 
     Ok(sampled_tokens_out)
+}
+
+/// Free-function companion for `MetalRequestState::try_decode_qwen35_dflash_speculative_batch`.
+/// See doc comment on the method for eligibility rules and contract.
+fn try_decode_qwen35_dflash_speculative_batch<'a>(
+    states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
+) -> Result<Option<Vec<u32>>> {
+    if states.len() < 2 {
+        return Ok(None);
+    }
+
+    // ── 1. Eligibility gates. Any mismatch → Ok(None) (caller falls back). ──
+    // Basic: all Qwen3.5 Decode + DFlash-enabled + Cpp mode + empty token_buffer
+    // + same cache_len + committed last_token. All buffer/target_hidden reads
+    // are &-only here so we don't commit to anything before validation.
+    //
+    // Also require row-equal `target_hidden.shape()[0]` (the ctx_len the
+    // batched block stacks over) and row-equal `draft_state.len` (so
+    // per-row `[..len]` K/V slices stack cleanly — see Finding 2). Two rows
+    // can share `cache_len` but diverge on either of these after partial
+    // accept; routing them into the batched kernel would turn a normal
+    // divergence into a scheduler cancel.
+    //
+    // Plus the draft routing gates: the batched C++ graph is only valid
+    // when the same predicates the scalar `dflash_draft_forward` checks are
+    // true (`DFLASH_DRAFT_CPP=1` AND `draft_attention_mask != "causal"`).
+    // Anything else falls back to scalar per-row decode.
+    let first_cache_len = states[0].driver.cache_len;
+    let Some(first_dflash) = states[0].driver.dflash.as_ref() else {
+        return Ok(None);
+    };
+    let Some(first_target_hidden) = first_dflash.target_hidden.as_ref() else {
+        return Ok(None);
+    };
+    let Some(&first_target_hidden_len) = first_target_hidden.shape().first() else {
+        return Ok(None);
+    };
+    let first_draft_len = first_dflash.draft_state.active_len();
+    for state in states.iter() {
+        if state.phase != MetalRequestPhase::Decode {
+            return Ok(None);
+        }
+        let driver = &state.driver;
+        if driver.cache_len != first_cache_len {
+            return Ok(None);
+        }
+        let Qwen35StepMode::Cpp(_) = driver.mode else {
+            return Ok(None);
+        };
+        let Some(dflash) = driver.dflash.as_ref() else {
+            return Ok(None);
+        };
+        if !dflash.token_buffer.is_empty() {
+            // Round-3 codex finding [P2]: this demotes the whole bucket
+            // whenever any row is still draining speculative tail tokens
+            // from a prior successful block (common: accept>1 leaves
+            // `token_buffer` non-empty). Fix planned with bench-enable
+            // (#13): per-row filter that carves the ready subset instead
+            // of returning Ok(None) for the whole bucket. Documented at
+            // `docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2c4-concurrent-dflash-b2-bit-ident.md`.
+            return Ok(None);
+        }
+        let Some(target_hidden) = dflash.target_hidden.as_ref() else {
+            return Ok(None);
+        };
+        // target_hidden is rank-2 `[ctx_len, hidden]`; axis-0 must match across
+        // rows to stack. Partial-accept divergence rebuilds this per-row from
+        // `accepted_inputs`, so equal `cache_len` does NOT imply equal
+        // `target_hidden.shape()[0]`.
+        match target_hidden.shape().first().copied() {
+            Some(ctx) if ctx == first_target_hidden_len => {}
+            _ => return Ok(None),
+        }
+        // All rows must share `draft_state.len` — Finding 2's per-row
+        // `[..len]` slice stacks cleanly iff this holds.
+        if dflash.draft_state.active_len() != first_draft_len {
+            return Ok(None);
+        }
+        if state.last_token.is_none() {
+            return Ok(None);
+        }
+        // Runtime routing gates (Finding 3): match the scalar path's C++/mask
+        // predicates. `runtime` ptr-equality is enforced below, so checking
+        // on the first-row's runtime is fine, but check per-row here for
+        // defensive clarity before we cross the ptr-equality check.
+        if !dflash.runtime.batched_draft_path_eligible() {
+            return Ok(None);
+        }
+    }
+
+    // Shared model handles; all rows must point to the same runtime/weights.
+    let first = &states[0].driver;
+    let weights = first.weights;
+    let config = first.config;
+    let arch = first.arch;
+    let runtime: &MetalDflashRuntime = first
+        .dflash
+        .as_ref()
+        .expect("dflash presence validated above")
+        .runtime;
+    let target_config: &MetalModelConfig = first
+        .dflash
+        .as_ref()
+        .expect("dflash presence validated above")
+        .config;
+    for state in states.iter() {
+        let d = state.driver.dflash.as_ref().expect("validated above");
+        if !std::ptr::eq(state.driver.weights, weights)
+            || !std::ptr::eq(state.driver.config, config)
+            || !std::ptr::eq(state.driver.arch, arch)
+            || !std::ptr::eq(d.runtime, runtime)
+            || !std::ptr::eq(d.config, target_config)
+        {
+            return Ok(None);
+        }
+    }
+
+    let cpp_model: &CppQwen35Model = weights
+        .cpp_model
+        .as_ref()
+        .context("DFlash batched decode requires the compiled Qwen3.5 path")?;
+
+    let block_size = runtime.block_size();
+    let block_size_i32 =
+        i32::try_from(block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
+
+    // ── 2. Ensure per-row target KV capacity for batch_cache_len + block_size. ──
+    // Mirrors the scalar scheduler path at request_state.rs:2922–2928. We also
+    // drain any live cpp session so `cpp_state.kv_flat/gdr_flat` are materialized
+    // before we stack them.
+    let needed_cap = first_cache_len + block_size_i32;
+    for state in states.iter_mut() {
+        if needed_cap > state.driver.kv_capacity {
+            state.driver.ensure_capacity(needed_cap)?;
+        } else {
+            state.driver.ensure_cpp_session_drained()?;
+        }
+    }
+
+    // ── 3. Collect per-row inputs (read-only slices of mutable state). ──
+    let batch_i32 = i32::try_from(states.len())
+        .context("try_decode_qwen35_dflash_speculative_batch batch size overflow")?;
+
+    let current_tokens: Vec<u32> = states
+        .iter()
+        .map(|state| state.last_token.expect("validated above"))
+        .collect();
+    let params_per_row: Vec<SamplingParams> = states
+        .iter()
+        .map(|state| state.driver.params.clone())
+        .collect();
+    let target_hidden_per_row: Vec<MlxArray> = states
+        .iter()
+        .map(|state| {
+            state
+                .driver
+                .dflash
+                .as_ref()
+                .expect("validated above")
+                .target_hidden
+                .as_ref()
+                .expect("validated above")
+                .clone()
+        })
+        .collect();
+
+    // Stack target KV per-layer across rows. Each row's kv_flat[l] has shape
+    // [1, n_kv, kv_capacity, head_dim]; axis-0 concatenate yields
+    // [B, n_kv, kv_capacity, head_dim]. Phase 2B = same-length only, so no
+    // left-padding (left_padding = [0; B], batch_cache_len = first_cache_len).
+    let n_kv_per_request = {
+        let Qwen35StepMode::Cpp(cpp) = &states[0].driver.mode else {
+            unreachable!("validated above")
+        };
+        cpp.kv_flat.len()
+    };
+    let n_gdr_per_request = {
+        let Qwen35StepMode::Cpp(cpp) = &states[0].driver.mode else {
+            unreachable!("validated above")
+        };
+        cpp.gdr_flat.len()
+    };
+
+    let mut packed_target_kv_flat: Vec<MlxArray> = Vec::with_capacity(n_kv_per_request);
+    for l in 0..n_kv_per_request {
+        let per_row: Vec<MlxArray> = states
+            .iter()
+            .map(|state| match &state.driver.mode {
+                Qwen35StepMode::Cpp(cpp) => cpp.kv_flat[l].clone(),
+                Qwen35StepMode::Rust(_) => unreachable!("validated above"),
+            })
+            .collect();
+        packed_target_kv_flat.push(concatenate_axis(&per_row, 0));
+    }
+    let mut packed_target_gdr_flat: Vec<MlxArray> = Vec::with_capacity(n_gdr_per_request);
+    for g in 0..n_gdr_per_request {
+        let per_row: Vec<MlxArray> = states
+            .iter()
+            .map(|state| match &state.driver.mode {
+                Qwen35StepMode::Cpp(cpp) => cpp.gdr_flat[g].clone(),
+                Qwen35StepMode::Rust(_) => unreachable!("validated above"),
+            })
+            .collect();
+        packed_target_gdr_flat.push(concatenate_axis(&per_row, 0));
+    }
+
+    let mut target_cache_lens: Vec<i32> = vec![first_cache_len; states.len()];
+    let left_padding: Vec<i32> = vec![0; states.len()];
+    let batch_cache_len = first_cache_len;
+
+    // Detach per-row draft states so we can pass `&mut [ContiguousKvState]` to
+    // the batched kernel without holding a simultaneous mutable borrow of the
+    // caller's state tree. The kernel mutates in place; we reinstall on exit.
+    let mut draft_states: Vec<dflash::ContiguousKvState> = states
+        .iter_mut()
+        .map(|state| {
+            let dflash_state = state.driver.dflash.as_mut().expect("validated above");
+            std::mem::replace(
+                &mut dflash_state.draft_state,
+                dflash::ContiguousKvState::new(1, 1, 1, 1),
+            )
+        })
+        .collect();
+
+    // ── 4. Invoke the batched kernel. ──
+    let kernel_result = dflash::qwen35_dflash_speculative_block_batched(
+        runtime,
+        &weights.embed_tokens,
+        &weights.lm_head,
+        target_config,
+        cpp_model,
+        &params_per_row,
+        &current_tokens,
+        &target_hidden_per_row,
+        &mut packed_target_kv_flat,
+        &mut packed_target_gdr_flat,
+        &mut target_cache_lens,
+        &left_padding,
+        batch_cache_len,
+        &mut draft_states,
+    );
+
+    // ── 5. Reinstall draft states before bailing on error (even on failure
+    //      the kernel mutates them in place and the caller's State should
+    //      reflect whatever the kernel left behind). ──
+    for (state, draft) in states.iter_mut().zip(draft_states.into_iter()) {
+        let dflash_state = state.driver.dflash.as_mut().expect("validated above");
+        dflash_state.draft_state = draft;
+    }
+
+    let block_results = kernel_result?;
+    ensure!(
+        block_results.len() == states.len(),
+        "try_decode_qwen35_dflash_speculative_batch: kernel returned {} rows, expected {}",
+        block_results.len(),
+        states.len()
+    );
+
+    // ── 6. Unstack packed KV/GDR back into each row's cpp_state. ──
+    for (row_idx, state) in states.iter_mut().enumerate() {
+        let row = i32::try_from(row_idx)
+            .context("try_decode_qwen35_dflash_speculative_batch row overflow")?;
+        let Qwen35StepMode::Cpp(cpp) = &mut state.driver.mode else {
+            unreachable!("validated above")
+        };
+        for (slot, packed) in cpp.kv_flat.iter_mut().zip(packed_target_kv_flat.iter()) {
+            let new_slot = slice_row(packed, row);
+            let old = std::mem::replace(slot, new_slot);
+            drop(old);
+        }
+        for (slot, packed) in cpp.gdr_flat.iter_mut().zip(packed_target_gdr_flat.iter()) {
+            let new_slot = slice_row(packed, row);
+            let old = std::mem::replace(slot, new_slot);
+            drop(old);
+        }
+    }
+    let _ = batch_i32; // silence unused warning on path where overflow guard moved
+
+    // ── 7. Per-row scheduler state: cache_len advance + token_buffer fan-out +
+    //      updated_target_hidden + acceptance metrics + record first token. ──
+    let mut sampled_first_tokens: Vec<u32> = Vec::with_capacity(states.len());
+    for (row_idx, (state, block)) in states.iter_mut().zip(block_results.into_iter()).enumerate() {
+        ensure!(
+            !block.accepted_tokens.is_empty(),
+            "DFlash batched block row {row_idx} produced zero accepted tokens"
+        );
+
+        // Mirror the scalar path at request_state.rs:2964–2973: advance cache
+        // to the kernel-reported value, publish updated target_hidden, push
+        // accepted tokens into the buffer, then pop the first for this tick.
+        state.driver.cache_len = target_cache_lens[row_idx];
+        let dflash_state = state.driver.dflash.as_mut().expect("validated above");
+        dflash_state.acceptance_lengths.push(block.accepted_inputs);
+        dflash_state.target_hidden = Some(block.updated_target_hidden);
+        for t in block.accepted_tokens {
+            dflash_state.token_buffer.push_back(t);
+        }
+        let first_token = dflash_state
+            .token_buffer
+            .pop_front()
+            .context("DFlash batched block produced empty token buffer after push")?;
+
+        // Propagate through ResumableRequestState just like scalar decode_step:
+        // record_sampled_token updates last_token + generated_tokens and may
+        // transition to Finished.
+        state.record_sampled_token(first_token)?;
+        sampled_first_tokens.push(first_token);
+    }
+
+    Ok(Some(sampled_first_tokens))
 }
 
 fn decode_qwen35_batch(

@@ -38,6 +38,21 @@ pub struct MetalSchedulerConfig {
     pub decode_active_prefill_cap: usize,
     /// Maximum requests waiting in the queue.
     pub max_waiting_requests: usize,
+    /// When true (default), disable DFlash whenever >1 slot is open (legacy
+    /// behavior). When false, concurrent DFlash-enabled rows are batched
+    /// through `execute_qwen35_dflash_packed_batch`; rows that must plain-
+    /// decode this tick still serialize via `execute_decode_single`.
+    ///
+    /// Default is `true` because today's admission path at
+    /// `runtime::admit_request` only enables DFlash for solo requests
+    /// (`active.is_empty()`), so the new concurrent-DFlash fast path is
+    /// currently unreachable in production without also flipping admission.
+    /// Until we bench-prove concurrent DFlash beats concurrent plain-decode
+    /// and lift the admission gate, flag-default stays on the legacy
+    /// downgrade to avoid regressing the A+B case (a lone DFlash row
+    /// serializing via `execute_decode_single` instead of joining the
+    /// packed plain batch via the downgrade).
+    pub metal_dflash_concurrency_off: bool,
 }
 
 impl Default for MetalSchedulerConfig {
@@ -47,6 +62,7 @@ impl Default for MetalSchedulerConfig {
             prefill_chunk_size: 512,
             decode_active_prefill_cap: 128,
             max_waiting_requests: 256,
+            metal_dflash_concurrency_off: true,
         }
     }
 }
@@ -646,6 +662,7 @@ mod tests {
             prefill_chunk_size: chunk,
             decode_active_prefill_cap: decode_cap,
             max_waiting_requests: 16,
+            metal_dflash_concurrency_off: false,
         })
         .expect("config should be valid")
     }
@@ -662,6 +679,7 @@ mod tests {
                 prefill_chunk_size: chunk,
                 decode_active_prefill_cap: decode_cap,
                 max_waiting_requests: 16,
+                metal_dflash_concurrency_off: false,
             },
             event_sink,
         )

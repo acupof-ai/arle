@@ -83,7 +83,20 @@ struct DFlashDraftModel {
     float rms_eps = 1e-6f;
 
     std::function<std::vector<array>(const std::vector<array>&)> compiled_forward;
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_forward_batched;
+    // Separate compile slot for the mixed-length batched path: the mask is
+    // threaded as the LAST input so the compiled graph never captures it by
+    // reference across compile boundaries (mirrors the verify_block_batched
+    // pattern in mlx_qwen35_model.cpp, but adapted because draft IS compiled
+    // while verify is not).
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_forward_batched_masked;
     bool is_compiled = false;
+
+    // Set by the FFI entrypoint when the caller passes a non-null attn_mask.
+    // Read inside forward_batched() to pick which compiled slot to dispatch.
+    // The actual mask array is appended to the inputs vector — never captured
+    // via this member by the compiled lambda.
+    bool current_has_attn_mask = false;
 
     // Keep inputs/outputs alive across the C boundary so MLX can safely retain
     // graph references until Rust forces materialization downstream.
@@ -198,6 +211,122 @@ struct DFlashDraftModel {
         return outputs;
     }
 
+    std::vector<array> forward_batched_impl(
+        const std::vector<array>& inputs,
+        bool with_mask
+    ) const {
+        const size_t expected_inputs = 4 + layers.size() * 2 + (with_mask ? 1 : 0);
+        if (inputs.size() != expected_inputs) {
+            throw std::runtime_error("DFlash draft batched forward input count mismatch");
+        }
+
+        auto hidden_states = inputs[0];
+        auto target_hidden = inputs[1];
+        auto q_offsets = inputs[2];
+        auto k_offsets = inputs[3];
+        // Mask, if present, lives at the very end of `inputs` (after all KV
+        // caches) so the input layout for the unmasked path stays unchanged.
+        const array* attn_mask_ptr = with_mask ? &inputs.back() : nullptr;
+
+        if (hidden_states.ndim() != 3 || target_hidden.ndim() != 3) {
+            throw std::runtime_error(
+                "DFlash draft batched forward expects rank-3 noise/target inputs");
+        }
+        if (q_offsets.ndim() != 1 || k_offsets.ndim() != 1) {
+            throw std::runtime_error(
+                "DFlash draft batched forward expects rank-1 q/k offset arrays");
+        }
+
+        const int B = hidden_states.shape(0);
+        const int seq_len = hidden_states.shape(1);
+        const int context_len = target_hidden.shape(1);
+        if (target_hidden.shape(0) != B) {
+            throw std::runtime_error("DFlash draft batched forward batch size mismatch");
+        }
+        if (q_offsets.shape(0) != B || k_offsets.shape(0) != B) {
+            throw std::runtime_error("DFlash draft batched forward offset length mismatch");
+        }
+
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        auto target_hidden_proj = fc.apply(target_hidden);
+        target_hidden_proj = fast::rms_norm(target_hidden_proj, hidden_norm, rms_eps);
+
+        std::vector<array> new_caches;
+        new_caches.reserve(layers.size() * 2);
+        size_t input_idx = 4;
+
+        for (const auto& layer : layers) {
+            auto residual = hidden_states;
+            auto normed_hidden = fast::rms_norm(hidden_states, layer.input_layernorm, rms_eps);
+
+            auto q_raw = layer.q_proj.apply(normed_hidden);
+            auto kv_states = concatenate({target_hidden_proj, normed_hidden}, 1);
+            auto k_raw = layer.k_proj.apply(kv_states);
+            auto v_raw = layer.v_proj.apply(kv_states);
+
+            auto q = reshape(q_raw, {B, seq_len, num_heads, head_dim});
+            q = fast::rms_norm(q, layer.q_norm, rms_eps);
+            q = transpose(q, {0, 2, 1, 3});
+            q = fast::rope(q, head_dim, false, rope_theta, 1.0f, q_offsets);
+
+            const int total_len = context_len + seq_len;
+            auto k = reshape(k_raw, {B, total_len, num_kv_heads, head_dim});
+            k = fast::rms_norm(k, layer.k_norm, rms_eps);
+            k = transpose(k, {0, 2, 1, 3});
+            k = fast::rope(k, head_dim, false, rope_theta, 1.0f, k_offsets);
+
+            auto v = reshape(v_raw, {B, total_len, num_kv_heads, head_dim});
+            v = transpose(v, {0, 2, 1, 3});
+
+            auto new_k_cache = concatenate({inputs[input_idx++], k}, 2);
+            auto new_v_cache = concatenate({inputs[input_idx++], v}, 2);
+
+            array attn(0);
+            if (attn_mask_ptr != nullptr) {
+                // Mixed-length packed batch: caller supplies an additive mask
+                // that zeroes out left-padded KV columns per row. Causal-only
+                // would attend to those padded slots and corrupt logits.
+                attn = fast::scaled_dot_product_attention(
+                    q,
+                    new_k_cache,
+                    new_v_cache,
+                    attn_scale,
+                    "",
+                    *attn_mask_ptr);
+            } else {
+                attn = fast::scaled_dot_product_attention(
+                    q,
+                    new_k_cache,
+                    new_v_cache,
+                    attn_scale,
+                    "");
+            }
+            attn = transpose(attn, {0, 2, 1, 3});
+            attn = reshape(attn, {B, seq_len, num_heads * head_dim});
+            attn = layer.o_proj.apply(attn);
+            hidden_states = residual + attn;
+
+            auto residual2 = hidden_states;
+            auto post_norm = fast::rms_norm(hidden_states, layer.post_attention_layernorm, rms_eps);
+            auto gate = layer.gate_proj.apply(post_norm);
+            auto up = layer.up_proj.apply(post_norm);
+            auto mlp = layer.down_proj.apply(compiled_swiglu()({gate, up})[0]);
+            hidden_states = residual2 + mlp;
+
+            new_caches.push_back(std::move(new_k_cache));
+            new_caches.push_back(std::move(new_v_cache));
+        }
+
+        std::vector<array> outputs;
+        outputs.reserve(1 + new_caches.size());
+        outputs.push_back(fast::rms_norm(hidden_states, norm, rms_eps));
+        for (auto& cache : new_caches) {
+            outputs.push_back(std::move(cache));
+        }
+        return outputs;
+    }
+
     void finalize() {
         if (static_cast<int>(layers.size()) != num_layers) {
             throw std::runtime_error("DFlash draft layer count mismatch at finalize");
@@ -214,6 +343,35 @@ struct DFlashDraftModel {
             prev_outputs = compiled_forward(prev_inputs);
         } else {
             prev_outputs = forward_impl(prev_inputs);
+        }
+        return prev_outputs;
+    }
+
+    std::vector<array> forward_batched(const std::vector<array>& inputs) {
+        prev_inputs = inputs;
+        const bool with_mask = current_has_attn_mask;
+        if (is_compiled) {
+            if (with_mask) {
+                if (!compiled_forward_batched_masked) {
+                    compiled_forward_batched_masked = mlx::core::compile(
+                        [this](const std::vector<array>& call_inputs) {
+                            return this->forward_batched_impl(call_inputs, true);
+                        },
+                        true /* shapeless */);
+                }
+                prev_outputs = compiled_forward_batched_masked(prev_inputs);
+            } else {
+                if (!compiled_forward_batched) {
+                    compiled_forward_batched = mlx::core::compile(
+                        [this](const std::vector<array>& call_inputs) {
+                            return this->forward_batched_impl(call_inputs, false);
+                        },
+                        true /* shapeless */);
+                }
+                prev_outputs = compiled_forward_batched(prev_inputs);
+            }
+        } else {
+            prev_outputs = forward_batched_impl(prev_inputs, with_mask);
         }
         return prev_outputs;
     }
@@ -358,6 +516,86 @@ int32_t dflash_draft_forward(
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
+        return -1;
+    }
+}
+
+int32_t dflash_draft_forward_batched(
+    void* model,
+    mlx_array* noise_embedding,
+    mlx_array* target_hidden,
+    int32_t batch_size,
+    mlx_array* q_offsets,
+    mlx_array* k_offsets,
+    mlx_array** kv_caches,
+    int32_t n_kv,
+    mlx_array* attn_mask,           // additive [B, 1, seq, key_len], nullable
+    mlx_array** out_hidden,
+    mlx_array** out_kv_caches
+) {
+    auto* m = static_cast<DFlashDraftModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error("DFlash draft batched forward requires batch_size > 0");
+        }
+        if (noise_embedding == nullptr || target_hidden == nullptr) {
+            throw std::runtime_error("DFlash draft batched forward inputs must not be null");
+        }
+        if (q_offsets == nullptr || k_offsets == nullptr) {
+            throw std::runtime_error("DFlash draft batched forward offsets must not be null");
+        }
+        if (n_kv != static_cast<int32_t>(m->layers.size() * 2)) {
+            throw std::runtime_error("DFlash draft batched forward cache count mismatch");
+        }
+
+        const auto* noise_arr = to_arr(noise_embedding);
+        const auto* target_arr = to_arr(target_hidden);
+        const auto* q_offsets_arr = to_arr(q_offsets);
+        const auto* k_offsets_arr = to_arr(k_offsets);
+        if (noise_arr->ndim() != 3 || target_arr->ndim() != 3) {
+            throw std::runtime_error(
+                "DFlash draft batched forward expects rank-3 noise/target inputs");
+        }
+        if (noise_arr->shape(0) != batch_size || target_arr->shape(0) != batch_size) {
+            throw std::runtime_error("DFlash draft batched forward batch size mismatch");
+        }
+        if (q_offsets_arr->ndim() != 1 || k_offsets_arr->ndim() != 1 ||
+            q_offsets_arr->shape(0) != batch_size || k_offsets_arr->shape(0) != batch_size) {
+            throw std::runtime_error("DFlash draft batched forward offset shape mismatch");
+        }
+
+        // Mirror qwen35_compiled_verify_block_batched: stash the has-mask flag
+        // on the model struct so forward_batched() can pick the right compiled
+        // slot. The mask array itself is appended to `inputs` (NOT captured by
+        // the compiled lambda) to avoid stale references across compile cache
+        // hits.
+        m->current_has_attn_mask = attn_mask != nullptr;
+
+        std::vector<array> inputs;
+        inputs.reserve(4 + static_cast<size_t>(n_kv) + (attn_mask != nullptr ? 1 : 0));
+        inputs.push_back(*noise_arr);
+        inputs.push_back(*target_arr);
+        inputs.push_back(*q_offsets_arr);
+        inputs.push_back(*k_offsets_arr);
+        for (int32_t idx = 0; idx < n_kv; ++idx) {
+            inputs.push_back(*to_arr(kv_caches[idx]));
+        }
+        if (attn_mask != nullptr) {
+            inputs.push_back(*to_arr(attn_mask));
+        }
+
+        auto outputs = m->forward_batched(inputs);
+        *out_hidden = from_arr(std::move(outputs[0]));
+        for (int32_t idx = 0; idx < n_kv; ++idx) {
+            out_kv_caches[idx] = from_arr(std::move(outputs[1 + idx]));
+        }
+        m->current_has_attn_mask = false;
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_has_attn_mask = false;
         return -1;
     }
 }
