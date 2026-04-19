@@ -9,7 +9,7 @@
 //! fallbacks so a backend does not need to implement every op day one.
 
 use crate::Result;
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +77,29 @@ unsafe impl Send for MlxHandle {}
 unsafe impl Sync for MlxHandle {}
 
 #[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy)]
-pub struct CudaHandlePlaceholder;
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub struct CudaStorage {
+    inner: Arc<cudarc::driver::CudaSlice<f32>>,
+}
+
+#[cfg(feature = "cuda")]
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+impl CudaStorage {
+    pub(crate) fn new(inner: cudarc::driver::CudaSlice<f32>) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub(crate) fn slice(&self) -> &cudarc::driver::CudaSlice<f32> {
+        self.inner.as_ref()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum DeviceHandle {
@@ -86,7 +107,7 @@ pub enum DeviceHandle {
     #[cfg(feature = "metal")]
     Metal(MlxHandle),
     #[cfg(feature = "cuda")]
-    Cuda(CudaHandlePlaceholder),
+    Cuda(CudaStorage),
 }
 
 pub trait Backend: std::fmt::Debug + Send + Sync {

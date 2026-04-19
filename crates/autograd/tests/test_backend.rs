@@ -171,6 +171,21 @@ fn cuda_backend_matches_cpu_small_2d() {
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 #[test]
+fn cuda_backend_matmul_matches_cpu_small_2d() {
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[8, 16], 77);
+    let b = make_rows(&[16, 32], 88);
+    let (got, got_shape) =
+        run_lazy_matmul(&backend, &a, &[8, 16], &b, &[16, 32]).expect("cuda lazy matmul");
+    let (want, _) = cpu_matmul_forward(&a, &[8, 16], &b, &[16, 32]).expect("ref");
+    assert_eq!(got_shape, vec![8, 32]);
+    assert_close(&got, &want, 1e-3, "cuda lazy matmul 2d");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
 fn cuda_backend_matches_cpu_batched_3d() {
     use autograd::backend_cuda::CudaBackend;
 
@@ -183,4 +198,16 @@ fn cuda_backend_matches_cpu_batched_3d() {
     let (want, _) = cpu_matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32]).expect("ref");
     assert_eq!(got_shape, vec![3, 8, 32]);
     assert_close(&got, &want, 1e-3, "cuda 3d batched");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_add_matches_cpu_2d() {
+    use autograd::backend_cuda::CudaBackend;
+
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let a = make_rows(&[8, 32], 505);
+    let b = make_rows(&[8, 32], 606);
+    let got = run_lazy_add(&backend, &a, &b, &[8, 32]).expect("cuda add");
+    assert_close(&got, &reference_add(&a, &b), 1e-3, "cuda add 2d");
 }

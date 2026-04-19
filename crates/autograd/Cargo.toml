@@ -22,6 +22,7 @@ cudarc = { version = "0.18", features = [
     "cuda-version-from-build-system",
     "cublas",
     "cuda-12080",
+    "nvrtc",
 ], optional = true }
 
 [lints]

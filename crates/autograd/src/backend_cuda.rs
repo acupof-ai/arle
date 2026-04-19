@@ -1,5 +1,4 @@
-//! CUDA backend via `cudarc::cublas` SGEMM. Host `Vec<f32>` stays
-//! authoritative: upload per call, SGEMM on device, download back.
+//! CUDA backend via cuBLAS SGEMM plus NVRTC-compiled point kernels.
 //!
 //! PENDING REMOTE CUDA VERIFICATION — user validates on GPU box.
 //! Type-checks on Mac under `--no-default-features --features cuda,no-cuda`;
@@ -12,103 +11,143 @@
 //! of the output buffer matches the row-major layout we want on host.
 //! Batched (rank-3) uses `sgemm_strided_batched` with the same swap.
 
+#[cfg(not(feature = "no-cuda"))]
 use crate::{
-    AutogradError, Result,
+    AutogradError,
+    backend::{CudaStorage, matmul_output_shape},
+};
+use crate::{
+    Result,
     backend::{Backend, Device, DeviceHandle},
 };
+#[cfg(not(feature = "no-cuda"))]
+#[path = "backend_cuda/kernels.rs"]
+mod kernels;
+
+#[cfg(not(feature = "no-cuda"))]
+use self::kernels::{KernelCache, launch_1d};
+#[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+#[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::driver::{CudaContext, CudaStream};
+#[cfg(not(feature = "no-cuda"))]
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+#[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
-/// cuBLAS-backed matmul. Holds an `Arc<CudaStream>` + `CudaBlas` handle so the
-/// context lives as long as the backend; safe to share across threads.
+/// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
+/// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
+/// safe to share across threads.
 #[derive(Debug)]
 pub struct CudaBackend {
+    #[cfg(not(feature = "no-cuda"))]
     stream: Arc<CudaStream>,
+    #[cfg(not(feature = "no-cuda"))]
     blas: Arc<CudaBlas>,
+    #[cfg(not(feature = "no-cuda"))]
+    kernels: KernelCache,
 }
 
 impl CudaBackend {
     /// Create a backend bound to the CUDA device at `ordinal`.
     ///
     /// # Errors
-    /// Returns an error if the device cannot be opened or cuBLAS cannot be
-    /// initialised. On non-CUDA targets this code path is unreachable — the
-    /// Mac build uses the `no-cuda` feature and surfaces a `todo!()` if run.
+    /// Returns an error if the device cannot be opened, cuBLAS cannot be
+    /// initialised, or the autograd CUDA kernels fail NVRTC compilation.
     pub fn new(ordinal: usize) -> Result<Self> {
-        let ctx = CudaContext::new(ordinal).map_err(|_| {
-            AutogradError::TapeInvariant("CudaContext::new failed (is a GPU present?)")
-        })?;
-        let stream = ctx.default_stream();
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|_| AutogradError::TapeInvariant("CudaBlas::new failed"))?;
-        Ok(Self {
-            stream,
-            blas: Arc::new(blas),
-        })
-    }
-}
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = ordinal;
+            todo!("GPU required: CudaBackend::new is unavailable under feature no-cuda")
+        }
 
-impl Backend for CudaBackend {
-    fn device(&self) -> Device {
-        Device::Cuda
-    }
-
-    fn upload(&self, _host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
-        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
-    }
-
-    fn readback(&self, _handle: &DeviceHandle) -> Result<Vec<f32>> {
-        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let ctx = CudaContext::new(ordinal).map_err(|_| {
+                AutogradError::TapeInvariant("CudaContext::new failed (is a GPU present?)")
+            })?;
+            let stream = ctx.default_stream();
+            let blas = CudaBlas::new(stream.clone())
+                .map_err(|_| AutogradError::TapeInvariant("CudaBlas::new failed"))?;
+            let kernels = KernelCache::new(stream.context())?;
+            Ok(Self {
+                stream,
+                blas: Arc::new(blas),
+                kernels,
+            })
+        }
     }
 
-    fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
-        todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
+    #[cfg(not(feature = "no-cuda"))]
+    fn upload_slice(&self, host: &[f32], shape: &[usize]) -> Result<CudaSlice<f32>> {
+        let size = shape_size(shape);
+        if host.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+
+        self.stream
+            .clone_htod(host)
+            .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))
     }
 
-    fn matmul(
+    #[cfg(not(feature = "no-cuda"))]
+    fn cuda_slice<'a>(
         &self,
-        _a: &DeviceHandle,
-        _a_shape: &[usize],
-        _b: &DeviceHandle,
-        _b_shape: &[usize],
-    ) -> Result<(DeviceHandle, Vec<usize>)> {
-        todo!("PENDING REMOTE CUDA VERIFICATION: Backend::matmul lazy path")
+        handle: &'a DeviceHandle,
+        op: &'static str,
+    ) -> Result<&'a CudaSlice<f32>> {
+        match handle {
+            DeviceHandle::Cuda(storage) => Ok(storage.slice()),
+            DeviceHandle::Cpu(_) => Err(AutogradError::TapeInvariant(match op {
+                "add" => "cuda backend cannot add a cpu device handle",
+                "matmul" => "cuda backend cannot matmul a cpu device handle",
+                _ => "cuda backend cannot operate on a cpu device handle",
+            })),
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(match op {
+                "add" => "cuda backend cannot add a metal device handle",
+                "matmul" => "cuda backend cannot matmul a metal device handle",
+                _ => "cuda backend cannot operate on a metal device handle",
+            })),
+        }
     }
 
-    fn add(&self, _a: &DeviceHandle, _b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
-        todo!("PENDING REMOTE CUDA VERIFICATION: Backend::add lazy path")
+    #[cfg(not(feature = "no-cuda"))]
+    fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
+        match handle {
+            DeviceHandle::Cpu(_) | DeviceHandle::Cuda(_) => Ok(()),
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
+                "cuda backend cannot evaluate a metal device handle",
+            )),
+        }
     }
 
-    fn matmul_forward(
+    #[cfg(not(feature = "no-cuda"))]
+    fn matmul_device(
         &self,
-        a: &[f32],
+        a: &CudaSlice<f32>,
         a_shape: &[usize],
-        b: &[f32],
+        b: &CudaSlice<f32>,
         b_shape: &[usize],
-    ) -> Result<(Vec<f32>, Vec<usize>)> {
+    ) -> Result<(CudaSlice<f32>, Vec<usize>)> {
+        if a.len() != shape_size(a_shape) || b.len() != shape_size(b_shape) {
+            return Err(AutogradError::TapeInvariant(
+                "cuda backend matmul handle size does not match shape",
+            ));
+        }
+
+        let out_shape = matmul_output_shape(a_shape, b_shape)?;
         match (a_shape.len(), b_shape.len()) {
             (2, 2) => {
                 let m = a_shape[0];
                 let k = a_shape[1];
-                if b_shape[0] != k {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![k],
-                        got: vec![b_shape[0]],
-                    });
-                }
                 let n = b_shape[1];
-
-                let a_dev = self
-                    .stream
-                    .clone_htod(a)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed for A"))?;
-                let b_dev = self
-                    .stream
-                    .clone_htod(b)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed for B"))?;
-                let mut c_dev = self
+                let mut c = self
                     .stream
                     .alloc_zeros::<f32>(m * n)
                     .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
@@ -129,52 +168,22 @@ impl Backend for CudaBackend {
                 // Safety: shapes validated above; device buffers outlive the call.
                 unsafe {
                     self.blas
-                        .gemm(cfg, &b_dev, &a_dev, &mut c_dev)
+                        .gemm(cfg, b, a, &mut c)
                         .map_err(|_| AutogradError::TapeInvariant("cuBLAS sgemm failed"))?;
                 }
-
-                let mut host = vec![0.0f32; m * n];
-                self.stream
-                    .memcpy_dtoh(&c_dev, &mut host)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
-                self.stream
-                    .synchronize()
-                    .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
-
-                Ok((host, vec![m, n]))
+                Ok((c, out_shape))
             }
             (3, 3) => {
                 let batch = a_shape[0];
-                if b_shape[0] != batch {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![batch],
-                        got: vec![b_shape[0]],
-                    });
-                }
                 let m = a_shape[1];
                 let k = a_shape[2];
-                if b_shape[1] != k {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![k],
-                        got: vec![b_shape[1]],
-                    });
-                }
                 let n = b_shape[2];
-
-                let a_dev = self
-                    .stream
-                    .clone_htod(a)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed for A"))?;
-                let b_dev = self
-                    .stream
-                    .clone_htod(b)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed for B"))?;
-                let mut c_dev = self
+                let mut c = self
                     .stream
                     .alloc_zeros::<f32>(batch * m * n)
                     .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
-                let gemm_cfg = GemmConfig::<f32> {
+                let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
                     transb: cublasOperation_t::CUBLAS_OP_N,
                     m: n as i32,
@@ -187,7 +196,7 @@ impl Backend for CudaBackend {
                     ldc: n as i32,
                 };
                 let cfg = StridedBatchedConfig::<f32> {
-                    gemm: gemm_cfg,
+                    gemm,
                     batch_size: batch as i32,
                     stride_a: (k * n) as i64,
                     stride_b: (m * k) as i64,
@@ -197,26 +206,177 @@ impl Backend for CudaBackend {
                 // Safety: shapes validated above; device buffers outlive the call.
                 unsafe {
                     self.blas
-                        .gemm_strided_batched(cfg, &b_dev, &a_dev, &mut c_dev)
+                        .gemm_strided_batched(cfg, b, a, &mut c)
                         .map_err(|_| {
                             AutogradError::TapeInvariant("cuBLAS sgemm_strided_batched failed")
                         })?;
                 }
-
-                let mut host = vec![0.0f32; batch * m * n];
-                self.stream
-                    .memcpy_dtoh(&c_dev, &mut host)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
-                self.stream
-                    .synchronize()
-                    .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
-
-                Ok((host, vec![batch, m, n]))
+                Ok((c, out_shape))
             }
             _ => Err(AutogradError::InvalidRank {
                 expected: "both operands must be rank-2 or rank-3",
                 got: a_shape.len().max(b_shape.len()),
             }),
         }
+    }
+}
+
+impl Backend for CudaBackend {
+    fn device(&self) -> Device {
+        Device::Cuda
+    }
+
+    fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (host, shape);
+            todo!("GPU required: cuda upload is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            Ok(DeviceHandle::Cuda(CudaStorage::new(
+                self.upload_slice(host, shape)?,
+            )))
+        }
+    }
+
+    fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = handle;
+            todo!("GPU required: cuda readback is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            match handle {
+                DeviceHandle::Cpu(data) => Ok(data.clone()),
+                DeviceHandle::Cuda(storage) => {
+                    let mut host = vec![0.0f32; storage.len()];
+                    self.stream
+                        .memcpy_dtoh(storage.slice(), &mut host)
+                        .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
+                    self.stream
+                        .synchronize()
+                        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+                    Ok(host)
+                }
+                #[cfg(feature = "metal")]
+                DeviceHandle::Metal(_) => Err(AutogradError::TapeInvariant(
+                    "cuda backend cannot read back a metal device handle",
+                )),
+            }
+        }
+    }
+
+    fn eval(&self, handles: &[&DeviceHandle]) -> Result<()> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = handles;
+            todo!("GPU required: cuda eval is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            for handle in handles {
+                self.validate_cuda_handle_kind(handle)?;
+            }
+            self.stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))
+        }
+    }
+
+    fn matmul(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, a_shape, b, b_shape);
+            todo!("GPU required: cuda lazy matmul is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let a = self.cuda_slice(a, "matmul")?;
+            let b = self.cuda_slice(b, "matmul")?;
+            let (out, out_shape) = self.matmul_device(a, a_shape, b, b_shape)?;
+            Ok((DeviceHandle::Cuda(CudaStorage::new(out)), out_shape))
+        }
+    }
+
+    fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, b, shape);
+            todo!("GPU required: cuda lazy add is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let a = self.cuda_slice(a, "add")?;
+            let b = self.cuda_slice(b, "add")?;
+            let size = shape_size(shape);
+            if a.len() != size || b.len() != size {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: shape.to_vec(),
+                    got: vec![a.len().min(b.len())],
+                });
+            }
+
+            let mut out = self
+                .stream
+                .alloc_zeros::<f32>(size)
+                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            let n = i32::try_from(size)
+                .map_err(|_| AutogradError::TapeInvariant("cuda add length exceeds i32"))?;
+            launch_1d(
+                &self.stream,
+                self.kernels.function("add_f32")?,
+                size,
+                |builder| {
+                    builder.arg(&mut out).arg(a).arg(b).arg(&n);
+                },
+            )?;
+            Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
+        }
+    }
+
+    fn matmul_forward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+    ) -> Result<(Vec<f32>, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, a_shape, b, b_shape);
+            todo!("GPU required: cuda matmul_forward is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let a_handle = self.upload(a, a_shape)?;
+            let b_handle = self.upload(b, b_shape)?;
+            let (out_handle, out_shape) = self.matmul(&a_handle, a_shape, &b_handle, b_shape)?;
+            self.eval(&[&out_handle])?;
+            let out = self.readback(&out_handle)?;
+            Ok((out, out_shape))
+        }
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn shape_size(shape: &[usize]) -> usize {
+    if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
     }
 }
