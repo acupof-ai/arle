@@ -10,7 +10,8 @@ use crate::{
     backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape},
 };
 use mlx_sys::{
-    MLX_FLOAT32, mlx_array_data_float32, mlx_array_from_data, mlx_array_size, mlx_eval, mlx_matmul,
+    MLX_FLOAT32, mlx_add, mlx_array_data_float32, mlx_array_from_data, mlx_array_size, mlx_eval,
+    mlx_matmul,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -168,5 +169,33 @@ impl Backend for MetalBackend {
             });
         }
         Ok((out, out_shape))
+    }
+
+    fn add(&self, a: &DeviceHandle, b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(a_handle) = a else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot add a non-metal device handle",
+            ));
+        };
+        let DeviceHandle::Metal(b_handle) = b else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot add a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: both pointers come from live `MlxHandle`s borrowed for this
+        // call, ownership of the returned MLX node transfers into the new
+        // `MlxHandle`, and `MLX_GUARD` serializes access to MLX's global state.
+        let out = unsafe {
+            let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant("mlx_add returned null"));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
     }
 }

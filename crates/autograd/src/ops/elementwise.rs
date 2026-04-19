@@ -7,36 +7,34 @@ use crate::{
 };
 
 pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let (a_data, a_shape, a_requires_grad) = {
-        let tensor = store.tensor(a)?;
-        (
-            tensor.data.clone(),
-            tensor.shape.clone(),
-            tensor.requires_grad,
-        )
-    };
-    let (b_data, b_shape, b_requires_grad) = {
-        let tensor = store.tensor(b)?;
-        (
-            tensor.data.clone(),
-            tensor.shape.clone(),
-            tensor.requires_grad,
-        )
-    };
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
     if a_shape != b_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: a_shape,
             got: b_shape,
         });
     }
+    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
 
-    let data = a_data
-        .iter()
-        .zip(b_data.iter())
-        .map(|(lhs, rhs)| lhs + rhs)
-        .collect();
-    let requires_grad = a_requires_grad || b_requires_grad;
-    let output_id = store.alloc(GpuTensor::new(data, a_shape, requires_grad)?);
+    store.ensure_device(a)?;
+    store.ensure_device(b)?;
+    let a_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+    let b_handle = store
+        .tensor(b)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+
+    let out_handle = store.backend().add(&a_handle, &b_handle, &a_shape)?;
+    let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
 
     if requires_grad {
         tape.record(TapeEntry {

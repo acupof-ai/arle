@@ -58,8 +58,6 @@ pub fn add_broadcast(
 }
 
 pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(a)?;
-    store.ensure_host(b)?;
     elementwise::add(a, b, store, tape)
 }
 
