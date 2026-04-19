@@ -103,12 +103,18 @@ INFER_CAPTURE_STEP=5 \
       --prompt-tokens 32 --generation-tokens 10 --warmup 3 --runs 1
 ```
 
-- `INFER_CAPTURE_STEP=N` — 0-indexed step (N=0 = first call, post-warmup in
-  `metal_bench`). Unset = disabled.
+- `INFER_CAPTURE_STEP=N` — **0-indexed count of `qwen35_compiled_step_session`
+  calls since process start**, across all warmup runs, timed runs, and any
+  other callers. The counter is process-global and NOT reset between runs.
+  For `metal_bench --warmup W --runs R --generation-tokens G --use-step-driver`,
+  the first post-warmup decode step is `W × G` (e.g. `--warmup 3
+  --generation-tokens 10` → use `INFER_CAPTURE_STEP=30` to capture the 1st
+  timed-run decode; `=31` for the 2nd; etc.). Unset = disabled.
 - `INFER_CAPTURE_PATH=…` — optional override; default
   `/tmp/qwen35_step_<unix_ts>.gputrace`.
-- The hook issues `eval()` inside the capture window so GPU work lands in
-  the trace rather than deferring past `stopCapture`.
+- The hook issues `eval(outputs)` **before** swapping session state so an
+  eval failure cleanly rolls back — the caller sees `-1` with no partial
+  cache advance and no leaked output handle.
 
 Open the resulting `.gputrace` in Xcode. Full runbook:
 [`docs/plans/metal-gdr-kernel-xcode-capture.md`](../../docs/plans/metal-gdr-kernel-xcode-capture.md).

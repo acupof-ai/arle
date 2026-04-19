@@ -1443,6 +1443,17 @@ int32_t qwen35_compiled_step_session(
         m->prev_outputs = m->forward(inputs);
         auto& outputs = m->prev_outputs;
 
+        // Force GPU work to flush inside the capture window so the .gputrace
+        // actually contains this step's dispatches. Do it BEFORE mutating
+        // session state: if eval() throws (OOM / Metal runtime error), the
+        // catch below fires without `outputs` having been moved-from, without
+        // `*out_logits` being set, and without the session caches being
+        // advanced — caller observes -1 with clean rollback.
+        // No-op branch when capture is disabled.
+        if (capture_started) {
+            eval(outputs);
+        }
+
         std::vector<array> next_kv_caches;
         std::vector<array> next_gdr_states;
         next_kv_caches.reserve(n_kv);
@@ -1458,17 +1469,6 @@ int32_t qwen35_compiled_step_session(
         m->session_kv_caches = std::move(next_kv_caches);
         m->session_gdr_states = std::move(next_gdr_states);
         *out_logits = logits;
-        // Force GPU work to flush inside the capture window so the .gputrace
-        // actually contains this step's dispatches. The caller (Rust) also
-        // evals later; this is a no-op branch when capture is disabled.
-        if (capture_started) {
-            std::vector<array> to_eval;
-            to_eval.reserve(1 + m->session_kv_caches.size() + m->session_gdr_states.size());
-            to_eval.push_back(*to_arr(logits));
-            for (const auto& kv : m->session_kv_caches) to_eval.push_back(kv);
-            for (const auto& gdr : m->session_gdr_states) to_eval.push_back(gdr);
-            eval(to_eval);
-        }
         maybe_capture_qwen35_step_end(capture_started);
         return 0;
     } catch (const std::exception& e) {
