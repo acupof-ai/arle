@@ -4,10 +4,14 @@ pub mod checkpoint;
 pub mod control;
 #[path = "curriculum.rs"]
 pub mod curriculum;
+#[path = "data_adapter.rs"]
+pub mod data_adapter;
 #[path = "dataset.rs"]
 pub mod dataset;
 #[path = "grpo.rs"]
 pub mod grpo;
+#[path = "hub_dataset.rs"]
+pub mod hub_dataset;
 #[path = "lora.rs"]
 pub mod lora;
 #[path = "model.rs"]
