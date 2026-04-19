@@ -134,6 +134,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         b: &[f32],
         b_shape: &[usize],
     ) -> Result<(Vec<f32>, Vec<usize>)>;
+
+    /// Elementwise `C = A + B` over identically-shaped contiguous tensors.
+    /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
+    fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -196,6 +200,41 @@ impl Backend for CpuBackend {
         b_shape: &[usize],
     ) -> Result<(Vec<f32>, Vec<usize>)> {
         cpu_matmul_forward(a, a_shape, b, b_shape)
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Cpu(a_data) = a else {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot add a non-cpu device handle",
+            ));
+        };
+        let DeviceHandle::Cpu(b_data) = b else {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot add a non-cpu device handle",
+            ));
+        };
+        let size = shape_size(shape);
+        if a_data.len() != size || b_data.len() != size {
+            return Err(crate::AutogradError::ShapeMismatch {
+                expected: vec![size],
+                got: vec![a_data.len().min(b_data.len())],
+            });
+        }
+        let out: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(lhs, rhs)| lhs + rhs)
+            .collect();
+        Ok(DeviceHandle::Cpu(out))
+    }
+}
+
+fn shape_size(shape: &[usize]) -> usize {
+    if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
     }
 }
 

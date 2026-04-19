@@ -77,6 +77,10 @@ impl Backend for CudaBackend {
         todo!("PENDING REMOTE CUDA VERIFICATION: Backend::matmul lazy path")
     }
 
+    fn add(&self, _a: &DeviceHandle, _b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        todo!("PENDING REMOTE CUDA VERIFICATION: Backend::add lazy path")
+    }
+
     fn matmul_forward(
         &self,
         a: &[f32],
