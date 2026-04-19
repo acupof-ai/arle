@@ -8,6 +8,14 @@ use std::sync::Arc;
 const ELEMENTWISE_CU: &str = include_str!("kernels/elementwise.cu");
 #[cfg(not(feature = "no-cuda"))]
 const SOFTMAX_CU: &str = include_str!("kernels/softmax.cu");
+#[cfg(not(feature = "no-cuda"))]
+const SILU_CU: &str = include_str!("kernels/silu.cu");
+#[cfg(not(feature = "no-cuda"))]
+const RMS_NORM_CU: &str = include_str!("kernels/rms_norm.cu");
+#[cfg(not(feature = "no-cuda"))]
+const EMBEDDING_CU: &str = include_str!("kernels/embedding.cu");
+#[cfg(not(feature = "no-cuda"))]
+const REDUCE_CU: &str = include_str!("kernels/reduce.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -19,6 +27,11 @@ const FUNCTION_NAMES: &[&str] = &[
     "neg_f32",
     "softmax_last_axis_f32",
     "log_softmax_last_axis_f32",
+    "silu_f32",
+    "rms_norm_f32",
+    "embedding_f32",
+    "sum_last_axis_f32",
+    "mean_last_axis_f32",
 ];
 
 #[derive(Debug)]
@@ -154,9 +167,16 @@ where
 #[cfg(not(feature = "no-cuda"))]
 fn concat_sources() -> String {
     let mut src = String::new();
-    src.push_str(ELEMENTWISE_CU);
-    src.push('\n');
-    src.push_str(SOFTMAX_CU);
-    src.push('\n');
+    for chunk in [
+        ELEMENTWISE_CU,
+        SOFTMAX_CU,
+        SILU_CU,
+        RMS_NORM_CU,
+        EMBEDDING_CU,
+        REDUCE_CU,
+    ] {
+        src.push_str(chunk);
+        src.push('\n');
+    }
     src
 }

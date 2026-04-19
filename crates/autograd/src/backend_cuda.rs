@@ -414,6 +414,138 @@ impl Backend for CudaBackend {
             cuda_softmax_like(self, x, shape, "log_softmax_last_axis_f32")
         }
     }
+
+    fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, b);
+            todo!("GPU required: cuda mul is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_binary_1d(self, a, b, "mul_f32")
+        }
+    }
+
+    fn mul_scalar_forward(&self, a: &[f32], s: f32) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (a, s);
+            todo!("GPU required: cuda mul_scalar is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_scalar_1d(self, a, s, "mul_scalar_f32")
+        }
+    }
+
+    fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = a;
+            todo!("GPU required: cuda exp is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_unary_1d(self, a, "exp_f32")
+        }
+    }
+
+    fn neg_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = a;
+            todo!("GPU required: cuda neg is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_unary_1d(self, a, "neg_f32")
+        }
+    }
+
+    fn gelu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = a;
+            todo!("GPU required: cuda gelu is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_unary_1d(self, a, "gelu_f32")
+        }
+    }
+
+    fn silu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = a;
+            todo!("GPU required: cuda silu is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_unary_1d(self, a, "silu_f32")
+        }
+    }
+
+    fn rms_norm_forward(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        shape: &[usize],
+        eps: f32,
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, weight, shape, eps);
+            todo!("GPU required: cuda rms_norm is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_rms_norm(self, x, weight, shape, eps)
+        }
+    }
+
+    fn embedding_forward(
+        &self,
+        weight: &[f32],
+        vocab: usize,
+        dim: usize,
+        ids: &[i32],
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (weight, vocab, dim, ids);
+            todo!("GPU required: cuda embedding is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_embedding(self, weight, vocab, dim, ids)
+        }
+    }
+
+    fn sum_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda sum is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_reduce_last_axis(self, x, shape, "sum_last_axis_f32")
+        }
+    }
+
+    fn mean_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda mean is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_reduce_last_axis(self, x, shape, "mean_last_axis_f32")
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -482,4 +614,282 @@ fn shape_size(shape: &[usize]) -> usize {
     } else {
         shape.iter().product()
     }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_unary_1d(backend: &CudaBackend, a: &[f32], kernel_name: &'static str) -> Result<Vec<f32>> {
+    let n_usize = a.len();
+    let d_in = backend
+        .stream
+        .clone_htod(a)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    let n = i32::try_from(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda unary length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        n_usize,
+        |builder| {
+            builder.arg(&mut d_out).arg(&d_in).arg(&n);
+        },
+    )?;
+    cuda_download(backend, &d_out, n_usize)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_scalar_1d(
+    backend: &CudaBackend,
+    a: &[f32],
+    s: f32,
+    kernel_name: &'static str,
+) -> Result<Vec<f32>> {
+    let n_usize = a.len();
+    let d_in = backend
+        .stream
+        .clone_htod(a)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    let n = i32::try_from(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scalar length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        n_usize,
+        |builder| {
+            builder.arg(&mut d_out).arg(&d_in).arg(&s).arg(&n);
+        },
+    )?;
+    cuda_download(backend, &d_out, n_usize)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_binary_1d(
+    backend: &CudaBackend,
+    a: &[f32],
+    b: &[f32],
+    kernel_name: &'static str,
+) -> Result<Vec<f32>> {
+    if a.len() != b.len() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![a.len()],
+            got: vec![b.len()],
+        });
+    }
+    let n_usize = a.len();
+    let d_a = backend
+        .stream
+        .clone_htod(a)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_b = backend
+        .stream
+        .clone_htod(b)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    let n = i32::try_from(n_usize)
+        .map_err(|_| AutogradError::TapeInvariant("cuda binary length exceeds i32"))?;
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        n_usize,
+        |builder| {
+            builder.arg(&mut d_out).arg(&d_a).arg(&d_b).arg(&n);
+        },
+    )?;
+    cuda_download(backend, &d_out, n_usize)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_rms_norm(
+    backend: &CudaBackend,
+    x: &[f32],
+    weight: &[f32],
+    shape: &[usize],
+    eps: f32,
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+    if weight.len() != last_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![last_dim],
+            got: vec![weight.len()],
+        });
+    }
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda rms_norm cols exceeds i32"))?;
+    let d_x = backend.upload_slice(x, shape)?;
+    let d_w = backend
+        .stream
+        .clone_htod(weight)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(expected)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("rms_norm_f32")?,
+        rows,
+        BLOCK,
+        SHARED,
+        |builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(&d_x)
+                .arg(&d_w)
+                .arg(&cols)
+                .arg(&eps);
+        },
+    )?;
+    cuda_download(backend, &d_out, expected)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_embedding(
+    backend: &CudaBackend,
+    weight: &[f32],
+    vocab: usize,
+    dim: usize,
+    ids: &[i32],
+) -> Result<Vec<f32>> {
+    if weight.len() != vocab * dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![vocab * dim],
+            got: vec![weight.len()],
+        });
+    }
+    let n_ids = ids.len();
+    let out_len = n_ids * dim;
+    let d_w = backend
+        .stream
+        .clone_htod(weight)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_ids = backend
+        .stream
+        .clone_htod(ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let n_i32 = i32::try_from(n_ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding n_ids exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding vocab exceeds i32"))?;
+    let dim_i32 = i32::try_from(dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda embedding dim exceeds i32"))?;
+
+    const BLOCK: u32 = 256;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("embedding_f32")?,
+        n_ids,
+        BLOCK,
+        0,
+        |builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(&d_w)
+                .arg(&d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32)
+                .arg(&dim_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, out_len)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_reduce_last_axis(
+    backend: &CudaBackend,
+    x: &[f32],
+    shape: &[usize],
+    kernel_name: &'static str,
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda reduce cols exceeds i32"))?;
+    let d_in = backend.upload_slice(x, shape)?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        rows,
+        BLOCK,
+        SHARED,
+        |builder| {
+            builder.arg(&mut d_out).arg(&d_in).arg(&cols);
+        },
+    )?;
+    cuda_download(backend, &d_out, rows)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_download(
+    backend: &CudaBackend,
+    d_out: &cudarc::driver::CudaSlice<f32>,
+    len: usize,
+) -> Result<Vec<f32>> {
+    let mut host = vec![0.0_f32; len];
+    backend
+        .stream
+        .memcpy_dtoh(d_out, &mut host)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
+    backend
+        .stream
+        .synchronize()
+        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+    Ok(host)
 }
