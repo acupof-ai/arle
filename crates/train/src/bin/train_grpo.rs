@@ -1,8 +1,9 @@
-use std::{collections::HashSet, env, str::FromStr};
+use std::{collections::HashSet, env};
 
 use autograd::{AutogradError, Tape, TensorId, TensorStore, module::Module, optim::AdamW};
 use thiserror::Error;
 use train::{
+    cli_args::{ArgError, next_value, parse_value},
     dataset::{CopyDataset, Dataset, LcgRng},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     lora::LoraConfig,
@@ -50,12 +51,8 @@ impl Default for CliArgs {
 enum CliError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
 }
 
 fn main() -> Result<(), CliError> {
@@ -228,7 +225,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
-            _ => return Err(CliError::UnknownFlag(flag)),
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
     Ok(args)
@@ -248,21 +245,6 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         }));
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T>(flag: &str, value: String) -> Result<T, CliError>
-where
-    T: FromStr,
-{
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_prompt_batch(
