@@ -24,6 +24,8 @@ pub mod rollout;
 pub mod sampling;
 #[path = "server.rs"]
 pub mod server;
+#[path = "sft_data.rs"]
+pub mod sft_data;
 #[path = "task_gen.rs"]
 pub mod task_gen;
 #[path = "tokenizer.rs"]

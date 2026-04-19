@@ -1,13 +1,11 @@
-use std::{
-    collections::HashMap,
-    f32::consts::TAU,
-    fs,
-    path::Path,
-};
+use std::{collections::HashMap, f32::consts::TAU, fs, path::Path};
 
 use autograd::{
     AutogradError, GpuTensor, Tape, TensorId, TensorStore,
-    ops::{add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, silu, transpose},
+    ops::{
+        add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, silu,
+        transpose,
+    },
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -152,9 +150,33 @@ impl Qwen3Layer {
         let k = linear_forward(h, self.self_attn.k_proj, store, tape)?;
         let v = linear_forward(h, self.self_attn.v_proj, store, tape)?;
 
-        let q = split_heads(q, 1, seq_len, cfg.num_attention_heads, cfg.head_dim, store, tape)?;
-        let k = split_heads(q_or_kv_heads_tensor(k), 1, seq_len, cfg.num_kv_heads, cfg.head_dim, store, tape)?;
-        let v = split_heads(q_or_kv_heads_tensor(v), 1, seq_len, cfg.num_kv_heads, cfg.head_dim, store, tape)?;
+        let q = split_heads(
+            q,
+            1,
+            seq_len,
+            cfg.num_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let k = split_heads(
+            q_or_kv_heads_tensor(k),
+            1,
+            seq_len,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            q_or_kv_heads_tensor(v),
+            1,
+            seq_len,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
 
         let q = rmsnorm(q, self.self_attn.q_norm, cfg.rms_norm_eps, store, tape)?;
         let k = rmsnorm(k, self.self_attn.k_norm, cfg.rms_norm_eps, store, tape)?;
@@ -164,11 +186,25 @@ impl Qwen3Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
         let attn = causal_sdpa(q, k, v, store, tape)?;
-        let attn = merge_heads(attn, 1, seq_len, cfg.num_attention_heads, cfg.head_dim, store, tape)?;
+        let attn = merge_heads(
+            attn,
+            1,
+            seq_len,
+            cfg.num_attention_heads,
+            cfg.head_dim,
+            store,
+            tape,
+        )?;
         let attn_out = linear_forward(attn, self.self_attn.o_proj, store, tape)?;
         let x = add(x, attn_out, store, tape)?;
 
-        let h = rmsnorm(x, self.post_attention_layernorm, cfg.rms_norm_eps, store, tape)?;
+        let h = rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
         let gate = linear_forward(h, self.mlp.gate_proj, store, tape)?;
         let up = linear_forward(h, self.mlp.up_proj, store, tape)?;
         let gate = silu(gate, store, tape)?;
@@ -195,20 +231,34 @@ impl Qwen3Model {
         cfg.validate()?;
 
         let mut param_names = HashMap::new();
-        let embed_tokens = normal_parameter("model.embed_tokens.weight", &[cfg.vocab_size, cfg.hidden_size], 0.02, store)?;
+        let embed_tokens = normal_parameter(
+            "model.embed_tokens.weight",
+            &[cfg.vocab_size, cfg.hidden_size],
+            0.02,
+            store,
+        )?;
         param_names.insert("model.embed_tokens.weight", embed_tokens);
 
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
         } else {
-            normal_parameter("lm_head.weight", &[cfg.vocab_size, cfg.hidden_size], 0.02, store)?
+            normal_parameter(
+                "lm_head.weight",
+                &[cfg.vocab_size, cfg.hidden_size],
+                0.02,
+                store,
+            )?
         };
         param_names.insert("lm_head.weight", lm_head);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let prefix = format!("model.layers.{layer_idx}");
-            let input_layernorm = ones_parameter(leak_name(format!("{prefix}.input_layernorm.weight")), &[cfg.hidden_size], store)?;
+            let input_layernorm = ones_parameter(
+                leak_name(format!("{prefix}.input_layernorm.weight")),
+                &[cfg.hidden_size],
+                store,
+            )?;
             let q_proj = normal_parameter(
                 leak_name(format!("{prefix}.self_attn.q_proj.weight")),
                 &[cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size],
@@ -233,8 +283,16 @@ impl Qwen3Model {
                 0.02,
                 store,
             )?;
-            let q_norm = ones_parameter(leak_name(format!("{prefix}.self_attn.q_norm.weight")), &[cfg.head_dim], store)?;
-            let k_norm = ones_parameter(leak_name(format!("{prefix}.self_attn.k_norm.weight")), &[cfg.head_dim], store)?;
+            let q_norm = ones_parameter(
+                leak_name(format!("{prefix}.self_attn.q_norm.weight")),
+                &[cfg.head_dim],
+                store,
+            )?;
+            let k_norm = ones_parameter(
+                leak_name(format!("{prefix}.self_attn.k_norm.weight")),
+                &[cfg.head_dim],
+                store,
+            )?;
             let gate_proj = normal_parameter(
                 leak_name(format!("{prefix}.mlp.gate_proj.weight")),
                 &[cfg.intermediate_size, cfg.hidden_size],
@@ -253,19 +311,49 @@ impl Qwen3Model {
                 0.02,
                 store,
             )?;
-            let post_attention_layernorm =
-                ones_parameter(leak_name(format!("{prefix}.post_attention_layernorm.weight")), &[cfg.hidden_size], store)?;
+            let post_attention_layernorm = ones_parameter(
+                leak_name(format!("{prefix}.post_attention_layernorm.weight")),
+                &[cfg.hidden_size],
+                store,
+            )?;
 
-            param_names.insert(leak_name(format!("{prefix}.input_layernorm.weight")), input_layernorm);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.q_proj.weight")), q_proj);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.k_proj.weight")), k_proj);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.v_proj.weight")), v_proj);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.o_proj.weight")), o_proj);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.q_norm.weight")), q_norm);
-            param_names.insert(leak_name(format!("{prefix}.self_attn.k_norm.weight")), k_norm);
-            param_names.insert(leak_name(format!("{prefix}.mlp.gate_proj.weight")), gate_proj);
+            param_names.insert(
+                leak_name(format!("{prefix}.input_layernorm.weight")),
+                input_layernorm,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.q_proj.weight")),
+                q_proj,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.k_proj.weight")),
+                k_proj,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.v_proj.weight")),
+                v_proj,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.o_proj.weight")),
+                o_proj,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.q_norm.weight")),
+                q_norm,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.self_attn.k_norm.weight")),
+                k_norm,
+            );
+            param_names.insert(
+                leak_name(format!("{prefix}.mlp.gate_proj.weight")),
+                gate_proj,
+            );
             param_names.insert(leak_name(format!("{prefix}.mlp.up_proj.weight")), up_proj);
-            param_names.insert(leak_name(format!("{prefix}.mlp.down_proj.weight")), down_proj);
+            param_names.insert(
+                leak_name(format!("{prefix}.mlp.down_proj.weight")),
+                down_proj,
+            );
             param_names.insert(
                 leak_name(format!("{prefix}.post_attention_layernorm.weight")),
                 post_attention_layernorm,
@@ -327,7 +415,10 @@ impl Qwen3Model {
         }
 
         let token_indices = input_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
-        let positions = position_ids.iter().map(|&id| id as usize).collect::<Vec<_>>();
+        let positions = position_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
         let cos = select_cache_rows(self.cos_cache, &positions, store)?;
         let sin = select_cache_rows(self.sin_cache, &positions, store)?;
 
@@ -335,7 +426,13 @@ impl Qwen3Model {
         for layer in &self.layers {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
-        let hidden = rmsnorm(hidden, self.final_norm, self.config.rms_norm_eps, store, tape)?;
+        let hidden = rmsnorm(
+            hidden,
+            self.final_norm,
+            self.config.rms_norm_eps,
+            store,
+            tape,
+        )?;
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
@@ -412,10 +509,19 @@ fn merge_heads(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let x = transpose(x, 1, 2, store, tape)?;
-    Ok(reshape(x, &[batch, seq_len, heads * head_dim], store, tape)?)
+    Ok(reshape(
+        x,
+        &[batch, seq_len, heads * head_dim],
+        store,
+        tape,
+    )?)
 }
 
-fn select_cache_rows(cache: TensorId, position_ids: &[usize], store: &mut TensorStore) -> Result<TensorId> {
+fn select_cache_rows(
+    cache: TensorId,
+    position_ids: &[usize],
+    store: &mut TensorStore,
+) -> Result<TensorId> {
     let cache_tensor = store
         .get(cache)
         .ok_or(AutogradError::InvalidTensorId(cache))?
@@ -447,7 +553,11 @@ fn select_cache_rows(cache: TensorId, position_ids: &[usize], store: &mut Tensor
 fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(TensorId, TensorId)> {
     let half_dim = cfg.head_dim / 2;
     let inv_freq = (0..half_dim)
-        .map(|index| 1.0 / cfg.rope_theta.powf((2.0 * index as f32) / cfg.head_dim as f32))
+        .map(|index| {
+            1.0 / cfg
+                .rope_theta
+                .powf((2.0 * index as f32) / cfg.head_dim as f32)
+        })
         .collect::<Vec<_>>();
     let mut cos = vec![0.0; cfg.max_position_embeddings * half_dim];
     let mut sin = vec![0.0; cfg.max_position_embeddings * half_dim];
@@ -496,9 +606,17 @@ fn normal_parameter(
     Ok(store.alloc(GpuTensor::new(data, shape.to_vec(), true)?))
 }
 
-fn ones_parameter(name: &'static str, shape: &[usize], store: &mut TensorStore) -> Result<TensorId> {
+fn ones_parameter(
+    name: &'static str,
+    shape: &[usize],
+    store: &mut TensorStore,
+) -> Result<TensorId> {
     let _ = name;
-    Ok(store.alloc(GpuTensor::new(vec![1.0; shape.iter().product()], shape.to_vec(), true)?))
+    Ok(store.alloc(GpuTensor::new(
+        vec![1.0; shape.iter().product()],
+        shape.to_vec(),
+        true,
+    )?))
 }
 
 fn seed_from_name(name: &str) -> u64 {

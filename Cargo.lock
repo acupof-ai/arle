@@ -3702,7 +3702,9 @@ name = "train"
 version = "0.1.0"
 dependencies = [
  "autograd",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers",
 ]
