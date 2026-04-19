@@ -286,24 +286,97 @@ struct StreamingStats {
     consumer_dropped: bool,
 }
 
+/// Decision returned by a generation sink for each sampled token.
+///
+/// `Continue` advances the loop; `ConsumerDropped` aborts (used by the
+/// streaming path when the HTTP client disconnects).
 #[cfg(feature = "cuda")]
-fn generate<M: ModelForward>(
+enum SinkControl {
+    Continue,
+    ConsumerDropped,
+}
+
+/// Telemetry flavor for `generate_inner`. Captures the per-variant observable
+/// differences without introducing a new async boundary or trait object.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum TraceMode {
+    /// `generate` — outer span "generate", TTFT/TPOT via both span props and `debug!`.
+    Full,
+    /// `generate_tokens_with_logprobs_inner` — no fastrace span, no TTFT/TPOT debug logs.
+    Silent,
+    /// `generate_streaming_with_callback` — outer span "generate_streaming", TTFT/TPOT via `debug!` only.
+    Streaming,
+}
+
+/// Shared driver for the three CUDA generation variants. All three share the
+/// same tokenize → prefill → (first-token sample) → decode-loop → stop-check →
+/// emit shape; they differ only in:
+///
+/// - **Sampler**: `select_token` vs `select_token_with_logprob` (driven by
+///   `want_logprobs`; pre-existing default impl of `select_token_with_logprob`
+///   falls back to `select_token` so the non-greedy path stays identical).
+/// - **Per-token observation/control**: what to do with the sampled token.
+///   Split into two callbacks to preserve the original logprob-path timing:
+///   `on_sampled` fires **before** the stop-token check (so logprobs for a
+///   stop-token get recorded), `on_emit` fires **after** the token has been
+///   pushed onto `tokens` (so the streaming callback sees tokens that made it
+///   into the output).
+/// - **Trace/debug emission**: see [`TraceMode`].
+#[cfg(feature = "cuda")]
+fn generate_inner<M, Observe, Emit>(
     model: &M,
     state: &mut M::State,
     prompt_tokens: &[u32],
     max_new_tokens: usize,
     params: &SamplingParams,
     rng: &mut StdRng,
-) -> Result<Vec<u32>> {
+    want_logprobs: bool,
+    trace: TraceMode,
+    mut on_sampled: Observe,
+    mut on_emit: Emit,
+) -> Result<(Vec<u32>, StreamingStats)>
+where
+    M: ModelForward,
+    Observe: FnMut(u32, Option<f32>),
+    Emit: FnMut(u32) -> SinkControl,
+{
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-    let _span = LocalSpan::enter_with_local_parent("generate").with_properties(|| {
-        [
-            ("prompt_len", prompt_tokens.len().to_string()),
-            ("max_new_tokens", max_new_tokens.to_string()),
-        ]
-    });
+
+    let _outer_span = match trace {
+        TraceMode::Full => Some(
+            LocalSpan::enter_with_local_parent("generate").with_properties(|| {
+                [
+                    ("prompt_len", prompt_tokens.len().to_string()),
+                    ("max_new_tokens", max_new_tokens.to_string()),
+                ]
+            }),
+        ),
+        TraceMode::Streaming => Some(
+            LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
+                [
+                    ("prompt_len", prompt_tokens.len().to_string()),
+                    ("max_new_tokens", max_new_tokens.to_string()),
+                ]
+            }),
+        ),
+        TraceMode::Silent => None,
+    };
 
     let mut tokens = prompt_tokens.to_vec();
+    let emit_debug = !matches!(trace, TraceMode::Silent);
+
+    // Closure unifying the two sampler shapes. The trait default for
+    // `select_token_with_logprob` is `select_token` + `None`, so passing
+    // `want_logprobs = false` lets model impls that override `select_token`
+    // (e.g. batched decode) skip the logprob path entirely.
+    let sample = |state: &mut M::State, rng: &mut StdRng| -> Result<(u32, Option<f32>)> {
+        if want_logprobs {
+            model.select_token_with_logprob(state, params, rng)
+        } else {
+            model.select_token(state, params, rng).map(|t| (t, None))
+        }
+    };
 
     let ttft_start = Instant::now();
     model.forward_prefill(prompt_tokens, state)?;
@@ -313,171 +386,74 @@ fn generate<M: ModelForward>(
             e
         );
     }
-    let next_token = model.select_token(state, params, rng)?;
+    let (next_token, next_lp) = sample(state, rng)?;
     let ttft = ttft_start.elapsed();
 
-    LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
-    debug!(
-        "TTFT: {:.2}ms (prompt_len={})",
-        ttft.as_secs_f64() * 1000.0,
-        prompt_tokens.len()
-    );
-
-    if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok(tokens);
+    if matches!(trace, TraceMode::Full) {
+        LocalSpan::add_property(|| ("ttft_ms", format!("{:.2}", ttft.as_secs_f64() * 1000.0)));
     }
-    tokens.push(next_token);
-
-    let tpot_start = Instant::now();
-    let mut generated_count = 0;
-    for i in 1..max_new_tokens {
-        let _span = LocalSpan::enter_with_local_parent("decode_step")
-            .with_property(|| ("step", i.to_string()));
-        model.forward_decode(*tokens.last().unwrap(), state)?;
-        let next_token = model.select_token(state, params, rng)?;
-
-        if !params.ignore_eos && model.is_stop_token(next_token) {
-            break;
-        }
-        tokens.push(next_token);
-        generated_count += 1;
-    }
-
-    if generated_count > 0 {
-        let tpot_total = tpot_start.elapsed();
-        let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-        LocalSpan::add_properties(|| {
-            [
-                ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
-                ("generated_tokens", generated_count.to_string()),
-                (
-                    "tok_per_sec",
-                    format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
-                ),
-            ]
-        });
+    if emit_debug {
         debug!(
-            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-            tpot_avg * 1000.0,
-            generated_count,
-            tpot_total.as_secs_f64() * 1000.0,
-            generated_count as f64 / tpot_total.as_secs_f64()
+            "TTFT: {:.2}ms (prompt_len={})",
+            ttft.as_secs_f64() * 1000.0,
+            prompt_tokens.len()
         );
     }
 
-    Ok(tokens)
-}
+    // Observe the freshly sampled token (incl. its logprob) BEFORE the
+    // stop-token check — matches the original logprob-path semantics where
+    // a stop token's logprob is recorded even though the token itself is
+    // not appended to `tokens`.
+    on_sampled(next_token, next_lp);
 
-/// Same as `generate_tokens_inner` but also returns per-token logprobs (greedy only).
-#[cfg(feature = "cuda")]
-fn generate_tokens_with_logprobs_inner<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
-    prompt_tokens: &[u32],
-    max_new_tokens: usize,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-) -> Result<(Vec<u32>, Vec<f32>)> {
-    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-
-    let mut tokens = prompt_tokens.to_vec();
-    let mut logprobs = Vec::new();
-
-    model.forward_prefill(prompt_tokens, state)?;
-    if let Err(e) = state.save_prefix_snapshot() {
-        warn!(
-            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
-            e
-        );
-    }
-    let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
-    if let Some(lp) = lp {
-        logprobs.push(lp);
-    }
-
+    // Stop-token early-return. Matches the original per-variant behavior:
+    // - generate / logprobs: return the (unchanged) prompt-only tokens.
+    // - streaming: return emitted=0, hit_eos=true.
     if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok((tokens, logprobs));
-    }
-    tokens.push(next_token);
-
-    for _i in 1..max_new_tokens {
-        model.forward_decode(*tokens.last().unwrap(), state)?;
-        let (next_token, lp) = model.select_token_with_logprob(state, params, rng)?;
-        if let Some(lp) = lp {
-            logprobs.push(lp);
-        }
-
-        if !params.ignore_eos && model.is_stop_token(next_token) {
-            break;
-        }
-        tokens.push(next_token);
+        return Ok((
+            tokens,
+            StreamingStats {
+                emitted_tokens: 0,
+                hit_eos: true,
+                consumer_dropped: false,
+            },
+        ));
     }
 
-    Ok((tokens, logprobs))
-}
-
-#[cfg(feature = "cuda")]
-fn generate_streaming_with_callback<M: ModelForward>(
-    model: &M,
-    state: &mut M::State,
-    prompt_tokens: &[u32],
-    max_new_tokens: usize,
-    params: &SamplingParams,
-    rng: &mut StdRng,
-    mut on_token: impl FnMut(u32) -> bool,
-) -> Result<StreamingStats> {
-    anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
-    let _span = LocalSpan::enter_with_local_parent("generate_streaming").with_properties(|| {
-        [
-            ("prompt_len", prompt_tokens.len().to_string()),
-            ("max_new_tokens", max_new_tokens.to_string()),
-        ]
-    });
-
-    let mut tokens = prompt_tokens.to_vec();
-
-    let ttft_start = Instant::now();
-    model.forward_prefill(prompt_tokens, state)?;
-    if let Err(e) = state.save_prefix_snapshot() {
-        warn!(
-            "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
-            e
-        );
-    }
-    let next_token = model.select_token(state, params, rng)?;
-    let ttft = ttft_start.elapsed();
-    debug!(
-        "TTFT: {:.2}ms (prompt_len={})",
-        ttft.as_secs_f64() * 1000.0,
-        prompt_tokens.len()
-    );
-
-    if !params.ignore_eos && model.is_stop_token(next_token) {
-        return Ok(StreamingStats {
-            emitted_tokens: 0,
-            hit_eos: true,
-            consumer_dropped: false,
-        });
-    }
-
+    // Emit the first generated token. A ConsumerDropped here only happens in
+    // the streaming variant; non-streaming callers always return Continue.
+    // Matches the original streaming behavior exactly: the token IS pushed,
+    // emitted_tokens=1, then we abort with consumer_dropped=true.
     tokens.push(next_token);
     let mut emitted_tokens = 1usize;
-    if !on_token(next_token) {
-        return Ok(StreamingStats {
-            emitted_tokens,
-            hit_eos: false,
-            consumer_dropped: true,
-        });
+    if let SinkControl::ConsumerDropped = on_emit(next_token) {
+        return Ok((
+            tokens,
+            StreamingStats {
+                emitted_tokens,
+                hit_eos: false,
+                consumer_dropped: true,
+            },
+        ));
     }
 
     let tpot_start = Instant::now();
     let mut generated_count = 0;
     let mut hit_eos = false;
     for i in 1..max_new_tokens {
-        let _span = LocalSpan::enter_with_local_parent("decode_step")
-            .with_property(|| ("step", i.to_string()));
+        let _decode_span = if matches!(trace, TraceMode::Full | TraceMode::Streaming) {
+            Some(
+                LocalSpan::enter_with_local_parent("decode_step")
+                    .with_property(|| ("step", i.to_string())),
+            )
+        } else {
+            None
+        };
         model.forward_decode(*tokens.last().unwrap(), state)?;
-        let next_token = model.select_token(state, params, rng)?;
+        let (next_token, next_lp) = sample(state, rng)?;
+
+        // Observe BEFORE stop-check (preserves logprob recording for the stop token).
+        on_sampled(next_token, next_lp);
 
         if !params.ignore_eos && model.is_stop_token(next_token) {
             hit_eos = true;
@@ -488,32 +464,52 @@ fn generate_streaming_with_callback<M: ModelForward>(
         generated_count += 1;
         emitted_tokens += 1;
 
-        if !on_token(next_token) {
-            return Ok(StreamingStats {
-                emitted_tokens,
-                hit_eos: false,
-                consumer_dropped: true,
-            });
+        if let SinkControl::ConsumerDropped = on_emit(next_token) {
+            return Ok((
+                tokens,
+                StreamingStats {
+                    emitted_tokens,
+                    hit_eos: false,
+                    consumer_dropped: true,
+                },
+            ));
         }
     }
 
     if generated_count > 0 {
         let tpot_total = tpot_start.elapsed();
         let tpot_avg = tpot_total.as_secs_f64() / generated_count as f64;
-        debug!(
-            "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
-            tpot_avg * 1000.0,
-            generated_count,
-            tpot_total.as_secs_f64() * 1000.0,
-            generated_count as f64 / tpot_total.as_secs_f64()
-        );
+        if matches!(trace, TraceMode::Full) {
+            LocalSpan::add_properties(|| {
+                [
+                    ("tpot_avg_ms", format!("{:.2}", tpot_avg * 1000.0)),
+                    ("generated_tokens", generated_count.to_string()),
+                    (
+                        "tok_per_sec",
+                        format!("{:.1}", generated_count as f64 / tpot_total.as_secs_f64()),
+                    ),
+                ]
+            });
+        }
+        if emit_debug {
+            debug!(
+                "TPOT: {:.2}ms/tok (generated {} tokens in {:.2}ms, {:.1} tok/s)",
+                tpot_avg * 1000.0,
+                generated_count,
+                tpot_total.as_secs_f64() * 1000.0,
+                generated_count as f64 / tpot_total.as_secs_f64()
+            );
+        }
     }
 
-    Ok(StreamingStats {
-        emitted_tokens,
-        hit_eos,
-        consumer_dropped: false,
-    })
+    Ok((
+        tokens,
+        StreamingStats {
+            emitted_tokens,
+            hit_eos,
+            consumer_dropped: false,
+        },
+    ))
 }
 
 // ============================================================================
@@ -701,26 +697,28 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
     fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
         let prompt_tokens = self.tokenizer.encode(&req.prompt)?;
         let (effective, _prefix_len) = self.prepare_with_prefix_cache(&prompt_tokens)?;
-        let (output_tokens, token_logprobs) = if req.logprobs && req.sampling.is_greedy() {
-            generate_tokens_with_logprobs_inner(
-                &self.model,
-                &mut self.state,
-                &effective,
-                req.max_tokens,
-                &req.sampling,
-                &mut self.rng,
-            )?
-        } else {
-            let tokens = generate(
-                &self.model,
-                &mut self.state,
-                &effective,
-                req.max_tokens,
-                &req.sampling,
-                &mut self.rng,
-            )?;
-            (tokens, vec![])
-        };
+        let want_logprobs = req.logprobs && req.sampling.is_greedy();
+        let mut token_logprobs: Vec<f32> = Vec::new();
+        let (output_tokens, _stats) = generate_inner(
+            &self.model,
+            &mut self.state,
+            &effective,
+            req.max_tokens,
+            &req.sampling,
+            &mut self.rng,
+            want_logprobs,
+            if want_logprobs {
+                TraceMode::Silent
+            } else {
+                TraceMode::Full
+            },
+            |_token, lp| {
+                if want_logprobs && let Some(lp) = lp {
+                    token_logprobs.push(lp);
+                }
+            },
+            |_token| SinkControl::Continue,
+        )?;
         // Update cached prompt for next request.
         self.cached_prompt = prompt_tokens.clone();
         // output_tokens = effective_prompt + generated tokens
@@ -773,62 +771,72 @@ impl<M: ModelForward> InferenceEngine for ModelInferenceEngine<M> {
         let mut sent_len: usize = 0;
         let stopped_by_stop_sequence = std::cell::Cell::new(false);
 
-        let stats = generate_streaming_with_callback(
+        let mut on_token = |token_id: u32| match decoder.step(token_id) {
+            Ok(Some(text_delta)) => {
+                if let Some(ref stop_list) = stops {
+                    let new_full = {
+                        let emitted = decoder.emitted_text();
+                        emitted.to_string()
+                    };
+                    if let Some((to_send, stopped)) =
+                        truncate_at_stop(&new_full, sent_len, stop_list)
+                    {
+                        if !to_send.is_empty()
+                            && tx
+                                .send(CompletionStreamDelta {
+                                    text_delta: to_send,
+                                    finish_reason: None,
+                                    usage: None,
+                                    logprob: None,
+                                })
+                                .is_err()
+                        {
+                            return false;
+                        }
+                        sent_len = new_full.len() - stopped.len();
+                        stopped_by_stop_sequence.set(true);
+                        return false;
+                    }
+                    let to_send = &new_full[sent_len..];
+                    sent_len = new_full.len();
+                    tx.send(CompletionStreamDelta {
+                        text_delta: to_send.to_string(),
+                        finish_reason: None,
+                        usage: None,
+                        logprob: None,
+                    })
+                    .is_ok()
+                } else {
+                    tx.send(CompletionStreamDelta {
+                        text_delta,
+                        finish_reason: None,
+                        usage: None,
+                        logprob: None,
+                    })
+                    .is_ok()
+                }
+            }
+            Ok(None) => true,
+            Err(err) => {
+                decode_error = Some(err);
+                false
+            }
+        };
+        let (_tokens, stats) = generate_inner(
             &self.model,
             &mut self.state,
             &effective_prompt,
             req.max_tokens,
             &req.sampling,
             &mut self.rng,
-            |token_id| match decoder.step(token_id) {
-                Ok(Some(text_delta)) => {
-                    if let Some(ref stop_list) = stops {
-                        let new_full = {
-                            let emitted = decoder.emitted_text();
-                            emitted.to_string()
-                        };
-                        if let Some((to_send, stopped)) =
-                            truncate_at_stop(&new_full, sent_len, stop_list)
-                        {
-                            if !to_send.is_empty()
-                                && tx
-                                    .send(CompletionStreamDelta {
-                                        text_delta: to_send,
-                                        finish_reason: None,
-                                        usage: None,
-                                        logprob: None,
-                                    })
-                                    .is_err()
-                            {
-                                return false;
-                            }
-                            sent_len = new_full.len() - stopped.len();
-                            stopped_by_stop_sequence.set(true);
-                            return false;
-                        }
-                        let to_send = &new_full[sent_len..];
-                        sent_len = new_full.len();
-                        tx.send(CompletionStreamDelta {
-                            text_delta: to_send.to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        })
-                        .is_ok()
-                    } else {
-                        tx.send(CompletionStreamDelta {
-                            text_delta,
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        })
-                        .is_ok()
-                    }
-                }
-                Ok(None) => true,
-                Err(err) => {
-                    decode_error = Some(err);
-                    false
+            false,
+            TraceMode::Streaming,
+            |_token, _lp| {},
+            |token| {
+                if on_token(token) {
+                    SinkControl::Continue
+                } else {
+                    SinkControl::ConsumerDropped
                 }
             },
         )?;
