@@ -18,6 +18,7 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+safetensors = { workspace = true }
 
 [[bin]]
 name = "train_tiny_lm"
