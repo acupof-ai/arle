@@ -312,13 +312,11 @@ fn estimate_per_slot_bytes(
     use std::path::Path;
 
     let config_path = Path::new(model_path).join("config.json");
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(_) => return 0,
+    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
+        return 0;
     };
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(_) => return 0,
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        return 0;
     };
 
     let num_layers = config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
