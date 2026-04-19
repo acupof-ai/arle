@@ -514,6 +514,18 @@ mlx_array* mlx_sigmoid(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(sigmoid(*to_arr(a))));
 }
 
+mlx_array* mlx_tanh(mlx_array* a) {
+    MLX_TRY_RETURN(from_arr(tanh(*to_arr(a))));
+}
+
+mlx_array* mlx_erf(mlx_array* a) {
+    MLX_TRY_RETURN(from_arr(erf(*to_arr(a))));
+}
+
+mlx_array* mlx_log(mlx_array* a) {
+    MLX_TRY_RETURN(from_arr(log(*to_arr(a))));
+}
+
 // === Shape ops ===
 
 mlx_array* mlx_reshape(mlx_array* a, const int32_t* shape, size_t ndim) {
@@ -602,6 +614,22 @@ mlx_array* mlx_where(mlx_array* cond, mlx_array* a, mlx_array* b) {
 
 mlx_array* mlx_sum_axis(mlx_array* a, int32_t axis, bool keepdims) {
     MLX_TRY_RETURN(from_arr(sum(*to_arr(a), static_cast<int>(axis), keepdims)));
+}
+
+mlx_array* mlx_mean_axis(mlx_array* a, int32_t axis, bool keepdims) {
+    MLX_TRY_RETURN(from_arr(mean(*to_arr(a), static_cast<int>(axis), keepdims)));
+}
+
+mlx_array* mlx_max_axis(mlx_array* a, int32_t axis, bool keepdims) {
+    MLX_TRY_RETURN(from_arr(max(*to_arr(a), static_cast<int>(axis), keepdims)));
+}
+
+mlx_array* mlx_logsumexp_axis(mlx_array* a, int32_t axis, bool keepdims) {
+    MLX_TRY_RETURN(from_arr(logsumexp(*to_arr(a), static_cast<int>(axis), keepdims)));
+}
+
+mlx_array* mlx_softmax_axis(mlx_array* a, int32_t axis, bool precise) {
+    MLX_TRY_RETURN(from_arr(softmax(*to_arr(a), static_cast<int>(axis), precise)));
 }
 
 mlx_array* mlx_argmax(mlx_array* a, bool keepdims) {
