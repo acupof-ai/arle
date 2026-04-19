@@ -39,6 +39,9 @@ enum Backing {
     /// Non-CUDA backing used both on the no-cuda feature lane and in
     /// scheduler tests on CUDA hosts that do not want to spend real
     /// pinned memory. Plain `Vec<u8>` — Send + Sync via std.
+    // Only constructed under `not(feature = "cuda")`. Under the `cuda,no-cuda`
+    // Mac typecheck this variant is dead; allow silences the false positive.
+    #[cfg_attr(feature = "cuda", allow(dead_code))]
     InMemory { buffer: Vec<u8> },
 }
 

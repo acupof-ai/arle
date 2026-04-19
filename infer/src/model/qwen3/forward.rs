@@ -13,7 +13,6 @@ use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
-    pub(super) ctx: DeviceContext,
     pub(crate) decode_bufs: DecodeBuffers,
     pub(crate) base: GenerationStateBase,
 }
@@ -83,7 +82,6 @@ impl ModelForward for Qwen3Model {
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
-            ctx: self.ctx.clone(),
             decode_bufs: DecodeBuffers::new(&self.ctx, &self.config)?,
             base: GenerationStateBase::new(
                 self.config.num_hidden_layers,
