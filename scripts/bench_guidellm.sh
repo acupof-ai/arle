@@ -179,6 +179,12 @@ if [[ -z "$PROCESSOR" ]]; then
 fi
 echo "    processor: $PROCESSOR"
 
+# guidellm 0.6.0 hangs at "Setup complete, starting benchmarks..." on macOS
+# under the default `fork` mp context (Python 3.11+ deprecates fork on darwin
+# and the worker_group spawn deadlocks). `forkserver` boots cleanly. See
+# scripts/setup_bench_toolchain.sh for the toolchain pin.
+export GUIDELLM__MP_CONTEXT_TYPE="${GUIDELLM__MP_CONTEXT_TYPE:-forkserver}"
+
 set +e
 guidellm benchmark run \
     --target "$TARGET" \
