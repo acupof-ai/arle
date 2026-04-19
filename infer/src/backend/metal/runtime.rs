@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use super::kv_pool::MetalKVPool;
 use super::prefix_cache::MetalPrefixCache;
 use super::request_state::{
-    MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
+    DflashBatchOutcome, MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
     Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
@@ -1090,19 +1090,23 @@ fn execute_decode_batch(
     // run sequentially (no async fan-out) — mixed-mode parallelism is
     // deferred to Phase 2b.
     //
-    // Default is `true` because (a) `admit_request` only enables DFlash for
+    // Default is `true` because `admit_request` only enables DFlash for
     // solo admissions (`active.is_empty()`), so the opt-in path is
-    // unreachable in production without also lifting admission, and
-    // (b) a known issue logged at
-    // `docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2c4-concurrent-dflash-b2-bit-ident.md`
-    // §"round-3 codex findings" still blocks bench-enabling: all-or-nothing
-    // DFlash demotion on buffered-speculative rows (fix at
-    // `request_state.rs::try_decode_qwen35_dflash_speculative_batch`).
-    // The companion "plain-decode cache rollback" finding was retracted
-    // by a follow-up codex review — the `invalidate_*` sync on the
-    // `Ok(None)` arm is the ONLY path that propagates
-    // `packed_kv_flat`/`packed_gdr_flat` updates into per-request state;
-    // dropping it would starve the singleton fallback of current KV.
+    // unreachable in production without also lifting admission.
+    // The round-3 codex findings on this partitioner have both been
+    // addressed:
+    //   - [P2] "all-or-nothing DFlash demotion on buffered-speculative
+    //     rows" is fixed at
+    //     `request_state.rs::try_decode_qwen35_dflash_speculative_batch`:
+    //     the function now partitions into a ready subset (batched) and a
+    //     stale subset (scalar), so a non-empty `token_buffer` on one row
+    //     no longer demotes the whole bucket.
+    //   - [P1] "plain-decode cache rollback on singleton fallback" was
+    //     retracted by a follow-up codex review — the `invalidate_*` sync
+    //     on the `Ok(None)` arm is the ONLY path that propagates
+    //     `packed_kv_flat`/`packed_gdr_flat` updates into per-request
+    //     state; dropping it would starve the singleton fallback of
+    //     current KV.
     if open.len() >= 2 && dflash_concurrency_off {
         for (_, request) in open.iter_mut() {
             if request.request_state.is_dflash_enabled() {
@@ -1215,17 +1219,19 @@ fn execute_qwen35_dflash_packed_batch(
         return;
     }
 
-    let sampled = {
+    let outcome = {
         let mut request_refs: Vec<&mut MetalRequestState<'static>> = rows
             .iter_mut()
             .map(|(_, request)| &mut request.request_state)
             .collect();
         match MetalRequestState::try_decode_qwen35_dflash_speculative_batch(&mut request_refs) {
-            Ok(Some(tokens)) => tokens,
+            Ok(Some(outcome)) => outcome,
             Ok(None) => {
-                // Not eligible (wrong mode / phase / target_hidden not captured):
-                // fall back to per-row single-path decode. Scalar `decode_token`
-                // handles the stale-target_hidden and Rust-mode cases cleanly.
+                // <2 rows ready (wrong mode / phase / target_hidden not
+                // captured / non-empty token_buffer / cross-row disagreement):
+                // every row falls back to per-row single-path decode. Scalar
+                // `decode_token` handles the stale-target_hidden, Rust-mode,
+                // and buffered-drain cases cleanly.
                 for (req_id, request) in rows {
                     execute_decode_single(req_id, request, metrics, scheduler, active);
                 }
@@ -1242,10 +1248,15 @@ fn execute_qwen35_dflash_packed_batch(
         }
     };
 
-    if sampled.len() != rows.len() {
+    let DflashBatchOutcome {
+        ready_indices,
+        tokens: sampled,
+    } = outcome;
+
+    if sampled.len() != ready_indices.len() {
         error!(
             "Metal Qwen3.5 DFlash batched decode: expected {} sampled tokens, got {}",
-            rows.len(),
+            ready_indices.len(),
             sampled.len()
         );
         metrics.record_request_failed();
@@ -1255,24 +1266,38 @@ fn execute_qwen35_dflash_packed_batch(
         return;
     }
 
-    for ((req_id, mut request), sampled_token) in rows.into_iter().zip(sampled) {
-        if let Err(err) = request.process_token(sampled_token) {
-            error!(
-                "Metal DFlash batched decode post-process failed for {:?}: {err:#}",
-                req_id
+    // Commit ready-row tokens and dispatch stale rows in the original
+    // scheduler order (priority/arrival established by `build_decode_batch`).
+    // `ready_indices` is sorted ascending, so one linear pass suffices.
+    let mut sampled_iter = sampled.into_iter();
+    let mut ready_cursor = 0usize;
+    for (idx, (req_id, mut request)) in rows.into_iter().enumerate() {
+        let is_ready = ready_cursor < ready_indices.len() && idx == ready_indices[ready_cursor];
+        if is_ready {
+            ready_cursor += 1;
+            let sampled_token = sampled_iter
+                .next()
+                .expect("sampled.len() == ready_indices.len() validated above");
+            if let Err(err) = request.process_token(sampled_token) {
+                error!(
+                    "Metal DFlash batched decode post-process failed for {:?}: {err:#}",
+                    req_id
+                );
+                metrics.record_request_failed();
+                cancel_detached_request(req_id, request, scheduler);
+                continue;
+            }
+            finish_or_requeue_decoded_request(
+                req_id,
+                request,
+                sampled_token,
+                metrics,
+                scheduler,
+                active,
             );
-            metrics.record_request_failed();
-            cancel_detached_request(req_id, request, scheduler);
-            continue;
+        } else {
+            execute_decode_single(req_id, request, metrics, scheduler, active);
         }
-        finish_or_requeue_decoded_request(
-            req_id,
-            request,
-            sampled_token,
-            metrics,
-            scheduler,
-            active,
-        );
     }
 }
 

@@ -108,6 +108,22 @@ pub struct PrefillChunkResult {
     pub finish_reason: Option<&'static str>,
 }
 
+/// Result of `MetalRequestState::try_decode_qwen35_dflash_speculative_batch`:
+/// identifies which rows of the caller's input slice were dispatched through
+/// the batched speculative kernel, and the first sampled token for each.
+///
+/// Contract:
+///   - `ready_indices` is sorted ascending, `len() >= 2`.
+///   - `tokens.len() == ready_indices.len()`; `tokens[i]` is the sampled
+///     token for the input row at `ready_indices[i]`.
+///   - Every input-slice index NOT in `ready_indices` must be run scalar by
+///     the caller — those rows were left untouched.
+#[derive(Clone, Debug)]
+pub(crate) struct DflashBatchOutcome {
+    pub(crate) ready_indices: Vec<usize>,
+    pub(crate) tokens: Vec<u32>,
+}
+
 trait StepDriver {
     fn prefill_token(&mut self, token: u32, terminal_prompt: bool) -> Result<Option<u32>>;
     fn prefill_tokens(&mut self, tokens: &[u32], terminal_prompt: bool) -> Result<Option<u32>> {
@@ -927,30 +943,50 @@ impl<'a> MetalRequestState<'a> {
         sync_qwen35_packed_decode_batch(&mut qwen35_states, batch)
     }
 
-    /// Phase-2B batched DFlash speculative decode.
+    /// Phase-2B batched DFlash speculative decode with per-row filter.
     ///
-    /// Runs one `qwen35_dflash_speculative_block_batched` call across all rows
-    /// in `states`, fanning the per-row outputs (sampled tokens, cache_pos,
-    /// KV/GDR, updated `target_hidden`) back into each `MetalRequestState`.
-    /// Returns the first accepted token per row; remaining accepted tokens get
-    /// pushed into each row's `token_buffer` for subsequent scalar drain.
+    /// Partitions the input slice into a READY subset (every eligibility
+    /// predicate holds, and all ready rows agree on cross-row shape/handle
+    /// invariants anchored on the first ready row) and a STALE subset
+    /// (everyone else). If `ready.len() >= 2`, dispatches one
+    /// `qwen35_dflash_speculative_block_batched` call across the ready rows
+    /// only, fanning per-row outputs (sampled tokens, cache_pos, KV/GDR,
+    /// updated `target_hidden`) back into each `MetalRequestState`. Remaining
+    /// accepted tokens land in each row's `token_buffer` for scalar drain on
+    /// the next tick.
     ///
-    /// Returns `Ok(None)` when the batch is not eligible — caller falls back
-    /// to per-row `execute_decode_single`. Eligibility gates:
-    ///   - All rows Qwen3.5 in Decode phase, Cpp mode, DFlash enabled.
-    ///   - All rows have a captured `target_hidden` (post-prefill).
-    ///   - All rows have an empty `token_buffer` (otherwise draining logic
-    ///     would diverge from the scalar path mid-block).
-    ///   - All rows share `cache_len` (Phase 2B = same-length-only; varlen
-    ///     via per-row `left_padding` is deferred).
-    ///   - All rows carry a committed `last_token` (post-prefill invariant).
+    /// Returns:
+    ///   - `Ok(None)` when fewer than two rows are ready — caller runs every
+    ///     row through scalar `execute_decode_single`.
+    ///   - `Ok(Some(outcome))` when at least two rows were batched; callers
+    ///     MUST run every input index NOT in `outcome.ready_indices` through
+    ///     `execute_decode_single` themselves. Stale rows are left untouched
+    ///     by this function.
+    ///
+    /// Per-row eligibility:
+    ///   - Qwen3.5 Decode phase, `Qwen35StepMode::Cpp`, DFlash enabled.
+    ///   - Captured `target_hidden` (post-prefill).
+    ///   - Empty `token_buffer` (still draining a prior block → scalar path).
+    ///   - Committed `last_token` (post-prefill invariant).
+    ///   - `runtime.batched_draft_path_eligible()` — scalar draft routing
+    ///     gates hold.
+    ///
+    /// Cross-row eligibility (checked vs the first per-row-ready anchor):
+    ///   - Identical `cache_len`, `target_hidden.shape()[0]`,
+    ///     `draft_state.active_len()`.
+    ///   - Shared `weights`/`config`/`arch`/DFlash `runtime`/`config` ptrs.
     pub(crate) fn try_decode_qwen35_dflash_speculative_batch(
         states: &mut [&mut MetalRequestState<'a>],
-    ) -> Result<Option<Vec<u32>>> {
+    ) -> Result<Option<DflashBatchOutcome>> {
         if states.len() < 2 {
             return Ok(None);
         }
 
+        // Current caller (`execute_qwen35_dflash_packed_batch`) only passes
+        // DFlash-enabled rows, which are always Qwen3.5. Defensive bail if a
+        // Qwen3 row ever leaks through: the inner function requires a uniform
+        // `ResumableRequestState<Qwen35StepDriver>` slice, so there's no
+        // middle ground — demote the whole bucket to scalar.
         let mut qwen35_states: Vec<&mut ResumableRequestState<Qwen35StepDriver<'a>>> =
             Vec::with_capacity(states.len());
         for state in states.iter_mut() {
@@ -1655,95 +1691,116 @@ fn decode_qwen35_packed_batch<'a>(
 /// See doc comment on the method for eligibility rules and contract.
 fn try_decode_qwen35_dflash_speculative_batch<'a>(
     states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>],
-) -> Result<Option<Vec<u32>>> {
+) -> Result<Option<DflashBatchOutcome>> {
     if states.len() < 2 {
         return Ok(None);
     }
 
-    // ── 1. Eligibility gates. Any mismatch → Ok(None) (caller falls back). ──
-    // Basic: all Qwen3.5 Decode + DFlash-enabled + Cpp mode + empty token_buffer
-    // + same cache_len + committed last_token. All buffer/target_hidden reads
-    // are &-only here so we don't commit to anything before validation.
+    // ── 1. Per-row + cross-row eligibility. Partitions into a ready subset
+    //      (passed to the batched kernel) and a stale subset (caller runs
+    //      scalar). Two-pass structure avoids committing to any single anchor
+    //      row until we know at least two rows agree on cross-row predicates.
     //
-    // Also require row-equal `target_hidden.shape()[0]` (the ctx_len the
-    // batched block stacks over) and row-equal `draft_state.len` (so
-    // per-row `[..len]` K/V slices stack cleanly — see Finding 2). Two rows
-    // can share `cache_len` but diverge on either of these after partial
-    // accept; routing them into the batched kernel would turn a normal
-    // divergence into a scheduler cancel.
+    // Per-row predicates (any miss → row not ready):
+    //   - `phase == Decode`, `Qwen35StepMode::Cpp`
+    //   - `dflash.is_some()` with captured `target_hidden`
+    //   - `dflash.token_buffer.is_empty()` — a non-empty buffer means the row
+    //     is still draining a prior speculative block's tail tokens and the
+    //     batched path's cache advance would race the scalar drain.
+    //   - `last_token.is_some()` (post-prefill invariant)
+    //   - `dflash.runtime.batched_draft_path_eligible()` — scalar
+    //     `dflash_draft_forward` routing gates (`DFLASH_DRAFT_CPP=1` AND
+    //     `draft_attention_mask != "causal"`).
     //
-    // Plus the draft routing gates: the batched C++ graph is only valid
-    // when the same predicates the scalar `dflash_draft_forward` checks are
-    // true (`DFLASH_DRAFT_CPP=1` AND `draft_attention_mask != "causal"`).
-    // Anything else falls back to scalar per-row decode.
-    let first_cache_len = states[0].driver.cache_len;
-    let Some(first_dflash) = states[0].driver.dflash.as_ref() else {
-        return Ok(None);
-    };
-    let Some(first_target_hidden) = first_dflash.target_hidden.as_ref() else {
-        return Ok(None);
-    };
-    let Some(&first_target_hidden_len) = first_target_hidden.shape().first() else {
-        return Ok(None);
-    };
-    let first_draft_len = first_dflash.draft_state.active_len();
+    // Cross-row predicates form an equivalence relation; we want the LARGEST
+    // agreeing subset, not "whoever agrees with the first ready row". Picking
+    // the first row as anchor would reintroduce all-or-nothing demotion when
+    // the first ready row is the outlier — e.g. `[outlier, compat, compat]`
+    // would filter both `compat` rows out. O(n²) majority-equivalence-class
+    // scan is fine: bucket sizes are tiny.
+    //   - identical `cache_len`
+    //   - identical `target_hidden.shape()[0]` (ctx_len axis the batched
+    //     block stacks over — partial-accept rebuilds this per row so equal
+    //     cache_len does NOT imply equal ctx_len)
+    //   - identical `draft_state.active_len()` (per-row `[..len]` slice stacks
+    //     cleanly iff this holds)
+    //   - identical `weights`/`config`/`arch` pointers and identical DFlash
+    //     `runtime`/`config` pointers (shared model handles)
+    let mut ready_flags: Vec<bool> = Vec::with_capacity(states.len());
     for state in states.iter() {
-        if state.phase != MetalRequestPhase::Decode {
-            return Ok(None);
+        ready_flags.push(row_passes_dflash_batch_per_row_predicates(state));
+    }
+
+    let mut best_anchor: Option<usize> = None;
+    let mut best_count: usize = 0;
+    for (candidate_idx, &candidate_ready) in ready_flags.iter().enumerate() {
+        if !candidate_ready {
+            continue;
         }
-        let driver = &state.driver;
-        if driver.cache_len != first_cache_len {
-            return Ok(None);
+        let mut count = 0usize;
+        for (other_idx, &other_ready) in ready_flags.iter().enumerate() {
+            if !other_ready {
+                continue;
+            }
+            if other_idx == candidate_idx
+                || rows_agree_on_dflash_batch_cross_row_predicates(
+                    states[candidate_idx],
+                    states[other_idx],
+                )
+            {
+                count += 1;
+            }
         }
-        let Qwen35StepMode::Cpp(_) = driver.mode else {
-            return Ok(None);
-        };
-        let Some(dflash) = driver.dflash.as_ref() else {
-            return Ok(None);
-        };
-        if !dflash.token_buffer.is_empty() {
-            // Round-3 codex finding [P2]: this demotes the whole bucket
-            // whenever any row is still draining speculative tail tokens
-            // from a prior successful block (common: accept>1 leaves
-            // `token_buffer` non-empty). Fix planned with bench-enable
-            // (#13): per-row filter that carves the ready subset instead
-            // of returning Ok(None) for the whole bucket. Documented at
-            // `docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2c4-concurrent-dflash-b2-bit-ident.md`.
-            return Ok(None);
-        }
-        let Some(target_hidden) = dflash.target_hidden.as_ref() else {
-            return Ok(None);
-        };
-        // target_hidden is rank-2 `[ctx_len, hidden]`; axis-0 must match across
-        // rows to stack. Partial-accept divergence rebuilds this per-row from
-        // `accepted_inputs`, so equal `cache_len` does NOT imply equal
-        // `target_hidden.shape()[0]`.
-        match target_hidden.shape().first().copied() {
-            Some(ctx) if ctx == first_target_hidden_len => {}
-            _ => return Ok(None),
-        }
-        // All rows must share `draft_state.len` — Finding 2's per-row
-        // `[..len]` slice stacks cleanly iff this holds.
-        if dflash.draft_state.active_len() != first_draft_len {
-            return Ok(None);
-        }
-        if state.last_token.is_none() {
-            return Ok(None);
-        }
-        // Runtime routing gates (Finding 3): match the scalar path's C++/mask
-        // predicates. `runtime` ptr-equality is enforced below, so checking
-        // on the first-row's runtime is fine, but check per-row here for
-        // defensive clarity before we cross the ptr-equality check.
-        if !dflash.runtime.batched_draft_path_eligible() {
-            return Ok(None);
+        if count > best_count {
+            best_count = count;
+            best_anchor = Some(candidate_idx);
         }
     }
 
-    // Shared model handles; all rows must point to the same runtime/weights.
+    if let Some(anchor_idx) = best_anchor {
+        for (idx, flag) in ready_flags.iter_mut().enumerate() {
+            if !*flag || idx == anchor_idx {
+                continue;
+            }
+            if !rows_agree_on_dflash_batch_cross_row_predicates(states[anchor_idx], states[idx]) {
+                *flag = false;
+            }
+        }
+    } else {
+        ready_flags.fill(false);
+    }
+
+    let ready_indices: Vec<usize> = ready_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &ready)| if ready { Some(idx) } else { None })
+        .collect();
+
+    if ready_indices.len() < 2 {
+        return Ok(None);
+    }
+
+    // Compact `states` down to the ready subset. The existing batched-kernel
+    // body below runs against `ready_states` unchanged; stale rows are left
+    // untouched for the caller to run scalar.
+    let mut ready_states: Vec<&mut ResumableRequestState<Qwen35StepDriver<'a>>> =
+        Vec::with_capacity(ready_indices.len());
+    for (idx, state) in states.iter_mut().enumerate() {
+        if ready_flags[idx] {
+            // Reborrow: `states[idx]` is `&mut &mut ResumableRequestState<_>`;
+            // deref once, then reborrow mutably to produce a fresh
+            // `&mut ResumableRequestState<_>` tied to this function's lifetime.
+            ready_states.push(&mut **state);
+        }
+    }
+    let states: &mut [&mut ResumableRequestState<Qwen35StepDriver<'a>>] = &mut ready_states;
+
+    let first_cache_len = states[0].driver.cache_len;
+
+    // Shared model handles anchored on the first ready row; ptr-equality was
+    // already enforced by the cross-row filter above.
     let first = &states[0].driver;
     let weights = first.weights;
-    let config = first.config;
-    let arch = first.arch;
     let runtime: &MetalDflashRuntime = first
         .dflash
         .as_ref()
@@ -1754,17 +1811,6 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
         .as_ref()
         .expect("dflash presence validated above")
         .config;
-    for state in states.iter() {
-        let d = state.driver.dflash.as_ref().expect("validated above");
-        if !std::ptr::eq(state.driver.weights, weights)
-            || !std::ptr::eq(state.driver.config, config)
-            || !std::ptr::eq(state.driver.arch, arch)
-            || !std::ptr::eq(d.runtime, runtime)
-            || !std::ptr::eq(d.config, target_config)
-        {
-            return Ok(None);
-        }
-    }
 
     let cpp_model: &CppQwen35Model = weights
         .cpp_model
@@ -1958,7 +2004,97 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
         sampled_first_tokens.push(first_token);
     }
 
-    Ok(Some(sampled_first_tokens))
+    Ok(Some(DflashBatchOutcome {
+        ready_indices,
+        tokens: sampled_first_tokens,
+    }))
+}
+
+/// Per-row predicate for `try_decode_qwen35_dflash_speculative_batch`. True iff
+/// the row can join a DFlash batched-speculative block in isolation (cross-row
+/// agreement is checked separately, anchored on the first row that passes
+/// this predicate).
+fn row_passes_dflash_batch_per_row_predicates<'a>(
+    state: &ResumableRequestState<Qwen35StepDriver<'a>>,
+) -> bool {
+    if state.phase != MetalRequestPhase::Decode {
+        return false;
+    }
+    if state.last_token.is_none() {
+        return false;
+    }
+    let driver = &state.driver;
+    let Qwen35StepMode::Cpp(_) = driver.mode else {
+        return false;
+    };
+    let Some(dflash) = driver.dflash.as_ref() else {
+        return false;
+    };
+    // Non-empty buffer means the row is still draining a prior speculative
+    // block's tail tokens; routing it through the batched path would double-
+    // advance the cache.
+    if !dflash.token_buffer.is_empty() {
+        return false;
+    }
+    let Some(target_hidden) = dflash.target_hidden.as_ref() else {
+        return false;
+    };
+    if target_hidden.shape().first().is_none() {
+        return false;
+    }
+    if !dflash.runtime.batched_draft_path_eligible() {
+        return false;
+    }
+    true
+}
+
+/// Cross-row predicate: does `candidate` agree with `anchor` on every axis the
+/// batched kernel needs to stack cleanly? Callers must have already confirmed
+/// both rows individually pass `row_passes_dflash_batch_per_row_predicates`.
+fn rows_agree_on_dflash_batch_cross_row_predicates<'a>(
+    anchor: &ResumableRequestState<Qwen35StepDriver<'a>>,
+    candidate: &ResumableRequestState<Qwen35StepDriver<'a>>,
+) -> bool {
+    let anchor_driver = &anchor.driver;
+    let candidate_driver = &candidate.driver;
+    if anchor_driver.cache_len != candidate_driver.cache_len {
+        return false;
+    }
+    let anchor_dflash = anchor_driver
+        .dflash
+        .as_ref()
+        .expect("anchor per-row predicate guarantees dflash");
+    let candidate_dflash = candidate_driver
+        .dflash
+        .as_ref()
+        .expect("candidate per-row predicate guarantees dflash");
+    let anchor_target_hidden = anchor_dflash
+        .target_hidden
+        .as_ref()
+        .expect("anchor per-row predicate guarantees target_hidden");
+    let candidate_target_hidden = candidate_dflash
+        .target_hidden
+        .as_ref()
+        .expect("candidate per-row predicate guarantees target_hidden");
+    // target_hidden is rank-2 `[ctx_len, hidden]`; axis-0 must match across
+    // rows to stack. Partial-accept divergence rebuilds this per-row from
+    // `accepted_inputs`, so equal `cache_len` does NOT imply equal
+    // `target_hidden.shape()[0]`.
+    if anchor_target_hidden.shape().first() != candidate_target_hidden.shape().first() {
+        return false;
+    }
+    if anchor_dflash.draft_state.active_len() != candidate_dflash.draft_state.active_len() {
+        return false;
+    }
+    if !std::ptr::eq(anchor_driver.weights, candidate_driver.weights)
+        || !std::ptr::eq(anchor_driver.config, candidate_driver.config)
+        || !std::ptr::eq(anchor_driver.arch, candidate_driver.arch)
+        || !std::ptr::eq(anchor_dflash.runtime, candidate_dflash.runtime)
+        || !std::ptr::eq(anchor_dflash.config, candidate_dflash.config)
+    {
+        return false;
+    }
+    true
 }
 
 fn decode_qwen35_batch(
