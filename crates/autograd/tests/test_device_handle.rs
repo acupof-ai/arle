@@ -73,6 +73,7 @@ fn metal_handle_drops_cleanly_on_scope_exit() -> Result<()> {
     }
 
     let fresh = backend.upload(&[11.0_f32, 12.0], &[2])?;
+    backend.eval(&[&fresh])?;
     let roundtrip = backend.readback(&fresh)?;
     assert_eq!(f32_bytes(&roundtrip), f32_bytes(&[11.0_f32, 12.0]));
     Ok(())

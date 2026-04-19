@@ -6,29 +6,42 @@ use std::{collections::HashSet, sync::Arc};
 
 pub type TensorId = usize;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dirty {
+    Host,
+    Device,
+    Both,
+}
+
 #[derive(Debug)]
 pub struct GpuTensor {
     pub data: Vec<f32>,
-    pub device_handle: Option<DeviceHandle>,
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
     pub size: usize,
     pub requires_grad: bool,
     pub grad: Option<TensorId>,
+    pub device_handle: Option<DeviceHandle>,
+    pub dirty: Dirty,
 }
 
 impl Clone for GpuTensor {
     fn clone(&self) -> Self {
+        assert!(
+            self.dirty != Dirty::Device,
+            "ensure_host before cloning a device-resident tensor"
+        );
         Self {
             data: self.data.clone(),
             // Device handles own unique backend allocations; clones fall back
             // to the host copy until an explicit re-upload repopulates them.
-            device_handle: None,
             shape: self.shape.clone(),
             strides: self.strides.clone(),
             size: self.size,
             requires_grad: self.requires_grad,
             grad: self.grad,
+            device_handle: None,
+            dirty: Dirty::Host,
         }
     }
 }
@@ -47,12 +60,13 @@ impl GpuTensor {
         let strides = contiguous_strides(&shape);
         Ok(Self {
             data,
-            device_handle: None,
             shape,
             strides,
             size,
             requires_grad,
             grad: None,
+            device_handle: None,
+            dirty: Dirty::Host,
         })
     }
 }
@@ -126,7 +140,20 @@ impl TensorStore {
     }
 
     pub fn get_mut(&mut self, id: TensorId) -> Option<&mut GpuTensor> {
-        self.tensors.get_mut(id).and_then(Option::as_mut)
+        if matches!(
+            self.tensors
+                .get(id)
+                .and_then(Option::as_ref)
+                .map(|tensor| &tensor.dirty),
+            Some(Dirty::Device)
+        ) {
+            self.ensure_host(id)
+                .expect("ensure_host before mutable tensor access");
+        }
+
+        let tensor = self.tensors.get_mut(id).and_then(Option::as_mut)?;
+        tensor.dirty = Dirty::Host;
+        Some(tensor)
     }
 
     pub fn from_slice(&mut self, data: &[f32], shape: &[usize]) -> Result<TensorId> {
@@ -134,8 +161,87 @@ impl TensorStore {
         Ok(self.alloc(tensor))
     }
 
-    pub fn to_host(&self, id: TensorId) -> Result<Vec<f32>> {
+    pub fn ensure_host(&mut self, id: TensorId) -> Result<()> {
+        if self.tensor(id)?.dirty != Dirty::Device {
+            return Ok(());
+        }
+
+        let handle = self
+            .tensor(id)?
+            .device_handle
+            .as_ref()
+            .ok_or(AutogradError::TapeInvariant(
+                "device-resident tensor missing device handle",
+            ))?
+            .clone();
+        self.backend().eval(&[&handle])?;
+        let host = self.backend().readback(&handle)?;
+        let tensor = self.raw_tensor_mut(id)?;
+        tensor.data = host;
+        tensor.dirty = Dirty::Both;
+        Ok(())
+    }
+
+    pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
+        let (dirty, has_handle, data, shape) = {
+            let tensor = self.tensor(id)?;
+            (
+                tensor.dirty.clone(),
+                tensor.device_handle.is_some(),
+                tensor.data.clone(),
+                tensor.shape.clone(),
+            )
+        };
+
+        if has_handle && dirty != Dirty::Host {
+            return Ok(());
+        }
+
+        let handle = self.backend().upload(&data, &shape)?;
+        let tensor = self.raw_tensor_mut(id)?;
+        tensor.device_handle = Some(handle);
+        tensor.dirty = Dirty::Both;
+        Ok(())
+    }
+
+    pub fn to_host(&mut self, id: TensorId) -> Result<Vec<f32>> {
+        self.ensure_host(id)?;
         Ok(self.tensor(id)?.data.clone())
+    }
+
+    pub fn alloc_device_tensor(
+        &mut self,
+        shape: Vec<usize>,
+        handle: DeviceHandle,
+    ) -> Result<TensorId> {
+        let tensor = GpuTensor {
+            data: Vec::new(),
+            shape: shape.clone(),
+            strides: contiguous_strides(&shape),
+            size: shape_size(&shape),
+            requires_grad: false,
+            grad: None,
+            device_handle: Some(handle),
+            dirty: Dirty::Device,
+        };
+        Ok(self.alloc(tensor))
+    }
+
+    pub(crate) fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
+        self.raw_tensor_mut(id)?.requires_grad = requires_grad;
+        Ok(())
+    }
+
+    pub(crate) fn set_grad(&mut self, id: TensorId, grad: Option<TensorId>) -> Result<()> {
+        self.raw_tensor_mut(id)?.grad = grad;
+        Ok(())
+    }
+
+    fn raw_tensor_mut(&mut self, id: TensorId) -> Result<&mut GpuTensor> {
+        self.tensors
+            .get_mut(id)
+            .and_then(Option::as_mut)
+            .ok_or(AutogradError::InvalidTensorId(id))
     }
 
     pub fn zeros_like(&mut self, id: TensorId) -> Result<TensorId> {
@@ -165,14 +271,16 @@ impl TensorStore {
         match existing_grad {
             Some(existing_id) => {
                 let incoming = self.to_host(grad_id)?;
-                let existing = self.tensor_mut(existing_id)?;
+                let existing = self
+                    .get_mut(existing_id)
+                    .ok_or(AutogradError::InvalidTensorId(existing_id))?;
                 for (dst, src) in existing.data.iter_mut().zip(incoming) {
                     *dst += src;
                 }
             }
             None => {
                 let cloned_grad_id = self.clone_tensor(grad_id)?;
-                self.tensor_mut(param_id)?.grad = Some(cloned_grad_id);
+                self.set_grad(param_id, Some(cloned_grad_id))?;
             }
         }
 
@@ -188,6 +296,7 @@ impl TensorStore {
     }
 
     pub(crate) fn clone_tensor(&mut self, id: TensorId) -> Result<TensorId> {
+        self.ensure_host(id)?;
         let tensor = self.tensor(id)?.clone();
         Ok(self.alloc(tensor))
     }

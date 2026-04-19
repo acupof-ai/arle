@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 
 use crate::{
     AutogradError, Result, ops,
-    tensor::{TensorId, TensorStore},
+    tensor::{Dirty, TensorId, TensorStore},
 };
 
 #[derive(Debug, Clone)]
@@ -120,6 +120,20 @@ impl Tape {
         self.enabled = false;
 
         let result = (|| {
+            let device_ids: Vec<TensorId> = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    store
+                        .get(entry.output_id)
+                        .is_some_and(|tensor| tensor.dirty == Dirty::Device)
+                })
+                .map(|entry| entry.output_id)
+                .collect();
+            for id in device_ids {
+                store.ensure_host(id)?;
+            }
+
             let mut entry_by_output = HashMap::with_capacity(self.entries.len());
             for (index, entry) in self.entries.iter().enumerate() {
                 entry_by_output.insert(entry.output_id, index);
