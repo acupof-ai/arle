@@ -6,7 +6,7 @@ use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     lora::LoraConfig,
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
     rollout::rollout_group,
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
@@ -62,9 +62,9 @@ fn main() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
 
-    let mut config = LmConfig {
+    let mut config = TransformerConfig {
         max_seq_len: args.seq,
-        ..LmConfig::default()
+        ..TransformerConfig::default()
     };
     if args.lora_rank > 0 {
         let alpha = if args.lora_alpha > 0.0 {
@@ -80,7 +80,7 @@ fn main() -> Result<(), CliError> {
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store)?;
+    let policy = Transformer::new(config, &mut store)?;
     let params = policy.parameters();
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
@@ -357,7 +357,7 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
     }
 }
 
-fn retained_ids(models: &[&Lm], store: &TensorStore) -> HashSet<TensorId> {
+fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for model in models {
         for param_id in model.all_parameter_ids() {

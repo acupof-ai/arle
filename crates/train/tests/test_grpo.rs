@@ -4,7 +4,7 @@ use autograd::{Tape, TensorId, TensorStore, module::Module, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
     grpo::{GrpoConfig, group_advantages, grpo_loss, ppo_active_mask},
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
     rollout::{Trajectory, rollout_group},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
@@ -57,7 +57,7 @@ fn group_advantages_normalizes_per_group() {
 
 #[test]
 fn grpo_loss_gradient_non_zero() {
-    let config = LmConfig {
+    let config = TransformerConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -70,7 +70,7 @@ fn grpo_loss_gradient_non_zero() {
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store).expect("build policy");
+    let policy = Transformer::new(config, &mut store).expect("build policy");
     let ref_model = policy.clone_frozen(&mut store);
     let params = policy.parameters();
     {
@@ -139,7 +139,7 @@ fn grpo_loss_gradient_non_zero() {
 #[test]
 fn grpo_smoke_reward_nondecreasing_on_trivial_task() {
     let started = Instant::now();
-    let config = LmConfig {
+    let config = TransformerConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -152,7 +152,7 @@ fn grpo_smoke_reward_nondecreasing_on_trivial_task() {
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store).expect("build policy");
+    let policy = Transformer::new(config, &mut store).expect("build policy");
     let params = policy.parameters();
     let mut optimizer = AdamW::new(1.0e-2, (0.9, 0.999), 1.0e-8, 0.0);
     let mut dataset = CopyDataset::with_vocab(2, 8, 7, 8, 15);
@@ -289,7 +289,7 @@ fn mean_reward(trajectories: &[Trajectory]) -> f32 {
         / trajectories.len() as f32
 }
 
-fn retained_ids(models: &[&Lm], store: &TensorStore) -> HashSet<TensorId> {
+fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for model in models {
         for param_id in model.all_parameter_ids() {

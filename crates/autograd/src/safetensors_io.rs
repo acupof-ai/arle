@@ -7,7 +7,7 @@ use half::bf16;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors, serialize_to_file};
 
-use crate::{AutogradError, Tensor, Result, TensorId, TensorStore};
+use crate::{AutogradError, Result, Tensor, TensorId, TensorStore};
 
 pub struct SafetensorsRegistry {
     map: HashMap<String, TensorId>,
@@ -204,11 +204,7 @@ mod tests {
         let path = dir.path().join("roundtrip.safetensors");
 
         let mut source_store = TensorStore::default();
-        let first = source_store.alloc(Tensor::new(
-            vec![1.0, -2.5, 3.25, 0.0],
-            vec![2, 2],
-            true,
-        )?);
+        let first = source_store.alloc(Tensor::new(vec![1.0, -2.5, 3.25, 0.0], vec![2, 2], true)?);
         let second = source_store.alloc(Tensor::new(vec![4.5, -5.0, 6.75], vec![3], true)?);
 
         let mut source_registry = SafetensorsRegistry::new();
@@ -319,8 +315,7 @@ mod tests {
         // assert with a relative tolerance because bf16 is lossy.
         let source_values = vec![1.0_f32, -2.5, 3.25, 0.0];
         let mut source_store = TensorStore::default();
-        let weight_id =
-            source_store.alloc(Tensor::new(source_values.clone(), vec![2, 2], true)?);
+        let weight_id = source_store.alloc(Tensor::new(source_values.clone(), vec![2, 2], true)?);
         let mut source_registry = SafetensorsRegistry::new();
         source_registry.insert("weight", weight_id);
         source_registry.save_from_bf16(&mut source_store, &path)?;

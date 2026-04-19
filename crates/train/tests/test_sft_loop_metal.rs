@@ -17,7 +17,7 @@ use autograd::{
 use tempfile::tempdir;
 use train::{
     dataset::LcgRng,
-    qwen3_autograd::{Qwen3Config, Qwen3Model},
+    qwen3::{Qwen3Config, Qwen3Model},
     sft_data::TokenizedSft,
 };
 

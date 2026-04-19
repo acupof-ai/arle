@@ -9,11 +9,7 @@ use crate::{
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(a)?.clone();
     let value = input.data.iter().sum();
-    let output_id = store.alloc(Tensor::new(
-        vec![value],
-        Vec::new(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 
     if input.requires_grad {
         tape.record(TapeEntry {
@@ -30,11 +26,7 @@ pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(a)?.clone();
     let value = input.data.iter().sum::<f32>() / input.size as f32;
-    let output_id = store.alloc(Tensor::new(
-        vec![value],
-        Vec::new(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 
     if input.requires_grad {
         tape.record(TapeEntry {
@@ -83,11 +75,7 @@ pub(crate) fn sum_backward(
     } else {
         shape.iter().product()
     };
-    let grad_id = store.alloc(Tensor::new(
-        vec![grad_value; size],
-        shape.clone(),
-        false,
-    )?);
+    let grad_id = store.alloc(Tensor::new(vec![grad_value; size], shape.clone(), false)?);
     Ok(smallvec![(a, grad_id)])
 }
 

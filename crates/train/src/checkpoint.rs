@@ -1,4 +1,4 @@
-//! Minimal f32 checkpoint format for Lm-sized models.
+//! Minimal f32 checkpoint format for Transformer-sized models.
 //!
 //! Self-contained serialization — no postcard, no serde. Walks a
 //! `Module`'s parameter list in declaration order and writes one
@@ -9,7 +9,7 @@
 //!
 //! ## On-disk layout
 //! ```text
-//! magic: 8 bytes, literal "TLMCKP02"
+//! magic: 8 bytes, literal "LMCKP003"
 //! config: 7 × u64 LE — vocab_size, d_model, n_layers, n_heads, d_head,
 //!                     d_ff, max_seq_len
 //! num_tensors: u64 LE
@@ -26,9 +26,10 @@ use std::path::Path;
 
 use autograd::{TensorId, TensorStore, module::Module};
 
-use crate::model::LmConfig;
+use crate::model::TransformerConfig;
 
-const MAGIC: &[u8; 8] = b"TLMCKP02";
+// bumped 2026-04-19 when TinyLM was renamed to Transformer (no on-disk format change)
+const MAGIC: &[u8; 8] = b"LMCKP003";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
@@ -52,7 +53,7 @@ pub type Result<T> = std::result::Result<T, CheckpointError>;
 
 pub fn save<M: Module>(
     model: &M,
-    config: &LmConfig,
+    config: &TransformerConfig,
     store: &TensorStore,
     path: impl AsRef<Path>,
 ) -> Result<()> {
@@ -83,13 +84,13 @@ pub fn save<M: Module>(
     Ok(())
 }
 
-pub fn read_config(path: impl AsRef<Path>) -> Result<LmConfig> {
+pub fn read_config(path: impl AsRef<Path>) -> Result<TransformerConfig> {
     let file = File::open(path.as_ref())?;
     let mut reader = BufReader::new(file);
     read_header(&mut reader).map(|(config, _)| config)
 }
 
-fn read_header<R: Read>(reader: &mut R) -> Result<(LmConfig, usize)> {
+fn read_header<R: Read>(reader: &mut R) -> Result<(TransformerConfig, usize)> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -98,7 +99,7 @@ fn read_header<R: Read>(reader: &mut R) -> Result<(LmConfig, usize)> {
             actual: magic,
         });
     }
-    let config = LmConfig {
+    let config = TransformerConfig {
         vocab_size: read_u64(reader)? as usize,
         d_model: read_u64(reader)? as usize,
         n_layers: read_u64(reader)? as usize,

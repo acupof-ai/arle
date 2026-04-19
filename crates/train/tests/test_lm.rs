@@ -3,13 +3,13 @@ use std::collections::HashSet;
 use autograd::{Tape, TensorId, TensorStore, module::Module, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset},
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
 #[test]
 fn lm_copy_loss_drops_over_three_steps() {
-    let config = LmConfig {
+    let config = TransformerConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -22,7 +22,7 @@ fn lm_copy_loss_drops_over_three_steps() {
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let model = Lm::new(config, &mut store).expect("build tiny model");
+    let model = Transformer::new(config, &mut store).expect("build tiny model");
     let params = model.parameters();
     let mut optimizer = AdamW::new(1.0e-2, (0.9, 0.999), 1.0e-8, 0.0);
     let mut losses = Vec::with_capacity(3);

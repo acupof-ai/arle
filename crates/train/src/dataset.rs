@@ -145,3 +145,54 @@ impl Dataset for BytesDataset {
         (self.batch_size, self.seq_len)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct CorpusDataset {
+    batch_size: usize,
+    seq_len: usize,
+    rng: LcgRng,
+    tokens: Vec<usize>,
+}
+
+impl CorpusDataset {
+    pub fn new(tokens: Vec<usize>, batch_size: usize, seq_len: usize, seed: u64) -> Self {
+        assert!(
+            tokens.len() > seq_len,
+            "corpus ({} tokens) must exceed seq_len ({})",
+            tokens.len(),
+            seq_len
+        );
+        Self {
+            batch_size,
+            seq_len,
+            rng: LcgRng::seed(seed),
+            tokens,
+        }
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
+impl Dataset for CorpusDataset {
+    fn sample(&mut self) -> (Vec<usize>, Vec<usize>) {
+        let window = self.seq_len + 1;
+        let upper = self.tokens.len().saturating_sub(window) + 1;
+        let mut inputs = Vec::with_capacity(self.batch_size * self.seq_len);
+        let mut targets = Vec::with_capacity(self.batch_size * self.seq_len);
+
+        for _ in 0..self.batch_size {
+            let start = self.rng.gen_range(upper);
+            let slice = &self.tokens[start..start + window];
+            inputs.extend(slice[..self.seq_len].iter().copied());
+            targets.extend(slice[1..].iter().copied());
+        }
+
+        (inputs, targets)
+    }
+
+    fn batch_shape(&self) -> (usize, usize) {
+        (self.batch_size, self.seq_len)
+    }
+}

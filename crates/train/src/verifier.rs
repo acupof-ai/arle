@@ -1,4 +1,4 @@
-//! Verifier trait + concrete reward functions for Lm training.
+//! Verifier trait + concrete reward functions for Transformer training.
 //!
 //! Each verifier maps `(prompt_ids, full_ids, response_mask) -> f32` in
 //! `[0, 1]` (aggregators may emit larger magnitudes). Trajectories only

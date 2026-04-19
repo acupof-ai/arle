@@ -4,7 +4,7 @@ use tempfile::tempdir;
 use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
 use train::{
     sft_data::{ChatMessage, SftExample, load_jsonl, tokenize_example},
-    tokenizer::TrainTokenizer,
+    tokenizer::ChatTokenizer,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -63,7 +63,7 @@ fn tokenize_masks_non_assistant() -> TestResult {
     let dir = tempdir()?;
     let tokenizer_path = dir.path().join("tokenizer.json");
     write_test_tokenizer(&tokenizer_path)?;
-    let tokenizer = TrainTokenizer::from_file(&tokenizer_path)?;
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let example = SftExample {
         messages: vec![
             ChatMessage {

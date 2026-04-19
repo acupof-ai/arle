@@ -44,11 +44,7 @@ pub fn rmsnorm(
     }
 
     let requires_grad = x_tensor.requires_grad || weight_tensor.requires_grad;
-    let output_id = store.alloc(Tensor::new(
-        output,
-        x_tensor.shape.clone(),
-        requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, x_tensor.shape.clone(), requires_grad)?);
     if requires_grad {
         tape.record(TapeEntry {
             op: BackwardOp::RMSNorm,

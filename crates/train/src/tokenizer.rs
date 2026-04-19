@@ -10,17 +10,17 @@ use tokenizers::Tokenizer;
 
 use autograd::{AutogradError, Result};
 
-pub struct TrainTokenizer {
+pub struct ChatTokenizer {
     inner: Tokenizer,
 }
 
 #[derive(Debug, Clone)]
-pub struct ChatMsg<'a> {
+pub struct ChatMessageRef<'a> {
     pub role: &'a str,
     pub content: &'a str,
 }
 
-impl TrainTokenizer {
+impl ChatTokenizer {
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner = Tokenizer::from_file(path).map_err(|e| {
             AutogradError::TapeInvariant(Box::leak(
@@ -77,7 +77,7 @@ impl TrainTokenizer {
     ///
     /// Appended with `<|im_start|>assistant\n` when `add_generation_prompt`
     /// so the model knows it's the assistant's turn.
-    pub fn render_chat(msgs: &[ChatMsg<'_>], add_generation_prompt: bool) -> String {
+    pub fn render_chat(msgs: &[ChatMessageRef<'_>], add_generation_prompt: bool) -> String {
         let mut out = String::new();
         for m in msgs {
             out.push_str("<|im_start|>");
@@ -111,7 +111,7 @@ mod tests {
             eprintln!("no tokenizer.json at {}; skipping", path.display());
             return;
         }
-        let tok = TrainTokenizer::from_file(&path).expect("load tokenizer");
+        let tok = ChatTokenizer::from_file(&path).expect("load tokenizer");
         assert!(tok.vocab_size() > 1000, "vocab suspiciously small");
 
         let ids = tok.encode("hello world", false).expect("encode");
@@ -124,16 +124,16 @@ mod tests {
     #[test]
     fn chat_template_shape() {
         let msgs = [
-            ChatMsg {
+            ChatMessageRef {
                 role: "user",
                 content: "hi",
             },
-            ChatMsg {
+            ChatMessageRef {
                 role: "assistant",
                 content: "hello",
             },
         ];
-        let rendered = TrainTokenizer::render_chat(&msgs, true);
+        let rendered = ChatTokenizer::render_chat(&msgs, true);
         assert!(rendered.contains("<|im_start|>user\nhi<|im_end|>"));
         assert!(rendered.contains("<|im_start|>assistant\nhello<|im_end|>"));
         assert!(rendered.ends_with("<|im_start|>assistant\n"));

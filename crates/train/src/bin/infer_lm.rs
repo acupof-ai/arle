@@ -1,4 +1,4 @@
-//! Standalone inference binary for Lm checkpoints.
+//! Standalone inference binary for Transformer checkpoints.
 //!
 //! Loads a checkpoint produced by `train_multi_turn --save-path …`,
 //! runs greedy (or temperature-sampled) autoregressive decoding on a
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use autograd::{AutogradError, Backend, CpuBackend, Tape, TensorStore};
 use thiserror::Error;
 use train::dataset::LcgRng;
-use train::model::Lm;
+use train::model::Transformer;
 use train::sampling::sample_categorical;
 
 #[derive(Debug, Error)]
@@ -143,7 +143,7 @@ fn main() -> Result<(), CliError> {
         config.max_seq_len,
     );
 
-    let policy = Lm::new(config, &mut store)?;
+    let policy = Transformer::new(config, &mut store)?;
     train::checkpoint::load(&policy, &mut store, &args.load_path)?;
     println!("loaded checkpoint from {}", args.load_path);
 
