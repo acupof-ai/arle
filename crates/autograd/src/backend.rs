@@ -156,6 +156,40 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         b_shape: &[usize],
     ) -> Result<(Vec<f32>, Vec<usize>)>;
 
+    /// Compute the gradients for `C = A @ B` given upstream gradient `dC`.
+    /// `need_grad_a`/`need_grad_b` let the caller skip one side; each returned
+    /// vector is empty (`vec![]`) if the corresponding `need_grad_*` is false.
+    ///
+    /// Shapes:
+    /// - rank-2: `A:[M,K]`, `B:[K,N]`, `dC:[M,N]`.
+    /// - rank-3 (batched): `A:[B,M,K]`, `B:[B,K,N]`, `dC:[B,M,N]`.
+    ///
+    /// Semantics: `grad_a = dC @ B^T` and `grad_b = A^T @ dC`. The default
+    /// implementation forwards to `cpu_matmul_backward`; Metal/CUDA override
+    /// to run on-device.
+    fn matmul_backward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+        grad_out: &[f32],
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        cpu_matmul_backward(
+            a,
+            a_shape,
+            b,
+            b_shape,
+            grad_out,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )
+    }
+
     /// Elementwise `C = A + B` over identically-shaped contiguous tensors.
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
@@ -456,6 +490,87 @@ pub fn cpu_matmul_forward(
             expected: "both operands must be rank-2 or rank-3",
             got: a_shape.len().max(b_shape.len()),
         }),
+    }
+}
+
+/// CPU reference matmul backward. Computes `grad_a = grad_out @ B^T` and
+/// `grad_b = A^T @ grad_out`. Physically transposes the last two axes of the
+/// saved operand on the host and then calls `cpu_matmul_forward` — this is
+/// the authoritative numerical reference every GPU backend must match.
+///
+/// `need_grad_a`/`need_grad_b` skip the corresponding SGEMM when false; the
+/// returned `Vec<f32>` is empty in that case so callers can cheaply detect
+/// "no grad produced" without allocating.
+pub fn cpu_matmul_backward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    grad_out: &[f32],
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let expected_out = matmul_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    let grad_a = if need_grad_a {
+        // grad_a = grad_out @ b^T
+        let (b_t, b_t_shape) = transpose_last_two_ref(b, b_shape);
+        let (data, _) = cpu_matmul_forward(grad_out, grad_out_shape, &b_t, &b_t_shape)?;
+        data
+    } else {
+        Vec::new()
+    };
+    let grad_b = if need_grad_b {
+        // grad_b = a^T @ grad_out
+        let (a_t, a_t_shape) = transpose_last_two_ref(a, a_shape);
+        let (data, _) = cpu_matmul_forward(&a_t, &a_t_shape, grad_out, grad_out_shape)?;
+        data
+    } else {
+        Vec::new()
+    };
+    Ok((grad_a, grad_b))
+}
+
+/// Transpose the inner-most two axes of a rank-2 or rank-3 row-major buffer.
+/// Pure-host scratch used by `cpu_matmul_backward` and the `no-cuda`
+/// type-check path of the CUDA backend.
+pub(crate) fn transpose_last_two_ref(data: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>) {
+    match shape.len() {
+        2 => {
+            let rows = shape[0];
+            let cols = shape[1];
+            let mut out = vec![0.0f32; rows * cols];
+            for row in 0..rows {
+                for col in 0..cols {
+                    out[col * rows + row] = data[row * cols + col];
+                }
+            }
+            (out, vec![cols, rows])
+        }
+        3 => {
+            let batch = shape[0];
+            let rows = shape[1];
+            let cols = shape[2];
+            let plane = rows * cols;
+            let mut out = vec![0.0f32; batch * plane];
+            for batch_index in 0..batch {
+                let base = batch_index * plane;
+                for row in 0..rows {
+                    for col in 0..cols {
+                        out[base + col * rows + row] = data[base + row * cols + col];
+                    }
+                }
+            }
+            (out, vec![batch, cols, rows])
+        }
+        _ => (data.to_vec(), shape.to_vec()),
     }
 }
 
