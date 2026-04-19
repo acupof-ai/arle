@@ -8,8 +8,8 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use infer_cuda_kernels::TokenKVPool;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use cuda_kernels::TokenKVPool;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Per-request mutable state for GLM-4.
 pub struct GLM4State {

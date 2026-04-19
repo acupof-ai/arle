@@ -1,9 +1,9 @@
-# `infer-cuda-kernels` — Agent Guide
+# `cuda-kernels` — Agent Guide
 
 Extracted CUDA kernel crate: CUDA C kernels + Triton AOT + FFI + the seven
 tensor/pool/metadata types that `infer` proper consumes. **This is the
 proto-public API for the eventual Option-B split.** Load this file before
-touching anything under `crates/infer-cuda-kernels/`.
+touching anything under `crates/cuda-kernels/`.
 
 ## Why this crate exists
 
@@ -14,14 +14,14 @@ split into one kernel crate. `infer/src/backend/cuda.rs` is now a ~15-line
 call sites still resolve while we wait for the final extraction trigger
 (FA-3 H100, MLA, NCCL, FP8 GEMM, spec-decode GPU, or a second consumer).
 
-**Invariant:** the dependency edge is `infer → infer-cuda-kernels`, **never
+**Invariant:** the dependency edge is `infer → cuda-kernels`, **never
 the reverse**. Nothing in this crate may depend on `infer` — no tokenizer,
 no scheduler, no model-specific weight struct, no `EngineOptions`.
 
 ## Crate layout
 
 ```
-crates/infer-cuda-kernels/
+crates/cuda-kernels/
 ├── Cargo.toml           — features: `cuda` (enables cudarc), `no-cuda` (compile-without-nvcc)
 ├── build.rs             — SM auto-detection, Triton AOT, CUDA C compile, FlashInfer link
 ├── csrc/                — CUDA C sources, grouped by concern

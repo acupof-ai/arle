@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn rmsnorm(
@@ -44,7 +44,7 @@ pub fn rmsnorm(
     }
 
     let requires_grad = x_tensor.requires_grad || weight_tensor.requires_grad;
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         x_tensor.shape.clone(),
         requires_grad,
@@ -110,7 +110,7 @@ pub(crate) fn rmsnorm_backward(
                     (inv * scaled_grad) - (x_tensor.data[base + col] * inv * correction);
             }
         }
-        let grad_id = store.alloc(GpuTensor::new(grad_x, x_tensor.shape.clone(), false)?);
+        let grad_id = store.alloc(Tensor::new(grad_x, x_tensor.shape.clone(), false)?);
         grads.push((x, grad_id));
     }
 
@@ -122,7 +122,7 @@ pub(crate) fn rmsnorm_backward(
                 *grad_slot += upstream.data[base + col] * x_tensor.data[base + col] * inv;
             }
         }
-        let grad_id = store.alloc(GpuTensor::new(grad_weight, weight_tensor.shape, false)?);
+        let grad_id = store.alloc(Tensor::new(grad_weight, weight_tensor.shape, false)?);
         grads.push((weight, grad_id));
     }
 

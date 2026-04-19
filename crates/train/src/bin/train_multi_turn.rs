@@ -14,7 +14,7 @@ use train::{
     dataset::LcgRng,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
     lora::LoraConfig,
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
@@ -167,7 +167,7 @@ fn main() -> Result<(), CliError> {
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
     let seq_len = args.prompt_len + total_agent + total_obs;
 
-    let mut config = TinyLMConfig {
+    let mut config = LmConfig {
         vocab_size: args.vocab_size,
         d_model: args.d_model,
         n_layers: args.n_layers,
@@ -193,7 +193,7 @@ fn main() -> Result<(), CliError> {
     eprintln!("[train_multi_turn] backend={:?}", backend.device());
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
-    let policy = TinyLM::new(config, &mut store)?;
+    let policy = Lm::new(config, &mut store)?;
     let params = policy.parameters();
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let ref_model = policy.clone_frozen(&mut store);
@@ -411,9 +411,9 @@ fn main() -> Result<(), CliError> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_eval(
-    policy: &TinyLM,
-    ref_model: &TinyLM,
-    config: &TinyLMConfig,
+    policy: &Lm,
+    ref_model: &Lm,
+    config: &LmConfig,
     n_prompts: usize,
     prompt_len: usize,
     separator: usize,
@@ -652,7 +652,7 @@ where
     })
 }
 
-fn retained_ids(models: &[&TinyLM], store: &TensorStore) -> HashSet<TensorId> {
+fn retained_ids(models: &[&Lm], store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for model in models {
         for param_id in model.all_parameter_ids() {

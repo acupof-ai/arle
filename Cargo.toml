@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "infer", "crates/autograd", "crates/infer-agent", "crates/infer-chat", "crates/infer-cli", "crates/infer-cuda-kernels", "crates/infer-tools", "crates/mlx-sys", "crates/train"]
+members = [".", "infer", "crates/agent", "crates/autograd", "crates/chat", "crates/cli", "crates/cuda-kernels", "crates/mlx-sys", "crates/tools", "crates/train"]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,18 +45,18 @@ edition = "2024"
 [features]
 # Enable CUDA (mirrors infer's cuda feature). Default on, like infer.
 default = ["cuda"]
-cli = ["dep:infer-cli"]
-cuda = ["infer-cli/cuda"]
+cli = ["dep:cli"]
+cuda = ["cli/cuda"]
 # Marker feature for CPU-only builds (CI, macOS). Pass --no-default-features --features no-cuda.
-no-cuda = ["infer-cli/no-cuda"]
+no-cuda = ["cli/no-cuda"]
 # Development-oriented CPU backend. Use with --no-default-features --features cpu,no-cuda.
-cpu = ["infer-cli/cpu"]
+cpu = ["cli/cpu"]
 # Metal backend via mlx-rs (Apple Silicon). Use with --no-default-features --features metal,no-cuda.
-metal = ["infer-cli/metal"]
+metal = ["cli/metal"]
 
 [dependencies]
 anyhow = "1.0"
-infer-cli = { path = "crates/infer-cli", default-features = false, optional = true }
+cli = { path = "crates/cli", default-features = false, optional = true }
 
 [dev-dependencies]
 infer = { path = "infer", default-features = false }

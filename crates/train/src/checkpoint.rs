@@ -1,4 +1,4 @@
-//! Minimal f32 checkpoint format for TinyLM-sized models.
+//! Minimal f32 checkpoint format for Lm-sized models.
 //!
 //! Self-contained serialization — no postcard, no serde. Walks a
 //! `Module`'s parameter list in declaration order and writes one
@@ -26,7 +26,7 @@ use std::path::Path;
 
 use autograd::{TensorId, TensorStore, module::Module};
 
-use crate::model::TinyLMConfig;
+use crate::model::LmConfig;
 
 const MAGIC: &[u8; 8] = b"TLMCKP02";
 
@@ -52,7 +52,7 @@ pub type Result<T> = std::result::Result<T, CheckpointError>;
 
 pub fn save<M: Module>(
     model: &M,
-    config: &TinyLMConfig,
+    config: &LmConfig,
     store: &TensorStore,
     path: impl AsRef<Path>,
 ) -> Result<()> {
@@ -83,13 +83,13 @@ pub fn save<M: Module>(
     Ok(())
 }
 
-pub fn read_config(path: impl AsRef<Path>) -> Result<TinyLMConfig> {
+pub fn read_config(path: impl AsRef<Path>) -> Result<LmConfig> {
     let file = File::open(path.as_ref())?;
     let mut reader = BufReader::new(file);
     read_header(&mut reader).map(|(config, _)| config)
 }
 
-fn read_header<R: Read>(reader: &mut R) -> Result<(TinyLMConfig, usize)> {
+fn read_header<R: Read>(reader: &mut R) -> Result<(LmConfig, usize)> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -98,7 +98,7 @@ fn read_header<R: Read>(reader: &mut R) -> Result<(TinyLMConfig, usize)> {
             actual: magic,
         });
     }
-    let config = TinyLMConfig {
+    let config = LmConfig {
         vocab_size: read_u64(reader)? as usize,
         d_model: read_u64(reader)? as usize,
         n_layers: read_u64(reader)? as usize,

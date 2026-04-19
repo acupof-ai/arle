@@ -58,7 +58,7 @@ Notes:
 | TurboQuant KV (2–4 bit) | Experimental | Fused decode attention with dequant. Fast-moving optimization area. |
 | W8 / W4 / W2 weight quantization | Beta | Native W4 GEMV path + Marlin W4 prefill (5–25× TTFT on long prompts). |
 | GPTQ / AWQ (W4A16) | Beta | GEMV + Marlin kernel path; format detection production-ready. |
-| GGUF loading | Beta | Supported loader path. Native Q4_K GPU kernel shipped (`q4k_gemv_kernel` + packed fast path in `crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. |
+| GGUF loading | Beta | Supported loader path. Native Q4_K GPU kernel shipped (`q4k_gemv_kernel` + packed fast path in `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`) — fits Carnice-27B on L4-24GB. |
 
 Backend note:
 

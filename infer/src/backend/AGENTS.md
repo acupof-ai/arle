@@ -18,7 +18,7 @@ Load this file before editing anything under `infer/src/backend/`.
 1. **`InferenceBackend` is `Send`, not `Sync`.** If you need parallelism,
    do it in the runtime on top — don't share one backend across threads.
 2. **`backend/cuda.rs` must stay a re-export shim.** New CUDA types go in
-   `crates/infer-cuda-kernels/`; new glue goes in `cuda/bootstrap.rs`.
+   `crates/cuda-kernels/`; new glue goes in `cuda/bootstrap.rs`.
    Adding types directly here re-creates the bootstrap straddle that
    Route-A reverted (`docs/experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md`).
 3. **Cross-backend code cannot mention CUDA/Metal types directly.** Use the
@@ -48,5 +48,5 @@ Load this file before editing anything under `infer/src/backend/`.
   in-tree, the trip wires for final kernel-crate extraction.
 - `docs/experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md` — why
   the 4-shell split was reverted; do not re-litigate.
-- `crates/infer-cuda-kernels/src/prelude.rs` — the proto-API contract this
+- `crates/cuda-kernels/src/prelude.rs` — the proto-API contract this
   module re-exports.

@@ -1,4 +1,4 @@
-//! Multi-turn episode scaffolding for TinyLM (M4.1).
+//! Multi-turn episode scaffolding for Lm (M4.1).
 //!
 //! Single episode (unbatched) with interleaved agent turns and environment
 //! observations. The episode flattens to a `Trajectory` that GRPO can train
@@ -16,7 +16,7 @@ use autograd::{AutogradError, Result, Tape, TensorId, TensorStore};
 
 use crate::{
     dataset::LcgRng,
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     rollout::Trajectory,
     sampling::{log_prob_at_index, sample_categorical},
 };
@@ -88,9 +88,9 @@ impl Episode {
 
 #[allow(clippy::too_many_arguments)]
 pub fn rollout_episode(
-    policy: &TinyLM,
-    ref_model: &TinyLM,
-    config: &TinyLMConfig,
+    policy: &Lm,
+    ref_model: &Lm,
+    config: &LmConfig,
     initial_prompt: &[usize],
     turns: &[TurnSpec],
     env: &impl Environment,
@@ -222,7 +222,7 @@ pub fn rollout_episode(
     Ok(episode)
 }
 
-fn retained_ids(policy: &TinyLM, ref_model: &TinyLM, store: &TensorStore) -> HashSet<TensorId> {
+fn retained_ids(policy: &Lm, ref_model: &Lm, store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for param_id in policy
         .all_parameter_ids()

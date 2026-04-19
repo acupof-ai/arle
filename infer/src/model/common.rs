@@ -220,4 +220,4 @@ pub(crate) fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>>
         })
         .collect()
 }
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};

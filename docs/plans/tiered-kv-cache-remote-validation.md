@@ -15,9 +15,9 @@ scheduler swap not yet landed" are now labelled **M1** and are still
 the next remote-validation work item when M1 lands. The file paths
 referenced below reflect the pre Route-A tree
 (`infer/src/paged_kv.rs`, `infer/src/flashinfer_metadata.rs`,
-`infer/src/metal_*`, etc.); post Route-A and post the `infer-cuda-kernels`
+`infer/src/metal_*`, etc.); post Route-A and post the `cuda-kernels`
 extraction (2026-04-15 `a4e12f5`), the kernel Rust layer is now under
-`crates/infer-cuda-kernels/src/` (`paged_kv.rs`, `flashinfer.rs`,
+`crates/cuda-kernels/src/` (`paged_kv.rs`, `flashinfer.rs`,
 `graph_pool.rs`, `tensor.rs`, `ffi.rs` + `ffi/*`, `prelude.rs`,
 `kv_quant.rs`, `kv_turboquant.rs`, `kv_types.rs`, `turboquant_state.rs`),
 and the Metal layer is under `infer/src/backend/metal/*`. Only

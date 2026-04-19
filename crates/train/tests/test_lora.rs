@@ -4,13 +4,13 @@ use autograd::{Tape, TensorId, TensorStore, module::Module, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset},
     lora::LoraConfig,
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
 #[test]
 fn lora_trains_with_frozen_base() {
-    let config = TinyLMConfig {
+    let config = LmConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -26,7 +26,7 @@ fn lora_trains_with_frozen_base() {
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let model = TinyLM::new(config, &mut store).expect("build tiny model with lora");
+    let model = Lm::new(config, &mut store).expect("build tiny model with lora");
     let params = model.parameters();
     let base_params = model.base_parameter_ids();
     let base_before = snapshot(&base_params, &mut store);

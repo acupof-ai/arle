@@ -3,16 +3,16 @@
 > **Path update 2026-04-15.** This audit was written while the transient
 > `crates/infer-engine/` split was active. That split was reverted the
 > next day by Route-A and the kernel Rust layer was subsequently
-> extracted to `crates/infer-cuda-kernels/` on 2026-04-15 (`a4e12f5`).
+> extracted to `crates/cuda-kernels/` on 2026-04-15 (`a4e12f5`).
 > The audit conclusions about KV-quant dispatch are still valid; only
 > the paths have moved. Current locations are given in parentheses below.
 
 ## What was checked
 
 - `crates/infer-engine/src/backend/cuda/paged_kv.rs`
-  (now `crates/infer-cuda-kernels/src/paged_kv.rs`)
+  (now `crates/cuda-kernels/src/paged_kv.rs`)
 - `crates/infer-engine/src/ops/kv_quant.rs`
-  (now `crates/infer-cuda-kernels/src/kv_quant.rs`)
+  (now `crates/cuda-kernels/src/kv_quant.rs`)
 - `crates/infer-engine/src/model/{qwen3,qwen35,glm4}/batch_decode.rs`
   (now `infer/src/model/{qwen3,qwen35,glm4}/batch_decode.rs` — the model
   layer stayed in `infer` and was never actually split into `infer-engine`)

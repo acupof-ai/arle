@@ -2,8 +2,8 @@ use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// GDR (gated delta rule) shared weights: `dt_bias` + `a_log` are reused across every GDR layer.
 pub struct GdrWeights<'a> {

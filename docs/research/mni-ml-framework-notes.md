@@ -296,7 +296,7 @@ it("add backward", () => {
 ## 7. Open questions（本调研未解决）
 
 1. **CPU 路径要不要留？** mni-ml 留了，用于无 GPU 环境。我们的约束是"单机 CUDA first，Metal 支线"。CPU 路径的价值是 **grad-check 的黄金参考**（bitwise stable，double 精度），建议**保留最小集**（只够 grad-check 的 op）。
-2. **和 `infer-cuda-kernels` 的 device 复用**：mni-ml 有 `GpuDevice::instance()` 单例；agent-infer 现在有自己的 CUDA context 管理。spike 阶段需要验证两者能否共进程共 context（预期可以，`cudarc` 就支持多 `Arc<CudaDevice>` 指向同一 GPU 上下文）。
+2. **和 `cuda-kernels` 的 device 复用**：mni-ml 有 `GpuDevice::instance()` 单例；agent-infer 现在有自己的 CUDA context 管理。spike 阶段需要验证两者能否共进程共 context（预期可以，`cudarc` 就支持多 `Arc<CudaDevice>` 指向同一 GPU 上下文）。
 3. **LoRA adapter 如何接 agent-infer base forward**：需要一个 hook 点让 `W @ x` 执行完后立刻执行 `B @ (A @ x)` 并相加。最简方案：在 `autograd::ops::linear` 里提供 `linear_with_lora(x, W_frozen, A, B)`，base 侧执行走 agent-infer 的 merged-QKV / gate-up 路径，LoRA 分支独立 cuBLAS 两次小 GEMM。
 4. **Base weights 的 ownership**：agent-infer 目前 `Arc<Weights>`，我们新建一个 `autograd::FrozenView` 零拷贝包装，不参与 tape。
 

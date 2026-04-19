@@ -4,8 +4,8 @@ use anyhow::Result;
 use rand::rngs::StdRng;
 
 use crate::sampler::SamplingParams;
-use infer_cuda_kernels::TokenKVPool;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use cuda_kernels::TokenKVPool;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 #[path = "model/common.rs"]
 pub(crate) mod common;

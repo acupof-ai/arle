@@ -242,11 +242,11 @@ infer/src/
 
 The CUDA C kernels and Triton AOT sources used to live at `infer/csrc/cuda/`
 and `infer/tools/triton/`, but were extracted into their own crate on
-2026-04-15 (`a4e12f5 refactor(cuda): extract infer-cuda-kernels api`). They
+2026-04-15 (`a4e12f5 refactor(cuda): extract cuda-kernels api`). They
 now live at:
 
 ```
-crates/infer-cuda-kernels/
+crates/cuda-kernels/
 ├── Cargo.toml / build.rs     # nvcc + Triton AOT (lifted from infer/build.rs)
 ├── csrc/
 │   ├── attention/            # flashinfer_*, fused_attention, prefill_attention, decode_prep_paged, ...
@@ -271,7 +271,7 @@ for the canonical current shape.
 
 ### Triton AOT
 
-Triton kernels are compiled at build time into generated C wrappers. Runtime has no Python dependency. Build triggers when `crates/infer-cuda-kernels/tools/triton/` sources change; output lands in `target/`. See `crates/infer-cuda-kernels/tools/triton/README.md` for setup.
+Triton kernels are compiled at build time into generated C wrappers. Runtime has no Python dependency. Build triggers when `crates/cuda-kernels/tools/triton/` sources change; output lands in `target/`. See `crates/cuda-kernels/tools/triton/README.md` for setup.
 
 ## Roadmap
 

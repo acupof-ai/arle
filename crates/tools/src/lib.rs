@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
+use chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 

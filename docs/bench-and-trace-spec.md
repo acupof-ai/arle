@@ -99,7 +99,7 @@ A clean falsification is a successful run. Don't grind for false precision.
 
 **Triggers outside a single task:**
 
-- Any optimization commit touching `infer/src/ops/`, `crates/infer-cuda-kernels/csrc/`, `crates/mlx-sys/src/` → regression run vs latest baseline. No exceptions.
+- Any optimization commit touching `infer/src/ops/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/` → regression run vs latest baseline. No exceptions.
 - Diagnosis entry without a follow-up fix entry within 14 days = debt item → open in `docs/plans/`.
 
 ---

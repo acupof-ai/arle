@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn add_broadcast(
@@ -23,7 +23,7 @@ pub fn add_broadcast(
     }
 
     let requires_grad = a_tensor.requires_grad || b_tensor.requires_grad;
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         a_tensor.shape.clone(),
         requires_grad,
@@ -70,7 +70,7 @@ pub(crate) fn add_broadcast_backward(
 
     let mut grads = GradPairs::new();
     if store.tensor(a)?.requires_grad {
-        let grad_id = store.alloc(GpuTensor::new(upstream.data.clone(), a_shape, false)?);
+        let grad_id = store.alloc(Tensor::new(upstream.data.clone(), a_shape, false)?);
         grads.push((a, grad_id));
     }
 
@@ -85,7 +85,7 @@ pub(crate) fn add_broadcast_backward(
             let offset = broadcast_offset(index, &entry.output_id_shape(store)?, &b_shape);
             grad_b[offset] += *grad_value;
         }
-        let grad_id = store.alloc(GpuTensor::new(grad_b, b_shape, false)?);
+        let grad_id = store.alloc(Tensor::new(grad_b, b_shape, false)?);
         grads.push((b, grad_id));
     }
 

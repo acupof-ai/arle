@@ -8,7 +8,7 @@ use crate::model::common::{self, MLP};
 use crate::weight_loader::{
     load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
 };
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
 pub(super) struct FullAttentionLayer {
@@ -77,7 +77,7 @@ pub struct Qwen35Model {
     /// and across all subsequent prefills — matches sglang's single
     /// `workspace_buffer` pattern. See qwen3 `paged_prefill_plan` for rationale.
     pub(super) paged_prefill_plan_hd256:
-        std::sync::Mutex<Option<infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
+        std::sync::Mutex<Option<cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
 }
 
 impl Qwen35Model {

@@ -28,7 +28,7 @@
 - **2026-04-18** — Metal DFlash Layer 2 batched-verify primitives landed: `mlx_tape_replay_varlen` (per-row step counts) and `qwen35_compiled_verify_block_batched` (B>1 single-forward verify, B=1 path bit-identical to the scalar verify against real Qwen3.5-4B-4bit weights). Unblocks Layer 2c — lifting the `open.len() >= 2` DFlash auto-downgrade. Concurrent bench on M4 Max + Qwen3.5-4B-4bit: c=1 27.4 tok/s (DFlash) vs 63.6 tok/s (plain); c≥2 silently flips to packed decode and plateaus at ~145 tok/s regardless of DFlash flag. Step-time fit `t(B) ≈ 4.4 + 6.3·B ms` — per-row GDR recurrent work, not scheduler/HTTP, is the current ceiling.
 - **2026-04-17** — Qwen3.5 DFlash intra-request verify collapsed to a single forward at `seq_len = block_size` (Layer 1). Output matches greedy baseline; single-stream 4-bit is still a structural regression vs plain decode on M4 Max — see [verify-batch plan](docs/plans/metal-dflash-qwen35-verify-batch.md) and [bench note](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
 - **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
-- **2026-04-15** — [`infer-cuda-kernels`](crates/infer-cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → infer-cuda-kernels`.
+- **2026-04-15** — [`cuda-kernels`](crates/cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → cuda-kernels`.
 - **2026-04-15** — Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c shipped locally and remote-accepted on L4. Radix selector flip, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract.
 - **2026-04-15** — Metal M0.2a resumable request state for Qwen3 + Qwen3.5 (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
 - **Early April 2026** — Qwen3-8B at SGLang parity (TTFT 2.5× faster); Qwen3.5-4B scheduler + FlashInfer HD256 batched decode (+14% over SGLang at C=4); TurboQuant 3-bit KV + weights; GPTQ/AWQ W4 production-ready with Marlin prefill; FP8/INT8 KV with fused-dequant decode; native Q4_K GPU kernel (`q4k_gemv_kernel`) fits Carnice-27B on L4-24GB.
@@ -273,10 +273,10 @@ The root CLI binary is behind the `cli` feature. Without `--features cli`, `agen
 Current package boundary for agent mode:
 
 - `agent-infer` -> thin binary wrapper
-- `infer-cli` -> REPL and slash commands
+- `cli` -> REPL and slash commands
 - `infer` -> `server_engine::LoadedInferenceEngine` backend loading and `hf_hub::resolve_model_source` for model auto-discovery
-- `infer-agent` -> conversation loop and tool-call recovery
-- `infer-tools` / `infer-chat` -> shared tool definitions, execution helpers, and protocol types
+- `agent` -> conversation loop and tool-call recovery
+- `tools` / `chat` -> shared tool definitions, execution helpers, and protocol types
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
@@ -309,11 +309,11 @@ The CLI keeps conversation history across turns, stores line history in `~/.agen
 Workspace split:
 
 - `agent-infer` — thin binary wrapper
-- `infer-cli` — REPL / CLI flow
-- `infer-agent` — conversation state, tool-call recovery, agent turn loop
-- `infer-tools` / `infer-chat` — tool execution helpers and protocol types
+- `cli` — REPL / CLI flow
+- `agent` — conversation state, tool-call recovery, agent turn loop
+- `tools` / `chat` — tool execution helpers and protocol types
 - `infer` — HTTP server, scheduler, runtime, backend implementations; owns the single `InferenceEngine` contract
-- `infer-cuda-kernels` — extracted CUDA kernel layer (csrc/, Triton AOT, Rust FFI). One-way dep: `infer → infer-cuda-kernels`.
+- `cuda-kernels` — extracted CUDA kernel layer (csrc/, Triton AOT, Rust FFI). One-way dep: `infer → cuda-kernels`.
 - `mlx-sys` — MLX C++ bridge for the Metal backend
 
 See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/codebase-map.md), and [crates/README.md](crates/README.md)
@@ -338,7 +338,7 @@ for the current package boundaries.
 └────────────────────────┬─────────────────────────────────┘
                          ▼
       FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
-         (CUDA C + Triton AOT, crates/infer-cuda-kernels/)
+         (CUDA C + Triton AOT, crates/cuda-kernels/)
 ```
 
 ---

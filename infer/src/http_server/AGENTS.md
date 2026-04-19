@@ -63,7 +63,7 @@ implementation detail.
 - `infer/src/server_engine.rs` — `InferenceEngine`, `CompletionRequest`,
   `CompletionOutput`, `CompletionStreamDelta`, `TokenUsage`, `FinishReason`.
 - `infer/src/request_handle.rs` — `RequestHandle` trait (backend-agnostic).
-- `crates/infer-chat/src/lib.rs` — chat → prompt rendering.
+- `crates/chat/src/lib.rs` — chat → prompt rendering.
 - `docs/projects/agent-first-architecture.md` — session routing design.
 - `docs/plans/2026-04-15-metal-backend-acceptance-plan.md` — HTTP API
   acceptance gates for the Metal backend.

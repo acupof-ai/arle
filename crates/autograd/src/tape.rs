@@ -295,12 +295,12 @@ fn merge_grad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::GpuTensor;
+    use crate::tensor::Tensor;
 
     #[test]
     fn backward_on_empty_tape_does_not_panic() {
         let mut store = TensorStore::default();
-        let loss = store.alloc(GpuTensor::new(vec![5.0], Vec::new(), true).expect("create scalar"));
+        let loss = store.alloc(Tensor::new(vec![5.0], Vec::new(), true).expect("create scalar"));
         let mut tape = Tape::new();
 
         let grads = tape.backward(loss, &mut store).expect("backward succeeds");

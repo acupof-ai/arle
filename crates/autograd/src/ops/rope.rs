@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn rope(
@@ -45,7 +45,7 @@ pub fn rope(
         }
     }
 
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         x_tensor.shape.clone(),
         x_tensor.requires_grad,
@@ -119,7 +119,7 @@ pub(crate) fn rope_backward(
         }
     }
 
-    let grad_id = store.alloc(GpuTensor::new(grad_x, x_shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad_x, x_shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 

@@ -89,7 +89,7 @@ Expected: `compute` definition in `types.rs`, one call site inside
 chained loop.
 
 ```bash
-rg -n "stable_tag" crates/infer-cuda-kernels/src/kv_types.rs \
+rg -n "stable_tag" crates/cuda-kernels/src/kv_types.rs \
   infer/src/scheduler/cuda/core.rs
 ```
 

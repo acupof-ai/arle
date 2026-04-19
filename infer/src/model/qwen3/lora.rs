@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix};
 
 /// A single LoRA adapter: `delta = scale * B @ A`.
 ///

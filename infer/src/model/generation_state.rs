@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use super::cuda_graph::CudaGraphState;
 use super::kv_cache::KVCache;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Common generation-state fields shared across all model implementations.
 ///

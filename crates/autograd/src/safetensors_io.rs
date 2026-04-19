@@ -7,7 +7,7 @@ use half::bf16;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors, serialize_to_file};
 
-use crate::{AutogradError, GpuTensor, Result, TensorId, TensorStore};
+use crate::{AutogradError, Tensor, Result, TensorId, TensorStore};
 
 pub struct SafetensorsRegistry {
     map: HashMap<String, TensorId>,
@@ -71,7 +71,7 @@ impl SafetensorsRegistry {
                 let tensor = store.tensor_mut(id)?;
                 tensor.data = data;
             } else {
-                let id = store.alloc(GpuTensor::new(data, shape, true)?);
+                let id = store.alloc(Tensor::new(data, shape, true)?);
                 self.insert(name.to_owned(), id);
             }
         }
@@ -204,12 +204,12 @@ mod tests {
         let path = dir.path().join("roundtrip.safetensors");
 
         let mut source_store = TensorStore::default();
-        let first = source_store.alloc(GpuTensor::new(
+        let first = source_store.alloc(Tensor::new(
             vec![1.0, -2.5, 3.25, 0.0],
             vec![2, 2],
             true,
         )?);
-        let second = source_store.alloc(GpuTensor::new(vec![4.5, -5.0, 6.75], vec![3], true)?);
+        let second = source_store.alloc(Tensor::new(vec![4.5, -5.0, 6.75], vec![3], true)?);
 
         let mut source_registry = SafetensorsRegistry::new();
         source_registry.insert("layer.weight", first);
@@ -252,14 +252,14 @@ mod tests {
 
         let mut source_store = TensorStore::default();
         let original_id =
-            source_store.alloc(GpuTensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)?);
+            source_store.alloc(Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)?);
         let mut source_registry = SafetensorsRegistry::new();
         source_registry.insert("weight", original_id);
         source_registry.save_from(&mut source_store, &path)?;
 
         let mut target_store = TensorStore::default();
         let existing_id =
-            target_store.alloc(GpuTensor::new(vec![0.0, 0.0, 0.0, 0.0], vec![2, 2], true)?);
+            target_store.alloc(Tensor::new(vec![0.0, 0.0, 0.0, 0.0], vec![2, 2], true)?);
         let mut target_registry = SafetensorsRegistry::new();
         target_registry.insert("weight", existing_id);
 
@@ -320,7 +320,7 @@ mod tests {
         let source_values = vec![1.0_f32, -2.5, 3.25, 0.0];
         let mut source_store = TensorStore::default();
         let weight_id =
-            source_store.alloc(GpuTensor::new(source_values.clone(), vec![2, 2], true)?);
+            source_store.alloc(Tensor::new(source_values.clone(), vec![2, 2], true)?);
         let mut source_registry = SafetensorsRegistry::new();
         source_registry.insert("weight", weight_id);
         source_registry.save_from_bf16(&mut source_store, &path)?;
@@ -354,7 +354,7 @@ mod tests {
         let path = dir.path().join("shape-mismatch.safetensors");
 
         let mut source_store = TensorStore::default();
-        let source_id = source_store.alloc(GpuTensor::new(
+        let source_id = source_store.alloc(Tensor::new(
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             vec![2, 3],
             true,
@@ -364,7 +364,7 @@ mod tests {
         source_registry.save_from(&mut source_store, &path)?;
 
         let mut target_store = TensorStore::default();
-        let target_id = target_store.alloc(GpuTensor::new(
+        let target_id = target_store.alloc(Tensor::new(
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             vec![3, 2],
             true,

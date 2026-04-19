@@ -38,7 +38,7 @@ the same pair for **prefill**.
 
 ### New C++ kernels (mirror tc_decode pair)
 
-1. **`crates/infer-cuda-kernels/csrc/attention/flashinfer_planned_prefill.cu`** — HD=128.
+1. **`crates/cuda-kernels/csrc/attention/flashinfer_planned_prefill.cu`** — HD=128.
    - `flashinfer_planned_prefill_plan(...)` — wraps `flashinfer::PrefillPlan<IdType>`
      with `qo_indptr=[0, seq_len]` (single-request), `kv_indptr=[0, kv_len]`,
      `enable_cuda_graph=true`. Writes `PrefillPlanInfo` to an opaque buffer.
@@ -51,7 +51,7 @@ the same pair for **prefill**.
 
 ### New Rust FFI layer
 
-`crates/infer-cuda-kernels/src/ffi/attention.rs`: add `planned_prefill_plan`
+`crates/cuda-kernels/src/ffi/attention.rs`: add `planned_prefill_plan`
 and `planned_prefill_run` bindings + one `PrefillPlanInfo` opaque buffer
 type (~200 bytes, carry as `[u8; 256]`).
 
@@ -109,13 +109,13 @@ one-off; replays reuse the same buffer.
 
 | File | Change |
 |------|--------|
-| `crates/infer-cuda-kernels/csrc/attention/flashinfer_planned_prefill.cu` | **new** — HD128 variant |
-| `crates/infer-cuda-kernels/csrc/attention/flashinfer_planned_prefill_hd256.cu` | **new** — HD256 variant |
-| `crates/infer-cuda-kernels/src/ffi/attention.rs` | + 4 extern C bindings + opaque `PrefillPlanInfo` type |
+| `crates/cuda-kernels/csrc/attention/flashinfer_planned_prefill.cu` | **new** — HD128 variant |
+| `crates/cuda-kernels/csrc/attention/flashinfer_planned_prefill_hd256.cu` | **new** — HD256 variant |
+| `crates/cuda-kernels/src/ffi/attention.rs` | + 4 extern C bindings + opaque `PrefillPlanInfo` type |
 | `infer/src/ops/attention.rs` | switch `single_prefill` callers to plan→run path |
 | `infer/src/model/qwen3/prefill_buffers.rs` | + plan cache struct, workspace |
 | `infer/src/model/qwen35/prefill_buffers.rs` | same |
-| `crates/infer-cuda-kernels/build.rs` | (no change — `flashinfer_*.cu` already matched by the stem prefix) |
+| `crates/cuda-kernels/build.rs` | (no change — `flashinfer_*.cu` already matched by the stem prefix) |
 
 ## Acceptance criteria
 

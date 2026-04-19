@@ -18,10 +18,10 @@ use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::kv_quant;
-use infer_cuda_kernels::kv_turboquant;
-use infer_cuda_kernels::prelude::{
+use cuda_kernels::ffi;
+use cuda_kernels::kv_quant;
+use cuda_kernels::kv_turboquant;
+use cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
 

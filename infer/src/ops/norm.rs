@@ -1,8 +1,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// RMSNorm into pre-allocated output buffer
 pub fn rms_norm_into(

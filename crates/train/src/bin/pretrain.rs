@@ -1,11 +1,13 @@
-use std::{collections::HashSet, env, str::FromStr};
+use std::{collections::HashSet, env, str::FromStr, sync::Arc};
 
-use autograd::{AutogradError, Tape, TensorId, TensorStore, module::Module, optim::AdamW};
+use autograd::{
+    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
+};
 use thiserror::Error;
 use train::{
     dataset::{BytesDataset, CopyDataset, Dataset},
     lora::LoraConfig,
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
@@ -13,6 +15,26 @@ use train::{
 enum DatasetKind {
     Copy,
     Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendChoice {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl FromStr for BackendChoice {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
+            _ => Err(format!("unknown backend: {value}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +48,7 @@ struct CliArgs {
     grad_clip: Option<f32>,
     lora_rank: usize,
     lora_alpha: f32,
+    backend: BackendChoice,
 }
 
 impl Default for CliArgs {
@@ -40,6 +63,7 @@ impl Default for CliArgs {
             grad_clip: Some(1.0),
             lora_rank: 0,
             lora_alpha: 0.0,
+            backend: BackendChoice::Cpu,
         }
     }
 }
@@ -58,7 +82,7 @@ enum CliError {
 
 fn main() -> Result<(), CliError> {
     let args = parse_args()?;
-    let mut config = TinyLMConfig::default();
+    let mut config = LmConfig::default();
     if args.lora_rank > 0 {
         let alpha = if args.lora_alpha > 0.0 {
             args.lora_alpha
@@ -77,9 +101,11 @@ fn main() -> Result<(), CliError> {
         }));
     }
 
-    let mut store = TensorStore::default();
+    let backend = build_backend(args.backend)?;
+    println!("backend: {:?}", backend.device());
+    let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
-    let model = TinyLM::new(config, &mut store)?;
+    let model = Lm::new(config, &mut store)?;
     let params = model.parameters();
     let base_params = model.base_parameter_ids();
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
@@ -168,6 +194,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
             "--no-grad-clip" => args.grad_clip = None,
+            "--backend" => {
+                args.backend = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             _ => return Err(CliError::UnknownFlag(flag)),
         }
     }
@@ -188,6 +217,30 @@ where
         flag: flag.to_string(),
         value,
     })
+}
+
+fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
+    match choice {
+        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
+        #[cfg(feature = "metal")]
+        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
+        #[cfg(not(feature = "metal"))]
+        BackendChoice::Metal => {
+            eprintln!(
+                "[pretrain] warning: metal backend requested without --features metal; falling back to cpu"
+            );
+            Ok(Arc::new(CpuBackend))
+        }
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => Ok(Arc::new(autograd::backend_cuda::CudaBackend::new(0)?)),
+        #[cfg(not(feature = "cuda"))]
+        BackendChoice::Cuda => {
+            eprintln!(
+                "[pretrain] warning: cuda backend requested without --features cuda; falling back to cpu"
+            );
+            Ok(Arc::new(CpuBackend))
+        }
+    }
 }
 
 fn build_dataset(kind: DatasetKind, batch: usize, seq: usize) -> Box<dyn Dataset> {

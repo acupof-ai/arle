@@ -1,5 +1,5 @@
 use autograd::{
-    AutogradError, GpuTensor, Result, Tape, TensorId, TensorStore,
+    AutogradError, Tensor, Result, Tape, TensorId, TensorStore,
     module::{Linear, Module},
     ops::{add, matmul, mul_scalar, reshape, transpose},
 };
@@ -38,11 +38,11 @@ impl LoraLinear {
             .map(|_| sample_uniform(&mut state, bound))
             .collect::<Vec<_>>();
         let lora_a = store.alloc(
-            GpuTensor::new(lora_a_data, vec![cfg.rank, in_features], true)
+            Tensor::new(lora_a_data, vec![cfg.rank, in_features], true)
                 .expect("LoRA A init shape is internally consistent"),
         );
         let lora_b = store.alloc(
-            GpuTensor::new(
+            Tensor::new(
                 vec![0.0; out_features * cfg.rank],
                 vec![out_features, cfg.rank],
                 true,

@@ -266,7 +266,7 @@ Sign-off requires:
    sessions may require upgrading the completions path too.
 2. **`copy_pages_to_host` direction**: does the CUDA kernel layer
    already have a `cudaMemcpyDeviceToHost` variant in
-   `crates/infer-cuda-kernels/src/paged_kv.rs`? If yes, thin
+   `crates/cuda-kernels/src/paged_kv.rs`? If yes, thin
    wrapper. If no, one new FFI binding.
 3. **`session_fingerprints` walk cost**: O(nodes) walk per save is
    fine for a few hundred blocks, probably not fine for a 30k-token

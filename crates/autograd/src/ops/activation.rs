@@ -4,7 +4,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 const INV_SQRT_2: f32 = 0.707_106_77;
@@ -13,7 +13,7 @@ const INV_SQRT_2PI: f32 = 0.398_942_3;
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let output = input.data.iter().map(|&value| value.exp()).collect();
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
         input.requires_grad,
@@ -38,7 +38,7 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
         .iter()
         .map(|&value| 0.5 * value * (1.0 + erff(value * INV_SQRT_2)))
         .collect();
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
         input.requires_grad,
@@ -66,7 +66,7 @@ pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
             value * sigmoid
         })
         .collect();
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
         input.requires_grad,
@@ -118,7 +118,7 @@ pub(crate) fn exp_backward(
         .zip(upstream.data.iter())
         .map(|(&y, &grad_out)| grad_out * y)
         .collect();
-    let grad_id = store.alloc(GpuTensor::new(grad, output.shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 
@@ -156,7 +156,7 @@ pub(crate) fn gelu_backward(
             grad_out * derivative
         })
         .collect();
-    let grad_id = store.alloc(GpuTensor::new(grad, input.shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, input.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 
@@ -193,6 +193,6 @@ pub(crate) fn silu_backward(
             grad_out * derivative
         })
         .collect();
-    let grad_id = store.alloc(GpuTensor::new(grad, input.shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, input.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }

@@ -23,7 +23,7 @@ This constant serves two coupled purposes:
 
 Because our prefill attention kernel
 (`SinglePrefillWithKVCacheDispatched`, HD128 + HD256 variants in
-`crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill*.cu`)
+`crates/cuda-kernels/csrc/attention/flashinfer_prefill*.cu`)
 consumes a **contiguous** K/V tensor, the contiguous buffer size is a
 hard ceiling on chunk size. sglang sidesteps this by calling
 `BatchPrefillWithPagedKVCache` — paged prefill needs no contiguous
@@ -38,7 +38,7 @@ in one forward.
 | Contiguous buffer sizing uses the constant | `infer/src/scheduler/cuda/core.rs:304` (`state.set_max_seq_len(CONTIGUOUS_KV_TOKENS)`) |
 | Allocation is `num_kv_heads × max_seq_len × head_dim` per layer per dir | `infer/src/model/kv_cache.rs:98,105-106` |
 | Chunk-size getter caps with the same constant | `infer/src/scheduler/cuda/core.rs:886` |
-| Prefill forward consumes a contiguous K/V scratch | `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill.cu:92`, `flashinfer_prefill_hd256.cu:66` |
+| Prefill forward consumes a contiguous K/V scratch | `crates/cuda-kernels/csrc/attention/flashinfer_prefill.cu:92`, `flashinfer_prefill_hd256.cu:66` |
 | After each chunk, KV migrates to paged pool | `infer/src/scheduler/cuda/prefill.rs:264` |
 | Timing breakdown: 107ms/chunk × 8 chunks = 856ms ≈ 820ms observed | `docs/experience/wins/2026-04-17-qwen35-prefill-timing-breakdown.md` |
 | Per-chunk compute is fine (0.193 ms/tok vs sglang 0.150); compounding factor is 8× setup | same |

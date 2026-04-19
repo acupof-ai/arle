@@ -75,7 +75,7 @@
 //!    --features no-cuda` and `cargo check --features metal` both
 //!    validate it. Cuda-specific types (cudarc handles, FlashInfer
 //!    metadata) live in `infer/src/backend/cuda/` and in
-//!    `crates/infer-cuda-kernels`.
+//!    `crates/cuda-kernels`.
 //!
 //! # Layout
 //!

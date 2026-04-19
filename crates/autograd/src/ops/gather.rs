@@ -6,7 +6,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn gather_last_dim(
@@ -48,7 +48,7 @@ pub fn gather_last_dim(
         output[prefix_index] = src_tensor.data[(prefix_index * vocab) + index];
     }
 
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         output_shape,
         src_tensor.requires_grad,
@@ -103,6 +103,6 @@ pub(crate) fn gather_last_dim_backward(
         grad[(prefix_index * vocab) + index] += upstream.data[prefix_index];
     }
 
-    let grad_id = store.alloc(GpuTensor::new(grad, src_shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, src_shape, false)?);
     Ok(smallvec![(src, grad_id)])
 }

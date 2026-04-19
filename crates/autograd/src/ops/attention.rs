@@ -1,7 +1,7 @@
 use crate::{
     AutogradError, Result,
     ops::{add_broadcast, matmul, mul_scalar, reshape, softmax, transpose},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn repeat_kv(
@@ -35,7 +35,7 @@ pub fn repeat_kv(
         store,
         tape,
     )?;
-    let zeros = store.alloc(GpuTensor::new(
+    let zeros = store.alloc(Tensor::new(
         vec![0.0; expanded.iter().product()],
         expanded,
         false,
@@ -87,7 +87,7 @@ fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
             data[(row * seq_len) + col] = f32::NEG_INFINITY;
         }
     }
-    Ok(store.alloc(GpuTensor::new(data, vec![1, seq_len, seq_len], false)?))
+    Ok(store.alloc(Tensor::new(data, vec![1, seq_len, seq_len], false)?))
 }
 
 fn validate_attention_shapes(

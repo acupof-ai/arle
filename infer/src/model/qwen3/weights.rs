@@ -9,7 +9,7 @@ use crate::weight_loader::{
     load_tensor_1d, load_tensor_2d, load_tensor_2d_maybe_quantized, precompute_rope,
     resolve_rope_cache_len,
 };
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelRuntimeConfig {
@@ -61,7 +61,7 @@ pub struct Qwen3Model {
     /// model — matches sglang's `workspace_buffer` pattern and avoids the
     /// async-free pressure that caused foreign C++ exceptions under load.
     pub(super) paged_prefill_plan:
-        std::sync::Mutex<Option<infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
+        std::sync::Mutex<Option<cuda_kernels::flashinfer::BatchPrefillPagedPlan>>,
     /// Optional PEFT LoRA bundle. `None` = no adapter, forward uses base
     /// weights verbatim. When `Some`, every projection site in prefill /
     /// decode / batch_decode checks `lora.layers[layer_idx].<module>` and

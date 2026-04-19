@@ -1,6 +1,6 @@
 //! End-to-end verification that SFT training works through the Metal
 //! matmul backend, plus a bf16 save → f32 load roundtrip that mirrors what
-//! `train_sft --save-dtype bf16` produces and what `infer-cli` will consume.
+//! `train_sft --save-dtype bf16` produces and what `cli` will consume.
 //!
 //! Only compiled when the `metal` feature is enabled — on other targets we
 //! skip rather than fail-closed, since Metal is a Mac-specific path.
@@ -65,7 +65,7 @@ fn sft_loop_metal_trains_and_bf16_roundtrips() -> TestResult {
     );
 
     // bf16 save → widening load. This is the exact path train_sft --save-dtype bf16
-    // produces for consumption by infer-cli. bf16 has ~7-bit mantissa, so we
+    // produces for consumption by cli. bf16 has ~7-bit mantissa, so we
     // can only assert relative-tolerance, not bit-exact.
     let registry = build_registry(&model);
     let dir = tempdir()?;
@@ -75,7 +75,7 @@ fn sft_loop_metal_trains_and_bf16_roundtrips() -> TestResult {
     // Guard against save_from_bf16 ever regressing to F32: inspect the raw
     // dtype of every tensor on disk. `load_into` widens all float dtypes, so
     // a dtype regression would otherwise be invisible at this layer but
-    // would break infer-cli, which casts raw bytes as &[bf16].
+    // would break cli, which casts raw bytes as &[bf16].
     assert_on_disk_dtype_is_bf16(&path)?;
 
     let mut loaded_store = TensorStore::default();

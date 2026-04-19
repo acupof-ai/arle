@@ -43,7 +43,7 @@ The existing prefill unit tests already use tolerances, not bitwise checks: `inf
 
 The biggest missing risk is same-slot prefix reuse. Admission only treats a radix hit as reusable when a free slot still "materializes" that prefix via `block_owner_slots` and `slot_materialized_prompt_lens` (`infer/src/scheduler/cuda/runtime.rs:343-356`). `step_new()` then truncates/restores local state and migrates the prefix range from contiguous KV into the pool (`infer/src/scheduler/cuda/prefill.rs:99-156`, `prefill.rs:174-194`). The plan's statement that "prefix-cache already operates on the paged pool" (`paged-kv-prefill.md:145-153`) is not accurate today — that path still depends on contiguous state as the source.
 
-Pool fragmentation is under-described. The allocator is a LIFO `free_pages` stack (`crates/infer-cuda-kernels/src/paged_kv.rs:60-61`) and `alloc_tokens()` appends whatever physical pages are popped (`paged_kv.rs:405-438`). Long prefill allocations will change page reuse patterns even if total bytes stay flat.
+Pool fragmentation is under-described. The allocator is a LIFO `free_pages` stack (`crates/cuda-kernels/src/paged_kv.rs:60-61`) and `alloc_tokens()` appends whatever physical pages are popped (`paged_kv.rs:405-438`). Long prefill allocations will change page reuse patterns even if total bytes stay flat.
 
 The Metal backend is correctly out of scope — `infer/src/backend/metal/` has its own prefill path and the plan's CUDA-only gating is correct. No issue there.
 

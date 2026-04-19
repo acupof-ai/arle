@@ -12,7 +12,7 @@ Load this file before editing anything under `kv_tier/`, and re-read
 
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
-| T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/infer-cuda-kernels/src/paged_kv.rs`. |
+| T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
 | T1   | Host pinned DRAM  | ~10 µs   | M3 (CUDA only). `host_pool.rs` skeleton exists, locally-verifiable bookkeeping only. |
 | T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` impl exists, not yet wired into a coordinator. |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
@@ -56,7 +56,7 @@ kv_tier/coordinator.rs  — Coordinator, CoordinatorCommand (Demote/Promote/Shut
 4. **No `#[cfg(feature = "cuda")]` in this module.** The skeleton is
    always-on so `cargo check --features no-cuda` and `--features metal`
    both validate it. CUDA types (cudarc handles, FlashInfer metadata) live
-   in `backend/cuda/` and `crates/infer-cuda-kernels/`.
+   in `backend/cuda/` and `crates/cuda-kernels/`.
 5. **Coordinator locking.** `RadixCache` is scheduler-thread-owned today.
    It will grow a reader lock only when the M3 coordinator thread starts
    issuing promote/demote writes from a separate OS thread. Do not

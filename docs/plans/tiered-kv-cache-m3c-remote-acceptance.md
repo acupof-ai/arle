@@ -64,7 +64,7 @@ rg -n "OFFLOAD_BLOCK_SIZE|prefetch_kv_to_gpu|offload_kv_if_needed|prefetch_to_gp
 Expected: **no output**.
 
 ```bash
-rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/infer-cli/src/{args,lib}.rs
+rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/cli/src/{args,lib}.rs
 ```
 
 Expected: matches only for the compatibility shim / warning path.

@@ -298,8 +298,8 @@
 ### Phase A — 契约与维护基础（2026-04-15 状态）
 
 1. 收敛 `infer` public API / feature gating
-2. 拆 `src/agent.rs`，降低核心控制流复杂度（Route-A 后 `agent_engine.rs` 已被折叠回 `server_engine.rs`，REPL 逻辑搬到 `infer-cli`）
-3. 统一协议真源（tool call / chat protocol）已落在 `infer-chat`
+2. 拆 `src/agent.rs`，降低核心控制流复杂度（Route-A 后 `agent_engine.rs` 已被折叠回 `server_engine.rs`，REPL 逻辑搬到 `cli`）
+3. 统一协议真源（tool call / chat protocol）已落在 `chat`
 4. 统一 env var 命名与兼容策略
 5. ✅ `docs/stability-policy.md` 已存在
 6. ✅ `docs/support-matrix.md` 已存在

@@ -1,5 +1,5 @@
 [package]
-name = "infer-cli"
+name = "cli"
 version = "0.1.0"
 edition = "2024"
 
@@ -17,10 +17,10 @@ console = "0.16"
 dialoguer = "0.11"
 hf-hub = { version = "0.5", features = ["tokio"] }
 indicatif = "0.18"
-infer-agent = { path = "../infer-agent" }
-infer-chat = { path = "../infer-chat" }
+agent = { path = "../agent" }
+chat = { path = "../chat" }
 infer = { path = "../../infer", default-features = false }
-infer-tools = { path = "../infer-tools" }
+tools = { path = "../tools" }
 log = "0.4"
 nucleo-matcher = "0.3"
 reqwest = { version = "0.12", features = ["blocking", "json"] }

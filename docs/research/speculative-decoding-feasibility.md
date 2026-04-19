@@ -63,7 +63,7 @@ KV slots before acceptance. On rejection, those slots must be freed.
 - On rejection: discard the suffix (no complex page-level rollback needed)
 - Reference: "Transactional KV Caching for Speculative Decoding under Paged KV Memory" (TechRxiv 2025)
 
-For agent-infer CUDA: `PagedKvPool` in `crates/infer-cuda-kernels/src/paged_kv.rs`
+For agent-infer CUDA: `PagedKvPool` in `crates/cuda-kernels/src/paged_kv.rs`
 (post `a4e12f5`) does not need per-page rollback. Instead, draft tokens operate
 on a per-request contiguous buffer, and only on acceptance are they appended to
 the paged pool. This is simpler than full transactional semantics.
@@ -72,7 +72,7 @@ the paged pool. This is simpler than full transactional semantics.
 
 ### What Needs to be Built
 
-**1. DraftModel GPU Implementation** (new file, would land alongside `infer/src/speculative.rs` — current CPU-only framework location — with GPU kernels contributed to `crates/infer-cuda-kernels/`)
+**1. DraftModel GPU Implementation** (new file, would land alongside `infer/src/speculative.rs` — current CPU-only framework location — with GPU kernels contributed to `crates/cuda-kernels/`)
 - `DraftEngine`: wraps a second loaded model (e.g. Qwen3-0.5B)
 - Reuses CUDA scheduler infrastructure but runs single-threaded
 - `draft_batch()` → calls `model.forward()` K times, collects token + probability
@@ -81,7 +81,7 @@ the paged pool. This is simpler than full transactional semantics.
 - Draft tokens get tentative KV cache entries in a separate pool
 - On rejection: free the rejected draft KV entries (rollback)
 - On acceptance: "commit" draft KV entries to the main pool
-- Current `PagedKvPool` in `crates/infer-cuda-kernels/src/paged_kv.rs` needs a "tentative" concept
+- Current `PagedKvPool` in `crates/cuda-kernels/src/paged_kv.rs` needs a "tentative" concept
 
 **3. Scheduler Integration** (`infer/src/scheduler/cuda/`)
 - `SpeculativeScheduler`: wraps draft + target schedulers

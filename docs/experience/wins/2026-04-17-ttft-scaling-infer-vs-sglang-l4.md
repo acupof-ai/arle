@@ -103,7 +103,7 @@ By projected ROI, lowest-effort first:
 
 3. **FlashInfer prefill wrapper** (~100ms of single-request gap at 4096 tok).
    sglang cache's the wrapper `plan()` across calls; ours rebuilds per-call.
-   Audit `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill*.cu`
+   Audit `crates/cuda-kernels/csrc/attention/flashinfer_prefill*.cu`
    bindings for a reusable plan cache.
 
 4. **Prefill kernel selection for mid-range (1024-4096)** — crossover at

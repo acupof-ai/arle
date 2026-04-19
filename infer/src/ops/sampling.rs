@@ -11,8 +11,8 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, RawDevicePtr};
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, RawDevicePtr};
 
 /// Argmax — returns the index of the maximum element.
 ///

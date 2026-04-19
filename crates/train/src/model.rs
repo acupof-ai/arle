@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use autograd::{
-    AutogradError, GpuTensor, Result, Tape, TensorId, TensorStore,
+    AutogradError, Tensor, Result, Tape, TensorId, TensorStore,
     module::{Linear, Module},
     ops::{
         add, add_broadcast, embedding, gelu, matmul, mul_scalar, reshape, rmsnorm, softmax,
@@ -12,7 +12,7 @@ use autograd::{
 use crate::lora::{LoraConfig, LoraLinear};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TinyLMConfig {
+pub struct LmConfig {
     pub vocab_size: usize,
     pub d_model: usize,
     pub n_layers: usize,
@@ -23,7 +23,7 @@ pub struct TinyLMConfig {
     pub lora: Option<LoraConfig>,
 }
 
-impl Default for TinyLMConfig {
+impl Default for LmConfig {
     fn default() -> Self {
         Self {
             vocab_size: 256,
@@ -110,7 +110,7 @@ struct Block {
 }
 
 impl Block {
-    fn new(config: TinyLMConfig, store: &mut TensorStore) -> Result<Self> {
+    fn new(config: LmConfig, store: &mut TensorStore) -> Result<Self> {
         Ok(Self {
             attn_norm_weight: ones_parameter(&[config.d_model], store)?,
             wq: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
@@ -128,7 +128,7 @@ impl Block {
         x: TensorId,
         batch: usize,
         seq_len: usize,
-        config: TinyLMConfig,
+        config: LmConfig,
         causal_mask: TensorId,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -195,16 +195,16 @@ impl Block {
 }
 
 #[derive(Debug, Clone)]
-pub struct TinyLM {
-    config: TinyLMConfig,
+pub struct Lm {
+    config: LmConfig,
     token_embed: TensorId,
     pos_embed: TensorId,
     blocks: Vec<Block>,
     final_norm_weight: TensorId,
 }
 
-impl TinyLM {
-    pub fn new(config: TinyLMConfig, store: &mut TensorStore) -> Result<Self> {
+impl Lm {
+    pub fn new(config: LmConfig, store: &mut TensorStore) -> Result<Self> {
         validate_config(config)?;
 
         let token_embed = uniform_parameter(
@@ -245,7 +245,7 @@ impl TinyLM {
         })
     }
 
-    pub fn config(&self) -> TinyLMConfig {
+    pub fn config(&self) -> LmConfig {
         self.config
     }
 
@@ -346,7 +346,7 @@ impl TinyLM {
     }
 }
 
-impl Module for TinyLM {
+impl Module for Lm {
     fn parameters(&self) -> Vec<TensorId> {
         let mut params = Vec::new();
         if self.config.lora.is_none() {
@@ -361,7 +361,7 @@ impl Module for TinyLM {
     }
 }
 
-fn validate_config(config: TinyLMConfig) -> Result<()> {
+fn validate_config(config: LmConfig) -> Result<()> {
     let packed_heads = config.n_heads * config.d_head;
     if config.d_model != packed_heads {
         return Err(AutogradError::ShapeMismatch {
@@ -406,7 +406,7 @@ fn split_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
-    config: TinyLMConfig,
+    config: LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -423,7 +423,7 @@ fn merge_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
-    config: TinyLMConfig,
+    config: LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -436,7 +436,7 @@ fn attention_scores(
     k: TensorId,
     batch: usize,
     seq_len: usize,
-    config: TinyLMConfig,
+    config: LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -468,7 +468,7 @@ fn attention_context(
     v: TensorId,
     batch: usize,
     seq_len: usize,
-    config: TinyLMConfig,
+    config: LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -500,7 +500,7 @@ fn causal_mask(seq_len: usize, store: &mut TensorStore) -> Result<TensorId> {
             data[(row * seq_len) + col] = -1.0e9;
         }
     }
-    Ok(store.alloc(GpuTensor::new(data, vec![seq_len, seq_len], false)?))
+    Ok(store.alloc(Tensor::new(data, vec![seq_len, seq_len], false)?))
 }
 
 fn position_indices(batch: usize, seq_len: usize) -> Vec<usize> {
@@ -513,7 +513,7 @@ fn position_indices(batch: usize, seq_len: usize) -> Vec<usize> {
 
 fn ones_parameter(shape: &[usize], store: &mut TensorStore) -> Result<TensorId> {
     let size = shape.iter().product();
-    Ok(store.alloc(GpuTensor::new(vec![1.0; size], shape.to_vec(), true)?))
+    Ok(store.alloc(Tensor::new(vec![1.0; size], shape.to_vec(), true)?))
 }
 
 fn uniform_parameter(
@@ -527,7 +527,7 @@ fn uniform_parameter(
     let data = (0..size)
         .map(|_| sample_uniform(&mut state, bound))
         .collect::<Vec<_>>();
-    Ok(store.alloc(GpuTensor::new(data, shape.to_vec(), true)?))
+    Ok(store.alloc(Tensor::new(data, shape.to_vec(), true)?))
 }
 
 fn sample_uniform(state: &mut u32, bound: f32) -> f32 {

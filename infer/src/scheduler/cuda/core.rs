@@ -1005,7 +1005,7 @@ impl<M: ModelForward> Scheduler<M> {
                 info!("Autotuning cublasLt GEMM algorithms ({} shapes)...", warmed);
                 let t_at = std::time::Instant::now();
                 unsafe {
-                    infer_cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
+                    cuda_kernels::ffi::autotune_all_cached_gemms_cuda(
                         self.model.device_context().stream.cu_stream(),
                     );
                 }

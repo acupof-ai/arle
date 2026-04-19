@@ -45,7 +45,7 @@ Run these before any long build/test job:
 
 ```bash
 rg -n "default_page_size|page_size = 16|max_total_pages|free_pages|page_indices|seq_lens" \
-  crates/infer-cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs
+  crates/cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs
 ```
 
 Expected:
@@ -55,8 +55,8 @@ Expected:
 
 ```bash
 rg -n "kv_cache_to_paged_range_hnd_cuda|kv_cache_to_paged_range_hnd_kernel" \
-  crates/infer-cuda-kernels/src/ffi/kv.rs \
-  crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu
+  crates/cuda-kernels/src/ffi/kv.rs \
+  crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu
 ```
 
 Expected: one FFI declaration plus one CUDA kernel/wrapper pair.

@@ -4,7 +4,7 @@ use autograd::{
 };
 
 use crate::{
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     rollout::Trajectory,
     sampling::log_prob_at_index,
 };
@@ -54,11 +54,11 @@ pub fn group_advantages(rewards: &[f32], group_size: usize) -> Vec<f32> {
 }
 
 pub fn grpo_loss(
-    policy: &TinyLM,
+    policy: &Lm,
     trajectories: &[Trajectory],
     advantages: &[f32],
     cfg: &GrpoConfig,
-    config: &TinyLMConfig,
+    config: &LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -90,11 +90,11 @@ pub fn grpo_loss(
 }
 
 pub fn grpo_loss_per_position(
-    policy: &TinyLM,
+    policy: &Lm,
     trajectories: &[Trajectory],
     advantages_per_position: &[f32],
     cfg: &GrpoConfig,
-    config: &TinyLMConfig,
+    config: &LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -199,9 +199,9 @@ pub fn ppo_active_mask(
 }
 
 pub fn mean_sampled_kl(
-    policy: &TinyLM,
+    policy: &Lm,
     trajectories: &[Trajectory],
-    config: &TinyLMConfig,
+    config: &LmConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<f32> {

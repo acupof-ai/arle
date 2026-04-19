@@ -99,7 +99,7 @@ Assume 1 engineer-week of focus, ROI-ranked:
 
 - 100ms off single-request TTFT on Qwen3-4B 4096-prompt.
 - sglang caches the wrapper state; we rebuild per-call.
-- Audit `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill*.cu` bindings.
+- Audit `crates/cuda-kernels/csrc/attention/flashinfer_prefill*.cu` bindings.
 
 ### P3 — Extend decode fusion to Qwen3.5 attn output gate path
 

@@ -5,12 +5,12 @@
 //! two reasons:
 //!
 //! 1. **Stable consumer surface.** Model code says
-//!    `use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, …};`
-//!    instead of three separate `use infer_cuda_kernels::{tensor::…,
+//!    `use cuda_kernels::prelude::{DeviceContext, DeviceVec, …};`
+//!    instead of three separate `use cuda_kernels::{tensor::…,
 //!    paged_kv::…, flashinfer::…}` lines. The consumer's import block is
 //!    insulated from the underlying module layout.
 //!
-//! 2. **Proto-API for the eventual `infer-cuda-kernels` crate extraction.**
+//! 2. **Proto-API for the eventual `cuda-kernels` crate extraction.**
 //!    See `docs/plans/cuda-kernel-crate-extraction.md`. When one of the
 //!    trip wires (FA-3 H100, MLA / DeepSeek-V3, NCCL tensor parallel,
 //!    parallel kernel build configs, second consumer of the kernel layer)
@@ -47,7 +47,7 @@
 //! - `TokenKVPool` (paged_kv) — too narrow (3 callers).
 //! - Anything from `super::ffi::*` — the FFI submodule tree is its own
 //!   namespace; consumers that need `extern "C"` symbols use
-//!   `infer_cuda_kernels::ffi::xxx` directly.
+//!   `cuda_kernels::ffi::xxx` directly.
 //! - `EngineOptions` / `InferenceEngineOptions` — these are runtime
 //!   configuration types owned by `infer::server_engine`, not kernel types.
 //! - Any model-specific state (`Qwen3Model`, etc.) — those are application

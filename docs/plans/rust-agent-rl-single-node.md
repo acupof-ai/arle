@@ -191,7 +191,7 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 
 | # | 任务 | 要点 | 验收 |
 |---|---|---|---|
-| M4.1 | **Multi-turn trajectory**：agent tool loop 的每一步 (action, observation) 都进 trajectory，step logp 按 action-token 计算 | 参考 infer-agent 现有 tool loop，不改逻辑，加 callback | 多轮 trajectory 能回到 trainer，logp 和 forward 一致 |
+| M4.1 | **Multi-turn trajectory**：agent tool loop 的每一步 (action, observation) 都进 trajectory，step logp 按 action-token 计算 | 参考 agent 现有 tool loop，不改逻辑，加 callback | 多轮 trajectory 能回到 trainer，logp 和 forward 一致 |
 | M4.2 | **Stepwise reward assignment**：最终 reward 按 step 反向折扣（γ=1 或 0.99）；工具调用失败的 step 单独加小惩罚 | `train/src/reward.rs` | 手造 3 种失败样例，惩罚正确触发 |
 | M4.3 | **多 verifier**：数学 + 代码（pytest-like 单测 Rust 原生实现）+ 工具调用成功率 | `train/src/reward/{math,code,tool}.rs` | 每个 verifier 独立单测 |
 | M4.4 | **Reward aggregation**：多 verifier 加权；权重作为 config，方便调 | `train/src/reward/aggregate.rs` | 文档化每个 verifier 的 scale |

@@ -5,7 +5,7 @@
 Going into this session, the workspace was in a half-finished state from a
 previous attempt to atomize `infer` into 8 crates (`infer-core`,
 `infer-engine`, `infer-observability`, `infer-policy`, plus the existing
-`infer-agent` / `infer-cli` / `infer-chat` / `infer-tools`). The compute
+`agent` / `cli` / `chat` / `tools`). The compute
 core (`backend/`, `model/`, `ops/`, `weight_loader.rs`) had been physically
 relocated under `crates/infer-engine/src/`, but only via 12 `#[path]`
 redirects in `infer/src/lib.rs` — every file in those directories still used
@@ -18,7 +18,7 @@ In parallel, the engine layer was carrying a duplicate naming scheme:
 `agent_engine.rs::AgentCompleteRequest` / `AgentCompleteOutput` /
 `AgentEngine` / `LoadedAgentEngine` were exact field-by-field duplicates of
 `server_engine.rs::CompleteRequest` / `CompleteOutput` / `ServerEngine` /
-`LoadedServerEngine`, and `infer-chat` had two `ChatMessage` types (one for
+`LoadedServerEngine`, and `chat` had two `ChatMessage` types (one for
 the OpenAI wire format in `lib.rs`, one for the internal protocol in
 `protocol.rs`) re-exported with confusing `Protocol*` aliases.
 
@@ -40,7 +40,7 @@ attempt, in this order:
    contract under `infer::server_engine::{InferenceEngine, LoadedInferenceEngine}`.
    Renamed all the engine types for unambiguous semantics (`ServerEngine` →
    `InferenceEngine`, `CompleteRequest` → `CompletionRequest`, `Usage` →
-   `TokenUsage`, etc.). Renamed all the OpenAI wire types in `infer-chat`
+   `TokenUsage`, etc.). Renamed all the OpenAI wire types in `chat`
    to `OpenAi*` so the canonical protocol names could be re-exported clean
    from `infer_chat::protocol`. Net diff: 138 files, +991 / -1198 lines.
    274 CPU lib tests + 280 Metal lib tests passing throughout.

@@ -327,7 +327,7 @@ impl DeviceVec {
     /// Copy to host as f32 (for testing). Exposed publicly so downstream
     /// crates in this workspace (notably `infer`) can use it from their
     /// own test suites, since that would otherwise sit behind the
-    /// infer-cuda-kernels `#[cfg(test)]` boundary.
+    /// cuda-kernels `#[cfg(test)]` boundary.
     pub fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
         let host_f16 = ctx
             .stream

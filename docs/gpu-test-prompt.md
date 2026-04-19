@@ -42,8 +42,8 @@ scripts/bench_throughput_sweep.py --label post-route-a-cuda
   aliases.
 - `Cargo.toml` workspace members do not list `infer-core`, `infer-engine`,
   `infer-observability`, or `infer-policy`.
-- `crates/` contains `infer-agent`, `infer-chat`, `infer-cli`,
-  `infer-tools`, `mlx-sys`, `infer-cuda-kernels` (added by the
+- `crates/` contains `agent`, `chat`, `cli`,
+  `tools`, `mlx-sys`, `cuda-kernels` (added by the
   2026-04-15 `a4e12f5` kernel-crate extraction — the CUDA kernel
   Rust layer now lives here rather than under `infer/src/backend/cuda/`),
   and `README.md`.

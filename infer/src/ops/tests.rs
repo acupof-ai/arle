@@ -3,8 +3,8 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use super::*;
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::*;
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::*;
 
 fn bf16_vec(data: &[f32]) -> Vec<bf16> {
     data.iter().map(|&x| bf16::from_f32(x)).collect()
@@ -1255,7 +1255,7 @@ fn turboquant_hadamard_signs_deterministic() {
 fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     // Roundtrip test: BF16 → TQ quantize → TQ dequantize → BF16
     // Verify reconstruction error is within expected bounds.
-    use infer_cuda_kernels::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
+    use cuda_kernels::turboquant_state::{TurboQuantLayerState, packed_bytes_per_head};
 
     let ctx = DeviceContext::new()?;
 
@@ -1295,7 +1295,7 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
         .map_err(|e| anyhow!("alloc norms: {e}"))?;
 
     // Quantize
-    infer_cuda_kernels::kv_turboquant::turboquant_quantize_paged_single(
+    cuda_kernels::kv_turboquant::turboquant_quantize_paged_single(
         &ctx,
         {
             let (ptr, _g) = input.data.device_ptr(&ctx.stream);
@@ -1318,7 +1318,7 @@ fn turboquant_kv_roundtrip_gpu() -> Result<()> {
     let mut output = DeviceVec::zeros(&ctx, batch_size * kv_dim)?;
 
     // Dequantize (contiguous path)
-    infer_cuda_kernels::kv_turboquant::turboquant_dequantize_inplace(
+    cuda_kernels::kv_turboquant::turboquant_dequantize_inplace(
         &ctx,
         &packed,
         &norms,
