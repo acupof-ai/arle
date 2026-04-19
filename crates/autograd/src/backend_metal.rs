@@ -7,11 +7,10 @@
 
 use crate::{
     AutogradError, Result,
-    backend::{Backend, Device, DeviceHandle, MlxHandle},
+    backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape},
 };
 use mlx_sys::{
-    MLX_FLOAT32, mlx_array, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
-    mlx_array_size, mlx_eval, mlx_matmul,
+    MLX_FLOAT32, mlx_array_data_float32, mlx_array_from_data, mlx_array_size, mlx_eval, mlx_matmul,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -63,13 +62,11 @@ impl Backend for MetalBackend {
                 let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
 
                 // Safety: the raw MLX array pointer is owned by `handle` for the
-                // duration of this borrow, `mlx_eval` only observes/evaluates that
-                // live array, and the host buffer we copy into is freshly allocated.
+                // duration of this borrow, the caller is responsible for having
+                // evaluated the array before readback, and the destination host
+                // buffer is freshly allocated for this copy.
                 let host = unsafe {
                     let array = handle.as_ptr();
-                    let mut eval_array = array;
-                    mlx_eval(&mut eval_array, 1);
-
                     let size = mlx_array_size(array);
                     let data_ptr = mlx_array_data_float32(array);
                     if data_ptr.is_null() {
@@ -116,6 +113,41 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn matmul(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let out_shape = matmul_output_shape(a_shape, b_shape)?;
+        let DeviceHandle::Metal(a_handle) = a else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot matmul a non-metal device handle",
+            ));
+        };
+        let DeviceHandle::Metal(b_handle) = b else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot matmul a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: both pointers come from live `MlxHandle`s borrowed for this
+        // call, ownership of the returned MLX node transfers into the new
+        // `MlxHandle`, and `MLX_GUARD` serializes access to MLX's global state.
+        let out = unsafe {
+            let out_arr = mlx_matmul(a_handle.as_ptr(), b_handle.as_ptr());
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant("mlx_matmul returned null"));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok((out, out_shape))
+    }
+
     fn matmul_forward(
         &self,
         a: &[f32],
@@ -123,114 +155,18 @@ impl Backend for MetalBackend {
         b: &[f32],
         b_shape: &[usize],
     ) -> Result<(Vec<f32>, Vec<usize>)> {
-        let out_shape = match (a_shape.len(), b_shape.len()) {
-            (2, 2) => {
-                if a_shape[1] != b_shape[0] {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![a_shape[1]],
-                        got: vec![b_shape[0]],
-                    });
-                }
-                vec![a_shape[0], b_shape[1]]
-            }
-            (3, 3) => {
-                if a_shape[0] != b_shape[0] {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![a_shape[0]],
-                        got: vec![b_shape[0]],
-                    });
-                }
-                if a_shape[2] != b_shape[1] {
-                    return Err(AutogradError::ShapeMismatch {
-                        expected: vec![a_shape[2]],
-                        got: vec![b_shape[1]],
-                    });
-                }
-                vec![a_shape[0], a_shape[1], b_shape[2]]
-            }
-            _ => {
-                return Err(AutogradError::InvalidRank {
-                    expected: "both operands must be rank-2 or rank-3",
-                    got: a_shape.len().max(b_shape.len()),
-                });
-            }
-        };
-
-        let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
-        let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
-
-        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
-
-        // Safety: all pointers are produced by mlx_array_from_data / mlx_matmul
-        // and freed on every path. Host slices outlive the from_data call,
-        // and MLX copies into its own storage before eval.
-        let out = unsafe {
-            let a_arr = mlx_array_from_data(
-                a.as_ptr() as *const c_void,
-                a_shape_i32.as_ptr(),
-                a_shape_i32.len() as i32,
-                MLX_FLOAT32,
-            );
-            if a_arr.is_null() {
-                return Err(AutogradError::TapeInvariant(
-                    "mlx_array_from_data returned null for A",
-                ));
-            }
-            let b_arr = mlx_array_from_data(
-                b.as_ptr() as *const c_void,
-                b_shape_i32.as_ptr(),
-                b_shape_i32.len() as i32,
-                MLX_FLOAT32,
-            );
-            if b_arr.is_null() {
-                mlx_array_free(a_arr);
-                return Err(AutogradError::TapeInvariant(
-                    "mlx_array_from_data returned null for B",
-                ));
-            }
-
-            let out_arr = mlx_matmul(a_arr, b_arr);
-            if out_arr.is_null() {
-                mlx_array_free(a_arr);
-                mlx_array_free(b_arr);
-                return Err(AutogradError::TapeInvariant("mlx_matmul returned null"));
-            }
-
-            let mut eval_arr: *mut mlx_array = out_arr;
-            mlx_eval(&mut eval_arr, 1);
-
-            let size = mlx_array_size(out_arr);
-            let expected_size: usize = out_shape.iter().product();
-            if size != expected_size {
-                mlx_array_free(a_arr);
-                mlx_array_free(b_arr);
-                mlx_array_free(out_arr);
-                return Err(AutogradError::ShapeMismatch {
-                    expected: out_shape.clone(),
-                    got: vec![size],
-                });
-            }
-
-            let data_ptr = mlx_array_data_float32(out_arr);
-            if data_ptr.is_null() {
-                mlx_array_free(a_arr);
-                mlx_array_free(b_arr);
-                mlx_array_free(out_arr);
-                return Err(AutogradError::TapeInvariant(
-                    "mlx_array_data_float32 returned null",
-                ));
-            }
-
-            let mut out_host = vec![0.0f32; size];
-            std::ptr::copy_nonoverlapping(data_ptr, out_host.as_mut_ptr(), size);
-
-            mlx_array_free(a_arr);
-            mlx_array_free(b_arr);
-            mlx_array_free(out_arr);
-
-            out_host
-        };
-
+        let a_handle = self.upload(a, a_shape)?;
+        let b_handle = self.upload(b, b_shape)?;
+        let (out_handle, out_shape) = self.matmul(&a_handle, a_shape, &b_handle, b_shape)?;
+        self.eval(&[&out_handle])?;
+        let out = self.readback(&out_handle)?;
+        let expected_size: usize = out_shape.iter().product();
+        if out.len() != expected_size {
+            return Err(AutogradError::ShapeMismatch {
+                expected: out_shape.clone(),
+                got: vec![out.len()],
+            });
+        }
         Ok((out, out_shape))
     }
 }

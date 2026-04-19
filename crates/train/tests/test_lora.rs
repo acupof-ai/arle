@@ -29,8 +29,8 @@ fn lora_trains_with_frozen_base() {
     let model = TinyLM::new(config, &mut store).expect("build tiny model with lora");
     let params = model.parameters();
     let base_params = model.base_parameter_ids();
-    let base_before = snapshot(&base_params, &store);
-    let trainable_before = snapshot(&params, &store);
+    let base_before = snapshot(&base_params, &mut store);
+    let trainable_before = snapshot(&params, &mut store);
     let mut optimizer = AdamW::new(1.0e-2, (0.9, 0.999), 1.0e-8, 0.0);
     let mut dataset = CopyDataset::with_vocab(1, 4, 7, 15, 15);
     let mut losses = Vec::with_capacity(5);
@@ -85,7 +85,7 @@ fn lora_trains_with_frozen_base() {
     );
 }
 
-fn snapshot(params: &[TensorId], store: &TensorStore) -> HashMap<TensorId, Vec<f32>> {
+fn snapshot(params: &[TensorId], store: &mut TensorStore) -> HashMap<TensorId, Vec<f32>> {
     params
         .iter()
         .map(|&id| {

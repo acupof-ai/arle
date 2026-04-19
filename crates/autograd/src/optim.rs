@@ -31,17 +31,19 @@ impl AdamW {
         let bc2 = 1.0 - beta2.powi(self.step);
 
         for &param_id in params {
-            let Some(param_snapshot) = store.get(param_id) else {
-                panic!("adamw parameter {param_id} does not exist");
-            };
-            let Some(grad_id) = param_snapshot.grad else {
-                continue;
+            let (grad_id, param_len) = {
+                let Some(param_snapshot) = store.get(param_id) else {
+                    panic!("adamw parameter {param_id} does not exist");
+                };
+                let Some(grad_id) = param_snapshot.grad else {
+                    continue;
+                };
+                (grad_id, param_snapshot.data.len())
             };
 
             let grad = store
                 .to_host(grad_id)
                 .expect("gradient tensor should be readable from the store");
-            let param_len = param_snapshot.data.len();
             let state = self
                 .state
                 .entry(param_id)

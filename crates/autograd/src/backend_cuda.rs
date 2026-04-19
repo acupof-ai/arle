@@ -67,6 +67,16 @@ impl Backend for CudaBackend {
         todo!("PENDING REMOTE CUDA VERIFICATION: DeviceHandle::Cuda not implemented")
     }
 
+    fn matmul(
+        &self,
+        _a: &DeviceHandle,
+        _a_shape: &[usize],
+        _b: &DeviceHandle,
+        _b_shape: &[usize],
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        todo!("PENDING REMOTE CUDA VERIFICATION: Backend::matmul lazy path")
+    }
+
     fn matmul_forward(
         &self,
         a: &[f32],

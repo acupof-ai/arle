@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::matmul_output_shape as backend_matmul_output_shape,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{GpuTensor, TensorId, TensorStore},
 };
@@ -12,16 +13,28 @@ pub fn matmul(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let a_tensor = store.tensor(a)?.clone();
-    let b_tensor = store.tensor(b)?.clone();
-    let (data, output_shape) = store.backend().matmul_forward(
-        &a_tensor.data,
-        &a_tensor.shape,
-        &b_tensor.data,
-        &b_tensor.shape,
-    )?;
-    let requires_grad = a_tensor.requires_grad || b_tensor.requires_grad;
-    let output_id = store.alloc(GpuTensor::new(data, output_shape, requires_grad)?);
+    store.ensure_device(a)?;
+    store.ensure_device(b)?;
+    let a_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+    let b_handle = store
+        .tensor(b)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
+    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
+    let (out_handle, out_shape) = store
+        .backend()
+        .matmul(&a_handle, &a_shape, &b_handle, &b_shape)?;
+    let output_id = store.alloc_device_tensor(out_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
 
     if requires_grad {
         tape.record(TapeEntry {
@@ -159,12 +172,5 @@ pub(crate) fn matmul_backward(
 }
 
 fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {
-    match (a_shape.len(), b_shape.len()) {
-        (2, 2) => Ok(vec![a_shape[0], b_shape[1]]),
-        (3, 3) => Ok(vec![a_shape[0], a_shape[1], b_shape[2]]),
-        _ => Err(AutogradError::InvalidRank {
-            expected: "both operands must be rank-2 or rank-3",
-            got: a_shape.len().max(b_shape.len()),
-        }),
-    }
+    backend_matmul_output_shape(a_shape, b_shape)
 }
