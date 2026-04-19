@@ -21,6 +21,11 @@ crate:
   `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
 
+Phase 6 training stack (orthogonal to the inference runtime; see
+[projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md)):
+- `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend` trait with CPU/Metal/CUDA matmul
+- `train`: LoRA + GRPO trainer (`train_multi_turn` binary), depends on `autograd`
+
 The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,
 `infer-policy`, and `infer-engine` back into `infer` because the split never
 achieved real independence.
