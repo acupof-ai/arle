@@ -101,7 +101,8 @@ impl Default for GraphPool {
 }
 
 impl GraphPool {
-    /// Create an empty pool.  No graphs are captured until [`warmup`] is called.
+    /// Create an empty pool.  No graphs are captured until a warmup pass
+    /// (see [`warmup_schedule`]) drives the scheduler through the pool sizes.
     pub fn new() -> Self {
         let states = POOL_BATCH_SIZES
             .iter()

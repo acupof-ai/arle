@@ -34,9 +34,9 @@ pub struct FlashInferDecodeMetadata {
     prev_slot_indices: Vec<usize>,
     /// Previous slot epochs; changes when a slot is recycled for a new request.
     prev_slot_epochs: Vec<u64>,
-    /// Host-side q_indptr for TC decode: [0, 1, 2, ..., max_batch_size].
+    /// Host-side q_indptr for TC decode: `[0, 1, 2, ..., max_batch_size]`.
     pub qo_indptr_h: Vec<i32>,
-    /// Physical page id of the last logical page per request [max_batch_size].
+    /// Physical page id of the last logical page per request `[max_batch_size]`.
     /// Used only by the page_size=1 quantize-after-write fast paths.
     pub last_token_indices: CudaSlice<i32>,
     /// Host scratch for building last_token_indices.

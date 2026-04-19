@@ -4,7 +4,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use infer_cuda_kernels::ffi;
 use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
-/// Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
+/// Embedding lookup reading token_id from `decode_meta[0]` (CUDA Graph safe)
 pub fn embedding_decode_into(
     ctx: &DeviceContext,
     embed: &DeviceMatrix,

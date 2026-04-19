@@ -1,7 +1,9 @@
 //! In-process inference benchmark CLI.
 //!
 //! Usage:
-//!   cargo run -r --bin bench_serving -- [GLOBAL_OPTIONS] <SUBCOMMAND> [OPTIONS]
+//! ```text
+//! cargo run -r --bin bench_serving -- [GLOBAL_OPTIONS] <SUBCOMMAND> [OPTIONS]
+//! ```
 //!
 //! Examples:
 //!   cargo run -r --bin bench_serving -- request --prompt "Tell me a story" --output-len 128
