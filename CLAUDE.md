@@ -68,30 +68,44 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 - Pre-push type check on Mac without nvcc:
   `cargo check -p infer --no-default-features --features cuda,no-cuda`.
 
-### Delegation to Codex
+### Delegation (subagents execute, Codex reviews, parallel by default)
 
-Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
-(Agent `subagent_type: "codex:codex-rescue"`) or `mcp__openmax__execute_with_codex`.
+Claude = **direction + integration**. Execution runs through **subagents**
+(Agent tool: `general-purpose`, `Explore`, `Plan`, `codex:codex-rescue`).
+Review runs through **`codex review`** at the Bash tool. Reserve direct
+hand-written diffs for edits ≤ ~3 files / trivial mechanical changes.
 
 | Area | Owner |
 |------|-------|
 | Docs, planning, architecture, roadmaps | Claude |
-| Code execution (implement/refactor/tests) | **Codex** (delegate) |
+| Code execution (implement/refactor/tests) | **Subagent** (delegate via Agent tool) |
 | Code review of non-trivial diffs | **Claude runs `codex review`** |
-| Stuck-problem rescue | **Codex** (after 2 failed attempts) |
+| Broad codebase exploration | **Explore / general-purpose subagent** |
+| Implementation planning spanning >5 files | **Plan subagent** |
+| Stuck-problem rescue (2-strike hand-off) | **`codex:codex-rescue` subagent** |
 
-- **Task-execution bias:** when a task is "write/change code", draft a brief
-  (files, constraints, acceptance criteria) and delegate. Claude integrates
-  and verifies — Claude does not hand-write substantial diffs.
-- **Code review is Claude-driven:** invoke `codex review --uncommitted` (or
-  `--commit <sha>` / `--base <branch>`) directly from the Bash tool and relay
-  the findings. Do NOT spawn a `codex:codex-rescue` agent for review. Reserve
-  agent delegation for execution tasks.
-- **2-strike rule:** two good-faith failed attempts → hand off. Brief must
-  list what was tried, what was observed, why each attempt failed, so Codex
-  picks a different angle.
+- **Parallelize by default.** When multiple delegated tasks are independent
+  (different files, different layers, research + execution), fire them in a
+  **single message with multiple Agent tool uses** so they run concurrently.
+  Serial delegation is reserved for genuinely data-dependent steps.
+- **Execution bias:** when a task is "write/change code", draft a brief
+  (files, constraints, acceptance criteria) and delegate to a subagent.
+  Claude integrates and verifies — Claude does not hand-write substantial
+  diffs. Reach Codex via `subagent_type: "codex:codex-rescue"` or
+  `mcp__openmax__execute_with_codex` when the task specifically benefits
+  from Codex's strengths (complex refactors, unfamiliar codebases); use
+  `general-purpose` for routine implementation work.
+- **Code review is Claude-driven via Codex CLI:** invoke
+  `codex review --uncommitted` (or `--commit <sha>` / `--base <branch>`)
+  directly from the Bash tool and relay the findings. Do NOT spawn a
+  `codex:codex-rescue` agent for review — review is a shell command, not
+  a delegation.
+- **2-strike rule:** two good-faith failed attempts → hand off to Codex.
+  Brief must list what was tried, what was observed, why each attempt
+  failed, so Codex picks a different angle.
 - **Claude always owns:** planning docs, experience entries, roadmap edits,
-  user-facing explanations, final integration after Codex reports back.
+  user-facing explanations, final integration after subagents report back,
+  and the `codex review` pass before commit on non-trivial diffs.
 
 ### Benchmarks
 
