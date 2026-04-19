@@ -67,6 +67,9 @@ pub(crate) struct Config35 {
     pub(crate) num_hidden_layers: usize,
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
+    // Only read by the metal backend; under `cuda,no-cuda` typecheck (no metal),
+    // this field is constructed and held but never consumed.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     pub(crate) eos_token_id: u32,
     /// All stop token IDs (from generation_config.json or fallback to eos_token_id).
     pub(crate) stop_token_ids: Vec<u32>,
