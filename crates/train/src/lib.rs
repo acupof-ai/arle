@@ -24,6 +24,8 @@ pub mod sampling;
 pub mod server;
 #[path = "task_gen.rs"]
 pub mod task_gen;
+#[path = "tokenizer.rs"]
+pub mod tokenizer;
 #[path = "trainer.rs"]
 pub mod trainer;
 #[path = "verifier.rs"]
