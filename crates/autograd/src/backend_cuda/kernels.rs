@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 #[cfg(not(feature = "no-cuda"))]
 const ELEMENTWISE_CU: &str = include_str!("kernels/elementwise.cu");
+#[cfg(not(feature = "no-cuda"))]
+const SOFTMAX_CU: &str = include_str!("kernels/softmax.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -15,6 +17,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "gelu_f32",
     "exp_f32",
     "neg_f32",
+    "softmax_last_axis_f32",
+    "log_softmax_last_axis_f32",
 ];
 
 #[derive(Debug)]
@@ -66,6 +70,47 @@ impl KernelCache {
     }
 }
 
+pub(super) fn launch_rows<F>(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    rows: usize,
+    block: u32,
+    shared_bytes: u32,
+    build_args: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut LaunchArgs<'_>),
+{
+    #[cfg(feature = "no-cuda")]
+    {
+        let _ = (stream, func, rows, block, shared_bytes, build_args);
+        todo!("GPU required: cuda kernel launch is unavailable under feature no-cuda")
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    {
+        if rows == 0 {
+            return Ok(());
+        }
+        let grid_x = u32::try_from(rows)
+            .map_err(|_| AutogradError::TapeInvariant("cuda launch rows exceeds u32"))?;
+        let mut launch_args = stream.launch_builder(func);
+        build_args(&mut launch_args);
+        // Safety: caller controls the kernel symbol + argument order, and all
+        // device buffers outlive the asynchronous launch.
+        unsafe {
+            launch_args
+                .launch(LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (block, 1, 1),
+                    shared_mem_bytes: shared_bytes,
+                })
+                .map_err(|_| AutogradError::TapeInvariant("cuda kernel launch failed"))?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn launch_1d<F>(
     stream: &Arc<CudaStream>,
     func: &CudaFunction,
@@ -110,6 +155,8 @@ where
 fn concat_sources() -> String {
     let mut src = String::new();
     src.push_str(ELEMENTWISE_CU);
+    src.push('\n');
+    src.push_str(SOFTMAX_CU);
     src.push('\n');
     src
 }
