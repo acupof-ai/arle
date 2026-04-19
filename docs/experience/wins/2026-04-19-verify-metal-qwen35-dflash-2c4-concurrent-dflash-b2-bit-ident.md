@@ -240,9 +240,9 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 330 filtered out; fi
      block (`accepted_inputs > 1` with tail kept), that row carried a
      non-empty buffer on the next tick, so in practice any mixed-
      acceptance pattern collapsed the bucket. **Fixed in follow-up
-     commit FIXME-commit-sha**: the function now partitions rows into a
+     commit f09b25a**: the function now partitions rows into a
      ready subset (empty buffer + captured `target_hidden` + cross-row
-     shape/handle agreement with the first ready row) and a stale
+     shape/handle agreement via majority equivalence class) and a stale
      subset; the batched kernel runs on the ready subset iff `len >= 2`,
      and the caller in
      `runtime.rs::execute_qwen35_dflash_packed_batch` routes stale rows
