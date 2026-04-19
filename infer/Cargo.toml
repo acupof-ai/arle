@@ -168,3 +168,4 @@ harness = false
 [[bench]]
 name = "ops_bench"
 harness = false
+required-features = ["cuda"]
