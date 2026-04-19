@@ -85,6 +85,23 @@ NVRTC kernel needs a real GPU run alongside the existing
 `scatter_add_rows_f32` verification from the prior session:
 `cargo test -p autograd --release --features cuda --test test_backend`.
 
+### 5. Metal pretrain end-to-end bit-identical to CPU
+
+`pretrain_qwen3 --backend metal --seed 42 --steps 3` on the same
+tiny-model config as the CPU check in §3 produced step 0/1/2 =
+**11.8966 / 11.8840 / 11.8226** with eval **11.7904** — bit-identical
+to the CPU trajectory. At ~500 ms/step (Metal) vs ~3700 ms/step (CPU),
+that's a ~7× training speedup with zero numerical drift at this model
+size. Stronger evidence than the 38/38 unit parity alone, because it
+exercises the full forward+backward composition (rmsnorm, add_broadcast
+from bias-broadcast sites, scatter_add from embedding/gather backward,
+matmul, rope, silu, softmax, etc.) in integrated use.
+
+Note the earlier 2026-04-19 Metal win logged drift past step-0 at
+larger hidden/vocab sizes due to accumulation-order differences — this
+smaller config doesn't trigger that, so don't generalize "Metal is
+bit-identical to CPU" beyond the audit checkpoint above.
+
 ## Rule
 
 When routing a forward op through the backend trait but the backward
