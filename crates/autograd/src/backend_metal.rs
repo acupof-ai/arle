@@ -5,7 +5,10 @@
 //! so we pass shape through unchanged. Shape validation mirrors
 //! `cpu_matmul_forward` so the trait contract stays identical.
 
-use crate::{AutogradError, Result, backend::Backend, backend::Device};
+use crate::{
+    AutogradError, Result,
+    backend::{Backend, Device, DeviceHandle, MlxHandle},
+};
 use mlx_sys::{
     MLX_FLOAT32, mlx_array, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
     mlx_array_size, mlx_eval, mlx_matmul,
@@ -18,7 +21,7 @@ use std::sync::Mutex;
 // default `cargo test` parallelism) SEGV the interpreter. A static
 // mutex here is coarse but correct — training is single-threaded, and
 // the lock is held only for the duration of one matmul FFI round-trip.
-static MLX_GUARD: Mutex<()> = Mutex::new(());
+pub(crate) static MLX_GUARD: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetalBackend;
@@ -26,6 +29,91 @@ pub struct MetalBackend;
 impl Backend for MetalBackend {
     fn device(&self) -> Device {
         Device::Metal
+    }
+
+    fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
+        let shape_i32: Vec<i32> = shape.iter().map(|&dim| dim as i32).collect();
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `host` and `shape_i32` stay alive for the duration of the FFI
+        // call, MLX copies from the host slice into its own array storage, and
+        // the returned pointer becomes uniquely owned by the `MlxHandle`.
+        let handle = unsafe {
+            let array = mlx_array_from_data(
+                host.as_ptr() as *const c_void,
+                shape_i32.as_ptr(),
+                shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if array.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(array))
+        };
+
+        Ok(handle)
+    }
+
+    fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
+        match handle {
+            DeviceHandle::Cpu(data) => Ok(data.clone()),
+            DeviceHandle::Metal(handle) => {
+                let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+                // Safety: the raw MLX array pointer is owned by `handle` for the
+                // duration of this borrow, `mlx_eval` only observes/evaluates that
+                // live array, and the host buffer we copy into is freshly allocated.
+                let host = unsafe {
+                    let array = handle.as_ptr();
+                    let mut eval_array = array;
+                    mlx_eval(&mut eval_array, 1);
+
+                    let size = mlx_array_size(array);
+                    let data_ptr = mlx_array_data_float32(array);
+                    if data_ptr.is_null() {
+                        return Err(AutogradError::TapeInvariant(
+                            "mlx_array_data_float32 returned null",
+                        ));
+                    }
+
+                    let mut out = vec![0.0f32; size];
+                    std::ptr::copy_nonoverlapping(data_ptr, out.as_mut_ptr(), size);
+                    out
+                };
+
+                Ok(host)
+            }
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(_) => Err(AutogradError::TapeInvariant(
+                "metal backend cannot read back a cuda device handle",
+            )),
+        }
+    }
+
+    fn eval(&self, handles: &[&DeviceHandle]) -> Result<()> {
+        let mut metal_handles = handles
+            .iter()
+            .filter_map(|handle| match handle {
+                DeviceHandle::Metal(handle) => Some(handle.as_ptr()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if metal_handles.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: each pointer comes from a live `MlxHandle` borrowed for the
+        // duration of this call, ownership stays with those handles, and MLX
+        // access is serialized under `MLX_GUARD`.
+        unsafe {
+            mlx_eval(metal_handles.as_mut_ptr(), metal_handles.len());
+        }
+
+        Ok(())
     }
 
     fn matmul_forward(

@@ -1,19 +1,36 @@
 use crate::{
     AutogradError, Result,
-    backend::{Backend, CpuBackend},
+    backend::{Backend, CpuBackend, DeviceHandle},
 };
 use std::{collections::HashSet, sync::Arc};
 
 pub type TensorId = usize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GpuTensor {
     pub data: Vec<f32>,
+    pub device_handle: Option<DeviceHandle>,
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
     pub size: usize,
     pub requires_grad: bool,
     pub grad: Option<TensorId>,
+}
+
+impl Clone for GpuTensor {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            // Device handles own unique backend allocations; clones fall back
+            // to the host copy until an explicit re-upload repopulates them.
+            device_handle: None,
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            size: self.size,
+            requires_grad: self.requires_grad,
+            grad: self.grad,
+        }
+    }
 }
 
 impl GpuTensor {
@@ -30,6 +47,7 @@ impl GpuTensor {
         let strides = contiguous_strides(&shape);
         Ok(Self {
             data,
+            device_handle: None,
             shape,
             strides,
             size,

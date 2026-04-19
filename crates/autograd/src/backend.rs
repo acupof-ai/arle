@@ -17,8 +17,92 @@ pub enum Device {
     Cuda,
 }
 
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+pub struct MlxHandle {
+    ptr: *mut mlx_sys::mlx_array,
+}
+
+#[cfg(feature = "metal")]
+impl MlxHandle {
+    pub(crate) fn from_raw(ptr: *mut mlx_sys::mlx_array) -> Self {
+        Self { ptr }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut mlx_sys::mlx_array {
+        self.ptr
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for MlxHandle {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+
+        let _guard = crate::backend_metal::MLX_GUARD
+            .lock()
+            .expect("mlx guard poisoned");
+
+        // Safety: `ptr` is owned by this handle, came from MLX FFI allocation,
+        // and this Drop impl is the unique free path for the wrapped array.
+        // `MLX_GUARD` serializes the free against all other MLX FFI calls.
+        unsafe {
+            mlx_sys::mlx_array_free(self.ptr);
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+// Safety: `MlxHandle` owns an MLX array pointer. MLX's global stream is not
+// safe for concurrent mutation, but all MLX FFI use in this crate is
+// serialized by `backend_metal.rs`'s `MLX_GUARD`, which is the synchronization
+// boundary for moving these opaque handles across threads.
+unsafe impl Send for MlxHandle {}
+
+#[cfg(feature = "metal")]
+// Safety: see the `Send` impl above. Shared references are only used to pass
+// opaque handles into MLX while holding `MLX_GUARD`.
+unsafe impl Sync for MlxHandle {}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct CudaHandlePlaceholder;
+
+#[derive(Debug)]
+pub enum DeviceHandle {
+    Cpu(Vec<f32>),
+    #[cfg(feature = "metal")]
+    Metal(MlxHandle),
+    #[cfg(feature = "cuda")]
+    Cuda(CudaHandlePlaceholder),
+}
+
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
+
+    fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
+        Ok(DeviceHandle::Cpu(host.to_vec()))
+    }
+
+    fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
+        match handle {
+            DeviceHandle::Cpu(data) => Ok(data.clone()),
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => Err(crate::AutogradError::TapeInvariant(
+                "device handle readback not implemented for metal on this backend",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(_) => Err(crate::AutogradError::TapeInvariant(
+                "device handle readback not implemented for cuda on this backend",
+            )),
+        }
+    }
+
+    fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
+        Ok(())
+    }
 
     /// Compute `C = A @ B` for rank-2 or rank-3 (batched) row-major tensors.
     /// Returns `(data, output_shape)`. Backends that cannot accelerate a
@@ -38,6 +122,28 @@ pub struct CpuBackend;
 impl Backend for CpuBackend {
     fn device(&self) -> Device {
         Device::Cpu
+    }
+
+    fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
+        Ok(DeviceHandle::Cpu(host.to_vec()))
+    }
+
+    fn readback(&self, handle: &DeviceHandle) -> Result<Vec<f32>> {
+        match handle {
+            DeviceHandle::Cpu(data) => Ok(data.clone()),
+            #[cfg(feature = "metal")]
+            DeviceHandle::Metal(_) => Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot read back a metal device handle",
+            )),
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(_) => Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot read back a cuda device handle",
+            )),
+        }
+    }
+
+    fn eval(&self, _handles: &[&DeviceHandle]) -> Result<()> {
+        Ok(())
     }
 
     fn matmul_forward(
