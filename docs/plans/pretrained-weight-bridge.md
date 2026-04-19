@@ -19,7 +19,7 @@ Qwen3-0.5B safetensors
   → run autograd-side Qwen3 forward         (step 3)
   → SFT one step on a small JSONL           (step 4)
   → export to safetensors                   (step 5)
-  → serve via `infer-cli` HTTP              (already built)
+  → serve via `cli` HTTP              (already built)
   → chat in OpenAI v1 client and get coherent output  (acceptance gate)
 ```
 
@@ -137,7 +137,7 @@ weight). Qwen3-4B is a stretch goal once Metal/CUDA paths compose.
 **Acceptance:**
 ```bash
 cargo run -p train --bin train_sft --release -- --model Qwen3-0.5B --data tiny_sft.jsonl --steps 100 --out /tmp/trained
-cargo run -p infer-cli --release -- chat --model /tmp/trained "hello"
+cargo run -p cli --release -- chat --model /tmp/trained "hello"
 ```
 Chat response is coherent (not garbage). Bit-identical reload would be ideal but f32→bf16 round-trip will drift; accept ≤1e-3 logit delta on the tokenized test prompt.
 

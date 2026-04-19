@@ -4,11 +4,11 @@ mod cuda_tests {
     use std::time::Instant;
 
     use anyhow::{Result, anyhow};
+    use cuda_kernels::ffi;
+    use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
+    use cuda_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
     use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
     use half::bf16;
-    use infer_cuda_kernels::ffi;
-    use infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan;
-    use infer_cuda_kernels::tensor::{DeviceContext, DeviceVec, HiddenStates};
 
     // HD128 matches bitwise — same FlashInfer kernel template as reference.
     // HD256 has a small drift because BatchPrefillWithPagedKVCacheDispatched

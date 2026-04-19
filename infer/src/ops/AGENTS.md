@@ -70,10 +70,10 @@ there's an existing caller that can't hold the buffer.
 
 ## Pointers
 
-- `crates/infer-cuda-kernels/src/prelude.rs` — the types you're allowed to
+- `crates/cuda-kernels/src/prelude.rs` — the types you're allowed to
   take as arguments across the crate boundary.
-- `crates/infer-cuda-kernels/csrc/` — the underlying CUDA C source.
-- `crates/infer-cuda-kernels/tools/triton/` — Triton AOT kernel definitions.
+- `crates/cuda-kernels/csrc/` — the underlying CUDA C source.
+- `crates/cuda-kernels/tools/triton/` — Triton AOT kernel definitions.
 - `docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md` — the
   audited kernel heat map; don't add a new op without checking where it
   lands on this list.

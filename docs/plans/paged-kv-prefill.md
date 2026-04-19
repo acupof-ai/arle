@@ -55,7 +55,7 @@ sglang's `BatchPrefillWithPagedKVCacheWrapper.run(q, kv_cache)` takes:
 - `o` : `[total_qo_tokens, num_qo_heads, head_dim]`
 
 We already emit exactly this shape for decode at
-`crates/infer-cuda-kernels/csrc/attention/flashinfer_tc_decode.cu` with
+`crates/cuda-kernels/csrc/attention/flashinfer_tc_decode.cu` with
 qo_len=1 per request. Prefill is the same call with real qo_len ≥ 1
 per request, and with K/V tokens **written via page-table
 indirection** before the attention kernel fires (not into a contiguous
@@ -65,11 +65,11 @@ buffer that's later migrated).
 
 | # | file | change |
 |---|------|--------|
-| 1 | `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill_paged.cu` (NEW) | HD128 paged-prefill wrapper — structural analogue of `flashinfer_prefill.cu` but using `BatchPrefillPagedParams` + `paged_kv_t`. Includes `flashinfer_batch_prefill_paged_plan` and `flashinfer_batch_prefill_paged_run`. |
-| 2 | `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill_paged_hd256.cu` (NEW) | Same as #1 for HD256 (Qwen3.5 full-attn layers). |
-| 3 | `crates/infer-cuda-kernels/csrc/attention/prefill_attention_paged_prep.cu` (NEW) | New QK-norm + RoPE + **paged** K/V write. Adapts `prefill_attention_prep_dual_write_cuda` → paged-only (drop contiguous write). HD128 + HD256 variants. |
-| 4 | `crates/infer-cuda-kernels/src/ffi/attention.rs` | Declare FFIs for #1–3. Keep old FFIs until #8–11 land. |
-| 5 | `crates/infer-cuda-kernels/src/flashinfer.rs` | Expose the paged-prefill wrapper with workspace allocation mirroring the decode planner. |
+| 1 | `crates/cuda-kernels/csrc/attention/flashinfer_prefill_paged.cu` (NEW) | HD128 paged-prefill wrapper — structural analogue of `flashinfer_prefill.cu` but using `BatchPrefillPagedParams` + `paged_kv_t`. Includes `flashinfer_batch_prefill_paged_plan` and `flashinfer_batch_prefill_paged_run`. |
+| 2 | `crates/cuda-kernels/csrc/attention/flashinfer_prefill_paged_hd256.cu` (NEW) | Same as #1 for HD256 (Qwen3.5 full-attn layers). |
+| 3 | `crates/cuda-kernels/csrc/attention/prefill_attention_paged_prep.cu` (NEW) | New QK-norm + RoPE + **paged** K/V write. Adapts `prefill_attention_prep_dual_write_cuda` → paged-only (drop contiguous write). HD128 + HD256 variants. |
+| 4 | `crates/cuda-kernels/src/ffi/attention.rs` | Declare FFIs for #1–3. Keep old FFIs until #8–11 land. |
+| 5 | `crates/cuda-kernels/src/flashinfer.rs` | Expose the paged-prefill wrapper with workspace allocation mirroring the decode planner. |
 | 6 | `infer/src/ops/attention.rs` | Add `prefill_attention_paged_batch` (HD128) + `prefill_attention_hd256_paged_batch` (HD256). Signature consumes `PagedKVMeta` (already exists for decode) + `qo_indptr` + `kv_indptr` + `kv_indices` + `kv_last_page_len`. Keep old variants until migration completes. |
 | 7 | `infer/src/ops.rs` | Re-export new ops. |
 | 8 | `infer/src/model/qwen3/prefill.rs` | Switch both call sites (`prefill_attention_batch`@278,460) to `prefill_attention_paged_batch`. Pass paged metadata threaded through from the scheduler. |
@@ -102,7 +102,7 @@ the **same** commit, per-model.
   constructs a paged-KV fixture and calls the FFI directly; compares
   output against the existing `SinglePrefill` path on the same
   logical tokens. Within per-tensor tolerance from `ops/tests.rs`.
-- Acceptance: `cargo build --release -p infer-cuda-kernels` clean;
+- Acceptance: `cargo build --release -p cuda-kernels` clean;
   FFI-level test passes.
 
 **Phase 2 — Rust ops + scheduler plumbing** (files 6, 7, 11 partial, 19 partial)
@@ -220,7 +220,7 @@ For each model:
    a second workspace.**
 
 5. **FlashInfer version compatibility.** Our vendored FlashInfer
-   (pinned in `crates/infer-cuda-kernels/third_party/flashinfer/`) must
+   (pinned in `crates/cuda-kernels/third_party/flashinfer/`) must
    expose `PrefillPlanInfo` + `BatchPrefillPagedParams` with the
    signatures we already use in decode. Both are present — confirmed
    via `flashinfer_tc_decode.cu:30,53`.

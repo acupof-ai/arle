@@ -1,7 +1,7 @@
 use std::{collections::HashMap, f32::consts::TAU, fs, path::Path};
 
 use autograd::{
-    AutogradError, GpuTensor, Tape, TensorId, TensorStore,
+    AutogradError, Tensor, Tape, TensorId, TensorStore,
     ops::{
         add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, silu,
         transpose,
@@ -70,11 +70,11 @@ impl Qwen3Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.hidden_size != self.num_attention_heads * self.head_dim {
-            return Err(Qwen3AutogradError::InvalidConfig(
-                "hidden_size must equal num_attention_heads * head_dim",
-            ));
-        }
+        // Qwen3 decouples hidden_size from num_attention_heads * head_dim — e.g.
+        // Qwen3-0.6B has hidden=1024 but q_proj is 16*128=2048 wide. The
+        // projection shapes in Qwen3Model::new already allocate q/k/v/o at the
+        // correct widths, so the only constraint here is that the individual
+        // attention dims are non-zero and compatible.
         if self.num_attention_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
             return Err(Qwen3AutogradError::InvalidConfig(
                 "attention heads and head_dim must be non-zero",
@@ -550,7 +550,7 @@ fn select_cache_rows(
         data.extend_from_slice(&cache_tensor.data[base..base + cols]);
     }
     let output_shape = vec![position_ids.len(), cols];
-    Ok(store.alloc(GpuTensor::new(data, output_shape, false)?))
+    Ok(store.alloc(Tensor::new(data, output_shape, false)?))
 }
 
 fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(TensorId, TensorId)> {
@@ -574,12 +574,12 @@ fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(Tenso
         }
     }
 
-    let cos_cache = store.alloc(GpuTensor::new(
+    let cos_cache = store.alloc(Tensor::new(
         cos,
         vec![cfg.max_position_embeddings, half_dim],
         false,
     )?);
-    let sin_cache = store.alloc(GpuTensor::new(
+    let sin_cache = store.alloc(Tensor::new(
         sin,
         vec![cfg.max_position_embeddings, half_dim],
         false,
@@ -606,7 +606,7 @@ fn normal_parameter(
             data.push(std * radius * theta.sin());
         }
     }
-    Ok(store.alloc(GpuTensor::new(data, shape.to_vec(), true)?))
+    Ok(store.alloc(Tensor::new(data, shape.to_vec(), true)?))
 }
 
 fn ones_parameter(
@@ -615,7 +615,7 @@ fn ones_parameter(
     store: &mut TensorStore,
 ) -> Result<TensorId> {
     let _ = name;
-    Ok(store.alloc(GpuTensor::new(
+    Ok(store.alloc(Tensor::new(
         vec![1.0; shape.iter().product()],
         shape.to_vec(),
         true,

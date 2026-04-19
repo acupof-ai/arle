@@ -65,7 +65,7 @@ cargo fmt --all -- --check                                         # clean
 
 Pre-existing failures (same list as M2b, not in scope): `e2e_qwen35`
 baseline drift, `greedy_consistency` B=3 decode, clippy unused import
-in infer-tools.
+in tools.
 
 The Phase 3 e2e regression that surfaced here was addressed inline —
 see

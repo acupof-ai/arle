@@ -137,7 +137,7 @@ per call (unlikely given cudarc API) or the pool uses a different
 stream for page bookkeeping, §2 / §3 break.
 
 **Verify:** `grep "stream" infer/src/backend/cuda/tensor.rs` and
-`crates/infer-cuda-kernels/src/paged_kv.rs` — is there exactly one
+`crates/cuda-kernels/src/paged_kv.rs` — is there exactly one
 stream?
 
 ### (b) Does `evict_prefix_cache_for_allocation` ever release a page currently in a slot's `page_indices`?

@@ -4,9 +4,9 @@ use cudarc::driver::CudaSlice;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
-use infer_cuda_kernels::TokenKVPool;
-use infer_cuda_kernels::flashinfer::BatchPrefillPagedPlan;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use cuda_kernels::TokenKVPool;
+use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
 /// Pre-allocated scratch buffers for one prefill forward pass.
 /// Created once per prefill in `process_all_layers_batch`, eliminating

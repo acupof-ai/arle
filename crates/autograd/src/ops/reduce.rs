@@ -3,13 +3,13 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(a)?.clone();
     let value = input.data.iter().sum();
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         vec![value],
         Vec::new(),
         input.requires_grad,
@@ -30,7 +30,7 @@ pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(a)?.clone();
     let value = input.data.iter().sum::<f32>() / input.size as f32;
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         vec![value],
         Vec::new(),
         input.requires_grad,
@@ -83,7 +83,7 @@ pub(crate) fn sum_backward(
     } else {
         shape.iter().product()
     };
-    let grad_id = store.alloc(GpuTensor::new(
+    let grad_id = store.alloc(Tensor::new(
         vec![grad_value; size],
         shape.clone(),
         false,
@@ -123,6 +123,6 @@ pub(crate) fn mean_backward(
 
     let input_shape = store.tensor(a)?.shape.clone();
     let grad_value = output_grad.data[0] / numel as f32;
-    let grad_id = store.alloc(GpuTensor::new(vec![grad_value; numel], input_shape, false)?);
+    let grad_id = store.alloc(Tensor::new(vec![grad_value; numel], input_shape, false)?);
     Ok(smallvec![(a, grad_id)])
 }

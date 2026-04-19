@@ -26,7 +26,7 @@ pub use backend::{Backend, CpuBackend, Device, DeviceHandle};
 #[cfg(feature = "safetensors")]
 pub use safetensors_io::SafetensorsRegistry;
 pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
-pub use tensor::{GpuTensor, TensorId, TensorStore};
+pub use tensor::{Tensor, TensorId, TensorStore};
 
 use thiserror::Error;
 

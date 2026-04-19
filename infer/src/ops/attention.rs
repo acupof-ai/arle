@@ -15,9 +15,9 @@
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::flashinfer::{BatchPrefillPagedPlan, FlashInferWorkspace};
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
+use cuda_kernels::ffi;
+use cuda_kernels::flashinfer::{BatchPrefillPagedPlan, FlashInferWorkspace};
+use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates, PagedKVPool};
 
 // ============================================================================
 // Parameter structs — group related config/weight params for high-arity ops.

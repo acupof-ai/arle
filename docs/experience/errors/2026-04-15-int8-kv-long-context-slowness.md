@@ -45,14 +45,14 @@ and dequantises in registers — **no bf16 working buffer
 materialisation of the prior KV span anywhere on the hot path**.
 
 The bf16 work buffer that `TokenKVPool` holds
-(`crates/infer-cuda-kernels/src/paged_kv.rs:31`) is only used as a
+(`crates/cuda-kernels/src/paged_kv.rs:31`) is only used as a
 staging area for the *single new token* before
 `quantize_paged_kv_single` at `batch_decode.rs:494` writes it into
 the INT8 pool. Not the full cache. This rules out the "full
 materialise every step" failure mode.
 
 FlashInfer's own int8 paged decode wrapper does not exist in-tree
-(`crates/infer-cuda-kernels/csrc/attention/flashinfer_decode.cu` is
+(`crates/cuda-kernels/csrc/attention/flashinfer_decode.cu` is
 bf16-only, `BatchDecodeParams<__nv_bfloat16, ...>`), so the int8
 path has no choice but to use the custom
 `decode_attention_int8_partial_kernel` in
@@ -78,7 +78,7 @@ documented at the time as **intentional but known-broken follow-up**:
   > to a separate HND format**.
 - [`docs/projects/tiered-kv-cache.md:107`](../../projects/tiered-kv-cache.md)
   Granularity-mismatch row: "Quantized tiers still need follow-up."
-- [`infer/src/model/kv_types.rs:21-26`](../../../crates/infer-cuda-kernels/src/kv_types.rs)
+- [`infer/src/model/kv_types.rs:21-26`](../../../crates/cuda-kernels/src/kv_types.rs)
   (`KVFormat::default_page_size`) hardcodes `BF16 => 16`,
   `FP8E4M3 | INT8 | TurboQuant { .. } => 1`.
 
@@ -88,7 +88,7 @@ in the 2026-04-15 tree.
 ### 2. `decode_attention_int8_partial_kernel` is a scalar per-token loop, not a tile-based pipeline
 
 The CUDA kernel at
-[`crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`](../../../crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu)
+[`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`](../../../crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu)
 was clearly intended to use shared-memory tiling and `cp.async`
 pipelining — the header carries:
 
@@ -100,7 +100,7 @@ pipelining — the header carries:
 but the actual kernel body at lines 42-217 **never references either**:
 
 - `TILE_TOKENS` is defined but unused in the kernel file (checked:
-  `rg TILE_TOKENS crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`
+  `rg TILE_TOKENS crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`
   returns 2 matches, both in the comment + `#define`).
 - No `cp.async` / `__pipeline_*` invocations anywhere in the file.
 - No `__shared__ smem_k` / `smem_v` tile for K/V data. The only
@@ -251,7 +251,7 @@ Concretely:
 2. **Land the cheapest fix that the profile justifies**:
    - If profile points at Option A: commit a focused
      `perf(kv-quant): SMEM-tile + cp.async int8 decode kernel` under
-     `crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`
+     `crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`
      alone. The commit should attach a 4k / 8k / 16k / 25k rerun
      of `/tmp/longseq_bench.py` showing int8 ITL within 5 % of
      bf16 at 25 k.
@@ -296,6 +296,6 @@ rewrite at least has numbers attached.
 **Corollary 2**: `TILE_TOKENS` + `#include <cuda_pipeline.h>` in a
 kernel file that does not actually use them is a code smell — it
 means someone started an optimisation and never finished it. A lint
-pass over `crates/infer-cuda-kernels/csrc/` looking for this
+pass over `crates/cuda-kernels/csrc/` looking for this
 pattern would turn up at least one real item (this one) and
 probably more.

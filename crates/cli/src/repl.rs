@@ -6,21 +6,21 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use anyhow::Result;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::server_engine::InferenceEngine;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_agent::{
+use agent::{
     AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
+use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer_tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
+use chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use infer::server_engine::InferenceEngine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::error::ReadlineError;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Clone, PartialEq, Eq)]

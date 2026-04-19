@@ -118,13 +118,13 @@ now. Tracking as Phase 1C.
 
 ## Fixes
 
-- `crates/infer-cuda-kernels/src/flashinfer.rs`
+- `crates/cuda-kernels/src/flashinfer.rs`
   - Add `FlashInferWorkspace::new_with_float_bytes` — callers choose the
     workspace size; default constructor keeps 256 MiB for decode paths.
   - Expose `HD256_FLOAT_WORKSPACE_BYTES = 512 MiB` as the known-safe size.
   - `BatchPrefillPagedPlan::new` (HD128) now uses 512 MiB.
   - `BatchPrefillPagedPlan::new_hd256` added for the Qwen3.5 HD256 path.
-- `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill_paged{,_hd256}.cu`
+- `crates/cuda-kernels/csrc/attention/flashinfer_prefill_paged{,_hd256}.cu`
   - Wrap `_plan` and `_run` in `try { … } catch (const std::exception& e) { fprintf; return -1; }`
     so workspace overflows surface as a FlashInfer return code, not a
     process abort.

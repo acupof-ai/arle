@@ -26,7 +26,7 @@ Reverted, documented as a dead-end in the commit message.
 
 **Hypothesis 2 (empirically-tested, clean result)** — the split-KV
 grid was undersized. `choose_decode_num_splits` at
-`crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu:472`
+`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu:472`
 picks `num_splits = ceil(target_blocks / total_q_heads)` where
 `target_blocks = kTargetBlocksPerSm × num_SMs`. The default
 `kTargetBlocksPerSm = 4` gives `target_blocks = 4 × 58 = 232` and
@@ -39,7 +39,7 @@ softmax/reduce with low SM occupancy.
 Bumping to `kTargetBlocksPerSm = 32` gives `target_blocks = 1856`,
 `desired_splits = ceil(1856 / 32) = 58`, clamped to `kMaxSplits = 32`
 (which is the workspace pre-allocation ceiling in
-`crates/infer-cuda-kernels/src/paged_kv.rs:333`). So `num_splits = 32`
+`crates/cuda-kernels/src/paged_kv.rs:333`). So `num_splits = 32`
 at runtime, producing **1024 blocks = 4096 warps** — closer to SM
 saturation, and each CTA only handles 781 tokens at 25k so the
 hand-written softmax loop stays out of the way of the SM scheduler.

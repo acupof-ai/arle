@@ -5,7 +5,7 @@
 The 2026-04-15 long-seq bench
 ([`../experience/wins/2026-04-15-bench-longseq-int8-splits32.md`](../experience/wins/2026-04-15-bench-longseq-int8-splits32.md))
 showed that our INT8 decode attention kernel
-(`crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`)
+(`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`)
 sits at **55.2 ms ITL at 25k** vs bf16's **33.1 ms** — a 22 ms
 residual gap after all the tuning levers (SMEM-tile + cp.async +
 splits=32) were pulled. User asked me to survey how the major serving
@@ -187,8 +187,8 @@ problem.
 Effort: unknown without a prototype. The bindings would add:
 
 - A new Rust FFI wrapper around `trtllm_batch_decode_with_kv_cache`
-  in `crates/infer-cuda-kernels/src/ffi/kv.rs`
-- A new Rust callable in `crates/infer-cuda-kernels/src/kv_quant.rs`
+  in `crates/cuda-kernels/src/ffi/kv.rs`
+- A new Rust callable in `crates/cuda-kernels/src/kv_quant.rs`
 - Dispatch in `batch_decode.rs` for the quant decode path that
   prefers the FlashInfer path over our custom kernel when
   FP8 E4M3 + per-tensor scale

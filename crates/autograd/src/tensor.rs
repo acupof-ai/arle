@@ -14,7 +14,7 @@ pub enum Dirty {
 }
 
 #[derive(Debug)]
-pub struct GpuTensor {
+pub struct Tensor {
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
@@ -25,7 +25,7 @@ pub struct GpuTensor {
     pub dirty: Dirty,
 }
 
-impl Clone for GpuTensor {
+impl Clone for Tensor {
     fn clone(&self) -> Self {
         assert!(
             self.dirty != Dirty::Device,
@@ -46,7 +46,7 @@ impl Clone for GpuTensor {
     }
 }
 
-impl GpuTensor {
+impl Tensor {
     pub fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Result<Self> {
         let size = shape_size(&shape);
         if data.len() != size {
@@ -73,7 +73,7 @@ impl GpuTensor {
 
 #[derive(Debug)]
 pub struct TensorStore {
-    pub tensors: Vec<Option<GpuTensor>>,
+    pub tensors: Vec<Option<Tensor>>,
     pub free_ids: Vec<TensorId>,
     backend: Arc<dyn Backend>,
 }
@@ -101,7 +101,7 @@ impl TensorStore {
         self.backend = backend;
     }
 
-    pub fn alloc(&mut self, tensor: GpuTensor) -> TensorId {
+    pub fn alloc(&mut self, tensor: Tensor) -> TensorId {
         if let Some(id) = self.free_ids.pop() {
             self.tensors[id] = Some(tensor);
             id
@@ -135,11 +135,11 @@ impl TensorStore {
         }
     }
 
-    pub fn get(&self, id: TensorId) -> Option<&GpuTensor> {
+    pub fn get(&self, id: TensorId) -> Option<&Tensor> {
         self.tensors.get(id).and_then(Option::as_ref)
     }
 
-    pub fn get_mut(&mut self, id: TensorId) -> Option<&mut GpuTensor> {
+    pub fn get_mut(&mut self, id: TensorId) -> Option<&mut Tensor> {
         if matches!(
             self.tensors
                 .get(id)
@@ -157,7 +157,7 @@ impl TensorStore {
     }
 
     pub fn from_slice(&mut self, data: &[f32], shape: &[usize]) -> Result<TensorId> {
-        let tensor = GpuTensor::new(data.to_vec(), shape.to_vec(), false)?;
+        let tensor = Tensor::new(data.to_vec(), shape.to_vec(), false)?;
         Ok(self.alloc(tensor))
     }
 
@@ -214,7 +214,7 @@ impl TensorStore {
         shape: Vec<usize>,
         handle: DeviceHandle,
     ) -> Result<TensorId> {
-        let tensor = GpuTensor {
+        let tensor = Tensor {
             data: Vec::new(),
             shape: shape.clone(),
             strides: contiguous_strides(&shape),
@@ -237,7 +237,7 @@ impl TensorStore {
         Ok(())
     }
 
-    fn raw_tensor_mut(&mut self, id: TensorId) -> Result<&mut GpuTensor> {
+    fn raw_tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor> {
         self.tensors
             .get_mut(id)
             .and_then(Option::as_mut)
@@ -246,7 +246,7 @@ impl TensorStore {
 
     pub fn zeros_like(&mut self, id: TensorId) -> Result<TensorId> {
         let source = self.tensor(id)?;
-        let tensor = GpuTensor::new(vec![0.0; source.size], source.shape.clone(), false)?;
+        let tensor = Tensor::new(vec![0.0; source.size], source.shape.clone(), false)?;
         Ok(self.alloc(tensor))
     }
 
@@ -287,11 +287,11 @@ impl TensorStore {
         Ok(())
     }
 
-    pub(crate) fn tensor(&self, id: TensorId) -> Result<&GpuTensor> {
+    pub(crate) fn tensor(&self, id: TensorId) -> Result<&Tensor> {
         self.get(id).ok_or(AutogradError::InvalidTensorId(id))
     }
 
-    pub(crate) fn tensor_mut(&mut self, id: TensorId) -> Result<&mut GpuTensor> {
+    pub(crate) fn tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor> {
         self.get_mut(id).ok_or(AutogradError::InvalidTensorId(id))
     }
 
@@ -303,7 +303,7 @@ impl TensorStore {
 
     pub(crate) fn fill_like(&mut self, id: TensorId, value: f32) -> Result<TensorId> {
         let source = self.tensor(id)?;
-        let tensor = GpuTensor::new(vec![value; source.size], source.shape.clone(), false)?;
+        let tensor = Tensor::new(vec![value; source.size], source.shape.clone(), false)?;
         Ok(self.alloc(tensor))
     }
 }

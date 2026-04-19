@@ -133,7 +133,7 @@ Pre-existing unrelated failures (tracked separately, not in scope):
 `greedy_consistency` (B=3 batched decode —
 `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md`),
 `e2e_qwen35` (baseline drift vs current HF Qwen3.5-4B weights),
-clippy `unused import: Path` in `crates/infer-tools/src/lib.rs`.
+clippy `unused import: Path` in `crates/tools/src/lib.rs`.
 
 ## Rule
 

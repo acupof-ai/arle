@@ -1,12 +1,12 @@
 # agent-infer Codebase Map
 
-Updated 2026-04-15 (post `infer-cuda-kernels` extraction, tiered KV
+Updated 2026-04-15 (post `cuda-kernels` extraction, tiered KV
 M3a/M3b/M3c local, and Metal M0.2a request-state landing).
 Supplemented 2026-04-19 with Phase 6 `crates/autograd` + `crates/train`
 (from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md)).
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
-the CUDA kernel layer was extracted into `crates/infer-cuda-kernels/`
+the CUDA kernel layer was extracted into `crates/cuda-kernels/`
 (commit `a4e12f5`).
 
 ## 1. Workspace at a glance
@@ -27,12 +27,12 @@ Current workspace members:
 
 - `agent-infer`
 - `infer`
-- `crates/infer-cuda-kernels`
+- `crates/cuda-kernels`
 - `crates/mlx-sys`
-- `crates/infer-agent`
-- `crates/infer-chat`
-- `crates/infer-cli`
-- `crates/infer-tools`
+- `crates/agent`
+- `crates/chat`
+- `crates/cli`
+- `crates/tools`
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
 - `crates/train` (Phase 6 — LoRA + GRPO RL trainer, `train_multi_turn` binary; depends on `autograd`)
 
@@ -52,13 +52,13 @@ src/main.rs
 Key files:
 
 - `src/main.rs`: root binary entrypoint
-- `crates/infer-cli/src/lib.rs`: CLI startup and backend selection
-- `crates/infer-cli/src/repl.rs`: REPL loop, slash commands, terminal UX
+- `crates/cli/src/lib.rs`: CLI startup and backend selection
+- `crates/cli/src/repl.rs`: REPL loop, slash commands, terminal UX
 - `infer/src/server_engine.rs`: unified `InferenceEngine` trait, `CompletionRequest`/`CompletionOutput`/`TokenUsage`/`CompletionStreamDelta` types, and `LoadedInferenceEngine` backend dispatch enum
 - `infer/src/hf_hub.rs`: local model discovery + `resolve_model_source`
-- `crates/infer-agent/src/lib.rs`: session state, prompt assembly, turn loop
-- `crates/infer-tools/src/lib.rs`: builtin tools and shared tool hooks
-- `crates/infer-chat/src/lib.rs`: `OpenAiChatMessage` / `OpenAiToolDefinition` wire format + re-exports of the internal `ChatMessage` / `ToolCall` / `ToolDefinition` protocol types from `crate::protocol`
+- `crates/agent/src/lib.rs`: session state, prompt assembly, turn loop
+- `crates/tools/src/lib.rs`: builtin tools and shared tool hooks
+- `crates/chat/src/lib.rs`: `OpenAiChatMessage` / `OpenAiToolDefinition` wire format + re-exports of the internal `ChatMessage` / `ToolCall` / `ToolDefinition` protocol types from `crate::protocol`
 
 ### CUDA serving path
 
@@ -70,7 +70,7 @@ infer/src/main.rs
   -> scheduler/cuda/*
   -> model.rs + model/*
   -> ops.rs + ops/*
-  -> crates/infer-cuda-kernels kernels / FlashInfer / CUDA graph path
+  -> crates/cuda-kernels kernels / FlashInfer / CUDA graph path
 ```
 
 Key files:
@@ -140,12 +140,12 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 ### Memory, KV, caching, and batching support
 
 - `infer/src/block_manager.rs`: KV block accounting for the batch scheduler
-- `crates/infer-cuda-kernels/src/paged_kv.rs`: token-level KV pool for CUDA paged attention (page-aware, BF16 `page_size=16`)
+- `crates/cuda-kernels/src/paged_kv.rs`: token-level KV pool for CUDA paged attention (page-aware, BF16 `page_size=16`)
 - `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse; tier-aware `RadixNode` metadata (`hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`) + `lookup_or_stage` contract
 - `infer/src/kv_tier.rs` + `infer/src/kv_tier/{lookup,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); M3a host-tier skeleton + M3b `lookup_or_stage` contract + page-lifecycle state machine landed locally 2026-04-15
 - `infer/src/memory_planner.rs`: memory planning helpers
-- `crates/infer-cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
-- `crates/infer-cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer
+- `crates/cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
+- `crates/cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer
 - `infer/src/backend/metal/kv_pool.rs`
 - `infer/src/backend/metal/prefix_cache.rs`
 - `infer/src/backend/metal/gdr.rs`
@@ -159,7 +159,7 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 - `infer/src/model/glm4.rs`
 - supporting files under `infer/src/model/`
 - `infer/src/ops.rs` and `infer/src/ops/*`
-- `crates/infer-cuda-kernels/src/tensor.rs`: CUDA tensor/device abstractions (`DeviceContext`, `DeviceVec`, `DeviceMatrix`, `HiddenStates`, `RawDevicePtr`)
+- `crates/cuda-kernels/src/tensor.rs`: CUDA tensor/device abstractions (`DeviceContext`, `DeviceVec`, `DeviceMatrix`, `HiddenStates`, `RawDevicePtr`)
 - `infer/src/weight_loader.rs`: weight loading
 - `infer/src/gguf.rs`: GGUF parsing
 - `infer/src/quant.rs`: quantization metadata + dispatch
@@ -178,30 +178,30 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 
 These crates remain independent after Route A:
 
-- `crates/infer-agent`: agent session state, tool recovery, turn loop
-- `crates/infer-chat`: shared protocol parsing/formatting and OpenAI chat types
-- `crates/infer-cli`: CLI entry, arg parsing, REPL UX
-- `crates/infer-tools`: builtin tools, sandbox/tool execution, shared tool hooks
-- `crates/infer-cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
+- `crates/agent`: agent session state, tool recovery, turn loop
+- `crates/chat`: shared protocol parsing/formatting and OpenAI chat types
+- `crates/cli`: CLI entry, arg parsing, REPL UX
+- `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
+- `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend
 
 Current dependency direction:
 
 ```text
 agent-infer
-  -> infer-cli
+  -> cli
      -> infer
-     -> infer-agent
-     -> infer-chat
-     -> infer-tools
+     -> agent
+     -> chat
+     -> tools
 
-infer-agent
+agent
   -> infer
-  -> infer-chat
+  -> chat
 
 infer
-  -> infer-chat
-  -> infer-cuda-kernels  (one-way; never the reverse)
+  -> chat
+  -> cuda-kernels  (one-way; never the reverse)
   -> mlx-sys (feature = "metal")
 ```
 
@@ -227,5 +227,5 @@ infer
   `infer/src/backend/cuda/bootstrap.rs` for the CUDA bring-up
 - CUDA serving path: `infer/src/main.rs` → `infer/src/http_server.rs` →
   `infer/src/scheduler/cuda/`
-- Agent CLI path: `src/main.rs` → `crates/infer-cli/src/lib.rs` →
-  `infer/src/server_engine.rs` → `crates/infer-agent/src/lib.rs`
+- Agent CLI path: `src/main.rs` → `crates/cli/src/lib.rs` →
+  `infer/src/server_engine.rs` → `crates/agent/src/lib.rs`

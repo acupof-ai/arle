@@ -1,8 +1,8 @@
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr};
 
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::{DeviceContext, HiddenStates};
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::{DeviceContext, HiddenStates};
 
 /// Scatter-write prefill K/V from contiguous GEMM output to a token-level KV pool.
 ///

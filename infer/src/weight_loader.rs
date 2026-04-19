@@ -15,8 +15,8 @@ use std::fs;
 use std::time::Instant;
 
 use crate::gguf::{self, GgufFile};
-use infer_cuda_kernels::ffi;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
+use cuda_kernels::ffi;
+use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec};
 
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {

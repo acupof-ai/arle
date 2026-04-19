@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
@@ -25,7 +25,7 @@ pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<
         }
     }
 
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
         input.requires_grad,
@@ -62,7 +62,7 @@ pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
         }
     }
 
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
         input.requires_grad,
@@ -121,7 +121,7 @@ pub(crate) fn softmax_backward(
         }
     }
 
-    let grad_id = store.alloc(GpuTensor::new(grad, output.shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 
@@ -166,7 +166,7 @@ pub(crate) fn log_softmax_backward(
         }
     }
 
-    let grad_id = store.alloc(GpuTensor::new(grad, output.shape, false)?);
+    let grad_id = store.alloc(Tensor::new(grad, output.shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 

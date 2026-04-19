@@ -1,6 +1,6 @@
 //! Backend matmul parity tests. The CPU reference is authoritative; each
 //! gated backend must match it to within `1e-3` relative tolerance on the
-//! three shapes we actually hit in TinyLM training: small 2D, square 2D,
+//! three shapes we actually hit in Lm training: small 2D, square 2D,
 //! and batched rank-3.
 
 use autograd::{

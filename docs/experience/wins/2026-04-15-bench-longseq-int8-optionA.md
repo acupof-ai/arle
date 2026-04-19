@@ -5,7 +5,7 @@
 Follow-up to
 [`../errors/2026-04-15-int8-kv-long-context-slowness.md`](../errors/2026-04-15-int8-kv-long-context-slowness.md).
 Root cause: `decode_attention_int8_partial_kernel` in
-`crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`
+`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`
 was a naive per-token loop that defined `TILE_TOKENS = 16` and
 included `<cuda_pipeline.h>` but never actually wired them up. Inner
 loop did four scalar global loads per token per warp (pool_idx,
@@ -35,7 +35,7 @@ sandbox had no CUDA / network access).
 One file, 90 insertions / 34 deletions, all inside
 `decode_attention_int8_partial_kernel` (HEAD_DIM template), lines
 114-218 of
-`crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`.
+`crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`.
 
 - Lines 114-122: **double-buffered shared-memory tiles** —
   `smem_k[2][TILE_TOKENS][HEAD_DIM]`,

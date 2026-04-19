@@ -177,7 +177,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
   - New crate or module: `infer/src/constrained/` with the compiler + FSM.
   - `infer/src/ops/sampling.rs` — inject logit mask before top-k / top-p.
   - `infer/src/http_server/openai_v1.rs` — accept `response_format`.
-  - `crates/infer-chat` — consume constrained output (skip regex fallback
+  - `crates/chat` — consume constrained output (skip regex fallback
     when a schema was enforced).
 - **Exit**: On a tool-calling bench (τ-bench or BFCL), syntax-error rate
   for 7B-class models drops ≥10× compared to the current free-form path.
@@ -228,7 +228,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **Why**: Agent UI depends on progressive tool-call rendering. Current
   implementation emits content deltas then "un-emits" at completion.
 - **Where**:
-  - `crates/infer-chat/src/protocol.rs` — streaming parser.
+  - `crates/chat/src/protocol.rs` — streaming parser.
   - `infer/src/http_server/openai_v1.rs` — emit `delta.tool_calls`.
   - `infer/src/http_server.rs::delta_sse_events` — branch on tool-call
     state.
@@ -281,7 +281,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **Why**: Current quickstart asks a newcomer to reason about feature
   flags before they have a working token.
 - **Where**:
-  - `crates/infer-cli/src/args.rs` — add `serve` subcommand.
+  - `crates/cli/src/args.rs` — add `serve` subcommand.
   - `infer/src/server_engine.rs::LoadedInferenceEngine::load` — runtime
     dispatch rather than compile-time cfg walls.
 - **Exit**: `cargo install agent-infer && agent-infer serve` produces a
@@ -292,7 +292,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **What**: `examples/agent_loop.rs` showing ≤15 lines: load engine,
   loop `engine.complete(...)`. Link from README as example one.
 - **Why**: The current pub API (`LoadedInferenceEngine` + `InferenceEngine` trait)
-  is clean but undocumented; newcomers must read `infer-cli::repl` to
+  is clean but undocumented; newcomers must read `cli::repl` to
   learn the pattern.
 - **Where**:
   - New: `examples/agent_loop.rs` (at workspace root).
@@ -314,7 +314,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **Where**:
   - `infer/src/http_server.rs` — new route + a ring buffer sink
     implementing `EventSink`.
-  - `crates/infer-cli/src/args.rs` — `doctor` subcommand.
+  - `crates/cli/src/args.rs` — `doctor` subcommand.
   - `infer/src/metrics.rs` — reuse or extend for trace storage.
 - **Exit**: Both endpoints exist, document a per-turn slow-path
   investigation that would have been impossible before.

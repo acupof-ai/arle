@@ -47,7 +47,7 @@ CUDA code. ✅
 Second grep — `set_max_gpu_kv` should only be the compat shim / warning:
 
 ```
-rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/infer-cli/src/{args,lib}.rs
+rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/cli/src/{args,lib}.rs
 ```
 
 → matches in:
@@ -60,7 +60,7 @@ rg -n "set_max_gpu_kv" infer/src/server_engine.rs crates/infer-cli/src/{args,lib
   Qwen3/Qwen3.5/GLM4 forward to the ModelInferenceEngine shim,
   Metal/Cpu variants log an analogous "was CUDA-only and has been
   retired" warning.
-- `crates/infer-cli/src/lib.rs:41` — `engine.set_max_gpu_kv(max_kv)`,
+- `crates/cli/src/lib.rs:41` — `engine.set_max_gpu_kv(max_kv)`,
   the one CLI call site which is now wired to the shim and never
   touches any offload path.
 
@@ -85,7 +85,7 @@ cargo fmt --all -- --check                                         # clean
 ```
 
 Pre-existing failures (not in scope): `e2e_qwen35` baseline drift,
-`greedy_consistency` B=3 decode, clippy unused import in infer-tools.
+`greedy_consistency` B=3 decode, clippy unused import in tools.
 
 ## Long-session regression gate (§4)
 

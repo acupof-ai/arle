@@ -12,7 +12,7 @@ memory-tuning constraints that surfaced along the way.
 
 Two side findings also belong in this note:
 
-1. **Pre-existing panic at `crates/infer-cuda-kernels/src/paged_kv.rs:595`**
+1. **Pre-existing panic at `crates/cuda-kernels/src/paged_kv.rs:595`**
    fires from the prefix-cache publish path when the completed
    request's prompt length cannot be represented by the published
    radix blocks (either pool OOM or an off-by-some span boundary).
@@ -156,7 +156,7 @@ final bf16 run (`--max-seq-len 28000 --kv-pool-headroom-mb 1536`)
 hit the same panic on cleanup of the 25 k request:
 
 ```
-thread '<unnamed>' (…) panicked at crates/infer-cuda-kernels/src/paged_kv.rs:595:33:
+thread '<unnamed>' (…) panicked at crates/cuda-kernels/src/paged_kv.rs:595:33:
 ```
 
 Surrounding log context on the failing path (first attempt, earlier

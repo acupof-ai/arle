@@ -176,13 +176,13 @@ mod tests {
 
     #[test]
     fn stub_transport_reports_its_name() {
-        let t = NixlTransport::new("infer-agent-0");
-        assert_eq!(t.name(), "infer-agent-0");
+        let t = NixlTransport::new("agent-0");
+        assert_eq!(t.name(), "agent-0");
     }
 
     #[test]
     fn stub_put_and_get_return_m5_stub_error() {
-        let t = NixlTransport::new("infer-agent-0");
+        let t = NixlTransport::new("agent-0");
         let err = t
             .put_batch(&[])
             .expect_err("put_batch should be a stub error");
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn stub_register_returns_m5_stub_error() {
-        let t = NixlTransport::new("infer-agent-0");
+        let t = NixlTransport::new("agent-0");
         let mut dummy = [0u8; 16];
         // Safety: pointer is valid for the duration of the unsafe call;
         // the stub does not dereference it.
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn stub_poll_returns_ready_error() {
-        let t = NixlTransport::new("infer-agent-0");
+        let t = NixlTransport::new("agent-0");
         let mut op = NixlOp { _stub: () };
         match t.poll(&mut op) {
             Poll::Ready(Err(TransportError::Other(msg))) => {

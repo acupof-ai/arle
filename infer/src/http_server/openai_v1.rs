@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
 use crate::types::SessionId;
-use infer_chat::{OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls};
+use chat::{OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls};
 
 /// Normalize a raw string session hint from a client request. Empty / whitespace
 /// ids are dropped so that "" and `null` behave identically.

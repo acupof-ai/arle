@@ -54,7 +54,7 @@ doc-drift notes:
 
 ```
 cargo build -p infer --release                             # 4m 11s cold, 12 s incremental
-cargo test --workspace --exclude mlx-sys --release --lib   # 348 tests pass (273 infer + 35 infer-cuda-kernels + 40 others)
+cargo test --workspace --exclude mlx-sys --release --lib   # 348 tests pass (273 infer + 35 cuda-kernels + 40 others)
 cargo test -p infer --release --test e2e                   # Phase 1-4 all pass after the replay-drift fix below
 cargo fmt --all -- --check                                 # clean
 ```
@@ -69,7 +69,7 @@ regressions):
   decode divergence, tracked in
   `../errors/2026-04-13-batched-decode-high-concurrency.md`.
 - `cargo clippy --workspace -- -D warnings` — pre-existing
-  `unused import: Path` in `crates/infer-tools/src/lib.rs:3`.
+  `unused import: Path` in `crates/tools/src/lib.rs:3`.
   Reported per the `project_remote_cuda_box.md` instruction "report,
   don't silently fix", left for a separate cleanup commit.
 

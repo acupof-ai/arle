@@ -1,6 +1,6 @@
-# `infer-cuda-kernels` extraction blueprint
+# `cuda-kernels` extraction blueprint
 
-**Status:** ✅ **executed** — landed in `a4e12f5 refactor(cuda): extract infer-cuda-kernels api`
+**Status:** ✅ **executed** — landed in `a4e12f5 refactor(cuda): extract cuda-kernels api`
 (with fmt follow-up `f81e2d5`). Kept as a historical reference for the trip
 wires and decision rationale; §3 Target topology has been updated to match
 what actually landed. For the current workspace shape see
@@ -12,7 +12,7 @@ what actually landed. For the current workspace shape see
 
 This was the forward-looking plan for migrating `infer/src/backend/cuda/**`
 plus `infer/csrc/cuda/**` plus `infer/tools/triton/**` plus the relevant
-build.rs slice into a standalone `crates/infer-cuda-kernels/` crate. The plan
+build.rs slice into a standalone `crates/cuda-kernels/` crate. The plan
 was designed so the execution was **mechanical, not architectural** — no
 re-debate, no scope creep, no Route-A 2.0. That property held: the extraction
 landed in one commit, the before/after benchmarks stayed within the ≤1%
@@ -69,9 +69,9 @@ project is committed to following SGLang/vLLM in capability:
 | **T1** | **Parallel kernel build configs producing incompatible `.a` artifacts** | E.g. when FA-3 H100 work introduces sm_90-only kernel paths that conflict with sm_80 fallbacks, or when a vendored FlashInfer fork needs a different include search path. A single `infer/build.rs` cannot ship two different `libkernels_cuda.a` flavors. Extraction lets each artifact live in its own crate (or feature-gated within one). |
 | **T2** | **Adding NCCL tensor parallel communication** | `ROADMAP.md` §"Missing" explicitly calls this out. NCCL pulls in `libnccl` linkage + multi-GPU coordination kernels. Today the build script already has feature gates piling up (`cuda`, `no-cuda`, `metal`, `cpu`, `rdma-nixl`, `rdma-nixl-real`); adding `nccl` on top will start producing combinatorial build matrices that don't fit cleanly under one crate's feature flags. |
 | **T3** | **FlashAttention-3 (H100 / sm_90) prefill** | `ROADMAP.md` §1.2. FA-3 needs warp specialization + async pipeline. The current `prefill_attention.cu` + `flashinfer_single_prefill` path is sm_80-tuned. Adding FA-3 means **two parallel attention kernel implementations selected by SM target** — i.e., trip wire T1 follows. |
-| **T4** | **MLA attention (DeepSeek-V2/V3/R1) + DeepSeek MoE + FP8 GEMM (sm_90)** | `ROADMAP.md` §1.3 + §1.4. This is essentially a second compute backend: new attention algorithm (latent KV compression), new GEMM family (FP8 E4M3), new model family. ~30+ new kernel files. The `crates/infer-cuda-kernels/csrc/` tree doubles in size, and the parallel kernel set forces T1 / T2 anyway. |
+| **T4** | **MLA attention (DeepSeek-V2/V3/R1) + DeepSeek MoE + FP8 GEMM (sm_90)** | `ROADMAP.md` §1.3 + §1.4. This is essentially a second compute backend: new attention algorithm (latent KV compression), new GEMM family (FP8 E4M3), new model family. ~30+ new kernel files. The `crates/cuda-kernels/csrc/` tree doubles in size, and the parallel kernel set forces T1 / T2 anyway. |
 | **T5** | **Speculative decoding GPU integration** | `ROADMAP.md` §"Missing". Today `infer/src/speculative.rs` and `infer/src/speculative/cuda.rs` are CPU stubs. Real GPU integration means a draft kernel surface that gets called from inside the scheduler hot loop. The existing scheduler→backend→cuda boundary will need cleanup before this lands cleanly. |
-| **T6** | **A second team / external consumer starts owning only the kernel layer** | E.g. another inference project wants to reuse `infer-cuda-kernels` directly without pulling in the agent runtime. The "two direct consumers" admission criterion from `docs/archives/art-grade-architecture-for-long-agent-infer.md` §六 is met. |
+| **T6** | **A second team / external consumer starts owning only the kernel layer** | E.g. another inference project wants to reuse `cuda-kernels` directly without pulling in the agent runtime. The "two direct consumers" admission criterion from `docs/archives/art-grade-architecture-for-long-agent-infer.md` §六 is met. |
 
 **Decision rule:** if **any one** of T1–T6 enters in-flight implementation
 status (i.e., a real PR opens against it), execute this blueprint *as part of
@@ -84,7 +84,7 @@ extracted crate from day one.
 ## 3 · Target topology (as actually landed)
 
 > **Divergence from the pre-extraction draft of this section.** The earlier
-> draft kept an `infer/csrc/cuda/` → `crates/infer-cuda-kernels/csrc/cuda/`
+> draft kept an `infer/csrc/cuda/` → `crates/cuda-kernels/csrc/cuda/`
 > rename during the move. At execution time we flattened that — the `cuda/`
 > subdirectory was dropped and the domain folders (`attention/`, `gemm/`,
 > `kv/`, `misc/`, `quant/`) became direct children of `csrc/`. Everything
@@ -93,10 +93,10 @@ extracted crate from day one.
 ```
 agent-infer/                        ← workspace root (unchanged)
 ├── crates/
-│   ├── infer-agent/                ← unchanged
-│   ├── infer-chat/                 ← unchanged
-│   ├── infer-cli/                  ← unchanged
-│   ├── infer-cuda-kernels/         ← shipped
+│   ├── agent/                ← unchanged
+│   ├── chat/                 ← unchanged
+│   ├── cli/                  ← unchanged
+│   ├── cuda-kernels/         ← shipped
 │   │   ├── Cargo.toml              ← cudarc + cc + flashinfer detection;
 │   │   │                              `cuda` and `no-cuda` features mirror infer's
 │   │   ├── build.rs                ← lifted from infer/build.rs (nvcc + Triton AOT)
@@ -120,13 +120,13 @@ agent-infer/                        ← workspace root (unchanged)
 │   │       ├── graph_pool.rs
 │   │       ├── kv_quant.rs / kv_turboquant.rs / kv_types.rs / turboquant_state.rs
 │   │       └── prelude.rs          ← THE public API surface (see §4)
-│   ├── infer-tools/                ← unchanged
+│   ├── tools/                ← unchanged
 │   └── mlx-sys/                    ← unchanged
 ├── infer/                          ← thin runtime + HTTP shell
 │   ├── build.rs                    ← stripped of nvcc + Triton; only the
 │   │                                  pure-Rust feature pass-through
-│   ├── csrc/                       ← (gone — moved to infer-cuda-kernels)
-│   ├── tools/                      ← (gone — moved to infer-cuda-kernels)
+│   ├── csrc/                       ← (gone — moved to cuda-kernels)
+│   ├── tools/                      ← (gone — moved to cuda-kernels)
 │   └── src/
 │       ├── backend/
 │       │   ├── cuda.rs             ← `pub use infer_cuda_kernels::*;` re-export shim
@@ -143,13 +143,13 @@ agent-infer/                        ← workspace root (unchanged)
 **Key invariant:** `bootstrap.rs` stays inside `infer` because it needs
 `crate::model::*` and `crate::scheduler::*`. It calls into
 `infer_cuda_kernels` from the `infer` side. The dependency edge is
-**`infer → infer-cuda-kernels`, never the reverse.**
+**`infer → cuda-kernels`, never the reverse.**
 
 ---
 
 ## 4 · The public API surface
 
-The `infer-cuda-kernels::prelude` module is the **only** thing `infer`'s
+The `cuda-kernels::prelude` module is the **only** thing `infer`'s
 model/ops/scheduler code is allowed to import from. Today's `prelude.rs`
 already pre-stages this contract:
 
@@ -181,7 +181,7 @@ one focused day on a CUDA-equipped host.
 ### 5.1 — Pre-flight (Darwin or CUDA host)
 
 ```
-git checkout -b extract/infer-cuda-kernels
+git checkout -b extract/cuda-kernels
 cargo fmt --all -- --check
 cargo check -p infer --no-default-features --features cuda,no-cuda
 cargo check --workspace --no-default-features --features cpu,no-cuda
@@ -198,31 +198,31 @@ move, so the domain folders (`attention/`, `gemm/`, `kv/`, `misc/`,
 `quant/`) ended up as direct children of `csrc/` inside the new crate:
 
 ```
-git mv infer/csrc/cuda/attention            crates/infer-cuda-kernels/csrc/attention
-git mv infer/csrc/cuda/gemm                 crates/infer-cuda-kernels/csrc/gemm
-git mv infer/csrc/cuda/kv                   crates/infer-cuda-kernels/csrc/kv
-git mv infer/csrc/cuda/misc                 crates/infer-cuda-kernels/csrc/misc
-git mv infer/csrc/cuda/quant                crates/infer-cuda-kernels/csrc/quant
-git mv infer/csrc/cuda/common.cuh           crates/infer-cuda-kernels/csrc/common.cuh
-git mv infer/tools/triton                   crates/infer-cuda-kernels/tools/triton
-git mv infer/src/backend/cuda/ffi.rs        crates/infer-cuda-kernels/src/ffi.rs
-git mv infer/src/backend/cuda/ffi           crates/infer-cuda-kernels/src/ffi
-git mv infer/src/backend/cuda/tensor.rs     crates/infer-cuda-kernels/src/tensor.rs
-git mv infer/src/backend/cuda/paged_kv.rs   crates/infer-cuda-kernels/src/paged_kv.rs
-git mv infer/src/backend/cuda/flashinfer.rs crates/infer-cuda-kernels/src/flashinfer.rs
-git mv infer/src/backend/cuda/graph_pool.rs crates/infer-cuda-kernels/src/graph_pool.rs
-git mv infer/src/backend/cuda/prelude.rs    crates/infer-cuda-kernels/src/prelude.rs
+git mv infer/csrc/cuda/attention            crates/cuda-kernels/csrc/attention
+git mv infer/csrc/cuda/gemm                 crates/cuda-kernels/csrc/gemm
+git mv infer/csrc/cuda/kv                   crates/cuda-kernels/csrc/kv
+git mv infer/csrc/cuda/misc                 crates/cuda-kernels/csrc/misc
+git mv infer/csrc/cuda/quant                crates/cuda-kernels/csrc/quant
+git mv infer/csrc/cuda/common.cuh           crates/cuda-kernels/csrc/common.cuh
+git mv infer/tools/triton                   crates/cuda-kernels/tools/triton
+git mv infer/src/backend/cuda/ffi.rs        crates/cuda-kernels/src/ffi.rs
+git mv infer/src/backend/cuda/ffi           crates/cuda-kernels/src/ffi
+git mv infer/src/backend/cuda/tensor.rs     crates/cuda-kernels/src/tensor.rs
+git mv infer/src/backend/cuda/paged_kv.rs   crates/cuda-kernels/src/paged_kv.rs
+git mv infer/src/backend/cuda/flashinfer.rs crates/cuda-kernels/src/flashinfer.rs
+git mv infer/src/backend/cuda/graph_pool.rs crates/cuda-kernels/src/graph_pool.rs
+git mv infer/src/backend/cuda/prelude.rs    crates/cuda-kernels/src/prelude.rs
 ```
 
 `bootstrap.rs` stays at `infer/src/backend/cuda/bootstrap.rs`.
 
-### 5.3 — New `crates/infer-cuda-kernels/Cargo.toml`
+### 5.3 — New `crates/cuda-kernels/Cargo.toml`
 
 Mirror `infer/Cargo.toml`'s CUDA deps:
 
 ```toml
 [package]
-name = "infer-cuda-kernels"
+name = "cuda-kernels"
 version = "0.1.0"
 edition = "2024"
 
@@ -247,7 +247,7 @@ workspace = true
 ### 5.4 — Lift `build.rs`
 
 Move the nvcc + Triton AOT pass from `infer/build.rs` into
-`crates/infer-cuda-kernels/build.rs`. The FlashInfer detection helper
+`crates/cuda-kernels/build.rs`. The FlashInfer detection helper
 (`find_flashinfer_include`) goes with it. Strip the corresponding lines from
 `infer/build.rs`. The `infer/build.rs` becomes a small no-op (or is deleted
 entirely if no other build-time work remains).
@@ -256,24 +256,24 @@ entirely if no other build-time work remains).
 
 ```toml
 [dependencies]
-infer-cuda-kernels = { path = "../crates/infer-cuda-kernels", default-features = false, optional = true }
+cuda-kernels = { path = "../crates/cuda-kernels", default-features = false, optional = true }
 
 [features]
-cuda = ["dep:cudarc", "dep:memmap2", "infer-cuda-kernels/cuda"]
-no-cuda = ["infer-cuda-kernels/no-cuda"]
+cuda = ["dep:cudarc", "dep:memmap2", "cuda-kernels/cuda"]
+no-cuda = ["cuda-kernels/no-cuda"]
 ```
 
 `cudarc` and `memmap2` stay in `infer/Cargo.toml` because `bootstrap.rs` and
 the rest of the runtime still use them. They are also pulled in transitively
-through `infer-cuda-kernels`, but Cargo will dedupe.
+through `cuda-kernels`, but Cargo will dedupe.
 
 ### 5.6 — Re-pub the prelude exports
 
-In each of `crates/infer-cuda-kernels/src/{tensor,paged_kv,flashinfer,graph_pool}.rs`,
+In each of `crates/cuda-kernels/src/{tensor,paged_kv,flashinfer,graph_pool}.rs`,
 change `pub(crate)` → `pub` on the items listed in the prelude (and `TokenKVPool`).
 Everything else stays `pub(crate)` to preserve encapsulation.
 
-In `crates/infer-cuda-kernels/src/lib.rs`:
+In `crates/cuda-kernels/src/lib.rs`:
 
 ```rust
 pub mod ffi;
@@ -289,7 +289,7 @@ pub mod tensor;
 Replace the existing module declarations with a thin re-export shim:
 
 ```rust
-//! Re-exports of the `infer-cuda-kernels` crate so existing
+//! Re-exports of the `cuda-kernels` crate so existing
 //! `crate::backend::cuda::…` paths continue to resolve.
 pub use infer_cuda_kernels::*;
 
@@ -306,7 +306,7 @@ every `use crate::backend::cuda::ffi::xxx` keeps resolving via the re-export.
 ```
 cargo fmt --all
 cargo check -p infer --no-default-features --features cuda,no-cuda
-cargo check -p infer-cuda-kernels --no-default-features --features cuda,no-cuda
+cargo check -p cuda-kernels --no-default-features --features cuda,no-cuda
 cargo check --workspace --no-default-features --features cpu,no-cuda
 cargo check --workspace --no-default-features --features metal
 cargo test --workspace --release --no-default-features --features cpu,no-cuda --lib
@@ -351,7 +351,7 @@ mirrors the Route-A revert commit `d902090`).
 | `infer/src/scheduler/cuda/**` | Scheduler is application logic. It uses `PagedKVPool` and `DeviceContext` from the prelude. |
 | `infer/src/server_engine.rs` | Hosts the `InferenceEngine` trait + `LoadedInferenceEngine` enum. Backend-agnostic by design. |
 
-The split's **load-bearing principle**: a file goes in `infer-cuda-kernels`
+The split's **load-bearing principle**: a file goes in `cuda-kernels`
 **only if it knows nothing about models or schedulers**. A file stays in
 `infer` if it reaches for `Tokenizer`, model-specific weights, or scheduler
 state. Bootstrap is the one and only place where the two layers meet.
@@ -370,7 +370,7 @@ state. Bootstrap is the one and only place where the two layers meet.
 - **No `infer-runtime-api` trait crate.** Already covered by
   `infer::server_engine::InferenceEngine`. Putting it in a separate crate
   with no second consumer would re-create the Route-A failure mode.
-- **No `infer-cuda` (Rust-only) AND `infer-cuda-kernels` (native-only) split.**
+- **No `infer-cuda` (Rust-only) AND `cuda-kernels` (native-only) split.**
   One crate, both layers. The Rust types and the kernels they wrap belong
   together — splitting them creates a `*-sys` boundary with one consumer.
 
@@ -386,7 +386,7 @@ revert path is:
 1. `git mv` everything back (one commit).
 2. Update `infer/Cargo.toml`, `infer/build.rs`, `infer/src/backend/cuda.rs`
    to the pre-extraction shape.
-3. Delete `crates/infer-cuda-kernels/`.
+3. Delete `crates/cuda-kernels/`.
 4. Write a `docs/experience/errors/YYYY-MM-DD-cuda-extraction-revert.md`
    postmortem documenting which prediction failed.
 

@@ -157,10 +157,10 @@ Total bytes per token per KV head: `ceil(D * bits / 8) + 2`.
 
 > **Post-extraction note (2026-04-15).** The file tree below reflects where
 > things landed during the TurboQuant integration. After the
-> `infer-cuda-kernels` kernel-crate extraction, `paged_kv.rs`, `ffi.rs`,
+> `cuda-kernels` kernel-crate extraction, `paged_kv.rs`, `ffi.rs`,
 > `turboquant_state.rs`, and `kv_turboquant.rs` moved into
-> `crates/infer-cuda-kernels/src/`, and `turboquant.cu` moved into
-> `crates/infer-cuda-kernels/csrc/quant/`. The dispatch and model-owned
+> `crates/cuda-kernels/src/`, and `turboquant.cu` moved into
+> `crates/cuda-kernels/csrc/quant/`. The dispatch and model-owned
 > pieces stayed in `infer/`.
 
 ```
@@ -173,7 +173,7 @@ infer/
 │   │   └── qwen35/ etc.             # MODIFIED — use TQ dispatch when selected
 │   └── quant.rs                     # MODIFIED — TurboQuant format detection
 
-crates/infer-cuda-kernels/
+crates/cuda-kernels/
 ├── src/
 │   ├── kv_turboquant.rs             # TQ quantize/dequantize/init FFI wrappers
 │   ├── turboquant_state.rs          # TurboQuantState, codebook precompute

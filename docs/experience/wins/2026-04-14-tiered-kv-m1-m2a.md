@@ -115,7 +115,7 @@ they did not have before:
 All three commits built clean on the L4 box (`CUDA 13.0`,
 `driver 580.82.07`, `SM 89`) and passed their respective test gates:
 
-- `cargo test -p infer-cuda-kernels --features cuda --lib` → 31 passed,
+- `cargo test -p cuda-kernels --features cuda --lib` → 31 passed,
   0 failed (27 pre-existing + 4 new `MockPool`-based refcount tests:
   `retain_then_free_slot_keeps_page_in_limbo`,
   `release_after_free_slot_reclaims_limbo_pages`,

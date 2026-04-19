@@ -27,7 +27,7 @@ Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill
 - **FP8 KV cache**: custom fused FP8 E4M3 decode attention, 50% KV memory reduction
 - Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
 - **Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c locally shipped and remote-accepted on L4 (2026-04-15)**: scheduler selector flip to radix, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract + page-lifecycle state machine, legacy contiguous CPU KV offload retired. See `docs/projects/tiered-kv-cache.md`.
-- **`infer-cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/infer-cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → infer-cuda-kernels`.
+- **`cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → cuda-kernels`.
 - **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
 - **Metal M0.2a resumable request state + M0.2b scheduler-backed serving**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup); `metal_serve` now routes through `SchedulerHandle` via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics` (`infer/src/backend/metal/runtime.rs:580`). M0.2 throughput exit still pending variable-length decode + per-step batch-state rebuild cost work — see [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
 - **Metal packed-batch concurrent decode fixed (2026-04-16)**: `extend_kv_cache` batch-dim bug that crashed the scheduler when packed cache rolled past `KV_CACHE_CHUNK` was repaired; varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA.
@@ -189,7 +189,7 @@ ShareGPT dataset loader for realistic prompt distributions.
 ## Phase 1 — Core GPU Features (GPU required)
 
 ### 1.1 PagedAttention Kernel ✅ Shipped
-**Files**: `crates/infer-cuda-kernels/csrc/attention/{flashinfer_decode,flashinfer_decode_hd256,decode_prep_paged,decode_prep_paged_hd256,fused_attention}.cu`, `infer/src/ops/attention.rs`
+**Files**: `crates/cuda-kernels/csrc/attention/{flashinfer_decode,flashinfer_decode_hd256,decode_prep_paged,decode_prep_paged_hd256,fused_attention}.cu`, `infer/src/ops/attention.rs`
 **Goal**: Replace contiguous KV cache with paged blocks. Eliminates memory fragmentation, enables sharing blocks across requests (prefix cache), enables swap.
 
 Shipped via a three-path split (not a single `paged_attention_decode`):
@@ -199,12 +199,12 @@ Shipped via a three-path split (not a single `paged_attention_decode`):
 - **Prefill**: FlashInfer `prefill_attention.cu` + `prefill_attention_hd256.cu`.
 - **Paged metadata staging**: `flashinfer_metadata.cu` + `decode_prep_paged{,_hd256}.cu` build per-request page-indices on GPU.
 
-Pool bookkeeping lives in `crates/infer-cuda-kernels/src/paged_kv.rs` (`PagedKVPool` + `TokenKVPool`).
+Pool bookkeeping lives in `crates/cuda-kernels/src/paged_kv.rs` (`PagedKVPool` + `TokenKVPool`).
 
 ---
 
 ### 1.2 FlashAttention-3 (prefill)
-**Files**: `crates/infer-cuda-kernels/tools/triton/flash_attention_v3_kernel.py`, `infer/src/ops/attention.rs`
+**Files**: `crates/cuda-kernels/tools/triton/flash_attention_v3_kernel.py`, `infer/src/ops/attention.rs`
 **Goal**: Upgrade prefill kernel from FA2 → FA3 for better A100/H100 utilization. FA3 uses warp specialization + async pipeline.
 
 Key improvements over FA2:
@@ -319,7 +319,7 @@ impl WeightLoader {
 ---
 
 ### 2.2 GPTQ / AWQ INT4 Kernels ✅ Shipped
-**Files**: `crates/infer-cuda-kernels/csrc/gemm/{quantized_gemv,marlin_kernel,marlin_repack}.cu`
+**Files**: `crates/cuda-kernels/csrc/gemm/{quantized_gemv,marlin_kernel,marlin_repack}.cu`
 **Goal**: Fused dequantize-GEMM kernels for INT4 weights. Required for serving quantized open-source models (most popular community models are GPTQ/AWQ quantized).
 
 Shipped:
@@ -329,7 +329,7 @@ Shipped:
 ---
 
 ### 2.3 FP8 (E4M3) KV Cache + Attention ✅ Shipped
-**Files**: `crates/infer-cuda-kernels/csrc/attention/decode_attention_quantized.cu`, `crates/infer-cuda-kernels/csrc/kv/kv_quant.cu`, `crates/infer-cuda-kernels/src/kv_quant.rs`
+**Files**: `crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu`, `crates/cuda-kernels/csrc/kv/kv_quant.cu`, `crates/cuda-kernels/src/kv_quant.rs`
 **Goal**: FP8 KV cache for long-context agent workloads.
 
 Shipped as an **FP8 KV path**, not an FP8 GEMM path — the latency win for agent workloads comes from halving KV bandwidth, not from FP8 matmul on the weight side.
@@ -342,7 +342,7 @@ Native FP8 **weight** GEMM (DeepSeek-V3 style) remains deferred — not required
 ---
 
 ### 2.4 INT8 / W8A16 ✅ Shipped
-**Files**: `crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu`, `crates/infer-cuda-kernels/csrc/kv/kv_quant.cu`
+**Files**: `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu`, `crates/cuda-kernels/csrc/kv/kv_quant.cu`
 **Goal**: INT8 weight + INT8 KV cache paths for memory savings.
 
 Shipped:
@@ -360,7 +360,7 @@ Shipped:
 - Minimal GGUF parser with tensor directory + per-tensor readers
 - BF16 / F16 / Q8_0 fast paths in `load_tensor_2d_gguf`
 - **Q4_K_M native GPU path** — `q4k_gemv_kernel` in
-  `crates/infer-cuda-kernels/csrc/gemm/quantized_gemv.cu` keeps superblocks
+  `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu` keeps superblocks
   packed on GPU (no BF16 intermediate), with `DeviceMatrix::from_quantized_q4k`
   consuming verbatim 144-byte Q4_K superblock bytes. Carnice-27B (64L × 5120d)
   fits on L4-24GB. See [docs/plans/q4k-native-gpu.md](docs/plans/q4k-native-gpu.md).
@@ -648,7 +648,7 @@ Core design (locked):
 - Acceptance: 6h stable, held-out pass@1 ≥ base + 15%, not reward-hacking (human spot-check 20 samples → ≥15 coherent)
 
 **M4 — Agent self-evolution MVP (4–6 w)**:
-- Multi-turn agent trajectory via `infer-agent` tool loop; step-wise logp on action tokens
+- Multi-turn agent trajectory via `agent` tool loop; step-wise logp on action tokens
 - Stepwise reward assignment (γ discount + tool-failure penalty)
 - Multi-verifier: math + code (Rust-native pytest-like) + tool-use success rate
 - Basic curriculum: difficulty buckets; retire easy tasks when pass@1 > 0.8; introduce harder ones
@@ -669,7 +669,7 @@ Core design (locked):
 | Trajectory emit | `infer/src/scheduler/` | Add mpsc channel; emit on `RequestOutcome::Finished` |
 | LoRA hook | `infer/src/ops/linear.rs` | `Option<&LoRAAdapter>` argument; default `None` is zero-cost |
 | Base weights share | `infer/src/backend/cuda/` | Expose `Arc<CudaDevice>` + frozen view tensors |
-| Agent callback | `infer-agent/` | Trajectory callback on tool loop steps |
+| Agent callback | `agent/` | Trajectory callback on tool loop steps |
 | Train control plane | `infer/src/http_server/train.rs` (new, M4) | `/v1/train/{start,stop,status,checkpoint}` |
 
 ---
@@ -693,7 +693,7 @@ Phase 6 (Agent RL) — NEW MAIN LINE
   6.1 M1 core op suite              → depends on 6.0
   6.2 M2 LoRA graft                 → depends on 6.1 + infer linear path (already exists)
   6.3 M3 GRPO closed loop           → depends on 6.2 + scheduler trajectory emit
-  6.4 M4 agent self-evolution MVP   → depends on 6.3 + infer-agent (already exists)
+  6.4 M4 agent self-evolution MVP   → depends on 6.3 + agent (already exists)
   6.5 M5 Metal parity               → depends on 6.1 + mlx-sys bridge (already exists);
                                       can run parallel to 6.3/6.4
 ```

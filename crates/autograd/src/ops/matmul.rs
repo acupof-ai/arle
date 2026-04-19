@@ -4,7 +4,7 @@ use crate::{
     AutogradError, Result,
     backend::matmul_output_shape as backend_matmul_output_shape,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn matmul(
@@ -89,7 +89,7 @@ pub(crate) fn matmul_backward(
                         grad_a[(row * k) + inner] = acc;
                     }
                 }
-                let grad_id = store.alloc(GpuTensor::new(grad_a, a_tensor.shape.clone(), false)?);
+                let grad_id = store.alloc(Tensor::new(grad_a, a_tensor.shape.clone(), false)?);
                 grads.push((a, grad_id));
             }
 
@@ -105,7 +105,7 @@ pub(crate) fn matmul_backward(
                         grad_b[(inner * n) + col] = acc;
                     }
                 }
-                let grad_id = store.alloc(GpuTensor::new(grad_b, b_tensor.shape.clone(), false)?);
+                let grad_id = store.alloc(Tensor::new(grad_b, b_tensor.shape.clone(), false)?);
                 grads.push((b, grad_id));
             }
         }
@@ -135,7 +135,7 @@ pub(crate) fn matmul_backward(
                         }
                     }
                 }
-                let grad_id = store.alloc(GpuTensor::new(grad_a, a_tensor.shape.clone(), false)?);
+                let grad_id = store.alloc(Tensor::new(grad_a, a_tensor.shape.clone(), false)?);
                 grads.push((a, grad_id));
             }
 
@@ -156,7 +156,7 @@ pub(crate) fn matmul_backward(
                         }
                     }
                 }
-                let grad_id = store.alloc(GpuTensor::new(grad_b, b_tensor.shape.clone(), false)?);
+                let grad_id = store.alloc(Tensor::new(grad_b, b_tensor.shape.clone(), false)?);
                 grads.push((b, grad_id));
             }
         }

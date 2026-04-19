@@ -20,7 +20,7 @@
 
 ## 1. Why
 
-The workspace already has eight shell crates under `crates/` (`infer-core`, `infer-engine`, `infer-chat`, `infer-policy`, `infer-observability`, `infer-agent`, `infer-cli`, `infer-tools`), four of which the `infer` crate already depends on (`infer-core`, `infer-chat`, `infer-policy`, `infer-observability`). The direction "break `infer` single-crate into a set of focused crates" is the path the project already committed to.
+The workspace already has eight shell crates under `crates/` (`infer-core`, `infer-engine`, `chat`, `infer-policy`, `infer-observability`, `agent`, `cli`, `tools`), four of which the `infer` crate already depends on (`infer-core`, `chat`, `infer-policy`, `infer-observability`). The direction "break `infer` single-crate into a set of focused crates" is the path the project already committed to.
 
 But the **compute core** — `backend/`, `ops/`, `model/`, `scheduler/`, `weight_loader.rs` — still lives inside the monolithic `infer` crate (44 k+ lines of Rust). This means:
 - `cargo check -p infer` rebuilds the entire engine for every single `http_server.rs` edit.
@@ -125,7 +125,7 @@ Note: re-exports are normally a "backwards-compat hack" (CLAUDE.md forbids them)
 
 ### 3.5 Shells to delete (dead shells, no path forward)
 
-Audit `crates/infer-tools` (empty — no `infer` dependency, no consumers), `crates/infer-agent`, and `crates/infer-cli`. If any have no source files beyond a stub `lib.rs` and no dependents, delete them in the final Round 3 commit with a `chore(crates): drop unused shells` message. Leave them alone if they have anything non-trivial.
+Audit `crates/tools` (empty — no `infer` dependency, no consumers), `crates/agent`, and `crates/cli`. If any have no source files beyond a stub `lib.rs` and no dependents, delete them in the final Round 3 commit with a `chore(crates): drop unused shells` message. Leave them alone if they have anything non-trivial.
 
 ---
 
@@ -261,7 +261,7 @@ Moves `ops.rs` + `ops/` into `infer-engine`. Much smaller than Layer 1 because a
 2. Clean up `infer/Cargo.toml` — remove now-unused dependencies (`cudarc`, `mlx-sys`, `safetensors`, etc. are only needed through `infer-engine`).
 3. Expected state: `infer/src/` contains `main.rs`, `bin/`, `http_server.rs`, `http_server/`, `server_engine.rs`, `lib.rs`, possibly `error.rs` stub. Line count target for `infer/src/` total: **< 8000 lines** (down from current 44000+).
 
-**Commit 3 (optional):** `chore(crates): drop unused infer-tools/agent/cli shells`
+**Commit 3 (optional):** `chore(crates): drop unused tools/agent/cli shells`
 
 Only if §3.5's audit confirms they have no dependents. Conservative default: leave them.
 

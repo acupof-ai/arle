@@ -89,7 +89,7 @@ the largest captured seq_len.
 | `infer/src/model/qwen35/forward.rs` | Split `forward_prefill` into `forward_prefill_launch` (pure launch sequence, captureable) + `forward_prefill_readback` (the sync + first-token sample). |
 | `infer/src/model/qwen35/batch_decode.rs` | Extend `PrefillGraphCache` paralleling existing decode-graph cache; key by `(seq_len_bucket,)`. |
 | `infer/src/scheduler/cuda/prefill.rs` | Call the graph-replay variant when a match exists. Fall back to non-captured path on first call. |
-| `crates/infer-cuda-kernels/csrc/attention/flashinfer_prefill_hd256.cu` | Verify `cudaError_t` return does not trigger host sync during capture; may need to inspect FlashInfer wrapper for hidden syncs. |
+| `crates/cuda-kernels/csrc/attention/flashinfer_prefill_hd256.cu` | Verify `cudaError_t` return does not trigger host sync during capture; may need to inspect FlashInfer wrapper for hidden syncs. |
 
 ## Acceptance criteria
 

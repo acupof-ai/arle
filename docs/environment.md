@@ -165,7 +165,7 @@ export INFER_TRITON_PYTHON=.venv/bin/python
 
 ### `INFER_CUDA_SM` (alt: `CUDA_SM`)
 
-Override detected CUDA SM targets. Consumed by `crates/infer-cuda-kernels/build.rs`
+Override detected CUDA SM targets. Consumed by `crates/cuda-kernels/build.rs`
 during nvcc + Triton AOT compile; falls back to `CUDA_SM`, then `nvidia-smi`,
 then `sm_80`.
 

@@ -15,9 +15,9 @@ use anyhow::{Result, anyhow};
 use cudarc::driver::CudaSlice;
 use log::info;
 
-use infer_cuda_kernels::kv_quant;
-use infer_cuda_kernels::prelude::{DeviceContext, DeviceVec};
-pub use infer_cuda_kernels::{KVCacheDtype, KVFormat};
+use cuda_kernels::kv_quant;
+use cuda_kernels::prelude::{DeviceContext, DeviceVec};
+pub use cuda_kernels::{KVCacheDtype, KVFormat};
 
 /// KV Cache — contiguous buffers for fused attention.
 pub(crate) struct KVCache {

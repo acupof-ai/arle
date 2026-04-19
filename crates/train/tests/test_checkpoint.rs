@@ -1,9 +1,9 @@
 use autograd::{TensorStore, module::Module};
 use train::checkpoint;
-use train::model::{TinyLM, TinyLMConfig};
+use train::model::{Lm, LmConfig};
 
-fn tiny_config() -> TinyLMConfig {
-    TinyLMConfig {
+fn tiny_config() -> LmConfig {
+    LmConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -15,7 +15,7 @@ fn tiny_config() -> TinyLMConfig {
     }
 }
 
-fn perturb_params(store: &mut TensorStore, model: &TinyLM, scale: f32) {
+fn perturb_params(store: &mut TensorStore, model: &Lm, scale: f32) {
     for (i, id) in model.parameters().iter().enumerate() {
         let tensor = store.get_mut(*id).expect("param");
         for (j, value) in tensor.data.iter_mut().enumerate() {
@@ -24,7 +24,7 @@ fn perturb_params(store: &mut TensorStore, model: &TinyLM, scale: f32) {
     }
 }
 
-fn snapshot(store: &TensorStore, model: &TinyLM) -> Vec<Vec<f32>> {
+fn snapshot(store: &TensorStore, model: &Lm) -> Vec<Vec<f32>> {
     model
         .parameters()
         .iter()
@@ -41,7 +41,7 @@ fn save_then_load_restores_exact_parameter_values() {
 
     let config = tiny_config();
     let mut store = TensorStore::default();
-    let model = TinyLM::new(config, &mut store).expect("model");
+    let model = Lm::new(config, &mut store).expect("model");
 
     // Put known values into the live model and snapshot.
     perturb_params(&mut store, &model, 0.125);
@@ -72,7 +72,7 @@ fn config_is_readable_standalone() {
     ));
     let config = tiny_config();
     let mut store = TensorStore::default();
-    let model = TinyLM::new(config, &mut store).expect("model");
+    let model = Lm::new(config, &mut store).expect("model");
     checkpoint::save(&model, &config, &store, &tmp).expect("save");
 
     let read_back = checkpoint::read_config(&tmp).expect("read config");
@@ -95,7 +95,7 @@ fn bad_magic_is_rejected() {
     std::fs::write(&tmp, b"NOTMAGICxxxxxxxxxxxxxxxxxxxxxxxx").expect("write");
 
     let mut store = TensorStore::default();
-    let model = TinyLM::new(tiny_config(), &mut store).expect("model");
+    let model = Lm::new(tiny_config(), &mut store).expect("model");
     let err = checkpoint::load(&model, &mut store, &tmp).unwrap_err();
     assert!(
         matches!(err, checkpoint::CheckpointError::BadMagic { .. }),

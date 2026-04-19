@@ -1,14 +1,14 @@
-use autograd::{GpuTensor, TensorStore, optim::AdamW};
+use autograd::{Tensor, TensorStore, optim::AdamW};
 
 #[test]
 fn adamw_matches_reference_update_for_ten_steps() {
     let mut store = TensorStore::default();
     let param = store.alloc(
-        GpuTensor::new(vec![0.25, -0.5, 1.5], vec![3], true)
+        Tensor::new(vec![0.25, -0.5, 1.5], vec![3], true)
             .expect("parameter shape is internally consistent"),
     );
     let grad = store.alloc(
-        GpuTensor::new(vec![0.1, -0.2, 0.3], vec![3], false)
+        Tensor::new(vec![0.1, -0.2, 0.3], vec![3], false)
             .expect("gradient shape is internally consistent"),
     );
     store.get_mut(param).expect("parameter exists").grad = Some(grad);

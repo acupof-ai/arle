@@ -9,12 +9,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chat",
+ "infer",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tools",
+]
+
+[[package]]
 name = "agent-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cli",
  "infer",
- "infer-cli",
 ]
 
 [[package]]
@@ -371,6 +385,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -447,6 +469,29 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "chat",
+ "clap",
+ "console 0.16.3",
+ "dialoguer",
+ "hf-hub",
+ "indicatif",
+ "infer",
+ "log",
+ "nucleo-matcher",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tools",
+]
 
 [[package]]
 name = "clipboard-win"
@@ -717,6 +762,17 @@ name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
+name = "cuda-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "cudarc",
+ "half",
+ "log",
+]
 
 [[package]]
 name = "cudarc"
@@ -1582,18 +1638,18 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "cc",
+ "chat",
  "clap",
  "colored",
  "comfy-table",
  "criterion",
  "crossbeam-channel",
+ "cuda-kernels",
  "cudarc",
  "fastrace",
  "futures-util",
  "half",
  "hf-hub",
- "infer-chat",
- "infer-cuda-kernels",
  "libc",
  "log",
  "logforth",
@@ -1613,72 +1669,6 @@ dependencies = [
  "tokio-stream",
  "tower",
  "uuid",
-]
-
-[[package]]
-name = "infer-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "infer",
- "infer-chat",
- "infer-tools",
- "log",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "infer-chat"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "infer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "console 0.16.3",
- "dialoguer",
- "hf-hub",
- "indicatif",
- "infer",
- "infer-agent",
- "infer-chat",
- "infer-tools",
- "log",
- "nucleo-matcher",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "sysinfo",
-]
-
-[[package]]
-name = "infer-cuda-kernels"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "cudarc",
- "half",
- "log",
-]
-
-[[package]]
-name = "infer-tools"
-version = "0.1.0"
-dependencies = [
- "infer-chat",
- "log",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3617,6 +3607,16 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tools"
+version = "0.1.0"
+dependencies = [
+ "chat",
+ "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

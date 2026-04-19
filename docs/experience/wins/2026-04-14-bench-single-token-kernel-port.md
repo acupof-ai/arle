@@ -13,7 +13,7 @@ single-request step) — see the commit message of `fix(cuda): restore
 single-token split-KV decode kernels` (`132bc84`) for the full write-up.
 
 Forward fix in `132bc84`: add two new CUDA C kernels to
-`crates/infer-cuda-kernels/csrc/attention/fused_attention.cu`
+`crates/cuda-kernels/csrc/attention/fused_attention.cu`
 (`fused_gqa_attention_decode_single_kernel`,
 `attention_decode_reduce_single_kernel`) that are `batch_size=1`
 specialisations of the existing `fused_gqa_attention_decode_batched_kernel`,

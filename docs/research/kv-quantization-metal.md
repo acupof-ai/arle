@@ -5,7 +5,7 @@ _Date: 2026-04-14_
 ## Current State
 
 ### CUDA Backend (Already Done)
-`crates/infer-cuda-kernels/src/paged_kv.rs` (post-extraction 2026-04-15 `a4e12f5`) already has:
+`crates/cuda-kernels/src/paged_kv.rs` (post-extraction 2026-04-15 `a4e12f5`) already has:
 - `migrate_from_contiguous_fp8()` (line 743): FP16 → FP8 E4M3 KV conversion
 - `ops::kv_quant::quantize_scatter_kv_fp8()`: scatter to paged KV pool
 - `ops::kv_quant::decode_attention_int8_workspace_bytes()`: INT8 workspace

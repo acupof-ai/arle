@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub fn reshape(
@@ -20,7 +20,7 @@ pub fn reshape(
         });
     }
 
-    let output_id = store.alloc(GpuTensor::new(
+    let output_id = store.alloc(Tensor::new(
         input.data,
         shape.to_vec(),
         input.requires_grad,
@@ -48,7 +48,7 @@ pub fn transpose(
 ) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let (data, shape) = transpose_data(&input.data, &input.shape, axis1, axis2)?;
-    let output_id = store.alloc(GpuTensor::new(data, shape, input.requires_grad)?);
+    let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
 
     if input.requires_grad {
         tape.record(TapeEntry {
@@ -88,7 +88,7 @@ pub(crate) fn reshape_backward(
         });
     }
 
-    let grad_id = store.alloc(GpuTensor::new(upstream.data, input_shape, false)?);
+    let grad_id = store.alloc(Tensor::new(upstream.data, input_shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn transpose_backward(
     };
     let upstream = store.tensor(output_grad_id)?.clone();
     let (data, shape) = transpose_data(&upstream.data, &upstream.shape, axis1, axis2)?;
-    let grad_id = store.alloc(GpuTensor::new(data, shape, false)?);
+    let grad_id = store.alloc(Tensor::new(data, shape, false)?);
     Ok(smallvec![(x, grad_id)])
 }
 

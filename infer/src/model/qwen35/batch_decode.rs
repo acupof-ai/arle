@@ -19,11 +19,9 @@ use super::weights::{
 use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
 use crate::ops;
-use infer_cuda_kernels::kv_quant;
-use infer_cuda_kernels::kv_turboquant;
-use infer_cuda_kernels::prelude::{
-    DeviceContext, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
-};
+use cuda_kernels::kv_quant;
+use cuda_kernels::kv_turboquant;
+use cuda_kernels::prelude::{DeviceContext, FlashInferDecodeMetadata, HiddenStates, PagedKVPool};
 
 // ── Sub-structs ─────────────────────────────────────────────────────────────
 

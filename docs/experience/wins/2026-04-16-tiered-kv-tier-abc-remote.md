@@ -114,11 +114,11 @@ Raw test-result summary (`cargo test --workspace --exclude mlx-sys
   `block_index_tracks_inserts_and_evictions`,
   `rebuild_block_index_round_trips_after_serde`, and the
   `SchedulerConfig` validation tests)
-- infer-cuda-kernels: 35 passed
-- infer-agent: 12 passed
-- infer-chat: 12 passed
-- infer-cli: 7 passed
-- infer-tools: 2 passed
+- cuda-kernels: 35 passed
+- agent: 12 passed
+- chat: 12 passed
+- cli: 7 passed
+- tools: 2 passed
 
 **Total: 363 tests pass, 11 ignored, 0 fail.**
 
@@ -137,7 +137,7 @@ acceptance this week, explicitly deferred):
   B=3 batched decode bug tracked in
   `../errors/2026-04-13-batched-decode-high-concurrency.md`.
 - `cargo clippy --workspace -- -D warnings` — pre-existing
-  `unused import: Path` in `crates/infer-tools/src/lib.rs:3`. Memory
+  `unused import: Path` in `crates/tools/src/lib.rs:3`. Memory
   instructs "report, don't silently fix"; left for a separate
   cleanup commit.
 

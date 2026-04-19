@@ -102,40 +102,40 @@ milestone plan.
   iterate orphans). Unit-tested, no scheduler changes. Details in §2.1 below.
 - **M0.3** — page_size lift from 1 to 16 with per-format dispatch (the old
   P0). **Local implementation landed** on the extracted
-  `crates/infer-cuda-kernels/**` paths; remote CUDA validation remains.
+  `crates/cuda-kernels/**` paths; remote CUDA validation remains.
 
-**Paths updated post Route-A + `infer-cuda-kernels` extraction (structural, not content)**:
+**Paths updated post Route-A + `cuda-kernels` extraction (structural, not content)**:
 
 All "cuda-gated" file paths in the detailed task sections below shifted
 twice: first during the Route-A workspace rewrite (commit `d902090`) and
 the CUDA internal hygiene pass (commit `26c8f39`), then again during the
-`infer-cuda-kernels` kernel-crate extraction on 2026-04-15 (commit
-`a4e12f5 refactor(cuda): extract infer-cuda-kernels api`). The table
+`cuda-kernels` kernel-crate extraction on 2026-04-15 (commit
+`a4e12f5 refactor(cuda): extract cuda-kernels api`). The table
 below lists the **final** current paths:
 
 | Pre Route-A path | Current path |
 |---|---|
-| `infer/src/paged_kv.rs` | `crates/infer-cuda-kernels/src/paged_kv.rs` |
-| `infer/src/flashinfer_metadata.rs` | `crates/infer-cuda-kernels/src/flashinfer.rs` |
-| `infer/src/tensor.rs` | `crates/infer-cuda-kernels/src/tensor.rs` |
-| `infer/src/graph_pool.rs` | `crates/infer-cuda-kernels/src/graph_pool.rs` |
-| `infer/src/ffi.rs` | `crates/infer-cuda-kernels/src/ffi.rs` + `ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,recurrent,misc}.rs` |
+| `infer/src/paged_kv.rs` | `crates/cuda-kernels/src/paged_kv.rs` |
+| `infer/src/flashinfer_metadata.rs` | `crates/cuda-kernels/src/flashinfer.rs` |
+| `infer/src/tensor.rs` | `crates/cuda-kernels/src/tensor.rs` |
+| `infer/src/graph_pool.rs` | `crates/cuda-kernels/src/graph_pool.rs` |
+| `infer/src/ffi.rs` | `crates/cuda-kernels/src/ffi.rs` + `ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,recurrent,misc}.rs` |
 | `infer/src/metal_kv_pool.rs` | `infer/src/backend/metal/kv_pool.rs` |
 | `infer/src/metal_prefix_cache.rs` | `infer/src/backend/metal/prefix_cache.rs` |
 | `infer/src/metal_gdr.rs` | `infer/src/backend/metal/gdr.rs` |
 | `infer/mlx-sys/src/lib.rs` | `crates/mlx-sys/src/lib.rs` |
 
 When reading §1–§6 below, apply these renames mentally. The
-`infer-cuda-kernels` extraction landed on 2026-04-15, so the entire CUDA
+`cuda-kernels` extraction landed on 2026-04-15, so the entire CUDA
 kernel Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`,
 `ffi`, `kv_quant`, `kv_turboquant`, `kv_types`, `turboquant_state`,
-`prelude`) now lives in `crates/infer-cuda-kernels/src/`. The only
+`prelude`) now lives in `crates/cuda-kernels/src/`. The only
 file that remains under `infer/src/backend/cuda/` is `bootstrap.rs`,
 which reaches into `crate::model::*` / `crate::scheduler::*` and
 therefore stays in `infer`. `.cu` and Triton paths moved together:
 `infer/csrc/cuda/*.cu` →
-`crates/infer-cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/*.cu` and
-`infer/tools/triton/*.py` → `crates/infer-cuda-kernels/tools/triton/*.py`.
+`crates/cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/*.cu` and
+`infer/tools/triton/*.py` → `crates/cuda-kernels/tools/triton/*.py`.
 
 ---
 
@@ -169,7 +169,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 - [x] `[L+R]` Change `migrate_kv_range_to_paged` to take
       `(slot, start_pos, token_count)` rather than only the newly allocated
       tail ids
-- [x] `[L]` `cargo check -p infer-cuda-kernels --tests --no-default-features --features cuda,no-cuda`
+- [x] `[L]` `cargo check -p cuda-kernels --tests --no-default-features --features cuda,no-cuda`
 - [x] `[L]` `cargo check -p infer --tests --no-default-features --features cuda,no-cuda`
 - [x] `[L]` `cargo check -p infer --no-default-features --features metal`
 - [ ] `[R]` Remote CUDA acceptance via
@@ -207,17 +207,17 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 
 **Migration path**:
 - **vLLM/SGLang prefill DIRECTLY into paged blocks.** No contiguous intermediate. `attn_impl.forward` calls FlashInfer `append_paged_kv_cache` with the slot-mapping from `KVCacheManager.allocate_slots` before the kernel runs.
-- **agent-infer's `migrate_from_contiguous`** at [`crates/infer-cuda-kernels/src/paged_kv.rs`](../../crates/infer-cuda-kernels/src/paged_kv.rs) is a **legacy artifact** of the old `ContiguousKVCache`. It works at page_size=1 because `kv_cache_to_paged.cu:41-47` uses `logical_page = pos / page_size`.
+- **agent-infer's `migrate_from_contiguous`** at [`crates/cuda-kernels/src/paged_kv.rs`](../../crates/cuda-kernels/src/paged_kv.rs) is a **legacy artifact** of the old `ContiguousKVCache`. It works at page_size=1 because `kv_cache_to_paged.cu:41-47` uses `logical_page = pos / page_size`.
 - **Recommendation**: P0 keeps the migration path. Mark `migrate_from_contiguous` as `#[deprecated = "P1: prefill direct into paged blocks"]`. Schedule P1+ follow-up to remove contiguous prefill entirely (matches vLLM/SGLang).
 
-**Kernel readiness** (verified by reading `crates/infer-cuda-kernels/csrc/`):
-- ✅ [`kv/paged_kv_append.cu:43-57`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/kv/paged_kv_append.cu) — `logical_page = pos / page_size`, `physical_page = page_indices[indptr[b] + logical_page]`, `stride_page = num_kv_heads * page_size * head_dim` (computed inside kernel). **Fully page_size-parametric.**
-- ✅ [`attention/decode_prep_paged.cu:138-155`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/attention/decode_prep_paged.cu) (HD128) — uses `last_page_len - 1` for in-page offset; HND addressing correct. Caller must set `stride_page = num_kv_heads * page_size * head_dim`.
-- ✅ [`attention/decode_prep_paged_hd256.cu:157-160`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu) — identical paging logic for Qwen3.5 full attention.
-- ✅ [`kv/kv_cache_to_paged.cu:18-51`](../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L18) — `kv_cache_to_paged_kernel` (the non-range bf16 path) is fully page_size-parametric with HND output.
-- 🔴 **CORRECTION (2026-04-14)**: [`kv/kv_cache_to_paged.cu:53-82`](../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L53) — `kv_cache_to_paged_range_kernel` (the **range** variant, which is what `migrate_from_contiguous_range_bf16` actually dispatches to from `scheduler/cuda/prefill.rs:184,270`) is hardcoded `dst = pool_idx * kv_dim + kv_head * head_dim + dim` — **NHD per-token**. Header comment line 53 explicitly says "for token-level (page_size=1) paged pools". This audit row missed the range variant; the production prefill path uses **only** the range kernel, never the non-range one. P0 needs a new HND-aware range kernel before BF16 can move off `page_size=1`.
+**Kernel readiness** (verified by reading `crates/cuda-kernels/csrc/`):
+- ✅ [`kv/paged_kv_append.cu:43-57`](file:///path/to/code/agent-infer/crates/cuda-kernels/csrc/kv/paged_kv_append.cu) — `logical_page = pos / page_size`, `physical_page = page_indices[indptr[b] + logical_page]`, `stride_page = num_kv_heads * page_size * head_dim` (computed inside kernel). **Fully page_size-parametric.**
+- ✅ [`attention/decode_prep_paged.cu:138-155`](file:///path/to/code/agent-infer/crates/cuda-kernels/csrc/attention/decode_prep_paged.cu) (HD128) — uses `last_page_len - 1` for in-page offset; HND addressing correct. Caller must set `stride_page = num_kv_heads * page_size * head_dim`.
+- ✅ [`attention/decode_prep_paged_hd256.cu:157-160`](file:///path/to/code/agent-infer/crates/cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu) — identical paging logic for Qwen3.5 full attention.
+- ✅ [`kv/kv_cache_to_paged.cu:18-51`](../../crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L18) — `kv_cache_to_paged_kernel` (the non-range bf16 path) is fully page_size-parametric with HND output.
+- 🔴 **CORRECTION (2026-04-14)**: [`kv/kv_cache_to_paged.cu:53-82`](../../crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L53) — `kv_cache_to_paged_range_kernel` (the **range** variant, which is what `migrate_from_contiguous_range_bf16` actually dispatches to from `scheduler/cuda/prefill.rs:184,270`) is hardcoded `dst = pool_idx * kv_dim + kv_head * head_dim + dim` — **NHD per-token**. Header comment line 53 explicitly says "for token-level (page_size=1) paged pools". This audit row missed the range variant; the production prefill path uses **only** the range kernel, never the non-range one. P0 needs a new HND-aware range kernel before BF16 can move off `page_size=1`.
 - ✅ All FlashInfer wrapper files (`attention/flashinfer_decode.cu`, `attention/flashinfer_decode_hd256.cu`, `attention/flashinfer_tc_decode.cu`) just forward `page_size` into FlashInfer's `paged_kv_t<>`.
-- ⚠️ **`kv_cache_to_paged_int8_kernel` at [`kv/kv_cache_to_paged.cu:64-103`](file:///path/to/code/agent-infer/crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L64) hardcodes page_size=1.** Computes `pool_idx = page_indices[pos]` directly. No `page_size` parameter in signature.
+- ⚠️ **`kv_cache_to_paged_int8_kernel` at [`kv/kv_cache_to_paged.cu:64-103`](file:///path/to/code/agent-infer/crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L64) hardcodes page_size=1.** Computes `pool_idx = page_indices[pos]` directly. No `page_size` parameter in signature.
 - ⚠️ **`kv_quant.cu:184,193,207,211`** (`quantize_paged_kv_fp8_kernel`, `quantize_scatter_kv_fp8_kernel`) — same NHD per-token assumption.
 - ⚠️ **`scatter_kv.cu`** — entirely page_size=1.
 
@@ -227,7 +227,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
    - **Recommended**: gate `page_size` per-format. `TokenKVPool::page_size` becomes `match format { BF16 => 16, INT8 | FP8E4M3 | TurboQuant => 1 }`. Document the divergence prominently. Schedule P1.5 to either rewrite the INT8 kernels with `pos / page_size` decomposition or move INT8 to a separate HND format. **Single-line change in `with_format`**: `let page_size = if format.uses_paged_layout() { 16 } else { 1 };`
    - Alternative: rewrite `kv_cache_to_paged_int8_kernel` and the FP8 quantize kernels in P0. Bigger blast radius, kernel work, +1 PR. **Defer.**
 2. **`indptr` semantics change** — `build_indptr` cumulates pages now, not tokens. This is the most subtle change in P0; every caller of `pool.build_indptr()` must be re-audited. Currently 1 caller: `flashinfer_metadata.rs:124`.
-3. **Empty-slot filter** — `build_flashinfer_metadata` must skip slots with `seq_len == 0`. Currently it emits `last_page_len[i] = 0` for empty slots ([`crates/infer-cuda-kernels/src/paged_kv.rs`](../../crates/infer-cuda-kernels/src/paged_kv.rs)), which violates FlashInfer's `[1, page_size]` invariant. The fact this hasn't crashed at page_size=1 is luck — FlashInfer treats `last_page_len=0` as "empty pages array, length 0", which the test path tolerates because `indptr[i+1] - indptr[i] = 0` for empty slots. At page_size>1 this no longer reliably aligns.
+3. **Empty-slot filter** — `build_flashinfer_metadata` must skip slots with `seq_len == 0`. Currently it emits `last_page_len[i] = 0` for empty slots ([`crates/cuda-kernels/src/paged_kv.rs`](../../crates/cuda-kernels/src/paged_kv.rs)), which violates FlashInfer's `[1, page_size]` invariant. The fact this hasn't crashed at page_size=1 is luck — FlashInfer treats `last_page_len=0` as "empty pages array, length 0", which the test path tolerates because `indptr[i+1] - indptr[i] = 0` for empty slots. At page_size>1 this no longer reliably aligns.
 4. **Two-level allocator data model** — slot-level state changes from `token_indices: Vec<Vec<u32>>` to `(page_indices: Vec<Vec<u32>>, last_page_len: Vec<u32>)`. The free list changes from `free_slots: Vec<u32>` to `free_pages: Vec<u32>` (pages, not tokens). Total pool bytes unchanged: `max_total_pages = max_total_tokens / page_size`.
 5. **2026-04-14: BF16 prefill→pool migration kernel is the actual P0 blocker.** Plan §1.2 Kernel Readiness audited `kv_cache_to_paged_kernel` (the non-range bf16 path) and concluded the bf16 migration was page_size-parametric. **The production prefill code never calls that function** — it dispatches through `migrate_kv_range_to_paged → kv_cache_to_paged_range_kernel`, which is hardcoded NHD per-token and explicitly only works at `page_size=1`. P0 must add a new `kv_cache_to_paged_range_hnd_kernel` (additive, ~60 lines CUDA) and route the BF16 migration through it. See [`docs/experience/errors/2026-04-14-p0-page16-blocker.md`](../experience/errors/2026-04-14-p0-page16-blocker.md) for the full root cause, byte-offset proof, and the rescoped P0 file list (~12 files instead of the original ~7).
 6. **2026-04-14: `alloc_tokens` callers — 2 of 4 USE the returned `Vec`, not discard it.** Plan §1.1 said all 4 callers discard so returning `Vec::new()` was a safe shortcut for the two-level allocator rewrite. Verified false: `scheduler/cuda/prefill.rs:184` and `:270` consume `new_indices` and feed it to `state.migrate_kv_range_to_paged(...)`. The two-level allocator must return real indices that the migration kernel can address into the pool.
@@ -517,7 +517,7 @@ P3 has the most local content of any phase — **all of P3 is `[L]` except the l
 - [x] `[L]` Add `infer/src/http_server/sessions.rs` — **pure Rust** `save_session` / `load_session` + `LoadedSession` + `SessionSnapshotError` shipped in M4d (`c87c68b`). **HTTP axum handlers deliberately NOT wrapped in this batch** — the function signatures need one more review before they become user-facing API contract.
 - [ ] `[L]` Edit `infer/src/http_server.rs` — register `POST /v1/sessions/:id/save` / `POST /v1/sessions/:id/load` / `GET /v1/sessions/:id/manifest` / `DELETE /v1/sessions/:id` axum routes (deferred to a follow-up M4 HTTP batch)
 - [ ] `[L]` Idempotency-Key header support; ETag = content_hash for skip-re-upload (deferred to the HTTP wrapper batch)
-- [ ] `[L]` `crates/infer-agent/src/lib.rs` — extend `save_to_path / load_from_path` with optional `Option<KvBlobRef>` on `SessionSnapshot` pointing at content hash (deferred — depends on the HTTP wrapper)
+- [ ] `[L]` `crates/agent/src/lib.rs` — extend `save_to_path / load_from_path` with optional `Option<KvBlobRef>` on `SessionSnapshot` pointing at content hash (deferred — depends on the HTTP wrapper)
 - [x] `[L]` `cargo test -p infer --release --no-default-features --features no-cuda sessions` — **3 tests green on Mac** (M4d)
 
 #### MLX wired memory bindings — Local (Mac)
@@ -855,7 +855,7 @@ These should already be running by the time P0 edits land:
 
 **M0.3 · `page_size = 1 → 16` with per-format dispatch** is now **local
 done, remote CUDA acceptance pending**. The file-path migration into
-`crates/infer-cuda-kernels/**` already happened; the remaining gate is the
+`crates/cuda-kernels/**` already happened; the remaining gate is the
 remote checklist in `tiered-kv-cache-m0.3-m3a-remote-acceptance.md`.
 **M0.3 is a prereq for M3 behavior, not for M1** — M1's exit gate is T0-only
 `cached_prompts` parity and does not depend on `page_size`.
@@ -917,7 +917,7 @@ M0.3's exit gate has a comparison point when it unblocks.
   - **Coordinator threading model** commits to OS thread + crossbeam (the §3.3 course correction, now project doc §4.4), not tokio.
   - **P4 KVFlow-lite** dropped from critical path. Ship LRU / SessionBiasedLru in M3; revisit reuse-distance only if M3's default policy proves insufficient.
   - **P5 NIXL real RDMA** deferred. Trigger criteria documented in project doc §6 M5: prefill/decode disaggregation, cluster-wide session roaming, or second consumer of the kernel crate.
-  - **File paths updated for Route-A + kernel-crate extraction**: `infer/src/paged_kv.rs` → `crates/infer-cuda-kernels/src/paged_kv.rs` (post-extraction 2026-04-15 `a4e12f5`), `infer/src/metal_*` → `infer/src/backend/metal/*`, etc. See §0.5 table for the full rename list.
+  - **File paths updated for Route-A + kernel-crate extraction**: `infer/src/paged_kv.rs` → `crates/cuda-kernels/src/paged_kv.rs` (post-extraction 2026-04-15 `a4e12f5`), `infer/src/metal_*` → `infer/src/backend/metal/*`, etc. See §0.5 table for the full rename list.
   - **New sources** added: 14 industry research references (vLLM KV offloading connector blog, SGLang HiCache design, LMCache/CacheBlend, Mooncake FAST'25 paper, Dynamo KVBM, TRT-LLM KV reuse, etc.). Full list in project doc §12.
 - **2026-04-13**: Initial split (without per-phase research).
 - **2026-04-13** (later): Enriched with 6-agent industry research. Added §N.2 Industry references and §N.3 Course corrections subsections per phase. Major design changes:
@@ -1003,8 +1003,8 @@ M0.3's exit gate has a comparison point when it unblocks.
 - [Monoio benchmark docs](https://github.com/redacted/monoio/blob/master/docs/en/benchmark.md)
 
 ### Local files (referenced repeatedly)
-- `crates/infer-cuda-kernels/src/paged_kv.rs` (cuda-gated, post `a4e12f5` extraction)
-- `crates/infer-cuda-kernels/src/flashinfer.rs` (cuda-gated, post `a4e12f5` extraction)
+- `crates/cuda-kernels/src/paged_kv.rs` (cuda-gated, post `a4e12f5` extraction)
+- `crates/cuda-kernels/src/flashinfer.rs` (cuda-gated, post `a4e12f5` extraction)
 - `infer/src/prefix_cache.rs` (always-on, local-checkable)
 - `infer/src/scheduler/cuda/{prefill,decode,core,runtime,request}.rs` (cuda-gated)
 - `infer/src/server_engine.rs`
@@ -1014,8 +1014,8 @@ M0.3's exit gate has a comparison point when it unblocks.
 - `infer/src/backend/metal/prefix_cache.rs`
 - `infer/src/backend/metal/gdr.rs` — **Gated Delta Rule, not GPUDirect** (rename suggested in separate cleanup PR)
 - `crates/mlx-sys/src/lib.rs`
-- `crates/infer-cuda-kernels/csrc/kv/{paged_kv_append,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
-- `crates/infer-cuda-kernels/csrc/attention/{decode_prep_paged,decode_prep_paged_hd256}.cu`
+- `crates/cuda-kernels/csrc/kv/{paged_kv_append,kv_cache_to_paged,kv_quant,scatter_kv}.cu`
+- `crates/cuda-kernels/csrc/attention/{decode_prep_paged,decode_prep_paged_hd256}.cu`
 - `infer/src/scheduler/policy.rs:64-78,133-152` — existing `AdmissionPolicy` / `ChunkingPolicy`
 - `infer/src/events.rs:7-24` — existing `EngineEvent` / `EventSink`
-- `crates/infer-agent/src/lib.rs:166-188` — `AgentSession::save_to_path / load_from_path` (JSON-only today)
+- `crates/agent/src/lib.rs:166-188` — `AgentSession::save_to_path / load_from_path` (JSON-only today)

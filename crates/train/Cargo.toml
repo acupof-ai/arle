@@ -21,8 +21,8 @@ tempfile = "3"
 safetensors = { workspace = true }
 
 [[bin]]
-name = "train_tiny_lm"
-path = "src/bin/train_tiny_lm.rs"
+name = "pretrain"
+path = "src/bin/pretrain.rs"
 
 [[bin]]
 name = "train_grpo"

@@ -16,8 +16,8 @@ use axum::{
     middleware,
     routing::{get, post},
 };
+use chat::openai_messages_to_prompt as chat_messages_to_prompt;
 use futures_util::{StreamExt, stream};
-use infer_chat::openai_messages_to_prompt as chat_messages_to_prompt;
 use log::{error, info, warn};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -293,7 +293,7 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
     let mut messages = Vec::new();
     if let Some(instructions) = req.instructions.as_deref() {
         if !instructions.trim().is_empty() {
-            messages.push(infer_chat::OpenAiChatMessage {
+            messages.push(chat::OpenAiChatMessage {
                 role: "system".into(),
                 content: Some(instructions.into()),
                 tool_calls: Vec::new(),
@@ -311,7 +311,7 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
                     "empty_input",
                 ));
             }
-            messages.push(infer_chat::OpenAiChatMessage {
+            messages.push(chat::OpenAiChatMessage {
                 role: "user".into(),
                 content: Some(text.clone().into()),
                 tool_calls: Vec::new(),

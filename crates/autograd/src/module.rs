@@ -1,7 +1,7 @@
 use crate::{
     AutogradError, Result,
     ops::{add_broadcast, matmul, reshape, transpose},
-    tensor::{GpuTensor, TensorId, TensorStore},
+    tensor::{Tensor, TensorId, TensorStore},
 };
 
 pub trait Parameter {
@@ -42,12 +42,12 @@ impl Linear {
         let weight_data = (0..out_features * in_features)
             .map(|_| sample_uniform(&mut state, bound))
             .collect::<Vec<_>>();
-        let weight = GpuTensor::new(weight_data, vec![out_features, in_features], true)
+        let weight = Tensor::new(weight_data, vec![out_features, in_features], true)
             .expect("linear weight init shape is internally consistent");
         let w = store.alloc(weight);
 
         let b = if with_bias {
-            let bias = GpuTensor::new(vec![0.0; out_features], vec![out_features], true)
+            let bias = Tensor::new(vec![0.0; out_features], vec![out_features], true)
                 .expect("linear bias init shape is internally consistent");
             Some(store.alloc(bias))
         } else {

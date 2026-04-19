@@ -7,16 +7,16 @@ Updated 2026-04-15 after the Route-A refactor.
 The repository is a small control-plane workspace around one runtime-heavy
 crate:
 
-- `agent-infer`: thin binary wrapper that delegates to `infer-cli`
+- `agent-infer`: thin binary wrapper that delegates to `cli`
 - `infer`: inference runtime, HTTP server, scheduler, backend runtime, model
   loading, CUDA/Metal/CPU backends, and the unified `server_engine::InferenceEngine`
   contract that both the HTTP server and the agent CLI call through
-- `infer-chat`: shared chat/tool-call protocol and OpenAI chat surface types
-- `infer-tools`: builtin tool definitions plus sandboxed execution helpers
-- `infer-agent`: agent session state, prompt assembly, tool-call recovery, and
+- `chat`: shared chat/tool-call protocol and OpenAI chat surface types
+- `tools`: builtin tool definitions plus sandboxed execution helpers
+- `agent`: agent session state, prompt assembly, tool-call recovery, and
   turn loop logic
-- `infer-cli`: REPL and CLI wiring for the `agent-infer` binary
-- `infer-cuda-kernels`: CUDA kernel layer — `csrc/` + Triton AOT + Rust FFI
+- `cli`: REPL and CLI wiring for the `agent-infer` binary
+- `cuda-kernels`: CUDA kernel layer — `csrc/` + Triton AOT + Rust FFI
   (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`,
   `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
@@ -36,11 +36,11 @@ achieved real independence.
 
 ```text
 agent-infer (root binary)
-  -> infer-cli::run()
+  -> cli::run()
   -> infer::hf_hub::resolve_model_source() / infer::server_engine::LoadedInferenceEngine::load()
-  -> infer-agent::AgentSession (uses `dyn InferenceEngine`)
-  -> infer-tools builtin tools
-  -> infer-chat prompt/tool-call protocol
+  -> agent::AgentSession (uses `dyn InferenceEngine`)
+  -> tools builtin tools
+  -> chat prompt/tool-call protocol
   -> infer::server_engine::LoadedInferenceEngine
      - CUDA: Qwen3InferenceEngine / Qwen35InferenceEngine / GLM4InferenceEngine
      - Metal: BackendInferenceEngine<MetalBackend>
@@ -63,10 +63,10 @@ infer binary / metal_serve / cpu_serve
 | Crate | Owns | Does not own |
 | --- | --- | --- |
 | `agent-infer` | Binary entrypoint only | REPL logic, backend loading |
-| `infer-cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
-| `infer-agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
-| `infer-tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
-| `infer-chat` | Shared protocol formatting/parsing | Runtime scheduling and backend logic |
+| `cli` | CLI args, REPL commands, terminal UX | Session state, runtime internals |
+| `agent` | Conversation state, tool recovery, request/response contract for agent turns | Concrete backend/runtime implementations |
+| `tools` | Tool schemas and execution wrappers | Prompt formatting, model inference |
+| `chat` | Shared protocol formatting/parsing | Runtime scheduling and backend logic |
 | `infer` | Scheduler, HTTP server, backend runtime, model/kernel integration, `server_engine::InferenceEngine` contract | Terminal UX and agent-session orchestration |
 
 ## Backend Split
@@ -100,7 +100,7 @@ surface looked like. The discussion happened between Claude and Codex on
 could land as mechanical refactor, not re-debate.
 
 The extraction **landed in commit `a4e12f5 refactor(cuda): extract
-infer-cuda-kernels api`**, followed by `f81e2d5 style(workspace): run
+cuda-kernels api`**, followed by `f81e2d5 style(workspace): run
 cargo fmt after kernel-crate extraction`. From that point on, the
 "option A vs option B" framing is historical; the current tree is
 option B.
@@ -108,7 +108,7 @@ option B.
 ### Current layout (what the extraction moved)
 
 ```
-crates/infer-cuda-kernels/
+crates/cuda-kernels/
 ├── Cargo.toml
 ├── build.rs                 ← nvcc + Triton AOT, lifted from infer/build.rs
 ├── csrc/
@@ -142,7 +142,7 @@ infer/
                                 crate::model_registry::*.
 ```
 
-The dependency edge is **`infer → infer-cuda-kernels`, never the reverse**.
+The dependency edge is **`infer → cuda-kernels`, never the reverse**.
 `bootstrap.rs` is the only file where kernel concerns and model/scheduler
 concerns meet; keeping it in `infer` is what let the kernel crate ship
 without forcing `Tokenizer`, `KVCacheDtype`, `ModelType`, or per-model
@@ -156,7 +156,7 @@ are what made the single-day extraction actually mechanical:
 1. `infer/src/backend/cuda/ffi.rs` was split into 10 domain submodules
    (`ffi/{attention,gemm,kv,norm,quant,sampling,embedding,elementwise,
    recurrent,misc}.rs`). They carried over intact to
-   `crates/infer-cuda-kernels/src/ffi/`.
+   `crates/cuda-kernels/src/ffi/`.
 2. `prelude.rs` was the **proto-API contract** — seven cross-cutting types
    that 25+ files imported through, gated by a "≥3 consumers + stable +
    would not force any `infer` type to become cross-crate `pub`" rule.
@@ -195,7 +195,7 @@ or model layers out. They are no longer arguments about the kernel crate.
 ### Cross-references
 
 - `docs/plans/cuda-kernel-crate-extraction.md` — full execution blueprint.
-- `crates/infer-cuda-kernels/src/prelude.rs` — the proto-API contract (graduated from `infer/src/backend/cuda/prelude.rs` at extraction time).
+- `crates/cuda-kernels/src/prelude.rs` — the proto-API contract (graduated from `infer/src/backend/cuda/prelude.rs` at extraction time).
 - `docs/archives/art-grade-architecture-for-long-agent-infer.md` — the
   ambitious 8-crate split that Route-A reverted; §六 governance and §七
   acceptance criteria still inform the trip wire bar.

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
+use chat::{OpenAiChatMessage, openai_messages_to_prompt};
 use clap::{ArgAction, Parser};
 use infer::backend::metal::{
     MetalBackend, MetalBackendOptions, MetalDflashOptions, MetalRuntimeLimits,
@@ -11,7 +12,6 @@ use infer::backend::metal::{
 use infer::backend::{GenerateResult, InferenceBackend};
 use infer::logging;
 use infer::sampler::SamplingParams;
-use infer_chat::{OpenAiChatMessage, openai_messages_to_prompt};
 
 fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     let parsed: i32 = raw

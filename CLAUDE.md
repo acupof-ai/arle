@@ -24,16 +24,16 @@ after any change affecting numerical output.
 
 ```
 agent-infer/
-├── src/                       ← thin infer-cli::run() binary
+├── src/                       ← thin cli::run() binary
 ├── infer/                     ← runtime crate (scheduler/model/ops/backends/HTTP)
 ├── crates/
-│   ├── infer-cuda-kernels/    ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── cuda-kernels/    ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
 │   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
-│   ├── infer-agent/chat/cli/tools
+│   ├── agent/chat/cli/tools
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 
-CUDA kernels live at `crates/infer-cuda-kernels/csrc/`, **not** `infer/csrc/`
+CUDA kernels live at `crates/cuda-kernels/csrc/`, **not** `infer/csrc/`
 (common mistake — extracted 2026-04-15).
 
 ---
@@ -126,7 +126,7 @@ changes.
   condition for any diff that could move numbers. No bench entry → not
   shipped.
   - **In scope** (bench required): anything under `infer/src/`,
-    `crates/infer-cuda-kernels/csrc/`, `crates/mlx-sys/src/`, `src/`, any
+    `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/`, `src/`, any
     `scripts/bench_*.{sh,py}` parameter change, feature-flag default flips,
     scheduler/kernel/ops/model/backend edits, dependency bumps that touch
     the hot path.
@@ -174,7 +174,7 @@ changes.
 
 ### GPU kernel work
 
-Touching `crates/infer-cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths?
+Touching `crates/cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths?
 Evaluate against the project-specific heat map in
 [`docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md`](docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md)
 — that's where the audited priorities live. Measure with `ncu` (CUDA) or
@@ -233,7 +233,7 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 | `infer/src/ops/` | [AGENTS.md](infer/src/ops/AGENTS.md) — visibility policy, `_into` variants, batched conventions |
 | `infer/src/kv_tier/` | [AGENTS.md](infer/src/kv_tier/AGENTS.md) — tier model, RadixCache invariant, MR stability |
 | `infer/src/http_server/` | [AGENTS.md](infer/src/http_server/AGENTS.md) — OpenAI v1 compat, `session_id`, streaming |
-| `crates/infer-cuda-kernels/` | [AGENTS.md](crates/infer-cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, Triton AOT |
+| `crates/cuda-kernels/` | [AGENTS.md](crates/cuda-kernels/AGENTS.md) — prelude discipline, csrc layout, Triton AOT |
 | `crates/mlx-sys/` | [AGENTS.md](crates/mlx-sys/AGENTS.md) — single Metal bridge, cmake+cc build, no repo `.metal` |
 
 ---
@@ -243,5 +243,5 @@ Load the relevant `AGENTS.md` **before** editing inside a module.
 - [`docs/index.md`](docs/index.md) — PARA index; always start a session here.
 - [`docs/codebase-map.md`](docs/codebase-map.md) — execution paths + where to start reading.
 - [`docs/architecture.md`](docs/architecture.md) — workspace topology + Option-A→B kernel-crate extraction story.
-- [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — final `infer-cuda-kernels` extraction blueprint (trip wires + acceptance).
+- [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — final `cuda-kernels` extraction blueprint (trip wires + acceptance).
 - [`docs/support-matrix.md`](docs/support-matrix.md) — backend / model / quant support levels.

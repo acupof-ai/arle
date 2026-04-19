@@ -4,7 +4,7 @@ use autograd::{AutogradError, Result, Tape, TensorStore};
 
 use crate::{
     dataset::LcgRng,
-    model::{TinyLM, TinyLMConfig},
+    model::{Lm, LmConfig},
     sampling::{log_prob_at_index, sample_categorical},
 };
 
@@ -19,9 +19,9 @@ pub struct Trajectory {
 }
 
 pub fn rollout_group(
-    policy: &TinyLM,
-    ref_model: &TinyLM,
-    config: &TinyLMConfig,
+    policy: &Lm,
+    ref_model: &Lm,
+    config: &LmConfig,
     prompts: &[Vec<usize>],
     group_size: usize,
     temperature: f32,
@@ -168,7 +168,7 @@ fn response_mask(seq_len: usize) -> Result<Vec<bool>> {
     Ok(mask)
 }
 
-fn retained_ids(policy: &TinyLM, ref_model: &TinyLM, store: &TensorStore) -> HashSet<usize> {
+fn retained_ids(policy: &Lm, ref_model: &Lm, store: &TensorStore) -> HashSet<usize> {
     let mut keep = HashSet::new();
     for param_id in policy
         .all_parameter_ids()

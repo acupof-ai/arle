@@ -50,7 +50,7 @@ confuse readers about which project they are looking at.
 ## 2 · Non-goals
 
 - **New attention kernels.** page_size is a pool/bookkeeping change, not a
-  kernel rewrite; everything under `crates/infer-cuda-kernels/csrc/` that
+  kernel rewrite; everything under `crates/cuda-kernels/csrc/` that
   touches paged KV already parameterizes page_size.
 - **Metal hierarchy.** MLX unified memory makes T0↔T1 a self-memcpy; Metal
   only joins at M4 for T2 (disk), and only because the wired-memory
@@ -114,11 +114,11 @@ contiguous state still materialises the matched prefix.
 
 | Area | State | File:line |
 |---|---|---|
-| CUDA paged pool | **M0.3 accepted 2026-04-15 on L4**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Same-host `page1 → page16` sweep is within noise on C≤4 and recovers C≥8 from the 2026-04-13 zero-throughput regression (see `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`). | `crates/infer-cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
-| CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/infer-cli/src/args.rs` |
+| CUDA paged pool | **M0.3 accepted 2026-04-15 on L4**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Same-host `page1 → page16` sweep is within noise on C≤4 and recovers C≥8 from the 2026-04-13 zero-throughput regression (see `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`). | `crates/cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
+| CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/cli/src/args.rs` |
 | `infer/src/prefix_cache.rs` | Leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`) plus **M2b tombstone GC scaffolding** (`free_nodes`, `alloc_node`, `gc_orphan_tombstones()`). **M3a/M3b local now also land the tier-aware contract surface and runtime metadata mutators**: `hit_count`, `tier_location`, `session_id`, `fingerprint`, `byte_len`, `soft_pin_until`, `lookup_or_stage(...) -> LookupOutcome`, plus public setters so scheduler code can stamp GPU/session/keepalive truth onto published blocks. Tier B/C local follow-on also makes `insert_with_fingerprints(...)` the canonical insert path, keeps `insert(...)` as a zero-fingerprint back-compat shim, and maintains a private `block_index` for O(1) `BlockId` → node lookup. | `infer/src/prefix_cache.rs`, `infer/src/kv_tier/lookup.rs` |
 | CUDA scheduler prefix logic | **M2b local shipped, M3b degraded runtime wire landed, M3c cleanup applied, Tier A/C follow-on landed locally**: `assign_slots()` now passes a real `CoordinatorHandle` as `StagePlanner`, staged hits park in `stage_waiting`, `run()` drains coordinator events every iteration, and completed tickets re-enter admission through the waiting queue. `step_new()` still truncates / replays contiguous KV directly, and `cleanup()` publishes prefixes under `SchedulerConfig::prefix_cache_retain_hard_cap` while decode preemption clears slot ownership. **Cross-slot page aliasing is intentionally not implemented** — reuse is safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
-| Legacy API compatibility | `set_max_gpu_kv` remains as a compatibility no-op warning so CLI / external callers do not break in the same batch that deletes the old CPU offload implementation. This shim should be removed in a later surface-cleanup PR, not mixed into the runtime staging work. | `infer/src/server_engine.rs`, `crates/infer-cli/src/lib.rs`, `crates/infer-cli/src/args.rs` |
+| Legacy API compatibility | `set_max_gpu_kv` remains as a compatibility no-op warning so CLI / external callers do not break in the same batch that deletes the old CPU offload implementation. This shim should be removed in a later surface-cleanup PR, not mixed into the runtime staging work. | `infer/src/server_engine.rs`, `crates/cli/src/lib.rs`, `crates/cli/src/args.rs` |
 | `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). **M3a local shipped** `host_pool.rs`, `coordinator.rs`, and `transport/local_cuda.rs`; **M3b/Tier A local now ship both the contract and a live scheduler-visible coordinator loop**: `lookup.rs` (`HitKind`, `LookupOutcome`, `StageTicket`, `LookupHeuristics`), the `PageLifecycleState` state machine, a named OS thread (`infer-tiered-kv-coord`), ticketed staging events, and scheduler admission that re-parks/re-admits staged requests by ticket. `DiskStore` round-trips bytes and fingerprints locally, but it is still **not wired** into the coordinator `Stage` path. `NixlTransport` stub compiles under `rdma-nixl` (stub-api). Real staged completion still starts in a later M3 behavior patch because `LocalCudaTransport` currently emits `StagingQueued` + synchronous `StagingCompleted` echo instead of real async copy completion. | `infer/src/kv_tier/**`, `infer/src/scheduler/cuda/runtime.rs` |
 | `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` now has local publish-time call sites via `compute_from_tokens`, but M4 session save/load is still the first consumer that must survive restart / reconciliation. | `infer/src/types.rs:8` |
 | `infer::scheduler::policy` | Trait + 4 impls (`LruEviction`, `ReuseBiasedLru`, `HitCountLru`, `SessionBiasedLru`) plus `EvictionCandidate` data struct + `SchedulerSignals`. **M3b local runtime wire landed**: `RadixCache::evict_with_policy` exists, cleanup/allocation eviction now consumes live queue/decode-derived signals rather than `SchedulerSignals::default()`, and published blocks stamp session/keepalive metadata. Tier C local follow-on promoted the prefix-cache watermarks / keepalive knobs onto `SchedulerConfig`; combined remote CUDA acceptance is still pending. | `infer/src/scheduler/policy.rs`, `infer/src/prefix_cache.rs`, `infer/src/scheduler/cuda/core.rs` |
@@ -126,7 +126,7 @@ contiguous state still materialises the matched prefix.
 | Metal KV pool | `SlotLedger` refcount-only, MLX unified memory, no tier concept. Untouched by M1/M2a. | `infer/src/backend/metal/kv_pool.rs` |
 | Metal prefix cache | Wraps RadixCache, not wired into the Metal scheduler. | `infer/src/backend/metal/prefix_cache.rs` |
 | Storage deps | `nixl-sys = "1.0"` optional, behind `rdma-nixl` (stub-api) and `rdma-nixl-real` features | `infer/Cargo.toml` |
-| **Granularity mismatch** | Two granularities still coexist: BF16 paged pool `page_size = 16` (M0.3 local) and quantized paged pool `page_size = 1` (intentional for now). The legacy contiguous offload's `OFFLOAD_BLOCK_SIZE = 64` is gone locally, so BF16 T0↔T1 transfer is no longer blocked on that older mismatch. Quantized tiers still need follow-up. | `crates/infer-cuda-kernels/src/paged_kv.rs` |
+| **Granularity mismatch** | Two granularities still coexist: BF16 paged pool `page_size = 16` (M0.3 local) and quantized paged pool `page_size = 1` (intentional for now). The legacy contiguous offload's `OFFLOAD_BLOCK_SIZE = 64` is gone locally, so BF16 T0↔T1 transfer is no longer blocked on that older mismatch. Quantized tiers still need follow-up. | `crates/cuda-kernels/src/paged_kv.rs` |
 
 Seven facts shape everything below (original fact 6 "P1(a) shipped, P1(b) never did" retired by M1b landing; replaced with the policy.rs / hand-rolled watermark divergence that Codex 2026-04-15 surfaced):
 
@@ -284,7 +284,7 @@ pattern alone takes prefix hit rate from ~0 to ~80% on Novita's workload
 and cuts TTFT 56%.
 
 **Where it lives**: entirely inside `infer/src/prefix_cache.rs::RadixCache`
-and `crates/infer-cuda-kernels/src/paged_kv.rs::TokenKVPool`. No new
+and `crates/cuda-kernels/src/paged_kv.rs::TokenKVPool`. No new
 module. M2a already implemented the refcount half (`page_ref_count`,
 `retain_pages`, `release_pages`, refcount-aware `free_slot`); M2b adds
 the selector-flip half.
@@ -846,12 +846,12 @@ production prefill→pool migration used a range kernel that still assumed
 NHD-per-token layout. That required adding a new BF16 HND range kernel and
 expanding the touch list. The parallel kernel-crate extraction also changed
 the file paths mid-stream; the final local implementation landed on the new
-`crates/infer-cuda-kernels/**` paths.
+`crates/cuda-kernels/**` paths.
 
 **Files**:
-- `crates/infer-cuda-kernels/src/paged_kv.rs:7,76-87,482-511,549-562,614,760`
-  (post `a4e12f5 refactor(cuda): extract infer-cuda-kernels api`, 2026-04-15)
-- `crates/infer-cuda-kernels/src/flashinfer.rs` (incremental metadata update)
+- `crates/cuda-kernels/src/paged_kv.rs:7,76-87,482-511,549-562,614,760`
+  (post `a4e12f5 refactor(cuda): extract cuda-kernels api`, 2026-04-15)
+- `crates/cuda-kernels/src/flashinfer.rs` (incremental metadata update)
 - `infer/src/model/qwen3/batch_decode.rs:384`,
   `qwen35/batch_decode.rs:724`, `glm4/batch_decode.rs:338` — drop the
   `let page_size = 1;` locals
@@ -923,7 +923,7 @@ selector flip required the pool's refcount discipline to already exist.
   `release_pages` / `retained_count` + a refcount-aware `free_slot`
   that leaves pinned pages in limbo (not in any slot, not in
   `free_slots`, still physically live in HBM). Implementation at
-  `crates/infer-cuda-kernels/src/paged_kv.rs:71-83,416-440`.
+  `crates/cuda-kernels/src/paged_kv.rs:71-83,416-440`.
 - `Scheduler::publish_to_prefix_cache` (`infer/src/scheduler/cuda/core.rs:333`)
   takes a `slot_idx`, snapshots `token_indices(slot_idx)`, inserts
   **real** physical page indices into the radix as `BlockId`s, and
@@ -939,7 +939,7 @@ selector flip required the pool's refcount discipline to already exist.
   retained fraction crosses the high mark. **Tier C local promoted these
   from deleted module consts to real config fields** — see §5.4.1.
 - 4 new `MockPool`-based refcount unit tests in
-  `crates/infer-cuda-kernels`. **Done.**
+  `crates/cuda-kernels`. **Done.**
 
 #### M2b · selector flip + retain hard cap + tombstone GC — **accepted 2026-04-15 on L4**
 
@@ -1138,7 +1138,7 @@ when one of these triggers fires:
 - **Cluster-wide session roaming** — a session moves between nodes and
   its KV must follow
 - **Second consumer of the kernel layer** — an external project wants to
-  reuse `infer-cuda-kernels` + the transport, and needs a functional
+  reuse `cuda-kernels` + the transport, and needs a functional
   remote tier to do it
 
 See [`../plans/cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md)
@@ -1325,7 +1325,7 @@ already shipped, and M1 can proceed on M0.1 alone.
   M4 enters execution.
 - [`cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md) —
   the `.cu` file moves landed 2026-04-15, so M0.3 kernel references now live at
-  `crates/infer-cuda-kernels/csrc/kv/*.cu` (and `crates/infer-cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
+  `crates/cuda-kernels/csrc/kv/*.cu` (and `crates/cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
 - [`../archives/art-grade-architecture-for-long-agent-infer.md`](../archives/art-grade-architecture-for-long-agent-infer.md) —
   archived workspace crate topology proposal. PR discipline (§六) and
   crate admission criteria (§七) still apply; the §一 topology was
@@ -1622,7 +1622,7 @@ the 2026-04-15 internal survey + 7-system industry comparison forced:
    - Affected sections: §3 current state fact 3, §6 M0.3, §8 pitfall 3
    - File impact: CUDA pool, FlashInfer metadata, 3 model batch-decode
      callers, scheduler `decode.rs:193`. M0.3 blocks on the in-flight
-     `infer-cuda-kernels` crate extraction landing.
+     `cuda-kernels` crate extraction landing.
 
 Additional touches in the same revision:
 

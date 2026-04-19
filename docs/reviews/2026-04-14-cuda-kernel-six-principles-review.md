@@ -4,8 +4,8 @@
 
 审计对象是当前生产路径下的 CUDA kernel crate：
 
-- `crates/infer-cuda-kernels/csrc/` 下 `33` 个 `.cu` 文件
-- `crates/infer-cuda-kernels/tools/triton/` 下 `13` 个 Triton AOT kernel
+- `crates/cuda-kernels/csrc/` 下 `33` 个 `.cu` 文件
+- `crates/cuda-kernels/tools/triton/` 下 `13` 个 Triton AOT kernel
 
 方法不是“逐个猜哪段会快”，而是按六要素过一遍，再结合现有 profiling / benchmark 文档给热路径排优先级：
 
@@ -161,8 +161,8 @@
 
 文件：
 
-- `crates/infer-cuda-kernels/csrc/misc/gated_delta_rule.cu`
-- `crates/infer-cuda-kernels/csrc/misc/gdr_decode_batch.cu`
+- `crates/cuda-kernels/csrc/misc/gated_delta_rule.cu`
+- `crates/cuda-kernels/csrc/misc/gdr_decode_batch.cu`
 
 改动：
 
@@ -179,7 +179,7 @@
 
 文件：
 
-- `crates/infer-cuda-kernels/csrc/misc/conv1d_decode_batch.cu`
+- `crates/cuda-kernels/csrc/misc/conv1d_decode_batch.cu`
 
 改动：
 

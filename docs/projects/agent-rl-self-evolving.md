@@ -61,7 +61,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 | RL 算法 | GRPO（无 critic） | PPO / DPO / RLAIF（v2 可选） |
 | 模型 | Qwen3 4B 起步，8B 压测 | 多架构支持（v2） |
 | 权重共享 | `Arc<BaseWeights>` + `RwLock<LoRADelta>` double-buffer | 跨进程 shared memory |
-| Rollout | 复用 agent-infer scheduler + infer-agent tool loop | 重写 rollout |
+| Rollout | 复用 agent-infer scheduler + agent tool loop | 重写 rollout |
 | Reward | 单 verifier 起步（数学 exact-match / 代码单测） | Learned reward model |
 | 数据 | 在线 self-play，verifier-grounded | 离线 dataset loader（v2） |
 | Python 依赖 | **零** | HF `datasets` / tokenizers 以 tokenizers crate 替代 |
@@ -137,9 +137,9 @@ crates/
 │   │   └── trainer.rs         ← 主循环（rollout ↔ train 交替）
 │   └── tests/
 │
-├── infer-cuda-kernels/        ← 现有（共享给推理 + 训练 fwd）
+├── cuda-kernels/        ← 现有（共享给推理 + 训练 fwd）
 ├── mlx-sys/                   ← 现有（Metal 支线）
-├── infer-agent/chat/cli/tools ← 现有
+├── agent/chat/cli/tools ← 现有
 └── ...
 ```
 
@@ -152,7 +152,7 @@ crates/
 | `infer/src/scheduler/` | 新增 trajectory emit channel | rollout 结束时，把 (prompt_tokens, response_tokens, logp_per_step) 推给 trainer；不改调度逻辑 |
 | `infer/src/model/` | 新增 LoRA merge hook | `linear_with_lora(x, W_base, A, B)` 可选路径；base 分支走现有 merged-QKV / gate-up |
 | `infer/src/backend/cuda/` | 暴露 `CudaDevice` | trainer 复用同一个 context，零拷贝共权重 |
-| `infer-agent/` | 新增 trajectory 采集 callback | tool loop 每一步记 action + observation，最终形成 step-wise trajectory |
+| `agent/` | 新增 trajectory 采集 callback | tool loop 每一步记 action + observation，最终形成 step-wise trajectory |
 | `infer/src/http_server/` | 新增 `/v1/train/*` 控制面 | start/stop/status/checkpoint（可选，M2 之后） |
 
 ---
@@ -225,7 +225,7 @@ crates/
 **依赖**（必须先有）：
 - agent-infer 推理栈稳定（已有，CUDA/Metal 都跑通）
 - `cudarc` + `cuBLAS` 可直调（已有）
-- `crates/infer-cuda-kernels` 可被训练侧借鉴（已有）
+- `crates/cuda-kernels` 可被训练侧借鉴（已有）
 
 **不依赖**（明确切断）：
 - Python / PyTorch / HF transformers

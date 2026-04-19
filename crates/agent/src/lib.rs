@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chat::{ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition};
 use infer::sampler::SamplingParams;
 use infer::server_engine::{CompletionRequest, InferenceEngine};
-use infer_chat::{ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,11 +57,11 @@ pub trait ToolPolicy {
 }
 
 fn format_prompt(messages: &[Message], tools: &[ToolDefinition]) -> String {
-    infer_chat::messages_to_prompt(messages, tools)
+    chat::messages_to_prompt(messages, tools)
 }
 
 fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    infer_chat::parse_tool_calls(text)
+    chat::parse_tool_calls(text)
 }
 
 const DEFAULT_SYSTEM_PROMPT: &str = r"You are a local CLI assistant.
@@ -533,14 +533,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Result, anyhow};
+    use chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
     use infer::server_engine::{
         CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
         TokenUsage,
     };
-    use infer_chat::{ParsedAssistantResponse, ToolCall, ToolDefinition};
-    use infer_tools::BuiltinToolPolicyHooks;
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
+    use tools::BuiltinToolPolicyHooks;
 
     use super::{AgentSession, AgentSettings, Message, ToolExecutor, ToolPolicy};
 
@@ -617,7 +617,7 @@ mod tests {
 
     impl ToolExecutor for TestToolExecutor {
         fn execute(&self, tool_call: &ToolCall) -> String {
-            infer_tools::execute_tool_call(tool_call)
+            tools::execute_tool_call(tool_call)
         }
     }
 
@@ -696,7 +696,7 @@ mod tests {
     }
 
     fn python_tool_available() -> bool {
-        infer_tools::execute_tool("python", &json!({ "code": "print(1)" }))
+        tools::execute_tool("python", &json!({ "code": "print(1)" }))
             .trim()
             .eq("1")
     }
@@ -844,7 +844,7 @@ mod tests {
         session.reset();
 
         assert_eq!(session.messages().len(), 1);
-        assert_eq!(session.messages()[0].role, infer_chat::ChatRole::System);
+        assert_eq!(session.messages()[0].role, chat::ChatRole::System);
     }
 
     #[test]

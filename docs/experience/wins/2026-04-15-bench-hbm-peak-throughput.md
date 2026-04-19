@@ -21,7 +21,7 @@ worth writing down even though they aren't perf wins on their own:
 2. The auto-sizer's `reserved=6.4 GB` is **conservative**. Observed
    peak HBM on a saturating bench is ~15.3 GB — there is ~7 GB of
    HBM left on the table at default flags.
-3. The pre-existing `crates/infer-cuda-kernels/src/paged_kv.rs:595`
+3. The pre-existing `crates/cuda-kernels/src/paged_kv.rs:595`
    index-OOB panic from the long-seq note still fires under
    `--num-slots 14 --kv-cache-dtype int8 --kv-pool-headroom-mb 1024`
    when the publish path tries to insert a span that exceeds the

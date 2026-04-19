@@ -107,7 +107,7 @@ _Date: 2026-04-14_
 建议放置位置：
 
 - request 级元数据：`infer/src/scheduler/cuda/request.rs`
-- GPU buffer / helper：`infer/src/model/*` 或 `crates/infer-cuda-kernels/src/*`(post `a4e12f5` kernel-crate 抽取)
+- GPU buffer / helper：`infer/src/model/*` 或 `crates/cuda-kernels/src/*`(post `a4e12f5` kernel-crate 抽取)
 
 这个 buffer 的职责：
 
@@ -364,7 +364,7 @@ verify pass 才是主收益路径，优先 capture：
 
 - `infer/src/model.rs`
 - `infer/src/model/qwen3/*`
-- `crates/infer-cuda-kernels/src/paged_kv.rs`
+- `crates/cuda-kernels/src/paged_kv.rs`
 - `infer/src/scheduler/cuda/request.rs`
 
 ## Phase 3：scheduler 接 speculative
