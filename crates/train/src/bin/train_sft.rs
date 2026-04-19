@@ -44,6 +44,27 @@ impl FromStr for BackendChoice {
     }
 }
 
+// bf16 is the default because infer/'s DeviceMatrix::from_safetensors
+// reinterprets the safetensors bytes as `&[bf16]`. f32 is kept for bit-exact
+// debugging — it round-trips inside autograd but infer will reject it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveDtype {
+    F32,
+    Bf16,
+}
+
+impl FromStr for SaveDtype {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "f32" => Ok(Self::F32),
+            "bf16" => Ok(Self::Bf16),
+            _ => Err(format!("unknown save dtype: {value}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CliArgs {
     model: PathBuf,
@@ -57,6 +78,7 @@ struct CliArgs {
     save_every: usize,
     log_every: usize,
     seed: u64,
+    save_dtype: SaveDtype,
 }
 
 impl Default for CliArgs {
@@ -73,6 +95,7 @@ impl Default for CliArgs {
             save_every: 50,
             log_every: 1,
             seed: 0,
+            save_dtype: SaveDtype::Bf16,
         }
     }
 }
@@ -211,6 +234,7 @@ fn main() -> Result<(), CliError> {
                 &mut store,
                 &config_path,
                 &tokenizer_path,
+                args.save_dtype,
             )?;
         }
     }
@@ -242,6 +266,11 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.log_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--save-dtype" => {
+                args.save_dtype = next_value(&mut iter, &flag)?
+                    .parse()
+                    .map_err(|value| CliError::InvalidValue { flag, value })?;
+            }
             _ => return Err(CliError::UnknownFlag(flag)),
         }
     }
@@ -432,17 +461,23 @@ fn save_checkpoint(
     store: &mut TensorStore,
     config_path: &Path,
     tokenizer_path: &Path,
+    save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
     let step_dir = out_dir.join(format!("step_{step}"));
     fs::create_dir_all(&step_dir)?;
     fs::copy(config_path, step_dir.join("config.json"))?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
-    registry.save_from(store, &step_dir.join("model.safetensors"))?;
+    let weights_path = step_dir.join("model.safetensors");
+    match save_dtype {
+        SaveDtype::F32 => registry.save_from(store, &weights_path)?,
+        SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
+    }
     println!(
-        "[train_sft] saved checkpoint for step {} to {} (source model dir: {})",
+        "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
         step,
         step_dir.display(),
-        model_dir.display()
+        model_dir.display(),
+        save_dtype
     );
     Ok(())
 }

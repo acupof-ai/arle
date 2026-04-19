@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+use half::bf16;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors, serialize_to_file};
 
@@ -91,6 +92,28 @@ impl SafetensorsRegistry {
             .map_err(|err| tape_invariant(format!("failed to serialize safetensors: {err}")))?;
         Ok(())
     }
+
+    // infer/'s DeviceMatrix::from_safetensors reinterprets the file bytes as
+    // `&[bf16]` and rejects anything else. The f32 path above stays bit-exact
+    // for training-side roundtrip tests; this bf16 path is the one whose
+    // output infer can actually consume end-to-end.
+    pub fn save_from_bf16(&self, store: &mut TensorStore, path: &Path) -> Result<()> {
+        let mut data = Vec::with_capacity(self.map.len());
+        for (name, id) in &self.map {
+            let shape = store.tensor(*id)?.shape.clone();
+            let host = store.to_host(*id)?;
+            let bytes: Vec<u8> = host
+                .iter()
+                .flat_map(|value| bf16::from_f32(*value).to_le_bytes())
+                .collect();
+            data.push((name.clone(), TensorFileBf16View { shape, bytes }));
+        }
+
+        serialize_to_file(data, None, path).map_err(|err| {
+            tape_invariant(format!("failed to serialize bf16 safetensors: {err}"))
+        })?;
+        Ok(())
+    }
 }
 
 impl Default for SafetensorsRegistry {
@@ -107,6 +130,29 @@ struct TensorFileView {
 impl safetensors::View for TensorFileView {
     fn dtype(&self) -> Dtype {
         Dtype::F32
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.bytes.as_slice())
+    }
+
+    fn data_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+struct TensorFileBf16View {
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl safetensors::View for TensorFileBf16View {
+    fn dtype(&self) -> Dtype {
+        Dtype::BF16
     }
 
     fn shape(&self) -> &[usize] {
@@ -149,7 +195,6 @@ fn tape_invariant(message: String) -> AutogradError {
 mod tests {
     use super::*;
 
-    use half::bf16;
     use safetensors::{Dtype, serialize_to_file};
     use tempfile::tempdir;
 
@@ -261,6 +306,44 @@ mod tests {
         for (got, want) in loaded.iter().zip(expected.iter()) {
             assert!((got - want).abs() <= 1e-2, "got {got}, want {want}");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_bf16_via_save() -> Result<()> {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("roundtrip-bf16.safetensors");
+
+        // Pick values that actually survive bf16's 7-bit mantissa; we still
+        // assert with a relative tolerance because bf16 is lossy.
+        let source_values = vec![1.0_f32, -2.5, 3.25, 0.0];
+        let mut source_store = TensorStore::default();
+        let weight_id =
+            source_store.alloc(GpuTensor::new(source_values.clone(), vec![2, 2], true)?);
+        let mut source_registry = SafetensorsRegistry::new();
+        source_registry.insert("weight", weight_id);
+        source_registry.save_from_bf16(&mut source_store, &path)?;
+
+        let mut loaded_store = TensorStore::default();
+        let mut loaded_registry = SafetensorsRegistry::new();
+        loaded_registry.load_into(&mut loaded_store, &path)?;
+
+        let loaded = loaded_store.to_host(loaded_registry.get("weight").expect("weight id"))?;
+        assert_eq!(loaded.len(), source_values.len());
+        for (got, want) in loaded.iter().zip(source_values.iter()) {
+            let tol = want.abs().max(1.0) * 1e-2;
+            assert!(
+                (got - want).abs() <= tol,
+                "bf16 roundtrip drift: got {got}, want {want}"
+            );
+        }
+        assert_eq!(
+            loaded_store
+                .tensor(loaded_registry.get("weight").expect("weight id"))?
+                .shape,
+            vec![2, 2]
+        );
 
         Ok(())
     }
