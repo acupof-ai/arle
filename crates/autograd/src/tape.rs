@@ -37,8 +37,15 @@ pub enum SavedContext {
         weight: TensorId,
         inv_rms: Vec<f32>,
     },
+    SiluCtx {
+        x: TensorId,
+    },
     GeluCtx {
         x: TensorId,
+    },
+    RoPECtx {
+        cos: TensorId,
+        sin: TensorId,
     },
     ReshapeCtx {
         input_shape: Vec<usize>,
@@ -70,7 +77,9 @@ pub enum BackwardOp {
     Gather,
     Mean,
     RMSNorm,
+    Silu,
     Gelu,
+    RoPE,
     Reshape,
     Transpose,
     AddBroadcast,
@@ -186,7 +195,9 @@ impl Tape {
                     }
                     BackwardOp::Mean => ops::mean_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Silu => ops::silu_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::RoPE => ops::rope_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Transpose => {
                         ops::transpose_backward(&entry, output_grad_id, store)?
