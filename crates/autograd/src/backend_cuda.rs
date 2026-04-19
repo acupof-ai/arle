@@ -389,6 +389,48 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn matmul_backward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+        grad_out: &[f32],
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (
+                a,
+                a_shape,
+                b,
+                b_shape,
+                grad_out,
+                grad_out_shape,
+                need_grad_a,
+                need_grad_b,
+            );
+            todo!("GPU required: cuda matmul_backward is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_matmul_backward(
+                self,
+                a,
+                a_shape,
+                b,
+                b_shape,
+                grad_out,
+                grad_out_shape,
+                need_grad_a,
+                need_grad_b,
+            )
+        }
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -685,6 +727,220 @@ fn shape_size(shape: &[usize]) -> usize {
         1
     } else {
         shape.iter().product()
+    }
+}
+
+// Compute both matmul gradients via two cuBLAS SGEMM calls with an OP_T on
+// whichever operand must be transposed; avoids the host-side physical
+// transpose the old CPU fallback did and keeps the math on-device.
+//
+// Row-major conventions in the header comment (swap-and-OP_N forward trick)
+// carry through: we reuse the same "pass B first, then A" ordering. For
+// `grad_a = dC @ B^T` we pass `(B, dC, transa=OP_T, transb=OP_N)`; for
+// `grad_b = A^T @ dC` we pass `(dC, A, transa=OP_N, transb=OP_T)`. See the
+// file-level comment + derivation in the companion commit for the full
+// dimension/ld walk-through. PENDING REMOTE CUDA VERIFICATION.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_matmul_backward(
+    backend: &CudaBackend,
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    grad_out: &[f32],
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let expected_out = matmul_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+
+    if !need_grad_a && !need_grad_b {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    match (a_shape.len(), b_shape.len()) {
+        (2, 2) => {
+            let m = a_shape[0];
+            let k = a_shape[1];
+            let n = b_shape[1];
+
+            // Upload inputs once each and reuse for both SGEMMs.
+            let d_a = backend.upload_slice(a, a_shape)?;
+            let d_b = backend.upload_slice(b, b_shape)?;
+            let d_g = backend.upload_slice(grad_out, grad_out_shape)?;
+
+            let grad_a_host = if need_grad_a {
+                // grad_a[M,K] = grad_out[M,N] @ B^T[N,K]
+                // cuBLAS: first_arg=B(OP_T), second_arg=dC(OP_N); m=K,n=M,k=N.
+                // lda = N (B cm[N,K]), ldb = N (dC cm[N,M]), ldc = K.
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(m * k)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let cfg = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: k as i32,
+                    n: m as i32,
+                    k: n as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: n as i32,
+                    beta: 0.0,
+                    ldc: k as i32,
+                };
+                // Safety: dims validated; device buffers outlive the call.
+                unsafe {
+                    backend.blas.gemm(cfg, &d_b, &d_g, &mut c).map_err(|_| {
+                        AutogradError::TapeInvariant("cuBLAS sgemm failed (grad_a)")
+                    })?;
+                }
+                cuda_download(backend, &c, m * k)?
+            } else {
+                Vec::new()
+            };
+
+            let grad_b_host = if need_grad_b {
+                // grad_b[K,N] = A^T[K,M] @ grad_out[M,N]
+                // cuBLAS: first_arg=dC(OP_N), second_arg=A(OP_T); m=N,n=K,k=M.
+                // lda = N (dC cm[N,M]), ldb = K (A cm[K,M]), ldc = N.
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(k * n)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let cfg = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublasOperation_t::CUBLAS_OP_T,
+                    m: n as i32,
+                    n: k as i32,
+                    k: m as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: k as i32,
+                    beta: 0.0,
+                    ldc: n as i32,
+                };
+                // Safety: dims validated; device buffers outlive the call.
+                unsafe {
+                    backend.blas.gemm(cfg, &d_g, &d_a, &mut c).map_err(|_| {
+                        AutogradError::TapeInvariant("cuBLAS sgemm failed (grad_b)")
+                    })?;
+                }
+                cuda_download(backend, &c, k * n)?
+            } else {
+                Vec::new()
+            };
+
+            Ok((grad_a_host, grad_b_host))
+        }
+        (3, 3) => {
+            let batch = a_shape[0];
+            let m = a_shape[1];
+            let k = a_shape[2];
+            let n = b_shape[2];
+            if b_shape[0] != batch || grad_out_shape[0] != batch {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: vec![batch],
+                    got: vec![b_shape[0].min(grad_out_shape[0])],
+                });
+            }
+
+            let d_a = backend.upload_slice(a, a_shape)?;
+            let d_b = backend.upload_slice(b, b_shape)?;
+            let d_g = backend.upload_slice(grad_out, grad_out_shape)?;
+
+            let grad_a_host = if need_grad_a {
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(batch * m * k)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let gemm = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_T,
+                    transb: cublasOperation_t::CUBLAS_OP_N,
+                    m: k as i32,
+                    n: m as i32,
+                    k: n as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: n as i32,
+                    beta: 0.0,
+                    ldc: k as i32,
+                };
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm,
+                    batch_size: batch as i32,
+                    stride_a: (k * n) as i64,
+                    stride_b: (m * n) as i64,
+                    stride_c: (m * k) as i64,
+                };
+                // Safety: dims validated; buffers outlive the call.
+                unsafe {
+                    backend
+                        .blas
+                        .gemm_strided_batched(cfg, &d_b, &d_g, &mut c)
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant(
+                                "cuBLAS sgemm_strided_batched failed (grad_a)",
+                            )
+                        })?;
+                }
+                cuda_download(backend, &c, batch * m * k)?
+            } else {
+                Vec::new()
+            };
+
+            let grad_b_host = if need_grad_b {
+                let mut c = backend
+                    .stream
+                    .alloc_zeros::<f32>(batch * k * n)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                let gemm = GemmConfig::<f32> {
+                    transa: cublasOperation_t::CUBLAS_OP_N,
+                    transb: cublasOperation_t::CUBLAS_OP_T,
+                    m: n as i32,
+                    n: k as i32,
+                    k: m as i32,
+                    alpha: 1.0,
+                    lda: n as i32,
+                    ldb: k as i32,
+                    beta: 0.0,
+                    ldc: n as i32,
+                };
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm,
+                    batch_size: batch as i32,
+                    stride_a: (m * n) as i64,
+                    stride_b: (m * k) as i64,
+                    stride_c: (k * n) as i64,
+                };
+                // Safety: dims validated; buffers outlive the call.
+                unsafe {
+                    backend
+                        .blas
+                        .gemm_strided_batched(cfg, &d_g, &d_a, &mut c)
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant(
+                                "cuBLAS sgemm_strided_batched failed (grad_b)",
+                            )
+                        })?;
+                }
+                cuda_download(backend, &c, batch * k * n)?
+            } else {
+                Vec::new()
+            };
+
+            Ok((grad_a_host, grad_b_host))
+        }
+        _ => Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2 or rank-3",
+            got: a_shape.len().max(b_shape.len()),
+        }),
     }
 }
 

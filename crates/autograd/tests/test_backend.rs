@@ -7,10 +7,10 @@ use autograd::{
     CpuBackend,
     backend::{
         Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
-        cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_forward,
-        cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward,
-        cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward, cpu_silu_forward,
-        cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
+        cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_backward,
+        cpu_matmul_forward, cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward,
+        cpu_neg_forward, cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward,
+        cpu_silu_forward, cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
     },
 };
 
@@ -1098,5 +1098,172 @@ fn cuda_backend_add_broadcast_matches_cpu() {
             .expect("cuda add_broadcast");
         let want = reference_add_broadcast(&a, a_shape, &b, b_shape);
         assert_close(&got, &want, 1e-5, "cuda add_broadcast");
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// matmul_backward parity tests.
+// Three shapes, mirroring the forward parity block:
+//   [8,16] @ [16,32]       — small 2D
+//   [4,64] @ [64,64]       — square 2D
+//   [3,8,16] @ [3,16,32]   — batched 3D
+// Each case validates `grad_a = dC @ B^T` and `grad_b = A^T @ dC` against
+// the CPU reference (`cpu_matmul_backward`).
+// ──────────────────────────────────────────────────────────────────────
+
+fn matmul_backward_cases() -> Vec<(Vec<usize>, Vec<usize>, Vec<usize>, u64, u64, u64)> {
+    vec![
+        (
+            vec![8, 16],
+            vec![16, 32],
+            vec![8, 32],
+            0xA1A1,
+            0xB2B2,
+            0xC3C3,
+        ),
+        (
+            vec![4, 64],
+            vec![64, 64],
+            vec![4, 64],
+            0xA4A4,
+            0xB5B5,
+            0xC6C6,
+        ),
+        (
+            vec![3, 8, 16],
+            vec![3, 16, 32],
+            vec![3, 8, 32],
+            0xA7A7,
+            0xB8B8,
+            0xC9C9,
+        ),
+    ]
+}
+
+#[test]
+fn cpu_backend_matmul_backward_matches_reference() {
+    let backend = CpuBackend;
+    for (a_shape, b_shape, c_shape, sa, sb, sc) in matmul_backward_cases() {
+        let a = make_rows(&a_shape, sa);
+        let b = make_rows(&b_shape, sb);
+        let grad_out = make_rows(&c_shape, sc);
+        let (got_a, got_b) = backend
+            .matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+            .expect("cpu backward");
+        let (want_a, want_b) =
+            cpu_matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+                .expect("cpu ref");
+        assert_close(
+            &got_a,
+            &want_a,
+            1e-5,
+            &format!("cpu backward grad_a {a_shape:?}"),
+        );
+        assert_close(
+            &got_b,
+            &want_b,
+            1e-5,
+            &format!("cpu backward grad_b {a_shape:?}"),
+        );
+    }
+}
+
+#[test]
+fn cpu_matmul_backward_skips_unneeded_sides() {
+    // need_grad_a=false → grad_a is empty; need_grad_b=false → grad_b empty.
+    let a = make_rows(&[4, 6], 1);
+    let b = make_rows(&[6, 5], 2);
+    let grad_out = make_rows(&[4, 5], 3);
+    let (grad_a, grad_b) =
+        cpu_matmul_backward(&a, &[4, 6], &b, &[6, 5], &grad_out, &[4, 5], true, false).unwrap();
+    assert_eq!(grad_a.len(), 24);
+    assert!(grad_b.is_empty());
+    let (grad_a, grad_b) =
+        cpu_matmul_backward(&a, &[4, 6], &b, &[6, 5], &grad_out, &[4, 5], false, true).unwrap();
+    assert!(grad_a.is_empty());
+    assert_eq!(grad_b.len(), 30);
+    let (grad_a, grad_b) =
+        cpu_matmul_backward(&a, &[4, 6], &b, &[6, 5], &grad_out, &[4, 5], false, false).unwrap();
+    assert!(grad_a.is_empty());
+    assert!(grad_b.is_empty());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_matmul_backward_matches_cpu() {
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    for (a_shape, b_shape, c_shape, sa, sb, sc) in matmul_backward_cases() {
+        let a = make_rows(&a_shape, sa ^ 0xFEED);
+        let b = make_rows(&b_shape, sb ^ 0xFEED);
+        let grad_out = make_rows(&c_shape, sc ^ 0xFEED);
+        let (got_a, got_b) = backend
+            .matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+            .expect("metal backward");
+        let (want_a, want_b) =
+            cpu_matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+                .expect("cpu ref");
+        assert_close(
+            &got_a,
+            &want_a,
+            1e-3,
+            &format!("metal backward grad_a {a_shape:?}"),
+        );
+        assert_close(
+            &got_b,
+            &want_b,
+            1e-3,
+            &format!("metal backward grad_b {a_shape:?}"),
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_matmul_backward_skip_sides() {
+    // `need_grad_*=false` on one side must yield an empty vec; the other
+    // side still matches the CPU reference exactly (mod tolerance).
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 16], 1);
+    let b = make_rows(&[16, 8], 2);
+    let grad_out = make_rows(&[4, 8], 3);
+    let (got_a, got_b) = backend
+        .matmul_backward(&a, &[4, 16], &b, &[16, 8], &grad_out, &[4, 8], true, false)
+        .expect("metal backward");
+    assert_eq!(got_a.len(), 4 * 16);
+    assert!(got_b.is_empty());
+    let (want_a, _) =
+        cpu_matmul_backward(&a, &[4, 16], &b, &[16, 8], &grad_out, &[4, 8], true, false).unwrap();
+    assert_close(&got_a, &want_a, 1e-3, "metal backward skip grad_b");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_matmul_backward_matches_cpu() {
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    for (a_shape, b_shape, c_shape, sa, sb, sc) in matmul_backward_cases() {
+        let a = make_rows(&a_shape, sa ^ 0xBEEF);
+        let b = make_rows(&b_shape, sb ^ 0xBEEF);
+        let grad_out = make_rows(&c_shape, sc ^ 0xBEEF);
+        let (got_a, got_b) = backend
+            .matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+            .expect("cuda backward");
+        let (want_a, want_b) =
+            cpu_matmul_backward(&a, &a_shape, &b, &b_shape, &grad_out, &c_shape, true, true)
+                .expect("cpu ref");
+        assert_close(
+            &got_a,
+            &want_a,
+            1e-3,
+            &format!("cuda backward grad_a {a_shape:?}"),
+        );
+        assert_close(
+            &got_b,
+            &want_b,
+            1e-3,
+            &format!("cuda backward grad_b {a_shape:?}"),
+        );
     }
 }

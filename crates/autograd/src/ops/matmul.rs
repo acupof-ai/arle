@@ -73,32 +73,29 @@ pub(crate) fn matmul_backward(
     let mut grads = GradPairs::new();
     match (a_tensor.shape.len(), b_tensor.shape.len()) {
         (2, 2) | (3, 3) => {
-            if a_tensor.requires_grad {
-                // grad_a = upstream @ b^T
-                let (b_t, b_t_shape) = transpose_last_two(&b_tensor.data, &b_tensor.shape);
-                let (grad_a, grad_a_shape) = store.backend().matmul_forward(
+            let need_grad_a = a_tensor.requires_grad;
+            let need_grad_b = b_tensor.requires_grad;
+            if need_grad_a || need_grad_b {
+                let (grad_a_data, grad_b_data) = store.backend().matmul_backward(
+                    &a_tensor.data,
+                    &a_tensor.shape,
+                    &b_tensor.data,
+                    &b_tensor.shape,
                     &upstream.data,
                     &upstream.shape,
-                    &b_t,
-                    &b_t_shape,
+                    need_grad_a,
+                    need_grad_b,
                 )?;
-                debug_assert_eq!(grad_a_shape, a_tensor.shape);
-                let grad_id = store.alloc(Tensor::new(grad_a, grad_a_shape, false)?);
-                grads.push((a, grad_id));
-            }
-
-            if b_tensor.requires_grad {
-                // grad_b = a^T @ upstream
-                let (a_t, a_t_shape) = transpose_last_two(&a_tensor.data, &a_tensor.shape);
-                let (grad_b, grad_b_shape) = store.backend().matmul_forward(
-                    &a_t,
-                    &a_t_shape,
-                    &upstream.data,
-                    &upstream.shape,
-                )?;
-                debug_assert_eq!(grad_b_shape, b_tensor.shape);
-                let grad_id = store.alloc(Tensor::new(grad_b, grad_b_shape, false)?);
-                grads.push((b, grad_id));
+                if need_grad_a {
+                    let grad_id =
+                        store.alloc(Tensor::new(grad_a_data, a_tensor.shape.clone(), false)?);
+                    grads.push((a, grad_id));
+                }
+                if need_grad_b {
+                    let grad_id =
+                        store.alloc(Tensor::new(grad_b_data, b_tensor.shape.clone(), false)?);
+                    grads.push((b, grad_id));
+                }
             }
         }
         _ => {
@@ -110,47 +107,6 @@ pub(crate) fn matmul_backward(
     }
 
     Ok(grads)
-}
-
-/// Physically transpose the inner-most two axes of a rank-2 or rank-3 row-major
-/// tensor. Returns `(data, shape)` for the transposed tensor. O(N) memory
-/// movement — kept on CPU since it is not a FLOP-bound op.
-fn transpose_last_two(data: &[f32], shape: &[usize]) -> (Vec<f32>, Vec<usize>) {
-    match shape.len() {
-        2 => {
-            let rows = shape[0];
-            let cols = shape[1];
-            let mut out = vec![0.0f32; rows * cols];
-            for row in 0..rows {
-                for col in 0..cols {
-                    out[col * rows + row] = data[row * cols + col];
-                }
-            }
-            (out, vec![cols, rows])
-        }
-        3 => {
-            let batch = shape[0];
-            let rows = shape[1];
-            let cols = shape[2];
-            let plane = rows * cols;
-            let mut out = vec![0.0f32; batch * plane];
-            for batch_index in 0..batch {
-                let base = batch_index * plane;
-                for row in 0..rows {
-                    for col in 0..cols {
-                        out[base + col * rows + row] = data[base + row * cols + col];
-                    }
-                }
-            }
-            (out, vec![batch, cols, rows])
-        }
-        _ => {
-            // Unreachable in practice: matmul_backward validates rank before
-            // calling in. Fall through to an identity to keep this helper
-            // total.
-            (data.to_vec(), shape.to_vec())
-        }
-    }
 }
 
 fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {

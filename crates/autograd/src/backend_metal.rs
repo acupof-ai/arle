@@ -14,7 +14,7 @@ use mlx_sys::{
     mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval, mlx_exp,
     mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative,
     mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract, mlx_sum_axis,
-    mlx_take_axis, mlx_tanh,
+    mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -174,6 +174,29 @@ impl Backend for MetalBackend {
         Ok((out, out_shape))
     }
 
+    fn matmul_backward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+        grad_out: &[f32],
+        grad_out_shape: &[usize],
+        need_grad_a: bool,
+        need_grad_b: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        mlx_matmul_backward(
+            a,
+            a_shape,
+            b,
+            b_shape,
+            grad_out,
+            grad_out_shape,
+            need_grad_a,
+            need_grad_b,
+        )
+    }
+
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         mlx_softmax_like(x, shape, SoftmaxKind::Softmax)
     }
@@ -306,6 +329,202 @@ impl Backend for MetalBackend {
         vocab: usize,
     ) -> Result<Vec<f32>> {
         mlx_scatter_add_rows(upstream, prefix_rows, feature_dim, indices, vocab)
+    }
+}
+
+// Compute matmul gradients on-device. `grad_a = grad_out @ B^T` and
+// `grad_b = A^T @ grad_out`; the inner-most two axes of A/B are transposed
+// via `mlx_transpose_axes` (a lazy view that MLX fuses into the GEMM), so
+// no host-side transpose or extra upload is needed. The `need_grad_a`/
+// `need_grad_b` gates let the caller skip whichever SGEMM is not needed.
+//
+// One MLX round-trip per requested gradient: upload A, B, grad_out once,
+// issue two matmuls and one eval, then copy the results back. Mirrors the
+// forward's lock/eval/readback discipline.
+fn mlx_matmul_backward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    grad_out: &[f32],
+    grad_out_shape: &[usize],
+    need_grad_a: bool,
+    need_grad_b: bool,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let expected_out = matmul_output_shape(a_shape, b_shape)?;
+    if grad_out_shape != expected_out.as_slice() {
+        return Err(AutogradError::ShapeMismatch {
+            expected: expected_out,
+            got: grad_out_shape.to_vec(),
+        });
+    }
+    let a_size: usize = a_shape.iter().product();
+    let b_size: usize = b_shape.iter().product();
+    let g_size: usize = grad_out_shape.iter().product();
+    if a.len() != a_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: a_size,
+        });
+    }
+    if b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+    if grad_out.len() != g_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: grad_out.len(),
+            shape: grad_out_shape.to_vec(),
+            size: g_size,
+        });
+    }
+
+    if !need_grad_a && !need_grad_b {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let rank = a_shape.len();
+    if rank != 2 && rank != 3 {
+        return Err(AutogradError::InvalidRank {
+            expected: "both operands must be rank-2 or rank-3",
+            got: rank,
+        });
+    }
+
+    // Axes permutation that swaps the last two dims (rank 2 or 3). MLX's
+    // transpose_axes takes the full permutation vector.
+    let transpose_axes: Vec<i32> = if rank == 2 { vec![1, 0] } else { vec![0, 2, 1] };
+
+    let a_shape_i32: Vec<i32> = a_shape.iter().map(|&d| d as i32).collect();
+    let b_shape_i32: Vec<i32> = b_shape.iter().map(|&d| d as i32).collect();
+    let g_shape_i32: Vec<i32> = grad_out_shape.iter().map(|&d| d as i32).collect();
+
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `a`, `b`, `grad_out` outlive the FFI calls (MLX copies host
+    // slices into its own storage); every MLX array allocated below is freed
+    // on every return path.
+    unsafe {
+        let g_arr = mlx_array_from_data(
+            grad_out.as_ptr() as *const c_void,
+            g_shape_i32.as_ptr(),
+            g_shape_i32.len() as i32,
+            MLX_FLOAT32,
+        );
+        if g_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (grad_out)",
+            ));
+        }
+
+        // grad_a = grad_out @ B^T
+        let grad_a_host = if need_grad_a {
+            let b_arr = mlx_array_from_data(
+                b.as_ptr() as *const c_void,
+                b_shape_i32.as_ptr(),
+                b_shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if b_arr.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null (b)",
+                ));
+            }
+            let b_t = mlx_transpose_axes(b_arr, transpose_axes.as_ptr(), transpose_axes.len());
+            mlx_array_free(b_arr);
+            if b_t.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_transpose_axes returned null (b)",
+                ));
+            }
+            let out = mlx_matmul(g_arr, b_t);
+            mlx_array_free(b_t);
+            if out.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_matmul returned null (grad_a)",
+                ));
+            }
+            let host = match eval_and_readback(out) {
+                Ok(h) => h,
+                Err(e) => {
+                    mlx_array_free(out);
+                    mlx_array_free(g_arr);
+                    return Err(e);
+                }
+            };
+            mlx_array_free(out);
+            if host.len() != a_size {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::ShapeMismatch {
+                    expected: a_shape.to_vec(),
+                    got: vec![host.len()],
+                });
+            }
+            host
+        } else {
+            Vec::new()
+        };
+
+        // grad_b = A^T @ grad_out
+        let grad_b_host = if need_grad_b {
+            let a_arr = mlx_array_from_data(
+                a.as_ptr() as *const c_void,
+                a_shape_i32.as_ptr(),
+                a_shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if a_arr.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null (a)",
+                ));
+            }
+            let a_t = mlx_transpose_axes(a_arr, transpose_axes.as_ptr(), transpose_axes.len());
+            mlx_array_free(a_arr);
+            if a_t.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_transpose_axes returned null (a)",
+                ));
+            }
+            let out = mlx_matmul(a_t, g_arr);
+            mlx_array_free(a_t);
+            if out.is_null() {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_matmul returned null (grad_b)",
+                ));
+            }
+            let host = match eval_and_readback(out) {
+                Ok(h) => h,
+                Err(e) => {
+                    mlx_array_free(out);
+                    mlx_array_free(g_arr);
+                    return Err(e);
+                }
+            };
+            mlx_array_free(out);
+            if host.len() != b_size {
+                mlx_array_free(g_arr);
+                return Err(AutogradError::ShapeMismatch {
+                    expected: b_shape.to_vec(),
+                    got: vec![host.len()],
+                });
+            }
+            host
+        } else {
+            Vec::new()
+        };
+
+        mlx_array_free(g_arr);
+        Ok((grad_a_host, grad_b_host))
     }
 }
 
