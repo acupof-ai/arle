@@ -4,10 +4,14 @@
 // cost beyond a single thread-safe getenv cache check + atomic increment.
 //
 // Env vars:
-//   INFER_CAPTURE_STEP=N    Capture the Nth invocation (0-indexed; N=0 = first
-//                           call after the hook is first observed). Unset =
-//                           capture disabled entirely (zero work on the hot
-//                           path beyond one relaxed atomic load).
+//   INFER_CAPTURE_STEP=N    Capture the Nth `qwen35_compiled_step_session`
+//                           invocation (0-indexed). The counter is PROCESS-
+//                           GLOBAL and never resets, so warmup runs count
+//                           too — for `metal_bench --warmup W
+//                           --generation-tokens G --use-step-driver`, the
+//                           first post-warmup decode step is N = W*G.
+//                           Unset = capture disabled entirely (zero work on
+//                           the hot path beyond one relaxed atomic load).
 //   INFER_CAPTURE_PATH=...  Destination `.gputrace` path. Default:
 //                           /tmp/qwen35_step_<unix_timestamp>.gputrace
 //   MTL_CAPTURE_ENABLED=1   Required by Apple's toolchain before programmatic

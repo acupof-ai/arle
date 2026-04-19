@@ -72,14 +72,15 @@ Env vars:
 | Var | Required? | Meaning |
 |---|---|---|
 | `MTL_CAPTURE_ENABLED=1` | yes | Apple toolchain gate; without it `startCaptureWithDescriptor` fails |
-| `INFER_CAPTURE_STEP=N` | yes to enable | 0-indexed step to capture; N=0 captures the first `qwen35_compiled_step_session` invocation (which in `metal_bench` is post-`--warmup` when driving via `--use-step-driver`) |
+| `INFER_CAPTURE_STEP=N` | yes to enable | 0-indexed count of `qwen35_compiled_step_session` calls **since process start**, across all warmup and timed runs — the counter is process-global and never resets. For `metal_bench --warmup W --generation-tokens G --use-step-driver`, the first post-warmup decode step is `N = W*G`. Example: `--warmup 3 --generation-tokens 10` → `INFER_CAPTURE_STEP=30` captures the first decode step of the first timed run; `=31` captures its 2nd; etc. |
 | `INFER_CAPTURE_PATH=/path/foo.gputrace` | no | Override output path. Default: `/tmp/qwen35_step_<unix_timestamp>.gputrace` |
 
-Run:
+Run (example: capture 1st timed-run decode with 3 warmup runs × 10 decode
+tokens each = 30 prior invocations, so target step index = 30):
 
 ```bash
 MTL_CAPTURE_ENABLED=1 \
-INFER_CAPTURE_STEP=5 \
+INFER_CAPTURE_STEP=30 \
 INFER_CAPTURE_PATH=/tmp/qwen35_step_c1.gputrace \
   ./target/release/metal_bench \
     --model /path/to/Qwen3.5-4B-MLX-4bit \
@@ -93,9 +94,15 @@ INFER_CAPTURE_PATH=/tmp/qwen35_step_c1.gputrace \
 Stderr will show:
 
 ```
-[capture] started GPU trace at step 5 → /tmp/qwen35_step_c1.gputrace
+[capture] started GPU trace at step 30 → /tmp/qwen35_step_c1.gputrace
 [capture] stopped GPU trace → /tmp/qwen35_step_c1.gputrace
 ```
+
+> **Note on eval ordering**: the hook forces `eval(outputs)` **before** the
+> step's session state is mutated. This is a deliberate correctness choice:
+> if `eval` fails (OOM / Metal runtime error), the catch rolls back cleanly
+> — no leaked output handle, no half-advanced session caches. See
+> `crates/mlx-sys/src/mlx_qwen35_model.cpp::qwen35_compiled_step_session`.
 
 The hook calls `eval(...)` on logits + caches inside the capture window so
 the `.gputrace` actually contains the step's GPU dispatches rather than just
