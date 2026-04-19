@@ -171,6 +171,72 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     fn log_softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
         cpu_log_softmax_forward_last_axis(x, shape)
     }
+
+    /// Elementwise `out = a * b` over identically-sized contiguous tensors.
+    fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+        cpu_mul_forward(a, b)
+    }
+
+    /// Elementwise `out = a * s` for scalar `s`.
+    fn mul_scalar_forward(&self, a: &[f32], s: f32) -> Result<Vec<f32>> {
+        cpu_mul_scalar_forward(a, s)
+    }
+
+    /// Elementwise `out = exp(a)`.
+    fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_exp_forward(a)
+    }
+
+    /// Elementwise `out = -a`.
+    fn neg_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_neg_forward(a)
+    }
+
+    /// Elementwise GELU (tanh approximation), matches `ops::activation::gelu`.
+    fn gelu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_gelu_forward(a)
+    }
+
+    /// Elementwise SiLU (Swish) — `out = a * sigmoid(a)`.
+    fn silu_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_silu_forward(a)
+    }
+
+    /// Row-wise RMSNorm over the last axis. `weight` has length = last_dim;
+    /// `x` is a contiguous tensor of any rank ≥ 1 with last dim matching.
+    fn rms_norm_forward(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        shape: &[usize],
+        eps: f32,
+    ) -> Result<Vec<f32>> {
+        cpu_rms_norm_forward(x, weight, shape, eps)
+    }
+
+    /// Gather embedding rows by token ids.
+    /// `weight` is `[vocab, dim]` row-major; `ids` has length `n_ids`.
+    /// Returns a contiguous `[n_ids * dim]` buffer shaped by the caller.
+    fn embedding_forward(
+        &self,
+        weight: &[f32],
+        vocab: usize,
+        dim: usize,
+        ids: &[i32],
+    ) -> Result<Vec<f32>> {
+        cpu_embedding_forward(weight, vocab, dim, ids)
+    }
+
+    /// Reduce-sum over the last axis. Output has length `product(shape[..-1])`
+    /// (or 1 if `shape.len() == 1`).
+    fn sum_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        cpu_sum_last_axis_forward(x, shape)
+    }
+
+    /// Reduce-mean over the last axis.
+    fn mean_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        cpu_mean_last_axis_forward(x, shape)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -388,6 +454,167 @@ pub fn cpu_log_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<V
         for col in 0..last_dim {
             out[base + col] = (slice[col] - max_value) - log_denom;
         }
+    }
+    Ok(out)
+}
+
+/// CPU reference `out = a * b` for equal-length contiguous slices.
+pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+    if a.len() != b.len() {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![a.len()],
+            got: vec![b.len()],
+        });
+    }
+    Ok(a.iter().zip(b.iter()).map(|(x, y)| x * y).collect())
+}
+
+/// CPU reference `out = a * s`.
+pub fn cpu_mul_scalar_forward(a: &[f32], s: f32) -> Result<Vec<f32>> {
+    Ok(a.iter().map(|x| x * s).collect())
+}
+
+/// CPU reference `out = exp(a)`.
+pub fn cpu_exp_forward(a: &[f32]) -> Result<Vec<f32>> {
+    Ok(a.iter().map(|x| x.exp()).collect())
+}
+
+/// CPU reference `out = -a`.
+pub fn cpu_neg_forward(a: &[f32]) -> Result<Vec<f32>> {
+    Ok(a.iter().map(|x| -x).collect())
+}
+
+/// CPU reference GELU (tanh approximation). Matches the CUDA `gelu_f32` kernel.
+pub fn cpu_gelu_forward(a: &[f32]) -> Result<Vec<f32>> {
+    const K: f32 = 0.797_884_6_f32; // sqrt(2/pi)
+    Ok(a.iter()
+        .map(|&x| {
+            let inner = K * (x + 0.044_715_f32 * x * x * x);
+            0.5_f32 * x * (1.0_f32 + inner.tanh())
+        })
+        .collect())
+}
+
+/// CPU reference SiLU (Swish): `out = a * sigmoid(a)`.
+pub fn cpu_silu_forward(a: &[f32]) -> Result<Vec<f32>> {
+    Ok(a.iter()
+        .map(|&x| x * (1.0_f32 / (1.0_f32 + (-x).exp())))
+        .collect())
+}
+
+/// CPU reference RMSNorm over the last axis.
+pub fn cpu_rms_norm_forward(
+    x: &[f32],
+    weight: &[f32],
+    shape: &[usize],
+    eps: f32,
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+    if weight.len() != last_dim {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![last_dim],
+            got: vec![weight.len()],
+        });
+    }
+
+    let rows = expected / last_dim;
+    let mut out = vec![0.0_f32; expected];
+    for row in 0..rows {
+        let base = row * last_dim;
+        let slice = &x[base..base + last_dim];
+        let mean_sq = slice.iter().map(|v| v * v).sum::<f32>() / last_dim as f32;
+        let inv_rms = (mean_sq + eps).sqrt().recip();
+        for col in 0..last_dim {
+            out[base + col] = slice[col] * inv_rms * weight[col];
+        }
+    }
+    Ok(out)
+}
+
+/// CPU reference embedding gather. Returns `[n_ids * dim]` row-major; ids out
+/// of range produce a zero row (matches the CUDA kernel's behavior).
+pub fn cpu_embedding_forward(
+    weight: &[f32],
+    vocab: usize,
+    dim: usize,
+    ids: &[i32],
+) -> Result<Vec<f32>> {
+    if weight.len() != vocab * dim {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![vocab * dim],
+            got: vec![weight.len()],
+        });
+    }
+    let mut out = vec![0.0_f32; ids.len() * dim];
+    for (row, &id) in ids.iter().enumerate() {
+        if id < 0 {
+            continue;
+        }
+        let id = id as usize;
+        if id >= vocab {
+            continue;
+        }
+        let src = &weight[id * dim..(id + 1) * dim];
+        let dst = &mut out[row * dim..(row + 1) * dim];
+        dst.copy_from_slice(src);
+    }
+    Ok(out)
+}
+
+/// CPU reference sum over the last axis.
+pub fn cpu_sum_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+    let rows = expected / last_dim;
+    let mut out = vec![0.0_f32; rows];
+    for (row, slot) in out.iter_mut().enumerate().take(rows) {
+        let base = row * last_dim;
+        *slot = x[base..base + last_dim].iter().sum();
+    }
+    Ok(out)
+}
+
+/// CPU reference mean over the last axis.
+pub fn cpu_mean_last_axis_forward(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    let mut out = cpu_sum_last_axis_forward(x, shape)?;
+    let inv = 1.0_f32 / last_dim as f32;
+    for v in out.iter_mut() {
+        *v *= inv;
     }
     Ok(out)
 }
