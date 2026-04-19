@@ -1,5 +1,7 @@
 #[path = "ops/activation.rs"]
 pub mod activation;
+#[path = "ops/attention.rs"]
+pub mod attention;
 #[path = "ops/broadcast.rs"]
 pub mod broadcast;
 #[path = "ops/elementwise.rs"]
@@ -16,6 +18,8 @@ pub mod matmul;
 pub mod norm;
 #[path = "ops/reduce.rs"]
 pub mod reduce;
+#[path = "ops/rope.rs"]
+pub mod rope;
 #[path = "ops/softmax.rs"]
 pub mod softmax;
 
@@ -25,7 +29,7 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-pub(crate) use activation::{exp_backward, gelu_backward};
+pub(crate) use activation::{exp_backward, gelu_backward, silu_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
@@ -34,6 +38,7 @@ pub(crate) use layout::{reshape_backward, transpose_backward};
 pub(crate) use matmul::matmul_backward;
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
+pub(crate) use rope::rope_backward;
 pub(crate) use softmax::{log_softmax_backward, softmax_backward};
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
@@ -44,6 +49,33 @@ pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_host(x)?;
     activation::gelu(x, store, tape)
+}
+
+pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_host(x)?;
+    activation::silu(x, store, tape)
+}
+
+pub fn repeat_kv(
+    x: TensorId,
+    n_rep: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    attention::repeat_kv(x, n_rep, store, tape)
+}
+
+pub fn causal_sdpa(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_host(q)?;
+    store.ensure_host(k)?;
+    store.ensure_host(v)?;
+    attention::causal_sdpa(q, k, v, store, tape)
 }
 
 pub fn add_broadcast(
@@ -137,6 +169,19 @@ pub fn rmsnorm(
     store.ensure_host(x)?;
     store.ensure_host(weight)?;
     norm::rmsnorm(x, weight, eps, store, tape)
+}
+
+pub fn rope(
+    x: TensorId,
+    cos: TensorId,
+    sin: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_host(x)?;
+    store.ensure_host(cos)?;
+    store.ensure_host(sin)?;
+    rope::rope(x, cos, sin, store, tape)
 }
 
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {

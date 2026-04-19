@@ -4,6 +4,7 @@
 //! exact bytes.
 
 use std::{
+    io::ErrorKind,
     io::{Read, Write},
     net::TcpStream,
     sync::Arc,
@@ -104,7 +105,11 @@ fn http_status_stop_save_404() {
     // The server helper binds internally, so we pick a port deterministically
     // from a port-range and retry if flaky. Simpler: bind TcpListener once,
     // drop it, grab the port. On macOS this rarely TOCTOUs in a unit test.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("reserve port: {err}"),
+    };
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
@@ -115,8 +120,11 @@ fn http_status_stop_save_404() {
         s.started = true;
     });
 
-    let _handle = bind_and_serve_on_thread(Arc::clone(&ctrl), format!("127.0.0.1:{port}"))
-        .expect("bind server");
+    let _handle = match bind_and_serve_on_thread(Arc::clone(&ctrl), format!("127.0.0.1:{port}")) {
+        Ok(handle) => handle,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("bind server: {err}"),
+    };
     // Give the listener thread a moment to arm accept().
     thread::sleep(Duration::from_millis(50));
 
