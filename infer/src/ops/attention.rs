@@ -758,13 +758,13 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
 /// 2*B launches from the per-request loop. Each request's KV cache is accessed
 /// via device pointer arrays.
 ///
-/// Q/K/V are already in contiguous batch buffers [B, dim]. Output is written
-/// directly to `output` batch buffer [B, q_dim]. No D2D copies needed.
+/// Q/K/V are already in contiguous batch buffers `[B, dim]`. Output is written
+/// directly to `output` batch buffer `[B, q_dim]`. No D2D copies needed.
 ///
-/// `positions`: [B] i32 on GPU — current_pos per request
-/// `seq_lens`: [B] i32 on GPU — seq_len per request (= pos + 1)
-/// `k_cache_ptrs`/`v_cache_ptrs`: [B] device pointers on GPU
-/// `partial_out/m/l`: pre-allocated FP32 scratch [B * num_qheads * NUM_KV_SPLITS * ...]
+/// `positions`: `[B]` i32 on GPU — current_pos per request
+/// `seq_lens`: `[B]` i32 on GPU — seq_len per request (= pos + 1)
+/// `k_cache_ptrs`/`v_cache_ptrs`: `[B]` device pointers on GPU
+/// `partial_out/m/l`: pre-allocated FP32 scratch `[B * num_qheads * NUM_KV_SPLITS * ...]`
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attention_decode_batched_into(
     ctx: &DeviceContext,

@@ -507,7 +507,7 @@ impl TokenKVPool {
     ///   by the next `alloc_tokens` call immediately
     /// - `page_ref_count > 0`  → **limbo**: the physical HBM row stays
     ///   live, but it is no longer owned by any slot. It will rejoin the
-    ///   free list the next time [`release_pages`] drops its refcount to
+    ///   free list the next time [`Self::release_pages`] drops its refcount to
     ///   zero. This is the M2 dual-residency path: the
     ///   `crate::prefix_cache::RadixCache` on the scheduler thread holds
     ///   the refcount, and a future admission whose prompt prefix

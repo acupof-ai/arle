@@ -318,7 +318,7 @@ pub fn fused_add_rms_norm_offset_into(
 }
 
 /// Per-head RMSNorm with F32 weight + SiLU gate multiplication.
-/// x: [num_heads * head_dim], weight: [head_dim] f32, gate: [num_heads * head_dim]
+/// `x`: `[num_heads * head_dim]`, `weight`: `[head_dim]` f32, `gate`: `[num_heads * head_dim]`
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_gated_into(
     ctx: &DeviceContext,

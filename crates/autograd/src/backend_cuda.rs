@@ -7,7 +7,7 @@
 //! `todo!("GPU required: ...")` so a CPU-only binary fails loudly.
 //!
 //! Row-major dispatch uses the standard cuBLAS swap-and-transpose trick:
-//! for row-major C[M,N] = A[M,K] @ B[K,N], call SGEMM with args swapped
+//! for row-major `C[M,N] = A[M,K] @ B[K,N]`, call SGEMM with args swapped
 //! (A=B_data, B=A_data) and m=N, n=M, k=K so cuBLAS's column-major view
 //! of the output buffer matches the row-major layout we want on host.
 //! Batched (rank-3) uses `sgemm_strided_batched` with the same swap.

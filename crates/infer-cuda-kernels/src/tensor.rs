@@ -148,7 +148,7 @@ impl DeviceContext {
 pub struct DeviceVec {
     pub data: CudaSlice<bf16>,
     pub len: usize,
-    /// Debug label describing the tensor's semantic shape (e.g., "norm_weight[hidden]", "kv_cache[heads,seq,dim]").
+    /// Debug label describing the tensor's semantic shape (e.g., `norm_weight[hidden]`, `kv_cache[heads,seq,dim]`).
     pub label: &'static str,
 }
 
@@ -379,11 +379,11 @@ pub struct DeviceMatrix {
     /// TQ packed indices [rows, packed_cols] u8.
     /// 3-bit uses 4-bit nibble packing (2 per byte), 2-bit uses 4 per byte.
     pub tq_packed: Option<CudaSlice<u8>>,
-    /// TQ per-group f16 norms [rows, cols/group_size], stored as u16 on device.
+    /// TQ per-group f16 norms `[rows, cols/group_size]`, stored as u16 on device.
     pub tq_scales: Option<CudaSlice<u16>>,
-    /// TQ Hadamard signs [cols] i8 (+1/-1), shared across rows.
+    /// TQ Hadamard signs `[cols]` i8 (+1/-1), shared across rows.
     pub tq_signs: Option<CudaSlice<i8>>,
-    /// TQ Lloyd-Max centroids [2^bits] f32, shared across all layers.
+    /// TQ Lloyd-Max centroids `[2^bits]` f32, shared across all layers.
     pub tq_centroids: Option<CudaSlice<f32>>,
     /// TQ bit width (2, 3, or 4). 0 = not TQ.
     pub tq_bits: u8,

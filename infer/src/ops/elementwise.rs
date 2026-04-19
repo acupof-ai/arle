@@ -117,7 +117,7 @@ pub(crate) fn add_bias_batch_into(
     Ok(())
 }
 
-/// Batched SiLU+mul: out[i] = silu(gate[i]) * up[i]
+/// Batched SiLU+mul: `out[i] = silu(gate[i]) * up[i]`
 pub fn silu_mul_batch(
     ctx: &DeviceContext,
     gate: &HiddenStates,
