@@ -159,6 +159,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Elementwise `C = A + B` over identically-shaped contiguous tensors.
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
+
+    /// Row-wise softmax over the last dim. `shape` describes a contiguous
+    /// tensor of rank ≥ 1; softmax is applied along the final axis.
+    fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        cpu_softmax_forward_last_axis(x, shape)
+    }
+
+    /// Row-wise log-softmax over the last dim. Numerically stable
+    /// (subtract max, log-sum-exp) — mirrors `ops::softmax::log_softmax`.
+    fn log_softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        cpu_log_softmax_forward_last_axis(x, shape)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -317,6 +329,67 @@ pub fn cpu_matmul_forward(
             got: a_shape.len().max(b_shape.len()),
         }),
     }
+}
+
+/// CPU reference for row-wise softmax over the last axis. Matches the
+/// numerically-stable implementation in `ops::softmax::softmax` so that
+/// backends can fall back to this when GPU acceleration is unavailable.
+pub fn cpu_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let rows = x.len() / last_dim;
+    let mut out = vec![0.0f32; x.len()];
+    for row in 0..rows {
+        let base = row * last_dim;
+        let slice = &x[base..base + last_dim];
+        let max_value = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denom = slice
+            .iter()
+            .map(|value| (*value - max_value).exp())
+            .sum::<f32>();
+        for col in 0..last_dim {
+            out[base + col] = (slice[col] - max_value).exp() / denom;
+        }
+    }
+    Ok(out)
+}
+
+/// CPU reference for row-wise log-softmax over the last axis.
+pub fn cpu_log_softmax_forward_last_axis(x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(crate::AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(crate::AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let rows = x.len() / last_dim;
+    let mut out = vec![0.0f32; x.len()];
+    for row in 0..rows {
+        let base = row * last_dim;
+        let slice = &x[base..base + last_dim];
+        let max_value = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denom = slice
+            .iter()
+            .map(|value| (*value - max_value).exp())
+            .sum::<f32>();
+        let log_denom = denom.ln();
+        for col in 0..last_dim {
+            out[base + col] = (slice[col] - max_value) - log_denom;
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {

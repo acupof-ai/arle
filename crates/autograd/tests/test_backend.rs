@@ -5,7 +5,10 @@
 
 use autograd::{
     CpuBackend,
-    backend::{Backend, cpu_matmul_forward},
+    backend::{
+        Backend, cpu_log_softmax_forward_last_axis, cpu_matmul_forward,
+        cpu_softmax_forward_last_axis,
+    },
 };
 
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
@@ -198,6 +201,51 @@ fn cuda_backend_matches_cpu_batched_3d() {
     let (want, _) = cpu_matmul_forward(&a, &[3, 8, 16], &b, &[3, 16, 32]).expect("ref");
     assert_eq!(got_shape, vec![3, 8, 32]);
     assert_close(&got, &want, 1e-3, "cuda 3d batched");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_softmax_matches_cpu_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let x = make_rows(&[4, 32], 909);
+    let got = backend
+        .softmax_forward_last_axis(&x, &[4, 32])
+        .expect("metal softmax");
+    let want = cpu_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal softmax 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_log_softmax_matches_cpu_2d() {
+    use autograd::backend_metal::MetalBackend;
+
+    let backend = MetalBackend;
+    let x = make_rows(&[4, 32], 808);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[4, 32])
+        .expect("metal log_softmax");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[4, 32]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal log_softmax 2d");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_log_softmax_matches_cpu_wide_vocab() {
+    use autograd::backend_metal::MetalBackend;
+
+    // Stresses the actual hot path: log_softmax over a realistic vocab
+    // dimension from pretrain (vocab≈150k). 4096 is a shrunken proxy that
+    // still exercises the full reduction + broadcast path.
+    let backend = MetalBackend;
+    let x = make_rows(&[8, 4096], 707);
+    let got = backend
+        .log_softmax_forward_last_axis(&x, &[8, 4096])
+        .expect("metal log_softmax wide");
+    let want = cpu_log_softmax_forward_last_axis(&x, &[8, 4096]).expect("ref");
+    assert_close(&got, &want, 1e-3, "metal log_softmax wide");
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]

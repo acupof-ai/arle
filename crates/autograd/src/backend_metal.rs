@@ -10,8 +10,8 @@ use crate::{
     backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape},
 };
 use mlx_sys::{
-    MLX_FLOAT32, mlx_add, mlx_array_data_float32, mlx_array_from_data, mlx_array_size, mlx_eval,
-    mlx_matmul,
+    MLX_FLOAT32, mlx_add, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
+    mlx_array_size, mlx_eval, mlx_logsumexp_axis, mlx_matmul, mlx_softmax_axis, mlx_subtract,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -171,6 +171,14 @@ impl Backend for MetalBackend {
         Ok((out, out_shape))
     }
 
+    fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        mlx_softmax_like(x, shape, SoftmaxKind::Softmax)
+    }
+
+    fn log_softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        mlx_softmax_like(x, shape, SoftmaxKind::LogSoftmax)
+    }
+
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(a_handle) = a else {
             return Err(AutogradError::TapeInvariant(
@@ -197,5 +205,109 @@ impl Backend for MetalBackend {
         };
 
         Ok(out)
+    }
+}
+
+#[derive(Copy, Clone)]
+enum SoftmaxKind {
+    Softmax,
+    LogSoftmax,
+}
+
+// Upload host slice → call mlx_softmax_axis (or x - logsumexp for log form)
+// on axis=-1 → eval → copy back. The intermediate MLX arrays are freed
+// explicitly so the host slice is the only authoritative copy, matching
+// the matmul_forward contract.
+fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+
+    let shape_i32: Vec<i32> = shape.iter().map(|&dim| dim as i32).collect();
+    // MLX treats -1 as "last axis"; using the signed form avoids a shape-len
+    // dependency for ranks other than 2/3.
+    let axis = -1_i32;
+
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `x` and `shape_i32` stay alive through the FFI call; MLX copies
+    // from the host slice into its own array storage; every allocated MLX
+    // array is freed in the same scope (softmax/logsumexp/subtract produce
+    // fresh MLX nodes that we own here).
+    unsafe {
+        let input = mlx_array_from_data(
+            x.as_ptr() as *const c_void,
+            shape_i32.as_ptr(),
+            shape_i32.len() as i32,
+            MLX_FLOAT32,
+        );
+        if input.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null",
+            ));
+        }
+
+        let out_arr = match kind {
+            SoftmaxKind::Softmax => mlx_softmax_axis(input, axis, true),
+            SoftmaxKind::LogSoftmax => {
+                let lse = mlx_logsumexp_axis(input, axis, true);
+                if lse.is_null() {
+                    mlx_array_free(input);
+                    return Err(AutogradError::TapeInvariant(
+                        "mlx_logsumexp_axis returned null",
+                    ));
+                }
+                let diff = mlx_subtract(input, lse);
+                mlx_array_free(lse);
+                diff
+            }
+        };
+        if out_arr.is_null() {
+            mlx_array_free(input);
+            return Err(AutogradError::TapeInvariant(
+                "mlx softmax/log_softmax returned null",
+            ));
+        }
+
+        let mut eval_handles = [out_arr];
+        mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+
+        let size = mlx_array_size(out_arr);
+        let data_ptr = mlx_array_data_float32(out_arr);
+        if data_ptr.is_null() {
+            mlx_array_free(input);
+            mlx_array_free(out_arr);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_data_float32 returned null",
+            ));
+        }
+
+        let mut host = vec![0.0f32; size];
+        std::ptr::copy_nonoverlapping(data_ptr, host.as_mut_ptr(), size);
+
+        mlx_array_free(input);
+        mlx_array_free(out_arr);
+
+        if host.len() != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![expected],
+                got: vec![host.len()],
+            });
+        }
+        Ok(host)
     }
 }
