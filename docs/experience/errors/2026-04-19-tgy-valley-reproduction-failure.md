@@ -41,6 +41,23 @@ Three things stand out:
 3. **c=5 tg_y=2 win persists** (+5.8%) across both sessions — this one signal
    is probably real, but too small to justify a one-off code path on its own.
 
+### Update — session 2 (same day) kills c=5 too
+
+Re-ran matched env=4 vs env=2 at c=5 in a fresh server-restart session
+(N=24, max=128, same binary):
+
+| session | env=4 | env=2 | Δ at c=5 |
+|---------|-------|-------|----------|
+| 1       | 150.8 | 159.6 | **+5.8%** |
+| 2       | 145.9 | 145.9 | **0.0%**  |
+
+Session 2 shows **zero** difference — the session-1 tg_y=2 advantage at c=5
+was also thermal noise. No signal remains across any c. The entire
+tg_y-class investigation closes: **GDR decode default tg_y=4 is fine**.
+No code change. This confirms the feedback-memory rule —
+effects ≤10% in a single matched A/B need ≥2 independent sessions, and
+session 2 here did the disproving work.
+
 ## Root Cause
 
 The single-session c=1..8 sweep in `concurrency-sweep-c3-c5-valleys.md`
