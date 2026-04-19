@@ -1,10 +1,13 @@
 # agent-infer Codebase Map
 
 Updated 2026-04-15 (post `infer-cuda-kernels` extraction, tiered KV
-M3a/M3b/M3c local, and Metal M0.2a request-state landing). This document
-describes the repository as it exists after the Route-A refactor folded the
-partial runtime split back into `infer`, and after the CUDA kernel layer was
-extracted into `crates/infer-cuda-kernels/` (commit `a4e12f5`).
+M3a/M3b/M3c local, and Metal M0.2a request-state landing).
+Supplemented 2026-04-19 with Phase 6 `crates/autograd` + `crates/train`
+(from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md)).
+This document describes the repository as it exists after the Route-A
+refactor folded the partial runtime split back into `infer`, and after
+the CUDA kernel layer was extracted into `crates/infer-cuda-kernels/`
+(commit `a4e12f5`).
 
 ## 1. Workspace at a glance
 
@@ -30,6 +33,8 @@ Current workspace members:
 - `crates/infer-chat`
 - `crates/infer-cli`
 - `crates/infer-tools`
+- `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
+- `crates/train` (Phase 6 — LoRA + GRPO RL trainer, `train_multi_turn` binary; depends on `autograd`)
 
 ## 2. Main execution paths
 
