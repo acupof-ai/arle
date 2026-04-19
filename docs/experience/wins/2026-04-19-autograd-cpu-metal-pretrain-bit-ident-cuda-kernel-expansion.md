@@ -28,7 +28,10 @@ checkpoint at step 40 (`/tmp/agent-infer-runs/{cpu,metal}/step_40/`).
 Wall-time: Metal ~2.45 s/step, CPU ~3.03 s/step on the same M-series box
 — Metal 1.22× on this tiny config (softmax+matmul FFI overhead dominates
 at vocab=151669×128 lm-head shape; bigger configs should show a larger
-gap).
+gap). Re-verified after wiring `silu` + `embedding` + `rope` through
+`store.backend()` — losses remained bit-ident at 20 steps
+(11.9799→11.1729) with Metal improving to ~2.32 s/step as more ops moved
+off the Rust loop.
 
 This is the first direct parity signal between autograd CPU and Metal
 backends across a real training loop (previously only op-level parity
@@ -37,7 +40,7 @@ numerically sensitive ops (`matmul_forward`, `softmax_forward_last_axis`,
 `log_softmax_forward_last_axis`, `add`) matches CPU to bit-exactness on
 realistic Qwen3-shaped tensors.
 
-### 2. CUDA backend op coverage — 10 new trait methods + 4 new .cu files
+### 2. CUDA backend op coverage — 11 new trait methods + 5 new .cu files
 
 Added slice-in / slice-out `forward` methods to `Backend` with CPU
 default impls so no existing backend breaks:
@@ -54,6 +57,7 @@ default impls so no existing backend breaks:
 | `embedding_forward` | **new** `embedding.cu::embedding_f32` | wired |
 | `sum_last_axis_forward` | **new** `reduce.cu::sum_last_axis_f32` | wired |
 | `mean_last_axis_forward` | **new** `reduce.cu::mean_last_axis_f32` | wired |
+| `rope_forward` | **new** `rope.cu::rope_f32` | wired |
 
 All new `.cu` source files use NVRTC-safe primitives only (`__expf`,
 `rsqrtf`, `__int_as_float(0xFF800000)` for -inf literals). Row-reduce
@@ -61,7 +65,7 @@ kernels follow the same shape as `softmax.cu` — one block per row,
 shared-memory tree reduction on 256 threads, grid=(rows,1,1),
 shared=1024 bytes.
 
-**PENDING REMOTE CUDA VERIFICATION** — 10 CUDA parity tests gated behind
+**PENDING REMOTE CUDA VERIFICATION** — 11 CUDA parity tests gated behind
 `#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]` compile clean
 on Mac (`cargo clippy -p autograd --no-default-features --features
 cuda,no-cuda --tests -- -D warnings`). User runs on GPU box:
@@ -78,7 +82,7 @@ cargo check -p autograd --no-default-features --features cuda,no-cuda # Mac CUDA
 ```
 
 Test matrix on Mac:
-- CPU parity: 7/7 green (includes new silu, rms_norm, embedding, sum/mean refs)
+- CPU parity: 8/8 green (includes new silu, rms_norm, embedding, sum/mean, rope refs)
 - Metal parity: 15/15 green (matmul 2D/3D, add 2D/3D, softmax, log_softmax — 2D + wide_vocab for softmax)
 
 ## Rule
