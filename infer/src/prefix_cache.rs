@@ -216,7 +216,7 @@ impl RadixCache {
         }
     }
 
-    /// Rebuild [`Self::block_index`] from the current `nodes` array.
+    /// Rebuild `block_index` from the current `nodes` array.
     ///
     /// Callers that deserialize a snapshot (which does not persist the index)
     /// or that bulk-mutate `block_id`s via [`Self::reconcile`] should

@@ -302,7 +302,7 @@ impl GgufFile {
             .is_some_and(|t| !matches!(t.dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
     }
 
-    /// Read Q8_0 tensor in packed format: split into (qweight: Vec<i8>, scales: Vec<bf16>).
+    /// Read Q8_0 tensor in packed format: split into (`qweight: Vec<i8>`, `scales: Vec<bf16>`).
     ///
     /// Returns data suitable for `DeviceMatrix::from_quantized_int8`:
     ///   - qweight: `[numel]` i8 values (one per element)

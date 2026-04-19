@@ -9,7 +9,7 @@
 //! 1. block files are named by [`crate::types::BlockFingerprint`] so a
 //!    restarted process can reconcile persisted content by semantic
 //!    identity instead of transient pool slot ids;
-//! 2. each file starts with a postcard-encoded [`DiskBlockHeader`]
+//! 2. each file starts with a postcard-encoded `DiskBlockHeader`
 //!    followed by the raw KV payload bytes.
 //!
 //! # Scope (intentional)

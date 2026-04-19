@@ -25,7 +25,7 @@
 //!
 //! - [`SpecConfig`] validation
 //! - [`verify_tokens`] acceptance/rejection sampling (pure f32 math)
-//! - [`acceptance_rate`] from a [`VerificationResult`]
+//! - [`VerificationResult::acceptance_rate`] from a [`VerificationResult`]
 //! - [`DraftModel`] trait (GPU stub)
 
 use anyhow::{Result, bail};
