@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
+    process::ExitCode,
     str::FromStr,
     sync::Arc,
     time::Instant,
@@ -118,7 +119,21 @@ enum CliError {
     Custom(String),
 }
 
-fn main() -> Result<(), CliError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        // Display (not Debug): thiserror's #[error(transparent)] already
+        // delegates to the inner error's Display impl, so io errors surface as
+        // "No such file or directory (os error 2)" instead of the Debug blob
+        // "Os { code: 2, kind: NotFound, message: \"...\" }".
+        Err(err) => {
+            eprintln!("[train_sft] error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
     fs::create_dir_all(&args.out)?;

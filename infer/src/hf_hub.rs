@@ -38,10 +38,23 @@ const DEFAULT_DISCOVERY_CANDIDATES: &[&str] = &[
 ///   ID (e.g. `"Qwen/Qwen2.5-0.5B-Instruct"`, `"mlx-community/Qwen2.5-0.5B-4bit"`).
 ///
 /// Returns the path to the directory that contains `config.json` and weight files.
+///
+/// Short-circuit: if the input *looks like* a filesystem path
+/// (see [`looks_like_local_path`]) but that path does not exist locally, the
+/// call fails immediately with a clear error rather than falling through to
+/// a HuggingFace Hub download. Repo-id inputs (e.g. `Qwen/Qwen3-0.6B`) still
+/// fall through to the hub as before.
 pub fn resolve_model_path(model_id_or_path: &str) -> Result<PathBuf> {
     if let Some(local) = resolve_local_model_path(model_id_or_path) {
         log::info!("Using local model path: {}", local.display());
         return Ok(local);
+    }
+
+    if looks_like_local_path(model_id_or_path) {
+        anyhow::bail!(
+            "model path does not exist: '{}' (looks like a filesystem path, skipping HuggingFace Hub lookup)",
+            model_id_or_path
+        );
     }
 
     log::info!("Model not found locally — downloading from HuggingFace: {model_id_or_path}");
@@ -323,6 +336,34 @@ fn parse_hf_model_id(model_id_or_path: &str) -> Option<(String, String)> {
     Some((org.to_string(), repo.to_string()))
 }
 
+/// Heuristic: does the input *look like* a filesystem path rather than a
+/// HuggingFace repo id?
+///
+/// Treated as path-like:
+/// - starts with `/`, `./`, `../`, or `~`
+/// - contains a backslash (Windows-style separator)
+/// - contains more than one forward slash (`a/b/c`)
+///
+/// Treated as a repo id (not path-like):
+/// - bare name (`foo`)
+/// - single-slash `org/repo` form (`Qwen/Qwen3-0.6B`, `databricks/databricks-dolly-15k`)
+///
+/// Note: HuggingFace repo names can legitimately contain dots
+/// (`Qwen/Qwen3.5-4B`), so a dot alone does **not** mark the input as path-like.
+pub(crate) fn looks_like_local_path(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with('~') {
+        return true;
+    }
+    if s.contains('\\') {
+        return true;
+    }
+    s.matches('/').count() > 1
+}
+
 fn snapshot_dirs(cache_repo_dir: &Path) -> Vec<PathBuf> {
     let snapshot_root = cache_repo_dir.join("snapshots");
     let Ok(entries) = std::fs::read_dir(&snapshot_root) else {
@@ -381,8 +422,8 @@ fn has_safetensors_twin(all: &[String], bin_file: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        common_local_roots, has_safetensors_twin, parse_hf_model_id, resolve_local_model_path,
-        resolve_local_weighted_model_path,
+        common_local_roots, has_safetensors_twin, looks_like_local_path, parse_hf_model_id,
+        resolve_local_model_path, resolve_local_weighted_model_path, resolve_model_path,
     };
 
     #[test]
@@ -450,5 +491,49 @@ mod tests {
         let roots = common_local_roots();
         assert!(roots.contains(&cwd.join("models")));
         assert!(roots.contains(&cwd.join("infer").join("models")));
+    }
+
+    #[test]
+    fn looks_like_local_path_classifies_paths() {
+        // Path-like: absolute, relative with ./ or ../, home, multiple slashes.
+        assert!(looks_like_local_path("/does/not/exist"));
+        assert!(looks_like_local_path("/tmp/models"));
+        assert!(looks_like_local_path("./models"));
+        assert!(looks_like_local_path("../models/Qwen3-0.6B"));
+        assert!(looks_like_local_path("~/models"));
+        assert!(looks_like_local_path("foo/bar/baz"));
+        assert!(looks_like_local_path("C:\\models\\Qwen3"));
+    }
+
+    #[test]
+    fn looks_like_local_path_classifies_repo_ids() {
+        // HF repo ids (single slash, no leading special char) are NOT paths.
+        assert!(!looks_like_local_path("Qwen/Qwen3-0.6B"));
+        assert!(!looks_like_local_path("databricks/databricks-dolly-15k"));
+        assert!(!looks_like_local_path("mlx-community/Qwen3-0.6B-4bit"));
+        // Dots are legal in HF repo names (e.g. Qwen3.5).
+        assert!(!looks_like_local_path("Qwen/Qwen3.5-4B"));
+        // Bare name.
+        assert!(!looks_like_local_path("Qwen3-0.6B"));
+        // Empty.
+        assert!(!looks_like_local_path(""));
+    }
+
+    #[test]
+    fn resolve_model_path_fails_fast_for_missing_local_path() {
+        // /definitely/does/not/exist/<pid> looks like an absolute path, so it
+        // must short-circuit without touching the network.
+        let bogus = format!(
+            "/definitely/does/not/exist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let err = resolve_model_path(&bogus).expect_err("must bail for missing path");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not exist"), "bad error message: {msg}");
+        assert!(msg.contains(&bogus), "error should mention input: {msg}");
     }
 }
