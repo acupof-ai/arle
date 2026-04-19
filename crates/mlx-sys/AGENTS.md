@@ -88,6 +88,31 @@ Cached under `target/.../build/mlx-sys-*/out/build/_deps/mlx-src/`. A
 - Forgetting to add new frameworks to the link line. Rare — MLX's own
   dependencies cover most things — but a new MPS call may require more.
 
+## Debugging hooks
+
+### Qwen3.5 GPU trace capture (`mlx_metal_capture.mm`)
+
+Env-gated `MTLCaptureManager` hook around `qwen35_compiled_step_session`.
+Default OFF — the only hot-path cost when disabled is one relaxed atomic load
+inside `maybe_capture_qwen35_step_begin`.
+
+```bash
+MTL_CAPTURE_ENABLED=1 \
+INFER_CAPTURE_STEP=5 \
+  ./target/release/metal_bench --model <path> --use-step-driver \
+      --prompt-tokens 32 --generation-tokens 10 --warmup 3 --runs 1
+```
+
+- `INFER_CAPTURE_STEP=N` — 0-indexed step (N=0 = first call, post-warmup in
+  `metal_bench`). Unset = disabled.
+- `INFER_CAPTURE_PATH=…` — optional override; default
+  `/tmp/qwen35_step_<unix_ts>.gputrace`.
+- The hook issues `eval()` inside the capture window so GPU work lands in
+  the trace rather than deferring past `stopCapture`.
+
+Open the resulting `.gputrace` in Xcode. Full runbook:
+[`docs/plans/metal-gdr-kernel-xcode-capture.md`](../../docs/plans/metal-gdr-kernel-xcode-capture.md).
+
 ## Pointers
 
 - `infer/src/backend/metal/AGENTS.md` — the Rust consumer side.

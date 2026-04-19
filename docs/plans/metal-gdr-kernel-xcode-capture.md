@@ -59,44 +59,51 @@ Two ways. Pick one.
 5. Xcode opens the .gputrace browser with all dispatched kernels, encoders,
    and command buffers from one decode step.
 
-### 2b — Programmatic capture via `MTLCaptureManager` (if 2a flakes)
+### 2b — Programmatic capture via `MTLCaptureManager` (shipped, env-gated)
 
-Modify `mlx_qwen35_model.cpp::qwen35_compiled_step_session` to wrap one
-specific step in `MTLCaptureManager.startCapture/stopCapture`. **DON'T
-COMMIT this** — it's a debugging-only diff. Save the .gputrace to
-`/tmp/qwen35_step_<timestamp>.gputrace`. Open in Xcode.
+The capture hook is committed and lives in
+`crates/mlx-sys/src/mlx_metal_capture.mm`. It is invoked from
+`qwen35_compiled_step_session` only when `INFER_CAPTURE_STEP` is set — default
+behavior is unchanged (single relaxed atomic load + one env-var string
+compare on first call).
 
-Skeleton (Objective-C++ snippet, for reference — not committed):
+Env vars:
 
-```objc
-#import <Metal/Metal.h>
+| Var | Required? | Meaning |
+|---|---|---|
+| `MTL_CAPTURE_ENABLED=1` | yes | Apple toolchain gate; without it `startCaptureWithDescriptor` fails |
+| `INFER_CAPTURE_STEP=N` | yes to enable | 0-indexed step to capture; N=0 captures the first `qwen35_compiled_step_session` invocation (which in `metal_bench` is post-`--warmup` when driving via `--use-step-driver`) |
+| `INFER_CAPTURE_PATH=/path/foo.gputrace` | no | Override output path. Default: `/tmp/qwen35_step_<unix_timestamp>.gputrace` |
 
-void capture_one_step() {
-    MTLCaptureManager* cm = [MTLCaptureManager sharedCaptureManager];
-    MTLCaptureDescriptor* desc = [[MTLCaptureDescriptor alloc] init];
-    desc.captureObject = MTLCreateSystemDefaultDevice();
-    desc.destination = MTLCaptureDestinationGPUTraceDocument;
-    desc.outputURL = [NSURL fileURLWithPath:@"/tmp/qwen35_step.gputrace"];
+Run:
 
-    NSError* err = nil;
-    if (![cm startCaptureWithDescriptor:desc error:&err]) {
-        NSLog(@"capture start failed: %@", err);
-        return;
-    }
-    // … run one decode step here …
-    [cm stopCapture];
-}
+```bash
+MTL_CAPTURE_ENABLED=1 \
+INFER_CAPTURE_STEP=5 \
+INFER_CAPTURE_PATH=/tmp/qwen35_step_c1.gputrace \
+  ./target/release/metal_bench \
+    --model /path/to/Qwen3.5-4B-MLX-4bit \
+    --prompt-tokens 32 \
+    --generation-tokens 10 \
+    --warmup 3 \
+    --runs 1 \
+    --use-step-driver
 ```
 
-Trigger it on the Nth decode step (skip warmup) via an env-gated counter:
+Stderr will show:
 
-```cpp
-static int step_n = 0;
-if (getenv("INFER_CAPTURE_STEP") &&
-    step_n++ == atoi(getenv("INFER_CAPTURE_STEP"))) {
-    capture_one_step();
-}
 ```
+[capture] started GPU trace at step 5 → /tmp/qwen35_step_c1.gputrace
+[capture] stopped GPU trace → /tmp/qwen35_step_c1.gputrace
+```
+
+The hook calls `eval(...)` on logits + caches inside the capture window so
+the `.gputrace` actually contains the step's GPU dispatches rather than just
+the graph-build side. Open the resulting `.gputrace` in Xcode → proceed to
+Step 3.
+
+If no `[capture]` line prints, either `MTL_CAPTURE_ENABLED` is missing or the
+`.gputrace` destination isn't writable.
 
 ---
 

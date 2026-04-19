@@ -1400,6 +1400,12 @@ int32_t qwen35_session_end(
     }
 }
 
+// Env-gated MTLCaptureManager hook — default no-op, enabled by
+// INFER_CAPTURE_STEP=N (see crates/mlx-sys/src/mlx_metal_capture.mm and
+// docs/plans/metal-gdr-kernel-xcode-capture.md §Step 2b).
+extern "C" int32_t maybe_capture_qwen35_step_begin(void);
+extern "C" void maybe_capture_qwen35_step_end(int32_t started);
+
 int32_t qwen35_compiled_step_session(
     void* model,
     mlx_array* token_id,
@@ -1407,6 +1413,7 @@ int32_t qwen35_compiled_step_session(
     mlx_array** out_logits
 ) {
     auto* m = static_cast<Qwen35CompiledModel*>(model);
+    const int32_t capture_started = maybe_capture_qwen35_step_begin();
     try {
         mlx_clear_error();
 
@@ -1451,9 +1458,22 @@ int32_t qwen35_compiled_step_session(
         m->session_kv_caches = std::move(next_kv_caches);
         m->session_gdr_states = std::move(next_gdr_states);
         *out_logits = logits;
+        // Force GPU work to flush inside the capture window so the .gputrace
+        // actually contains this step's dispatches. The caller (Rust) also
+        // evals later; this is a no-op branch when capture is disabled.
+        if (capture_started) {
+            std::vector<array> to_eval;
+            to_eval.reserve(1 + m->session_kv_caches.size() + m->session_gdr_states.size());
+            to_eval.push_back(*to_arr(logits));
+            for (const auto& kv : m->session_kv_caches) to_eval.push_back(kv);
+            for (const auto& gdr : m->session_gdr_states) to_eval.push_back(gdr);
+            eval(to_eval);
+        }
+        maybe_capture_qwen35_step_end(capture_started);
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
+        maybe_capture_qwen35_step_end(capture_started);
         return -1;
     }
 }
