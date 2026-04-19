@@ -11,6 +11,8 @@ cuda = ["autograd/cuda"]
 
 [dependencies]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
+anyhow = "1.0"
+hf-hub = { version = "0.5", features = ["tokio"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +33,14 @@ path = "src/bin/train_grpo.rs"
 [[bin]]
 name = "train_sft"
 path = "src/bin/train_sft.rs"
+
+[[bin]]
+name = "download_dataset"
+path = "src/bin/download_dataset.rs"
+
+[[bin]]
+name = "convert_dataset"
+path = "src/bin/convert_dataset.rs"
 
 [lints]
 workspace = true
