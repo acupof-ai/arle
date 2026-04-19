@@ -39,8 +39,9 @@ Coordinated refactor round finishing Route-A and pre-staging the internal seams 
 - Deleted four dead Triton kernels that had no live callers and removed the vestigial `replaced_cuda_files` bookkeeping directory left over from an earlier migration.
 - `build.rs` Triton `cargo:rerun-if-changed` list is now auto-derived from a directory walk instead of a hand-maintained constant, so new Triton kernels don't silently skip rebuilds.
 
-#### Future direction
-- Locked in [`docs/plans/cuda-kernel-crate-extraction.md`](plans/cuda-kernel-crate-extraction.md) as the forward blueprint. The current `infer` layout is option A (monolithic); option B (standalone `infer-cuda-kernels` crate) is pre-staged through the `backend::cuda::prelude` seam and executes as a one-day mechanical refactor when any of the six documented trip wires fires (FA-3 for H100, MLA / DeepSeek-V3, NCCL tensor parallel, FP8 GEMM, speculative decode GPU path, or a second in-tree consumer of the kernel layer).
+#### Kernel crate extraction (option B landed same day)
+- Followed the hygiene round by executing the option B extraction locked in [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — the `backend::cuda::prelude` seam was the staging point, and commits `a4e12f5` → `0ab2cd1` → `081cf32` landed the one-day mechanical refactor. `backend/cuda/` now contains only `bootstrap.rs`; all kernel sources, FFI, paged KV, FlashInfer wrappers, graph pool, tensor primitives, KV quant, and TurboQuant live under [`crates/infer-cuda-kernels/`](crates/infer-cuda-kernels/) with a one-way `infer → infer-cuda-kernels` dependency. CUDA kernel C++ sources moved from `infer/csrc/cuda/` to `crates/infer-cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/`.
+- The `mlx-sys` bridge was promoted from `infer/mlx-sys/` to [`crates/mlx-sys/`](crates/mlx-sys/) as part of the same Route-A flattening so both native layers (CUDA, Metal) sit peer-level under `crates/`.
 
 ### Governance
 - Added a formal stability policy
