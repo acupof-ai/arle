@@ -18,32 +18,12 @@ pub fn rope(
     let sin_tensor = store.tensor(sin)?.clone();
     validate_shapes(&x_tensor.shape, &cos_tensor.shape, &sin_tensor.shape)?;
 
-    let batch = x_tensor.shape[0];
-    let heads = x_tensor.shape[1];
-    let seq_len = x_tensor.shape[2];
-    let head_dim = x_tensor.shape[3];
-    let half_dim = head_dim / 2;
-    let mut output = vec![0.0; x_tensor.size];
-
-    for batch_idx in 0..batch {
-        for head_idx in 0..heads {
-            for token_idx in 0..seq_len {
-                let rope_base = token_idx * half_dim;
-                let x_base = (((batch_idx * heads + head_idx) * seq_len) + token_idx) * head_dim;
-                // NeoX / `rotate_half` layout: pair element `i` with element
-                // `i + half_dim`. This matches Qwen3 HF weights + the infer-side
-                // `precompute_rope` (infer/src/weight_loader.rs:450).
-                for pair_idx in 0..half_dim {
-                    let x0 = x_tensor.data[x_base + pair_idx];
-                    let x1 = x_tensor.data[x_base + pair_idx + half_dim];
-                    let cos_value = cos_tensor.data[rope_base + pair_idx];
-                    let sin_value = sin_tensor.data[rope_base + pair_idx];
-                    output[x_base + pair_idx] = (x0 * cos_value) - (x1 * sin_value);
-                    output[x_base + pair_idx + half_dim] = (x1 * cos_value) + (x0 * sin_value);
-                }
-            }
-        }
-    }
+    let output = store.backend().rope_forward(
+        &x_tensor.data,
+        &x_tensor.shape,
+        &cos_tensor.data,
+        &sin_tensor.data,
+    )?;
 
     let output_id = store.alloc(Tensor::new(
         output,
