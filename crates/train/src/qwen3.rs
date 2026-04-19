@@ -1,7 +1,7 @@
 use std::{collections::HashMap, f32::consts::TAU, fs, path::Path};
 
 use autograd::{
-    AutogradError, Tensor, Tape, TensorId, TensorStore,
+    AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
         add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, silu,
         transpose,
@@ -11,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum Qwen3AutogradError {
+pub enum Qwen3Error {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
     #[error(transparent)]
@@ -31,7 +31,7 @@ pub enum Qwen3AutogradError {
     PositionOutOfBounds { position: usize, upper: usize },
 }
 
-pub type Result<T> = std::result::Result<T, Qwen3AutogradError>;
+pub type Result<T> = std::result::Result<T, Qwen3Error>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3Config {
@@ -76,22 +76,22 @@ impl Qwen3Config {
         // correct widths, so the only constraint here is that the individual
         // attention dims are non-zero and compatible.
         if self.num_attention_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
-            return Err(Qwen3AutogradError::InvalidConfig(
+            return Err(Qwen3Error::InvalidConfig(
                 "attention heads and head_dim must be non-zero",
             ));
         }
         if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
-            return Err(Qwen3AutogradError::InvalidConfig(
+            return Err(Qwen3Error::InvalidConfig(
                 "num_attention_heads must be divisible by num_kv_heads",
             ));
         }
         if !self.head_dim.is_multiple_of(2) {
-            return Err(Qwen3AutogradError::InvalidConfig(
+            return Err(Qwen3Error::InvalidConfig(
                 "head_dim must be even for RoPE",
             ));
         }
         if self.max_position_embeddings == 0 {
-            return Err(Qwen3AutogradError::InvalidConfig(
+            return Err(Qwen3Error::InvalidConfig(
                 "max_position_embeddings must be non-zero",
             ));
         }
@@ -403,13 +403,13 @@ impl Qwen3Model {
         position_ids: &[u32],
     ) -> Result<TensorId> {
         if input_ids.len() != position_ids.len() {
-            return Err(Qwen3AutogradError::InputLenMismatch {
+            return Err(Qwen3Error::InputLenMismatch {
                 input_len: input_ids.len(),
                 position_len: position_ids.len(),
             });
         }
         if input_ids.is_empty() {
-            return Err(Qwen3AutogradError::InvalidConfig(
+            return Err(Qwen3Error::InvalidConfig(
                 "forward requires at least one token",
             ));
         }
@@ -541,7 +541,7 @@ fn select_cache_rows(
     let mut data = Vec::with_capacity(position_ids.len() * cols);
     for &position in position_ids {
         if position >= rows {
-            return Err(Qwen3AutogradError::PositionOutOfBounds {
+            return Err(Qwen3Error::PositionOutOfBounds {
                 position,
                 upper: rows,
             });
@@ -648,7 +648,7 @@ fn read_usize(value: &Value, field: &'static str) -> Result<usize> {
         .get(field)
         .and_then(Value::as_u64)
         .map(|raw| raw as usize)
-        .ok_or(Qwen3AutogradError::InvalidConfigField { field })
+        .ok_or(Qwen3Error::InvalidConfigField { field })
 }
 
 fn read_usize_alias(value: &Value, field: &'static str, alias: &'static str) -> Result<usize> {
@@ -657,7 +657,7 @@ fn read_usize_alias(value: &Value, field: &'static str, alias: &'static str) -> 
         .or_else(|| value.get(alias))
         .and_then(Value::as_u64)
         .map(|raw| raw as usize)
-        .ok_or(Qwen3AutogradError::InvalidConfigField { field })
+        .ok_or(Qwen3Error::InvalidConfigField { field })
 }
 
 fn read_f32(value: &Value, field: &'static str) -> Result<f32> {
@@ -665,14 +665,14 @@ fn read_f32(value: &Value, field: &'static str) -> Result<f32> {
         .get(field)
         .and_then(Value::as_f64)
         .map(|raw| raw as f32)
-        .ok_or(Qwen3AutogradError::InvalidConfigField { field })
+        .ok_or(Qwen3Error::InvalidConfigField { field })
 }
 
 fn read_bool(value: &Value, field: &'static str) -> Result<bool> {
     value
         .get(field)
         .and_then(Value::as_bool)
-        .ok_or(Qwen3AutogradError::InvalidConfigField { field })
+        .ok_or(Qwen3Error::InvalidConfigField { field })
 }
 
 fn q_or_kv_heads_tensor(x: TensorId) -> TensorId {
