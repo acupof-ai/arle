@@ -12,14 +12,15 @@ drop the literal `1` in three model `batch_decode.rs` files plus
 `scheduler/cuda/decode.rs`, expose a `--page-size` CLI flag.
 
 Mid-implementation exploration (read of every touch point and every
-CUDA kernel under `infer/csrc/cuda/`) surfaced an architectural
+CUDA kernel under `crates/infer-cuda-kernels/csrc/` — at the time of
+writing, `infer/csrc/cuda/`; extracted 2026-04-15 Route-A) surfaced an architectural
 blocker that makes BF16 + `page_size > 1` produce **silently wrong
 attention output**, not a build error. We stopped before writing any
 code and recorded this entry.
 
 ## Root Cause
 The plan doc audited `kv_cache_to_paged_kernel`
-([`infer/csrc/cuda/kv/kv_cache_to_paged.cu:18-51`](../../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L18))
+([`crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu:18-51`](../../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L18))
 and concluded the BF16 migration path was page_size-parametric — the
 non-range kernel correctly does `logical_page = pos / page_size` and
 writes HND. That's true.
@@ -32,7 +33,7 @@ from
 and
 [`infer/src/scheduler/cuda/prefill.rs:270`](../../../infer/src/scheduler/cuda/prefill.rs#L270),
 which dispatches to **`kv_cache_to_paged_range_kernel`** at
-[`kv_cache_to_paged.cu:53-82`](../../../infer/csrc/cuda/kv/kv_cache_to_paged.cu#L53):
+[`kv_cache_to_paged.cu:53-82`](../../../crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu#L53):
 
 ```cpp
 // Range variant for token-level (page_size=1) paged pools.
@@ -47,7 +48,7 @@ The header comment on line 53 explicitly says "for token-level
 (page_size=1) paged pools".
 
 FlashInfer reads the same pool buffer via
-[`flashinfer_decode.cu:137`](../../../infer/csrc/cuda/attention/flashinfer_decode.cu#L137):
+[`flashinfer_decode.cu:137`](../../../crates/infer-cuda-kernels/csrc/attention/flashinfer_decode.cu#L137):
 
 ```cpp
 /*layout=*/ flashinfer::QKVLayout::kHND,
@@ -108,7 +109,7 @@ attempt has accurate prerequisites:
 
 ### Required additions to P0 scope (was: ~7 files, now: ~12 files)
 1. **New CUDA kernel** `kv_cache_to_paged_range_hnd_kernel` in
-   `infer/csrc/cuda/kv/kv_cache_to_paged.cu` (additive, ~60 lines):
+   `crates/infer-cuda-kernels/csrc/kv/kv_cache_to_paged.cu` (additive, ~60 lines):
    takes `(start_pos, count, slot_page_table, page_size, stride_page,
    …)`, writes HND pages. Does **not** touch the existing range
    kernel or either of the forbidden quant kernels
