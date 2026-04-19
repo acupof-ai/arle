@@ -77,6 +77,12 @@ Same default config — 50 iters, group 8, eval every 25:
 - **Metal TinyLM slowdown** was expected. Device-resident tensors + a
   batched `mx::matmul` path would amortize the upload, but that's the full
   Option-A→B tensor rewrite in the plan and is not on the critical path.
+  [MLX lazy-eval docs](https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html)
+  recommend tens-to-thousands of ops per `eval()` — our per-call `matmul→eval
+  →readback` constructs 1-op graphs, hitting MLX's degenerate path. Design
+  direction captured in
+  [`docs/plans/rust-agent-rl-single-node.md`](../../plans/rust-agent-rl-single-node.md)
+  §7.2 M5.3 annotation (commit `8080273`).
 - **Greedy eval pass@1 = 0** is a reward-shape artifact, not a regression.
   Documented here so future readers don't mistake it for a training bug.
 
