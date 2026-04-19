@@ -1,5 +1,7 @@
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
+#[path = "cli_args.rs"]
+pub mod cli_args;
 #[path = "control.rs"]
 pub mod control;
 #[path = "curriculum.rs"]

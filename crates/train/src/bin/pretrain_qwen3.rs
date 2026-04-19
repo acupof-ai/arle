@@ -20,6 +20,7 @@ use autograd::{
 use serde_json::json;
 use thiserror::Error;
 use train::{
+    cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     tokenizer::ChatTokenizer,
@@ -152,12 +153,8 @@ enum CliError {
     Qwen3(#[from] Qwen3Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
@@ -514,18 +511,18 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--no-grad-clip" => args.grad_clip = None,
             "--backend" => {
                 args.backend = next_value(&mut iter, &flag)?.parse().map_err(|value| {
-                    CliError::InvalidValue {
+                    CliError::Arg(ArgError::InvalidValue {
                         flag: flag.clone(),
                         value,
-                    }
+                    })
                 })?;
             }
             "--save-dtype" => {
                 args.save_dtype = next_value(&mut iter, &flag)?.parse().map_err(|value| {
-                    CliError::InvalidValue {
+                    CliError::Arg(ArgError::InvalidValue {
                         flag: flag.clone(),
                         value,
-                    }
+                    })
                 })?;
             }
             "--vocab-size" => {
@@ -555,7 +552,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--eos-token-id" => {
                 args.eos_token_id = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
     Ok(args)
@@ -586,37 +583,25 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ("--max-pos", args.max_position_embeddings),
     ] {
         if value == 0 {
-            return Err(CliError::InvalidValue {
+            return Err(CliError::Arg(ArgError::InvalidValue {
                 flag: flag.into(),
                 value: "0".into(),
-            });
+            }));
         }
     }
     if !(0.0..1.0).contains(&args.eval_frac) {
-        return Err(CliError::InvalidValue {
+        return Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--eval-frac".into(),
             value: args.eval_frac.to_string(),
-        });
+        }));
     }
     if args.eval_every > 0 && args.eval_windows == 0 {
-        return Err(CliError::InvalidValue {
+        return Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--eval-windows".into(),
             value: "0".into(),
-        });
+        }));
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T: FromStr>(flag: &str, value: String) -> Result<T, CliError> {
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {

@@ -5,6 +5,7 @@ use autograd::{
 };
 use thiserror::Error;
 use train::{
+    cli_args::{ArgError, next_value, parse_value},
     dataset::{BytesDataset, CopyDataset, CorpusDataset, Dataset},
     lora::LoraConfig,
     model::{Transformer, TransformerConfig},
@@ -94,12 +95,8 @@ impl Default for CliArgs {
 enum CliError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
@@ -241,7 +238,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
                     "bytes" => DatasetKind::Bytes,
                     "corpus" => DatasetKind::Corpus,
                     _ => {
-                        return Err(CliError::InvalidValue { flag, value });
+                        return Err(CliError::Arg(ArgError::InvalidValue { flag, value }));
                     }
                 };
             }
@@ -294,26 +291,11 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--backend" => {
                 args.backend = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
 
     Ok(args)
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T>(flag: &str, value: String) -> Result<T, CliError>
-where
-    T: FromStr,
-{
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {

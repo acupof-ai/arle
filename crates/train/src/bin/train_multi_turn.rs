@@ -10,6 +10,7 @@ use autograd::{
 };
 use thiserror::Error;
 use train::{
+    cli_args::{ArgError, next_value, parse_value},
     control::TrainingController,
     dataset::LcgRng,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
@@ -113,10 +114,10 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
         #[cfg(feature = "metal")]
         BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
         #[cfg(not(feature = "metal"))]
-        BackendChoice::Metal => Err(CliError::InvalidValue {
+        BackendChoice::Metal => Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--backend".into(),
             value: "metal (build with --features metal)".into(),
-        }),
+        })),
         #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
         BackendChoice::Cuda => {
             let backend =
@@ -124,10 +125,10 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
             Ok(Arc::new(backend))
         }
         #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
-        BackendChoice::Cuda => Err(CliError::InvalidValue {
+        BackendChoice::Cuda => Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--backend".into(),
             value: "cuda (build with --features cuda and no no-cuda)".into(),
-        }),
+        })),
     }
 }
 
@@ -135,12 +136,8 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
 enum CliError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
@@ -604,9 +601,11 @@ fn parse_args() -> Result<CliArgs, CliError> {
             }
             "--backend" => {
                 let value = next_value(&mut iter, &flag)?;
-                args.backend = value.parse().map_err(|_| CliError::InvalidValue {
-                    flag: flag.clone(),
-                    value,
+                args.backend = value.parse().map_err(|_| {
+                    CliError::Arg(ArgError::InvalidValue {
+                        flag: flag.clone(),
+                        value,
+                    })
                 })?;
             }
             "--save-path" => {
@@ -615,7 +614,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--serve" => {
                 args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
     Ok(args)
@@ -635,21 +634,6 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         }));
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T>(flag: &str, value: String) -> Result<T, CliError>
-where
-    T: FromStr,
-{
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {

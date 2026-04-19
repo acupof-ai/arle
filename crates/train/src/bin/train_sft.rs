@@ -15,6 +15,7 @@ use autograd::{
 };
 use thiserror::Error;
 use train::{
+    cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
@@ -109,12 +110,8 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
-    #[error("unknown flag {0}")]
-    UnknownFlag(String),
-    #[error("missing value for flag {0}")]
-    MissingValue(String),
-    #[error("invalid value for {flag}: {value}")]
-    InvalidValue { flag: String, value: String },
+    #[error(transparent)]
+    Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
 }
@@ -272,7 +269,7 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--backend" => {
                 args.backend = next_value(&mut iter, &flag)?
                     .parse()
-                    .map_err(|value| CliError::InvalidValue { flag, value })?;
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
             }
             "--save-every" => {
                 args.save_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
@@ -284,9 +281,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--save-dtype" => {
                 args.save_dtype = next_value(&mut iter, &flag)?
                     .parse()
-                    .map_err(|value| CliError::InvalidValue { flag, value })?;
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
             }
-            _ => return Err(CliError::UnknownFlag(flag)),
+            _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
 
@@ -311,28 +308,13 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ("--log-every", args.log_every),
     ] {
         if value == 0 {
-            return Err(CliError::InvalidValue {
+            return Err(CliError::Arg(ArgError::InvalidValue {
                 flag: flag.into(),
                 value: "0".into(),
-            });
+            }));
         }
     }
     Ok(())
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CliError> {
-    iter.next()
-        .ok_or_else(|| CliError::MissingValue(flag.to_string()))
-}
-
-fn parse_value<T>(flag: &str, value: String) -> Result<T, CliError>
-where
-    T: FromStr,
-{
-    value.parse::<T>().map_err(|_| CliError::InvalidValue {
-        flag: flag.to_string(),
-        value,
-    })
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
