@@ -66,7 +66,7 @@ pub fn tokenize_example(
     tokenizer: &TrainTokenizer,
     max_seq_len: usize,
 ) -> Result<TokenizedSft> {
-    let trailing_nl_len = tokenizer.encode("\n", false)?.len();
+    const IM_END: &str = "<|im_end|>";
     let mut input_ids = Vec::new();
     let mut labels = Vec::new();
 
@@ -76,23 +76,42 @@ pub fn tokenize_example(
         // combined form is what Qwen's chat template actually feeds the model
         // at inference; piecewise-encoded concatenation can diverge.
         let turn = format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
+            "<|im_start|>{}\n{}{IM_END}\n",
             message.role, message.content
         );
-        let turn_ids = tokenizer.encode(&turn, false)?;
+        let (turn_ids, offsets) = tokenizer.encode_with_offsets(&turn, false)?;
         let supervise = message.role == "assistant";
 
-        // Locate assistant body span within the combined encoding. The prefix
-        // ends with a special `<|im_start|>...\n` token boundary, which BPE
-        // will not merge across, so encoding the header alone gives a stable
-        // token count for the header portion of `turn_ids`.
-        let header = format!("<|im_start|>{}\n", message.role);
-        let header_len = tokenizer.encode(&header, false)?.len();
-        let body_end = turn_ids.len().saturating_sub(trailing_nl_len);
+        // Locate the assistant body via **byte offsets** in the combined
+        // encoding, not piecewise token counts. Encoding the header alone
+        // isn't stable — e.g. content that starts with `\n` causes the
+        // header-trailing `\n` and the content-leading `\n` to merge into a
+        // single token, so the standalone header is one token longer than
+        // the header slice of `turn_ids`. Byte offsets remain accurate
+        // regardless of merges.
+        let header_byte_end = format!("<|im_start|>{}\n", message.role).len();
+        let body_byte_end = header_byte_end + message.content.len() + IM_END.len();
+
+        let body_start = if supervise {
+            offsets
+                .iter()
+                .position(|&(s, _)| s >= header_byte_end)
+                .unwrap_or(turn_ids.len())
+        } else {
+            turn_ids.len()
+        };
+        let body_end = if supervise {
+            offsets
+                .iter()
+                .position(|&(s, _)| s >= body_byte_end)
+                .unwrap_or(turn_ids.len())
+        } else {
+            turn_ids.len()
+        };
 
         for (i, &token_id) in turn_ids.iter().enumerate() {
             input_ids.push(token_id);
-            let supervised_here = supervise && i >= header_len && i < body_end;
+            let supervised_here = supervise && i >= body_start && i < body_end;
             labels.push(if supervised_here {
                 token_id as i32
             } else {
