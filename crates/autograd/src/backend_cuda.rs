@@ -95,13 +95,27 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn cuda_storage_slice<'a>(&self, storage: &'a CudaStorage) -> Result<&'a CudaSlice<f32>> {
+        let slice = storage.slice();
+        // Reject handles that live on a different cudarc context/ordinal —
+        // submitting foreign device pointers on our stream surfaces as
+        // invalid-context driver errors. PENDING REMOTE CUDA VERIFICATION.
+        if slice.context() != self.stream.context() {
+            return Err(AutogradError::TapeInvariant(
+                "cuda handle from different context/ordinal",
+            ));
+        }
+        Ok(slice)
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn cuda_slice<'a>(
         &self,
         handle: &'a DeviceHandle,
         op: &'static str,
     ) -> Result<&'a CudaSlice<f32>> {
         match handle {
-            DeviceHandle::Cuda(storage) => Ok(storage.slice()),
+            DeviceHandle::Cuda(storage) => self.cuda_storage_slice(storage),
             DeviceHandle::Cpu(_) => Err(AutogradError::TapeInvariant(match op {
                 "add" => "cuda backend cannot add a cpu device handle",
                 "matmul" => "cuda backend cannot matmul a cpu device handle",
@@ -253,10 +267,14 @@ impl Backend for CudaBackend {
             match handle {
                 DeviceHandle::Cpu(data) => Ok(data.clone()),
                 DeviceHandle::Cuda(storage) => {
-                    let mut host = vec![0.0f32; storage.len()];
+                    let slice = self.cuda_storage_slice(storage)?;
+                    let mut host = vec![0.0f32; slice.len()];
                     self.stream
-                        .memcpy_dtoh(storage.slice(), &mut host)
+                        .memcpy_dtoh(slice, &mut host)
                         .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
+                    // cudarc 0.18 routes memcpy_dtoh through cuMemcpyDtoHAsync_v2
+                    // (async DMA); callers do not always eval() first, so this
+                    // single host fence is required. PENDING REMOTE CUDA VERIFICATION.
                     self.stream
                         .synchronize()
                         .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
