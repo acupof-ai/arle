@@ -522,10 +522,12 @@ fn select_cache_rows(
     position_ids: &[usize],
     store: &mut TensorStore,
 ) -> Result<TensorId> {
+    // Borrow the cache tensor — the full RoPE cache is ~max_position_embeddings *
+    // head_dim/2 floats (8–10 MiB for Qwen3 configs); cloning it twice per
+    // forward would be O(max_pos) instead of O(seq_len).
     let cache_tensor = store
         .get(cache)
-        .ok_or(AutogradError::InvalidTensorId(cache))?
-        .clone();
+        .ok_or(AutogradError::InvalidTensorId(cache))?;
     if cache_tensor.shape.len() != 2 {
         return Err(AutogradError::InvalidRank {
             expected: "2",
@@ -547,7 +549,8 @@ fn select_cache_rows(
         let base = position * cols;
         data.extend_from_slice(&cache_tensor.data[base..base + cols]);
     }
-    Ok(store.alloc(GpuTensor::new(data, vec![position_ids.len(), cols], false)?))
+    let output_shape = vec![position_ids.len(), cols];
+    Ok(store.alloc(GpuTensor::new(data, output_shape, false)?))
 }
 
 fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(TensorId, TensorId)> {
