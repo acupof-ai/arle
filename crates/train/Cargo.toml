@@ -10,10 +10,14 @@ metal = ["autograd/metal"]
 cuda = ["autograd/cuda"]
 
 [dependencies]
-autograd = { path = "../autograd", default-features = false }
+autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "train_tiny_lm"
@@ -22,6 +26,10 @@ path = "src/bin/train_tiny_lm.rs"
 [[bin]]
 name = "train_grpo"
 path = "src/bin/train_grpo.rs"
+
+[[bin]]
+name = "train_sft"
+path = "src/bin/train_sft.rs"
 
 [lints]
 workspace = true

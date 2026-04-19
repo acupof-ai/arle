@@ -1,7 +1,4 @@
-use autograd::{
-    Tape, TensorStore,
-    ops::sum,
-};
+use autograd::{Tape, TensorStore, ops::sum};
 use train::qwen3_autograd::{Qwen3Config, Qwen3Model};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -30,7 +27,11 @@ fn qwen3_autograd_forward_smoke_tiny_config() -> TestResult {
     let position_ids = [0_u32, 1, 2, 3];
     let logits = model.forward(&mut store, &mut tape, &input_ids, &position_ids)?;
 
-    let logits_shape = store.get(logits).expect("logits tensor exists").shape.clone();
+    let logits_shape = store
+        .get(logits)
+        .expect("logits tensor exists")
+        .shape
+        .clone();
     assert_eq!(logits_shape, vec![1, 4, cfg.vocab_size]);
 
     let logits_host = store.to_host(logits)?;
