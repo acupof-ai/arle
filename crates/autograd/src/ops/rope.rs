@@ -74,30 +74,17 @@ pub(crate) fn rope_backward(
         });
     }
 
-    let batch = x_shape[0];
-    let heads = x_shape[1];
-    let seq_len = x_shape[2];
-    let head_dim = x_shape[3];
-    let half_dim = head_dim / 2;
-    let mut grad_x = vec![0.0; upstream.size];
-
-    for batch_idx in 0..batch {
-        for head_idx in 0..heads {
-            for token_idx in 0..seq_len {
-                let rope_base = token_idx * half_dim;
-                let grad_base = (((batch_idx * heads + head_idx) * seq_len) + token_idx) * head_dim;
-                for pair_idx in 0..half_dim {
-                    let grad0 = upstream.data[grad_base + pair_idx];
-                    let grad1 = upstream.data[grad_base + pair_idx + half_dim];
-                    let cos_value = cos_tensor.data[rope_base + pair_idx];
-                    let sin_value = sin_tensor.data[rope_base + pair_idx];
-                    grad_x[grad_base + pair_idx] = (grad0 * cos_value) + (grad1 * sin_value);
-                    grad_x[grad_base + pair_idx + half_dim] =
-                        (grad1 * cos_value) - (grad0 * sin_value);
-                }
-            }
-        }
-    }
+    // rope backward is rope forward with sin negated:
+    //   forward:  y0 = x0*cos - x1*sin,   y1 = x1*cos + x0*sin
+    //   backward: gx0 = gy0*cos + gy1*sin, gx1 = gy1*cos - gy0*sin
+    //           = rope_forward(gy, cos, -sin)
+    // Negate on the CPU (cheap; cache only; tiny compared to the 4-D rotation)
+    // then dispatch through the backend so Metal / CUDA accelerate the bulk op.
+    let neg_sin = store.backend().neg_forward(&sin_tensor.data)?;
+    let grad_x =
+        store
+            .backend()
+            .rope_forward(&upstream.data, &x_shape, &cos_tensor.data, &neg_sin)?;
 
     let grad_id = store.alloc(Tensor::new(grad_x, x_shape, false)?);
     Ok(smallvec![(x, grad_id)])

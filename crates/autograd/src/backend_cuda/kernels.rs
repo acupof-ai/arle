@@ -20,6 +20,8 @@ const REDUCE_CU: &str = include_str!("kernels/reduce.cu");
 const ROPE_CU: &str = include_str!("kernels/rope.cu");
 #[cfg(not(feature = "no-cuda"))]
 const GATHER_CU: &str = include_str!("kernels/gather.cu");
+#[cfg(not(feature = "no-cuda"))]
+const SCATTER_ADD_CU: &str = include_str!("kernels/scatter_add.cu");
 
 #[cfg(not(feature = "no-cuda"))]
 const FUNCTION_NAMES: &[&str] = &[
@@ -38,6 +40,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "mean_last_axis_f32",
     "rope_f32",
     "gather_last_dim_f32",
+    "scatter_add_rows_f32",
 ];
 
 #[derive(Debug)]
@@ -182,6 +185,7 @@ fn concat_sources() -> String {
         REDUCE_CU,
         ROPE_CU,
         GATHER_CU,
+        SCATTER_ADD_CU,
     ] {
         src.push_str(chunk);
         src.push('\n');

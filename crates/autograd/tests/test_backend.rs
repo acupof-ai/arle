@@ -9,8 +9,8 @@ use autograd::{
         Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
         cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_forward,
         cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward,
-        cpu_rms_norm_forward, cpu_rope_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
-        cpu_sum_last_axis_forward,
+        cpu_rms_norm_forward, cpu_rope_forward, cpu_scatter_add_rows_forward, cpu_silu_forward,
+        cpu_softmax_forward_last_axis, cpu_sum_last_axis_forward,
     },
 };
 
@@ -32,6 +32,7 @@ fn _touch_refs() {
     let _ = cpu_mean_last_axis_forward;
     let _ = cpu_rope_forward;
     let _ = cpu_gather_last_dim_forward;
+    let _ = cpu_scatter_add_rows_forward;
 }
 
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
@@ -822,4 +823,139 @@ fn metal_backend_gather_last_dim_matches_cpu() {
         .expect("metal gather");
     let want = cpu_gather_last_dim_forward(&src, shape, &ids).unwrap();
     assert_close(&got, &want, 1e-6, "metal gather");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// scatter_add_rows_forward: CPU self-parity + GPU backend parity.
+// Covers the two call-site shapes:
+//   embedding_backward → feature_dim = hidden, aliased indices (token ids
+//   repeating across positions → atomicAdd on GPU).
+//   gather_last_dim_backward → feature_dim = 1, remapped flat indices
+//   `i * vocab + original_indices[i]` (all unique by construction).
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cpu_scatter_add_rows_embedding_shape() {
+    // 5 prefix rows, feature_dim = 4, vocab = 3. Index 0 is hit by rows 0
+    // and 2 so rows 0 and 2 of upstream must sum into bin 0 (exercises the
+    // aliasing path the CUDA atomicAdd is there for).
+    let prefix_rows = 5_usize;
+    let feature_dim = 4_usize;
+    let vocab = 3_usize;
+    let upstream: Vec<f32> = (0..(prefix_rows * feature_dim) as i32)
+        .map(|i| i as f32 * 0.1)
+        .collect();
+    let indices = [0_i32, 1, 0, 2, -1];
+    let got =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
+    let mut want = vec![0.0_f32; vocab * feature_dim];
+    for (row, &id) in indices.iter().enumerate() {
+        if id < 0 || (id as usize) >= vocab {
+            continue;
+        }
+        let src_base = row * feature_dim;
+        let dst_base = (id as usize) * feature_dim;
+        for col in 0..feature_dim {
+            want[dst_base + col] += upstream[src_base + col];
+        }
+    }
+    assert_close(&got, &want, 1e-6, "cpu scatter_add_rows embedding");
+}
+
+#[test]
+fn cpu_scatter_add_rows_gather_shape() {
+    // gather_last_dim_backward: feature_dim = 1, flat_vocab = prefix * vocab.
+    let prefix_rows = 4_usize;
+    let vocab = 5_usize;
+    let flat_vocab = prefix_rows * vocab;
+    let upstream = [1.5_f32, -2.0, 0.25, 3.5];
+    let original = [2_usize, 0, 4, 1];
+    let flat_ids: Vec<i32> = original
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (i * vocab + id) as i32)
+        .collect();
+    let got =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, 1, &flat_ids, flat_vocab).unwrap();
+    let mut want = vec![0.0_f32; flat_vocab];
+    for (i, &id) in original.iter().enumerate() {
+        want[i * vocab + id] += upstream[i];
+    }
+    assert_close(&got, &want, 1e-6, "cpu scatter_add_rows gather");
+}
+
+#[test]
+fn cpu_scatter_add_rows_oob_skips() {
+    // Negative and out-of-range ids must be silently dropped (matches the
+    // CUDA kernel's early-return and the pre-existing inline scatter in
+    // embedding_backward).
+    let upstream = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let indices = [-1_i32, 10, 0];
+    let got = cpu_scatter_add_rows_forward(&upstream, 3, 2, &indices, 3).unwrap();
+    // Only row 2 (id=0) contributed, adding [5.0, 6.0] into bin 0.
+    let want = [5.0_f32, 6.0, 0.0, 0.0, 0.0, 0.0];
+    assert_close(&got, &want, 1e-6, "cpu scatter_add_rows oob");
+}
+
+#[test]
+fn cpu_backend_trait_scatter_add_rows_matches_reference() {
+    // Confirms CpuBackend's trait method dispatches to the CPU reference
+    // (no override) and gives identical output on the embedding shape.
+    let backend = CpuBackend;
+    let prefix_rows = 6_usize;
+    let feature_dim = 3_usize;
+    let vocab = 4_usize;
+    let upstream: Vec<f32> = (0..(prefix_rows * feature_dim))
+        .map(|i| (i as f32) * 0.5 - 1.0)
+        .collect();
+    let indices = [0_i32, 3, 3, 1, -1, 2];
+    let got = backend
+        .scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab)
+        .unwrap();
+    let want =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
+    assert_close(&got, &want, 1e-6, "cpu backend scatter_add_rows");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_scatter_add_rows_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    // No MLX override today (mlx-sys has no scatter_add binding yet — see
+    // the TODO in backend_metal.rs). This test pins the CPU default path to
+    // correct output so a future MLX override cannot silently drift.
+    let backend = MetalBackend;
+    let prefix_rows = 7_usize;
+    let feature_dim = 8_usize;
+    let vocab = 5_usize;
+    let upstream = make_rows(&[prefix_rows, feature_dim], 4321);
+    let indices = [0_i32, 4, 2, 2, -1, 7, 1];
+    let got = backend
+        .scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab)
+        .expect("metal scatter_add_rows");
+    let want =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
+    assert_close(&got, &want, 1e-5, "metal scatter_add_rows");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_scatter_add_rows_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let prefix_rows = 9_usize;
+    let feature_dim = 16_usize;
+    let vocab = 6_usize;
+    let upstream = make_rows(&[prefix_rows, feature_dim], 9876);
+    // Mix of in-range, OOB, and negative ids plus aliased indices (5 hit
+    // three times) so the atomicAdd path is exercised.
+    let indices = [0_i32, 5, 5, 2, -1, 8, 1, 3, 5];
+    let got = backend
+        .scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab)
+        .expect("cuda scatter_add_rows");
+    let want =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
+    assert_close(&got, &want, 1e-4, "cuda scatter_add_rows");
 }

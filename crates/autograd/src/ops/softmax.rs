@@ -81,18 +81,21 @@ pub(crate) fn softmax_backward(
         });
     }
 
-    let last_dim = last_dim(&output.shape)?;
-    let rows = output.size / last_dim;
-    let mut grad = vec![0.0; output.size];
+    // dL/dx = y * (dL/dy - sum(dL/dy * y, axis=-1, keepdim))
+    // Stream row-wise so we only allocate the output buffer — full-vocab logits
+    // on training paths make intermediate `mul`/`sub` materializations cost
+    // 3-4× peak memory (codex review 2026-04-19).
+    let last = last_dim(&output.shape)?;
+    let rows = output.data.len() / last;
+    let mut grad = vec![0.0_f32; output.data.len()];
     for row in 0..rows {
-        let base = row * last_dim;
-        let mut dot = 0.0;
-        for col in 0..last_dim {
+        let base = row * last;
+        let mut dot = 0.0_f32;
+        for col in 0..last {
             dot += upstream.data[base + col] * output.data[base + col];
         }
-        for col in 0..last_dim {
-            let y_value = output.data[base + col];
-            grad[base + col] = y_value * (upstream.data[base + col] - dot);
+        for col in 0..last {
+            grad[base + col] = output.data[base + col] * (upstream.data[base + col] - dot);
         }
     }
 
@@ -127,16 +130,20 @@ pub(crate) fn log_softmax_backward(
         });
     }
 
-    let last_dim = last_dim(&output.shape)?;
-    let rows = output.size / last_dim;
-    let mut grad = vec![0.0; output.size];
+    // dL/dx = dL/dy - softmax(x) * sum(dL/dy, axis=-1, keepdim)
+    // Saved output is log_softmax(x), so softmax(x) = exp(output). Stream
+    // row-wise to avoid materializing `exp(output)` + `scaled` + `grad` at
+    // full-vocab scale (codex review 2026-04-19).
+    let last = last_dim(&output.shape)?;
+    let rows = output.data.len() / last;
+    let mut grad = vec![0.0_f32; output.data.len()];
     for row in 0..rows {
-        let base = row * last_dim;
-        let mut sum_grad = 0.0;
-        for col in 0..last_dim {
+        let base = row * last;
+        let mut sum_grad = 0.0_f32;
+        for col in 0..last {
             sum_grad += upstream.data[base + col];
         }
-        for col in 0..last_dim {
+        for col in 0..last {
             grad[base + col] = upstream.data[base + col] - output.data[base + col].exp() * sum_grad;
         }
     }
