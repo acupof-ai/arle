@@ -347,7 +347,14 @@ fn build_dataset(
 ) -> Result<Box<dyn Dataset>, CliError> {
     match args.dataset {
         DatasetKind::Copy => Ok(Box::new(CopyDataset::new(args.batch, args.seq))),
-        DatasetKind::Bytes => Ok(Box::new(BytesDataset::new(args.batch, args.seq))),
+        DatasetKind::Bytes => {
+            if vocab_size < 256 {
+                return Err(CliError::Custom(format!(
+                    "--dataset bytes emits byte ids 0..=255; --vocab-size {vocab_size} < 256 would overflow the embedding table"
+                )));
+            }
+            Ok(Box::new(BytesDataset::new(args.batch, args.seq)))
+        }
         DatasetKind::Corpus => {
             let path = args.corpus.as_ref().ok_or_else(|| {
                 CliError::Custom("--dataset corpus requires --corpus <path>".into())

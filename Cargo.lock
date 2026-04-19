@@ -3701,7 +3701,9 @@ dependencies = [
 name = "train"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "autograd",
+ "hf-hub",
  "safetensors",
  "serde",
  "serde_json",

@@ -106,6 +106,12 @@ pub struct ConvertStats {
 }
 
 pub fn convert_file(input: &Path, output: &Path, format: InputFormat) -> Result<ConvertStats> {
+    if paths_alias(input, output) {
+        return Err(anyhow!(
+            "--input and --output resolve to the same file ({}); in-place conversion would truncate the source before reading",
+            input.display()
+        ));
+    }
     let reader = BufReader::new(
         File::open(input).with_context(|| format!("open input {}", input.display()))?,
     );
@@ -154,6 +160,13 @@ pub fn convert_file(input: &Path, output: &Path, format: InputFormat) -> Result<
 
     writer.flush()?;
     Ok(stats)
+}
+
+fn paths_alias(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 fn convert_line(line: &str, format: InputFormat) -> Result<Vec<Message>> {

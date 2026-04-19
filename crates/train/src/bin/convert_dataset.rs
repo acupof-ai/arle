@@ -70,6 +70,12 @@ fn main() -> ExitCode {
                 "[convert_dataset] {} lines · {} written · {} skipped",
                 stats.total_lines, stats.written, stats.skipped
             );
+            if stats.written == 0 {
+                eprintln!(
+                    "[convert_dataset] error: produced 0 records (wrong --format, or input didn't match the expected schema)"
+                );
+                return ExitCode::from(1);
+            }
             ExitCode::from(0)
         }
         Err(err) => {
