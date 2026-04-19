@@ -610,6 +610,49 @@ mlx_array* mlx_where(mlx_array* cond, mlx_array* a, mlx_array* b) {
     MLX_TRY_RETURN(from_arr(where(*to_arr(cond), *to_arr(a), *to_arr(b))));
 }
 
+// Scatter-add `prefix_rows` feature vectors into a zero-initialized
+// `[vocab, feature_dim]` output. Caller has already filtered OOB/negative
+// indices host-side so `indices_data` is guaranteed in-bounds and
+// `n_valid == prefix_rows` from the bridge's perspective.
+//
+// Implementation: build `zeros({vocab, feature_dim})` as the base, upload
+// updates as `[n_valid, feature_dim]` and reshape to `[n_valid, 1, feature_dim]`
+// (scatter_add wants `updates.ndim() == indices.ndim() + a.ndim()` = 1+2 = 3),
+// upload indices as int32 `[n_valid]`, call scatter_add on axis 0.
+mlx_array* mlx_scatter_add_rows_f32(const float* updates_data,
+                                    const int32_t* indices_data,
+                                    int32_t prefix_rows, int32_t feature_dim,
+                                    int32_t vocab) {
+    MLX_TRY_RETURN([&]() {
+        if (vocab <= 0 || feature_dim <= 0) {
+            throw std::invalid_argument("mlx_scatter_add_rows_f32: vocab and feature_dim must be positive");
+        }
+        Shape out_shape = {vocab, feature_dim};
+        // prefix_rows == 0 (or everything filtered out) → just return zeros.
+        if (prefix_rows <= 0) {
+            return from_arr(zeros(out_shape, float32));
+        }
+        if (updates_data == nullptr || indices_data == nullptr) {
+            throw std::invalid_argument("mlx_scatter_add_rows_f32: null data pointer with prefix_rows > 0");
+        }
+        Shape updates_shape = {prefix_rows, 1, feature_dim};
+        size_t updates_bytes = static_cast<size_t>(prefix_rows) *
+                               static_cast<size_t>(feature_dim) * sizeof(float);
+        auto updates_buf = allocator::malloc(updates_bytes);
+        std::memcpy(updates_buf.raw_ptr(), updates_data, updates_bytes);
+        auto updates_arr = array(std::move(updates_buf), updates_shape, float32);
+
+        Shape idx_shape = {prefix_rows};
+        size_t idx_bytes = static_cast<size_t>(prefix_rows) * sizeof(int32_t);
+        auto idx_buf = allocator::malloc(idx_bytes);
+        std::memcpy(idx_buf.raw_ptr(), indices_data, idx_bytes);
+        auto idx_arr = array(std::move(idx_buf), idx_shape, int32);
+
+        auto base = zeros(out_shape, float32);
+        return from_arr(scatter_add(base, idx_arr, updates_arr, 0));
+    }());
+}
+
 // === Reduction ===
 
 mlx_array* mlx_sum_axis(mlx_array* a, int32_t axis, bool keepdims) {

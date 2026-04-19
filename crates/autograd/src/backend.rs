@@ -182,6 +182,21 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mul_scalar_forward(a, s)
     }
 
+    /// Right-aligned broadcast-add `out[i..] = a[i..] + b[broadcast_offset(i)]`.
+    ///
+    /// `b_shape.len() <= a_shape.len()`. Each `b`-axis of size 1 broadcasts
+    /// across the corresponding `a`-axis; otherwise the size must match.
+    /// Output shape equals `a_shape`.
+    fn add_broadcast_forward(
+        &self,
+        a: &[f32],
+        a_shape: &[usize],
+        b: &[f32],
+        b_shape: &[usize],
+    ) -> Result<Vec<f32>> {
+        cpu_add_broadcast_forward(a, a_shape, b, b_shape)
+    }
+
     /// Elementwise `out = exp(a)`.
     fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         cpu_exp_forward(a)
@@ -519,6 +534,118 @@ pub fn cpu_mul_forward(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
 /// CPU reference `out = a * s`.
 pub fn cpu_mul_scalar_forward(a: &[f32], s: f32) -> Result<Vec<f32>> {
     Ok(a.iter().map(|x| x * s).collect())
+}
+
+/// CPU reference right-aligned broadcast-add.
+///
+/// Output shape equals `a_shape`; `b` is broadcast into `a`. `b_shape.len()`
+/// must be `<= a_shape.len()`; each matching `b`-axis must be either `1` or
+/// equal to the corresponding `a`-axis. See `broadcast_offset` for the
+/// index rule.
+pub fn cpu_add_broadcast_forward(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+) -> Result<Vec<f32>> {
+    validate_broadcast(a_shape, b_shape)?;
+    let a_size: usize = shape_size(a_shape);
+    let b_size: usize = shape_size(b_shape);
+    if a.len() != a_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: a.len(),
+            shape: a_shape.to_vec(),
+            size: a_size,
+        });
+    }
+    if b.len() != b_size {
+        return Err(crate::AutogradError::DataLengthMismatch {
+            len: b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+    let mut out = vec![0.0f32; a_size];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = a[index] + b[broadcast_offset(index, a_shape, b_shape)];
+    }
+    Ok(out)
+}
+
+/// Validate that `b_shape` is right-aligned broadcast-compatible into `a_shape`.
+pub(crate) fn validate_broadcast(a_shape: &[usize], b_shape: &[usize]) -> Result<()> {
+    if b_shape.len() > a_shape.len() {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: a_shape.to_vec(),
+            got: b_shape.to_vec(),
+        });
+    }
+
+    let rank_offset = a_shape.len() - b_shape.len();
+    for (index, &dim) in b_shape.iter().enumerate() {
+        let target = a_shape[rank_offset + index];
+        if dim != 1 && dim != target {
+            return Err(crate::AutogradError::ShapeMismatch {
+                expected: a_shape.to_vec(),
+                got: b_shape.to_vec(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Map an output linear index in `out_shape` to the corresponding flat offset
+/// into a right-aligned broadcast operand with shape `b_shape`.
+pub(crate) fn broadcast_offset(out_index: usize, out_shape: &[usize], b_shape: &[usize]) -> usize {
+    if b_shape.is_empty() {
+        return 0;
+    }
+
+    let coords = linear_to_coords(out_index, out_shape);
+    let rank_offset = out_shape.len() - b_shape.len();
+    let b_strides = broadcast_strides(b_shape);
+    let mut offset = 0usize;
+    for (index, stride) in b_strides.iter().enumerate() {
+        let coord = if b_shape[index] == 1 {
+            0
+        } else {
+            coords[rank_offset + index]
+        };
+        offset += coord * stride;
+    }
+    offset
+}
+
+/// Row-major contiguous strides for `shape`. Shared helper used by broadcast
+/// math (not the `Tensor` layout stride — that lives in `tensor.rs`).
+pub(crate) fn broadcast_strides(shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+
+    let mut strides = vec![0; shape.len()];
+    let mut stride = 1usize;
+    for (index, dim) in shape.iter().enumerate().rev() {
+        strides[index] = stride;
+        stride *= *dim;
+    }
+    strides
+}
+
+/// Unravel a linear index into per-axis coordinates (row-major).
+pub(crate) fn linear_to_coords(mut linear: usize, shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+
+    let mut coords = vec![0; shape.len()];
+    for index in (0..shape.len()).rev() {
+        let dim = shape[index];
+        coords[index] = linear % dim;
+        linear /= dim;
+    }
+    coords
 }
 
 /// CPU reference `out = exp(a)`.

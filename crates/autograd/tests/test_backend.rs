@@ -922,9 +922,9 @@ fn cpu_backend_trait_scatter_add_rows_matches_reference() {
 fn metal_backend_scatter_add_rows_matches_cpu() {
     use autograd::backend::Backend;
     use autograd::backend_metal::MetalBackend;
-    // No MLX override today (mlx-sys has no scatter_add binding yet — see
-    // the TODO in backend_metal.rs). This test pins the CPU default path to
-    // correct output so a future MLX override cannot silently drift.
+    // Exercises the MLX `scatter_add` binding via `mlx_scatter_add_rows_f32`:
+    // aliased indices (2 appears twice) confirm additive semantics; -1 and 7
+    // exercise the host-side OOB/negative filter before hitting MLX.
     let backend = MetalBackend;
     let prefix_rows = 7_usize;
     let feature_dim = 8_usize;
@@ -937,6 +937,47 @@ fn metal_backend_scatter_add_rows_matches_cpu() {
     let want =
         cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
     assert_close(&got, &want, 1e-5, "metal scatter_add_rows");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_scatter_add_rows_gather_shape() {
+    // gather_last_dim_backward shape: feature_dim = 1, flat indices unique.
+    // Exercises the `feature_dim == 1` edge case through the MLX path.
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let prefix_rows = 4_usize;
+    let vocab = 5_usize;
+    let flat_vocab = prefix_rows * vocab;
+    let upstream = [1.5_f32, -2.0, 0.25, 3.5];
+    let flat_ids: Vec<i32> = [2_usize, 0, 4, 1]
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (i * vocab + id) as i32)
+        .collect();
+    let got = backend
+        .scatter_add_rows_forward(&upstream, prefix_rows, 1, &flat_ids, flat_vocab)
+        .expect("metal scatter_add_rows gather shape");
+    let want =
+        cpu_scatter_add_rows_forward(&upstream, prefix_rows, 1, &flat_ids, flat_vocab).unwrap();
+    assert_close(&got, &want, 1e-5, "metal scatter_add_rows gather shape");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_scatter_add_rows_all_oob() {
+    // Every index out of range → MLX is never called (host filter returns
+    // zeros early). Confirms the empty-valid path doesn't regress.
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let upstream = [1.0_f32, 2.0, 3.0, 4.0];
+    let indices = [-1_i32, 10];
+    let got = backend
+        .scatter_add_rows_forward(&upstream, 2, 2, &indices, 3)
+        .expect("metal scatter_add_rows all oob");
+    assert_eq!(got, vec![0.0_f32; 6]);
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
@@ -958,4 +999,104 @@ fn cuda_backend_scatter_add_rows_matches_cpu() {
     let want =
         cpu_scatter_add_rows_forward(&upstream, prefix_rows, feature_dim, &indices, vocab).unwrap();
     assert_close(&got, &want, 1e-4, "cuda scatter_add_rows");
+}
+
+// -----------------------------------------------------------------------------
+// add_broadcast_forward: CPU reference + GPU backend parity.
+
+// Naive reference that does not go through the backend trait — used to
+// cross-check the trait default and every backend override.
+fn reference_add_broadcast(a: &[f32], a_shape: &[usize], b: &[f32], b_shape: &[usize]) -> Vec<f32> {
+    let a_size: usize = a_shape.iter().product();
+    let rank_offset = a_shape.len() - b_shape.len();
+
+    // Right-aligned contiguous strides for b, zero on broadcast axes.
+    let mut b_strides = vec![0_usize; a_shape.len()];
+    let mut stride = 1_usize;
+    for i in (0..b_shape.len()).rev() {
+        let dim = b_shape[i];
+        b_strides[rank_offset + i] = if dim == 1 { 0 } else { stride };
+        stride *= dim;
+    }
+
+    let mut out = vec![0.0_f32; a_size];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // Unravel i in a_shape (row-major).
+        let mut coords = vec![0_usize; a_shape.len()];
+        let mut linear = i;
+        for d in (0..a_shape.len()).rev() {
+            coords[d] = linear % a_shape[d];
+            linear /= a_shape[d];
+        }
+        let mut b_off = 0_usize;
+        for d in 0..a_shape.len() {
+            b_off += coords[d] * b_strides[d];
+        }
+        *slot = a[i] + b[b_off];
+    }
+    out
+}
+
+#[test]
+fn cpu_add_broadcast_matches_reference() {
+    use autograd::backend::Backend;
+    let backend = CpuBackend;
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[4, 8], &[8]),
+        (&[2, 3, 4], &[1, 3, 4]),
+        (&[3, 1, 5], &[5]),
+    ];
+    for (ai, (a_shape, b_shape)) in cases.iter().enumerate() {
+        let a = make_rows(a_shape, 100 + ai as u64);
+        let b = make_rows(b_shape, 200 + ai as u64);
+        let got = backend
+            .add_broadcast_forward(&a, a_shape, &b, b_shape)
+            .expect("cpu add_broadcast");
+        let want = reference_add_broadcast(&a, a_shape, &b, b_shape);
+        assert_close(&got, &want, 1e-6, "cpu add_broadcast");
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_add_broadcast_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[4, 8], &[8]),
+        (&[2, 3, 4], &[1, 3, 4]),
+        (&[3, 1, 5], &[5]),
+    ];
+    for (ai, (a_shape, b_shape)) in cases.iter().enumerate() {
+        let a = make_rows(a_shape, 1000 + ai as u64);
+        let b = make_rows(b_shape, 2000 + ai as u64);
+        let got = backend
+            .add_broadcast_forward(&a, a_shape, &b, b_shape)
+            .expect("metal add_broadcast");
+        let want = reference_add_broadcast(&a, a_shape, &b, b_shape);
+        assert_close(&got, &want, 1e-5, "metal add_broadcast");
+    }
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_add_broadcast_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[4, 8], &[8]),
+        (&[2, 3, 4], &[1, 3, 4]),
+        (&[3, 1, 5], &[5]),
+    ];
+    for (ai, (a_shape, b_shape)) in cases.iter().enumerate() {
+        let a = make_rows(a_shape, 10_000 + ai as u64);
+        let b = make_rows(b_shape, 20_000 + ai as u64);
+        let got = backend
+            .add_broadcast_forward(&a, a_shape, &b, b_shape)
+            .expect("cuda add_broadcast");
+        let want = reference_add_broadcast(&a, a_shape, &b, b_shape);
+        assert_close(&got, &want, 1e-5, "cuda add_broadcast");
+    }
 }

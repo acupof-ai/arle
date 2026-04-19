@@ -72,11 +72,7 @@ pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
         });
     }
 
-    let data = a_data
-        .iter()
-        .zip(b_data.iter())
-        .map(|(lhs, rhs)| lhs * rhs)
-        .collect();
+    let data = store.backend().mul_forward(&a_data, &b_data)?;
     let requires_grad = a_requires_grad || b_requires_grad;
     let output_id = store.alloc(Tensor::new(data, a_shape, requires_grad)?);
 
@@ -107,7 +103,7 @@ pub fn mul_scalar(
         )
     };
 
-    let data = input_data.iter().map(|value| value * k).collect();
+    let data = store.backend().mul_scalar_forward(&input_data, k)?;
     let output_id = store.alloc(Tensor::new(data, input_shape, requires_grad)?);
 
     if requires_grad {
@@ -175,20 +171,12 @@ pub(crate) fn mul_backward(
 
     let mut grads = GradPairs::new();
     if a_tensor.requires_grad {
-        let grad_a = upstream
-            .iter()
-            .zip(b_tensor.data.iter())
-            .map(|(grad, rhs)| grad * rhs)
-            .collect();
+        let grad_a = store.backend().mul_forward(&upstream, &b_tensor.data)?;
         let grad_id = store.alloc(Tensor::new(grad_a, a_tensor.shape.clone(), false)?);
         grads.push((a, grad_id));
     }
     if b_tensor.requires_grad {
-        let grad_b = upstream
-            .iter()
-            .zip(a_tensor.data.iter())
-            .map(|(grad, lhs)| grad * lhs)
-            .collect();
+        let grad_b = store.backend().mul_forward(&upstream, &a_tensor.data)?;
         let grad_id = store.alloc(Tensor::new(grad_b, b_tensor.shape.clone(), false)?);
         grads.push((b, grad_id));
     }
@@ -213,7 +201,7 @@ pub(crate) fn mul_scalar_backward(
 
     let upstream = store.to_host(output_grad_id)?;
     let input_shape = store.tensor(a)?.shape.clone();
-    let grad = upstream.iter().map(|value| value * k).collect();
+    let grad = store.backend().mul_scalar_forward(&upstream, k)?;
     let grad_id = store.alloc(Tensor::new(grad, input_shape, false)?);
     Ok(smallvec![(a, grad_id)])
 }
