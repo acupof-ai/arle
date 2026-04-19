@@ -564,6 +564,23 @@ impl Backend for CudaBackend {
             cuda_rope(self, x, x_shape, cos, sin)
         }
     }
+
+    fn gather_last_dim_forward(
+        &self,
+        src: &[f32],
+        src_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (src, src_shape, ids);
+            todo!("GPU required: cuda gather is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_gather_last_dim(self, src, src_shape, ids)
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -979,6 +996,68 @@ fn cuda_rope(
         },
     )?;
     cuda_download(backend, &d_out, total)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_gather_last_dim(
+    backend: &CudaBackend,
+    src: &[f32],
+    src_shape: &[usize],
+    ids: &[i32],
+) -> Result<Vec<f32>> {
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let expected: usize = src_shape.iter().product();
+    if src.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![src.len()],
+        });
+    }
+    if ids.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: ids.len(),
+        });
+    }
+    let d_src = backend.upload_slice(src, src_shape)?;
+    let d_ids = backend
+        .stream
+        .clone_htod(ids)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(prefix)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let n_i32 = i32::try_from(prefix)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather n exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda gather vocab exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("gather_last_dim_f32")?,
+        prefix,
+        |builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(&d_src)
+                .arg(&d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, prefix)
 }
 
 #[cfg(not(feature = "no-cuda"))]

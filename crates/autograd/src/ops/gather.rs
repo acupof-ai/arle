@@ -37,16 +37,22 @@ pub fn gather_last_dim(
         });
     }
 
-    let mut output = vec![0.0; prefix_elems];
-    for (prefix_index, &index) in indices.iter().enumerate() {
+    // Bounds-check here so the error surfaces the original `usize` index
+    // (the CUDA kernel zero-fills on OOB to keep the device path branch-free).
+    for &index in indices {
         if index >= vocab {
             return Err(AutogradError::IndexOutOfBounds {
                 index,
                 upper: vocab,
             });
         }
-        output[prefix_index] = src_tensor.data[(prefix_index * vocab) + index];
     }
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let output =
+        store
+            .backend()
+            .gather_last_dim_forward(&src_tensor.data, &src_tensor.shape, &ids_i32)?;
+    debug_assert_eq!(output.len(), prefix_elems);
 
     let output_id = store.alloc(Tensor::new(output, output_shape, src_tensor.requires_grad)?);
     if src_tensor.requires_grad {

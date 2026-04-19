@@ -6,10 +6,10 @@
 use autograd::{
     CpuBackend,
     backend::{
-        Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gelu_forward,
-        cpu_log_softmax_forward_last_axis, cpu_matmul_forward, cpu_mean_last_axis_forward,
-        cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward, cpu_rms_norm_forward,
-        cpu_rope_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
+        Backend, cpu_embedding_forward, cpu_exp_forward, cpu_gather_last_dim_forward,
+        cpu_gelu_forward, cpu_log_softmax_forward_last_axis, cpu_matmul_forward,
+        cpu_mean_last_axis_forward, cpu_mul_forward, cpu_mul_scalar_forward, cpu_neg_forward,
+        cpu_rms_norm_forward, cpu_rope_forward, cpu_silu_forward, cpu_softmax_forward_last_axis,
         cpu_sum_last_axis_forward,
     },
 };
@@ -31,6 +31,7 @@ fn _touch_refs() {
     let _ = cpu_sum_last_axis_forward;
     let _ = cpu_mean_last_axis_forward;
     let _ = cpu_rope_forward;
+    let _ = cpu_gather_last_dim_forward;
 }
 
 fn make_rows(shape: &[usize], seed: u64) -> Vec<f32> {
@@ -398,6 +399,19 @@ fn cpu_sum_and_mean_last_axis() {
 }
 
 #[test]
+fn cpu_gather_last_dim_basic() {
+    // src shape [3, 5], pick one element per row.
+    let src: Vec<f32> = (0..15).map(|i| i as f32).collect();
+    let ids = [0_i32, 2, 4];
+    let got = cpu_gather_last_dim_forward(&src, &[3, 5], &ids).unwrap();
+    assert_eq!(got, vec![0.0, 7.0, 14.0]);
+
+    // Out-of-range → error.
+    let bad = [0_i32, 2, 5];
+    assert!(cpu_gather_last_dim_forward(&src, &[3, 5], &bad).is_err());
+}
+
+#[test]
 fn cpu_rope_matches_ops() {
     // Cross-check the Backend trait default (`cpu_rope_forward`) against the
     // original `ops::rope::rope` implementation on a small Qwen3-shaped input.
@@ -574,6 +588,22 @@ fn cuda_backend_mean_last_axis_matches_cpu() {
         .expect("cuda mean");
     let want = cpu_mean_last_axis_forward(&x, shape).unwrap();
     assert_close(&got, &want, 1e-5, "cuda mean");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_backend_gather_last_dim_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_cuda::CudaBackend;
+    let backend = CudaBackend::new(0).expect("cuda ctx");
+    let shape = &[4_usize, 128_usize];
+    let src = make_rows(shape, 71);
+    let ids = [5_i32, 0, 127, 42];
+    let got = backend
+        .gather_last_dim_forward(&src, shape, &ids)
+        .expect("cuda gather");
+    let want = cpu_gather_last_dim_forward(&src, shape, &ids).unwrap();
+    assert_close(&got, &want, 1e-6, "cuda gather");
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]

@@ -250,6 +250,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<f32>> {
         cpu_rope_forward(x, x_shape, cos, sin)
     }
+
+    /// Gather along the last axis: `out[prefix] = src[prefix * vocab + ids[prefix]]`.
+    /// `src_shape[..-1]` dictates the prefix shape; `ids.len()` must equal the
+    /// prefix product. The caller is expected to have bounds-checked the ids.
+    fn gather_last_dim_forward(
+        &self,
+        src: &[f32],
+        src_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<Vec<f32>> {
+        cpu_gather_last_dim_forward(src, src_shape, ids)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -689,6 +701,53 @@ pub fn cpu_rope_forward(
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+/// CPU reference gather along the last axis.
+/// `out[prefix] = src[prefix * vocab + ids[prefix]]`. Out-of-range or negative
+/// ids produce an error (unlike embedding which zero-fills — the caller is
+/// responsible for validating ids).
+pub fn cpu_gather_last_dim_forward(
+    src: &[f32],
+    src_shape: &[usize],
+    ids: &[i32],
+) -> Result<Vec<f32>> {
+    use crate::AutogradError;
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    let expected: usize = src_shape.iter().product();
+    if src.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![src.len()],
+        });
+    }
+    if ids.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: ids.len(),
+        });
+    }
+    let mut out = vec![0.0_f32; prefix];
+    for (i, &id) in ids.iter().enumerate() {
+        if id < 0 || (id as usize) >= vocab {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: id as usize,
+                upper: vocab,
+            });
+        }
+        out[i] = src[i * vocab + id as usize];
     }
     Ok(out)
 }
