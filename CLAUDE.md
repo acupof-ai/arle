@@ -47,7 +47,7 @@ CUDA kernels live at `crates/infer-cuda-kernels/csrc/`, **not** `infer/csrc/`
 | **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
 | **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
 | **Implement** (check prior art in `infer/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
-| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path) | Tests green, `cargo clippy -- -D warnings` clean. |
+| **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if diff is in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub with `pending-remote`)**. |
 | **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
 Skip rules: trivial → Implement + Verify; exploration questions → Explore only.
@@ -101,6 +101,29 @@ Claude = **direction**; Codex = **execution**. Reach via `codex:codex-rescue`
   Learnings), goal taxonomy, watch-list during runs, and **auto-iteration
   rules** (§7: when to loop, when to stop, information-volume triggers).
   Applies to both benchmarks and traces.
+- **MANDATORY — every runtime change produces a bench entry.** A change is
+  not "done" until a dated entry lands under `docs/experience/wins/` (or
+  `errors/` if a regression was found). This is the Verify phase exit
+  condition for any diff that could move numbers. No bench entry → not
+  shipped.
+  - **In scope** (bench required): anything under `infer/src/`,
+    `crates/infer-cuda-kernels/csrc/`, `crates/mlx-sys/src/`, `src/`, any
+    `scripts/bench_*.{sh,py}` parameter change, feature-flag default flips,
+    scheduler/kernel/ops/model/backend edits, dependency bumps that touch
+    the hot path.
+  - **Exempt** (no bench): pure docs (`docs/`, `*.md`, `AGENTS.md`),
+    comment-only diffs, `CLAUDE.md` / memory, dev-only tooling,
+    gitignored-output paths. When exempt, state so in the commit body.
+  - **Regression-check minimum.** Even a "small" change: one
+    `scripts/bench_guidellm.sh` run against the most recent baseline for
+    the affected backend+model, with a Δ% row. Full sweep only when the
+    change is an optimization or architectural.
+  - **If the bench can't run locally** (e.g. CUDA change on a Mac),
+    the commit body MUST cite the remote-machine ticket or plan entry
+    that will execute it, and the entry is opened as a stub under
+    `wins/` with status `pending-remote`. No silent skips.
+  - **Auto-iterate** per spec §7 until stopping rules hold; then cross-link
+    the wins entry from the project/plan that commissioned the change.
 - Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
   using the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
