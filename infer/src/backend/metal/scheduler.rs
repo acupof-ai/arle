@@ -38,20 +38,18 @@ pub struct MetalSchedulerConfig {
     pub decode_active_prefill_cap: usize,
     /// Maximum requests waiting in the queue.
     pub max_waiting_requests: usize,
-    /// When true (default), disable DFlash whenever >1 slot is open (legacy
-    /// behavior). When false, concurrent DFlash-enabled rows are batched
-    /// through `execute_qwen35_dflash_packed_batch`; rows that must plain-
-    /// decode this tick still serialize via `execute_decode_single`.
+    /// When true, disable DFlash whenever >1 slot is open (legacy behavior,
+    /// retained for A/B bench and kill-switch). When false (default),
+    /// concurrent DFlash-enabled rows are batched through
+    /// `execute_qwen35_dflash_packed_batch`; rows that must plain-decode
+    /// this tick still serialize via `execute_decode_single`.
     ///
-    /// Default is `true` because today's admission path at
-    /// `runtime::admit_request` only enables DFlash for solo requests
-    /// (`active.is_empty()`), so the new concurrent-DFlash fast path is
-    /// currently unreachable in production without also flipping admission.
-    /// Until we bench-prove concurrent DFlash beats concurrent plain-decode
-    /// and lift the admission gate, flag-default stays on the legacy
-    /// downgrade to avoid regressing the A+B case (a lone DFlash row
-    /// serializing via `execute_decode_single` instead of joining the
-    /// packed plain batch via the downgrade).
+    /// Flag flipped to false 2026-04-19 after bench-proving concurrent
+    /// DFlash beats the legacy downgrade at c≥2 (see
+    /// `docs/experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md`).
+    /// Admission was flipped in parallel at
+    /// `runtime::admit_request` — all Qwen3.5 requests now acquire DFlash
+    /// state regardless of `active` occupancy.
     pub metal_dflash_concurrency_off: bool,
 }
 
@@ -62,7 +60,7 @@ impl Default for MetalSchedulerConfig {
             prefill_chunk_size: 512,
             decode_active_prefill_cap: 128,
             max_waiting_requests: 256,
-            metal_dflash_concurrency_off: true,
+            metal_dflash_concurrency_off: false,
         }
     }
 }
