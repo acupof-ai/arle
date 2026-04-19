@@ -26,19 +26,21 @@ pub fn embedding(
     let vocab = table_tensor.shape[0];
     let hidden = table_tensor.shape[1];
     let seq_len = indices.len();
-    let mut output = vec![0.0; seq_len * hidden];
-    for (position, &index) in indices.iter().enumerate() {
+    // Bounds-check here so the error carries the original `usize` index (the
+    // backend kernel silently zero-fills OOB rows for well-defined behavior).
+    for &index in indices {
         if index >= vocab {
             return Err(AutogradError::IndexOutOfBounds {
                 index,
                 upper: vocab,
             });
         }
-        let src_base = index * hidden;
-        let dst_base = position * hidden;
-        output[dst_base..dst_base + hidden]
-            .copy_from_slice(&table_tensor.data[src_base..src_base + hidden]);
     }
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let output = store
+        .backend()
+        .embedding_forward(&table_tensor.data, vocab, hidden, &ids_i32)?;
+    debug_assert_eq!(output.len(), seq_len * hidden);
 
     // Raw indices do not carry an explicit [B, S] shape, so M1 treats them as a
     // single batch row `[1, S]` instead of introducing a separate integer tensor store.

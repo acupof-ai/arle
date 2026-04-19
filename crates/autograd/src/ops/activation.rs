@@ -58,14 +58,7 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
-    let output = input
-        .data
-        .iter()
-        .map(|&value| {
-            let sigmoid = 1.0 / (1.0 + (-value).exp());
-            value * sigmoid
-        })
-        .collect();
+    let output = store.backend().silu_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
