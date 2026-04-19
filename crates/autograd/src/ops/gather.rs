@@ -100,10 +100,26 @@ pub(crate) fn gather_last_dim_backward(
     let vocab = *src_shape.last().ok_or(AutogradError::TapeInvariant(
         "gather missing source last dim",
     ))?;
-    let mut grad = vec![0.0; src_shape.iter().product()];
-    for (prefix_index, &index) in indices.iter().enumerate() {
-        grad[(prefix_index * vocab) + index] += upstream.data[prefix_index];
-    }
+    // Gather's backward is a per-prefix point-write into a `[prefix_rows, vocab]`
+    // buffer. Each `(prefix_index, original_index)` pair is unique, so we can
+    // flatten the target to `[prefix_rows * vocab]` and dispatch a single
+    // scatter-add with remapped indices `i * vocab + original_indices[i]`.
+    // One trait call, one GPU launch — the same shape the old inline loop wrote.
+    let prefix_rows = indices.len();
+    let flat_vocab = prefix_rows * vocab;
+    let flat_ids: Vec<i32> = indices
+        .iter()
+        .enumerate()
+        .map(|(i, &index)| (i * vocab + index) as i32)
+        .collect();
+    let grad = store.backend().scatter_add_rows_forward(
+        &upstream.data,
+        prefix_rows,
+        1,
+        &flat_ids,
+        flat_vocab,
+    )?;
+    debug_assert_eq!(grad.len(), src_shape.iter().product::<usize>());
 
     let grad_id = store.alloc(Tensor::new(grad, src_shape, false)?);
     Ok(smallvec![(src, grad_id)])

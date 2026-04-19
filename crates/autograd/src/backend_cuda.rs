@@ -581,6 +581,25 @@ impl Backend for CudaBackend {
             cuda_gather_last_dim(self, src, src_shape, ids)
         }
     }
+
+    fn scatter_add_rows_forward(
+        &self,
+        upstream: &[f32],
+        prefix_rows: usize,
+        feature_dim: usize,
+        indices: &[i32],
+        vocab: usize,
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (upstream, prefix_rows, feature_dim, indices, vocab);
+            todo!("GPU required: cuda scatter_add_rows is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_scatter_add_rows(self, upstream, prefix_rows, feature_dim, indices, vocab)
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -1058,6 +1077,74 @@ fn cuda_gather_last_dim(
         },
     )?;
     cuda_download(backend, &d_out, prefix)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_scatter_add_rows(
+    backend: &CudaBackend,
+    upstream: &[f32],
+    prefix_rows: usize,
+    feature_dim: usize,
+    indices: &[i32],
+    vocab: usize,
+) -> Result<Vec<f32>> {
+    let expected_upstream = prefix_rows * feature_dim;
+    if upstream.len() != expected_upstream {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_upstream],
+            got: vec![upstream.len()],
+        });
+    }
+    if indices.len() != prefix_rows {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix_rows,
+            got: indices.len(),
+        });
+    }
+    let out_len = vocab * feature_dim;
+    // Zero-initialize the accumulator on-device — the kernel only adds.
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    if prefix_rows == 0 || feature_dim == 0 {
+        return cuda_download(backend, &d_out, out_len);
+    }
+    let d_upstream = backend
+        .stream
+        .clone_htod(upstream)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_idx = backend
+        .stream
+        .clone_htod(indices)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+
+    let prefix_i32 = i32::try_from(prefix_rows)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add prefix_rows exceeds i32"))?;
+    let feature_i32 = i32::try_from(feature_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add feature_dim exceeds i32"))?;
+    let vocab_i32 = i32::try_from(vocab)
+        .map_err(|_| AutogradError::TapeInvariant("cuda scatter_add vocab exceeds i32"))?;
+
+    let block = std::cmp::min(feature_dim, 256) as u32;
+    let block = block.max(1);
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function("scatter_add_rows_f32")?,
+        prefix_rows,
+        block,
+        0,
+        |builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(&d_upstream)
+                .arg(&d_idx)
+                .arg(&prefix_i32)
+                .arg(&feature_i32)
+                .arg(&vocab_i32);
+        },
+    )?;
+    cuda_download(backend, &d_out, out_len)
 }
 
 #[cfg(not(feature = "no-cuda"))]

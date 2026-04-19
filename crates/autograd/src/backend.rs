@@ -262,6 +262,28 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ) -> Result<Vec<f32>> {
         cpu_gather_last_dim_forward(src, src_shape, ids)
     }
+
+    /// Scatter-add rows into a `[vocab, feature_dim]` output.
+    ///
+    /// `upstream` is `[prefix_rows * feature_dim]` row-major. For each prefix
+    /// position `row`, `upstream[row * feature_dim .. (row+1) * feature_dim]`
+    /// is summed into `out[indices[row] * feature_dim .. (indices[row]+1) * feature_dim]`.
+    /// Out-of-range or negative indices are skipped (matches the CPU/CUDA
+    /// scatter-add semantics used by `embedding_backward` and
+    /// `gather_last_dim_backward`). Covers both shapes:
+    ///
+    /// - `embedding_backward`: `feature_dim = hidden`, `vocab = weight_shape[0]`.
+    /// - `gather_last_dim_backward`: `feature_dim = 1`, `vocab = src_shape.last()`.
+    fn scatter_add_rows_forward(
+        &self,
+        upstream: &[f32],
+        prefix_rows: usize,
+        feature_dim: usize,
+        indices: &[i32],
+        vocab: usize,
+    ) -> Result<Vec<f32>> {
+        cpu_scatter_add_rows_forward(upstream, prefix_rows, feature_dim, indices, vocab)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -748,6 +770,52 @@ pub fn cpu_gather_last_dim_forward(
             });
         }
         out[i] = src[i * vocab + id as usize];
+    }
+    Ok(out)
+}
+
+/// CPU reference scatter-add into a `[vocab, feature_dim]` output.
+///
+/// `upstream` has length `prefix_rows * feature_dim`; `indices.len() == prefix_rows`.
+/// For each row, the feature slice is added into the bin selected by the
+/// corresponding index. Negative or out-of-range indices are silently
+/// skipped — matches the prior inline scatter in `embedding_backward`
+/// (which bounds-checked at the op layer) and the CUDA kernel's OOB
+/// handling so behavior is identical across backends.
+pub fn cpu_scatter_add_rows_forward(
+    upstream: &[f32],
+    prefix_rows: usize,
+    feature_dim: usize,
+    indices: &[i32],
+    vocab: usize,
+) -> Result<Vec<f32>> {
+    let expected_upstream = prefix_rows * feature_dim;
+    if upstream.len() != expected_upstream {
+        return Err(crate::AutogradError::ShapeMismatch {
+            expected: vec![expected_upstream],
+            got: vec![upstream.len()],
+        });
+    }
+    if indices.len() != prefix_rows {
+        return Err(crate::AutogradError::InvalidIndicesLen {
+            expected: prefix_rows,
+            got: indices.len(),
+        });
+    }
+    let mut out = vec![0.0_f32; vocab * feature_dim];
+    for (row, &id) in indices.iter().enumerate() {
+        if id < 0 {
+            continue;
+        }
+        let id = id as usize;
+        if id >= vocab {
+            continue;
+        }
+        let src_base = row * feature_dim;
+        let dst_base = id * feature_dim;
+        for col in 0..feature_dim {
+            out[dst_base + col] += upstream[src_base + col];
+        }
     }
     Ok(out)
 }

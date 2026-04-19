@@ -97,14 +97,15 @@ pub(crate) fn embedding_backward(
         });
     }
 
-    let mut grad_table = vec![0.0; table_shape.iter().product()];
-    for (position, &index) in indices.iter().enumerate() {
-        let src_base = position * hidden;
-        let dst_base = index * hidden;
-        for col in 0..hidden {
-            grad_table[dst_base + col] += upstream.data[src_base + col];
-        }
-    }
+    let vocab = table_shape[0];
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let grad_table = store.backend().scatter_add_rows_forward(
+        &upstream.data,
+        indices.len(),
+        hidden,
+        &ids_i32,
+        vocab,
+    )?;
 
     let grad_id = store.alloc(Tensor::new(grad_table, table_shape, false)?);
     Ok(smallvec![(table, grad_id)])
