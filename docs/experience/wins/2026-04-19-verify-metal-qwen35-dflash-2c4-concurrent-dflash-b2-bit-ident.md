@@ -221,24 +221,20 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 330 filtered out; fi
      `std::slice::from_ref(target_hidden)`; batched caller passes
      `&target_hidden_per_row`) so each row's fallback is its own
      pre-block hidden state.
-- **Two more [P1]/[P2] codex findings on the round-3 diff — deferred to
-  bench-enablement (#13), NOT fixed in this Phase 2B commit.** Both only
-  trigger when the `metal_dflash_concurrency_off` flag is flipped to
-  `false`; default-`true` production paths are unaffected. In-code
-  pointers added at the exact sites (`runtime.rs:1092-1116` partition
-  comment, `request_state.rs:1704-1713` eligibility gate).
-  1. [P1] **Plain-decode cache rollback on singleton fallback**
-     (`runtime.rs:1105-1116`). When the partition leaves one plain row,
-     `execute_qwen35_packed_decode_batch` returns `Ok(None)` for
-     `open.len() < 2` and the survivor advances via
-     `execute_decode_single`. The cached `Qwen35PackedDecodeBatch` still
-     holds the pre-singleton state; on the next membership change
-     `invalidate_qwen35_decode_batch_cache` syncs the stale cache back
-     into the live request, rolling it back by the singleton decode
-     step. **Fix:** invalidate the cache before the singleton fallback
-     (or bypass the cache for `open.len() == 1` entirely).
-  2. [P2] **All-or-nothing DFlash demotion on buffered-speculative
-     rows** (`request_state.rs:1704-1706`). The eligibility gate returns
+- **Two [P1]/[P2] codex findings on the round-3 diff.** The [P1]
+  "plain-decode cache rollback on singleton fallback" was **retracted**
+  by a follow-up codex review (2026-04-19): the
+  `invalidate_qwen35_decode_batch_cache` sync on the `Ok(None)` arm is
+  the ONLY mechanism that propagates `packed_kv_flat`/`packed_gdr_flat`
+  updates from batched decode into each request's per-row KV state —
+  bypassing it (as an earlier attempted fix did) leaves the singleton
+  survivor decoding on stale caches. The original unconditional invalidate
+  is correct; no fix needed. The [P2] finding below is still open and
+  deferred to bench-enablement (#13). It only triggers when
+  `metal_dflash_concurrency_off=false`; default-`true` production paths
+  are unaffected.
+  1. [P2] **All-or-nothing DFlash demotion on buffered-speculative
+     rows** (`request_state.rs:1704-1713`). The eligibility gate returns
      `Ok(None)` as soon as any row has `!dflash.token_buffer.is_empty()`
      or missing `target_hidden`, which demotes the whole bucket to
      scalar `execute_decode_single`. After a successful speculative
