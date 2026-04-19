@@ -162,10 +162,22 @@ fn main() -> Result<(), CliError> {
         optimizer.zero_grad(&params, &mut store);
 
         let mut step_loss = 0.0_f32;
+        // Each micro-step's loss is already averaged over its own supervised
+        // tokens, so the gradient accumulated by tape.backward() is the
+        // per-example gradient. Scale by 1/batch before backward so the
+        // summed gradient equals the mean across micro-steps — otherwise
+        // the effective learning rate grows linearly with --batch.
+        let loss_scale = 1.0_f32 / args.batch.max(1) as f32;
         for micro_step in 0..args.batch {
             let example_index = sample_index(&mut rng, dataset.len(), step, micro_step);
-            step_loss +=
-                train_on_example(&model, &dataset[example_index], &mut store, &mut tape, &cfg)?;
+            step_loss += train_on_example(
+                &model,
+                &dataset[example_index],
+                &mut store,
+                &mut tape,
+                &cfg,
+                loss_scale,
+            )?;
 
             tape.entries.clear();
             tape.set_enabled(true);
@@ -333,13 +345,22 @@ fn train_on_example(
     store: &mut TensorStore,
     tape: &mut Tape,
     cfg: &Qwen3Config,
+    loss_scale: f32,
 ) -> Result<f32, CliError> {
     let input_len = example.input_ids.len() - 1;
     let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
     let logits = model.forward(store, tape, &example.input_ids[..input_len], &position_ids)?;
     let loss_id = assistant_masked_causal_loss(logits, &example.labels[1..], store, tape, cfg)?;
     let loss = store.to_host(loss_id)?[0];
-    tape.backward(loss_id, store)?;
+    // Scale the loss used for backward so the accumulated per-example
+    // gradients average (rather than sum) across micro-steps. Reported loss
+    // is the unscaled value so log output remains human-meaningful.
+    let backward_id = if (loss_scale - 1.0).abs() > f32::EPSILON {
+        mul_scalar(loss_id, loss_scale, store, tape)?
+    } else {
+        loss_id
+    };
+    tape.backward(backward_id, store)?;
     Ok(loss)
 }
 
