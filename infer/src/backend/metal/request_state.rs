@@ -3459,33 +3459,64 @@ impl StepDriver for Qwen35StepDriver<'_> {
         }
 
         // ── Standard single-token decode ─────────────────────────────────
-        let can_prequeue = self.dflash.is_none() && self.cache_len + 2 <= self.kv_capacity;
-        let result = if let Some(sampled) = self.pending_sampled.take() {
-            let result = sampled.item_i32() as u32;
-            // Commit the step that was already pre-queued on the previous call.
+        //
+        // Cross-step double-buffering (mlx_lm pattern). On the hot path the
+        // sampled MlxArray from step N is kept as a deferred tensor; we
+        // immediately build + async_eval step N+1 *using that tensor* as the
+        // input token (no CPU round-trip), and only THEN materialize step N's
+        // scalar. This keeps the GPU command queue one step deep so it never
+        // idles between steps.
+        //
+        // `sampled` from gpu_sample_token may be shape `[]` (argmax) or `[1]`
+        // (categorical); normalize to `[1]` before feeding it into
+        // `run_step_with_token`, which expects a 1-element token array.
+        let result = if let Some(prev_sampled) = self.pending_sampled.take() {
+            // Fast path: step N was pre-queued on the previous call.
+            // Commit its cache slot accounting first.
             self.cache_len += 1;
-            result
+
+            // cache_len is post-increment (committed); prequeue only needs one more slot.
+            let can_prequeue = self.dflash.is_none() && self.cache_len + 1 <= self.kv_capacity;
+            if can_prequeue {
+                if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
+                    clear_metal_cache();
+                }
+                self.ensure_capacity(self.cache_len + 1)?;
+                let token_arr = super::mlx::reshape(&prev_sampled, &[1]);
+                let next_logits = self.run_step_with_token(&token_arr)?;
+                let next_sampled = gpu_sample_token(&next_logits, &self.params);
+                async_eval(&[&next_sampled]);
+                self.pending_sampled = Some(next_sampled);
+            }
+
+            // Materialize step N's token LAST so step N+1 is already queued.
+            prev_sampled.item_i32() as u32
         } else {
+            // Cold path: no pre-queued step (first decode call, or previous
+            // call hit the kv-capacity ceiling and skipped prequeue).
             if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
                 clear_metal_cache();
             }
             let logits = self.run_step(token)?;
             let sampled = gpu_sample_token(&logits, &self.params);
             async_eval(&[&sampled]);
+
+            let can_prequeue = self.dflash.is_none() && self.cache_len + 2 <= self.kv_capacity;
+            if can_prequeue {
+                if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
+                    clear_metal_cache();
+                }
+                self.ensure_capacity(self.cache_len + 1)?;
+                let token_arr = super::mlx::reshape(&sampled, &[1]);
+                let next_logits = self.run_step_with_token(&token_arr)?;
+                let next_sampled = gpu_sample_token(&next_logits, &self.params);
+                async_eval(&[&next_sampled]);
+                self.pending_sampled = Some(next_sampled);
+            }
+
+            // Materialize step N AFTER step N+1 has been queued (if any).
             sampled.item_i32() as u32
         };
-
-        if can_prequeue {
-            if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
-                clear_metal_cache();
-            }
-            let result_arr = MlxArray::from_slice_i32(&[result as i32], &[1]);
-            self.ensure_capacity(self.cache_len + 1)?;
-            let next_logits = self.run_step_with_token(&result_arr)?;
-            let next_sampled = gpu_sample_token(&next_logits, &self.params);
-            async_eval(&[&next_sampled]);
-            self.pending_sampled = Some(next_sampled);
-        }
 
         Ok(result)
     }
