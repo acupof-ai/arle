@@ -634,3 +634,192 @@ fn cuda_backend_rope_matches_cpu() {
     let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
     assert_close(&got, &want, 1e-4, "cuda rope");
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Metal parity tests for the 12 newly-added Backend trait methods.
+// Mirrors the CUDA block above: upload → backend op → compare vs CPU ref.
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_mul_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[3, 17], 111);
+    let b = make_rows(&[3, 17], 222);
+    let got = backend.mul_forward(&a, &b).expect("metal mul");
+    let want = cpu_mul_forward(&a, &b).unwrap();
+    assert_close(&got, &want, 1e-5, "metal mul");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_mul_scalar_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 9], 77);
+    let got = backend
+        .mul_scalar_forward(&a, -0.5)
+        .expect("metal mul_scalar");
+    let want = cpu_mul_scalar_forward(&a, -0.5).unwrap();
+    assert_close(&got, &want, 1e-6, "metal mul_scalar");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_exp_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[2, 128], 3);
+    let got = backend.exp_forward(&a).expect("metal exp");
+    let want = cpu_exp_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-3, "metal exp");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_neg_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 16], 5);
+    let got = backend.neg_forward(&a).expect("metal neg");
+    let want = cpu_neg_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-6, "metal neg");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_gelu_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 128], 9);
+    let got = backend.gelu_forward(&a).expect("metal gelu");
+    let want = cpu_gelu_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-3, "metal gelu");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_silu_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let a = make_rows(&[4, 128], 13);
+    let got = backend.silu_forward(&a).expect("metal silu");
+    let want = cpu_silu_forward(&a).unwrap();
+    assert_close(&got, &want, 1e-4, "metal silu");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_rms_norm_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let shape = &[4, 64];
+    let x = make_rows(shape, 33);
+    let weight: Vec<f32> = (0..64).map(|i| 0.5 + (i as f32) * 0.01).collect();
+    let got = backend
+        .rms_norm_forward(&x, &weight, shape, 1e-6)
+        .expect("metal rms_norm");
+    let want = cpu_rms_norm_forward(&x, &weight, shape, 1e-6).unwrap();
+    assert_close(&got, &want, 1e-4, "metal rms_norm");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_embedding_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let vocab = 64_usize;
+    let dim = 32_usize;
+    let weight = make_rows(&[vocab, dim], 17);
+    // Mirror the CUDA embedding test: the CPU reference zero-fills both negative
+    // and out-of-bounds ids, so the Metal impl is expected to do the same. If a
+    // mismatch surfaces here, the parallel Metal impl owns the divergence.
+    let ids = [0_i32, 5, 10, 63, -1, 99, 7];
+    let got = backend
+        .embedding_forward(&weight, vocab, dim, &ids)
+        .expect("metal embed");
+    let want = cpu_embedding_forward(&weight, vocab, dim, &ids).unwrap();
+    assert_close(&got, &want, 1e-6, "metal embedding");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_sum_last_axis_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let shape = &[6, 257];
+    let x = make_rows(shape, 41);
+    let got = backend.sum_last_axis_forward(&x, shape).expect("metal sum");
+    let want = cpu_sum_last_axis_forward(&x, shape).unwrap();
+    assert_close(&got, &want, 1e-3, "metal sum");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_mean_last_axis_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let shape = &[6, 257];
+    let x = make_rows(shape, 43);
+    let got = backend
+        .mean_last_axis_forward(&x, shape)
+        .expect("metal mean");
+    let want = cpu_mean_last_axis_forward(&x, shape).unwrap();
+    assert_close(&got, &want, 1e-5, "metal mean");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_rope_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let batch = 2_usize;
+    let heads = 4_usize;
+    let seq = 16_usize;
+    let head_dim = 64_usize;
+    let half_dim = head_dim / 2;
+    let shape = &[batch, heads, seq, head_dim];
+    let x = make_rows(shape, 55);
+    let mut cos = Vec::with_capacity(seq * half_dim);
+    let mut sin = Vec::with_capacity(seq * half_dim);
+    for t in 0..seq {
+        for i in 0..half_dim {
+            let theta = (t as f32) * (0.02_f32 + (i as f32) * 0.01_f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+    }
+    let got = backend
+        .rope_forward(&x, shape, &cos, &sin)
+        .expect("metal rope");
+    let want = cpu_rope_forward(&x, shape, &cos, &sin).unwrap();
+    assert_close(&got, &want, 1e-4, "metal rope");
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_backend_gather_last_dim_matches_cpu() {
+    use autograd::backend::Backend;
+    use autograd::backend_metal::MetalBackend;
+    let backend = MetalBackend;
+    let shape = &[4_usize, 128_usize];
+    let src = make_rows(shape, 71);
+    let ids = [5_i32, 0, 127, 42];
+    let got = backend
+        .gather_last_dim_forward(&src, shape, &ids)
+        .expect("metal gather");
+    let want = cpu_gather_last_dim_forward(&src, shape, &ids).unwrap();
+    assert_close(&got, &want, 1e-6, "metal gather");
+}
