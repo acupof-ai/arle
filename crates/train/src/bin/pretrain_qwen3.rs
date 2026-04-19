@@ -81,6 +81,10 @@ struct CliArgs {
     lr: f32,
     log_every: usize,
     save_every: usize,
+    eval_every: usize,
+    eval_windows: usize,
+    eval_frac: f32,
+    resume: Option<PathBuf>,
     seed: u64,
     grad_clip: Option<f32>,
     backend: BackendChoice,
@@ -113,6 +117,10 @@ impl Default for CliArgs {
             lr: 3.0e-4,
             log_every: 5,
             save_every: 50,
+            eval_every: 0,
+            eval_windows: 8,
+            eval_frac: 0.1,
+            resume: None,
             seed: 0xC0FFEE,
             grad_clip: Some(1.0),
             backend: BackendChoice::Cpu,
@@ -200,7 +208,23 @@ fn main() -> Result<(), CliError> {
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
     let model = Qwen3Model::new(&cfg, &mut store)?;
-    let registry = build_registry(&model);
+    let mut registry = build_registry(&model);
+
+    // --resume loads weights from a prior checkpoint (step_N dir). Optimizer
+    // state (AdamW m/v) is NOT persisted yet — the optimizer reinitializes
+    // with zeroed moments, so you may want a brief LR warmup after resume.
+    let start_step = if let Some(resume_dir) = &args.resume {
+        resume_from_checkpoint(resume_dir, &mut registry, &mut store, &cfg)?
+    } else {
+        0
+    };
+    if start_step > 0 {
+        println!(
+            "[pretrain_qwen3] resumed from {} at step {} (optimizer state reset)",
+            args.resume.as_ref().unwrap().display(),
+            start_step
+        );
+    }
 
     // Tokenize corpus once and validate IDs against configured vocab.
     let text = fs::read_to_string(&args.corpus).map_err(|e| {
@@ -225,10 +249,30 @@ fn main() -> Result<(), CliError> {
             )));
         }
     }
+    // Hold out the last `eval_frac` slice for eval. The boundary is
+    // deterministic from corpus length + eval_frac, so eval and train stay
+    // reproducible across resumes of the same corpus.
+    let eval_len = ((token_ids.len() as f32) * args.eval_frac).floor() as usize;
+    let (train_tokens, eval_tokens) = if args.eval_every > 0 && eval_len > args.seq {
+        let split = token_ids.len() - eval_len;
+        let (train, eval) = token_ids.split_at(split);
+        (train.to_vec(), eval.to_vec())
+    } else {
+        (token_ids.clone(), Vec::new())
+    };
+    if train_tokens.len() <= args.seq {
+        return Err(CliError::Custom(format!(
+            "train slice has {} tokens after eval split but --seq is {}; reduce --eval-frac or grow corpus",
+            train_tokens.len(),
+            args.seq
+        )));
+    }
     println!(
-        "corpus: {} tokens from {}",
+        "corpus: {} tokens from {} (train={} eval={})",
         token_ids.len(),
-        args.corpus.display()
+        args.corpus.display(),
+        train_tokens.len(),
+        eval_tokens.len(),
     );
 
     let model_ids = live_tensor_ids(&store);
@@ -248,11 +292,13 @@ fn main() -> Result<(), CliError> {
     );
 
     let mut optimizer = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
-    let mut rng = LcgRng::seed(args.seed);
+    let mut rng = LcgRng::seed(args.seed ^ start_step as u64);
+    let mut eval_rng = LcgRng::seed(args.seed ^ 0x4556_414C_5F50_5245);
     let window = args.seq + 1;
-    let upper = token_ids.len().saturating_sub(window) + 1;
+    let upper = train_tokens.len().saturating_sub(window) + 1;
 
-    for step in 0..args.steps {
+    for step_offset in 0..args.steps {
+        let step = start_step + step_offset;
         let step_start = Instant::now();
         optimizer.zero_grad(&params, &mut store);
 
@@ -261,7 +307,7 @@ fn main() -> Result<(), CliError> {
 
         for _micro in 0..args.batch {
             let start = (rng.next_u64() % upper as u64) as usize;
-            let slice = &token_ids[start..start + window];
+            let slice = &train_tokens[start..start + window];
             let input_ids: Vec<u32> = slice[..args.seq].to_vec();
             let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
             let position_ids: Vec<u32> = (0..args.seq as u32).collect();
@@ -298,7 +344,7 @@ fn main() -> Result<(), CliError> {
         store.retain_ids(&keep);
 
         let mean_loss = step_loss / args.batch as f32;
-        if step % args.log_every == 0 || step + 1 == args.steps {
+        if step_offset % args.log_every == 0 || step_offset + 1 == args.steps {
             println!(
                 "step {} loss {:.4} ms {:.2}",
                 step,
@@ -307,7 +353,28 @@ fn main() -> Result<(), CliError> {
             );
         }
 
-        if (step + 1) % args.save_every == 0 || step + 1 == args.steps {
+        if args.eval_every > 0
+            && !eval_tokens.is_empty()
+            && ((step_offset + 1) % args.eval_every == 0 || step_offset + 1 == args.steps)
+        {
+            let eval_loss = run_eval(
+                &model,
+                &mut store,
+                &mut tape,
+                &eval_tokens,
+                args.seq,
+                args.eval_windows,
+                &mut eval_rng,
+                &model_ids,
+                &params,
+            )?;
+            println!(
+                "eval @ step {} loss {:.4} windows {}",
+                step, eval_loss, args.eval_windows
+            );
+        }
+
+        if (step_offset + 1) % args.save_every == 0 || step_offset + 1 == args.steps {
             save_checkpoint(
                 &args.out,
                 step + 1,
@@ -325,6 +392,101 @@ fn main() -> Result<(), CliError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_eval(
+    model: &Qwen3Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    eval_tokens: &[u32],
+    seq: usize,
+    windows: usize,
+    rng: &mut LcgRng,
+    model_ids: &HashSet<TensorId>,
+    params: &[TensorId],
+) -> Result<f32, CliError> {
+    let window = seq + 1;
+    let upper = eval_tokens.len().saturating_sub(window) + 1;
+    if upper == 0 {
+        return Ok(f32::NAN);
+    }
+    let position_ids: Vec<u32> = (0..seq as u32).collect();
+    let mut sum = 0.0_f32;
+    let mut count = 0;
+    for _ in 0..windows {
+        let start = (rng.next_u64() % upper as u64) as usize;
+        let slice = &eval_tokens[start..start + window];
+        let input_ids: Vec<u32> = slice[..seq].to_vec();
+        let targets: Vec<usize> = slice[1..].iter().map(|&t| t as usize).collect();
+
+        tape.entries.clear();
+        tape.set_enabled(false);
+        let logits = model.forward(store, tape, &input_ids, &position_ids)?;
+        let loss_id = cross_entropy_loss(logits, &targets, store, tape)?;
+        sum += store.to_host(loss_id)?[0];
+        count += 1;
+
+        tape.entries.clear();
+        let keep = retained_ids(model_ids, params, store);
+        store.retain_ids(&keep);
+    }
+    tape.set_enabled(true);
+    Ok(sum / count.max(1) as f32)
+}
+
+fn resume_from_checkpoint(
+    resume_dir: &Path,
+    registry: &mut SafetensorsRegistry,
+    store: &mut TensorStore,
+    cfg: &Qwen3Config,
+) -> Result<usize, CliError> {
+    let weights = resume_dir.join("model.safetensors");
+    if !weights.exists() {
+        return Err(CliError::Custom(format!(
+            "resume path {} has no model.safetensors",
+            resume_dir.display()
+        )));
+    }
+
+    // Verify the checkpoint's config.json matches the requested config so a
+    // silent shape mismatch doesn't surface as a mid-training crash.
+    let cfg_path = resume_dir.join("config.json");
+    if cfg_path.exists() {
+        let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)?;
+        let mismatches: Vec<String> = [
+            ("hidden_size", cfg.hidden_size as i64),
+            ("intermediate_size", cfg.intermediate_size as i64),
+            ("num_hidden_layers", cfg.num_hidden_layers as i64),
+            ("num_attention_heads", cfg.num_attention_heads as i64),
+            ("num_key_value_heads", cfg.num_kv_heads as i64),
+            ("head_dim", cfg.head_dim as i64),
+            ("vocab_size", cfg.vocab_size as i64),
+        ]
+        .iter()
+        .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
+            Some(seen) if seen != *v => Some(format!("{k}: ckpt={seen} cli={v}")),
+            _ => None,
+        })
+        .collect();
+        if !mismatches.is_empty() {
+            return Err(CliError::Custom(format!(
+                "resume config mismatch: {}",
+                mismatches.join(", ")
+            )));
+        }
+    }
+
+    registry.load_into(store, &weights)?;
+
+    // Derive absolute step from the dir name `step_<N>` if present; otherwise 0.
+    let start_step = resume_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|s| s.strip_prefix("step_"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(start_step)
+}
+
 fn parse_args() -> Result<CliArgs, CliError> {
     let mut args = CliArgs::default();
     let mut iter = env::args().skip(1);
@@ -339,6 +501,12 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--lr" => args.lr = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--log-every" => args.log_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--save-every" => args.save_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--eval-every" => args.eval_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--eval-windows" => {
+                args.eval_windows = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--eval-frac" => args.eval_frac = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--resume" => args.resume = Some(PathBuf::from(next_value(&mut iter, &flag)?)),
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--grad-clip" => {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
@@ -423,6 +591,18 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
                 value: "0".into(),
             });
         }
+    }
+    if !(0.0..1.0).contains(&args.eval_frac) {
+        return Err(CliError::InvalidValue {
+            flag: "--eval-frac".into(),
+            value: args.eval_frac.to_string(),
+        });
+    }
+    if args.eval_every > 0 && args.eval_windows == 0 {
+        return Err(CliError::InvalidValue {
+            flag: "--eval-windows".into(),
+            value: "0".into(),
+        });
     }
     Ok(())
 }
