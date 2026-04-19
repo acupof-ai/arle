@@ -2525,13 +2525,21 @@ mod tests {
         };
         eprintln!("draft_forward_batched_matches_forward_for_b1 config_ready");
 
-        let runtime = MetalDflashRuntime::load(
+        let runtime = match MetalDflashRuntime::load(
             &MetalDflashOptions {
                 draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
                 speculative_tokens: None,
             },
             &target_config,
-        )?;
+        ) {
+            Ok(rt) => rt,
+            Err(err) => {
+                eprintln!(
+                    "DFlash draft model unavailable ({err:#}); skipping draft_forward_batched_matches_forward_for_b1. Set `QWEN35_DFLASH_DRAFT_PATH` to a local checkpoint to enable."
+                );
+                return Ok(());
+            }
+        };
         eprintln!("draft_forward_batched_matches_forward_for_b1 runtime_loaded");
         let cpp_model = runtime
             .draft_cpp_model
@@ -2823,13 +2831,21 @@ mod tests {
             .as_ref()
             .context("Qwen3.5 compiled C++ model unavailable")?;
 
-        let runtime = MetalDflashRuntime::load(
+        let runtime = match MetalDflashRuntime::load(
             &MetalDflashOptions {
                 draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
                 speculative_tokens: None,
             },
             &target_config,
-        )?;
+        ) {
+            Ok(rt) => rt,
+            Err(err) => {
+                eprintln!(
+                    "DFlash draft model unavailable ({err:#}); skipping dflash_qwen35_verify_batched_matches_two_single_row_runs. Set `QWEN35_DFLASH_DRAFT_PATH` to a local checkpoint to enable."
+                );
+                return Ok(());
+            }
+        };
         eprintln!("dflash_qwen35_verify_batched_matches_two_single_row_runs runtime_loaded");
 
         // Two distinct prompts of equal length so both rows share the same
@@ -3136,13 +3152,21 @@ mod tests {
         // owned values (the test process exits immediately after, so this
         // is a bounded ≤1MB leak per run). Weights + config similarly leak
         // for the `&'a` constructor bounds.
-        let runtime = MetalDflashRuntime::load(
+        let runtime = match MetalDflashRuntime::load(
             &MetalDflashOptions {
                 draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
                 speculative_tokens: None,
             },
             &config,
-        )?;
+        ) {
+            Ok(rt) => rt,
+            Err(err) => {
+                eprintln!(
+                    "DFlash draft model unavailable ({err:#}); skipping qwen35_dflash_packed_batch_b2_matches_scalar_runs. Set `QWEN35_DFLASH_DRAFT_PATH` to a local checkpoint to enable."
+                );
+                return Ok(());
+            }
+        };
         eprintln!("qwen35_dflash_packed_batch_b2_matches_scalar_runs runtime_loaded");
 
         let runtime_static: &'static MetalDflashRuntime = Box::leak(Box::new(runtime));

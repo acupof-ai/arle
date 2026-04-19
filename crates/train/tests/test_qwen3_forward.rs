@@ -1,10 +1,10 @@
 use autograd::{Tape, TensorStore, ops::sum};
-use train::qwen3_autograd::{Qwen3Config, Qwen3Model};
+use train::qwen3::{Qwen3Config, Qwen3Model};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn qwen3_autograd_forward_smoke_tiny_config() -> TestResult {
+fn qwen3_forward_smoke_tiny_config() -> TestResult {
     let cfg = Qwen3Config {
         vocab_size: 200,
         hidden_size: 64,
