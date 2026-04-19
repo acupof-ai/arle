@@ -25,7 +25,7 @@ use crate::{
 mod kernels;
 
 #[cfg(not(feature = "no-cuda"))]
-use self::kernels::{KernelCache, launch_1d};
+use self::kernels::{KernelCache, launch_1d, launch_rows};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
@@ -388,6 +388,91 @@ impl Backend for CudaBackend {
             Ok((out, out_shape))
         }
     }
+
+    fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda softmax is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_softmax_like(self, x, shape, "softmax_last_axis_f32")
+        }
+    }
+
+    fn log_softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda log_softmax is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_softmax_like(self, x, shape, "log_softmax_last_axis_f32")
+        }
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_softmax_like(
+    backend: &CudaBackend,
+    x: &[f32],
+    shape: &[usize],
+    kernel_name: &'static str,
+) -> Result<Vec<f32>> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    let expected: usize = shape.iter().product();
+    if x.len() != expected {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected],
+            got: vec![x.len()],
+        });
+    }
+
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda softmax cols exceeds i32"))?;
+    let d_in = backend.upload_slice(x, shape)?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(expected)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        rows,
+        BLOCK,
+        SHARED,
+        |builder| {
+            builder.arg(&mut d_out).arg(&d_in).arg(&cols);
+        },
+    )?;
+
+    let mut host = vec![0.0f32; expected];
+    backend
+        .stream
+        .memcpy_dtoh(&d_out, &mut host)
+        .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
+    backend
+        .stream
+        .synchronize()
+        .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+    Ok(host)
 }
 
 #[cfg(not(feature = "no-cuda"))]
