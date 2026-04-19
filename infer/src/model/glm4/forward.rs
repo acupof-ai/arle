@@ -254,8 +254,7 @@ impl ModelForward for GLM4Model {
 
         // Phase 3: Readback all results
         let mut tokens = Vec::with_capacity(b);
-        for i in 0..b {
-            let si = slot_indices[i];
+        for &si in slot_indices {
             tokens.push(crate::ops::gpu_sample_readback(
                 &self.ctx,
                 &states[si].decode_bufs.sample_out,
