@@ -15,9 +15,9 @@ use autograd::{
 use thiserror::Error;
 use train::{
     dataset::LcgRng,
-    qwen3_autograd::{Qwen3AutogradError, Qwen3Config, Qwen3Model},
+    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
-    tokenizer::TrainTokenizer,
+    tokenizer::ChatTokenizer,
 };
 
 const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
@@ -107,7 +107,7 @@ enum CliError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
-    Qwen3(#[from] Qwen3AutogradError),
+    Qwen3(#[from] Qwen3Error),
     #[error("unknown flag {0}")]
     UnknownFlag(String),
     #[error("missing value for flag {0}")]
@@ -138,7 +138,7 @@ fn main() -> Result<(), CliError> {
     }
 
     let cfg = Qwen3Config::from_json_file(&config_path)?;
-    let tokenizer = TrainTokenizer::from_file(&tokenizer_path)?;
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let mut store = TensorStore::with_backend(build_backend(args.backend)?);
     let model = Qwen3Model::new(&cfg, &mut store)?;
     let mut registry = build_registry(&model);

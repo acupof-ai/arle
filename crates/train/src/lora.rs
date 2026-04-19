@@ -1,5 +1,5 @@
 use autograd::{
-    AutogradError, Tensor, Result, Tape, TensorId, TensorStore,
+    AutogradError, Result, Tape, Tensor, TensorId, TensorStore,
     module::{Linear, Module},
     ops::{add, matmul, mul_scalar, reshape, transpose},
 };

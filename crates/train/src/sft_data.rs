@@ -7,12 +7,21 @@ use std::{
 use autograd::{AutogradError, Result};
 use serde::Deserialize;
 
-use crate::tokenizer::TrainTokenizer;
+use crate::tokenizer::{ChatMessageRef, ChatTokenizer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+impl<'a> From<&'a ChatMessage> for ChatMessageRef<'a> {
+    fn from(message: &'a ChatMessage) -> Self {
+        Self {
+            role: message.role.as_str(),
+            content: message.content.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -63,7 +72,7 @@ pub fn load_jsonl(path: &Path) -> Result<Vec<SftExample>> {
 
 pub fn tokenize_example(
     example: &SftExample,
-    tokenizer: &TrainTokenizer,
+    tokenizer: &ChatTokenizer,
     max_seq_len: usize,
 ) -> Result<TokenizedSft> {
     const IM_END: &str = "<|im_end|>";

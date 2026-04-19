@@ -86,9 +86,7 @@ impl Qwen3Config {
             ));
         }
         if !self.head_dim.is_multiple_of(2) {
-            return Err(Qwen3Error::InvalidConfig(
-                "head_dim must be even for RoPE",
-            ));
+            return Err(Qwen3Error::InvalidConfig("head_dim must be even for RoPE"));
         }
         if self.max_position_embeddings == 0 {
             return Err(Qwen3Error::InvalidConfig(

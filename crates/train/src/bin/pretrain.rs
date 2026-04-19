@@ -1,13 +1,14 @@
-use std::{collections::HashSet, env, str::FromStr, sync::Arc};
+use std::{collections::HashSet, env, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use autograd::{
     AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
 };
 use thiserror::Error;
 use train::{
-    dataset::{BytesDataset, CopyDataset, Dataset},
+    dataset::{BytesDataset, CopyDataset, CorpusDataset, Dataset},
     lora::LoraConfig,
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
+    tokenizer::ChatTokenizer,
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
@@ -15,6 +16,7 @@ use train::{
 enum DatasetKind {
     Copy,
     Bytes,
+    Corpus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,16 @@ struct CliArgs {
     lora_rank: usize,
     lora_alpha: f32,
     backend: BackendChoice,
+    corpus: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+    vocab_size: Option<usize>,
+    d_model: Option<usize>,
+    n_layers: Option<usize>,
+    n_heads: Option<usize>,
+    d_head: Option<usize>,
+    d_ff: Option<usize>,
+    max_seq_len: Option<usize>,
+    seed: u64,
 }
 
 impl Default for CliArgs {
@@ -64,6 +76,16 @@ impl Default for CliArgs {
             lora_rank: 0,
             lora_alpha: 0.0,
             backend: BackendChoice::Cpu,
+            corpus: None,
+            tokenizer: None,
+            vocab_size: None,
+            d_model: None,
+            n_layers: None,
+            n_heads: None,
+            d_head: None,
+            d_ff: None,
+            max_seq_len: None,
+            seed: 0xCAFEBABE,
         }
     }
 }
@@ -78,11 +100,46 @@ enum CliError {
     MissingValue(String),
     #[error("invalid value for {flag}: {value}")]
     InvalidValue { flag: String, value: String },
+    #[error("{0}")]
+    Custom(String),
 }
 
 fn main() -> Result<(), CliError> {
     let args = parse_args()?;
-    let mut config = LmConfig::default();
+
+    // Load tokenizer first — `--corpus` implies we tokenize the file now, and
+    // the tokenizer's vocab size is the natural default for the model's
+    // vocab_size when the user didn't override it.
+    let tokenizer = match args.tokenizer.as_ref() {
+        Some(path) => Some(ChatTokenizer::from_file(path)?),
+        None => None,
+    };
+
+    let mut config = TransformerConfig::default();
+    if let Some(tok) = tokenizer.as_ref() {
+        config.vocab_size = tok.vocab_size();
+    }
+    if let Some(vocab) = args.vocab_size {
+        config.vocab_size = vocab;
+    }
+    if let Some(d_model) = args.d_model {
+        config.d_model = d_model;
+    }
+    if let Some(n_layers) = args.n_layers {
+        config.n_layers = n_layers;
+    }
+    if let Some(n_heads) = args.n_heads {
+        config.n_heads = n_heads;
+    }
+    if let Some(d_head) = args.d_head {
+        config.d_head = d_head;
+    }
+    if let Some(d_ff) = args.d_ff {
+        config.d_ff = d_ff;
+    }
+    if let Some(max_seq_len) = args.max_seq_len {
+        config.max_seq_len = max_seq_len;
+    }
     if args.lora_rank > 0 {
         let alpha = if args.lora_alpha > 0.0 {
             args.lora_alpha
@@ -103,13 +160,23 @@ fn main() -> Result<(), CliError> {
 
     let backend = build_backend(args.backend)?;
     println!("backend: {:?}", backend.device());
+    println!(
+        "config: vocab={} d_model={} n_layers={} n_heads={} d_head={} d_ff={} max_seq_len={}",
+        config.vocab_size,
+        config.d_model,
+        config.n_layers,
+        config.n_heads,
+        config.d_head,
+        config.d_ff,
+        config.max_seq_len,
+    );
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
-    let model = Lm::new(config, &mut store)?;
+    let model = Transformer::new(config, &mut store)?;
     let params = model.parameters();
     let base_params = model.base_parameter_ids();
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
-    let mut dataset = build_dataset(args.dataset, args.batch, args.seq);
+    let mut dataset = build_dataset(&args, tokenizer.as_ref(), config.vocab_size)?;
 
     if let Some(lora) = config.lora {
         let base_count = count_parameters(&base_params, &store);
@@ -172,11 +239,41 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.dataset = match value.as_str() {
                     "copy" => DatasetKind::Copy,
                     "bytes" => DatasetKind::Bytes,
+                    "corpus" => DatasetKind::Corpus,
                     _ => {
                         return Err(CliError::InvalidValue { flag, value });
                     }
                 };
             }
+            "--corpus" => {
+                args.corpus = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+                args.dataset = DatasetKind::Corpus;
+            }
+            "--tokenizer" => {
+                args.tokenizer = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--vocab-size" => {
+                args.vocab_size = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--d-model" => {
+                args.d_model = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--n-layers" => {
+                args.n_layers = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--n-heads" => {
+                args.n_heads = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--d-head" => {
+                args.d_head = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--d-ff" => {
+                args.d_ff = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--max-seq-len" => {
+                args.max_seq_len = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--steps" => args.steps = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--batch" => args.batch = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--seq" => args.seq = parse_value(&flag, next_value(&mut iter, &flag)?)?,
@@ -243,10 +340,51 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
     }
 }
 
-fn build_dataset(kind: DatasetKind, batch: usize, seq: usize) -> Box<dyn Dataset> {
-    match kind {
-        DatasetKind::Copy => Box::new(CopyDataset::new(batch, seq)),
-        DatasetKind::Bytes => Box::new(BytesDataset::new(batch, seq)),
+fn build_dataset(
+    args: &CliArgs,
+    tokenizer: Option<&ChatTokenizer>,
+    vocab_size: usize,
+) -> Result<Box<dyn Dataset>, CliError> {
+    match args.dataset {
+        DatasetKind::Copy => Ok(Box::new(CopyDataset::new(args.batch, args.seq))),
+        DatasetKind::Bytes => Ok(Box::new(BytesDataset::new(args.batch, args.seq))),
+        DatasetKind::Corpus => {
+            let path = args.corpus.as_ref().ok_or_else(|| {
+                CliError::Custom("--dataset corpus requires --corpus <path>".into())
+            })?;
+            let tok = tokenizer.ok_or_else(|| {
+                CliError::Custom("--dataset corpus requires --tokenizer <path>".into())
+            })?;
+            let text = fs::read_to_string(path).map_err(|e| {
+                CliError::Custom(format!("failed to read corpus {}: {e}", path.display()))
+            })?;
+            let ids = tok.encode(&text, false)?;
+            if ids.is_empty() {
+                return Err(CliError::Custom(format!(
+                    "corpus {} tokenized to 0 tokens",
+                    path.display()
+                )));
+            }
+            for &id in &ids {
+                if (id as usize) >= vocab_size {
+                    return Err(CliError::Custom(format!(
+                        "token id {id} exceeds configured vocab_size {vocab_size}"
+                    )));
+                }
+            }
+            let tokens: Vec<usize> = ids.iter().map(|&id| id as usize).collect();
+            if tokens.len() <= args.seq {
+                return Err(CliError::Custom(format!(
+                    "corpus has {} tokens but seq_len is {}; need more tokens",
+                    tokens.len(),
+                    args.seq
+                )));
+            }
+            println!("corpus: {} tokens from {}", tokens.len(), path.display());
+            Ok(Box::new(CorpusDataset::new(
+                tokens, args.batch, args.seq, args.seed,
+            )))
+        }
     }
 }
 

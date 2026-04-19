@@ -2,12 +2,12 @@ use autograd::{Tape, TensorStore, module::Module};
 use train::{
     dataset::LcgRng,
     grpo::{GrpoConfig, group_advantages, grpo_loss},
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
 };
 
-fn tiny_config() -> LmConfig {
-    LmConfig {
+fn tiny_config() -> TransformerConfig {
+    TransformerConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -38,7 +38,7 @@ fn rollout_episode_shapes_and_masks() {
     let config = tiny_config();
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store).expect("policy");
+    let policy = Transformer::new(config, &mut store).expect("policy");
     let ref_model = policy.clone_frozen(&mut store);
 
     let initial_prompt = vec![1usize, 2, 3, 15];
@@ -112,7 +112,7 @@ fn episode_trajectory_feeds_grpo_loss() {
     let config = tiny_config();
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store).expect("policy");
+    let policy = Transformer::new(config, &mut store).expect("policy");
     let ref_model = policy.clone_frozen(&mut store);
 
     let initial_prompt = vec![1usize, 2, 3, 15];

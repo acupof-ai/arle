@@ -48,11 +48,7 @@ pub fn gather_last_dim(
         output[prefix_index] = src_tensor.data[(prefix_index * vocab) + index];
     }
 
-    let output_id = store.alloc(Tensor::new(
-        output,
-        output_shape,
-        src_tensor.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, output_shape, src_tensor.requires_grad)?);
     if src_tensor.requires_grad {
         tape.record(TapeEntry {
             op: BackwardOp::Gather,

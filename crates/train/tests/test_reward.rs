@@ -2,7 +2,7 @@ use autograd::{Tape, TensorStore};
 use train::{
     dataset::LcgRng,
     grpo::{GrpoConfig, grpo_loss_per_position},
-    model::{Lm, LmConfig},
+    model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     reward::{apply_turn_penalty, discounted_returns, group_normalize, returns_to_per_position},
 };
@@ -78,8 +78,8 @@ impl Environment for EchoSeparator {
     }
 }
 
-fn tiny_config() -> LmConfig {
-    LmConfig {
+fn tiny_config() -> TransformerConfig {
+    TransformerConfig {
         vocab_size: 16,
         d_model: 16,
         n_layers: 2,
@@ -98,7 +98,7 @@ fn stepwise_pipeline_feeds_grpo_loss_per_position() {
     let config = tiny_config();
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Lm::new(config, &mut store).expect("policy");
+    let policy = Transformer::new(config, &mut store).expect("policy");
     let ref_model = policy.clone_frozen(&mut store);
 
     let initial_prompt = vec![1usize, 2, 3, 15];

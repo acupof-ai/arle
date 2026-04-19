@@ -14,8 +14,8 @@ pub mod lora;
 pub mod model;
 #[path = "multi_turn.rs"]
 pub mod multi_turn;
-#[path = "qwen3_autograd.rs"]
-pub mod qwen3_autograd;
+#[path = "qwen3.rs"]
+pub mod qwen3;
 #[path = "reward.rs"]
 pub mod reward;
 #[path = "rollout.rs"]

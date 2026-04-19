@@ -23,11 +23,7 @@ pub fn add_broadcast(
     }
 
     let requires_grad = a_tensor.requires_grad || b_tensor.requires_grad;
-    let output_id = store.alloc(Tensor::new(
-        output,
-        a_tensor.shape.clone(),
-        requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, a_tensor.shape.clone(), requires_grad)?);
     if requires_grad {
         tape.record(TapeEntry {
             op: BackwardOp::AddBroadcast,

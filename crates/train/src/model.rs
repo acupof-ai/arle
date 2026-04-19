@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use autograd::{
-    AutogradError, Tensor, Result, Tape, TensorId, TensorStore,
+    AutogradError, Result, Tape, Tensor, TensorId, TensorStore,
     module::{Linear, Module},
     ops::{
         add, add_broadcast, embedding, gelu, matmul, mul_scalar, reshape, rmsnorm, softmax,
@@ -12,7 +12,7 @@ use autograd::{
 use crate::lora::{LoraConfig, LoraLinear};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LmConfig {
+pub struct TransformerConfig {
     pub vocab_size: usize,
     pub d_model: usize,
     pub n_layers: usize,
@@ -23,7 +23,7 @@ pub struct LmConfig {
     pub lora: Option<LoraConfig>,
 }
 
-impl Default for LmConfig {
+impl Default for TransformerConfig {
     fn default() -> Self {
         Self {
             vocab_size: 256,
@@ -110,7 +110,7 @@ struct Block {
 }
 
 impl Block {
-    fn new(config: LmConfig, store: &mut TensorStore) -> Result<Self> {
+    fn new(config: TransformerConfig, store: &mut TensorStore) -> Result<Self> {
         Ok(Self {
             attn_norm_weight: ones_parameter(&[config.d_model], store)?,
             wq: MaybeLora::new(config.d_model, config.d_model, false, config.lora, store),
@@ -128,7 +128,7 @@ impl Block {
         x: TensorId,
         batch: usize,
         seq_len: usize,
-        config: LmConfig,
+        config: TransformerConfig,
         causal_mask: TensorId,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -195,16 +195,16 @@ impl Block {
 }
 
 #[derive(Debug, Clone)]
-pub struct Lm {
-    config: LmConfig,
+pub struct Transformer {
+    config: TransformerConfig,
     token_embed: TensorId,
     pos_embed: TensorId,
     blocks: Vec<Block>,
     final_norm_weight: TensorId,
 }
 
-impl Lm {
-    pub fn new(config: LmConfig, store: &mut TensorStore) -> Result<Self> {
+impl Transformer {
+    pub fn new(config: TransformerConfig, store: &mut TensorStore) -> Result<Self> {
         validate_config(config)?;
 
         let token_embed = uniform_parameter(
@@ -245,7 +245,7 @@ impl Lm {
         })
     }
 
-    pub fn config(&self) -> LmConfig {
+    pub fn config(&self) -> TransformerConfig {
         self.config
     }
 
@@ -346,7 +346,7 @@ impl Lm {
     }
 }
 
-impl Module for Lm {
+impl Module for Transformer {
     fn parameters(&self) -> Vec<TensorId> {
         let mut params = Vec::new();
         if self.config.lora.is_none() {
@@ -361,7 +361,7 @@ impl Module for Lm {
     }
 }
 
-fn validate_config(config: LmConfig) -> Result<()> {
+fn validate_config(config: TransformerConfig) -> Result<()> {
     let packed_heads = config.n_heads * config.d_head;
     if config.d_model != packed_heads {
         return Err(AutogradError::ShapeMismatch {
@@ -406,7 +406,7 @@ fn split_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
-    config: LmConfig,
+    config: TransformerConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -423,7 +423,7 @@ fn merge_heads(
     x: TensorId,
     batch: usize,
     seq_len: usize,
-    config: LmConfig,
+    config: TransformerConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -436,7 +436,7 @@ fn attention_scores(
     k: TensorId,
     batch: usize,
     seq_len: usize,
-    config: LmConfig,
+    config: TransformerConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -468,7 +468,7 @@ fn attention_context(
     v: TensorId,
     batch: usize,
     seq_len: usize,
-    config: LmConfig,
+    config: TransformerConfig,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {

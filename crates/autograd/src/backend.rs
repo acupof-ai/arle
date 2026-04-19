@@ -1,6 +1,6 @@
 //! Backend abstraction for heavy ops. Today: matmul forward only.
 //!
-//! Lm training is ~90% matmul FLOPs; moving matmul to GPU swings the
+//! Transformer training is ~90% matmul FLOPs; moving matmul to GPU swings the
 //! big lever without requiring device-resident tensors. Host `Vec<f32>`
 //! stays authoritative; GPU backends upload, compute, and download per
 //! call. Non-matmul ops (softmax, elementwise, norm, gather) stay on CPU.
