@@ -2,7 +2,11 @@
 
 **Status**: Layer 1 landed 2026-04-17. Layer 2a (`mlx_tape_replay_varlen`)
 landed 2026-04-18 (FFI at `crates/mlx-sys/src/lib.rs:621`, kernel at
-`mlx_bridge.cpp:154`). Layer 2b–2d still pending. See port-vs-reference
+`mlx_bridge.cpp:154`). Layer 2b (`qwen35_compiled_verify_block_batched`)
+landed 2026-04-18 (commit `29e0e31`) and verified bit-identical at B=1
+on 2026-04-19
+([`docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md`](../experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md)).
+Layer 2c–2d still pending. See port-vs-reference
 snapshot:
 [`docs/experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md`](../experience/wins/2026-04-18-metal-dflash-kernel-port-vs-reference.md).
 **Scope**: Apple Silicon Metal backend, Qwen3.5-4B hybrid model,
@@ -78,18 +82,25 @@ DFlash on under concurrency.  Decomposes into four sub-pieces that
   request and has no varlen variant.
 - Unblocks 2b/2c/2d.
 
-**2b — `qwen35_compiled_verify_block_batched` C++ FFI**
-- New C++ FFI mirroring `qwen35_compiled_verify_block` but accepting
-  `[B, S_padded]` tokens, `attn_mask: [B, 1, S_padded, key_len]`
-  additive, `rope_offsets: int32[B]`, per-row `cache_lens: int32[B]`.
+**2b — `qwen35_compiled_verify_block_batched` C++ FFI** ✅ landed
+2026-04-18 (commit `29e0e31`), verified 2026-04-19.
+- New C++ FFI at `mlx_qwen35_model.cpp:1752` mirroring
+  `qwen35_compiled_verify_block` but accepting `[B, S_padded]` tokens,
+  `attn_mask: [B, 1, S_padded, key_len]` additive, `rope_offsets:
+  int32[B]`, per-row `cache_pos_arr: int32[B]`.
 - Reuses the `step_batch_packed` plumbing
   (`crates/mlx-sys/src/mlx_qwen35_model.cpp`) that already lands
   varlen plain-decode with per-row RoPE offsets.
 - Emits logits `[B, S_padded, V]`, GDR tapes `[B, S_padded, Hv, Dv]`
   (one set per GDR layer), capture hidden `[B, S_padded, H]`.
-- Acceptance: `cargo test --release --features metal -- --test-threads=1
-  qwen35_compiled_verify_block_batched` — B=1 run is bit-identical to
-  existing `qwen35_compiled_verify_block`.
+- Acceptance (B=1 bit-identity) confirmed by
+  `backend::metal::qwen35::tests::verify_block_batched_matches_verify_block_for_b1`;
+  regression-check entry at
+  [`docs/experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md`](../experience/wins/2026-04-19-verify-metal-qwen35-dflash-2b-bit-ident.md).
+- **Outstanding for 2c:** promote the test-local `verify_block_batched_b1`
+  helper (`infer/src/backend/metal/qwen35.rs:1681`) to a
+  `pub(super) fn verify_block_batched` on `CppQwen35Model` — the
+  scheduler dispatch cannot live inside a `#[cfg(test)]` block.
 
 **2c — Lift the `open.len() >= 2` downgrade + packed verify dispatch**
 - Remove (or gate behind a config toggle) the permanent DFlash disable
@@ -203,7 +214,7 @@ Steady-state throughput under concurrency 16 ≥ 1.5× Layer 2.
 |-------|-----|-------|
 | 1 (intra-request single forward) | **Done 2026-04-17** | Claude |
 | 2a (varlen `mlx_tape_replay`) | **Done 2026-04-18** | Codex |
-| 2b (`verify_block_batched` FFI) | After 2a | Codex |
+| 2b (`verify_block_batched` FFI) | **Done 2026-04-18, verified 2026-04-19** | Codex |
 | 2c (DFlash scheduler integration) | After 2b | Claude (direction) + Codex (impl) |
 | 2d (packed verify wire-up) | After 2c | Codex |
 | 3 (cross-slot scheduling) | After 2d; may collapse into 2c | TBD |
