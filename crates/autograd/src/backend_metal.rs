@@ -18,6 +18,7 @@ use mlx_sys::{
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // MLX's default stream/device is process-global and its C++ allocator is
 // not re-entrant across threads. Concurrent `mlx_matmul` calls (e.g.
@@ -25,6 +26,35 @@ use std::sync::Mutex;
 // mutex here is coarse but correct — training is single-threaded, and
 // the lock is held only for the duration of one matmul FFI round-trip.
 pub(crate) static MLX_GUARD: Mutex<()> = Mutex::new(());
+
+// Per-process counter for every `mlx_eval` call that flows through the
+// Metal backend. Used by M5.3a acceptance tests to confirm that a
+// well-structured forward+backward step terminates in exactly one eval
+// boundary (see `docs/plans/m5.3-device-resident-tensor.md` §5). Covers
+// `MetalBackend::eval` as well as the legacy `eval_and_readback` tail
+// used by non-device-resident ops.
+static METAL_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `mlx_eval` invocations performed by the Metal backend since
+/// process start (or the last `reset_eval_count`). Cheap atomic load;
+/// intended for tests and bench harnesses, not hot-path instrumentation.
+pub fn eval_count() -> u64 {
+    METAL_EVAL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the eval counter to zero. Exposed so test harnesses can scope a
+/// measurement around a single training step. Thread-safe but not
+/// synchronized with concurrent `mlx_eval` calls — the training tape is
+/// single-threaded, so resetting immediately before the step under test
+/// is the contract.
+pub fn reset_eval_count() {
+    METAL_EVAL_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn bump_eval_count() {
+    METAL_EVAL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetalBackend;
@@ -113,6 +143,7 @@ impl Backend for MetalBackend {
         unsafe {
             mlx_eval(metal_handles.as_mut_ptr(), metal_handles.len());
         }
+        bump_eval_count();
 
         Ok(())
     }
@@ -605,6 +636,7 @@ fn mlx_softmax_like(x: &[f32], shape: &[usize], kind: SoftmaxKind) -> Result<Vec
 
         let mut eval_handles = [out_arr];
         mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+        bump_eval_count();
 
         let size = mlx_array_size(out_arr);
         let data_ptr = mlx_array_data_float32(out_arr);
@@ -1560,6 +1592,7 @@ unsafe fn eval_and_readback(arr: *mut mlx_sys::mlx_array) -> Result<Vec<f32>> {
     unsafe {
         let mut eval_handles = [arr];
         mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+        bump_eval_count();
         let size = mlx_array_size(arr);
         let data_ptr = mlx_array_data_float32(arr);
         if data_ptr.is_null() {
