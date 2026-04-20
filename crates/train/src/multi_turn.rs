@@ -1,4 +1,4 @@
-//! Multi-turn episode scaffolding for Transformer (M4.1).
+//! Multi-turn episode scaffolding for GRPO policies (M4.1).
 //!
 //! Single episode (unbatched) with interleaved agent turns and environment
 //! observations. The episode flattens to a `Trajectory` that GRPO can train
@@ -7,8 +7,8 @@
 //! `rollout::rollout_group`.
 //!
 //! Autoregressive sampling matches `rollout_group`'s pattern: for each agent
-//! position, re-forward the current full state and sample from logits at
-//! (position - 1). Environment observations are written in deterministically.
+//! position, forward the known prefix and sample from logits at
+//! (position - 1). Environment observations are written deterministically.
 
 use std::collections::HashSet;
 
@@ -16,7 +16,7 @@ use autograd::{AutogradError, Result, Tape, TensorId, TensorStore};
 
 use crate::{
     dataset::LcgRng,
-    model::{Transformer, TransformerConfig},
+    policy::{GrpoPolicy, GrpoPolicyConfig},
     rollout::Trajectory,
     sampling::{log_prob_at_index, sample_categorical},
 };
@@ -87,10 +87,9 @@ impl Episode {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn rollout_episode(
-    policy: &Transformer,
-    ref_model: &Transformer,
-    config: &TransformerConfig,
+pub fn rollout_episode<P>(
+    policy: &P,
+    ref_model: &P,
     initial_prompt: &[usize],
     turns: &[TurnSpec],
     env: &impl Environment,
@@ -99,7 +98,14 @@ pub fn rollout_episode(
     verifier: &impl Fn(&Episode) -> f32,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<Episode> {
+) -> Result<Episode>
+where
+    P: GrpoPolicy,
+    P::Config: GrpoPolicyConfig,
+{
+    let config = policy.config();
+    let max_seq_len = config.max_seq_len();
+    let vocab_size = config.vocab_size();
     if turns.is_empty() {
         return Err(AutogradError::InvalidRank {
             expected: "at least one turn",
@@ -109,9 +115,9 @@ pub fn rollout_episode(
     let total_agent: usize = turns.iter().map(|t| t.agent_tokens).sum();
     let total_obs: usize = turns.iter().map(|t| t.observation_tokens).sum();
     let seq_len = initial_prompt.len() + total_agent + total_obs;
-    if seq_len > config.max_seq_len {
+    if seq_len > max_seq_len {
         return Err(AutogradError::ShapeMismatch {
-            expected: vec![config.max_seq_len],
+            expected: vec![max_seq_len],
             got: vec![seq_len],
         });
     }
@@ -144,12 +150,16 @@ pub fn rollout_episode(
                         got: 0,
                     });
                 }
-                let logits_id = policy.forward(&full_ids, 1, seq_len, store, tape)?;
+                // Only the known prefix up to the current token matters for
+                // autoregressive sampling; avoid re-forwarding the padded
+                // future tail of the episode.
+                let logits_id =
+                    policy.forward_batch_tokens(&full_ids[..position], 1, position, store, tape)?;
                 let logits = store.to_host(logits_id)?;
-                let logits_base = (position - 1) * config.vocab_size;
-                let slice = &logits[logits_base..logits_base + config.vocab_size];
+                let logits_base = (position - 1) * vocab_size;
+                let slice = &logits[logits_base..logits_base + vocab_size];
                 let (sampled, sampled_log_probs) =
-                    sample_categorical(slice, (1, 1), config.vocab_size, temperature, rng);
+                    sample_categorical(slice, (1, 1), vocab_size, temperature, rng);
                 full_ids[position] = sampled[0];
                 old_log_probs[position] = sampled_log_probs[0];
                 response_mask[position] = true;
@@ -177,16 +187,16 @@ pub fn rollout_episode(
         }
         debug_assert_eq!(cursor, seq_len);
 
-        let ref_logits_id = ref_model.forward(&full_ids, 1, seq_len, store, tape)?;
+        let ref_logits_id = ref_model.forward_batch_tokens(&full_ids, 1, seq_len, store, tape)?;
         let ref_logits = store.to_host(ref_logits_id)?;
         let mut ref_log_probs = vec![0.0f32; seq_len];
         for (position, masked) in response_mask.iter().enumerate() {
             if !*masked || position == 0 {
                 continue;
             }
-            let logits_base = (position - 1) * config.vocab_size;
+            let logits_base = (position - 1) * vocab_size;
             ref_log_probs[position] = log_prob_at_index(
-                &ref_logits[logits_base..logits_base + config.vocab_size],
+                &ref_logits[logits_base..logits_base + vocab_size],
                 1.0,
                 full_ids[position],
             );
@@ -223,8 +233,8 @@ pub fn rollout_episode(
 }
 
 fn retained_ids(
-    policy: &Transformer,
-    ref_model: &Transformer,
+    policy: &impl GrpoPolicy,
+    ref_model: &impl GrpoPolicy,
     store: &TensorStore,
 ) -> HashSet<TensorId> {
     let mut keep = HashSet::new();

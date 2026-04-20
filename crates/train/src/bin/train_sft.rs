@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -21,6 +20,7 @@ use train::{
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
     qwen3::{Qwen3Error, Qwen3Model},
+    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -495,30 +495,6 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
     }
 }
 
-fn build_registry(model: &Qwen3Model) -> SafetensorsRegistry {
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    registry
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|tensor_id| {
-            store
-                .get(*tensor_id)
-                .is_some_and(|tensor| tensor.requires_grad)
-        })
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
-}
-
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
@@ -761,6 +737,35 @@ fn write_generation_config(
     Ok(())
 }
 
+fn has_supervised_target(example: &TokenizedSft) -> bool {
+    example.labels.iter().skip(1).any(|&label| label >= 0)
+}
+
+/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
+/// running RNG, so a `--resume-from` run picks up the same data stream a
+/// single uninterrupted run would have produced. Mixing is SplitMix64 on
+/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
+/// consecutive triples spread uniformly across `[0, upper)` instead of
+/// clustering on a single-bit flip.
+///
+/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
+/// from a shared `LcgRng` whose position was not persisted in the
+/// checkpoint, so a resumed run redrew from position 0 and diverged
+/// immediately from the interrupted-run's data order.
+fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
+    if upper <= 1 {
+        return 0;
+    }
+    let mut h =
+        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % upper as u64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,42 +822,4 @@ mod tests {
         .expect("parse generation config");
         assert_eq!(generated["eos_token_id"], json!([7, 3]));
     }
-}
-
-fn has_supervised_target(example: &TokenizedSft) -> bool {
-    example.labels.iter().skip(1).any(|&label| label >= 0)
-}
-
-/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
-/// running RNG, so a `--resume-from` run picks up the same data stream a
-/// single uninterrupted run would have produced. Mixing is SplitMix64 on
-/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
-/// consecutive triples spread uniformly across `[0, upper)` instead of
-/// clustering on a single-bit flip.
-///
-/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
-/// from a shared `LcgRng` whose position was not persisted in the
-/// checkpoint, so a resumed run redrew from position 0 and diverged
-/// immediately from the interrupted-run's data order.
-fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
-    if upper <= 1 {
-        return 0;
-    }
-    let mut h =
-        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^= h >> 31;
-    (h % upper as u64) as usize
-}
-
-fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
-    store
-        .tensors
-        .iter()
-        .enumerate()
-        .filter_map(|(tensor_id, slot)| slot.as_ref().map(|_| tensor_id))
-        .collect()
 }

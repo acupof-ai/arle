@@ -41,8 +41,9 @@ fn qwen3_forward_smoke_tiny_config() -> TestResult {
     let grads = tape.backward(loss, &mut store)?;
 
     let param_map = model.param_name_map();
+    let lm_head_name = cfg.lm_head_tensor_name();
     let lm_head = *param_map
-        .get("lm_head.weight")
+        .get(lm_head_name)
         .expect("lm_head weight registered");
     let grad_id = *grads.get(&lm_head).expect("grad for lm_head");
     let grad = store.to_host(grad_id)?;

@@ -78,8 +78,7 @@ where
     let seq_len = trajectories[0].full_ids.len();
     let mut per_position_advantages = Vec::with_capacity(trajectories.len() * seq_len);
     for (trajectory, advantage) in trajectories.iter().zip(advantages.iter().copied()) {
-        per_position_advantages
-            .extend(std::iter::repeat(advantage).take(trajectory.full_ids.len()));
+        per_position_advantages.extend(std::iter::repeat_n(advantage, trajectory.full_ids.len()));
     }
 
     grpo_loss_from_flat_advantages(

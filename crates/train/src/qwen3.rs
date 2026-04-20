@@ -176,13 +176,14 @@ impl Qwen3Model {
                 param_ids.push(id);
             }
         };
+        let embed_tokens_name = cfg.embed_tokens_tensor_name();
         let embed_tokens = normal_parameter(
-            "model.embed_tokens.weight",
+            embed_tokens_name,
             &[cfg.vocab_size, cfg.hidden_size],
             0.02,
             store,
         )?;
-        register_param("model.embed_tokens.weight", embed_tokens);
+        register_param(embed_tokens_name, embed_tokens);
 
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
@@ -198,111 +199,78 @@ impl Qwen3Model {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
-            let prefix = format!("model.layers.{layer_idx}");
-            let input_layernorm = ones_parameter(
-                leak_name(format!("{prefix}.input_layernorm.weight")),
-                &[cfg.hidden_size],
-                store,
-            )?;
+            let names = cfg.layer_tensor_names(layer_idx);
+            let input_layernorm_name = leak_name(names.input_layernorm);
+            let q_proj_name = leak_name(names.q_proj);
+            let k_proj_name = leak_name(names.k_proj);
+            let v_proj_name = leak_name(names.v_proj);
+            let o_proj_name = leak_name(names.o_proj);
+            let q_norm_name = leak_name(names.q_norm);
+            let k_norm_name = leak_name(names.k_norm);
+            let gate_proj_name = leak_name(names.mlp_gate_proj);
+            let up_proj_name = leak_name(names.mlp_up_proj);
+            let down_proj_name = leak_name(names.mlp_down_proj);
+            let post_attention_layernorm_name = leak_name(names.post_attention_layernorm);
+
+            let input_layernorm = ones_parameter(input_layernorm_name, &[cfg.hidden_size], store)?;
             let q_proj = normal_parameter(
-                leak_name(format!("{prefix}.self_attn.q_proj.weight")),
+                q_proj_name,
                 &[cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let k_proj = normal_parameter(
-                leak_name(format!("{prefix}.self_attn.k_proj.weight")),
+                k_proj_name,
                 &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let v_proj = normal_parameter(
-                leak_name(format!("{prefix}.self_attn.v_proj.weight")),
+                v_proj_name,
                 &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let o_proj = normal_parameter(
-                leak_name(format!("{prefix}.self_attn.o_proj.weight")),
+                o_proj_name,
                 &[cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim],
                 0.02,
                 store,
             )?;
-            let q_norm = ones_parameter(
-                leak_name(format!("{prefix}.self_attn.q_norm.weight")),
-                &[cfg.head_dim],
-                store,
-            )?;
-            let k_norm = ones_parameter(
-                leak_name(format!("{prefix}.self_attn.k_norm.weight")),
-                &[cfg.head_dim],
-                store,
-            )?;
+            let q_norm = ones_parameter(q_norm_name, &[cfg.head_dim], store)?;
+            let k_norm = ones_parameter(k_norm_name, &[cfg.head_dim], store)?;
             let gate_proj = normal_parameter(
-                leak_name(format!("{prefix}.mlp.gate_proj.weight")),
+                gate_proj_name,
                 &[cfg.intermediate_size, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let up_proj = normal_parameter(
-                leak_name(format!("{prefix}.mlp.up_proj.weight")),
+                up_proj_name,
                 &[cfg.intermediate_size, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let down_proj = normal_parameter(
-                leak_name(format!("{prefix}.mlp.down_proj.weight")),
+                down_proj_name,
                 &[cfg.hidden_size, cfg.intermediate_size],
                 0.02,
                 store,
             )?;
-            let post_attention_layernorm = ones_parameter(
-                leak_name(format!("{prefix}.post_attention_layernorm.weight")),
-                &[cfg.hidden_size],
-                store,
-            )?;
+            let post_attention_layernorm =
+                ones_parameter(post_attention_layernorm_name, &[cfg.hidden_size], store)?;
 
-            register_param(
-                leak_name(format!("{prefix}.input_layernorm.weight")),
-                input_layernorm,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.q_proj.weight")),
-                q_proj,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.k_proj.weight")),
-                k_proj,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.v_proj.weight")),
-                v_proj,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.o_proj.weight")),
-                o_proj,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.q_norm.weight")),
-                q_norm,
-            );
-            register_param(
-                leak_name(format!("{prefix}.self_attn.k_norm.weight")),
-                k_norm,
-            );
-            register_param(
-                leak_name(format!("{prefix}.mlp.gate_proj.weight")),
-                gate_proj,
-            );
-            register_param(leak_name(format!("{prefix}.mlp.up_proj.weight")), up_proj);
-            register_param(
-                leak_name(format!("{prefix}.mlp.down_proj.weight")),
-                down_proj,
-            );
-            register_param(
-                leak_name(format!("{prefix}.post_attention_layernorm.weight")),
-                post_attention_layernorm,
-            );
+            register_param(input_layernorm_name, input_layernorm);
+            register_param(q_proj_name, q_proj);
+            register_param(k_proj_name, k_proj);
+            register_param(v_proj_name, v_proj);
+            register_param(o_proj_name, o_proj);
+            register_param(q_norm_name, q_norm);
+            register_param(k_norm_name, k_norm);
+            register_param(gate_proj_name, gate_proj);
+            register_param(up_proj_name, up_proj);
+            register_param(down_proj_name, down_proj);
+            register_param(post_attention_layernorm_name, post_attention_layernorm);
 
             layers.push(Qwen3Layer {
                 input_layernorm,
@@ -323,8 +291,9 @@ impl Qwen3Model {
             });
         }
 
-        let final_norm = ones_parameter("model.norm.weight", &[cfg.hidden_size], store)?;
-        register_param("model.norm.weight", final_norm);
+        let final_norm_name = cfg.norm_tensor_name();
+        let final_norm = ones_parameter(final_norm_name, &[cfg.hidden_size], store)?;
+        register_param(final_norm_name, final_norm);
 
         let (cos_cache, sin_cache) = build_rope_cache(cfg, store)?;
         if seen.insert(cos_cache) {

@@ -1,9 +1,10 @@
-use autograd::{Tape, TensorStore, module::Module};
+use autograd::{Result, Tape, TensorId, TensorStore, module::Module};
 use train::{
     dataset::LcgRng,
     grpo::{GrpoConfig, group_advantages, grpo_loss},
     model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
+    policy::{GrpoPolicy, GrpoPolicyConfig},
 };
 
 fn tiny_config() -> TransformerConfig {
@@ -33,6 +34,73 @@ impl Environment for EchoSeparator {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MockPolicyConfig {
+    vocab_size: usize,
+    max_seq_len: usize,
+}
+
+impl GrpoPolicyConfig for MockPolicyConfig {
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+#[derive(Clone)]
+struct MockPolicy {
+    config: MockPolicyConfig,
+}
+
+impl GrpoPolicy for MockPolicy {
+    type Config = MockPolicyConfig;
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn forward_single(
+        &self,
+        input_ids: &[usize],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        self.forward_batch_tokens(input_ids, 1, input_ids.len(), store, tape)
+    }
+
+    fn forward_batch_tokens(
+        &self,
+        input_ids: &[usize],
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> Result<TensorId> {
+        assert_eq!(input_ids.len(), batch * seq_len);
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; batch * seq_len * vocab];
+        for (index, token) in input_ids.iter().copied().enumerate() {
+            let base = index * vocab;
+            let token = token % vocab;
+            for value in 0..vocab {
+                logits[base + value] = if value == token { 8.0 } else { -8.0 };
+            }
+        }
+        store.from_slice(&logits, &[batch, seq_len, vocab])
+    }
+
+    fn all_parameter_ids(&self) -> Vec<TensorId> {
+        Vec::new()
+    }
+
+    fn clone_frozen(&self, _store: &mut TensorStore) -> Self {
+        self.clone()
+    }
+}
+
 #[test]
 fn rollout_episode_shapes_and_masks() {
     let config = tiny_config();
@@ -57,7 +125,6 @@ fn rollout_episode_shapes_and_masks() {
     let episode = rollout_episode(
         &policy,
         &ref_model,
-        &config,
         &initial_prompt,
         &turns,
         &env,
@@ -108,6 +175,61 @@ fn rollout_episode_shapes_and_masks() {
 }
 
 #[test]
+fn rollout_episode_uses_generic_grpo_policy_path() {
+    let config = MockPolicyConfig {
+        vocab_size: 16,
+        max_seq_len: 32,
+    };
+    let policy = MockPolicy { config };
+    let ref_model = policy.clone();
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+
+    let initial_prompt = vec![1usize, 2, 3, 15];
+    let turns = [
+        TurnSpec {
+            agent_tokens: 3,
+            observation_tokens: 2,
+        },
+        TurnSpec {
+            agent_tokens: 3,
+            observation_tokens: 0,
+        },
+    ];
+    let mut rng = LcgRng::seed(11);
+    let env = EchoSeparator(15);
+    let episode = rollout_episode(
+        &policy,
+        &ref_model,
+        &initial_prompt,
+        &turns,
+        &env,
+        1.0,
+        &mut rng,
+        &|_: &Episode| 0.0,
+        &mut store,
+        &mut tape,
+    )
+    .expect("rollout");
+
+    let expected_len = initial_prompt.len() + 3 + 2 + 3;
+    assert_eq!(episode.full_ids.len(), expected_len);
+    assert_eq!(episode.response_mask.len(), expected_len);
+    assert_eq!(episode.turn_boundaries, vec![(4, 7), (9, 12)]);
+    assert_eq!(episode.full_ids[7..9], [15, 15]);
+
+    for (position, masked) in episode.response_mask.iter().enumerate() {
+        if *masked {
+            assert!(episode.old_log_probs[position].is_finite());
+            assert!(
+                (episode.old_log_probs[position] - episode.ref_log_probs[position]).abs() < 1e-6,
+                "position {position} diverged"
+            );
+        }
+    }
+}
+
+#[test]
 fn episode_trajectory_feeds_grpo_loss() {
     let config = tiny_config();
     let mut store = TensorStore::default();
@@ -147,7 +269,6 @@ fn episode_trajectory_feeds_grpo_loss() {
         let episode = rollout_episode(
             &policy,
             &ref_model,
-            &config,
             &initial_prompt,
             &turns,
             &env,

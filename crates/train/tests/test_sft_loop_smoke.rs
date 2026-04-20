@@ -1,7 +1,7 @@
 use std::{collections::HashSet, error::Error};
 
 use autograd::{
-    SafetensorsRegistry, Tape, TensorId, TensorStore,
+    Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
@@ -9,6 +9,7 @@ use tempfile::tempdir;
 use train::{
     dataset::LcgRng,
     qwen3::{Qwen3Config, Qwen3Model},
+    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     sft_data::TokenizedSft,
 };
 
@@ -78,11 +79,12 @@ fn sft_loop_smoke_trains_and_roundtrips() -> TestResult {
 
     let param_map = model.param_name_map();
     let loaded_param_map = loaded_model.param_name_map();
+    let embed_tokens_name = cfg.embed_tokens_tensor_name();
     let source_id = *param_map
-        .get("model.embed_tokens.weight")
+        .get(embed_tokens_name)
         .expect("embed tokens weight present");
     let loaded_id = *loaded_param_map
-        .get("model.embed_tokens.weight")
+        .get(embed_tokens_name)
         .expect("loaded embed tokens weight present");
     let source = store.to_host(source_id)?;
     let loaded = loaded_store.to_host(loaded_id)?;
@@ -164,39 +166,6 @@ fn assistant_masked_loss(
     let masked = mul(gathered, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
     Ok(mul_scalar(total, -1.0 / valid_count as f32, store, tape)?)
-}
-
-fn build_registry(model: &Qwen3Model) -> SafetensorsRegistry {
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    registry
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|tensor_id| {
-            store
-                .get(*tensor_id)
-                .is_some_and(|tensor| tensor.requires_grad)
-        })
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
-}
-
-fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
-    store
-        .tensors
-        .iter()
-        .enumerate()
-        .filter_map(|(tensor_id, slot)| slot.as_ref().map(|_| tensor_id))
-        .collect()
 }
 
 fn retained_ids(

@@ -495,11 +495,12 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
     symlink(target_basename, &tmp)?;
     // POSIX rename is atomic on the same filesystem and will replace an
     // existing symlink at `link` without an intermediate "missing" state.
-    std::fs::rename(&tmp, &link).map_err(|err| {
+    if let Err(err) = std::fs::rename(&tmp, &link) {
         // Best-effort cleanup so we don't leave `.latest.tmp` behind.
         let _ = std::fs::remove_file(&tmp);
-        err
-    })
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
