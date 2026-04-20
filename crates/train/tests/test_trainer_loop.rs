@@ -357,24 +357,24 @@ fn metrics_emit_at_log_every() {
         .expect("trainer.run");
 
     let samples = buf.lock().unwrap();
+    // Codex review 44a7e19 (medium): the Trainer now always force-emits on
+    // step 1 and on the final step in addition to the `log_every` rule, to
+    // match the pre-migration train_sft CLI contract. So log_every=2 +
+    // total_steps=4 yields 3 samples: step 1 (forced), step 2
+    // (is_multiple_of), step 4 (is_multiple_of AND final).
     assert_eq!(
         samples.len(),
-        2,
-        "total_steps=4 / log_every=2 should emit 2 samples, got {}",
+        3,
+        "total_steps=4 / log_every=2 should emit 3 samples (1 forced + 2 + 4), got {}",
         samples.len()
     );
-    // Emitted steps should be 2 and 4.
-    assert_eq!(samples[0].step, 2);
-    assert_eq!(samples[1].step, 4);
-    // Every sample carries the documented field set.
-    let expected_keys = [
-        "loss",
-        "lr",
-        "grad_norm",
-        "ms_per_step",
-        "tok_per_sec",
-        "step",
-    ];
+    assert_eq!(samples[0].step, 1);
+    assert_eq!(samples[1].step, 2);
+    assert_eq!(samples[2].step, 4);
+    // Every sample carries the documented field set. `"step"` intentionally
+    // not in this list anymore — sinks read it from `MetricSample.step`
+    // (codex review 44a7e19 low).
+    let expected_keys = ["loss", "lr", "grad_norm", "ms_per_step", "tok_per_sec"];
     for s in samples.iter() {
         for k in expected_keys {
             assert!(
@@ -383,7 +383,68 @@ fn metrics_emit_at_log_every() {
                 s.step
             );
         }
+        assert!(
+            !s.fields.iter().any(|(name, _)| name == "step"),
+            "sample at step {} still carries redundant `step` field",
+            s.step
+        );
     }
+}
+
+/// Codex review 44a7e19 (medium): the Trainer must always force-emit on
+/// step 1 and the final step regardless of `log_every`. Pins the CLI
+/// contract inherited from pre-migration train_sft so `--log-every 5
+/// --steps 12` still produces a first progress line and a final summary,
+/// not just steps 5 and 10.
+#[test]
+fn metrics_force_emit_on_first_and_final_step() {
+    let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        buf: Arc::clone(&buf),
+    };
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 12,
+        grad_accum_steps: 1,
+        log_every: 5,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(sink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 3,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    let samples = buf.lock().unwrap();
+    // Expected: step 1 (forced), step 5 (log_every), step 10 (log_every),
+    // step 12 (forced final). Final is not a multiple of 5, so the force
+    // rule is load-bearing here.
+    let emitted_steps: Vec<u64> = samples.iter().map(|s| s.step).collect();
+    assert_eq!(
+        emitted_steps,
+        vec![1, 5, 10, 12],
+        "expected forced emits on step 1 and final (12) plus log_every=5"
+    );
 }
 
 /// `run_with_hooks` must invoke `on_step_end` exactly once per optimizer step
@@ -596,6 +657,56 @@ fn resume_accepts_legacy_bare_schedule_name() {
         .expect("legacy bare prefix must still resume");
     assert_eq!(resumed, 7);
     assert_eq!(trainer.step(), 7);
+}
+
+/// Second legacy-compat case (codex review on bdde441 suggestion): make sure
+/// the prefix path also accepts `"linear-warmup"` against a live schedule
+/// whose `describe()` is `"linear-warmup(base_lr=..., warmup=...)"`. Pins
+/// behavior for the non-constant branch of `parse_lr_schedule`.
+#[test]
+fn resume_accepts_legacy_bare_linear_warmup_name() {
+    let tmp = tempdir().expect("tempdir");
+    let ckpt_dir = tmp.path().join("step_000003");
+    std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+    let doc = TrainerStateDoc {
+        step: 3,
+        optim_schema: "adamw-v1".to_string(),
+        schedule_name: "linear-warmup".to_string(),
+        schedule_params: serde_json::json!({}),
+        grad_accum_current: 0,
+        rng_seed: 0,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = AdamWState {
+        step: 3,
+        skipped_export: 0,
+        params: vec![AdamWParamState {
+            name: "p".to_string(),
+            m: vec![0.0],
+            v: vec![0.0],
+            shape: vec![1],
+        }],
+    };
+    save_trainer_state_v2(&ckpt_dir, &doc, &optim_state).expect("save v2");
+
+    let (_store, p) = setup_param(&[0.0]);
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        resume_from: Some(ckpt_dir.clone()),
+        ..default_cfg(100)
+    };
+    let live = LinearWarmup {
+        base_lr: 1e-3,
+        warmup_steps: 5,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, live, Box::new(NullSink), cfg);
+
+    let resumed = trainer
+        .resume_if_configured(&[(p, "p".to_string())])
+        .expect("legacy bare linear-warmup prefix must still resume");
+    assert_eq!(resumed, 3);
+    assert_eq!(trainer.step(), 3);
 }
 
 // ---------------------------------------------------------------------------

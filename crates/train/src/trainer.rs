@@ -413,7 +413,14 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             steps_since_last_log += 1;
 
             // ---- metrics emission ----
-            if self.step.is_multiple_of(self.cfg.log_every) {
+            // Codex review 44a7e19 (medium): pre-migration train_sft always
+            // logged step 1 and the final step regardless of `log_every`.
+            // Force-emit on both boundaries so the CLI contract is preserved
+            // (first progress line + final summary) across log_every values.
+            let is_final = self.step == self.cfg.total_steps;
+            let log_now =
+                self.step == 1 || is_final || self.step.is_multiple_of(self.cfg.log_every);
+            if log_now {
                 let elapsed = log_timer.elapsed();
                 let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
                 let elapsed_s = elapsed.as_secs_f64().max(1e-9);
@@ -423,13 +430,17 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 // `log_every > 1`.
                 let ms_per_step = elapsed_ms / steps_since_last_log.max(1) as f64;
 
-                let fields: [(&str, f64); 6] = [
+                // Codex review 44a7e19 (low): don't include "step" in the
+                // fields array — MetricSample carries it in `sample.step`
+                // already, and both StdoutSink and JsonlSink emit it from
+                // there. Redundant "step" produced `step=5 ... step=5.000000`
+                // in stdout + a duplicate JSON key.
+                let fields: [(&str, f64); 5] = [
                     ("loss", running_loss_sum as f64),
                     ("lr", lr as f64),
                     ("grad_norm", grad_norm as f64),
                     ("ms_per_step", ms_per_step),
                     ("tok_per_sec", tok_per_sec),
-                    ("step", self.step as f64),
                 ];
                 self.metrics.emit(&MetricSample {
                     step: self.step,
@@ -446,10 +457,12 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 && self.step.is_multiple_of(eval_n)
             {
                 let eval = eval_fn(store, tape)?;
-                let fields: [(&str, f64); 3] = [
+                // Codex review 44a7e19 (low): same redundant-step issue as the
+                // training-metrics emit — drop "step" from fields, sinks read
+                // it from sample.step.
+                let fields: [(&str, f64); 2] = [
                     ("eval_loss", eval.loss as f64),
                     ("eval_tokens", eval.token_count as f64),
-                    ("step", self.step as f64),
                 ];
                 self.metrics.emit(&MetricSample {
                     step: self.step,
