@@ -14,6 +14,8 @@
 #   --processor PATH tokenizer path / HF id (default: local models/Qwen3-4B)
 #
 # Exploration mode (faster, non-canonical; DOES NOT produce a wins entry):
+#   --fast               short c=16 preset: profile=concurrent, rate=16,
+#                        data=4096-in/256-out, max-seconds=30.
 #   --quick              ~4-minute matched-A/B preset: profile=concurrent,
 #                        rate=1,2,4,8, data=512-in/128-out, max-seconds=60,
 #                        warmup=5. Short dataset so requests complete in
@@ -90,6 +92,8 @@ Canonical run (produces a wins entry):
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
 
 Exploration mode (faster, no wins entry):
+  --fast                 short c=16 preset: profile=concurrent, rate=16,
+                         data=4096-in/256-out, max-seconds=30
   --quick                 ~4-min preset: profile=concurrent rate=1,2,4,8
                           data=512-in/128-out max-seconds=60 warmup=5
   --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
@@ -111,6 +115,12 @@ while [[ $# -gt 0 ]]; do
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; exit 2; }
             MODEL="$2"; shift 2 ;;
+        --fast)
+            EXPLORATION_MODE=true
+            PROFILE="concurrent"
+            RATE_OVERRIDE="16"
+            MAX_SECONDS=30
+            shift ;;
         --processor)
             [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
             PROCESSOR="$2"; shift 2 ;;
