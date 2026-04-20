@@ -25,9 +25,6 @@ use cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
 
-#[allow(dead_code)]
-pub(crate) const MIXED_PREFILL_CAP: usize = 64;
-
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
 pub struct BatchDecodeBuffers {
@@ -105,6 +102,7 @@ pub(crate) struct MixedBatchBuffers {
     logits: HiddenStates,
     token_ids_gpu: CudaSlice<i32>,
     metadata: FlashInferDecodeMetadata,
+    max_prefill_tokens: usize,
     max_tokens: usize,
 }
 
@@ -115,8 +113,10 @@ impl MixedBatchBuffers {
         model_config: &Config,
         max_batch_size: usize,
         max_total_pages: usize,
+        max_prefill_tokens: usize,
     ) -> Result<Self> {
-        let max_tokens = max_batch_size + MIXED_PREFILL_CAP;
+        let max_prefill_tokens = max_prefill_tokens.max(1);
+        let max_tokens = max_batch_size + max_prefill_tokens;
         let q_dim = model_config.num_attention_heads * model_config.head_dim;
         let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
 
@@ -142,9 +142,10 @@ impl MixedBatchBuffers {
             metadata: FlashInferDecodeMetadata::new(
                 ctx,
                 max_tokens,
-                max_total_pages + MIXED_PREFILL_CAP,
+                max_total_pages + max_prefill_tokens,
                 model_config.num_attention_heads,
             )?,
+            max_prefill_tokens,
             max_tokens,
         })
     }
@@ -255,13 +256,20 @@ impl BatchDecodeBuffers {
         &mut self,
         model: &Qwen3Model,
         kv_pool: &PagedKVPool,
+        max_prefill_tokens: usize,
     ) -> Result<&mut MixedBatchBuffers> {
-        if self.mixed.is_none() {
+        let needs_realloc = self
+            .mixed
+            .as_ref()
+            .map(|mixed| mixed.max_prefill_tokens < max_prefill_tokens)
+            .unwrap_or(true);
+        if needs_realloc {
             self.mixed = Some(MixedBatchBuffers::new(
                 &model.ctx,
                 &model.config,
                 self.max_batch_size,
                 kv_pool.max_total_pages,
+                max_prefill_tokens,
             )?);
         }
         Ok(self.mixed.as_mut().unwrap())
@@ -352,7 +360,7 @@ impl Qwen3Model {
         if self.lora.is_some() {
             return Ok(false);
         }
-        if paged_kv_pool.format != KVFormat::BF16 || c > MIXED_PREFILL_CAP {
+        if paged_kv_pool.format != KVFormat::BF16 {
             return Ok(false);
         }
         let pool_seq = paged_kv_pool.seq_len(prefill_slot_idx);
@@ -379,9 +387,9 @@ impl Qwen3Model {
         }
         let logits_batch_ptr = bufs.logits_batch.as_mut().unwrap() as *mut HiddenStates;
 
-        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool)?;
+        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool, c)?;
         let total_tokens = b + c;
-        if total_tokens > mixed.max_tokens {
+        if c > mixed.max_prefill_tokens || total_tokens > mixed.max_tokens {
             return Ok(false);
         }
         mixed.set_seq_len(total_tokens);

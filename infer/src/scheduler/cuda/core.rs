@@ -8,10 +8,8 @@ use super::{
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
-use crate::scheduler::policy::{
-    ChunkingPolicy, DecodeAwareChunking, SchedulerSignals, SessionBiasedLru,
-};
-use crate::types::{BlockFingerprint, InferenceMode, KvContentContext};
+use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
+use crate::types::{BlockFingerprint, KvContentContext};
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
 /// Chosen to match the M0.3 target paged-pool page size so that when
@@ -62,6 +60,7 @@ pub(super) struct PendingDecode {
     pub greedy_launched: bool,
     pub sampling_params_greedy: Vec<bool>,
     pub mixed_prefill_request_idx: Option<usize>,
+    pub mixed_prefill_tokens: usize,
     pub mixed_prefill_chunk_complete: bool,
 }
 
@@ -359,13 +358,19 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, prefill_chunk_size={}",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}",
             model_id,
             config.max_slots,
             seed,
             effective_max_seq_len.map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
             config.max_waiting_requests,
-            config.prefill_chunk_size,
+            config.chunked_prefill_size,
+            config.max_prefill_tokens,
+            config
+                .prefill_max_requests
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            config.enable_mixed_chunk,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -883,36 +888,24 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn prefill_chunk_size(&self) -> usize {
-        let signals = SchedulerSignals::queue_state(
-            self.waiting.len(),
-            self.active
-                .iter()
-                .filter(|req| matches!(req.phase, Phase::Decoding))
-                .count(),
-        );
         // When the model writes prefill K/V directly to the paged pool, there
         // is no per-slot contiguous scratch to size the chunk against, so the
         // `CONTIGUOUS_KV_TOKENS` cap does not apply and the configured
-        // `prefill_chunk_size` (default 4096) is the only upper bound.
+        // `chunked_prefill_size` is the only upper bound.
         let contiguous_cap = if self.model.prefill_uses_paged_pool() {
             usize::MAX
         } else {
             CONTIGUOUS_KV_TOKENS
         };
-        let policy_chunk = DecodeAwareChunking {
-            decode_active_chunk: self.config.decode_active_prefill_cap,
-            idle_chunk: self.config.prefill_chunk_size,
-        }
-        .next_chunk_size(InferenceMode::Prefill, signals);
-        let out = policy_chunk
+        let out = self
+            .config
+            .chunked_prefill_size
             .max(1)
-            .min(self.config.prefill_chunk_size)
             .min(contiguous_cap);
         log::debug!(
-            "prefill_chunk_size: policy={policy_chunk} cap={contiguous_cap} cfg={} paged={} active_decodes={} => {out}",
-            self.config.prefill_chunk_size,
+            "prefill_chunk_size: chunked_prefill_size={} cap={contiguous_cap} paged={} => {out}",
+            self.config.chunked_prefill_size,
             self.model.prefill_uses_paged_pool(),
-            signals.active_decodes,
         );
         out
     }
