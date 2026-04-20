@@ -1,6 +1,130 @@
 use super::{ModelForward, Phase, Scheduler, info};
 
+#[derive(Clone, Copy, Debug)]
+struct PrefillReservation {
+    slot_idx: usize,
+    prefill_tokens: usize,
+    pool_tokens: usize,
+}
+
+#[derive(Debug)]
+struct PrefillBudget {
+    remaining_prefill_tokens: usize,
+    remaining_requests: usize,
+    remaining_free_pages: usize,
+    planned_seq_lens: Vec<usize>,
+    page_size: usize,
+}
+
+impl PrefillBudget {
+    fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
+        let page_size = scheduler.paged_kv_pool.page_size.max(1);
+        let partial_capacity = (0..scheduler.states.len())
+            .map(|slot_idx| {
+                let used = scheduler.paged_kv_pool.seq_len(slot_idx) % page_size;
+                if used == 0 { 0 } else { page_size - used }
+            })
+            .sum::<usize>();
+        let free_page_tokens = scheduler
+            .paged_kv_pool
+            .free_count()
+            .saturating_sub(partial_capacity);
+
+        Self {
+            remaining_prefill_tokens: scheduler.config.max_prefill_tokens,
+            remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
+            remaining_free_pages: free_page_tokens / page_size,
+            planned_seq_lens: (0..scheduler.states.len())
+                .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
+                .collect(),
+            page_size,
+        }
+    }
+
+    fn can_schedule(&self, reservation: PrefillReservation) -> bool {
+        if reservation.prefill_tokens == 0
+            || reservation.prefill_tokens > self.remaining_prefill_tokens
+            || self.remaining_requests == 0
+        {
+            return false;
+        }
+        self.additional_pages_needed(reservation.slot_idx, reservation.pool_tokens)
+            <= self.remaining_free_pages
+    }
+
+    fn reserve(&mut self, reservation: PrefillReservation) {
+        debug_assert!(self.can_schedule(reservation));
+        self.remaining_prefill_tokens = self
+            .remaining_prefill_tokens
+            .saturating_sub(reservation.prefill_tokens);
+        self.remaining_requests = self.remaining_requests.saturating_sub(1);
+        self.reserve_pool_tokens(reservation.slot_idx, reservation.pool_tokens);
+    }
+
+    fn reserve_mixed_prefill(&mut self, prefill_tokens: usize) {
+        if prefill_tokens == 0 {
+            return;
+        }
+        self.remaining_prefill_tokens = self.remaining_prefill_tokens.saturating_sub(prefill_tokens);
+        self.remaining_requests = self.remaining_requests.saturating_sub(1);
+    }
+
+    fn reserve_pool_tokens(&mut self, slot_idx: usize, pool_tokens: usize) {
+        let new_pages = self.additional_pages_needed(slot_idx, pool_tokens);
+        debug_assert!(new_pages <= self.remaining_free_pages);
+        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
+        self.planned_seq_lens[slot_idx] =
+            self.planned_seq_lens[slot_idx].saturating_add(pool_tokens);
+    }
+
+    fn additional_pages_needed(&self, slot_idx: usize, pool_tokens: usize) -> usize {
+        if pool_tokens == 0 {
+            return 0;
+        }
+        let used_in_last_page = self.planned_seq_lens[slot_idx] % self.page_size;
+        let available_in_last_page = if used_in_last_page == 0 {
+            0
+        } else {
+            self.page_size - used_in_last_page
+        };
+        pool_tokens
+            .saturating_sub(available_in_last_page)
+            .div_ceil(self.page_size)
+    }
+}
+
 impl<M: ModelForward> Scheduler<M> {
+    fn prefill_reservation(&self, idx: usize) -> Option<PrefillReservation> {
+        if self.active[idx].delta_tx.is_closed() {
+            return None;
+        }
+        let Phase::Prefilling {
+            effective_tokens,
+            progress,
+        } = &self.active[idx].phase
+        else {
+            return None;
+        };
+
+        let remaining_tokens = effective_tokens.len().saturating_sub(*progress);
+        if remaining_tokens == 0 {
+            return None;
+        }
+
+        let prefill_tokens = remaining_tokens.min(self.prefill_chunk_size());
+        let pool_tokens = if self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active()
+        {
+            prefill_tokens
+        } else {
+            0
+        };
+        Some(PrefillReservation {
+            slot_idx: self.active[idx].slot_idx,
+            prefill_tokens,
+            pool_tokens,
+        })
+    }
+
     pub(super) fn step(&mut self) {
         let num = self.active.len();
         if num == 0 {
@@ -24,14 +148,17 @@ impl<M: ModelForward> Scheduler<M> {
         self.pending_mixed_prefill_idx = None;
         let decode_launch_us = if has_decode {
             let t = std::time::Instant::now();
-            let mixed_prefill_idx = self
-                .active
-                .iter()
-                .enumerate()
-                .find(|(_, r)| {
-                    matches!(r.phase, Phase::Prefilling { .. }) && !r.delta_tx.is_closed()
-                })
-                .map(|(i, _)| i);
+            let mixed_prefill_idx = if self.config.enable_mixed_chunk {
+                self.active
+                    .iter()
+                    .enumerate()
+                    .find(|(_, r)| {
+                        matches!(r.phase, Phase::Prefilling { .. }) && !r.delta_tx.is_closed()
+                    })
+                    .map(|(i, _)| i)
+            } else {
+                None
+            };
             if let Some(pi) = mixed_prefill_idx {
                 self.step_decode_launch_mixed(pi);
             } else {
@@ -79,33 +206,47 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let new_us = new_t.elapsed().as_micros();
 
-        // Phase 2c: Prefill chunks — queued on GPU stream while decode is in flight.
-        // Adaptive rate based on decode batch size.
+        // Phase 2c: Prefill chunks — queued on the same GPU stream after decode.
+        // Decode always launches first; prefill work is then bounded by explicit
+        // SGLang-style token/request budgets instead of a decode-active hard cap.
         let prefill_t = std::time::Instant::now();
-        let decode_count = self
-            .active
-            .iter()
-            .filter(|r| matches!(r.phase, Phase::Decoding))
-            .count();
-        let max_prefills = if !has_decode {
-            8 // No decode: drain prefill queue fast
-        } else if decode_count <= 4 {
-            4 // Ramp-up: GPU has headroom, reduce TTFT
-        } else if decode_count <= 16 {
-            2 // Moderate load: balance TTFT vs ITL
-        } else {
-            1 // High concurrency: protect decode latency
-        };
         let already_mixed = self.pending_mixed_prefill_idx.take();
+        let mixed_prefill_tokens = self
+            .pending_decode
+            .as_ref()
+            .map(|pending| pending.mixed_prefill_tokens)
+            .unwrap_or(0);
+        let mut budget = PrefillBudget::from_scheduler(self);
+        budget.reserve_mixed_prefill(mixed_prefill_tokens);
         let prefill_indices: Vec<usize> = (0..self.active.len())
             .filter(|&i| matches!(self.active[i].phase, Phase::Prefilling { .. }))
             .filter(|&i| Some(i) != already_mixed)
-            .take(max_prefills)
             .collect();
         for idx in prefill_indices {
-            if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
-                self.step_prefill_chunk(idx);
+            let Some(reservation) = self.prefill_reservation(idx) else {
+                continue;
+            };
+            if !budget.can_schedule(reservation) {
+                break;
             }
+            let scheduled = self.step_prefill_chunk(idx, reservation.prefill_tokens);
+            if scheduled == 0 {
+                if matches!(self.active[idx].phase, Phase::Prefilling { .. }) {
+                    break;
+                }
+                continue;
+            }
+            budget.reserve(PrefillReservation {
+                prefill_tokens: scheduled,
+                pool_tokens: if self.model.prefill_uses_paged_pool()
+                    && self.paged_kv_pool.is_active()
+                {
+                    scheduled
+                } else {
+                    0
+                },
+                ..reservation
+            });
         }
         let prefill_us = prefill_t.elapsed().as_micros();
 

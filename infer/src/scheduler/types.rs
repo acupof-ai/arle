@@ -27,16 +27,21 @@ pub enum PreemptionMode {
 pub struct SchedulerConfig {
     /// Maximum number of concurrently active request slots.
     pub max_slots: usize,
-    /// Chunked prefill chunk size (tokens per prefill step).
-    pub prefill_chunk_size: usize,
+    /// Maximum number of tokens in a single prefill chunk.
+    pub chunked_prefill_size: usize,
+    /// Maximum total prefill tokens to queue in one scheduler step.
+    pub max_prefill_tokens: usize,
+    /// Maximum number of prefilling requests to advance in one scheduler step.
+    /// `None` means no explicit request-count cap.
+    pub prefill_max_requests: Option<usize>,
+    /// Allow mixing one prefill chunk into a decode batch when the model
+    /// supports it. Mirrors SGLang's `--enable-mixed-chunk`; default stays off.
+    pub enable_mixed_chunk: bool,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
     /// Strategy to use when a running request must be preempted.
     pub preemption_mode: PreemptionMode,
-    /// Prefill chunk size cap when decode requests are active.
-    /// Smaller values reduce decode latency at the cost of prefill throughput.
-    pub decode_active_prefill_cap: usize,
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom. Default 0.88.
     pub mem_fraction_static: f64,
@@ -88,10 +93,12 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             max_slots: 4,
-            prefill_chunk_size: 512,
+            chunked_prefill_size: 512,
+            max_prefill_tokens: 16384,
+            prefill_max_requests: None,
+            enable_mixed_chunk: false,
             max_waiting_requests: 256,
             preemption_mode: PreemptionMode::Recompute,
-            decode_active_prefill_cap: 512,
             mem_fraction_static: 0.88,
             min_seq_len: 256,
             kv_pool_fallback_bytes: 4 * 1024 * 1024 * 1024,
@@ -126,7 +133,7 @@ impl SchedulerConfig {
     pub fn runtime_defaults(max_slots: usize) -> Self {
         Self {
             max_slots,
-            prefill_chunk_size: 4096,
+            chunked_prefill_size: 4096,
             ..Self::default()
         }
     }
@@ -135,11 +142,17 @@ impl SchedulerConfig {
         if self.max_slots == 0 {
             anyhow::bail!("max_slots must be ≥ 1");
         }
-        if self.prefill_chunk_size == 0 {
-            anyhow::bail!("prefill_chunk_size must be ≥ 1");
+        if self.chunked_prefill_size == 0 {
+            anyhow::bail!("chunked_prefill_size must be ≥ 1");
         }
-        if self.decode_active_prefill_cap == 0 {
-            anyhow::bail!("decode_active_prefill_cap must be ≥ 1");
+        if self.max_prefill_tokens == 0 {
+            anyhow::bail!("max_prefill_tokens must be ≥ 1");
+        }
+        if self.max_prefill_tokens < self.chunked_prefill_size {
+            anyhow::bail!("max_prefill_tokens must be ≥ chunked_prefill_size");
+        }
+        if matches!(self.prefill_max_requests, Some(0)) {
+            anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
         }
         if self.min_seq_len == 0 {
             anyhow::bail!("min_seq_len must be ≥ 1");
@@ -349,7 +362,10 @@ mod tests {
     fn runtime_defaults_match_documented_defaults() {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
-        assert_eq!(cfg.prefill_chunk_size, 4096);
+        assert_eq!(cfg.chunked_prefill_size, 4096);
+        assert_eq!(cfg.max_prefill_tokens, 16384);
+        assert_eq!(cfg.prefill_max_requests, None);
+        assert!(!cfg.enable_mixed_chunk);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
@@ -380,6 +396,20 @@ mod tests {
     fn scheduler_config_rejects_zero_t1_keepalive() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.t1_host_pinned_keepalive_ticks = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_prefill_budget_smaller_than_chunk() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_prefill_tokens = cfg.chunked_prefill_size - 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_prefill_max_requests() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.prefill_max_requests = Some(0);
         assert!(cfg.validate().is_err());
     }
 

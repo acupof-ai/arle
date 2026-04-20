@@ -232,11 +232,10 @@ impl<M: ModelForward> Scheduler<M> {
 
     /// Process one chunk of a prefill. When all chunks are done, sample the
     /// first token and transition to Decoding.
-    pub(super) fn step_prefill_chunk(&mut self, idx: usize) {
-        let chunk_size = self.prefill_chunk_size();
+    pub(super) fn step_prefill_chunk(&mut self, idx: usize, chunk_size: usize) -> usize {
         if self.active[idx].delta_tx.is_closed() {
             self.active[idx].phase = Phase::Finished;
-            return;
+            return 0;
         }
 
         let slot_idx = self.active[idx].slot_idx;
@@ -255,9 +254,12 @@ impl<M: ModelForward> Scheduler<M> {
                     total,
                 )
             }
-            _ => return,
+            _ => return 0,
         };
         let chunk_len = chunk_tokens.len();
+        if chunk_len == 0 {
+            return 0;
+        }
         let chunk_end = progress_val + chunk_len;
 
         let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
@@ -270,12 +272,11 @@ impl<M: ModelForward> Scheduler<M> {
             match self.alloc_pool_tokens_with_retry(slot_idx, chunk_len) {
                 Err(e) => {
                     let req_id = self.active[idx].id;
-                    error!(
-                        "Request {}: pool alloc for paged prefill failed: {}",
+                    warn!(
+                        "Request {}: deferring paged prefill chunk after pool alloc failed: {}",
                         req_id, e
                     );
-                    self.active[idx].phase = Phase::Finished;
-                    return;
+                    return 0;
                 }
                 Ok(_new_pages) => {
                     let ctx = self.model.device_context();
@@ -300,7 +301,7 @@ impl<M: ModelForward> Scheduler<M> {
             let req_id = self.active[idx].id;
             error!("Request {}: prefill chunk failed: {}", req_id, e);
             self.active[idx].phase = Phase::Finished;
-            return;
+            return 0;
         }
 
         let new_progress = chunk_end;
@@ -312,7 +313,7 @@ impl<M: ModelForward> Scheduler<M> {
                 "Request {}: prefill chunk {}/{} tokens",
                 self.active[idx].id, new_progress, total
             );
-            return;
+            return chunk_len;
         }
 
         // Post-forward KV migration (only when contiguous-KV prefill was used).
@@ -364,13 +365,13 @@ impl<M: ModelForward> Scheduler<M> {
             Ok(token) => {
                 if !self.active[idx].sampling.ignore_eos && self.model.is_stop_token(token) {
                     self.active[idx].finish(FinishReason::Stop, &self.tokenizer);
-                    return;
+                    return chunk_len;
                 }
                 self.active[idx].generated_tokens.push(token);
                 self.active[idx].emit_delta(&self.tokenizer);
 
                 if matches!(self.active[idx].phase, Phase::Finished) {
-                    return;
+                    return chunk_len;
                 }
                 if self.active[idx].generated_tokens.len() >= self.active[idx].max_tokens {
                     self.active[idx].finish(FinishReason::Length, &self.tokenizer);
@@ -389,6 +390,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.active[idx].phase = Phase::Finished;
             }
         }
+        chunk_len
     }
 }
 

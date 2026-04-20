@@ -5,9 +5,178 @@ use super::{
 use crate::model::kv_cache::KVFormat;
 use crate::scheduler::cuda::core::PendingDecode;
 
-const MIXED_PREFILL_CAP: usize = 64;
-
 impl<M: ModelForward> Scheduler<M> {
+    fn launch_decode_batch_from_tokens(
+        &mut self,
+        mut decode_indices: Vec<usize>,
+        token_ids: Vec<u32>,
+        decode_tokens_already_allocated: bool,
+    ) {
+        if decode_indices.is_empty() {
+            return;
+        }
+
+        let token_ids = if decode_tokens_already_allocated {
+            token_ids
+        } else {
+            let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
+            let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
+            for (j, &i) in decode_indices.iter().enumerate() {
+                let slot = self.active[i].slot_idx;
+                if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
+                    error!(
+                        "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
+                        self.active[i].id, slot, e
+                    );
+                    self.active[i].finish(FinishReason::Length, &self.tokenizer);
+                } else {
+                    alloc_ok_indices.push(i);
+                    alloc_ok_tokens.push(token_ids[j]);
+                }
+            }
+            decode_indices = alloc_ok_indices;
+            alloc_ok_tokens
+        };
+
+        if decode_indices.is_empty() {
+            return;
+        }
+
+        let slot_indices: Vec<usize> = decode_indices
+            .iter()
+            .map(|&i| self.active[i].slot_idx)
+            .collect();
+
+        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
+            .iter()
+            .map(|&i| &self.active[i].sampling)
+            .collect();
+        let all_greedy = sampling_params
+            .iter()
+            .all(|p| p.is_greedy() && !p.has_penalties());
+
+        if self.decode_bufs.is_none() {
+            match self
+                .model
+                .create_decode_context(self.states.len(), &self.paged_kv_pool)
+            {
+                Ok(ctx) => self.decode_bufs = Some(ctx),
+                Err(e) => {
+                    error!("Failed to create decode context: {}", e);
+                    for &i in &decode_indices {
+                        self.active[i].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        }
+        let decode_ctx = self.decode_bufs.as_mut().unwrap();
+
+        {
+            use crate::model::DecodeContextOps;
+            let ctx = self.model.device_context();
+            decode_ctx.set_batch_size(token_ids.len());
+            if let Err(e) = decode_ctx.upload_token_ids(ctx, &token_ids) {
+                error!("Pre-decode upload_token_ids failed: {}", e);
+                for &i in &decode_indices {
+                    self.active[i].phase = Phase::Finished;
+                }
+                return;
+            }
+            match decode_ctx.update_metadata(ctx, &self.paged_kv_pool, &slot_indices) {
+                Ok(reallocated) => {
+                    if reallocated {
+                        decode_ctx.invalidate_graph_cache(token_ids.len());
+                    }
+                }
+                Err(e) => {
+                    error!("Pre-decode update_metadata failed: {}", e);
+                    for &i in &decode_indices {
+                        self.active[i].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+            if let Err(e) = decode_ctx.plan_attention(
+                ctx,
+                token_ids.len(),
+                self.model.num_q_heads(),
+                self.model.num_kv_heads(),
+                self.paged_kv_pool.page_size,
+                self.model.head_dim(),
+                self.paged_kv_pool.format,
+            ) {
+                error!("Pre-decode plan_attention failed: {}", e);
+                for &i in &decode_indices {
+                    self.active[i].phase = Phase::Finished;
+                }
+                return;
+            }
+        }
+
+        let forward_result = self.model.forward_decode_batch(
+            &token_ids,
+            &mut self.states,
+            &slot_indices,
+            Some(&mut self.paged_kv_pool),
+            decode_ctx,
+            all_greedy,
+        );
+
+        if let Err(e) = forward_result {
+            error!("Batched decode failed: {}", e);
+            for &i in &decode_indices {
+                self.active[i].phase = Phase::Finished;
+            }
+            return;
+        }
+
+        let greedy_launched = if all_greedy {
+            match self
+                .model
+                .sample_batch_greedy_launch(&slot_indices, decode_ctx)
+            {
+                Ok(true) => true,
+                Ok(false) => {
+                    if let Err(e) = self.model.prepare_batch_sampling_fallback(
+                        &mut self.states,
+                        &slot_indices,
+                        decode_ctx,
+                    ) {
+                        error!("Preparing batched sampling fallback failed: {}", e);
+                        for &req_idx in &decode_indices {
+                            self.active[req_idx].phase = Phase::Finished;
+                        }
+                        return;
+                    }
+                    false
+                }
+                Err(e) => {
+                    error!("Batched greedy sampling launch failed: {}", e);
+                    for &req_idx in &decode_indices {
+                        self.active[req_idx].phase = Phase::Finished;
+                    }
+                    return;
+                }
+            }
+        } else {
+            false
+        };
+
+        self.pending_decode = Some(PendingDecode {
+            decode_indices,
+            slot_indices,
+            greedy_launched,
+            sampling_params_greedy: sampling_params
+                .iter()
+                .map(|p| p.is_greedy() && !p.has_penalties())
+                .collect(),
+            mixed_prefill_request_idx: None,
+            mixed_prefill_tokens: 0,
+            mixed_prefill_chunk_complete: false,
+        });
+    }
+
     pub(super) fn step_decode_launch_mixed(&mut self, prefill_idx: usize) {
         let decode_indices: Vec<usize> = self
             .active
@@ -64,7 +233,10 @@ impl<M: ModelForward> Scheduler<M> {
                         self.step_decode_launch();
                         return;
                     }
-                    let end = (*progress + MIXED_PREFILL_CAP).min(effective_tokens.len());
+                    let mixed_chunk_size = self
+                        .prefill_chunk_size()
+                        .min(self.config.max_prefill_tokens.max(1));
+                    let end = (*progress + mixed_chunk_size).min(effective_tokens.len());
                     (
                         effective_tokens.len(),
                         *progress,
@@ -204,12 +376,15 @@ impl<M: ModelForward> Scheduler<M> {
             }
             Ok(false) => {
                 info!("Mixed batch: fallback (Ok(false))");
-                self.step_decode_launch();
+                self.launch_decode_batch_from_tokens(decode_indices, token_ids, true);
                 return;
             }
             Err(e) => {
-                error!("Mixed batched decode failed, falling back: {}", e);
-                self.step_decode_launch();
+                error!("Mixed batched decode failed after decode-token allocation: {}", e);
+                for &req_idx in &decode_indices {
+                    self.active[req_idx].phase = Phase::Finished;
+                }
+                self.active[prefill_idx].phase = Phase::Finished;
                 return;
             }
         };
@@ -259,6 +434,7 @@ impl<M: ModelForward> Scheduler<M> {
             greedy_launched,
             sampling_params_greedy,
             mixed_prefill_request_idx: Some(prefill_idx),
+            mixed_prefill_tokens: prefill_token_count,
             mixed_prefill_chunk_complete: new_progress >= prefill_total,
         });
     }
@@ -363,167 +539,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.waiting.push_front(requeue);
         }
 
-        // Allocate one pool token per remaining decode request.
-        let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
-        let mut alloc_ok_tokens: Vec<u32> = Vec::with_capacity(decode_indices.len());
-        for (j, &i) in decode_indices.iter().enumerate() {
-            let slot = self.active[i].slot_idx;
-            if let Err(e) = self.alloc_pool_tokens_with_retry(slot, 1) {
-                error!(
-                    "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
-                    self.active[i].id, slot, e
-                );
-                self.active[i].finish(FinishReason::Length, &self.tokenizer);
-            } else {
-                alloc_ok_indices.push(i);
-                alloc_ok_tokens.push(token_ids[j]);
-            }
-        }
-        let decode_indices = alloc_ok_indices;
-        let token_ids = alloc_ok_tokens;
-        if decode_indices.is_empty() {
-            return;
-        }
-        let slot_indices: Vec<usize> = decode_indices
-            .iter()
-            .map(|&i| self.active[i].slot_idx)
-            .collect();
-
-        let sampling_params: Vec<&crate::sampler::SamplingParams> = decode_indices
-            .iter()
-            .map(|&i| &self.active[i].sampling)
-            .collect();
-        let all_greedy = sampling_params
-            .iter()
-            .all(|p| p.is_greedy() && !p.has_penalties());
-
-        // Lazy-init decode context on first batched decode.
-        if self.decode_bufs.is_none() {
-            match self
-                .model
-                .create_decode_context(self.states.len(), &self.paged_kv_pool)
-            {
-                Ok(ctx) => self.decode_bufs = Some(ctx),
-                Err(e) => {
-                    error!("Failed to create decode context: {}", e);
-                    for &i in &decode_indices {
-                        self.active[i].phase = Phase::Finished;
-                    }
-                    return;
-                }
-            }
-        }
-        let decode_ctx = self.decode_bufs.as_mut().unwrap();
-
-        // Pre-decode: scheduler handles H2D, metadata, and FlashInfer plan
-        // via DecodeContextOps. This decouples scheduler-level work from
-        // model-level neural computation.
-        {
-            use crate::model::DecodeContextOps;
-            let ctx = self.model.device_context();
-            decode_ctx.set_batch_size(token_ids.len());
-            if let Err(e) = decode_ctx.upload_token_ids(ctx, &token_ids) {
-                error!("Pre-decode upload_token_ids failed: {}", e);
-                for &i in &decode_indices {
-                    self.active[i].phase = Phase::Finished;
-                }
-                return;
-            }
-            match decode_ctx.update_metadata(ctx, &self.paged_kv_pool, &slot_indices) {
-                Ok(reallocated) => {
-                    if reallocated {
-                        decode_ctx.invalidate_graph_cache(token_ids.len());
-                    }
-                }
-                Err(e) => {
-                    error!("Pre-decode update_metadata failed: {}", e);
-                    for &i in &decode_indices {
-                        self.active[i].phase = Phase::Finished;
-                    }
-                    return;
-                }
-            }
-            if let Err(e) = decode_ctx.plan_attention(
-                ctx,
-                token_ids.len(),
-                self.model.num_q_heads(),
-                self.model.num_kv_heads(),
-                self.paged_kv_pool.page_size,
-                self.model.head_dim(),
-                self.paged_kv_pool.format,
-            ) {
-                error!("Pre-decode plan_attention failed: {}", e);
-                for &i in &decode_indices {
-                    self.active[i].phase = Phase::Finished;
-                }
-                return;
-            }
-        }
-
-        // TODO(mixed-batch): probe `forward_mixed_batch(...)` here once a model
-        // implementation overrides the default `Ok(false)` path with a validated
-        // eager mixed decode+prefill forward. Keep the existing decode-only path
-        // unchanged until the model-side paged prefill prep is wired safely.
-        let forward_result = self.model.forward_decode_batch(
-            &token_ids,
-            &mut self.states,
-            &slot_indices,
-            Some(&mut self.paged_kv_pool),
-            decode_ctx,
-            all_greedy,
-        );
-
-        if let Err(e) = forward_result {
-            error!("Batched decode failed: {}", e);
-            for &i in &decode_indices {
-                self.active[i].phase = Phase::Finished;
-            }
-            return;
-        }
-
-        let greedy_launched = if all_greedy {
-            match self
-                .model
-                .sample_batch_greedy_launch(&slot_indices, decode_ctx)
-            {
-                Ok(true) => true,
-                Ok(false) => {
-                    if let Err(e) = self.model.prepare_batch_sampling_fallback(
-                        &mut self.states,
-                        &slot_indices,
-                        decode_ctx,
-                    ) {
-                        error!("Preparing batched sampling fallback failed: {}", e);
-                        for &req_idx in &decode_indices {
-                            self.active[req_idx].phase = Phase::Finished;
-                        }
-                        return;
-                    }
-                    false
-                }
-                Err(e) => {
-                    error!("Batched greedy sampling launch failed: {}", e);
-                    for &req_idx in &decode_indices {
-                        self.active[req_idx].phase = Phase::Finished;
-                    }
-                    return;
-                }
-            }
-        } else {
-            false
-        };
-
-        self.pending_decode = Some(PendingDecode {
-            decode_indices,
-            slot_indices,
-            greedy_launched,
-            sampling_params_greedy: sampling_params
-                .iter()
-                .map(|p| p.is_greedy() && !p.has_penalties())
-                .collect(),
-            mixed_prefill_request_idx: None,
-            mixed_prefill_chunk_complete: false,
-        });
+        self.launch_decode_batch_from_tokens(decode_indices, token_ids, false);
     }
 
     pub(super) fn step_decode_readback(&mut self) {

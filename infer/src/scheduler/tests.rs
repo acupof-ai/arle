@@ -35,7 +35,7 @@ fn scheduler_config_zero_slots_invalid() {
 #[test]
 fn scheduler_config_zero_chunk_invalid() {
     let cfg = SchedulerConfig {
-        prefill_chunk_size: 0,
+        chunked_prefill_size: 0,
         ..Default::default()
     };
     assert!(cfg.validate().is_err());
@@ -464,7 +464,7 @@ fn batch_scheduler_emits_prefill_started_once_for_chunked_request() {
 }
 
 #[test]
-fn batch_scheduler_uses_decode_aware_chunking_policy() {
+fn batch_scheduler_cpu_policy_uses_decode_aware_chunking() {
     let mut sched = make_batch_scheduler(512, 4, 512);
     let req0 = sched.add_request((1..=32).collect(), 8, RequestPriority::Normal);
     let _req1 = sched.add_request((33..=512).collect(), 8, RequestPriority::Normal);
@@ -472,7 +472,9 @@ fn batch_scheduler_uses_decode_aware_chunking_policy() {
     // Step 1: prefill req0, it becomes running for decode.
     let _ = sched.schedule_step();
 
-    // Step 2: mixed step, prefill chunk should be decode-capped by policy (64).
+    // Step 2: the backend-agnostic CPU accounting scheduler still uses its own
+    // decode-aware chunking policy. This is not the production CUDA runtime
+    // contract, which now uses explicit token/request budgets.
     match sched.schedule_step() {
         ScheduleDecision::Mixed { prefill, .. } => {
             assert_eq!(prefill.req_ids, vec![RequestId(req0.0 + 1)]);

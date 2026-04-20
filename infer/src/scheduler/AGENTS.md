@@ -10,7 +10,7 @@ works with any backend. Load before editing any scheduler internals.
 | `scheduler.rs` | Module root + `pub use` surface. |
 | `batch.rs` | **Backend-agnostic** CPU accounting scheduler (`BatchScheduler`) for lifecycle events + dry-run testing. |
 | `types.rs` | `IncomingRequest`, `SchedulerHandle`, `SchedulerConfig`, `SchedulerFull`. The config defaults live in `SchedulerConfig::runtime_defaults(num_slots)`. |
-| `policy.rs` | `SchedulerSignals`, `AdmissionPolicy`, `ChunkingPolicy`, `DecodeAwareChunking`. Agent-aware fields (`prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`) are plumbed but only wired under the tiered-KV project (`docs/projects/agent-first-architecture.md::B3`). |
+| `policy.rs` | `SchedulerSignals`, `AdmissionPolicy`, `ChunkingPolicy`, `DecodeAwareChunking`. `DecodeAwareChunking` is only for the backend-agnostic CPU accounting scheduler in `batch.rs`; the production CUDA runtime uses explicit `SchedulerConfig` token/request budgets. Agent-aware fields (`prefix_hit_tokens`, `session_affinity_slot`, `turn_depth`) are plumbed but only wired under the tiered-KV project (`docs/projects/agent-first-architecture.md::B3`). |
 | `metrics.rs` | Scheduler metrics accounting. |
 | `cuda/core.rs` | CUDA `Scheduler<M: ModelForward>` struct + construction. Owns slots, paged KV pool, radix prefix cache, `block_owner_slots`. |
 | `cuda/prefill.rs` | `step_new` — chunked prefill + prefix-hit paths (exact-full, prompt-prefix-of-cached, partial). |
@@ -36,9 +36,11 @@ works with any backend. Load before editing any scheduler internals.
    These are tuned — change only with a bench snapshot.
 4. **`PREFIX_CACHE_BLOCK_SIZE = 16` matches the paged-pool page size.**
    Changing one without the other breaks M2 dual residency.
-5. **`ChunkingPolicy` is decode-aware.** Default prefill chunk = 4096;
-   drops to 64 when decode is active so prefill can't starve decode ITL.
-   The test is `active_decodes > 0`, not "any running request".
+5. **Do not project `batch.rs` policy defaults onto CUDA runtime behavior.**
+   `ChunkingPolicy` / `DecodeAwareChunking` belongs to the backend-agnostic
+   CPU accounting scheduler only. The production CUDA runtime does not have a
+   "decode active => chunk = 64" rule; it uses `chunked_prefill_size`,
+   `max_prefill_tokens`, `prefill_max_requests`, and `enable_mixed_chunk`.
 6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from
