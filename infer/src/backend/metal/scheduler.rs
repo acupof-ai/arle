@@ -382,14 +382,13 @@ impl MetalScheduler {
             return None;
         };
 
-        let chunk_cap = self.prefill_chunk_budget(self.count_decode_runtime(runtime_states));
+        let chunk_cap = self.prefill_chunk_budget(Self::count_decode_runtime(runtime_states));
 
         let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
             let state = self.requests.get_mut(&req_id)?;
             let prompt_len = state.prompt_len();
             let prompt_start = runtime_state(runtime_states, req_id)
-                .map(|runtime| runtime.prompt_progress)
-                .unwrap_or(0)
+                .map_or(0, |runtime| runtime.prompt_progress)
                 .min(prompt_len);
             let prompt_end = (prompt_start + chunk_cap).min(prompt_len);
             let input_tokens = state.prompt_tokens[prompt_start..prompt_end].to_vec();
@@ -460,7 +459,7 @@ impl MetalScheduler {
         removed
     }
 
-    fn count_decode_runtime(&self, runtime_states: &[MetalRuntimeRequestState]) -> usize {
+    fn count_decode_runtime(runtime_states: &[MetalRuntimeRequestState]) -> usize {
         runtime_states
             .iter()
             .filter(|runtime| runtime.phase == MetalRequestPhase::Decoding)
@@ -468,10 +467,10 @@ impl MetalScheduler {
     }
 }
 
-fn runtime_state<'a>(
-    runtime_states: &'a [MetalRuntimeRequestState],
+fn runtime_state(
+    runtime_states: &[MetalRuntimeRequestState],
     req_id: RequestId,
-) -> Option<&'a MetalRuntimeRequestState> {
+) -> Option<&MetalRuntimeRequestState> {
     runtime_states.iter().find(|state| state.req_id == req_id)
 }
 
