@@ -331,8 +331,12 @@ fn resume_restores_step() {
 
     let (_store, p) = setup_param(&[0.0, 0.0, 0.0]);
     let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    // `rng_seed: 7` matches the doc above. codex review 2026-04-20 on
+    // d9eee61 (Medium): `resume_if_configured` now rejects a mismatch,
+    // so this test exercises the happy-path seed-match branch.
     let cfg = TrainerConfig {
         resume_from: Some(ckpt_dir.clone()),
+        rng_seed: 7,
         ..default_cfg(100)
     };
     let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
@@ -807,6 +811,63 @@ fn resume_rejects_mismatched_schedule() {
     assert!(
         msg.contains("lr schedule mismatch"),
         "expected schedule-mismatch error, got: {msg}"
+    );
+    assert_eq!(
+        trainer.step(),
+        0,
+        "failed resume must leave trainer.step() at 0"
+    );
+}
+
+/// Codex review 2026-04-20 on d9eee61 (Medium): resuming with a different
+/// `--seed` than the interrupted run used would silently consume a different
+/// data stream (the sampler is derived directly from the live seed).
+/// `resume_if_configured` must reject the mismatch.
+#[test]
+fn resume_rejects_mismatched_rng_seed() {
+    let tmp = tempdir().expect("tempdir");
+    let ckpt_dir = tmp.path().join("step_000020");
+    std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+    let doc = TrainerStateDoc {
+        step: 20,
+        optim_schema: "adamw-v1".to_string(),
+        schedule_name: ConstantLr(1e-3).describe(),
+        schedule_params: serde_json::json!({}),
+        grad_accum_current: 0,
+        // Saved with seed=123…
+        rng_seed: 123,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = AdamWState {
+        step: 20,
+        skipped_export: 0,
+        params: vec![AdamWParamState {
+            name: "p".to_string(),
+            m: vec![0.0],
+            v: vec![0.0],
+            shape: vec![1],
+        }],
+    };
+    save_trainer_state_v2(&ckpt_dir, &doc, &optim_state).expect("save v2");
+
+    // … resumed with seed=999 (live TrainerConfig.rng_seed = 999).
+    let (_store, p) = setup_param(&[0.0]);
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        resume_from: Some(ckpt_dir.clone()),
+        rng_seed: 999,
+        ..default_cfg(100)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    let err = trainer
+        .resume_if_configured(&[(p, "p".to_string())])
+        .expect_err("mismatched rng_seed must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("rng_seed mismatch"),
+        "expected rng_seed-mismatch error, got: {msg}"
     );
     assert_eq!(
         trainer.step(),

@@ -208,6 +208,27 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             ));
         }
 
+        // Codex review 2026-04-20 on d9eee61 (Medium): the checkpoint
+        // persists `rng_seed` (see `TrainerStateDoc`), but the previous
+        // version of this function never compared it to `self.cfg.rng_seed`.
+        // Binaries now derive their sampler directly from the live CLI
+        // `--seed` (e.g. the stateless `sample_index(seed, step, micro_step)`
+        // in `train_sft`). If the operator resumes with a different `--seed`
+        // than the interrupted run used, the sampler silently consumes a
+        // different data stream from the resume step onward. Reject the
+        // mismatch so the operator either restores the original seed or
+        // starts a fresh run.
+        if doc.rng_seed != self.cfg.rng_seed {
+            eprintln!(
+                "[trainer] rng_seed mismatch on resume: saved={saved}, live={live}",
+                saved = doc.rng_seed,
+                live = self.cfg.rng_seed,
+            );
+            return Err(AutogradError::TapeInvariant(
+                "checkpoint: rng_seed mismatch with live --seed (re-run with matching --seed or start fresh)",
+            ));
+        }
+
         self.optim
             .import_state(&optim_state, name_map)
             .map_err(|err| {
