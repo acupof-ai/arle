@@ -19,6 +19,7 @@ on:
       - 'docs/release-checklist.md'
       - 'docs/stability-policy.md'
       - 'docs/support-matrix.md'
+      - 'scripts/package_macos_metal_artifact.sh'
       - '.github/workflows/release.yml'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
@@ -40,6 +41,7 @@ on:
       - 'docs/release-checklist.md'
       - 'docs/stability-policy.md'
       - 'docs/support-matrix.md'
+      - 'scripts/package_macos_metal_artifact.sh'
       - '.github/workflows/release.yml'
       - 'benchmarks/metal_baseline.json'
       - '.github/workflows/metal-ci.yml'
@@ -111,9 +113,12 @@ jobs:
       - name: Validate baseline JSON
         run: python3 -c "import json; json.load(open('benchmarks/metal_baseline.json'))"
 
-      - name: Upload metal_serve artifact
+      - name: Package macOS Metal artifact
+        run: ./scripts/package_macos_metal_artifact.sh target/release/metal_serve agent-infer-macos-arm64.tar.gz
+
+      - name: Upload macOS Metal artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metal_serve-macos-arm64
-          path: target/release/metal_serve
+          name: macos-arm64
+          path: agent-infer-macos-arm64.tar.gz
           if-no-files-found: error

@@ -58,8 +58,10 @@ When the release surface changes:
 
 - treat `.github/workflows/release.yml` as the packaging authority
 - keep `.github/workflows/metal-ci.yml` in lockstep for the macOS
-  `metal_serve` build path so default-branch CI exercises the same
-  binary that release packaging will publish
+  packaging script so default-branch CI exercises the same tarball
+  shape that release packaging will publish
+- the shared macOS packaging script is
+  `scripts/package_macos_metal_artifact.sh`
 - for Metal-facing changes, make sure branch validation still covers the
   exact `cargo build --no-default-features --features metal,no-cuda --bin metal_serve --release`
   path, not just library checks
@@ -71,17 +73,22 @@ When the release surface changes:
 Current release automation publishes:
 
 - Linux x86_64 CUDA artifacts
-- macOS arm64 Metal artifacts with `metal_serve`
+- macOS arm64 Metal artifacts as
+  `agent-infer-<ref>-macos-arm64.tar.gz` containing a top-level
+  `metal_serve` binary
+- branch CI uploads the same tarball layout for validation with the
+  branch-local filename `agent-infer-macos-arm64.tar.gz`
 
 Before release, verify:
 
 - `.github/workflows/release.yml` still matches intended support and
   remains the artifact-packaging authority
-- `.github/workflows/metal-ci.yml` still mirrors the macOS `metal_serve`
-  build path used by release packaging
+- `.github/workflows/metal-ci.yml` still mirrors the same macOS
+  packaging script used by release packaging
+- both workflows still call `scripts/package_macos_metal_artifact.sh`
 - artifact names are correct
 - packaged binaries are the intended ones (`infer` / `bench_serving` on Linux,
-  `metal_serve` on macOS)
+  `metal_serve` inside the macOS tarball)
 
 ---
 

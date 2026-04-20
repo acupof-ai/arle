@@ -37,10 +37,7 @@ jobs:
           -p infer --lib --bin metal_serve
 
       - name: Package macOS artifacts
-        run: |
-          mkdir -p dist
-          cp target/release/metal_serve dist/
-          tar -czf agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz -C dist .
+        run: ./scripts/package_macos_metal_artifact.sh target/release/metal_serve agent-infer-${{ github.ref_name }}-macos-arm64.tar.gz
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
