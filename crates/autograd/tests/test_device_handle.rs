@@ -1,7 +1,8 @@
 #[cfg(feature = "metal")]
 use autograd::{
     AdamW, Tape, Tensor, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu,
-    ops::log_softmax, ops::matmul, ops::rmsnorm, ops::rope, ops::silu, ops::sum, tensor::Dirty,
+    ops::log_softmax, ops::matmul, ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::sum,
+    ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1086,6 +1087,180 @@ fn metal_adamw_step_batches_eval_across_params() -> Result<()> {
          back into `backend_metal::adamw_step` and is being re-charged per \
          param. Grep for `bump_eval_count` / `mlx_eval` inside adamw_step."
     );
+
+    Ok(())
+}
+
+/// M5.3b.12 acceptance: lazy `reshape` on Metal composes `mlx_reshape` into
+/// the lazy graph without triggering an eval. The fixture mirrors the
+/// Qwen3.5 q/k/v prep shape shuffle: `x @ w → reshape → sum`. The assertion
+/// is structural — after-matmul and after-reshape eval counts must both be
+/// zero, and backward (which does force the tape batch flush) must stay
+/// inside the existing ≤3 budget. If `reshape` regresses back into eager
+/// mode (e.g. a caller restores `ensure_host` at the public entry), this
+/// test fails on `after_reshape != 0`.
+///
+/// Parity: metal output is compared against `CpuBackend::matmul_forward`
+/// + an identity reshape (reshape is a no-op on contiguous row-major
+///   data, so the CPU reference is just the matmul result interpreted at
+///   the new shape — same bytes).
+#[cfg(feature = "metal")]
+#[test]
+fn metal_reshape_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let m = 6usize;
+    let k = 4usize;
+    let n = 8usize;
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.013 - 0.1).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.021).sin()).collect();
+
+    let a = store.from_slice(&a_data, &[m, k])?;
+    let b = store.from_slice(&b_data, &[k, n])?;
+    store.get_mut(b).expect("b exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // matmul → Dirty::Device lazy output [m, n]
+    let logits = matmul(a, b, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    // reshape [m, n] → [m * n] : metadata-only on MLX side, must stay lazy.
+    let flat = reshape(logits, &[m * n], &mut store, &mut tape)?;
+    let after_reshape = eval_count();
+
+    let loss = sum(flat, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_reshape, 0,
+        "M5.3b.12: lazy reshape forward must not force an eval; saw \
+         {after_reshape}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::reshape or a missing Dirty::Device dispatch in layout.rs."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity against CPU reference. Reshape is a pure view, so the bytes
+    // are identical to the matmul output.
+    let metal_out = store.get(flat).expect("flat output exists").data.clone();
+    let cpu = CpuBackend;
+    let (cpu_out, _shape) = cpu.matmul_forward(&a_data, &[m, k], &b_data, &[k, n])?;
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (a, b) in metal_out.iter().zip(cpu_out.iter()) {
+        assert!((a - b).abs() <= 1e-5, "reshape parity: metal={a} cpu={b}");
+    }
+
+    Ok(())
+}
+
+/// M5.3b.12 acceptance: lazy `transpose` on Metal composes
+/// `mlx_transpose_axes` (a lazy view, fused into downstream GEMMs by MLX).
+/// Fixture mirrors a Qwen3.5 attention-prep shuffle: rank-3 input transpose
+/// of axes 1↔2, feeding into a `sum`. Must not force an eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_transpose_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    // Shape mirrors [batch, seq, hidden] → [batch, hidden, seq] shuffle.
+    let batch = 2usize;
+    let seq = 4usize;
+    let hidden = 6usize;
+    let m = batch * seq;
+    let k = 3usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.011 - 0.15).collect();
+    let b_data: Vec<f32> = (0..k * hidden)
+        .map(|i| ((i as f32) * 0.019).cos())
+        .collect();
+
+    let a = store.from_slice(&a_data, &[m, k])?;
+    let b = store.from_slice(&b_data, &[k, hidden])?;
+    store.get_mut(b).expect("b exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // matmul → [m, hidden] = [batch*seq, hidden], then reshape to rank-3.
+    let logits = matmul(a, b, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    let rank3 = reshape(logits, &[batch, seq, hidden], &mut store, &mut tape)?;
+    let after_reshape = eval_count();
+
+    // transpose axes 1↔2: [batch, seq, hidden] → [batch, hidden, seq].
+    let transposed = transpose(rank3, 1, 2, &mut store, &mut tape)?;
+    let after_transpose = eval_count();
+
+    let loss = sum(transposed, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_reshape, 0,
+        "M5.3b.12: lazy reshape forward must not force an eval; saw {after_reshape}"
+    );
+    assert_eq!(
+        after_transpose, 0,
+        "M5.3b.12: lazy transpose forward must not force an eval; saw \
+         {after_transpose}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::transpose or a missing Dirty::Device dispatch in layout.rs."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity against CPU: matmul → reshape(no-op view) → transpose(1↔2).
+    let metal_out = store
+        .get(transposed)
+        .expect("transposed output exists")
+        .data
+        .clone();
+    let cpu = CpuBackend;
+    let (cpu_mm, _shape) = cpu.matmul_forward(&a_data, &[m, k], &b_data, &[k, hidden])?;
+    // Reshape is a contiguous no-op, so cpu_mm already has the rank-3 layout.
+    // Now apply transpose(1↔2) via `cpu_transpose_swap` (exposed by
+    // `autograd::backend`) for a clean reference.
+    use autograd::backend::cpu_transpose_swap;
+    let (cpu_out, _new_shape) = cpu_transpose_swap(&cpu_mm, &[batch, seq, hidden], 1, 2)?;
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (a, b) in metal_out.iter().zip(cpu_out.iter()) {
+        assert!((a - b).abs() <= 1e-5, "transpose parity: metal={a} cpu={b}");
+    }
 
     Ok(())
 }

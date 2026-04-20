@@ -3,10 +3,78 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn reshape(
+    x: TensorId,
+    shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // M5.3b.12: dispatch on device-handle presence (same gate as rope /
+    // embedding / gather / AdamW). Reshape is free on MLX — `mlx_reshape`
+    // is metadata-only — so taking the lazy branch when x is device-
+    // resident keeps the whole forward chain on-device. Qwen3.5 hits this
+    // ~6× per attention layer (q/k/v projection + attn-out reshape) × 28
+    // layers = ~168 evals/step that previously tripped the old
+    // `ensure_host`-at-public-entry path.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        reshape_device_lazy(x, shape, store, tape)
+    } else {
+        reshape_host_eager(x, shape, store, tape)
+    }
+}
+
+fn reshape_device_lazy(
+    x: TensorId,
+    shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(x)?;
+
+    let (input_shape, requires_grad) = {
+        let t = store.tensor(x)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    if shape_numel(shape) != shape_numel(&input_shape) {
+        return Err(AutogradError::ShapeMismatch {
+            expected: input_shape,
+            got: shape.to_vec(),
+        });
+    }
+
+    let x_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "reshape: ensure_device left x without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store.backend().reshape(&x_handle, shape)?;
+    let output_id = store.alloc_device_tensor(shape.to_vec(), out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Reshape,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::ReshapeCtx { input_shape },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn reshape_host_eager(
     x: TensorId,
     shape: &[usize],
     store: &mut TensorStore,
@@ -40,6 +108,77 @@ pub fn reshape(
 }
 
 pub fn transpose(
+    x: TensorId,
+    axis1: usize,
+    axis2: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // M5.3b.12: same gate as `reshape`. `mlx_transpose_axes` is a lazy
+    // view op — MLX fuses it into downstream GEMMs, so we pay nothing
+    // for staying on device. Qwen3.5 q/k/v projections transpose once
+    // each × 3 × 28 layers = 84 evals/step of old eager-path churn.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        transpose_device_lazy(x, axis1, axis2, store, tape)
+    } else {
+        transpose_host_eager(x, axis1, axis2, store, tape)
+    }
+}
+
+fn transpose_device_lazy(
+    x: TensorId,
+    axis1: usize,
+    axis2: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(x)?;
+
+    let (input_shape, requires_grad) = {
+        let t = store.tensor(x)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    let rank = input_shape.len();
+    if axis1 >= rank {
+        return Err(AutogradError::AxisOutOfBounds { axis: axis1, rank });
+    }
+    if axis2 >= rank {
+        return Err(AutogradError::AxisOutOfBounds { axis: axis2, rank });
+    }
+
+    let x_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "transpose: ensure_device left x without a device handle",
+        ))?
+        .clone();
+
+    let (out_handle, new_shape) =
+        store
+            .backend()
+            .transpose_axes_swap(&x_handle, &input_shape, axis1, axis2)?;
+    let output_id = store.alloc_device_tensor(new_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Transpose,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::TransposeCtx { axis1, axis2 },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn transpose_host_eager(
     x: TensorId,
     axis1: usize,
     axis2: usize,
