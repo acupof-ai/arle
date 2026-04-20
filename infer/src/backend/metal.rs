@@ -119,7 +119,8 @@ use loader::{
 use qwen35::{load_qwen35_metal_weights, metal_generate_qwen35};
 #[cfg(feature = "metal")]
 pub use runtime::{
-    spawn_metal_scheduler_handle_from_path, spawn_metal_scheduler_handle_from_path_with_options,
+    MetalSchedulerHandle, spawn_metal_scheduler_handle_from_path,
+    spawn_metal_scheduler_handle_from_path_with_options,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
 
@@ -237,6 +238,14 @@ impl MetalBackend {
         run_with_metal_panic_boundary("token-id generation", || {
             self.generate_from_token_ids_with_callback(input_ids, params, |_token_id| Ok(()))
         })
+    }
+
+    /// Borrow the DFlash runtime for read-only introspection
+    /// (e.g. `/v1/models` status). Returns `None` both when DFlash was never
+    /// requested and when load-time compatibility fallback disabled it.
+    #[cfg(feature = "metal")]
+    pub(crate) fn dflash_runtime_ref(&self) -> Option<&dflash::MetalDflashRuntime> {
+        self.dflash.as_ref()
     }
 
     /// Return the DFlash runtime ref with `'static` lifetime.
@@ -593,11 +602,20 @@ impl InferenceBackend for MetalBackend {
 
             let dflash_options = self.dflash_options.clone();
             self.dflash = if let Some(ref options) = dflash_options {
-                Some(dflash::MetalDflashRuntime::load(options, &config)?)
+                // Shape/config mismatches emit a warn and fall back to the
+                // standard Metal path (returns Ok(None)); genuine FFI /
+                // weight-load failures still propagate.
+                dflash::MetalDflashRuntime::load_or_fallback(options, &config)?
             } else {
                 None
             };
-            self.dflash_options = dflash_options;
+            // Keep dflash_options in sync with the runtime state so
+            // status reporting matches reality when fallback kicked in.
+            self.dflash_options = if self.dflash.is_some() {
+                dflash_options
+            } else {
+                None
+            };
         }
         #[cfg(not(feature = "metal"))]
         {

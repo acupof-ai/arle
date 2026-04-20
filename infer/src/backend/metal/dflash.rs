@@ -199,19 +199,166 @@ pub(crate) struct MetalDflashRuntime {
     draft_attention_mask: String,
 }
 
+/// Internal error variant for the DFlash load routine. `Fatal` is an
+/// unrecoverable anyhow::Error (missing file, parse failure, FFI panic);
+/// `Compat` is a user-fixable shape/config mismatch that triggers a warn +
+/// fallback to the standard Metal path.
+enum LoadError {
+    Fatal(anyhow::Error),
+    Compat(DflashCompatError),
+}
+
+/// Reasons DFlash load can be disabled gracefully rather than crashing the
+/// backend. Anything the user can fix by swapping the draft model belongs
+/// here; config parse errors / missing files / FFI panics stay as hard errors.
+#[derive(Debug)]
+pub(crate) enum DflashCompatError {
+    /// Specific named field mismatch (`field`, `target_value`, `draft_value`).
+    FieldMismatch {
+        field: &'static str,
+        target: String,
+        draft: String,
+        suggestion: String,
+    },
+    /// Target architecture family isn't supported by any DFlash draft.
+    Architecture { detail: String, suggestion: String },
+}
+
+impl std::fmt::Display for DflashCompatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FieldMismatch {
+                field,
+                target,
+                draft,
+                suggestion,
+            } => write!(
+                f,
+                "DFlash draft/target {field} mismatch (target={target}, draft={draft}). Fix: {suggestion}"
+            ),
+            Self::Architecture { detail, suggestion } => {
+                write!(
+                    f,
+                    "DFlash architecture mismatch: {detail}. Fix: {suggestion}"
+                )
+            }
+        }
+    }
+}
+
+/// Pure-logic compatibility check between a target model config and a loaded
+/// draft config. Returns `Err(DflashCompatError)` for user-fixable mismatches
+/// (swap the draft model); returns `Ok(())` when the draft is safe to run.
+pub(crate) fn check_compatibility(
+    target: &MetalModelConfig,
+    draft: &DFlashDraftConfig,
+    draft_model_id: &str,
+) -> std::result::Result<(), DflashCompatError> {
+    if !matches!(
+        target.arch,
+        MetalModelArch::Qwen3 | MetalModelArch::Qwen35(_)
+    ) {
+        return Err(DflashCompatError::Architecture {
+            detail: "target is not Qwen3 or Qwen3.5".to_string(),
+            suggestion: "disable DFlash or switch to a Qwen3/Qwen3.5 target model".to_string(),
+        });
+    }
+    if draft.target_layer_ids.is_empty() {
+        return Err(DflashCompatError::Architecture {
+            detail: format!("draft '{draft_model_id}' has empty target_layer_ids"),
+            suggestion: "rebuild the draft with a valid dflash_config.target_layer_ids list"
+                .to_string(),
+        });
+    }
+    if let Some(&max_layer) = draft.target_layer_ids.iter().max()
+        && max_layer >= target.num_hidden_layers
+    {
+        return Err(DflashCompatError::FieldMismatch {
+            field: "target_layer_ids",
+            target: format!("num_hidden_layers={}", target.num_hidden_layers),
+            draft: format!("max target_layer_id={max_layer}"),
+            suggestion: "use a draft whose target layer indices are within the target's layer \
+                         range, or rebuild the draft against this target"
+                .to_string(),
+        });
+    }
+    if draft.hidden_size != target.hidden_size {
+        return Err(DflashCompatError::FieldMismatch {
+            field: "hidden_size",
+            target: target.hidden_size.to_string(),
+            draft: draft.hidden_size.to_string(),
+            suggestion: format!(
+                "pick a draft trained for hidden_size={} (e.g. the DFlash pair shipped alongside \
+                 this target)",
+                target.hidden_size
+            ),
+        });
+    }
+    if draft.num_attention_heads != target.num_attention_heads {
+        return Err(DflashCompatError::FieldMismatch {
+            field: "num_attention_heads",
+            target: target.num_attention_heads.to_string(),
+            draft: draft.num_attention_heads.to_string(),
+            suggestion: format!(
+                "use a draft with num_attention_heads={}",
+                target.num_attention_heads
+            ),
+        });
+    }
+    if draft.num_key_value_heads != target.num_key_value_heads {
+        return Err(DflashCompatError::FieldMismatch {
+            field: "num_key_value_heads",
+            target: target.num_key_value_heads.to_string(),
+            draft: draft.num_key_value_heads.to_string(),
+            suggestion: format!(
+                "use a draft with num_key_value_heads={}",
+                target.num_key_value_heads
+            ),
+        });
+    }
+    if draft.head_dim != target.head_dim {
+        return Err(DflashCompatError::FieldMismatch {
+            field: "head_dim",
+            target: target.head_dim.to_string(),
+            draft: draft.head_dim.to_string(),
+            suggestion: format!("use a draft with head_dim={}", target.head_dim),
+        });
+    }
+    Ok(())
+}
+
 impl MetalDflashRuntime {
-    pub(crate) fn load(
+    /// Load the DFlash draft, validating compatibility with the target.
+    ///
+    /// Hard errors (missing config.json, weight load failure, FFI panic) still
+    /// propagate — those mean the draft itself is broken. User-fixable
+    /// mismatches (hidden_size / head count / target layer ids / unsupported
+    /// target arch) return `Ok(None)` with a `log::warn!` that names the
+    /// field and suggests a fix, so the server can fall back to standard
+    /// Metal without crashing.
+    pub(crate) fn load_or_fallback(
         options: &MetalDflashOptions,
         target_config: &MetalModelConfig,
-    ) -> Result<Self> {
-        options.validate()?;
-        ensure!(
-            matches!(
-                target_config.arch,
-                MetalModelArch::Qwen3 | MetalModelArch::Qwen35(_)
-            ),
-            "Metal DFlash requires Qwen3 or Qwen3.5 target model"
-        );
+    ) -> Result<Option<Self>> {
+        match Self::load_validated(options, target_config) {
+            Ok(rt) => Ok(Some(rt)),
+            Err(LoadError::Compat(reason)) => {
+                log::warn!(
+                    "DFlash disabled: {reason}. Falling back to standard Metal path. (draft='{}')",
+                    options.draft_model
+                );
+                Ok(None)
+            }
+            Err(LoadError::Fatal(err)) => Err(err),
+        }
+    }
+
+    /// Private wrapper that splits recoverable compat errors from fatal ones.
+    fn load_validated(
+        options: &MetalDflashOptions,
+        target_config: &MetalModelConfig,
+    ) -> std::result::Result<Self, LoadError> {
+        options.validate().map_err(LoadError::Fatal)?;
 
         let draft_model_dir = hf_hub::resolve_weighted_model_path(&options.draft_model)
             .with_context(|| {
@@ -219,18 +366,14 @@ impl MetalDflashRuntime {
                     "failed to resolve DFlash draft model '{}'",
                     options.draft_model
                 )
-            })?;
-        let draft_config = DFlashDraftConfig::load(&draft_model_dir)?;
-        ensure!(
-            !draft_config.target_layer_ids.is_empty(),
-            "DFlash draft config must declare at least one target layer id"
-        );
-        ensure!(
-            draft_config.hidden_size == target_config.hidden_size,
-            "DFlash draft hidden_size {} != target hidden_size {}",
-            draft_config.hidden_size,
-            target_config.hidden_size
-        );
+            })
+            .map_err(LoadError::Fatal)?;
+        let draft_config = DFlashDraftConfig::load(&draft_model_dir).map_err(LoadError::Fatal)?;
+
+        if let Err(compat) = check_compatibility(target_config, &draft_config, &options.draft_model)
+        {
+            return Err(LoadError::Compat(compat));
+        }
 
         let draft_weights = DFlashDraftWeights::load(&draft_model_dir, &draft_config)
             .with_context(|| {
@@ -238,7 +381,8 @@ impl MetalDflashRuntime {
                     "failed to load DFlash draft weights from {}",
                     draft_model_dir.display()
                 )
-            })?;
+            })
+            .map_err(LoadError::Fatal)?;
         let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config);
         let default_block_size = draft_config.block_size.max(1);
         let requested_block_size = options
@@ -292,6 +436,18 @@ impl MetalDflashRuntime {
             draft_cpp_model,
             draft_attention_mask,
         })
+    }
+
+    /// Legacy test-only wrapper. Flattens `Ok(None)` (fallback) to an error
+    /// so existing ignored-tests that expected `?` to either produce a
+    /// runtime or bail continue to compile.
+    #[cfg(test)]
+    pub(crate) fn load(
+        options: &MetalDflashOptions,
+        target_config: &MetalModelConfig,
+    ) -> Result<Self> {
+        Self::load_or_fallback(options, target_config)?
+            .ok_or_else(|| anyhow!("DFlash load disabled by compatibility fallback"))
     }
 
     pub(crate) fn draft_model_id(&self) -> &str {
@@ -3292,5 +3448,137 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ── Item 2: compatibility-fallback unit tests ────────────────────────────
+    //
+    // These exercise the pure-logic `check_compatibility` helper with
+    // synthetic configs — no GPU, no weights, no network. They pin the
+    // contract that shape/arch mismatches produce a named `FieldMismatch`
+    // with both values and a "Fix:" suggestion instead of an opaque
+    // FFI crash at weight-load time.
+
+    fn synthetic_target_config() -> super::super::config::MetalModelConfig {
+        use super::super::config::{MetalModelArch, MetalModelConfig, MetalNormWeightMode};
+        MetalModelConfig {
+            hidden_size: 2048,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            num_hidden_layers: 36,
+            vocab_size: 151_936,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            head_dim: 128,
+            eos_token_id: 151_643,
+            stop_token_ids: vec![151_643],
+            quantization: None,
+            norm_weight_mode: MetalNormWeightMode::AddUnitOffset,
+            arch: MetalModelArch::Qwen3,
+        }
+    }
+
+    fn synthetic_draft_config() -> super::DFlashDraftConfig {
+        super::DFlashDraftConfig {
+            hidden_size: 2048,
+            num_hidden_layers: 1,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            block_size: 4,
+            mask_token_id: 0,
+            target_layer_ids: vec![35],
+            quantization: None,
+        }
+    }
+
+    #[test]
+    fn compat_check_matching_configs_pass() {
+        let target = synthetic_target_config();
+        let draft = synthetic_draft_config();
+        super::check_compatibility(&target, &draft, "synthetic/draft").expect("should accept");
+    }
+
+    #[test]
+    fn compat_check_hidden_size_mismatch_names_field_and_values() {
+        let target = synthetic_target_config();
+        let mut draft = synthetic_draft_config();
+        draft.hidden_size = 4096;
+        let err = super::check_compatibility(&target, &draft, "synthetic/draft")
+            .expect_err("should reject mismatched hidden_size");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hidden_size"),
+            "error should name the field: {msg}"
+        );
+        assert!(msg.contains("2048"), "error should include target: {msg}");
+        assert!(msg.contains("4096"), "error should include draft: {msg}");
+        assert!(msg.contains("Fix:"), "error should suggest a fix: {msg}");
+    }
+
+    #[test]
+    fn compat_check_head_counts_mismatch_named() {
+        let target = synthetic_target_config();
+        let mut draft = synthetic_draft_config();
+        draft.num_key_value_heads = 4;
+        let err = super::check_compatibility(&target, &draft, "synthetic/draft")
+            .expect_err("should reject mismatched num_key_value_heads");
+        assert!(err.to_string().contains("num_key_value_heads"));
+    }
+
+    #[test]
+    fn compat_check_target_layer_oob_named() {
+        let target = synthetic_target_config();
+        let mut draft = synthetic_draft_config();
+        draft.target_layer_ids = vec![99]; // target has 36 layers
+        let err = super::check_compatibility(&target, &draft, "synthetic/draft")
+            .expect_err("should reject out-of-range target_layer_ids");
+        assert!(err.to_string().contains("target_layer_ids"));
+    }
+
+    #[test]
+    fn metal_dflash_options_rejects_zero_speculative_tokens() {
+        let options = super::MetalDflashOptions {
+            draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
+            speculative_tokens: Some(0),
+        };
+        let err = options
+            .validate()
+            .expect_err("validate() must reject speculative_tokens=0");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(">= 1") || msg.contains("must be"),
+            "error should explain the >= 1 requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn metal_dflash_options_accepts_unset_and_positive_speculative_tokens() {
+        let unset = super::MetalDflashOptions {
+            draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
+            speculative_tokens: None,
+        };
+        unset
+            .validate()
+            .expect("unset speculative_tokens must fall through to draft default");
+        let positive = super::MetalDflashOptions {
+            draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
+            speculative_tokens: Some(4),
+        };
+        positive
+            .validate()
+            .expect("positive speculative_tokens must validate");
+    }
+
+    #[test]
+    fn metal_dflash_options_rejects_empty_draft_model() {
+        let options = super::MetalDflashOptions {
+            draft_model: "   ".to_string(),
+            speculative_tokens: Some(4),
+        };
+        options
+            .validate()
+            .expect_err("empty draft model must be rejected before load");
     }
 }
