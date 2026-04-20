@@ -1673,7 +1673,8 @@ fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalReques
 fn request_mode(request: &ActiveMetalRequest) -> Option<InferenceMode> {
     match request.phase() {
         RuntimePhase::Prefill => Some(InferenceMode::Prefill),
-        RuntimePhase::Decode | RuntimePhase::Finished => Some(InferenceMode::Decode),
+        RuntimePhase::Decode => Some(InferenceMode::Decode),
+        RuntimePhase::Finished => None,
     }
 }
 
@@ -1682,6 +1683,7 @@ fn scheduler_runtime_states(
 ) -> Vec<MetalRuntimeRequestState> {
     active
         .iter()
+        .filter(|(_, request)| request.phase() != RuntimePhase::Finished)
         .map(|(req_id, request)| MetalRuntimeRequestState {
             req_id: *req_id,
             phase: match request.phase() {
