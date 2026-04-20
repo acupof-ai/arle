@@ -397,6 +397,17 @@ impl GrpoPolicy for Transformer {
         self.forward(input_ids, 1, input_ids.len(), store, tape)
     }
 
+    fn forward_batch_tokens(
+        &self,
+        input_ids: &[usize],
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        self.forward(input_ids, batch, seq_len, store, tape)
+    }
+
     fn all_parameter_ids(&self) -> Vec<TensorId> {
         Self::all_parameter_ids(self)
     }
