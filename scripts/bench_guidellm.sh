@@ -8,9 +8,23 @@
 #   <backend-label>  e.g. cuda-h100, cuda-a100, metal-m3max
 #                    used to name the output dir and wins file
 #
-# Optional flags:
+# Optional flags (canonical run, produces a wins entry):
 #   --target URL     inference server URL   (default: http://localhost:8000)
 #   --model  NAME    model identifier       (default: Qwen/Qwen3-4B)
+#   --processor PATH tokenizer path / HF id (default: local models/Qwen3-4B)
+#
+# Exploration mode (faster, non-canonical; DOES NOT produce a wins entry):
+#   --quick              2-minute matched-A/B preset: profile=concurrent,
+#                        rate=1,2,4,8, max-seconds=30, warmup=3.
+#   --concurrencies L    comma-separated concurrency list, e.g. "1,2,4,8".
+#                        Switches profile to `concurrent`.
+#   --profile TYPE       override profile (sweep|concurrent|synchronous|…).
+#   --max-seconds N      override per-benchmark duration.
+#   --warmup N           run guidellm's warmup phase (seconds or 0 < f < 1).
+#
+# Any of those overrides flips the run to exploration mode: raw artefacts
+# still land under bench-output/, but no wins entry is seeded. Keep the
+# wins pipeline reserved for canonical measurements.
 #
 # Preconditions:
 #   * guidellm, curl, jq on PATH
@@ -20,9 +34,9 @@
 # Side effects:
 #   * Writes raw artefacts to bench-output/<date>-<label>[-runN]/
 #     (benchmarks.json / .csv / .html). This dir is gitignored.
-#   * Seeds a new docs/experience/wins/<date>-bench-guidellm-<label>.md
-#     from docs/experience/wins/TEMPLATE-bench-guidellm.md with the commit
-#     sha, paths, and a best-effort headline metric table filled in.
+#   * Canonical mode only: seeds a new
+#     docs/experience/wins/<date>-bench-guidellm-<label>.md from the
+#     template with the commit sha, paths, and best-effort headline table.
 #
 # The canonical benchmark parameters are LOCKED here. Changing them is a
 # deliberate commit, not a flag flip. See docs/plans/guidellm-integration.md §3.
@@ -57,14 +71,29 @@ MODEL="Qwen/Qwen3-4B"
 PROCESSOR_DEFAULT="models/Qwen3-4B"
 PROCESSOR=""
 LABEL=""
+# Exploration-mode overrides. Empty = use the canonical value above.
+RATE_OVERRIDE=""
+WARMUP_OVERRIDE=""
+EXPLORATION_MODE=false
 
 usage() {
     cat <<EOF
-usage: $(basename "$0") <backend-label> [--target URL] [--model NAME]
+usage: $(basename "$0") <backend-label> [options]
 
-  <backend-label>   required, e.g. cuda-h100, metal-m3max
-  --target URL      default: $TARGET
-  --model NAME      default: $MODEL
+  <backend-label>        required, e.g. cuda-h100, metal-m3max
+
+Canonical run (produces a wins entry):
+  --target URL           default: $TARGET
+  --model NAME           default: $MODEL
+  --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
+
+Exploration mode (faster, no wins entry):
+  --quick                 ~2-min preset: profile=concurrent rate=1,2,4,8
+                          max-seconds=30 warmup=3
+  --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
+  --profile TYPE          sweep|concurrent|synchronous|throughput|…
+  --max-seconds N         override per-benchmark duration
+  --warmup N              seconds (int >= 1) or fraction (0 < f < 1)
 
 See docs/plans/guidellm-integration.md for the canonical parameters and
 why this wrapper exists.
@@ -83,6 +112,31 @@ while [[ $# -gt 0 ]]; do
         --processor)
             [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
             PROCESSOR="$2"; shift 2 ;;
+        --quick)
+            EXPLORATION_MODE=true
+            PROFILE="concurrent"
+            RATE_OVERRIDE="1,2,4,8"
+            MAX_SECONDS=30
+            WARMUP_OVERRIDE="3"
+            shift ;;
+        --concurrencies)
+            [[ $# -ge 2 ]] || { echo "error: --concurrencies requires a value" >&2; exit 2; }
+            EXPLORATION_MODE=true
+            PROFILE="concurrent"
+            RATE_OVERRIDE="$2"
+            shift 2 ;;
+        --profile)
+            [[ $# -ge 2 ]] || { echo "error: --profile requires a value" >&2; exit 2; }
+            EXPLORATION_MODE=true
+            PROFILE="$2"; shift 2 ;;
+        --max-seconds)
+            [[ $# -ge 2 ]] || { echo "error: --max-seconds requires a value" >&2; exit 2; }
+            EXPLORATION_MODE=true
+            MAX_SECONDS="$2"; shift 2 ;;
+        --warmup)
+            [[ $# -ge 2 ]] || { echo "error: --warmup requires a value" >&2; exit 2; }
+            EXPLORATION_MODE=true
+            WARMUP_OVERRIDE="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         --*)
@@ -165,6 +219,17 @@ echo "    profile: $PROFILE"
 echo "    data   : $DATA"
 echo "    seconds: $MAX_SECONDS"
 echo "    seed   : $RANDOM_SEED"
+if [[ -n "$RATE_OVERRIDE" ]]; then
+    echo "    rate   : $RATE_OVERRIDE"
+fi
+if [[ -n "$WARMUP_OVERRIDE" ]]; then
+    echo "    warmup : $WARMUP_OVERRIDE"
+fi
+if [[ "$EXPLORATION_MODE" == true ]]; then
+    echo "    mode   : exploration (no wins entry)"
+else
+    echo "    mode   : canonical"
+fi
 echo "    output : $OUTPUT_DIR"
 echo
 
@@ -185,19 +250,28 @@ echo "    processor: $PROCESSOR"
 # scripts/setup_bench_toolchain.sh for the toolchain pin.
 export GUIDELLM__MP_CONTEXT_TYPE="${GUIDELLM__MP_CONTEXT_TYPE:-forkserver}"
 
-set +e
-guidellm benchmark run \
-    --target "$TARGET" \
-    --model "$MODEL" \
-    --processor "$PROCESSOR" \
-    --profile "$PROFILE" \
-    --data "$DATA" \
-    --max-seconds "$MAX_SECONDS" \
-    --random-seed "$RANDOM_SEED" \
-    --output-dir "$OUTPUT_DIR" \
-    --outputs "$OUTPUTS" \
-    --backend "$BACKEND" \
+GUIDELLM_ARGS=(
+    --target "$TARGET"
+    --model "$MODEL"
+    --processor "$PROCESSOR"
+    --profile "$PROFILE"
+    --data "$DATA"
+    --max-seconds "$MAX_SECONDS"
+    --random-seed "$RANDOM_SEED"
+    --output-dir "$OUTPUT_DIR"
+    --outputs "$OUTPUTS"
+    --backend "$BACKEND"
     --backend-kwargs "$BACKEND_KWARGS"
+)
+if [[ -n "$RATE_OVERRIDE" ]]; then
+    GUIDELLM_ARGS+=(--rate "$RATE_OVERRIDE")
+fi
+if [[ -n "$WARMUP_OVERRIDE" ]]; then
+    GUIDELLM_ARGS+=(--warmup "$WARMUP_OVERRIDE")
+fi
+
+set +e
+guidellm benchmark run "${GUIDELLM_ARGS[@]}"
 gdl_rc=$?
 set -e
 
@@ -266,6 +340,41 @@ echo
 echo ">>> headline table"
 cat "$TABLE_FILE"
 echo
+
+# ---- stability check: flag noisy ITL (p99 >> p50) ----------------------------
+# Large gap between ITL p50 and p99 usually means thermal throttling, GC
+# pause, or saturation. Flag anything where p99 > 2.0 × p50 — at that
+# point the percentiles aren't stable enough for A/B comparison.
+STABILITY_WARN="$(jq -r '
+    .benchmarks
+    | map({
+        rate: (
+            .config.strategy
+            | if   .type_ == "synchronous" then "sync"
+              elif .type_ == "concurrent"  then "conc\(.max_concurrency // "?")"
+              else .type_
+              end
+        ),
+        p50: (.metrics.inter_token_latency_ms.successful.percentiles.p50 // 0),
+        p99: (.metrics.inter_token_latency_ms.successful.percentiles.p99 // 0)
+    })
+    | map(select(.p50 > 0 and .p99 / .p50 > 2.0))
+    | map("  - \(.rate): ITL p99/p50 = \((.p99 / .p50) | .*100 | round / 100) (p50=\(.p50) ms, p99=\(.p99) ms)")
+    | .[]
+' "$JSON_FILE" 2>/dev/null || true)"
+if [[ -n "$STABILITY_WARN" ]]; then
+    echo ">>> stability warning — ITL p99 > 2× p50 at:"
+    echo "$STABILITY_WARN"
+    echo "    Consider re-running with a higher --warmup to let thermals settle."
+    echo
+fi
+
+# ---- exploration mode: skip wins entry ---------------------------------------
+if [[ "$EXPLORATION_MODE" == true ]]; then
+    echo ">>> exploration mode — skipping wins entry seed"
+    echo "    raw artefacts: $OUTPUT_DIR"
+    exit 0
+fi
 
 # ---- seed the wins file ------------------------------------------------------
 # Copy template, replace placeholders, append the real table into the
