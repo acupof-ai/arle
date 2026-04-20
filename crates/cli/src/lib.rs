@@ -64,6 +64,7 @@ pub fn run() -> Result<()> {
             args.max_turns,
             args.max_tokens,
             args.temperature,
+            args.tools,
         )?;
 
         Ok(())

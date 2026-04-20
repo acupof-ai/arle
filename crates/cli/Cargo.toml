@@ -14,6 +14,7 @@ metal = ["infer/metal"]
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 console = "0.16"
+ctrlc = "3"
 dialoguer = "0.11"
 hf-hub = { version = "0.5", features = ["tokio"] }
 indicatif = "0.18"
@@ -28,6 +29,7 @@ rustyline = "15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.35"
+tokio = { version = "1", features = ["sync"] }
 
 [lints]
 workspace = true
