@@ -34,6 +34,12 @@ namespace {
 
 using mlx::core::array;
 
+struct SortedSwitchInputs {
+    array x;
+    array indices;
+    array inv_order;
+};
+
 // Quantized linear: y = x @ dequantize(w).T — matches QWeight::apply() in
 // mlx_qwen35_model.cpp. Kept local so this TU doesn't depend on Qwen3.5 model
 // internals.
@@ -56,6 +62,33 @@ array quantized_swiglu(const array& x,
     // silu(gate) * up
     auto h = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate)), up);
     return qmm(h, down_w, down_s, down_b, group_size, bits);
+}
+
+// Match mlx-lm's `_gather_sort`/`_scatter_unsort` optimization in
+// `switch_layers.py`: when many token→expert routes are active, sort routes by
+// expert id so `gather_qmm` sees expert-locality and can use its
+// `sorted_indices=true` fast path.
+SortedSwitchInputs gather_sort_switch_inputs(const array& x, const array& indices) {
+    const auto& shape = indices.shape();
+    const int last_dim = shape.back();
+    auto flat_indices = mlx::core::flatten(indices);
+    auto order = mlx::core::astype(mlx::core::argsort(flat_indices), mlx::core::int32);
+    auto inv_order = mlx::core::astype(mlx::core::argsort(order), mlx::core::int32);
+    auto rows = mlx::core::floor_divide(order, array(last_dim, mlx::core::int32));
+    auto flat_x = mlx::core::flatten(x, 0, -3);
+    return {
+        mlx::core::take(flat_x, rows, 0),
+        mlx::core::take(flat_indices, order, 0),
+        inv_order,
+    };
+}
+
+array scatter_unsort_switch_outputs(
+    const array& x,
+    const array& inv_order,
+    const mlx::core::Shape& indices_shape) {
+    auto unsorted = mlx::core::take(x, inv_order, 0);
+    return mlx::core::unflatten(unsorted, 0, indices_shape);
 }
 
 // SwitchGLU forward — batched quantized gather_qmm × 3 with SiLU gate.
@@ -81,19 +114,28 @@ array switch_glu_forward(
     int group_size, int bits) {
     // expand_dims accepts a vector of axes; add 1 at both -2 and -3.
     auto x5 = mlx::core::expand_dims(x, std::vector<int>{-2, -3});
+    const bool do_sort = inds.size() >= 64;
+    auto idx = inds;
+    array inv_order(0);
+    if (do_sort) {
+        auto sorted = gather_sort_switch_inputs(x5, inds);
+        x5 = sorted.x;
+        idx = sorted.indices;
+        inv_order = sorted.inv_order;
+    }
 
     auto x_gate = mlx::core::gather_qmm(
         x5, gate_w, gate_s, /*biases=*/gate_b,
         /*lhs_indices=*/std::nullopt,
-        /*rhs_indices=*/inds,
+        /*rhs_indices=*/idx,
         /*transpose=*/true,
         /*group_size=*/group_size,
         /*bits=*/bits,
         /*mode=*/"affine",
-        /*sorted_indices=*/false);
+        /*sorted_indices=*/do_sort);
     auto x_up = mlx::core::gather_qmm(
         x5, up_w, up_s, /*biases=*/up_b,
-        std::nullopt, inds, true, group_size, bits, "affine", false);
+        std::nullopt, idx, true, group_size, bits, "affine", do_sort);
 
     // silu(gate) * up
     auto h = mlx::core::multiply(
@@ -102,7 +144,11 @@ array switch_glu_forward(
 
     auto y = mlx::core::gather_qmm(
         h, down_w, down_s, /*biases=*/down_b,
-        std::nullopt, inds, true, group_size, bits, "affine", false);
+        std::nullopt, idx, true, group_size, bits, "affine", do_sort);
+
+    if (do_sort) {
+        y = scatter_unsort_switch_outputs(y, inv_order, inds.shape());
+    }
 
     // Drop the trailing unit dim: [..., top_k, 1, H] -> [..., top_k, H].
     return mlx::core::squeeze(y, -2);
