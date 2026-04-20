@@ -526,6 +526,25 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, new_shape))
     }
 
+    /// Contiguous-stride slice of `x` over `old_shape` from per-axis `starts`
+    /// (inclusive) to `ends` (exclusive). Returns a new device handle whose
+    /// logical shape is `ends - starts` (caller computes). Default: readback →
+    /// host slice loop → upload. Metal overrides to `mlx_slice` with
+    /// strides=1, wrapping the non-contiguous view in `mlx_contiguous` so
+    /// readback respects the sliced window (same rationale as the
+    /// `transpose_axes_swap` override). M5.3b.16.
+    fn slice(
+        &self,
+        x: &DeviceHandle,
+        old_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let (data, new_shape) = cpu_slice(&host, old_shape, starts, ends)?;
+        self.upload(&data, &new_shape)
+    }
+
     /// In-place AdamW step for a single parameter given host-resident
     /// gradient `grad` and device-resident `param` / `m` / `v` handles.
     ///
@@ -1433,6 +1452,83 @@ pub fn cpu_transpose_swap(
             .iter()
             .zip(old_strides.iter())
             .map(|(c, s)| c * s)
+            .sum();
+        *slot = data[input_index];
+    }
+    Ok((out, new_shape))
+}
+
+/// CPU reference contiguous slice: copy elements of `data` (row-major over
+/// `old_shape`) whose per-axis coordinate is in `[starts[i], ends[i])`.
+/// Returns `(sliced_data, new_shape)` with `new_shape[i] = ends[i] - starts[i]`.
+/// Used by the `Backend::slice` default fallback so device-default and host
+/// paths share one numerical reference. M5.3b.16.
+pub fn cpu_slice(
+    data: &[f32],
+    old_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    let rank = old_shape.len();
+    if starts.len() != rank {
+        return Err(crate::AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: starts.len(),
+        });
+    }
+    if ends.len() != rank {
+        return Err(crate::AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: ends.len(),
+        });
+    }
+    for ((&start, &end), &dim) in starts.iter().zip(ends.iter()).zip(old_shape.iter()) {
+        if start > end {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu_slice: start must be <= end for every axis",
+            ));
+        }
+        if end > dim {
+            return Err(crate::AutogradError::IndexOutOfBounds {
+                index: end,
+                upper: dim,
+            });
+        }
+    }
+
+    let new_shape: Vec<usize> = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(&s, &e)| e - s)
+        .collect();
+    let new_numel: usize = if new_shape.is_empty() {
+        1
+    } else {
+        new_shape.iter().product()
+    };
+
+    let mut old_strides = vec![0usize; rank];
+    let mut stride = 1usize;
+    for (index, dim) in old_shape.iter().enumerate().rev() {
+        old_strides[index] = stride;
+        stride *= *dim;
+    }
+
+    let mut out = vec![0.0_f32; new_numel];
+    for (out_index, slot) in out.iter_mut().enumerate() {
+        let mut coords = vec![0usize; rank];
+        let mut linear = out_index;
+        for axis in (0..rank).rev() {
+            let dim = new_shape[axis];
+            if dim > 0 {
+                coords[axis] = linear % dim;
+                linear /= dim;
+            }
+        }
+        let input_index: usize = coords
+            .iter()
+            .enumerate()
+            .map(|(axis, &c)| (c + starts[axis]) * old_strides[axis])
             .sum();
         *slot = data[input_index];
     }

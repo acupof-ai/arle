@@ -814,6 +814,75 @@ impl Backend for MetalBackend {
         }
     }
 
+    // M5.3b.16: `mlx_slice` is a lazy view op — fuses with downstream GEMMs
+    // when the slice feeds a matmul (as in Qwen3.5's q/gate split per
+    // attention layer). Strides are all 1 since autograd's `slice` is
+    // always a contiguous window. Same view-materialization trap as
+    // transpose: the raw `mlx_array_data_float32` pointer ignores view
+    // strides/offsets, so wrap the result in `mlx_contiguous` to force
+    // a layout-correct materialization on the next eval. MLX short-
+    // circuits `contiguous` on already-contig arrays; the copy only
+    // fires when the view is non-contiguous (always, for a non-full
+    // slice — but only once per logical op).
+    fn slice(
+        &self,
+        x: &DeviceHandle,
+        old_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        let rank = old_shape.len();
+        if starts.len() != rank || ends.len() != rank {
+            return Err(AutogradError::InvalidIndicesLen {
+                expected: rank,
+                got: starts.len().max(ends.len()),
+            });
+        }
+        for ((&s, &e), &d) in starts.iter().zip(ends.iter()).zip(old_shape.iter()) {
+            if s > e {
+                return Err(AutogradError::TapeInvariant(
+                    "metal slice: start must be <= end for every axis",
+                ));
+            }
+            if e > d {
+                return Err(AutogradError::IndexOutOfBounds { index: e, upper: d });
+            }
+        }
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot slice a non-metal device handle",
+            ));
+        };
+
+        let starts_i32: Vec<i32> = starts.iter().map(|&s| s as i32).collect();
+        let ends_i32: Vec<i32> = ends.iter().map(|&e| e as i32).collect();
+        let strides_i32: Vec<i32> = vec![1; rank];
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        unsafe {
+            let view = mlx_slice(
+                x_handle.as_ptr(),
+                starts_i32.as_ptr(),
+                ends_i32.as_ptr(),
+                strides_i32.as_ptr(),
+                rank,
+            );
+            if view.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_slice returned null (device slice)",
+                ));
+            }
+            let out = mlx_contiguous(view);
+            mlx_array_free(view);
+            if out.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_contiguous returned null (device slice materialization)",
+                ));
+            }
+            Ok(DeviceHandle::Metal(MlxHandle::from_raw(out)))
+        }
+    }
+
     // Lazy fused AdamW per-param update. Upload `grad` once as a flat
     // `[size]` f32 array and compose the entire update into the MLX graph:
     //
