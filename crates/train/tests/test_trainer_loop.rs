@@ -3,12 +3,15 @@
 //! (step counting, accumulation, LR ticking, resume, checkpoint dir, metric
 //! emission) without pulling any Transformer wiring in.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use autograd::adamw_state::{AdamWParamState, AdamWState};
 use autograd::ops::{mean, mul};
-use autograd::{AdamW, ConstantLr, LinearWarmup, Optimizer, Tape, Tensor, TensorId, TensorStore};
+use autograd::{
+    AdamW, ConstantLr, LinearWarmup, LrSchedule, Optimizer, Tape, Tensor, TensorId, TensorStore,
+};
 use tempfile::tempdir;
 use train::checkpoint::{TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, save_trainer_state_v2};
 use train::grad_clip::NoClip;
@@ -101,6 +104,7 @@ fn trainer_runs_total_steps() {
             &mut tape,
             vec![p],
             vec![(p, "p".to_string())],
+            HashSet::new(),
             |ctx| {
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
                 Ok(StepOutcome {
@@ -146,6 +150,7 @@ fn grad_accum_triggers_step_every_n() {
             &mut tape,
             vec![p],
             vec![(p, "p".to_string())],
+            HashSet::new(),
             |ctx: &mut StepCtx<'_>| {
                 *step_fn_calls_hook.lock().unwrap() += 1;
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
@@ -196,6 +201,7 @@ fn lr_schedule_drives_optimizer_lr() {
             &mut tape,
             vec![p],
             vec![(p, "p".to_string())],
+            HashSet::new(),
             |ctx| {
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
                 Ok(StepOutcome {
@@ -224,10 +230,12 @@ fn resume_restores_step() {
     let ckpt_dir = tmp.path().join("step_000042");
     std::fs::create_dir_all(&ckpt_dir).unwrap();
 
+    // Must match the live `ConstantLr(1e-3).describe()` string exactly —
+    // trainer.rs now validates the full describe() on resume (codex P2).
     let doc = TrainerStateDoc {
         step: 42,
         optim_schema: "adamw-v1".to_string(),
-        schedule_name: "constant".to_string(),
+        schedule_name: ConstantLr(1e-3).describe(),
         schedule_params: serde_json::json!({}),
         grad_accum_current: 0,
         rng_seed: 7,
@@ -288,6 +296,7 @@ fn checkpoint_save_writes_directory() {
             &mut tape,
             vec![p],
             vec![(p, "p".to_string())],
+            HashSet::new(),
             |ctx| {
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
                 Ok(StepOutcome {
@@ -336,6 +345,7 @@ fn metrics_emit_at_log_every() {
             &mut tape,
             vec![p],
             vec![(p, "p".to_string())],
+            HashSet::new(),
             |ctx| {
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
                 Ok(StepOutcome {
@@ -374,6 +384,122 @@ fn metrics_emit_at_log_every() {
             );
         }
     }
+}
+
+/// Codex review P1 (2026-04-20): the Trainer loop must prune `TensorStore`
+/// after every backward + every optimizer step so activation allocations
+/// don't grow linearly with `total_steps * grad_accum_steps`. The toy
+/// `mean(p * p)` forward allocates at least one temporary (`sq = p * p`)
+/// that must be gone by the time we read the store after the run.
+#[test]
+fn trainer_cleans_up_activations_after_each_step() {
+    let (mut store, p) = setup_param(&[0.25, -0.5, 0.1]);
+    let mut tape = Tape::new();
+
+    // Snapshot the live-id count before the loop — this is the baseline
+    // the cleanup target must respect (param + its eventual grad only).
+    let pre_run_live_ids: usize = (0..store.tensors.len())
+        .filter(|&i| store.get(i).is_some())
+        .count();
+
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 20,
+        grad_accum_steps: 3,
+        log_every: 1,
+        ..default_cfg(20)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(NullSink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    // Post-run: tape must be empty (never carries forward across steps) and
+    // the live-id count bounded — param (+ its grad) is the only thing
+    // we guarantee; everything else must have been pruned. 20 steps × 3
+    // micro would be ~60 allocations if cleanup silently regressed.
+    assert!(tape.entries.is_empty(), "tape must be empty after run");
+    let post_run_live_ids: usize = (0..store.tensors.len())
+        .filter(|&i| store.get(i).is_some())
+        .count();
+    assert!(
+        post_run_live_ids <= pre_run_live_ids + 2,
+        "store grew unboundedly: pre={pre_run_live_ids}, post={post_run_live_ids} (expected <= pre+2 for param+grad)"
+    );
+}
+
+/// Codex review P2 (2026-04-20): a saved schedule_name that doesn't match the
+/// live schedule's `describe()` must cause `resume_if_configured` to error
+/// rather than silently resuming under mismatched LR flags.
+#[test]
+fn resume_rejects_mismatched_schedule() {
+    let tmp = tempdir().expect("tempdir");
+    let ckpt_dir = tmp.path().join("step_000010");
+    std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+    // Save a doc that claims the schedule was `LinearWarmup(base_lr=0.1,
+    // warmup_steps=5)` …
+    let doc = TrainerStateDoc {
+        step: 10,
+        optim_schema: "adamw-v1".to_string(),
+        schedule_name: LinearWarmup {
+            base_lr: 0.1,
+            warmup_steps: 5,
+        }
+        .describe(),
+        schedule_params: serde_json::json!({}),
+        grad_accum_current: 0,
+        rng_seed: 0,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = AdamWState {
+        step: 10,
+        skipped_export: 0,
+        params: vec![AdamWParamState {
+            name: "p".to_string(),
+            m: vec![0.0],
+            v: vec![0.0],
+            shape: vec![1],
+        }],
+    };
+    save_trainer_state_v2(&ckpt_dir, &doc, &optim_state).expect("save v2");
+
+    // … but construct the live trainer with a *different* schedule.
+    let (_store, p) = setup_param(&[0.0]);
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        resume_from: Some(ckpt_dir.clone()),
+        ..default_cfg(100)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    let err = trainer
+        .resume_if_configured(&[(p, "p".to_string())])
+        .expect_err("mismatched schedule must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("lr schedule mismatch"),
+        "expected schedule-mismatch error, got: {msg}"
+    );
+    assert_eq!(
+        trainer.step(),
+        0,
+        "failed resume must leave trainer.step() at 0"
+    );
 }
 
 // ---------------------------------------------------------------------------

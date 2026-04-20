@@ -13,6 +13,7 @@
 pub use crate::grad_clip::clip_grad_norm;
 pub use crate::loss::cross_entropy_loss;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -162,8 +163,29 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             // is hit at most once per run. We return a plain TapeInvariant
             // with a generic message and the schema details end up in logs
             // through the `wrap_checkpoint_err` fallback instead.
+            eprintln!(
+                "[trainer] optimizer schema mismatch on resume: saved={saved}, live={live}",
+                saved = doc.optim_schema,
+                live = live_schema,
+            );
             return Err(AutogradError::TapeInvariant(
                 "checkpoint: optimizer schema mismatch with live optimizer",
+            ));
+        }
+
+        // P2 (codex review 2026-04-20): validate the saved LR schedule matches
+        // the live one so a CLI flag flip between runs cannot silently resume
+        // under a different schedule (e.g. switching `linear-warmup` for
+        // `cosine-with-warmup` preserves steps but yields wrong LRs).
+        let live_describe = self.schedule.describe();
+        if doc.schedule_name != live_describe {
+            eprintln!(
+                "[trainer] lr schedule mismatch on resume: saved={saved:?}, live={live:?}",
+                saved = doc.schedule_name,
+                live = live_describe,
+            );
+            return Err(AutogradError::TapeInvariant(
+                "checkpoint: lr schedule mismatch with live schedule (re-run with matching flags)",
             ));
         }
 
@@ -185,12 +207,19 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
     /// Trainer is architecture-agnostic. Binaries that want weight
     /// checkpoints must persist them from inside `step_fn` (or via a
     /// separate callback layered on top).
+    ///
+    /// `keep_extra` is the set of tensor ids the caller wants preserved
+    /// across cleanup (model weights, frozen buffers, tokenizer caches —
+    /// anything referenced by future micro-batches). The Trainer always
+    /// keeps `params` + their `.grad` entries in addition. Toy tests can
+    /// pass `HashSet::new()` when params == entire live set.
     pub fn run<F>(
         &mut self,
         store: &mut TensorStore,
         tape: &mut Tape,
         params: Vec<TensorId>,
         param_names: Vec<(TensorId, String)>,
+        keep_extra: HashSet<TensorId>,
         step_fn: F,
     ) -> Result<()>
     where
@@ -207,7 +236,15 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         };
         // Force eval_every off so the no-op eval closure is unreachable.
         let saved_eval_every = self.cfg.eval_every.take();
-        let result = self.run_inner(store, tape, params, param_names, step_fn, eval_fn);
+        let result = self.run_inner(
+            store,
+            tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            eval_fn,
+        );
         self.cfg.eval_every = saved_eval_every;
         result
     }
@@ -220,6 +257,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         tape: &mut Tape,
         params: Vec<TensorId>,
         param_names: Vec<(TensorId, String)>,
+        keep_extra: HashSet<TensorId>,
         step_fn: F,
         eval_fn: E,
     ) -> Result<()>
@@ -227,7 +265,15 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         F: FnMut(&mut StepCtx<'_>) -> Result<StepOutcome>,
         E: FnMut(&mut TensorStore, &mut Tape) -> Result<EvalOutcome>,
     {
-        self.run_inner(store, tape, params, param_names, step_fn, eval_fn)
+        self.run_inner(
+            store,
+            tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            eval_fn,
+        )
     }
 
     // Monomorphised shared body. `run` supplies a no-op eval closure plus
@@ -238,6 +284,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         tape: &mut Tape,
         params: Vec<TensorId>,
         param_names: Vec<(TensorId, String)>,
+        keep_extra: HashSet<TensorId>,
         mut step_fn: F,
         mut eval_fn: E,
     ) -> Result<()>
@@ -294,6 +341,14 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
 
                 tape.backward(scaled_id, store)?;
 
+                // P1 (codex review 2026-04-20): clear tape + prune the
+                // TensorStore after each backward. Grads have already been
+                // accumulated into param `.grad` fields by the backward pass,
+                // so the per-micro activation graph is dead weight — leaving
+                // it in place grows `store` (and therefore RSS) linearly
+                // with `total_steps * grad_accum_steps`.
+                cleanup_after_backward(store, tape, &params, &keep_extra);
+
                 let ready = self.accum.observe_and_check_ready();
                 micro_idx += 1;
                 if ready {
@@ -306,6 +361,9 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             self.optim.step(store, &params)?;
             self.optim.zero_grad(store, &params);
             self.accum.reset_after_step();
+            // Prune again after zero_grad so any temporaries allocated by
+            // clip/step/zero_grad don't leak into the next step.
+            cleanup_after_backward(store, tape, &params, &keep_extra);
 
             self.step += 1;
             tokens_since_last_log += running_tokens;
@@ -379,15 +437,11 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         })?;
 
         let optim_state = self.optim.export_state(param_names);
-        // Parse the first whitespace-free prefix of `describe()` as the
-        // schedule name for round-trippability with the parse_lr_schedule
-        // allow-list (`constant`, `linear-warmup`, `cosine-with-warmup`).
-        let describe = self.schedule.describe();
-        let schedule_name = describe
-            .split(['(', ' '])
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
+        // Persist the full `describe()` so `resume_if_configured` can
+        // reject mismatched schedule flags at load time. Per codex review
+        // 2026-04-20 (P2) a bare prefix lost base_lr/warmup/total information
+        // and silently let one schedule impersonate another on resume.
+        let schedule_name = self.schedule.describe();
 
         let doc = TrainerStateDoc {
             step: self.step,
@@ -406,4 +460,28 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
 fn wrap_checkpoint_err(err: CheckpointError) -> AutogradError {
     eprintln!("[trainer] checkpoint error: {err}");
     AutogradError::TapeInvariant("checkpoint: v2 codec failure (see stderr)")
+}
+
+/// Post-backward cleanup: clear the tape, re-enable it for the next
+/// micro-batch, then prune the store down to `keep_extra ∪ params ∪ grads`.
+///
+/// Matches the `tape.entries.clear(); tape.set_enabled(true);
+/// store.retain_ids(...)` idiom used across the hand-written training
+/// binaries (`pretrain.rs`, `train_sft.rs`, `train_grpo.rs`, …).
+fn cleanup_after_backward(
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    params: &[TensorId],
+    keep_extra: &HashSet<TensorId>,
+) {
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let mut keep = keep_extra.clone();
+    for &param_id in params {
+        keep.insert(param_id);
+        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
+            keep.insert(grad_id);
+        }
+    }
+    store.retain_ids(&keep);
 }

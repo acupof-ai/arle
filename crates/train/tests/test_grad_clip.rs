@@ -4,7 +4,7 @@
 //! exactly sqrt(4) = 2.0 (param A's grad sums-of-squares = 1, param B's = 3).
 
 use autograd::{Tensor, TensorId, TensorStore};
-use train::grad_clip::{GlobalNorm, GradClip, NoClip};
+use train::grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm};
 
 /// Build a `TensorStore` with two params and pre-filled gradients.
 ///
@@ -57,7 +57,11 @@ fn snapshot_grads(params: &[TensorId], store: &TensorStore) -> Vec<Vec<f32>> {
 }
 
 #[test]
-fn no_clip_returns_zero_and_leaves_grads_untouched() {
+fn no_clip_reports_true_norm_and_leaves_grads_untouched() {
+    // NoClip's contract (per the GradClip trait docstring) is to return the
+    // pre-clip global L2 norm for logging, *without* mutating gradients.
+    // Returning a hard-coded 0.0 would mask explode/vanish gradients in
+    // unclipped baselines — see codex review P3 (2026-04-20).
     let (mut store, params) = setup_two_params_with_grads();
     let pre_norm = global_grad_l2(&params, &store);
     assert!((pre_norm - 2.0).abs() < 1e-6, "setup pre-norm != 2.0");
@@ -67,7 +71,10 @@ fn no_clip_returns_zero_and_leaves_grads_untouched() {
     let reported = clip.clip(&mut store, &params).expect("no_clip clip");
     let after = snapshot_grads(&params, &store);
 
-    assert_eq!(reported, 0.0, "NoClip must report 0.0");
+    assert!(
+        (reported - 2.0).abs() < 1e-4,
+        "NoClip must report true pre-clip norm (~2.0), got {reported}"
+    );
     assert_eq!(before, after, "NoClip must not modify grads");
 }
 
@@ -129,4 +136,102 @@ fn global_norm_zero_max_is_noop() {
         before, after,
         "GlobalNorm with max_norm=0.0 must be a no-op (matches clip_grad_norm)"
     );
+}
+
+// GC-4 — guard silent divide-by-zero: GlobalNorm::new(0.0) must panic at
+// construction, not at clip time; same for negative/NaN/Inf. The struct
+// literal form `GlobalNorm { max_norm: 0.0 }` remains a no-op (covered
+// above) for backwards compatibility with the existing call sites — the
+// panic is opt-in via the explicit `new` constructor.
+#[test]
+#[should_panic(expected = "max_norm must be > 0.0")]
+fn global_norm_zero_max_norm_panics_early() {
+    let _clipper = GlobalNorm::new(0.0);
+}
+
+#[test]
+#[should_panic(expected = "max_norm must be > 0.0")]
+fn global_norm_negative_max_norm_panics_early() {
+    let _clipper = GlobalNorm::new(-0.5);
+}
+
+#[test]
+#[should_panic(expected = "max_norm must be > 0.0")]
+fn global_norm_nan_max_norm_panics_early() {
+    let _clipper = GlobalNorm::new(f32::NAN);
+}
+
+// GC-5 — guard trait-vs-free-fn drift: `GlobalNorm::clip` and the legacy
+// `clip_grad_norm` free function must produce bitwise-identical post-clip
+// gradients given the same inputs. Prevents silent divergence if one impl
+// is optimised without the other.
+#[test]
+fn norm_computation_matches_legacy_free_fn() {
+    let (mut store_a, params_a) = setup_two_params_with_grads();
+    let (mut store_b, params_b) = setup_two_params_with_grads();
+
+    // Sanity-check setups start identical.
+    let before_a = snapshot_grads(&params_a, &store_a);
+    let before_b = snapshot_grads(&params_b, &store_b);
+    assert_eq!(before_a, before_b, "initial grads diverge");
+
+    // A goes through the legacy free function.
+    clip_grad_norm(&params_a, 1.0, &mut store_a);
+
+    // B goes through the trait surface.
+    let mut trait_clip = GlobalNorm { max_norm: 1.0 };
+    let _ = trait_clip
+        .clip(&mut store_b, &params_b)
+        .expect("trait clip");
+
+    let after_a = snapshot_grads(&params_a, &store_a);
+    let after_b = snapshot_grads(&params_b, &store_b);
+    assert_eq!(after_a.len(), after_b.len(), "shape drift across impls");
+    for (pi, (a_grads, b_grads)) in after_a.iter().zip(after_b.iter()).enumerate() {
+        assert_eq!(
+            a_grads.len(),
+            b_grads.len(),
+            "param {pi} grad len drift across impls"
+        );
+        for (i, (a, b)) in a_grads.iter().zip(b_grads.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "param {pi} grad[{i}] bitwise mismatch: free-fn {a} vs trait {b}"
+            );
+        }
+    }
+}
+
+// GC-6 — guard NaN from 0 / 0: empty params slice must return 0.0 and leave
+// nothing to mutate — no panic, no NaN surfaced into the report.
+#[test]
+fn norm_on_empty_params_is_zero() {
+    let (mut store, _params) = setup_two_params_with_grads();
+    let empty: Vec<TensorId> = Vec::new();
+
+    // Trait surface: `NoClip` on empty inputs → 0.0.
+    let mut no_clip = NoClip;
+    let reported_noclip = no_clip.clip(&mut store, &empty).expect("no_clip on empty");
+    assert_eq!(reported_noclip, 0.0);
+    assert!(
+        reported_noclip.is_finite(),
+        "NoClip empty report must be finite, got {reported_noclip}"
+    );
+
+    // `GlobalNorm::clip` on empty inputs must also report 0.0 pre-clip
+    // without dividing by zero anywhere. Use the struct-literal form so the
+    // new-constructor panic doesn't hide this path.
+    let mut global = GlobalNorm { max_norm: 1.0 };
+    let reported_global = global
+        .clip(&mut store, &empty)
+        .expect("global_norm on empty");
+    assert_eq!(reported_global, 0.0);
+    assert!(
+        reported_global.is_finite(),
+        "GlobalNorm empty pre-clip must be finite, got {reported_global}"
+    );
+
+    // Legacy free-function: empty params → early return, no panic, no mutation.
+    clip_grad_norm(&empty, 1.0, &mut store);
 }

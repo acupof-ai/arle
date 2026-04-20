@@ -136,3 +136,85 @@ fn parse_lr_schedule_rejects_unknown() {
         "error should list allowed values: {msg}"
     );
 }
+
+// LR-3 — guard against MLX #2617: cosine decay must not modulate the warmup
+// phase; step < warmup_steps is pure linear warmup.
+#[test]
+fn cosine_with_warmup_no_decay_during_warmup() {
+    let sched = CosineWithWarmup {
+        base_lr: 1.0,
+        min_lr: 0.1,
+        warmup_steps: 10,
+        total_steps: 100,
+    };
+
+    // Concrete probe: step 5 must be exactly 0.5 * base_lr (linear halfway
+    // through warmup). A cosine term would knock this off by a measurable
+    // amount because `cos(PI * (5 - 10) / 90) != 1` when mixed in naively.
+    assert!(
+        (sched.lr(5) - 0.5).abs() < EPS,
+        "lr(5) should be exactly 0.5 * base_lr during warmup, got {}",
+        sched.lr(5)
+    );
+
+    // Step 0 is exactly 0.0 — no min_lr floor during the ramp.
+    assert_eq!(
+        sched.lr(0),
+        0.0,
+        "lr(0) must be 0.0 with no cosine/min_lr bleed-through"
+    );
+
+    // Every step in [0, warmup_steps) must equal linear warmup exactly.
+    for step in 0..sched.warmup_steps {
+        let expected = sched.base_lr * (step as f32 / sched.warmup_steps as f32);
+        let actual = sched.lr(step);
+        assert!(
+            (actual - expected).abs() < EPS,
+            "warmup step {step}: expected linear {expected}, got {actual} \
+             (cosine must not be applied during warmup)"
+        );
+    }
+}
+
+// LR-6 — guard NaN from cosine `cos(PI * (step-total) / decay)` when step
+// overshoots; schedules must clamp to their terminal LR rather than extrapolate.
+#[test]
+fn step_past_total_clamps_to_final_lr() {
+    let cosine = CosineWithWarmup {
+        base_lr: 1.0e-3,
+        min_lr: 1.0e-5,
+        warmup_steps: 100,
+        total_steps: 1_000,
+    };
+    let past = cosine.lr(1_000 + 1_000);
+    assert!(
+        past.is_finite(),
+        "lr past total_steps must be finite, got {past}"
+    );
+    assert_eq!(past, 1.0e-5, "cosine lr past total must clamp to min_lr");
+    let way_past = cosine.lr(u64::MAX / 2);
+    assert!(
+        way_past.is_finite(),
+        "lr at extreme step must be finite, got {way_past}"
+    );
+    assert_eq!(way_past, 1.0e-5);
+
+    // LinearWarmup has no decay phase: past warmup, lr is permanently at
+    // base_lr (and never NaN even at extreme steps).
+    let linear = LinearWarmup {
+        base_lr: 2.5e-4,
+        warmup_steps: 100,
+    };
+    let linear_past = linear.lr(u64::MAX / 2);
+    assert!(
+        linear_past.is_finite(),
+        "linear-warmup lr at extreme step must be finite, got {linear_past}"
+    );
+    assert_eq!(linear_past, 2.5e-4);
+
+    // ConstantLr is always flat; extreme step must still return base_lr.
+    let constant = ConstantLr(3.5e-4);
+    let constant_past = constant.lr(u64::MAX);
+    assert!(constant_past.is_finite());
+    assert_eq!(constant_past, 3.5e-4);
+}
