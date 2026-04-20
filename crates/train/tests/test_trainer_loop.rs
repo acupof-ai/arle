@@ -1087,8 +1087,18 @@ fn eval_final_step_forced_even_when_steps_mod_eval_every() {
 
     let observed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
     let observed_eval = Rc::clone(&observed);
-    let step_counter = Rc::new(RefCell::new(0u64));
-    let step_counter_eval = Rc::clone(&step_counter);
+    // Codex review 2026-04-20 on 813d4f6 (Low): the earlier version of this
+    // test fabricated `[2, 4, 5]` from the eval call count and would have
+    // silently accepted eval firing on the wrong steps as long as it fired
+    // three times. Fix: step_fn stashes its post-increment trainer step
+    // (`ctx.step + 1` — `ctx.step` is 0-indexed pre-increment, the eval
+    // check in `run_inner` evaluates on the 1-indexed post-increment
+    // `self.step`, so we add 1 here to align) into a shared cell that
+    // eval_fn reads. The assertion now compares against the actual
+    // trainer.step at each eval boundary, not a call-count index.
+    let last_train_step: Rc<RefCell<u64>> = Rc::new(RefCell::new(0));
+    let last_train_step_fn = Rc::clone(&last_train_step);
+    let last_train_step_eval = Rc::clone(&last_train_step);
 
     trainer
         .run_with_eval(
@@ -1097,7 +1107,8 @@ fn eval_final_step_forced_even_when_steps_mod_eval_every() {
             vec![p],
             vec![(p, "p".to_string())],
             HashSet::new(),
-            |ctx| {
+            move |ctx| {
+                *last_train_step_fn.borrow_mut() = ctx.step + 1;
                 let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
                 Ok(StepOutcome {
                     loss_id: loss,
@@ -1105,18 +1116,9 @@ fn eval_final_step_forced_even_when_steps_mod_eval_every() {
                 })
             },
             move |_store, _tape| {
-                let mut counter = step_counter_eval.borrow_mut();
-                *counter += 1;
-                // Infer the current trainer.step by reconstructing from the
-                // eval boundary pattern: eval fires at 2, 4, and final=5.
-                // We push the call-order so the assertion can compare to the
-                // expected [2, 4, 5] sequence.
-                observed_eval.borrow_mut().push(match *counter {
-                    1 => 2,
-                    2 => 4,
-                    3 => 5,
-                    other => other + 100, // sentinel for unexpected extra calls
-                });
+                observed_eval
+                    .borrow_mut()
+                    .push(*last_train_step_eval.borrow());
                 Ok(train::EvalOutcome {
                     loss: 0.0,
                     token_count: 1,
