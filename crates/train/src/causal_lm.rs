@@ -92,6 +92,24 @@ pub fn trainable_params<M: CausalLm>(model: &M, store: &TensorStore) -> Vec<Tens
     params
 }
 
+pub fn trainable_param_name_map<M: CausalLm>(
+    model: &M,
+    store: &TensorStore,
+) -> Vec<(TensorId, String)> {
+    let trainable: HashSet<TensorId> = trainable_params(model, store).into_iter().collect();
+    let mut named = model
+        .param_name_map()
+        .into_iter()
+        .filter(|(_, tensor_id)| trainable.contains(tensor_id))
+        .map(|(name, tensor_id)| (tensor_id, name.to_string()))
+        .collect::<Vec<_>>();
+    named.sort_unstable_by(|(id_a, name_a), (id_b, name_b)| {
+        name_a.cmp(name_b).then_with(|| id_a.cmp(id_b))
+    });
+    named.dedup_by(|(id_a, _), (id_b, _)| id_a == id_b);
+    named
+}
+
 pub fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
     store
         .tensors
