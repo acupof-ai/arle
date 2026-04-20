@@ -32,10 +32,38 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    /// DFlash speculative-decode sub-object. Omitted entirely when the
+    /// runtime was not started with a DFlash draft, so existing consumers
+    /// of `/v1/models` keep the same shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dflash: Option<DflashStatusPayload>,
+}
+
+/// DFlash sub-object embedded under `ModelObject.dflash`. Serialised only
+/// when the Metal runtime reports an active DFlash pairing.
+#[derive(Debug, Serialize)]
+pub(super) struct DflashStatusPayload {
+    /// Whether a DFlash draft was loaded and is actively speculating.
+    pub enabled: bool,
+    /// HuggingFace-style id or local path of the draft model.
+    pub draft: String,
+    /// Speculative block size (tokens drafted per verification step).
+    pub speculative_tokens: usize,
+    /// Rolling acceptance rate over the last ~1000 blocks, in [0, 1].
+    /// `None` until at least one speculative block has run this process.
+    pub acceptance_rate: Option<f64>,
 }
 
 impl ModelsListResponse {
-    pub(super) fn single(model_id: &str, created: u64) -> Self {
+    /// Build the single-model response. `dflash` is `None` for the baseline
+    /// shape and `Some(_)` only when the runtime reports active speculative
+    /// decode — the field is `skip_serializing_if = "Option::is_none"` so
+    /// existing consumers keep the same JSON output.
+    pub(super) fn single(
+        model_id: &str,
+        created: u64,
+        dflash: Option<DflashStatusPayload>,
+    ) -> Self {
         Self {
             object: "list",
             data: vec![ModelObject {
@@ -43,6 +71,7 @@ impl ModelsListResponse {
                 object: "model",
                 created,
                 owned_by: "agent-infer",
+                dflash,
             }],
         }
     }

@@ -366,6 +366,18 @@ impl ServerMetrics {
         from_draft as f64 / accepted as f64
     }
 
+    /// Like [`dflash_acceptance_rate`](Self::dflash_acceptance_rate) but
+    /// returns `None` before any speculative block has executed, so HTTP
+    /// callers can surface "unknown" (JSON `null`) instead of a misleading
+    /// `0.0`. Used by `/v1/models` — the Prometheus gauge stays a flat `f64`.
+    pub fn dflash_acceptance_rate_opt(&self) -> Option<f64> {
+        let blocks = self.inner.dflash_blocks_total.load(Ordering::Relaxed);
+        if blocks == 0 {
+            return None;
+        }
+        Some(self.dflash_acceptance_rate())
+    }
+
     /// DFlash utilization: fraction of total speculative capacity used.
     /// Formula: sum(accepted_inputs) / sum(block_size)
     pub fn dflash_utilization(&self) -> f64 {
