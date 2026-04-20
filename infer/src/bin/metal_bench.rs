@@ -108,6 +108,13 @@ struct Cli {
     /// Ignore EOS in --use-step-driver mode and continue until --generation-tokens.
     #[arg(long, default_value_t = false)]
     ignore_eos: bool,
+
+    /// Run baseline (no DFlash) + DFlash back-to-back against the same model
+    /// with matched params and print a one-line delta row on stdout. The
+    /// DFlash draft defaults to the published pair for the target; pass
+    /// `--dflash-draft-model` elsewhere for an explicit pairing.
+    #[arg(long, default_value_t = false, conflicts_with = "dflash_draft_model")]
+    baseline_compare: bool,
 }
 
 impl Cli {
@@ -136,6 +143,25 @@ impl Cli {
             true
         }
     }
+}
+
+/// Pick a default DFlash draft for `--baseline-compare` when the user did
+/// not pass an explicit `--dflash-draft-model`. Looks at recognisable
+/// substrings in the target model path — intentionally conservative: we
+/// only ship a default for the two target/draft pairs the project
+/// currently publishes. Anything else → `None`, and the caller bails with
+/// a clear instruction to pass an explicit draft.
+fn default_draft_for_target(model: &str) -> Option<&'static str> {
+    let lower = model.to_lowercase();
+    // Qwen3.5-4B (hybrid) — MLX 4-bit or other flavours → z-lab/Qwen3.5-4B-DFlash
+    if lower.contains("qwen3.5-4b") || lower.contains("qwen35-4b") {
+        return Some("z-lab/Qwen3.5-4B-DFlash");
+    }
+    // Qwen3-4B-bf16 (or -b16) → z-lab/Qwen3-4B-DFlash-b16
+    if lower.contains("qwen3-4b") && (lower.contains("bf16") || lower.contains("-b16")) {
+        return Some("z-lab/Qwen3-4B-DFlash-b16");
+    }
+    None
 }
 
 struct Run {
@@ -353,6 +379,10 @@ fn run_bench() -> Result<()> {
     use infer::sampler::SamplingParams;
 
     let cli = Cli::parse();
+
+    if cli.baseline_compare {
+        return run_baseline_compare(&cli);
+    }
 
     let params = SamplingParams {
         temperature: 0.0, // greedy — deterministic runs
@@ -799,6 +829,131 @@ fn peak_rss_kb() -> u64 {
     }
 }
 
+/// Run `cli.runs` timed generations with the given backend (plus `cli.warmup`
+/// warmups) and return mean (TPOT_ms, generation_tps). TPOT = decode time per
+/// emitted token = (total - ttft) / completion_tokens, averaged over runs.
+///
+/// Only used by `--baseline-compare`. The main path stays on `Run`/stats
+/// so save/compare/update-baseline output is unchanged.
+#[cfg(feature = "metal")]
+fn bench_tpot(
+    backend: &infer::backend::metal::MetalBackend,
+    prompt_ids: &[u32],
+    params: &infer::sampler::SamplingParams,
+    warmup: usize,
+    runs: usize,
+) -> Result<(f64, f64)> {
+    use infer::backend::InferenceBackend;
+    let _ = backend.name(); // silence unused-import lint if any
+
+    for _ in 0..warmup {
+        backend.generate_from_token_ids(prompt_ids, params)?;
+    }
+
+    let mut tpots = Vec::with_capacity(runs);
+    let mut gen_tps = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let result = backend.generate_from_token_ids(prompt_ids, params)?;
+        anyhow::ensure!(
+            result.completion_tokens > 0,
+            "baseline-compare produced 0 tokens; aborting"
+        );
+        let decode_ms = (result.total_time_ms - result.ttft_ms).max(0.0);
+        let tpot_ms = decode_ms / result.completion_tokens as f64;
+        tpots.push(tpot_ms);
+        gen_tps.push(result.generation_tps);
+    }
+    let mean_tpot = tpots.iter().sum::<f64>() / tpots.len() as f64;
+    let mean_gen_tps = gen_tps.iter().sum::<f64>() / gen_tps.len() as f64;
+    Ok((mean_tpot, mean_gen_tps))
+}
+
+/// Execute `--baseline-compare`: loads the target twice (baseline, then with
+/// DFlash) and prints a one-line delta row as the LAST stdout line so scripts
+/// can parse it. Defaults the draft via `default_draft_for_target` unless the
+/// caller names one explicitly (`--dflash-draft-model` — enforced at the CLI
+/// layer via `conflicts_with`).
+#[cfg(feature = "metal")]
+fn run_baseline_compare(cli: &Cli) -> Result<()> {
+    use infer::backend::InferenceBackend;
+    use infer::backend::metal::{MetalBackend, MetalBackendOptions, MetalDflashOptions};
+    use infer::sampler::SamplingParams;
+
+    anyhow::ensure!(
+        !cli.use_step_driver,
+        "--baseline-compare is not yet wired for --use-step-driver; drop that flag"
+    );
+
+    let draft_model = match default_draft_for_target(&cli.model) {
+        Some(draft) => draft.to_string(),
+        None => bail!(
+            "--baseline-compare has no default DFlash draft for target '{}'. \
+             Known defaults: Qwen3.5-4B-* → z-lab/Qwen3.5-4B-DFlash, \
+             Qwen3-4B-bf16/-b16 → z-lab/Qwen3-4B-DFlash-b16. \
+             Retry without --baseline-compare and instead pass --dflash-draft-model <id>.",
+            cli.model
+        ),
+    };
+
+    let params = SamplingParams {
+        temperature: 0.0,
+        ignore_eos: true,
+        max_new_tokens: Some(cli.generation_tokens),
+        ..Default::default()
+    };
+
+    eprintln!(
+        "baseline-compare: target={} draft={} runs={} warmup={}",
+        cli.model, draft_model, cli.runs, cli.warmup
+    );
+
+    // ── Phase 1: baseline (no DFlash) ───────────────────────────────────────
+    let mut baseline_backend = MetalBackend::with_options(MetalBackendOptions {
+        dflash: None,
+        kv_pool: cli.kv_pool_override(),
+        runtime_limits: cli.runtime_limits(),
+    });
+    baseline_backend.load(std::path::Path::new(&cli.model))?;
+    let prompt_ids = baseline_backend.benchmark_prompt_ids(cli.prompt_tokens)?;
+    let (baseline_tpot, baseline_gen_tps) = bench_tpot(
+        &baseline_backend,
+        &prompt_ids,
+        &params,
+        cli.warmup,
+        cli.runs,
+    )?;
+    drop(baseline_backend);
+
+    // ── Phase 2: DFlash (default draft) ─────────────────────────────────────
+    let mut dflash_backend = MetalBackend::with_options(MetalBackendOptions {
+        dflash: Some(MetalDflashOptions {
+            draft_model: draft_model.clone(),
+            speculative_tokens: cli.speculative_tokens,
+        }),
+        kv_pool: cli.kv_pool_override(),
+        runtime_limits: cli.runtime_limits(),
+    });
+    dflash_backend.load(std::path::Path::new(&cli.model))?;
+    let (dflash_tpot, dflash_gen_tps) =
+        bench_tpot(&dflash_backend, &prompt_ids, &params, cli.warmup, cli.runs)?;
+
+    // ── Delta row (last stdout line, exact format in the task spec) ─────────
+    let delta_pct = if baseline_tpot > 0.0 {
+        (dflash_tpot - baseline_tpot) / baseline_tpot * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "baseline gen_tps={:.1}  DFlash gen_tps={:.1}",
+        baseline_gen_tps, dflash_gen_tps
+    );
+    println!(
+        "compare | baseline TPOT {:.2} ms \u{2192} DFlash {:.2} ms  (\u{0394} {:+.1}%)",
+        baseline_tpot, dflash_tpot, delta_pct
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -876,5 +1031,68 @@ mod tests {
         let sorted = [1.0, 2.0, 3.0, 4.0];
         assert_eq!(percentile(&sorted, 50.0), 2.0);
         assert_eq!(percentile(&sorted, 99.0), 4.0);
+    }
+
+    // ── Item 1: --baseline-compare default draft + flag conflicts ────────────
+
+    #[test]
+    fn baseline_compare_default_draft_qwen35_4b() {
+        assert_eq!(
+            super::default_draft_for_target("mlx-community/Qwen3.5-4B-MLX-4bit"),
+            Some("z-lab/Qwen3.5-4B-DFlash")
+        );
+        assert_eq!(
+            super::default_draft_for_target("models/Qwen3.5-4B"),
+            Some("z-lab/Qwen3.5-4B-DFlash")
+        );
+    }
+
+    #[test]
+    fn baseline_compare_default_draft_qwen3_4b_bf16() {
+        assert_eq!(
+            super::default_draft_for_target("models/Qwen3-4B-bf16"),
+            Some("z-lab/Qwen3-4B-DFlash-b16")
+        );
+        assert_eq!(
+            super::default_draft_for_target("models/Qwen3-4B-b16"),
+            Some("z-lab/Qwen3-4B-DFlash-b16")
+        );
+    }
+
+    #[test]
+    fn baseline_compare_default_draft_unknown_returns_none() {
+        // Unknown target — the helper must return None so run_baseline_compare
+        // bails with a clear instruction rather than pick a stale default.
+        assert_eq!(super::default_draft_for_target("llama-3-8b"), None);
+        assert_eq!(
+            super::default_draft_for_target("Qwen3-0.6B-4bit"),
+            None,
+            "small Qwen3 targets must not silently pick the 4B draft"
+        );
+    }
+
+    #[test]
+    fn baseline_compare_rejects_explicit_draft() {
+        // --baseline-compare declares `conflicts_with = "dflash_draft_model"`
+        // on the Cli struct. Verify clap enforces it without executing the
+        // bench by parsing a conflicting argv.
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "metal_bench",
+            "--model",
+            "models/Qwen3.5-4B",
+            "--baseline-compare",
+            "--dflash-draft-model",
+            "z-lab/Qwen3.5-4B-DFlash",
+        ]);
+        let err = match parsed {
+            Err(err) => err,
+            Ok(_) => panic!("clap should reject --baseline-compare + --dflash-draft-model"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflict"),
+            "expected a conflicts_with error, got: {msg}"
+        );
     }
 }
