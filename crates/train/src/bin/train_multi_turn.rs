@@ -11,8 +11,8 @@
 use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use autograd::{
-    optim::{AdamW, Optimizer},
     AutogradError, Backend, CpuBackend, Tape, TensorStore,
+    optim::{AdamW, Optimizer},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,22 +22,22 @@ use train::{
         trainable_param_name_map,
     },
     checkpoint::{
-        load_trainer_state_v2, save_trainer_state_v2, TrainerStateDoc, TRAINER_STATE_CODEC_VERSION,
+        TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
-    cli_args::{next_value, parse_value, ArgError},
+    cli_args::{ArgError, next_value, parse_value},
     control::TrainingController,
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
-    grpo::{group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl, GrpoConfig},
+    grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl},
     lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
-    multi_turn::{rollout_episode, Environment, Episode, TurnSpec},
+    multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
     qwen35::{LayerType, Qwen35Config, Qwen35Error, Qwen35Model},
     qwen35_checkpoint::{
-        save_step_checkpoint, ConfigJsonSource, GenerationConfigSource, Qwen35CheckpointError,
-        Qwen35StepCheckpoint,
+        ConfigJsonSource, GenerationConfigSource, Qwen35CheckpointError, Qwen35StepCheckpoint,
+        save_step_checkpoint,
     },
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
@@ -980,11 +980,7 @@ fn mean_per_turn(per_turn_rewards: &[Vec<f32>]) -> f32 {
             count += 1.0;
         }
     }
-    if count == 0.0 {
-        0.0
-    } else {
-        sum / count
-    }
+    if count == 0.0 { 0.0 } else { sum / count }
 }
 
 fn build_prompt(
@@ -1129,7 +1125,7 @@ mod tests {
     use super::*;
     use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
     use tempfile::tempdir;
-    use train::{checkpoint::load_trainer_state_v2, LoraAdapterConfig};
+    use train::{LoraAdapterConfig, checkpoint::load_trainer_state_v2};
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 

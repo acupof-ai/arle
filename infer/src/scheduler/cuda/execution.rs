@@ -65,7 +65,8 @@ impl PrefillBudget {
         if prefill_tokens == 0 {
             return;
         }
-        self.remaining_prefill_tokens = self.remaining_prefill_tokens.saturating_sub(prefill_tokens);
+        self.remaining_prefill_tokens =
+            self.remaining_prefill_tokens.saturating_sub(prefill_tokens);
         self.remaining_requests = self.remaining_requests.saturating_sub(1);
     }
 
