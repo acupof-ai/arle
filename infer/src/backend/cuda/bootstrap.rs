@@ -8,9 +8,13 @@
 use std::fmt;
 #[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
+use std::thread::JoinHandle;
 
 #[cfg(feature = "cuda")]
 use anyhow::{Context, Result, bail};
+#[cfg(feature = "cuda")]
+use log::{info, warn};
 
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, ModelForward, ModelRuntimeConfig, Qwen3Model, Qwen35Model};
@@ -242,7 +246,7 @@ pub fn spawn_scheduler_handle(
     components: LoadedModelComponents,
     runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
-) -> Result<SchedulerHandle> {
+) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
     match components {
         LoadedModelComponents::Qwen3(components) => {
             spawn_scheduler_for_model(components, runtime, metrics)
@@ -264,9 +268,56 @@ pub fn spawn_scheduler_handle_from_path(
     model_path: &str,
     runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
-) -> Result<SchedulerHandle> {
+) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
     let components = load_model_components(model_path, runtime.engine)?;
     spawn_scheduler_handle(components, runtime, metrics)
+}
+
+#[cfg(feature = "cuda")]
+pub struct SchedulerRuntimeGuard {
+    model_id: String,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "cuda")]
+impl SchedulerRuntimeGuard {
+    fn new(model_id: String, thread: JoinHandle<()>) -> Self {
+        Self {
+            model_id,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn wait(mut self) {
+        self.join_inner();
+    }
+
+    fn join_inner(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        info!(
+            "Waiting for scheduler thread to shut down cleanly (model={})",
+            self.model_id
+        );
+        match thread.join() {
+            Ok(()) => info!(
+                "Scheduler thread shut down cleanly (model={})",
+                self.model_id
+            ),
+            Err(_) => warn!(
+                "Scheduler thread panicked during shutdown (model={})",
+                self.model_id
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for SchedulerRuntimeGuard {
+    fn drop(&mut self) {
+        self.join_inner();
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -274,7 +325,7 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
     components: ModelComponents<M>,
     runtime: ServerRuntimeConfig,
     metrics: crate::metrics::ServerMetrics,
-) -> Result<SchedulerHandle> {
+) -> Result<(SchedulerHandle, SchedulerRuntimeGuard)> {
     let ModelComponents {
         model_id,
         tokenizer,
@@ -301,6 +352,32 @@ fn spawn_scheduler_for_model<M: ModelForward + 'static>(
         kv_cache_dtype,
         kv_pool_format,
     )?;
-    std::thread::spawn(move || scheduler.run());
-    Ok(handle)
+    let model_id_for_guard = model_id.clone();
+    let thread = std::thread::spawn(move || scheduler.run());
+    Ok((
+        handle,
+        SchedulerRuntimeGuard::new(model_id_for_guard, thread),
+    ))
+}
+
+#[cfg(all(feature = "cuda", test))]
+mod tests {
+    use super::SchedulerRuntimeGuard;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn scheduler_runtime_guard_joins_thread_on_drop() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let joined_thread = Arc::clone(&joined);
+        let thread = std::thread::spawn(move || {
+            joined_thread.store(true, Ordering::SeqCst);
+        });
+
+        drop(SchedulerRuntimeGuard::new("test-model".to_string(), thread));
+
+        assert!(joined.load(Ordering::SeqCst));
+    }
 }
