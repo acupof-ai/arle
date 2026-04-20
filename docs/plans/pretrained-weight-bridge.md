@@ -1,5 +1,9 @@
 # Plan — pretrained-weight bridge (train ↔ infer)
 
+**Status**: Historical / superseded by [`train-eval-infer-dx-v1.md`](train-eval-infer-dx-v1.md)
+and the landed DX-1 `latest` marker flow. Kept as a record of the original
+bridge decomposition.
+
 **Directive (2026-04-19):** User approved the 5-step critical path in
 `docs/experience/wins/2026-04-19-m5.3a-m5.3b-add-device-resident-tensor.md`
 follow-up chat: wire up a real pretrained weight → autograd training → serve

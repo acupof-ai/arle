@@ -238,9 +238,11 @@ don't (because every other test uses synthetic loss).
 
 ### 3.11 Existing binary regressions
 
-The four un-migrated binaries (`pretrain`, `pretrain_qwen3`, `train_grpo`,
-`train_multi_turn`) continue to compile against the legacy `trainer::*`
-re-exports until Phase 3 migrates them. Regression guard: a `#[test]` in
+The runtime migration has already landed on the main `Trainer<O, C, S>`
+path. The older binaries (`pretrain`, `pretrain_qwen3`, `train_grpo`,
+`train_multi_turn`) still compile against the legacy `trainer::*`
+re-exports as compatibility aliases; this section now only guards that
+surface until the aliases are retired. Regression guard: a `#[test]` in
 `crates/train/tests/test_legacy_imports.rs` that imports each legacy
 symbol by path:
 
@@ -251,7 +253,7 @@ fn legacy_clip_grad_norm_is_exported() {
 }
 ```
 
-Removed once Phase 3 finishes migration.
+Removed once the compatibility aliases are retired.
 
 ---
 
@@ -280,7 +282,7 @@ Wave-aligned with the Phase 2 rollout:
 | T-2 | §3.7 TL-1..TL-7 | Wave 2 Trainer lands |
 | T-3 | §3.7 TL-8..TL-10, §3.8, §3.9, §3.10 | Trainer tests green |
 | T-4 | §3.11 regression | Phase 2 commit boundary |
-| T-5 | remove §3.11 | Phase 3 binary migration |
+| T-5 | retire §3.11 aliases | compatibility cleanup |
 
 Each wave ships as one commit with a matching wins entry citing the
 fixtures and the lesson# each new test guards.
