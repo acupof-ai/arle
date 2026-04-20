@@ -2,8 +2,8 @@
 use autograd::{
     AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::causal_sdpa, ops::embedding,
     ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul,
-    ops::mul_scalar, ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::slice, ops::sum,
-    ops::transpose, tensor::Dirty,
+    ops::mul_scalar, ops::reshape, ops::rmsnorm, ops::rope, ops::sigmoid, ops::silu, ops::slice,
+    ops::sum, ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -393,6 +393,95 @@ fn metal_exp_forward_stays_lazy() -> Result<()> {
           mlx_matmul_backward FFI eval + 1 slack for exp_backward's \
           host mul_forward on the saved output."
     );
+    Ok(())
+}
+
+/// M5.3b.18 acceptance: `sigmoid` forward must compose into the MLX lazy
+/// graph with no `mlx_eval` for a Dirty::Device input. Forward chain
+/// `matmul → sigmoid → sum` records zero evals; backward pays only
+/// tape.backward's batch flush + the matmul backward FFI eval + slack for
+/// the host `mul_forward` inside `sigmoid_backward` that reads the saved
+/// output. Qwen3.5 hot path: `gate = sigmoid(gate_proj)` × 28 attention
+/// layers = 28 evals/token previously forced by the public `ops::sigmoid`
+/// entry's `ensure_host`.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_sigmoid_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let d_in = 16usize;
+    let d_out = 16usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_data: Vec<f32> = (0..d_in).map(|i| (i as f32) * 0.01).collect();
+    let w_data: Vec<f32> = (0..d_in * d_out)
+        .map(|i| ((i % 5) as f32 - 2.0) * 0.01)
+        .collect();
+
+    let x = store.from_slice(&x_data, &[1, d_in])?;
+    let w = store.from_slice(&w_data, &[d_in, d_out])?;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // `y` is Dirty::Device (lazy matmul output); sigmoid must stay lazy on it.
+    let y = matmul(x, w, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let act = sigmoid(y, &mut store, &mut tape)?;
+    let after_sigmoid = eval_count();
+    let loss = sum(act, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_sigmoid, 0,
+        "M5.3b.18: lazy sigmoid forward must not force an eval; saw {after_sigmoid}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward} \
+         (after_matmul={after_matmul} after_sigmoid={after_sigmoid} \
+          after_sum={after_sum}). Budget = tape.backward flush + \
+          mlx_matmul_backward FFI eval + 1 slack for sigmoid_backward's \
+          host compute on the saved output."
+    );
+
+    // CPU reference parity: re-run the chain on CpuBackend and confirm the
+    // lazy forward value matches f32 host reference to ≤ 1e-4.
+    let metal_act_data = store.to_host(act)?;
+
+    let mut cpu_store = TensorStore::with_backend(Arc::new(CpuBackend));
+    let mut cpu_tape = Tape::new();
+    let cpu_x = cpu_store.from_slice(&x_data, &[1, d_in])?;
+    let cpu_w = cpu_store.from_slice(&w_data, &[d_in, d_out])?;
+    cpu_store
+        .get_mut(cpu_w)
+        .expect("cpu w exists")
+        .requires_grad = true;
+    let cpu_y = matmul(cpu_x, cpu_w, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_act = sigmoid(cpu_y, &mut cpu_store, &mut cpu_tape)?;
+    let cpu_act_data = cpu_store.to_host(cpu_act)?;
+
+    assert_eq!(metal_act_data.len(), cpu_act_data.len());
+    for (i, (m, c)) in metal_act_data.iter().zip(cpu_act_data.iter()).enumerate() {
+        assert!(
+            (m - c).abs() <= 1e-4,
+            "sigmoid forward parity at [{i}]: metal={m} cpu={c}"
+        );
+    }
     Ok(())
 }
 

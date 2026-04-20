@@ -67,7 +67,13 @@ pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 }
 
 pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.18: inner `activation::sigmoid` dispatches on `x.dirty`; a
+    // Dirty::Device/Both input stays lazy via `backend.sigmoid`
+    // (`mlx_sigmoid` single node into the MLX graph), Dirty::Host takes
+    // the eager host path. Stripping `ensure_host` here is the enabler —
+    // Qwen3.5 attention's `gate = sigmoid(gate_proj)` × 28 layers
+    // previously flushed the q_full slice to host before the gate
+    // multiply.
     activation::sigmoid(x, store, tape)
 }
 
