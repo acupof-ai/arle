@@ -72,7 +72,7 @@ MODEL="Qwen/Qwen3-4B"
 # deserializer can't download it in sandboxed environments and bails with
 # "OSError: Qwen3-4B is not a local folder". Defaults to a weights dir
 # that already exists on CUDA and Metal bring-up boxes.
-PROCESSOR_DEFAULT="models/Qwen3-4B"
+PROCESSOR_DEFAULT="infer/models/Qwen3-4B"
 PROCESSOR=""
 LABEL=""
 # Exploration-mode overrides. Empty = use the canonical value above.
