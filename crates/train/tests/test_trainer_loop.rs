@@ -1222,3 +1222,147 @@ fn trainer_optim_state(trainer: &Trainer<AdamW, NoClip, ConstantLr>, p: TensorId
 fn trainer_lr(trainer: &Trainer<AdamW, NoClip, LinearWarmup>) -> f32 {
     trainer.optim().lr()
 }
+
+/// Codex review 2026-04-20 on 09c5c89 (P1): the SFT→GRPO boundary in
+/// `train_grpo` used to silently reset AdamW moments and bias correction
+/// because a fresh AdamW was constructed for the GRPO phase. The fix hands
+/// optimizer state across via `Trainer::optim().export_state(...)` +
+/// `AdamW::import_state(...)`. Pin that roundtrip: 3 steps in trainer A →
+/// export → import into a fresh AdamW → 1 step in trainer B must match
+/// 4 consecutive steps on a single AdamW instance to within float noise.
+#[test]
+fn adamw_state_roundtrip_across_trainer_boundary() {
+    // Two independent TensorStores, same init state. On each one we run 4
+    // steps of the toy `loss = mean(p * p)` task (grad = 2*p/N) at a fixed
+    // LR — baseline uses a single AdamW; boundary uses two AdamWs with an
+    // export/import handoff after step 3.
+    let init = [0.25f32, -0.5, 0.1, 0.75];
+
+    // ---- Baseline: one AdamW, 4 steps through one Trainer ----
+    let (mut store_a, p_a) = setup_param(&init);
+    let mut tape_a = Tape::new();
+    let optim_a = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let mut trainer_a = Trainer::new(
+        optim_a,
+        NoClip,
+        ConstantLr(1e-2),
+        Box::new(NullSink),
+        default_cfg(4),
+    );
+    trainer_a
+        .run(
+            &mut store_a,
+            &mut tape_a,
+            vec![p_a],
+            vec![(p_a, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p_a, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("baseline trainer run");
+    let baseline_final: Vec<f32> = store_a.to_host(p_a).unwrap();
+    let baseline_state = trainer_a.optim().export_state(&[(p_a, "p".to_string())]);
+    assert_eq!(
+        baseline_state.step, 4,
+        "baseline should have taken 4 optimizer steps"
+    );
+
+    // ---- Boundary: 3 steps in trainer B1, export; fresh AdamW, import,
+    //     1 step in trainer B2.
+    let (mut store_b, p_b) = setup_param(&init);
+    let mut tape_b = Tape::new();
+
+    let optim_b1 = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let mut trainer_b1 = Trainer::new(
+        optim_b1,
+        NoClip,
+        ConstantLr(1e-2),
+        Box::new(NullSink),
+        default_cfg(3),
+    );
+    trainer_b1
+        .run(
+            &mut store_b,
+            &mut tape_b,
+            vec![p_b],
+            vec![(p_b, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p_b, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer_b1 run (3 steps)");
+    let handoff = trainer_b1.optim().export_state(&[(p_b, "p".to_string())]);
+    assert_eq!(
+        handoff.step, 3,
+        "handoff state should carry step=3 across the boundary"
+    );
+
+    // Fresh AdamW + fresh Trainer — this is the GRPO-phase shape in
+    // train_grpo.rs. Without `import_state`, bias correction would restart
+    // at step=1 here and moments would be zeroed.
+    let mut optim_b2 = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let restored = optim_b2
+        .import_state(&handoff, &[(p_b, "p".to_string())])
+        .expect("import_state roundtrip");
+    assert_eq!(
+        restored, 1,
+        "one param should have been restored from handoff state"
+    );
+
+    let mut trainer_b2 = Trainer::new(
+        optim_b2,
+        NoClip,
+        ConstantLr(1e-2),
+        Box::new(NullSink),
+        default_cfg(1),
+    );
+    trainer_b2
+        .run(
+            &mut store_b,
+            &mut tape_b,
+            vec![p_b],
+            vec![(p_b, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p_b, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer_b2 run (1 step after handoff)");
+    let boundary_final: Vec<f32> = store_b.to_host(p_b).unwrap();
+    let boundary_state = trainer_b2.optim().export_state(&[(p_b, "p".to_string())]);
+    assert_eq!(
+        boundary_state.step, 4,
+        "boundary path must match baseline step count (3 + 1 = 4)"
+    );
+
+    // Params must be bitwise close — AdamW's update is a deterministic
+    // scalar recurrence, so round-tripping (m, v, step) through export +
+    // import must yield the same trajectory to within float-rounding noise
+    // on the single extra step.
+    assert_eq!(
+        baseline_final.len(),
+        boundary_final.len(),
+        "param shape mismatch"
+    );
+    for (i, (lhs, rhs)) in baseline_final.iter().zip(boundary_final.iter()).enumerate() {
+        let diff = (lhs - rhs).abs();
+        assert!(
+            diff < 1e-6,
+            "param[{i}] drifted across SFT→GRPO handoff: baseline={lhs} boundary={rhs} diff={diff}"
+        );
+    }
+}

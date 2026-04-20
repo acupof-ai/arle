@@ -1,8 +1,8 @@
-use std::{collections::HashSet, env, path::PathBuf};
+use std::{collections::HashSet, env, path::PathBuf, process::ExitCode};
 
 use autograd::{
     AutogradError, ConstantLr, Result as AutogradResult, Tape, TensorId, TensorStore,
-    module::Module, optim::AdamW,
+    adamw_state::AdamWState, module::Module, optim::AdamW,
 };
 use thiserror::Error;
 use train::{
@@ -83,7 +83,20 @@ impl GradClip for GrpoClip {
     }
 }
 
-fn main() -> Result<(), CliError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        // Display (not Debug): `#[error(transparent)]` delegates to the inner
+        // error's Display impl, so the user sees the real message instead of
+        // `Error: Custom("...")`. Mirrors the `train_sft.rs` pattern.
+        Err(err) => {
+            eprintln!("[train_grpo] error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
 
@@ -121,7 +134,12 @@ fn main() -> Result<(), CliError> {
     // device→host copy of logits per step; the migrated Trainer-format
     // metrics line drops it. GRPO-phase reward tracking (via
     // `mean_reward`) is unaffected.
-    run_sft_phase(&args, &policy, &params, &base_params, &mut store, &mut tape)?;
+    //
+    // We export the final AdamW state so the GRPO-phase optimizer can
+    // resume moments + step counter instead of starting cold (codex review
+    // on 09c5c89 P1).
+    let sft_optim_state =
+        run_sft_phase(&args, &policy, &params, &base_params, &mut store, &mut tape)?;
 
     // ---- GRPO phase (hand-written; see commit body for the "why") ----
     let ref_model = policy.clone_frozen(&mut store);
@@ -147,13 +165,22 @@ fn main() -> Result<(), CliError> {
         kl_coef: args.kl_coef,
         group_size: args.group_size,
     };
-    // Intentional known imperfection: the SFT-phase Trainer owns its own
-    // AdamW instance and we can't reach it after `trainer.run(...)` returns
-    // (no `Trainer::into_optimizer()` API today). Build a second AdamW for
-    // the GRPO phase with the same hyperparameters — on a 30→20-step
-    // copy-task smoke run the lost warm-start moments are noise vs. the
-    // convergence target. See commit body for the full rationale.
+    // Hand AdamW's final SFT-phase state (moments + step counter) across
+    // the SFT→GRPO boundary so bias correction keeps counting and the
+    // second-moment buffers are warm-started, matching the pre-migration
+    // single-instance behaviour. Codex review on 09c5c89 correctly rebutted
+    // the earlier "no API" claim — `Trainer::optim()` + `Optimizer::
+    // export_state/import_state` were already sufficient, no Trainer
+    // surface changes needed.
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let param_names: Vec<(TensorId, String)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, format!("param.{i:04}")))
+        .collect();
+    optimizer
+        .import_state(&sft_optim_state, &param_names)
+        .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
     let mut reward_trajectory = Vec::with_capacity(args.grpo_iters);
     let mut last_kl = 0.0_f32;
     let mut best_mean_reward = baseline_reward;
@@ -235,7 +262,7 @@ fn run_sft_phase(
     base_params: &[TensorId],
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<(), CliError> {
+) -> Result<AdamWState, CliError> {
     let optim = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     // Mirror pretrain.rs: `--grad-clip 0/NaN/inf` warns and falls through
     // to NoClip instead of panicking in `GlobalNorm::new`.
@@ -306,11 +333,14 @@ fn run_sft_phase(
         store,
         tape,
         params.to_vec(),
-        param_names,
+        param_names.clone(),
         keep_extra,
         step_fn,
     )?;
-    Ok(())
+    // Export optimizer state so the caller can re-import it into the
+    // GRPO-phase AdamW and preserve moments + step counter across the
+    // SFT→GRPO boundary (codex review on 09c5c89 P1).
+    Ok(trainer.optim().export_state(&param_names))
 }
 
 fn parse_args() -> Result<CliArgs, CliError> {
@@ -433,4 +463,34 @@ fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorI
         }
     }
     keep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Codex review 2026-04-20 on 09c5c89 (P2): `fn main() -> Result<(),
+    /// CliError>` leaked the Debug format through to stderr (`Error:
+    /// Custom("...")`). We now wrap in `ExitCode` + `eprintln!("{err}")`
+    /// which routes through `Display`. Pin the Display format so a future
+    /// `derive(Debug)`-only regression can't silently re-introduce the
+    /// Custom(...) wrapper.
+    #[test]
+    fn cli_error_display_does_not_leak_debug_wrapper() {
+        let err = CliError::Custom(
+            "metrics sink: failed to create JSONL metrics sink at /root/forbidden.jsonl: \
+             No such file or directory (os error 2)"
+                .to_string(),
+        );
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("Custom("),
+            "Display for CliError::Custom must NOT wrap the payload in Custom(...); \
+             got: {rendered}"
+        );
+        assert!(
+            rendered.contains("metrics sink"),
+            "Display should surface the underlying message verbatim; got: {rendered}"
+        );
+    }
 }
