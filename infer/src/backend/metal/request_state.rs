@@ -671,6 +671,13 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub fn last_token(&self) -> Option<u32> {
+        match &self.inner {
+            MetalRequestStateInner::Qwen3(state) => state.last_token,
+            MetalRequestStateInner::Qwen35(state) => state.last_token,
+        }
+    }
+
     pub fn is_qwen35(&self) -> bool {
         matches!(self.inner, MetalRequestStateInner::Qwen35(_))
     }
