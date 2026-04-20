@@ -605,13 +605,18 @@ fn metrics_emit_at_log_every() {
     }
 }
 
-/// Phase 4 (plan v1 §7): perplexity is derived from loss in the metric
-/// pipeline — `ppl == exp(loss)` on every training sample and `eval_ppl ==
-/// exp(eval_loss)` on every eval sample. Pins the derivation so downstream
-/// tooling can rely on it without doing the exp itself, and catches a
-/// future refactor that drops the field or wires it to the wrong source.
+/// Phase 4 (plan v1 §7): pins the **pipeline derivation** — the `ppl`
+/// field equals `exp(loss)` on every training sample and `eval_ppl`
+/// equals `exp(eval_loss)` on every eval sample, regardless of what the
+/// closure returns. This is a mechanical assertion about the metric
+/// plumbing, not a claim that `squared_mean_loss` is a cross-entropy in
+/// nats (it isn't). See the `StepOutcome` / `EvalOutcome` metric contract
+/// in `trainer.rs`: binaries that return non-CE scalars still get a
+/// numerically defined `ppl` field populated and should ignore it at
+/// the consumer. What this test catches: a future refactor that drops
+/// the field, reorders it, or wires `ppl` to the wrong source scalar.
 #[test]
-fn ppl_metric_equals_exp_of_loss_on_every_sample() {
+fn ppl_field_equals_exp_of_loss_field_in_metric_plumbing() {
     let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = VecSink {
         buf: Arc::clone(&buf),
