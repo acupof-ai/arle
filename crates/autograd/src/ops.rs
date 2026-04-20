@@ -42,7 +42,11 @@ pub(crate) use rope::rope_backward;
 pub(crate) use softmax::{log_softmax_backward, softmax_backward};
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.4: inner `activation::exp` dispatches on `dirty`; a Dirty::Device
+    // input stays lazy via `backend.exp` (MLX `mlx_exp`), while Dirty::Host
+    // / Dirty::Both take the eager host path. Stripping `ensure_host` here
+    // is the critical enabler — previously it forced a readback before the
+    // inner fn could see the device state.
     activation::exp(x, store, tape)
 }
 
