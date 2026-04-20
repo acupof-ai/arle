@@ -105,6 +105,21 @@ aligns them), eval_fn reads that cell — assertion now pins actual
 trainer.step at each eval boundary. Codex review 813d4f6 (Low)
 closed.
 
+Commit 13afa3f closes out Phase 3 by aligning `train_multi_turn.rs`
+to the shared CLI conventions — no Trainer migration (same
+rollout/ref_model/mid-step mean_sampled_kl mismatch with `step_fn`
+that kept train_grpo's GRPO phase hand-written; train_multi_turn is
+entirely that shape, so there's no SFT portion to migrate
+independently). +53/-10: deleted `GRAD_CLIP_NORM = 1.0` constant,
+added `--grad-clip <f32>`/`--no-grad-clip`/`--metrics-jsonl <path>`,
+wrapped `main` in the `ExitCode` pattern mirroring train_sft /
+train_grpo / pretrain_qwen3. Per-iter `mt iter N: ...` println
+replaced by a `MetricSample` emit through the shared sink (which
+tees to stdout when `tee=true`), giving structured JSONL output
+like `{"best_reward":0.125,"loss":..,"mean_kl":..,"mean_reward":..,"step":1}`.
+Codex reviews of 1a24db1 and 8c11856 both came back with no
+findings.
+
 Commit 813d4f6 plugs two regressions from the bd5e277 codex review:
 (1) **High** — multi-window eval in `pretrain_qwen3` cleared
 `tape.entries` per window but never pruned `TensorStore`, so
