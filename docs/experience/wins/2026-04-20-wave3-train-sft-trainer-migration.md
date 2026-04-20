@@ -16,21 +16,40 @@ Commit ad5568b then wired the remaining Phase 2 acceptance flags:
 `impl<T: LrSchedule + ?Sized> LrSchedule for Box<T>` blanket in autograd.
 
 Also landed mid-wave from codex review on 3d9125d, feae23b, bdde441,
-44a7e19, bd6c871, ad5568b: P1 tape/store cleanup hook, P2
-schedule-describe persistence, P3 NoClip returning true pre-clip norm,
-legacy-bare-schedule-name compat on resume, force-emit metrics on step 1
-\+ final, dropping the redundant `step` key from the metrics fields
-array, final-step force-save in the Trainer so runs that end between
-save boundaries still persist a resumable checkpoint, aligning
+44a7e19, bd6c871, ad5568b, 49512b1, d9eee61: P1 tape/store cleanup hook,
+P2 schedule-describe persistence, P3 NoClip returning true pre-clip
+norm, legacy-bare-schedule-name compat on resume, force-emit metrics on
+step 1 + final, dropping the redundant `step` key from the metrics
+fields array, final-step force-save in the Trainer so runs that end
+between save boundaries still persist a resumable checkpoint, aligning
 `train_sft`'s bf16 checkpoint directory to `step_{:06}` to share a dir
-with `trainer_state.json + optimizer.safetensors`, and the
-`--resume-from` weight-reload step (without which a resumed SFT run
-combined base `--model` weights with the resume dir's AdamW moments —
-a silently corrupt resume).
+with `trainer_state.json + optimizer.safetensors`, the `--resume-from`
+weight-reload step (without which a resumed SFT run combined base
+`--model` weights with the resume dir's AdamW moments — a silently
+corrupt resume), `SafetensorsRegistry::load_into_strict` +
+`validate_resume_config` to fail fast on partial/mismatched checkpoints
+instead of silently hybridising with base weights, and a stateless
+`sample_index(seed, step, micro_step)` derivation so resumed runs pick
+up the same data stream a single uninterrupted run would have produced
+(the prior `LcgRng` position was not persisted in the checkpoint codec).
+
+Phase 3 (this wins entry extended from Phase 2):
+
+Commit 6bd0211 migrates `pretrain.rs` — the simplest Phase 3 binary
+(~400 LOC, custom Transformer, no prior checkpoint support) — onto
+`Trainer<AdamW, PretrainClip, ConstantLr>`. A local `PretrainClip` enum
+wraps `NoClip` / `GlobalNorm` so `--grad-clip` and `--no-grad-clip`
+collapse to one concrete `C`. `--metrics-jsonl` joins the shared
+MetricSink path. Save/resume left wired to `None` pending a
+`TransformerRegistry` codec (the custom `Transformer` has no
+safetensors support yet; the hand-written loop also did not support
+it). Smoke: `--dataset copy --steps 10 --vocab-size 300` yields step=1
++ every-2 + final=10 log lines with `grad_norm`/`tok_per_sec`/`lr`
+fields populated and the expected decreasing loss.
 
 ## What Worked
 
-- 14 `test_trainer_loop` unit tests green covering step counts,
+- 15 `test_trainer_loop` unit tests green covering step counts,
   grad-accum, LR schedule wiring, metrics (both log_every + forced),
   save (including the new final-step force-save for
   `save_every=5 total_steps=7`), eval-side `step`-field omission,
