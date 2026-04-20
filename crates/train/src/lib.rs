@@ -1,3 +1,5 @@
+#[path = "causal_lm.rs"]
+pub mod causal_lm;
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
 #[path = "cli_args.rs"]
@@ -18,22 +20,26 @@ pub mod grad_clip;
 pub mod grpo;
 #[path = "hub_dataset.rs"]
 pub mod hub_dataset;
-#[path = "lora.rs"]
-pub mod lora;
 #[path = "loss.rs"]
 pub mod loss;
 #[path = "metrics.rs"]
 pub mod metrics;
-#[path = "model.rs"]
-pub mod model;
+#[path = "model_family.rs"]
+pub mod model_family;
 #[path = "multi_turn.rs"]
 pub mod multi_turn;
 #[path = "policy.rs"]
 pub mod policy;
+#[path = "policy_support.rs"]
+pub mod policy_support;
 #[path = "qwen3.rs"]
 pub mod qwen3;
-#[path = "qwen3_support.rs"]
-pub mod qwen3_support;
+#[path = "qwen35.rs"]
+pub mod qwen35;
+#[path = "qwen35_checkpoint.rs"]
+pub mod qwen35_checkpoint;
+#[path = "qwen3_checkpoint.rs"]
+pub mod qwen3_checkpoint;
 #[path = "reward.rs"]
 pub mod reward;
 #[path = "rollout.rs"]
@@ -53,6 +59,7 @@ pub mod trainer;
 #[path = "verifier.rs"]
 pub mod verifier;
 
+pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
 pub use metrics::*;
 pub use policy::{GrpoPolicy, GrpoPolicyConfig};

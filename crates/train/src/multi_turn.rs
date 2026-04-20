@@ -10,13 +10,12 @@
 //! position, forward the known prefix and sample from logits at
 //! (position - 1). Environment observations are written deterministically.
 
-use std::collections::HashSet;
-
-use autograd::{AutogradError, Result, Tape, TensorId, TensorStore};
+use autograd::{AutogradError, Result, Tape, TensorStore};
 
 use crate::{
     dataset::LcgRng,
     policy::{GrpoPolicy, GrpoPolicyConfig},
+    policy_support::retained_ids,
     rollout::Trajectory,
     sampling::{log_prob_at_index, sample_categorical},
 };
@@ -164,7 +163,7 @@ where
                 old_log_probs[position] = sampled_log_probs[0];
                 response_mask[position] = true;
 
-                let keep = retained_ids(policy, ref_model, store);
+                let keep = retained_ids(&[policy, ref_model], store);
                 store.retain_ids(&keep);
             }
             turn_boundaries.push((agent_start, agent_end));
@@ -226,27 +225,8 @@ where
     };
     episode.reward = verifier(&episode);
 
-    let keep = retained_ids(policy, ref_model, store);
+    let keep = retained_ids(&[policy, ref_model], store);
     store.retain_ids(&keep);
 
     Ok(episode)
-}
-
-fn retained_ids(
-    policy: &impl GrpoPolicy,
-    ref_model: &impl GrpoPolicy,
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = HashSet::new();
-    for param_id in policy
-        .all_parameter_ids()
-        .into_iter()
-        .chain(ref_model.all_parameter_ids())
-    {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
 }

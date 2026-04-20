@@ -9,6 +9,13 @@ Current train control-plane truth: `crates/train` owns the active
 training server, surfaced by `train_multi_turn --serve`; the
 `infer/src/http_server/train.rs` `/v1/train/*` surface is the target
 unified entrypoint, not the current implementation.
+Current train-side model reality is a generic Qwen-family control plane
+with Qwen3.5 as the optimized default: `train_sft` and `train_grpo`
+dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` already
+runs on the dense/full-attn Qwen3.5 path, checkpoints are written as
+HF-style directories, the handwritten Transformer/TinyLM runtime
+compatibility path has been deleted, GSPO has not landed, and the hybrid
+linear-attn Qwen3.5 train path has not landed yet.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -38,8 +45,10 @@ Current workspace members:
 - `crates/chat`
 - `crates/cli`
 - `crates/tools`
+- `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
+- `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
-- `crates/train` (Phase 6 — LoRA + GRPO RL trainer, train-side server exposed by `train_multi_turn --serve`; depends on `autograd`)
+- `crates/train` (Phase 6 — generic Qwen-family SFT/GRPO trainer, train-side server exposed by `train_multi_turn --serve`; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs; depends on `autograd`)
 
 ## 2. Main execution paths
 
@@ -119,7 +128,7 @@ not the current repository surface.
 
 Key files:
 
-- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint; `--serve` starts the train-side control plane
+- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint on the Qwen3.5-family dense/full-attn path; `--serve` starts the train-side control plane
 - `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|stop|save`
 - `crates/train/src/control.rs`: shared controller / status state used by the server thread and trainer loop
 

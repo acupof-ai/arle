@@ -24,16 +24,18 @@ use autograd::{
     Tape, TensorId, TensorStore, optim::AdamW,
 };
 use qwen3_spec::Qwen3Config;
-use serde_json::json;
 use thiserror::Error;
 use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
-    checkpoint::publish_latest_after_weights,
+    causal_lm::{build_registry, live_tensor_ids, trainable_params},
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
     qwen3::{Qwen3Error, Qwen3Model},
-    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
+    qwen3_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen3CheckpointError, Qwen3StepCheckpoint,
+        save_step_checkpoint,
+    },
     tokenizer::ChatTokenizer,
     trainer::cross_entropy_loss,
 };
@@ -199,6 +201,8 @@ enum CliError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Qwen3Checkpoint(#[from] Qwen3CheckpointError),
     #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
     #[error(transparent)]
@@ -853,52 +857,35 @@ fn save_checkpoint(
     eos_token_id: u32,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    // DX-1: zero-padded 6-digit to match Trainer::save_checkpoint and
-    // train_sft::save_checkpoint_via_registry. Consistent padding makes
-    // resume-path lookup a single glob + lex-max pattern instead of
-    // per-binary branches.
-    let step_basename = format!("step_{step:06}");
-    let step_dir = out_dir.join(&step_basename);
-    fs::create_dir_all(&step_dir)?;
-
-    let config_json = json!({
-        "architectures": ["Qwen3ForCausalLM"],
-        "model_type": "qwen3",
-        "hidden_size": cfg.hidden_size,
-        "intermediate_size": cfg.intermediate_size,
-        "num_hidden_layers": cfg.num_hidden_layers,
-        "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_key_value_heads,
-        "head_dim": cfg.head_dim,
-        "vocab_size": cfg.vocab_size,
-        "rms_norm_eps": cfg.rms_norm_eps,
-        "rope_theta": cfg.rope_theta,
-        "bos_token_id": bos_token_id,
-        "eos_token_id": eos_token_id,
-        "tie_word_embeddings": cfg.tie_word_embeddings,
-        "max_position_embeddings": cfg.max_position_embeddings,
-        "torch_dtype": match save_dtype { SaveDtype::F32 => "float32", SaveDtype::Bf16 => "bfloat16" },
-    });
-    fs::write(
-        step_dir.join("config.json"),
-        serde_json::to_string_pretty(&config_json)?,
+    let torch_dtype = match save_dtype {
+        SaveDtype::F32 => "float32",
+        SaveDtype::Bf16 => "bfloat16",
+    };
+    let step_dir = save_step_checkpoint(
+        Qwen3StepCheckpoint {
+            out_dir,
+            step,
+            tokenizer_path: Some(tokenizer_path),
+            config_json: ConfigJsonSource::Synthesize {
+                cfg,
+                bos_token_id,
+                eos_token_id,
+                torch_dtype,
+            },
+            generation_config: GenerationConfigSource::Synthesize {
+                bos_token_id,
+                eos_token_id,
+            },
+        },
+        |weights_path| match save_dtype {
+            SaveDtype::F32 => registry
+                .save_from(store, weights_path)
+                .map_err(Qwen3CheckpointError::from),
+            SaveDtype::Bf16 => registry
+                .save_from_bf16(store, weights_path)
+                .map_err(Qwen3CheckpointError::from),
+        },
     )?;
-    fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
-    write_generation_config(&step_dir, bos_token_id, eos_token_id)?;
-
-    let weights_path = step_dir.join("model.safetensors");
-    match save_dtype {
-        SaveDtype::F32 => registry.save_from(store, &weights_path)?,
-        SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
-    }
-    // DX-1: refresh `<out>/latest` symlink after weights write so the
-    // just-written step becomes directly addressable for `infer` / resume.
-    // `publish_latest_after_weights` asserts `model.safetensors` exists in
-    // `step_dir` before flipping the symlink — codifies the publish-last
-    // contract so a future refactor that moves this call above the weight
-    // write (or drops it) would fail a targeted unit test instead of silently
-    // exposing an incomplete checkpoint dir.
-    publish_latest_after_weights(out_dir, &step_basename)?;
 
     println!(
         "[pretrain_qwen3] saved step {} to {} (dtype: {:?})",
@@ -907,41 +894,4 @@ fn save_checkpoint(
         save_dtype
     );
     Ok(())
-}
-
-fn write_generation_config(
-    step_dir: &Path,
-    bos_token_id: u32,
-    eos_token_id: u32,
-) -> Result<(), CliError> {
-    let mut eos_token_ids = vec![eos_token_id];
-    if bos_token_id != eos_token_id {
-        eos_token_ids.push(bos_token_id);
-    }
-    let generation_config = json!({
-        "eos_token_id": eos_token_ids,
-    });
-    fs::write(
-        step_dir.join("generation_config.json"),
-        serde_json::to_string_pretty(&generation_config)?,
-    )?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn generation_config_is_written_with_stop_tokens() {
-        let tmp = tempdir().expect("tempdir");
-        write_generation_config(tmp.path(), 151_643, 151_645).expect("write generation config");
-
-        let value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(tmp.path().join("generation_config.json")).expect("read file"),
-        )
-        .expect("parse generation config");
-        assert_eq!(value["eos_token_id"], json!([151_645, 151_643]));
-    }
 }

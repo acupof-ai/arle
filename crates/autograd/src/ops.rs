@@ -29,12 +29,12 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-pub(crate) use activation::{exp_backward, gelu_backward, silu_backward};
+pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use gather::gather_last_dim_backward;
-pub(crate) use layout::{reshape_backward, transpose_backward};
+pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
 pub(crate) use matmul::matmul_backward;
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
@@ -54,6 +54,11 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_host(x)?;
     activation::silu(x, store, tape)
+}
+
+pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_host(x)?;
+    activation::sigmoid(x, store, tape)
 }
 
 pub fn repeat_kv(
@@ -148,6 +153,17 @@ pub fn transpose(
 ) -> Result<TensorId> {
     store.ensure_host(x)?;
     layout::transpose(x, axis1, axis2, store, tape)
+}
+
+pub fn slice(
+    x: TensorId,
+    starts: &[usize],
+    ends: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_host(x)?;
+    layout::slice(x, starts, ends, store, tape)
 }
 
 pub fn matmul(

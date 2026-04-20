@@ -1677,6 +1677,7 @@ dependencies = [
  "nixl-sys",
  "postcard",
  "qwen3-spec",
+ "qwen35-spec",
  "rand 0.10.0",
  "safetensors",
  "serde",
@@ -2729,6 +2730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen35-spec"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3746,6 +3757,7 @@ dependencies = [
  "chat",
  "hf-hub",
  "qwen3-spec",
+ "qwen35-spec",
  "safetensors",
  "serde",
  "serde_json",

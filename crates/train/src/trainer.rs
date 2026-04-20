@@ -644,8 +644,8 @@ fn wrap_checkpoint_err(err: CheckpointError) -> AutogradError {
 /// micro-batch, then prune the store down to `keep_extra ∪ params ∪ grads`.
 ///
 /// Matches the `tape.entries.clear(); tape.set_enabled(true);
-/// store.retain_ids(...)` idiom used across the hand-written training
-/// binaries (`pretrain.rs`, `train_sft.rs`, `train_grpo.rs`, …).
+/// store.retain_ids(...)` idiom used across the historic hand-written
+/// training loops before the shared trainer/runtime factoring landed.
 ///
 /// Exposed `pub` so eval closures that produce multi-forward activations
 /// (e.g. `pretrain_qwen3`'s `--eval-windows N` loop) can prune the store
@@ -662,11 +662,27 @@ pub fn cleanup_after_backward(
     tape.entries.clear();
     tape.set_enabled(true);
     let mut keep = keep_extra.clone();
-    for &param_id in params {
+    extend_keep_with_params_and_grads(&mut keep, params.iter().copied(), store);
+    store.retain_ids(&keep);
+}
+
+pub fn retained_param_and_grad_ids(params: &[TensorId], store: &TensorStore) -> HashSet<TensorId> {
+    let mut keep = HashSet::with_capacity(params.len() * 2);
+    extend_keep_with_params_and_grads(&mut keep, params.iter().copied(), store);
+    keep
+}
+
+pub fn extend_keep_with_params_and_grads<I>(
+    keep: &mut HashSet<TensorId>,
+    params: I,
+    store: &TensorStore,
+) where
+    I: IntoIterator<Item = TensorId>,
+{
+    for param_id in params {
         keep.insert(param_id);
         if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
             keep.insert(grad_id);
         }
     }
-    store.retain_ids(&keep);
 }

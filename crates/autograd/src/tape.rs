@@ -40,6 +40,9 @@ pub enum SavedContext {
     SiluCtx {
         x: TensorId,
     },
+    SigmoidCtx {
+        y: TensorId,
+    },
     GeluCtx {
         x: TensorId,
     },
@@ -49,6 +52,11 @@ pub enum SavedContext {
     },
     ReshapeCtx {
         input_shape: Vec<usize>,
+    },
+    SliceCtx {
+        input_shape: Vec<usize>,
+        starts: Vec<usize>,
+        ends: Vec<usize>,
     },
     TransposeCtx {
         axis1: usize,
@@ -78,9 +86,11 @@ pub enum BackwardOp {
     Mean,
     RMSNorm,
     Silu,
+    Sigmoid,
     Gelu,
     RoPE,
     Reshape,
+    Slice,
     Transpose,
     AddBroadcast,
     Embedding,
@@ -202,9 +212,11 @@ impl Tape {
                     BackwardOp::Mean => ops::mean_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RMSNorm => ops::rmsnorm_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Silu => ops::silu_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Sigmoid => ops::sigmoid_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RoPE => ops::rope_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Transpose => {
                         ops::transpose_backward(&entry, output_grad_id, store)?
                     }

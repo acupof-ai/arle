@@ -11,16 +11,24 @@ use autograd::{
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
-use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
-use serde_json::json;
 use thiserror::Error;
 use train::{
-    StepOutcome, Trainer, TrainerConfig,
-    checkpoint::publish_latest_after_weights,
+    CausalLm, GrpoPolicy, GrpoPolicyConfig, StepOutcome, Trainer, TrainerConfig,
+    causal_lm::{build_registry, live_tensor_ids, trainable_params},
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
-    qwen3::{Qwen3Error, Qwen3Model},
-    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
+    model_family::{ModelFamily, ModelFamilyError, resolve_model_family},
+    qwen3::{Qwen3Config, Qwen3ConfigError, Qwen3Error, Qwen3Model},
+    qwen3_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen3CheckpointError, Qwen3StepCheckpoint,
+        save_step_checkpoint,
+    },
+    qwen35::{Qwen35Config, Qwen35ConfigError, Qwen35Error, Qwen35Model},
+    qwen35_checkpoint::{
+        ConfigJsonSource as Qwen35ConfigJsonSource,
+        GenerationConfigSource as Qwen35GenerationConfigSource, Qwen35CheckpointError,
+        Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
+    },
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -72,6 +80,7 @@ impl FromStr for SaveDtype {
 
 #[derive(Debug, Clone)]
 struct CliArgs {
+    model_family: ModelFamily,
     model: PathBuf,
     data: PathBuf,
     out: PathBuf,
@@ -96,6 +105,7 @@ struct CliArgs {
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
+            model_family: ModelFamily::Auto,
             model: PathBuf::new(),
             data: PathBuf::new(),
             out: PathBuf::new(),
@@ -125,13 +135,133 @@ enum CliError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
+    Qwen3Checkpoint(#[from] Qwen3CheckpointError),
+    #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
     #[error(transparent)]
     Qwen3Config(#[from] Qwen3ConfigError),
     #[error(transparent)]
+    Qwen35Checkpoint(#[from] Qwen35CheckpointError),
+    #[error(transparent)]
+    Qwen35(#[from] Qwen35Error),
+    #[error(transparent)]
+    Qwen35Config(#[from] Qwen35ConfigError),
+    #[error(transparent)]
+    ModelFamily(#[from] ModelFamilyError),
+    #[error(transparent)]
     Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
+}
+
+trait SftFamily {
+    type Config: train::GrpoPolicyConfig + Clone;
+    type Model: CausalLm<Config = Self::Config>;
+
+    fn family_name() -> &'static str;
+    fn load_config(config_path: &Path) -> Result<Self::Config, CliError>;
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError>;
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError>;
+    fn save_checkpoint(
+        model_dir: &Path,
+        out_dir: &Path,
+        step: usize,
+        registry: &SafetensorsRegistry,
+        store: &mut TensorStore,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        save_dtype: SaveDtype,
+    ) -> Result<(), CliError>;
+}
+
+struct Qwen3Family;
+
+impl SftFamily for Qwen3Family {
+    type Config = Qwen3Config;
+    type Model = Qwen3Model;
+
+    fn family_name() -> &'static str {
+        "qwen3"
+    }
+
+    fn load_config(config_path: &Path) -> Result<Self::Config, CliError> {
+        Qwen3Config::from_json_file(config_path).map_err(Into::into)
+    }
+
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
+        Qwen3Model::new(cfg, store).map_err(Into::into)
+    }
+
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
+        validate_qwen3_resume_config(resume_dir, cfg)
+    }
+
+    fn save_checkpoint(
+        model_dir: &Path,
+        out_dir: &Path,
+        step: usize,
+        registry: &SafetensorsRegistry,
+        store: &mut TensorStore,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        save_dtype: SaveDtype,
+    ) -> Result<(), CliError> {
+        save_qwen3_checkpoint_via_registry(
+            model_dir,
+            out_dir,
+            step,
+            registry,
+            store,
+            config_path,
+            tokenizer_path,
+            save_dtype,
+        )
+    }
+}
+
+struct Qwen35Family;
+
+impl SftFamily for Qwen35Family {
+    type Config = Qwen35Config;
+    type Model = Qwen35Model;
+
+    fn family_name() -> &'static str {
+        "qwen35"
+    }
+
+    fn load_config(config_path: &Path) -> Result<Self::Config, CliError> {
+        Qwen35Config::from_json_file(config_path).map_err(Into::into)
+    }
+
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
+        Qwen35Model::new(cfg, store).map_err(Into::into)
+    }
+
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
+        validate_qwen35_resume_config(resume_dir, cfg)
+    }
+
+    fn save_checkpoint(
+        model_dir: &Path,
+        out_dir: &Path,
+        step: usize,
+        registry: &SafetensorsRegistry,
+        store: &mut TensorStore,
+        config_path: &Path,
+        tokenizer_path: &Path,
+        save_dtype: SaveDtype,
+    ) -> Result<(), CliError> {
+        save_qwen35_checkpoint_via_registry(
+            model_dir,
+            out_dir,
+            step,
+            registry,
+            store,
+            config_path,
+            tokenizer_path,
+            save_dtype,
+        )
+    }
 }
 
 fn main() -> ExitCode {
@@ -151,9 +281,18 @@ fn main() -> ExitCode {
 fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
+    let config_path = args.model.join("config.json");
+
+    match resolve_model_family(&config_path, args.model_family)? {
+        ModelFamily::Qwen35 => run_with_family::<Qwen35Family>(&args, &config_path),
+        ModelFamily::Qwen3 => run_with_family::<Qwen3Family>(&args, &config_path),
+        ModelFamily::Auto => unreachable!("auto must resolve to a concrete family"),
+    }
+}
+
+fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(), CliError> {
     fs::create_dir_all(&args.out)?;
 
-    let config_path = args.model.join("config.json");
     let tokenizer_path = args.model.join("tokenizer.json");
     let weights_path = args.model.join("model.safetensors");
     let shard_index = args.model.join("model.safetensors.index.json");
@@ -167,19 +306,20 @@ fn run() -> Result<(), CliError> {
         ));
     }
 
-    let cfg = Qwen3Config::from_json_file(&config_path).map_err(Qwen3Error::from)?;
+    let cfg = F::load_config(config_path)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let mut store = TensorStore::with_backend(build_backend(args.backend)?);
-    let model = Qwen3Model::new(&cfg, &mut store)?;
+    let model = F::build_model(&cfg, &mut store)?;
     let mut registry = build_registry(&model);
     registry.load_into(&mut store, &weights_path)?;
 
     let model_ids = live_tensor_ids(&store);
     let params = trainable_params(&model, &store);
     if params.is_empty() {
-        return Err(CliError::Custom(
-            "qwen3 model exposed no trainable parameters".into(),
-        ));
+        return Err(CliError::Custom(format!(
+            "{} model exposed no trainable parameters",
+            F::family_name()
+        )));
     }
     let param_names = model
         .param_name_map()
@@ -287,7 +427,7 @@ fn run() -> Result<(), CliError> {
                 resume_dir.display(),
             )));
         }
-        validate_resume_config(resume_dir, &cfg)?;
+        F::validate_resume_config(resume_dir, &cfg)?;
         registry.load_into_strict(&mut store, &resume_weights)?;
         let resumed = trainer
             .resume_if_configured(&param_names)
@@ -316,7 +456,6 @@ fn run() -> Result<(), CliError> {
     // step/micro_idx is a natural resume cursor: a resumed run picks up
     // the same sequence it would have seen in a single uninterrupted run.
     let model_ref = &model;
-    let cfg_ref = &cfg;
     let dataset_ref = &dataset;
     let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
         let example_index =
@@ -324,20 +463,18 @@ fn run() -> Result<(), CliError> {
         let example = &dataset_ref[example_index];
         let input_len = example.input_ids.len() - 1;
         let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
-        let logits = model_ref
-            .forward(
-                ctx.store,
-                ctx.tape,
-                &example.input_ids[..input_len],
-                &position_ids,
-            )
-            .map_err(autograd_from_qwen3)?;
+        let logits = model_ref.forward_with_positions(
+            ctx.store,
+            ctx.tape,
+            &example.input_ids[..input_len],
+            &position_ids,
+        )?;
         let loss_id = assistant_masked_causal_loss(
             logits,
             &example.labels[1..],
             ctx.store,
             ctx.tape,
-            cfg_ref,
+            model_ref.config().vocab_size(),
         )?;
         Ok(StepOutcome {
             loss_id,
@@ -350,7 +487,7 @@ fn run() -> Result<(), CliError> {
     // pre-migration behavior byte-for-byte.
     let model_path = args.model.clone();
     let out_path = args.out.clone();
-    let cfg_path = config_path.clone();
+    let cfg_path = config_path;
     let tok_path = tokenizer_path.clone();
     let registry_ref = &registry;
     let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
@@ -360,13 +497,13 @@ fn run() -> Result<(), CliError> {
         // that the Trainer just populated with `trainer_state.json +
         // optimizer.safetensors`. Keep the two gates in sync.
         if step_usize.is_multiple_of(save_every) || step_usize == total_steps {
-            save_checkpoint_via_registry(
+            F::save_checkpoint(
                 &model_path,
                 &out_path,
                 step_usize,
                 registry_ref,
                 store,
-                &cfg_path,
+                cfg_path,
                 &tok_path,
                 save_dtype,
             )
@@ -395,6 +532,11 @@ fn parse_args() -> Result<CliArgs, CliError> {
     let mut iter = env::args().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
+            "--model-family" => {
+                args.model_family = next_value(&mut iter, &flag)?
+                    .parse()
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
+            }
             "--model" => args.model = PathBuf::from(next_value(&mut iter, &flag)?),
             "--data" => args.data = PathBuf::from(next_value(&mut iter, &flag)?),
             "--out" => args.out = PathBuf::from(next_value(&mut iter, &flag)?),
@@ -500,7 +642,7 @@ fn assistant_masked_causal_loss(
     labels: &[i32],
     store: &mut TensorStore,
     tape: &mut Tape,
-    cfg: &Qwen3Config,
+    vocab_size: usize,
 ) -> autograd::Result<TensorId> {
     let logits_shape = store
         .get(logits)
@@ -529,11 +671,10 @@ fn assistant_masked_causal_loss(
     let mut gather_indices: Vec<usize> = Vec::with_capacity(labels.len());
     for &label in labels {
         let idx = match usize::try_from(label) {
-            Ok(index) if index < cfg.vocab_size => index,
+            Ok(index) if index < vocab_size => index,
             Ok(index) => {
                 return Err(leak_autograd_err(format!(
-                    "train_sft: label {index} is outside vocab size {}",
-                    cfg.vocab_size
+                    "train_sft: label {index} is outside vocab size {vocab_size}",
                 )));
             }
             Err(_) => 0,
@@ -565,10 +706,6 @@ fn leak_autograd_err(msg: String) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(msg.into_boxed_str()))
 }
 
-fn autograd_from_qwen3(err: Qwen3Error) -> AutogradError {
-    leak_autograd_err(format!("train_sft: qwen3 forward: {err}"))
-}
-
 fn autograd_from_cli(err: CliError) -> AutogradError {
     leak_autograd_err(format!("train_sft: checkpoint save: {err}"))
 }
@@ -585,7 +722,7 @@ fn autograd_from_cli(err: CliError) -> AutogradError {
 /// function is meant to close. Older checkpoints that need to resume
 /// can regenerate their `config.json` from the live `Qwen3Config` and
 /// drop it into the resume dir.
-fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), CliError> {
+fn validate_qwen3_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), CliError> {
     let cfg_path = resume_dir.join("config.json");
     if !cfg_path.exists() {
         return Err(CliError::Custom(format!(
@@ -628,18 +765,19 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
     if let Some(saw) = file_cfg
         .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
-        && saw != cfg.tie_word_embeddings
     {
-        mismatches.push(format!(
-            "tie_word_embeddings: ckpt={saw} live={}",
-            cfg.tie_word_embeddings
-        ));
+        if saw != cfg.tie_word_embeddings {
+            mismatches.push(format!(
+                "tie_word_embeddings: ckpt={saw} live={}",
+                cfg.tie_word_embeddings
+            ));
+        }
     }
 
-    if let Some(seen) = file_cfg.get("rope_theta").and_then(|v| v.as_f64())
-        && seen != cfg.rope_theta as f64
-    {
-        mismatches.push(format!("rope_theta: ckpt={seen} live={}", cfg.rope_theta));
+    if let Some(seen) = file_cfg.get("rope_theta").and_then(|v| v.as_f64()) {
+        if seen != cfg.rope_theta as f64 {
+            mismatches.push(format!("rope_theta: ckpt={seen} live={}", cfg.rope_theta));
+        }
     }
 
     if !mismatches.is_empty() {
@@ -652,7 +790,114 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
     Ok(())
 }
 
-fn save_checkpoint_via_registry(
+fn validate_qwen35_resume_config(resume_dir: &Path, cfg: &Qwen35Config) -> Result<(), CliError> {
+    let cfg_path = resume_dir.join("config.json");
+    if !cfg_path.exists() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no config.json; refuse to resume without a config-match check",
+            resume_dir.display()
+        )));
+    }
+    let file_cfg = Qwen35Config::from_json_file(&cfg_path).map_err(|err| {
+        CliError::Custom(format!(
+            "resume config {} does not parse as qwen3.5-family: {err}",
+            cfg_path.display()
+        ))
+    })?;
+
+    let mut mismatches = Vec::new();
+    for (name, live, seen) in [
+        ("hidden_size", cfg.hidden_size, file_cfg.hidden_size),
+        (
+            "intermediate_size",
+            cfg.intermediate_size,
+            file_cfg.intermediate_size,
+        ),
+        (
+            "num_hidden_layers",
+            cfg.num_hidden_layers,
+            file_cfg.num_hidden_layers,
+        ),
+        (
+            "num_attention_heads",
+            cfg.num_attention_heads,
+            file_cfg.num_attention_heads,
+        ),
+        (
+            "num_key_value_heads",
+            cfg.num_key_value_heads,
+            file_cfg.num_key_value_heads,
+        ),
+        ("head_dim", cfg.head_dim, file_cfg.head_dim),
+        ("vocab_size", cfg.vocab_size, file_cfg.vocab_size),
+        (
+            "linear_num_key_heads",
+            cfg.linear_num_key_heads,
+            file_cfg.linear_num_key_heads,
+        ),
+        (
+            "linear_key_head_dim",
+            cfg.linear_key_head_dim,
+            file_cfg.linear_key_head_dim,
+        ),
+        (
+            "linear_num_value_heads",
+            cfg.linear_num_value_heads,
+            file_cfg.linear_num_value_heads,
+        ),
+        (
+            "linear_value_head_dim",
+            cfg.linear_value_head_dim,
+            file_cfg.linear_value_head_dim,
+        ),
+        (
+            "linear_conv_kernel_dim",
+            cfg.linear_conv_kernel_dim,
+            file_cfg.linear_conv_kernel_dim,
+        ),
+    ] {
+        if live != seen {
+            mismatches.push(format!("{name}: ckpt={seen} live={live}"));
+        }
+    }
+    if cfg.tie_word_embeddings != file_cfg.tie_word_embeddings {
+        mismatches.push(format!(
+            "tie_word_embeddings: ckpt={} live={}",
+            file_cfg.tie_word_embeddings, cfg.tie_word_embeddings
+        ));
+    }
+    if cfg.rope_theta != file_cfg.rope_theta {
+        mismatches.push(format!(
+            "rope_theta: ckpt={} live={}",
+            file_cfg.rope_theta, cfg.rope_theta
+        ));
+    }
+    if cfg.partial_rotary_factor != file_cfg.partial_rotary_factor {
+        mismatches.push(format!(
+            "partial_rotary_factor: ckpt={} live={}",
+            file_cfg.partial_rotary_factor, cfg.partial_rotary_factor
+        ));
+    }
+    if cfg.rope_cache_len_hint != file_cfg.rope_cache_len_hint {
+        mismatches.push(format!(
+            "rope_cache_len_hint: ckpt={:?} live={:?}",
+            file_cfg.rope_cache_len_hint, cfg.rope_cache_len_hint
+        ));
+    }
+    if cfg.layer_types != file_cfg.layer_types {
+        mismatches.push("layer_types mismatch".to_string());
+    }
+    if !mismatches.is_empty() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} config mismatch with --model: {}",
+            resume_dir.display(),
+            mismatches.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn save_qwen3_checkpoint_via_registry(
     model_dir: &Path,
     out_dir: &Path,
     step: usize,
@@ -662,33 +907,24 @@ fn save_checkpoint_via_registry(
     tokenizer_path: &Path,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    // Zero-padded 6-digit format matches the Trainer's own save_checkpoint
-    // path (`step_{:06}`), so the bf16 weights file lands next to
-    // `trainer_state.json + optimizer.safetensors` in a single directory —
-    // required for `--resume-from` to roundtrip correctly (codex review
-    // 2026-04-20 on ad5568b, P1).
-    let step_basename = format!("step_{step:06}");
-    let step_dir = out_dir.join(&step_basename);
-    fs::create_dir_all(&step_dir)?;
-    fs::copy(config_path, step_dir.join("config.json"))?;
-    fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
-    write_generation_config(model_dir, config_path, &step_dir)?;
-    let weights_path = step_dir.join("model.safetensors");
-    match save_dtype {
-        SaveDtype::F32 => registry.save_from(store, &weights_path)?,
-        SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
-    }
-
-    // DX-1: refresh `<out>/latest` symlink so `infer --model-path <out>/latest`
-    // and `--resume-from <out>/latest` address the newest checkpoint without
-    // the caller reading directory listings. Trainer::save_checkpoint runs
-    // *first* in `on_step_end` and intentionally does NOT publish `latest`
-    // (that would expose a half-written dir without model.safetensors yet).
-    // `publish_latest_after_weights` asserts the weight file exists before
-    // flipping the symlink, so a future refactor that reorders these calls
-    // fails the targeted unit test in checkpoint.rs instead of silently
-    // publishing an incomplete checkpoint.
-    publish_latest_after_weights(out_dir, &step_basename)?;
+    let step_dir = save_step_checkpoint(
+        Qwen3StepCheckpoint {
+            out_dir,
+            step,
+            tokenizer_path: Some(tokenizer_path),
+            config_json: ConfigJsonSource::CopyFrom(config_path),
+            generation_config: GenerationConfigSource::CopyOrSynthesize {
+                source_path: &model_dir.join("generation_config.json"),
+                fallback_config_path: config_path,
+            },
+        },
+        |weights_path| match save_dtype {
+            SaveDtype::F32 => registry.save_from(store, weights_path).map_err(Into::into),
+            SaveDtype::Bf16 => registry
+                .save_from_bf16(store, weights_path)
+                .map_err(Into::into),
+        },
+    )?;
 
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
@@ -700,50 +936,42 @@ fn save_checkpoint_via_registry(
     Ok(())
 }
 
-fn write_generation_config(
+fn save_qwen35_checkpoint_via_registry(
     model_dir: &Path,
+    out_dir: &Path,
+    step: usize,
+    registry: &SafetensorsRegistry,
+    store: &mut TensorStore,
     config_path: &Path,
-    step_dir: &Path,
+    tokenizer_path: &Path,
+    save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let target = step_dir.join("generation_config.json");
-    let source = model_dir.join("generation_config.json");
-    if source.is_file() {
-        fs::copy(source, target)?;
-        return Ok(());
-    }
-
-    let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(config_path)?)
-        .map_err(|e| CliError::Custom(format!("save checkpoint config parse error: {e}")))?;
-    let bos_token_id = config
-        .get("bos_token_id")
-        .and_then(|value| value.as_u64())
-        .ok_or_else(|| {
-            CliError::Custom(format!(
-                "source config {} is missing bos_token_id",
-                config_path.display()
-            ))
-        })?;
-    let eos_token_id = config
-        .get("eos_token_id")
-        .and_then(|value| value.as_u64())
-        .ok_or_else(|| {
-            CliError::Custom(format!(
-                "source config {} is missing eos_token_id",
-                config_path.display()
-            ))
-        })?;
-
-    let mut eos_token_ids = vec![eos_token_id];
-    if bos_token_id != eos_token_id {
-        eos_token_ids.push(bos_token_id);
-    }
-    fs::write(
-        target,
-        serde_json::to_string_pretty(&json!({
-            "eos_token_id": eos_token_ids,
-        }))
-        .map_err(|e| CliError::Custom(format!("save checkpoint generation_config json: {e}")))?,
+    let step_dir = save_qwen35_step_checkpoint(
+        Qwen35StepCheckpoint {
+            out_dir,
+            step,
+            tokenizer_path: Some(tokenizer_path),
+            config_json: Qwen35ConfigJsonSource::CopyFrom(config_path),
+            generation_config: Qwen35GenerationConfigSource::CopyOrSynthesize {
+                source_path: &model_dir.join("generation_config.json"),
+                fallback_config_path: config_path,
+            },
+        },
+        |weights_path| match save_dtype {
+            SaveDtype::F32 => registry.save_from(store, weights_path).map_err(Into::into),
+            SaveDtype::Bf16 => registry
+                .save_from_bf16(store, weights_path)
+                .map_err(Into::into),
+        },
     )?;
+
+    println!(
+        "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
+        step,
+        step_dir.display(),
+        model_dir.display(),
+        save_dtype
+    );
     Ok(())
 }
 
@@ -779,6 +1007,7 @@ fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn resume_cfg() -> Qwen3Config {
@@ -819,65 +1048,13 @@ mod tests {
     }
 
     #[test]
-    fn generation_config_is_copied_when_present() {
-        let tmp = tempdir().expect("tempdir");
-        let model_dir = tmp.path().join("model");
-        let step_dir = tmp.path().join("step");
-        fs::create_dir_all(&model_dir).expect("create model dir");
-        fs::create_dir_all(&step_dir).expect("create step dir");
-        fs::write(
-            model_dir.join("generation_config.json"),
-            r#"{"eos_token_id":[7,3]}"#,
-        )
-        .expect("write generation config");
-        fs::write(
-            model_dir.join("config.json"),
-            r#"{"bos_token_id":3,"eos_token_id":7}"#,
-        )
-        .expect("write config");
-        fs::write(step_dir.join("dummy"), "").expect("touch step dir");
-
-        write_generation_config(&model_dir, &model_dir.join("config.json"), &step_dir)
-            .expect("copy generation config");
-
-        let copied: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(step_dir.join("generation_config.json")).expect("read file"),
-        )
-        .expect("parse generation config");
-        assert_eq!(copied["eos_token_id"], json!([7, 3]));
-    }
-
-    #[test]
-    fn generation_config_falls_back_to_config_tokens_when_missing() {
-        let tmp = tempdir().expect("tempdir");
-        let model_dir = tmp.path().join("model");
-        let step_dir = tmp.path().join("step");
-        fs::create_dir_all(&model_dir).expect("create model dir");
-        fs::create_dir_all(&step_dir).expect("create step dir");
-        fs::write(
-            model_dir.join("config.json"),
-            r#"{"bos_token_id":3,"eos_token_id":7}"#,
-        )
-        .expect("write config");
-
-        write_generation_config(&model_dir, &model_dir.join("config.json"), &step_dir)
-            .expect("synthesize generation config");
-
-        let generated: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(step_dir.join("generation_config.json")).expect("read file"),
-        )
-        .expect("parse generation config");
-        assert_eq!(generated["eos_token_id"], json!([7, 3]));
-    }
-
-    #[test]
     fn validate_resume_config_accepts_matching_config() {
         let tmp = tempdir().expect("tempdir");
         let resume_dir = tmp.path();
         let cfg = resume_cfg();
         write_resume_config(resume_dir, &cfg);
 
-        validate_resume_config(resume_dir, &cfg).expect("matching config should pass");
+        validate_qwen3_resume_config(resume_dir, &cfg).expect("matching config should pass");
     }
 
     #[test]
@@ -892,7 +1069,7 @@ mod tests {
             ..cfg
         };
 
-        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        let err = validate_qwen3_resume_config(resume_dir, &live_cfg).expect_err("should reject");
         assert!(
             err.to_string().contains("max_position_embeddings"),
             "unexpected error: {err}"
@@ -911,7 +1088,7 @@ mod tests {
             ..cfg
         };
 
-        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        let err = validate_qwen3_resume_config(resume_dir, &live_cfg).expect_err("should reject");
         assert!(
             err.to_string().contains("rope_theta"),
             "unexpected error: {err}"

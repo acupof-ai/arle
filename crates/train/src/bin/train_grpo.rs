@@ -12,13 +12,17 @@ use train::{
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     loss::cross_entropy_loss,
+    model_family::{ModelFamily, synthetic_qwen3_config, synthetic_qwen35_dense_config},
+    policy::{GrpoPolicy, GrpoPolicyConfig},
+    policy_support::{retained_ids, trainable_param_ids},
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
-    qwen3_support::trainable_params,
+    qwen35::{Qwen35Config, Qwen35Error, Qwen35Model},
     rollout::rollout_group,
 };
 
 #[derive(Debug, Clone)]
 struct CliArgs {
+    model_family: ModelFamily,
     sft_steps: usize,
     grpo_iters: usize,
     batch_prompts: usize,
@@ -35,6 +39,7 @@ struct CliArgs {
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
+            model_family: ModelFamily::Qwen35,
             sft_steps: 30,
             grpo_iters: 20,
             batch_prompts: 4,
@@ -58,8 +63,57 @@ enum CliError {
     Arg(#[from] ArgError),
     #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
+    #[error(transparent)]
+    Qwen35(#[from] Qwen35Error),
     #[error("{0}")]
     Custom(String),
+}
+
+trait SyntheticGrpoFamily {
+    type Config: GrpoPolicyConfig + Clone;
+    type Model: GrpoPolicy<Config = Self::Config>;
+
+    fn family_name() -> &'static str;
+    fn build_config(seq: usize) -> Self::Config;
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError>;
+}
+
+struct Qwen3GrpoFamily;
+
+impl SyntheticGrpoFamily for Qwen3GrpoFamily {
+    type Config = Qwen3Config;
+    type Model = Qwen3Model;
+
+    fn family_name() -> &'static str {
+        "qwen3"
+    }
+
+    fn build_config(seq: usize) -> Self::Config {
+        synthetic_qwen3_config(seq)
+    }
+
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
+        Qwen3Model::new(cfg, store).map_err(Into::into)
+    }
+}
+
+struct Qwen35GrpoFamily;
+
+impl SyntheticGrpoFamily for Qwen35GrpoFamily {
+    type Config = Qwen35Config;
+    type Model = Qwen35Model;
+
+    fn family_name() -> &'static str {
+        "qwen35"
+    }
+
+    fn build_config(seq: usize) -> Self::Config {
+        synthetic_qwen35_dense_config(seq)
+    }
+
+    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
+        Qwen35Model::new(cfg, store).map_err(Into::into)
+    }
 }
 
 /// Phase 3 train_grpo migration choice, mirroring `pretrain.rs`:
@@ -98,12 +152,24 @@ fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
 
-    let config = qwen3_config(args.seq);
+    match args.model_family {
+        ModelFamily::Auto | ModelFamily::Qwen35 => run_with_family::<Qwen35GrpoFamily>(&args),
+        ModelFamily::Qwen3 => run_with_family::<Qwen3GrpoFamily>(&args),
+    }
+}
 
+fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliError> {
+    let config = F::build_config(args.seq);
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Qwen3Model::new(&config, &mut store)?;
-    let params = trainable_params(&policy, &store);
+    let policy = F::build_model(&config, &mut store)?;
+    let params = trainable_param_ids(&policy, &store);
+    if params.is_empty() {
+        return Err(CliError::Custom(format!(
+            "{} model exposed no trainable parameters",
+            F::family_name()
+        )));
+    }
     let keep_extra = policy
         .all_parameter_ids()
         .into_iter()
@@ -126,7 +192,7 @@ fn run() -> Result<(), CliError> {
     // resume moments + step counter instead of starting cold (codex review
     // on 09c5c89 P1).
     let sft_optim_state = run_sft_phase(
-        &args,
+        args,
         &policy,
         &params,
         keep_extra.clone(),
@@ -276,7 +342,7 @@ fn run() -> Result<(), CliError> {
 /// copy per step and only fed the println, no correctness concern.
 fn run_sft_phase(
     args: &CliArgs,
-    policy: &Qwen3Model,
+    policy: &impl GrpoPolicy,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
     store: &mut TensorStore,
@@ -356,6 +422,11 @@ fn parse_args() -> Result<CliArgs, CliError> {
     let mut iter = env::args().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
+            "--model-family" => {
+                args.model_family = next_value(&mut iter, &flag)?
+                    .parse()
+                    .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
+            }
             "--sft-steps" => args.sft_steps = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--grpo-iters" => {
                 args.grpo_iters = parse_value(&flag, next_value(&mut iter, &flag)?)?;
@@ -453,36 +524,6 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
             / trajectories.len() as f32
     }
 }
-
-fn qwen3_config(seq: usize) -> Qwen3Config {
-    Qwen3Config {
-        vocab_size: 256,
-        hidden_size: 64,
-        num_hidden_layers: 2,
-        num_attention_heads: 4,
-        num_key_value_heads: 2,
-        head_dim: 16,
-        intermediate_size: 128,
-        max_position_embeddings: seq,
-        rms_norm_eps: 1.0e-6,
-        rope_theta: 1_000_000.0,
-        tie_word_embeddings: false,
-    }
-}
-
-fn retained_ids(models: &[&Qwen3Model], store: &TensorStore) -> HashSet<TensorId> {
-    let mut keep = HashSet::new();
-    for model in models {
-        for param_id in model.all_parameter_ids() {
-            keep.insert(param_id);
-            if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-                keep.insert(grad_id);
-            }
-        }
-    }
-    keep
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

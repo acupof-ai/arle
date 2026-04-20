@@ -1,8 +1,8 @@
 //! CheckpointCodec v2 roundtrip + error-path tests.
 //!
 //! Covers the Phase 2 directory-layout codec: `trainer_state.json` +
-//! `optimizer.safetensors`. The legacy `LMCKP003` single-file format is
-//! exercised by `test_checkpoint.rs`; this file stays scoped to v2.
+//! `optimizer.safetensors`. The handwritten-Transformer single-file
+//! checkpoint path has been retired; this file stays scoped to v2.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

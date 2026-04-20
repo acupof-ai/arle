@@ -3,9 +3,18 @@
 Companion to [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md).
 Written 2026-04-20. Scope: the training runtime primitives that land in Phase 1
 (lr_schedule, grad_accum, adamw_state, metrics, grad_clip, checkpoint v2) plus
-the Phase 2 `Trainer<O, C, S>` loop and its integration with the existing
-binaries (`train_sft`, `pretrain`, `pretrain_qwen3`, `train_grpo`,
-`train_multi_turn`).
+the Phase 2 `Trainer<O, C, S>` loop and its integration with the current
+train binaries (`train_sft`, `pretrain_qwen3`, `train_grpo`,
+`train_multi_turn`) plus legacy compatibility surfaces that are being
+retired.
+
+Current reality: the train-side implementation already includes the
+dense/full-attn Qwen3.5-family path, `train_multi_turn` runs on it, and
+checkpoints are already HF-style directories. The handwritten
+Transformer/TinyLM runtime compatibility path has been deleted, and the
+hybrid linear-attn train path has not landed yet. The acceptance
+contract below tracks that current path and the post-legacy train test
+surface.
 
 This document is **the acceptance contract for Phase 1 + Phase 2**. A change
 in the train runtime is not "done" until the matching row here is either
@@ -209,7 +218,8 @@ deterministic — `PROPTEST_CASES=64 PROPTEST_SEED=0xfeed`.
 
 **File:** `crates/train/tests/test_sft_end_to_end.rs` *(new, §D7)*.
 
-One test: tiny Qwen3 stub (2 layers, hidden=16, vocab=64) trained for 8
+One test: tiny train-side stub on the dense/full-attn Qwen3.5-family path
+with 2 layers, hidden=16, vocab=64, trained for 8
 optimizer steps with grad_accum=2, log_every=2, save_every=4. Three runs
 compared:
 
@@ -239,7 +249,7 @@ don't (because every other test uses synthetic loss).
 ### 3.11 Existing binary regressions
 
 The runtime migration has already landed on the main `Trainer<O, C, S>`
-path. The older binaries (`pretrain`, `pretrain_qwen3`, `train_grpo`,
+path. The current training binaries (`pretrain_qwen3`, `train_grpo`,
 `train_multi_turn`) still compile against the legacy `trainer::*`
 re-exports as compatibility aliases; this section now only guards that
 surface until the aliases are retired. Regression guard: a `#[test]` in

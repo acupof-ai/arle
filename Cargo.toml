@@ -9,6 +9,7 @@ members = [
     "crates/cuda-kernels",
     "crates/mlx-sys",
     "crates/qwen3-spec",
+    "crates/qwen35-spec",
     "crates/tools",
     "crates/train",
 ]

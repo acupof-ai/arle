@@ -1,10 +1,9 @@
-use std::collections::HashSet;
-
 use autograd::{AutogradError, Result, Tape, TensorStore};
 
 use crate::{
     dataset::LcgRng,
     policy::{GrpoPolicy, GrpoPolicyConfig},
+    policy_support::retained_ids,
     sampling::{log_prob_at_index, sample_categorical},
 };
 
@@ -95,7 +94,7 @@ where
                 trajectory.old_log_probs[position] = sampled_log_prob;
             }
 
-            let keep = retained_ids(policy, ref_model, store);
+            let keep = retained_ids(&[policy, ref_model], store);
             store.retain_ids(&keep);
         }
 
@@ -128,7 +127,7 @@ where
 
     tape.set_enabled(was_enabled);
     if trajectories.is_ok() {
-        let keep = retained_ids(policy, ref_model, store);
+        let keep = retained_ids(&[policy, ref_model], store);
         store.retain_ids(&keep);
     }
     trajectories
@@ -194,23 +193,4 @@ fn response_mask(seq_len: usize) -> Result<Vec<bool>> {
         *value = true;
     }
     Ok(mask)
-}
-
-fn retained_ids(
-    policy: &impl GrpoPolicy,
-    ref_model: &impl GrpoPolicy,
-    store: &TensorStore,
-) -> HashSet<usize> {
-    let mut keep = HashSet::new();
-    for param_id in policy
-        .all_parameter_ids()
-        .into_iter()
-        .chain(ref_model.all_parameter_ids())
-    {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
 }
