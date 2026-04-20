@@ -7,6 +7,7 @@ use super::forward::build_forward_graph;
 use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, zeros};
 use super::weights::StandardMetalWeights;
+use crate::backend::is_stream_stop_matched;
 use crate::sampler::SamplingParams;
 
 #[cfg(feature = "metal")]
@@ -222,7 +223,12 @@ pub(super) fn metal_generate(
         let stop = (!params.ignore_eos && config.is_stop_token(next_token))
             || params.stop_token_ids.contains(&next_token);
         generated.push(next_token);
-        on_token(next_token)?;
+        if let Err(err) = on_token(next_token) {
+            if is_stream_stop_matched(&err) {
+                break "stop";
+            }
+            return Err(err);
+        }
 
         if stop {
             break "stop";

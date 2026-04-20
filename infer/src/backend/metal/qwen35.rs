@@ -15,6 +15,7 @@ use super::{
     load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
     merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
 };
+use crate::backend::is_stream_stop_matched;
 use crate::sampler::SamplingParams;
 
 pub(super) struct MetalQwen35FullAttentionWeights {
@@ -803,10 +804,12 @@ impl CppQwen35Model {
         struct CallbackCtx<'a> {
             on_token: &'a mut dyn FnMut(u32) -> Result<()>,
             error: Option<anyhow::Error>,
+            stop_requested: bool,
         }
         let mut ctx = CallbackCtx {
             on_token,
             error: None,
+            stop_requested: false,
         };
 
         unsafe extern "C" fn token_callback(token_id: i32, ctx_ptr: *mut std::ffi::c_void) -> i32 {
@@ -814,6 +817,7 @@ impl CppQwen35Model {
             match (ctx.on_token)(token_id as u32) {
                 Ok(()) => 0,
                 Err(e) => {
+                    ctx.stop_requested = is_stream_stop_matched(&e);
                     ctx.error = Some(e);
                     -1
                 }
@@ -841,6 +845,16 @@ impl CppQwen35Model {
             )
         };
 
+        if ctx.stop_requested {
+            return Ok((
+                out_tokens[..out_count as usize]
+                    .iter()
+                    .map(|&id| id as u32)
+                    .collect(),
+                prefill_ms,
+                decode_ms,
+            ));
+        }
         if let Some(e) = ctx.error {
             return Err(e);
         }
@@ -1085,7 +1099,12 @@ pub(super) fn metal_generate_qwen35(
         let stop = (!params.ignore_eos && config.is_stop_token(next_token))
             || params.stop_token_ids.contains(&next_token);
         generated.push(next_token);
-        on_token(next_token)?;
+        if let Err(err) = on_token(next_token) {
+            if is_stream_stop_matched(&err) {
+                break 'decode "stop";
+            }
+            return Err(err);
+        }
 
         if stop {
             break 'decode "stop";

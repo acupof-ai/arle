@@ -29,7 +29,7 @@ use crate::backend::metal::MetalBackend;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::runtime::StopChunkProcessor;
 #[cfg(any(feature = "metal", feature = "cpu"))]
-use crate::backend::{InferenceBackend, StreamingInferenceBackend};
+use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
@@ -111,10 +111,9 @@ fn choose_prefix_reuse_action(
 /// (from `sent_len` up to but not including the stop) and the matching stop.
 /// Prefers the longest matching stop when several match at the end.
 ///
-/// Only used by the CUDA single-request streaming path — the
-/// Metal/CPU `BackendInferenceEngine::complete_stream` uses
-/// `StopChunkProcessor` instead, which scans the unsent suffix and
-/// handles mid-chunk + chunk-spanning stops.
+/// Only used by the CUDA single-request streaming path. The shared
+/// `StopChunkProcessor` handles the Metal/CPU/backend-runtime streaming
+/// paths, including mid-chunk and chunk-spanning stops.
 #[cfg(any(feature = "cuda", test))]
 fn truncate_at_stop<'a>(
     new_full: &str,
@@ -975,17 +974,17 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
     ///    accumulated tail.** The default `StreamingInferenceBackend`
     ///    impl emits the entire completion as one chunk ([backend.rs:62]),
     ///    and real backends can produce stops that span chunk boundaries.
-    ///    We route through [`StopChunkProcessor`] — same helper the
-    ///    serial-runtime path uses ([backend/runtime.rs:253]) — which
-    ///    scans for the earliest stop and withholds `max_stop_len - 1`
+    ///    We route through [`StopChunkProcessor`] — the shared helper
+    ///    used by the serial-runtime and Metal paths ([backend/runtime.rs:253]) —
+    ///    which scans for the earliest stop and withholds `max_stop_len - 1`
     ///    bytes so a marker crossing a chunk boundary isn't leaked.
     ///
-    /// 2. **Usage must come from the backend, not be hard-coded.** The
-    ///    stop path must not return `Err` from `generate_stream` — the
-    ///    REPL reads `prompt_tokens`/`completion_tokens` from the final
-    ///    delta ([crates/cli/src/repl.rs:787]). We let the backend run
-    ///    to its own EOS/`max_tokens`, silently absorb post-stop chunks
-    ///    in the processor, and report real totals.
+    /// 2. **Matched text stops must short-circuit decode and still carry
+    ///    real usage.** The callback returns `Err(StreamStopMatched)` once
+    ///    the shared processor flips `hit_stop()`. Backends treat that
+    ///    sentinel as graceful termination and still return their final
+    ///    `GenerateResult`, so the REPL keeps seeing exact usage in the
+    ///    terminal delta ([crates/cli/src/repl.rs:787]).
     ///
     /// Dropping `tx` (rx disconnected) still propagates back through the
     /// callback as an `Err` — the REPL's Ctrl-C path relies on that
@@ -1012,7 +1011,12 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
         let generated = catch_unwind(AssertUnwindSafe(|| {
             self.backend
                 .generate_stream(&req.prompt, &sampling, |chunk: &str| -> Result<()> {
-                    let delta = processor.borrow_mut().push_chunk(chunk);
+                    let (delta, stop_hit) = {
+                        let mut processor = processor.borrow_mut();
+                        let delta = processor.push_chunk(chunk);
+                        let stop_hit = processor.hit_stop();
+                        (delta, stop_hit)
+                    };
                     if let Some(delta) = delta
                         && !delta.is_empty()
                         && tx
@@ -1026,6 +1030,9 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
                     {
                         consumer_dropped.set(true);
                         return Err(anyhow::anyhow!("consumer dropped"));
+                    }
+                    if stop_hit {
+                        return Err(StreamStopMatched.into());
                     }
                     Ok(())
                 })
@@ -1046,10 +1053,10 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
             return Ok(());
         }
 
-        // Backend completed naturally (EOS, max_tokens, or stop hit +
-        // processor absorbing the tail). Flush any bytes still held back
-        // by the max_stop_len - 1 safety window, then emit the final
-        // delta with the backend's actual usage numbers.
+        // Backend completed naturally or short-circuited on a matched
+        // text stop and still returned its final usage counters. Flush any
+        // bytes still held back by the max_stop_len - 1 safety window, then
+        // emit the final delta.
         let generated = generated?;
 
         if let Some(trailing) = processor.borrow_mut().finish()
@@ -1068,15 +1075,16 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
         } else {
             parse_finish_reason(&generated.finish_reason)
         };
+        let usage = TokenUsage {
+            prompt_tokens: generated.prompt_tokens,
+            completion_tokens: generated.completion_tokens,
+            total_tokens: generated.prompt_tokens + generated.completion_tokens,
+        };
 
         let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
             finish_reason: Some(finish_reason),
-            usage: Some(TokenUsage {
-                prompt_tokens: generated.prompt_tokens,
-                completion_tokens: generated.completion_tokens,
-                total_tokens: generated.prompt_tokens + generated.completion_tokens,
-            }),
+            usage: Some(usage),
             logprob: None,
         });
         Ok(())
@@ -1323,7 +1331,7 @@ impl SessionPersistence for LoadedInferenceEngine {}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+    #[cfg(any(feature = "cuda", test))]
     use super::truncate_at_stop;
     use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
     #[cfg(any(feature = "cuda", test))]
@@ -1357,7 +1365,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+    #[cfg(any(feature = "cuda", test))]
     #[test]
     fn test_truncate_at_stop() {
         let stops = ["\n"];
@@ -1601,7 +1609,14 @@ mod tests {
             where
                 F: FnMut(&str) -> anyhow::Result<()>,
             {
-                on_chunk("hello<|im_end|>trailing")?;
+                match on_chunk("hello<|im_end|>trailing") {
+                    Ok(()) => {}
+                    Err(err)
+                        if err
+                            .downcast_ref::<crate::backend::StreamStopMatched>()
+                            .is_some() => {}
+                    Err(err) => return Err(err),
+                }
                 Ok(GenerateResult {
                     text: "hello<|im_end|>trailing".into(),
                     prompt_tokens: 3,
@@ -1655,12 +1670,14 @@ mod tests {
             "raw stop marker must never reach the consumer"
         );
         assert_eq!(finish, Some(FinishReason::Stop));
-        let usage = usage.expect("final delta must carry usage");
         assert_eq!(
-            usage.completion_tokens, 7,
-            "real backend usage must propagate (not hard-coded 0)"
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 7,
+                total_tokens: 10,
+            })
         );
-        assert_eq!(usage.prompt_tokens, 3);
     }
 
     /// Regression for codex review 70e2776 High #2 — stop *spanning*
@@ -1705,7 +1722,14 @@ mod tests {
                 F: FnMut(&str) -> anyhow::Result<()>,
             {
                 on_chunk("hello<|im_")?;
-                on_chunk("end|>trail")?;
+                match on_chunk("end|>trail") {
+                    Ok(()) => {}
+                    Err(err)
+                        if err
+                            .downcast_ref::<crate::backend::StreamStopMatched>()
+                            .is_some() => {}
+                    Err(err) => return Err(err),
+                }
                 Ok(GenerateResult {
                     text: "hello<|im_end|>trail".into(),
                     prompt_tokens: 2,
@@ -1762,9 +1786,140 @@ mod tests {
             "no partial stop-marker bytes may leak (got {joined:?})",
         );
         assert_eq!(finish, Some(FinishReason::Stop));
-        let usage = usage.expect("final delta must carry usage");
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.prompt_tokens, 2);
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 5,
+                total_tokens: 7,
+            })
+        );
+    }
+
+    /// Regression for codex review 2026-04-20 P1 — once a streamed text
+    /// stop is matched, the consumer must stop seeing bytes, but final
+    /// usage must still come from the backend's real completion result.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[tokio::test]
+    async fn backend_complete_stream_text_stop_keeps_real_usage() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine, TokenUsage};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        #[derive(Clone)]
+        struct CountingStopMock {
+            chunks_attempted: Arc<AtomicUsize>,
+        }
+
+        impl InferenceBackend for CountingStopMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!()
+            }
+            fn name(&self) -> &'static str {
+                "counting-stop-mock"
+            }
+        }
+
+        impl StreamingInferenceBackend for CountingStopMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                for chunk in ["hello<|im_end|>waste", "never-sent"] {
+                    self.chunks_attempted.fetch_add(1, Ordering::Relaxed);
+                    if let Err(err) = on_chunk(chunk) {
+                        if err
+                            .downcast_ref::<crate::backend::StreamStopMatched>()
+                            .is_some()
+                        {
+                            return Ok(GenerateResult {
+                                text: "hello<|im_end|>waste".into(),
+                                prompt_tokens: 4,
+                                completion_tokens: 5,
+                                finish_reason: "stop".into(),
+                                ttft_ms: 0.0,
+                                prompt_tps: 0.0,
+                                generation_tps: 0.0,
+                                total_time_ms: 0.0,
+                            });
+                        }
+                        return Err(err);
+                    }
+                }
+                Ok(GenerateResult {
+                    text: "hello<|im_end|>waste never-sent".into(),
+                    prompt_tokens: 4,
+                    completion_tokens: 9,
+                    finish_reason: "length".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let chunks_attempted = Arc::new(AtomicUsize::new(0));
+        let mut engine = BackendInferenceEngine {
+            model_id: "counting-stop-mock".into(),
+            backend: CountingStopMock {
+                chunks_attempted: Arc::clone(&chunks_attempted),
+            },
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        engine
+            .complete_stream(
+                CompletionRequest {
+                    prompt: "p".into(),
+                    max_tokens: 32,
+                    sampling: SamplingParams::default(),
+                    stop: Some(vec!["<|im_end|>".into()]),
+                    logprobs: false,
+                },
+                tx,
+            )
+            .unwrap();
+
+        let mut text = String::new();
+        let mut finish = None;
+        let mut usage = None;
+        while let Ok(chunk) = rx.try_recv() {
+            text.push_str(&chunk.text_delta);
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+                usage = chunk.usage;
+                break;
+            }
+        }
+
+        assert_eq!(text, "hello");
+        assert_eq!(finish, Some(FinishReason::Stop));
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 4,
+                completion_tokens: 5,
+                total_tokens: 9,
+            })
+        );
+        assert_eq!(chunks_attempted.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::metal::MetalBackend;
 use super::metal::MetalBackendOptions;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::InferenceBackend;
-use crate::backend::{GenerateResult, StreamingInferenceBackend};
+use crate::backend::{GenerateResult, StreamStopMatched, StreamingInferenceBackend};
 use crate::metrics::ServerMetrics;
 use crate::request_handle::{RequestHandle, SubmitError};
 use crate::scheduler::IncomingRequest;
@@ -254,6 +254,9 @@ where
         if let Some(delta) = stop_processor.push_chunk(chunk) {
             send_text_delta(&delta_tx, delta)?;
         }
+        if stop_processor.hit_stop() {
+            return Err(StreamStopMatched.into());
+        }
         Ok(())
     })?;
 
@@ -281,7 +284,6 @@ where
     } else {
         parse_finish_reason(&generated)
     };
-
     let usage = TokenUsage {
         prompt_tokens: generated.prompt_tokens,
         completion_tokens: generated.completion_tokens,
@@ -332,10 +334,10 @@ fn send_text_delta(
 /// flips `hit_stop`, and thereafter absorbs further chunks silently so
 /// the raw stop bytes never reach the consumer.
 ///
-/// Also used by `BackendInferenceEngine::complete_stream` in
-/// `server_engine.rs` — share this, do not re-implement. (Exists
-/// separately in `backend/metal/runtime.rs:StopChunkProcessor`; that
-/// duplicate is out of scope here.)
+/// Shared by `BackendInferenceEngine::complete_stream` in
+/// `server_engine.rs` and the Metal runtime stream path. Keep the stop
+/// buffering logic here so all streaming callers agree on the same
+/// boundary and tail-withholding behavior.
 pub(crate) struct StopChunkProcessor {
     accumulated: String,
     sent_len: usize,
@@ -480,7 +482,12 @@ mod tests {
             F: FnMut(&str) -> Result<()>,
         {
             for chunk in &self.chunks {
-                on_chunk(chunk)?;
+                if let Err(err) = on_chunk(chunk) {
+                    if crate::backend::is_stream_stop_matched(&err) {
+                        return self.generate("", &SamplingParams::default());
+                    }
+                    return Err(err);
+                }
             }
             self.generate("", &SamplingParams::default())
         }
@@ -573,6 +580,113 @@ mod tests {
 
         assert_eq!(text, "hello");
         assert_eq!(finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn backend_runtime_short_circuits_after_text_stop_match() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct CountingStopBackend {
+            chunks: Vec<String>,
+            chunks_attempted: Arc<AtomicUsize>,
+        }
+
+        impl InferenceBackend for CountingStopBackend {
+            fn load(&mut self, _model_path: &Path) -> Result<()> {
+                Ok(())
+            }
+
+            fn generate(&self, _prompt: &str, _params: &SamplingParams) -> Result<GenerateResult> {
+                unreachable!("test exercises streaming path only")
+            }
+
+            fn name(&self) -> &'static str {
+                "counting-stop"
+            }
+        }
+
+        impl StreamingInferenceBackend for CountingStopBackend {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> Result<GenerateResult>
+            where
+                F: FnMut(&str) -> Result<()>,
+            {
+                for chunk in &self.chunks {
+                    self.chunks_attempted.fetch_add(1, Ordering::Relaxed);
+                    if let Err(err) = on_chunk(chunk) {
+                        if err
+                            .downcast_ref::<crate::backend::StreamStopMatched>()
+                            .is_some()
+                        {
+                            return Ok(GenerateResult {
+                                text: "helloENDwaste".into(),
+                                prompt_tokens: 11,
+                                completion_tokens: 7,
+                                finish_reason: "stop".into(),
+                                ttft_ms: 12.0,
+                                prompt_tps: 1.0,
+                                generation_tps: 2.0,
+                                total_time_ms: 45.0,
+                            });
+                        }
+                        return Err(err);
+                    }
+                }
+                Ok(GenerateResult {
+                    text: "helloENDwaste never-sent".into(),
+                    prompt_tokens: 11,
+                    completion_tokens: 13,
+                    finish_reason: "length".into(),
+                    ttft_ms: 12.0,
+                    prompt_tps: 1.0,
+                    generation_tps: 2.0,
+                    total_time_ms: 45.0,
+                })
+            }
+        }
+
+        let chunks_attempted = Arc::new(AtomicUsize::new(0));
+        let handle = spawn_backend_runtime_handle(
+            CountingStopBackend {
+                chunks: vec!["helloENDwaste".into(), "never-sent".into()],
+                chunks_attempted: Arc::clone(&chunks_attempted),
+            },
+            Arc::<str>::from("mock-model"),
+            8,
+        );
+
+        let (req, mut delta_rx) = make_request("hi", Some(vec!["END".into()]));
+        handle.submit(req).unwrap();
+
+        let mut text = String::new();
+        let mut finish_reason = None;
+        let mut usage = None;
+        while let Some(delta) = delta_rx.recv().await {
+            text.push_str(&delta.text_delta);
+            if delta.finish_reason.is_some() {
+                finish_reason = delta.finish_reason;
+                usage = delta.usage;
+                break;
+            }
+        }
+
+        assert_eq!(text, "hello");
+        assert_eq!(finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            usage,
+            Some(TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                total_tokens: 18,
+            })
+        );
+        assert_eq!(chunks_attempted.load(Ordering::Relaxed), 1);
     }
 
     /// A mock backend that blocks for a configurable duration, used to test
