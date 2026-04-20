@@ -262,7 +262,14 @@ pub fn rope(
 }
 
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(a)?;
+    // M5.3b.19: inner `reduce::mean` dispatches on `a.dirty`; a Dirty::Device
+    // input stays lazy by composing `sum_all + mul_scalar(1/numel)` on the
+    // MLX graph (reusing the M5.3b.1 lazy `sum_all` + M5.3b.13 lazy
+    // `mul_scalar` — no new trait method needed), while Dirty::Host /
+    // Dirty::Both take the eager host path. Stripping `ensure_host` here is
+    // the enabler — the CE-loss path `log_softmax → gather_last_dim → mean`
+    // previously flushed the full log-probs tensor to host per step,
+    // reversing every upstream M5.3b lazy win.
     reduce::mean(a, store, tape)
 }
 
