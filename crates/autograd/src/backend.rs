@@ -293,6 +293,25 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_add_broadcast_forward(a, a_shape, b, b_shape)
     }
 
+    /// Device-handle variant of `add_broadcast_forward`. Lazy on backends
+    /// whose native add already broadcasts (Metal: `mlx_add` — NumPy-style
+    /// right-aligned broadcasting, no explicit `broadcast_to` needed); the
+    /// default implementation falls back to `readback → host compute →
+    /// upload` so CPU/CUDA need no special-case. Output shape equals
+    /// `a_shape` (the same contract as `add_broadcast_forward`). M5.3b.14.
+    fn add_broadcast(
+        &self,
+        a: &DeviceHandle,
+        a_shape: &[usize],
+        b: &DeviceHandle,
+        b_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let out = self.add_broadcast_forward(&a_host, a_shape, &b_host, b_shape)?;
+        self.upload(&out, a_shape)
+    }
+
     /// Elementwise `out = exp(a)`.
     fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         cpu_exp_forward(a)

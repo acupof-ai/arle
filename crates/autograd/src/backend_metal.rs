@@ -265,6 +265,48 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy right-aligned broadcast-add: MLX's `mlx_add` already implements
+    // NumPy-style right-aligned broadcasting, so the lazy path is just the
+    // same FFI call as `add` — no explicit `mlx_broadcast_to` needed.
+    // `a_shape`/`b_shape` are passed through for the host-fallback contract
+    // but ignored on Metal (MLX reads shapes off the arrays themselves).
+    // Output shape equals `a_shape`. M5.3b.14.
+    fn add_broadcast(
+        &self,
+        a: &DeviceHandle,
+        _a_shape: &[usize],
+        b: &DeviceHandle,
+        _b_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(a_handle) = a else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot add_broadcast a non-metal device handle",
+            ));
+        };
+        let DeviceHandle::Metal(b_handle) = b else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot add_broadcast a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: both pointers come from live `MlxHandle`s borrowed for
+        // this call; ownership of the returned node transfers into the
+        // new `MlxHandle`; `MLX_GUARD` serializes access to MLX globals.
+        let out = unsafe {
+            let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_add returned null (add_broadcast)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
     // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
     // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
     // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
