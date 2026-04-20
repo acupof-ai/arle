@@ -2,6 +2,11 @@
 
 **Status**: Resolved (option **b**) · **Opened**: 2026-04-18 · **Resolved**: 2026-04-18 · **Owner**: ckl
 
+This is a historical blocker analysis for the Qwen3-era LoRA hook path.
+It is kept as transitional record only; it is not a co-equal active
+mainline now that the train-side target is converging on the Qwen3.5
+family.
+
 ## Finding
 
 M2.3 as written in [`rust-agent-rl-single-node.md`](rust-agent-rl-single-node.md) §4.2 requires a **CUDA-resident LoRA adapter** that `infer/src/ops/linear.rs` can multiply against and the train crate can update with gradients. That primitive does not exist yet.
@@ -28,20 +33,20 @@ Cost: ~10–14 days (M1.2 + M1.8 + frozen-view). Correct, matches plan as design
 
 - Define `LoRAAdapter { a: DeviceMatrix, b: DeviceMatrix, scale: f32 }` **inside `infer/`** (not shared with train).
 - `linear.rs` takes `Option<&LoRAAdapter>`; if present, runs extra `gemm_into(a, x)` → `gemm_into(b, tmp)` and `add_into(y, y_lora)`.
-- Training side stays CPU/TinyLM only; Qwen3-LoRA is inference-time only (e.g., loading a pre-trained external LoRA).
+- Training side stays CPU/TinyLM only; Qwen3-LoRA is inference-time only (e.g., loading a pre-trained external LoRA). This branch is preserved here as historical Qwen3-era scaffolding, not as the active train-side target.
 
 Cost: ~2 days. Ships the hook but does not close the train↔infer loop. Deferred gradient integration.
 
 ### (c) Skip M2b, proceed to M4 agent-multi-turn on TinyLM
 
-- Treat TinyLM + GRPO (now green) as the end-to-end training target for M4 agent work.
+- Treat TinyLM + GRPO (now green) as the end-to-end training target for M4 agent work. Historical note: this was the accepted transitional path before the Qwen3.5-family train-line target was clarified.
 - Qwen3 LoRA RL blocked until M1 CUDA path lands; revisit later.
 
 Cost: 0 days. Lets research/agent-loop work proceed. Best if the immediate goal is "self-evolving agent prototype" not "Qwen3 RL".
 
 ### (b′) Merge-time utility — **added 2026-04-18 after industry survey**
 
-- Small CLI / binary that takes `(base_weights_path, lora_adapter_path, out_path)`, computes `W' = W + alpha/rank · B @ A` per-layer in fp32, and writes a new checkpoint. Merge happens **before** the usual Qwen3 load path — zero changes to `infer/src/ops/linear.rs` or any model file.
+- Small CLI / binary that takes `(base_weights_path, lora_adapter_path, out_path)`, computes `W' = W + alpha/rank · B @ A` per-layer in fp32, and writes a new checkpoint. Merge happens **before** the usual Qwen3 load path — zero changes to `infer/src/ops/linear.rs` or any model file. Kept here as a historical Qwen3-era option, not as the current sole train-side path.
 - Matches the **llama.cpp default** and the mistral.rs "bake-in" path. See `docs/research/2026-04-18-lora-inference-patterns.md` for the survey: llama.cpp merges into GGUF, mistral.rs supports dynamic swap only because they target multi-tenant serving, vLLM needs Punica SGMV only at thousands-of-adapter scale. For a single-researcher self-evolve loop, dynamic swap is not on the path.
 
 Cost: ~1 day, zero risk to the hot path. Doesn't unlock the train↔infer gradient loop (that's still option (a)) but it does ship "Qwen3 + externally-trained LoRA works" with no GPU verification needed from ckl.
@@ -50,7 +55,7 @@ Cost: ~1 day, zero risk to the hot path. Doesn't unlock the train↔infer gradie
 
 Original recommendation was **(a)**. After the industry survey (llama.cpp merges by default, mistral.rs runtime hook exists but adds overhead, Punica is multi-tenant-only), **(b′)** is the pragmatic first move: it ships the user-visible feature without touching the hot path, and leaves (a) fully open for when the project actually needs real-time train↔infer gradient flow.
 
-Pick **(b′)** if the near-term goal is "a Qwen3 binary that can consume a LoRA someone else trained." Pick **(a)** if the goal is "RL-train a Qwen3 LoRA and immediately serve it in the same process." The project's current stated goal is the former.
+Pick **(b′)** if the near-term goal is "a Qwen3 binary that can consume a LoRA someone else trained." Pick **(a)** if the goal is "RL-train a Qwen3 LoRA and immediately serve it in the same process." The project's current stated goal was the former; this record is retained for transition history rather than current model-line authority.
 
 ## Decision pending
 
