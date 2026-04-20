@@ -466,6 +466,36 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &out_shape)
     }
 
+    /// Pure-layout reshape: returns a handle whose view is `new_shape` over
+    /// the same logical elements. Numel must match (`product(new_shape) ==
+    /// product(old_shape)`); the caller is expected to have checked that.
+    /// Default: readback → host (no-op reshape, contiguous) → upload.
+    /// Metal overrides to `mlx_reshape` so the whole graph stays lazy —
+    /// reshape is a free metadata op on MLX side. M5.3b.12.
+    fn reshape(&self, x: &DeviceHandle, new_shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        self.upload(&host, new_shape)
+    }
+
+    /// Swap two axes of `x`. `old_shape` is the pre-swap shape; the caller is
+    /// responsible for computing the post-swap shape (just swap the two
+    /// entries). `axis1`/`axis2` must be valid axes into `old_shape`. Default:
+    /// readback → host transpose loop → upload. Metal overrides to
+    /// `mlx_transpose_axes` with a permutation that is identity except for
+    /// the two swapped positions, composing into the lazy graph. M5.3b.12.
+    fn transpose_axes_swap(
+        &self,
+        x: &DeviceHandle,
+        old_shape: &[usize],
+        axis1: usize,
+        axis2: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let host = self.readback(x)?;
+        let (data, new_shape) = cpu_transpose_swap(&host, old_shape, axis1, axis2)?;
+        let handle = self.upload(&data, &new_shape)?;
+        Ok((handle, new_shape))
+    }
+
     /// In-place AdamW step for a single parameter given host-resident
     /// gradient `grad` and device-resident `param` / `m` / `v` handles.
     ///
@@ -1321,6 +1351,62 @@ pub fn cpu_scatter_add_rows_forward(
         }
     }
     Ok(out)
+}
+
+/// CPU reference transpose-swap: swap `axis1` and `axis2` of a contiguous
+/// row-major tensor with shape `old_shape`. Returns `(data, new_shape)`.
+/// Used by the `Backend::transpose_axes_swap` default fallback and by the
+/// ops-layer host-eager path — keeping both on the same function means the
+/// device-default-fallback and the host path produce byte-identical output
+/// for a given input.
+pub fn cpu_transpose_swap(
+    data: &[f32],
+    old_shape: &[usize],
+    axis1: usize,
+    axis2: usize,
+) -> Result<(Vec<f32>, Vec<usize>)> {
+    let rank = old_shape.len();
+    if axis1 >= rank {
+        return Err(crate::AutogradError::AxisOutOfBounds { axis: axis1, rank });
+    }
+    if axis2 >= rank {
+        return Err(crate::AutogradError::AxisOutOfBounds { axis: axis2, rank });
+    }
+    if axis1 == axis2 {
+        return Ok((data.to_vec(), old_shape.to_vec()));
+    }
+
+    let mut new_shape = old_shape.to_vec();
+    new_shape.swap(axis1, axis2);
+
+    // Contiguous strides over `old_shape` — the source we're reading from.
+    let mut old_strides = vec![0usize; rank];
+    let mut stride = 1usize;
+    for (index, dim) in old_shape.iter().enumerate().rev() {
+        old_strides[index] = stride;
+        stride *= *dim;
+    }
+
+    let mut out = vec![0.0_f32; data.len()];
+    for (out_index, slot) in out.iter_mut().enumerate() {
+        // Decompose out_index into new_shape coords, then swap the two
+        // axes to recover the original source coords.
+        let mut coords = vec![0usize; rank];
+        let mut linear = out_index;
+        for axis in (0..rank).rev() {
+            let dim = new_shape[axis];
+            coords[axis] = linear % dim;
+            linear /= dim;
+        }
+        coords.swap(axis1, axis2);
+        let input_index: usize = coords
+            .iter()
+            .zip(old_strides.iter())
+            .map(|(c, s)| c * s)
+            .sum();
+        *slot = data[input_index];
+    }
+    Ok((out, new_shape))
 }
 
 /// CPU reference in-place AdamW update. Matches the formula in

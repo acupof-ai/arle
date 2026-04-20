@@ -11,11 +11,11 @@ use crate::{
 };
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
-    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_erf,
-    mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis,
-    mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid,
-    mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh,
-    mlx_transpose_axes,
+    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis,
+    mlx_contiguous, mlx_erf, mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul,
+    mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape,
+    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract,
+    mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -635,6 +635,104 @@ impl Backend for MetalBackend {
         vocab: usize,
     ) -> Result<Vec<f32>> {
         mlx_scatter_add_rows(upstream, prefix_rows, feature_dim, indices, vocab)
+    }
+
+    // M5.3b.12: reshape is a pure metadata op on MLX — `mlx_reshape` composes
+    // into the lazy graph without triggering an eval. No new MLX primitives.
+    // Stripped `ensure_host` at ops/layout.rs → reshape now stays device-
+    // resident through q/k/v prep in every Qwen3.5 attention layer.
+    fn reshape(&self, x: &DeviceHandle, new_shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot reshape a non-metal device handle",
+            ));
+        };
+        let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        unsafe {
+            let reshaped = mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len());
+            if reshaped.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_reshape returned null (device reshape)",
+                ));
+            }
+            Ok(DeviceHandle::Metal(MlxHandle::from_raw(reshaped)))
+        }
+    }
+
+    // M5.3b.12: transpose is also free on MLX (`mlx_transpose_axes` creates a
+    // lazy view), so the whole attention-prep chain
+    // `matmul → reshape → slice → transpose → rope → matmul`
+    // now stays on the lazy graph. Permutation is identity except axis1↔axis2;
+    // MLX fuses the view into downstream GEMMs.
+    fn transpose_axes_swap(
+        &self,
+        x: &DeviceHandle,
+        old_shape: &[usize],
+        axis1: usize,
+        axis2: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let rank = old_shape.len();
+        if axis1 >= rank {
+            return Err(AutogradError::AxisOutOfBounds { axis: axis1, rank });
+        }
+        if axis2 >= rank {
+            return Err(AutogradError::AxisOutOfBounds { axis: axis2, rank });
+        }
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot transpose a non-metal device handle",
+            ));
+        };
+        let mut new_shape = old_shape.to_vec();
+        new_shape.swap(axis1, axis2);
+        if axis1 == axis2 {
+            // Identity: return a reshape-same-shape clone, matches the
+            // non-swap fast path in `cpu_transpose_swap`. `mlx_reshape`
+            // with identical shape is a cheap view alias; avoids a no-op
+            // permutation and keeps ownership semantics consistent.
+            let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
+            let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+            let view =
+                unsafe { mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len()) };
+            if view.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_reshape returned null (transpose axis1==axis2 alias)",
+                ));
+            }
+            return Ok((DeviceHandle::Metal(MlxHandle::from_raw(view)), new_shape));
+        }
+        // Build identity permutation then swap the two chosen axes.
+        let mut perm: Vec<i32> = (0..rank as i32).collect();
+        perm.swap(axis1, axis2);
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        unsafe {
+            let view = mlx_transpose_axes(x_handle.as_ptr(), perm.as_ptr(), perm.len());
+            if view.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_transpose_axes returned null (device transpose)",
+                ));
+            }
+            // `mlx_transpose_axes` returns a lazy non-contiguous VIEW; the
+            // raw `mlx_array_data_float32` pointer readback uses ignores
+            // strides and yields the original layout, causing a silent
+            // row-ordering parity bug against CPU. Wrap in `mlx_contiguous`
+            // so the returned handle materializes in the new layout on the
+            // next eval. MLX short-circuits `contiguous` on already-contig
+            // arrays, so the cost is zero in the common case; the copy
+            // only fires when the view IS non-contiguous (i.e. always,
+            // for a non-identity swap — but only once per logical op,
+            // the way the pre-M5.3b.12 host-path always produced
+            // contiguous output).
+            let out = mlx_contiguous(view);
+            mlx_array_free(view);
+            if out.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_contiguous returned null (device transpose materialization)",
+                ));
+            }
+            Ok((DeviceHandle::Metal(MlxHandle::from_raw(out)), new_shape))
+        }
     }
 
     // Lazy fused AdamW per-param update. Upload `grad` once as a flat

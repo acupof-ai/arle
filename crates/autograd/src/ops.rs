@@ -157,7 +157,12 @@ pub fn reshape(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.12: inner `layout::reshape` dispatches on `x.dirty`; a
+    // Dirty::Device input stays lazy via `backend.reshape` (MLX
+    // `mlx_reshape` — metadata-only, no compute), Dirty::Host takes the
+    // host-eager path. Stripping `ensure_host` here is the enabler — it
+    // previously flushed the q/k/v projection matmul's output to host
+    // before every attention-layer reshape.
     layout::reshape(x, shape, store, tape)
 }
 
@@ -168,7 +173,11 @@ pub fn transpose(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.12: inner `layout::transpose` dispatches on `x.dirty`;
+    // device-resident input stays lazy via `backend.transpose_axes_swap`
+    // (MLX `mlx_transpose_axes` — a lazy view fused into downstream
+    // GEMMs). Same rationale as `reshape` — the hot path is Qwen3.5
+    // q/k/v projections.
     layout::transpose(x, axis1, axis2, store, tape)
 }
 
