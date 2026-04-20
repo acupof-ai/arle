@@ -120,13 +120,8 @@ impl AdamW {
         self.step = step;
     }
 
-    pub(crate) fn set_state(&mut self, id: TensorId, m: Vec<f32>, v: Vec<f32>) {
+    pub(crate) fn set_state(&mut self, id: TensorId, m: Vec<f32>, v: Vec<f32>, shape: Vec<usize>) {
         debug_assert_eq!(m.len(), v.len(), "m and v must share length");
-        let shape = self
-            .state
-            .get(&id)
-            .map(|p| p.shape.clone())
-            .unwrap_or_else(|| vec![m.len()]);
         self.state.insert(id, ParamMoments { m, v, shape });
     }
 }

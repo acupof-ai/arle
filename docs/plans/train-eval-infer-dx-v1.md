@@ -37,14 +37,13 @@ the step count or reading directory listings.
 this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
 
 **Work:**
-1. Every trainer save_checkpoint hook (and the hand-written save
-   paths in `pretrain_qwen3`) writes a `latest` symlink in the
+1. Every trainer save_checkpoint hook (and the pretrain
+   Qwen-family save path in `pretrain_qwen3`) writes a `latest` symlink in the
    parent dir pointing at the just-written `step_N` dir. Atomic via
    `symlink_metadata()` unlink + `symlink()` (or `LATEST` text file
    containing the step dir name if the filesystem refuses symlinks).
 2. Normalize checkpoint dir padding to `step_{N:06}` across all
-   producers (`pretrain_qwen3` currently unpadded; Trainer
-   `save_every` already pads to 6). Resume path lookup becomes a
+   producers. Resume path lookup becomes a
    single glob pattern instead of per-binary branches.
 3. `scripts/train_and_chat.sh` walkthrough: 3-line data.jsonl →
    train_sft 10 steps → REPL, with inline comments explaining each
@@ -75,27 +74,23 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
 Qwen3.5 checkpoint dirs, accepts tokenized JSONL or chat JSONL, and
 reports token-mean loss + perplexity as JSON.
 
-**Work:**
-1. Extract the held-out eval loop from `pretrain_qwen3.rs` into a
-   `train::eval_lm` helper: takes `&Weights`, `&State`, tokenized
-   eval windows → `EvalOutcome { loss, token_count }` (same type
-   the Trainer already emits).
-2. New binary `crates/train/src/bin/eval_lm.rs`: load weights via the
-   current Qwen3.5-family loader, tokenize `--data` via existing jsonl
-   dataloader, call the helper, emit one `MetricSample` with
-   `eval_loss`, `eval_ppl = exp(eval_loss)`, `eval_tokens`.
-3. Shares `cli_args::trainer_args()` helper for consistency with
-   training binaries.
+**Delivered shape:**
+1. Shared helper `train::eval_lm` owns the token-mean CE / perplexity
+   path for checkpoint dirs written by the current train code.
+2. `crates/train/src/bin/eval_lm.rs` loads Qwen3 or Qwen3.5-family
+   checkpoint dirs, accepts tokenized JSONL or chat JSONL, and emits
+   `loss`, `ppl`, and `tokens` as JSON.
+3. The helper is wired as a standalone surface rather than staying
+   embedded inside `pretrain_qwen3.rs`.
 
-**Acceptance tests:** reproduce the `eval_loss` that
-`pretrain_qwen3.rs` prints on the same data + checkpoint to within
-f32 round-trip. Catches "extracted helper diverged from inline
-path" regressions.
+**Acceptance tests:** smoke coverage now pins both Qwen3 and Qwen3.5
+checkpoint-dir loads through `eval_lm`, plus the shared helper path for
+tokenized inputs.
 
 **Out of scope:** non-CE loss surfaces (e.g. reward models); add
 only if a real caller needs them.
 
-**Estimate:** 1-2 commits, ~200 LOC + tests + wins entry.
+**Shipped in:** `feat(train): add standalone eval_lm`
 
 ### Phase DX-3 — CLI flag normalization + clap adoption
 
