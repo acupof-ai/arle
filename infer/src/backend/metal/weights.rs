@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use super::config::MetalModelConfig;
 use super::loader::{
-    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
+    TensorMap, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map, tensor_get,
     tie_lm_head_from_embed_tokens,
 };
 use super::mlx::{Dtype, MlxArray, concatenate_axis, eval};
@@ -66,6 +66,105 @@ impl WeightTensor {
                 .context("quantized projection missing output dimension"),
         }
     }
+}
+
+/// A 3-D stack of affine-quantized expert weights (Qwen3.5/3.6 MoE).
+///
+/// Mirrors the MLX community Qwen3.6 checkpoint layout after `sanitize()`:
+///   - `weight`: packed uint32, shape `[num_experts, out_dim, in_dim / packing]`
+///   - `scales` / `biases`: shape `[num_experts, out_dim, in_dim / group_size]`
+///
+/// Feeds `mlx::core::gather_qmm` inside the Qwen3.5 MoE block (see
+/// `crates/mlx-sys/src/mlx_qwen35_moe_block.cpp`). Unlike [`WeightTensor`],
+/// this variant assumes 3-D shapes and intentionally does not participate in
+/// the 2-D `merge_quantized_projection_rows` fusion.
+// GPU required: MlxArrays are backed by Metal buffers.
+#[cfg(feature = "metal")]
+pub struct StackedQuantized {
+    pub weight: MlxArray,
+    pub scales: MlxArray,
+    pub biases: MlxArray,
+    pub group_size: i32,
+    pub bits: i32,
+}
+
+/// Load a 2-D affine-quantized projection with explicit bits/group_size.
+///
+/// Unlike [`load_proj_from_tensors`], which takes the model-level
+/// [`super::config::QuantConfig`], this helper lets the caller override the
+/// per-tensor bit width — Qwen3.6 stores its router (`mlp.gate`) and the
+/// shared-expert sigmoid gate (`mlp.shared_expert_gate`) as 8-bit while the
+/// rest of the MLP is 4-bit. Fails loudly if any of the triple is missing.
+#[cfg(feature = "metal")]
+pub(super) fn load_quantized_with_bits(
+    tensors: &TensorMap,
+    base: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<WeightTensor> {
+    let w = tensors
+        .get(&format!("{base}.weight"))
+        .cloned()
+        .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
+    let scales = tensors
+        .get(&format!("{base}.scales"))
+        .cloned()
+        .with_context(|| format!("missing quantized scales '{base}.scales'"))?;
+    let biases = tensors
+        .get(&format!("{base}.biases"))
+        .cloned()
+        .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+    Ok(WeightTensor::Quantized {
+        w,
+        scales,
+        biases,
+        group_size,
+        bits,
+    })
+}
+
+/// Load a 3-D affine-quantized expert stack from a safetensors tensor map.
+///
+/// Unlike [`load_proj_from_tensors`], this helper always returns
+/// [`StackedQuantized`] and fails if any of the three tensors are missing —
+/// there is no dense fallback for stacked experts in the Qwen3.5/3.6 MoE
+/// checkpoint format. `group_size` and `bits` must be passed explicitly
+/// because the per-layer router/expert quantization bits differ from the
+/// global default (router is 8-bit, experts are 4-bit in A3B-4bit).
+///
+/// `base` is the key prefix that owns `.weight`, `.scales`, `.biases` —
+/// e.g. `"language_model.model.layers.0.mlp.switch_mlp.gate_proj"`.
+#[cfg(feature = "metal")]
+pub(super) fn load_stacked_quantized(
+    tensors: &TensorMap,
+    base: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<StackedQuantized> {
+    let weight = tensors
+        .get(&format!("{base}.weight"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized weight '{base}.weight'"))?;
+    let scales = tensors
+        .get(&format!("{base}.scales"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized scales '{base}.scales'"))?;
+    let biases = tensors
+        .get(&format!("{base}.biases"))
+        .cloned()
+        .with_context(|| format!("missing stacked quantized biases '{base}.biases'"))?;
+    anyhow::ensure!(
+        weight.shape().len() == 3,
+        "stacked quantized weight '{base}.weight' must be 3-D, got shape {:?}",
+        weight.shape()
+    );
+    Ok(StackedQuantized {
+        weight,
+        scales,
+        biases,
+        group_size,
+        bits,
+    })
 }
 
 /// Attention input projections for one transformer layer.

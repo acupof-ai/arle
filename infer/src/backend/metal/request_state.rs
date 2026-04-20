@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -16,6 +17,12 @@ use super::weights::{MetalWeights, StandardMetalWeights};
 use crate::sampler::SamplingParams;
 
 const METAL_REQUEST_STATE_ID: usize = 0;
+
+fn metal_qwen35_trace_enabled() -> bool {
+    std::env::var("AGENT_INFER_METAL_QWEN35_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
 
 fn round_up_kv_capacity(tokens: i32) -> i32 {
     ((tokens + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK
@@ -703,7 +710,28 @@ impl<'a> MetalRequestState<'a> {
     pub fn prefill_chunk(&mut self, budget: usize) -> Result<PrefillChunkResult> {
         match &mut self.inner {
             MetalRequestStateInner::Qwen3(state) => state.prefill_chunk(budget),
-            MetalRequestStateInner::Qwen35(state) => state.prefill_chunk(budget),
+            MetalRequestStateInner::Qwen35(state) => {
+                let trace = metal_qwen35_trace_enabled();
+                let started = trace.then(Instant::now);
+                let prompt_before = state.prompt_progress();
+                let phase_before = state.phase();
+                let result = state.prefill_chunk(budget);
+                if let (true, Some(started), Ok(chunk)) = (trace, started, result.as_ref()) {
+                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "metal_trace[qwen35_prefill_chunk]: phase={:?}->{:?} budget={} prompt={}..{} processed={} emitted={} elapsed_ms={:.1}",
+                        phase_before,
+                        chunk.phase,
+                        budget,
+                        prompt_before,
+                        prompt_before + chunk.processed_tokens,
+                        chunk.processed_tokens,
+                        chunk.emitted_token.is_some(),
+                        elapsed_ms,
+                    );
+                }
+                result
+            }
         }
     }
 
@@ -2990,13 +3018,15 @@ impl<'a> Qwen35StepDriver<'a> {
     }
 
     fn ensure_cpp_session_drained(&mut self) -> Result<()> {
-        let cpp_model = self
-            .weights
-            .cpp_model
-            .as_ref()
-            .context("Qwen3.5 C++ step path missing compiled model")?;
         match &mut self.mode {
-            Qwen35StepMode::Cpp(state) => state.ensure_caches_drained(cpp_model),
+            Qwen35StepMode::Cpp(state) => {
+                let cpp_model = self
+                    .weights
+                    .cpp_model
+                    .as_ref()
+                    .context("Qwen3.5 C++ step path missing compiled model")?;
+                state.ensure_caches_drained(cpp_model)
+            }
             Qwen35StepMode::Rust(_) => Ok(()),
         }
     }
@@ -3304,13 +3334,32 @@ impl StepDriver for Qwen35StepDriver<'_> {
             return Ok(None);
         }
         self.pending_sampled = None;
+        let trace = metal_qwen35_trace_enabled();
+        let started = trace.then(Instant::now);
+        let cache_len_before = self.cache_len;
 
         let use_cpp_batch_prefill = matches!(self.mode, Qwen35StepMode::Cpp(_)) && tokens.len() > 1;
+        if trace {
+            let mode = if use_cpp_batch_prefill {
+                "cpp_batch_prefill"
+            } else if matches!(self.mode, Qwen35StepMode::Cpp(_)) {
+                "cpp_scalar_prefill"
+            } else {
+                "rust_scalar_prefill"
+            };
+            eprintln!(
+                "metal_trace[qwen35_prefill_tokens:start]: mode={} tokens={} terminal={} cache_len={}",
+                mode,
+                tokens.len(),
+                terminal_prompt,
+                cache_len_before,
+            );
+        }
         if use_cpp_batch_prefill {
             self.ensure_capacity(self.cache_len + tokens.len() as i32)?;
         }
 
-        match &mut self.mode {
+        let result = match &mut self.mode {
             Qwen35StepMode::Cpp(state) if tokens.len() > 1 => {
                 let token_values: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
                 let token_arr = MlxArray::from_slice_i32(&token_values, &[tokens.len() as i32]);
@@ -3386,7 +3435,28 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 }
                 Ok(emitted)
             }
+        };
+        if let (true, Some(started), Ok(emitted)) = (trace, started, result.as_ref()) {
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mode = if use_cpp_batch_prefill {
+                "cpp_batch_prefill"
+            } else if matches!(self.mode, Qwen35StepMode::Cpp(_)) {
+                "cpp_scalar_prefill"
+            } else {
+                "rust_scalar_prefill"
+            };
+            eprintln!(
+                "metal_trace[qwen35_prefill_tokens:done]: mode={} tokens={} terminal={} cache_len={}=>{} emitted={} elapsed_ms={:.1}",
+                mode,
+                tokens.len(),
+                terminal_prompt,
+                cache_len_before,
+                self.cache_len,
+                emitted.is_some(),
+                elapsed_ms,
+            );
         }
+        result
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {
@@ -3483,7 +3553,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
             self.cache_len += 1;
 
             // cache_len is post-increment (committed); prequeue only needs one more slot.
-            let can_prequeue = self.dflash.is_none() && self.cache_len + 1 <= self.kv_capacity;
+            let can_prequeue = self.dflash.is_none() && self.cache_len < self.kv_capacity;
             if can_prequeue {
                 if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
                     clear_metal_cache();

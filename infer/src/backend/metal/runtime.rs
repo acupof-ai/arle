@@ -236,7 +236,13 @@ impl MetalLivePrefixRuntime {
                     cache: MetalPrefixCache::new(METAL_PREFIX_BLOCK_SIZE),
                 })))
             }
-            MetalWeights::Qwen35(_) => {
+            MetalWeights::Qwen35(weights) => {
+                if weights.cpp_model.is_none() {
+                    info!(
+                        "Metal live prefix cache disabled for Qwen3.6/Qwen3.5-MoE: snapshot replay requires the compiled Qwen3.5 step path"
+                    );
+                    return Ok(None);
+                }
                 info!(
                     "Metal live prefix cache enabled for Qwen3.5 snapshot replay: block_size={}, max_cached_tokens={}",
                     METAL_PREFIX_BLOCK_SIZE, max_total_tokens

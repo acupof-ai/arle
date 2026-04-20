@@ -579,17 +579,36 @@ impl InferenceBackend for MetalBackend {
                 config.vocab_size,
                 config.eos_token_id,
             ),
-            MetalModelArch::Qwen35(arch) => log::info!(
-                "  arch: Qwen3.5 {} layers (full={}, linear={}), hidden={}, heads={}/{}(kv), vocab={}, eos={}",
-                config.num_hidden_layers,
-                arch.num_full_attention_layers(),
-                arch.num_linear_attention_layers(),
-                config.hidden_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.vocab_size,
-                config.eos_token_id,
-            ),
+            MetalModelArch::Qwen35(arch) => {
+                if let Some(moe) = &arch.moe {
+                    log::info!(
+                        "  arch: Qwen3.6/Qwen3.5-MoE {} layers (full={}, linear={}, moe={}), hidden={}, heads={}/{}(kv), vocab={}, eos={}",
+                        config.num_hidden_layers,
+                        arch.num_full_attention_layers(),
+                        arch.num_linear_attention_layers(),
+                        (0..config.num_hidden_layers)
+                            .filter(|&idx| moe.is_moe_layer(idx))
+                            .count(),
+                        config.hidden_size,
+                        config.num_attention_heads,
+                        config.num_key_value_heads,
+                        config.vocab_size,
+                        config.eos_token_id,
+                    );
+                } else {
+                    log::info!(
+                        "  arch: Qwen3.5 {} layers (full={}, linear={}), hidden={}, heads={}/{}(kv), vocab={}, eos={}",
+                        config.num_hidden_layers,
+                        arch.num_full_attention_layers(),
+                        arch.num_linear_attention_layers(),
+                        config.hidden_size,
+                        config.num_attention_heads,
+                        config.num_key_value_heads,
+                        config.vocab_size,
+                        config.eos_token_id,
+                    );
+                }
+            }
         }
 
         // ── 4. Load weights into Metal memory ───────────────────────────────

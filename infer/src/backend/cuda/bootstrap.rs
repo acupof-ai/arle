@@ -26,6 +26,10 @@ use crate::tokenizer::Tokenizer;
 pub enum ModelType {
     Qwen3,
     Qwen35,
+    /// Qwen3.5 Mixture-of-Experts (Qwen3.6-35B-A3B). CUDA path is a
+    /// `todo!()` stub until the CUDA MoE kernel lands; Metal path lives
+    /// entirely outside this module. See `docs/plans/qwen36-moe-metal.md`.
+    Qwen35Moe,
     GLM4,
 }
 
@@ -35,6 +39,7 @@ impl fmt::Display for ModelType {
         match self {
             Self::Qwen3 => write!(f, "Qwen3"),
             Self::Qwen35 => write!(f, "Qwen3.5"),
+            Self::Qwen35Moe => write!(f, "Qwen3.5-MoE"),
             Self::GLM4 => write!(f, "GLM-4"),
         }
     }
@@ -97,6 +102,7 @@ pub fn detect_model_type(model_path: &str) -> Result<ModelType> {
     match detect_arch(resolved.to_str().unwrap_or(model_path))? {
         ModelArch::Qwen3 => Ok(ModelType::Qwen3),
         ModelArch::Qwen35 => Ok(ModelType::Qwen35),
+        ModelArch::Qwen3_5_Moe => Ok(ModelType::Qwen35Moe),
         ModelArch::GLM4 => Ok(ModelType::GLM4),
         arch => bail!("model architecture {arch:?} is not supported by the runtime yet"),
     }
@@ -119,6 +125,10 @@ pub struct ModelComponents<M> {
 pub enum LoadedModelComponents {
     Qwen3(ModelComponents<Qwen3Model>),
     Qwen35(ModelComponents<Qwen35Model>),
+    /// Qwen3.5 MoE shares the `Qwen35Model` component type for now; the
+    /// MoE-specific dispatch happens at the engine layer. The CUDA loader
+    /// for this variant is intentionally a `todo!()` stub.
+    Qwen35Moe(ModelComponents<Qwen35Model>),
     GLM4(ModelComponents<GLM4Model>),
 }
 
@@ -182,6 +192,20 @@ pub fn load_qwen35_components(
     })
 }
 
+/// Qwen3.5 MoE (Qwen3.6-35B-A3B) CUDA loader stub.
+///
+/// The CUDA MoE forward path is not yet implemented. Metal has its own
+/// code path that does not go through this function. We keep the symbol so
+/// the CUDA dispatch table type-checks; attempting to actually load a MoE
+/// model under CUDA panics with a clear message.
+#[cfg(feature = "cuda")]
+pub fn load_qwen35_moe_components(
+    _model_path: &str,
+    _options: InferenceEngineOptions,
+) -> Result<ModelComponents<Qwen35Model>> {
+    todo!("GPU required: Qwen3.6 CUDA not yet implemented")
+}
+
 #[cfg(feature = "cuda")]
 pub fn load_glm4_components(
     model_path: &str,
@@ -204,6 +228,9 @@ pub fn load_model_components(
         ModelType::Qwen35 => Ok(LoadedModelComponents::Qwen35(load_qwen35_components(
             model_path, options,
         )?)),
+        ModelType::Qwen35Moe => Ok(LoadedModelComponents::Qwen35Moe(
+            load_qwen35_moe_components(model_path, options)?,
+        )),
         ModelType::GLM4 => Ok(LoadedModelComponents::GLM4(load_glm4_components(
             model_path, options,
         )?)),
@@ -221,6 +248,9 @@ pub fn spawn_scheduler_handle(
             spawn_scheduler_for_model(components, runtime, metrics)
         }
         LoadedModelComponents::Qwen35(components) => {
+            spawn_scheduler_for_model(components, runtime, metrics)
+        }
+        LoadedModelComponents::Qwen35Moe(components) => {
             spawn_scheduler_for_model(components, runtime, metrics)
         }
         LoadedModelComponents::GLM4(components) => {

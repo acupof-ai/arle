@@ -29,6 +29,40 @@ pub(super) enum MetalQwen35LayerType {
     LinearAttention,
 }
 
+/// Mixture-of-Experts architectural parameters for Qwen3.5/3.6.
+///
+/// Populated only when the checkpoint declares a non-zero `num_experts`
+/// (Qwen3.6-35B-A3B and future MoE variants). Dense Qwen3.5 leaves this
+/// `None` — the old SwiGLU path stays intact.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(super) struct MetalQwen35MoeConfig {
+    pub(super) num_experts: usize,
+    pub(super) num_experts_per_tok: usize,
+    pub(super) decoder_sparse_step: usize,
+    pub(super) norm_topk_prob: bool,
+    pub(super) mlp_only_layers: Vec<usize>,
+    /// Router quantization: `mlp.gate` and `mlp.shared_expert_gate` — 8-bit
+    /// on MLX-community A3B-4bit, group_size 64.
+    pub(super) router_bits: i32,
+    pub(super) router_group_size: i32,
+    /// Expert quantization: `mlp.switch_mlp.*` and `mlp.shared_expert.*` —
+    /// 4-bit on MLX-community A3B-4bit, group_size 64.
+    pub(super) expert_bits: i32,
+    pub(super) expert_group_size: i32,
+}
+
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+impl MetalQwen35MoeConfig {
+    /// Whether the given layer index uses a MoE block (mirrors
+    /// `Qwen35Config::is_moe_layer` — kept local so the Metal config doesn't
+    /// need to depend on `qwen35-spec`).
+    pub(super) fn is_moe_layer(&self, idx: usize) -> bool {
+        !self.mlp_only_layers.contains(&idx)
+            && (idx + 1).is_multiple_of(self.decoder_sparse_step.max(1))
+    }
+}
+
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(super) struct MetalQwen35ArchConfig {
@@ -36,6 +70,8 @@ pub(super) struct MetalQwen35ArchConfig {
     pub(super) rotary_dim: usize,
     #[cfg(feature = "metal")]
     pub(super) linear: super::gdr::MetalGdrConfig,
+    /// `Some` for Qwen3.6 / Qwen3_5_Moe checkpoints; `None` for dense Qwen3.5.
+    pub(super) moe: Option<MetalQwen35MoeConfig>,
 }
 
 impl MetalQwen35ArchConfig {
@@ -161,7 +197,7 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         .is_some_and(|arr| !arr.is_empty());
 
     let arch = match declared_arch {
-        ModelArch::Qwen35 => {
+        ModelArch::Qwen35 | ModelArch::Qwen3_5_Moe => {
             anyhow::ensure!(
                 has_layer_types,
                 "Qwen3.5 Metal config requires non-empty `layer_types`"
@@ -194,6 +230,92 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                 .and_then(|rope| rope.get("partial_rotary_factor"))
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(1.0);
+            // Optional MoE sub-block — Qwen3.6 only (Qwen3_5_Moe). Absence of
+            // `num_experts` (or 0) = dense Qwen3.5 path, preserved unchanged.
+            let moe = {
+                let nested_moe = model
+                    .get("moe_config")
+                    .and_then(serde_json::Value::as_object);
+                let mut raw_num_experts = get_usize(model, "num_experts", 0);
+                let mut raw_top_k = get_usize(model, "num_experts_per_tok", 0);
+                let mut decoder_sparse_step = get_usize(model, "decoder_sparse_step", 1).max(1);
+                let mut norm_topk_prob = model
+                    .get("norm_topk_prob")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                let mut mlp_only_layers = model
+                    .get("mlp_only_layers")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as usize))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                if let Some(nested) = nested_moe {
+                    let nested_num_experts = get_usize(nested, "num_experts", 0);
+                    if nested_num_experts > 0 {
+                        raw_num_experts = nested_num_experts;
+                    }
+                    let nested_top_k = get_usize(nested, "num_experts_per_tok", 0);
+                    if nested_top_k > 0 {
+                        raw_top_k = nested_top_k;
+                    }
+                    let nested_sparse_step = get_usize(nested, "decoder_sparse_step", 1);
+                    if nested_sparse_step > 1 {
+                        decoder_sparse_step = nested_sparse_step;
+                    }
+                    if nested
+                        .get("norm_topk_prob")
+                        .and_then(serde_json::Value::as_bool)
+                        .is_some_and(|value| !value)
+                    {
+                        norm_topk_prob = false;
+                    }
+                    if let Some(nested_layers) = nested
+                        .get("mlp_only_layers")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|layers| !layers.is_empty())
+                    {
+                        mlp_only_layers = nested_layers;
+                    }
+                }
+
+                if raw_num_experts > 0 {
+                    // Quantization: defaults from `quantization` at the root.
+                    // Router and shared_expert_gate are 8-bit in MLX-community
+                    // A3B-4bit; experts and shared_expert SwiGLU are 4-bit.
+                    // We encode the expected pattern here — a future checkpoint
+                    // with different overrides would need per-layer bit reads.
+                    let (group_size_default, bits_default) =
+                        quantization.map_or((64, 4), |qc| (qc.group_size, qc.bits));
+                    // If base quantization is 8-bit, router and experts
+                    // collapse to the same bit width — safe to still drive the
+                    // MoE block; the FFI accepts independent bits per side.
+                    let router_bits = 8.max(bits_default);
+                    let expert_bits = bits_default;
+                    Some(MetalQwen35MoeConfig {
+                        num_experts: raw_num_experts,
+                        num_experts_per_tok: raw_top_k,
+                        decoder_sparse_step,
+                        norm_topk_prob,
+                        mlp_only_layers,
+                        router_bits,
+                        router_group_size: group_size_default,
+                        expert_bits,
+                        expert_group_size: group_size_default,
+                    })
+                } else {
+                    None
+                }
+            };
+
             MetalModelArch::Qwen35(MetalQwen35ArchConfig {
                 rotary_dim: (head_dim as f64 * partial_rotary_factor) as usize,
                 layer_types,
@@ -207,11 +329,12 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
                     hidden_size,
                     rms_norm_eps: rms_norm_eps as f32,
                 },
+                moe,
             })
         }
         ModelArch::Qwen3 => MetalModelArch::Qwen3,
         other => anyhow::bail!(
-            "Metal backend currently supports Qwen3/Qwen3.5 only; got {}",
+            "Metal backend currently supports Qwen3/Qwen3.5/Qwen3.6 only; got {}",
             other.display_name()
         ),
     };
@@ -227,7 +350,7 @@ pub(super) fn load_metal_config(model_dir: &Path) -> Result<MetalModelConfig> {
         // MLX-converted Qwen3.5 checkpoints already run sanitize(), which shifts
         // the offset-style RMSNorm weights during conversion. The Metal path
         // must consume those weights directly instead of applying a second `+1`.
-        ModelArch::Qwen35 => MetalNormWeightMode::Direct,
+        ModelArch::Qwen35 | ModelArch::Qwen3_5_Moe => MetalNormWeightMode::Direct,
         ModelArch::Qwen3 => MetalNormWeightMode::AddUnitOffset,
         _ => unreachable!("unsupported architectures return earlier"),
     };
@@ -337,7 +460,71 @@ mod tests {
         );
 
         let err = load_metal_config(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("supports Qwen3/Qwen3.5 only"), "err={err}");
+        assert!(
+            err.contains("supports Qwen3/Qwen3.5/Qwen3.6 only"),
+            "err={err}"
+        );
         assert!(err.contains("GLM-4"), "err={err}");
+    }
+
+    #[test]
+    fn loads_qwen36_config_with_nested_moe_block() {
+        let dir = write_config_file(
+            r#"{
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "text_config": {
+                    "hidden_size": 2048,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 4,
+                    "head_dim": 128,
+                    "layer_types": [
+                        "linear_attention",
+                        "full_attention",
+                        "linear_attention",
+                        "full_attention"
+                    ],
+                    "linear_num_key_heads": 8,
+                    "linear_key_head_dim": 128,
+                    "linear_num_value_heads": 16,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "rope_parameters": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0
+                    },
+                    "moe_config": {
+                        "num_experts": 128,
+                        "num_experts_per_tok": 4,
+                        "decoder_sparse_step": 2,
+                        "norm_topk_prob": false,
+                        "mlp_only_layers": [1]
+                    }
+                },
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64
+                }
+            }"#,
+        );
+
+        let config = load_metal_config(dir.path()).unwrap();
+        match config.arch {
+            MetalModelArch::Qwen35(arch) => {
+                let moe = arch.moe.expect("expected nested moe_config to be loaded");
+                assert_eq!(moe.num_experts, 128);
+                assert_eq!(moe.num_experts_per_tok, 4);
+                assert_eq!(moe.decoder_sparse_step, 2);
+                assert!(!moe.norm_topk_prob);
+                assert_eq!(moe.mlp_only_layers, vec![1]);
+                assert_eq!(moe.router_bits, 8);
+                assert_eq!(moe.expert_bits, 4);
+                assert!(!moe.is_moe_layer(0));
+                assert!(!moe.is_moe_layer(1));
+                assert!(!moe.is_moe_layer(2));
+                assert!(moe.is_moe_layer(3));
+            }
+            MetalModelArch::Qwen3 => panic!("expected Qwen3.6 config, got Qwen3"),
+        }
     }
 }

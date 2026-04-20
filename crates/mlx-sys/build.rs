@@ -71,6 +71,7 @@ fn main() {
         .file("src/mlx_bridge.cpp")
         .file("src/mlx_dflash_draft_model.cpp")
         .file("src/mlx_qwen35_model.cpp")
+        .file("src/mlx_qwen35_moe_block.cpp")
         .include("src")
         .include(&mlx_vendor_dir)
         .include(&mlx_build) // for generated headers
@@ -120,6 +121,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx_bridge.cpp");
     println!("cargo:rerun-if-changed=src/mlx_dflash_draft_model.cpp");
     println!("cargo:rerun-if-changed=src/mlx_qwen35_model.cpp");
+    println!("cargo:rerun-if-changed=src/mlx_qwen35_moe_block.cpp");
     println!("cargo:rerun-if-changed=src/mlx_metal_capture.mm");
     println!("cargo:rerun-if-changed=src/mlx_common.h");
     println!("cargo:rerun-if-changed=vendor");
