@@ -1,7 +1,8 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use autograd::{
-    Tape, TensorStore, ops::exp, ops::log_softmax, ops::matmul, ops::rope, ops::silu, ops::sum,
+    Tape, TensorStore, ops::exp, ops::log_softmax, ops::matmul, ops::rmsnorm, ops::rope, ops::silu,
+    ops::sum,
 };
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
@@ -477,6 +478,94 @@ fn metal_rope_forward_stays_lazy() -> Result<()> {
     for (m, c) in metal_out.iter().zip(cpu_out.iter()) {
         let diff: f32 = (m - c).abs();
         assert!(diff <= 1e-5, "rope parity: metal={m} cpu={c} diff={diff}");
+    }
+
+    Ok(())
+}
+
+/// M5.3b.6 acceptance: `rmsnorm` forward must compose into the MLX lazy
+/// graph with no `mlx_eval` for a Dirty::Device `x`. Weight stays
+/// host-resident (typical per-layer RMSNorm weight shape `[hidden]`).
+/// `matmul → rmsnorm → sum` records zero evals through the forward.
+/// Backward pays tape.backward's batch flush plus the host-eager
+/// `rmsnorm_backward` body (which re-reads `x` and `weight`; the lazy
+/// branch's empty `inv_rms` sentinel triggers a host recompute using
+/// the `eps` now threaded on `RMSNormCtx`).
+#[cfg(feature = "metal")]
+#[test]
+fn metal_rmsnorm_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let rows = 4usize;
+    let hidden = 16usize;
+    let eps = 1e-5f32;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_data: Vec<f32> = (0..rows * hidden).map(|i| (i as f32) * 0.01).collect();
+    let w_data: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.01).collect();
+    // Unit matmul weight to keep the lazy op graph minimal but still
+    // produce a Dirty::Device output feeding rmsnorm.
+    let id_data: Vec<f32> = (0..hidden * hidden)
+        .map(|i| if i / hidden == i % hidden { 1.0 } else { 0.0 })
+        .collect();
+
+    let x = store.from_slice(&x_data, &[rows, hidden])?;
+    let id = store.from_slice(&id_data, &[hidden, hidden])?;
+    let w = store.from_slice(&w_data, &[hidden])?;
+    store.get_mut(x).expect("x exists").requires_grad = true;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // `y` is Dirty::Device (lazy matmul output); rmsnorm must stay lazy.
+    let y = matmul(x, id, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let normed = rmsnorm(y, w, eps, &mut store, &mut tape)?;
+    let after_rmsnorm = eval_count();
+    let loss = sum(normed, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_rmsnorm, 0,
+        "M5.3b.6: lazy rmsnorm forward must not force an eval; saw {after_rmsnorm}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}. \
+         Budget = tape.backward batch flush + mlx_matmul_backward FFI eval + \
+         1 slack for the host recompute path."
+    );
+
+    // Parity: metal lazy output vs CpuBackend::rms_norm_forward on the
+    // same inputs.
+    let metal_out = store
+        .get(normed)
+        .expect("normed tensor exists")
+        .data
+        .clone();
+    let cpu = CpuBackend;
+    let cpu_out = cpu.rms_norm_forward(&x_data, &w_data, &[rows, hidden], eps)?;
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (m, c) in metal_out.iter().zip(cpu_out.iter()) {
+        let diff: f32 = (m - c).abs();
+        assert!(
+            diff <= 1e-4,
+            "rmsnorm parity: metal={m} cpu={c} diff={diff}"
+        );
     }
 
     Ok(())

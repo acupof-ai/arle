@@ -517,6 +517,27 @@ impl Backend for MetalBackend {
         mlx_rope(x, x_shape, cos, sin)
     }
 
+    // Lazy fused row-wise RMSNorm: borrows `x` as an existing MLX handle,
+    // uploads `weight` per call (typically host-resident), and returns
+    // the `mlx_fast_rms_norm` output wrapped in an `MlxHandle` without
+    // evaluating. Backward recomputes `inv_rms` host-side from the saved
+    // `x` (flushed to host by `tape.backward` before backward walks).
+    // M5.3b.6.
+    fn rms_norm(
+        &self,
+        x: &DeviceHandle,
+        weight: &[f32],
+        shape: &[usize],
+        eps: f32,
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot rms_norm a non-metal device handle",
+            ));
+        };
+        mlx_rms_norm_lazy(x_handle.as_ptr(), weight, shape, eps)
+    }
+
     // Lazy half-split rotation: same graph as `mlx_rope` (slice → multiply →
     // sub/add → concat) but borrows `x` as an existing MLX handle and skips
     // the final `eval_and_readback`. cos/sin still upload per call from host
@@ -1184,6 +1205,62 @@ fn mlx_add_broadcast(
             });
         }
         Ok(host)
+    }
+}
+
+// Lazy sibling of `mlx_rms_norm`: borrows an existing MLX `x` handle,
+// uploads `weight` as a temporary array, calls `mlx_fast_rms_norm`, and
+// returns the result wrapped in an `MlxHandle` without calling
+// `mlx_eval`. Mirrors the shape validation from `mlx_rms_norm`. M5.3b.6.
+fn mlx_rms_norm_lazy(
+    x_ptr: *mut mlx_array,
+    weight: &[f32],
+    shape: &[usize],
+    eps: f32,
+) -> Result<DeviceHandle> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    if weight.len() != last_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![last_dim],
+            got: vec![weight.len()],
+        });
+    }
+
+    let w_shape = [last_dim as i32];
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `x_ptr` is borrowed for the duration of this call; `w_arr`
+    // is allocated here and freed before return; the returned `MlxHandle`
+    // owns the final `mlx_fast_rms_norm` result.
+    unsafe {
+        let w_arr = mlx_array_from_data(
+            weight.as_ptr() as *const c_void,
+            w_shape.as_ptr(),
+            1,
+            MLX_FLOAT32,
+        );
+        if w_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (rms_norm lazy weight)",
+            ));
+        }
+        let out_arr = mlx_fast_rms_norm(x_ptr, w_arr, eps);
+        mlx_array_free(w_arr);
+        if out_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_fast_rms_norm returned null (lazy)",
+            ));
+        }
+        Ok(DeviceHandle::Metal(MlxHandle::from_raw(out_arr)))
     }
 }
 
