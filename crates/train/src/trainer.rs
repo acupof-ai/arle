@@ -177,8 +177,21 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         // the live one so a CLI flag flip between runs cannot silently resume
         // under a different schedule (e.g. switching `linear-warmup` for
         // `cosine-with-warmup` preserves steps but yields wrong LRs).
+        //
+        // Legacy compat (codex review 2026-04-20 on 3d9125d, P1): pre-P2
+        // checkpoints stored a bare name like `"constant"` (the
+        // `describe().split(['(', ' ']).next()` prefix). Accept that form when
+        // its prefix matches the live `describe()` prefix so old checkpoints
+        // still resume; strict full-describe match otherwise.
         let live_describe = self.schedule.describe();
-        if doc.schedule_name != live_describe {
+        let live_prefix = live_describe
+            .split(['(', ' '])
+            .next()
+            .unwrap_or(&live_describe);
+        let saved = &doc.schedule_name;
+        let saved_looks_legacy = !saved.contains('(') && !saved.contains(' ');
+        let ok = saved == &live_describe || (saved_looks_legacy && saved == live_prefix);
+        if !ok {
             eprintln!(
                 "[trainer] lr schedule mismatch on resume: saved={saved:?}, live={live:?}",
                 saved = doc.schedule_name,
