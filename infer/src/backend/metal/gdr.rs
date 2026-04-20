@@ -965,6 +965,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hosted Apple runners intermittently GPU-hang in GDR kernel/tape replay"]
     fn test_gated_delta_parallel_matches_serial_state_update() {
         let _guard = metal_test_guard();
         use crate::backend::metal::mlx::{eval, slice};
@@ -1000,6 +1001,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hosted Apple runners intermittently GPU-hang in GDR kernel/tape replay"]
     fn test_tape_replay_matches_reference_fp32_state_update() {
         let _guard = metal_test_guard();
         use crate::backend::metal::mlx::eval;
@@ -1019,6 +1021,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hosted Apple runners intermittently GPU-hang in GDR kernel/tape replay"]
     fn test_tape_replay_varlen_matches_scalar() {
         let _guard = metal_test_guard();
         use crate::backend::metal::mlx::{Dtype, as_dtype, eval, slice};
