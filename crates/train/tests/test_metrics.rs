@@ -5,7 +5,9 @@ use std::io::BufRead;
 use std::path::PathBuf;
 
 use tempfile::tempdir;
-use train::metrics::{JsonlSink, MetricSample, MetricSink, MultiSink, NullSink, open_sink};
+use train::metrics::{
+    JsonlSink, MetricSample, MetricSink, MultiSink, NullSink, open_sink, open_sink_append,
+};
 
 fn read_lines(path: &PathBuf) -> Vec<String> {
     let file = fs::File::open(path).expect("open jsonl");
@@ -204,4 +206,93 @@ fn jsonl_line_is_parseable_by_serde_json() {
     assert!(v3["loss"].is_null(), "NaN should serialise as null");
     assert_eq!(v3["tokens_per_s"].as_f64().unwrap(), 1234.5);
     assert!(v3["grad_norm"].is_null(), "Inf should serialise as null");
+}
+
+/// Phase 4 follow-up (commit 60f7183): `JsonlSink::open_append` is the
+/// multi-phase-binary sibling of `create`. `train_grpo` uses it for the
+/// GRPO phase so JSONL output from the SFT-phase Trainer doesn't get
+/// clobbered. Pins the truncate-vs-append contract so a future
+/// "simplify" refactor can't silently swap append for truncate.
+#[test]
+fn jsonl_sink_open_append_extends_existing_file() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("two_phase.jsonl");
+
+    // Phase 1: create (truncate) + two samples.
+    {
+        let mut sink = JsonlSink::create(&path).expect("create jsonl");
+        let f1 = [("loss", 1.0f64)];
+        sink.emit(&MetricSample {
+            step: 1,
+            fields: &f1,
+        });
+        let f2 = [("loss", 0.5f64)];
+        sink.emit(&MetricSample {
+            step: 2,
+            fields: &f2,
+        });
+    }
+
+    // Phase 2: open_append + one sample. Must NOT truncate.
+    {
+        let mut sink = JsonlSink::open_append(&path).expect("open_append jsonl");
+        let f3 = [("reward", 0.125f64)];
+        sink.emit(&MetricSample {
+            step: 3,
+            fields: &f3,
+        });
+    }
+
+    let lines = read_lines(&path);
+    assert_eq!(
+        lines.len(),
+        3,
+        "open_append must extend, not truncate — got {:?}",
+        lines
+    );
+    let v1: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse 1");
+    let v2: serde_json::Value = serde_json::from_str(&lines[1]).expect("parse 2");
+    let v3: serde_json::Value = serde_json::from_str(&lines[2]).expect("parse 3");
+    assert_eq!(v1["step"], serde_json::json!(1));
+    assert_eq!(v2["step"], serde_json::json!(2));
+    assert_eq!(v3["step"], serde_json::json!(3));
+    assert_eq!(v3["reward"].as_f64().unwrap(), 0.125);
+}
+
+/// Factory-level variant of the above: `open_sink_append` must yield a
+/// sink that extends rather than truncates, matching what `train_grpo`
+/// actually calls. Also verifies `open_sink_append` creates the file
+/// when absent (i.e. single-phase binaries wouldn't break if they
+/// accidentally used the append variant).
+#[test]
+fn open_sink_append_factory_extends_and_creates() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("factory.jsonl");
+
+    // First call: file does not exist — append factory must create it.
+    {
+        let mut sink = open_sink_append(Some(&path), false).expect("open_sink_append create");
+        let f = [("loss", 0.75f64)];
+        sink.emit(&MetricSample {
+            step: 10,
+            fields: &f,
+        });
+    }
+    assert_eq!(read_lines(&path).len(), 1);
+
+    // Second call: file exists — append factory must extend.
+    {
+        let mut sink = open_sink_append(Some(&path), false).expect("open_sink_append extend");
+        let f = [("loss", 0.25f64)];
+        sink.emit(&MetricSample {
+            step: 11,
+            fields: &f,
+        });
+    }
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 2, "factory must append, got {:?}", lines);
+    let v10: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let v11: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(v10["step"], serde_json::json!(10));
+    assert_eq!(v11["step"], serde_json::json!(11));
 }
