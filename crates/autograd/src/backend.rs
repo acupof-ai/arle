@@ -489,6 +489,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// killing the ~200-param × param-size re-upload churn that the prior
     /// `get_mut`-triggered `Dirty::Host` path caused on Qwen3.5-class models
     /// (see `docs/experience/wins/2026-04-21-adamw-on-device-metal.md`).
+    ///
+    /// **Eval contract (M5.3b.11):** implementations MUST return the updated
+    /// handles *unevaluated*. The caller (`AdamW::step_device`) collects every
+    /// param's `(new_param, new_m, new_v)` triple and fires a single
+    /// `backend.eval(&handles)` at the end of the optimizer step. This turns
+    /// the per-step eval count from `num_params` (~200 on Qwen3.5) into `1`
+    /// regardless of parameter count — the independent per-param MLX chains
+    /// share no sub-node, so batching them into one eval is safe. Backends
+    /// whose `eval` is a no-op (CPU default) silently get the old semantics
+    /// (work already done during the formula); only lazy-graph backends
+    /// (Metal) benefit from the batching, and they MUST NOT call
+    /// `mlx_eval` inside this method.
     #[allow(clippy::too_many_arguments)]
     fn adamw_step(
         &self,

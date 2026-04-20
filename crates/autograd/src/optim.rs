@@ -197,6 +197,15 @@ impl AdamW {
             .expect("step_device called without a backend")
             .clone();
 
+        // M5.3b.11: collect every param's (new_param, new_m, new_v) handle
+        // clones during the loop and fire a single terminal
+        // `backend.eval(...)` after — one eval per optimizer step regardless
+        // of parameter count. The MLX chains for independent params share no
+        // sub-node, so batching is safe. `DeviceHandle::Metal(MlxHandle)`
+        // clones are cheap Arc ref-counts, so holding 3 × num_params handles
+        // through the loop costs ~negligible memory.
+        let mut pending_eval: Vec<DeviceHandle> = Vec::with_capacity(params.len() * 3);
+
         for &param_id in params {
             let (grad_id, param_shape, param_size) = {
                 let Some(param_snapshot) = store.get(param_id) else {
@@ -279,6 +288,11 @@ impl AdamW {
                 )
                 .expect("backend adamw_step");
 
+            // Record cheap Arc-clones for the terminal batched eval below.
+            pending_eval.push(new_param.clone());
+            pending_eval.push(new_m.clone());
+            pending_eval.push(new_v.clone());
+
             // Install the new param handle WITHOUT going through get_mut
             // (which would ensure_host → mark Dirty::Host → force re-upload).
             store
@@ -287,6 +301,17 @@ impl AdamW {
 
             entry.m = MomentStorage::Device(new_m);
             entry.v = MomentStorage::Device(new_v);
+        }
+
+        // M5.3b.11: one terminal eval for the whole optimizer step. The
+        // Metal backend's `adamw_step` returned every triple unevaluated,
+        // so without this line the MLX graph would accumulate until the
+        // next forward pass's `ensure_host` forces a catch-up eval —
+        // correctness-equivalent but gives up the batching benefit for
+        // the eval counter. The CPU default `Backend::eval` is a no-op.
+        if !pending_eval.is_empty() {
+            let refs: Vec<&DeviceHandle> = pending_eval.iter().collect();
+            backend.eval(&refs).expect("batched adamw terminal eval");
         }
     }
 

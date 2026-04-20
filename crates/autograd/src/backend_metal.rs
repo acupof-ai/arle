@@ -644,13 +644,18 @@ impl Backend for MetalBackend {
     //   v' = β2·v + (1-β2)·g²
     //   param' = (1 - lr·wd)·param - lr·(m'/bc1) / (√(v'/bc2) + eps)
     //
-    // One terminal `mlx_eval` covers {new_param, new_m, new_v} so the
-    // handles are numerically realized before the next forward reads
-    // them — but `param` stays `Dirty::Device`, so no re-upload happens
-    // on the next step. The prior host-loop path downloaded + uploaded
-    // every param every step (get_mut → ensure_host → mutate → mark
-    // Dirty::Host → next ensure_device re-uploads); M5.3b.10. Scalar
-    // constants broadcast-multiply via `mlx_array_new_float32`, which is
+    // M5.3b.11: returns the three MLX graph nodes UNEVALUATED. The caller
+    // (`AdamW::step_device`) collects every param's triple and issues a
+    // single `backend.eval(&handles)` at the end of the optimizer step,
+    // so per-step eval count is `1` regardless of param count (~200 on
+    // Qwen3.5-class models). Composing independent per-param chains into
+    // one eval is safe — the updates share no sub-node.
+    //
+    // M5.3b.10 context (preserved for reference): the prior host-loop path
+    // downloaded + uploaded every param every step (`get_mut` →
+    // `ensure_host` → mutate → mark Dirty::Host → next `ensure_device`
+    // re-uploads). Staying Dirty::Device across steps kills that churn.
+    // Scalar constants broadcast-multiply via `mlx_array_new_float32`,
     // the same primitive the lazy `gelu` uses for 0.5/INV_SQRT_2. No new
     // MLX primitives introduced — `mlx_divide` does not exist in the
     // bridge, so we reach the reciprocal via `mlx_reciprocal`.
@@ -988,15 +993,13 @@ impl Backend for MetalBackend {
                 ));
             }
 
-            // One terminal eval so the three returned handles are
-            // numerically realized — the next forward will read `param`
-            // (and re-read-ish `m`/`v` on the next step) through its MLX
-            // handle, which requires the value to be materialized. This is
-            // the single accepted eval in the M5.3b.10 budget.
-            let mut eval_handles = [new_param, new_m, new_v];
-            mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
-            bump_eval_count();
-
+            // M5.3b.11: no intra-op eval. The three MLX graph nodes return
+            // unevaluated; `AdamW::step_device` collects every param's
+            // triple and fires a single `backend.eval(...)` at the end of
+            // the optimizer step, turning the per-step eval count from
+            // `num_params` into `1` regardless of how many parameters the
+            // model has. Lazy-graph composition across params is safe — the
+            // updates are independent, no sub-node is shared.
             Ok((
                 DeviceHandle::Metal(MlxHandle::from_raw(new_param)),
                 DeviceHandle::Metal(MlxHandle::from_raw(new_m)),
