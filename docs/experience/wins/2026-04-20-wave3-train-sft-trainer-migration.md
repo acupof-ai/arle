@@ -1,0 +1,62 @@
+# Wave 3: train_sft migrated onto Trainer<O, C, S> — pending remote bench
+
+## Context
+
+Phase 2 of `docs/plans/train-runtime-architecture-v1.md`. The pre-migration
+`train_sft` bin hand-rolled the optimizer/step/clip/zero_grad/save loop
+(~500 LOC total). Wave 3 (commit 44a7e19) composed the generic
+`Trainer<AdamW, NoClip, ConstantLr>` via `run_with_hooks` with the binary
+keeping only the step closure, the on_step_end weight-save hook, and the
+CLI wiring.
+
+Commit ad5568b then wired the remaining Phase 2 acceptance flags:
+`--lr-schedule` (constant / linear-warmup / cosine-with-warmup),
+`--warmup-steps`, `--min-lr`, `--grad-accum-steps`, `--metrics-jsonl`,
+`--resume-from`. Schedule is a `Box<dyn LrSchedule>` through the new
+`impl<T: LrSchedule + ?Sized> LrSchedule for Box<T>` blanket in autograd.
+
+Also landed mid-wave from codex review on 3d9125d, feae23b, bdde441,
+44a7e19: P1 tape/store cleanup hook, P2 schedule-describe persistence,
+P3 NoClip returning true pre-clip norm, legacy-bare-schedule-name
+compat on resume, force-emit metrics on step 1 + final, dropping the
+redundant `step` key from the metrics fields array.
+
+## What Worked
+
+- 12 `test_trainer_loop` unit tests green covering step counts,
+  grad-accum, LR schedule wiring, metrics (both log_every + forced),
+  save, resume (fresh / mismatch-reject / legacy-compat ×2), hook
+  firing, activation cleanup.
+- `test_convergence_smoke` confirms a tiny model (4-token copy task,
+  AdamW lr=1e-2) still converges through the new loop: loss[0] - loss[9]
+  > 0.5 with deterministic init.
+- `cargo clippy --release -p train --no-default-features -- -D warnings`
+  clean; `cargo check -p infer --no-default-features --features cuda,no-cuda`
+  clean (CUDA-Rust typecheck on Mac).
+
+## Status: pending-remote
+
+End-to-end smoke + throughput compare needs a remote runner with
+`Qwen3-0.6B` weights. CLAUDE.md bench policy (line 303 of plan v1):
+> training-loss-curve bench; guidellm is inference-side and does not apply here
+
+Plan:
+1. On the remote, run `train_sft --model Qwen/Qwen3-0.6B --data
+   <tiny-sft.jsonl> --steps 20 --batch 1 --log-every 1 --backend metal`
+   and record the loss curve under the pre-migration binary (git
+   checkout 41374a7^) and the post-migration binary (HEAD).
+2. Expected delta: < 1% per-step loss difference — the migration is
+   behavior-preserving. Anything larger is a regression.
+3. Record tok/s + ms/step under both. Expected: within ±5% of pre.
+
+Plan revisit after remote run → this file gets:
+- `## Results` with both loss curves and the diff
+- `## Problems` if any
+- Backlinks from the plan §9 Phase 2 row.
+
+## Rule
+
+**Migration refactors that pass all unit tests but alter the step-loop
+control flow still warrant a real-model smoke before declaring bench
+regression-free.** Synthetic-loss tests exercise optim/backward but
+not the forward/loss topology that the model actually takes.

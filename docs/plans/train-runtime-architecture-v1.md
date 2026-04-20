@@ -242,15 +242,16 @@ step_000123/
 - ✅ `MetricSink` (`train/src/metrics.rs`) — Null/Stdout/Jsonl/Multi
 - 🟡 `AdamWState` export/import codec on the existing concrete `AdamW` (not trait'd yet)
 
-### Phase 2 — Trait extraction + TrainerLoop skeleton + train_sft migration
+### Phase 2 — Trait extraction + TrainerLoop skeleton + train_sft migration — ✅ landed 2026-04-20
 
-- Extract `Optimizer` trait in `crates/autograd/src/optim.rs`; `AdamW` implements it (signature of `step` / `zero_grad` already compatible — thin wrapper).
-- Add `GradClip` trait + `NoClip` + `GlobalNorm` in `crates/train/src/grad_clip.rs` (port existing `clip_grad_norm`).
-- Implement `Trainer<O, C, S>` in `crates/train/src/trainer.rs`.
-- Implement CheckpointCodec v2: `save(&dir, &TrainerState, &OptimStateDoc)` + `load(&dir) -> (TrainerState, OptimStateDoc)` in `crates/train/src/checkpoint.rs` (directory mode). Keep `LMCKP003` reader for pretrain compat.
-- **Migrate `train_sft.rs` onto Trainer as the proving ground.** Target: binary drops from ~500 LOC to ~150–200 LOC. Adds `--lr-schedule`, `--warmup-steps`, `--grad-accum-steps`, `--metrics-jsonl`, `--resume-from`.
-- Tests: Trainer step-level unit tests (mock `Optimizer`, `LrSchedule`, `MetricSink`). End-to-end: 2-step SFT smoke test.
-- Bench: train_sft throughput on Metal before/after (expected: within ±5% — this is refactor, not perf change).
+- ✅ `Optimizer` trait in `crates/autograd/src/optim.rs`; `AdamW` implements it.
+- ✅ `GradClip` trait + `NoClip` + `GlobalNorm` in `crates/train/src/grad_clip.rs`.
+- ✅ `Trainer<O, C, S>` in `crates/train/src/trainer.rs` (incl. `run_with_hooks`, `resume_if_configured`, v2 codec, P1/P2/P3 from codex review 3d9125d/feae23b + P1 legacy compat from 3d9125d).
+- ✅ CheckpointCodec v2 directory layout in `crates/train/src/checkpoint.rs`. `LMCKP003` reader retained for pretrain compat.
+- ✅ **`train_sft.rs` migrated onto Trainer** (commits 44a7e19 + ad5568b). Binary ~250 LOC on the trainer, with `--lr-schedule`, `--warmup-steps`, `--min-lr`, `--grad-accum-steps`, `--metrics-jsonl`, `--resume-from` all wired.
+- ✅ Trainer step-level tests (12 tests in `crates/train/tests/test_trainer_loop.rs`) covering step counts, grad-accum, LR schedule wiring, metrics, save, resume, legacy resume, force-emit on step 1 + final, hook firing, activation cleanup.
+- ⏳ End-to-end 2-step SFT smoke test — pending remote runner w/ Qwen3-0.6B weights.
+- ⏳ Bench: train_sft throughput on Metal before/after — pending remote (stub in `docs/experience/wins/2026-04-20-wave3-train-sft-trainer-migration.md`).
 
 ### Phase 3 — Migrate remaining 4 binaries
 
