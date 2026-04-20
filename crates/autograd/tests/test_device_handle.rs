@@ -1,6 +1,6 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
-use autograd::{Tape, TensorStore, ops::matmul, ops::sum};
+use autograd::{Tape, TensorStore, ops::log_softmax, ops::matmul, ops::sum};
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
 
@@ -180,6 +180,89 @@ fn metal_single_forward_backward_step_has_bounded_eval_count() -> Result<()> {
         after_backward <= 2,
         "forward+backward eval count must be bounded; saw {after_backward} \
          (after_matmul={after_matmul} after_sum={after_sum})"
+    );
+    Ok(())
+}
+
+/// Characterization test — M5.3b.2 boundary marker.
+///
+/// Records the current eval cost of `matmul → log_softmax → sum → backward`
+/// on Metal. Today (`matmul` lazy via M5.3a, `sum` lazy via M5.3b.1,
+/// `log_softmax` still CPU-bound) the forward pays **two evals per
+/// log_softmax call**:
+///
+/// 1. `ops/softmax.rs::log_softmax` does `store.tensor(x)?.clone()` which
+///    triggers `ensure_host(x)` on the Dirty::Device matmul output → one
+///    `mlx_eval` + readback to materialize host data.
+/// 2. `backend.log_softmax_forward_last_axis` internally calls
+///    `mlx_softmax_like(...) → eval_and_readback` → a second `mlx_eval`.
+///
+/// Regression intent:
+/// - **Loose upper bound** (strict today): `after_log_softmax <= 2`.
+///   Today it is exactly 2; if it climbs to 3+, a third readback has
+///   sneaked into the forward path.
+/// - **Tight lower bound** (aspirational): when M5.3b.2 ports log_softmax
+///   to the lazy MLX graph (`mlx_softmax_axis` / `mlx_logsumexp_axis` +
+///   `mlx_subtract`, no intermediate `mlx_eval`), flip this to
+///   `assert_eq!(after_log_softmax, 0)` so the forward-pass chain
+///   `matmul → log_softmax → sum` stays fully lazy end-to-end.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_log_softmax_forward_backward_records_current_eval_cost() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let d_in = 32usize;
+    let d_out = 16usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_data: Vec<f32> = (0..d_in).map(|i| (i as f32) * 0.01).collect();
+    let w_data: Vec<f32> = (0..d_in * d_out)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+        .collect();
+
+    let x = store.from_slice(&x_data, &[1, d_in])?;
+    let w = store.from_slice(&w_data, &[d_in, d_out])?;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    reset_eval_count();
+
+    let y = matmul(x, w, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let logp = log_softmax(y, &mut store, &mut tape)?;
+    let after_log_softmax = eval_count();
+    let loss = sum(logp, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert!(
+        after_log_softmax <= 2,
+        "log_softmax forward pays at most two evals today (pre-M5.3b.2: \
+         one readback for the matmul-output input + one inside \
+         mlx_softmax_like); saw {after_log_softmax}. If this climbs to 3+ \
+         the forward path has regressed. When M5.3b.2 lands, flip to \
+         assert_eq!(_, 0)."
+    );
+    assert!(
+        after_sum >= after_log_softmax,
+        "sum cannot decrease the running eval count; saw after_log_softmax={after_log_softmax} \
+         after_sum={after_sum}"
+    );
+    assert!(
+        after_backward <= 5,
+        "forward+backward eval count bounded; saw {after_backward} \
+         (after_matmul={after_matmul} after_log_softmax={after_log_softmax} \
+          after_sum={after_sum}). Ceiling covers: pre-M5.3b.2 two-eval \
+          log_softmax forward + tape.backward flush + mlx_matmul_backward + \
+          log_softmax backward host-mul."
     );
     Ok(())
 }
