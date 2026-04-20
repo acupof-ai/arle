@@ -247,6 +247,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Device-handle variant of `exp_forward`. Lazy on backends with a
+    /// native `exp` graph node (Metal: `mlx_exp`); the default
+    /// implementation falls back to `readback → host compute → upload`
+    /// so CPU/CUDA need no special-case. M5.3b.4.
+    fn exp(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.exp_forward(&host)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * b` over identically-sized contiguous tensors.
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         cpu_mul_forward(a, b)
