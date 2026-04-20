@@ -21,6 +21,10 @@
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 ---
 
 ## 📰 Latest Updates
@@ -35,18 +39,46 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 
 ## 🚦 Status at a glance
 
-| Area | Status | Notes |
-|------|--------|-------|
-| CUDA / Linux — Qwen3 / Qwen3.5 / GLM4 | **Supported** | Primary serving path. |
-| Metal / Apple Silicon — Qwen3 / Qwen3.5 | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length decode not yet batched. |
-| Metal DFlash (Qwen3 / Qwen3.5) | **Beta — default-on** | Shipped default-on 2026-04-19; Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-ident parity + long-prompt + c=1..8 validated 2026-04-20. |
-| CPU-only / `no-cuda` | **Development only** | Smoke tests, request-path validation. Not a production target. |
-| `/v1/completions`, `/v1/chat/completions`, `/v1/models` | **Stable** | OpenAI-compatible. |
-| `/v1/responses` | **Beta** | Non-streaming + SSE `output_text.delta`. |
-| FP8 / INT8 / TurboQuant KV, GPTQ/AWQ W4, Q4_K GGUF | **Beta** (CUDA) | Quantized KV is CUDA-only today. |
+Four axes, each answering one question. Authoritative matrix lives in
+[docs/support-matrix.md](docs/support-matrix.md); stability tiers
+(**Stable** → **Beta** → **Dev**) are defined in
+[docs/stability-policy.md](docs/stability-policy.md).
 
-Authoritative matrix: [docs/support-matrix.md](docs/support-matrix.md) ·
-Stability policy: [docs/stability-policy.md](docs/stability-policy.md)
+### Backends — *where does it run?*
+
+| Backend | Platform | Status | What ships |
+|---------|----------|:------:|------------|
+| **CUDA** | Linux + NVIDIA | **Stable** | Primary serving path. Continuous batching, prefix cache, CUDA Graph, FlashInfer. |
+| **Metal** | Apple Silicon | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length batched decode pending. |
+| **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated (2026-04-20). |
+| **CPU** | Portable | **Dev only** | Smoke tests and request-path validation. Not a serving target. |
+
+### Models — *what does it load?*
+
+| Model | Attention | CUDA | Metal |
+|-------|-----------|:----:|:-----:|
+| Qwen3 (0.6B – 72B) | GQA | ✅ | ✅ |
+| Qwen3.5-4B | Hybrid (linear + full) | ✅ | ✅ |
+| GLM4 | GQA | ✅ | — |
+| Llama 3 / 4 | GQA | *planned* | *planned* |
+| DeepSeek V3 / R1 | MLA | *planned* | *planned* |
+
+### HTTP API — *what can clients call?*
+
+| Endpoint | Status | Notes |
+|----------|:------:|-------|
+| `POST /v1/completions` · `POST /v1/chat/completions` · `GET /v1/models` | **Stable** | OpenAI-compatible. Chat supports SSE streaming. |
+| `POST /v1/responses` | **Beta** | Non-streaming subset + SSE `output_text.delta`. |
+| `GET /metrics` · `GET /v1/stats` | **Stable** | Prometheus + human-readable ops surface. |
+
+### Quantization — *how small does it get?*
+
+| Format | Status | Available on |
+|--------|:------:|--------------|
+| FP8 / INT8 / TurboQuant KV | **Beta** | CUDA |
+| GPTQ W4 · AWQ W4 | **Beta** | CUDA |
+| Q4_K GGUF | **Beta** | CUDA |
+| MLX 4-bit | **Beta** | Metal (default for the canonical `start_metal_serve.sh` path) |
 
 ---
 
