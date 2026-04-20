@@ -6,6 +6,17 @@ c=2 TPOT delta remains `pending-remote` for a matched-A/B session per
 `feedback_matched_ab_for_small_bench_effects.md` — the 2–5% sized effect
 is below the single-session thermal-noise threshold.
 
+**2026-04-20 follow-up:** matched-A/B close-out ran (two thermal-separated
+sessions, order-randomized). Result: **inconclusive — within noise**.
+Cross-session mean Δ = −1.4% (well below the 10% bar); per-session
+deltas sign-flip with run order (−4.5% session 1, +1.8% session 2),
+indicating order-of-run (cold vs warm) dominates binary identity at this
+effect size. See
+[`2026-04-20-dflash-async-eval-matched-ab.md`](./2026-04-20-dflash-async-eval-matched-ab.md)
+for full 2×2 table + rule update. `pending-remote` status retained: we
+have the measurement, but no confirmed numeric to replace it with;
+correctness gates still pass and the change is non-regressing.
+
 **Date**: 2026-04-20
 **Machine**: Apple M4 Max (40 GPU cores, ~400 GB/s UMA), macOS 26.3.1
 **Model**: `mlx-community/Qwen3.5-4B-MLX-4bit` + `z-lab/Qwen3.5-4B-DFlash`
