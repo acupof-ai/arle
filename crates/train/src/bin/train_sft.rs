@@ -1,10 +1,8 @@
 use std::{
-    cell::RefCell,
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
-    rc::Rc,
     str::FromStr,
     sync::Arc,
 };
@@ -18,7 +16,6 @@ use thiserror::Error;
 use train::{
     StepOutcome, Trainer, TrainerConfig,
     cli_args::{ArgError, next_value, parse_value},
-    dataset::LcgRng,
     grad_clip::NoClip,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
@@ -250,9 +247,15 @@ fn run() -> Result<(), CliError> {
     // restores optimizer state + step counter — the Trainer is
     // architecture-agnostic and does not know how to reload model weights.
     // So we first overwrite the base `--model` weights with the checkpoint's
-    // `model.safetensors`, then call the trainer-side restore. Without the
-    // explicit weight reload, a resumed run would combine base-model
-    // weights with resumed Adam moments + step state — a corrupt resume.
+    // `model.safetensors`, then call the trainer-side restore.
+    //
+    // Codex review 2026-04-20 on 49512b1 (#1, High): the bare weight reload
+    // is not enough — (a) `load_into` silently ignores registered tensors
+    // absent from the file, so a partial checkpoint silently hybridises
+    // with base weights; (b) a checkpoint with mismatched architecture
+    // slips through until a shape mismatch crashes mid-training. Use the
+    // strict variant + validate the checkpoint's `config.json` matches the
+    // live `--model` config before letting the run proceed.
     if let Some(resume_dir) = &args.resume_from {
         let resume_weights = resume_dir.join("model.safetensors");
         if !resume_weights.is_file() {
@@ -261,7 +264,8 @@ fn run() -> Result<(), CliError> {
                 resume_dir.display(),
             )));
         }
-        registry.load_into(&mut store, &resume_weights)?;
+        validate_resume_config(resume_dir, &cfg)?;
+        registry.load_into_strict(&mut store, &resume_weights)?;
         let resumed = trainer
             .resume_if_configured(&param_names)
             .map_err(CliError::Autograd)?;
@@ -272,28 +276,28 @@ fn run() -> Result<(), CliError> {
     }
 
     let mut tape = Tape::new();
-    let rng = Rc::new(RefCell::new(LcgRng::seed(args.seed)));
     let dataset_len = dataset.len();
     let total_steps = args.steps;
     let save_every = args.save_every;
     let save_dtype = args.save_dtype;
+    let seed = args.seed;
 
     // Step closure: forward + assistant-masked cross-entropy. Trainer handles
     // the `1/batch` loss-scale + backward + optimizer.step + cleanup.
-    let rng_for_step = Rc::clone(&rng);
+    //
+    // Codex review 2026-04-20 on 49512b1 (#2, Medium): sample_index is
+    // keyed on `(seed, step, micro_idx)` alone — NOT on a shared stateful
+    // RNG. A stateful RNG would reset to position 0 on `--resume-from`
+    // (we don't persist RNG state in the checkpoint codec), causing data
+    // order to diverge from the interrupted run. With this derivation,
+    // step/micro_idx is a natural resume cursor: a resumed run picks up
+    // the same sequence it would have seen in a single uninterrupted run.
     let model_ref = &model;
     let cfg_ref = &cfg;
     let dataset_ref = &dataset;
     let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
-        let example_index = {
-            let mut rng = rng_for_step.borrow_mut();
-            sample_index(
-                &mut rng,
-                dataset_len,
-                ctx.step as usize,
-                ctx.micro_idx as usize,
-            )
-        };
+        let example_index =
+            sample_index(seed, dataset_len, ctx.step as usize, ctx.micro_idx as usize);
         let example = &dataset_ref[example_index];
         let input_len = example.input_ids.len() - 1;
         let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
@@ -570,6 +574,51 @@ fn autograd_from_cli(err: CliError) -> AutogradError {
     leak_autograd_err(format!("train_sft: checkpoint save: {err}"))
 }
 
+/// Verify the resume dir's `config.json` matches the live `--model` config
+/// on the dimensions that determine tensor shapes — hidden size, layer
+/// count, attention shape, vocab. A silent shape mismatch would otherwise
+/// surface as a mid-training crash on the first forward pass; per the
+/// codex review of 49512b1 (#1 High), fail fast before the run starts.
+///
+/// Missing `config.json` is treated as a soft warning (consistent with
+/// `pretrain_qwen3::resume_from_checkpoint`) so older checkpoints still
+/// resume under operator responsibility.
+fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), CliError> {
+    let cfg_path = resume_dir.join("config.json");
+    if !cfg_path.exists() {
+        eprintln!(
+            "[train_sft] warning: --resume-from {} has no config.json; skipping config-match check",
+            resume_dir.display()
+        );
+        return Ok(());
+    }
+    let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)
+        .map_err(|e| CliError::Custom(format!("resume config.json parse error: {e}")))?;
+    let mismatches: Vec<String> = [
+        ("hidden_size", cfg.hidden_size as i64),
+        ("intermediate_size", cfg.intermediate_size as i64),
+        ("num_hidden_layers", cfg.num_hidden_layers as i64),
+        ("num_attention_heads", cfg.num_attention_heads as i64),
+        ("num_key_value_heads", cfg.num_kv_heads as i64),
+        ("head_dim", cfg.head_dim as i64),
+        ("vocab_size", cfg.vocab_size as i64),
+    ]
+    .iter()
+    .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
+        Some(seen) if seen != *v => Some(format!("{k}: ckpt={seen} live={v}")),
+        _ => None,
+    })
+    .collect();
+    if !mismatches.is_empty() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} config mismatch with --model: {}",
+            resume_dir.display(),
+            mismatches.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn save_checkpoint_via_registry(
     model_dir: &Path,
     out_dir: &Path,
@@ -608,15 +657,29 @@ fn has_supervised_target(example: &TokenizedSft) -> bool {
     example.labels.iter().skip(1).any(|&label| label >= 0)
 }
 
-fn sample_index(rng: &mut LcgRng, upper: usize, step: usize, micro_step: usize) -> usize {
+/// Deterministic in `(seed, step, micro_step)` — stateless w.r.t. any
+/// running RNG, so a `--resume-from` run picks up the same data stream a
+/// single uninterrupted run would have produced. Mixing is SplitMix64 on
+/// top of a `step * golden_ratio ^ (micro_step << 32)` combine so
+/// consecutive triples spread uniformly across `[0, upper)` instead of
+/// clustering on a single-bit flip.
+///
+/// Codex review 2026-04-20 on 49512b1 (#2 Medium): prior version drew
+/// from a shared `LcgRng` whose position was not persisted in the
+/// checkpoint, so a resumed run redrew from position 0 and diverged
+/// immediately from the interrupted-run's data order.
+fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usize {
     if upper <= 1 {
         return 0;
     }
-    let mix = rng
-        .next_u64()
-        .wrapping_add(step as u64)
-        .wrapping_add((micro_step as u64) << 32);
-    (mix % upper as u64) as usize
+    let mut h =
+        seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((micro_step as u64) << 32);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % upper as u64) as usize
 }
 
 fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
