@@ -443,7 +443,7 @@ impl ModelForward for Qwen3Model {
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
         // The LoRA-aware batched decode runs eagerly, so skip warmup.
-        self.lora.is_none()
+        self.enable_cuda_graph && self.lora.is_none()
     }
 
     fn forward_mixed_batch(

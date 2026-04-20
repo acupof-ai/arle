@@ -58,6 +58,7 @@ fn qwen3_4b_gguf_generate() {
         let out = match &mut engine {
             LoadedInferenceEngine::Qwen3(e) => e.complete(req).unwrap(),
             LoadedInferenceEngine::Qwen35(e) => e.complete(req).unwrap(),
+            LoadedInferenceEngine::Qwen35Moe(e) => e.complete(req).unwrap(),
             LoadedInferenceEngine::GLM4(e) => e.complete(req).unwrap(),
         };
         let shown: String = prompt.chars().take(60).collect();

@@ -827,7 +827,9 @@ impl Qwen3Model {
         // plan() was called by the scheduler before this method (updates
         // int_workspace). graph_body only does kernel launches — no allocs, no
         // H2D, no CPU memcpy.
-        if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
+        if !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
+            self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+        } else if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;

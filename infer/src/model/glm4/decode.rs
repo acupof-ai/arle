@@ -28,7 +28,7 @@ impl GLM4Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
-        if self.enable_cuda_graph {
+        if <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
             graph_state.run_or_capture(&self.ctx, || self.decode_kernels(kv_cache, bufs))?;
         } else {
             self.decode_kernels(kv_cache, bufs)?;

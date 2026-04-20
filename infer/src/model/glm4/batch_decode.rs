@@ -251,7 +251,9 @@ impl GLM4Model {
         }
 
         // CUDA Graph capture/replay
-        if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
+        if !<Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
+            self.decode_batch_graph_body(bufs, paged_kv_pool, batch_size)?;
+        } else if let Some(ref graph) = bufs.graph_cache[batch_size - 1] {
             graph
                 .launch()
                 .map_err(|e| anyhow::anyhow!("CUDA Graph replay (B={}): {e}", batch_size))?;

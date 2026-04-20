@@ -237,6 +237,10 @@ impl ModelForward for Qwen35Model {
         Ok(())
     }
 
+    fn supports_cuda_graph_decode(&self) -> bool {
+        self.enable_cuda_graph
+    }
+
     fn select_token(
         &self,
         state: &mut Self::State,

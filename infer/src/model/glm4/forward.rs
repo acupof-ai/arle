@@ -159,6 +159,10 @@ impl ModelForward for GLM4Model {
         Ok(())
     }
 
+    fn supports_cuda_graph_decode(&self) -> bool {
+        self.enable_cuda_graph
+    }
+
     fn forward_prefill_with_pool(
         &self,
         tokens: &[u32],
