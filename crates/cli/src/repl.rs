@@ -1,4 +1,6 @@
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+use std::cell::RefCell;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::path::{Path, PathBuf};
@@ -13,7 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
-    AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, ToolExecutor, ToolPolicy,
+    AgentSession, AgentSessionStats, AgentSettings, AgentTraceEvent, AgentTurnCallbacks,
+    ToolExecutor, ToolPolicy,
 };
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
@@ -920,7 +923,37 @@ fn run_agent_turn(
     cancel: Arc<AtomicBool>,
 ) {
     let start = Instant::now();
-    match session.run_turn_interruptibly(
+    let color_on = io::stdout().is_terminal();
+    let render_state = RefCell::new((false, false, false));
+    let mut on_text_chunk = |chunk: &str| {
+        if chunk.is_empty() {
+            return;
+        }
+        let mut state = render_state.borrow_mut();
+        if color_on && !state.0 {
+            print!("\x1b[1;34m");
+            let _ = io::stdout().flush();
+            state.0 = true;
+        }
+        print!("{chunk}");
+        let _ = io::stdout().flush();
+        state.1 = true;
+        state.2 = true;
+    };
+    let mut on_trace_event = |event: &AgentTraceEvent| {
+        let mut state = render_state.borrow_mut();
+        if color_on && state.0 {
+            print!("\x1b[0m");
+            let _ = io::stdout().flush();
+            state.0 = false;
+        }
+        if state.2 {
+            println!();
+            state.2 = false;
+        }
+        print_trace_event(event);
+    };
+    match session.run_turn_interruptibly_with_callbacks(
         engine,
         input,
         tools,
@@ -932,11 +965,23 @@ fn run_agent_turn(
             temperature,
         },
         cancel.as_ref(),
+        AgentTurnCallbacks {
+            on_text_chunk: Some(&mut on_text_chunk),
+            on_trace_event: Some(&mut on_trace_event),
+        },
     ) {
         Ok(Some(result)) => {
-            print_trace_events(&result.trace_events);
-            println!();
-            println!("\x1b[1;34m{}\x1b[0m", result.text);
+            let (color_open, streamed_any, streamed_line_open) = *render_state.borrow();
+            if color_on && color_open {
+                print!("\x1b[0m");
+                let _ = io::stdout().flush();
+            }
+            if streamed_line_open {
+                println!();
+            }
+            if !streamed_any {
+                println!("\x1b[1;34m{}\x1b[0m", result.text);
+            }
             if result.max_turns_reached {
                 println!("\x1b[2m(agent stopped after reaching max turns)\x1b[0m");
             }
@@ -946,12 +991,28 @@ fn run_agent_turn(
             println!();
         }
         Ok(None) => {
+            let (color_open, _streamed_any, streamed_line_open) = *render_state.borrow();
+            if color_on && color_open {
+                print!("\x1b[0m");
+                let _ = io::stdout().flush();
+            }
+            if streamed_line_open {
+                println!();
+            }
             println!();
             println!("\x1b[2m^C (generation cancelled)\x1b[0m");
             cancel.store(false, Ordering::Relaxed);
             println!();
         }
         Err(e) => {
+            let (color_open, _streamed_any, streamed_line_open) = *render_state.borrow();
+            if color_on && color_open {
+                print!("\x1b[0m");
+                let _ = io::stdout().flush();
+            }
+            if streamed_line_open {
+                println!();
+            }
             eprintln!("\x1b[1;31mError: {e:#}\x1b[0m");
             println!();
         }
@@ -1129,7 +1190,9 @@ fn execute_repl_command(
         }
         ReplCommand::SwitchAgent => {
             *mode = ReplMode::Agent;
-            println!("\x1b[2m(switched to agent mode — tool-calling loop, no streaming)\x1b[0m");
+            println!(
+                "\x1b[2m(switched to agent mode — tool-calling loop, visible streaming)\x1b[0m"
+            );
             println!();
             true
         }
@@ -1457,31 +1520,29 @@ fn print_tools_help(tools: &[ToolDefinition]) {
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn print_trace_events(events: &[AgentTraceEvent]) {
-    for event in events {
-        match event {
-            AgentTraceEvent::AssistantNote(content) => {
-                println!("\x1b[2m{}\x1b[0m", content);
-            }
-            AgentTraceEvent::ToolCall {
+fn print_trace_event(event: &AgentTraceEvent) {
+    match event {
+        AgentTraceEvent::AssistantNote(content) => {
+            println!("\x1b[2m{}\x1b[0m", content);
+        }
+        AgentTraceEvent::ToolCall {
+            name,
+            arguments,
+            result,
+        } => {
+            println!();
+            println!(
+                "\x1b[33m[tool: {}]\x1b[0m {}",
                 name,
-                arguments,
-                result,
-            } => {
-                println!();
-                println!(
-                    "\x1b[33m[tool: {}]\x1b[0m {}",
-                    name,
-                    serde_json::to_string(arguments).unwrap_or_default()
-                );
-                let display_result = if result.len() > 500 {
-                    format!("{}... ({} chars total)", &result[..500], result.len())
-                } else {
-                    result.clone()
-                };
-                println!("\x1b[36m{}\x1b[0m", display_result);
-                println!();
-            }
+                serde_json::to_string(arguments).unwrap_or_default()
+            );
+            let display_result = if result.len() > 500 {
+                format!("{}... ({} chars total)", &result[..500], result.len())
+            } else {
+                result.clone()
+            };
+            println!("\x1b[36m{}\x1b[0m", display_result);
+            println!();
         }
     }
 }

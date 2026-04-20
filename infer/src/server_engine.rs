@@ -25,14 +25,20 @@ pub use crate::backend::cuda::bootstrap::{
     InferenceEngineOptions, ModelType, ServerRuntimeConfig, detect_model_type,
 };
 #[cfg(feature = "metal")]
-use crate::backend::metal::MetalBackend;
+use crate::backend::metal::{
+    MetalBackend, MetalSchedulerHandle, spawn_metal_scheduler_handle_from_path,
+};
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::runtime::StopChunkProcessor;
 #[cfg(any(feature = "metal", feature = "cpu"))]
 use crate::backend::{InferenceBackend, StreamStopMatched, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
+#[cfg(any(feature = "metal", test))]
+use crate::request_handle::RequestHandle;
 use crate::sampler::SamplingParams;
+#[cfg(any(feature = "metal", test))]
+use crate::scheduler::{IncomingRequest, RequestPriority};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::session_persistence::SessionPersistence;
 #[cfg(feature = "cuda")]
@@ -897,14 +903,32 @@ pub struct BackendInferenceEngine<B: InferenceBackend> {
     backend: B,
 }
 
+#[cfg(any(feature = "metal", test))]
+pub struct RequestHandleInferenceEngine<H: RequestHandle> {
+    model_id: String,
+    handle: H,
+}
+
 #[cfg(feature = "metal")]
 impl BackendInferenceEngine<MetalBackend> {
+    #[allow(dead_code)]
     fn load(model_path: &str) -> Result<Self> {
         let mut backend = MetalBackend::new();
         backend.load(Path::new(model_path))?;
         Ok(Self {
             model_id: model_id_from_path(model_path),
             backend,
+        })
+    }
+}
+
+#[cfg(feature = "metal")]
+impl RequestHandleInferenceEngine<MetalSchedulerHandle> {
+    fn load(model_path: &str) -> Result<Self> {
+        let handle = spawn_metal_scheduler_handle_from_path(model_path, 0)?;
+        Ok(Self {
+            model_id: model_id_from_path(model_path),
+            handle,
         })
     }
 }
@@ -1091,6 +1115,72 @@ impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
     }
 }
 
+#[cfg(any(feature = "metal", test))]
+impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
+    fn submit_request(
+        &self,
+        req: CompletionRequest,
+        delta_tx: UnboundedSender<CompletionStreamDelta>,
+    ) -> Result<()> {
+        self.handle
+            .submit(IncomingRequest {
+                prompt: req.prompt,
+                max_tokens: req.max_tokens,
+                sampling: req.sampling,
+                stop: req.stop,
+                priority: RequestPriority::Normal,
+                session_id: None,
+                delta_tx,
+            })
+            .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))
+    }
+}
+
+#[cfg(any(feature = "metal", test))]
+impl<H: RequestHandle> InferenceEngine for RequestHandleInferenceEngine<H> {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.submit_request(req, tx)?;
+
+        let mut text = String::new();
+        let mut finish_reason = None;
+        let mut usage = None;
+
+        while let Some(delta) = rx.blocking_recv() {
+            if !delta.text_delta.is_empty() {
+                text.push_str(&delta.text_delta);
+            }
+            if let Some(final_usage) = delta.usage {
+                usage = Some(final_usage);
+            }
+            if let Some(reason) = delta.finish_reason {
+                finish_reason = Some(reason);
+                break;
+            }
+        }
+
+        Ok(CompletionOutput {
+            text,
+            finish_reason: finish_reason
+                .ok_or_else(|| anyhow::anyhow!("stream ended without finish reason"))?,
+            usage: usage.ok_or_else(|| anyhow::anyhow!("stream ended without token usage"))?,
+            token_logprobs: Vec::new(),
+        })
+    }
+
+    fn complete_stream(
+        &mut self,
+        req: CompletionRequest,
+        tx: UnboundedSender<CompletionStreamDelta>,
+    ) -> Result<()> {
+        self.submit_request(req, tx)
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub enum LoadedInferenceEngine {
     #[cfg(feature = "cuda")]
@@ -1105,7 +1195,7 @@ pub enum LoadedInferenceEngine {
     #[cfg(feature = "cuda")]
     GLM4(GLM4InferenceEngine),
     #[cfg(feature = "metal")]
-    Metal(BackendInferenceEngine<MetalBackend>),
+    Metal(RequestHandleInferenceEngine<MetalSchedulerHandle>),
     #[cfg(feature = "cpu")]
     Cpu(BackendInferenceEngine<CpuBackend>),
 }
@@ -1188,7 +1278,7 @@ impl LoadedInferenceEngine {
         #[cfg(all(not(feature = "cuda"), feature = "metal"))]
         {
             let _ = enable_cuda_graph;
-            return Ok(Self::Metal(BackendInferenceEngine::load(model_path)?));
+            return Ok(Self::Metal(RequestHandleInferenceEngine::load(model_path)?));
         }
 
         #[cfg(all(not(feature = "cuda"), not(feature = "metal"), feature = "cpu"))]
@@ -1348,6 +1438,9 @@ impl<M: ModelForward> SessionPersistence for ModelInferenceEngine<M> {}
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
 impl<B: InferenceBackend> SessionPersistence for BackendInferenceEngine<B> {}
+
+#[cfg(any(feature = "metal", test))]
+impl<H: RequestHandle> SessionPersistence for RequestHandleInferenceEngine<H> {}
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 impl SessionPersistence for LoadedInferenceEngine {}
@@ -1588,6 +1681,84 @@ mod tests {
         }
         assert_eq!(text_parts.concat(), "hello");
         assert_eq!(finish, Some(FinishReason::Length));
+    }
+
+    #[cfg(any(feature = "metal", test))]
+    #[test]
+    fn request_handle_engine_complete_collects_streamed_deltas() {
+        use super::{
+            CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine,
+            RequestHandleInferenceEngine, TokenUsage,
+        };
+        use crate::request_handle::{RequestHandle, SubmitError};
+        use crate::sampler::SamplingParams;
+        use crate::scheduler::IncomingRequest;
+
+        struct MockHandle;
+
+        impl RequestHandle for MockHandle {
+            fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: "hel".into(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                });
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: "lo".into(),
+                    finish_reason: None,
+                    usage: None,
+                    logprob: None,
+                });
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: String::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        total_tokens: 5,
+                    }),
+                    logprob: None,
+                });
+                Ok(())
+            }
+
+            fn model_id(&self) -> &str {
+                "mock-handle"
+            }
+        }
+
+        let mut engine = RequestHandleInferenceEngine {
+            model_id: "mock-handle".into(),
+            handle: MockHandle,
+        };
+        let output = engine
+            .complete(CompletionRequest {
+                prompt: "hi".into(),
+                max_tokens: 2,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+            })
+            .expect("complete");
+
+        let CompletionOutput {
+            text,
+            finish_reason,
+            usage,
+            token_logprobs,
+        } = output;
+        assert_eq!(text, "hello");
+        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            }
+        );
+        assert!(token_logprobs.is_empty());
     }
 
     /// Regression for codex review 70e2776 High #1 — stop *inside* a

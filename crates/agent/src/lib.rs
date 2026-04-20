@@ -82,6 +82,10 @@ If the user asks for an exact format, output exactly that.
 Do not expose chain-of-thought.";
 const TOOL_PLANNING_MAX_TOKENS: usize = 256;
 const STREAM_POLL_INTERVAL: Duration = Duration::from_micros(200);
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -121,6 +125,122 @@ pub struct AgentSessionStats {
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     messages: Vec<Message>,
+}
+
+#[derive(Default)]
+pub struct AgentTurnCallbacks<'a> {
+    pub on_text_chunk: Option<&'a mut dyn FnMut(&str)>,
+    pub on_trace_event: Option<&'a mut dyn FnMut(&AgentTraceEvent)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HiddenBlock {
+    ToolCall,
+    Think,
+}
+
+#[derive(Default)]
+struct VisibleTextStream {
+    pending: String,
+    hidden: Option<HiddenBlock>,
+}
+
+impl VisibleTextStream {
+    fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> String {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> String {
+        let mut visible = String::new();
+
+        loop {
+            match self.hidden {
+                None => {
+                    const VISIBLE_TAGS: [&str; 4] =
+                        [TOOL_CALL_OPEN, TOOL_CALL_CLOSE, THINK_OPEN, THINK_CLOSE];
+                    let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
+                        if flush {
+                            visible.push_str(&self.pending);
+                            self.pending.clear();
+                        } else {
+                            let keep = longest_tag_prefix_suffix(&self.pending, &VISIBLE_TAGS);
+                            let emit_len = self.pending.len().saturating_sub(keep);
+                            visible.push_str(&self.pending[..emit_len]);
+                            self.pending.drain(..emit_len);
+                        }
+                        break;
+                    };
+
+                    visible.push_str(&self.pending[..idx]);
+                    self.pending.drain(..idx + tag.len());
+                    self.hidden = match tag {
+                        TOOL_CALL_OPEN => Some(HiddenBlock::ToolCall),
+                        THINK_OPEN => Some(HiddenBlock::Think),
+                        _ => None,
+                    };
+                }
+                Some(HiddenBlock::ToolCall) => {
+                    if let Some(idx) = self.pending.find(TOOL_CALL_CLOSE) {
+                        self.pending.drain(..idx + TOOL_CALL_CLOSE.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_CLOSE]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+                Some(HiddenBlock::Think) => {
+                    if let Some(idx) = self.pending.find(THINK_CLOSE) {
+                        self.pending.drain(..idx + THINK_CLOSE.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(&self.pending, &[THINK_CLOSE]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+            }
+        }
+
+        visible
+    }
+}
+
+fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn longest_tag_prefix_suffix(text: &str, tags: &[&str]) -> usize {
+    let max_len = tags
+        .iter()
+        .map(|tag| tag.len())
+        .max()
+        .unwrap_or(0)
+        .min(text.len());
+    (1..=max_len)
+        .rev()
+        .find(|&len| {
+            let suffix = &text[text.len() - len..];
+            tags.iter().any(|tag| tag.starts_with(suffix))
+        })
+        .unwrap_or(0)
 }
 
 impl Default for AgentSession {
@@ -217,6 +337,7 @@ impl AgentSession {
             tool_policy,
             settings,
             None,
+            AgentTurnCallbacks::default(),
         )?
         .ok_or_else(|| anyhow!("agent turn cancelled"))
     }
@@ -231,6 +352,33 @@ impl AgentSession {
         settings: AgentSettings,
         cancel: &AtomicBool,
     ) -> Result<Option<AgentTurnResult>> {
+        self.run_turn_interruptibly_with_callbacks(
+            engine,
+            user_input,
+            tools,
+            tool_executor,
+            tool_policy,
+            settings,
+            cancel,
+            AgentTurnCallbacks::default(),
+        )
+    }
+
+    pub fn run_turn_interruptibly_with_callbacks<
+        E: InferenceEngine + ?Sized,
+        X: ToolExecutor,
+        P: ToolPolicy,
+    >(
+        &mut self,
+        engine: &mut E,
+        user_input: &str,
+        tools: &[ToolDefinition],
+        tool_executor: &X,
+        tool_policy: &P,
+        settings: AgentSettings,
+        cancel: &AtomicBool,
+        callbacks: AgentTurnCallbacks<'_>,
+    ) -> Result<Option<AgentTurnResult>> {
         self.run_turn_inner(
             engine,
             user_input,
@@ -239,6 +387,7 @@ impl AgentSession {
             tool_policy,
             settings,
             Some(cancel),
+            callbacks,
         )
     }
 
@@ -251,6 +400,7 @@ impl AgentSession {
         tool_policy: &P,
         settings: AgentSettings,
         cancel: Option<&AtomicBool>,
+        callbacks: AgentTurnCallbacks<'_>,
     ) -> Result<Option<AgentTurnResult>> {
         self.messages.push(Message::user(user_input));
 
@@ -258,6 +408,8 @@ impl AgentSession {
         let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
         let mut trace_events = Vec::new();
+        let mut on_text_chunk = callbacks.on_text_chunk;
+        let mut on_trace_event = callbacks.on_trace_event;
 
         for turn in 0..settings.max_turns {
             let prompt = format_prompt(&self.messages, tools);
@@ -274,6 +426,16 @@ impl AgentSession {
                 settings.max_tokens
             };
 
+            let mut visible_stream = VisibleTextStream::default();
+            let stream_visible_enabled = on_text_chunk.is_some();
+            let mut stream_visible_chunk = |chunk: &str| {
+                let visible = visible_stream.push(chunk);
+                if !visible.is_empty()
+                    && let Some(callback) = on_text_chunk.as_deref_mut()
+                {
+                    callback(&visible);
+                }
+            };
             let Some(output) = complete_with_optional_cancel(
                 engine,
                 CompletionRequest {
@@ -287,10 +449,17 @@ impl AgentSession {
                     logprobs: false,
                 },
                 cancel,
+                stream_visible_enabled.then_some(&mut stream_visible_chunk as &mut dyn FnMut(&str)),
             )?
             else {
                 return Ok(None);
             };
+            if let Some(callback) = on_text_chunk.as_deref_mut() {
+                let tail = visible_stream.finish();
+                if !tail.is_empty() {
+                    callback(&tail);
+                }
+            }
 
             info!(
                 "Generated {} chars, finish_reason={:?}",
@@ -354,6 +523,10 @@ impl AgentSession {
                 &mut last_tool_name,
                 &mut last_tool_scalar_result,
                 &mut trace_events,
+                match on_trace_event {
+                    Some(ref mut callback) => Some(&mut **callback),
+                    None => None,
+                },
             );
 
             if let Some(text) = tool_policy.finalize_after_tool_execution(
@@ -494,6 +667,7 @@ fn execute_tool_calls(
     last_tool_name: &mut Option<String>,
     last_tool_scalar_result: &mut Option<String>,
     trace_events: &mut Vec<AgentTraceEvent>,
+    mut on_trace_event: Option<&mut dyn FnMut(&AgentTraceEvent)>,
 ) {
     for tool_call in tool_calls {
         *tool_calls_executed += 1;
@@ -506,6 +680,11 @@ fn execute_tool_calls(
             arguments: tool_call.arguments.clone(),
             result: result.clone(),
         });
+        if let Some(callback) = on_trace_event.as_deref_mut()
+            && let Some(event) = trace_events.last()
+        {
+            callback(event);
+        }
         messages.push(Message::tool_result(&tool_call.name, &result));
     }
 }
@@ -563,6 +742,7 @@ If no tool is needed, output exactly NO_TOOL.",
             logprobs: false,
         },
         cancel,
+        None,
     )?
     else {
         return Ok(None);
@@ -584,10 +764,11 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
     engine: &mut E,
     req: CompletionRequest,
     cancel: Option<&AtomicBool>,
+    mut on_text_chunk: Option<&mut dyn FnMut(&str)>,
 ) -> Result<Option<CompletionOutput>> {
-    let Some(cancel_flag) = cancel else {
+    if cancel.is_none() && on_text_chunk.is_none() {
         return engine.complete(req).map(Some);
-    };
+    }
 
     let (tx, rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
     let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
@@ -601,7 +782,7 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
         let worker = s.spawn(|| engine.complete_stream(req, tx));
 
         loop {
-            if cancel_flag.load(Ordering::Relaxed) {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 cancelled = true;
                 rx = None;
                 break;
@@ -611,6 +792,9 @@ fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
             match rx_ref.try_recv() {
                 Ok(delta) => {
                     if !delta.text_delta.is_empty() {
+                        if let Some(callback) = on_text_chunk.as_deref_mut() {
+                            callback(&delta.text_delta);
+                        }
                         text.push_str(&delta.text_delta);
                     }
                     if let Some(final_usage) = delta.usage {
@@ -743,6 +927,22 @@ mod tests {
             max_tokens: 128,
             temperature: 0.0,
         }
+    }
+
+    #[test]
+    fn visible_text_stream_strips_hidden_blocks_across_chunk_boundaries() {
+        let mut stream = super::VisibleTextStream::default();
+        let mut visible = String::new();
+        for chunk in [
+            "Hello<th",
+            "ink>secret</th",
+            "ink> world<tool",
+            "_call>{\"name\":\"shell\"}</tool_call>!",
+        ] {
+            visible.push_str(&stream.push(chunk));
+        }
+        visible.push_str(&stream.finish());
+        assert_eq!(visible, "Hello world!");
     }
 
     struct TestToolExecutor;
