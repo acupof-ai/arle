@@ -646,6 +646,7 @@ fn handle_repl_input(
                 max_turns,
                 max_tokens,
                 temperature,
+                cancel,
             );
         }
     }
@@ -916,9 +917,10 @@ fn run_agent_turn(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
+    cancel: Arc<AtomicBool>,
 ) {
     let start = Instant::now();
-    match session.run_turn(
+    match session.run_turn_interruptibly(
         engine,
         input,
         tools,
@@ -929,8 +931,9 @@ fn run_agent_turn(
             max_tokens,
             temperature,
         },
+        cancel.as_ref(),
     ) {
-        Ok(result) => {
+        Ok(Some(result)) => {
             print_trace_events(&result.trace_events);
             println!();
             println!("\x1b[1;34m{}\x1b[0m", result.text);
@@ -940,6 +943,12 @@ fn run_agent_turn(
             println!();
             let elapsed = start.elapsed();
             println!("\x1b[2m({:.1}s)\x1b[0m", elapsed.as_secs_f64());
+            println!();
+        }
+        Ok(None) => {
+            println!();
+            println!("\x1b[2m^C (generation cancelled)\x1b[0m");
+            cancel.store(false, Ordering::Relaxed);
             println!();
         }
         Err(e) => {

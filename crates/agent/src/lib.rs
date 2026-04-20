@@ -1,12 +1,18 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chat::{ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition};
 use infer::sampler::SamplingParams;
-use infer::server_engine::{CompletionRequest, InferenceEngine};
+use infer::server_engine::{
+    CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
+    TokenUsage,
+};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 pub type Message = ChatMessage;
 
@@ -61,7 +67,11 @@ fn format_prompt(messages: &[Message], tools: &[ToolDefinition]) -> String {
 }
 
 fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
-    chat::parse_tool_calls(text)
+    let mut parsed = chat::parse_tool_calls(text);
+    parsed
+        .tool_calls
+        .retain(|call| !call.name.trim().is_empty());
+    parsed
 }
 
 const DEFAULT_SYSTEM_PROMPT: &str = r"You are a local CLI assistant.
@@ -70,6 +80,8 @@ If a tool is needed, emit a <tool_call> block immediately with no explanation fi
 After tool results, answer directly.
 If the user asks for an exact format, output exactly that.
 Do not expose chain-of-thought.";
+const TOOL_PLANNING_MAX_TOKENS: usize = 256;
+const STREAM_POLL_INTERVAL: Duration = Duration::from_micros(200);
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -197,40 +209,55 @@ impl AgentSession {
         tool_policy: &P,
         settings: AgentSettings,
     ) -> Result<AgentTurnResult> {
+        self.run_turn_inner(
+            engine,
+            user_input,
+            tools,
+            tool_executor,
+            tool_policy,
+            settings,
+            None,
+        )?
+        .ok_or_else(|| anyhow!("agent turn cancelled"))
+    }
+
+    pub fn run_turn_interruptibly<E: InferenceEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
+        &mut self,
+        engine: &mut E,
+        user_input: &str,
+        tools: &[ToolDefinition],
+        tool_executor: &X,
+        tool_policy: &P,
+        settings: AgentSettings,
+        cancel: &AtomicBool,
+    ) -> Result<Option<AgentTurnResult>> {
+        self.run_turn_inner(
+            engine,
+            user_input,
+            tools,
+            tool_executor,
+            tool_policy,
+            settings,
+            Some(cancel),
+        )
+    }
+
+    fn run_turn_inner<E: InferenceEngine + ?Sized, X: ToolExecutor, P: ToolPolicy>(
+        &mut self,
+        engine: &mut E,
+        user_input: &str,
+        tools: &[ToolDefinition],
+        tool_executor: &X,
+        tool_policy: &P,
+        settings: AgentSettings,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Option<AgentTurnResult>> {
         self.messages.push(Message::user(user_input));
 
         let mut tool_calls_executed = 0usize;
         let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
         let mut trace_events = Vec::new();
-
-        if let Some(initial) = tool_policy.recover_tool_calls_from_user_request(user_input, tools) {
-            info!("Recovered tool call(s) from user request before first model turn");
-            self.messages
-                .push(Message::assistant("", initial.tool_calls.clone()));
-            execute_tool_calls(
-                &initial.tool_calls,
-                tool_executor,
-                &mut self.messages,
-                &mut tool_calls_executed,
-                &mut last_tool_name,
-                &mut last_tool_scalar_result,
-                &mut trace_events,
-            );
-
-            if let Some(text) = tool_policy.finalize_after_tool_execution(
-                user_input,
-                last_tool_name.as_deref(),
-                last_tool_scalar_result.as_deref(),
-            ) {
-                return Ok(AgentTurnResult {
-                    text,
-                    tool_calls_executed,
-                    max_turns_reached: false,
-                    trace_events,
-                });
-            }
-        }
 
         for turn in 0..settings.max_turns {
             let prompt = format_prompt(&self.messages, tools);
@@ -241,16 +268,29 @@ impl AgentSession {
                 prompt.len()
             );
 
-            let output = engine.complete(CompletionRequest {
-                prompt,
-                max_tokens: settings.max_tokens,
-                sampling: SamplingParams {
-                    temperature: settings.temperature,
-                    ..SamplingParams::default()
+            let turn_max_tokens = if tool_calls_executed == 0 && !tools.is_empty() {
+                settings.max_tokens.min(TOOL_PLANNING_MAX_TOKENS)
+            } else {
+                settings.max_tokens
+            };
+
+            let Some(output) = complete_with_optional_cancel(
+                engine,
+                CompletionRequest {
+                    prompt,
+                    max_tokens: turn_max_tokens,
+                    sampling: SamplingParams {
+                        temperature: settings.temperature,
+                        ..SamplingParams::default()
+                    },
+                    stop: Some(vec!["<|im_end|>".to_string()]),
+                    logprobs: false,
                 },
-                stop: Some(vec!["<|im_end|>".to_string()]),
-                logprobs: false,
-            })?;
+                cancel,
+            )?
+            else {
+                return Ok(None);
+            };
 
             info!(
                 "Generated {} chars, finish_reason={:?}",
@@ -260,15 +300,21 @@ impl AgentSession {
 
             let mut parsed = parse_tool_calls(&output.text);
             if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
-                if let Some(recovered) = tool_policy
-                    .recover_tool_calls_from_user_request(user_input, tools)
-                    .or_else(|| tool_policy.recover_tool_calls_from_draft(&output.text, tools))
+                if let Some(recovered) =
+                    tool_policy.recover_tool_calls_from_draft(&output.text, tools)
                 {
                     info!("Recovered tool call(s) via deterministic extraction");
                     parsed = recovered;
-                } else if tool_policy.should_repair_tool_calls(&parsed.content)
-                    && let Some(repaired) =
-                        repair_tool_calls(engine, &self.messages, tools, settings, &output.text)?
+                } else if (output.text.contains("<tool_call>")
+                    || tool_policy.should_repair_tool_calls(&parsed.content))
+                    && let Some(repaired) = repair_tool_calls(
+                        engine,
+                        &self.messages,
+                        tools,
+                        settings,
+                        &output.text,
+                        cancel,
+                    )?
                 {
                     info!("Recovered tool call(s) via repair turn");
                     parsed = repaired;
@@ -288,12 +334,12 @@ impl AgentSession {
                 .push(Message::assistant(&content, tool_calls.clone()));
 
             if tool_calls.is_empty() {
-                return Ok(AgentTurnResult {
+                return Ok(Some(AgentTurnResult {
                     text: content,
                     tool_calls_executed,
                     max_turns_reached: false,
                     trace_events,
-                });
+                }));
             }
 
             if !content.is_empty() {
@@ -315,21 +361,21 @@ impl AgentSession {
                 last_tool_name.as_deref(),
                 last_tool_scalar_result.as_deref(),
             ) {
-                return Ok(AgentTurnResult {
+                return Ok(Some(AgentTurnResult {
                     text,
                     tool_calls_executed,
                     max_turns_reached: false,
                     trace_events,
-                });
+                }));
             }
         }
 
-        Ok(AgentTurnResult {
+        Ok(Some(AgentTurnResult {
             text: "(max turns reached - agent stopped)".to_string(),
             tool_calls_executed,
             max_turns_reached: true,
             trace_events,
-        })
+        }))
     }
 }
 
@@ -493,6 +539,7 @@ fn repair_tool_calls<E: InferenceEngine + ?Sized>(
     tools: &[ToolDefinition],
     settings: AgentSettings,
     assistant_draft: &str,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<ParsedAssistantResponse>> {
     let mut repair_messages = messages.to_vec();
     repair_messages.push(Message::assistant(assistant_draft, vec![]));
@@ -503,16 +550,23 @@ If no tool is needed, output exactly NO_TOOL.",
     ));
 
     let repair_prompt = format_prompt(&repair_messages, tools);
-    let repair_output = engine.complete(CompletionRequest {
-        prompt: repair_prompt,
-        max_tokens: settings.max_tokens.min(128),
-        sampling: SamplingParams {
-            temperature: 0.0,
-            ..SamplingParams::default()
+    let Some(repair_output) = complete_with_optional_cancel(
+        engine,
+        CompletionRequest {
+            prompt: repair_prompt,
+            max_tokens: settings.max_tokens.min(128),
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Some(vec!["<|im_end|>".to_string()]),
+            logprobs: false,
         },
-        stop: Some(vec!["<|im_end|>".to_string()]),
-        logprobs: false,
-    })?;
+        cancel,
+    )?
+    else {
+        return Ok(None);
+    };
 
     let repaired = parse_tool_calls(&repair_output.text);
     if !repaired.tool_calls.is_empty() {
@@ -524,6 +578,81 @@ If no tool is needed, output exactly NO_TOOL.",
     }
 
     Ok(None)
+}
+
+fn complete_with_optional_cancel<E: InferenceEngine + ?Sized>(
+    engine: &mut E,
+    req: CompletionRequest,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<CompletionOutput>> {
+    let Some(cancel_flag) = cancel else {
+        return engine.complete(req).map(Some);
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
+    let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
+    let mut text = String::new();
+    let mut finish_reason = None::<FinishReason>;
+    let mut usage = None::<TokenUsage>;
+    let mut stream_err = None::<anyhow::Error>;
+    let mut cancelled = false;
+
+    std::thread::scope(|s| {
+        let worker = s.spawn(|| engine.complete_stream(req, tx));
+
+        loop {
+            if cancel_flag.load(Ordering::Relaxed) {
+                cancelled = true;
+                rx = None;
+                break;
+            }
+
+            let Some(rx_ref) = rx.as_mut() else { break };
+            match rx_ref.try_recv() {
+                Ok(delta) => {
+                    if !delta.text_delta.is_empty() {
+                        text.push_str(&delta.text_delta);
+                    }
+                    if let Some(final_usage) = delta.usage {
+                        usage = Some(final_usage);
+                    }
+                    if let Some(reason) = delta.finish_reason {
+                        finish_reason = Some(reason);
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(STREAM_POLL_INTERVAL);
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if let Ok(res) = worker.join()
+            && let Err(err) = res
+        {
+            stream_err = Some(err);
+        }
+    });
+
+    if cancelled {
+        return Ok(None);
+    }
+
+    if let Some(err) = stream_err {
+        return Err(err);
+    }
+
+    let finish_reason =
+        finish_reason.ok_or_else(|| anyhow!("stream ended without finish reason"))?;
+    let usage = usage.ok_or_else(|| anyhow!("stream ended without token usage"))?;
+
+    Ok(Some(CompletionOutput {
+        text,
+        finish_reason,
+        usage,
+        token_logprobs: Vec::new(),
+    }))
 }
 
 #[cfg(test)]
@@ -547,6 +676,7 @@ mod tests {
     struct FakeEngine {
         outputs: VecDeque<String>,
         prompts: Vec<String>,
+        max_tokens: Vec<usize>,
     }
 
     impl FakeEngine {
@@ -554,6 +684,7 @@ mod tests {
             Self {
                 outputs: outputs.into_iter().map(str::to_string).collect(),
                 prompts: Vec::new(),
+                max_tokens: Vec::new(),
             }
         }
     }
@@ -565,6 +696,7 @@ mod tests {
 
         fn complete(&mut self, req: CompletionRequest) -> Result<CompletionOutput> {
             self.prompts.push(req.prompt);
+            self.max_tokens.push(req.max_tokens);
             let text = self
                 .outputs
                 .pop_front()
@@ -918,14 +1050,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_python_request_can_skip_model_generation() {
+    fn explicit_python_request_waits_for_model_tool_choice() {
         if !python_tool_available() {
             eprintln!("Skipping test: python tool is unavailable in this environment");
             return;
         }
 
         let mut session = AgentSession::new();
-        let mut engine = FakeEngine::new(vec!["I'll help with that.", "The result is 56088."]);
+        let mut engine = FakeEngine::new(vec!["I'll help with that."]);
 
         let result = session
             .run_turn(
@@ -938,9 +1070,9 @@ mod tests {
             )
             .expect("tool recovery turn");
 
-        assert_eq!(result.tool_calls_executed, 1);
-        assert_eq!(result.text, "56088");
-        assert_eq!(engine.prompts.len(), 0);
+        assert_eq!(result.tool_calls_executed, 0);
+        assert_eq!(result.text, "I'll help with that.");
+        assert_eq!(engine.prompts.len(), 1);
     }
 
     #[test]
@@ -986,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn chinese_file_listing_request_is_recovered_with_shell_tool() {
+    fn chinese_file_listing_request_waits_for_model_tool_choice() {
         let mut session = AgentSession::new();
         let mut engine = FakeEngine::new(vec![
             "I don't have a tool for listing files.",
@@ -1004,8 +1136,83 @@ mod tests {
             )
             .expect("file listing turn");
 
+        assert_eq!(result.tool_calls_executed, 0);
+        assert_eq!(result.text, "I don't have a tool for listing files.");
+        assert_eq!(engine.prompts.len(), 2);
+    }
+
+    #[test]
+    fn shell_tool_follow_up_text_comes_from_model_not_template() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
+            "I listed the current directory contents above.",
+        ]);
+
+        let result = session
+            .run_turn(
+                &mut engine,
+                "本地有哪些文件",
+                &[shell_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("shell tool turn");
+
         assert_eq!(result.tool_calls_executed, 1);
-        assert_eq!(result.text, "Listed the current directory above.");
-        assert_eq!(engine.prompts.len(), 0);
+        assert_eq!(
+            result.text,
+            "I listed the current directory contents above."
+        );
+        assert_eq!(engine.prompts.len(), 2);
+    }
+
+    #[test]
+    fn first_agent_tool_planning_turn_is_capped() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec!["Done."]);
+
+        let result = session
+            .run_turn(
+                &mut engine,
+                "Summarize the current workspace.",
+                &[shell_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                AgentSettings {
+                    max_turns: 4,
+                    max_tokens: 4096,
+                    temperature: 0.0,
+                },
+            )
+            .expect("tool planning turn");
+
+        assert_eq!(result.tool_calls_executed, 0);
+        assert_eq!(engine.max_tokens, vec![super::TOOL_PLANNING_MAX_TOKENS]);
+    }
+
+    #[test]
+    fn malformed_tool_call_block_triggers_repair_instead_of_empty_tool_name() {
+        let mut session = AgentSession::new();
+        let mut engine = FakeEngine::new(vec![
+            "<tool_call>\n{\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd && ls -la\"}}\n</tool_call>",
+            "done",
+        ]);
+
+        let result = session
+            .run_turn(
+                &mut engine,
+                "本地有哪些文件",
+                &[shell_tool()],
+                &tool_executor(),
+                &tool_policy(),
+                settings(),
+            )
+            .expect("repair turn");
+
+        assert_eq!(result.tool_calls_executed, 1);
+        assert_eq!(result.text, "done");
     }
 }
