@@ -54,6 +54,16 @@ Then add targeted validation depending on what changed.
 Use [perf-and-correctness-gates.md](perf-and-correctness-gates.md) as the rule
 for deciding what else must run.
 
+When the release surface changes:
+
+- treat `.github/workflows/release.yml` as the packaging authority
+- keep `.github/workflows/metal-ci.yml` in lockstep for the macOS
+  `metal_serve` build path so default-branch CI exercises the same
+  binary that release packaging will publish
+- for Metal-facing changes, make sure branch validation still covers the
+  exact `cargo build --no-default-features --features metal,no-cuda --bin metal_serve --release`
+  path, not just library checks
+
 ---
 
 ## 4. Verify Release Artifacts
@@ -65,7 +75,10 @@ Current release automation publishes:
 
 Before release, verify:
 
-- `.github/workflows/release.yml` still matches intended support
+- `.github/workflows/release.yml` still matches intended support and
+  remains the artifact-packaging authority
+- `.github/workflows/metal-ci.yml` still mirrors the macOS `metal_serve`
+  build path used by release packaging
 - artifact names are correct
 - packaged binaries are the intended ones (`infer` / `bench_serving` on Linux,
   `metal_serve` on macOS)
