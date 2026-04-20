@@ -237,6 +237,24 @@ impl Environment for EchoSeparator {
     }
 }
 
+#[cfg(feature = "metal")]
+fn metal_eval_reset() {
+    autograd::backend_metal::reset_eval_count();
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_eval_reset() {}
+
+#[cfg(feature = "metal")]
+fn metal_eval_snapshot() -> Option<u64> {
+    Some(autograd::backend_metal::eval_count())
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_eval_snapshot() -> Option<u64> {
+    None
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -403,6 +421,8 @@ fn run() -> Result<(), CliError> {
 
         tape.entries.clear();
         tape.set_enabled(true);
+        metal_eval_reset();
+        let eval_count_loop_start = metal_eval_snapshot();
         let loss_id = match args.objective {
             MultiTurnObjective::StepwiseGrpo => {
                 let advantages_per_position = stepwise_advantages(
@@ -437,9 +457,11 @@ fn run() -> Result<(), CliError> {
             }
         };
         let loss_value = store.to_host(loss_id)?[0];
+        let eval_count_after_forward = metal_eval_snapshot();
 
         optimizer.zero_grad(&params, &mut store);
         tape.backward(loss_id, &mut store)?;
+        let eval_count_after_backward = metal_eval_snapshot();
         // `clip_grad_norm` is a no-op when `max_norm` is non-positive / non-
         // finite (see its sanitize-at-boundary contract landed in 429efc3),
         // so `--grad-clip 0 / NaN / inf` collapse to "disabled" without
@@ -449,6 +471,7 @@ fn run() -> Result<(), CliError> {
             clip_grad_norm(&params, max_norm, &mut store);
         }
         optimizer.step(&params, &mut store);
+        let eval_count_after_step = metal_eval_snapshot();
 
         tape.entries.clear();
         tape.set_enabled(true);
@@ -461,14 +484,42 @@ fn run() -> Result<(), CliError> {
         best_reward = best_reward.max(mean_turn_reward);
         // Emit via the sink only; `open_sink(_, true)` already tees to
         // StdoutSink, so a parallel `println!` would double-print.
+        // Metal per-step eval-count delta lets us verify M5.3b.1–19 lazy
+        // work on real training shapes (not just test_device_handle).
+        // `start` is snapshotted after reset, so we report absolute deltas
+        // per phase. On non-Metal builds the snapshots are None and the
+        // fields are elided.
+        let metal_fwd_evals = match (eval_count_loop_start, eval_count_after_forward) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a) as f64),
+            _ => None,
+        };
+        let metal_bwd_evals = match (eval_count_after_forward, eval_count_after_backward) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a) as f64),
+            _ => None,
+        };
+        let metal_opt_evals = match (eval_count_after_backward, eval_count_after_step) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a) as f64),
+            _ => None,
+        };
+
+        let mut metric_fields: Vec<(&str, f64)> = vec![
+            ("loss", loss_value as f64),
+            ("mean_reward", mean_turn_reward as f64),
+            ("best_reward", best_reward as f64),
+            ("mean_kl", last_kl as f64),
+        ];
+        if let Some(v) = metal_fwd_evals {
+            metric_fields.push(("metal_evals_fwd", v));
+        }
+        if let Some(v) = metal_bwd_evals {
+            metric_fields.push(("metal_evals_bwd", v));
+        }
+        if let Some(v) = metal_opt_evals {
+            metric_fields.push(("metal_evals_opt", v));
+        }
         metrics.emit(&MetricSample {
             step: iter as u64 + 1,
-            fields: &[
-                ("loss", loss_value as f64),
-                ("mean_reward", mean_turn_reward as f64),
-                ("best_reward", best_reward as f64),
-                ("mean_kl", last_kl as f64),
-            ],
+            fields: &metric_fields,
         });
 
         let wall_so_far = loop_start.elapsed().as_secs_f32();
