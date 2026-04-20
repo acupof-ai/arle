@@ -28,10 +28,9 @@ impl Qwen3Model {
             )
             .map_err(|e| anyhow::anyhow!("H2D decode_meta failed: {}", e))?;
 
-        // LoRA's `apply_lora_{gemv,gemm}_add` allocate per-call temp
-        // DeviceVecs; CUDA stream capture rejects allocations. Force the
-        // eager path whenever a LoRA adapter is attached.
-        let use_graph = self.enable_cuda_graph && self.lora.is_none();
+        // Respect the shared model-level graph gate so single-token decode,
+        // batched decode, and scheduler warmup stay on the same contract.
+        let use_graph = <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self);
         if use_graph {
             graph_state.run_or_capture(&self.ctx, || self.decode_kernels(kv_cache, bufs))?;
         } else {

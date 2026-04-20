@@ -570,7 +570,9 @@ impl Qwen35Model {
         let linear_idx_start = linear_idx_end - linear_count;
 
         // Graph capture/replay for this group
-        if group_idx < bufs.graph_cache.len() {
+        let use_graph = <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self)
+            && group_idx < bufs.graph_cache.len();
+        if use_graph {
             if let Some(ref graph) = bufs.graph_cache[group_idx][batch_size - 1] {
                 // Replay existing graph
                 graph.launch().map_err(|e| {
@@ -581,7 +583,7 @@ impl Qwen35Model {
         }
 
         // No graph cached — try to capture
-        if group_idx < bufs.graph_cache.len() {
+        if use_graph {
             self.ctx
                 .stream
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -602,7 +604,7 @@ impl Qwen35Model {
         }
 
         // End capture
-        if group_idx < bufs.graph_cache.len() {
+        if use_graph {
             let graph_opt = self
                 .ctx
                 .stream

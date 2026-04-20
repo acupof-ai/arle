@@ -528,7 +528,7 @@ impl Qwen35Model {
             .map_err(|e| anyhow::anyhow!("H2D start_pos failed: {}", e))?;
 
         // GPU kernel sequence — captured on first call, replayed on subsequent calls
-        if self.enable_cuda_graph {
+        if <Self as crate::model::ModelForward>::supports_cuda_graph_decode(self) {
             graph_state.run_or_capture(&self.ctx, || {
                 self.single_token_kernels(kv_cache, recurrent, bufs)
             })?;
