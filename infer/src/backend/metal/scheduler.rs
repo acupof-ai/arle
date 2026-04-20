@@ -95,6 +95,17 @@ pub enum MetalRequestPhase {
     Decoding,
 }
 
+/// Runtime-authored request lifecycle snapshot used by the scheduler when it
+/// needs to pick the next chunk. The scheduler treats this as read-only
+/// authority for phase/progress and keeps only queueing/ordering state itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetalRuntimeRequestState {
+    pub req_id: RequestId,
+    pub phase: MetalRequestPhase,
+    pub prompt_progress: usize,
+    pub last_token: Option<u32>,
+}
+
 /// Scheduling error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetalSchedulerError {
@@ -102,13 +113,6 @@ pub enum MetalSchedulerError {
     QueueFull,
     EmptyPrompt,
     UnknownRequest(RequestId),
-    PrefillIncomplete(RequestId),
-    DecodeAlreadyStarted(RequestId),
-    WrongPhase {
-        req_id: RequestId,
-        expected: MetalRequestPhase,
-        actual: MetalRequestPhase,
-    },
 }
 
 impl fmt::Display for MetalSchedulerError {
@@ -118,21 +122,6 @@ impl fmt::Display for MetalSchedulerError {
             Self::QueueFull => write!(f, "waiting queue is full"),
             Self::EmptyPrompt => write!(f, "prompt_tokens must not be empty"),
             Self::UnknownRequest(req_id) => write!(f, "unknown request {req_id:?}"),
-            Self::PrefillIncomplete(req_id) => {
-                write!(f, "request {req_id:?} has not finished prefill yet")
-            }
-            Self::DecodeAlreadyStarted(req_id) => {
-                write!(f, "request {req_id:?} already has decode state")
-            }
-            Self::WrongPhase {
-                req_id,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "request {req_id:?} is in phase {:?}, expected {:?}",
-                actual, expected
-            ),
         }
     }
 }
@@ -143,23 +132,14 @@ impl std::error::Error for MetalSchedulerError {}
 struct MetalRequestState {
     req_id: RequestId,
     prompt_tokens: Vec<u32>,
-    max_tokens: usize,
     priority: MetalRequestPriority,
     arrival_order: u64,
-    phase: MetalRequestPhase,
-    prefill_progress: usize,
-    generated_tokens: usize,
-    last_token: Option<u32>,
+    admitted: bool,
 }
 
 impl MetalRequestState {
     fn prompt_len(&self) -> usize {
         self.prompt_tokens.len()
-    }
-
-    fn decode_input_token(&self) -> u32 {
-        self.last_token
-            .unwrap_or_else(|| self.prompt_tokens.last().copied().unwrap_or(0))
     }
 }
 
@@ -221,21 +201,18 @@ impl MetalScheduler {
         }
         .allow(SchedulerSignals::queue_state(
             queued_requests,
-            self.requests
-                .values()
-                .filter(|req| req.phase == MetalRequestPhase::Decoding)
-                .count(),
+            self.requests.values().filter(|req| req.admitted).count(),
         ))
     }
 
-    fn prefill_chunk_budget(&self) -> usize {
+    fn prefill_chunk_budget(&self, decode_count: usize) -> usize {
         DecodeAwareChunking {
             decode_active_chunk: self.config.decode_active_prefill_cap,
             idle_chunk: self.config.prefill_chunk_size,
         }
         .next_chunk_size(
             InferenceMode::Prefill,
-            SchedulerSignals::queue_state(self.waiting.len(), self.decoding_len()),
+            SchedulerSignals::queue_state(self.waiting.len(), decode_count),
         )
         .max(1)
         .min(self.config.prefill_chunk_size)
@@ -291,13 +268,9 @@ impl MetalScheduler {
             MetalRequestState {
                 req_id,
                 prompt_tokens,
-                max_tokens,
                 priority,
                 arrival_order,
-                phase: MetalRequestPhase::Waiting,
-                prefill_progress: 0,
-                generated_tokens: 0,
-                last_token: None,
+                admitted: false,
             },
         );
         self.waiting.push(req_id);
@@ -310,9 +283,9 @@ impl MetalScheduler {
     /// The returned decision follows decode-priority semantics:
     /// decode work is always emitted before any new or continuing prefill work.
     /// Prefill is chunked so it can be interleaved with decode.
-    pub fn step(&mut self) -> MetalScheduleDecision {
-        let decode_batch = self.build_decode_batch();
-        let prefill_chunk = self.build_prefill_chunk();
+    pub fn step(&mut self, runtime_states: &[MetalRuntimeRequestState]) -> MetalScheduleDecision {
+        let decode_batch = self.build_decode_batch(runtime_states);
+        let prefill_chunk = self.build_prefill_chunk(runtime_states);
 
         match (decode_batch.req_ids.is_empty(), prefill_chunk) {
             (true, Some(prefill)) => MetalScheduleDecision::PrefillChunk(prefill),
@@ -325,106 +298,10 @@ impl MetalScheduler {
         }
     }
 
-    /// Commit a sampled decode token for one request.
-    ///
-    /// Returns `true` if the request reaches its `max_tokens` budget and is
-    /// removed from the scheduler.
-    pub fn advance_decode(
-        &mut self,
-        req_id: RequestId,
-        sampled_token: u32,
-    ) -> Result<bool, MetalSchedulerError> {
-        let should_finish = {
-            let state = self
-                .requests
-                .get_mut(&req_id)
-                .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
-
-            if state.phase != MetalRequestPhase::Decoding {
-                return Err(MetalSchedulerError::WrongPhase {
-                    req_id,
-                    expected: MetalRequestPhase::Decoding,
-                    actual: state.phase,
-                });
-            }
-
-            state.last_token = Some(sampled_token);
-            state.generated_tokens += 1;
-            state.generated_tokens >= state.max_tokens
-        };
-
-        self.emit_event(
-            req_id,
-            RequestEventKind::DecodeStep,
-            Some(InferenceMode::Decode),
-        );
-
-        if should_finish {
-            self.finish_request(req_id);
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Commit the first sampled token produced by the terminal prefill chunk.
-    ///
-    /// Prefill computes logits for the prompt tail; the scheduler records the
-    /// first sampled token here so the subsequent decode step consumes that
-    /// token, not the prompt's final token a second time.
-    pub fn complete_prefill(
-        &mut self,
-        req_id: RequestId,
-        sampled_token: u32,
-    ) -> Result<bool, MetalSchedulerError> {
-        let should_finish = {
-            let state = self
-                .requests
-                .get_mut(&req_id)
-                .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
-
-            if state.phase != MetalRequestPhase::Decoding {
-                return Err(MetalSchedulerError::WrongPhase {
-                    req_id,
-                    expected: MetalRequestPhase::Decoding,
-                    actual: state.phase,
-                });
-            }
-            if state.prefill_progress < state.prompt_len() {
-                return Err(MetalSchedulerError::PrefillIncomplete(req_id));
-            }
-            if state.generated_tokens > 0 {
-                return Err(MetalSchedulerError::DecodeAlreadyStarted(req_id));
-            }
-
-            state.last_token = Some(sampled_token);
-            state.generated_tokens = 1;
-            state.generated_tokens >= state.max_tokens
-        };
-
-        self.emit_event(
-            req_id,
-            RequestEventKind::DecodeStep,
-            Some(InferenceMode::Decode),
-        );
-
-        if should_finish {
-            self.finish_request(req_id);
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
     /// Explicitly finish a request, releasing all scheduler bookkeeping.
-    pub fn finish_request(&mut self, req_id: RequestId) -> bool {
+    pub fn finish_request(&mut self, req_id: RequestId, mode: Option<InferenceMode>) -> bool {
         let removed = self.remove_request(req_id);
-        if let Some(state) = removed {
-            let mode = match state.phase {
-                MetalRequestPhase::Waiting => None,
-                MetalRequestPhase::Prefilling => Some(InferenceMode::Prefill),
-                MetalRequestPhase::Decoding => Some(InferenceMode::Decode),
-            };
+        if removed.is_some() {
             self.emit_event(req_id, RequestEventKind::Completed, mode);
             true
         } else {
@@ -432,9 +309,11 @@ impl MetalScheduler {
         }
     }
 
-    /// Get the current phase of a request.
-    pub fn request_phase(&self, req_id: RequestId) -> Option<MetalRequestPhase> {
-        self.requests.get(&req_id).map(|state| state.phase)
+    /// Whether the request is still queued and has not been admitted yet.
+    pub fn is_waiting(&self, req_id: RequestId) -> bool {
+        self.requests
+            .get(&req_id)
+            .is_some_and(|state| !state.admitted)
     }
 
     /// Number of waiting requests.
@@ -446,57 +325,8 @@ impl MetalScheduler {
     pub fn active_len(&self) -> usize {
         self.requests
             .values()
-            .filter(|state| {
-                matches!(
-                    state.phase,
-                    MetalRequestPhase::Prefilling | MetalRequestPhase::Decoding
-                )
-            })
+            .filter(|state| state.admitted)
             .count()
-    }
-
-    /// Count requests currently decoding.
-    pub fn decoding_len(&self) -> usize {
-        self.requests
-            .values()
-            .filter(|state| state.phase == MetalRequestPhase::Decoding)
-            .count()
-    }
-
-    /// Count requests currently prefilling.
-    pub fn prefilling_len(&self) -> usize {
-        self.requests
-            .values()
-            .filter(|state| state.phase == MetalRequestPhase::Prefilling)
-            .count()
-    }
-
-    /// Fast-forward scheduler-side prefill progress for one request.
-    ///
-    /// Used by the DFlash runtime path, which must consume the whole prompt
-    /// in a single FFI call (because `qwen3_forward_with_hidden_states`
-    /// captures hidden states for every position) while the scheduler-side
-    /// chunk loop only advanced `prefill_progress` by `chunk_cap` per call.
-    /// Without this sync, `complete_prefill` would reject the terminal token
-    /// commit because the scheduler still believes the request is
-    /// `Prefilling`.
-    ///
-    /// See `docs/experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md`
-    /// for the full root cause. Only callers that genuinely consumed the
-    /// prompt through a fast path should invoke this — normal chunked
-    /// prefill must continue to go through `build_prefill_chunk`.
-    pub fn fast_forward_prefill(&mut self, req_id: RequestId, new_progress: usize) {
-        if let Some(state) = self.requests.get_mut(&req_id) {
-            if new_progress > state.prefill_progress {
-                state.prefill_progress = new_progress;
-            }
-            if state.prefill_progress >= state.prompt_len() {
-                state.phase = MetalRequestPhase::Decoding;
-                if state.last_token.is_none() {
-                    state.last_token = state.prompt_tokens.last().copied();
-                }
-            }
-        }
     }
 
     pub fn rewrite_waiting_prompt(
@@ -512,31 +342,27 @@ impl MetalScheduler {
             .requests
             .get_mut(&req_id)
             .ok_or(MetalSchedulerError::UnknownRequest(req_id))?;
-        if state.phase != MetalRequestPhase::Waiting || state.prefill_progress != 0 {
-            return Err(MetalSchedulerError::WrongPhase {
-                req_id,
-                expected: MetalRequestPhase::Waiting,
-                actual: state.phase,
-            });
-        }
 
         state.prompt_tokens = prompt_tokens;
         Ok(())
     }
 
-    fn build_decode_batch(&self) -> MetalDecodeBatch {
-        let mut states: Vec<&MetalRequestState> = self
+    fn build_decode_batch(&self, runtime_states: &[MetalRuntimeRequestState]) -> MetalDecodeBatch {
+        let mut states: Vec<(&MetalRequestState, u32)> = self
             .requests
             .values()
-            .filter(|state| state.phase == MetalRequestPhase::Decoding)
+            .filter_map(|state| {
+                let runtime = runtime_state(runtime_states, state.req_id)?;
+                (state.admitted
+                    && runtime.phase == MetalRequestPhase::Decoding
+                    && runtime.last_token.is_some())
+                .then_some((state, runtime.last_token?))
+            })
             .collect();
-        states.sort_by(|a, b| compare_decode_order(a, b));
+        states.sort_by(|(a, _), (b, _)| compare_decode_order(a, b));
 
-        let req_ids = states.iter().map(|state| state.req_id).collect();
-        let input_tokens = states
-            .iter()
-            .map(|state| state.decode_input_token())
-            .collect();
+        let req_ids = states.iter().map(|(state, _)| state.req_id).collect();
+        let input_tokens = states.into_iter().map(|(_, token)| token).collect();
 
         MetalDecodeBatch {
             req_ids,
@@ -544,8 +370,11 @@ impl MetalScheduler {
         }
     }
 
-    fn build_prefill_chunk(&mut self) -> Option<MetalPrefillChunk> {
-        let req_id = if let Some(req_id) = self.find_prefilling_request() {
+    fn build_prefill_chunk(
+        &mut self,
+        runtime_states: &[MetalRuntimeRequestState],
+    ) -> Option<MetalPrefillChunk> {
+        let req_id = if let Some(req_id) = self.find_prefilling_request(runtime_states) {
             req_id
         } else if self.active_len() < self.config.max_active_requests {
             self.admit_next_waiting_request()?
@@ -553,26 +382,17 @@ impl MetalScheduler {
             return None;
         };
 
-        let chunk_cap = self.prefill_chunk_budget();
+        let chunk_cap = self.prefill_chunk_budget(self.count_decode_runtime(runtime_states));
 
         let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
             let state = self.requests.get_mut(&req_id)?;
-            if state.phase == MetalRequestPhase::Waiting {
-                state.phase = MetalRequestPhase::Prefilling;
-            }
-
             let prompt_len = state.prompt_len();
-            let prompt_start = state.prefill_progress;
+            let prompt_start = runtime_state(runtime_states, req_id)
+                .map(|runtime| runtime.prompt_progress)
+                .unwrap_or(0)
+                .min(prompt_len);
             let prompt_end = (prompt_start + chunk_cap).min(prompt_len);
             let input_tokens = state.prompt_tokens[prompt_start..prompt_end].to_vec();
-            state.prefill_progress = prompt_end;
-
-            if state.prefill_progress >= prompt_len {
-                state.phase = MetalRequestPhase::Decoding;
-                state.last_token = state.prompt_tokens.last().copied();
-            } else {
-                state.phase = MetalRequestPhase::Prefilling;
-            }
 
             (
                 prompt_len,
@@ -600,10 +420,17 @@ impl MetalScheduler {
         })
     }
 
-    fn find_prefilling_request(&self) -> Option<RequestId> {
+    fn find_prefilling_request(
+        &self,
+        runtime_states: &[MetalRuntimeRequestState],
+    ) -> Option<RequestId> {
         self.requests
             .values()
-            .filter(|state| state.phase == MetalRequestPhase::Prefilling)
+            .filter(|state| {
+                state.admitted
+                    && runtime_state(runtime_states, state.req_id)
+                        .is_some_and(|runtime| runtime.phase == MetalRequestPhase::Prefilling)
+            })
             .min_by(|a, b| compare_prefill_order(a, b))
             .map(|state| state.req_id)
     }
@@ -619,7 +446,7 @@ impl MetalScheduler {
 
         let req_id = self.waiting.remove(best_idx);
         let state = self.requests.get_mut(&req_id)?;
-        state.phase = MetalRequestPhase::Prefilling;
+        state.admitted = true;
         Some(req_id)
     }
 
@@ -632,6 +459,20 @@ impl MetalScheduler {
         }
         removed
     }
+
+    fn count_decode_runtime(&self, runtime_states: &[MetalRuntimeRequestState]) -> usize {
+        runtime_states
+            .iter()
+            .filter(|runtime| runtime.phase == MetalRequestPhase::Decoding)
+            .count()
+    }
+}
+
+fn runtime_state<'a>(
+    runtime_states: &'a [MetalRuntimeRequestState],
+    req_id: RequestId,
+) -> Option<&'a MetalRuntimeRequestState> {
+    runtime_states.iter().find(|state| state.req_id == req_id)
 }
 
 fn compare_priority_waiting(a: &MetalRequestState, b: &MetalRequestState) -> Ordering {
@@ -678,6 +519,20 @@ mod tests {
         sink.events.lock().expect("poisoned").clone()
     }
 
+    fn rt(
+        req_id: RequestId,
+        phase: MetalRequestPhase,
+        prompt_progress: usize,
+        last_token: Option<u32>,
+    ) -> MetalRuntimeRequestState {
+        MetalRuntimeRequestState {
+            req_id,
+            phase,
+            prompt_progress,
+            last_token,
+        }
+    }
+
     fn make_scheduler(
         max_active_requests: usize,
         chunk: usize,
@@ -722,19 +577,17 @@ mod tests {
             .submit(vec![5, 6, 7, 8, 9], 8, MetalRequestPriority::Normal)
             .expect("submit req1");
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req0);
                 assert_eq!(prefill.input_tokens, vec![1, 2, 3, 4]);
-                assert_eq!(sched.request_phase(req0), Some(MetalRequestPhase::Decoding));
+                assert_eq!(prefill.prompt_start, 0);
+                assert_eq!(prefill.prompt_end, 4);
             }
             other => panic!("expected initial prefill, got {other:?}"),
         }
 
-        assert!(!sched.advance_decode(req0, 11).expect("decode commit"));
-        assert_eq!(sched.request_phase(req0), Some(MetalRequestPhase::Decoding));
-
-        match sched.step() {
+        match sched.step(&[rt(req0, MetalRequestPhase::Decoding, 4, Some(11))]) {
             MetalScheduleDecision::Mixed { decode, prefill } => {
                 assert_eq!(decode.req_ids, vec![req0]);
                 assert_eq!(decode.input_tokens, vec![11]);
@@ -758,45 +611,42 @@ mod tests {
             )
             .expect("submit");
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req);
                 assert_eq!(prefill.input_tokens, vec![10, 11, 12]);
                 assert_eq!(prefill.prompt_start, 0);
                 assert_eq!(prefill.prompt_end, 3);
-                assert_eq!(
-                    sched.request_phase(req),
-                    Some(MetalRequestPhase::Prefilling)
-                );
             }
             other => panic!("expected chunk 1, got {other:?}"),
         }
 
-        match sched.step() {
+        match sched.step(&[rt(req, MetalRequestPhase::Prefilling, 3, None)]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.input_tokens, vec![13, 14, 15]);
                 assert_eq!(prefill.prompt_start, 3);
                 assert_eq!(prefill.prompt_end, 6);
-                assert_eq!(
-                    sched.request_phase(req),
-                    Some(MetalRequestPhase::Prefilling)
-                );
             }
             other => panic!("expected chunk 2, got {other:?}"),
         }
 
-        match sched.step() {
+        match sched.step(&[rt(req, MetalRequestPhase::Prefilling, 6, None)]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.input_tokens, vec![16, 17]);
                 assert_eq!(prefill.prompt_start, 6);
                 assert_eq!(prefill.prompt_end, 8);
-                assert_eq!(sched.request_phase(req), Some(MetalRequestPhase::Decoding));
+                assert_eq!(prefill.prompt_len, 8);
             }
             other => panic!("expected chunk 3, got {other:?}"),
         }
 
-        assert_eq!(sched.prefilling_len(), 0);
-        assert_eq!(sched.decoding_len(), 1);
+        match sched.step(&[rt(req, MetalRequestPhase::Decoding, 8, Some(77))]) {
+            MetalScheduleDecision::DecodeBatch(batch) => {
+                assert_eq!(batch.req_ids, vec![req]);
+                assert_eq!(batch.input_tokens, vec![77]);
+            }
+            other => panic!("expected decode batch after terminal prefill, got {other:?}"),
+        }
     }
 
     #[test]
@@ -809,24 +659,22 @@ mod tests {
             .submit(vec![5, 6, 7, 8], 1, MetalRequestPriority::Normal)
             .expect("submit req1");
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req0);
-                assert_eq!(sched.request_phase(req0), Some(MetalRequestPhase::Decoding));
+                assert_eq!(prefill.input_tokens, vec![1, 2, 3, 4]);
             }
             other => panic!("expected req0 prefill, got {other:?}"),
         }
 
-        assert!(sched.advance_decode(req0, 99).expect("req0 should finish"));
-        assert_eq!(sched.request_phase(req0), None);
+        assert!(sched.finish_request(req0, Some(InferenceMode::Decode)));
         assert_eq!(sched.active_len(), 0);
         assert_eq!(sched.waiting_len(), 1);
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req1);
                 assert_eq!(prefill.input_tokens, vec![5, 6, 7, 8]);
-                assert_eq!(sched.request_phase(req1), Some(MetalRequestPhase::Decoding));
             }
             other => panic!("expected req1 to start after req0 finished, got {other:?}"),
         }
@@ -853,7 +701,7 @@ mod tests {
             .submit(vec![1, 2, 3, 4], 1, MetalRequestPriority::Normal)
             .expect("submit");
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req);
                 assert_eq!(prefill.input_tokens, vec![1, 2, 3, 4]);
@@ -861,11 +709,7 @@ mod tests {
             other => panic!("expected initial prefill, got {other:?}"),
         }
 
-        assert!(
-            sched
-                .complete_prefill(req, 99)
-                .expect("request should finish")
-        );
+        assert!(sched.finish_request(req, Some(InferenceMode::Decode)));
 
         assert_eq!(
             recorded_events(sink.as_ref()),
@@ -879,11 +723,6 @@ mod tests {
                     request_id: req,
                     kind: RequestEventKind::PrefillStarted,
                     mode: Some(InferenceMode::Prefill),
-                },
-                EngineEvent {
-                    request_id: req,
-                    kind: RequestEventKind::DecodeStep,
-                    mode: Some(InferenceMode::Decode),
                 },
                 EngineEvent {
                     request_id: req,
@@ -901,18 +740,15 @@ mod tests {
             .submit(vec![1, 2, 3, 4], 3, MetalRequestPriority::Normal)
             .expect("submit");
 
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req);
                 assert_eq!(prefill.prompt_end, 4);
-                assert_eq!(sched.request_phase(req), Some(MetalRequestPhase::Decoding));
             }
             other => panic!("expected initial prefill, got {other:?}"),
         }
 
-        assert!(!sched.complete_prefill(req, 77).expect("complete prefill"));
-
-        match sched.step() {
+        match sched.step(&[rt(req, MetalRequestPhase::Decoding, 4, Some(77))]) {
             MetalScheduleDecision::DecodeBatch(batch) => {
                 assert_eq!(batch.req_ids, vec![req]);
                 assert_eq!(batch.input_tokens, vec![77]);
@@ -922,58 +758,22 @@ mod tests {
     }
 
     #[test]
-    fn complete_prefill_rejects_duplicate_first_token_commit() {
+    fn decode_batch_uses_runtime_last_token_for_input() {
         let mut sched = make_scheduler(1, 4, 4);
-        let req = sched
-            .submit(vec![1, 2, 3, 4], 3, MetalRequestPriority::Normal)
-            .expect("submit");
-
-        let _ = sched.step();
-        sched
-            .complete_prefill(req, 77)
-            .expect("first complete_prefill");
-        assert_eq!(
-            sched.complete_prefill(req, 88),
-            Err(MetalSchedulerError::DecodeAlreadyStarted(req))
-        );
-    }
-
-    #[test]
-    fn fast_forward_prefill_transitions_to_decoding_when_prompt_complete() {
-        // Simulates the DFlash one-shot prefill path: scheduler hands out a
-        // single `chunk_cap`-sized chunk, runtime consumes the whole prompt
-        // under a widened budget, then calls `fast_forward_prefill` to
-        // re-sync the scheduler before committing the terminal token.
-        let mut sched = make_scheduler(1, 4, 4);
-        let prompt = vec![1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let prompt = vec![1u32, 2, 3, 4];
         let req = sched
             .submit(prompt.clone(), 3, MetalRequestPriority::Normal)
             .expect("submit");
 
-        // First scheduler step: emits a short chunk (chunk_cap = 4 < 10),
-        // leaving the request in Prefilling with progress = 4.
-        match sched.step() {
+        match sched.step(&[]) {
             MetalScheduleDecision::PrefillChunk(prefill) => {
                 assert_eq!(prefill.req_id, req);
                 assert_eq!(prefill.prompt_end, 4);
-                assert_eq!(
-                    sched.request_phase(req),
-                    Some(MetalRequestPhase::Prefilling)
-                );
             }
             other => panic!("expected initial prefill, got {other:?}"),
         }
 
-        // Runtime took the DFlash fast path and consumed the whole prompt;
-        // re-sync the scheduler.
-        sched.fast_forward_prefill(req, prompt.len());
-        assert_eq!(sched.request_phase(req), Some(MetalRequestPhase::Decoding));
-
-        // complete_prefill must now succeed — this is the case that used to
-        // fail with `WrongPhase` in the bug doc.
-        assert!(!sched.complete_prefill(req, 99).expect("complete_prefill"));
-
-        match sched.step() {
+        match sched.step(&[rt(req, MetalRequestPhase::Decoding, 4, Some(99))]) {
             MetalScheduleDecision::DecodeBatch(batch) => {
                 assert_eq!(batch.req_ids, vec![req]);
                 assert_eq!(batch.input_tokens, vec![99]);
@@ -983,31 +783,44 @@ mod tests {
     }
 
     #[test]
-    fn fast_forward_prefill_is_a_noop_for_unknown_request() {
+    fn decode_batch_skips_requests_missing_runtime_last_token() {
         let mut sched = make_scheduler(1, 4, 4);
-        // Must not panic / must not insert state.
-        sched.fast_forward_prefill(RequestId(12345), 10);
-        assert_eq!(sched.active_len(), 0);
+        let req = sched
+            .submit(vec![10, 11, 12, 13], 3, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        match sched.step(&[]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.prompt_end, 4);
+            }
+            other => panic!("expected initial prefill, got {other:?}"),
+        }
+
+        assert_eq!(
+            sched.step(&[rt(req, MetalRequestPhase::Decoding, 4, None)]),
+            MetalScheduleDecision::Idle
+        );
     }
 
     #[test]
-    fn fast_forward_prefill_does_not_regress_progress() {
+    fn waiting_request_may_be_rewritten_before_admission() {
         let mut sched = make_scheduler(1, 4, 4);
         let req = sched
             .submit(vec![1, 2, 3, 4, 5, 6], 2, MetalRequestPriority::Normal)
             .expect("submit");
-        // Advance to progress = 4 via the normal chunked path.
-        let _ = sched.step();
-        assert_eq!(
-            sched.request_phase(req),
-            Some(MetalRequestPhase::Prefilling)
-        );
-        // A stale smaller value must not rewind progress or change phase.
-        sched.fast_forward_prefill(req, 2);
-        assert_eq!(
-            sched.request_phase(req),
-            Some(MetalRequestPhase::Prefilling)
-        );
+
+        sched
+            .rewrite_waiting_prompt(req, vec![7, 8, 9, 10])
+            .expect("rewrite waiting prompt");
+
+        match sched.step(&[]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![7, 8, 9, 10]);
+            }
+            other => panic!("expected rewritten prefill, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1022,14 +835,26 @@ mod tests {
             )
             .expect("submit");
 
-        for expected_chunk in [vec![10, 11, 12], vec![13, 14, 15], vec![16, 17]] {
-            match sched.step() {
-                MetalScheduleDecision::PrefillChunk(prefill) => {
-                    assert_eq!(prefill.req_id, req);
-                    assert_eq!(prefill.input_tokens, expected_chunk);
-                }
-                other => panic!("expected prefill chunk, got {other:?}"),
+        match sched.step(&[]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![10, 11, 12]);
             }
+            other => panic!("expected prefill chunk, got {other:?}"),
+        }
+        match sched.step(&[rt(req, MetalRequestPhase::Prefilling, 3, None)]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![13, 14, 15]);
+            }
+            other => panic!("expected prefill chunk, got {other:?}"),
+        }
+        match sched.step(&[rt(req, MetalRequestPhase::Prefilling, 6, None)]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![16, 17]);
+            }
+            other => panic!("expected prefill chunk, got {other:?}"),
         }
 
         assert_eq!(
@@ -1047,5 +872,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn runtime_prefill_progress_controls_chunk_selection() {
+        let mut sched = make_scheduler(1, 4, 4);
+        let req = sched
+            .submit(
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                4,
+                MetalRequestPriority::Normal,
+            )
+            .expect("submit");
+
+        match sched.step(&[]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.prompt_start, 0);
+                assert_eq!(prefill.prompt_end, 4);
+            }
+            other => panic!("expected first prefill, got {other:?}"),
+        }
+
+        match sched.step(&[rt(req, MetalRequestPhase::Prefilling, 4, None)]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.prompt_start, 4);
+                assert_eq!(prefill.prompt_end, 8);
+            }
+            other => panic!("expected second prefill, got {other:?}"),
+        }
     }
 }

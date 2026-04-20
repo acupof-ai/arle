@@ -16,17 +16,18 @@ use super::request_state::{
     Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
-    MetalRequestPhase as SchedulerPhase, MetalRequestPriority, MetalScheduleDecision,
-    MetalScheduler, MetalSchedulerConfig,
+    MetalRequestPriority, MetalRuntimeRequestState, MetalScheduleDecision, MetalScheduler,
+    MetalSchedulerConfig,
 };
 use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
+use crate::backend::runtime::StopChunkProcessor;
 use crate::metrics::ServerMetrics;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
-use crate::types::RequestId;
+use crate::types::{InferenceMode, RequestId};
 
 struct ActiveMetalRequest {
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -783,7 +784,8 @@ fn run_metal_scheduler_runtime(
             }
         }
 
-        match scheduler.step() {
+        let runtime_states = scheduler_runtime_states(&active);
+        match scheduler.step(&runtime_states) {
             MetalScheduleDecision::Idle => continue,
             MetalScheduleDecision::PrefillChunk(prefill) => execute_prefill_chunk(
                 prefill.req_id,
@@ -875,7 +877,7 @@ fn refresh_waiting_prefix_hits(
             }
             (request.phase() == RuntimePhase::Prefill
                 && request.request_state.prompt_progress() == 0
-                && scheduler.request_phase(*req_id) == Some(SchedulerPhase::Waiting))
+                && scheduler.is_waiting(*req_id))
             .then_some(*req_id)
         })
         .collect();
@@ -1039,7 +1041,7 @@ fn execute_prefill_chunk(
                 "Metal prefill chunk referenced missing request {:?}",
                 req_id
             );
-            scheduler.finish_request(req_id);
+            scheduler.finish_request(req_id, None);
             return;
         };
 
@@ -1069,39 +1071,16 @@ fn execute_prefill_chunk(
             runtime_finished,
             stop_hit,
         } => {
-            let mut scheduler_finished = false;
-            if let Some(token) = emitted_token {
+            if let Some(_token) = emitted_token {
                 if let Some(prefix_runtime) = prefix_runtime.as_mut()
                     && let Some(request) = active.get(&req_id)
                     && let Err(err) = prefix_runtime.publish_prompt_prefix(request)
                 {
                     warn!("Metal live prefix publish failed for {:?}: {err:#}", req_id);
                 }
-                // DFlash widens the runtime-side prefill budget to consume
-                // the whole prompt in one FFI call (see budget override
-                // above). The scheduler-side `prefill_progress` still only
-                // advanced by `chunk_cap` per step, so we must re-sync it
-                // before `complete_prefill`, which otherwise rejects with
-                // `WrongPhase` for any prompt > prefill_chunk_size.
-                // See docs/experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md.
-                if let Some(request) = active.get(&req_id)
-                    && request.request_state.is_dflash_enabled()
-                {
-                    let prompt_len = request.request_state.prompt_len();
-                    scheduler.fast_forward_prefill(req_id, prompt_len);
-                }
-                match scheduler.complete_prefill(req_id, token) {
-                    Ok(done) => scheduler_finished = done,
-                    Err(err) => {
-                        error!("Metal complete_prefill failed for {:?}: {err}", req_id);
-                        metrics.record_request_failed();
-                        cancel_request(req_id, scheduler, active);
-                        return;
-                    }
-                }
             }
 
-            if runtime_finished || stop_hit || scheduler_finished {
+            if runtime_finished || stop_hit {
                 finalize_request(req_id, metrics, scheduler, active);
             }
         }
@@ -1130,7 +1109,7 @@ fn execute_decode_batch(
     for req_id in req_ids {
         let Some(request) = active.remove(&req_id) else {
             warn!("Metal decode batch referenced missing request {:?}", req_id);
-            scheduler.finish_request(req_id);
+            scheduler.finish_request(req_id, None);
             continue;
         };
         staged.push((req_id, request));
@@ -1139,7 +1118,7 @@ fn execute_decode_batch(
     let mut open = Vec::with_capacity(staged.len());
     for (req_id, request) in staged {
         if request.delta_closed() {
-            scheduler.finish_request(req_id);
+            scheduler.finish_request(req_id, request_mode(&request));
             continue;
         }
         open.push((req_id, request));
@@ -1240,14 +1219,7 @@ fn execute_decode_batch(
                 cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
-            finish_or_requeue_decoded_request(
-                req_id,
-                request,
-                sampled_token,
-                metrics,
-                scheduler,
-                active,
-            );
+            finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
         }
         return;
     }
@@ -1347,14 +1319,7 @@ fn execute_qwen35_dflash_packed_batch(
                 cancel_detached_request(req_id, request, scheduler);
                 continue;
             }
-            finish_or_requeue_decoded_request(
-                req_id,
-                request,
-                sampled_token,
-                metrics,
-                scheduler,
-                active,
-            );
+            finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
         } else {
             execute_decode_single(req_id, request, metrics, scheduler, active);
         }
@@ -1538,7 +1503,6 @@ fn execute_decode_single(
 ) {
     enum Outcome {
         Progress {
-            sampled_token: u32,
             runtime_finished: bool,
             stop_hit: bool,
         },
@@ -1550,8 +1514,7 @@ fn execute_decode_single(
         Outcome::ClientDropped
     } else {
         match request.decode_step() {
-            Ok(sampled_token) => Outcome::Progress {
-                sampled_token,
+            Ok(_sampled_token) => Outcome::Progress {
                 runtime_finished: request.phase() == RuntimePhase::Finished,
                 stop_hit: request.stop_hit(),
             },
@@ -1567,28 +1530,17 @@ fn execute_decode_single(
 
     match outcome {
         Outcome::Progress {
-            sampled_token,
             runtime_finished,
             stop_hit,
         } => {
-            let scheduler_finished = match scheduler.advance_decode(req_id, sampled_token) {
-                Ok(done) => done,
-                Err(err) => {
-                    error!("Metal advance_decode failed for {:?}: {err}", req_id);
-                    metrics.record_request_failed();
-                    cancel_detached_request(req_id, request, scheduler);
-                    return;
-                }
-            };
-
-            if runtime_finished || stop_hit || scheduler_finished {
+            if runtime_finished || stop_hit {
                 finalize_detached_request(req_id, request, metrics, scheduler);
             } else {
                 active.insert(req_id, request);
             }
         }
         Outcome::ClientDropped => {
-            scheduler.finish_request(req_id);
+            scheduler.finish_request(req_id, request_mode(&request));
             if let Err(err) = request.cancel() {
                 warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
             }
@@ -1604,24 +1556,13 @@ fn execute_decode_single(
 fn finish_or_requeue_decoded_request(
     req_id: RequestId,
     request: ActiveMetalRequest,
-    sampled_token: u32,
     metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
     let runtime_finished = request.phase() == RuntimePhase::Finished;
     let stop_hit = request.stop_hit();
-    let scheduler_finished = match scheduler.advance_decode(req_id, sampled_token) {
-        Ok(done) => done,
-        Err(err) => {
-            error!("Metal advance_decode failed for {:?}: {err}", req_id);
-            metrics.record_request_failed();
-            cancel_detached_request(req_id, request, scheduler);
-            return;
-        }
-    };
-
-    if runtime_finished || stop_hit || scheduler_finished {
+    if runtime_finished || stop_hit {
         finalize_detached_request(req_id, request, metrics, scheduler);
     } else {
         active.insert(req_id, request);
@@ -1633,7 +1574,7 @@ fn cancel_detached_request(
     mut request: ActiveMetalRequest,
     scheduler: &mut MetalScheduler,
 ) {
-    scheduler.finish_request(req_id);
+    scheduler.finish_request(req_id, request_mode(&request));
     if let Err(err) = request.cancel() {
         warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
     }
@@ -1645,7 +1586,7 @@ fn finalize_detached_request(
     metrics: &ServerMetrics,
     scheduler: &mut MetalScheduler,
 ) {
-    scheduler.finish_request(req_id);
+    scheduler.finish_request(req_id, Some(InferenceMode::Decode));
     record_request_completed(metrics, &request);
     if let Err(err) = request.send_final_delta() {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
@@ -1671,7 +1612,8 @@ fn cancel_request(
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
-    scheduler.finish_request(req_id);
+    let mode = active.get(&req_id).map(request_mode);
+    scheduler.finish_request(req_id, mode.flatten());
     if let Some(mut request) = active.remove(&req_id)
         && let Err(err) = request.cancel()
     {
@@ -1685,7 +1627,7 @@ fn finalize_request(
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
-    scheduler.finish_request(req_id);
+    scheduler.finish_request(req_id, Some(InferenceMode::Decode));
     let Some(mut request) = active.remove(&req_id) else {
         return;
     };
@@ -1726,6 +1668,32 @@ fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalReques
             metrics.record_dflash_block(accepted.get(i).copied().unwrap_or(0), drafted);
         }
     }
+}
+
+fn request_mode(request: &ActiveMetalRequest) -> Option<InferenceMode> {
+    match request.phase() {
+        RuntimePhase::Prefill => Some(InferenceMode::Prefill),
+        RuntimePhase::Decode | RuntimePhase::Finished => Some(InferenceMode::Decode),
+    }
+}
+
+fn scheduler_runtime_states(
+    active: &HashMap<RequestId, ActiveMetalRequest>,
+) -> Vec<MetalRuntimeRequestState> {
+    active
+        .iter()
+        .map(|(req_id, request)| MetalRuntimeRequestState {
+            req_id: *req_id,
+            phase: match request.phase() {
+                RuntimePhase::Prefill => super::scheduler::MetalRequestPhase::Prefilling,
+                RuntimePhase::Decode | RuntimePhase::Finished => {
+                    super::scheduler::MetalRequestPhase::Decoding
+                }
+            },
+            prompt_progress: request.request_state.prompt_progress(),
+            last_token: request.request_state.last_token(),
+        })
+        .collect()
 }
 
 fn refresh_runtime_metrics(
@@ -1783,99 +1751,4 @@ fn send_text_delta(
             logprob: None,
         })
         .map_err(|_| anyhow!("stream consumer dropped"))
-}
-
-struct StopChunkProcessor {
-    accumulated: String,
-    sent_len: usize,
-    stops: Vec<String>,
-    max_stop_len: usize,
-    hit_stop: bool,
-}
-
-impl StopChunkProcessor {
-    fn new(stops: Vec<String>) -> Self {
-        let max_stop_len = stops.iter().map(String::len).max().unwrap_or(0);
-        Self {
-            accumulated: String::new(),
-            sent_len: 0,
-            stops,
-            max_stop_len,
-            hit_stop: false,
-        }
-    }
-
-    fn push_chunk(&mut self, chunk: &str) -> Option<String> {
-        if self.hit_stop {
-            return None;
-        }
-
-        self.accumulated.push_str(chunk);
-
-        if let Some(stop_pos) = self.find_earliest_stop() {
-            let delta = self.accumulated[self.sent_len..stop_pos].to_string();
-            self.sent_len = stop_pos;
-            self.hit_stop = true;
-            return Some(delta);
-        }
-
-        if self.max_stop_len <= 1 {
-            return self.flush_ready(self.accumulated.len());
-        }
-
-        let safe_end = self
-            .accumulated
-            .len()
-            .saturating_sub(self.max_stop_len.saturating_sub(1));
-        let safe_end = clamp_char_boundary(&self.accumulated, safe_end);
-        self.flush_ready(safe_end)
-    }
-
-    fn finish(&mut self) -> Option<String> {
-        if self.hit_stop {
-            return None;
-        }
-        self.flush_ready(self.accumulated.len())
-    }
-
-    fn hit_stop(&self) -> bool {
-        self.hit_stop
-    }
-
-    fn flush_ready(&mut self, end: usize) -> Option<String> {
-        if end <= self.sent_len {
-            return None;
-        }
-        let delta = self.accumulated[self.sent_len..end].to_string();
-        self.sent_len = end;
-        Some(delta)
-    }
-
-    fn find_earliest_stop(&self) -> Option<usize> {
-        let unsent = &self.accumulated[self.sent_len..];
-        let mut earliest = None::<usize>;
-
-        for stop in &self.stops {
-            if stop.is_empty() {
-                continue;
-            }
-            if let Some(pos) = unsent.find(stop) {
-                let absolute = self.sent_len + pos;
-                earliest = Some(match earliest {
-                    None => absolute,
-                    Some(existing) => existing.min(absolute),
-                });
-            }
-        }
-
-        earliest
-    }
-}
-
-fn clamp_char_boundary(text: &str, mut idx: usize) -> usize {
-    idx = idx.min(text.len());
-    while idx > 0 && !text.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
