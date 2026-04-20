@@ -37,13 +37,19 @@ pub struct TrainerConfig {
     pub total_steps: u64,
     /// Micro-batches per optimizer step. Must be >= 1.
     pub grad_accum_steps: u64,
-    /// Emit a metric sample every N optimizer steps. Must be >= 1.
+    /// Emit a metric sample every N optimizer steps. Must be >= 1. The loop
+    /// additionally force-emits on the very first step (step == 1) and the
+    /// final step (step == total_steps) so CLI-consumers always see a first
+    /// progress line and a closing summary regardless of `N`.
     pub log_every: u64,
     /// If `Some(n)`, call the eval closure (if provided) every N optimizer
     /// steps. Ignored by `run` (only honored by `run_with_eval`).
     pub eval_every: Option<u64>,
     /// If `Some(n)`, save a checkpoint every N optimizer steps. Requires
-    /// `save_dir` to be `Some`.
+    /// `save_dir` to be `Some`. The loop also force-saves on the final step
+    /// (step == total_steps) — mirrors the metrics force-emit pattern so a
+    /// training run that ends between save boundaries still produces a final,
+    /// resumable checkpoint.
     pub save_every: Option<u64>,
     /// Root directory for `step_{NNNNNN}/{trainer_state.json,optimizer.safetensors}`.
     pub save_dir: Option<PathBuf>,
@@ -471,8 +477,12 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             }
 
             // ---- save ----
+            // Codex review 2026-04-20 on ad5568b (P1): force-save on the final
+            // step too — otherwise a run with save_every=5 + total_steps=12
+            // would save at 5/10 but drop the real "training done" state at
+            // 12, leaving resume unable to pick up where the run ended.
             if let Some(save_n) = self.cfg.save_every
-                && self.step.is_multiple_of(save_n)
+                && (self.step.is_multiple_of(save_n) || is_final)
             {
                 self.save_checkpoint(&param_names)?;
             }

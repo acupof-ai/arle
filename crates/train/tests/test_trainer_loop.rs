@@ -316,6 +316,133 @@ fn checkpoint_save_writes_directory() {
     assert!(optim_path.is_file(), "expected optimizer safetensors");
 }
 
+/// Codex review 2026-04-20 on ad5568b (P1): the Trainer must force-save on
+/// the final step even when it isn't a multiple of `save_every`. Otherwise
+/// a run with `save_every=5 --steps 7` would save at step 5 only and lose
+/// the 2 steps of progress between the last save boundary and termination.
+#[test]
+fn checkpoint_save_forces_final_step_when_not_multiple() {
+    let tmp = tempdir().expect("tempdir");
+    let save_dir: PathBuf = tmp.path().join("ckpt");
+
+    let (mut store, p) = setup_param(&[0.25, -0.5]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 7,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: Some(5),
+        save_dir: Some(save_dir.clone()),
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    let step5 = save_dir.join("step_000005").join("trainer_state.json");
+    let step7 = save_dir.join("step_000007").join("trainer_state.json");
+    assert!(step5.is_file(), "expected step 5 checkpoint at {step5:?}");
+    assert!(
+        step7.is_file(),
+        "expected forced final-step 7 checkpoint at {step7:?}"
+    );
+}
+
+/// Codex review 2026-04-20 on bd6c871 (nit): the eval-path metrics emit
+/// dropped `"step"` from its fields array alongside the training path, but
+/// only the training side had a dedicated test. Pin the eval-side behavior
+/// so a future regression cannot silently re-introduce `step=N ... step=N`
+/// duplication in eval sinks.
+#[test]
+fn eval_metrics_fields_omit_step() {
+    let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        buf: Arc::clone(&buf),
+    };
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 4,
+        grad_accum_steps: 1,
+        log_every: 100, // suppress training emits except forced (1 + 4)
+        eval_every: Some(2),
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(sink), cfg);
+
+    trainer
+        .run_with_eval(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+            |_store, _tape| {
+                Ok(train::EvalOutcome {
+                    loss: 0.5,
+                    token_count: 42,
+                })
+            },
+        )
+        .expect("trainer.run_with_eval");
+
+    let samples = buf.lock().unwrap();
+    // Identify eval samples by their distinctive key set.
+    let eval_samples: Vec<&OwnedSample> = samples
+        .iter()
+        .filter(|s| s.fields.iter().any(|(k, _)| k == "eval_loss"))
+        .collect();
+    assert!(
+        !eval_samples.is_empty(),
+        "expected at least one eval sample (eval_every=2 total_steps=4)"
+    );
+    for s in eval_samples {
+        let expected = ["eval_loss", "eval_tokens"];
+        for k in expected {
+            assert!(
+                s.fields.iter().any(|(name, _)| name == k),
+                "eval sample at step {} missing field {k}",
+                s.step
+            );
+        }
+        assert!(
+            !s.fields.iter().any(|(name, _)| name == "step"),
+            "eval sample at step {} still carries redundant `step` field",
+            s.step
+        );
+    }
+}
+
 /// total_steps=4 + log_every=2 should produce exactly 2 metric samples.
 #[test]
 fn metrics_emit_at_log_every() {
