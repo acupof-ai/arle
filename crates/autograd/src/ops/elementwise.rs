@@ -49,6 +49,91 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    // M5.3b.17: dispatch is OR-lazy — if EITHER operand is device-resident,
+    // upload the other and stay on the MLX graph. Same rationale as
+    // `add_broadcast`: the hot path is `attn * gate` and `silu(gate) * up`
+    // in Qwen3.5, where both operands are Dirty::Device chained from prior
+    // matmul/sigmoid/silu nodes. Forcing a readback on either side would
+    // flush the whole upstream graph.
+    let a_use_lazy = {
+        let t = store.tensor(a)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    let b_use_lazy = {
+        let t = store.tensor(b)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if a_use_lazy || b_use_lazy {
+        mul_device_lazy(a, b, store, tape)
+    } else {
+        mul_host_eager(a, b, store, tape)
+    }
+}
+
+fn mul_device_lazy(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (a_shape, a_requires_grad) = {
+        let t = store.tensor(a)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    let (b_shape, b_requires_grad) = {
+        let t = store.tensor(b)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    if a_shape != b_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: a_shape,
+            got: b_shape,
+        });
+    }
+
+    store.ensure_device(a)?;
+    store.ensure_device(b)?;
+    let a_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+    let b_handle = store
+        .tensor(b)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+
+    let out_handle = store.backend().mul(&a_handle, &b_handle, &a_shape)?;
+    let requires_grad = a_requires_grad || b_requires_grad;
+    let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Mul,
+            output_id,
+            input_ids: smallvec![a, b],
+            saved: SavedContext::Tensors(smallvec![a, b]),
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn mul_host_eager(
+    a: TensorId,
+    b: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // Mirror `add_broadcast_host_eager`: even on CPU backend, operands may
+    // be Dirty::Device-on-CPU-handle, so ensure_host synchronizes before
+    // `.clone()` (which asserts `dirty != Device`).
+    store.ensure_host(a)?;
+    store.ensure_host(b)?;
     let (a_data, a_shape, a_requires_grad) = {
         let tensor = store.tensor(a)?;
         (

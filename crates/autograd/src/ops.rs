@@ -117,8 +117,11 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(a)?;
-    store.ensure_host(b)?;
+    // M5.3b.17: inner `elementwise::mul` dispatches OR-lazy; if either
+    // operand is Dirty::Device/Both the pair stays on `mlx_multiply`
+    // in the MLX graph, else the host-eager path kicks in. Stripping
+    // `ensure_host` is the enabler — Qwen3.5 hot paths are `attn * gate`
+    // and `silu(gate) * up` per attention/MLP layer × 28 layers.
     elementwise::mul(a, b, store, tape)
 }
 

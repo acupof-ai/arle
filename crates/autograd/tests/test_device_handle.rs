@@ -1,9 +1,9 @@
 #[cfg(feature = "metal")]
 use autograd::{
     AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::causal_sdpa, ops::embedding,
-    ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul_scalar,
-    ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::slice, ops::sum, ops::transpose,
-    tensor::Dirty,
+    ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul,
+    ops::mul_scalar, ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::slice, ops::sum,
+    ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1469,6 +1469,84 @@ fn metal_add_broadcast_forward_stays_lazy() -> Result<()> {
                 "add_broadcast parity: expected -inf, got metal={a}"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// M5.3b.17: elementwise `mul` must stay lazy on Metal. Hot-path uses are
+/// Qwen3.5's `attn * gate` (attention gating) and `silu(gate) * up` (MLP
+/// SwiGLU). Must not force an eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_mul_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let rows = 4usize;
+    let cols = 8usize;
+    let k = 5usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    // Both operands come from matmul so they're Dirty::Device upstream.
+    let a_data: Vec<f32> = (0..rows * k).map(|i| (i as f32) * 0.017 - 0.2).collect();
+    let wa_data: Vec<f32> = (0..k * cols).map(|i| ((i as f32) * 0.029).cos()).collect();
+    let b_data: Vec<f32> = (0..rows * k).map(|i| ((i as f32) * 0.013).sin()).collect();
+    let wb_data: Vec<f32> = (0..k * cols).map(|i| (i as f32) * 0.011 + 0.1).collect();
+
+    let a = store.from_slice(&a_data, &[rows, k])?;
+    let wa = store.from_slice(&wa_data, &[k, cols])?;
+    let b = store.from_slice(&b_data, &[rows, k])?;
+    let wb = store.from_slice(&wb_data, &[k, cols])?;
+    store.get_mut(a).expect("a exists").requires_grad = true;
+    store.get_mut(b).expect("b exists").requires_grad = true;
+
+    reset_eval_count();
+
+    let am = matmul(a, wa, &mut store, &mut tape)?;
+    let bm = matmul(b, wb, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    let prod = mul(am, bm, &mut store, &mut tape)?;
+    let after_mul = eval_count();
+
+    let loss = sum(prod, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_mul, 0,
+        "M5.3b.17: lazy elementwise mul must not force an eval; saw \
+         {after_mul}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::mul or a missing OR-lazy dispatch in elementwise.rs."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 6,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity against CPU reference.
+    let metal_prod = store.get(prod).expect("mul output").data.clone();
+    let cpu = CpuBackend;
+    let (cpu_am, _) = cpu.matmul_forward(&a_data, &[rows, k], &wa_data, &[k, cols])?;
+    let (cpu_bm, _) = cpu.matmul_forward(&b_data, &[rows, k], &wb_data, &[k, cols])?;
+    let cpu_prod = cpu.mul_forward(&cpu_am, &cpu_bm)?;
+    assert_eq!(metal_prod.len(), cpu_prod.len());
+    for (x, y) in metal_prod.iter().zip(cpu_prod.iter()) {
+        assert!((x - y).abs() <= 1e-4, "mul parity: metal={x} cpu={y}");
     }
 
     Ok(())

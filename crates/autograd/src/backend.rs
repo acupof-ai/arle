@@ -262,6 +262,19 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mul_forward(a, b)
     }
 
+    /// Device-handle variant of `mul_forward`. Lazy on backends that can
+    /// compose `a * b` into their graph (Metal: `mlx_multiply`); default
+    /// falls back to `readback(a) → readback(b) → host compute → upload`
+    /// so CPU/CUDA need no special-case. Shapes must match on both sides
+    /// (elementwise, not broadcasted — use `add_broadcast`'s `mul` twin if
+    /// broadcast multiplication is ever needed). M5.3b.17.
+    fn mul(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let a_host = self.readback(a)?;
+        let b_host = self.readback(b)?;
+        let out = self.mul_forward(&a_host, &b_host)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * s` for scalar `s`.
     fn mul_scalar_forward(&self, a: &[f32], s: f32) -> Result<Vec<f32>> {
         cpu_mul_scalar_forward(a, s)
