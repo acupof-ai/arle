@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-infer(1) — pure-Rust LLM inference engine</title>
+<meta name="description" content="agent-infer is a pure-Rust LLM inference engine built around multi-turn KV reuse. CUDA primary, Metal on Apple Silicon, OpenAI-compatible HTTP.">
+<meta name="color-scheme" content="light">
+<meta property="og:title" content="agent-infer — pure-Rust LLM inference engine">
+<meta property="og:description" content="KV-cache-first inference engine for LLM agents. 4.6× faster TTFT than SGLang at c=1. CUDA + Metal backends.">
+<meta property="og:type" content="website">
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23F4EDE0'/><text x='16' y='22' font-family='monospace' font-size='22' text-anchor='middle' fill='%23D97757'>$</text></svg>">
+</head>
+<body>
+<main class="page">
+
+<header class="manhead" aria-label="man page header">
+  <span class="manhead-l">AGENT-INFER(1)</span>
+  <span class="manhead-c">General Commands Manual</span>
+  <span class="manhead-r">AGENT-INFER(1)</span>
+</header>
+
+<section class="hero" aria-label="banner">
+<pre class="ascii" aria-hidden="true">
+ █████╗  ██████╗ ███████╗███╗   ██╗████████╗       ██╗███╗   ██╗███████╗███████╗██████╗
+██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝       ██║████╗  ██║██╔════╝██╔════╝██╔══██╗
+███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║    ─●─   ██║██╔██╗ ██║█████╗  █████╗  ██████╔╝
+██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║          ██║██║╚██╗██║██╔══╝  ██╔══╝  ██╔══██╗
+██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║          ██║██║ ╚████║██║     ███████╗██║  ██║
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝          ╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝╚═╝  ╚═╝
+</pre>
+<p class="tagline">
+  pure-Rust LLM inference engine &mdash;
+  <span class="hl">KV-cache-first</span>, built for multi-turn agents.
+</p>
+<nav class="jumps" aria-label="sections">
+  <a href="#synopsis">[synopsis]</a>
+  <a href="#performance">[performance]</a>
+  <a href="#backends">[backends]</a>
+  <a href="#quickstart">[quickstart]</a>
+  <a href="#architecture">[architecture]</a>
+  <a href="https://github.com/cklxx/agent-infer">[github]</a>
+</nav>
+</section>
+
+<section id="name">
+<h2>NAME</h2>
+<p class="block">
+  <b>agent-infer</b> &mdash; continuous-batching LLM inference engine in pure
+  Rust. CUDA is the primary serving path; Metal runs on Apple Silicon via an
+  MLX C++ bridge. OpenAI-compatible HTTP API, built-in agent runtime.
+</p>
+</section>
+
+<section id="synopsis">
+<h2>SYNOPSIS</h2>
+<pre class="cmd"><span class="p">$</span> agent-infer --model-path <u>Qwen3-4B</u> --port <u>8000</u>
+<span class="p">$</span> curl localhost:8000/v1/chat/completions \
+    -H <i>'content-type: application/json'</i> \
+    -d <i>'{"messages":[{"role":"user","content":"hi"}]}'</i><span class="caret"></span></pre>
+</section>
+
+<section id="description">
+<h2>DESCRIPTION</h2>
+<p class="block">
+  Every agent turn pays a prefill tax: system prompt + conversation history +
+  tool results get re-processed as context grows. agent-infer treats prefix-KV
+  reuse as the core problem &mdash; everything else is consequence.
+</p>
+<table class="why">
+  <tbody>
+    <tr><td class="cap">Multi-turn KV reuse</td>
+        <td>slot-sticky prefix match; only the new user message prefills.</td></tr>
+    <tr><td class="cap">Token-level KV pool</td>
+        <td>page_size=1, SGLang-style. Zero fragmentation, O(1) alloc/free.</td></tr>
+    <tr><td class="cap">GPU&rarr;CPU offload</td>
+        <td>oldest blocks migrate to host RAM; prefetched before attention.</td></tr>
+    <tr><td class="cap">Copy-on-write blocks</td>
+        <td>paged blocks with ref-counting; N requests share 1&times; prefix.</td></tr>
+    <tr><td class="cap">CUDA Graph decode</td>
+        <td>one captured graph per batch size; 504 launches &rarr; 1 replay.</td></tr>
+  </tbody>
+</table>
+</section>
+
+<section id="performance">
+<h2>PERFORMANCE</h2>
+<p class="block">
+  Qwen3-4B on A100-SXM4-40GB vs SGLang v0.5.9.
+</p>
+<pre class="tbl" aria-label="perf table">
+┌─────────────┬──────────────┬────────────┬──────────┬────────────┐
+│ concurrency │  throughput  │  vs sglang │   ttft   │  vs sglang │
+├─────────────┼──────────────┼────────────┼──────────┼────────────┤
+│      1      │  119.5 tok/s │    0.99×   │   8.6 ms │   <b>4.6× faster</b>│
+│      4      │  414.8 tok/s │    0.99×   │  53.1 ms │   <b>2.6× faster</b>│
+│      8      │  811.0 tok/s │    0.92×   │  68.7 ms │   <b>1.1× faster</b>│
+└─────────────┴──────────────┴────────────┴──────────┴────────────┘</pre>
+<p class="note">
+  &gt; the cache does the heavy lifting. full methodology + agent benchmark
+  in <a href="https://github.com/cklxx/agent-infer/blob/main/README.md#performance">README</a>.
+</p>
+</section>
+
+<section id="backends">
+<h2>BACKENDS</h2>
+<pre class="tbl">
+┌───────────────────────────────┬────────────┬──────────────────────────────┐
+│ <b>cuda</b>   · linux / nvidia         │  stable    │ flashinfer · cuda graph      │
+│ <b>metal</b>  · apple silicon          │  beta      │ mlx-sys bridge · dflash on   │
+│ <b>cpu</b>    · smoke tests only       │  dev       │ not a production target      │
+└───────────────────────────────┴────────────┴──────────────────────────────┘</pre>
+<p class="note">
+  dflash (speculative decode) is default-on for Qwen3 &amp; Qwen3.5 on Metal
+  since 2026-04-19 &mdash; bit-identical parity vs scalar path, c=1..8 stable.
+</p>
+</section>
+
+<section id="models">
+<h2>MODELS</h2>
+<pre class="tbl">
+┌──────────────────┬───────────────────────────────────┬──────────────┐
+│ Qwen3 (0.5B–72B) │ GQA                               │ ✓ supported  │
+│ Qwen3.5-4B       │ hybrid (linear + full attention)  │ ✓ supported  │
+│ GLM4             │ GQA                               │ ✓ supported  │
+│ Llama 3 / 4      │ GQA                               │ … planned    │
+│ DeepSeek V3 / R1 │ MLA                               │ … planned    │
+└──────────────────┴───────────────────────────────────┴──────────────┘</pre>
+</section>
+
+<section id="quickstart">
+<h2>QUICKSTART</h2>
+
+<h3>&mdash; CUDA / Linux</h3>
+<pre class="cmd"><span class="c"># docker (recommended)</span>
+<span class="p">$</span> docker run --gpus all -v $PWD/Qwen3-4B:/model \
+    ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
+
+<span class="c"># from source</span>
+<span class="p">$</span> git clone https://github.com/cklxx/agent-infer &amp;&amp; cd agent-infer
+<span class="p">$</span> cargo build -p infer --release
+<span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
+
+<h3>&mdash; Metal / Apple Silicon</h3>
+<pre class="cmd"><span class="c"># one-command serve (defaults to Qwen3-0.6B-4bit on :8000)</span>
+<span class="p">$</span> ./scripts/start_metal_serve.sh
+
+<span class="c"># speculative decode (default-on, Qwen3.5 target + draft)</span>
+<span class="p">$</span> ./scripts/run_dflash.sh              <span class="c"># serve</span>
+<span class="p">$</span> ./scripts/run_dflash.sh bench        <span class="c"># baseline vs dflash</span></pre>
+
+<p class="note">
+  prerequisites: CUDA 12.x · Rust 1.85+ · Python 3.10+ with
+  <code>flashinfer-python</code> (build-time only). Apple Silicon needs only
+  Rust + Xcode CLT.
+</p>
+</section>
+
+<section id="api">
+<h2>API</h2>
+<p class="block">
+  OpenAI-compatible. Stable surface:
+  <code>POST /v1/completions</code>,
+  <code>POST /v1/chat/completions</code>,
+  <code>GET  /v1/models</code>.
+  Beta: <code>POST /v1/responses</code> (non-streaming subset + SSE
+  <code>output_text.delta</code>).
+  Ops: <code>GET /metrics</code> (Prometheus), <code>GET /v1/stats</code>.
+</p>
+<pre class="cmd"><span class="p">$</span> curl localhost:8000/v1/chat/completions \
+    -d <i>'{"messages":[{"role":"user","content":"explain kv caching"}],"stream":true}'</i></pre>
+</section>
+
+<section id="architecture">
+<h2>ARCHITECTURE</h2>
+<pre class="diagram" aria-label="architecture diagram">
+┌────────────────────────────────────────────────────────────────────────┐
+│  HTTP API   /v1/completions · /v1/chat/completions · /v1/models        │
+└────────────────────────────┬───────────────────────────────────────────┘
+                             ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  SCHEDULER   decode-priority · chunked prefill                          │
+│  ┌──────────────┐  ┌─────────────┐  ┌────────────────────┐             │
+│  │ prefix cache │  │  kv pool    │  │  block manager     │             │
+│  │ (radix tree) │  │  (page=1)   │  │  (copy-on-write)   │             │
+│  └──────────────┘  └─────────────┘  └────────────────────┘             │
+└────────────────────────────┬───────────────────────────────────────────┘
+                             ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  MODEL FORWARD   Qwen3 (GQA) · Qwen3.5 (hybrid) · GLM4                  │
+└────────────────────────────┬───────────────────────────────────────────┘
+                             ▼
+   ┌────────────────────────────┐     ┌────────────────────────────┐
+   │  CUDA   flashinfer · cublas│     │  METAL  mlx-sys · dflash   │
+   │         cuda graph · triton│     │         scheduler runtime  │
+   └────────────────────────────┘     └────────────────────────────┘</pre>
+</section>
+
+<section id="files">
+<h2>FILES</h2>
+<pre class="files">
+<a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>           engineering overview · install · api reference
+<a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">/ROADMAP.md</a>          next up · model coverage · architectural bets
+<a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">/CHANGELOG.md</a>        full release history
+<a href="https://github.com/cklxx/agent-infer/tree/main/docs">/docs/</a>               support matrix · stability policy · plans &amp; reviews
+<a href="https://github.com/cklxx/agent-infer/tree/main/crates/cuda-kernels">/crates/cuda-kernels</a> extracted CUDA kernel crate (csrc/ · triton · ffi)
+<a href="https://github.com/cklxx/agent-infer/tree/main/crates/mlx-sys">/crates/mlx-sys</a>      metal backend · mlx c++ bridge</pre>
+</section>
+
+<section id="news">
+<h2>NEWS</h2>
+<ul class="news">
+  <li><span class="date">2026-04-20</span>&nbsp; Metal DFlash long-prompt prefill fixed; default-on for Qwen3.5 on Metal, validated across guidellm 10-strategy sweep with 5400-token prompts.</li>
+  <li><span class="date">2026-04-19</span>&nbsp; DFlash ships default-on for Metal. Qwen3.5-4B-4bit bit-identical parity against scalar path.</li>
+  <li><span class="date">2026-04-16</span>&nbsp; Metal packed-batch concurrent decode: <code>extend_kv_cache</code> batch-dim bug repaired; packed decode stable under 4× / 8× concurrency.</li>
+</ul>
+<p class="note">
+  full history: <a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a>
+</p>
+</section>
+
+<section id="see-also">
+<h2>SEE ALSO</h2>
+<ul class="seealso">
+  <li><a href="https://github.com/cklxx/agent-infer">github.com/cklxx/agent-infer</a> &mdash; source, issues, releases</li>
+  <li><a href="https://github.com/cklxx/agent-infer/blob/main/README.md">README.md</a> &mdash; engineering overview</li>
+  <li><a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; next milestones</li>
+  <li><a href="https://github.com/cklxx/agent-infer/blob/main/LICENSE">LICENSE</a> &mdash; MIT</li>
+</ul>
+</section>
+
+<section id="bugs">
+<h2>BUGS</h2>
+<p class="block">
+  report at <a href="https://github.com/cklxx/agent-infer/issues">github.com/cklxx/agent-infer/issues</a>.
+  pull requests welcome &mdash; read
+  <a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> first.
+</p>
+</section>
+
+<footer class="manfoot" aria-label="man page footer">
+  <span class="manfoot-l">agent-infer</span>
+  <span class="manfoot-c">2026-04-20</span>
+  <span class="manfoot-r">AGENT-INFER(1)</span>
+</footer>
+
+</main>
+
+<div class="statusline" role="status" aria-label="status bar">
+  <span class="sl-seg sl-mode">NORMAL</span>
+  <span class="sl-seg sl-ok"><span class="dot"></span>&nbsp;online</span>
+  <span class="sl-seg">rustc&nbsp;1.85</span>
+  <span class="sl-seg">cuda&nbsp;▪&nbsp;metal</span>
+  <span class="sl-seg sl-spacer"></span>
+  <span class="sl-seg">MIT</span>
+  <span class="sl-seg">gh:cklxx/agent-infer</span>
+  <span class="sl-seg sl-accent">⌁&nbsp;2026-04-20</span>
+</div>
+
+</body>
+</html>

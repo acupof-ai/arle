@@ -4,12 +4,14 @@
 </p>
 
 <p align="center">
+  <a href="https://cklxx.github.io/agent-infer/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Fagent--infer-D97757?style=flat-square" alt="Website"></a>
   <a href="https://github.com/cklxx/agent-infer/actions"><img src="https://github.com/cklxx/agent-infer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="https://github.com/cklxx/agent-infer/releases"><img src="https://img.shields.io/github/v/release/cklxx/agent-infer?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
+  <a href="https://cklxx.github.io/agent-infer/">Website</a> ·
   <a href="#-latest-updates">News</a> ·
   <a href="#-status-at-a-glance">Status</a> ·
   <a href="#quick-start">Quick Start</a> ·
@@ -23,15 +25,11 @@
 
 ## 📰 Latest Updates
 
-<!-- Keep this list short (last ~4 weeks). Older entries roll into CHANGELOG.md. -->
+<!-- Keep this list to the last 3 entries. Older history lives in CHANGELOG.md. -->
 
 - **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. See [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md) for the canonical usage guide.
 - **2026-04-19** — DFlash ships default-on for Metal (commit `47f958f`). Qwen3.5-4B-4bit bit-identical parity against scalar path for B≤2 batched verify, concurrent c=1..8 stable.
 - **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
-- **2026-04-15** — [`cuda-kernels`](crates/cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → cuda-kernels`.
-- **2026-04-15** — Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c shipped locally and remote-accepted on L4. Radix selector flip, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract.
-- **2026-04-15** — Metal M0.2a resumable request state for Qwen3 + Qwen3.5 (prefill-in-chunks, one-step decode, deterministic cleanup). Scheduler-backed serving (M0.2b) still blocked on `BackendRuntimeHandle` replacement.
-- **Early April 2026** — Qwen3-8B at SGLang parity (TTFT 2.5× faster); Qwen3.5-4B scheduler + FlashInfer HD256 batched decode (+14% over SGLang at C=4); TurboQuant 3-bit KV + weights; GPTQ/AWQ W4 production-ready with Marlin prefill; FP8/INT8 KV with fused-dequant decode; native Q4_K GPU kernel (`q4k_gemv_kernel`) fits Carnice-27B on L4-24GB.
 
 Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 
@@ -144,44 +142,22 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## Metal on Apple Silicon
 
-For first-time local bring-up, use the canonical wrapper:
-
 ```bash
+# Default: builds + runs with Metal features, binds 127.0.0.1:8000,
+#          loads mlx-community/Qwen3-0.6B-4bit
 ./scripts/start_metal_serve.sh
-```
 
-That script builds and runs `metal_serve` with the Metal backend feature set
-already selected. It defaults to `mlx-community/Qwen3-0.6B-4bit`, binds to
-`127.0.0.1:8000`, and forwards any extra `metal_serve` flags after `--`.
-
-To override the defaults:
-
-```bash
+# Override model + port; extra flags after `--`
 ./scripts/start_metal_serve.sh mlx-community/Qwen3-4B-bf16 8012 -- --warmup 0
-```
 
-If you prefer the direct Cargo invocation, it is still available:
-
-```bash
-cargo run --release -p infer --no-default-features --features metal,no-cuda --bin metal_serve -- \
-  --model-path mlx-community/Qwen3-0.6B-4bit
-```
-
-For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
-`metal_request` also expose `--memory-limit-bytes`, `--cache-limit-bytes`, and
-`--wired-limit-bytes` so MLX allocator behavior can be capped before model
-load.
-
-Metal DFlash speculative decode is default-on. The one-command runner
-handles build flags and the default Qwen3.5 target/draft pair:
-
-```bash
-./scripts/run_dflash.sh           # serve on :8000 with DFlash
+# Speculative decode (DFlash, default-on for Qwen3.5 target + draft)
+./scripts/run_dflash.sh           # serve
 ./scripts/run_dflash.sh bench     # baseline vs DFlash throughput
-./scripts/run_dflash.sh help      # full menu
 ```
 
-Full parameter reference and supported model pairs:
+`metal_serve`, `metal_bench`, `metal_request` also expose
+`--memory-limit-bytes`, `--cache-limit-bytes`, `--wired-limit-bytes` for MLX
+allocator caps. Full DFlash reference and supported model pairs:
 [docs/resources/metal-dflash.md](docs/resources/metal-dflash.md).
 
 ---
@@ -382,18 +358,12 @@ INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --no-default-features --features metal,no-cuda,cli -- --ignored --nocapture
 ```
 
-Before opening a PR, read:
-
-- [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and contribution rules
-- [docs/support-matrix.md](docs/support-matrix.md) for what is currently supported
-- [docs/perf-and-correctness-gates.md](docs/perf-and-correctness-gates.md) for
-  minimum verification expectations
-- [docs/compatibility.md](docs/compatibility.md) if your change affects CLI,
-  API, documented env vars, or migration-sensitive behavior
-- [docs/environment.md](docs/environment.md) for the current environment-variable
-  reference
-
-For release work, also use [docs/release-checklist.md](docs/release-checklist.md).
+Before opening a PR: [CONTRIBUTING.md](CONTRIBUTING.md),
+[support-matrix](docs/support-matrix.md),
+[perf-and-correctness-gates](docs/perf-and-correctness-gates.md),
+[compatibility](docs/compatibility.md),
+[environment](docs/environment.md). Release work:
+[release-checklist](docs/release-checklist.md).
 
 ---
 
