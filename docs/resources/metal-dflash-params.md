@@ -108,6 +108,7 @@ cargo run -p infer --bin metal_bench --release --no-default-features --features 
 | `--save-baseline <PATH>` | No | none | Write current results as a baseline JSON file | Does not compare |
 | `--compare-baseline <PATH>` | No | none | Compare against an existing baseline | Fails if metrics regress past thresholds |
 | `--update-baseline <PATH>` | No | none | Overwrite a baseline only if thresholds pass | Safe update flow |
+| `--baseline-compare` | No | `false` | One-shot baseline-vs-DFlash run with matched params | Mutually exclusive with `--dflash-draft-model`; picks the draft heuristically (see below) |
 | `--kv-pool` | No | env fallback | Enable the experimental Metal KV pool | Only affects the Qwen3 fallback path today |
 | `--no-kv-pool` | No | env fallback | Force-disable the Metal KV pool | Overrides `AGENT_INFER_METAL_KV_POOL` |
 | `--dflash-draft-model <PATH_OR_REPO>` | No | disabled | Enable DFlash | Shared DFlash flag |
@@ -144,6 +145,51 @@ Recommended first workload:
 - `--generation-tokens 256`
 
 That is the currently validated generation-heavy case.
+
+### `--baseline-compare` one-shot
+
+Purpose:
+
+- Single invocation loads the target twice (baseline Metal, then DFlash) with
+  matched warmup / runs / prompt-tokens / generation-tokens and prints a delta
+  row on the last stdout line.
+- Saves you from maintaining two matched command lines when you just want
+  "did DFlash help?"
+
+Defaults for the draft model (heuristic, picks a known-good pair):
+
+| Target model | Draft picked |
+| --- | --- |
+| `mlx-community/Qwen3.5-4B-*` / any path containing `Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` |
+| `mlx-community/Qwen3-4B-bf16` / any path containing `Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` |
+
+If the target is not one of the above families, the bench bails out with a
+clear error explaining which known pair it expected. Pass
+`--dflash-draft-model` yourself for the standard two-command workflow;
+`--baseline-compare` and `--dflash-draft-model` are mutually exclusive.
+
+Example:
+
+```bash
+cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
+  --model mlx-community/Qwen3-4B-bf16 \
+  --baseline-compare \
+  --prompt-tokens 20 \
+  --generation-tokens 256 \
+  --warmup 1 \
+  --runs 3
+```
+
+Sample final stdout line:
+
+```
+compare | baseline TPOT 22.98 ms → DFlash 21.83 ms  (Δ -5.0%)
+```
+
+The delta is a percentage change on TPOT (time per output token); negative
+means DFlash is faster. The rest of the bench output (per-phase TPS, p50 /
+p99, JSON with `--json`) still prints per-run exactly as in the two-command
+flow.
 
 ## `metal_serve`
 
@@ -184,6 +230,52 @@ Important server limitation:
 - Startup warmup only reduces cold-start latency for the first live request.
   It does not change steady-state serial serving throughput.
 
+### `/v1/models` DFlash status
+
+When DFlash is loaded, `GET /v1/models` surfaces a `dflash` sub-object on
+each model entry. The field is omitted (not present as `null`) when DFlash
+is disabled so OpenAI-compatible clients that only read the legacy fields
+keep working.
+
+Shape:
+
+```jsonc
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen3-4B-bf16",
+      "object": "model",
+      "created": 1713620000,
+      "owned_by": "agent-infer",
+      "dflash": {
+        "enabled": true,
+        "draft": "z-lab/Qwen3-4B-DFlash-b16",
+        "speculative_tokens": 5,
+        "acceptance_rate": 0.73
+      }
+    }
+  ]
+}
+```
+
+Field semantics:
+
+- `enabled` — `true` whenever DFlash was successfully loaded at startup.
+- `draft` — the draft model id that the backend loaded (the string the
+  server resolved; may differ from the flag if the flag was a local path).
+- `speculative_tokens` — the block size in effect (after any `--speculative-tokens`
+  override or draft default).
+- `acceptance_rate` — rolling draft-token acceptance rate over the most
+  recent ~1000 DFlash blocks; `null` when no blocks have run yet (e.g.
+  warmup-only server).
+
+When DFlash load fails because the draft is incompatible with the target
+(e.g. mismatched `hidden_size`), the server logs a `warn!` with the
+specific field name and suggested fix, falls back to the standard Metal
+path, and `/v1/models` omits the `dflash` sub-object — the server keeps
+serving normally.
+
 ## Supported combinations
 
 Working today (both default-on since commit `47f958f`, 2026-04-19):
@@ -197,7 +289,11 @@ Rejected:
 
 - CUDA backend (Metal-only today)
 - DFlash without a draft model
-- Draft / target with mismatched `hidden_size`
+- Draft / target with mismatched `hidden_size`, `num_attention_heads`,
+  `num_key_value_heads`, `head_dim`, or out-of-range `target_layer_ids`.
+  These cases previously panicked inside the C++ FFI; they now log a
+  `warn!` naming the field + both values + a fix suggestion and fall
+  back to the standard Metal path instead of crashing the backend.
 
 ## Removed environment variables
 
