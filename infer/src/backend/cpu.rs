@@ -127,7 +127,11 @@ impl StreamingInferenceBackend for CpuBackend {
     {
         let generated = self.generate(prompt, params)?;
         for chunk in chunk_text(&generated.text, STREAM_CHUNK_CHARS) {
-            on_chunk(chunk)?;
+            match on_chunk(chunk) {
+                Ok(()) => {}
+                Err(err) if crate::backend::is_stream_stop_matched(&err) => return Ok(generated),
+                Err(err) => return Err(err),
+            }
         }
         Ok(generated)
     }
