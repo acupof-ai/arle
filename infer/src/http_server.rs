@@ -673,11 +673,7 @@ async fn models_handler(
             speculative_tokens: status.speculative_tokens,
             acceptance_rate: state.metrics.dflash_acceptance_rate_opt(),
         });
-    let response = ModelsListResponse::single(
-        state.identity.model_id.as_str(),
-        now_secs(),
-        dflash,
-    );
+    let response = ModelsListResponse::single(state.identity.model_id.as_str(), now_secs(), dflash);
     Ok(Json(response).into_response())
 }
 
