@@ -194,6 +194,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
 
+    /// Reduce-sum **all** elements of `x` into a rank-0 scalar device handle.
+    /// `shape` describes the input layout (`product(shape)` elements; an
+    /// empty shape means a 1-element scalar).
+    ///
+    /// Lazy on backends that support it: Metal composes this into the MLX
+    /// graph (`reshape -> sum_axis(0)`) and defers `mlx_eval` to whatever
+    /// terminal op forces a host readback. CPU/CUDA remain eager and return
+    /// a fully-realized handle.
+    fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
+
     /// Row-wise softmax over the last dim. `shape` describes a contiguous
     /// tensor of rank ≥ 1; softmax is applied along the final axis.
     fn softmax_forward_last_axis(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {
@@ -422,6 +432,25 @@ impl Backend for CpuBackend {
             .map(|(lhs, rhs)| lhs + rhs)
             .collect();
         Ok(DeviceHandle::Cpu(out))
+    }
+
+    #[allow(irrefutable_let_patterns)]
+    fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Cpu(data) = x else {
+            return Err(crate::AutogradError::TapeInvariant(
+                "cpu backend cannot sum a non-cpu device handle",
+            ));
+        };
+        let size = shape_size(shape);
+        if data.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: data.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let total: f32 = data.iter().sum();
+        Ok(DeviceHandle::Cpu(vec![total]))
     }
 }
 

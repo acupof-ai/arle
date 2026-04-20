@@ -13,8 +13,8 @@ use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
     mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval, mlx_exp,
     mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative,
-    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract, mlx_sum_axis,
-    mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract,
+    mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -257,6 +257,49 @@ impl Backend for MetalBackend {
             let out_arr = mlx_add(a_handle.as_ptr(), b_handle.as_ptr());
             if out_arr.is_null() {
                 return Err(AutogradError::TapeInvariant("mlx_add returned null"));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
+    // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
+    // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
+    // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
+    // `mlx_eval` here — the tape's terminal flush (`ensure_host` on the loss)
+    // is the single eval boundary. This is the M5.3b.1 deliverable; before
+    // M5.3b.1 `sum` always forced a flush via `sum_last_axis_forward`.
+    fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot sum a non-metal device handle",
+            ));
+        };
+        let size = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product::<usize>()
+        };
+
+        let flat_shape = [size as i32];
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // both intermediate arrays we allocate here are freed (the reshape
+        // node) or transferred into `MlxHandle` (the sum result) before
+        // returning, and `MLX_GUARD` serializes MLX state access.
+        let out = unsafe {
+            let flat = mlx_reshape(x_handle.as_ptr(), flat_shape.as_ptr(), 1);
+            if flat.is_null() {
+                return Err(AutogradError::TapeInvariant("mlx_reshape returned null"));
+            }
+            let out_arr = mlx_sum_axis(flat, 0, false);
+            mlx_array_free(flat);
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_sum_axis returned null (sum_all)",
+                ));
             }
             DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
         };

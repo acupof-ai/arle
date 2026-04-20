@@ -129,6 +129,14 @@ impl Tape {
         self.enabled = false;
 
         let result = (|| {
+            // Batch-flush all Dirty::Device tape outputs in a single
+            // `mlx_eval` call before walking the backward graph. The naive
+            // per-id `ensure_host` loop would call `eval` once per handle —
+            // a regression once M5.3b.1 made `sum` lazy, because both `y`
+            // and `loss` end up Dirty::Device and each per-id eval crosses
+            // the FFI boundary + grabs `MLX_GUARD`. MLX consumes the batch
+            // as one graph realization (terminal handles share upstream
+            // nodes), so subsequent per-id `readback`s are O(copy) only.
             let device_ids: Vec<TensorId> = self
                 .entries
                 .iter()
@@ -139,9 +147,7 @@ impl Tape {
                 })
                 .map(|entry| entry.output_id)
                 .collect();
-            for id in device_ids {
-                store.ensure_host(id)?;
-            }
+            store.flush_to_host_batch(&device_ids)?;
 
             let mut entry_by_output = HashMap::with_capacity(self.entries.len());
             for (index, entry) in self.entries.iter().enumerate() {

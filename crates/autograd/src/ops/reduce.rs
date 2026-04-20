@@ -7,16 +7,35 @@ use crate::{
 };
 
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(a)?.clone();
-    let value = input.data.iter().sum();
-    let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
+    // Pull only the metadata we need (shape + requires_grad) so the input's
+    // device handle stays untouched: Metal keeps the matmul output as a
+    // lazy MLX node, and `backend.sum_all` composes a `reshape -> sum_axis`
+    // onto that node without forcing an `mlx_eval`. No `Tensor::clone` here
+    // — that would assert against `Dirty::Device`.
+    store.ensure_device(a)?;
+    let (input_shape, requires_grad) = {
+        let tensor = store.tensor(a)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let input_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "sum: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
 
-    if input.requires_grad {
+    let out_handle = store.backend().sum_all(&input_handle, &input_shape)?;
+    let output_id = store.alloc_device_tensor(Vec::new(), out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
         tape.record(TapeEntry {
             op: BackwardOp::Sum,
             output_id,
             input_ids: smallvec![a],
-            saved: SavedContext::Shape(input.shape),
+            saved: SavedContext::Shape(input_shape),
         });
     }
 
