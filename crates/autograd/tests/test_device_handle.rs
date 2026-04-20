@@ -1,6 +1,8 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
-use autograd::{Tape, TensorStore, ops::exp, ops::log_softmax, ops::matmul, ops::silu, ops::sum};
+use autograd::{
+    Tape, TensorStore, ops::exp, ops::log_softmax, ops::matmul, ops::rope, ops::silu, ops::sum,
+};
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
 
@@ -388,5 +390,94 @@ fn metal_exp_forward_stays_lazy() -> Result<()> {
           mlx_matmul_backward FFI eval + 1 slack for exp_backward's \
           host mul_forward on the saved output."
     );
+    Ok(())
+}
+
+/// M5.3b.5 acceptance: `rope` forward must compose into the MLX lazy graph
+/// with no `mlx_eval` for a Dirty::Device `x`. cos/sin stay host
+/// (typical Qwen cache layout). The forward chain
+/// `ensure_device(x) → rope → sum` records zero evals; backward pays
+/// tape.backward's batch flush + the eager `rope_forward` inside
+/// `rope_backward` (one internal eval from its `eval_and_readback` tail).
+#[cfg(feature = "metal")]
+#[test]
+fn metal_rope_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let batch = 1usize;
+    let heads = 2usize;
+    let seq = 4usize;
+    let head_dim = 8usize;
+    let half_dim = head_dim / 2;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_len = batch * heads * seq * head_dim;
+    let x_data: Vec<f32> = (0..x_len).map(|i| (i as f32) * 0.01).collect();
+    let cos_data: Vec<f32> = (0..seq * half_dim)
+        .map(|i| ((i as f32) * 0.1).cos())
+        .collect();
+    let sin_data: Vec<f32> = (0..seq * half_dim)
+        .map(|i| ((i as f32) * 0.1).sin())
+        .collect();
+
+    let x = store.from_slice(&x_data, &[batch, heads, seq, head_dim])?;
+    store.get_mut(x).expect("x exists").requires_grad = true;
+    let cos = store.from_slice(&cos_data, &[seq, half_dim])?;
+    let sin = store.from_slice(&sin_data, &[seq, half_dim])?;
+
+    // Force `x` device-resident so the rope dispatch hits the lazy branch.
+    // ensure_device uploads but does NOT call mlx_eval; confirm by resetting
+    // the counter right after.
+    store.ensure_device(x)?;
+    reset_eval_count();
+
+    let rotated = rope(x, cos, sin, &mut store, &mut tape)?;
+    let after_rope = eval_count();
+    let loss = sum(rotated, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_rope, 0,
+        "M5.3b.5: lazy rope forward must not force an eval; saw {after_rope}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward} \
+         (after_rope={after_rope} after_sum={after_sum}). Budget = \
+         tape.backward batch flush + rope_backward's eager \
+         `backend.rope_forward` internal eval (one eval_and_readback)."
+    );
+
+    // Parity: same inputs on CpuBackend must produce numerically close
+    // output. Readback the rotated device tensor via tape.backward's flush
+    // side-effect, then rerun through the CPU path.
+    let metal_out = store
+        .get(rotated)
+        .expect("rotated tensor exists")
+        .data
+        .clone();
+    let cpu = CpuBackend;
+    let cpu_out = cpu.rope_forward(
+        &x_data,
+        &[batch, heads, seq, head_dim],
+        &cos_data,
+        &sin_data,
+    )?;
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (m, c) in metal_out.iter().zip(cpu_out.iter()) {
+        let diff: f32 = (m - c).abs();
+        assert!(diff <= 1e-5, "rope parity: metal={m} cpu={c} diff={diff}");
+    }
+
     Ok(())
 }

@@ -203,9 +203,13 @@ pub fn rope(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(x)?;
-    store.ensure_host(cos)?;
-    store.ensure_host(sin)?;
+    // M5.3b.5: inner `rope::rope` dispatches on `x.dirty`; a Dirty::Device
+    // `x` stays lazy via `backend.rope` (half-split rotation on device),
+    // while Dirty::Host/Both take the eager host path. cos/sin are
+    // `ensure_host`-ed inside the lazy branch (caches are typically host
+    // already; the readback is a no-op in the common case). Stripping the
+    // `ensure_host(x)` here is the enabler — it previously forced a
+    // readback of every q/k before each layer's rope.
     rope::rope(x, cos, sin, store, tape)
 }
 
