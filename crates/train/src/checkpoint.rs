@@ -446,6 +446,15 @@ impl safetensors::View for OptimTensorView {
 /// Refuses to overwrite a regular file or directory at `<parent>/latest`
 /// (only an existing symlink is replaced). This guards against a user
 /// accidentally stashing their final checkpoint under that exact name.
+///
+/// The update is atomic from a reader's perspective: we create the new
+/// symlink under `.latest.tmp` first, then `rename()` it onto `latest`.
+/// POSIX `rename` on the same directory is atomic, so readers either see
+/// the old target or the new one — never a missing/half-applied pointer.
+/// Codex review 2026-04-20 on 0da212f (Medium): the previous
+/// remove-then-create sequence exposed a brief window where `latest`
+/// did not exist. An `infer --model-path <out>/latest` call that landed
+/// in that window would fail even though a checkpoint was ready.
 #[cfg(unix)]
 pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
     use std::os::unix::fs::symlink;
@@ -458,10 +467,10 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
     }
 
     let link = parent.join("latest");
+    // Refuse to overwrite a non-symlink (file or directory) at `<parent>/latest`.
+    // We only want to atomically swap an existing symlink or fill an empty slot.
     match std::fs::symlink_metadata(&link) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            std::fs::remove_file(&link)?;
-        }
+        Ok(meta) if meta.file_type().is_symlink() => { /* swap via rename below */ }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -471,10 +480,26 @@ pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<
                 ),
             ));
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => { /* fresh install */ }
+        Err(e) => return Err(e),
+    }
+
+    // Clean up any leftover tmp from a prior crashed call.
+    let tmp = parent.join(".latest.tmp");
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(_) => std::fs::remove_file(&tmp)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    symlink(target_basename, &link)
+
+    symlink(target_basename, &tmp)?;
+    // POSIX rename is atomic on the same filesystem and will replace an
+    // existing symlink at `link` without an intermediate "missing" state.
+    std::fs::rename(&tmp, &link).map_err(|err| {
+        // Best-effort cleanup so we don't leave `.latest.tmp` behind.
+        let _ = std::fs::remove_file(&tmp);
+        err
+    })
 }
 
 #[cfg(not(unix))]
