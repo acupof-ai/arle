@@ -443,6 +443,29 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_gather_last_dim_forward(src, src_shape, ids)
     }
 
+    /// Device-handle variant of `gather_last_dim_forward`. Lazy on backends
+    /// that can compose `flatten → take_axis → reshape` into their eval
+    /// stream (Metal: `mlx_reshape` to `[prefix*vocab]`, `mlx_take_axis`
+    /// with remapped `i * vocab + ids[i]` flat ids, `mlx_reshape` back to
+    /// `src_shape[..-1]`). Default implementation falls back to
+    /// `readback → host compute → upload`. Output shape is
+    /// `src_shape[..-1]` (empty for rank-1 input). M5.3b.9.
+    fn gather_last_dim(
+        &self,
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(src)?;
+        let out = self.gather_last_dim_forward(&host, src_shape, ids)?;
+        let out_shape: Vec<usize> = if src_shape.len() <= 1 {
+            Vec::new()
+        } else {
+            src_shape[..src_shape.len() - 1].to_vec()
+        };
+        self.upload(&out, &out_shape)
+    }
+
     /// Scatter-add rows into a `[vocab, feature_dim]` output.
     ///
     /// `upstream` is `[prefix_rows * feature_dim]` row-major. For each prefix

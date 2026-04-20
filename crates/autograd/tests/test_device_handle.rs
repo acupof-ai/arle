@@ -1,8 +1,8 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use autograd::{
-    Tape, TensorStore, ops::embedding, ops::exp, ops::gelu, ops::log_softmax, ops::matmul,
-    ops::rmsnorm, ops::rope, ops::silu, ops::sum,
+    Tape, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax,
+    ops::matmul, ops::rmsnorm, ops::rope, ops::silu, ops::sum,
 };
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
@@ -736,6 +736,97 @@ fn metal_gelu_forward_stays_lazy() -> Result<()> {
     for (m, c) in metal_out.iter().zip(cpu_out.iter()) {
         let diff: f32 = (m - c).abs();
         assert!(diff <= 1e-4, "gelu parity: metal={m} cpu={c} diff={diff}");
+    }
+
+    Ok(())
+}
+
+/// M5.3b.9 acceptance: `gather_last_dim` forward must compose into the
+/// MLX lazy graph when `src` is Dirty::Device — the typical CE-loss
+/// situation where logits come straight out of the final matmul. The
+/// chain `matmul → gather_last_dim → sum` records zero evals through
+/// the forward. Parity vs `CpuBackend::gather_last_dim_forward` on the
+/// same inputs stays ≤ 1e-5.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_gather_last_dim_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let seq = 4usize;
+    let vocab = 8usize;
+    let hidden = 6usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_data: Vec<f32> = (0..seq * hidden).map(|i| (i as f32) * 0.03 - 0.2).collect();
+    let w_data: Vec<f32> = (0..hidden * vocab)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+
+    let x = store.from_slice(&x_data, &[seq, hidden])?;
+    let w = store.from_slice(&w_data, &[hidden, vocab])?;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // logits = x @ w  →  [seq, vocab], Dirty::Device from lazy matmul
+    let logits = matmul(x, w, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    let indices = [5usize, 2, 7, 0];
+    let picked = gather_last_dim(logits, &indices, &mut store, &mut tape)?;
+    let after_gather = eval_count();
+
+    let loss = sum(picked, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_gather, 0,
+        "M5.3b.9: lazy gather_last_dim forward must not force an eval; saw {after_gather}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}. \
+         Budget = tape.backward batch flush + mlx_matmul_backward FFI eval + \
+         1 slack for gather_backward's host scatter."
+    );
+
+    // Parity: metal lazy output vs CpuBackend::gather_last_dim_forward
+    // on the same logits data.
+    let metal_picked = store
+        .get(picked)
+        .expect("gather output exists")
+        .data
+        .clone();
+
+    // Independently compute logits on the host for the CPU reference.
+    let cpu = CpuBackend;
+    let (host_logits, host_logits_shape) =
+        cpu.matmul_forward(&x_data, &[seq, hidden], &w_data, &[hidden, vocab])?;
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let cpu_picked = cpu.gather_last_dim_forward(&host_logits, &host_logits_shape, &ids_i32)?;
+
+    assert_eq!(metal_picked.len(), cpu_picked.len());
+    for (m, c) in metal_picked.iter().zip(cpu_picked.iter()) {
+        let diff: f32 = (m - c).abs();
+        assert!(
+            diff <= 1e-5,
+            "gather_last_dim parity: metal={m} cpu={c} diff={diff}"
+        );
     }
 
     Ok(())

@@ -6,10 +6,106 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn gather_last_dim(
+    src: TensorId,
+    indices: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // M5.3b.9: dispatch on device-handle presence (same gate as rope /
+    // rmsnorm / embedding — `device_handle.is_some() && dirty != Host`).
+    // `gather_last_dim` is the final op in the CE-loss path: logits come
+    // straight out of the output matmul, so staying on-device through the
+    // per-row gather keeps the entire forward lazy. Dirty::Host inputs
+    // take the eager host path for parity.
+    let has_device_handle = {
+        let t = store.tensor(src)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        gather_last_dim_device_lazy(src, indices, store, tape)
+    } else {
+        gather_last_dim_host_eager(src, indices, store, tape)
+    }
+}
+
+fn gather_last_dim_device_lazy(
+    src: TensorId,
+    indices: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(src)?;
+
+    let (src_shape, requires_grad) = {
+        let t = store.tensor(src)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("shape checked above");
+    let output_shape = src_shape[..src_shape.len() - 1].to_vec();
+    let prefix_elems = if output_shape.is_empty() {
+        1
+    } else {
+        output_shape.iter().product()
+    };
+    if indices.len() != prefix_elems {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix_elems,
+            got: indices.len(),
+        });
+    }
+    // Bounds-check once here; the lazy helper re-checks but the early
+    // error carries the original `usize` index the caller passed.
+    for &index in indices {
+        if index >= vocab {
+            return Err(AutogradError::IndexOutOfBounds {
+                index,
+                upper: vocab,
+            });
+        }
+    }
+
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let src_handle = store
+        .tensor(src)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "gather_last_dim: ensure_device left src without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store
+        .backend()
+        .gather_last_dim(&src_handle, &src_shape, &ids_i32)?;
+    let output_id = store.alloc_device_tensor(output_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Gather,
+            output_id,
+            input_ids: smallvec![src],
+            saved: SavedContext::GatherCtx {
+                indices: indices.to_vec(),
+                src_shape,
+            },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn gather_last_dim_host_eager(
     src: TensorId,
     indices: &[usize],
     store: &mut TensorStore,

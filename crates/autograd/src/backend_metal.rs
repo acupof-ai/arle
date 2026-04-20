@@ -604,6 +604,27 @@ impl Backend for MetalBackend {
         mlx_gather_last_dim(src, src_shape, ids)
     }
 
+    // Lazy gather along the last axis. `src` is borrowed as a live MLX
+    // handle; flatten to `[prefix*vocab]`, upload the remapped flat ids
+    // (`i * vocab + ids[i]`) as a tiny int32 array, `mlx_take_axis(axis=0)`
+    // picks the chosen element per row, final `mlx_reshape` restores
+    // `src_shape[..-1]`. No eval — the whole chain composes into the MLX
+    // graph. Backward stays on the host scatter-add path (already
+    // `mlx_scatter_add_rows_f32`-backed). M5.3b.9.
+    fn gather_last_dim(
+        &self,
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(src_handle) = src else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot gather_last_dim a non-metal device handle",
+            ));
+        };
+        mlx_gather_last_dim_lazy(src_handle.as_ptr(), src_shape, ids)
+    }
+
     fn scatter_add_rows_forward(
         &self,
         upstream: &[f32],
@@ -1415,6 +1436,99 @@ fn mlx_embedding_lazy(
         if reshaped.is_null() {
             return Err(AutogradError::TapeInvariant(
                 "mlx_reshape returned null (embedding lazy)",
+            ));
+        }
+        Ok(DeviceHandle::Metal(MlxHandle::from_raw(reshaped)))
+    }
+}
+
+fn mlx_gather_last_dim_lazy(
+    src_ptr: *mut mlx_array,
+    src_shape: &[usize],
+    ids: &[i32],
+) -> Result<DeviceHandle> {
+    if src_shape.is_empty() {
+        return Err(AutogradError::InvalidRank {
+            expected: "at least 1",
+            got: 0,
+        });
+    }
+    let vocab = *src_shape.last().expect("non-empty shape above");
+    let prefix: usize = src_shape[..src_shape.len() - 1]
+        .iter()
+        .product::<usize>()
+        .max(1);
+    if ids.len() != prefix {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: prefix,
+            got: ids.len(),
+        });
+    }
+    for &id in ids {
+        if id < 0 || (id as usize) >= vocab {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: id as usize,
+                upper: vocab,
+            });
+        }
+    }
+
+    // Remap to flat ids on the host: one int32 per output row. Tiny
+    // buffer, re-uploaded per call — the prefix product is typically
+    // `B * S` which is dwarfed by the flattened src.
+    let vocab_i32 = vocab as i32;
+    let flat_ids: Vec<i32> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (i as i32) * vocab_i32 + id)
+        .collect();
+
+    let flat_src_shape = [(prefix * vocab) as i32];
+    let ids_shape = [prefix as i32];
+    let out_shape_i32: Vec<i32> = src_shape[..src_shape.len() - 1]
+        .iter()
+        .map(|&d| d as i32)
+        .collect();
+    let out_ndim = out_shape_i32.len();
+
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `src_ptr` is borrowed for the duration of this call. The
+    // int32 ids array and intermediate `flat` / `gathered` views are
+    // allocated here and freed before return; the returned handle owns
+    // the final reshape output.
+    unsafe {
+        let flat = mlx_reshape(src_ptr, flat_src_shape.as_ptr(), 1);
+        if flat.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_reshape returned null (gather lazy flatten)",
+            ));
+        }
+        let ids_arr = mlx_array_from_data(
+            flat_ids.as_ptr() as *const c_void,
+            ids_shape.as_ptr(),
+            1,
+            MLX_INT32,
+        );
+        if ids_arr.is_null() {
+            mlx_array_free(flat);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (gather lazy ids)",
+            ));
+        }
+        let gathered = mlx_take_axis(flat, ids_arr, 0);
+        mlx_array_free(flat);
+        mlx_array_free(ids_arr);
+        if gathered.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_take_axis returned null (gather lazy)",
+            ));
+        }
+        let reshaped = mlx_reshape(gathered, out_shape_i32.as_ptr(), out_ndim);
+        mlx_array_free(gathered);
+        if reshaped.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_reshape returned null (gather lazy out)",
             ));
         }
         Ok(DeviceHandle::Metal(MlxHandle::from_raw(reshaped)))
