@@ -950,9 +950,13 @@ mod tests {
         assert_eq!(config.qkv_dim(), 8192);
         assert_eq!(config.z_dim(), 4096);
 
-        let state = MetalRecurrentState::new(24, &config);
-        assert_eq!(state.states.len(), 24);
-        assert_eq!(state.conv_states.len(), 24);
+        // This is a shape smoke test, not a full-model allocation test.
+        // Keeping the layer count minimal avoids pointless large Metal
+        // allocations on CI runners while still exercising the Qwen3.5
+        // head/value/key dimensions.
+        let state = MetalRecurrentState::new(1, &config);
+        assert_eq!(state.states.len(), 1);
+        assert_eq!(state.conv_states.len(), 1);
         assert_eq!(state.states[0].shape(), &[1, 32, 128, 128]);
         assert_eq!(state.conv_states[0].shape(), &[1, 3, 8192]);
     }
