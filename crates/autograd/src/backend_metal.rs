@@ -403,6 +403,43 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy scalar-broadcast multiply: composes `mlx_multiply(x, scalar)`
+    // into the MLX graph with no `mlx_eval`. The scalar is allocated as a
+    // rank-0 `mlx_array` via `mlx_array_new_float32` and freed after the
+    // multiply; MLX broadcasts rank-0 scalars across any rank. Shape is
+    // passed through (unused — output matches input shape). M5.3b.13.
+    fn mul_scalar(&self, x: &DeviceHandle, s: f32, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot mul_scalar a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // `scalar` is allocated here and freed before return; the `out`
+        // result is transferred into the returned `MlxHandle`.
+        let out = unsafe {
+            let scalar = mlx_array_new_float32(s);
+            if scalar.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_new_float32 returned null (mul_scalar)",
+                ));
+            }
+            let out_arr = mlx_multiply(x_handle.as_ptr(), scalar);
+            mlx_array_free(scalar);
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (mul_scalar)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
     // Lazy row-wise log-softmax over the last axis. Composes
     // `x - mlx_logsumexp_axis(x, -1, keepdims=true)` into the MLX graph
     // with no `mlx_eval`. The intermediate `lse` node is freed after the

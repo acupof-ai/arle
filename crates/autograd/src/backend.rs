@@ -267,6 +267,17 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_mul_scalar_forward(a, s)
     }
 
+    /// Device-handle variant of `mul_scalar_forward`. Lazy on backends
+    /// that can compose `x * s` into their graph (Metal: broadcast
+    /// `mlx_multiply` against a rank-0 scalar `mlx_array`); the default
+    /// implementation falls back to `readback → host compute → upload`
+    /// so CPU/CUDA need no special-case. M5.3b.13.
+    fn mul_scalar(&self, x: &DeviceHandle, s: f32, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.mul_scalar_forward(&host, s)?;
+        self.upload(&out, shape)
+    }
+
     /// Right-aligned broadcast-add `out[i..] = a[i..] + b[broadcast_offset(i)]`.
     ///
     /// `b_shape.len() <= a_shape.len()`. Each `b`-axis of size 1 broadcasts
