@@ -80,16 +80,31 @@ pub struct StepCtx<'a> {
 }
 
 /// What the per-micro-batch forward closure returns.
+///
+/// **Metric contract.** The Trainer emits `ppl = exp(loss)` alongside
+/// `loss` on every training metric sample, treating `loss_id` as a
+/// token-mean cross-entropy in natural-log space. Binaries that return a
+/// non-CE scalar (MSE, rollout returns, contrastive losses) will still see
+/// the `ppl` field populated with `exp(raw_scalar)`, which is mathematically
+/// defined but semantically meaningless — downstream consumers should
+/// ignore the `ppl` column in that case. See
+/// `docs/plans/train-runtime-architecture-v1.md` §Phase 4.
 pub struct StepOutcome {
     /// Scalar loss tensor in `store`/`tape`. The Trainer will `mul_scalar`
     /// this by `1/N` (when N > 1) and then call `tape.backward` on the
-    /// scaled id.
+    /// scaled id. Interpreted as token-mean CE in nats for the `ppl` emit
+    /// (see struct-level contract).
     pub loss_id: TensorId,
     /// Tokens processed in this micro-batch, for the `tok_per_sec` metric.
     pub token_count: u64,
 }
 
 /// What an eval closure returns.
+///
+/// **Metric contract.** Same as [`StepOutcome`]: the Trainer emits
+/// `eval_ppl = exp(loss)` on eval metric samples, treating `loss` as a
+/// token-mean CE in nats. Non-CE eval losses populate `eval_ppl` with a
+/// mathematically defined but semantically meaningless number.
 pub struct EvalOutcome {
     pub loss: f32,
     pub token_count: u64,
@@ -498,6 +513,12 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 // there. Redundant "step" produced `step=5 ... step=5.000000`
                 // in stdout + a duplicate JSON key.
                 let loss_f64 = running_loss_sum as f64;
+                // Phase 4: `ppl = exp(loss)` assumes `loss` is token-mean CE
+                // in nats — see the StepOutcome metric contract. Non-CE
+                // callers still get a numerically defined `ppl` field; it
+                // is on them to ignore it. Overflow → +inf, which JsonlSink
+                // null-falls back on via `Number::from_f64` and StdoutSink
+                // prints readably.
                 let fields: [(&str, f64); 6] = [
                     ("loss", loss_f64),
                     ("ppl", loss_f64.exp()),
@@ -536,6 +557,8 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 // training-metrics emit — drop "step" from fields, sinks read
                 // it from sample.step.
                 let eval_loss_f64 = eval.loss as f64;
+                // Phase 4: same CE-in-nats contract as the training emit
+                // above — see EvalOutcome doc.
                 let fields: [(&str, f64); 3] = [
                     ("eval_loss", eval_loss_f64),
                     ("eval_ppl", eval_loss_f64.exp()),
