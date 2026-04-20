@@ -265,7 +265,7 @@ step_000123/
 ### Phase 4 — Eval + observability tightening
 
 - ✅ Built-in metrics: `loss`, `lr`, `grad_norm`, `tok_per_sec`, `ms_per_step` land via Trainer emission (44a7e19 + follow-ups). `alloc_mb` deferred (requires a cross-backend RSS probe, separate track).
-- ✅ **Perplexity derived from loss in metric pipeline** — Trainer now emits `ppl = exp(loss)` on training samples and `eval_ppl = exp(eval_loss)` on eval samples. Sinks already null-fallback on non-finite f64 (JsonlSink) / render `inf` (StdoutSink), so cold-start overflow stays benign. Test `ppl_metric_equals_exp_of_loss_on_every_sample` pins the derivation on both surfaces.
+- ✅ **Perplexity derived from loss in metric pipeline** — Trainer now emits `ppl = exp(loss)` on training samples and `eval_ppl = exp(eval_loss)` on eval samples, treating `loss` / `eval_loss` as token-mean cross-entropy in natural-log space (see `StepOutcome` / `EvalOutcome` metric contract in `crates/train/src/trainer.rs`). Non-CE callers get a numerically defined `ppl` field and should ignore it at the consumer. Sinks already null-fallback on non-finite f64 (JsonlSink) / render `inf` (StdoutSink), so cold-start overflow stays benign. Test `ppl_field_equals_exp_of_loss_field_in_metric_plumbing` pins the mechanical derivation (not semantic correctness) on both surfaces.
 - ✅ Held-out eval set support via `run_with_eval(...)` / `run_with_eval_and_hooks(...)` landed in 613ff3c + bd5e277 (+ 813d4f6 leak/final-step fix). Eval fields are prefixed `eval_` (underscore, not dot — matches sink-kv convention: `eval_loss`, `eval_ppl`, `eval_tokens`).
 - Additive `Backend::global_grad_norm` with CPU default — opens device-side norm reduction seam without implementing it yet.
 

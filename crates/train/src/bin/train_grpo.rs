@@ -141,6 +141,15 @@ fn run() -> Result<(), CliError> {
     let sft_optim_state =
         run_sft_phase(&args, &policy, &params, &base_params, &mut store, &mut tape)?;
 
+    // Phase 4 follow-up: extend `--metrics-jsonl` to cover the GRPO phase.
+    // `run_sft_phase` already truncated the JSONL file (JsonlSink::create),
+    // so the GRPO phase opens in APPEND mode to extend the same file
+    // instead of clobbering SFT-phase samples. `also_stdout = false` keeps
+    // the human-readable `grpo iter N:` println below as the stdout
+    // contract; the MetricSample emit is JSONL-only tooling output.
+    let mut grpo_metrics = train::metrics::open_sink_append(args.metrics_jsonl.as_deref(), false)
+        .map_err(|e| CliError::Custom(format!("grpo metrics sink: {e}")))?;
+
     // ---- GRPO phase (hand-written; see commit body for the "why") ----
     let ref_model = policy.clone_frozen(&mut store);
     let baseline_prompts =
@@ -242,6 +251,23 @@ fn run() -> Result<(), CliError> {
         println!(
             "grpo iter {iter}: loss {loss_value:.4} mean_reward {mean_reward:.4} best_mean_reward {best_mean_reward:.4} mean_kl {last_kl:.4}"
         );
+        // JSONL-only emit (see sink construction above): records the
+        // GRPO-phase iter as `step = iter + 1` so the SFT-phase Trainer
+        // samples (1-indexed from 1..=sft_steps) chain naturally with GRPO
+        // samples (sft_steps+1..=sft_steps+grpo_iters) in the same file.
+        // Field set is intentionally NOT a superset of the SFT schema —
+        // GRPO doesn't have lr/grad_norm semantics the same way, so
+        // downstream tools key off field presence to distinguish phases.
+        let fields: [(&str, f64); 4] = [
+            ("loss", loss_value as f64),
+            ("mean_reward", mean_reward as f64),
+            ("best_mean_reward", best_mean_reward as f64),
+            ("mean_kl", last_kl as f64),
+        ];
+        grpo_metrics.emit(&train::metrics::MetricSample {
+            step: (args.sft_steps as u64) + (iter as u64) + 1,
+            fields: &fields,
+        });
     }
 
     println!("final kl {last_kl:.4}");

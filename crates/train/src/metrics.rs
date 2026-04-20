@@ -4,7 +4,7 @@
 //! factory [`open_sink`] picks between JSONL file, stdout, both (via
 //! [`MultiSink`]) or [`NullSink`] based on caller flags.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -72,6 +72,18 @@ impl JsonlSink {
     /// not creatable — no implicit `mkdir -p`.
     pub fn create(path: &Path) -> std::io::Result<Self> {
         let file = File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    /// Open `path` in append mode (creating it if absent) and wrap it in a
+    /// buffered writer. Use this for multi-phase binaries that already
+    /// truncated `path` at phase 1 and need subsequent phases to extend the
+    /// same JSONL file rather than restart it (e.g. `train_grpo`'s SFT →
+    /// GRPO handoff).
+    pub fn open_append(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
         })
@@ -146,11 +158,36 @@ pub fn open_sink(
     jsonl_path: Option<&Path>,
     also_stdout: bool,
 ) -> anyhow::Result<Box<dyn MetricSink>> {
+    open_sink_inner(jsonl_path, also_stdout, /* append = */ false)
+}
+
+/// Append-mode sibling of [`open_sink`]. Used by multi-phase binaries
+/// (e.g. `train_grpo`'s GRPO phase, which runs after `run_sft_phase`
+/// already truncated and wrote the JSONL header) so the second phase
+/// extends the same file rather than restarting it.
+pub fn open_sink_append(
+    jsonl_path: Option<&Path>,
+    also_stdout: bool,
+) -> anyhow::Result<Box<dyn MetricSink>> {
+    open_sink_inner(jsonl_path, also_stdout, /* append = */ true)
+}
+
+fn open_sink_inner(
+    jsonl_path: Option<&Path>,
+    also_stdout: bool,
+    append: bool,
+) -> anyhow::Result<Box<dyn MetricSink>> {
     let mut sinks: Vec<Box<dyn MetricSink>> = Vec::new();
     if let Some(path) = jsonl_path {
-        let sink = JsonlSink::create(path).map_err(|e| {
+        let sink = if append {
+            JsonlSink::open_append(path)
+        } else {
+            JsonlSink::create(path)
+        };
+        let sink = sink.map_err(|e| {
             anyhow::anyhow!(
-                "failed to create JSONL metrics sink at {}: {}",
+                "failed to {} JSONL metrics sink at {}: {}",
+                if append { "open" } else { "create" },
                 path.display(),
                 e
             )
