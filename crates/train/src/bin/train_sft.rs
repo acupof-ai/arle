@@ -594,7 +594,7 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
     }
     let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)
         .map_err(|e| CliError::Custom(format!("resume config.json parse error: {e}")))?;
-    let mismatches: Vec<String> = [
+    let mut mismatches: Vec<String> = [
         ("hidden_size", cfg.hidden_size as i64),
         ("intermediate_size", cfg.intermediate_size as i64),
         ("num_hidden_layers", cfg.num_hidden_layers as i64),
@@ -609,6 +609,26 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         _ => None,
     })
     .collect();
+
+    // Codex review 2026-04-20 on d9eee61 (High): `tie_word_embeddings`
+    // changes the live parameter map — when true, `embed_tokens.weight`
+    // and `lm_head.weight` alias to the same `TensorId` in `param_ids`,
+    // when false they are distinct. An untied checkpoint resumed against
+    // a tied live config would pass the shape check above, then
+    // `load_into_strict` would load two different file tensors into the
+    // same live TensorId with the second one silently winning. Treat the
+    // flag as a shape-determining field so the run fails fast.
+    if let Some(saw) = file_cfg
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        && saw != cfg.tie_word_embeddings
+    {
+        mismatches.push(format!(
+            "tie_word_embeddings: ckpt={saw} live={}",
+            cfg.tie_word_embeddings
+        ));
+    }
+
     if !mismatches.is_empty() {
         return Err(CliError::Custom(format!(
             "--resume-from {} config mismatch with --model: {}",
