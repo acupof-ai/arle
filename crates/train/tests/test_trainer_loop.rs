@@ -1,0 +1,390 @@
+//! Trainer loop integration tests. Toy model: a single parameter tensor `p`
+//! with `loss = mean(p * p)`, so grad = 2*p/N. We verify loop semantics
+//! (step counting, accumulation, LR ticking, resume, checkpoint dir, metric
+//! emission) without pulling any Transformer wiring in.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use autograd::adamw_state::{AdamWParamState, AdamWState};
+use autograd::ops::{mean, mul};
+use autograd::{AdamW, ConstantLr, LinearWarmup, Optimizer, Tape, Tensor, TensorId, TensorStore};
+use tempfile::tempdir;
+use train::checkpoint::{TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, save_trainer_state_v2};
+use train::grad_clip::NoClip;
+use train::metrics::{MetricSample, MetricSink, NullSink};
+use train::{StepCtx, StepOutcome, Trainer, TrainerConfig};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `TensorStore` with a single 1-D parameter initialised to `init`
+/// and return its id.
+fn setup_param(init: &[f32]) -> (TensorStore, TensorId) {
+    let mut store = TensorStore::default();
+    let id = store.alloc(Tensor::new(init.to_vec(), vec![init.len()], true).expect("alloc param"));
+    (store, id)
+}
+
+/// Build `loss = mean(p * p)` and return the scalar tensor id.
+fn squared_mean_loss(
+    param: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> autograd::Result<TensorId> {
+    let sq = mul(param, param, store, tape)?;
+    mean(sq, store, tape)
+}
+
+/// Collecting `MetricSink` — stores every emit into an `Arc<Mutex<_>>` the
+/// test can inspect after the run. The `Arc<Mutex<_>>` is `Send`, satisfying
+/// the `MetricSink: Send` bound.
+#[derive(Default)]
+struct OwnedSample {
+    step: u64,
+    fields: Vec<(String, f64)>,
+}
+
+struct VecSink {
+    buf: Arc<Mutex<Vec<OwnedSample>>>,
+}
+
+impl MetricSink for VecSink {
+    fn emit(&mut self, sample: &MetricSample<'_>) {
+        let fields = sample
+            .fields
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect();
+        self.buf.lock().unwrap().push(OwnedSample {
+            step: sample.step,
+            fields,
+        });
+    }
+}
+
+fn default_cfg(total_steps: u64) -> TrainerConfig {
+    TrainerConfig {
+        total_steps,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// 5 optimizer steps, grad_accum=1 — verify the loop honours total_steps
+/// and actually moves the parameter toward zero (gradient = 2*p, so AdamW
+/// with any positive LR must decrease |p| monotonically on a quadratic).
+#[test]
+fn trainer_runs_total_steps() {
+    let (mut store, p) = setup_param(&[1.0, -1.0, 0.5, -0.5]);
+    let mut tape = Tape::new();
+
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = default_cfg(5);
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(NullSink), cfg);
+
+    let initial_abs_sum: f32 = store.to_host(p).unwrap().iter().map(|v| v.abs()).sum();
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    assert_eq!(trainer.step(), 5, "trainer should have run 5 steps");
+    let final_abs_sum: f32 = store.to_host(p).unwrap().iter().map(|v| v.abs()).sum();
+    assert!(
+        final_abs_sum < initial_abs_sum,
+        "|p| should decrease ({initial_abs_sum} -> {final_abs_sum})"
+    );
+}
+
+/// grad_accum_steps=4, total_steps=2 — step_fn must be invoked 8 times and
+/// the optimizer step only 2 times. We prove the optimizer-step count by
+/// inspecting AdamWState.step after the run (AdamW increments its internal
+/// step counter once per `optim.step`).
+#[test]
+fn grad_accum_triggers_step_every_n() {
+    let (mut store, p) = setup_param(&[0.3, -0.2]);
+    let mut tape = Tape::new();
+
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 2,
+        grad_accum_steps: 4,
+        log_every: 1,
+        ..default_cfg(2)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(NullSink), cfg);
+
+    let step_fn_calls = Arc::new(Mutex::new(0u64));
+    let step_fn_calls_hook = Arc::clone(&step_fn_calls);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            |ctx: &mut StepCtx<'_>| {
+                *step_fn_calls_hook.lock().unwrap() += 1;
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    assert_eq!(
+        *step_fn_calls.lock().unwrap(),
+        8,
+        "step_fn should have been called 2 * 4 = 8 times"
+    );
+    assert_eq!(
+        trainer.step(),
+        2,
+        "trainer should have run 2 optimizer steps"
+    );
+    let exported = trainer_optim_state(&trainer, p);
+    assert_eq!(
+        exported.step, 2,
+        "AdamW internal step counter should match optimizer-step count"
+    );
+}
+
+/// LinearWarmup(base_lr=0.1, warmup_steps=3): steps 0..3 are in-warmup
+/// (lr < base_lr), steps >= 3 saturate at base_lr. After 5 steps we expect
+/// `optim.lr() == 0.1`.
+#[test]
+fn lr_schedule_drives_optimizer_lr() {
+    let (mut store, p) = setup_param(&[0.5]);
+    let mut tape = Tape::new();
+
+    let optim = AdamW::new(0.0, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = default_cfg(5);
+    let schedule = LinearWarmup {
+        base_lr: 0.1,
+        warmup_steps: 3,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, schedule, Box::new(NullSink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    // After step=5 we called `set_lr(schedule.lr(4))` last. LinearWarmup
+    // with warmup_steps=3 saturates at base_lr once step >= warmup_steps.
+    assert_eq!(
+        trainer_lr(&trainer),
+        0.1,
+        "optimizer LR should saturate at base_lr after warmup"
+    );
+}
+
+/// Hand-craft a TrainerStateDoc with step=42 + AdamWState that matches
+/// param name "p", then resume. `resume_if_configured` should return 42
+/// and `trainer.step()` should read 42.
+#[test]
+fn resume_restores_step() {
+    let tmp = tempdir().expect("tempdir");
+    let ckpt_dir = tmp.path().join("step_000042");
+    std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+    let doc = TrainerStateDoc {
+        step: 42,
+        optim_schema: "adamw-v1".to_string(),
+        schedule_name: "constant".to_string(),
+        schedule_params: serde_json::json!({}),
+        grad_accum_current: 0,
+        rng_seed: 7,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = AdamWState {
+        step: 42,
+        skipped_export: 0,
+        params: vec![AdamWParamState {
+            name: "p".to_string(),
+            m: vec![0.1, -0.2, 0.3],
+            v: vec![1e-3, 2e-3, 3e-3],
+            shape: vec![3],
+        }],
+    };
+    save_trainer_state_v2(&ckpt_dir, &doc, &optim_state).expect("save v2");
+
+    let (_store, p) = setup_param(&[0.0, 0.0, 0.0]);
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        resume_from: Some(ckpt_dir.clone()),
+        ..default_cfg(100)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    let resumed = trainer
+        .resume_if_configured(&[(p, "p".to_string())])
+        .expect("resume_if_configured");
+    assert_eq!(resumed, 42);
+    assert_eq!(trainer.step(), 42);
+}
+
+/// save_every=2 + total_steps=2 — the run should write
+/// `{save_dir}/step_000002/trainer_state.json`.
+#[test]
+fn checkpoint_save_writes_directory() {
+    let tmp = tempdir().expect("tempdir");
+    let save_dir: PathBuf = tmp.path().join("ckpt");
+
+    let (mut store, p) = setup_param(&[0.25, -0.5]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 2,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: Some(2),
+        save_dir: Some(save_dir.clone()),
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    let expected = save_dir.join("step_000002").join("trainer_state.json");
+    assert!(
+        expected.is_file(),
+        "expected checkpoint JSON at {expected:?}"
+    );
+    let optim_path = save_dir.join("step_000002").join("optimizer.safetensors");
+    assert!(optim_path.is_file(), "expected optimizer safetensors");
+}
+
+/// total_steps=4 + log_every=2 should produce exactly 2 metric samples.
+#[test]
+fn metrics_emit_at_log_every() {
+    let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        buf: Arc::clone(&buf),
+    };
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 4,
+        grad_accum_steps: 1,
+        log_every: 2,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(sink), cfg);
+
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 7,
+                })
+            },
+        )
+        .expect("trainer.run");
+
+    let samples = buf.lock().unwrap();
+    assert_eq!(
+        samples.len(),
+        2,
+        "total_steps=4 / log_every=2 should emit 2 samples, got {}",
+        samples.len()
+    );
+    // Emitted steps should be 2 and 4.
+    assert_eq!(samples[0].step, 2);
+    assert_eq!(samples[1].step, 4);
+    // Every sample carries the documented field set.
+    let expected_keys = [
+        "loss",
+        "lr",
+        "grad_norm",
+        "ms_per_step",
+        "tok_per_sec",
+        "step",
+    ];
+    for s in samples.iter() {
+        for k in expected_keys {
+            assert!(
+                s.fields.iter().any(|(name, _)| name == k),
+                "sample at step {} missing field {k}",
+                s.step
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small shims on top of `Trainer::optim()` so the assertion-time call sites
+// stay focused on what they're proving.
+// ---------------------------------------------------------------------------
+
+fn trainer_optim_state(trainer: &Trainer<AdamW, NoClip, ConstantLr>, p: TensorId) -> AdamWState {
+    trainer.optim().export_state(&[(p, "p".to_string())])
+}
+
+fn trainer_lr(trainer: &Trainer<AdamW, NoClip, LinearWarmup>) -> f32 {
+    trainer.optim().lr()
+}
