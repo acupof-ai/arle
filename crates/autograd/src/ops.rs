@@ -214,11 +214,16 @@ pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 }
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.2: `softmax` is now device-resident on Metal for Dirty::Device
+    // inputs — `softmax::softmax` routes to `backend.softmax_last_axis`
+    // (composes `mlx_softmax_axis` into the MLX lazy graph, no eval).
+    // Dirty::Host / Dirty::Both inputs stay on the host fast path. CPU/CUDA
+    // use the default trait fallback (readback → host → upload); lazy
+    // semantics are Metal-only.
     softmax::softmax(x, store, tape)
 }
 
 pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // See `softmax`. Metal path composes `mlx_logsumexp_axis + mlx_subtract`.
     softmax::log_softmax(x, store, tape)
 }

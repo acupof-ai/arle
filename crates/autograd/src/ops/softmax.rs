@@ -3,39 +3,116 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    let input = store.tensor(x)?.clone();
-    let _ = last_dim(&input.shape)?;
-    let output = store
-        .backend()
-        .softmax_forward_last_axis(&input.data, &input.shape)?;
+    // M5.3b.2: route Dirty::Device inputs through the lazy
+    // `backend.softmax_last_axis` (composes `mlx_softmax_axis` into the MLX
+    // graph with no eval). Dirty::Host / Dirty::Both stay on the host fast
+    // path so host-resident producers don't pay an upload+device-reduce
+    // +readback. Mirrors the M5.3b.1 `sum` dispatch shape.
+    let dirty = store.tensor(x)?.dirty.clone();
+    match dirty {
+        Dirty::Device => softmax_device_lazy(x, store, tape, SoftmaxKind::Softmax),
+        Dirty::Host | Dirty::Both => softmax_host_eager(x, store, tape, SoftmaxKind::Softmax),
+    }
+}
 
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
-    if input.requires_grad {
+pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    // See `softmax` for the dispatch rationale (M5.3b.2).
+    let dirty = store.tensor(x)?.dirty.clone();
+    match dirty {
+        Dirty::Device => softmax_device_lazy(x, store, tape, SoftmaxKind::LogSoftmax),
+        Dirty::Host | Dirty::Both => softmax_host_eager(x, store, tape, SoftmaxKind::LogSoftmax),
+    }
+}
+
+#[derive(Copy, Clone)]
+enum SoftmaxKind {
+    Softmax,
+    LogSoftmax,
+}
+
+impl SoftmaxKind {
+    fn backward_op(self) -> BackwardOp {
+        match self {
+            SoftmaxKind::Softmax => BackwardOp::Softmax,
+            SoftmaxKind::LogSoftmax => BackwardOp::LogSoftmax,
+        }
+    }
+
+    fn saved(self, y: TensorId) -> SavedContext {
+        match self {
+            SoftmaxKind::Softmax => SavedContext::SoftmaxCtx { y },
+            SoftmaxKind::LogSoftmax => SavedContext::LogSoftmaxCtx { y },
+        }
+    }
+}
+
+fn softmax_device_lazy(
+    x: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    kind: SoftmaxKind,
+) -> Result<TensorId> {
+    // Defensive `ensure_device`: caller already routed a Dirty::Device
+    // tensor, but re-calling guards a future Dirty::Both path from silent
+    // drift (mirrors `sum_device_lazy`).
+    store.ensure_device(x)?;
+    let (input_shape, requires_grad) = {
+        let tensor = store.tensor(x)?;
+        let _ = last_dim(&tensor.shape)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let input_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "softmax: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = match kind {
+        SoftmaxKind::Softmax => store
+            .backend()
+            .softmax_last_axis(&input_handle, &input_shape)?,
+        SoftmaxKind::LogSoftmax => store
+            .backend()
+            .log_softmax_last_axis(&input_handle, &input_shape)?,
+    };
+    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
         tape.record(TapeEntry {
-            op: BackwardOp::Softmax,
+            op: kind.backward_op(),
             output_id,
             input_ids: smallvec![x],
-            saved: SavedContext::SoftmaxCtx { y: output_id },
+            saved: kind.saved(output_id),
         });
     }
 
     Ok(output_id)
 }
 
-pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+fn softmax_host_eager(
+    x: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    kind: SoftmaxKind,
+) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let _ = last_dim(&input.shape)?;
-    let output = store
-        .backend()
-        .log_softmax_forward_last_axis(&input.data, &input.shape)?;
+    let output = match kind {
+        SoftmaxKind::Softmax => store
+            .backend()
+            .softmax_forward_last_axis(&input.data, &input.shape)?,
+        SoftmaxKind::LogSoftmax => store
+            .backend()
+            .log_softmax_forward_last_axis(&input.data, &input.shape)?,
+    };
 
     let output_id = store.alloc(Tensor::new(
         output,
@@ -44,10 +121,10 @@ pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
     )?);
     if input.requires_grad {
         tape.record(TapeEntry {
-            op: BackwardOp::LogSoftmax,
+            op: kind.backward_op(),
             output_id,
             input_ids: smallvec![x],
-            saved: SavedContext::LogSoftmaxCtx { y: output_id },
+            saved: kind.saved(output_id),
         });
     }
 

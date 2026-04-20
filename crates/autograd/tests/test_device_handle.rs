@@ -184,28 +184,32 @@ fn metal_single_forward_backward_step_has_bounded_eval_count() -> Result<()> {
     Ok(())
 }
 
-/// Characterization test — M5.3b.2 boundary marker.
+/// M5.3b.2 acceptance: the forward chain `matmul → log_softmax → sum` now
+/// composes fully into the MLX lazy graph — zero `mlx_eval` calls through
+/// the forward — mirroring `metal_single_forward_backward_step_has_bounded_eval_count`
+/// but with log_softmax folded in.
 ///
-/// Records the current eval cost of `matmul → log_softmax → sum → backward`
-/// on Metal. Today (`matmul` lazy via M5.3a, `sum` lazy via M5.3b.1,
-/// `log_softmax` still CPU-bound) the forward pays **two evals per
-/// log_softmax call**:
+/// Observed breakdown post-M5.3b.2:
 ///
-/// 1. `ops/softmax.rs::log_softmax` does `store.tensor(x)?.clone()` which
-///    triggers `ensure_host(x)` on the Dirty::Device matmul output → one
-///    `mlx_eval` + readback to materialize host data.
-/// 2. `backend.log_softmax_forward_last_axis` internally calls
-///    `mlx_softmax_like(...) → eval_and_readback` → a second `mlx_eval`.
+/// | Stage                      | Eval count delta | Why                                                  |
+/// | -------------------------- | :--------------: | ---------------------------------------------------- |
+/// | `matmul` (lazy, M5.3a)     | 0                | composes into MLX graph                              |
+/// | `log_softmax` (lazy)       | 0                | `mlx_logsumexp_axis + mlx_subtract`, no eval         |
+/// | `sum` (lazy, M5.3b.1)      | 0                | `reshape -> sum_axis`, no eval                       |
+/// | `tape.backward` flush      | 1                | one batched `mlx_eval` for Dirty::Device outputs     |
+/// | `matmul_backward` (FFI)    | 1                | self-contained eval+readback for `grad_b = xᵀ @ dC`  |
+/// | `log_softmax_backward`     | ≤1 (slack)       | host-mul readbacks `y` (the tape-saved output)       |
 ///
-/// Regression intent:
-/// - **Loose upper bound** (strict today): `after_log_softmax <= 2`.
-///   Today it is exactly 2; if it climbs to 3+, a third readback has
-///   sneaked into the forward path.
-/// - **Tight lower bound** (aspirational): when M5.3b.2 ports log_softmax
-///   to the lazy MLX graph (`mlx_softmax_axis` / `mlx_logsumexp_axis` +
-///   `mlx_subtract`, no intermediate `mlx_eval`), flip this to
-///   `assert_eq!(after_log_softmax, 0)` so the forward-pass chain
-///   `matmul → log_softmax → sum` stays fully lazy end-to-end.
+/// `after_backward <= 3` budgets the tape flush + matmul_backward FFI
+/// eval, plus one unit of slack for the log_softmax backward host-mul
+/// which currently forces an `ensure_host(y)`. Pushing that to zero
+/// requires a device-side softmax backward (out of M5.3b.2 scope).
+///
+/// Regression signal: if `after_log_softmax > 0`, an eager path has
+/// crept back into `ops/softmax.rs::log_softmax`. If `after_backward`
+/// climbs above 3, trace the new `ensure_host` caller (or check that
+/// the batched-flush helper in `tape::backward` still groups every
+/// Dirty::Device output).
 #[cfg(feature = "metal")]
 #[test]
 fn metal_log_softmax_forward_backward_records_current_eval_cost() -> Result<()> {
@@ -243,26 +247,21 @@ fn metal_log_softmax_forward_backward_records_current_eval_cost() -> Result<()> 
         after_matmul, 0,
         "matmul must stay lazy (M5.3a); saw {after_matmul}"
     );
-    assert!(
-        after_log_softmax <= 2,
-        "log_softmax forward pays at most two evals today (pre-M5.3b.2: \
-         one readback for the matmul-output input + one inside \
-         mlx_softmax_like); saw {after_log_softmax}. If this climbs to 3+ \
-         the forward path has regressed. When M5.3b.2 lands, flip to \
-         assert_eq!(_, 0)."
+    assert_eq!(
+        after_log_softmax, 0,
+        "M5.3b.2: lazy log_softmax must not force an eval; saw {after_log_softmax}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
     );
     assert!(
-        after_sum >= after_log_softmax,
-        "sum cannot decrease the running eval count; saw after_log_softmax={after_log_softmax} \
-         after_sum={after_sum}"
-    );
-    assert!(
-        after_backward <= 5,
+        after_backward <= 3,
         "forward+backward eval count bounded; saw {after_backward} \
          (after_matmul={after_matmul} after_log_softmax={after_log_softmax} \
-          after_sum={after_sum}). Ceiling covers: pre-M5.3b.2 two-eval \
-          log_softmax forward + tape.backward flush + mlx_matmul_backward + \
-          log_softmax backward host-mul."
+          after_sum={after_sum}). Budget = tape.backward flush + \
+          mlx_matmul_backward FFI eval + 1 slack for log_softmax_backward's \
+          host-mul readback of the saved `y`."
     );
     Ok(())
 }
