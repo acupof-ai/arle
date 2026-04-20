@@ -19,6 +19,7 @@ use train::{
     metrics::MetricSample,
     model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
+    policy::{GrpoPolicy, GrpoPolicyConfig},
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
 };
@@ -280,7 +281,6 @@ fn run() -> Result<(), CliError> {
             let episode = rollout_episode(
                 &policy,
                 &ref_model,
-                &config,
                 &initial_prompt,
                 &turns,
                 &env,
@@ -385,7 +385,6 @@ fn run() -> Result<(), CliError> {
             let (eval_reward, eval_passrate) = run_eval(
                 &policy,
                 &ref_model,
-                &config,
                 args.eval_prompts,
                 args.prompt_len,
                 separator,
@@ -443,10 +442,9 @@ fn run() -> Result<(), CliError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_eval(
-    policy: &Transformer,
-    ref_model: &Transformer,
-    config: &TransformerConfig,
+fn run_eval<P>(
+    policy: &P,
+    ref_model: &P,
     n_prompts: usize,
     prompt_len: usize,
     separator: usize,
@@ -458,7 +456,11 @@ fn run_eval(
     sample_rng: &mut LcgRng,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<(f32, f32), CliError> {
+) -> Result<(f32, f32), CliError>
+where
+    P: GrpoPolicy,
+    P::Config: GrpoPolicyConfig,
+{
     if n_prompts == 0 {
         return Ok((0.0, 0.0));
     }
@@ -470,7 +472,6 @@ fn run_eval(
         let episode = rollout_episode(
             policy,
             ref_model,
-            config,
             &initial_prompt,
             turns,
             env,
@@ -679,7 +680,7 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {
+fn retained_ids<P: GrpoPolicy>(models: &[&P], store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for model in models {
         for param_id in model.all_parameter_ids() {

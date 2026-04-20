@@ -135,7 +135,6 @@ fn stepwise_pipeline_feeds_grpo_loss_per_position() {
         let episode = rollout_episode(
             &policy,
             &ref_model,
-            &config,
             &initial_prompt,
             &turns,
             &env,

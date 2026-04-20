@@ -13,6 +13,7 @@ use train::{
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     loss::cross_entropy_loss,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    qwen3_support::trainable_params,
     rollout::rollout_group,
 };
 
@@ -467,22 +468,6 @@ fn qwen3_config(seq: usize) -> Qwen3Config {
         rope_theta: 1_000_000.0,
         tie_word_embeddings: false,
     }
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|tensor_id| {
-            store
-                .get(*tensor_id)
-                .is_some_and(|tensor| tensor.requires_grad)
-        })
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
 }
 
 fn retained_ids(models: &[&Qwen3Model], store: &TensorStore) -> HashSet<TensorId> {

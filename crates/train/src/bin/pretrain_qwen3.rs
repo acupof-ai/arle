@@ -33,6 +33,7 @@ use train::{
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
     qwen3::{Qwen3Error, Qwen3Model},
+    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     tokenizer::ChatTokenizer,
     trainer::cross_entropy_loss,
 };
@@ -838,35 +839,6 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
             Ok(Arc::new(CpuBackend))
         }
     }
-}
-
-fn build_registry(model: &Qwen3Model) -> SafetensorsRegistry {
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    registry
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|id| store.get(*id).is_some_and(|t| t.requires_grad))
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
-}
-
-fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
-    store
-        .tensors
-        .iter()
-        .enumerate()
-        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

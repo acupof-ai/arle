@@ -32,6 +32,8 @@ pub mod multi_turn;
 pub mod policy;
 #[path = "qwen3.rs"]
 pub mod qwen3;
+#[path = "qwen3_support.rs"]
+pub mod qwen3_support;
 #[path = "reward.rs"]
 pub mod reward;
 #[path = "rollout.rs"]

@@ -9,7 +9,7 @@
 use std::{collections::HashSet, error::Error, sync::Arc};
 
 use autograd::{
-    Backend, SafetensorsRegistry, Tape, TensorId, TensorStore,
+    Backend, Tape, TensorId, TensorStore,
     backend_metal::MetalBackend,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
@@ -18,6 +18,7 @@ use tempfile::tempdir;
 use train::{
     dataset::LcgRng,
     qwen3::{Qwen3Config, Qwen3Model},
+    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     sft_data::TokenizedSft,
 };
 
@@ -214,35 +215,6 @@ fn assistant_masked_loss(
     let masked = mul(gathered, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
     Ok(mul_scalar(total, -1.0 / valid_count as f32, store, tape)?)
-}
-
-fn build_registry(model: &Qwen3Model) -> SafetensorsRegistry {
-    let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.param_name_map() {
-        registry.insert(name, tensor_id);
-    }
-    registry
-}
-
-fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
-    let mut params = model
-        .param_name_map()
-        .into_values()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|id| store.get(*id).is_some_and(|t| t.requires_grad))
-        .collect::<Vec<_>>();
-    params.sort_unstable();
-    params
-}
-
-fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
-    store
-        .tensors
-        .iter()
-        .enumerate()
-        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
-        .collect()
 }
 
 fn retained_ids(
