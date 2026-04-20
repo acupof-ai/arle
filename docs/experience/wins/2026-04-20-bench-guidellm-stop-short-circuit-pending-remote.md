@@ -47,5 +47,5 @@ Invoked via: `scripts/bench_guidellm.sh metal-stop-short-circuit`
 ## Notes
 
 - What changed in the code since baseline: streamed text stops now use the shared `StopChunkProcessor` in serial runtime, server engine, and Metal runtime paths; the consumer stops seeing bytes after the marker, while final usage still comes from the backend's real completion result.
-- Suspected cause of any regression: stop handling now preserves correctness without fabricating usage; any throughput delta comes from the extra backend work after a stop is matched and needs a real Metal sweep.
+- Suspected cause of any regression: stop handling now preserves correctness without fabricating usage while short-circuiting decode once a streamed text stop is matched; any throughput delta should come from the callback/error boundary and reduced wasted decode, and still needs a real Metal sweep.
 - Follow-ups: run `scripts/bench_guidellm.sh metal-stop-short-circuit` on the next Metal machine with model weights available; compare against the most recent Metal baseline and link the delta.
