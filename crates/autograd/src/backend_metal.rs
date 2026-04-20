@@ -13,8 +13,9 @@ use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
     mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_erf,
     mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis,
-    mlx_multiply, mlx_negative, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice,
-    mlx_softmax_axis, mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid,
+    mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh,
+    mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -634,6 +635,374 @@ impl Backend for MetalBackend {
         vocab: usize,
     ) -> Result<Vec<f32>> {
         mlx_scatter_add_rows(upstream, prefix_rows, feature_dim, indices, vocab)
+    }
+
+    // Lazy fused AdamW per-param update. Upload `grad` once as a flat
+    // `[size]` f32 array and compose the entire update into the MLX graph:
+    //
+    //   m' = β1·m + (1-β1)·g
+    //   v' = β2·v + (1-β2)·g²
+    //   param' = (1 - lr·wd)·param - lr·(m'/bc1) / (√(v'/bc2) + eps)
+    //
+    // One terminal `mlx_eval` covers {new_param, new_m, new_v} so the
+    // handles are numerically realized before the next forward reads
+    // them — but `param` stays `Dirty::Device`, so no re-upload happens
+    // on the next step. The prior host-loop path downloaded + uploaded
+    // every param every step (get_mut → ensure_host → mutate → mark
+    // Dirty::Host → next ensure_device re-uploads); M5.3b.10. Scalar
+    // constants broadcast-multiply via `mlx_array_new_float32`, which is
+    // the same primitive the lazy `gelu` uses for 0.5/INV_SQRT_2. No new
+    // MLX primitives introduced — `mlx_divide` does not exist in the
+    // bridge, so we reach the reciprocal via `mlx_reciprocal`.
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_step(
+        &self,
+        param: &DeviceHandle,
+        m: &DeviceHandle,
+        v: &DeviceHandle,
+        grad: &[f32],
+        shape: &[usize],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        let size: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+        if grad.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: grad.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+
+        let DeviceHandle::Metal(param_handle) = param else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot adamw_step a non-metal param handle",
+            ));
+        };
+        let DeviceHandle::Metal(m_handle) = m else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot adamw_step a non-metal m handle",
+            ));
+        };
+        let DeviceHandle::Metal(v_handle) = v else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot adamw_step a non-metal v handle",
+            ));
+        };
+
+        let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: every intermediate array we allocate is either freed
+        // before return or transferred into an `MlxHandle` at the final
+        // wrap site. `param_handle` / `m_handle` / `v_handle` are borrowed
+        // for this whole call under `MLX_GUARD`; the returned handles own
+        // fresh MLX arrays that become the caller's new params+moments.
+        // We run the composition inside a single closure so `?` cleanup
+        // drops intermediates correctly — but every step below allocates
+        // arrays that we must explicitly free via `mlx_array_free` if the
+        // next allocation fails. Follows the same free-on-null pattern as
+        // `mlx_gelu_erf_lazy` in this file.
+        unsafe {
+            // Upload grad as a flat [size] f32 array.
+            let grad_arr = mlx_array_from_data(
+                grad.as_ptr() as *const c_void,
+                shape_i32.as_ptr(),
+                shape_i32.len() as i32,
+                MLX_FLOAT32,
+            );
+            if grad_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_from_data returned null (adamw grad)",
+                ));
+            }
+
+            // Scalar constants for the composition.
+            let beta1_arr = mlx_array_new_float32(beta1);
+            let one_minus_beta1 = mlx_array_new_float32(1.0_f32 - beta1);
+            let beta2_arr = mlx_array_new_float32(beta2);
+            let one_minus_beta2 = mlx_array_new_float32(1.0_f32 - beta2);
+            let inv_bc1 = mlx_array_new_float32(1.0_f32 / bc1);
+            let inv_bc2 = mlx_array_new_float32(1.0_f32 / bc2);
+            let eps_arr = mlx_array_new_float32(eps);
+            let lr_arr = mlx_array_new_float32(lr);
+            let decay_arr = mlx_array_new_float32(1.0_f32 - (lr * wd));
+            if beta1_arr.is_null()
+                || one_minus_beta1.is_null()
+                || beta2_arr.is_null()
+                || one_minus_beta2.is_null()
+                || inv_bc1.is_null()
+                || inv_bc2.is_null()
+                || eps_arr.is_null()
+                || lr_arr.is_null()
+                || decay_arr.is_null()
+            {
+                mlx_array_free(grad_arr);
+                if !beta1_arr.is_null() {
+                    mlx_array_free(beta1_arr);
+                }
+                if !one_minus_beta1.is_null() {
+                    mlx_array_free(one_minus_beta1);
+                }
+                if !beta2_arr.is_null() {
+                    mlx_array_free(beta2_arr);
+                }
+                if !one_minus_beta2.is_null() {
+                    mlx_array_free(one_minus_beta2);
+                }
+                if !inv_bc1.is_null() {
+                    mlx_array_free(inv_bc1);
+                }
+                if !inv_bc2.is_null() {
+                    mlx_array_free(inv_bc2);
+                }
+                if !eps_arr.is_null() {
+                    mlx_array_free(eps_arr);
+                }
+                if !lr_arr.is_null() {
+                    mlx_array_free(lr_arr);
+                }
+                if !decay_arr.is_null() {
+                    mlx_array_free(decay_arr);
+                }
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_array_new_float32 returned null (adamw scalars)",
+                ));
+            }
+
+            // m' = β1·m + (1-β1)·g
+            let m_scaled = mlx_multiply(beta1_arr, m_handle.as_ptr());
+            let g_scaled = mlx_multiply(one_minus_beta1, grad_arr);
+            mlx_array_free(beta1_arr);
+            mlx_array_free(one_minus_beta1);
+            if m_scaled.is_null() || g_scaled.is_null() {
+                if !m_scaled.is_null() {
+                    mlx_array_free(m_scaled);
+                }
+                if !g_scaled.is_null() {
+                    mlx_array_free(g_scaled);
+                }
+                mlx_array_free(grad_arr);
+                mlx_array_free(beta2_arr);
+                mlx_array_free(one_minus_beta2);
+                mlx_array_free(inv_bc1);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw m update components)",
+                ));
+            }
+            let new_m = mlx_add(m_scaled, g_scaled);
+            mlx_array_free(m_scaled);
+            mlx_array_free(g_scaled);
+            if new_m.is_null() {
+                mlx_array_free(grad_arr);
+                mlx_array_free(beta2_arr);
+                mlx_array_free(one_minus_beta2);
+                mlx_array_free(inv_bc1);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_add returned null (adamw new_m)",
+                ));
+            }
+
+            // v' = β2·v + (1-β2)·g²
+            let g_sq = mlx_multiply(grad_arr, grad_arr);
+            mlx_array_free(grad_arr);
+            if g_sq.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(beta2_arr);
+                mlx_array_free(one_minus_beta2);
+                mlx_array_free(inv_bc1);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw g²)",
+                ));
+            }
+            let v_scaled = mlx_multiply(beta2_arr, v_handle.as_ptr());
+            let gsq_scaled = mlx_multiply(one_minus_beta2, g_sq);
+            mlx_array_free(beta2_arr);
+            mlx_array_free(one_minus_beta2);
+            mlx_array_free(g_sq);
+            if v_scaled.is_null() || gsq_scaled.is_null() {
+                if !v_scaled.is_null() {
+                    mlx_array_free(v_scaled);
+                }
+                if !gsq_scaled.is_null() {
+                    mlx_array_free(gsq_scaled);
+                }
+                mlx_array_free(new_m);
+                mlx_array_free(inv_bc1);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw v update components)",
+                ));
+            }
+            let new_v = mlx_add(v_scaled, gsq_scaled);
+            mlx_array_free(v_scaled);
+            mlx_array_free(gsq_scaled);
+            if new_v.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(inv_bc1);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_add returned null (adamw new_v)",
+                ));
+            }
+
+            // m_hat = new_m / bc1 (multiply by precomputed reciprocal).
+            let m_hat = mlx_multiply(new_m, inv_bc1);
+            mlx_array_free(inv_bc1);
+            if m_hat.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(inv_bc2);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw m_hat)",
+                ));
+            }
+            let v_over_bc2 = mlx_multiply(new_v, inv_bc2);
+            mlx_array_free(inv_bc2);
+            if v_over_bc2.is_null() {
+                mlx_array_free(m_hat);
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw v/bc2)",
+                ));
+            }
+            let v_hat_sqrt = mlx_sqrt(v_over_bc2);
+            mlx_array_free(v_over_bc2);
+            if v_hat_sqrt.is_null() {
+                mlx_array_free(m_hat);
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(eps_arr);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_sqrt returned null (adamw √(v/bc2))",
+                ));
+            }
+            let denom = mlx_add(v_hat_sqrt, eps_arr);
+            mlx_array_free(v_hat_sqrt);
+            mlx_array_free(eps_arr);
+            if denom.is_null() {
+                mlx_array_free(m_hat);
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_add returned null (adamw denom)",
+                ));
+            }
+
+            // update = lr · m_hat / denom = lr · m_hat · reciprocal(denom)
+            let denom_recip = mlx_reciprocal(denom);
+            mlx_array_free(denom);
+            if denom_recip.is_null() {
+                mlx_array_free(m_hat);
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_reciprocal returned null (adamw 1/denom)",
+                ));
+            }
+            let ratio = mlx_multiply(m_hat, denom_recip);
+            mlx_array_free(m_hat);
+            mlx_array_free(denom_recip);
+            if ratio.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(lr_arr);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw m_hat/denom)",
+                ));
+            }
+            let scaled_update = mlx_multiply(lr_arr, ratio);
+            mlx_array_free(lr_arr);
+            mlx_array_free(ratio);
+            if scaled_update.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                mlx_array_free(decay_arr);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw lr·ratio)",
+                ));
+            }
+
+            // decayed_param = (1 - lr·wd) · param
+            let decayed_param = mlx_multiply(decay_arr, param_handle.as_ptr());
+            mlx_array_free(decay_arr);
+            if decayed_param.is_null() {
+                mlx_array_free(scaled_update);
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (adamw decay·param)",
+                ));
+            }
+
+            // new_param = decayed_param - scaled_update
+            let new_param = mlx_subtract(decayed_param, scaled_update);
+            mlx_array_free(decayed_param);
+            mlx_array_free(scaled_update);
+            if new_param.is_null() {
+                mlx_array_free(new_m);
+                mlx_array_free(new_v);
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_subtract returned null (adamw new_param)",
+                ));
+            }
+
+            // One terminal eval so the three returned handles are
+            // numerically realized — the next forward will read `param`
+            // (and re-read-ish `m`/`v` on the next step) through its MLX
+            // handle, which requires the value to be materialized. This is
+            // the single accepted eval in the M5.3b.10 budget.
+            let mut eval_handles = [new_param, new_m, new_v];
+            mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
+            bump_eval_count();
+
+            Ok((
+                DeviceHandle::Metal(MlxHandle::from_raw(new_param)),
+                DeviceHandle::Metal(MlxHandle::from_raw(new_m)),
+                DeviceHandle::Metal(MlxHandle::from_raw(new_v)),
+            ))
+        }
     }
 }
 

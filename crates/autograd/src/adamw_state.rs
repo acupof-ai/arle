@@ -51,7 +51,7 @@ impl AdamW {
         let mut covered = 0usize;
 
         for (id, name) in names {
-            let Some((m, v)) = self.state_for(*id) else {
+            let Some((m, v)) = self.moments_host(*id) else {
                 // No moments recorded yet for this TensorId. Nothing to save.
                 continue;
             };
@@ -59,8 +59,8 @@ impl AdamW {
             let shape = self.param_shape(*id).unwrap_or_else(|| vec![m.len()]);
             params.push(AdamWParamState {
                 name: name.clone(),
-                m: m.clone(),
-                v: v.clone(),
+                m,
+                v,
                 shape,
             });
         }
