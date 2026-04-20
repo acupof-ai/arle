@@ -96,35 +96,42 @@ fn metal_handle_drops_cleanly_on_scope_exit() -> Result<()> {
     Ok(())
 }
 
-/// M5.3a acceptance (`docs/plans/m5.3-device-resident-tensor.md` §5): a
-/// single forward+backward pass of `y = x @ w; loss = y.sum()` through the
-/// Metal backend must resolve to a small, deterministic number of
+/// M5.3a + M5.3b.1 acceptance (`docs/plans/m5.3-device-resident-tensor.md` §5):
+/// a single forward+backward pass of `y = x @ w; loss = y.sum()` through
+/// the Metal backend must resolve to a small, deterministic number of
 /// `mlx_eval` boundaries — not one per op (the pre-M5.3a degenerate path
 /// that the 2026-04-18 TinyLM bench flagged as 1.9× slower than CPU).
 ///
-/// Observed breakdown post-M5.3a.2 + matmul-backward-on-GPU
-/// (`2026-04-20-matmul-backward-gpu.md`):
+/// Observed breakdown post-M5.3b.1 (lazy `sum_all` on Metal + batched
+/// `tape.backward` flush via `TensorStore::flush_to_host_batch`):
 ///
-/// | Op                 | Forward eval | Backward eval |
-/// | ------------------ | :----------: | :-----------: |
-/// | `matmul` (lazy)    | 0            | —             |
-/// | `sum` (host op)    | 1 (readback) | —             |
-/// | `matmul_backward`  | —            | 1 (eval+read) |
+/// | Stage                    | Eval count delta | Why                                   |
+/// | ------------------------ | :--------------: | ------------------------------------- |
+/// | `matmul` (lazy)          | 0                | composes into MLX graph               |
+/// | `sum` (lazy, M5.3b.1)    | 0                | `reshape -> sum_axis`, no eval        |
+/// | `tape.backward` flush    | 1                | one batched `mlx_eval` for {y, loss}  |
+/// | `matmul_backward` (FFI)  | 1                | self-contained eval+readback          |
 ///
-/// `matmul` composes into MLX's lazy graph with zero evals; the only
-/// host-forcing points are (a) `sum`'s `ensure_host(y)` and (b) the
-/// `mlx_matmul_backward` FFI helper's self-contained eval+readback for
-/// each requested gradient side. `need_grad_a=false` here (x is a leaf
-/// input, not a parameter) so only one gradient matmul runs on device.
+/// Both `matmul` and `sum` now compose into the MLX lazy graph with zero
+/// evals. `tape.backward` collapses every Dirty::Device output (here `y`
+/// and `loss`) into a single `Backend::eval(&[handle_y, handle_loss])`
+/// call before walking the backward graph — MLX realizes shared upstream
+/// nodes once, so the per-id `readback`s after that are O(copy). Without
+/// this batching, M5.3b.1's lazy `sum` would *increase* the steady-state
+/// eval count (y + loss become two Dirty::Device outputs where pre-M5.3b.1
+/// only y had to be flushed). The `mlx_matmul_backward` FFI then runs its
+/// own internal eval to compute `grad_b = x^T @ dC`; `need_grad_a=false`
+/// since `x` is a leaf input, so only one gradient SGEMM runs on device.
 ///
-/// Upper bound = 2. The stretch goal of 1 requires a lazy
+/// Stretch goal of `after_backward <= 1` requires a lazy
 /// `Backend::matmul_backward` that returns unevaluated `DeviceHandle`s
-/// and defers the eval to a terminal flush — tracked as a follow-up to
-/// M5.3b once more ops go device-resident.
+/// (folding the only remaining intra-graph eval into the terminal flush).
+/// Out of M5.3b.1 scope.
 ///
-/// Regression signal: if this count climbs back above 2, a host round-trip
-/// has sneaked into the middle of the graph (MLX's degenerate 1-op-per-eval
-/// pattern). Trace the caller and collapse to the end-of-tape flush.
+/// Regression signal: if this count climbs back above its bound, either
+/// a host round-trip has sneaked into the middle of the graph (trace the
+/// new `ensure_host` caller) or the batched-flush helper has been bypassed
+/// (check `tape::backward`).
 #[cfg(feature = "metal")]
 #[test]
 fn metal_single_forward_backward_step_has_bounded_eval_count() -> Result<()> {
@@ -159,17 +166,15 @@ fn metal_single_forward_backward_step_has_bounded_eval_count() -> Result<()> {
     let _grads = tape.backward(loss, &mut store)?;
     let after_backward = eval_count();
 
-    // Assert each stage against its expected counter value. The goal of 0
-    // after forward matmul (lazy) is the core M5.3a.2 invariant: matmul
-    // never forces an eval on its own. If `after_matmul > 0`, the lazy
-    // graph has regressed.
+    // The two assert_eq! gates are the strict M5.3 invariants; the
+    // assert! on `after_backward` is the bounded-flush regression bound.
     assert_eq!(
         after_matmul, 0,
         "forward matmul must not trigger an eval (lazy graph); saw {after_matmul}"
     );
     assert_eq!(
-        after_sum, 1,
-        "sum forces one readback of the matmul output; saw {after_sum}"
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
     );
     assert!(
         after_backward <= 2,

@@ -190,7 +190,10 @@ pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 }
 
 pub fn sum(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(a)?;
+    // M5.3b.1: `sum` is now device-resident on Metal — `reduce::sum` calls
+    // `store.ensure_device(a)` and `backend.sum_all`, composing into the
+    // MLX lazy graph instead of forcing a host readback. CPU/CUDA still get
+    // a fully-realized scalar handle; lazy semantics are Metal-only.
     reduce::sum(a, store, tape)
 }
 

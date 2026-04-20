@@ -182,6 +182,43 @@ impl TensorStore {
         Ok(())
     }
 
+    /// Flush a batch of `Dirty::Device` tensors to host using **one**
+    /// backend `eval` call, then per-id `readback`. Equivalent to calling
+    /// `ensure_host` for each id, but collapses N FFI eval boundaries
+    /// into 1 — meaningful on Metal where each `mlx_eval` round-trip
+    /// dominates at small shapes (see `tape::backward` flush loop).
+    /// Tensors not currently `Dirty::Device` are silently skipped, so the
+    /// caller can pass the entire output set without pre-filtering.
+    pub fn flush_to_host_batch(&mut self, ids: &[TensorId]) -> Result<()> {
+        let mut to_flush: Vec<(TensorId, DeviceHandle)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let tensor = self.tensor(id)?;
+            if tensor.dirty != Dirty::Device {
+                continue;
+            }
+            let handle = tensor
+                .device_handle
+                .as_ref()
+                .ok_or(AutogradError::TapeInvariant(
+                    "device-resident tensor missing device handle",
+                ))?
+                .clone();
+            to_flush.push((id, handle));
+        }
+        if to_flush.is_empty() {
+            return Ok(());
+        }
+        let handle_refs: Vec<&DeviceHandle> = to_flush.iter().map(|(_, h)| h).collect();
+        self.backend().eval(&handle_refs)?;
+        for (id, handle) in to_flush {
+            let host = self.backend().readback(&handle)?;
+            let tensor = self.raw_tensor_mut(id)?;
+            tensor.data = host;
+            tensor.dirty = Dirty::Both;
+        }
+        Ok(())
+    }
+
     pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
         let (dirty, has_handle, data, shape) = {
             let tensor = self.tensor(id)?;

@@ -365,6 +365,47 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn sum_all(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, shape);
+            todo!("GPU required: cuda sum_all is unavailable under feature no-cuda")
+        }
+
+        // CUDA stays eager for M5.3b.1 — no device-resident lazy graph here.
+        // We still keep the result on-device so the returned handle composes
+        // with future device-resident consumers (e.g. tape.backward()'s
+        // ensure_host of the loss). Strategy: download → reduce on host →
+        // upload the scalar back. This is one HtoD round-trip and a tiny
+        // sum, dwarfed by the matmul that produced `x`. PENDING REMOTE CUDA
+        // VERIFICATION.
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let slice = self.cuda_slice(x, "sum_all")?;
+            let size = shape_size(shape);
+            if slice.len() != size {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: slice.len(),
+                    shape: shape.to_vec(),
+                    size,
+                });
+            }
+            let mut host = vec![0.0_f32; size];
+            self.stream
+                .memcpy_dtoh(slice, &mut host)
+                .map_err(|_| AutogradError::TapeInvariant("cuda dtoh copy failed"))?;
+            self.stream
+                .synchronize()
+                .map_err(|_| AutogradError::TapeInvariant("cuda synchronize failed"))?;
+            let total: f32 = host.iter().sum();
+            let scalar = self
+                .stream
+                .clone_htod(&[total])
+                .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+            Ok(DeviceHandle::Cuda(CudaStorage::new(scalar)))
+        }
+    }
+
     fn matmul_forward(
         &self,
         a: &[f32],
