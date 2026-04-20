@@ -2,6 +2,7 @@
 //! and the root agent loop.
 
 use serde_json::{Map, Value, json};
+use std::ops::Range;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
@@ -61,6 +62,50 @@ struct PromptRenderer<'a> {
     prompt: String,
     tool_block: &'a str,
     system_injected: bool,
+}
+
+/// Borrowed ChatML message used by callers that only need raw role/content
+/// rendering without tool or default-system handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatMlMessage<'a> {
+    pub role: &'a str,
+    pub content: &'a str,
+}
+
+/// Byte spans for a rendered ChatML turn.
+///
+/// `turn` covers the full `<|im_start|>role\ncontent<|im_end|>\n` slice.
+/// `supervised` covers the body slice that should receive labels, including
+/// `<|im_end|>` but excluding the trailing newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMlSpan {
+    pub turn: Range<usize>,
+    pub supervised: Range<usize>,
+}
+
+/// Fully rendered ChatML prompt plus per-turn byte spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedChatMl {
+    pub prompt: String,
+    pub spans: Vec<ChatMlSpan>,
+}
+
+fn append_chatml_message_with_span(prompt: &mut String, role: &str, content: &str) -> ChatMlSpan {
+    let turn_start = prompt.len();
+    prompt.push_str("<|im_start|>");
+    prompt.push_str(role);
+    prompt.push('\n');
+
+    let supervised_start = prompt.len();
+    prompt.push_str(content);
+    prompt.push_str("<|im_end|>");
+    let supervised_end = prompt.len();
+    prompt.push('\n');
+
+    ChatMlSpan {
+        turn: turn_start..prompt.len(),
+        supervised: supervised_start..supervised_end,
+    }
 }
 
 impl<'a> PromptRenderer<'a> {
@@ -364,6 +409,34 @@ pub fn parse_tool_calls(text: &str) -> ParsedAssistantResponse {
     }
 }
 
+/// Render a raw ChatML message list using the canonical `<|im_start|>...`
+/// layout without tool or default-system injection.
+pub fn render_chatml(messages: &[ChatMlMessage<'_>], add_generation_prompt: bool) -> String {
+    render_chatml_with_spans(messages, add_generation_prompt).prompt
+}
+
+/// Render ChatML and return byte spans for each turn.
+pub fn render_chatml_with_spans(
+    messages: &[ChatMlMessage<'_>],
+    add_generation_prompt: bool,
+) -> RenderedChatMl {
+    let mut prompt = String::new();
+    let mut spans = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        spans.push(append_chatml_message_with_span(
+            &mut prompt,
+            message.role,
+            message.content,
+        ));
+    }
+    if add_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+    }
+
+    RenderedChatMl { prompt, spans }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +446,41 @@ mod tests {
         let prompt = messages_to_prompt(&[ChatMessage::user("hello")], &[]);
         assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn render_chatml_single_message() {
+        let prompt = render_chatml(
+            &[ChatMlMessage {
+                role: "user",
+                content: "hello",
+            }],
+            true,
+        );
+
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn render_chatml_with_spans_tracks_body_range() {
+        let rendered = render_chatml_with_spans(
+            &[ChatMlMessage {
+                role: "assistant",
+                content: "\nhello",
+            }],
+            false,
+        );
+
+        assert_eq!(
+            rendered.prompt,
+            "<|im_start|>assistant\n\nhello<|im_end|>\n"
+        );
+        assert_eq!(rendered.spans.len(), 1);
+        assert_eq!(rendered.spans[0].turn, 0..39);
+        assert_eq!(rendered.spans[0].supervised, 22..38);
     }
 
     #[test]

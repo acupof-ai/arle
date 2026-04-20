@@ -4,7 +4,7 @@ use autograd::{AutogradError, Result, Tape, TensorStore};
 
 use crate::{
     dataset::LcgRng,
-    model::{Transformer, TransformerConfig},
+    policy::{GrpoPolicy, GrpoPolicyConfig},
     sampling::{log_prob_at_index, sample_categorical},
 };
 
@@ -18,10 +18,10 @@ pub struct Trajectory {
     pub reward: f32,
 }
 
-pub fn rollout_group(
-    policy: &Transformer,
-    ref_model: &Transformer,
-    config: &TransformerConfig,
+pub fn rollout_group<P>(
+    policy: &P,
+    ref_model: &P,
+    config: &P::Config,
     prompts: &[Vec<usize>],
     group_size: usize,
     temperature: f32,
@@ -29,98 +29,71 @@ pub fn rollout_group(
     verifier: &impl Fn(&[usize], &[usize], &[bool]) -> f32,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<Vec<Trajectory>> {
+) -> Result<Vec<Trajectory>>
+where
+    P: GrpoPolicy,
+{
     if prompts.is_empty() || group_size == 0 {
         return Ok(Vec::new());
     }
 
     let seq_len = prompts[0].len();
-    validate_prompt_batch(prompts, seq_len, config.max_seq_len)?;
+    validate_prompt_batch(prompts, seq_len, config.max_seq_len())?;
     let response_mask = response_mask(seq_len)?;
-    let batch = prompts.len() * group_size;
-    let mut repeated_prompts = Vec::with_capacity(batch);
-    let mut flat_full_ids = Vec::with_capacity(batch * seq_len);
-    for prompt in prompts {
-        for _ in 0..group_size {
-            repeated_prompts.push(prompt.clone());
-            flat_full_ids.extend_from_slice(prompt);
-        }
-    }
-
     let was_enabled = tape.enabled;
     let trajectories = (|| {
         tape.set_enabled(false);
 
-        let mut trajectories = Vec::with_capacity(batch);
-        let mut full_batch = Vec::with_capacity(batch * seq_len);
-        for prompt_ids in &repeated_prompts {
-            trajectories.push(Trajectory {
-                prompt_ids: prompt_ids.clone(),
-                response_mask: response_mask.clone(),
-                full_ids: prompt_ids.clone(),
-                old_log_probs: vec![0.0; seq_len],
-                ref_log_probs: vec![0.0; seq_len],
-                reward: 0.0,
-            });
-        }
+        let mut trajectories = Vec::with_capacity(prompts.len() * group_size);
+        for prompt in prompts {
+            for _ in 0..group_size {
+                let mut trajectory = Trajectory {
+                    prompt_ids: prompt.clone(),
+                    response_mask: response_mask.clone(),
+                    full_ids: prompt.clone(),
+                    old_log_probs: vec![0.0; seq_len],
+                    ref_log_probs: vec![0.0; seq_len],
+                    reward: 0.0,
+                };
 
-        for (position, masked) in response_mask.iter().enumerate() {
-            if !*masked {
-                continue;
-            }
+                for (position, masked) in trajectory.response_mask.iter().enumerate() {
+                    if !*masked {
+                        continue;
+                    }
 
-            let logits_id = policy.forward(&flat_full_ids, batch, seq_len, store, tape)?;
-            let logits = store.to_host(logits_id)?;
-            let mut step_logits = Vec::with_capacity(batch * config.vocab_size);
-            for row in 0..batch {
-                let logits_row = row * seq_len + (position - 1);
-                let logits_base = logits_row * config.vocab_size;
-                step_logits
-                    .extend_from_slice(&logits[logits_base..logits_base + config.vocab_size]);
-            }
+                    let logits_id = policy.forward_single(&trajectory.full_ids, store, tape)?;
+                    let logits = store.to_host(logits_id)?;
+                    let logits_base = position.saturating_sub(1) * config.vocab_size();
+                    let slice = &logits[logits_base..logits_base + config.vocab_size()];
+                    let (sampled_ids, sampled_log_probs) =
+                        sample_categorical(slice, (1, 1), config.vocab_size(), temperature, rng);
+                    trajectory.full_ids[position] = sampled_ids[0];
+                    trajectory.old_log_probs[position] = sampled_log_probs[0];
 
-            // Causal next-token LM alignment: logits at position t - 1 predict token t.
-            let (sampled_ids, sampled_log_probs) = sample_categorical(
-                &step_logits,
-                (batch, 1),
-                config.vocab_size,
-                temperature,
-                rng,
-            );
-            for row in 0..batch {
-                let flat_index = row * seq_len + position;
-                flat_full_ids[flat_index] = sampled_ids[row];
-                trajectories[row].full_ids[position] = sampled_ids[row];
-                trajectories[row].old_log_probs[position] = sampled_log_probs[row];
-            }
-
-            let keep = retained_ids(policy, ref_model, store);
-            store.retain_ids(&keep);
-        }
-
-        full_batch.extend_from_slice(&flat_full_ids);
-
-        let ref_logits_id = ref_model.forward(&full_batch, batch, seq_len, store, tape)?;
-        let ref_logits = store.to_host(ref_logits_id)?;
-        for (row, trajectory) in trajectories.iter_mut().enumerate() {
-            for position in 0..seq_len {
-                if !trajectory.response_mask[position] {
-                    continue;
+                    let keep = retained_ids(policy, ref_model, store);
+                    store.retain_ids(&keep);
                 }
 
-                let logits_row = row * seq_len + (position - 1);
-                let logits_base = logits_row * config.vocab_size;
-                trajectory.ref_log_probs[position] = log_prob_at_index(
-                    &ref_logits[logits_base..logits_base + config.vocab_size],
-                    1.0,
-                    trajectory.full_ids[position],
+                let ref_logits_id = ref_model.forward_single(&trajectory.full_ids, store, tape)?;
+                let ref_logits = store.to_host(ref_logits_id)?;
+                for (position, masked) in trajectory.response_mask.iter().enumerate() {
+                    if !*masked {
+                        continue;
+                    }
+                    let logits_base = position.saturating_sub(1) * config.vocab_size();
+                    trajectory.ref_log_probs[position] = log_prob_at_index(
+                        &ref_logits[logits_base..logits_base + config.vocab_size()],
+                        1.0,
+                        trajectory.full_ids[position],
+                    );
+                }
+                trajectory.reward = verifier(
+                    &trajectory.prompt_ids,
+                    &trajectory.full_ids,
+                    &trajectory.response_mask,
                 );
+                trajectories.push(trajectory);
             }
-            trajectory.reward = verifier(
-                &trajectory.prompt_ids,
-                &trajectory.full_ids,
-                &trajectory.response_mask,
-            );
         }
 
         Ok(trajectories)
@@ -169,8 +142,8 @@ fn response_mask(seq_len: usize) -> Result<Vec<bool>> {
 }
 
 fn retained_ids(
-    policy: &Transformer,
-    ref_model: &Transformer,
+    policy: &impl GrpoPolicy,
+    ref_model: &impl GrpoPolicy,
     store: &TensorStore,
 ) -> HashSet<usize> {
     let mut keep = HashSet::new();

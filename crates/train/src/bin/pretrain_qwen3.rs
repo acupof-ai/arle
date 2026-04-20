@@ -912,6 +912,7 @@ fn save_checkpoint(
         serde_json::to_string_pretty(&config_json)?,
     )?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
+    write_generation_config(&step_dir, bos_token_id, eos_token_id)?;
 
     let weights_path = step_dir.join("model.safetensors");
     match save_dtype {
@@ -934,4 +935,41 @@ fn save_checkpoint(
         save_dtype
     );
     Ok(())
+}
+
+fn write_generation_config(
+    step_dir: &Path,
+    bos_token_id: u32,
+    eos_token_id: u32,
+) -> Result<(), CliError> {
+    let mut eos_token_ids = vec![eos_token_id];
+    if bos_token_id != eos_token_id {
+        eos_token_ids.push(bos_token_id);
+    }
+    let generation_config = json!({
+        "eos_token_id": eos_token_ids,
+    });
+    fs::write(
+        step_dir.join("generation_config.json"),
+        serde_json::to_string_pretty(&generation_config)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generation_config_is_written_with_stop_tokens() {
+        let tmp = tempdir().expect("tempdir");
+        write_generation_config(tmp.path(), 151_643, 151_645).expect("write generation config");
+
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join("generation_config.json")).expect("read file"),
+        )
+        .expect("parse generation config");
+        assert_eq!(value["eos_token_id"], json!([151_645, 151_643]));
+    }
 }

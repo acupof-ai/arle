@@ -10,6 +10,7 @@ use autograd::{
 };
 
 use crate::lora::{LoraConfig, LoraLinear};
+use crate::policy::{GrpoPolicy, GrpoPolicyConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransformerConfig {
@@ -302,6 +303,15 @@ impl Transformer {
         cloned
     }
 
+    pub fn forward_single(
+        &self,
+        input_ids: &[usize],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        self.forward(input_ids, 1, input_ids.len(), store, tape)
+    }
+
     pub fn forward(
         &self,
         indices: &[usize],
@@ -358,6 +368,41 @@ impl Module for Transformer {
             params.extend(block.parameters());
         }
         params
+    }
+}
+
+impl GrpoPolicyConfig for TransformerConfig {
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+impl GrpoPolicy for Transformer {
+    type Config = TransformerConfig;
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn forward_single(
+        &self,
+        input_ids: &[usize],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        self.forward(input_ids, 1, input_ids.len(), store, tape)
+    }
+
+    fn all_parameter_ids(&self) -> Vec<TensorId> {
+        Self::all_parameter_ids(self)
+    }
+
+    fn clone_frozen(&self, store: &mut TensorStore) -> Self {
+        Self::clone_frozen(self, store)
     }
 }
 

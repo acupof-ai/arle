@@ -14,12 +14,6 @@ pub struct ChatTokenizer {
     inner: Tokenizer,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChatMessageRef<'a> {
-    pub role: &'a str,
-    pub content: &'a str,
-}
-
 impl ChatTokenizer {
     pub fn from_file(path: &Path) -> Result<Self> {
         let inner = Tokenizer::from_file(path).map_err(|e| {
@@ -68,29 +62,6 @@ impl ChatTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }
-
-    /// Qwen3 / Qwen3.5 / GLM4 chat template:
-    ///
-    /// ```text
-    /// <|im_start|>role\ncontent<|im_end|>\n
-    /// ```
-    ///
-    /// Appended with `<|im_start|>assistant\n` when `add_generation_prompt`
-    /// so the model knows it's the assistant's turn.
-    pub fn render_chat(msgs: &[ChatMessageRef<'_>], add_generation_prompt: bool) -> String {
-        let mut out = String::new();
-        for m in msgs {
-            out.push_str("<|im_start|>");
-            out.push_str(m.role);
-            out.push('\n');
-            out.push_str(m.content);
-            out.push_str("<|im_end|>\n");
-        }
-        if add_generation_prompt {
-            out.push_str("<|im_start|>assistant\n");
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -119,23 +90,5 @@ mod tests {
         let text = tok.decode(&ids, true).expect("decode");
         // Tokenizers sometimes add/remove leading whitespace; trim and compare.
         assert_eq!(text.trim(), "hello world");
-    }
-
-    #[test]
-    fn chat_template_shape() {
-        let msgs = [
-            ChatMessageRef {
-                role: "user",
-                content: "hi",
-            },
-            ChatMessageRef {
-                role: "assistant",
-                content: "hello",
-            },
-        ];
-        let rendered = ChatTokenizer::render_chat(&msgs, true);
-        assert!(rendered.contains("<|im_start|>user\nhi<|im_end|>"));
-        assert!(rendered.contains("<|im_start|>assistant\nhello<|im_end|>"));
-        assert!(rendered.ends_with("<|im_start|>assistant\n"));
     }
 }

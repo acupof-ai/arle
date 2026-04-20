@@ -149,7 +149,12 @@ impl Qwen3Model {
 
         let t_gpu = Instant::now();
         debug!("Loading embeddings to GPU");
-        let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
+        let embed_tokens = load_tensor_2d(
+            &ctx,
+            &shards,
+            &weight_map,
+            config.embed_tokens_tensor_name(),
+        )?;
         let lm_head = if config.tie_word_embeddings {
             debug!("Using tied input/output embeddings");
             None
@@ -169,51 +174,41 @@ impl Qwen3Model {
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{}", i);
+            let names = config.layer_tensor_names(i);
 
             let block = TransformerBlock {
                 input_layernorm: load_tensor_1d(
                     &ctx,
                     &shards,
                     &weight_map,
-                    &format!("{}.input_layernorm.weight", prefix),
+                    &names.input_layernorm,
                 )?,
                 attention: {
-                    let q_proj = load_linear(&format!("{}.self_attn.q_proj.weight", prefix))?;
-                    let k_proj = load_linear(&format!("{}.self_attn.k_proj.weight", prefix))?;
-                    let v_proj = load_linear(&format!("{}.self_attn.v_proj.weight", prefix))?;
+                    let q_proj = load_linear(&names.q_proj)?;
+                    let k_proj = load_linear(&names.k_proj)?;
+                    let v_proj = load_linear(&names.v_proj)?;
                     let qkv_proj = DeviceMatrix::concat_rows(&ctx, &[&q_proj, &k_proj, &v_proj])?;
                     Attention {
                         q_proj,
                         k_proj,
                         v_proj,
                         qkv_proj,
-                        o_proj: load_linear(&format!("{}.self_attn.o_proj.weight", prefix))?,
-                        q_norm: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.self_attn.q_norm.weight", prefix),
-                        )?,
-                        k_norm: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.self_attn.k_norm.weight", prefix),
-                        )?,
+                        o_proj: load_linear(&names.o_proj)?,
+                        q_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.q_norm)?,
+                        k_norm: load_tensor_1d(&ctx, &shards, &weight_map, &names.k_norm)?,
                     }
                 },
                 post_attention_layernorm: load_tensor_1d(
                     &ctx,
                     &shards,
                     &weight_map,
-                    &format!("{}.post_attention_layernorm.weight", prefix),
+                    &names.post_attention_layernorm,
                 )?,
                 mlp: MLP::load_with_quant(
                     &ctx,
                     &shards,
                     &weight_map,
-                    &format!("{}.mlp", prefix),
+                    &names.mlp_prefix,
                     true, // merge gate+up for batched decode
                     quant_group_size,
                 )?,
@@ -221,7 +216,7 @@ impl Qwen3Model {
             layers.push(block);
         }
 
-        let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
+        let norm = load_tensor_1d(&ctx, &shards, &weight_map, config.norm_tensor_name())?;
 
         debug!("Precomputing RoPE cache on GPU");
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
@@ -389,7 +384,7 @@ impl Qwen3Model {
         // embed_tokens is read directly via embedding_decode_cuda, which is
         // NOT quant-aware — it would read from the 1-element dummy `.data`
         // buffer of a packed matrix and produce garbage. Force BF16 load.
-        let embed_tokens = load_tensor_2d_gguf_bf16(ctx, gguf, "model.embed_tokens.weight")?;
+        let embed_tokens = load_tensor_2d_gguf_bf16(ctx, gguf, config.embed_tokens_tensor_name())?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -402,51 +397,33 @@ impl Qwen3Model {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let p = format!("model.layers.{}", i);
+            let names = config.layer_tensor_names(i);
 
-            let q_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.q_proj.weight"))?;
-            let k_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.k_proj.weight"))?;
-            let v_proj = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.self_attn.v_proj.weight"))?;
+            let q_proj = load_tensor_2d_gguf(ctx, gguf, &names.q_proj)?;
+            let k_proj = load_tensor_2d_gguf(ctx, gguf, &names.k_proj)?;
+            let v_proj = load_tensor_2d_gguf(ctx, gguf, &names.v_proj)?;
             let qkv_proj = DeviceMatrix::concat_rows(ctx, &[&q_proj, &k_proj, &v_proj])?;
 
             layers.push(TransformerBlock {
-                input_layernorm: load_tensor_1d_gguf(
-                    ctx,
-                    gguf,
-                    &format!("{p}.input_layernorm.weight"),
-                )?,
+                input_layernorm: load_tensor_1d_gguf(ctx, gguf, &names.input_layernorm)?,
                 attention: Attention {
                     q_proj,
                     k_proj,
                     v_proj,
                     qkv_proj,
-                    o_proj: load_tensor_2d_gguf(
-                        ctx,
-                        gguf,
-                        &format!("{p}.self_attn.o_proj.weight"),
-                    )?,
-                    q_norm: load_tensor_1d_gguf(
-                        ctx,
-                        gguf,
-                        &format!("{p}.self_attn.q_norm.weight"),
-                    )?,
-                    k_norm: load_tensor_1d_gguf(
-                        ctx,
-                        gguf,
-                        &format!("{p}.self_attn.k_norm.weight"),
-                    )?,
+                    o_proj: load_tensor_2d_gguf(ctx, gguf, &names.o_proj)?,
+                    q_norm: load_tensor_1d_gguf(ctx, gguf, &names.q_norm)?,
+                    k_norm: load_tensor_1d_gguf(ctx, gguf, &names.k_norm)?,
                 },
                 post_attention_layernorm: load_tensor_1d_gguf(
                     ctx,
                     gguf,
-                    &format!("{p}.post_attention_layernorm.weight"),
+                    &names.post_attention_layernorm,
                 )?,
                 mlp: {
-                    let gate =
-                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.gate_proj.weight"))?;
-                    let up = load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.up_proj.weight"))?;
-                    let down =
-                        load_tensor_2d_gguf(ctx, gguf, &format!("{p}.mlp.down_proj.weight"))?;
+                    let gate = load_tensor_2d_gguf(ctx, gguf, &names.mlp_gate_proj)?;
+                    let up = load_tensor_2d_gguf(ctx, gguf, &names.mlp_up_proj)?;
+                    let down = load_tensor_2d_gguf(ctx, gguf, &names.mlp_down_proj)?;
                     let gate_up = DeviceMatrix::concat_rows(ctx, &[&gate, &up])?;
                     MLP {
                         gate_proj: gate,
@@ -462,7 +439,7 @@ impl Qwen3Model {
             }
         }
 
-        let norm = load_tensor_1d_gguf(ctx, gguf, "model.norm.weight")?;
+        let norm = load_tensor_1d_gguf(ctx, gguf, config.norm_tensor_name())?;
         let rope_cache_len = resolve_rope_cache_len(config.rope_cache_len_hint());
         let (cos_cache, sin_cache) =
             precompute_rope(ctx, config.head_dim, rope_cache_len, config.rope_theta)?;

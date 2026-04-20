@@ -28,6 +28,8 @@ pub mod metrics;
 pub mod model;
 #[path = "multi_turn.rs"]
 pub mod multi_turn;
+#[path = "policy.rs"]
+pub mod policy;
 #[path = "qwen3.rs"]
 pub mod qwen3;
 #[path = "reward.rs"]
@@ -51,6 +53,7 @@ pub mod verifier;
 
 pub use grad_accum::GradAccumulator;
 pub use metrics::*;
+pub use policy::{GrpoPolicy, GrpoPolicyConfig};
 pub use trainer::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig, cleanup_after_backward,
 };
