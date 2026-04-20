@@ -2105,7 +2105,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     batch_cache_len: i32,
     draft_states: &mut [ContiguousKvState],
 ) -> Result<Vec<DFlashBlockResult>> {
-    use super::mlx::{MlxArray as Arr, eval, expand_dims, reshape};
+    use super::mlx::{MlxArray as Arr, async_eval, expand_dims, reshape};
 
     let batch = current_tokens.len();
     ensure!(batch > 0, "Qwen3.5 DFlash batched block: empty batch");
@@ -2447,13 +2447,30 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         target_cache_lens[b] += k;
     }
 
-    // ── 12. Materialize all packed state so callers see consistent values. ──
+    // ── 12. Queue packed state for async materialization. ──
+    //
+    // Previously this was a blocking `eval` — a full CPU↔GPU fence right
+    // before returning. Defer via `async_eval` so the GPU can continue
+    // draining the queued work while the caller builds the *next* DFlash
+    // block's graph (mirrors the scalar Qwen3.5 step-driver double-buffer
+    // landed in commit f6be5f6: queue step N+1 before materializing step N).
+    //
+    // Correctness: callers of this function only consume the returned
+    // `updated_target_hidden` as an opaque MlxArray handle (stashed back
+    // into `dflash.target_hidden` at request_state.rs:1991 and fed as an
+    // input to the next block at request_state.rs:2702 / 3435). The packed
+    // KV/GDR arrays are sliced per-row (lazy view ops) and re-stashed. No
+    // caller issues a host-side read (`.item()` / `.as_slice()`) on these
+    // handles before the next DFlash block's own sync, so deferring is
+    // safe. The next block's prefix-match scan in `sample_rows()`
+    // (`dflash.rs:1505` → `.item_i32()`) or any subsequent `eval` call
+    // will flush this queue.
     {
         let mut to_eval: Vec<&Arr> = Vec::new();
         to_eval.extend(packed_target_kv_flat.iter());
         to_eval.extend(packed_target_gdr_flat.iter());
         to_eval.extend(updated_per_row.iter());
-        eval(&to_eval);
+        async_eval(&to_eval);
     }
 
     // ── Assemble per-row DFlashBlockResult. ──
