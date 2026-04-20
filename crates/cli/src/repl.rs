@@ -1,7 +1,7 @@
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::Arc;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use agent::{
@@ -65,8 +65,69 @@ enum ReplCommand {
     Load(String),
     SwitchChat,
     SwitchAgent,
+    /// `/models` with no arg lists discovered hub snapshots; `/models N` is
+    /// reserved for engine hot-swap which is currently unsupported (owner
+    /// pattern requires an owned `LoadedInferenceEngine` instead of the
+    /// `&mut dyn InferenceEngine` threaded through `run_repl`). When N is
+    /// supplied we print a friendly pointer to restart with `--model-path`.
+    Models(Option<usize>),
+    /// `/export` → default path; `/export <path>` → explicit path/dir.
+    Export(String),
+    /// `/retry` — drop last assistant turn, re-run the prior user turn.
+    Retry,
     Exit,
     Unknown(String),
+}
+
+/// Per-session rolling accumulators for `/stats` enrichment. Populated by
+/// streaming chat turns. Agent-mode turns do not contribute tokens here
+/// because agent-mode uses a different code path that doesn't surface
+/// streaming usage deltas to the REPL.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct SessionStats {
+    /// Number of chat turns (one user + one assistant reply each).
+    turn_count: usize,
+    /// Sum of prompt_tokens reported by each turn's final TokenUsage, when
+    /// populated. Falls back to chars/4 for the most recent user message
+    /// if usage was unset (e.g. backend without usage reporting).
+    prompt_tokens: u64,
+    /// Sum of completion_tokens reported by each turn's final TokenUsage,
+    /// when populated. Falls back to the rolling TpsMeter count.
+    completion_tokens: u64,
+    /// Weighted TPS accumulator: sum of (tokens · tokens/elapsed) across
+    /// turns; divided by total tokens for the weighted average.
+    /// Stored separately rather than as a running avg because a simple mean
+    /// over turns would treat a 1-token turn and a 1000-token turn equally.
+    weighted_rate_numer: f64,
+    /// Sum of elapsed seconds across turns (the /stats "wall time" row).
+    total_secs: f64,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+impl SessionStats {
+    fn record_turn(&mut self, prompt_tokens: u64, completion_tokens: u64, elapsed: Duration) {
+        self.turn_count = self.turn_count.saturating_add(1);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion_tokens);
+        let secs = elapsed.as_secs_f64();
+        self.total_secs += secs;
+        if secs > f64::EPSILON {
+            // Weight each turn's rate by its token count so long turns
+            // dominate, matching what an operator intuitively means by
+            // "avg throughput".
+            let rate = completion_tokens as f64 / secs;
+            self.weighted_rate_numer += rate * completion_tokens as f64;
+        }
+    }
+
+    fn avg_tps(&self) -> f64 {
+        if self.completion_tokens == 0 {
+            0.0
+        } else {
+            self.weighted_rate_numer / self.completion_tokens as f64
+        }
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -363,6 +424,7 @@ fn run_interactive_repl(
         .collect::<Vec<_>>();
     let mut session = AgentSession::new();
     let mut chat_history: Vec<ChatMessage> = vec![ChatMessage::system(SYSTEM_PROMPT_CHAT)];
+    let mut session_stats = SessionStats::default();
     let mut mode = initial_mode;
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
@@ -406,6 +468,7 @@ fn run_interactive_repl(
                     &tools,
                     &mut session,
                     &mut chat_history,
+                    &mut session_stats,
                     &mut mode,
                     input,
                     max_turns,
@@ -470,6 +533,7 @@ fn run_piped_repl(
     let mut reader = stdin.lock();
     let mut session = AgentSession::new();
     let mut chat_history: Vec<ChatMessage> = vec![ChatMessage::system(SYSTEM_PROMPT_CHAT)];
+    let mut session_stats = SessionStats::default();
     let mut mode = initial_mode;
 
     let (cancel, exit) = install_ctrlc_handler();
@@ -500,6 +564,7 @@ fn run_piped_repl(
                     &tools,
                     &mut session,
                     &mut chat_history,
+                    &mut session_stats,
                     &mut mode,
                     input,
                     max_turns,
@@ -532,6 +597,7 @@ fn handle_repl_input(
     tools: &[ToolDefinition],
     session: &mut AgentSession,
     chat_history: &mut Vec<ChatMessage>,
+    session_stats: &mut SessionStats,
     mode: &mut ReplMode,
     input: &str,
     max_turns: usize,
@@ -550,16 +616,26 @@ fn handle_repl_input(
             tools,
             session,
             chat_history,
+            session_stats,
             mode,
             max_turns,
             max_tokens,
             temperature,
+            cancel,
         ));
     }
 
     match *mode {
         ReplMode::Chat => {
-            run_chat_turn(engine, chat_history, input, max_tokens, temperature, cancel)?;
+            run_chat_turn(
+                engine,
+                chat_history,
+                session_stats,
+                input,
+                max_tokens,
+                temperature,
+                cancel,
+            )?;
         }
         ReplMode::Agent => {
             run_agent_turn(
@@ -593,16 +669,45 @@ fn handle_repl_input(
 /// the keystroke on the UI but block the REPL until the full completion
 /// finished; now it actually short-circuits the engine.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn run_chat_turn(
     engine: &mut dyn InferenceEngine,
     history: &mut Vec<ChatMessage>,
+    session_stats: &mut SessionStats,
     user_input: &str,
     max_tokens: usize,
     temperature: f32,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    // `/retry` pushes the user message itself and calls this variant so the
+    // history is not duplicated. The common path still builds history here.
     history.push(ChatMessage::user(user_input));
+    run_chat_turn_with_history(
+        engine,
+        history,
+        session_stats,
+        user_input,
+        max_tokens,
+        temperature,
+        cancel,
+    )
+}
 
+/// Same as `run_chat_turn` but assumes the caller has already appended the
+/// user message to `history`. Used by `/retry` to avoid a duplicate user
+/// turn after popping the prior assistant reply.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[allow(clippy::too_many_arguments)]
+fn run_chat_turn_with_history(
+    engine: &mut dyn InferenceEngine,
+    history: &mut Vec<ChatMessage>,
+    session_stats: &mut SessionStats,
+    user_input: &str,
+    max_tokens: usize,
+    temperature: f32,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let turn_start = Instant::now();
     let prompt = chat::messages_to_prompt(history, &[]);
     let req = CompletionRequest {
         prompt,
@@ -633,11 +738,19 @@ fn run_chat_turn(
     // Both CUDA and Metal backends set this at finish_reason; we prefer it
     // over the rolling counter for the final summary.
     let mut final_completion_tokens: Option<u64> = None;
+    // Prompt tokens reported by the final delta (exact from the backend).
+    let mut final_prompt_tokens: Option<u64> = None;
 
-    // Print a faint marker so the user sees we're generating before the
-    // first token arrives. Cleared on first delta.
-    print!("\x1b[34m");
-    let _ = io::stdout().flush();
+    // Assistant-text styling: dim green on TTY, nothing on piped stdout
+    // (matches the brief — "just the assistant streamed output"). We only
+    // print the opening SGR here; the close SGR lands at end-of-turn.
+    let color_on = io::stdout().is_terminal();
+    if color_on {
+        // 0;32 = normal-weight green. Readable on both light and dark
+        // terminals. (Bright green 1;32 ends up washed-out on light bg.)
+        print!("\x1b[32m");
+        let _ = io::stdout().flush();
+    }
 
     std::thread::scope(|s| {
         let worker = s.spawn(|| engine.complete_stream(req, tx));
@@ -673,6 +786,7 @@ fn run_chat_turn(
                     }
                     if let Some(usage) = delta.usage {
                         final_completion_tokens = Some(usage.completion_tokens as u64);
+                        final_prompt_tokens = Some(usage.prompt_tokens as u64);
                     }
                     if delta.finish_reason.is_some() {
                         break;
@@ -712,8 +826,10 @@ fn run_chat_turn(
         partial_bytes.clear();
     }
 
-    print!("\x1b[0m");
-    let _ = io::stdout().flush();
+    if color_on {
+        print!("\x1b[0m");
+        let _ = io::stdout().flush();
+    }
 
     if cancelled {
         println!();
@@ -733,12 +849,27 @@ fn run_chat_turn(
     // turns see consistent context.
     history.push(ChatMessage::assistant(&accumulated, vec![]));
 
+    // Accumulate into session-level /stats. Prefer the backend's exact
+    // usage; fall back to the chars/4 heuristic for prompt tokens when
+    // the stream closed without a finish_reason (cancelled, stream_err).
+    let prompt_tokens = final_prompt_tokens.unwrap_or_else(|| approx_tokens(user_input));
+    let completion_tokens = final_completion_tokens.unwrap_or(0);
+    session_stats.record_turn(prompt_tokens, completion_tokens, turn_start.elapsed());
+
     if let Some(err) = stream_err {
         eprintln!("\x1b[1;31mError: {err:#}\x1b[0m");
         println!();
     }
 
     Ok(())
+}
+
+/// Rough chars/4 estimator. Used as a fallback input-token count when the
+/// backend didn't report an exact value (e.g. streaming closed before the
+/// final usage delta). Standard industry heuristic.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn approx_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(4)
 }
 
 /// Decode bytes into a String, buffering an incomplete trailing multi-byte
@@ -835,9 +966,25 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
         "/reset" | "/clear" => Some(ReplCommand::Reset),
         "/tools" => Some(ReplCommand::Tools),
         "/model" => Some(ReplCommand::Model),
+        "/models" => {
+            // /models → list; /models <N> → switch attempt (currently a
+            // no-op with a pointer to --model-path). Non-numeric args fall
+            // through to Unknown so the user sees a clear error rather than
+            // silently listing.
+            if arg.is_empty() {
+                Some(ReplCommand::Models(None))
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(n) => Some(ReplCommand::Models(Some(n))),
+                    Err(_) => Some(ReplCommand::Unknown(format!("/models {arg}"))),
+                }
+            }
+        }
         "/stats" => Some(ReplCommand::Stats),
         "/save" => Some(ReplCommand::Save(arg.to_string())),
         "/load" => Some(ReplCommand::Load(arg.to_string())),
+        "/export" => Some(ReplCommand::Export(arg.to_string())),
+        "/retry" => Some(ReplCommand::Retry),
         "/chat" => Some(ReplCommand::SwitchChat),
         "/agent" => Some(ReplCommand::SwitchAgent),
         "/quit" | "/exit" => Some(ReplCommand::Exit),
@@ -854,10 +1001,12 @@ fn execute_repl_command(
     tools: &[ToolDefinition],
     session: &mut AgentSession,
     chat_history: &mut Vec<ChatMessage>,
+    session_stats: &mut SessionStats,
     mode: &mut ReplMode,
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
+    cancel: Arc<AtomicBool>,
 ) -> bool {
     match command {
         ReplCommand::Help => {
@@ -868,6 +1017,7 @@ fn execute_repl_command(
         ReplCommand::Reset => {
             session.reset();
             chat_history.truncate(1);
+            *session_stats = SessionStats::default();
             println!("\x1b[2m(conversation reset)\x1b[0m");
             println!();
             true
@@ -884,15 +1034,22 @@ fn execute_repl_command(
             println!();
             true
         }
+        ReplCommand::Models(maybe_idx) => {
+            handle_models_command(maybe_idx);
+            println!();
+            true
+        }
         ReplCommand::Stats => {
             print_session_stats(
+                engine.model_id(),
+                *mode,
+                *session_stats,
                 session.stats(),
                 chat_history.len().saturating_sub(1),
                 max_turns,
                 max_tokens,
                 temperature,
                 tools.len(),
-                *mode,
             );
             println!();
             true
@@ -933,6 +1090,28 @@ fn execute_repl_command(
             }
             true
         }
+        ReplCommand::Export(path_arg) => {
+            handle_export_command(engine.model_id(), chat_history, &path_arg);
+            println!();
+            true
+        }
+        ReplCommand::Retry => {
+            match *mode {
+                ReplMode::Chat => handle_retry_command(
+                    engine,
+                    chat_history,
+                    session_stats,
+                    max_tokens,
+                    temperature,
+                    cancel,
+                ),
+                ReplMode::Agent => {
+                    println!("\x1b[2m(/retry only works in chat mode)\x1b[0m");
+                    println!();
+                }
+            }
+            true
+        }
         ReplCommand::SwitchChat => {
             *mode = ReplMode::Chat;
             println!("\x1b[2m(switched to chat mode — streaming, no tools)\x1b[0m");
@@ -954,6 +1133,289 @@ fn execute_repl_command(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// /models — listing + (descoped) switch pointer.
+//
+// Hot-swap notes (2026-04-20 wave-2 UX polish):
+// Mid-REPL engine reinit would require owning the `LoadedInferenceEngine`
+// inside the REPL rather than taking `&mut dyn InferenceEngine`. Threading
+// the concrete type through the existing API would cascade into
+// `lib.rs`/`startup.rs` — outside the "crates/cli/ only" scope guard in the
+// wave-2 brief. Ship listing today; track hot-swap separately.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn handle_models_command(maybe_idx: Option<usize>) {
+    let snapshots = crate::hub_discovery::discover_hub_snapshots();
+    if snapshots.is_empty() {
+        println!("No local models found. Try --model-path or ./scripts/run_dflash.sh serve.");
+        return;
+    }
+
+    if let Some(idx_one_based) = maybe_idx {
+        if idx_one_based == 0 || idx_one_based > snapshots.len() {
+            eprintln!(
+                "\x1b[1;31mError: /models {idx_one_based} out of range (1..={})\x1b[0m",
+                snapshots.len()
+            );
+            return;
+        }
+        let picked = &snapshots[idx_one_based - 1];
+        println!("\x1b[2m(mid-REPL model hot-swap is not yet supported.)\x1b[0m");
+        println!(
+            "\x1b[2m Restart with:  agent-infer --model-path {}\x1b[0m",
+            picked.path.display()
+        );
+        return;
+    }
+
+    // Listing mode.
+    println!("Local models (from HuggingFace hub cache):");
+    for (i, snap) in snapshots.iter().enumerate() {
+        let size = approx_dir_size_gb(&snap.path);
+        let family = detect_family(&snap.model_id);
+        let size_str = match size {
+            Some(gb) => format!("{:>5.1} GB", gb),
+            None => "     ?".to_string(),
+        };
+        println!(
+            "  {:>2}. {:<42}  {}  {}",
+            i + 1,
+            snap.model_id,
+            size_str,
+            family,
+        );
+    }
+    println!();
+    println!(
+        "\x1b[2m /models <N>   would switch — currently unsupported; restart with --model-path.\x1b[0m"
+    );
+}
+
+/// Sum of top-level file sizes under `path`, in GB. Best-effort — returns
+/// `None` on any IO error rather than failing the listing.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn approx_dir_size_gb(path: &Path) -> Option<f64> {
+    let mut total: u64 = 0;
+    // HuggingFace snapshot dirs are typically flat (symlinks into blobs/),
+    // so walking one level is sufficient.
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        if let Ok(md) = entry.metadata() {
+            total = total.saturating_add(md.len());
+        }
+    }
+    Some((total as f64) / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// Infer model family from id substring — mirrors `hub_discovery`'s
+/// supported-families list. Returns a short label for the /models table.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+pub(crate) fn detect_family(model_id: &str) -> &'static str {
+    let lc = model_id.to_ascii_lowercase();
+    // Order matters — qwen3.5 and qwen2.5 must outrank the bare qwen3 match.
+    if lc.contains("qwen3.5") {
+        "qwen3.5"
+    } else if lc.contains("qwen2.5") {
+        "qwen2.5"
+    } else if lc.contains("qwen3") {
+        "qwen3"
+    } else if lc.contains("glm4") || lc.contains("glm-4") {
+        "glm4"
+    } else {
+        "other"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /export — markdown conversation dump.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn handle_export_command(model_id: &str, history: &[ChatMessage], path_arg: &str) {
+    // Count only real turns — system prompt at index 0 is excluded.
+    let turns = count_export_turns(history);
+    if turns == 0 {
+        println!("nothing to export (0 turns)");
+        return;
+    }
+
+    let md = render_history_markdown(model_id, history);
+    let out_path = resolve_export_path(path_arg);
+    match std::fs::write(&out_path, md) {
+        Ok(()) => {
+            let abs = out_path.canonicalize().unwrap_or_else(|_| out_path.clone());
+            println!("exported {turns} turns → {}", abs.display());
+        }
+        Err(err) => {
+            eprintln!(
+                "\x1b[1;31mError: could not write {}: {err}\x1b[0m",
+                out_path.display()
+            );
+        }
+    }
+}
+
+/// Count "turns" in the export-spec sense — one user message OR one
+/// assistant message. The system prompt at history[0] is excluded.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn count_export_turns(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .skip(1)
+        .filter(|m| matches!(m.role, chat::ChatRole::User | chat::ChatRole::Assistant))
+        .count()
+}
+
+/// Resolve the destination path:
+/// - empty arg    → `./agent-infer-<ts>.md` in CWD
+/// - dir path     → `<dir>/agent-infer-<ts>.md`
+/// - file path    → used verbatim
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn resolve_export_path(path_arg: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let default_name = format!("agent-infer-{ts}.md");
+
+    if path_arg.is_empty() {
+        return PathBuf::from(&default_name);
+    }
+    let p = PathBuf::from(path_arg);
+    if p.is_dir() {
+        return p.join(&default_name);
+    }
+    p
+}
+
+/// Build the markdown body per the wave-2 brief.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
+    let ts = iso8601_utc_now();
+    let turns = count_export_turns(history);
+
+    let mut out = String::new();
+    out.push_str(&format!("# agent-infer conversation — {model_id}\n\n"));
+    out.push_str(&format!("> Started: {ts}\n"));
+    out.push_str("> Mode: chat\n");
+    out.push_str(&format!("> Turns: {turns}\n\n"));
+
+    for msg in history.iter().skip(1) {
+        match &msg.role {
+            chat::ChatRole::User => {
+                out.push_str("## You\n\n");
+                out.push_str(msg.content.trim_end());
+                out.push_str("\n\n");
+            }
+            chat::ChatRole::Assistant => {
+                out.push_str("## Assistant\n\n");
+                out.push_str(msg.content.trim_end());
+                out.push_str("\n\n");
+            }
+            _ => { /* system / tool / other — skip */ }
+        }
+    }
+    out
+}
+
+/// Minimal RFC3339 UTC timestamp, no external deps.
+/// Format: `YYYY-MM-DDThh:mm:ssZ`. Uses Unix epoch arithmetic. This is
+/// adequate for a conversation banner — we don't need leap-second
+/// accuracy or subsecond precision.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn iso8601_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_iso8601_utc(secs)
+}
+
+/// Pure function separated out for testing — format Unix seconds as
+/// `YYYY-MM-DDThh:mm:ssZ`. Handles the 1970-… range with proleptic
+/// Gregorian calendar math.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn format_iso8601_utc(unix_secs: u64) -> String {
+    // Days since 1970-01-01.
+    let days = unix_secs / 86_400;
+    let rem = unix_secs % 86_400;
+    let h = rem / 3_600;
+    let m = (rem % 3_600) / 60;
+    let s = rem % 60;
+
+    // Civil-date from day-number algorithm (Howard Hinnant).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /retry — drop last assistant reply, re-run prior user turn.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+fn handle_retry_command(
+    engine: &mut dyn InferenceEngine,
+    history: &mut Vec<ChatMessage>,
+    session_stats: &mut SessionStats,
+    max_tokens: usize,
+    temperature: f32,
+    cancel: Arc<AtomicBool>,
+) {
+    // history[0] is the system prompt; anything past that is conversational.
+    let last = history.last();
+    let Some(last_msg) = last else {
+        println!("nothing to retry");
+        return;
+    };
+    match last_msg.role {
+        chat::ChatRole::Assistant => {
+            // Pop the assistant reply. The prior user message remains in
+            // history — `run_chat_turn_with_history` re-runs it in place.
+            history.pop();
+            // The prior turn's stats were already accumulated. We let the
+            // re-run add another turn rather than subtract the prior —
+            // simpler and more honest (time was genuinely spent).
+            let Some(last_user) = history
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, chat::ChatRole::User))
+            else {
+                // Consistency guard: assistant without a preceding user is
+                // an invariant violation, but fail soft rather than panic.
+                println!("nothing to retry");
+                return;
+            };
+            let user_text = last_user.content.clone();
+            if let Err(err) = run_chat_turn_with_history(
+                engine,
+                history,
+                session_stats,
+                &user_text,
+                max_tokens,
+                temperature,
+                cancel,
+            ) {
+                eprintln!("\x1b[1;31mError: {err:#}\x1b[0m");
+                println!();
+            }
+        }
+        _ => {
+            // System or user as last entry — nothing to retry yet.
+            println!("nothing to retry");
+        }
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_help() {
     println!("Commands:");
@@ -963,9 +1425,12 @@ fn print_repl_help() {
     println!("  /reset, /clear   Clear conversation history (both modes)");
     println!("  /tools           Show available tools");
     println!("  /model           Show active model, backend, and current mode");
-    println!("  /stats           Show session and runtime settings");
+    println!("  /models [N]      List local models; /models <N> shows switch hint");
+    println!("  /stats           Show session token/throughput rollup");
     println!("  /save <path>     Save the current agent session to JSON");
     println!("  /load <path>     Load a saved agent session JSON");
+    println!("  /export [path]   Dump chat history to markdown (default: ./agent-infer-<ts>.md)");
+    println!("  /retry           Re-run the last user turn (chat mode only)");
     println!("  /quit, /exit     Leave the REPL");
     println!();
     println!("Input:");
@@ -1015,23 +1480,33 @@ fn print_trace_events(events: &[AgentTraceEvent]) {
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[allow(clippy::too_many_arguments)]
 fn print_session_stats(
-    stats: AgentSessionStats,
+    model_id: &str,
+    mode: ReplMode,
+    session: SessionStats,
+    agent_stats: AgentSessionStats,
     chat_messages: usize,
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
     tool_count: usize,
-    mode: ReplMode,
 ) {
-    println!("Session:");
-    println!("  mode: {}", mode.label());
-    println!("  agent messages: {}", stats.conversation_messages);
-    println!("  agent users: {}", stats.user_messages);
-    println!("  agent assistants: {}", stats.assistant_messages);
-    println!("  agent tool results: {}", stats.tool_messages);
-    println!("  agent tool calls: {}", stats.tool_calls);
-    println!("  agent content chars: {}", stats.content_chars);
-    println!("  chat messages: {}", chat_messages);
+    println!("Session stats:");
+    println!("  Model:      {model_id}");
+    println!("  Mode:       {}", mode.label());
+    println!("  Turns:      {}", session.turn_count);
+    println!("  Tokens in:  {}", session.prompt_tokens);
+    println!("  Tokens out: {}", session.completion_tokens);
+    println!("  Avg TPS:    {:.1}", session.avg_tps());
+    println!("  Wall time:  {:.1}s", session.total_secs);
+    println!();
+    println!("Agent session:");
+    println!("  messages:    {}", agent_stats.conversation_messages);
+    println!("  users:       {}", agent_stats.user_messages);
+    println!("  assistants:  {}", agent_stats.assistant_messages);
+    println!("  tool results:{}", agent_stats.tool_messages);
+    println!("  tool calls:  {}", agent_stats.tool_calls);
+    println!("  chars:       {}", agent_stats.content_chars);
+    println!("  chat turns:  {}", chat_messages);
     println!("Runtime:");
     println!("  tools enabled: {}", tool_count);
     println!("  max turns: {}", max_turns);
@@ -1041,7 +1516,13 @@ fn print_session_stats(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplCommand, decode_chunk, parse_repl_command};
+    use super::{
+        ReplCommand, SessionStats, count_export_turns, decode_chunk, detect_family,
+        format_iso8601_utc, handle_export_command, handle_models_command, parse_repl_command,
+        render_history_markdown, resolve_export_path,
+    };
+    use chat::ChatMessage;
+    use std::time::Duration;
 
     #[test]
     fn parse_repl_command_supports_aliases_and_paths() {
@@ -1103,5 +1584,228 @@ mod tests {
         assert!(s.starts_with('a'));
         assert!(s.ends_with('b'));
         assert!(partial.is_empty());
+    }
+
+    // ── Wave-2 polish: new command parse coverage ───────────────────────
+
+    #[test]
+    fn parse_retry_command() {
+        assert_eq!(parse_repl_command("/retry"), Some(ReplCommand::Retry));
+        assert_eq!(
+            parse_repl_command("  /retry  "),
+            Some(ReplCommand::Retry),
+            "leading/trailing whitespace should not disturb parsing"
+        );
+    }
+
+    #[test]
+    fn parse_models_command_with_and_without_index() {
+        assert_eq!(
+            parse_repl_command("/models"),
+            Some(ReplCommand::Models(None))
+        );
+        assert_eq!(
+            parse_repl_command("/models 3"),
+            Some(ReplCommand::Models(Some(3)))
+        );
+        // Non-numeric -> Unknown, not silently a listing.
+        assert_eq!(
+            parse_repl_command("/models foo"),
+            Some(ReplCommand::Unknown("/models foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_export_command() {
+        assert_eq!(
+            parse_repl_command("/export"),
+            Some(ReplCommand::Export("".to_string()))
+        );
+        assert_eq!(
+            parse_repl_command("/export /tmp/out.md"),
+            Some(ReplCommand::Export("/tmp/out.md".to_string()))
+        );
+    }
+
+    // ── /export — markdown dump ─────────────────────────────────────────
+
+    #[test]
+    fn export_markdown_empty_history() {
+        // Empty = only the system prompt with no user/assistant turns.
+        let history = vec![ChatMessage::system("You are helpful.")];
+        assert_eq!(count_export_turns(&history), 0);
+
+        // Exporting to a nonexistent path should NOT create the file —
+        // 0 turns short-circuits the write. Use a path we can sanity-
+        // check post-call.
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-infer-export-empty-{}.md",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        handle_export_command("dummy/model", &history, tmp.to_str().unwrap());
+        assert!(!tmp.exists(), "no file should be written for empty history");
+    }
+
+    #[test]
+    fn export_markdown_writes_turns() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there", vec![]),
+            ChatMessage::user("bye"),
+            ChatMessage::assistant("see ya", vec![]),
+        ];
+        assert_eq!(count_export_turns(&history), 4);
+
+        let md = render_history_markdown("Qwen/Qwen3-4B", &history);
+        assert!(md.starts_with("# agent-infer conversation — Qwen/Qwen3-4B"));
+        assert!(md.contains("> Turns: 4"));
+        assert!(md.contains("## You\n\nhello"));
+        assert!(md.contains("## Assistant\n\nhi there"));
+        assert!(md.contains("## You\n\nbye"));
+        assert!(md.contains("## Assistant\n\nsee ya"));
+        // System prompt must NOT appear in the body.
+        assert!(!md.contains("\nsys\n"));
+
+        // Round-trip through handle_export_command to a temp file.
+        let tmp = std::env::temp_dir().join(format!(
+            "agent-infer-export-writes-{}.md",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        handle_export_command("Qwen/Qwen3-4B", &history, tmp.to_str().unwrap());
+        let written = std::fs::read_to_string(&tmp).expect("file written");
+        assert!(written.contains("## Assistant\n\nsee ya"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn export_default_path_in_cwd_with_timestamp() {
+        let p = resolve_export_path("");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("agent-infer-") && name.ends_with(".md"),
+            "default filename should be agent-infer-<ts>.md, got {name}"
+        );
+        assert!(
+            p.parent()
+                .map(|pp| pp.as_os_str().is_empty())
+                .unwrap_or(true),
+            "default path should be relative to CWD: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn export_resolves_dir_path_to_dir_slash_default() {
+        // Use the system temp dir, which is guaranteed to be a directory.
+        let tmp = std::env::temp_dir();
+        let p = resolve_export_path(tmp.to_str().unwrap());
+        assert!(
+            p.parent() == Some(tmp.as_path()),
+            "dir arg should prepend the dir: {}",
+            p.display()
+        );
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("agent-infer-") && name.ends_with(".md"));
+    }
+
+    // ── /stats session accumulator ──────────────────────────────────────
+
+    #[test]
+    fn stats_accumulator_sums_across_turns() {
+        let mut s = SessionStats::default();
+        s.record_turn(10, 20, Duration::from_secs(1));
+        s.record_turn(5, 40, Duration::from_secs(2));
+        assert_eq!(s.turn_count, 2);
+        assert_eq!(s.prompt_tokens, 15);
+        assert_eq!(s.completion_tokens, 60);
+        assert!((s.total_secs - 3.0).abs() < 1e-9);
+        // Turn 1: 20 tok / 1s = 20 tok/s; weight 20 → numer contrib 400
+        // Turn 2: 40 tok / 2s = 20 tok/s; weight 40 → numer contrib 800
+        // avg = (400 + 800) / 60 = 20
+        assert!((s.avg_tps() - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stats_avg_tps_weighted_not_plain_mean() {
+        // A 1-tok 1s turn (1 tok/s) should be dominated by a 1000-tok 10s
+        // turn (100 tok/s). Plain mean would be ~50.5; weighted ≈ 99.9.
+        let mut s = SessionStats::default();
+        s.record_turn(1, 1, Duration::from_secs(1));
+        s.record_turn(1, 1000, Duration::from_secs(10));
+        let avg = s.avg_tps();
+        assert!(
+            avg > 99.0,
+            "weighted avg should lean toward the big turn, got {avg}"
+        );
+    }
+
+    #[test]
+    fn stats_accumulator_handles_zero_elapsed() {
+        // A turn with zero elapsed time (should never happen at runtime
+        // but the math must not NaN out). weighted_rate_numer stays 0.
+        let mut s = SessionStats::default();
+        s.record_turn(5, 10, Duration::ZERO);
+        assert_eq!(s.turn_count, 1);
+        assert_eq!(s.avg_tps(), 0.0);
+    }
+
+    // ── /models offline fallback ────────────────────────────────────────
+
+    #[test]
+    fn models_command_offline_message() {
+        // Point HF cache at an empty temp dir so discover_hub_snapshots
+        // returns zero entries. handle_models_command should then emit
+        // the offline hint without touching the filesystem further.
+        let tmp =
+            std::env::temp_dir().join(format!("agent-infer-empty-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Use HUGGINGFACE_HUB_CACHE which hub_discovery::hub_cache_root
+        // honours with highest priority.
+        //
+        // Safety: this test is a single-threaded unit test; setting an env
+        // var from this process scope is safe because no other test in
+        // this file reads HUGGINGFACE_HUB_CACHE concurrently.
+        let prior = std::env::var_os("HUGGINGFACE_HUB_CACHE");
+        unsafe {
+            std::env::set_var("HUGGINGFACE_HUB_CACHE", &tmp);
+        }
+
+        // Smoke-test: should return without panicking or writing a file.
+        handle_models_command(None);
+        handle_models_command(Some(1));
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("HUGGINGFACE_HUB_CACHE", v),
+                None => std::env::remove_var("HUGGINGFACE_HUB_CACHE"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Misc helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_family_matches_known_ids() {
+        assert_eq!(detect_family("Qwen/Qwen3-4B"), "qwen3");
+        assert_eq!(detect_family("Qwen/Qwen3.5-4B"), "qwen3.5");
+        assert_eq!(detect_family("Qwen/Qwen2.5-7B"), "qwen2.5");
+        assert_eq!(detect_family("THUDM/glm-4-9b-chat"), "glm4");
+        assert_eq!(detect_family("something-else"), "other");
+    }
+
+    #[test]
+    fn format_iso8601_utc_known_epochs() {
+        // Unix epoch.
+        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
+        // 2026-04-20 00:00:00 UTC.
+        assert_eq!(format_iso8601_utc(1_776_643_200), "2026-04-20T00:00:00Z");
+        // Pre-2000 sanity: 1999-12-31 23:59:59 UTC = 946_684_799.
+        assert_eq!(format_iso8601_utc(946_684_799), "1999-12-31T23:59:59Z");
     }
 }
