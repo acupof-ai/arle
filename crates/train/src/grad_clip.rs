@@ -54,13 +54,27 @@ pub trait GradClip: Send {
 pub struct NoClip;
 
 impl GradClip for NoClip {
-    fn clip(&mut self, _store: &mut TensorStore, _params: &[TensorId]) -> Result<f32> {
-        Ok(0.0)
+    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<f32> {
+        // Report the true pre-clip global L2 norm so unclipped baselines
+        // still see explode/vanish gradients in logs.
+        Ok(compute_global_norm(params, store))
     }
 }
 
 pub struct GlobalNorm {
     pub max_norm: f32,
+}
+
+impl GlobalNorm {
+    /// Construct a `GlobalNorm` clipper. Panics if `max_norm <= 0.0` to fail
+    /// fast rather than silently becoming a no-op (see `clip_grad_norm`).
+    pub fn new(max_norm: f32) -> Self {
+        assert!(
+            max_norm > 0.0 && max_norm.is_finite(),
+            "GlobalNorm::new: max_norm must be > 0.0 and finite, got {max_norm}"
+        );
+        Self { max_norm }
+    }
 }
 
 impl GradClip for GlobalNorm {

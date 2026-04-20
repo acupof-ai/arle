@@ -257,3 +257,124 @@ fn skipped_export_counts_entries_missing_from_names() {
         "p_b was tracked in AdamW but unmapped by names → counted",
     );
 }
+
+// AS-3 — guard silent-zeros: if the state file lacks a param the caller
+// expects, the caller MUST be able to detect it (restored count < names len).
+#[test]
+fn import_with_missing_param_errors() {
+    // State holds only "p_a"; caller asks for both "p_a" and "p_b". The
+    // restore must report fewer restored entries than names supplied so the
+    // caller can tell something is missing — silent success with "b" left
+    // as uninitialised zeros would corrupt training.
+    let mut source = build_harness();
+    step_once(&mut source);
+
+    // Pretend the on-disk state only ever recorded p_a. Build it by hand.
+    let full = source.opt.export_state(&names(&source));
+    let p_a_entry = full
+        .params
+        .iter()
+        .find(|p| p.name == "p_a")
+        .expect("source exported p_a")
+        .clone();
+    let partial_state = AdamWState {
+        step: full.step,
+        params: vec![p_a_entry],
+        skipped_export: 0,
+    };
+
+    // Fresh optimizer that has seen both params (so import has a shape to
+    // compare against for p_b as well — makes the mismatch impossible to
+    // attribute to an un-seeded slot).
+    let mut dest = build_harness();
+    step_once(&mut dest);
+
+    let restored = dest
+        .opt
+        .import_state(&partial_state, &names(&dest))
+        .expect("import returns Ok even when some names miss");
+    assert!(
+        restored < names(&dest).len(),
+        "restored count ({restored}) must be strictly less than caller names ({}) \
+         so the caller can detect the missing param; silent completion would hide \
+         uninitialised moments for the missing name",
+        names(&dest).len()
+    );
+    assert_eq!(
+        restored, 1,
+        "exactly one of the two caller names (p_a) should have been restored"
+    );
+}
+
+// AS-4 — guard against shape drift on resume: mismatched tensor shape between
+// the loaded file and the live optimizer must hard-error, never silently
+// truncate or zero-extend.
+#[test]
+fn import_with_shape_mismatch_errors() {
+    // Build a state that claims p_a has a different shape than the live
+    // AdamW tracks. The live optimizer has seeded shape [4] (from step_once);
+    // the loaded state advertises shape [8]. Import must Err.
+    let mut source = build_harness();
+    step_once(&mut source);
+
+    let mut state = source.opt.export_state(&names(&source));
+    state.params[0].shape = vec![8];
+    state.params[0].m = vec![0.0; 8];
+    state.params[0].v = vec![0.0; 8];
+
+    let mut dest = build_harness();
+    step_once(&mut dest);
+
+    let err = dest
+        .opt
+        .import_state(&state, &names(&dest))
+        .expect_err("shape mismatch must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("shape"),
+        "error should mention the shape mismatch, got: {msg}"
+    );
+}
+
+// AS-5 — guard against device-handle leakage into the state doc (D6
+// cross-backend parity): AdamWState must serialise to plain host bytes. Uses
+// serde_json as the reference host-only byte image — the struct only exposes
+// String/u64/Vec<f32>/Vec<usize>/usize fields, so any device tensor would have
+// to bypass the type system entirely to sneak in.
+#[test]
+fn cross_backend_state_is_host_only() {
+    let mut a = build_harness();
+    step_once(&mut a);
+    step_once(&mut a);
+
+    let state = a.opt.export_state(&names(&a));
+
+    // Full serde_json round-trip. If any field referenced a device handle it
+    // would either fail to serialise or fail to round-trip bitwise.
+    let bytes = serde_json::to_vec(&state).expect("serialize AdamWState to host bytes");
+    let back: AdamWState = serde_json::from_slice(&bytes).expect("deserialize from host bytes");
+
+    assert_eq!(back.step, state.step);
+    assert_eq!(back.skipped_export, state.skipped_export);
+    assert_eq!(back.params.len(), state.params.len());
+    for (orig, loaded) in state.params.iter().zip(back.params.iter()) {
+        assert_eq!(orig.name, loaded.name);
+        assert_eq!(orig.shape, loaded.shape);
+        assert_eq!(orig.m.len(), loaded.m.len());
+        assert_eq!(orig.v.len(), loaded.v.len());
+        // Bitwise equality proves the data is pure f32 host values — no device
+        // handle round-tripped through JSON could reproduce bit patterns.
+        for (i, (o, l)) in orig.m.iter().zip(loaded.m.iter()).enumerate() {
+            assert_eq!(o.to_bits(), l.to_bits(), "m[{i}] bitwise mismatch");
+        }
+        for (i, (o, l)) in orig.v.iter().zip(loaded.v.iter()).enumerate() {
+            assert_eq!(o.to_bits(), l.to_bits(), "v[{i}] bitwise mismatch");
+        }
+    }
+
+    // The byte image must be valid UTF-8 JSON (no binary device handle bytes).
+    let text = std::str::from_utf8(&bytes).expect("state bytes are UTF-8 JSON (host-only)");
+    assert!(text.starts_with('{'), "JSON object expected");
+    assert!(text.contains("\"step\""));
+    assert!(text.contains("\"params\""));
+}

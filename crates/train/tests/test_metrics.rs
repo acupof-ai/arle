@@ -142,3 +142,66 @@ fn jsonl_sink_missing_parent_dir_errors() {
     let res = JsonlSink::create(&bogus);
     assert!(res.is_err(), "expected missing-parent-dir error");
 }
+
+// M-8 — guard against manual-JSON-string-building drift: every line written
+// by JsonlSink must parse cleanly with serde_json and round-trip the fields
+// emitted. If someone "optimises" emit() into hand-rolled string concat, this
+// catches dropped quoting / numeric formatting regressions.
+#[test]
+fn jsonl_line_is_parseable_by_serde_json() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("parseable.jsonl");
+
+    {
+        let mut sink = JsonlSink::create(&path).expect("create jsonl");
+        // Mix of float magnitudes and a negative value — exercises the
+        // default number formatter.
+        let f1 = [("loss", 2.5f64), ("lr", 3e-4f64)];
+        sink.emit(&MetricSample {
+            step: 1,
+            fields: &f1,
+        });
+        let f2 = [("loss", -0.125f64), ("grad_norm", 1.5e-12f64)];
+        sink.emit(&MetricSample {
+            step: 2,
+            fields: &f2,
+        });
+        // NaN + Inf serialise as JSON null per M-4/M-5; the line must still
+        // parse as a well-formed JSON object (regression would be "NaN" leaking
+        // into the stream and breaking serde_json).
+        let f3 = [
+            ("loss", f64::NAN),
+            ("tokens_per_s", 1234.5f64),
+            ("grad_norm", f64::INFINITY),
+        ];
+        sink.emit(&MetricSample {
+            step: 3,
+            fields: &f3,
+        });
+        sink.flush();
+    }
+
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 3, "expected 3 lines, got {:?}", lines);
+
+    // Every line parses as a JSON object and carries the emitted fields.
+    let v1: serde_json::Value = serde_json::from_str(&lines[0]).expect("line 1 parses");
+    assert!(v1.is_object(), "line 1 must be a JSON object");
+    assert_eq!(v1["step"], serde_json::json!(1));
+    assert_eq!(v1["loss"].as_f64().unwrap(), 2.5);
+    assert_eq!(v1["lr"].as_f64().unwrap(), 3e-4);
+
+    let v2: serde_json::Value = serde_json::from_str(&lines[1]).expect("line 2 parses");
+    assert!(v2.is_object());
+    assert_eq!(v2["step"], serde_json::json!(2));
+    assert_eq!(v2["loss"].as_f64().unwrap(), -0.125);
+    assert_eq!(v2["grad_norm"].as_f64().unwrap(), 1.5e-12);
+
+    let v3: serde_json::Value = serde_json::from_str(&lines[2]).expect("line 3 parses");
+    assert!(v3.is_object());
+    assert_eq!(v3["step"], serde_json::json!(3));
+    // NaN / Inf must have been substituted with JSON null per the sink contract.
+    assert!(v3["loss"].is_null(), "NaN should serialise as null");
+    assert_eq!(v3["tokens_per_s"].as_f64().unwrap(), 1234.5);
+    assert!(v3["grad_norm"].is_null(), "Inf should serialise as null");
+}
