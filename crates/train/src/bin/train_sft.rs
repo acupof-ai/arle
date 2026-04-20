@@ -1,22 +1,27 @@
 use std::{
+    cell::RefCell,
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    rc::Rc,
     str::FromStr,
     sync::Arc,
-    time::Instant,
 };
 
 use autograd::{
-    AutogradError, Backend, CpuBackend, SafetensorsRegistry, Tape, TensorId, TensorStore,
+    AutogradError, Backend, ConstantLr, CpuBackend, SafetensorsRegistry, Tape, TensorId,
+    TensorStore,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
 use thiserror::Error;
 use train::{
+    StepOutcome, Trainer, TrainerConfig,
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
+    grad_clip::NoClip,
+    metrics::StdoutSink,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
@@ -163,6 +168,12 @@ fn run() -> Result<(), CliError> {
             "qwen3 model exposed no trainable parameters".into(),
         ));
     }
+    let param_names = model
+        .param_name_map()
+        .into_iter()
+        .filter(|(_, id)| params.contains(id))
+        .map(|(name, id)| (id, name.to_string()))
+        .collect::<Vec<_>>();
 
     let raw_examples = load_jsonl(&args.data)?;
     let dataset = raw_examples
@@ -188,68 +199,109 @@ fn run() -> Result<(), CliError> {
         ));
     }
 
-    let mut optimizer = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    // --- Trainer setup (Wave 3 migration) ---
+    let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    let schedule = ConstantLr(args.lr);
+    let metrics: Box<dyn train::metrics::MetricSink> = Box::new(StdoutSink);
+    let trainer_cfg = TrainerConfig {
+        total_steps: args.steps as u64,
+        grad_accum_steps: args.batch.max(1) as u64,
+        log_every: args.log_every.max(1) as u64,
+        eval_every: None,
+        // The Trainer's built-in save_every writes `trainer_state.json +
+        // optimizer.safetensors` but NOT the bf16 model weights that infer
+        // wants — those go through the on_step_end hook below.
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: args.seed,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
+
     let mut tape = Tape::new();
-    let mut rng = LcgRng::seed(args.seed);
+    let rng = Rc::new(RefCell::new(LcgRng::seed(args.seed)));
+    let dataset_len = dataset.len();
+    let total_steps = args.steps;
+    let save_every = args.save_every;
+    let save_dtype = args.save_dtype;
 
-    for step in 0..args.steps {
-        let step_start = Instant::now();
-        optimizer.zero_grad(&params, &mut store);
+    // Step closure: forward + assistant-masked cross-entropy. Trainer handles
+    // the `1/batch` loss-scale + backward + optimizer.step + cleanup.
+    let rng_for_step = Rc::clone(&rng);
+    let model_ref = &model;
+    let cfg_ref = &cfg;
+    let dataset_ref = &dataset;
+    let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
+        let example_index = {
+            let mut rng = rng_for_step.borrow_mut();
+            sample_index(
+                &mut rng,
+                dataset_len,
+                ctx.step as usize,
+                ctx.micro_idx as usize,
+            )
+        };
+        let example = &dataset_ref[example_index];
+        let input_len = example.input_ids.len() - 1;
+        let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
+        let logits = model_ref
+            .forward(
+                ctx.store,
+                ctx.tape,
+                &example.input_ids[..input_len],
+                &position_ids,
+            )
+            .map_err(autograd_from_qwen3)?;
+        let loss_id = assistant_masked_causal_loss(
+            logits,
+            &example.labels[1..],
+            ctx.store,
+            ctx.tape,
+            cfg_ref,
+        )?;
+        Ok(StepOutcome {
+            loss_id,
+            token_count: input_len as u64,
+        })
+    };
 
-        let mut step_loss = 0.0_f32;
-        // Each micro-step's loss is already averaged over its own supervised
-        // tokens, so the gradient accumulated by tape.backward() is the
-        // per-example gradient. Scale by 1/batch before backward so the
-        // summed gradient equals the mean across micro-steps — otherwise
-        // the effective learning rate grows linearly with --batch.
-        let loss_scale = 1.0_f32 / args.batch.max(1) as f32;
-        for micro_step in 0..args.batch {
-            let example_index = sample_index(&mut rng, dataset.len(), step, micro_step);
-            step_loss += train_on_example(
-                &model,
-                &dataset[example_index],
-                &mut store,
-                &mut tape,
-                &cfg,
-                loss_scale,
-            )?;
-
-            tape.entries.clear();
-            tape.set_enabled(true);
-            let keep = retained_ids(&model_ids, &params, &store);
-            store.retain_ids(&keep);
+    // Post-step hook: dump bf16/f32 model weights to `<out>/step_<N>/` on
+    // `save_every` boundaries (and always on the final step). Mirrors the
+    // pre-migration behavior byte-for-byte.
+    let model_path = args.model.clone();
+    let out_path = args.out.clone();
+    let cfg_path = config_path.clone();
+    let tok_path = tokenizer_path.clone();
+    let registry_ref = &registry;
+    let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
+        let step_usize = step as usize;
+        if step_usize.is_multiple_of(save_every) || step_usize == total_steps {
+            save_checkpoint_via_registry(
+                &model_path,
+                &out_path,
+                step_usize,
+                registry_ref,
+                store,
+                &cfg_path,
+                &tok_path,
+                save_dtype,
+            )
+            .map_err(autograd_from_cli)?;
         }
+        Ok(())
+    };
 
-        optimizer.step(&params, &mut store);
-
-        tape.entries.clear();
-        tape.set_enabled(true);
-        let keep = retained_ids(&model_ids, &params, &store);
-        store.retain_ids(&keep);
-
-        let mean_loss = step_loss / args.batch as f32;
-        if step % args.log_every == 0 || step + 1 == args.steps {
-            println!(
-                "step={} loss={mean_loss:.6} lr={} ms={:.2}",
-                step + 1,
-                args.lr,
-                step_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        if (step + 1) % args.save_every == 0 || step + 1 == args.steps {
-            save_checkpoint(
-                &args.model,
-                &args.out,
-                step + 1,
-                &registry,
-                &mut store,
-                &config_path,
-                &tokenizer_path,
-                args.save_dtype,
-            )?;
-        }
-    }
+    trainer
+        .run_with_hooks(
+            &mut store,
+            &mut tape,
+            params,
+            param_names,
+            model_ids,
+            step_fn,
+            on_step_end,
+        )
+        .map_err(CliError::Autograd)?;
 
     Ok(())
 }
@@ -365,38 +417,13 @@ fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
     params
 }
 
-fn train_on_example(
-    model: &Qwen3Model,
-    example: &TokenizedSft,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-    cfg: &Qwen3Config,
-    loss_scale: f32,
-) -> Result<f32, CliError> {
-    let input_len = example.input_ids.len() - 1;
-    let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
-    let logits = model.forward(store, tape, &example.input_ids[..input_len], &position_ids)?;
-    let loss_id = assistant_masked_causal_loss(logits, &example.labels[1..], store, tape, cfg)?;
-    let loss = store.to_host(loss_id)?[0];
-    // Scale the loss used for backward so the accumulated per-example
-    // gradients average (rather than sum) across micro-steps. Reported loss
-    // is the unscaled value so log output remains human-meaningful.
-    let backward_id = if (loss_scale - 1.0).abs() > f32::EPSILON {
-        mul_scalar(loss_id, loss_scale, store, tape)?
-    } else {
-        loss_id
-    };
-    tape.backward(backward_id, store)?;
-    Ok(loss)
-}
-
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
     store: &mut TensorStore,
     tape: &mut Tape,
     cfg: &Qwen3Config,
-) -> Result<TensorId, CliError> {
+) -> autograd::Result<TensorId> {
     let logits_shape = store
         .get(logits)
         .ok_or(AutogradError::InvalidTensorId(logits))?
@@ -407,8 +434,8 @@ fn assistant_masked_causal_loss(
         .take(logits_shape.len() - 1)
         .product::<usize>();
     if labels.len() != target_count {
-        return Err(CliError::Custom(format!(
-            "shifted label count {} does not match logits prefix size {}",
+        return Err(leak_autograd_err(format!(
+            "train_sft: shifted label count {} does not match logits prefix size {}",
             labels.len(),
             target_count
         )));
@@ -416,22 +443,25 @@ fn assistant_masked_causal_loss(
 
     let valid_count = labels.iter().filter(|&&label| label >= 0).count();
     if valid_count == 0 {
-        return Err(CliError::Custom(
-            "example has no supervised assistant tokens after shifting".into(),
+        return Err(AutogradError::TapeInvariant(
+            "train_sft: example has no supervised assistant tokens after shifting",
         ));
     }
 
-    let gather_indices = labels
-        .iter()
-        .map(|&label| match usize::try_from(label) {
-            Ok(index) if index < cfg.vocab_size => Ok(index),
-            Ok(index) => Err(CliError::Custom(format!(
-                "label {index} is outside vocab size {}",
-                cfg.vocab_size
-            ))),
-            Err(_) => Ok(0),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut gather_indices: Vec<usize> = Vec::with_capacity(labels.len());
+    for &label in labels {
+        let idx = match usize::try_from(label) {
+            Ok(index) if index < cfg.vocab_size => index,
+            Ok(index) => {
+                return Err(leak_autograd_err(format!(
+                    "train_sft: label {index} is outside vocab size {}",
+                    cfg.vocab_size
+                )));
+            }
+            Err(_) => 0,
+        };
+        gather_indices.push(idx);
+    }
     let mask_values = labels
         .iter()
         .map(|&label| if label >= 0 { 1.0 } else { 0.0 })
@@ -447,10 +477,25 @@ fn assistant_masked_causal_loss(
     let mask = store.from_slice(&mask_values, &target_shape)?;
     let masked = mul(target_log_probs, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
-    Ok(mul_scalar(total, -1.0 / valid_count as f32, store, tape)?)
+    mul_scalar(total, -1.0 / valid_count as f32, store, tape)
 }
 
-fn save_checkpoint(
+/// Leak a `String` into a `&'static str` for `AutogradError::TapeInvariant`.
+/// Matches the pattern in `autograd/src/safetensors_io.rs` — fires at most
+/// once per run because the error immediately propagates up and aborts.
+fn leak_autograd_err(msg: String) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(msg.into_boxed_str()))
+}
+
+fn autograd_from_qwen3(err: Qwen3Error) -> AutogradError {
+    leak_autograd_err(format!("train_sft: qwen3 forward: {err}"))
+}
+
+fn autograd_from_cli(err: CliError) -> AutogradError {
+    leak_autograd_err(format!("train_sft: checkpoint save: {err}"))
+}
+
+fn save_checkpoint_via_registry(
     model_dir: &Path,
     out_dir: &Path,
     step: usize,
@@ -501,19 +546,4 @@ fn live_tensor_ids(store: &TensorStore) -> HashSet<TensorId> {
         .enumerate()
         .filter_map(|(tensor_id, slot)| slot.as_ref().map(|_| tensor_id))
         .collect()
-}
-
-fn retained_ids(
-    model_ids: &HashSet<TensorId>,
-    params: &[TensorId],
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = model_ids.clone();
-    for &param_id in params {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
 }
