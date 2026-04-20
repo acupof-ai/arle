@@ -323,7 +323,20 @@ fn send_text_delta(
         .map_err(|_| anyhow!("stream consumer dropped"))
 }
 
-struct StopChunkProcessor {
+/// Chunk-level stop-sequence guard.
+///
+/// Buffers streamed text and emits ready-to-send deltas while withholding
+/// the last `max_stop_len - 1` bytes — that tail could still complete a
+/// stop marker on the next chunk. When a stop is matched (anywhere in
+/// the unsent suffix, earliest wins), emits the delta up to the marker,
+/// flips `hit_stop`, and thereafter absorbs further chunks silently so
+/// the raw stop bytes never reach the consumer.
+///
+/// Also used by `BackendInferenceEngine::complete_stream` in
+/// `server_engine.rs` — share this, do not re-implement. (Exists
+/// separately in `backend/metal/runtime.rs:StopChunkProcessor`; that
+/// duplicate is out of scope here.)
+pub(crate) struct StopChunkProcessor {
     accumulated: String,
     sent_len: usize,
     stops: Vec<String>,
@@ -332,7 +345,7 @@ struct StopChunkProcessor {
 }
 
 impl StopChunkProcessor {
-    fn new(stops: Vec<String>) -> Self {
+    pub(crate) fn new(stops: Vec<String>) -> Self {
         let max_stop_len = stops.iter().map(String::len).max().unwrap_or(0);
         Self {
             accumulated: String::new(),
@@ -343,7 +356,7 @@ impl StopChunkProcessor {
         }
     }
 
-    fn push_chunk(&mut self, chunk: &str) -> Option<String> {
+    pub(crate) fn push_chunk(&mut self, chunk: &str) -> Option<String> {
         if self.hit_stop {
             return None;
         }
@@ -369,14 +382,14 @@ impl StopChunkProcessor {
         self.flush_ready(safe_end)
     }
 
-    fn finish(&mut self) -> Option<String> {
+    pub(crate) fn finish(&mut self) -> Option<String> {
         if self.hit_stop {
             return None;
         }
         self.flush_ready(self.accumulated.len())
     }
 
-    fn hit_stop(&self) -> bool {
+    pub(crate) fn hit_stop(&self) -> bool {
         self.hit_stop
     }
 
