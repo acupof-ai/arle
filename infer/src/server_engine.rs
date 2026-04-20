@@ -31,6 +31,7 @@ use crate::backend::{InferenceBackend, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use crate::session_persistence::SessionPersistence;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
