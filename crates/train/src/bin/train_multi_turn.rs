@@ -3,7 +3,7 @@
 //! grpo_loss_per_position -> AdamW. Mirrors `train_grpo` but on interleaved
 //! agent/observation episodes instead of suffix-only rollouts.
 
-use std::{collections::HashSet, env, str::FromStr, sync::Arc};
+use std::{collections::HashSet, env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use autograd::{
     AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
@@ -13,16 +13,15 @@ use train::{
     cli_args::{ArgError, next_value, parse_value},
     control::TrainingController,
     dataset::LcgRng,
+    grad_clip::clip_grad_norm,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
     lora::LoraConfig,
+    metrics::MetricSample,
     model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
-    trainer::clip_grad_norm,
 };
-
-const GRAD_CLIP_NORM: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -53,6 +52,8 @@ struct CliArgs {
     backend: BackendChoice,
     save_path: Option<String>,
     serve: Option<u16>,
+    grad_clip: Option<f32>,
+    metrics_jsonl: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,8 @@ impl Default for CliArgs {
             backend: BackendChoice::Cpu,
             save_path: None,
             serve: None,
+            grad_clip: Some(1.0),
+            metrics_jsonl: None,
         }
     }
 }
@@ -156,9 +159,28 @@ impl Environment for EchoSeparator {
     }
 }
 
-fn main() -> Result<(), CliError> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        // Display (not Debug): `#[error(transparent)]` delegates to the inner
+        // error's Display impl, so the user sees the real message instead of
+        // `Error: Custom("...")`. Mirrors the `train_sft.rs` / `train_grpo.rs`
+        // pattern.
+        Err(err) => {
+            eprintln!("[train_multi_turn] error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
+    if args.grad_clip.is_none() {
+        eprintln!("[train_multi_turn] gradient clipping disabled (--no-grad-clip)");
+    }
+    let mut metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
 
     let total_agent = args.agent_tokens * args.turns;
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
@@ -304,7 +326,14 @@ fn main() -> Result<(), CliError> {
 
         optimizer.zero_grad(&params, &mut store);
         tape.backward(loss_id, &mut store)?;
-        clip_grad_norm(&params, GRAD_CLIP_NORM, &mut store);
+        // `clip_grad_norm` is a no-op when `max_norm` is non-positive / non-
+        // finite (see its sanitize-at-boundary contract landed in 429efc3),
+        // so `--grad-clip 0 / NaN / inf` collapse to "disabled" without
+        // panicking. The `if let Some` gate covers the `--no-grad-clip`
+        // case.
+        if let Some(max_norm) = args.grad_clip {
+            clip_grad_norm(&params, max_norm, &mut store);
+        }
         optimizer.step(&params, &mut store);
 
         tape.entries.clear();
@@ -316,10 +345,17 @@ fn main() -> Result<(), CliError> {
         let mean_turn_reward = mean_per_turn(&per_turn_rewards);
         reward_trajectory.push(mean_turn_reward);
         best_reward = best_reward.max(mean_turn_reward);
-        println!(
-            "mt iter {iter}: loss {loss_value:.4} mean_reward {mean_turn_reward:.4} \
-             best_reward {best_reward:.4} mean_kl {last_kl:.4}"
-        );
+        // Emit via the sink only; `open_sink(_, true)` already tees to
+        // StdoutSink, so a parallel `println!` would double-print.
+        metrics.emit(&MetricSample {
+            step: iter as u64 + 1,
+            fields: &[
+                ("loss", loss_value as f64),
+                ("mean_reward", mean_turn_reward as f64),
+                ("best_reward", best_reward as f64),
+                ("mean_kl", last_kl as f64),
+            ],
+        });
 
         let wall_so_far = loop_start.elapsed().as_secs_f32();
         controller.update(|s| {
@@ -613,6 +649,13 @@ fn parse_args() -> Result<CliArgs, CliError> {
             }
             "--serve" => {
                 args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--grad-clip" => {
+                args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--no-grad-clip" => args.grad_clip = None,
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
