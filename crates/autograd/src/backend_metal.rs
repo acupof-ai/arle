@@ -450,6 +450,36 @@ impl Backend for MetalBackend {
     // rank-0 `mlx_array` via `mlx_array_new_float32` and freed after the
     // multiply; MLX broadcasts rank-0 scalars across any rank. Shape is
     // passed through (unused — output matches input shape). M5.3b.13.
+    // M5.3b.17: elementwise `a * b` via `mlx_multiply`. Hot-path in
+    // Qwen3.5: `attn * gate` (sigmoid-gated attention, 1 per layer) and
+    // `silu(gate) * up` (MLP SwiGLU activation, 1 per layer). Shapes must
+    // match on both sides (caller validates; MLX's `mlx_multiply` actually
+    // broadcasts right-aligned but this wrapper is for the elementwise
+    // `ops::mul` which keeps shape equality as a precondition).
+    fn mul(&self, a: &DeviceHandle, b: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(a_handle) = a else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot mul a non-metal lhs handle",
+            ));
+        };
+        let DeviceHandle::Metal(b_handle) = b else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot mul a non-metal rhs handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+        unsafe {
+            let out = mlx_multiply(a_handle.as_ptr(), b_handle.as_ptr());
+            if out.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (elementwise mul)",
+                ));
+            }
+            Ok(DeviceHandle::Metal(MlxHandle::from_raw(out)))
+        }
+    }
+
     fn mul_scalar(&self, x: &DeviceHandle, s: f32, _shape: &[usize]) -> Result<DeviceHandle> {
         let DeviceHandle::Metal(x_handle) = x else {
             return Err(AutogradError::TapeInvariant(
