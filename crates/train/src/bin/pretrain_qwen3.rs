@@ -414,6 +414,13 @@ fn main() -> Result<(), CliError> {
     // `params ∪ grads` itself, so we pass `model_ids` as the extra set.
     let keep_extra: HashSet<TensorId> = model_ids.clone();
 
+    // Codex review 2026-04-20 on bd5e277 (High): the eval closure needs its
+    // own copy of `params` and the model-id set so it can call
+    // `train::cleanup_after_backward` per eval window. Clone before the
+    // Trainer consumes `params` / `keep_extra`.
+    let eval_keep: Vec<TensorId> = params.clone();
+    let eval_model_ids: HashSet<TensorId> = model_ids.clone();
+
     // Sampler RNGs live outside the closures so their state persists across
     // step_fn invocations. The seed derivations match the hand-written loop
     // exactly: `args.seed ^ start_step` for train windows,
@@ -461,7 +468,7 @@ fn main() -> Result<(), CliError> {
     // Trainer's internal cleanup runs after the closure returns.
     let eval_windows = args.eval_windows;
     let seq = args.seq;
-    let eval_fn = |store: &mut TensorStore, tape: &mut Tape| -> AutogradResult<EvalOutcome> {
+    let eval_fn = move |store: &mut TensorStore, tape: &mut Tape| -> AutogradResult<EvalOutcome> {
         if eval_upper == 0 || eval_tokens_ref.is_empty() {
             return Ok(EvalOutcome {
                 loss: f32::NAN,
@@ -488,6 +495,14 @@ fn main() -> Result<(), CliError> {
             sum += store.to_host(loss_id)?[0];
             count += 1;
             tape.entries.clear();
+            // Codex review 2026-04-20 on bd5e277 (High): without this prune,
+            // the forward graph for every eval window accumulates in the
+            // store, so `--eval-windows N` with a large `--seq` OOMs.
+            // `cleanup_after_backward` re-enables the tape internally (it
+            // was designed for the training-path post-backward call site);
+            // flip it back off for the next window.
+            train::cleanup_after_backward(store, tape, &eval_keep, &eval_model_ids);
+            tape.set_enabled(false);
         }
         tape.set_enabled(true);
         Ok(EvalOutcome {

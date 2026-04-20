@@ -51,4 +51,6 @@ pub mod verifier;
 
 pub use grad_accum::GradAccumulator;
 pub use metrics::*;
-pub use trainer::{EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig};
+pub use trainer::{
+    EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig, cleanup_after_backward,
+};
