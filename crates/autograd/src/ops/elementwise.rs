@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
@@ -89,6 +89,56 @@ pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
 }
 
 pub fn mul_scalar(
+    a: TensorId,
+    k: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let tensor = store.tensor(a)?;
+    let use_lazy = tensor.device_handle.is_some() && tensor.dirty != Dirty::Host;
+    if use_lazy {
+        mul_scalar_device_lazy(a, k, store, tape)
+    } else {
+        mul_scalar_host_eager(a, k, store, tape)
+    }
+}
+
+fn mul_scalar_device_lazy(
+    a: TensorId,
+    k: f32,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (input_shape, requires_grad) = {
+        let tensor = store.tensor(a)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+
+    store.ensure_device(a)?;
+    let a_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .expect("ensure_device")
+        .clone();
+
+    let out_handle = store.backend().mul_scalar(&a_handle, k, &input_shape)?;
+    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::MulScalar,
+            output_id,
+            input_ids: smallvec![a],
+            saved: SavedContext::TensorAndScalar(a, k),
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn mul_scalar_host_eager(
     a: TensorId,
     k: f32,
     store: &mut TensorStore,

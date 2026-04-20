@@ -120,7 +120,13 @@ pub fn mul_scalar(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(a)?;
+    // M5.3b.13: inner `elementwise::mul_scalar` dispatches on `a.dirty`;
+    // Dirty::Device/Both inputs stay lazy via `backend.mul_scalar` (MLX
+    // `mlx_multiply(x, scalar_arr)` — broadcast rank-0 scalar).
+    // Dirty::Host takes the host-eager path. Stripping `ensure_host` here
+    // is the enabler — Qwen3.5 attention scales q by `1/sqrt(d_head)`
+    // once per layer, and previously this forced a readback of every
+    // layer's q projection before softmax.
     elementwise::mul_scalar(a, k, store, tape)
 }
 

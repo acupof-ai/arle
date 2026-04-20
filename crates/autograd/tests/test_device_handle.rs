@@ -1,8 +1,8 @@
 #[cfg(feature = "metal")]
 use autograd::{
     AdamW, Tape, Tensor, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu,
-    ops::log_softmax, ops::matmul, ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::sum,
-    ops::transpose, tensor::Dirty,
+    ops::log_softmax, ops::matmul, ops::mul_scalar, ops::reshape, ops::rmsnorm, ops::rope,
+    ops::silu, ops::sum, ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1260,6 +1260,88 @@ fn metal_transpose_forward_stays_lazy() -> Result<()> {
     assert_eq!(metal_out.len(), cpu_out.len());
     for (a, b) in metal_out.iter().zip(cpu_out.iter()) {
         assert!((a - b).abs() <= 1e-5, "transpose parity: metal={a} cpu={b}");
+    }
+
+    Ok(())
+}
+
+/// M5.3b.13 acceptance: lazy `mul_scalar` on Metal composes
+/// `mlx_multiply(x, scalar_arr)` (broadcast rank-0 scalar) into the MLX
+/// graph. Fixture mirrors Qwen3.5 attention q-scaling: matmul output
+/// scaled by `1/sqrt(d_head)`, feeding into a `sum`. Must not force an
+/// eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_mul_scalar_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let m = 5usize;
+    let k = 4usize;
+    let n = 7usize;
+    let d_head = 8.0_f32;
+    let scale = 1.0 / d_head.sqrt();
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.017 - 0.25).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.023).sin()).collect();
+
+    let a = store.from_slice(&a_data, &[m, k])?;
+    let b = store.from_slice(&b_data, &[k, n])?;
+    store.get_mut(b).expect("b exists").requires_grad = true;
+
+    reset_eval_count();
+
+    let logits = matmul(a, b, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    let scaled = mul_scalar(logits, scale, &mut store, &mut tape)?;
+    let after_mul_scalar = eval_count();
+
+    let loss = sum(scaled, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_mul_scalar, 0,
+        "M5.3b.13: lazy mul_scalar forward must not force an eval; saw \
+         {after_mul_scalar}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::mul_scalar or a missing Dirty::Device dispatch in \
+         elementwise.rs."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity against CPU reference.
+    let metal_out = store
+        .get(scaled)
+        .expect("scaled output exists")
+        .data
+        .clone();
+    let cpu = CpuBackend;
+    let (cpu_mm, _shape) = cpu.matmul_forward(&a_data, &[m, k], &b_data, &[k, n])?;
+    let cpu_out: Vec<f32> = cpu_mm.iter().map(|v| v * scale).collect();
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (a, b) in metal_out.iter().zip(cpu_out.iter()) {
+        assert!(
+            (a - b).abs() <= 1e-5,
+            "mul_scalar parity: metal={a} cpu={b}"
+        );
     }
 
     Ok(())
