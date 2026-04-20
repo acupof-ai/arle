@@ -10,8 +10,7 @@ use std::{
 };
 
 use autograd::{
-    AutogradError, Backend, ConstantLr, CpuBackend, SafetensorsRegistry, Tape, TensorId,
-    TensorStore,
+    AutogradError, Backend, CpuBackend, SafetensorsRegistry, Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
@@ -21,7 +20,6 @@ use train::{
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     grad_clip::NoClip,
-    metrics::StdoutSink,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
@@ -86,6 +84,13 @@ struct CliArgs {
     log_every: usize,
     seed: u64,
     save_dtype: SaveDtype,
+    // Phase 2 acceptance flags (docs/plans/train-runtime-architecture-v1.md §9).
+    lr_schedule: String,
+    warmup_steps: u64,
+    min_lr: f32,
+    grad_accum_steps: Option<usize>,
+    metrics_jsonl: Option<PathBuf>,
+    resume_from: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -103,6 +108,12 @@ impl Default for CliArgs {
             log_every: 1,
             seed: 0,
             save_dtype: SaveDtype::Bf16,
+            lr_schedule: "constant".to_string(),
+            warmup_steps: 0,
+            min_lr: 0.0,
+            grad_accum_steps: None,
+            metrics_jsonl: None,
+            resume_from: None,
         }
     }
 }
@@ -201,11 +212,23 @@ fn run() -> Result<(), CliError> {
 
     // --- Trainer setup (Wave 3 migration) ---
     let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
-    let schedule = ConstantLr(args.lr);
-    let metrics: Box<dyn train::metrics::MetricSink> = Box::new(StdoutSink);
+    // `--grad-accum-steps` overrides `--batch` when passed; otherwise the
+    // pre-migration semantics ("batch folds grads into a single optim step")
+    // hold. max(1) to keep the zero-check above happy even if a user passes 0.
+    let grad_accum = args.grad_accum_steps.unwrap_or(args.batch).max(1) as u64;
+    let schedule: Box<dyn autograd::LrSchedule> = autograd::parse_lr_schedule(
+        &args.lr_schedule,
+        args.lr,
+        args.warmup_steps,
+        args.steps as u64,
+        args.min_lr,
+    )
+    .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
+    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let trainer_cfg = TrainerConfig {
         total_steps: args.steps as u64,
-        grad_accum_steps: args.batch.max(1) as u64,
+        grad_accum_steps: grad_accum,
         log_every: args.log_every.max(1) as u64,
         eval_every: None,
         // The Trainer's built-in save_every writes `trainer_state.json +
@@ -213,10 +236,19 @@ fn run() -> Result<(), CliError> {
         // wants — those go through the on_step_end hook below.
         save_every: None,
         save_dir: None,
-        resume_from: None,
+        resume_from: args.resume_from.clone(),
         rng_seed: args.seed,
     };
     let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
+
+    // Resume if `--resume-from` was passed. Restores optimizer state +
+    // trainer.step counter from the v2 checkpoint directory.
+    if args.resume_from.is_some() {
+        let resumed = trainer
+            .resume_if_configured(&param_names)
+            .map_err(CliError::Autograd)?;
+        eprintln!("[train_sft] resumed from step {resumed}");
+    }
 
     let mut tape = Tape::new();
     let rng = Rc::new(RefCell::new(LcgRng::seed(args.seed)));
@@ -334,6 +366,24 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.save_dtype = next_value(&mut iter, &flag)?
                     .parse()
                     .map_err(|value| CliError::Arg(ArgError::InvalidValue { flag, value }))?;
+            }
+            "--lr-schedule" => {
+                args.lr_schedule = next_value(&mut iter, &flag)?;
+            }
+            "--warmup-steps" => {
+                args.warmup_steps = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--min-lr" => {
+                args.min_lr = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--grad-accum-steps" => {
+                args.grad_accum_steps = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--resume-from" => {
+                args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
