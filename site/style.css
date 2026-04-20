@@ -30,9 +30,16 @@
 
 * { box-sizing: border-box; }
 
-html, body {
+html {
+  scroll-behavior: smooth;
   background: var(--paper);
   color: var(--ink);
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+html, body {
   margin: 0;
   padding: 0;
 }
@@ -77,6 +84,13 @@ a:hover {
   background: var(--coral);
   text-decoration: none;
   outline: 1px solid var(--coral);
+}
+a:focus-visible,
+.jumps a:focus-visible {
+  outline: 2px solid var(--coral);
+  outline-offset: 2px;
+  background: var(--paper-dim);
+  color: var(--ink);
 }
 
 b, strong { font-weight: 700; color: var(--ink); }
@@ -160,6 +174,9 @@ code      { font-family: inherit; color: var(--coral-dim); }
   color: var(--ochre);
   text-decoration: none;
   border: 0;
+  padding: 2px 4px;
+  display: inline-block;
+  transition: background-color 80ms ease, color 80ms ease;
 }
 .jumps a:hover {
   color: var(--paper);
@@ -171,6 +188,9 @@ code      { font-family: inherit; color: var(--coral-dim); }
 section {
   padding: 14px 0 10px;
   border-bottom: 1px dashed rgba(42,36,30,0.24);
+  /* clear fixed statusline when jumping via #anchor */
+  scroll-margin-top: 12px;
+  scroll-margin-bottom: 60px;
 }
 section:last-of-type { border-bottom: none; }
 
@@ -371,3 +391,36 @@ ul.news li:last-child, ul.seealso li:last-child { border-bottom: none; }
 
 /* prefers-color-scheme: we intentionally stay in paper-warm even when
    the OS prefers dark. agent-infer's visual identity is warm paper. */
+
+/* ── print: it IS a man page, so make it print like one ───────────── */
+
+@media print {
+  :root { --fs: 11pt; }
+  html, body {
+    background: #ffffff;
+    color: #000000;
+  }
+  body {
+    background-image: none;
+    padding-bottom: 0;
+  }
+  .statusline,
+  .jumps,
+  .caret { display: none !important; }
+  a {
+    color: inherit;
+    text-decoration: underline;
+  }
+  a[href^="http"]::after {
+    content: " (" attr(href) ")";
+    font-size: 9pt;
+    color: #444;
+  }
+  pre.cmd, pre.tbl, pre.diagram, pre.files {
+    background: #ffffff;
+    border: 1px solid #000;
+    box-shadow: none;
+  }
+  section { page-break-inside: avoid; }
+  .hero { page-break-after: avoid; }
+}

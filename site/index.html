@@ -9,6 +9,8 @@
 <meta property="og:title" content="agent-infer — pure-Rust LLM inference engine">
 <meta property="og:description" content="KV-cache-first inference engine for LLM agents. 4.6× faster TTFT than SGLang at c=1. CUDA + Metal backends.">
 <meta property="og:type" content="website">
+<meta property="og:url" content="https://cklxx.github.io/agent-infer/">
+<link rel="canonical" href="https://cklxx.github.io/agent-infer/">
 <link rel="stylesheet" href="./style.css">
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23F4EDE0'/><text x='16' y='22' font-family='monospace' font-size='22' text-anchor='middle' fill='%23D97757'>$</text></svg>">
 </head>
@@ -55,7 +57,8 @@
 
 <section id="synopsis">
 <h2>SYNOPSIS</h2>
-<pre class="cmd"><span class="p">$</span> agent-infer --model-path <u>Qwen3-4B</u> --port <u>8000</u>
+<pre class="cmd"><span class="p">$</span> infer --model-path <u>Qwen3-4B</u> --port <u>8000</u>      <span class="c"># cuda / linux</span>
+<span class="p">$</span> ./scripts/start_metal_serve.sh               <span class="c"># apple silicon</span>
 <span class="p">$</span> curl localhost:8000/v1/chat/completions \
     -H <i>'content-type: application/json'</i> \
     -d <i>'{"messages":[{"role":"user","content":"hi"}]}'</i><span class="caret"></span></pre>
@@ -90,13 +93,13 @@
   Qwen3-4B on A100-SXM4-40GB vs SGLang v0.5.9.
 </p>
 <pre class="tbl" aria-label="perf table">
-┌─────────────┬──────────────┬────────────┬──────────┬────────────┐
-│ concurrency │  throughput  │  vs sglang │   ttft   │  vs sglang │
-├─────────────┼──────────────┼────────────┼──────────┼────────────┤
-│      1      │  119.5 tok/s │    0.99×   │   8.6 ms │   <b>4.6× faster</b>│
-│      4      │  414.8 tok/s │    0.99×   │  53.1 ms │   <b>2.6× faster</b>│
-│      8      │  811.0 tok/s │    0.92×   │  68.7 ms │   <b>1.1× faster</b>│
-└─────────────┴──────────────┴────────────┴──────────┴────────────┘</pre>
+┌─────────────┬──────────────┬────────────┬──────────┬────────────────┐
+│ concurrency │  throughput  │  vs sglang │   ttft   │   vs sglang    │
+├─────────────┼──────────────┼────────────┼──────────┼────────────────┤
+│      1      │  119.5 tok/s │    0.99×   │   8.6 ms │  <b>4.6× faster</b>   │
+│      4      │  414.8 tok/s │    0.99×   │  53.1 ms │  <b>2.6× faster</b>   │
+│      8      │  811.0 tok/s │    0.92×   │  68.7 ms │  <b>1.1× faster</b>   │
+└─────────────┴──────────────┴────────────┴──────────┴────────────────┘</pre>
 <p class="note">
   &gt; the cache does the heavy lifting. full methodology + agent benchmark
   in <a href="https://github.com/cklxx/agent-infer/blob/main/README.md#performance">README</a>.
@@ -107,9 +110,9 @@
 <h2>BACKENDS</h2>
 <pre class="tbl">
 ┌───────────────────────────────┬────────────┬──────────────────────────────┐
-│ <b>cuda</b>   · linux / nvidia         │  stable    │ flashinfer · cuda graph      │
-│ <b>metal</b>  · apple silicon          │  beta      │ mlx-sys bridge · dflash on   │
-│ <b>cpu</b>    · smoke tests only       │  dev       │ not a production target      │
+│ <b>cuda</b>   · linux / nvidia       │  stable    │ flashinfer · cuda graph      │
+│ <b>metal</b>  · apple silicon        │  beta      │ mlx-sys bridge · dflash on   │
+│ <b>cpu</b>    · smoke tests only     │  dev       │ not a production target      │
 └───────────────────────────────┴────────────┴──────────────────────────────┘</pre>
 <p class="note">
   dflash (speculative decode) is default-on for Qwen3 &amp; Qwen3.5 on Metal
@@ -211,9 +214,9 @@
 <section id="news">
 <h2>NEWS</h2>
 <ul class="news">
-  <li><span class="date">2026-04-20</span>&nbsp; Metal DFlash long-prompt prefill fixed; default-on for Qwen3.5 on Metal, validated across guidellm 10-strategy sweep with 5400-token prompts.</li>
-  <li><span class="date">2026-04-19</span>&nbsp; DFlash ships default-on for Metal. Qwen3.5-4B-4bit bit-identical parity against scalar path.</li>
-  <li><span class="date">2026-04-16</span>&nbsp; Metal packed-batch concurrent decode: <code>extend_kv_cache</code> batch-dim bug repaired; packed decode stable under 4× / 8× concurrency.</li>
+  <li><time class="date" datetime="2026-04-20">2026-04-20</time>&nbsp; Metal DFlash long-prompt prefill fixed; default-on for Qwen3.5 on Metal, validated across guidellm 10-strategy sweep with 5400-token prompts.</li>
+  <li><time class="date" datetime="2026-04-19">2026-04-19</time>&nbsp; DFlash ships default-on for Metal. Qwen3.5-4B-4bit bit-identical parity against scalar path.</li>
+  <li><time class="date" datetime="2026-04-16">2026-04-16</time>&nbsp; Metal packed-batch concurrent decode: <code>extend_kv_cache</code> batch-dim bug repaired; packed decode stable under 4× / 8× concurrency.</li>
 </ul>
 <p class="note">
   full history: <a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a>
