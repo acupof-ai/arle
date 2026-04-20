@@ -257,6 +257,21 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Elementwise `out = 1 / (1 + exp(-a))`.
+    fn sigmoid_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
+        cpu_sigmoid_forward(a)
+    }
+
+    /// Device-handle variant of `sigmoid_forward`. Lazy on backends with a
+    /// native `sigmoid` graph node (Metal: `mlx_sigmoid`); the default
+    /// implementation falls back to `readback → host compute → upload`
+    /// so CPU/CUDA need no special-case. M5.3b.18.
+    fn sigmoid(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.sigmoid_forward(&host)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * b` over identically-sized contiguous tensors.
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         cpu_mul_forward(a, b)
@@ -1141,6 +1156,13 @@ pub fn cpu_gelu_forward(a: &[f32]) -> Result<Vec<f32>> {
 pub fn cpu_silu_forward(a: &[f32]) -> Result<Vec<f32>> {
     Ok(a.iter()
         .map(|&x| x * (1.0_f32 / (1.0_f32 + (-x).exp())))
+        .collect())
+}
+
+/// CPU reference sigmoid: `out = 1 / (1 + exp(-a))`.
+pub fn cpu_sigmoid_forward(a: &[f32]) -> Result<Vec<f32>> {
+    Ok(a.iter()
+        .map(|&x| 1.0_f32 / (1.0_f32 + (-x).exp()))
         .collect())
 }
 

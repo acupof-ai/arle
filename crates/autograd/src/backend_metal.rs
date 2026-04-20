@@ -445,6 +445,35 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy elementwise sigmoid: pipes `x` through `mlx_sigmoid` with no
+    // `mlx_eval`. The returned handle owns the sigmoid result. Shape is
+    // passed through (unused on the MLX side — output matches the input
+    // shape). Qwen3.5 attention gates `gate = sigmoid(gate_proj)` once per
+    // layer × 28 layers. M5.3b.18.
+    fn sigmoid(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot sigmoid a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // the `out_arr` result is transferred into the returned `MlxHandle`.
+        let out = unsafe {
+            let out_arr = mlx_sigmoid(x_handle.as_ptr());
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_sigmoid returned null (sigmoid)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
     // Lazy scalar-broadcast multiply: composes `mlx_multiply(x, scalar)`
     // into the MLX graph with no `mlx_eval`. The scalar is allocated as a
     // rank-0 `mlx_array` via `mlx_array_new_float32` and freed after the

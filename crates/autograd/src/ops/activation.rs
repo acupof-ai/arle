@@ -227,12 +227,58 @@ fn silu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 }
 
 pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    // M5.3b.18: route Dirty::Device inputs through the lazy `backend.sigmoid`
+    // (pipes a single `mlx_sigmoid` node into the MLX graph, no eval).
+    // Dirty::Host stays on the host fast path. Dispatch covers Dirty::Both
+    // so post-matmul / post-reshape inputs also stay lazy. Backward reads
+    // the saved output `y` via `tape.backward`'s pre-walk flush, so
+    // `sigmoid_backward` always sees Dirty::Host even when forward stays
+    // lazy. Mirrors the M5.3b.4 exp dispatch shape.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        sigmoid_device_lazy(x, store, tape)
+    } else {
+        sigmoid_host_eager(x, store, tape)
+    }
+}
+
+fn sigmoid_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_device(x)?;
+    let (input_shape, requires_grad) = {
+        let tensor = store.tensor(x)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let input_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "sigmoid: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store.backend().sigmoid(&input_handle, &input_shape)?;
+    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Sigmoid,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::SigmoidCtx { y: output_id },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn sigmoid_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
-    let output: Vec<f32> = input
-        .data
-        .iter()
-        .map(|&value| 1.0 / (1.0 + (-value).exp()))
-        .collect();
+    let output = store.backend().sigmoid_forward(&input.data)?;
     let output_id = store.alloc(Tensor::new(
         output,
         input.shape.clone(),
