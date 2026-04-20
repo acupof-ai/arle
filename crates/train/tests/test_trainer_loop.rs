@@ -1061,6 +1061,155 @@ fn resume_accepts_legacy_bare_linear_warmup_name() {
     assert_eq!(trainer.step(), 3);
 }
 
+/// Codex review 2026-04-20 on bd5e277 (Medium): Trainer's eval branch only
+/// fired on `self.step.is_multiple_of(eval_n)`, so a run where
+/// `total_steps % eval_every != 0` silently lost its final-step eval sample.
+/// Mirror the save branch's `|| is_final` pattern; pin the behavior here.
+#[test]
+fn eval_final_step_forced_even_when_steps_mod_eval_every() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 5,
+        grad_accum_steps: 1,
+        log_every: 100, // suppress training emits, we only care about eval here
+        eval_every: Some(2),
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(NullSink), cfg);
+
+    let observed: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+    let observed_eval = Rc::clone(&observed);
+    let step_counter = Rc::new(RefCell::new(0u64));
+    let step_counter_eval = Rc::clone(&step_counter);
+
+    trainer
+        .run_with_eval(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+            move |_store, _tape| {
+                let mut counter = step_counter_eval.borrow_mut();
+                *counter += 1;
+                // Infer the current trainer.step by reconstructing from the
+                // eval boundary pattern: eval fires at 2, 4, and final=5.
+                // We push the call-order so the assertion can compare to the
+                // expected [2, 4, 5] sequence.
+                observed_eval.borrow_mut().push(match *counter {
+                    1 => 2,
+                    2 => 4,
+                    3 => 5,
+                    other => other + 100, // sentinel for unexpected extra calls
+                });
+                Ok(train::EvalOutcome {
+                    loss: 0.0,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run_with_eval");
+
+    let seen = observed.borrow();
+    assert_eq!(
+        seen.as_slice(),
+        &[2u64, 4, 5],
+        "eval should fire at multiples-of-2 (2, 4) AND the final step (5). \
+         Without the |is_final force, this would be [2, 4] and miss step 5."
+    );
+}
+
+/// Codex review 2026-04-20 on bd5e277 (High): the Trainer's eval branch must
+/// prune the TensorStore after `eval_fn` returns so a single-call eval
+/// closure that allocates scratch tensors (or multi-window eval that forgets
+/// to clean up between windows) doesn't leave them in the store to blow up
+/// on the next training step. Exercised via a closure that deliberately
+/// allocates a scratch tensor and does not prune it.
+#[test]
+fn trainer_cleans_up_after_eval() {
+    let (mut store, p) = setup_param(&[0.3, -0.2, 0.1]);
+    let mut tape = Tape::new();
+
+    // Snapshot the live-id count before the loop — param (+ grad after the
+    // first optimizer step) is the baseline the post-eval cleanup must
+    // respect.
+    let pre_run_live_ids: usize = (0..store.tensors.len())
+        .filter(|&i| store.get(i).is_some())
+        .count();
+
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 4,
+        grad_accum_steps: 1,
+        log_every: 100,
+        eval_every: Some(2), // eval at step 2 and final step 4
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(NullSink), cfg);
+
+    trainer
+        .run_with_eval(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+            // Eval closure deliberately allocates a scratch tensor and does
+            // NOT prune it. Without the Trainer's post-eval cleanup those
+            // scratch ids would accumulate unboundedly across eval boundaries.
+            |store, _tape| {
+                for _ in 0..3 {
+                    let _scratch = store.alloc(
+                        Tensor::new(vec![0.0f32; 16], vec![16], false).expect("alloc scratch"),
+                    );
+                }
+                Ok(train::EvalOutcome {
+                    loss: 0.0,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run_with_eval");
+
+    assert!(tape.entries.is_empty(), "tape must be empty after run");
+    // Two eval calls × 3 scratch allocs = 6 leaked ids if the Trainer didn't
+    // prune after eval. The eval-close cleanup collapses them down to
+    // param (+ grad) plus anything the training path legitimately keeps.
+    let post_run_live_ids: usize = (0..store.tensors.len())
+        .filter(|&i| store.get(i).is_some())
+        .count();
+    assert!(
+        post_run_live_ids <= pre_run_live_ids + 2,
+        "store grew unboundedly: pre={pre_run_live_ids}, post={post_run_live_ids} \
+         (expected <= pre+2 for param+grad; eval scratch tensors must have been pruned)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Small shims on top of `Trainer::optim()` so the assertion-time call sites
 // stay focused on what they're proving.

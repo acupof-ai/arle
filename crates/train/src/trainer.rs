@@ -515,10 +515,21 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             }
 
             // ---- eval ----
+            // Codex review 2026-04-20 on bd5e277 (Medium): also fire on the
+            // final step so `--steps` not divisible by `--eval-every` still
+            // gets the closing eval sample. Mirrors the save branch below.
             if let Some(eval_n) = self.cfg.eval_every
-                && self.step.is_multiple_of(eval_n)
+                && (self.step.is_multiple_of(eval_n) || is_final)
             {
                 let eval = eval_fn(store, tape)?;
+                // Codex review 2026-04-20 on bd5e277 (High): defensive
+                // post-eval cleanup. Multi-forward eval closures (see
+                // pretrain_qwen3's `--eval-windows N` path) accumulate
+                // forward temporaries across windows; even single-call evals
+                // can leave scratch tensors in the store. Prune down to
+                // `params ∪ grads ∪ keep_extra` so the next training step
+                // doesn't inherit eval temporaries.
+                cleanup_after_backward(store, tape, &params, &keep_extra);
                 // Codex review 44a7e19 (low): same redundant-step issue as the
                 // training-metrics emit — drop "step" from fields, sinks read
                 // it from sample.step.
@@ -596,7 +607,14 @@ fn wrap_checkpoint_err(err: CheckpointError) -> AutogradError {
 /// Matches the `tape.entries.clear(); tape.set_enabled(true);
 /// store.retain_ids(...)` idiom used across the hand-written training
 /// binaries (`pretrain.rs`, `train_sft.rs`, `train_grpo.rs`, …).
-fn cleanup_after_backward(
+///
+/// Exposed `pub` so eval closures that produce multi-forward activations
+/// (e.g. `pretrain_qwen3`'s `--eval-windows N` loop) can prune the store
+/// between windows. Note: this unconditionally re-enables the tape, which
+/// is correct for the post-backward path but NOT for an eval loop that
+/// wants the tape disabled across windows — the caller must re-disable
+/// with `tape.set_enabled(false)` after each invocation in that case.
+pub fn cleanup_after_backward(
     store: &mut TensorStore,
     tape: &mut Tape,
     params: &[TensorId],
