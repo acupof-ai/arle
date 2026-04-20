@@ -8,12 +8,13 @@ use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 use autograd::{AutogradError, Backend, CpuBackend, Tape, TensorStore, optim::AdamW};
 use thiserror::Error;
 use train::{
-    causal_lm::build_registry,
+    causal_lm::{build_adapter_registry, live_tensor_ids, save_materialized_registry},
     cli_args::{ArgError, next_value, parse_value},
     control::TrainingController,
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
+    lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     policy::{GrpoPolicy, GrpoPolicyConfig},
@@ -93,8 +94,8 @@ impl Default for CliArgs {
             clip_eps: 0.2,
             temperature: 1.0,
             gamma: 0.9,
-            lora_rank: 0,
-            lora_alpha: 0.0,
+            lora_rank: 8,
+            lora_alpha: 16.0,
             seed: 42,
             vocab_size: 32,
             target_range: 8,
@@ -143,6 +144,10 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
 enum CliError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Arg(#[from] ArgError),
     #[error(transparent)]
@@ -193,12 +198,11 @@ fn run() -> Result<(), CliError> {
     let total_agent = args.agent_tokens * args.turns;
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
     let seq_len = args.prompt_len + total_agent + total_obs;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
 
-    if args.lora_rank > 0 {
-        return Err(CliError::Custom(
-            "train_multi_turn: LoRA is not wired for the qwen3.5-family path".into(),
-        ));
-    }
     let separator = (args.vocab_size - 1).min(31);
     let config = qwen35_config(&args, seq_len, separator)?;
 
@@ -206,7 +210,7 @@ fn run() -> Result<(), CliError> {
     eprintln!("[train_multi_turn] backend={:?}", backend.device());
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
-    let policy = Qwen35Model::new(&config, &mut store)?;
+    let policy = Qwen35Model::new_with_lora(&config, Some(lora), &mut store)?;
     let params = trainable_param_ids(&policy, &store);
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let ref_model = policy.clone_frozen(&mut store);
@@ -362,7 +366,7 @@ fn run() -> Result<(), CliError> {
         if controller.take_save_request() {
             if let Some(path) = &args.save_path {
                 let step_dir =
-                    save_qwen35_checkpoint(path, iter + 1, &config, &policy, &mut store)?;
+                    save_qwen35_checkpoint(path, iter + 1, &config, &policy, &mut store, lora)?;
                 eprintln!(
                     "[train_multi_turn] save requested → flushed to {}",
                     step_dir.display()
@@ -424,6 +428,7 @@ fn run() -> Result<(), CliError> {
             &config,
             &policy,
             &mut store,
+            lora,
         )?;
         println!("checkpoint saved to {}", step_dir.display());
     }
@@ -491,9 +496,10 @@ fn save_qwen35_checkpoint(
     cfg: &Qwen35Config,
     model: &Qwen35Model,
     store: &mut TensorStore,
+    lora: LoraConfig,
 ) -> Result<PathBuf, CliError> {
-    let registry = build_registry(model);
     let out_dir = PathBuf::from(out_dir);
+    let keep_ids = live_tensor_ids(store);
     let step_dir = save_step_checkpoint(
         Qwen35StepCheckpoint {
             out_dir: out_dir.as_path(),
@@ -508,8 +514,22 @@ fn save_qwen35_checkpoint(
                 eos_token_id: cfg.eos_token_id,
             },
         },
-        |weights_path| registry.save_from(store, weights_path).map_err(Into::into),
+        |weights_path| {
+            let mut tape = Tape::new();
+            save_materialized_registry(model, store, &mut tape, weights_path, false)
+                .map_err(Into::into)
+        },
     )?;
+    store.retain_ids(&keep_ids);
+    let adapter_registry = build_adapter_registry(model);
+    if !adapter_registry.is_empty() {
+        adapter_registry.save_from(store, &step_dir.join("adapter_model.safetensors"))?;
+        let adapter_config = LoraAdapterConfig::new("synthetic://qwen35", "qwen35", lora);
+        std::fs::write(
+            step_dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&adapter_config)?,
+        )?;
+    }
     Ok(step_dir)
 }
 
@@ -749,5 +769,152 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             got: args.prompt_len,
         }));
     }
+    if args.lora_rank == 0 {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--lora-rank".into(),
+            value: "0".into(),
+        }));
+    }
+    if !(args.lora_alpha.is_finite() && args.lora_alpha > 0.0) {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--lora-alpha".into(),
+            value: args.lora_alpha.to_string(),
+        }));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
+    use serde_json::json;
+    use tempfile::tempdir;
+    use train::LoraAdapterConfig;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn save_qwen35_checkpoint_writes_merged_weights_and_adapter_artifacts() -> TestResult {
+        let tmp = tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+            }))?,
+        )
+        .expect("write config");
+        std::fs::write(model_dir.join("tokenizer.json"), "{}").expect("write tokenizer");
+
+        let cfg = Qwen35Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![2],
+            bos_token_id: Some(1),
+            eos_token_id: 2,
+            tie_word_embeddings: false,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            linear_num_key_heads: 4,
+            linear_key_head_dim: 8,
+            linear_num_value_heads: 4,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(16),
+            layer_types: vec![LayerType::FullAttention; 2],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        };
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let layer_names = cfg.layer_tensor_names(0);
+        let Qwen35AttentionTensorNames::Full(attn_names) = layer_names.attention else {
+            unreachable!("test config uses full attention");
+        };
+
+        let mut expected_store = TensorStore::default();
+        let expected_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut expected_store)?;
+        let mut save_store = TensorStore::default();
+        let save_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+
+        for (model, store) in [
+            (&expected_model, &mut expected_store),
+            (&save_model, &mut save_store),
+        ] {
+            let adapter_map = model.adapter_name_map();
+            let q_proj_a = *adapter_map
+                .get(format!("{}.lora_a", attn_names.q_proj).as_str())
+                .expect("adapter a");
+            let q_proj_b = *adapter_map
+                .get(format!("{}.lora_b", attn_names.q_proj).as_str())
+                .expect("adapter b");
+            store.get_mut(q_proj_a).expect("adapter a exists").data[0] = 1.0;
+            store.get_mut(q_proj_b).expect("adapter b exists").data[0] = 2.0;
+        }
+
+        let mut expected_tape = Tape::new();
+        let materialized = train::causal_lm::build_materialized_registry(
+            &expected_model,
+            &mut expected_store,
+            &mut expected_tape,
+        )?;
+        let expected_q = expected_store.to_host(
+            materialized
+                .get(attn_names.q_proj.as_str())
+                .expect("materialized q proj"),
+        )?;
+
+        let step_dir = save_qwen35_checkpoint(
+            out_dir.to_str().expect("utf8 out dir"),
+            4,
+            &cfg,
+            &save_model,
+            &mut save_store,
+            lora,
+        )?;
+
+        assert!(step_dir.join("model.safetensors").is_file());
+        assert!(step_dir.join("adapter_model.safetensors").is_file());
+        assert!(step_dir.join("adapter_config.json").is_file());
+        let adapter_config: LoraAdapterConfig = serde_json::from_str(&std::fs::read_to_string(
+            step_dir.join("adapter_config.json"),
+        )?)?;
+        assert_eq!(adapter_config.base_model_name_or_path, "synthetic://qwen35");
+        assert_eq!(
+            adapter_config.target_modules,
+            vec!["all-linear".to_string()]
+        );
+
+        let mut load_store = TensorStore::default();
+        let load_model = Qwen35Model::new_with_lora(&cfg, None, &mut load_store)?;
+        let mut registry = train::causal_lm::build_registry(&load_model);
+        registry.load_into_strict(&mut load_store, &step_dir.join("model.safetensors"))?;
+        let loaded_q = load_store.to_host(
+            *load_model
+                .param_name_map()
+                .get(attn_names.q_proj.as_str())
+                .expect("loaded q proj"),
+        )?;
+        assert_eq!(loaded_q, expected_q);
+        Ok(())
+    }
 }

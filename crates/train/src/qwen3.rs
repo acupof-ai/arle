@@ -1,4 +1,7 @@
-use std::{collections::HashMap, f32::consts::TAU};
+use std::{
+    collections::{HashMap, HashSet},
+    f32::consts::TAU,
+};
 
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
@@ -12,6 +15,7 @@ use thiserror::Error;
 
 use crate::{
     causal_lm::CausalLm,
+    lora::{LinearWithLora, LoraConfig},
     policy::{GrpoPolicy, GrpoPolicyConfig},
 };
 
@@ -36,19 +40,19 @@ pub type Result<T> = std::result::Result<T, Qwen3Error>;
 
 #[derive(Debug, Clone)]
 struct Qwen3Attention {
-    q_proj: TensorId,
-    k_proj: TensorId,
-    v_proj: TensorId,
-    o_proj: TensorId,
+    q_proj: LinearWithLora,
+    k_proj: LinearWithLora,
+    v_proj: LinearWithLora,
+    o_proj: LinearWithLora,
     q_norm: TensorId,
     k_norm: TensorId,
 }
 
 #[derive(Debug, Clone)]
 struct Qwen3Mlp {
-    gate_proj: TensorId,
-    up_proj: TensorId,
-    down_proj: TensorId,
+    gate_proj: LinearWithLora,
+    up_proj: LinearWithLora,
+    down_proj: LinearWithLora,
 }
 
 #[derive(Debug, Clone)]
@@ -85,9 +89,9 @@ impl Qwen3Layer {
         let seq_len = x_shape[1];
 
         let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
-        let q = linear_forward(h, self.self_attn.q_proj, store, tape)?;
-        let k = linear_forward(h, self.self_attn.k_proj, store, tape)?;
-        let v = linear_forward(h, self.self_attn.v_proj, store, tape)?;
+        let q = self.self_attn.q_proj.forward(h, store, tape)?;
+        let k = self.self_attn.k_proj.forward(h, store, tape)?;
+        let v = self.self_attn.v_proj.forward(h, store, tape)?;
 
         let q = split_heads(
             q,
@@ -134,7 +138,7 @@ impl Qwen3Layer {
             store,
             tape,
         )?;
-        let attn_out = linear_forward(attn, self.self_attn.o_proj, store, tape)?;
+        let attn_out = self.self_attn.o_proj.forward(attn, store, tape)?;
         let x = add(x, attn_out, store, tape)?;
 
         let h = rmsnorm(
@@ -144,11 +148,11 @@ impl Qwen3Layer {
             store,
             tape,
         )?;
-        let gate = linear_forward(h, self.mlp.gate_proj, store, tape)?;
-        let up = linear_forward(h, self.mlp.up_proj, store, tape)?;
+        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
+        let up = self.mlp.up_proj.forward(h, store, tape)?;
         let gate = silu(gate, store, tape)?;
         let act = mul(gate, up, store, tape)?;
-        let mlp_out = linear_forward(act, self.mlp.down_proj, store, tape)?;
+        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 }
@@ -156,6 +160,7 @@ impl Qwen3Layer {
 #[derive(Debug, Clone)]
 pub struct Qwen3Model {
     config: Qwen3Config,
+    lora: Option<LoraConfig>,
     layers: Vec<Qwen3Layer>,
     embed_tokens: TensorId,
     final_norm: TensorId,
@@ -163,30 +168,43 @@ pub struct Qwen3Model {
     cos_cache: TensorId,
     sin_cache: TensorId,
     param_names: HashMap<&'static str, TensorId>,
+    adapter_names: HashMap<&'static str, TensorId>,
     param_ids: Vec<TensorId>,
 }
 
 impl Qwen3Model {
     pub fn new(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<Self> {
+        Self::new_with_lora(cfg, None, store)
+    }
+
+    pub fn new_with_lora(
+        cfg: &Qwen3Config,
+        lora: Option<LoraConfig>,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
         cfg.validate()?;
 
         let mut param_names = HashMap::new();
+        let mut adapter_names = HashMap::new();
         let mut param_ids = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut register_param = |name: &'static str, id: TensorId| {
-            param_names.insert(name, id);
-            if seen.insert(id) {
-                param_ids.push(id);
-            }
-        };
+        let mut seen = HashSet::new();
+        let mut register_named =
+            |target: &mut HashMap<&'static str, TensorId>, name: &'static str, id: TensorId| {
+                target.insert(name, id);
+                if seen.insert(id) {
+                    param_ids.push(id);
+                }
+            };
+        let base_requires_grad = lora.is_none();
         let embed_tokens_name = cfg.embed_tokens_tensor_name();
         let embed_tokens = normal_parameter(
             embed_tokens_name,
             &[cfg.vocab_size, cfg.hidden_size],
             0.02,
+            base_requires_grad,
             store,
         )?;
-        register_param(embed_tokens_name, embed_tokens);
+        register_named(&mut param_names, embed_tokens_name, embed_tokens);
 
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
@@ -195,10 +213,11 @@ impl Qwen3Model {
                 "lm_head.weight",
                 &[cfg.vocab_size, cfg.hidden_size],
                 0.02,
+                base_requires_grad,
                 store,
             )?
         };
-        register_param("lm_head.weight", lm_head);
+        register_named(&mut param_names, "lm_head.weight", lm_head);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
@@ -215,65 +234,127 @@ impl Qwen3Model {
             let down_proj_name = leak_name(names.mlp_down_proj);
             let post_attention_layernorm_name = leak_name(names.post_attention_layernorm);
 
-            let input_layernorm = ones_parameter(input_layernorm_name, &[cfg.hidden_size], store)?;
-            let q_proj = normal_parameter(
+            let input_layernorm = ones_parameter(
+                input_layernorm_name,
+                &[cfg.hidden_size],
+                base_requires_grad,
+                store,
+            )?;
+            let q_proj = LinearWithLora::new(
                 q_proj_name,
-                &[cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size],
-                0.02,
+                cfg.hidden_size,
+                cfg.num_attention_heads * cfg.head_dim,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let k_proj = normal_parameter(
+            let k_proj = LinearWithLora::new(
                 k_proj_name,
-                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
-                0.02,
+                cfg.hidden_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let v_proj = normal_parameter(
+            let v_proj = LinearWithLora::new(
                 v_proj_name,
-                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
-                0.02,
+                cfg.hidden_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let o_proj = normal_parameter(
+            let o_proj = LinearWithLora::new(
                 o_proj_name,
-                &[cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim],
-                0.02,
+                cfg.num_attention_heads * cfg.head_dim,
+                cfg.hidden_size,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let q_norm = ones_parameter(q_norm_name, &[cfg.head_dim], store)?;
-            let k_norm = ones_parameter(k_norm_name, &[cfg.head_dim], store)?;
-            let gate_proj = normal_parameter(
+            let q_norm = ones_parameter(q_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
+            let k_norm = ones_parameter(k_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
+            let gate_proj = LinearWithLora::new(
                 gate_proj_name,
-                &[cfg.intermediate_size, cfg.hidden_size],
-                0.02,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let up_proj = normal_parameter(
+            let up_proj = LinearWithLora::new(
                 up_proj_name,
-                &[cfg.intermediate_size, cfg.hidden_size],
-                0.02,
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let down_proj = normal_parameter(
+            let down_proj = LinearWithLora::new(
                 down_proj_name,
-                &[cfg.hidden_size, cfg.intermediate_size],
-                0.02,
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                base_requires_grad,
+                lora,
                 store,
             )?;
-            let post_attention_layernorm =
-                ones_parameter(post_attention_layernorm_name, &[cfg.hidden_size], store)?;
+            let post_attention_layernorm = ones_parameter(
+                post_attention_layernorm_name,
+                &[cfg.hidden_size],
+                base_requires_grad,
+                store,
+            )?;
 
-            register_param(input_layernorm_name, input_layernorm);
-            register_param(q_proj_name, q_proj);
-            register_param(k_proj_name, k_proj);
-            register_param(v_proj_name, v_proj);
-            register_param(o_proj_name, o_proj);
-            register_param(q_norm_name, q_norm);
-            register_param(k_norm_name, k_norm);
-            register_param(gate_proj_name, gate_proj);
-            register_param(up_proj_name, up_proj);
-            register_param(down_proj_name, down_proj);
-            register_param(post_attention_layernorm_name, post_attention_layernorm);
+            register_named(&mut param_names, input_layernorm_name, input_layernorm);
+            for (name, id) in q_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in q_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            for (name, id) in k_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in k_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            for (name, id) in v_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in v_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            for (name, id) in o_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in o_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            register_named(&mut param_names, q_norm_name, q_norm);
+            register_named(&mut param_names, k_norm_name, k_norm);
+            for (name, id) in gate_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in gate_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            for (name, id) in up_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in up_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            for (name, id) in down_proj.parameter_name_map() {
+                register_named(&mut param_names, name, id);
+            }
+            for (name, id) in down_proj.adapter_name_map() {
+                register_named(&mut adapter_names, name, id);
+            }
+            register_named(
+                &mut param_names,
+                post_attention_layernorm_name,
+                post_attention_layernorm,
+            );
 
             layers.push(Qwen3Layer {
                 input_layernorm,
@@ -295,8 +376,13 @@ impl Qwen3Model {
         }
 
         let final_norm_name = cfg.norm_tensor_name();
-        let final_norm = ones_parameter(final_norm_name, &[cfg.hidden_size], store)?;
-        register_param(final_norm_name, final_norm);
+        let final_norm = ones_parameter(
+            final_norm_name,
+            &[cfg.hidden_size],
+            base_requires_grad,
+            store,
+        )?;
+        register_named(&mut param_names, final_norm_name, final_norm);
 
         let (cos_cache, sin_cache) = build_rope_cache(cfg, store)?;
         if seen.insert(cos_cache) {
@@ -308,6 +394,7 @@ impl Qwen3Model {
 
         Ok(Self {
             config: cfg.clone(),
+            lora,
             layers,
             embed_tokens,
             final_norm,
@@ -315,6 +402,7 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             param_names,
+            adapter_names,
             param_ids,
         })
     }
@@ -324,24 +412,12 @@ impl Qwen3Model {
     }
 
     pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
-        let cloned = Self::new(&self.config, store).expect("clone_frozen should preserve config");
-        let source_ids = self.all_parameter_ids();
-        let target_ids = cloned.all_parameter_ids();
-        assert_eq!(
-            source_ids.len(),
-            target_ids.len(),
-            "clone_frozen parameter topology drifted",
-        );
-
-        for (source_id, target_id) in source_ids.into_iter().zip(target_ids) {
-            let mut replacement = store
-                .get(source_id)
-                .cloned()
-                .expect("source parameter should remain readable");
-            replacement.requires_grad = false;
-            replacement.grad = None;
-            store.tensors[target_id] = Some(replacement);
-        }
+        let cloned = Self::new_with_lora(&self.config, self.lora, store)
+            .expect("clone_frozen should preserve config");
+        copy_frozen_tensor_map(&self.param_names, &cloned.param_names, store);
+        copy_frozen_tensor_map(&self.adapter_names, &cloned.adapter_names, store);
+        copy_frozen_tensor(self.cos_cache, cloned.cos_cache, store);
+        copy_frozen_tensor(self.sin_cache, cloned.sin_cache, store);
 
         cloned
     }
@@ -437,6 +513,73 @@ impl Qwen3Model {
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         self.param_names.clone()
     }
+
+    pub fn adapter_name_map(&self) -> HashMap<&'static str, TensorId> {
+        self.adapter_names.clone()
+    }
+
+    pub fn materialized_param_name_map(
+        &self,
+        store: &mut TensorStore,
+    ) -> Result<HashMap<&'static str, TensorId>> {
+        if self.lora.is_none() {
+            return Ok(self.param_names.clone());
+        }
+        let mut map = self.param_names.clone();
+        for layer in &self.layers {
+            let merged_q = {
+                let tensor = layer.self_attn.q_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_k = {
+                let tensor = layer.self_attn.k_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_v = {
+                let tensor = layer.self_attn.v_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_o = {
+                let tensor = layer.self_attn.o_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_gate = {
+                let tensor = layer.mlp.gate_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_up = {
+                let tensor = layer.mlp.up_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+            let merged_down = {
+                let tensor = layer.mlp.down_proj.merged_tensor(store)?;
+                store.alloc(tensor)
+            };
+
+            for (name, _) in layer.self_attn.q_proj.parameter_name_map() {
+                map.insert(name, merged_q);
+            }
+            for (name, _) in layer.self_attn.k_proj.parameter_name_map() {
+                map.insert(name, merged_k);
+            }
+            for (name, _) in layer.self_attn.v_proj.parameter_name_map() {
+                map.insert(name, merged_v);
+            }
+            for (name, _) in layer.self_attn.o_proj.parameter_name_map() {
+                map.insert(name, merged_o);
+            }
+            for (name, _) in layer.mlp.gate_proj.parameter_name_map() {
+                map.insert(name, merged_gate);
+            }
+            for (name, _) in layer.mlp.up_proj.parameter_name_map() {
+                map.insert(name, merged_up);
+            }
+            for (name, _) in layer.mlp.down_proj.parameter_name_map() {
+                map.insert(name, merged_down);
+            }
+        }
+        Ok(map)
+    }
 }
 
 impl GrpoPolicyConfig for Qwen3Config {
@@ -499,6 +642,18 @@ impl CausalLm for Qwen3Model {
     fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         Qwen3Model::param_name_map(self)
     }
+
+    fn adapter_name_map(&self) -> HashMap<&'static str, TensorId> {
+        Qwen3Model::adapter_name_map(self)
+    }
+
+    fn materialized_param_name_map(
+        &self,
+        store: &mut TensorStore,
+        _tape: &mut Tape,
+    ) -> autograd::Result<HashMap<&'static str, TensorId>> {
+        Qwen3Model::materialized_param_name_map(self, store).map_err(qwen3_to_autograd)
+    }
 }
 
 fn linear_forward(
@@ -548,6 +703,28 @@ fn linear_forward(
 
 fn qwen3_to_autograd(err: Qwen3Error) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
+}
+
+fn copy_frozen_tensor_map(
+    source: &HashMap<&'static str, TensorId>,
+    target: &HashMap<&'static str, TensorId>,
+    store: &mut TensorStore,
+) {
+    let mut names = source.keys().copied().collect::<Vec<_>>();
+    names.sort_unstable();
+    for name in names {
+        copy_frozen_tensor(source[&name], target[&name], store);
+    }
+}
+
+fn copy_frozen_tensor(source_id: TensorId, target_id: TensorId, store: &mut TensorStore) {
+    let mut replacement = store
+        .get(source_id)
+        .cloned()
+        .expect("source parameter should remain readable");
+    replacement.requires_grad = false;
+    replacement.grad = None;
+    store.tensors[target_id] = Some(replacement);
 }
 
 fn split_heads(
@@ -655,6 +832,7 @@ fn normal_parameter(
     name: &'static str,
     shape: &[usize],
     std: f32,
+    requires_grad: bool,
     store: &mut TensorStore,
 ) -> Result<TensorId> {
     let mut state = seed_from_name(name);
@@ -670,19 +848,20 @@ fn normal_parameter(
             data.push(std * radius * theta.sin());
         }
     }
-    Ok(store.alloc(Tensor::new(data, shape.to_vec(), true)?))
+    Ok(store.alloc(Tensor::new(data, shape.to_vec(), requires_grad)?))
 }
 
 fn ones_parameter(
     name: &'static str,
     shape: &[usize],
+    requires_grad: bool,
     store: &mut TensorStore,
 ) -> Result<TensorId> {
     let _ = name;
     Ok(store.alloc(Tensor::new(
         vec![1.0; shape.iter().product()],
         shape.to_vec(),
-        true,
+        requires_grad,
     )?))
 }
 

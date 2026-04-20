@@ -6,11 +6,12 @@ use autograd::{
 };
 use thiserror::Error;
 use train::{
-    StepCtx, StepOutcome, Trainer, TrainerConfig,
+    CausalLm, StepCtx, StepOutcome, Trainer, TrainerConfig,
     cli_args::{ArgError, next_value, parse_value},
     dataset::{CopyDataset, Dataset, LcgRng},
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
+    lora::LoraConfig,
     loss::cross_entropy_loss,
     model_family::{ModelFamily, synthetic_qwen3_config, synthetic_qwen35_dense_config},
     policy::{GrpoPolicy, GrpoPolicyConfig},
@@ -32,6 +33,8 @@ struct CliArgs {
     kl_coef: f32,
     temperature: f32,
     seed: u64,
+    lora_rank: usize,
+    lora_alpha: f32,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
 }
@@ -49,6 +52,8 @@ impl Default for CliArgs {
             kl_coef: 0.02,
             temperature: 1.0,
             seed: 42,
+            lora_rank: 8,
+            lora_alpha: 16.0,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
         }
@@ -71,11 +76,15 @@ enum CliError {
 
 trait SyntheticGrpoFamily {
     type Config: GrpoPolicyConfig + Clone;
-    type Model: GrpoPolicy<Config = Self::Config>;
+    type Model: GrpoPolicy<Config = Self::Config> + CausalLm<Config = Self::Config>;
 
     fn family_name() -> &'static str;
     fn build_config(seq: usize) -> Self::Config;
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError>;
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError>;
 }
 
 struct Qwen3GrpoFamily;
@@ -92,8 +101,12 @@ impl SyntheticGrpoFamily for Qwen3GrpoFamily {
         synthetic_qwen3_config(seq)
     }
 
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
-        Qwen3Model::new(cfg, store).map_err(Into::into)
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError> {
+        Qwen3Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
     }
 }
 
@@ -111,8 +124,12 @@ impl SyntheticGrpoFamily for Qwen35GrpoFamily {
         synthetic_qwen35_dense_config(seq)
     }
 
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
-        Qwen35Model::new(cfg, store).map_err(Into::into)
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError> {
+        Qwen35Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
     }
 }
 
@@ -160,9 +177,13 @@ fn run() -> Result<(), CliError> {
 
 fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliError> {
     let config = F::build_config(args.seq);
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = F::build_model(&config, &mut store)?;
+    let policy = F::build_model(&config, lora, &mut store)?;
     let params = trainable_param_ids(&policy, &store);
     if params.is_empty() {
         return Err(CliError::Custom(format!(
@@ -241,11 +262,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
     // export_state/import_state` were already sufficient, no Trainer
     // surface changes needed.
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    let param_names: Vec<(TensorId, String)> = params
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, format!("param.{i:04}")))
-        .collect();
+    let param_names = trainable_param_names(&policy, &params)?;
     optimizer
         .import_state(&sft_optim_state, &param_names)
         .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
@@ -340,14 +357,17 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 /// grad_norm=... ms_per_step=... tok_per_sec=...`). The teacher-forced
 /// `reward` print field is dropped — it required a logits device→host
 /// copy per step and only fed the println, no correctness concern.
-fn run_sft_phase(
+fn run_sft_phase<P>(
     args: &CliArgs,
-    policy: &impl GrpoPolicy,
+    policy: &P,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<AdamWState, CliError> {
+) -> Result<AdamWState, CliError>
+where
+    P: GrpoPolicy + CausalLm,
+{
     let optim = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     // Mirror pretrain.rs: `--grad-clip 0/NaN/inf` warns and falls through
     // to NoClip instead of panicking in `GlobalNorm::new`.
@@ -379,14 +399,7 @@ fn run_sft_phase(
     };
     let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
 
-    // Qwen3 exposes named parameters; synthesize stable
-    // names purely to satisfy the Trainer API (no optimizer-state
-    // persistence is wired — save_dir is None).
-    let param_names: Vec<(TensorId, String)> = params
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, format!("param.{i:04}")))
-        .collect();
+    let param_names = trainable_param_names(policy, params)?;
 
     let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
     let batch_shape = dataset.batch_shape();
@@ -417,6 +430,29 @@ fn run_sft_phase(
     Ok(trainer.optim().export_state(&param_names))
 }
 
+fn trainable_param_names<M: CausalLm>(
+    model: &M,
+    params: &[TensorId],
+) -> Result<Vec<(TensorId, String)>, CliError> {
+    let param_set = params.iter().copied().collect::<HashSet<_>>();
+    let mut names = model
+        .adapter_name_map()
+        .into_iter()
+        .filter_map(|(name, id)| param_set.contains(&id).then_some((id, name.to_string())))
+        .collect::<Vec<_>>();
+    names.sort_unstable_by(|(id_a, name_a), (id_b, name_b)| {
+        name_a.cmp(name_b).then_with(|| id_a.cmp(id_b))
+    });
+    if names.len() != params.len() {
+        return Err(CliError::Custom(format!(
+            "missing adapter names for {} trainable tensors (model exposed {} adapter names)",
+            params.len(),
+            names.len()
+        )));
+    }
+    Ok(names)
+}
+
 fn parse_args() -> Result<CliArgs, CliError> {
     let mut args = CliArgs::default();
     let mut iter = env::args().skip(1);
@@ -444,6 +480,12 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.temperature = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--lora-rank" => {
+                args.lora_rank = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--lora-alpha" => {
+                args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             "--grad-clip" => {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
@@ -468,6 +510,18 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         return Err(CliError::Autograd(AutogradError::InvalidRank {
             expected: "positive batch and group sizes",
             got: args.group_size.min(args.batch_prompts),
+        }));
+    }
+    if args.lora_rank == 0 {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--lora-rank".into(),
+            value: "0".into(),
+        }));
+    }
+    if !(args.lora_alpha.is_finite() && args.lora_alpha > 0.0) {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--lora-alpha".into(),
+            value: args.lora_alpha.to_string(),
         }));
     }
     Ok(())
@@ -527,6 +581,35 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trainable_param_names_use_adapter_names() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = Qwen3Config {
+            vocab_size: 128,
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            intermediate_size: 64,
+            max_position_embeddings: 16,
+            rms_norm_eps: 1.0e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: false,
+        };
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let mut store = TensorStore::default();
+        let model = Qwen3Model::new_with_lora(&cfg, Some(lora), &mut store)?;
+        let params = trainable_param_ids(&model, &store);
+        let names = trainable_param_names(&model, &params)?;
+        assert_eq!(names.len(), params.len());
+        assert!(names.iter().all(|(_, name)| name.contains(".lora_")));
+        assert!(names.iter().all(|(_, name)| !name.starts_with("param.")));
+        Ok(())
+    }
 
     /// Codex review 2026-04-20 on 09c5c89 (P2): `fn main() -> Result<(),
     /// CliError>` leaked the Debug format through to stderr (`Error:

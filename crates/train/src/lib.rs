@@ -20,6 +20,8 @@ pub mod grad_clip;
 pub mod grpo;
 #[path = "hub_dataset.rs"]
 pub mod hub_dataset;
+#[path = "lora.rs"]
+pub mod lora;
 #[path = "loss.rs"]
 pub mod loss;
 #[path = "metrics.rs"]
@@ -61,6 +63,7 @@ pub mod verifier;
 
 pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
+pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig};
 pub use metrics::*;
 pub use policy::{GrpoPolicy, GrpoPolicyConfig};
 pub use trainer::{
