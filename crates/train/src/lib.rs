@@ -12,6 +12,8 @@ pub mod curriculum;
 pub mod data_adapter;
 #[path = "dataset.rs"]
 pub mod dataset;
+#[path = "eval_lm.rs"]
+pub mod eval_lm;
 #[path = "grad_accum.rs"]
 pub mod grad_accum;
 #[path = "grad_clip.rs"]
@@ -62,6 +64,7 @@ pub mod trainer;
 pub mod verifier;
 
 pub use causal_lm::CausalLm;
+pub use eval_lm::{EvalExample, EvalSummary, evaluate_examples, load_eval_examples};
 pub use grad_accum::GradAccumulator;
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig};
 pub use metrics::*;
