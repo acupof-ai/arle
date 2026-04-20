@@ -454,12 +454,11 @@ impl MetalScheduler {
                 )
             });
 
-            if runtime.phase == MetalRequestPhase::Decoding && runtime.last_token.is_none() {
-                panic!(
-                    "Metal scheduler contract violation: admitted decode request {:?} missing last_token",
-                    state.req_id
-                );
-            }
+            assert!(
+                !(runtime.phase == MetalRequestPhase::Decoding && runtime.last_token.is_none()),
+                "Metal scheduler contract violation: admitted decode request {:?} missing last_token",
+                state.req_id
+            );
         }
     }
 
