@@ -1,5 +1,5 @@
-use std::io;
 use std::sync::Arc;
+use std::io;
 
 use axum::{
     Json, Router,
@@ -22,8 +22,6 @@ use crate::kv_tier::transport::disk::DiskBlockLocation;
 use crate::prefix_cache::{BlockId, RadixCache, ReconcileReport};
 #[cfg(test)]
 use std::collections::HashMap;
-#[cfg(test)]
-use std::io;
 #[cfg(test)]
 use std::path::PathBuf;
 
