@@ -53,7 +53,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 |---|---|---|
 | 硬件 | 单机单卡 NVIDIA（L40S/A100/H100 任一） | 分布式、多机、TP/PP/ZeRO |
 | Metal | 本地 dev 支线，M4 里程碑再做 | 和 CUDA 并行推进 |
-| 进程 | 目标态是统一 Rust 训练/推理栈，默认单进程起步；当前实现仍是独立 `train` crate + TCP control plane，后续允许异步 worker 边界 | 双栈分叉、各自维护模型真相 |
+| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现仍是独立 `train` crate + TCP control plane，后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
 | Autograd | **从零写，参考 mni-ml/framework 结构** | candle / burn / 包 PyTorch |
 | Op 集 | 只实现 LoRA+GRPO 用到的 ~7 个 op | 全量 op（conv/pool/full-attention-bwd） |
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |
@@ -70,11 +70,11 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 
 ## 3. 架构
 
-### 3.1 进程内数据流
+### 3.1 单机统一数据流（可同进程或异步 worker）
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Single Rust Process · CUDA                                      │
+│  Single Rust Node · CUDA                                         │
 │                                                                  │
 │  ┌───────────────┐   trajectory    ┌──────────────────────────┐  │
 │  │  Rollout      │──(prompt, resp, │  Trainer                 │  │
