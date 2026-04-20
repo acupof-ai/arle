@@ -45,6 +45,38 @@ second chunk cleanly. Making launches synchronous removed the crash, which
 isolates the bug to metadata/workspace lifetime across asynchronous stream
 execution.
 
+## Secondary Sweep Symptom
+
+The same bug also explains the later `sweep rate-controlled 0 req/s` symptom
+that showed up in the first SGLang-alignment benchmark run.
+
+The historical artefact at
+`bench-output/2026-04-20-infer-qwen3-4b-post-sglang-align-sweep/benchmarks.json`
+used the canonical sweep shape:
+
+- `prompt_tokens=4096,output_tokens=256`
+- `chunked_prefill_size=4096`
+- observed wire prompt length `4097` tokens (`4096 + 1`)
+
+That run reported:
+
+- synchronous row healthy: `7/7` successful
+- throughput row partially healthy, then degraded: `115` successful,
+  `1877` errored
+- every later constant-rate row: `0` successful, all requests errored with
+  HTTP `503`
+
+Those `503`s were not evidence of an independent rate-control bug. The HTTP
+layer maps both "waiting queue full" and "scheduler receiver is gone" to the
+same `503 Service Unavailable` surface. After the paged-prefill lifetime race
+poisoned the scheduler during the throughput leg, later sweep legs only saw
+the generic `503` symptom.
+
+After the forward-lifetime fix above, a fresh local sweep using the same
+`4097-token` canonical prompt shape advanced past the historical failure point:
+the synchronous row, throughput row, and multiple later constant-rate rows all
+completed requests instead of collapsing immediately to `0 req/s`.
+
 ## Fix
 
 Turn the paged-prefill forward itself into the synchronization boundary.
@@ -98,6 +130,13 @@ Result:
   `ITL p50 35.31 ms`, `ITL p99 35.32 ms`, `out tok/s 27.31`
 
 Artifacts: `bench-output/2026-04-20-p11-sync-fixed/`
+
+Additional sweep-level sanity check after the same fix:
+
+- reran the canonical `4096 -> 4097 on the wire` sweep shape locally
+- the new run progressed through the sync leg, the throughput leg, and later
+  constant-rate legs without reproducing the old immediate-all-`503` collapse
+  from `bench-output/2026-04-20-infer-qwen3-4b-post-sglang-align-sweep/`
 
 ## Rule
 
