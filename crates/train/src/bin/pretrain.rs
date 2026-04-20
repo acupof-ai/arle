@@ -1,16 +1,19 @@
 use std::{collections::HashSet, env, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use autograd::{
-    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
+    AutogradError, Backend, ConstantLr, CpuBackend, Result as AutogradResult, Tape, TensorId,
+    TensorStore, module::Module, optim::AdamW,
 };
 use thiserror::Error;
 use train::{
+    StepCtx, StepOutcome, Trainer, TrainerConfig,
     cli_args::{ArgError, next_value, parse_value},
     dataset::{BytesDataset, CopyDataset, CorpusDataset, Dataset},
+    grad_clip::{GlobalNorm, GradClip, NoClip},
     lora::LoraConfig,
+    loss::cross_entropy_loss,
     model::{Transformer, TransformerConfig},
     tokenizer::ChatTokenizer,
-    trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,7 @@ struct CliArgs {
     d_ff: Option<usize>,
     max_seq_len: Option<usize>,
     seed: u64,
+    metrics_jsonl: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -87,6 +91,7 @@ impl Default for CliArgs {
             d_ff: None,
             max_seq_len: None,
             seed: 0xCAFEBABE,
+            metrics_jsonl: None,
         }
     }
 }
@@ -99,6 +104,25 @@ enum CliError {
     Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
+}
+
+/// Wave 3 pretrain migration choice: `Trainer<O, C, S>` is generic on the
+/// clip policy, so `--no-grad-clip` vs `--grad-clip N` needs to collapse
+/// to a single concrete `C`. We keep `NoClip` + `GlobalNorm` as the
+/// real impls and forward through this enum so we don't have to
+/// monomorphise the Trainer twice.
+enum PretrainClip {
+    None(NoClip),
+    Norm(GlobalNorm),
+}
+
+impl GradClip for PretrainClip {
+    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> AutogradResult<f32> {
+        match self {
+            Self::None(c) => c.clip(store, params),
+            Self::Norm(c) => c.clip(store, params),
+        }
+    }
 }
 
 fn main() -> Result<(), CliError> {
@@ -172,7 +196,6 @@ fn main() -> Result<(), CliError> {
     let model = Transformer::new(config, &mut store)?;
     let params = model.parameters();
     let base_params = model.base_parameter_ids();
-    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
     let mut dataset = build_dataset(&args, tokenizer.as_ref(), config.vocab_size)?;
 
     if let Some(lora) = config.lora {
@@ -193,36 +216,88 @@ fn main() -> Result<(), CliError> {
         );
     }
 
-    let mut final_loss = f32::INFINITY;
-    for step in 0..args.steps {
-        let (input_ids, target_ids) = dataset.sample();
-        let (batch, seq_len) = dataset.batch_shape();
+    // ---- Trainer setup ----
+    // AdamW with the same defaults the hand-written loop used. `(0.9, 0.999)`
+    // + 1e-8 + wd 0.01 is the historical default for this binary (verified
+    // against the pre-migration commit) — flipping them would quietly change
+    // every convergence baseline.
+    let optim = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
+    let clip = match args.grad_clip {
+        Some(max_norm) => PretrainClip::Norm(GlobalNorm::new(max_norm)),
+        None => PretrainClip::None(NoClip),
+    };
+    let schedule = ConstantLr(args.lr);
+    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
 
-        tape.entries.clear();
-        tape.set_enabled(true);
+    // pretrain.rs did not support checkpoint save/resume in the hand-written
+    // loop — the custom `Transformer` has no safetensors codec (unlike
+    // `qwen3::Qwen3Model` in train_sft). Leaving both fields `None` preserves
+    // that prior semantics. Follow-up work: add a `TransformerRegistry`
+    // mirroring `SafetensorsRegistry` before wiring `save_every` here.
+    let trainer_cfg = TrainerConfig {
+        total_steps: args.steps as u64,
+        // Each `dataset.sample()` already produces a full batch; the
+        // hand-written loop ran one optimizer step per sample, so
+        // `grad_accum_steps = 1` preserves the historical semantics.
+        grad_accum_steps: 1,
+        log_every: args.log_every.max(1) as u64,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: args.seed,
+    };
+    let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
 
-        let logits = model.forward(&input_ids, batch, seq_len, &mut store, &mut tape)?;
-        let loss_id = cross_entropy_loss(logits, &target_ids, &mut store, &mut tape)?;
-        final_loss = store.to_host(loss_id)?[0];
+    // `param_name_map` — Transformer doesn't expose named parameters today;
+    // optimizer state persistence isn't wired anyway (save_dir is None), so
+    // we hand the Trainer synthetic stable names purely to satisfy the API.
+    // When the safetensors codec lands for Transformer, replace this with
+    // the real named-parameter map.
+    let param_names: Vec<(TensorId, String)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, format!("param.{i:04}")))
+        .collect();
 
-        optimizer.zero_grad(&params, &mut store);
-        tape.backward(loss_id, &mut store)?;
-        if let Some(max_norm) = args.grad_clip {
-            clip_grad_norm(&params, max_norm, &mut store);
-        }
-        optimizer.step(&params, &mut store);
-
-        tape.entries.clear();
-        tape.set_enabled(true);
-        let keep = retained_ids(&params, &base_params, &store);
-        store.retain_ids(&keep);
-
-        if step % args.log_every == 0 || step + 1 == args.steps {
-            println!("step {step}: loss {final_loss:.4}");
-        }
+    // keep_extra: base (frozen-or-not) parameter ids that aren't in the
+    // trainable `params` list — LoRA leaves the base matmul weights alive
+    // across backward passes, and the hand-written cleanup added them to the
+    // retain set (`retained_ids`). Matches that behaviour exactly.
+    let mut keep_extra: HashSet<TensorId> = HashSet::new();
+    for &id in &base_params {
+        keep_extra.insert(id);
     }
 
-    println!("final loss {final_loss:.4}");
+    let batch_shape = dataset.batch_shape();
+    let model_ref = &model;
+    let dataset_ref: &mut dyn Dataset = dataset.as_mut();
+    // `Cell`-free shim: the closure borrows `dataset` as `FnMut` so we can
+    // just call `dataset.sample()` directly each invocation.
+    let mut dataset_holder = Some(dataset_ref);
+    let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
+        let dataset = dataset_holder.as_mut().expect("dataset holder populated");
+        let (input_ids, target_ids) = dataset.sample();
+        let (batch, seq_len) = batch_shape;
+        let token_count = (batch * seq_len) as u64;
+
+        let logits = model_ref.forward(&input_ids, batch, seq_len, ctx.store, ctx.tape)?;
+        let loss_id = cross_entropy_loss(logits, &target_ids, ctx.store, ctx.tape)?;
+        Ok(StepOutcome {
+            loss_id,
+            token_count,
+        })
+    };
+
+    trainer.run(
+        &mut store,
+        &mut tape,
+        params,
+        param_names,
+        keep_extra,
+        step_fn,
+    )?;
     Ok(())
 }
 
@@ -290,6 +365,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--no-grad-clip" => args.grad_clip = None,
             "--backend" => {
                 args.backend = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
@@ -382,19 +460,4 @@ fn count_parameters(params: &[TensorId], store: &TensorStore) -> usize {
         .iter()
         .map(|&id| store.get(id).map_or(0, |tensor| tensor.size))
         .sum()
-}
-
-fn retained_ids(
-    params: &[TensorId],
-    base_params: &[TensorId],
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = HashSet::with_capacity((params.len() + base_params.len()) * 2);
-    for &param_id in params.iter().chain(base_params.iter()) {
-        keep.insert(param_id);
-        if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-            keep.insert(grad_id);
-        }
-    }
-    keep
 }
