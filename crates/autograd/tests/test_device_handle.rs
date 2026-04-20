@@ -1,8 +1,8 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use autograd::{
-    Tape, TensorStore, ops::embedding, ops::exp, ops::log_softmax, ops::matmul, ops::rmsnorm,
-    ops::rope, ops::silu, ops::sum,
+    Tape, TensorStore, ops::embedding, ops::exp, ops::gelu, ops::log_softmax, ops::matmul,
+    ops::rmsnorm, ops::rope, ops::silu, ops::sum,
 };
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
@@ -657,6 +657,85 @@ fn metal_embedding_forward_stays_lazy() -> Result<()> {
             diff <= 1e-5,
             "embedding parity: metal={m} cpu={c} diff={diff}"
         );
+    }
+
+    Ok(())
+}
+
+/// M5.3b.8 acceptance: `gelu` forward must compose into the MLX lazy
+/// graph as the erf form (`0.5 * x * (1 + erf(x/sqrt(2)))`) with no
+/// `mlx_eval` for a Dirty::Device `x`. `matmul → gelu → sum` records
+/// zero evals through the forward. Parity vs the inline erf formula
+/// used by `ops::activation::gelu`'s CPU eager path stays ≤ 1e-4 — the
+/// same erf formula, different erf implementations (MLX's builtin vs
+/// libm::erff) agree to the ULP range both use for f32 erf.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_gelu_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    const INV_SQRT_2: f32 = 0.707_106_77_f32;
+
+    let d_in = 16usize;
+    let d_out = 16usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    // Keep magnitudes moderate so erf stays in a well-conditioned range
+    // (|x| < 3-ish); matches the scale reaching GELU after a small matmul.
+    let x_data: Vec<f32> = (0..d_in).map(|i| (i as f32) * 0.05 - 0.4).collect();
+    let id_data: Vec<f32> = (0..d_in * d_out)
+        .map(|i| if i / d_out == i % d_out { 1.0 } else { 0.0 })
+        .collect();
+
+    let x = store.from_slice(&x_data, &[1, d_in])?;
+    let id = store.from_slice(&id_data, &[d_in, d_out])?;
+    store.get_mut(id).expect("id exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // `y` is Dirty::Device (lazy matmul output); gelu must stay lazy on it.
+    let y = matmul(x, id, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let act = gelu(y, &mut store, &mut tape)?;
+    let after_gelu = eval_count();
+    let loss = sum(act, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_gelu, 0,
+        "M5.3b.8: lazy gelu forward must not force an eval; saw {after_gelu}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}. \
+         Budget = tape.backward batch flush + mlx_matmul_backward FFI eval + \
+         1 slack for gelu_backward's host erf derivative."
+    );
+
+    // Parity: metal lazy output vs CPU erf formula on the same inputs.
+    let metal_out = store.get(act).expect("gelu output exists").data.clone();
+    let cpu_out: Vec<f32> = x_data
+        .iter()
+        .map(|&v| 0.5 * v * (1.0 + libm::erff(v * INV_SQRT_2)))
+        .collect();
+    assert_eq!(metal_out.len(), cpu_out.len());
+    for (m, c) in metal_out.iter().zip(cpu_out.iter()) {
+        let diff: f32 = (m - c).abs();
+        assert!(diff <= 1e-4, "gelu parity: metal={m} cpu={c} diff={diff}");
     }
 
     Ok(())
