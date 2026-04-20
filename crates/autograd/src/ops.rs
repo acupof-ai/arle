@@ -129,7 +129,9 @@ pub fn embedding(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(table)?;
+    // Inner dispatcher picks lazy-device vs host-eager via `table`'s dirty
+    // bit + device handle; each branch materializes the table on its own
+    // side. No eager readback here — that would defeat the lazy branch.
     embed::embedding(table, indices, store, tape)
 }
 
