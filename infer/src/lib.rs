@@ -35,10 +35,32 @@ pub mod types;
 pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    pub(crate) fn metal_test_guard() -> MutexGuard<'static, ()> {
+    pub(crate) struct MetalTestGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl MetalTestGuard {
+        fn clear_mlx_cache() {
+            // MLX keeps process-global Metal allocator state. Clear it at
+            // every test boundary so tiny unit tests do not inherit stale
+            // buffers or command-buffer pressure from earlier cases.
+            crate::backend::metal::mlx::clear_cache();
+        }
+    }
+
+    impl Drop for MetalTestGuard {
+        fn drop(&mut self) {
+            Self::clear_mlx_cache();
+        }
+    }
+
+    pub(crate) fn metal_test_guard() -> MetalTestGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MetalTestGuard::clear_mlx_cache();
+        MetalTestGuard { _lock: lock }
     }
 }
