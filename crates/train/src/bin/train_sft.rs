@@ -605,6 +605,7 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         ("num_key_value_heads", cfg.num_key_value_heads as i64),
         ("head_dim", cfg.head_dim as i64),
         ("vocab_size", cfg.vocab_size as i64),
+        ("max_position_embeddings", cfg.max_position_embeddings as i64),
     ]
     .iter()
     .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
@@ -629,6 +630,15 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         mismatches.push(format!(
             "tie_word_embeddings: ckpt={saw} live={}",
             cfg.tie_word_embeddings
+        ));
+    }
+
+    if let Some(seen) = file_cfg.get("rope_theta").and_then(|v| v.as_f64())
+        && seen != cfg.rope_theta as f64
+    {
+        mismatches.push(format!(
+            "rope_theta: ckpt={seen} live={}",
+            cfg.rope_theta
         ));
     }
 
@@ -771,6 +781,43 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn resume_cfg() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 2048,
+            intermediate_size: 5632,
+            num_hidden_layers: 24,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 151936,
+            rms_norm_eps: 1.0e-6,
+            rope_theta: 1_000_000.0,
+            tie_word_embeddings: true,
+            max_position_embeddings: 32768,
+        }
+    }
+
+    fn write_resume_config(dir: &Path, cfg: &Qwen3Config) {
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_hidden_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_key_value_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "rms_norm_eps": cfg.rms_norm_eps,
+                "rope_theta": cfg.rope_theta,
+                "tie_word_embeddings": cfg.tie_word_embeddings,
+                "max_position_embeddings": cfg.max_position_embeddings,
+            }))
+            .expect("serialize config"),
+        )
+        .expect("write config");
+    }
+
     #[test]
     fn generation_config_is_copied_when_present() {
         let tmp = tempdir().expect("tempdir");
@@ -821,5 +868,53 @@ mod tests {
         )
         .expect("parse generation config");
         assert_eq!(generated["eos_token_id"], json!([7, 3]));
+    }
+
+    #[test]
+    fn validate_resume_config_accepts_matching_config() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
+
+        validate_resume_config(resume_dir, &cfg).expect("matching config should pass");
+    }
+
+    #[test]
+    fn validate_resume_config_rejects_max_position_embeddings_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
+
+        let live_cfg = Qwen3Config {
+            max_position_embeddings: cfg.max_position_embeddings + 1,
+            ..cfg
+        };
+
+        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        assert!(
+            err.to_string().contains("max_position_embeddings"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resume_config_rejects_rope_theta_mismatch() {
+        let tmp = tempdir().expect("tempdir");
+        let resume_dir = tmp.path();
+        let cfg = resume_cfg();
+        write_resume_config(resume_dir, &cfg);
+
+        let live_cfg = Qwen3Config {
+            rope_theta: cfg.rope_theta * 2.0,
+            ..cfg
+        };
+
+        let err = validate_resume_config(resume_dir, &live_cfg).expect_err("should reject");
+        assert!(
+            err.to_string().contains("rope_theta"),
+            "unexpected error: {err}"
+        );
     }
 }
