@@ -216,8 +216,8 @@ infer
 
 ### Bench and helper entrypoints
 
-- `scripts/bench_guidellm.sh`: canonical throughput/latency sweep wrapper
-- `scripts/bench_throughput.py`: legacy throughput helper for narrower synthetic/sharegpt runs
+- `scripts/bench_guidellm.sh`: canonical throughput / latency sweep wrapper
+- `scripts/bench_throughput.py`: legacy helper for narrower synthetic/sharegpt runs; not canonical throughput / latency truth
 - `scripts/bench_agent_trace.py`: agent-style trace replay
 - `infer/src/bin/metal_bench.rs`: Metal micro/macro benchmark entrypoint
 

@@ -1,8 +1,9 @@
 # GuideLLM integration — canonical bench truth source
 
-**Status:** 🟡 planned (2026-04-20) — execution to be delegated to Codex.
-**Owner:** ckl. **Drives:** replaces the legacy throughput helper (`scripts/bench_throughput.py`)
-as the project's **canonical throughput/latency measurement tool**.
+**Status:** canonical (wrapper live; 2026-04-20).
+**Owner:** ckl. **Drives:** documents `scripts/bench_guidellm.sh` as the
+project's **canonical throughput/latency measurement tool** and keeps the
+remaining guardrails in one place.
 **Trigger:** 2026-04-16 discussion — the house-grown sweep script
 overlaps 1:1 with a well-maintained upstream tool ([vllm-project/guidellm](https://github.com/vllm-project/guidellm)),
 and we're about to start cross-referencing numbers with vLLM/SGLang where
@@ -14,8 +15,8 @@ stop hand-rolling.
 ## 1 · Why guidellm becomes the truth source
 
 - **LLM-native metrics**: TTFT / ITL / tok-s / request-rate distributions
-  with p50/p90/p95/p99, not generic HTTP RPS. Our existing throughput
-  helper only emits mean + stddev.
+  with p50/p90/p95/p99, not generic HTTP RPS. The legacy throughput helper
+  only emits mean + stddev.
 - **sweep profile** auto-scans from `synchronous` to saturation — one
   command replaces our manual concurrency grid.
 - **HTML report** is shareable; JSON is machine-readable for diffing across
@@ -31,7 +32,6 @@ stop hand-rolling.
 - `bench_kv_cache*.py`, `bench_offload*.py`, `bench_agent*.py`, `bench_long_agent.py`
   — those measure **internal behaviour** (prefix-cache hit rate, offload
   paths, agent-trace shapes) that guidellm can't observe from outside.
-- PPL / quality evals — out of scope; guidellm is a performance tool.
 - PPL / quality evals — out of scope; guidellm is a performance tool only.
 
 ---
@@ -87,7 +87,7 @@ agent-infer/
 │       └── bench = ["httpx==0.28.1", "guidellm[recommended]>=0.3"]   # ← NEW
 ├── requirements-bench.txt                                             # ← + guidellm
 ├── scripts/
-│   ├── bench_guidellm.sh                                              # ← NEW canonical wrapper
+│   ├── bench_guidellm.sh                                              # ← canonical wrapper
 │   └── bench_throughput.py                                            # ← legacy helper / deprecation banner
 ├── bench-output/                                                      # ← gitignored, raw guidellm JSON/HTML
 ├── docs/
@@ -165,7 +165,16 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 ```markdown
 # <short title> — guidellm sweep, <backend-label>, <date>
 
-## Context
+## Goal
+- <one sentence describing the benchmark goal and goal type>
+
+## Hypothesis
+- <expected outcome before the run>
+
+## Command
+- exact wrapper invocation + env vars + seed
+
+## Environment
 - Backend: <cuda|metal> · model: <Qwen/Qwen3-4B | ...>
 - Hardware: <GPU/SoC model, VRAM, CUDA/Metal version>
 - Commit: <short sha>
@@ -173,21 +182,31 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - Non-default flags: <env vars, server flags>
 
 ## Canonical params
-- `--profile sweep  --data prompt_tokens=4096,output_tokens=256  --max-seconds 60  --random-seed 20260416`
+- `--profile sweep`
+- `--data prompt_tokens=4096,output_tokens=256`
+- `--max-seconds 60`
+- `--random-seed 20260416`
+- `--outputs json,csv,html`
 - Wrapper: `scripts/bench_guidellm.sh <label>`
 
-## Results (headline table)
+## Results — sweep headline table
 | rate (req/s) | TTFT p50 | TTFT p99 | ITL p50 | ITL p99 | out tok/s |
 |---|---|---|---|---|---|
 | ... sweep points ... |
 
+## Problems
+- <anything that degraded, crashed, or deviated from the watch-list>
+
+## Learnings
+- <generalizable rule or tuning takeaway>
+
+## Δ vs baseline
+- Baseline: [`<date>-bench-guidellm-<label>.md`](<relative path>)
+- % change per column if prior snapshot exists.
+
 ## Artefacts
 - Raw: `bench-output/<date>-<label>/benchmarks.{json,csv,html}`
 - HTML report: `bench-output/<date>-<label>/benchmarks.html`
-
-## Delta vs previous
-- Baseline: [`<date>-bench-guidellm-<label>.md`](<relative path>)
-- % change per column if prior snapshot exists.
 ```
 
 CLAUDE.md rule "Never overwrite before-snapshots" carries over verbatim —
@@ -195,13 +214,9 @@ the `<date>-<label>` naming enforces it at the filesystem level.
 
 ---
 
-## 7 · CLAUDE.md edit (§Benchmarks)
+## 7 · Active doc wording
 
-Replace:
-
-> - Tool: `scripts/bench_throughput.py --label <name>`.
-
-With:
+Active docs should say:
 
 > - **Canonical tool: `scripts/bench_guidellm.sh <label>`** (thin wrapper
 >   around [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm)).
@@ -251,17 +266,16 @@ docs.
 - `bench-output/` accidentally gets committed because someone overrode
   the gitignore → wrapper should refuse to run if the output dir is
   tracked.
-- **Metal canonical sweep is NOT available yet.** Do not run
-  `--profile sweep` or `--profile throughput` on Metal until the MLX
-  allocator resource-limit panic is fixed. Sweep's throughput-burst
-  stage trips the live-buffer-count cap (499000), panics the scheduler,
-  and leaves the Metal server in a dead state.
+- **Some Metal hosts still cannot complete the canonical sweep reliably.**
+  The canonical truth surface remains `scripts/bench_guidellm.sh` with the
+  §3 params for every backend, but when a local Apple box or hosted runner
+  still hits the MLX allocator resource-limit panic during sweep's
+  throughput-burst stage, do not silently redefine the benchmark. Record a
+  `pending-remote` wins stub for the canonical run, then use exploration
+  mode (`--quick` or explicit overrides) only for local diagnosis.
   Root cause + fix plan:
   [`docs/experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md`](../experience/errors/2026-04-15-metal-allocator-resource-limit-panic.md).
-  Until that crash path is resolved, Metal wins entries must be produced
-  with `--profile synchronous` or `--profile constant --rate <low>` —
-  see the 2026-04-15 smoke win for the exact invocation. CUDA is
-  unaffected.
+  CUDA is unaffected.
 
 ---
 
