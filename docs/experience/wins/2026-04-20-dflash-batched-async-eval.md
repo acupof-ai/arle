@@ -1,7 +1,10 @@
 # Metal Qwen3.5 DFlash — defer batched terminal `eval` via `async_eval`
 
-**Status:** `pending-remote` for guidellm TPOT bench (Metal toolchain unavailable
-in this sandbox — see §Problems). Correctness verified locally; see §Results.
+**Status:** functional validation ✅ (DFlash sweep at prompt_tokens=1024
+completes cleanly, no regressions vs pre-fix crash-free baseline). Numeric
+c=2 TPOT delta remains `pending-remote` for a matched-A/B session per
+`feedback_matched_ab_for_small_bench_effects.md` — the 2–5% sized effect
+is below the single-session thermal-noise threshold.
 
 **Date**: 2026-04-20
 **Machine**: Apple M4 Max (40 GPU cores, ~400 GB/s UMA), macOS 26.3.1
@@ -84,42 +87,45 @@ run that is the direct correctness gate for this change — pass with real
 weights. The batched path's sampled first tokens still match the scalar
 path token-for-token, and per-row updated hidden deltas are 0.
 
-### Throughput — pending-remote
+### Throughput — functional pass, numeric delta pending matched-A/B
 
-The guidellm TPOT regression bench at c=2 (per CLAUDE.md §Benchmarks)
-could not run in this sandbox — the local Xcode installation is missing
-the Metal Toolchain component (`xcrun metal` fails with
-`cannot execute tool 'metal' due to missing Metal Toolchain`). This
-blocks rebuilding `mlx-sys` in the `.claude/worktrees/` target, so the
-`metal_bench` / guidellm runner binaries cannot be produced in this
-session. The parent worktree's older cached `libmlx.a` let the parent
-build + test the Rust-only change, but the bench harness needs a fresh
-build in the bench worktree.
+**Functional sweep ✅** — after Agent A's prefill-fastforward fix landed
+(`3bc8802`), DFlash sweep at `prompt_tokens=1024,output_tokens=128` on
+the same binary as this commit (`d8cb2f4`) completes all 10 guidellm
+strategies cleanly: no `WrongPhase` errors, no 500s, 100% request
+success. Artefacts: `bench-output/2026-04-20-dflash-fixes-validation/`.
+This confirms the `async_eval` swap does not regress the batched DFlash
+path at c=1..c=8 HTTP concurrency.
 
-Matched A/B at c=2 (DFlash default-on since `47f958f`) is ticketed for
-the next session with Metal Toolchain restored:
-- Branch: `worktree-agent-acaedbd9` (this commit).
+**Numeric c=2 TPOT delta — pending-remote (matched-A/B required).**
+The sized effect (2–5% at c=2 per Audit 1) sits below the single-session
+thermal-noise threshold documented in
+`feedback_matched_ab_for_small_bench_effects.md`. Resolving it above
+noise needs a matched same-binary env-A/B run in ≥2 sessions, which is
+its own bench session — not a drive-by. Ticketed for a dedicated
+session:
+- Parent commit: `d8cb2f4` on `main`.
 - Action: `scripts/bench_guidellm.sh metal-m4max-dflash-async-eval` at
-  `prompt_tokens=1024,output_tokens=256`, compare TPOT p50 to the most
-  recent `2026-04-17` / `2026-04-18` wins baseline and the
+  `prompt_tokens=1024,output_tokens=256`, paired with a revert-binary
+  baseline run in the same session.
+- Baselines to beat: `2026-04-17` / `2026-04-18` DFlash wins; the
   `2026-04-20-metal-qwen35-decode-double-buffer.md` HTTP c=2 row
-  (22.98 ms TPOT mdn, 58.5 out tok/s agg — which is a *scalar* c=1+
-  baseline, unaffected by this batched-path change).
+  (22.98 ms TPOT mdn, 58.5 out tok/s agg — *scalar* c=1+, unaffected
+  by this batched-path change).
 - Expected delta: +2–5% TPOT at c=2 on DFlash-batched decode, or within
   noise. Regression gate: anything ≥ −2% must be investigated.
 
 ## Problems
 
-- **Metal Toolchain missing in sandbox.** `xcrun metal` fails with a
-  prompt to run `xcodebuild -downloadComponent MetalToolchain`. Fresh
-  `mlx-sys` rebuilds cannot complete in this worktree. Verified via:
-  - `cargo build --release --no-default-features --features metal` in
-    the parent worktree (which has cached `libmlx.a`) → green with patch
-    applied, then reverted. All `cargo test` ran against that cached
-    build.
-  - Per CLAUDE.md §Benchmarks "bench can't run locally" → opened this
-    entry as `pending-remote` with the exact bench command + baseline
-    reference for the next session.
+- **Metal Toolchain state**. `xcrun metal` still errors in fresh
+  invocations (`cannot execute tool 'metal' due to missing Metal
+  Toolchain`), but the parent worktree's cached `libmlx.a` let an
+  incremental `cargo build --release --no-default-features --features
+  metal` complete in ~7 s — no fresh `.metal → .air` compile was
+  required. Both `metal_serve` and `metal_bench` rebuilt from this
+  cache, which unblocked the functional sweep above. A matched-A/B
+  numeric run still wants a clean toolchain to rebuild both binaries
+  side-by-side without cache skew.
 - No B>2 packed DFlash correctness test yet (only B=2 exists). This
   change affects any B≥2, but the B=2 suite covers the only currently-
   wired cross-row cases. Lift flagged in `docs/plans/metal-dflash-qwen35-verify-batch.md`.

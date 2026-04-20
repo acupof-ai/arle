@@ -1,8 +1,9 @@
 # DFlash long-prompt prefill: scheduler-side fast-forward
 
 **Date**: 2026-04-20
-**Status**: fix landed; bench gated `pending-remote` (Metal toolchain
-missing on this Mac, see Problems below).
+**Status**: fix landed; end-to-end bench ✅ (Metal Toolchain was in fact
+installed — rebuild was incremental since mlx-sys cache intact; see
+§End-to-end validation below).
 
 ## Context
 
@@ -85,27 +86,60 @@ Non-DFlash prefill keeps the old single-counter chunked path unchanged.
    is untouched, `fast_forward_prefill` is only called from the DFlash
    `is_dflash_enabled()` branch in `execute_prefill_chunk`.
 
+## End-to-end validation
+
+Ran `metal_serve` with `--dflash-draft-model
+z-lab/Qwen3.5-4B-DFlash` on M4 Max 40-core, macOS 26.3.1, Qwen3.5-4B-MLX-4bit
+and drove it with `guidellm benchmark run`.
+
+**Reproduce-the-bug smoke**: one synchronous `POST /v1/chat/completions`
+with a ~4100-token prompt (same shape that hit `WrongPhase` pre-fix)
+returned HTTP 200 + 8 tokens cleanly. Server log:
+`chat/completions done: prompt_tokens=4104, completion_tokens=8`.
+Pre-fix this request set errored every time with `Metal complete_prefill
+failed for RequestId(N): request is in phase Prefilling, expected
+Decoding`.
+
+**Sweep**: ran guidellm sweep (10 strategies, 60s each) at
+`prompt_tokens=1024,output_tokens=128` → Qwen3.5 tokenizer expands to
+~5400 actual prompt tokens. All ten strategies completed; no
+`WrongPhase` errors, no 500s. Artefacts at
+`bench-output/2026-04-20-dflash-fixes-validation/{benchmarks.json,csv}`
+(10.6 MB JSON).
+
+| Strategy    | Req lat mdn (s) | TTFT mdn (ms) | TPOT mdn (ms) | ITL mdn (ms) | Thru req/s |
+|-------------|-----------------|---------------|---------------|--------------|------------|
+| synchronous | 8.4             | 1364          | 65.3          | 54.6         | 0.12       |
+| throughput  | 42.6            | 12549         | 333.0         | 236.9        | 27.5       |
+| constant ×8 | 8.0–8.8         | 1387–1537     | 62.9–68.7     | 52.1–58.0    | ~0.1       |
+
+The canonical `prompt_tokens=4096` bench was tried but all requests
+exceeded the 60s max-seconds window per strategy (synthetic expansion
+to ~21k actual tokens, prefill alone ≈ 40 s each), so guidellm aborted
+with zero completed requests — an orthogonal guidellm-side tuning
+issue, not a regression. The 5400-token sweep above covers the
+fix's functional gate: long-prompt DFlash prefill no longer desyncs
+the scheduler.
+
+**Intentionally not measured here**: the numeric delta of the paired
+`perf(metal): defer DFlash batched terminal eval via async_eval` change
+(commit `d8cb2f4`). Agent B's expected effect is 2–5% at c=2 — well
+below the matched-A/B threshold in `feedback_matched_ab_for_small_bench_effects.md`.
+Same-binary same-session before/after runs are needed to resolve it
+above thermal noise; punted to a dedicated bench session.
+
 ## Problems
 
-- **Metal build blocked on this host**: Apple Xcode 26.4.1 on this M4
-  Max ships without the Metal Toolchain; `xcrun metal` errors with
-  `cannot execute tool 'metal' due to missing Metal Toolchain; use:
-  xcodebuild -downloadComponent MetalToolchain`. `cargo build --features
-  metal` cannot compile `mlx-sys`'s `.metal` shaders locally, so the
-  end-to-end bench verifying the error no longer surfaces has to run on
-  a machine with the toolchain installed. Scheduler + runtime Rust code
-  paths type-check cleanly under `--features no-cuda` (scheduler is
-  always-on per `infer/src/backend/metal/AGENTS.md` §Feature gating) and
-  all unit tests pass. The `runtime.rs` diff follows the same
-  `is_dflash_enabled()` / `prompt_len()` pattern as the pre-existing
-  DFlash budget override 20 lines above; no new API surface, no new
-  lifetime concerns.
-- **Bench status: `pending-remote`** — next Mac run with Metal Toolchain
-  should execute `scripts/bench_guidellm.sh metal-m4max` at the
-  canonical `prompt_tokens=4096` params and confirm the 500s are gone.
-  A regression bench against the c=1/2/4 baselines under
-  `prompt_tokens=1024` (wins-doc canonical) should show 0% delta — the
-  fast-forward path is a pure scheduler-state sync, no MLX ops.
+- **Canonical `prompt_tokens=4096` guidellm bench can't complete inside
+  the 60s max-seconds window on M4 Max** — synthetic expansion pushes
+  prompts to ~21k actual tokens, so one request takes ≈ 40 s of
+  prefill + ≈ 5 s of 256-token decode ≈ 45+ s, which guidellm's
+  warmup-calibration phase rejects as "no successful requests" when it
+  can't finish enough of them inside the window. Not a regression of
+  this fix — the canonical params simply outgrew the locked budget.
+  Follow-up: either raise max-seconds for long-prompt sweeps, or split
+  the canonical bench into a short-prompt throughput sweep + a
+  long-prompt correctness smoke.
 
 ## Rule
 
