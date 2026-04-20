@@ -1,7 +1,12 @@
-//! Multi-turn GRPO trainer: rollout_episode -> discounted per-turn returns
-//! -> cross-episode group-normalize per turn -> per-position advantages ->
-//! grpo_loss_per_position -> AdamW. Mirrors `train_grpo` but on interleaved
-//! agent/observation episodes instead of suffix-only rollouts.
+//! Multi-turn trainer with an explicit objective switch:
+//! - stepwise GRPO: rollout_episode -> discounted per-turn returns ->
+//!   cross-episode group-normalize per turn -> per-position advantages ->
+//!   grpo_loss_per_position -> AdamW.
+//! - sequence-level GSPO: rollout_episode -> one scalar episode score (mean
+//!   per-turn reward) -> group-normalize per episode -> grpo_loss -> AdamW.
+//!
+//! Mirrors `train_grpo` but on interleaved agent/observation episodes
+//! instead of suffix-only rollouts.
 
 use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
@@ -13,7 +18,7 @@ use train::{
     control::TrainingController,
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
-    grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
+    grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl},
     lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
@@ -59,6 +64,7 @@ struct CliArgs {
     serve: Option<u16>,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
+    objective: MultiTurnObjective,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +72,12 @@ enum BackendChoice {
     Cpu,
     Metal,
     Cuda,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiTurnObjective {
+    StepwiseGrpo,
+    SequenceGspo,
 }
 
 impl FromStr for BackendChoice {
@@ -112,6 +124,28 @@ impl Default for CliArgs {
             serve: None,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
+            objective: MultiTurnObjective::StepwiseGrpo,
+        }
+    }
+}
+
+impl MultiTurnObjective {
+    fn as_str(self) -> &'static str {
+        match self {
+            MultiTurnObjective::StepwiseGrpo => "stepwise-grpo",
+            MultiTurnObjective::SequenceGspo => "gspo",
+        }
+    }
+}
+
+impl FromStr for MultiTurnObjective {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stepwise-grpo" | "grpo" | "stepwise" => Ok(MultiTurnObjective::StepwiseGrpo),
+            "gspo" | "sequence-gspo" | "sequence" => Ok(MultiTurnObjective::SequenceGspo),
+            _ => Err(format!("unknown objective: {s}")),
         }
     }
 }
@@ -207,7 +241,11 @@ fn run() -> Result<(), CliError> {
     let config = qwen35_config(&args, seq_len, separator)?;
 
     let backend = build_backend(args.backend)?;
-    eprintln!("[train_multi_turn] backend={:?}", backend.device());
+    eprintln!(
+        "[train_multi_turn] backend={:?} objective={}",
+        backend.device(),
+        args.objective.as_str()
+    );
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
     let policy = Qwen35Model::new_with_lora(&config, Some(lora), &mut store)?;
@@ -294,14 +332,6 @@ fn run() -> Result<(), CliError> {
             per_turn_rewards.push(compute_per_turn_rewards(episode, &initial_prompt));
         }
 
-        let advantages_per_position = stepwise_advantages(
-            &episodes,
-            &per_turn_rewards,
-            args.gamma,
-            args.group_size,
-            seq_len,
-        );
-
         let trajectories: Vec<_> = episodes
             .iter()
             .map(|e| e.clone().into_trajectory())
@@ -309,15 +339,39 @@ fn run() -> Result<(), CliError> {
 
         tape.entries.clear();
         tape.set_enabled(true);
-        let loss_id = grpo_loss_per_position(
-            &policy,
-            &trajectories,
-            &advantages_per_position,
-            &grpo_cfg,
-            &config,
-            &mut store,
-            &mut tape,
-        )?;
+        let loss_id = match args.objective {
+            MultiTurnObjective::StepwiseGrpo => {
+                let advantages_per_position = stepwise_advantages(
+                    &episodes,
+                    &per_turn_rewards,
+                    args.gamma,
+                    args.group_size,
+                    seq_len,
+                );
+                grpo_loss_per_position(
+                    &policy,
+                    &trajectories,
+                    &advantages_per_position,
+                    &grpo_cfg,
+                    &config,
+                    &mut store,
+                    &mut tape,
+                )?
+            }
+            MultiTurnObjective::SequenceGspo => {
+                let sequence_scores = sequence_scores(&per_turn_rewards);
+                let advantages = group_advantages(&sequence_scores, args.group_size);
+                grpo_loss(
+                    &policy,
+                    &trajectories,
+                    &advantages,
+                    &grpo_cfg,
+                    &config,
+                    &mut store,
+                    &mut tape,
+                )?
+            }
+        };
         let loss_value = store.to_host(loss_id)?[0];
 
         optimizer.zero_grad(&params, &mut store);
@@ -647,6 +701,25 @@ fn stepwise_advantages(
     per_position
 }
 
+fn sequence_scores(per_turn_rewards: &[Vec<f32>]) -> Vec<f32> {
+    per_turn_rewards
+        .iter()
+        .map(|rewards| episode_sequence_score(rewards))
+        .collect()
+}
+
+// GSPO sequence score: the mean per-turn reward for the full episode.
+// This keeps the sequence-level objective grounded in the same verifier
+// signal the stepwise path uses, but collapses the episode to one scalar
+// before group normalization and GRPO broadcast.
+fn episode_sequence_score(per_turn_rewards: &[f32]) -> f32 {
+    if per_turn_rewards.is_empty() {
+        0.0
+    } else {
+        per_turn_rewards.iter().sum::<f32>() / per_turn_rewards.len() as f32
+    }
+}
+
 fn mean_per_turn(per_turn_rewards: &[Vec<f32>]) -> f32 {
     let mut sum = 0.0_f32;
     let mut count = 0.0_f32;
@@ -750,6 +823,15 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--metrics-jsonl" => {
                 args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
+            "--objective" => {
+                let value = next_value(&mut iter, &flag)?;
+                args.objective = value.parse().map_err(|_| {
+                    CliError::Arg(ArgError::InvalidValue {
+                        flag: flag.clone(),
+                        value,
+                    })
+                })?;
+            }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
@@ -793,6 +875,20 @@ mod tests {
     use train::LoraAdapterConfig;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn objective_mode_parser_accepts_stepwise_and_sequence_modes() {
+        assert_eq!(
+            "stepwise-grpo"
+                .parse::<MultiTurnObjective>()
+                .expect("stepwise"),
+            MultiTurnObjective::StepwiseGrpo
+        );
+        assert_eq!(
+            "gspo".parse::<MultiTurnObjective>().expect("gspo"),
+            MultiTurnObjective::SequenceGspo
+        );
+    }
 
     #[test]
     fn save_qwen35_checkpoint_writes_merged_weights_and_adapter_artifacts() -> TestResult {

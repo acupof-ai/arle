@@ -3,7 +3,7 @@ use std::time::Instant;
 use autograd::{Tape, TensorStore, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
-    grpo::{GrpoConfig, group_advantages, grpo_loss, ppo_active_mask},
+    grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, ppo_active_mask},
     policy_support::retained_ids,
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
     rollout::{Trajectory, rollout_group},
@@ -160,6 +160,84 @@ fn grpo_loss_gradient_non_zero() {
             .is_some_and(|grad| grad.data.iter().any(|value| value.abs() > 1.0e-7))
     });
     assert!(has_non_zero_grad, "expected a non-zero GRPO gradient");
+}
+
+#[test]
+fn gspo_scalar_advantages_broadcast_like_per_position_inputs() {
+    let config = tiny_qwen35_config(8);
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let policy = Qwen35Model::new(&config, &mut store).expect("build policy");
+    let ref_model = policy.clone_frozen(&mut store);
+
+    let mut rng = LcgRng::seed(31);
+    let prompts = build_prompt_batch(2, 4, 8, 15, &mut rng);
+    let trajectories = rollout_group(
+        &policy,
+        &ref_model,
+        &config,
+        &prompts,
+        2,
+        1.0,
+        &mut rng,
+        &copy_reward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("rollout");
+
+    let rewards = trajectories
+        .iter()
+        .map(|trajectory| trajectory.reward)
+        .collect::<Vec<_>>();
+    let scalar_advantages = group_advantages(&rewards, 2);
+    let seq_len = trajectories[0].full_ids.len();
+    let mut per_position_advantages = Vec::with_capacity(scalar_advantages.len() * seq_len);
+    for advantage in &scalar_advantages {
+        per_position_advantages.extend(std::iter::repeat_n(*advantage, seq_len));
+    }
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let scalar_loss = grpo_loss(
+        &policy,
+        &trajectories,
+        &scalar_advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 2,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("scalar grpo loss");
+    let scalar_loss_value = store.to_host(scalar_loss).expect("scalar loss")[0];
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let broadcast_loss = grpo_loss_per_position(
+        &policy,
+        &trajectories,
+        &per_position_advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 2,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("broadcast grpo loss");
+    let broadcast_loss_value = store.to_host(broadcast_loss).expect("broadcast loss")[0];
+
+    assert!(
+        (scalar_loss_value - broadcast_loss_value).abs() < 1.0e-6,
+        "scalar={scalar_loss_value} broadcast={broadcast_loss_value}"
+    );
 }
 
 #[test]

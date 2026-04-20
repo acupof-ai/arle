@@ -30,13 +30,13 @@ Phase 6 training stack (orthogonal to the inference runtime; see
 
 Current reality note: the train-side implementation already includes the
 dense/full-attn Qwen3.5-family path and a generic family-dispatch control
-plane. `train_multi_turn` runs on the Qwen3.5 path today, `train_sft` and
+plane. `train_multi_turn` runs on the Qwen3.5 path today and exposes a
+stepwise-GRPO vs sequence-level-GSPO objective switch, `train_sft` and
 `train_grpo` can dispatch across Qwen3 / Qwen3.5 families, checkpoints are
 written as HF-style directories, the handwritten Transformer/TinyLM runtime
-compatibility path has been deleted, GSPO has not landed yet, and the hybrid
-linear-attn Qwen3.5 train path has not landed yet. The shared
-config/tensor-name truth is beginning to move into the dedicated
-`qwen*-spec` crates.
+compatibility path has been deleted, and the hybrid linear-attn Qwen3.5 train
+path has not landed yet. The shared config/tensor-name truth is beginning to
+move into the dedicated `qwen*-spec` crates.
 
 The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,
 `infer-policy`, and `infer-engine` back into `infer` because the split never

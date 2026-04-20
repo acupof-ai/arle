@@ -8,7 +8,7 @@
 
 ## 0. TL;DR
 
-把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码已经有独立 `train` crate 的 train-side server，并通过 `train_multi_turn --serve` 暴露；当前 train-side 真相是通用 Qwen-family 训练架构，以 Qwen3.5 为默认和优化主线：`train_sft` / `train_grpo` 已经能在 Qwen3 / Qwen3.5 间切换，训练默认只更新 LoRA adapter，`train_sft` checkpoint 已经是 merged-model + PEFT-style adapter 双轨导出且支持 adapter-only resume，`train_multi_turn` 仍聚焦在 dense/full-attn 的 Qwen3.5 路径并导出同样的 adapter 工件，GSPO 尚未实现，hybrid linear-attn train path 还没有落地。下面描述的是要收敛到的目标态：
+把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码已经有独立 `train` crate 的 train-side server，并通过 `train_multi_turn --serve` 暴露；当前 train-side 真相是通用 Qwen-family 训练架构，以 Qwen3.5 为默认和优化主线：`train_sft` / `train_grpo` 已经能在 Qwen3 / Qwen3.5 间切换，训练默认只更新 LoRA adapter，`train_sft` checkpoint 已经是 merged-model + PEFT-style adapter 双轨导出且支持 adapter-only resume，`train_multi_turn` 现在支持 stepwise GRPO 与 sequence-level GSPO 两种 objective 并导出同样的 adapter 工件，hybrid linear-attn train path 还没有落地。下面描述的是要收敛到的目标态：
 
 ```
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
@@ -23,7 +23,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 > 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
 > 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
 > [`docs/plans/train-runtime-architecture-v1.md`](../plans/train-runtime-architecture-v1.md)。
-> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 dense/full-attn 为默认与优化主线；hybrid linear-attn 与 GSPO 仍是后续目标，不是已经完成的现状。
+> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 dense/full-attn 为默认与优化主线；`train_multi_turn` 已经支持 stepwise GRPO 和 sequence-level GSPO 两种 objective，但 hybrid linear-attn 仍是后续目标，不是已经完成的现状。
 
 ---
 
