@@ -134,7 +134,7 @@ fn tiny_qwen3_config() -> Qwen3Config {
         hidden_size: 64,
         num_hidden_layers: 2,
         num_attention_heads: 4,
-        num_kv_heads: 2,
+        num_key_value_heads: 2,
         head_dim: 16,
         intermediate_size: 128,
         max_position_embeddings: 32,
