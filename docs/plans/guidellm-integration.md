@@ -49,9 +49,11 @@ stop hand-rolling.
 ## 3 · Canonical bench parameters (the "truth" definition)
 
 Write **once** into `scripts/bench_guidellm.sh` and
-`docs/experience/wins/TEMPLATE-bench-guidellm.md`. Changing these values is
-a deliberate act, not a flag flip — any change lands in a commit whose
-subject says so, and new wins reference the date of the change.
+`docs/experience/wins/TEMPLATE-bench-guidellm.md`. The wrapper is the public
+contract; `guidellm benchmark run` is the internal implementation detail.
+Changing these values is a deliberate act, not a flag flip — any change
+lands in a commit whose subject says so, and new wins reference the date of
+the change.
 
 ```
 --profile sweep
@@ -112,7 +114,7 @@ canonical parameters fit in one heredoc.
 
 ```
 Usage:
-  scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME]
+  scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]
 
 Required:
   <backend-label>      e.g. cuda-h100, cuda-a100, metal-m3max
@@ -121,6 +123,7 @@ Required:
 Defaults (override with flags):
   --target   http://localhost:8000
   --model    Qwen/Qwen3-4B        (matches default HTTP server startup)
+  --processor models/Qwen3-4B     (tokenizer path / HF id)
 
 Behaviour:
   1. Check `guidellm` is on PATH. If not → print `pip install -e .[bench]`
@@ -129,14 +132,16 @@ Behaviour:
      "server not running at <target>, start it with
      scripts/start_infer.sh first".
   3. Invoke:
-        guidellm benchmark \
-            --target "$TARGET" --model "$MODEL" \
+        guidellm benchmark run \
+            --target "$TARGET" --model "$MODEL" --processor "$PROCESSOR" \
             --profile sweep \
             --data "prompt_tokens=4096,output_tokens=256" \
             --max-seconds 60 \
             --random-seed 20260416 \
             --output-dir "bench-output/$(date +%Y-%m-%d)-$LABEL/" \
-            --outputs json,csv,html
+            --outputs json,csv,html \
+            --backend openai_http \
+            --backend-kwargs '{"validate_backend": "/v1/models"}'
   4. Extract headline metrics from benchmarks.json:
         sweep rate points (req/s)
         TTFT p50 / p99 (ms)
@@ -172,7 +177,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - <expected outcome before the run>
 
 ## Command
-- exact wrapper invocation + env vars + seed
+- `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]`
 
 ## Environment
 - Backend: <cuda|metal> · model: <Qwen/Qwen3-4B | ...>
@@ -222,9 +227,9 @@ Active docs should say:
 >   around [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm)).
 >   Parameters are locked in `docs/plans/guidellm-integration.md` §3;
 >   changing them is a deliberate commit, not a flag flip.
-> - `scripts/bench_throughput.py` is **deprecated**; kept only so
->   historical wins remain reproducible. New wins MUST use the guidellm
->   wrapper.
+> - `scripts/bench_throughput.py` is **deprecated**; keep it only for
+>   historical reproducibility and component-level diagnostics. New wins MUST
+>   use the guidellm wrapper.
 
 ---
 

@@ -451,6 +451,8 @@ def print_report(results: list[RequestResult], wall_time_s: float):
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print("DEPRECATED: use scripts/bench_guidellm.sh instead", file=sys.stderr)
     p = argparse.ArgumentParser(description="infer throughput & latency benchmark")
     p.add_argument("--url", default="http://localhost:8000",
                    help="Server base URL (default: http://localhost:8000)")

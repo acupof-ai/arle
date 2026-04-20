@@ -17,8 +17,8 @@ Everything else is support. If a rule below doesn't serve one of those four, it'
 Scope: canonical guidellm throughput / latency sweeps, supporting
 component-level helper benches, and every trace (nsys, ncu, Metal capture,
 MLX instruments, `tracing` spans). Helper scripts may inform diagnosis, but
-they do not replace `scripts/bench_guidellm.sh` as the throughput / latency
-truth source.
+they do not replace `scripts/bench_guidellm.sh` as the canonical throughput /
+latency truth source.
 
 ---
 
@@ -35,7 +35,7 @@ aligned.
 | 2 | **Hypothesis** | Expected outcome *before* the run. Enables §5 to judge "was this surprising?". |
 | 3 | **Command** | Exact CLI + env vars + seed. Copy-pasteable. |
 | 4 | **Environment** | GPU/SoC model + VRAM, CUDA/Metal version, commit sha (never dirty tree), feature set, model + weights path. |
-| 5 | **Results** | Raw table first (TTFT p50/p99, ITL p50/p99, tok/s, VRAM peak, kernel counts). No summaries replacing numbers. Link raw artefacts. |
+| 5 | **Results** | Raw table first (TTFT p50/p99, ITL p50/p99, tok/s, req/s actual). Add VRAM peak / kernel counts only when the wrapper or a paired trace actually produces them. No summaries replacing numbers. Link raw artefacts. |
 | 6 | **Problems** | Anything that degraded, crashed, or deviated from §4 watch-list. Include smallest reproducer. |
 | 7 | **Learnings** | Generalizable rules, not run-specific facts. Each actionable: "X bound by Y → tune Z first". |
 | 8 | **Δ vs baseline** | Link prior entry + Δ% row. "First run" if none exists. |
@@ -47,8 +47,8 @@ reran this?" from §3+§4 alone, the entry is incomplete.
 
 ## 2. Tools
 
-- **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit.
-- **Helper benches** such as `scripts/bench_throughput.py` and `bench_kv_cache*.py` — legacy or component-level tools for narrower synthetic / diagnostic checks. They cannot replace the canonical wrapper for throughput / latency wins.
+- **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep wrapper. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit.
+- **`scripts/bench_throughput.py`** — legacy helper for narrower synthetic / diagnostic checks; keep it for historical reproducibility only. `bench_kv_cache*.py` remains component-level / internal-only.
 - **`nsys profile` / `ncu --set full`** — CUDA trace → `.nsys-rep` / `.ncu-rep`.
 - **Xcode Metal capture / MLX instruments** — Metal trace → `.gputrace`.
 
@@ -153,7 +153,8 @@ agent-infer/
 │       └── errors/                  ← bench that surfaced a bug
 ├── bench-output/                    ← gitignored; raw .json/.csv/.html/.nsys-rep/.gputrace
 ├── benchmarks/                      ← committed baseline JSONs (small)
-└── scripts/bench_*.{sh,py}          ← canonical tools
+├── scripts/bench_guidellm.sh        ← canonical throughput / latency wrapper
+└── scripts/bench_throughput.py       ← legacy helper / deprecation banner
 ```
 
 **Three locations, three rules:**
