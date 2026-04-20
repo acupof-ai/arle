@@ -15,6 +15,7 @@ use autograd::{
 use thiserror::Error;
 use train::{
     StepOutcome, Trainer, TrainerConfig,
+    checkpoint::write_latest_symlink,
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
@@ -658,7 +659,8 @@ fn save_checkpoint_via_registry(
     // `trainer_state.json + optimizer.safetensors` in a single directory —
     // required for `--resume-from` to roundtrip correctly (codex review
     // 2026-04-20 on ad5568b, P1).
-    let step_dir = out_dir.join(format!("step_{step:06}"));
+    let step_basename = format!("step_{step:06}");
+    let step_dir = out_dir.join(&step_basename);
     fs::create_dir_all(&step_dir)?;
     fs::copy(config_path, step_dir.join("config.json"))?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
@@ -667,6 +669,14 @@ fn save_checkpoint_via_registry(
         SaveDtype::F32 => registry.save_from(store, &weights_path)?,
         SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
     }
+
+    // DX-1: refresh `<out>/latest` symlink so `infer --model-path <out>/latest`
+    // and `--resume-from <out>/latest` address the newest checkpoint without
+    // the caller reading directory listings. Trainer::save_checkpoint (for
+    // optimizer/trainer state) writes the same symlink in parallel — last
+    // writer wins, and both point at the same step_dir basename.
+    write_latest_symlink(out_dir, &step_basename)?;
+
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
         step,

@@ -23,7 +23,7 @@ use autograd::{
 
 use crate::checkpoint::{
     CheckpointError, TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2,
-    save_trainer_state_v2,
+    save_trainer_state_v2, write_latest_symlink,
 };
 use crate::grad_accum::GradAccumulator;
 use crate::grad_clip::GradClip;
@@ -596,7 +596,8 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         let root = self.cfg.save_dir.as_ref().ok_or({
             AutogradError::TapeInvariant("checkpoint: save_every set but save_dir is None")
         })?;
-        let dir = root.join(format!("step_{:06}", self.step));
+        let step_basename = format!("step_{:06}", self.step);
+        let dir = root.join(&step_basename);
         std::fs::create_dir_all(&dir).map_err(|err| {
             eprintln!("[trainer] create_dir_all({:?}) failed: {err}", &dir);
             AutogradError::TapeInvariant("checkpoint: create_dir_all failed")
@@ -619,7 +620,19 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             codec_version: TRAINER_STATE_CODEC_VERSION,
         };
 
-        save_trainer_state_v2(&dir, &doc, &optim_state).map_err(wrap_checkpoint_err)
+        save_trainer_state_v2(&dir, &doc, &optim_state).map_err(wrap_checkpoint_err)?;
+
+        // DX-1: Maintain `<save_dir>/latest` symlink pointing at this step so
+        // `infer --model-path <out>/latest` and `--resume-from <out>/latest`
+        // roundtrip without the caller knowing the step number. On non-unix
+        // this is a no-op; symlink failures on unix surface as a hard error
+        // because the pointer is part of the shipped DX contract.
+        write_latest_symlink(root, &step_basename).map_err(|err| {
+            eprintln!("[trainer] write_latest_symlink({:?}) failed: {err}", root);
+            AutogradError::TapeInvariant("checkpoint: latest symlink failed")
+        })?;
+
+        Ok(())
     }
 }
 

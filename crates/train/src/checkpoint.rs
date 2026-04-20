@@ -431,3 +431,130 @@ impl safetensors::View for OptimTensorView {
         self.bytes.len()
     }
 }
+
+/// Atomically refresh a `latest` symlink inside `parent` pointing at a
+/// sibling directory named `target_basename`. Used by every training
+/// binary's save-checkpoint path so downstream tooling (e.g.
+/// `infer --model-path <out>/latest`) can reference "the most recent
+/// checkpoint" without knowing the step number. Docs/plan:
+/// `docs/plans/train-eval-infer-dx-v1.md` Phase DX-1.
+///
+/// `target_basename` must be a basename (e.g. `"step_000100"`), not a
+/// full path — the symlink is relative so the whole `<parent>/` tree
+/// remains copyable / rsync-safe.
+///
+/// Refuses to overwrite a regular file or directory at `<parent>/latest`
+/// (only an existing symlink is replaced). This guards against a user
+/// accidentally stashing their final checkpoint under that exact name.
+#[cfg(unix)]
+pub fn write_latest_symlink(parent: &Path, target_basename: &str) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if target_basename.contains('/') || target_basename.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("write_latest_symlink: target must be a basename, got {target_basename:?}"),
+        ));
+    }
+
+    let link = parent.join("latest");
+    match std::fs::symlink_metadata(&link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::remove_file(&link)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "write_latest_symlink: refusing to overwrite non-symlink at {}",
+                    link.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    symlink(target_basename, &link)
+}
+
+#[cfg(not(unix))]
+pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Result<()> {
+    // Non-unix targets (currently unsupported by this workspace per
+    // CLAUDE.md support matrix) — no-op rather than erroring. Callers
+    // who need a portable marker should fall back to reading the
+    // lexicographically-largest `step_*` entry.
+    Ok(())
+}
+
+#[cfg(test)]
+mod latest_symlink_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_latest_symlink_when_absent() {
+        let dir = tempdir().expect("tempdir");
+        let step_dir = dir.path().join("step_000001");
+        fs::create_dir_all(&step_dir).unwrap();
+        fs::write(step_dir.join("config.json"), "{}").unwrap();
+
+        write_latest_symlink(dir.path(), "step_000001").expect("write latest");
+
+        let link = dir.path().join("latest");
+        let meta = fs::symlink_metadata(&link).expect("latest exists");
+        assert!(meta.file_type().is_symlink(), "latest must be a symlink");
+        let resolved = fs::canonicalize(&link).expect("resolve latest");
+        let expected = fs::canonicalize(&step_dir).expect("resolve step");
+        assert_eq!(resolved, expected, "latest must point at step_000001");
+        // Downstream tooling treats `<out>/latest` as a model dir; the
+        // symlink must transparently expose the step dir's files.
+        assert!(
+            link.join("config.json").exists(),
+            "config.json must resolve through the symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refreshes_latest_symlink_to_new_target() {
+        let dir = tempdir().expect("tempdir");
+        let step1 = dir.path().join("step_000001");
+        let step2 = dir.path().join("step_000002");
+        fs::create_dir_all(&step1).unwrap();
+        fs::create_dir_all(&step2).unwrap();
+        fs::write(step1.join("marker.txt"), "one").unwrap();
+        fs::write(step2.join("marker.txt"), "two").unwrap();
+
+        write_latest_symlink(dir.path(), "step_000001").unwrap();
+        write_latest_symlink(dir.path(), "step_000002").unwrap();
+
+        let link = dir.path().join("latest");
+        let marker = fs::read_to_string(link.join("marker.txt")).expect("read marker");
+        assert_eq!(marker, "two", "latest must now point at step_000002");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_overwrite_regular_file_at_latest() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("latest"), "user-data").expect("pre-existing file");
+
+        let err = write_latest_symlink(dir.path(), "step_000001")
+            .expect_err("must refuse to clobber regular file");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // User data must survive.
+        let surviving = fs::read_to_string(dir.path().join("latest")).unwrap();
+        assert_eq!(surviving, "user-data");
+    }
+
+    #[test]
+    fn rejects_basename_with_path_separator() {
+        let dir = tempdir().expect("tempdir");
+        let err = write_latest_symlink(dir.path(), "../etc/passwd")
+            .expect_err("must reject path-like basename");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+}
