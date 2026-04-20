@@ -236,6 +236,17 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, shape)
     }
 
+    /// Device-handle variant of `silu_forward`. Lazy on backends that can
+    /// compose `x * sigmoid(x)` into their graph (Metal: `mlx_multiply` +
+    /// `mlx_sigmoid`); the default implementation falls back to
+    /// `readback → host compute → upload` so CPU/CUDA need no special-case.
+    /// M5.3b.3.
+    fn silu(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.silu_forward(&host)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * b` over identically-sized contiguous tensors.
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         cpu_mul_forward(a, b)

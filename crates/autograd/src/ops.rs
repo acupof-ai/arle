@@ -52,7 +52,12 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 }
 
 pub fn silu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.3: `silu` is now device-resident on Metal for Dirty::Device
+    // inputs — `activation::silu` routes to `backend.silu` (composes
+    // `mlx_multiply(x, mlx_sigmoid(x))` into the MLX lazy graph, no eval).
+    // Dirty::Host / Dirty::Both inputs stay on the host fast path. CPU/CUDA
+    // use the default trait fallback (readback → host → upload); lazy
+    // semantics are Metal-only.
     activation::silu(x, store, tape)
 }
 

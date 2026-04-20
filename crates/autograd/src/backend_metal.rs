@@ -339,6 +339,43 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy elementwise SiLU: composes `x * mlx_sigmoid(x)` into the MLX
+    // graph with no `mlx_eval`. The intermediate `sig` node is freed after
+    // the multiply; the returned handle owns the multiply result. Shape is
+    // passed through (unused on the MLX side — the output broadcasts to
+    // the input shape automatically). M5.3b.3.
+    fn silu(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot silu a non-metal device handle",
+            ));
+        };
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // `sig` is allocated here and freed before return; the `out`
+        // result is transferred into the returned `MlxHandle`.
+        let out = unsafe {
+            let sig = mlx_sigmoid(x_handle.as_ptr());
+            if sig.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_sigmoid returned null (silu)",
+                ));
+            }
+            let out_arr = mlx_multiply(x_handle.as_ptr(), sig);
+            mlx_array_free(sig);
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_multiply returned null (silu)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
     // Lazy row-wise log-softmax over the last axis. Composes
     // `x - mlx_logsumexp_axis(x, -1, keepdims=true)` into the MLX graph
     // with no `mlx_eval`. The intermediate `lse` node is freed after the
