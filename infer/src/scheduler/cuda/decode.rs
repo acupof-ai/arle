@@ -380,7 +380,10 @@ impl<M: ModelForward> Scheduler<M> {
                 return;
             }
             Err(e) => {
-                error!("Mixed batched decode failed after decode-token allocation: {}", e);
+                error!(
+                    "Mixed batched decode failed after decode-token allocation: {}",
+                    e
+                );
                 for &req_idx in &decode_indices {
                     self.active[req_idx].phase = Phase::Finished;
                 }

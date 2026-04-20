@@ -897,11 +897,7 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             CONTIGUOUS_KV_TOKENS
         };
-        let out = self
-            .config
-            .chunked_prefill_size
-            .max(1)
-            .min(contiguous_cap);
+        let out = self.config.chunked_prefill_size.max(1).min(contiguous_cap);
         log::debug!(
             "prefill_chunk_size: chunked_prefill_size={} cap={contiguous_cap} paged={} => {out}",
             self.config.chunked_prefill_size,
