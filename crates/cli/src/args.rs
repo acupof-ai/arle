@@ -28,6 +28,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) non_interactive: bool,
 
+    /// Start in tool-calling agent mode instead of streaming chat mode (default: chat).
+    /// Inside the REPL, `/agent` and `/chat` switch between modes at any time.
+    #[arg(long, default_value_t = false)]
+    pub(crate) tools: bool,
+
     /// Deprecated compatibility flag. Legacy contiguous CPU KV offload has
     /// been retired, so this value is ignored.
     #[arg(long)]
