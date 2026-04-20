@@ -19,8 +19,6 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[cfg(any(feature = "metal", feature = "cpu"))]
-use crate::backend::InferenceBackend;
 #[cfg(feature = "cpu")]
 use crate::backend::cpu::CpuBackend;
 #[cfg(feature = "cuda")]
@@ -29,6 +27,8 @@ pub use crate::backend::cuda::bootstrap::{
 };
 #[cfg(feature = "metal")]
 use crate::backend::metal::MetalBackend;
+#[cfg(any(feature = "metal", feature = "cpu"))]
+use crate::backend::{InferenceBackend, StreamingInferenceBackend};
 #[cfg(feature = "cuda")]
 use crate::model::{GLM4Model, GenerationState, ModelForward, Qwen3Model, Qwen35Model};
 use crate::sampler::SamplingParams;
@@ -108,7 +108,7 @@ fn choose_prefix_reuse_action(
 /// If `new_full` (accumulated text) ends with any of `stops`, return the delta to send
 /// (from `sent_len` up to but not including the stop) and the matching stop.
 /// Prefers the longest matching stop when several match at the end.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn truncate_at_stop<'a>(
     new_full: &str,
     sent_len: usize,
@@ -950,7 +950,9 @@ impl BackendInferenceEngine<CpuBackend> {
 }
 
 #[cfg(any(feature = "metal", feature = "cpu"))]
-impl<B: InferenceBackend> InferenceEngine for BackendInferenceEngine<B> {
+impl<B: InferenceBackend + StreamingInferenceBackend> InferenceEngine
+    for BackendInferenceEngine<B>
+{
     fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -992,24 +994,137 @@ impl<B: InferenceBackend> InferenceEngine for BackendInferenceEngine<B> {
         })
     }
 
+    /// Chunk-by-chunk streaming over `StreamingInferenceBackend`. Dropping
+    /// `tx` (rx disconnected) propagates back through the `on_chunk`
+    /// callback as an `Err`, which makes the backend short-circuit its
+    /// generation loop — this is the mechanism the REPL's Ctrl-C path
+    /// relies on (see `crates/cli/src/repl.rs:646`). Before this fix,
+    /// Metal + CPU backends ran the full completion synchronously inside
+    /// `self.complete(req)` and only touched `tx` at the end, so Ctrl-C
+    /// could not interrupt mid-generation (codex review 0da212f/97c1a95
+    /// High).
     fn complete_stream(
         &mut self,
         req: CompletionRequest,
         tx: UnboundedSender<CompletionStreamDelta>,
     ) -> Result<()> {
-        let output = self.complete(req)?;
-        if !output.text.is_empty() {
+        let mut sampling = req.sampling;
+        sampling.max_new_tokens = Some(req.max_tokens);
+
+        let stops: Option<Vec<String>> = req
+            .stop
+            .as_ref()
+            .map(|v| v.iter().filter(|s| !s.is_empty()).cloned().collect());
+
+        let emitted = std::cell::RefCell::new(String::new());
+        let sent_len = std::cell::Cell::new(0usize);
+        let stopped_by_stop_sequence = std::cell::Cell::new(false);
+        let consumer_dropped = std::cell::Cell::new(false);
+
+        let backend_name = self.backend.name();
+        let generated = catch_unwind(AssertUnwindSafe(|| {
+            self.backend
+                .generate_stream(&req.prompt, &sampling, |chunk: &str| -> Result<()> {
+                    let mut buf = emitted.borrow_mut();
+                    buf.push_str(chunk);
+                    // Stop-seq check on each chunk boundary — if we've just
+                    // produced a full stop sequence at the end of emitted
+                    // text, flush everything up to (but not including) it
+                    // and tell the backend to exit early.
+                    if let Some(ref stop_list) = stops {
+                        let stop_refs: Vec<&str> = stop_list.iter().map(String::as_str).collect();
+                        if let Some((to_send, stopped)) =
+                            truncate_at_stop(&buf, sent_len.get(), &stop_refs)
+                        {
+                            if !to_send.is_empty()
+                                && tx
+                                    .send(CompletionStreamDelta {
+                                        text_delta: to_send,
+                                        finish_reason: None,
+                                        usage: None,
+                                        logprob: None,
+                                    })
+                                    .is_err()
+                            {
+                                consumer_dropped.set(true);
+                                return Err(anyhow::anyhow!("consumer dropped"));
+                            }
+                            sent_len.set(buf.len() - stopped.len());
+                            stopped_by_stop_sequence.set(true);
+                            return Err(anyhow::anyhow!("stop sequence"));
+                        }
+                    }
+                    // No stop-seq match: forward the new tail.
+                    let to_send = buf[sent_len.get()..].to_string();
+                    sent_len.set(buf.len());
+                    if to_send.is_empty() {
+                        return Ok(());
+                    }
+                    if tx
+                        .send(CompletionStreamDelta {
+                            text_delta: to_send,
+                            finish_reason: None,
+                            usage: None,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
+                        consumer_dropped.set(true);
+                        return Err(anyhow::anyhow!("consumer dropped"));
+                    }
+                    Ok(())
+                })
+        }))
+        .map_err(|panic| {
+            anyhow::anyhow!(
+                "{} backend panicked during completion: {}",
+                backend_name,
+                panic_message(panic)
+            )
+        })?;
+
+        // Cancel path: rx dropped mid-generation. Backend exited via the
+        // `Err` we threaded through `on_chunk`. Return Ok — the REPL
+        // (or any other tokio consumer) already handled the cancel
+        // signal itself.
+        if consumer_dropped.get() {
+            return Ok(());
+        }
+
+        // Stop-sequence path: backend was asked to stop by us (not the
+        // consumer). Emit the finish marker with the tokens-so-far
+        // estimate and return. We don't have a reliable prompt/completion
+        // token split in this branch (the backend's result is an Err),
+        // so report `completion_tokens = 0` — callers that need exact
+        // usage should prefer `complete()`, which does one non-streaming
+        // pass and knows the totals.
+        if stopped_by_stop_sequence.get() {
             let _ = tx.send(CompletionStreamDelta {
-                text_delta: output.text.clone(),
-                finish_reason: None,
-                usage: None,
+                text_delta: String::new(),
+                finish_reason: Some(FinishReason::Stop),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                }),
                 logprob: None,
             });
+            return Ok(());
         }
+
+        // Normal completion — backend ran to EOS or max_tokens. The
+        // accumulated `emitted` text plus the backend's usage numbers
+        // land in the final chunk.
+        let generated = generated?;
+        let finish_reason = parse_finish_reason(&generated.finish_reason);
         let _ = tx.send(CompletionStreamDelta {
             text_delta: String::new(),
-            finish_reason: Some(output.finish_reason),
-            usage: Some(output.usage),
+            finish_reason: Some(finish_reason),
+            usage: Some(TokenUsage {
+                prompt_tokens: generated.prompt_tokens,
+                completion_tokens: generated.completion_tokens,
+                total_tokens: generated.prompt_tokens + generated.completion_tokens,
+            }),
             logprob: None,
         });
         Ok(())
@@ -1247,7 +1362,7 @@ impl InferenceEngine for LoadedInferenceEngine {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     use super::truncate_at_stop;
     use super::{FinishReason, model_id_from_path, parse_finish_reason, truncate_at_first_stop};
     #[cfg(any(feature = "cuda", test))]
@@ -1281,7 +1396,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     #[test]
     fn test_truncate_at_stop() {
         let stops = ["\n"];
@@ -1294,6 +1409,193 @@ mod tests {
             truncate_at_stop("ab\n", 2, &stops),
             Some((String::new(), "\n"))
         );
+    }
+
+    /// Regression test for codex review 0da212f/97c1a95 High: before this
+    /// fix, `BackendInferenceEngine<Metal|Cpu>::complete_stream` called
+    /// `self.complete(req)?` — a blocking full generation — and only
+    /// touched `tx` at the end. Dropping `rx` mid-generation had no
+    /// effect: the worker thread blocked until completion. The REPL's
+    /// Ctrl-C path at `crates/cli/src/repl.rs:646` (which relies on
+    /// `tx.send` failing when `rx` is dropped) was a lie on Metal + CPU.
+    ///
+    /// This test drops the receiver after zero chunks read, then
+    /// asserts the mock backend's chunk counter stops at 1 (not 10) —
+    /// i.e. the `on_chunk` callback propagated the `rx-disconnected`
+    /// error back through `generate_stream`, short-circuiting the loop.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[test]
+    fn backend_complete_stream_short_circuits_when_rx_dropped() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::mpsc;
+
+        #[derive(Clone)]
+        struct CountingMock {
+            chunks_attempted: Arc<AtomicUsize>,
+        }
+
+        impl InferenceBackend for CountingMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!("test exercises streaming path only")
+            }
+            fn name(&self) -> &'static str {
+                "counting-mock"
+            }
+        }
+
+        impl StreamingInferenceBackend for CountingMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                for _ in 0..10 {
+                    self.chunks_attempted.fetch_add(1, Ordering::Relaxed);
+                    on_chunk("x")?; // returns Err the instant tx fails
+                }
+                Ok(GenerateResult {
+                    text: "xxxxxxxxxx".into(),
+                    prompt_tokens: 1,
+                    completion_tokens: 10,
+                    finish_reason: "length".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut engine = BackendInferenceEngine {
+            model_id: "counting-mock".into(),
+            backend: CountingMock {
+                chunks_attempted: counter.clone(),
+            },
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // simulate REPL cancel before the first chunk.
+
+        let res = engine.complete_stream(
+            CompletionRequest {
+                prompt: "hi".into(),
+                max_tokens: 10,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+            },
+            tx,
+        );
+
+        assert!(res.is_ok(), "consumer-dropped is not an error");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "generate_stream must exit after the first failed tx.send, \
+             not keep looping through all 10 chunks"
+        );
+    }
+
+    /// Normal completion: no stop sequences, reader intact → backend
+    /// runs to completion, each chunk flows through, and the final
+    /// delta carries `finish_reason` + `usage`.
+    #[cfg(any(feature = "metal", feature = "cpu"))]
+    #[tokio::test]
+    async fn backend_complete_stream_emits_all_chunks_and_finish_marker() {
+        use super::{BackendInferenceEngine, CompletionRequest, InferenceEngine};
+        use crate::backend::{GenerateResult, InferenceBackend, StreamingInferenceBackend};
+        use crate::sampler::SamplingParams;
+        use std::path::Path;
+        use tokio::sync::mpsc;
+
+        struct FullRunMock;
+        impl InferenceBackend for FullRunMock {
+            fn load(&mut self, _p: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+            ) -> anyhow::Result<GenerateResult> {
+                unreachable!()
+            }
+            fn name(&self) -> &'static str {
+                "full-run-mock"
+            }
+        }
+        impl StreamingInferenceBackend for FullRunMock {
+            fn generate_stream<F>(
+                &self,
+                _prompt: &str,
+                _params: &SamplingParams,
+                mut on_chunk: F,
+            ) -> anyhow::Result<GenerateResult>
+            where
+                F: FnMut(&str) -> anyhow::Result<()>,
+            {
+                on_chunk("hel")?;
+                on_chunk("lo")?;
+                Ok(GenerateResult {
+                    text: "hello".into(),
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    finish_reason: "length".into(),
+                    ttft_ms: 0.0,
+                    prompt_tps: 0.0,
+                    generation_tps: 0.0,
+                    total_time_ms: 0.0,
+                })
+            }
+        }
+
+        let mut engine = BackendInferenceEngine {
+            model_id: "full-run-mock".into(),
+            backend: FullRunMock,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let res = engine.complete_stream(
+            CompletionRequest {
+                prompt: "p".into(),
+                max_tokens: 8,
+                sampling: SamplingParams::default(),
+                stop: None,
+                logprobs: false,
+            },
+            tx,
+        );
+        assert!(res.is_ok());
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut finish: Option<FinishReason> = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.finish_reason.is_some() {
+                finish = chunk.finish_reason;
+            }
+            if !chunk.text_delta.is_empty() {
+                text_parts.push(chunk.text_delta);
+            }
+        }
+        assert_eq!(text_parts.concat(), "hello");
+        assert_eq!(finish, Some(FinishReason::Length));
     }
 
     #[test]
