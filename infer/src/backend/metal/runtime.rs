@@ -48,6 +48,8 @@ impl ActiveMetalRequest {
     ) -> Result<(Vec<u32>, usize, Self)> {
         let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
         let max_tokens = incoming.max_tokens;
+        let mut sampling = incoming.sampling;
+        sampling.max_new_tokens = Some(max_tokens);
         // Thread DFlash runtime into the request state so Qwen3StepDriver
         // can initialize speculative-decode state. Both refs are 'static
         // because the backend is leaked into the scheduler runtime thread.
@@ -63,11 +65,8 @@ impl ActiveMetalRequest {
         } else {
             None
         };
-        let request_state = backend.create_request_state_with_dflash(
-            &prompt_tokens,
-            &incoming.sampling,
-            dflash_ref,
-        )?;
+        let request_state =
+            backend.create_request_state_with_dflash(&prompt_tokens, &sampling, dflash_ref)?;
         Ok((
             prompt_tokens.clone(),
             max_tokens,
