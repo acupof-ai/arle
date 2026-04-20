@@ -99,8 +99,14 @@ pub fn add_broadcast(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(a)?;
-    store.ensure_host(b)?;
+    // M5.3b.14: inner `broadcast::add_broadcast` dispatches on
+    // `a.dirty`/`b.dirty`; both-Device/Both inputs stay lazy via
+    // `backend.add_broadcast` (MLX `mlx_add` broadcasts natively via
+    // right-alignment). Mixed Host/Device inputs fall back to the host
+    // path. Stripping `ensure_host` here is the enabler — the hot paths
+    // are Qwen3.5 attention's causal-mask add (`scaled + causal_mask`
+    // per layer × 28 layers) and Linear bias add (`linear_out + bias`
+    // per projection × many projections).
     broadcast::add_broadcast(a, b, store, tape)
 }
 

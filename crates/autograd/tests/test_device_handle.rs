@@ -1,8 +1,8 @@
 #[cfg(feature = "metal")]
 use autograd::{
-    AdamW, Tape, Tensor, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu,
-    ops::log_softmax, ops::matmul, ops::mul_scalar, ops::reshape, ops::rmsnorm, ops::rope,
-    ops::silu, ops::sum, ops::transpose, tensor::Dirty,
+    AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::embedding, ops::exp,
+    ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul_scalar, ops::reshape,
+    ops::rmsnorm, ops::rope, ops::silu, ops::sum, ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1342,6 +1342,132 @@ fn metal_mul_scalar_forward_stays_lazy() -> Result<()> {
             (a - b).abs() <= 1e-5,
             "mul_scalar parity: metal={a} cpu={b}"
         );
+    }
+
+    Ok(())
+}
+
+/// M5.3b.14 acceptance: lazy `add_broadcast` on Metal when both operands
+/// are device-resident. Fixture mirrors Qwen3.5 attention's causal-mask
+/// add: `scaled [merged_heads, seq, seq] + mask [1, seq, seq]` where
+/// `scaled` is the Dirty::Device result of a prior matmul and `mask` is
+/// a host tensor that gets `ensure_device`-ed inside `add_broadcast`.
+/// Must not force an eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_add_broadcast_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    // Shape mirrors attention scores → mask-broadcast pre-softmax.
+    let merged_heads = 2usize;
+    let seq = 4usize;
+    let k = 5usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    // Build a matmul output that naturally has shape [merged_heads*seq, seq].
+    let q_data: Vec<f32> = (0..merged_heads * seq * k)
+        .map(|i| (i as f32) * 0.013 - 0.2)
+        .collect();
+    let k_data: Vec<f32> = (0..k * seq).map(|i| ((i as f32) * 0.021).sin()).collect();
+
+    let q = store.from_slice(&q_data, &[merged_heads * seq, k])?;
+    let k_t = store.from_slice(&k_data, &[k, seq])?;
+    store.get_mut(k_t).expect("k exists").requires_grad = true;
+
+    // Causal mask [1, seq, seq] (upper triangle = -inf).
+    let mut mask_data = vec![0.0_f32; seq * seq];
+    for row in 0..seq {
+        for col in (row + 1)..seq {
+            mask_data[row * seq + col] = f32::NEG_INFINITY;
+        }
+    }
+    let mask = store.from_slice(&mask_data, &[1, seq, seq])?;
+
+    reset_eval_count();
+
+    let scores_flat = matmul(q, k_t, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+
+    // Reshape to rank-3 [merged_heads, seq, seq] so the mask broadcasts
+    // along axis 0 (right-aligned against [1, seq, seq]).
+    let scores = reshape(
+        scores_flat,
+        &[merged_heads, seq, seq],
+        &mut store,
+        &mut tape,
+    )?;
+    let after_reshape = eval_count();
+
+    let masked = add_broadcast(scores, mask, &mut store, &mut tape)?;
+    let after_add_broadcast = eval_count();
+
+    let loss = sum(masked, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_reshape, 0,
+        "M5.3b.12: lazy reshape forward must not force an eval; saw {after_reshape}"
+    );
+    assert_eq!(
+        after_add_broadcast, 0,
+        "M5.3b.14: lazy add_broadcast forward must not force an eval; \
+         saw {after_add_broadcast}. Grep for a reintroduced `ensure_host` \
+         at ops.rs::add_broadcast or a missing device-lazy dispatch in \
+         broadcast.rs."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 4,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity against CPU reference (sum-of-masked-scores is a single f32
+    // — comparing the masked tensor element-wise would disagree on -inf
+    // entries between metal/cpu representations, so we compare the
+    // post-sum scalar which is finite on both paths if any row has
+    // non-masked entries).
+    let metal_masked = store.get(masked).expect("masked output").data.clone();
+    let cpu = CpuBackend;
+    let (cpu_scores_flat, _) =
+        cpu.matmul_forward(&q_data, &[merged_heads * seq, k], &k_data, &[k, seq])?;
+    // Apply mask (broadcast [1, seq, seq] across merged_heads).
+    let mut cpu_masked = vec![0.0_f32; merged_heads * seq * seq];
+    for h in 0..merged_heads {
+        for r in 0..seq {
+            for c in 0..seq {
+                let s = cpu_scores_flat[(h * seq + r) * seq + c];
+                let m = mask_data[r * seq + c];
+                cpu_masked[(h * seq + r) * seq + c] = s + m;
+            }
+        }
+    }
+    assert_eq!(metal_masked.len(), cpu_masked.len());
+    for (a, b) in metal_masked.iter().zip(cpu_masked.iter()) {
+        if b.is_finite() {
+            assert!(
+                (a - b).abs() <= 1e-5,
+                "add_broadcast parity: metal={a} cpu={b}"
+            );
+        } else {
+            assert!(
+                a.is_infinite() && a.is_sign_negative(),
+                "add_broadcast parity: expected -inf, got metal={a}"
+            );
+        }
     }
 
     Ok(())
