@@ -14,8 +14,10 @@
 #   --processor PATH tokenizer path / HF id (default: local models/Qwen3-4B)
 #
 # Exploration mode (faster, non-canonical; DOES NOT produce a wins entry):
-#   --quick              2-minute matched-A/B preset: profile=concurrent,
-#                        rate=1,2,4,8, max-seconds=30, warmup=3.
+#   --quick              ~4-minute matched-A/B preset: profile=concurrent,
+#                        rate=1,2,4,8, data=512-in/128-out, max-seconds=60,
+#                        warmup=5. Short dataset so requests complete in
+#                        seconds on 4–8B models.
 #   --concurrencies L    comma-separated concurrency list, e.g. "1,2,4,8".
 #                        Switches profile to `concurrent`.
 #   --profile TYPE       override profile (sweep|concurrent|synchronous|…).
@@ -88,8 +90,8 @@ Canonical run (produces a wins entry):
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
 
 Exploration mode (faster, no wins entry):
-  --quick                 ~2-min preset: profile=concurrent rate=1,2,4,8
-                          max-seconds=30 warmup=3
+  --quick                 ~4-min preset: profile=concurrent rate=1,2,4,8
+                          data=512-in/128-out max-seconds=60 warmup=5
   --concurrencies LIST    e.g. "1,2,4,8" (switches profile to concurrent)
   --profile TYPE          sweep|concurrent|synchronous|throughput|…
   --max-seconds N         override per-benchmark duration
@@ -113,11 +115,15 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
             PROCESSOR="$2"; shift 2 ;;
         --quick)
+            # Exploration preset: short dataset so requests finish in
+            # seconds even on 4–8B models; 60s window lets each stream
+            # complete multiple requests per concurrency level.
             EXPLORATION_MODE=true
             PROFILE="concurrent"
             RATE_OVERRIDE="1,2,4,8"
-            MAX_SECONDS=30
-            WARMUP_OVERRIDE="3"
+            DATA="prompt_tokens=512,output_tokens=128"
+            MAX_SECONDS=60
+            WARMUP_OVERRIDE="5"
             shift ;;
         --concurrencies)
             [[ $# -ge 2 ]] || { echo "error: --concurrencies requires a value" >&2; exit 2; }
