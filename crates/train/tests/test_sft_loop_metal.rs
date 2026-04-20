@@ -6,7 +6,7 @@
 //! skip rather than fail-closed, since Metal is a Mac-specific path.
 #![cfg(feature = "metal")]
 
-use std::{collections::HashSet, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use autograd::{
     Backend, Tape, TensorId, TensorStore,
@@ -16,9 +16,9 @@ use autograd::{
 };
 use tempfile::tempdir;
 use train::{
+    causal_lm::{build_registry, live_tensor_ids, retained_ids, trainable_params},
     dataset::LcgRng,
     qwen3::{Qwen3Config, Qwen3Model},
-    qwen3_support::{build_registry, live_tensor_ids, trainable_params},
     sft_data::TokenizedSft,
 };
 
@@ -215,21 +215,6 @@ fn assistant_masked_loss(
     let masked = mul(gathered, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
     Ok(mul_scalar(total, -1.0 / valid_count as f32, store, tape)?)
-}
-
-fn retained_ids(
-    model_ids: &HashSet<TensorId>,
-    params: &[TensorId],
-    store: &TensorStore,
-) -> HashSet<TensorId> {
-    let mut keep = model_ids.clone();
-    for &id in params {
-        keep.insert(id);
-        if let Some(grad) = store.get(id).and_then(|t| t.grad) {
-            keep.insert(grad);
-        }
-    }
-    keep
 }
 
 fn mean(values: &[f32]) -> f32 {

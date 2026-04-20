@@ -3,11 +3,22 @@
 **Status**: Draft · **Opened**: 2026-04-20 · **Driver**: systematize train stack for extensibility + CUDA readiness
 **Relates**: [rust-agent-rl-single-node.md](./rust-agent-rl-single-node.md) · [cuda-kernel-crate-extraction.md](./cuda-kernel-crate-extraction.md)
 
+> **Current reality note**
+> This runtime layer is model-family agnostic. The current train-side
+> implementation already includes a generic Qwen-family control plane with
+> Qwen3.5 as the optimized default. `train_sft` and `train_grpo` now
+> dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` runs on the
+> dense/full-attn Qwen3.5 path today, checkpoints are written as HF-style
+> directories, the handwritten Transformer/TinyLM runtime compatibility
+> path has been deleted, GSPO has not landed, and the hybrid linear-attn
+> train path has not landed yet. The target train-side model line is the
+> Qwen3.5 architecture family, not a parallel handwritten baseline.
+
 ---
 
 ## 1. Problem
 
-5 training binaries (`pretrain`, `pretrain_qwen3`, `train_sft`, `train_grpo`, `train_multi_turn`) each duplicate the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. Short-term pain shows up as:
+The active training binaries (`pretrain_qwen3`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. The handwritten Transformer runtime has already been removed from the active train crate, and the current remaining pain is mostly about duplicated family dispatch / checkpoint wiring around the shared loop. Short-term pain shows up as:
 
 - **AdamW is a concrete type, not a trait** — adding Lion/Muon/SGD means forking every binary.
 - **No LR schedule** — all binaries run constant LR (`pretrain_qwen3:212` has a comment lamenting the missing warmup on resume).
@@ -32,8 +43,8 @@ Without a shared runtime, every backend × feature combination becomes 5 binary 
 
 ```
                      ┌──────────────────────────────────────────────┐
- Binaries            │ pretrain · pretrain_qwen3 · train_sft ·      │
- (thin composers)    │ train_grpo · train_multi_turn                │
+ Binaries            │ pretrain_qwen3 · train_sft · train_grpo ·    │
+ (thin composers)    │ train_multi_turn                             │
                      └──────────────────────────────────────────────┘
                                          │
                                          ▼
@@ -214,7 +225,10 @@ Trainer owns: LR schedule (per-step `optim.set_lr`), grad accumulation, backward
 
 ## 7. Checkpoint Codec v2 (directory layout)
 
-Current `checkpoint.rs` uses single-file `LMCKP003` magic. Train_sft already writes HF-style directories (`step_N/model.safetensors + config.json + tokenizer.json`). Unify on directory:
+Live trainer state already uses the v2 directory layout, and the active
+Qwen3/Qwen3.5 train paths already write HF-style step directories. The
+remaining checkpoint work is to keep every active entrypoint on that
+directory contract:
 
 ```
 step_000123/
@@ -229,7 +243,8 @@ step_000123/
 - HF interop out of the box (safetensors + config.json + tokenizer.json matches HF convention).
 - Moments as safetensors → memory-mapped load, device-transferable.
 - `trainer_state.json` is small + human-readable for debugging resumes.
-- Retires custom `LMCKP003` binary format (exists only for pretrain; migrate via compat reader for 1 release then drop).
+- Keeps the active train path on one checkpoint truth instead of
+  re-introducing a parallel single-file legacy codec.
 
 **Resume**: Trainer reads `trainer_state.json`, validates `optim_schema` matches current `Optimizer::state_schema()`, imports moments + scalar state, jumps to `self.step = saved_step + 1`. Binary-side: model weights load is the binary's responsibility (it knows the architecture); trainer exposes a `resume_trainer_state(path) -> TrainerResumeDoc` helper.
 
@@ -247,18 +262,18 @@ step_000123/
 - ✅ `Optimizer` trait in `crates/autograd/src/optim.rs`; `AdamW` implements it.
 - ✅ `GradClip` trait + `NoClip` + `GlobalNorm` in `crates/train/src/grad_clip.rs`.
 - ✅ `Trainer<O, C, S>` in `crates/train/src/trainer.rs` (incl. `run_with_hooks`, `resume_if_configured`, v2 codec, P1/P2/P3 from codex review 3d9125d/feae23b + P1 legacy compat from 3d9125d).
-- ✅ CheckpointCodec v2 directory layout in `crates/train/src/checkpoint.rs`. `LMCKP003` reader retained for pretrain compat.
+- ✅ CheckpointCodec v2 directory layout in `crates/train/src/checkpoint.rs`.
 - ✅ **`train_sft.rs` migrated onto Trainer** (commits 44a7e19 + ad5568b + 49512b1). Binary ~250 LOC on the trainer, with `--lr-schedule`, `--warmup-steps`, `--min-lr`, `--grad-accum-steps`, `--metrics-jsonl`, `--resume-from` all wired. `--resume-from` roundtrips end-to-end: Trainer writes `trainer_state.json + optimizer.safetensors`, binary writes `model.safetensors` to the same `step_{:06}/` dir; resume overrides base weights from `<resume_from>/model.safetensors` before restoring optimizer state (fixes P1 flagged in codex review of ad5568b).
 - ✅ Trainer step-level tests (15 tests in `crates/train/tests/test_trainer_loop.rs`) covering step counts, grad-accum, LR schedule wiring, metrics, save (incl. force-save on final step), eval-field omission, resume, legacy resume, force-emit on step 1 + final, hook firing, activation cleanup, full save→resume roundtrip.
-- ⏳ End-to-end 2-step SFT smoke test — pending remote runner w/ Qwen3-0.6B weights.
+- ⏳ End-to-end 2-step SFT smoke test — pending remote runner w/ current compact fixture weights; historical validation for the Qwen3-era fixture path, not the target Qwen3.5-family line.
 - ⏳ Bench: train_sft throughput on Metal before/after — pending remote (stub in `docs/experience/wins/2026-04-20-wave3-train-sft-trainer-migration.md`).
 
 ### Phase 3 — Migrate remaining 4 binaries
 
-- ✅ **`pretrain.rs` migrated** (commit 6bd0211 + fix ef24ca6 for `--grad-clip 0` panic). Binary ~415 LOC; uses `Trainer<AdamW, PretrainClip, ConstantLr>` with local enum wrapping `NoClip`/`GlobalNorm`. Save/resume deferred pending a Transformer safetensors codec (the hand-written loop also had no checkpoint support).
+- ✅ **Legacy `pretrain` compatibility path retired from the active entrypoint set** (commit 6bd0211 + fix ef24ca6 for `--grad-clip 0` panic). The active train line is the dense/full-attn Qwen3.5-family path.
 - ✅ **`pretrain_qwen3.rs` migrated** (commit bd5e277, preceded by `Trainer::run_with_eval_and_hooks` in 613ff3c and the tied/untied resume fix in 429efc3/8f2df76). Binary uses `Trainer<AdamW, PretrainClip, ConstantLr>` + `run_with_eval_and_hooks` — eval closure runs the held-out windows, `on_step_end` hook writes `step_<N>/{config.json, tokenizer.json, model.safetensors}` via the existing `save_checkpoint` helper. Trainer-side `save_every` / `save_dir` / `resume_from` stay `None`; trainer_state.json + optimizer.safetensors are deferred follow-up work. `resume_from_checkpoint` stays as a pre-Trainer weight-only load (with `tie_word_embeddings` guard + `load_into_strict`) and returns an absolute `start_step` that the hook reconstructs for save directory naming; metric-sample step numbers are relative to the Trainer's 0..total_steps counter. `--grad-clip 0/NaN/inf` warns + falls through to NoClip. New `--metrics-jsonl` flag.
 - ✅ **`train_grpo.rs` SFT phase migrated** (commit 09c5c89 + fix 1a24db1). SFT warm-up runs through `Trainer<AdamW, GrpoClip, ConstantLr>` (local enum wrapping `NoClip`/`GlobalNorm` like `PretrainClip`). GRPO phase stays hand-written — rollout_group + ref_model + mid-step `mean_sampled_kl` do not fit the single `step_fn` shape cleanly. AdamW state flows across the SFT→GRPO boundary via `run_sft_phase → AdamWState → import_state` using the existing `Trainer::optim()` + `Optimizer::export_state`/`import_state` (no new public Trainer API needed, contra the original commit body). `CliError` now flows through an `ExitCode` wrapper that prints via `Display` instead of the default Debug format. New `--grad-clip`, `--no-grad-clip`, `--metrics-jsonl` flags; `GRAD_CLIP_NORM = 1.0` constant deleted. Follow-up — ✅ extend `--metrics-jsonl` to cover the GRPO phase (landed 60f7183 + tests 2dd8607): added `JsonlSink::open_append` / `open_sink_append` factory so the GRPO loop extends the JSONL `run_sft_phase` already wrote, with step chained as `sft_steps + iter + 1`. Remaining follow-up: migrate the GRPO phase itself once a GrpoTrainer/closure shape emerges from prototyping.
-- ✅ **`train_multi_turn.rs` CLI consistency cleanup** (commit 13afa3f). Revised scope after inspection: the binary is a **pure GRPO-rollout loop with no SFT phase** (rollout_episode → discounted_returns → group_normalize → grpo_loss_per_position → AdamW), so it does not fit `Trainer<O, C, S>`'s `step_fn` shape — same mismatch that kept train_grpo's GRPO phase hand-written. Full Trainer migration blocked by the same missing RL-shaped trainer variant. Instead, adopted the shared CLI conventions (+53/-10): deleted `GRAD_CLIP_NORM = 1.0` constant, added `--grad-clip`/`--no-grad-clip`/`--metrics-jsonl` flags, wrapped `main` in the `ExitCode` pattern so `CliError` prints via Display (no more `Error: Custom("...")` leak). Follow-up: migrate the multi-turn rollout loop onto Trainer once a GrpoTrainer/closure shape emerges from prototyping (shared with the train_grpo GRPO-phase follow-up).
+- ✅ **`train_multi_turn.rs` now runs on the dense/full-attn Qwen3.5-family path** while keeping its GRPO rollout loop hand-written. It builds a `Qwen35Model`, saves HF-style step directories through the shared checkpoint helpers, and no longer depends on the handwritten Transformer runtime. It still does not fit `Trainer<O, C, S>`'s single-step closure shape cleanly, so the RL loop remains hand-written pending an RL-shaped trainer variant.
 - Each binary lands as its own commit with a bench entry.
 - Retire duplicated CLI arg handling; extend `cli_args.rs` with shared `trainer_args()` helper.
 
@@ -280,15 +295,15 @@ step_000123/
 ## 9. Success criteria
 
 - **Phase 2 done when**: `train_sft --lr-schedule cosine-with-warmup --warmup-steps 100 --grad-accum-steps 4 --metrics-jsonl out.jsonl --resume-from step_50/` runs to completion, resumes correctly, writes JSONL, matches pre-refactor loss curve within bench noise.
-- **Phase 3 done when**: all 5 binaries on Trainer; binary LOC reduced ≥40% in aggregate; every binary smoke-tested.
+- **Phase 3 done when**: all active train entrypoints (`pretrain_qwen3`, `train_sft`, `train_grpo`, `train_multi_turn`) run on the shared runtime surfaces, no dead legacy runtime code remains in `crates/train`, and every entrypoint is smoke-tested.
 - **CUDA readiness done when**: `Backend::optim_adamw_step` trait method added with CPU default, `CudaBackend` overrides it, `train_sft --backend cuda` runs with ≥2× PCIe-bw reduction vs. host-authoritative step. (Gated — lands when CUDA weights bench drives the ask.)
 
 ## 10. Open questions (ckl decides)
 
-1. **Checkpoint layout: directory (HF-style) or single-file (bump to `LMCKP004`)?** Proposed: **directory**. HF-interop + mmap + device-transfer. Downside: more files per checkpoint.
-2. **Trainer vs RLTrainer?** Proposed: **one Trainer, GRPO logic lives in step_fn**. The GRPO-specific advantage calc is already per-step in the binary; trainer doesn't need to know.
-3. **Retire `LMCKP003` immediately or keep reader for 1 release?** Proposed: **keep reader 1 release** so pretrain can cross the gap without orphaning checkpoints.
-4. **Optimizer trait location: `autograd` or new `crates/train-runtime/`?** Proposed: **keep in `autograd`** alongside existing `AdamW`. Extracting a new crate is speculative until ≥2 optimizers exist.
+1. **Checkpoint layout**: directory (HF-style) is the current standard and is already used by the active train-side path (`train_sft` / `train_multi_turn`). Keep this as the canonical layout.
+2. **Trainer vs RLTrainer?** Proposed: **one Trainer for supervised paths, with an RL-shaped variant only if rollout loops keep resisting the current closure model**. `train_grpo` and `train_multi_turn` are the decision point.
+3. **Optimizer trait location: `autograd` or new `crates/train-runtime/`?** Proposed: **keep in `autograd`** alongside existing `AdamW`. Extracting a new crate is speculative until ≥2 optimizers exist.
+4. **When to delete generic-but-unused abstractions?** Proposed: keep only abstractions with a current caller or an immediate integration plan; otherwise remove them rather than preserving dead code.
 
 ## 11. Risks & mitigations
 
@@ -296,7 +311,7 @@ step_000123/
 |---|---|
 | Refactor churn causes bench regressions | Trainer is struct dispatch, not dyn; compiler devirtualizes. Bench train_sft before/after; target ±5%. |
 | CUDA path turns out to need device-resident state | CUDA PoC as a standalone bench BEFORE committing to the current trait; if ≥10× PCIe cost, revisit trait to add `device()` query. Expected: current host-authoritative step is fine for ≤1B param models. |
-| Directory ckpt breaks existing resume flows | Compat shim in checkpoint.rs reads both `LMCKP003` and directory layout for ≥1 release. |
+| Dead legacy code re-enters through “temporary” compatibility helpers | Delete compatibility code as complete slices and require every retained abstraction to have an active caller or immediate wiring plan. |
 | step_fn closure captures become awkward for GRPO rollout | Prototype GRPO migration in Phase 3 before declaring the shape frozen; willing to add `TrainerRl` subtype if single closure doesn't cut it. |
 
 ---

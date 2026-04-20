@@ -1,24 +1,11 @@
-use autograd::{Result, Tape, TensorId, TensorStore, module::Module};
+use autograd::{Result, Tape, TensorId, TensorStore};
 use train::{
     dataset::LcgRng,
     grpo::{GrpoConfig, group_advantages, grpo_loss},
-    model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     policy::{GrpoPolicy, GrpoPolicyConfig},
+    qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
-
-fn tiny_config() -> TransformerConfig {
-    TransformerConfig {
-        vocab_size: 16,
-        d_model: 16,
-        n_layers: 2,
-        n_heads: 2,
-        d_head: 8,
-        d_ff: 32,
-        max_seq_len: 32,
-        lora: None,
-    }
-}
 
 struct EchoSeparator(usize);
 
@@ -101,13 +88,50 @@ impl GrpoPolicy for MockPolicy {
     }
 }
 
+fn tiny_qwen35_config() -> Qwen35Config {
+    Qwen35Config {
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 2,
+        vocab_size: 16,
+        rms_norm_eps: 1.0e-6,
+        stop_token_ids: vec![15],
+        bos_token_id: Some(1),
+        eos_token_id: 15,
+        tie_word_embeddings: false,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 8,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 8,
+        linear_num_value_heads: 2,
+        linear_value_head_dim: 8,
+        linear_conv_kernel_dim: 4,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: 1.0,
+        rotary_dim: 8,
+        rope_cache_len_hint: Some(32),
+        layer_types: vec![LayerType::FullAttention; 2],
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        norm_topk_prob: true,
+        mlp_only_layers: Vec::new(),
+    }
+}
+
 #[test]
 fn rollout_episode_shapes_and_masks() {
-    let config = tiny_config();
+    let config = MockPolicyConfig {
+        vocab_size: 16,
+        max_seq_len: 32,
+    };
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store).expect("policy");
-    let ref_model = policy.clone_frozen(&mut store);
+    let policy = MockPolicy { config };
+    let ref_model = policy.clone();
 
     let initial_prompt = vec![1usize, 2, 3, 15];
     let turns = [
@@ -231,10 +255,10 @@ fn rollout_episode_uses_generic_grpo_policy_path() {
 
 #[test]
 fn episode_trajectory_feeds_grpo_loss() {
-    let config = tiny_config();
+    let config = tiny_qwen35_config();
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store).expect("policy");
+    let policy = Qwen35Model::new(&config, &mut store).expect("policy");
     let ref_model = policy.clone_frozen(&mut store);
 
     let initial_prompt = vec![1usize, 2, 3, 15];
@@ -309,7 +333,7 @@ fn episode_trajectory_feeds_grpo_loss() {
     );
 
     tape.backward(loss, &mut store).expect("backward");
-    let params = policy.parameters();
+    let params = policy.all_parameter_ids();
     let any_grad = params.iter().any(|id| {
         store
             .get(*id)

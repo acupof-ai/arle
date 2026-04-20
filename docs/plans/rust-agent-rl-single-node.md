@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`train_multi_turn --serve` 是当前控制面真相） / 训练端从零写
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`train_multi_turn --serve` 是当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family dense/full-attn path with HF-style checkpoint dirs; handwritten Transformer/TinyLM runtime compat deleted; hybrid linear-attn path not landed yet
 
 ---
 
@@ -19,6 +19,7 @@
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
 > 和 [`docs/codebase-map.md`](../codebase-map.md)。
+> 当前 train-side 训练模型实现已经是 Qwen3.5-family dense/full-attn 路径；HF-style checkpoint 目录已在用。手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线；hybrid linear-attn 还没落地。
 
 ---
 
@@ -134,13 +135,13 @@ M0 结束时 ckl 应该能用一句话说清：
 | M2.2 | `LoRAAdapter { A: Parameter, B: Parameter, rank, alpha }`，`forward(x) -> B @ (A @ x) * scale` | `train/src/lora.rs` | 单测：rank=8，alpha=16，forward shape 正确，grad 流通 |
 | M2.3 | **Hook 设计**：在 `infer/src/ops/linear.rs` 加 `linear_with_lora` 可选路径，base 侧 `W @ x` 走 agent-infer 现有 kernel，LoRA 分支独立 cuBLAS 小 GEMM，结果相加 | `infer/src/ops/linear.rs` + `train/src/hook.rs` | 单测：frozen base + LoRA 前向与"base 单独跑 + LoRA 手算相加"数值一致 |
 | M2.4 | `Arc<BaseWeights>` 零拷贝共享：autograd `GpuTensor` 支持"frozen view"模式，不参与 tape | `autograd/src/tensor.rs` | LoRA forward 不克隆 base weight，显存不翻倍 |
-| M2.5 | 合成数据 supervised fine-tune loop：随机生成 `(prompt_tokens, target_tokens)` pairs，cross-entropy loss，AdamW 更新 LoRA | `train/src/trainer.rs`，`train/tests/supervised.rs` | Qwen3 4B + LoRA rank=8，100 步 loss 明显下降（>50%） |
+| M2.5 | 合成数据 supervised fine-tune loop：随机生成 `(prompt_tokens, target_tokens)` pairs，cross-entropy loss，AdamW 更新 LoRA | `train/src/trainer.rs`，`train/tests/supervised.rs` | Qwen3.5-family model + LoRA rank=8，100 步 loss 明显下降（>50%） |
 | M2.6 | **热切**：LoRA delta 写完后，推理侧用新 adapter；double-buffer `Arc<RwLock<LoRAAdapters>>` 切换 | `train/src/weight_sync.rs` | 集成测试：训练 100 步后，推理同一 prompt 输出 token 分布明显变化 |
 | M2.7 | 只训练 LoRA（base 不更新）验证：跑 1 epoch 后，`BaseWeights` 的 CUDA 指针指向数据 bitwise 不变 | `train/tests/base_frozen.rs` | 测试绿 |
 
 ### 4.3 验收门槛
 
-- ✅ Qwen3 4B 加载后 + LoRA rank=8，显存占用 ≤ base 的 1.05x（LoRA 参数 < 1% base）
+- ✅ Qwen3.5-family checkpoint 加载后 + LoRA rank=8，显存占用 ≤ base 的 1.05x（LoRA 参数 < 1% base）
 - ✅ 推理侧热切 LoRA 后，同一 prompt 的 top-1 token 或 logits 发生非平凡变化
 - ✅ Base weights bitwise 不变（grad 流只到 LoRA）
 - ✅ `cargo test --workspace --release` 无回归
@@ -328,9 +329,9 @@ M0 Day 5:
 | 日期 | 里程碑 | 状态 | 备注 |
 |---|---|---|---|
 | 2026-04-18 | Plan + project doc + research note 提交 | ✅ | 锁定 scope v3；准备开工 M0 |
-| 2026-04-18 | M0–M1 Autograd + 核心 op + AdamW | ✅ | TinyLM (~8.4M) CPU SFT 收敛到位 |
-| 2026-04-18 | M2a LoRA on TinyLM (self-contained) | ✅ | frozen base + rank-r adapters, grad 仅流向 A/B |
-| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ✅ | 走 [`m2b-blocker-analysis.md`](m2b-blocker-analysis.md) 选项 (b)：`LoRAAdapter { a/b: DeviceMatrix }` 落在 `infer/src/model/qwen3/lora.rs`（不与 train `TensorStore` 共享），PEFT loader + additive apply ops + prefill/decode hot-path wiring + synthetic safetensors integration test；CUDA Graph decode 在 LoRA 激活时自动降级为 eager（`supports_cuda_graph_decode`），warmup 仍跑两遍以预热 cublasLt autotune cache；train↔infer gradient loop 仍走选项 (a)/M1-CUDA, 未在此 phase 内 |
+| 2026-04-18 | M0–M1 Autograd + 核心 op + AdamW | ✅ | TinyLM (~8.4M) CPU SFT 收敛到位；保留为历史 scaffolding，不是当前 train-side model line |
+| 2026-04-18 | M2a LoRA on TinyLM (self-contained) | ✅ | frozen base + rank-r adapters, grad 仅流向 A/B；保留为历史 scaffolding |
+| 2026-04-18 | M2b LoRA hook into Qwen3 `linear.rs` | ✅ | 走 [`m2b-blocker-analysis.md`](m2b-blocker-analysis.md) 选项 (b)：`LoRAAdapter { a/b: DeviceMatrix }` 落在 `infer/src/model/qwen3/lora.rs`（不与 train `TensorStore` 共享），PEFT loader + additive apply ops + prefill/decode hot-path wiring + synthetic safetensors integration test；这仍是 Qwen3-era 历史实现记录，不是当前 train-side 主线；CUDA Graph decode 在 LoRA 激活时自动降级为 eager（`supports_cuda_graph_decode`），warmup 仍跑两遍以预热 cublasLt autotune cache；train↔infer gradient loop 仍走选项 (a)/M1-CUDA, 未在此 phase 内 |
 | 2026-04-18 | M3 GRPO 单 verifier 闭环 | ✅ | rollout_group + group_advantages + PPO-clip surrogate |
 | 2026-04-18 | M3.5 PPO clip + multi-verifier scaffolding | ✅ | host-space active-mask；Copy/ReverseCopy/Palette/WeightedEnsemble |
 | 2026-04-18 | M4.1 Multi-turn episode scaffolding | ✅ | Episode / TurnSpec / Environment / rollout_episode |

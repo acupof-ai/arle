@@ -3,23 +3,26 @@
 //! grpo_loss_per_position -> AdamW. Mirrors `train_grpo` but on interleaved
 //! agent/observation episodes instead of suffix-only rollouts.
 
-use std::{collections::HashSet, env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
-use autograd::{
-    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore, module::Module, optim::AdamW,
-};
+use autograd::{AutogradError, Backend, CpuBackend, Tape, TensorStore, optim::AdamW};
 use thiserror::Error;
 use train::{
+    causal_lm::build_registry,
     cli_args::{ArgError, next_value, parse_value},
     control::TrainingController,
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
     grpo::{GrpoConfig, grpo_loss_per_position, mean_sampled_kl},
-    lora::LoraConfig,
     metrics::MetricSample,
-    model::{Transformer, TransformerConfig},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     policy::{GrpoPolicy, GrpoPolicyConfig},
+    policy_support::{retained_ids, trainable_param_ids},
+    qwen35::{LayerType, Qwen35Config, Qwen35Error, Qwen35Model},
+    qwen35_checkpoint::{
+        ConfigJsonSource, GenerationConfigSource, Qwen35CheckpointError, Qwen35StepCheckpoint,
+        save_step_checkpoint,
+    },
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
 };
@@ -142,6 +145,10 @@ enum CliError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Arg(#[from] ArgError),
+    #[error(transparent)]
+    Qwen35(#[from] Qwen35Error),
+    #[error(transparent)]
+    Qwen35Checkpoint(#[from] Qwen35CheckpointError),
     #[error("{0}")]
     Custom(String),
 }
@@ -187,34 +194,20 @@ fn run() -> Result<(), CliError> {
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
     let seq_len = args.prompt_len + total_agent + total_obs;
 
-    let mut config = TransformerConfig {
-        vocab_size: args.vocab_size,
-        d_model: args.d_model,
-        n_layers: args.n_layers,
-        n_heads: args.n_heads,
-        d_head: args.d_head,
-        d_ff: args.d_ff,
-        max_seq_len: seq_len.max(32),
-        lora: None,
-    };
     if args.lora_rank > 0 {
-        let alpha = if args.lora_alpha > 0.0 {
-            args.lora_alpha
-        } else {
-            (2 * args.lora_rank) as f32
-        };
-        config.lora = Some(LoraConfig {
-            rank: args.lora_rank,
-            alpha,
-        });
+        return Err(CliError::Custom(
+            "train_multi_turn: LoRA is not wired for the qwen3.5-family path".into(),
+        ));
     }
+    let separator = (args.vocab_size - 1).min(31);
+    let config = qwen35_config(&args, seq_len, separator)?;
 
     let backend = build_backend(args.backend)?;
     eprintln!("[train_multi_turn] backend={:?}", backend.device());
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store)?;
-    let params = policy.parameters();
+    let policy = Qwen35Model::new(&config, &mut store)?;
+    let params = trainable_param_ids(&policy, &store);
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let ref_model = policy.clone_frozen(&mut store);
     let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4D55_4C54_5455_524E);
@@ -222,7 +215,6 @@ fn run() -> Result<(), CliError> {
     let eval_prompt_seed = args.seed ^ 0x4556_414C_5F50_524D;
     let eval_sample_seed = args.seed ^ 0x4556_414C_5350_4C52;
 
-    let separator = (config.vocab_size - 1).min(31);
     let env = EchoSeparator(separator);
     let target_range = args
         .target_range
@@ -369,9 +361,12 @@ fn run() -> Result<(), CliError> {
 
         if controller.take_save_request() {
             if let Some(path) = &args.save_path {
-                train::checkpoint::save(&policy, &config, &store, path)
-                    .map_err(|e| CliError::Custom(format!("checkpoint save failed: {e}")))?;
-                eprintln!("[train_multi_turn] save requested → flushed to {path}");
+                let step_dir =
+                    save_qwen35_checkpoint(path, iter + 1, &config, &policy, &mut store)?;
+                eprintln!(
+                    "[train_multi_turn] save requested → flushed to {}",
+                    step_dir.display()
+                );
             } else {
                 eprintln!(
                     "[train_multi_turn] save requested but no --save-path configured; ignoring"
@@ -423,9 +418,14 @@ fn run() -> Result<(), CliError> {
     );
 
     if let Some(path) = &args.save_path {
-        train::checkpoint::save(&policy, &config, &store, path)
-            .map_err(|e| CliError::Custom(format!("checkpoint save failed: {e}")))?;
-        println!("checkpoint saved to {path}");
+        let step_dir = save_qwen35_checkpoint(
+            path,
+            controller.snapshot().iter,
+            &config,
+            &policy,
+            &mut store,
+        )?;
+        println!("checkpoint saved to {}", step_dir.display());
     }
 
     controller.update(|s| {
@@ -439,6 +439,78 @@ fn run() -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+fn qwen35_config(
+    args: &CliArgs,
+    seq_len: usize,
+    separator: usize,
+) -> Result<Qwen35Config, CliError> {
+    if args.d_model != args.n_heads * args.d_head {
+        return Err(CliError::Custom(format!(
+            "--d-model {} must equal --n-heads {} * --d-head {} for qwen3.5-family dense training",
+            args.d_model, args.n_heads, args.d_head
+        )));
+    }
+    Ok(Qwen35Config {
+        hidden_size: args.d_model,
+        intermediate_size: args.d_ff,
+        num_hidden_layers: args.n_layers,
+        vocab_size: args.vocab_size,
+        rms_norm_eps: 1.0e-6,
+        stop_token_ids: vec![separator as u32],
+        bos_token_id: Some(0),
+        eos_token_id: separator as u32,
+        tie_word_embeddings: false,
+        num_attention_heads: args.n_heads,
+        num_key_value_heads: args.n_heads,
+        head_dim: args.d_head,
+        linear_num_key_heads: args.n_heads,
+        linear_key_head_dim: args.d_head,
+        linear_num_value_heads: args.n_heads,
+        linear_value_head_dim: args.d_head,
+        linear_conv_kernel_dim: 4,
+        rope_theta: 1_000_000.0,
+        partial_rotary_factor: 1.0,
+        rotary_dim: args.d_head,
+        rope_cache_len_hint: Some(seq_len.max(32)),
+        layer_types: vec![LayerType::FullAttention; args.n_layers],
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        norm_topk_prob: true,
+        mlp_only_layers: Vec::new(),
+    })
+}
+
+fn save_qwen35_checkpoint(
+    out_dir: &str,
+    step: usize,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    store: &mut TensorStore,
+) -> Result<PathBuf, CliError> {
+    let registry = build_registry(model);
+    let out_dir = PathBuf::from(out_dir);
+    let step_dir = save_step_checkpoint(
+        Qwen35StepCheckpoint {
+            out_dir: out_dir.as_path(),
+            step,
+            tokenizer_path: None,
+            config_json: ConfigJsonSource::Synthesize {
+                cfg,
+                torch_dtype: "float32",
+            },
+            generation_config: GenerationConfigSource::Synthesize {
+                bos_token_id: cfg.bos_token_id,
+                eos_token_id: cfg.eos_token_id,
+            },
+        },
+        |weights_path| registry.save_from(store, weights_path).map_err(Into::into),
+    )?;
+    Ok(step_dir)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -678,17 +750,4 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         }));
     }
     Ok(())
-}
-
-fn retained_ids<P: GrpoPolicy>(models: &[&P], store: &TensorStore) -> HashSet<TensorId> {
-    let mut keep = HashSet::new();
-    for model in models {
-        for param_id in model.all_parameter_ids() {
-            keep.insert(param_id);
-            if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-                keep.insert(grad_id);
-            }
-        }
-    }
-    keep
 }

@@ -4,6 +4,13 @@
 (Can trained models be directly auto-evaluated and served? Polish the
 DX; make CLI usable and understandable.)
 
+Current reality: the train-side implementation already includes the
+dense/full-attn Qwen3.5-family path, `train_multi_turn` runs on it, and
+checkpoints are already HF-style directories. The handwritten
+Transformer/TinyLM runtime compatibility path has been deleted, and the
+hybrid linear-attn train path has not landed yet. This DX plan tracks
+the checkpoint / eval / serve tooling around that reality.
+
 **Status today** (from Explore punch-list 2026-04-20):
 
 | Question | Answer |
@@ -69,8 +76,8 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
    `train::eval_lm` helper: takes `&Weights`, `&State`, tokenized
    eval windows → `EvalOutcome { loss, token_count }` (same type
    the Trainer already emits).
-2. New binary `crates/train/src/bin/eval_lm.rs`: load weights via
-   existing Qwen3 loader, tokenize `--data` via existing jsonl
+2. New binary `crates/train/src/bin/eval_lm.rs`: load weights via the
+   current Qwen3.5-family loader, tokenize `--data` via existing jsonl
    dataloader, call the helper, emit one `MetricSample` with
    `eval_loss`, `eval_ppl = exp(eval_loss)`, `eval_tokens`.
 3. Shares `cli_args::trainer_args()` helper for consistency with
@@ -104,9 +111,9 @@ eval binary; flag names match across binaries for the same concept.
 | grad clip | `--grad-clip` / `--no-grad-clip` | f32 / flag |
 
 **Work:**
-1. Adopt `clap` derive across all train binaries (replacing hand-
-   rolled parsers in `pretrain.rs`, `pretrain_qwen3.rs`,
-   `train_sft.rs`, `train_grpo.rs`, `train_multi_turn.rs`).
+1. Adopt `clap` derive across the train binaries and retained
+   compatibility entrypoints (replacing hand-rolled parsers in the
+   current binaries plus any remaining legacy wrappers).
 2. Migrate to `cli_args::trainer_args()` shared helper (already
    exists per 15ed922 refactor).
 3. Keep old flag names as deprecated aliases for one release cycle

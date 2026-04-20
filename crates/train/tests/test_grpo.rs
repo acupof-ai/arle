@@ -1,13 +1,48 @@
-use std::{collections::HashSet, time::Instant};
+use std::time::Instant;
 
-use autograd::{Tape, TensorId, TensorStore, module::Module, optim::AdamW};
+use autograd::{Tape, TensorStore, optim::AdamW};
 use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
     grpo::{GrpoConfig, group_advantages, grpo_loss, ppo_active_mask},
-    model::{Transformer, TransformerConfig},
+    policy_support::retained_ids,
+    qwen35::{LayerType, Qwen35Config, Qwen35Model},
     rollout::{Trajectory, rollout_group},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
+
+fn tiny_qwen35_config(max_seq_len: usize) -> Qwen35Config {
+    Qwen35Config {
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 2,
+        vocab_size: 16,
+        rms_norm_eps: 1.0e-6,
+        stop_token_ids: vec![15],
+        bos_token_id: Some(1),
+        eos_token_id: 15,
+        tie_word_embeddings: false,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 8,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 8,
+        linear_num_value_heads: 2,
+        linear_value_head_dim: 8,
+        linear_conv_kernel_dim: 4,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: 1.0,
+        rotary_dim: 8,
+        rope_cache_len_hint: Some(max_seq_len),
+        layer_types: vec![LayerType::FullAttention; 2],
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        norm_topk_prob: true,
+        mlp_only_layers: Vec::new(),
+    }
+}
 
 #[test]
 fn ppo_active_mask_zeros_out_clipped_positions() {
@@ -57,22 +92,13 @@ fn group_advantages_normalizes_per_group() {
 
 #[test]
 fn grpo_loss_gradient_non_zero() {
-    let config = TransformerConfig {
-        vocab_size: 16,
-        d_model: 16,
-        n_layers: 2,
-        n_heads: 2,
-        d_head: 8,
-        d_ff: 32,
-        max_seq_len: 4,
-        lora: None,
-    };
+    let config = tiny_qwen35_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store).expect("build policy");
+    let policy = Qwen35Model::new(&config, &mut store).expect("build policy");
     let ref_model = policy.clone_frozen(&mut store);
-    let params = policy.parameters();
+    let params = policy.all_parameter_ids();
     {
         let tensor = store
             .get_mut(params[0])
@@ -139,21 +165,12 @@ fn grpo_loss_gradient_non_zero() {
 #[test]
 fn grpo_smoke_reward_nondecreasing_on_trivial_task() {
     let started = Instant::now();
-    let config = TransformerConfig {
-        vocab_size: 16,
-        d_model: 16,
-        n_layers: 2,
-        n_heads: 2,
-        d_head: 8,
-        d_ff: 32,
-        max_seq_len: 8,
-        lora: None,
-    };
+    let config = tiny_qwen35_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store).expect("build policy");
-    let params = policy.parameters();
+    let policy = Qwen35Model::new(&config, &mut store).expect("build policy");
+    let params = policy.all_parameter_ids();
     let mut optimizer = AdamW::new(1.0e-2, (0.9, 0.999), 1.0e-8, 0.0);
     let mut dataset = CopyDataset::with_vocab(2, 8, 7, 8, 15);
 
@@ -164,7 +181,7 @@ fn grpo_smoke_reward_nondecreasing_on_trivial_task() {
         tape.entries.clear();
         tape.set_enabled(true);
         let logits = policy
-            .forward(&inputs, batch, seq_len, &mut store, &mut tape)
+            .forward_batch_tokens(&inputs, batch, seq_len, &mut store, &mut tape)
             .expect("forward");
         let loss = cross_entropy_loss(logits, &targets, &mut store, &mut tape).expect("loss");
 
@@ -287,17 +304,4 @@ fn mean_reward(trajectories: &[Trajectory]) -> f32 {
         .map(|trajectory| trajectory.reward)
         .sum::<f32>()
         / trajectories.len() as f32
-}
-
-fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {
-    let mut keep = HashSet::new();
-    for model in models {
-        for param_id in model.all_parameter_ids() {
-            keep.insert(param_id);
-            if let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) {
-                keep.insert(grad_id);
-            }
-        }
-    }
-    keep
 }

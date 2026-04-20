@@ -20,11 +20,23 @@ crate:
   (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`,
   `kv_turboquant`). Extracted from `infer` in commit `a4e12f5` (2026-04-15).
 - `mlx-sys`: MLX C++ bridge used by the Metal backend
+- `qwen3-spec` / `qwen35-spec`: shared train↔infer model-contract crates for
+  canonical Qwen config fields and tensor names
 
 Phase 6 training stack (orthogonal to the inference runtime; see
 [projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md)):
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend` trait with CPU/Metal/CUDA matmul
-- `train`: LoRA + GRPO trainer (`train_multi_turn` binary), depends on `autograd`
+- `train`: generic Qwen-family SFT/GRPO trainer with Qwen3.5-optimized defaults; `train_multi_turn` remains the dense/full-attn Qwen3.5 path, while `train_sft` and `train_grpo` dispatch across Qwen3 / Qwen3.5 families. Depends on `autograd`
+
+Current reality note: the train-side implementation already includes the
+dense/full-attn Qwen3.5-family path and a generic family-dispatch control
+plane. `train_multi_turn` runs on the Qwen3.5 path today, `train_sft` and
+`train_grpo` can dispatch across Qwen3 / Qwen3.5 families, checkpoints are
+written as HF-style directories, the handwritten Transformer/TinyLM runtime
+compatibility path has been deleted, GSPO has not landed yet, and the hybrid
+linear-attn Qwen3.5 train path has not landed yet. The shared
+config/tensor-name truth is beginning to move into the dedicated
+`qwen*-spec` crates.
 
 The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,
 `infer-policy`, and `infer-engine` back into `infer` because the split never

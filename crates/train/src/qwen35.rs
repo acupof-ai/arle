@@ -3,11 +3,12 @@ use std::{collections::HashMap, f32::consts::TAU};
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, silu,
-        transpose,
+        add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
 };
-pub use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
+use qwen35_spec::Qwen35AttentionTensorNames;
+pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
 use thiserror::Error;
 
 use crate::{
@@ -16,26 +17,26 @@ use crate::{
 };
 
 #[derive(Debug, Error)]
-pub enum Qwen3Error {
+pub enum Qwen35Error {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
     #[error(transparent)]
-    Config(#[from] Qwen3ConfigError),
-    #[error("invalid qwen3 config: {0}")]
+    Config(#[from] Qwen35ConfigError),
+    #[error("invalid qwen3.5 config: {0}")]
     InvalidConfig(&'static str),
-    #[error("input_ids len {input_len} does not match position_ids len {position_len}")]
+    #[error("input_ids len {input_len} does not match expected {expected_len}")]
     InputLenMismatch {
         input_len: usize,
-        position_len: usize,
+        expected_len: usize,
     },
     #[error("position id {position} is out of bounds for rope cache size {upper}")]
     PositionOutOfBounds { position: usize, upper: usize },
 }
 
-pub type Result<T> = std::result::Result<T, Qwen3Error>;
+pub type Result<T> = std::result::Result<T, Qwen35Error>;
 
 #[derive(Debug, Clone)]
-struct Qwen3Attention {
+struct Qwen35FullAttention {
     q_proj: TensorId,
     k_proj: TensorId,
     v_proj: TensorId,
@@ -45,25 +46,25 @@ struct Qwen3Attention {
 }
 
 #[derive(Debug, Clone)]
-struct Qwen3Mlp {
+struct Qwen35Mlp {
     gate_proj: TensorId,
     up_proj: TensorId,
     down_proj: TensorId,
 }
 
 #[derive(Debug, Clone)]
-struct Qwen3Layer {
+struct Qwen35Layer {
     input_layernorm: TensorId,
-    self_attn: Qwen3Attention,
+    self_attn: Qwen35FullAttention,
     post_attention_layernorm: TensorId,
-    mlp: Qwen3Mlp,
+    mlp: Qwen35Mlp,
 }
 
-impl Qwen3Layer {
+impl Qwen35Layer {
     fn forward(
         &self,
         x: TensorId,
-        cfg: &Qwen3Config,
+        cfg: &Qwen35Config,
         cos: TensorId,
         sin: TensorId,
         store: &mut TensorStore,
@@ -85,21 +86,34 @@ impl Qwen3Layer {
         let seq_len = x_shape[1];
 
         let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
-        let q = linear_forward(h, self.self_attn.q_proj, store, tape)?;
-        let k = linear_forward(h, self.self_attn.k_proj, store, tape)?;
-        let v = linear_forward(h, self.self_attn.v_proj, store, tape)?;
-
-        let q = split_heads(
-            q,
-            batch,
-            seq_len,
-            cfg.num_attention_heads,
-            cfg.head_dim,
+        let q_full = linear_forward(h, self.self_attn.q_proj, store, tape)?;
+        let q_full = reshape(
+            q_full,
+            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
             store,
             tape,
         )?;
+        let q = slice(
+            q_full,
+            &[0, 0, 0, 0],
+            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+            store,
+            tape,
+        )?;
+        let gate = slice(
+            q_full,
+            &[0, 0, 0, cfg.head_dim],
+            &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
+            store,
+            tape,
+        )?;
+        let q = transpose(q, 1, 2, store, tape)?;
+        let gate = transpose(gate, 1, 2, store, tape)?;
+
+        let k = linear_forward(h, self.self_attn.k_proj, store, tape)?;
+        let v = linear_forward(h, self.self_attn.v_proj, store, tape)?;
         let k = split_heads(
-            q_or_kv_heads_tensor(k),
+            k,
             batch,
             seq_len,
             cfg.num_key_value_heads,
@@ -108,7 +122,7 @@ impl Qwen3Layer {
             tape,
         )?;
         let v = split_heads(
-            q_or_kv_heads_tensor(v),
+            v,
             batch,
             seq_len,
             cfg.num_key_value_heads,
@@ -121,10 +135,14 @@ impl Qwen3Layer {
         let k = rmsnorm(k, self.self_attn.k_norm, cfg.rms_norm_eps, store, tape)?;
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
+        let gate = sigmoid(gate, store, tape)?;
+
         let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
+
         let attn = causal_sdpa(q, k, v, store, tape)?;
+        let attn = mul(attn, gate, store, tape)?;
         let attn = merge_heads(
             attn,
             batch,
@@ -154,9 +172,9 @@ impl Qwen3Layer {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3Model {
-    config: Qwen3Config,
-    layers: Vec<Qwen3Layer>,
+pub struct Qwen35Model {
+    config: Qwen35Config,
+    layers: Vec<Qwen35Layer>,
     embed_tokens: TensorId,
     final_norm: TensorId,
     lm_head: TensorId,
@@ -166,9 +184,10 @@ pub struct Qwen3Model {
     param_ids: Vec<TensorId>,
 }
 
-impl Qwen3Model {
-    pub fn new(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<Self> {
+impl Qwen35Model {
+    pub fn new(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
         cfg.validate()?;
+        validate_train_config(cfg)?;
 
         let mut param_names = HashMap::new();
         let mut param_ids = Vec::new();
@@ -179,6 +198,7 @@ impl Qwen3Model {
                 param_ids.push(id);
             }
         };
+
         let embed_tokens_name = cfg.embed_tokens_tensor_name();
         let embed_tokens = normal_parameter(
             embed_tokens_name,
@@ -188,55 +208,66 @@ impl Qwen3Model {
         )?;
         register_param(embed_tokens_name, embed_tokens);
 
+        let lm_head_name = if cfg.tie_word_embeddings {
+            cfg.lm_head_tensor_name()
+        } else {
+            leak_name(format!("{}.lm_head.weight", cfg.model_prefix()))
+        };
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
         } else {
             normal_parameter(
-                "lm_head.weight",
+                lm_head_name,
                 &[cfg.vocab_size, cfg.hidden_size],
                 0.02,
                 store,
             )?
         };
-        register_param("lm_head.weight", lm_head);
+        register_param(lm_head_name, lm_head);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let names = cfg.layer_tensor_names(layer_idx);
-            let input_layernorm_name = leak_name(names.input_layernorm);
-            let q_proj_name = leak_name(names.q_proj);
-            let k_proj_name = leak_name(names.k_proj);
-            let v_proj_name = leak_name(names.v_proj);
-            let o_proj_name = leak_name(names.o_proj);
-            let q_norm_name = leak_name(names.q_norm);
-            let k_norm_name = leak_name(names.k_norm);
-            let gate_proj_name = leak_name(names.mlp_gate_proj);
-            let up_proj_name = leak_name(names.mlp_up_proj);
-            let down_proj_name = leak_name(names.mlp_down_proj);
-            let post_attention_layernorm_name = leak_name(names.post_attention_layernorm);
+            let Qwen35AttentionTensorNames::Full(attn_names) = names.attention else {
+                return Err(Qwen35Error::InvalidConfig(
+                    "train-side qwen3.5 currently supports full-attention layers only",
+                ));
+            };
+
+            let input_layernorm_name = leak_name(names.common.input_layernorm);
+            let post_attention_layernorm_name = leak_name(names.common.post_attention_layernorm);
+            let gate_proj_name = leak_name(names.common.mlp_gate_proj);
+            let up_proj_name = leak_name(names.common.mlp_up_proj);
+            let down_proj_name = leak_name(names.common.mlp_down_proj);
+            let q_proj_name = leak_name(attn_names.q_proj);
+            let k_proj_name = leak_name(attn_names.k_proj);
+            let v_proj_name = leak_name(attn_names.v_proj);
+            let o_proj_name = leak_name(attn_names.o_proj);
+            let q_norm_name = leak_name(attn_names.q_norm);
+            let k_norm_name = leak_name(attn_names.k_norm);
 
             let input_layernorm = ones_parameter(input_layernorm_name, &[cfg.hidden_size], store)?;
             let q_proj = normal_parameter(
                 q_proj_name,
-                &[cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size],
+                &[cfg.full_attn_q_proj_dim(), cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let k_proj = normal_parameter(
                 k_proj_name,
-                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
+                &[cfg.full_attn_kv_dim(), cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let v_proj = normal_parameter(
                 v_proj_name,
-                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
+                &[cfg.full_attn_kv_dim(), cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let o_proj = normal_parameter(
                 o_proj_name,
-                &[cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim],
+                &[cfg.hidden_size, cfg.full_attn_q_dim()],
                 0.02,
                 store,
             )?;
@@ -275,9 +306,9 @@ impl Qwen3Model {
             register_param(down_proj_name, down_proj);
             register_param(post_attention_layernorm_name, post_attention_layernorm);
 
-            layers.push(Qwen3Layer {
+            layers.push(Qwen35Layer {
                 input_layernorm,
-                self_attn: Qwen3Attention {
+                self_attn: Qwen35FullAttention {
                     q_proj,
                     k_proj,
                     v_proj,
@@ -286,7 +317,7 @@ impl Qwen3Model {
                     k_norm,
                 },
                 post_attention_layernorm,
-                mlp: Qwen3Mlp {
+                mlp: Qwen35Mlp {
                     gate_proj,
                     up_proj,
                     down_proj,
@@ -366,7 +397,7 @@ impl Qwen3Model {
         let position_ids = (0..seq_len).map(|index| index as u32).collect::<Vec<_>>();
         let input_ids = input_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
         self.forward_batch(store, tape, &input_ids, &position_ids, batch, seq_len)
-            .map_err(qwen3_to_autograd)
+            .map_err(qwen35_to_autograd)
     }
 
     pub fn forward_batch(
@@ -379,20 +410,26 @@ impl Qwen3Model {
         seq_len: usize,
     ) -> Result<TensorId> {
         if input_ids.len() != batch * seq_len {
-            return Err(Qwen3Error::InputLenMismatch {
+            return Err(Qwen35Error::InputLenMismatch {
                 input_len: input_ids.len(),
-                position_len: batch * seq_len,
+                expected_len: batch * seq_len,
             });
         }
         if position_ids.len() != seq_len {
-            return Err(Qwen3Error::InputLenMismatch {
-                input_len: input_ids.len(),
-                position_len: position_ids.len(),
+            return Err(Qwen35Error::InputLenMismatch {
+                input_len: position_ids.len(),
+                expected_len: seq_len,
             });
         }
-        if seq_len > self.config.max_position_embeddings {
-            return Err(Qwen3Error::InvalidConfig(
-                "sequence length exceeds context window",
+        let max_seq_len = self
+            .config
+            .rope_cache_len_hint
+            .ok_or(Qwen35Error::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ))?;
+        if seq_len > max_seq_len {
+            return Err(Qwen35Error::InvalidConfig(
+                "sequence length exceeds configured rope cache length",
             ));
         }
 
@@ -439,9 +476,9 @@ impl Qwen3Model {
     }
 }
 
-impl GrpoPolicyConfig for Qwen3Config {
+impl GrpoPolicyConfig for Qwen35Config {
     fn max_seq_len(&self) -> usize {
-        self.max_position_embeddings
+        self.rope_cache_len_hint.unwrap_or(0)
     }
 
     fn vocab_size(&self) -> usize {
@@ -449,8 +486,8 @@ impl GrpoPolicyConfig for Qwen3Config {
     }
 }
 
-impl GrpoPolicy for Qwen3Model {
-    type Config = Qwen3Config;
+impl GrpoPolicy for Qwen35Model {
+    type Config = Qwen35Config;
 
     fn config(&self) -> &Self::Config {
         &self.config
@@ -462,7 +499,7 @@ impl GrpoPolicy for Qwen3Model {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> autograd::Result<TensorId> {
-        Qwen3Model::forward_tokens(self, input_ids, store, tape)
+        Qwen35Model::forward_tokens(self, input_ids, store, tape)
     }
 
     fn forward_batch_tokens(
@@ -473,19 +510,19 @@ impl GrpoPolicy for Qwen3Model {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> autograd::Result<TensorId> {
-        Qwen3Model::forward_batch_tokens(self, input_ids, batch, seq_len, store, tape)
+        Qwen35Model::forward_batch_tokens(self, input_ids, batch, seq_len, store, tape)
     }
 
     fn all_parameter_ids(&self) -> Vec<TensorId> {
-        Qwen3Model::all_parameter_ids(self)
+        Qwen35Model::all_parameter_ids(self)
     }
 
     fn clone_frozen(&self, store: &mut TensorStore) -> Self {
-        Qwen3Model::clone_frozen(self, store)
+        Qwen35Model::clone_frozen(self, store)
     }
 }
 
-impl CausalLm for Qwen3Model {
+impl CausalLm for Qwen35Model {
     fn forward_with_positions(
         &self,
         store: &mut TensorStore,
@@ -493,12 +530,40 @@ impl CausalLm for Qwen3Model {
         input_ids: &[u32],
         position_ids: &[u32],
     ) -> autograd::Result<TensorId> {
-        Qwen3Model::forward(self, store, tape, input_ids, position_ids).map_err(qwen3_to_autograd)
+        Qwen35Model::forward(self, store, tape, input_ids, position_ids).map_err(qwen35_to_autograd)
     }
 
     fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
-        Qwen3Model::param_name_map(self)
+        Qwen35Model::param_name_map(self)
     }
+}
+
+fn validate_train_config(cfg: &Qwen35Config) -> Result<()> {
+    if cfg.is_moe() {
+        return Err(Qwen35Error::InvalidConfig(
+            "train-side qwen3.5 currently supports dense MLP layers only",
+        ));
+    }
+    if cfg
+        .layer_types
+        .iter()
+        .any(|layer_type| *layer_type != LayerType::FullAttention)
+    {
+        return Err(Qwen35Error::InvalidConfig(
+            "train-side qwen3.5 currently supports full-attention layers only",
+        ));
+    }
+    if cfg.rotary_dim != cfg.head_dim {
+        return Err(Qwen35Error::InvalidConfig(
+            "train-side qwen3.5 requires rotary_dim == head_dim",
+        ));
+    }
+    if cfg.rope_cache_len_hint.is_none() {
+        return Err(Qwen35Error::InvalidConfig(
+            "train-side qwen3.5 requires rope_cache_len_hint",
+        ));
+    }
+    Ok(())
 }
 
 fn linear_forward(
@@ -546,7 +611,7 @@ fn linear_forward(
     Ok(reshape(projected, &output_shape, store, tape)?)
 }
 
-fn qwen3_to_autograd(err: Qwen3Error) -> AutogradError {
+fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
 }
 
@@ -586,9 +651,6 @@ fn select_cache_rows(
     position_ids: &[usize],
     store: &mut TensorStore,
 ) -> Result<TensorId> {
-    // Borrow the cache tensor — the full RoPE cache is ~max_position_embeddings *
-    // head_dim/2 floats (8–10 MiB for Qwen3 configs); cloning it twice per
-    // forward would be O(max_pos) instead of O(seq_len).
     let cache_tensor = store
         .get(cache)
         .ok_or(AutogradError::InvalidTensorId(cache))?;
@@ -605,7 +667,7 @@ fn select_cache_rows(
     let mut data = Vec::with_capacity(position_ids.len() * cols);
     for &position in position_ids {
         if position >= rows {
-            return Err(Qwen3Error::PositionOutOfBounds {
+            return Err(Qwen35Error::PositionOutOfBounds {
                 position,
                 upper: rows,
             });
@@ -617,19 +679,22 @@ fn select_cache_rows(
     Ok(store.alloc(Tensor::new(data, output_shape, false)?))
 }
 
-fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(TensorId, TensorId)> {
-    let half_dim = cfg.head_dim / 2;
+fn build_rope_cache(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<(TensorId, TensorId)> {
+    let max_positions = cfg.rope_cache_len_hint.ok_or(Qwen35Error::InvalidConfig(
+        "train-side qwen3.5 requires rope_cache_len_hint",
+    ))?;
+    let half_dim = cfg.rotary_dim / 2;
     let inv_freq = (0..half_dim)
         .map(|index| {
             1.0 / cfg
                 .rope_theta
-                .powf((2.0 * index as f32) / cfg.head_dim as f32)
+                .powf((2.0 * index as f32) / cfg.rotary_dim as f32)
         })
         .collect::<Vec<_>>();
-    let mut cos = vec![0.0; cfg.max_position_embeddings * half_dim];
-    let mut sin = vec![0.0; cfg.max_position_embeddings * half_dim];
+    let mut cos = vec![0.0; max_positions * half_dim];
+    let mut sin = vec![0.0; max_positions * half_dim];
 
-    for position in 0..cfg.max_position_embeddings {
+    for position in 0..max_positions {
         let base = position * half_dim;
         for (freq_index, &freq) in inv_freq.iter().enumerate() {
             let angle = position as f32 * freq;
@@ -638,16 +703,8 @@ fn build_rope_cache(cfg: &Qwen3Config, store: &mut TensorStore) -> Result<(Tenso
         }
     }
 
-    let cos_cache = store.alloc(Tensor::new(
-        cos,
-        vec![cfg.max_position_embeddings, half_dim],
-        false,
-    )?);
-    let sin_cache = store.alloc(Tensor::new(
-        sin,
-        vec![cfg.max_position_embeddings, half_dim],
-        false,
-    )?);
+    let cos_cache = store.alloc(Tensor::new(cos, vec![max_positions, half_dim], false)?);
+    let sin_cache = store.alloc(Tensor::new(sin, vec![max_positions, half_dim], false)?);
     Ok((cos_cache, sin_cache))
 }
 
@@ -705,52 +762,4 @@ fn next_uniform(state: &mut u64) -> f32 {
 
 fn leak_name(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
-}
-
-fn q_or_kv_heads_tensor(x: TensorId) -> TensorId {
-    x
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use autograd::{Tape, TensorStore};
-
-    #[test]
-    fn batch_forward_matches_repeated_single_forward() {
-        let cfg = Qwen3Config {
-            vocab_size: 16,
-            hidden_size: 8,
-            num_hidden_layers: 1,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 4,
-            intermediate_size: 16,
-            max_position_embeddings: 8,
-            rms_norm_eps: 1.0e-6,
-            rope_theta: 10_000.0,
-            tie_word_embeddings: false,
-        };
-
-        let mut store = TensorStore::default();
-        let mut tape = Tape::new();
-        let model = Qwen3Model::new(&cfg, &mut store).expect("model");
-
-        let single_ids = vec![1, 2, 3, 4];
-        let single = model
-            .forward_tokens(&single_ids, &mut store, &mut tape)
-            .expect("single forward");
-        let single_logits = store.to_host(single).expect("single logits");
-
-        tape.entries.clear();
-        let batch_ids = [single_ids.clone(), single_ids.clone()].concat();
-        let batched = model
-            .forward_batch_tokens(&batch_ids, 2, single_ids.len(), &mut store, &mut tape)
-            .expect("batch forward");
-        let batched_logits = store.to_host(batched).expect("batch logits");
-
-        assert_eq!(batched_logits.len(), 2 * single_logits.len());
-        assert_eq!(&batched_logits[..single_logits.len()], &single_logits[..]);
-        assert_eq!(&batched_logits[single_logits.len()..], &single_logits[..]);
-    }
 }

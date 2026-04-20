@@ -8,7 +8,7 @@
 
 ## 0. TL;DR
 
-把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码还处在过渡期：训练主体已经落在独立 `train` crate 的 train-side server 上，并通过 `train_multi_turn --serve` 暴露；下面描述的是要收敛到的目标态：
+把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码已经有独立 `train` crate 的 train-side server，并通过 `train_multi_turn --serve` 暴露；当前 train-side 真相是通用 Qwen-family 训练架构，以 Qwen3.5 为默认和优化主线：`train_sft` / `train_grpo` 已经能在 Qwen3 / Qwen3.5 间切换，`train_multi_turn` 仍聚焦在 dense/full-attn 的 Qwen3.5 路径，checkpoint 以 HF-style 目录保存，手写 Transformer/TinyLM runtime compatibility 路径已经删除，GSPO 尚未实现，hybrid linear-attn train path 还没有落地。下面描述的是要收敛到的目标态：
 
 ```
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
@@ -23,6 +23,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 > 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
 > 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
 > [`docs/plans/train-runtime-architecture-v1.md`](../plans/train-runtime-architecture-v1.md)。
+> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 dense/full-attn 为默认与优化主线；hybrid linear-attn 与 GSPO 仍是后续目标，不是已经完成的现状。
 
 ---
 
@@ -67,7 +68,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |
 | 训练范围 | **LoRA only**，base 冻结 | 全参训练（v2 再考虑） |
 | RL 算法 | GRPO（无 critic） | PPO / DPO / RLAIF（v2 可选） |
-| 模型 | Qwen3 4B 起步，8B 压测 | 多架构支持（v2） |
+| 模型 | Qwen3.5 architecture family（规模参数化，大小只是配置，不是第二套权威） | 多架构支持（v2） |
 | 权重共享 | `Arc<BaseWeights>` + `RwLock<LoRADelta>` double-buffer | 跨进程 shared memory |
 | Rollout | 复用 agent-infer scheduler + agent tool loop | 重写 rollout |
 | Reward | 单 verifier 起步（数学 exact-match / 代码单测） | Learned reward model |
@@ -173,7 +174,7 @@ crates/
 |---|---|---|---|---|
 | **M0** | Autograd 起手式 | `crates/autograd` 骨架：`TensorStore` + `Tape` + `BackwardOp::{Add, Mul, MulScalar}` + Sum reduce + CPU 路径 | `y = sum((a+b)*3); y.backward()` 对 a、b 梯度手验过；CPU-only，无 GPU | 3–5 天 |
 | **M1** | Autograd 核心 op 完整 | + matmul (CPU+cuBLAS) + log_softmax + gather + AdamW (CPU+CUDA) + Module trait | 玩具 2 层 MLP 在 CPU 和 CUDA 下收敛；每 op 有 grad_check 单测；AdamW 对拍 PyTorch 参考值 | 10–14 天 |
-| **M2** | LoRA 合入 agent-infer | `crates/train` 骨架 + LoRA adapter + agent-infer base forward hook + 合成数据 supervised fine-tune 路径 | Qwen3 4B + LoRA rank=8；合成 prompt→target 数据，train loss 明显下降；推理侧热切 adapter 后输出变化可见 | 14 天 |
+| **M2** | LoRA 合入 agent-infer | `crates/train` 骨架 + LoRA adapter + agent-infer base forward hook + 合成数据 supervised fine-tune 路径 | Qwen3.5-family model + LoRA rank=8；合成 prompt→target 数据，train loss 明显下降；推理侧热切 adapter 后输出变化可见 | 14 天 |
 | **M3** | GRPO + 单 verifier 闭环 | GRPO loss + advantage + trajectory buffer + rollout↔train 交替主循环 + 数学 verifier | 小型 GSM8K-like 数据集；reward 曲线上升（≥基线 +15% pass@1 on held-out subset）；闭环稳定跑 ≥6 小时无 OOM/崩 | 21 天 |
 | **M4** | Agent 自进化 MVP | Multi-turn agent tool loop 接入 + 多 verifier（数学 + 代码单测）+ 基础 curriculum（难度上移） | 连续 N 轮自生成任务，reward 非平凡（非 reward hack）上升；冒烟：Agent 能**解决自己上轮解决不了的任务** | 4–6 周 |
 | **M5** | Metal 支线对齐 | autograd 在 `mlx-sys` 上提供对应 op；Mac 上能跑 M2 的最小 demo (1.5B) | Mac M4 Pro 上 LoRA forward+backward 跑通；收敛曲线形状和 CUDA 一致 | 与 M3/M4 并行 |
