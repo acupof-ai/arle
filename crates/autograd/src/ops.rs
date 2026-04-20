@@ -87,9 +87,11 @@ pub fn causal_sdpa(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(q)?;
-    store.ensure_host(k)?;
-    store.ensure_host(v)?;
+    // M5.3b.15: composite op — body is pure dispatch over reshape /
+    // transpose / matmul / mul_scalar / add_broadcast / softmax, all of
+    // which are lazy on Metal post M5.3b.1–14. Stripping `ensure_host`
+    // here lets the entire attention chain stay in the MLX graph end-
+    // to-end for each layer (Qwen3.5 × 28 layers).
     attention::causal_sdpa(q, k, v, store, tape)
 }
 
