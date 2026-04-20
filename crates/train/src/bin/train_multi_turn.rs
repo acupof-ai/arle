@@ -10,24 +10,34 @@
 
 use std::{env, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
-use autograd::{AutogradError, Backend, CpuBackend, Tape, TensorStore, optim::AdamW};
+use autograd::{
+    optim::{AdamW, Optimizer},
+    AutogradError, Backend, CpuBackend, Tape, TensorStore,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use train::{
-    causal_lm::{build_adapter_registry, live_tensor_ids, save_materialized_registry},
-    cli_args::{ArgError, next_value, parse_value},
+    causal_lm::{
+        build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
+        trainable_param_name_map,
+    },
+    checkpoint::{
+        load_trainer_state_v2, save_trainer_state_v2, TrainerStateDoc, TRAINER_STATE_CODEC_VERSION,
+    },
+    cli_args::{next_value, parse_value, ArgError},
     control::TrainingController,
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
-    grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl},
+    grpo::{group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl, GrpoConfig},
     lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
-    multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
+    multi_turn::{rollout_episode, Environment, Episode, TurnSpec},
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
     qwen35::{LayerType, Qwen35Config, Qwen35Error, Qwen35Model},
     qwen35_checkpoint::{
-        ConfigJsonSource, GenerationConfigSource, Qwen35CheckpointError, Qwen35StepCheckpoint,
-        save_step_checkpoint,
+        save_step_checkpoint, ConfigJsonSource, GenerationConfigSource, Qwen35CheckpointError,
+        Qwen35StepCheckpoint,
     },
     reward::{discounted_returns, group_normalize, returns_to_per_position},
     server::bind_and_serve_on_thread,
@@ -61,6 +71,7 @@ struct CliArgs {
     eval_temperature: f32,
     backend: BackendChoice,
     save_path: Option<String>,
+    resume_from: Option<PathBuf>,
     serve: Option<u16>,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
@@ -121,6 +132,7 @@ impl Default for CliArgs {
             eval_temperature: 0.3,
             backend: BackendChoice::Cpu,
             save_path: None,
+            resume_from: None,
             serve: None,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
@@ -148,6 +160,25 @@ impl FromStr for MultiTurnObjective {
             _ => Err(format!("unknown objective: {s}")),
         }
     }
+}
+
+const TRAIN_MODEL_FILENAME: &str = "train_model.safetensors";
+const MULTI_TURN_PROMPT_SALT: u64 = 0x4D55_4C54_5052_4F4D;
+const MULTI_TURN_SAMPLE_SALT: u64 = 0x4D55_4C54_5341_4D50;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct MultiTurnCheckpointMeta {
+    lr: f32,
+    objective: String,
+    best_reward: f32,
+    last_kl: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResumeState {
+    start_iter: usize,
+    best_reward: f32,
+    last_kl: f32,
 }
 
 fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
@@ -246,14 +277,37 @@ fn run() -> Result<(), CliError> {
         backend.device(),
         args.objective.as_str()
     );
+    let resume_dir = args
+        .resume_from
+        .as_ref()
+        .map(|path| {
+            path.canonicalize().map_err(|err| {
+                CliError::Custom(format!(
+                    "failed to canonicalize --resume-from {}: {err}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
     let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
     let policy = Qwen35Model::new_with_lora(&config, Some(lora), &mut store)?;
     let params = trainable_param_ids(&policy, &store);
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let resume = if let Some(resume_dir) = resume_dir.as_deref() {
+        resume_multi_turn_checkpoint(
+            resume_dir,
+            &args,
+            &config,
+            &policy,
+            &mut store,
+            &mut optimizer,
+            lora,
+        )?
+    } else {
+        ResumeState::default()
+    };
     let ref_model = policy.clone_frozen(&mut store);
-    let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4D55_4C54_5455_524E);
-    let mut sample_rng = LcgRng::seed(args.seed.wrapping_add(17));
     let eval_prompt_seed = args.seed ^ 0x4556_414C_5F50_524D;
     let eval_sample_seed = args.seed ^ 0x4556_414C_5350_4C52;
 
@@ -280,15 +334,18 @@ fn run() -> Result<(), CliError> {
         group_size: args.group_size,
     };
 
-    let mut reward_trajectory = Vec::with_capacity(args.iters);
-    let mut best_reward = 0.0_f32;
-    let mut last_kl = 0.0_f32;
+    let mut reward_trajectory = Vec::with_capacity(args.iters.saturating_sub(resume.start_iter));
+    let mut best_reward = resume.best_reward;
+    let mut last_kl = resume.last_kl;
     let loop_start = std::time::Instant::now();
 
     let controller = TrainingController::new();
     controller.update(|s| {
         s.total_iters = args.iters;
         s.started = true;
+        s.iter = resume.start_iter;
+        s.best_reward = best_reward;
+        s.last_kl = last_kl;
     });
     let _server_handle = if let Some(port) = args.serve {
         let addr = format!("127.0.0.1:{port}");
@@ -302,16 +359,23 @@ fn run() -> Result<(), CliError> {
     };
 
     let mut stopped_early = false;
-    for iter in 0..args.iters {
+    for iter in resume.start_iter..args.iters {
         if controller.should_stop() {
             eprintln!("[train_multi_turn] stop requested at iter {iter}");
             stopped_early = true;
             break;
         }
+        let mut prompt_rng = seeded_rng(args.seed, MULTI_TURN_PROMPT_SALT, iter as u64, 0);
         let initial_prompt =
             build_prompt(args.prompt_len, separator, target_range, &mut prompt_rng);
         let mut episodes = Vec::with_capacity(args.group_size);
-        for _ in 0..args.group_size {
+        for episode_idx in 0..args.group_size {
+            let mut sample_rng = seeded_rng(
+                args.seed,
+                MULTI_TURN_SAMPLE_SALT,
+                iter as u64,
+                episode_idx as u64,
+            );
             let episode = rollout_episode(
                 &policy,
                 &ref_model,
@@ -419,8 +483,18 @@ fn run() -> Result<(), CliError> {
 
         if controller.take_save_request() {
             if let Some(path) = &args.save_path {
-                let step_dir =
-                    save_qwen35_checkpoint(path, iter + 1, &config, &policy, &mut store, lora)?;
+                let step_dir = save_qwen35_checkpoint(
+                    path,
+                    iter + 1,
+                    &args,
+                    &config,
+                    &policy,
+                    &optimizer,
+                    &mut store,
+                    lora,
+                    best_reward,
+                    last_kl,
+                )?;
                 eprintln!(
                     "[train_multi_turn] save requested → flushed to {}",
                     step_dir.display()
@@ -479,10 +553,14 @@ fn run() -> Result<(), CliError> {
         let step_dir = save_qwen35_checkpoint(
             path,
             controller.snapshot().iter,
+            &args,
             &config,
             &policy,
+            &optimizer,
             &mut store,
             lora,
+            best_reward,
+            last_kl,
         )?;
         println!("checkpoint saved to {}", step_dir.display());
     }
@@ -544,13 +622,113 @@ fn qwen35_config(
     })
 }
 
-fn save_qwen35_checkpoint(
-    out_dir: &str,
-    step: usize,
+fn seeded_rng(seed: u64, salt: u64, major: u64, minor: u64) -> LcgRng {
+    let mut mixed = seed ^ salt;
+    mixed ^= major.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed = mixed.rotate_left(17);
+    mixed ^= minor.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = mixed.rotate_left(11);
+    LcgRng::seed(mixed)
+}
+
+fn resume_multi_turn_checkpoint(
+    resume_dir: &std::path::Path,
+    args: &CliArgs,
     cfg: &Qwen35Config,
     model: &Qwen35Model,
     store: &mut TensorStore,
+    optimizer: &mut AdamW,
     lora: LoraConfig,
+) -> Result<ResumeState, CliError> {
+    validate_qwen35_resume_config(resume_dir, cfg)?;
+    validate_adapter_resume_config(resume_dir, lora)?;
+
+    let train_model_path = resume_dir.join(TRAIN_MODEL_FILENAME);
+    if !train_model_path.is_file() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no {TRAIN_MODEL_FILENAME}",
+            resume_dir.display()
+        )));
+    }
+    let mut registry = build_registry(model);
+    registry.load_into_strict(store, &train_model_path)?;
+
+    let adapter_path = resume_dir.join("adapter_model.safetensors");
+    let mut adapter_registry = build_adapter_registry(model);
+    if !adapter_registry.is_empty() {
+        if !adapter_path.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no adapter_model.safetensors",
+                resume_dir.display()
+            )));
+        }
+        adapter_registry.load_into_strict(store, &adapter_path)?;
+    }
+
+    let (trainer_doc, optim_state) = load_trainer_state_v2(resume_dir)
+        .map_err(|err| CliError::Custom(format!("resume trainer state: {err}")))?;
+    if trainer_doc.rng_seed != args.seed {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} seed mismatch: checkpoint={} live={}",
+            resume_dir.display(),
+            trainer_doc.rng_seed,
+            args.seed
+        )));
+    }
+    if trainer_doc.schedule_name != "constant" {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} unsupported schedule {}",
+            resume_dir.display(),
+            trainer_doc.schedule_name
+        )));
+    }
+    let meta: MultiTurnCheckpointMeta = serde_json::from_value(trainer_doc.schedule_params)
+        .map_err(|err| {
+            CliError::Custom(format!("resume checkpoint metadata parse error: {err}"))
+        })?;
+    if (meta.lr - args.lr).abs() > 1.0e-8 {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} lr mismatch: checkpoint={} live={}",
+            resume_dir.display(),
+            meta.lr,
+            args.lr
+        )));
+    }
+    if meta.objective != args.objective.as_str() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} objective mismatch: checkpoint={} live={}",
+            resume_dir.display(),
+            meta.objective,
+            args.objective.as_str()
+        )));
+    }
+    let param_names = trainable_param_name_map(model, store);
+    let restored = optimizer
+        .import_state(&optim_state, &param_names)
+        .map_err(|err| CliError::Custom(format!("resume optimizer import failed: {err}")))?;
+    eprintln!(
+        "[train_multi_turn] resumed step {} with {restored} optimizer entries from {}",
+        trainer_doc.step,
+        resume_dir.display()
+    );
+    Ok(ResumeState {
+        start_iter: trainer_doc.step as usize,
+        best_reward: meta.best_reward,
+        last_kl: meta.last_kl,
+    })
+}
+
+fn save_qwen35_checkpoint(
+    out_dir: &str,
+    step: usize,
+    args: &CliArgs,
+    cfg: &Qwen35Config,
+    model: &Qwen35Model,
+    optimizer: &AdamW,
+    store: &mut TensorStore,
+    lora: LoraConfig,
+    best_reward: f32,
+    last_kl: f32,
 ) -> Result<PathBuf, CliError> {
     let out_dir = PathBuf::from(out_dir);
     let keep_ids = live_tensor_ids(store);
@@ -575,6 +753,8 @@ fn save_qwen35_checkpoint(
         },
     )?;
     store.retain_ids(&keep_ids);
+    let train_registry = build_registry(model);
+    train_registry.save_from(store, &step_dir.join(TRAIN_MODEL_FILENAME))?;
     let adapter_registry = build_adapter_registry(model);
     if !adapter_registry.is_empty() {
         adapter_registry.save_from(store, &step_dir.join("adapter_model.safetensors"))?;
@@ -584,7 +764,78 @@ fn save_qwen35_checkpoint(
             serde_json::to_string_pretty(&adapter_config)?,
         )?;
     }
+    let trainer_doc = TrainerStateDoc {
+        step: step as u64,
+        optim_schema: optimizer.state_schema().to_string(),
+        schedule_name: "constant".to_string(),
+        schedule_params: serde_json::to_value(MultiTurnCheckpointMeta {
+            lr: args.lr,
+            objective: args.objective.as_str().to_string(),
+            best_reward,
+            last_kl,
+        })?,
+        grad_accum_current: 0,
+        rng_seed: args.seed,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = optimizer.export_state(&trainable_param_name_map(model, store));
+    save_trainer_state_v2(&step_dir, &trainer_doc, &optim_state)
+        .map_err(|err| CliError::Custom(format!("save trainer state: {err}")))?;
     Ok(step_dir)
+}
+
+fn validate_qwen35_resume_config(
+    resume_dir: &std::path::Path,
+    cfg: &Qwen35Config,
+) -> Result<(), CliError> {
+    let cfg_path = resume_dir.join("config.json");
+    if !cfg_path.is_file() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no config.json",
+            resume_dir.display()
+        )));
+    }
+    let saved = Qwen35Config::from_json_file(&cfg_path).map_err(|err| {
+        CliError::Custom(format!(
+            "resume config {} parse error: {err}",
+            cfg_path.display()
+        ))
+    })?;
+    if saved != *cfg {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} config mismatch with live qwen3.5 setup",
+            resume_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_adapter_resume_config(
+    resume_dir: &std::path::Path,
+    lora: LoraConfig,
+) -> Result<(), CliError> {
+    let path = resume_dir.join("adapter_config.json");
+    if !path.is_file() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no adapter_config.json",
+            resume_dir.display()
+        )));
+    }
+    let saved: LoraAdapterConfig =
+        serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(|err| {
+            CliError::Custom(format!(
+                "resume adapter config {} parse error: {err}",
+                path.display()
+            ))
+        })?;
+    let expected = LoraAdapterConfig::new("synthetic://qwen35", "qwen35", lora);
+    if saved != expected {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} adapter mismatch with live LoRA config",
+            resume_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -729,7 +980,11 @@ fn mean_per_turn(per_turn_rewards: &[Vec<f32>]) -> f32 {
             count += 1.0;
         }
     }
-    if count == 0.0 { 0.0 } else { sum / count }
+    if count == 0.0 {
+        0.0
+    } else {
+        sum / count
+    }
 }
 
 fn build_prompt(
@@ -813,6 +1068,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--save-path" => {
                 args.save_path = Some(next_value(&mut iter, &flag)?);
             }
+            "--resume-from" => {
+                args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
             "--serve" => {
                 args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
@@ -870,11 +1128,61 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
-    use serde_json::json;
     use tempfile::tempdir;
-    use train::LoraAdapterConfig;
+    use train::{checkpoint::load_trainer_state_v2, LoraAdapterConfig};
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn tiny_args() -> CliArgs {
+        CliArgs {
+            iters: 4,
+            group_size: 2,
+            agent_tokens: 2,
+            obs_tokens: 1,
+            turns: 2,
+            prompt_len: 4,
+            lr: 1.0e-4,
+            kl_coef: 0.02,
+            clip_eps: 0.2,
+            temperature: 1.0,
+            gamma: 0.9,
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            seed: 42,
+            vocab_size: 128,
+            target_range: 8,
+            d_model: 32,
+            n_layers: 2,
+            n_heads: 4,
+            d_head: 8,
+            d_ff: 64,
+            eval_every: 0,
+            eval_prompts: 4,
+            eval_temperature: 0.3,
+            backend: BackendChoice::Cpu,
+            save_path: None,
+            resume_from: None,
+            serve: None,
+            grad_clip: Some(1.0),
+            metrics_jsonl: None,
+            objective: MultiTurnObjective::SequenceGspo,
+        }
+    }
+
+    fn assert_adamw_state_eq(
+        lhs: &autograd::adamw_state::AdamWState,
+        rhs: &autograd::adamw_state::AdamWState,
+    ) {
+        assert_eq!(lhs.step, rhs.step);
+        assert_eq!(lhs.skipped_export, rhs.skipped_export);
+        assert_eq!(lhs.params.len(), rhs.params.len());
+        for (left, right) in lhs.params.iter().zip(rhs.params.iter()) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.shape, right.shape);
+            assert_eq!(left.m, right.m);
+            assert_eq!(left.v, right.v);
+        }
+    }
 
     #[test]
     fn objective_mode_parser_accepts_stepwise_and_sequence_modes() {
@@ -893,19 +1201,8 @@ mod tests {
     #[test]
     fn save_qwen35_checkpoint_writes_merged_weights_and_adapter_artifacts() -> TestResult {
         let tmp = tempdir().expect("tempdir");
-        let model_dir = tmp.path().join("model");
         let out_dir = tmp.path().join("out");
-        std::fs::create_dir_all(&model_dir).expect("create model dir");
         std::fs::create_dir_all(&out_dir).expect("create out dir");
-        std::fs::write(
-            model_dir.join("config.json"),
-            serde_json::to_string_pretty(&json!({
-                "bos_token_id": 1,
-                "eos_token_id": 2,
-            }))?,
-        )
-        .expect("write config");
-        std::fs::write(model_dir.join("tokenizer.json"), "{}").expect("write tokenizer");
 
         let cfg = Qwen35Config {
             hidden_size: 32,
@@ -942,6 +1239,7 @@ mod tests {
             rank: 2,
             alpha: 4.0,
         };
+        let args = tiny_args();
         let layer_names = cfg.layer_tensor_names(0);
         let Qwen35AttentionTensorNames::Full(attn_names) = layer_names.attention else {
             unreachable!("test config uses full attention");
@@ -951,6 +1249,7 @@ mod tests {
         let expected_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut expected_store)?;
         let mut save_store = TensorStore::default();
         let save_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+        let optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
 
         for (model, store) in [
             (&expected_model, &mut expected_store),
@@ -982,15 +1281,22 @@ mod tests {
         let step_dir = save_qwen35_checkpoint(
             out_dir.to_str().expect("utf8 out dir"),
             4,
+            &args,
             &cfg,
             &save_model,
+            &optimizer,
             &mut save_store,
             lora,
+            0.5,
+            0.125,
         )?;
 
         assert!(step_dir.join("model.safetensors").is_file());
+        assert!(step_dir.join(TRAIN_MODEL_FILENAME).is_file());
         assert!(step_dir.join("adapter_model.safetensors").is_file());
         assert!(step_dir.join("adapter_config.json").is_file());
+        assert!(step_dir.join("trainer_state.json").is_file());
+        assert!(step_dir.join("optimizer.safetensors").is_file());
         let adapter_config: LoraAdapterConfig = serde_json::from_str(&std::fs::read_to_string(
             step_dir.join("adapter_config.json"),
         )?)?;
@@ -999,6 +1305,11 @@ mod tests {
             adapter_config.target_modules,
             vec!["all-linear".to_string()]
         );
+        let (trainer_doc, _) = load_trainer_state_v2(&step_dir)?;
+        let meta: MultiTurnCheckpointMeta = serde_json::from_value(trainer_doc.schedule_params)?;
+        assert_eq!(meta.objective, args.objective.as_str());
+        assert_eq!(meta.best_reward, 0.5);
+        assert_eq!(meta.last_kl, 0.125);
 
         let mut load_store = TensorStore::default();
         let load_model = Qwen35Model::new_with_lora(&cfg, None, &mut load_store)?;
@@ -1011,6 +1322,154 @@ mod tests {
                 .expect("loaded q proj"),
         )?;
         assert_eq!(loaded_q, expected_q);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_qwen35_checkpoint_restores_train_state_exactly() -> TestResult {
+        let tmp = tempdir().expect("tempdir");
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let cfg = Qwen35Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![2],
+            bos_token_id: Some(1),
+            eos_token_id: 2,
+            tie_word_embeddings: false,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            linear_num_key_heads: 4,
+            linear_key_head_dim: 8,
+            linear_num_value_heads: 4,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(16),
+            layer_types: vec![LayerType::FullAttention; 2],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        };
+        let args = tiny_args();
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let layer_names = cfg.layer_tensor_names(0);
+        let Qwen35AttentionTensorNames::Full(attn_names) = layer_names.attention else {
+            unreachable!("test config uses full attention");
+        };
+
+        let mut save_store = TensorStore::default();
+        let save_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+        let q_proj = *save_model
+            .param_name_map()
+            .get(attn_names.q_proj.as_str())
+            .expect("q proj");
+        save_store.get_mut(q_proj).expect("q proj exists").data[0] = 3.25;
+        let adapter_map = save_model.adapter_name_map();
+        let q_proj_a = *adapter_map
+            .get(format!("{}.lora_a", attn_names.q_proj).as_str())
+            .expect("adapter a");
+        let q_proj_b = *adapter_map
+            .get(format!("{}.lora_b", attn_names.q_proj).as_str())
+            .expect("adapter b");
+        save_store.get_mut(q_proj_a).expect("adapter a exists").data[0] = 1.5;
+        save_store.get_mut(q_proj_b).expect("adapter b exists").data[0] = -0.75;
+
+        let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+        let param_names = trainable_param_name_map(&save_model, &save_store);
+        let saved_state = autograd::adamw_state::AdamWState {
+            step: 3,
+            skipped_export: 0,
+            params: param_names
+                .iter()
+                .map(|(tensor_id, name)| {
+                    let shape = save_store
+                        .get(*tensor_id)
+                        .expect("tensor exists")
+                        .shape
+                        .clone();
+                    let len = shape.iter().product::<usize>().max(1);
+                    autograd::adamw_state::AdamWParamState {
+                        name: name.clone(),
+                        m: vec![0.25; len],
+                        v: vec![0.5; len],
+                        shape,
+                    }
+                })
+                .collect(),
+        };
+        optimizer.import_state(&saved_state, &param_names)?;
+        let saved_q = save_store.to_host(q_proj)?;
+        let saved_a = save_store.to_host(q_proj_a)?;
+        let saved_b = save_store.to_host(q_proj_b)?;
+
+        let step_dir = save_qwen35_checkpoint(
+            out_dir.to_str().expect("utf8 out dir"),
+            3,
+            &args,
+            &cfg,
+            &save_model,
+            &optimizer,
+            &mut save_store,
+            lora,
+            0.75,
+            0.125,
+        )?;
+
+        let mut resumed_store = TensorStore::default();
+        let resumed_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut resumed_store)?;
+        let mut resumed_optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+        let resume = resume_multi_turn_checkpoint(
+            &step_dir,
+            &args,
+            &cfg,
+            &resumed_model,
+            &mut resumed_store,
+            &mut resumed_optimizer,
+            lora,
+        )?;
+        assert_eq!(resume.start_iter, 3);
+        assert_eq!(resume.best_reward, 0.75);
+        assert_eq!(resume.last_kl, 0.125);
+
+        let resumed_q = resumed_store.to_host(
+            *resumed_model
+                .param_name_map()
+                .get(attn_names.q_proj.as_str())
+                .expect("resumed q proj"),
+        )?;
+        let resumed_adapter_map = resumed_model.adapter_name_map();
+        let resumed_a = resumed_store.to_host(
+            *resumed_adapter_map
+                .get(format!("{}.lora_a", attn_names.q_proj).as_str())
+                .expect("resumed adapter a"),
+        )?;
+        let resumed_b = resumed_store.to_host(
+            *resumed_adapter_map
+                .get(format!("{}.lora_b", attn_names.q_proj).as_str())
+                .expect("resumed adapter b"),
+        )?;
+        assert_eq!(resumed_q, saved_q);
+        assert_eq!(resumed_a, saved_a);
+        assert_eq!(resumed_b, saved_b);
+
+        let resumed_param_names = trainable_param_name_map(&resumed_model, &resumed_store);
+        let resumed_state = resumed_optimizer.export_state(&resumed_param_names);
+        assert_adamw_state_eq(&saved_state, &resumed_state);
         Ok(())
     }
 }

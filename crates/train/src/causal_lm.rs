@@ -98,8 +98,9 @@ pub fn trainable_param_name_map<M: CausalLm>(
 ) -> Vec<(TensorId, String)> {
     let trainable: HashSet<TensorId> = trainable_params(model, store).into_iter().collect();
     let mut named = model
-        .param_name_map()
+        .adapter_name_map()
         .into_iter()
+        .chain(model.param_name_map())
         .filter(|(_, tensor_id)| trainable.contains(tensor_id))
         .map(|(name, tensor_id)| (tensor_id, name.to_string()))
         .collect::<Vec<_>>();
