@@ -222,8 +222,24 @@ fn main() -> Result<(), CliError> {
     // against the pre-migration commit) — flipping them would quietly change
     // every convergence baseline.
     let optim = AdamW::new(args.lr, (0.9, 0.999), 1e-8, 0.01);
+    // Codex review 2026-04-20 on 6bd0211 (M1): pre-migration
+    // `clip_grad_norm(params, max_norm <= 0.0, store)` returned early
+    // as a no-op, so `--grad-clip 0` was legal and effectively disabled
+    // clipping. The migrated path sends `max_norm` into
+    // `GlobalNorm::new`, which asserts `max_norm > 0.0 && is_finite()`
+    // — `--grad-clip 0` would panic there. Preserve the legacy
+    // semantics by treating non-positive / non-finite values as NoClip
+    // instead of panicking, matching the old behaviour bit-for-bit.
     let clip = match args.grad_clip {
-        Some(max_norm) => PretrainClip::Norm(GlobalNorm::new(max_norm)),
+        Some(max_norm) if max_norm > 0.0 && max_norm.is_finite() => {
+            PretrainClip::Norm(GlobalNorm::new(max_norm))
+        }
+        Some(max_norm) => {
+            eprintln!(
+                "[pretrain] warning: --grad-clip {max_norm} is non-positive/non-finite; disabling gradient clipping"
+            );
+            PretrainClip::None(NoClip)
+        }
         None => PretrainClip::None(NoClip),
     };
     let schedule = ConstantLr(args.lr);
