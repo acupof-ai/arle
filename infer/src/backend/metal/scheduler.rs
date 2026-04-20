@@ -471,6 +471,34 @@ impl MetalScheduler {
             .count()
     }
 
+    /// Fast-forward scheduler-side prefill progress for one request.
+    ///
+    /// Used by the DFlash runtime path, which must consume the whole prompt
+    /// in a single FFI call (because `qwen3_forward_with_hidden_states`
+    /// captures hidden states for every position) while the scheduler-side
+    /// chunk loop only advanced `prefill_progress` by `chunk_cap` per call.
+    /// Without this sync, `complete_prefill` would reject the terminal token
+    /// commit because the scheduler still believes the request is
+    /// `Prefilling`.
+    ///
+    /// See `docs/experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md`
+    /// for the full root cause. Only callers that genuinely consumed the
+    /// prompt through a fast path should invoke this — normal chunked
+    /// prefill must continue to go through `build_prefill_chunk`.
+    pub fn fast_forward_prefill(&mut self, req_id: RequestId, new_progress: usize) {
+        if let Some(state) = self.requests.get_mut(&req_id) {
+            if new_progress > state.prefill_progress {
+                state.prefill_progress = new_progress;
+            }
+            if state.prefill_progress >= state.prompt_len() {
+                state.phase = MetalRequestPhase::Decoding;
+                if state.last_token.is_none() {
+                    state.last_token = state.prompt_tokens.last().copied();
+                }
+            }
+        }
+    }
+
     pub fn rewrite_waiting_prompt(
         &mut self,
         req_id: RequestId,
@@ -907,6 +935,78 @@ mod tests {
         assert_eq!(
             sched.complete_prefill(req, 88),
             Err(MetalSchedulerError::DecodeAlreadyStarted(req))
+        );
+    }
+
+    #[test]
+    fn fast_forward_prefill_transitions_to_decoding_when_prompt_complete() {
+        // Simulates the DFlash one-shot prefill path: scheduler hands out a
+        // single `chunk_cap`-sized chunk, runtime consumes the whole prompt
+        // under a widened budget, then calls `fast_forward_prefill` to
+        // re-sync the scheduler before committing the terminal token.
+        let mut sched = make_scheduler(1, 4, 4);
+        let prompt = vec![1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let req = sched
+            .submit(prompt.clone(), 3, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        // First scheduler step: emits a short chunk (chunk_cap = 4 < 10),
+        // leaving the request in Prefilling with progress = 4.
+        match sched.step() {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.prompt_end, 4);
+                assert_eq!(
+                    sched.request_phase(req),
+                    Some(MetalRequestPhase::Prefilling)
+                );
+            }
+            other => panic!("expected initial prefill, got {other:?}"),
+        }
+
+        // Runtime took the DFlash fast path and consumed the whole prompt;
+        // re-sync the scheduler.
+        sched.fast_forward_prefill(req, prompt.len());
+        assert_eq!(sched.request_phase(req), Some(MetalRequestPhase::Decoding));
+
+        // complete_prefill must now succeed — this is the case that used to
+        // fail with `WrongPhase` in the bug doc.
+        assert!(!sched.complete_prefill(req, 99).expect("complete_prefill"));
+
+        match sched.step() {
+            MetalScheduleDecision::DecodeBatch(batch) => {
+                assert_eq!(batch.req_ids, vec![req]);
+                assert_eq!(batch.input_tokens, vec![99]);
+            }
+            other => panic!("expected decode batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_forward_prefill_is_a_noop_for_unknown_request() {
+        let mut sched = make_scheduler(1, 4, 4);
+        // Must not panic / must not insert state.
+        sched.fast_forward_prefill(RequestId(12345), 10);
+        assert_eq!(sched.active_len(), 0);
+    }
+
+    #[test]
+    fn fast_forward_prefill_does_not_regress_progress() {
+        let mut sched = make_scheduler(1, 4, 4);
+        let req = sched
+            .submit(vec![1, 2, 3, 4, 5, 6], 2, MetalRequestPriority::Normal)
+            .expect("submit");
+        // Advance to progress = 4 via the normal chunked path.
+        let _ = sched.step();
+        assert_eq!(
+            sched.request_phase(req),
+            Some(MetalRequestPhase::Prefilling)
+        );
+        // A stale smaller value must not rewind progress or change phase.
+        sched.fast_forward_prefill(req, 2);
+        assert_eq!(
+            sched.request_phase(req),
+            Some(MetalRequestPhase::Prefilling)
         );
     }
 
