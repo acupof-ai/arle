@@ -605,10 +605,7 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         ("num_key_value_heads", cfg.num_key_value_heads as i64),
         ("head_dim", cfg.head_dim as i64),
         ("vocab_size", cfg.vocab_size as i64),
-        (
-            "max_position_embeddings",
-            cfg.max_position_embeddings as i64,
-        ),
+        ("max_position_embeddings", cfg.max_position_embeddings as i64),
     ]
     .iter()
     .filter_map(|(k, v)| match file_cfg.get(*k).and_then(|x| x.as_i64()) {
@@ -639,7 +636,10 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
     if let Some(seen) = file_cfg.get("rope_theta").and_then(|v| v.as_f64())
         && seen != cfg.rope_theta as f64
     {
-        mismatches.push(format!("rope_theta: ckpt={seen} live={}", cfg.rope_theta));
+        mismatches.push(format!(
+            "rope_theta: ckpt={seen} live={}",
+            cfg.rope_theta
+        ));
     }
 
     if !mismatches.is_empty() {
