@@ -18,6 +18,7 @@ use super::{
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
 };
+use crate::backend::is_stream_stop_matched;
 use crate::{hf_hub, sampler::SamplingParams};
 
 /// Draft KV cache sink size (attention-sink tokens kept at the start).
@@ -1130,7 +1131,18 @@ pub(crate) fn metal_generate_dflash_qwen3(
     let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut generated = vec![first_token];
-    on_token(first_token)?;
+    if let Err(err) = on_token(first_token) {
+        if is_stream_stop_matched(&err) {
+            let total_time_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            return Ok(MetalGenerateOutput {
+                tokens: generated,
+                finish_reason: "stop",
+                ttft_ms,
+                total_time_ms,
+            });
+        }
+        return Err(err);
+    }
     if is_stop_token(config, params, first_token) || generated.len() >= max_new_tokens {
         let total_time_ms = t0.elapsed().as_secs_f64() * 1000.0;
         return Ok(MetalGenerateOutput {
@@ -1214,7 +1226,18 @@ pub(crate) fn metal_generate_dflash_qwen3(
             .take(accepted_inputs.saturating_sub(1))
         {
             generated.push(*token);
-            on_token(*token)?;
+            if let Err(err) = on_token(*token) {
+                if is_stream_stop_matched(&err) {
+                    log::info!(
+                        "Metal DFlash: accepted {:?} (avg {:.2}) before stream stop",
+                        acceptance_lengths,
+                        average_acceptance(&acceptance_lengths)
+                    );
+                    accepted_finish_reason = Some("stop");
+                    break;
+                }
+                return Err(err);
+            }
             if is_stop_token(config, params, *token) {
                 log::info!(
                     "Metal DFlash: accepted {:?} (avg {:.2}) before stop",
@@ -1239,7 +1262,17 @@ pub(crate) fn metal_generate_dflash_qwen3(
         }
 
         generated.push(posterior_token);
-        on_token(posterior_token)?;
+        if let Err(err) = on_token(posterior_token) {
+            if is_stream_stop_matched(&err) {
+                log::info!(
+                    "Metal DFlash: accepted {:?} (avg {:.2}) before stream stop",
+                    acceptance_lengths,
+                    average_acceptance(&acceptance_lengths)
+                );
+                break "stop";
+            }
+            return Err(err);
+        }
         current_token = posterior_token;
         if is_stop_token(config, params, posterior_token) {
             log::info!(

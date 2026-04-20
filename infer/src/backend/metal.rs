@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "metal")]
 use crate::backend::StreamingInferenceBackend;
 use crate::{
-    backend::{GenerateResult, InferenceBackend},
+    backend::{GenerateResult, InferenceBackend, is_stream_stop_matched},
     hf_hub,
     sampler::SamplingParams,
     tokenizer::Tokenizer,
@@ -217,13 +217,21 @@ impl MetalBackend {
             let result =
                 self.generate_from_token_ids_with_callback(&input_ids, params, |token_id| {
                     if let Some(chunk) = decoder.step(token_id)? {
-                        on_chunk(&chunk)?;
+                        match on_chunk(&chunk) {
+                            Ok(()) => {}
+                            Err(err) if is_stream_stop_matched(&err) => return Err(err),
+                            Err(err) => return Err(err),
+                        }
                     }
                     Ok(())
                 })?;
 
             if let Some(tail) = decoder.finish()? {
-                on_chunk(&tail)?;
+                match on_chunk(&tail) {
+                    Ok(()) => {}
+                    Err(err) if is_stream_stop_matched(&err) => return Ok(result),
+                    Err(err) => return Err(err),
+                }
             }
 
             Ok(result)

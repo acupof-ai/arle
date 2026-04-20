@@ -26,6 +26,21 @@ use anyhow::Result;
 
 use crate::sampler::SamplingParams;
 
+#[derive(Debug)]
+pub(crate) struct StreamStopMatched;
+
+impl std::fmt::Display for StreamStopMatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stream text stop matched")
+    }
+}
+
+impl std::error::Error for StreamStopMatched {}
+
+pub(crate) fn is_stream_stop_matched(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StreamStopMatched>().is_some()
+}
+
 /// A single-request, synchronous inference backend.
 ///
 /// Implementors load model weights once, then answer repeated `generate` calls.
@@ -71,7 +86,11 @@ pub trait StreamingInferenceBackend: InferenceBackend {
     {
         let generated = self.generate(prompt, params)?;
         if !generated.text.is_empty() {
-            on_chunk(&generated.text)?;
+            match on_chunk(&generated.text) {
+                Ok(()) => {}
+                Err(err) if is_stream_stop_matched(&err) => return Ok(generated),
+                Err(err) => return Err(err),
+            }
         }
         Ok(generated)
     }

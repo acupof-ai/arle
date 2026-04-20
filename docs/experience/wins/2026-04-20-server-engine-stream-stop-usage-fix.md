@@ -1,4 +1,4 @@
-# `BackendInferenceEngine::complete_stream` — share `StopChunkProcessor`, propagate real usage
+# `BackendInferenceEngine::complete_stream` — share `StopChunkProcessor`, short-circuit on text stops, keep real usage
 
 **Commit (pending):** follow-up to 70e2776 — addresses the two codex review
 findings on the Ctrl-C / Metal streaming rewrite.
@@ -10,7 +10,11 @@ path) to route streaming through `generate_stream(…, on_chunk)` so
 `tx.send` failure propagates back to the backend and Ctrl-C actually
 cancels mid-generation. That landed Ctrl-C correctness, but the new
 stop-handling was not equivalent to the serial-runtime path's
-`StopChunkProcessor`, and the stop branch hard-coded usage to zero.
+`StopChunkProcessor`. The first follow-up fixed truncation but still
+left incremental backends decoding past matched text stops; the second
+follow-up then fixed prompt termination by fabricating zero usage. This
+landing closes the loop: prompt text stops now short-circuit decode
+*and* preserve real backend usage.
 
 `codex review --commit 70e2776` flagged (manually transcribed here
 because `~/.codex/sessions` was permission-blocked in the review
@@ -29,16 +33,16 @@ sandbox):
 > `backend/metal/runtime.rs:1808`): scan for earliest stop anywhere,
 > withhold `max_stop_len - 1` bytes.
 
-> **Medium** — the stop path hard-codes terminal usage to zero
-> (`server_engine.rs:1059`). The REPL always sets `stop = "<|im_end|>"`
-> (`crates/cli/src/repl.rs:719`) and trusts the final delta's usage for
-> token counts and session stats (`repl.rs:787, 855`). Every normal
-> chat turn now records `0` prompt/completion tokens and skews the TPS
-> stats.
+> **P1** — once a streamed text stop is matched, `complete_stream`
+> still returns `Ok(())` from the callback and lets incremental
+> backends keep sampling until EOS / `max_tokens`. On Metal that keeps
+> the REPL / HTTP stream open while burning decode on tokens that are
+> immediately discarded.
 
 ## What Worked
 
-**One shared helper, two behavioral corrections, two regression tests.**
+**One shared helper, one explicit stop sentinel, and backends that treat
+callback abort as graceful termination instead of an error.**
 
 1. **Promoted `StopChunkProcessor` to `pub(crate)`** in
    `infer/src/backend/runtime.rs` (with `pub(crate)` methods) and imported
@@ -59,44 +63,68 @@ sandbox):
    - After `hit_stop` flips, silently absorbs further chunks — no raw
      marker bytes can leak to the consumer.
 
-3. **Let the backend run to natural completion** even after a stop is
-   matched. This is the pattern `backend/runtime.rs:execute_request`
-   already uses: the callback returns `Ok(())` post-stop; the backend
-   hits its own EOS or `max_tokens`; we get *real*
-   `prompt_tokens`/`completion_tokens` in `GenerateResult`. The final
-   delta's usage comes from `generated.prompt_tokens` +
-   `generated.completion_tokens`, not a hard-coded zero.
+3. **Introduced `backend::StreamStopMatched` as the shared graceful-stop
+   sentinel.** Once `StopChunkProcessor::hit_stop()` flips, both
+   `backend/runtime.rs::execute_request` and
+   `server_engine.rs::complete_stream` return
+   `Err(StreamStopMatched)` from the callback. That means:
+   - the consumer stops seeing text immediately after the matched stop;
+   - incremental backends can stop sampling promptly instead of burning
+     decode to EOS / `max_tokens`;
+   - the callback error still has a distinct type from real failures.
 
-   Tradeoff: this means the backend generates a few extra tokens after
-   a stop is detected (until EOS or `max_tokens`). That's a
-   compute-waste cost that the CUDA continuous-batching path avoids by
-   propagating stop into the scheduler; the Metal/CPU serial path
-   doesn't have that wiring yet. Accepted for now — the Medium
-   complaint was about *correctness* (usage numbers), not waste. The
-   waste existed in the pre-70e2776 non-streaming path too.
+4. **Updated backend implementations to treat `StreamStopMatched` as a
+   graceful finish and still return `GenerateResult`.**
+   - The default `StreamingInferenceBackend::generate_stream` catches a
+     callback `StreamStopMatched` and returns the already-computed
+     `generate()` result.
+   - The Metal Rust loops (`generate.rs`, `dflash.rs`, `qwen35.rs`)
+     break immediately on `StreamStopMatched` after recording the token
+     that completed the stop and then return their partial
+     `MetalGenerateOutput`.
+   - The Qwen3/Qwen3.5 compiled C++ callback wrapper records partial
+     `out_tokens[..out_count]` and returns those as a normal result when
+     the callback asked to stop.
 
-4. **Kept the `consumer_dropped` path intact.** Ctrl-C still works:
+   Result: the final delta's `usage` still comes from the backend's
+   real counters; no more fabricated zeroes, and no more wasted decode
+   on the Metal incremental path.
+
+5. **Kept the `consumer_dropped` path intact.** Ctrl-C still works:
    dropping `rx` makes `tx.send` fail → callback returns `Err` → backend
    exits `generate_stream` early → `consumer_dropped` flag set →
    `complete_stream` returns `Ok(())` without emitting a final delta.
 
-5. **Added two regression tests** in
-   `infer/src/server_engine.rs::tests`:
+6. **Added / updated regression tests** in
+   `infer/src/server_engine.rs::tests` and
+   `infer/src/backend/runtime.rs::tests`:
    - `backend_complete_stream_stop_inside_single_chunk` — mock backend
      emits `"hello<|im_end|>trailing"` as a single chunk; asserts text
      is `"hello"`, no `<|im_end|>` leaks, `finish_reason == Stop`, and
-     `usage.completion_tokens == 7` (not 0).
+     `usage == { prompt_tokens: 3, completion_tokens: 7, total_tokens: 10 }`.
    - `backend_complete_stream_stop_spanning_chunks` — mock backend
      emits `"hello<|im_"` then `"end|>trail"` across two chunks;
      asserts text is `"hello"`, no partial marker bytes
-     (`<|im_`/`im_end`/`|>`) leak, and `usage.completion_tokens == 5`
-     (not 0).
+     (`<|im_`/`im_end`/`|>`) leak, and
+     `usage == { prompt_tokens: 2, completion_tokens: 5, total_tokens: 7 }`.
+   - `backend_runtime_short_circuits_after_text_stop_match` — serial runtime
+     mock backend emits a stop-bearing chunk plus one more chunk, but now
+     catches `StreamStopMatched` and returns a partial result immediately;
+     asserts stop-truncated text, real usage
+     `{ prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 }`, and
+     that the backend only attempted one chunk.
+   - `backend_complete_stream_short_circuits_on_text_stop_match` — same
+     contract at `BackendInferenceEngine`: prompt stop terminates after
+     the first stop-bearing chunk and still reports
+     `{ prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 }`.
 
    Together they pin the exact High/Medium failure modes from the
-   review. The existing
+   review and the final contract: streamed text stops are truncated for
+   consumers, decode short-circuits promptly, and usage is always
+   sourced from the backend's final completion result. The existing
    `backend_complete_stream_short_circuits_when_rx_dropped` and
    `backend_complete_stream_emits_all_chunks_and_finish_marker` still
-   pass — 4/4 green.
+   pass.
 
 ## Rule
 
@@ -109,22 +137,21 @@ be larger than the stop marker — which is the default
 is already in the repo (`StopChunkProcessor`); any new streaming-stop
 call site must reuse it, never re-derive an end-anchored check.
 
-**Do not hard-code terminal usage.** If a streaming path decides to
-exit early and fabricate a final delta, the REPL (and any aggregator
-that reads the last delta's `usage`) will report zero tokens. Either
-let the backend run to completion and surface its real numbers, or
-thread real token counts through the early-exit path. "I don't know
-how many tokens this was" is a silent data corruption, not a clean
-`None`.
+**If a callback needs to stop decode early, encode that as a typed,
+graceful control signal and make the backend return a real result.**
+Letting the backend ignore the stop wastes compute; aborting without a
+result tempts the caller to fabricate `usage=0`. The correct contract is
+"typed sentinel in the callback, real counters in the returned result."
 
 ## Bench Policy
 
 Bench-exempt? **Not strictly** — this touches `infer/src/` hot path.
 But the practical impact is:
-- Correctness fix on stop detection (no throughput delta on the happy
-  path; backend generates the same number of tokens before reaching
-  EOS/stop).
-- Usage-plumbing fix (metadata only, no token-generation impact).
+- Correctness fix on stop detection and prompt stop termination.
+- Small decode win on incremental backends because matched text stops no
+  longer burn tokens until EOS / `max_tokens`.
+- Usage-plumbing fix: metadata stays real instead of falling back to
+  zeroes.
 - Small CPU overhead of `StopChunkProcessor.push_chunk` buffering — a
   `String` append + a `.find` per chunk. Negligible compared to a
   single decode step.
