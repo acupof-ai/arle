@@ -1,9 +1,9 @@
-use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use autograd::{
-    Tape, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax,
-    ops::matmul, ops::rmsnorm, ops::rope, ops::silu, ops::sum,
+    AdamW, Tape, Tensor, TensorStore, ops::embedding, ops::exp, ops::gather_last_dim, ops::gelu,
+    ops::log_softmax, ops::matmul, ops::rmsnorm, ops::rope, ops::silu, ops::sum, tensor::Dirty,
 };
+use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
 
@@ -828,6 +828,160 @@ fn metal_gather_last_dim_forward_stays_lazy() -> Result<()> {
             "gather_last_dim parity: metal={m} cpu={c} diff={diff}"
         );
     }
+
+    Ok(())
+}
+
+/// M5.3b.10 acceptance: the device-backed AdamW path keeps `m`, `v`, and
+/// the param device-resident across steps on Metal. Five fixed-seed steps
+/// through `AdamW::new_with_device` must numerically match the host
+/// reference (plain `AdamW::new`) to ≤ 1e-5 L2 diff, and after each step
+/// the param's store tensor must be `Dirty::Device` — that's the flag that
+/// gates whether the NEXT forward re-uploads or reuses the lazy MLX handle.
+///
+/// Eval-count budget: the backend `adamw_step` records exactly one terminal
+/// `mlx_eval` per param to numerically commit the updated {param, m, v}
+/// triple. With a single param under test, the delta from `reset_eval_count`
+/// to after-step is therefore ≤ 2 (one optimizer eval + one unit of slack
+/// — the test uses no tape.backward here, grads are planted directly, so
+/// the backward flush eval is not counted). If a future diff batches
+/// multiple params through one `mlx_eval`, this bound will tighten
+/// automatically per-param but the total for N params will stay at 1.
+///
+/// Without this test, a regression that went back to `get_mut`-on-param
+/// would silently re-introduce the ~200-param-per-step CPU→GPU re-upload
+/// observed in pre-M5.3b.10 profiling, and the only signal would be
+/// steady-state throughput dropping at scale. The `Dirty::Device` assertion
+/// is the cheap structural catch.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_adamw_step_stays_device_resident() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    const LR: f32 = 1e-3;
+    const BETAS: (f32, f32) = (0.9, 0.95);
+    const EPS: f32 = 1e-8;
+    const WD: f32 = 0.01;
+    const STEPS: i32 = 5;
+
+    let shape = vec![8, 8];
+    let size: usize = shape.iter().product();
+
+    // Same seed for both sides: produce one param_init + STEPS grad vectors,
+    // replay them against host AdamW and device AdamW.
+    let seed = 1234_u64;
+    let param_init: Vec<f32> = (0..size)
+        .map(|i| {
+            let x = ((seed as usize + i).wrapping_mul(2654435761)) as u32;
+            ((x % 1000) as f32 / 1000.0 - 0.5) * 0.2
+        })
+        .collect();
+    let grads_per_step: Vec<Vec<f32>> = (0..STEPS)
+        .map(|step| {
+            (0..size)
+                .map(|i| {
+                    let x =
+                        ((seed as usize + step as usize * 17 + i).wrapping_mul(1315423911)) as u32;
+                    ((x % 1000) as f32 / 1000.0 - 0.5) * 0.1
+                })
+                .collect()
+        })
+        .collect();
+
+    // ---- Host reference ----
+    let mut host_store = TensorStore::default();
+    let host_param = host_store
+        .alloc(Tensor::new(param_init.clone(), shape.clone(), true).expect("host param tensor"));
+    let host_grad = host_store
+        .alloc(Tensor::new(vec![0.0; size], shape.clone(), false).expect("host grad tensor"));
+    host_store
+        .get_mut(host_param)
+        .expect("host param exists")
+        .grad = Some(host_grad);
+    let mut host_opt = AdamW::new(LR, BETAS, EPS, WD);
+
+    for step in 0..STEPS {
+        let grad_tensor = host_store.get_mut(host_grad).expect("host grad exists");
+        grad_tensor
+            .data
+            .copy_from_slice(&grads_per_step[step as usize]);
+        host_opt.step(&[host_param], &mut host_store);
+    }
+    let host_final = host_store.to_host(host_param).expect("host param readback");
+
+    // ---- Metal device-backed ----
+    let backend: Arc<MetalBackend> = Arc::new(MetalBackend);
+    let mut dev_store = TensorStore::with_backend(backend.clone());
+    let dev_param = dev_store
+        .alloc(Tensor::new(param_init.clone(), shape.clone(), true).expect("dev param tensor"));
+    let dev_grad = dev_store
+        .alloc(Tensor::new(vec![0.0; size], shape.clone(), false).expect("dev grad tensor"));
+    dev_store.get_mut(dev_param).expect("dev param exists").grad = Some(dev_grad);
+    let mut dev_opt = AdamW::new_with_device(LR, BETAS, EPS, WD, backend.clone());
+
+    // Pre-upload the param so the first step already sees it device-resident
+    // (the dispatch path will ensure_device if we don't, but being explicit
+    // here makes the Dirty::Device invariant measurable from step 1).
+    dev_store.ensure_device(dev_param)?;
+
+    let mut per_step_eval_deltas: Vec<u64> = Vec::with_capacity(STEPS as usize);
+    for step in 0..STEPS {
+        let grad_tensor = dev_store.get_mut(dev_grad).expect("dev grad exists");
+        grad_tensor
+            .data
+            .copy_from_slice(&grads_per_step[step as usize]);
+
+        reset_eval_count();
+        dev_opt.step(&[dev_param], &mut dev_store);
+        let after = eval_count();
+        per_step_eval_deltas.push(after);
+
+        // Post-condition: the param is device-resident, with host copy cleared.
+        let param_tensor = dev_store.get(dev_param).expect("dev param exists");
+        assert_eq!(
+            param_tensor.dirty,
+            Dirty::Device,
+            "M5.3b.10: after AdamW step {step} the param must remain Dirty::Device \
+             so the next forward reuses the lazy MLX handle without re-upload. \
+             Saw dirty={:?}",
+            param_tensor.dirty
+        );
+        assert!(
+            param_tensor.device_handle.is_some(),
+            "M5.3b.10: param must keep its device handle after AdamW step"
+        );
+    }
+
+    for (step, &delta) in per_step_eval_deltas.iter().enumerate() {
+        assert!(
+            delta <= 2,
+            "M5.3b.10: AdamW step {step} recorded {delta} mlx_evals; budget ≤ 2 \
+             (1 optimizer terminal eval for {{param, m, v}} + 1 slack). If this \
+             climbs, trace backend_metal::adamw_step for an accidental intra-graph \
+             eval, or check whether a newly-introduced upload-path inside step_device \
+             forced an eval."
+        );
+    }
+
+    // Readback the Metal param once at the end to compare; readback goes
+    // through the backend (MLX evaluates the final handle), which is the
+    // expected terminal flush the NEXT step would have triggered anyway.
+    let dev_final = dev_store.to_host(dev_param).expect("dev param readback");
+
+    assert_eq!(host_final.len(), dev_final.len());
+    let mut sq_err = 0.0_f32;
+    for (h, d) in host_final.iter().zip(dev_final.iter()) {
+        let diff = h - d;
+        sq_err += diff * diff;
+    }
+    let l2_diff = sq_err.sqrt();
+    assert!(
+        l2_diff <= 1e-5,
+        "M5.3b.10 parity: host vs Metal AdamW diverged after {STEPS} steps; \
+         L2 diff = {l2_diff} (gate 1e-5)"
+    );
 
     Ok(())
 }

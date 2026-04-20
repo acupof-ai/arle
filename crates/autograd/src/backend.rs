@@ -466,6 +466,82 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &out_shape)
     }
 
+    /// In-place AdamW step for a single parameter given host-resident
+    /// gradient `grad` and device-resident `param` / `m` / `v` handles.
+    ///
+    /// Returns the updated `(param, m, v)` device handles. The caller owns
+    /// installing them back into its store (`TensorStore::replace_device_handle`
+    /// + its own moment map). Shape / length invariants:
+    ///
+    /// - `grad.len() == product(shape)` — the caller typically sources `grad`
+    ///   via `store.to_host(grad_id)`; `matmul_backward` currently returns
+    ///   host `Vec<f32>`, so keeping `grad` host avoids an upload-then-readback
+    ///   round-trip just to land in this op.
+    /// - `param` / `m` / `v` must already be device-resident and share `shape`.
+    /// - `bc1` / `bc2` are the Adam bias-correction denominators
+    ///   `1 - beta1^step` / `1 - beta2^step`, passed in so this op never sees
+    ///   the step counter (matches how CUDA AdamW kernels are usually driven).
+    ///
+    /// Default implementation: `readback(param, m, v) → host formula → upload`.
+    /// This is CPU-correct by construction and gives non-Metal backends a
+    /// working fallback. Metal overrides to compose the update into its lazy
+    /// MLX graph so `m` / `v` / `param` stay device-resident across steps —
+    /// killing the ~200-param × param-size re-upload churn that the prior
+    /// `get_mut`-triggered `Dirty::Host` path caused on Qwen3.5-class models
+    /// (see `docs/experience/wins/2026-04-21-adamw-on-device-metal.md`).
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_step(
+        &self,
+        param: &DeviceHandle,
+        m: &DeviceHandle,
+        v: &DeviceHandle,
+        grad: &[f32],
+        shape: &[usize],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        wd: f32,
+        bc1: f32,
+        bc2: f32,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        let size = shape_size(shape);
+        if grad.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: grad.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut param_host = self.readback(param)?;
+        let mut m_host = self.readback(m)?;
+        let mut v_host = self.readback(v)?;
+        if param_host.len() != size || m_host.len() != size || v_host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: param_host.len().min(m_host.len()).min(v_host.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        cpu_adamw_step_in_place(
+            &mut param_host,
+            &mut m_host,
+            &mut v_host,
+            grad,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            bc1,
+            bc2,
+        );
+        let new_param = self.upload(&param_host, shape)?;
+        let new_m = self.upload(&m_host, shape)?;
+        let new_v = self.upload(&v_host, shape)?;
+        Ok((new_param, new_m, new_v))
+    }
+
     /// Scatter-add rows into a `[vocab, feature_dim]` output.
     ///
     /// `upstream` is `[prefix_rows * feature_dim]` row-major. For each prefix
@@ -1233,6 +1309,52 @@ pub fn cpu_scatter_add_rows_forward(
         }
     }
     Ok(out)
+}
+
+/// CPU reference in-place AdamW update. Matches the formula in
+/// `optim.rs::AdamW::step`:
+///
+/// - weight decay (decoupled): `param *= 1 - lr * wd`
+/// - EMAs: `m = β1·m + (1-β1)·g`, `v = β2·v + (1-β2)·g²`
+/// - bias-corrected step: `param -= lr · (m/bc1) / (√(v/bc2) + eps)`
+///
+/// Exposed as a free fn so `Backend::adamw_step` default impl and the
+/// optimizer's host path share one numerical reference. Any backend
+/// override (e.g. `MetalBackend::adamw_step`) MUST match this to the
+/// 1e-5 gate enforced by `metal_adamw_step_stays_device_resident`.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_adamw_step_in_place(
+    param: &mut [f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    grad: &[f32],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    wd: f32,
+    bc1: f32,
+    bc2: f32,
+) {
+    debug_assert_eq!(param.len(), m.len());
+    debug_assert_eq!(param.len(), v.len());
+    debug_assert_eq!(param.len(), grad.len());
+
+    if wd > 0.0 {
+        let decay = 1.0 - (lr * wd);
+        for value in param.iter_mut() {
+            *value *= decay;
+        }
+    }
+
+    for index in 0..param.len() {
+        let g = grad[index];
+        m[index] = (beta1 * m[index]) + ((1.0 - beta1) * g);
+        v[index] = (beta2 * v[index]) + ((1.0 - beta2) * g * g);
+        let m_hat = m[index] / bc1;
+        let v_hat = v[index] / bc2;
+        param[index] -= lr * m_hat / (v_hat.sqrt() + eps);
+    }
 }
 
 pub(crate) fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {

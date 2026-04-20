@@ -264,6 +264,24 @@ impl TensorStore {
         Ok(self.alloc(tensor))
     }
 
+    /// Replace an existing tensor's device handle with a fresh one, marking
+    /// the host copy stale (`Dirty::Device`) and clearing the cached host
+    /// `data` buffer.
+    ///
+    /// Used by the device-backed AdamW path (M5.3b.10): the optimizer
+    /// produces a new `DeviceHandle` for each updated parameter and we must
+    /// install it without going through `get_mut` — `get_mut` auto-triggers
+    /// `ensure_host`, which would re-download the old pre-update values and
+    /// then mark the tensor `Dirty::Host`, forcing a full re-upload on the
+    /// next forward pass. That is the exact churn this path exists to kill.
+    pub fn replace_device_handle(&mut self, id: TensorId, handle: DeviceHandle) -> Result<()> {
+        let tensor = self.raw_tensor_mut(id)?;
+        tensor.device_handle = Some(handle);
+        tensor.dirty = Dirty::Device;
+        tensor.data.clear();
+        Ok(())
+    }
+
     pub(crate) fn set_requires_grad(&mut self, id: TensorId, requires_grad: bool) -> Result<()> {
         self.raw_tensor_mut(id)?.requires_grad = requires_grad;
         Ok(())
