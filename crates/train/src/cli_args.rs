@@ -36,3 +36,50 @@ pub fn parse_value<T: FromStr>(flag: &str, value: String) -> Result<T, ArgError>
         value,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_value_returns_next_token() {
+        let mut iter = vec!["42".to_string()].into_iter();
+        assert_eq!(next_value(&mut iter, "--n").unwrap(), "42");
+    }
+
+    #[test]
+    fn next_value_missing_reports_flag() {
+        let mut iter = std::iter::empty::<String>();
+        let err = next_value(&mut iter, "--missing").unwrap_err();
+        assert!(
+            matches!(&err, ArgError::MissingValue(f) if f == "--missing"),
+            "got {err:?}"
+        );
+        assert_eq!(err.to_string(), "missing value for flag --missing");
+    }
+
+    #[test]
+    fn parse_value_ok() {
+        let n: usize = parse_value("--steps", "7".to_string()).unwrap();
+        assert_eq!(n, 7);
+    }
+
+    #[test]
+    fn parse_value_invalid_reports_flag_and_value() {
+        let err: ArgError = parse_value::<usize>("--steps", "nope".to_string()).unwrap_err();
+        match &err {
+            ArgError::InvalidValue { flag, value } => {
+                assert_eq!(flag, "--steps");
+                assert_eq!(value, "nope");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "invalid value for --steps: nope");
+    }
+
+    #[test]
+    fn unknown_flag_display_matches_legacy_wording() {
+        let err = ArgError::UnknownFlag("--bogus".to_string());
+        assert_eq!(err.to_string(), "unknown flag --bogus");
+    }
+}
