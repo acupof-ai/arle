@@ -39,7 +39,7 @@ use crate::request_handle::RequestHandle;
 use crate::sampler::SamplingParams;
 #[cfg(any(feature = "metal", test))]
 use crate::scheduler::{IncomingRequest, RequestPriority};
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu", test))]
 use crate::session_persistence::SessionPersistence;
 #[cfg(feature = "cuda")]
 use crate::tokenizer::Tokenizer;
