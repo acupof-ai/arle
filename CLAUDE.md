@@ -152,8 +152,11 @@ changes.
   Canonical params are locked in
   [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3;
   changing them is a deliberate commit, not a flag flip.
-- Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
-  feature set. Raw output table, not summaries.
+- **Legacy helper:** `scripts/bench_throughput.py` is deprecated; keep it only
+  for historical reproducibility and narrower diagnostic runs.
+- Include: GPU model, CUDA/Metal version, model, weights/processor path,
+  non-default flags, feature set. Raw output table, not summaries. Add VRAM
+  peak / kernel counts only when a paired trace actually produced them.
 - Install the Python dep once: `pip install -e .[bench]` (guidellm ships in
   the `bench` extra).
 

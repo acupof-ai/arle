@@ -3,7 +3,8 @@
 > Template for canonical guidellm bench wins. Copy this file when
 > `scripts/bench_guidellm.sh` runs, fill the placeholders, commit. Never
 > edit an existing wins entry — always create a new dated one and diff
-> against the prior. Canonical params are locked in
+> against the prior. `scripts/bench_throughput.py` is legacy only.
+> Canonical params are locked in
 > [`docs/plans/guidellm-integration.md`](../../plans/guidellm-integration.md) §3.
 
 ## Goal
@@ -17,18 +18,13 @@
 ## Command
 
 ```bash
-guidellm benchmark \
-  --target http://localhost:8000 \
-  --model <model> \
-  --profile sweep \
-  --data  prompt_tokens=4096,output_tokens=256 \
-  --max-seconds 60 \
-  --random-seed 20260416 \
-  --output-dir bench-output/<date>-<label>/ \
-  --outputs json,csv,html
+scripts/bench_guidellm.sh <backend-label> \
+  [--target http://localhost:8000] \
+  [--model Qwen/Qwen3-4B] \
+  [--processor models/Qwen3-4B]
 ```
 
-Invoked via: `scripts/bench_guidellm.sh <backend-label>`
+Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]`
 
 ## Environment
 
