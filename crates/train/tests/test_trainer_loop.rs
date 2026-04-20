@@ -221,6 +221,82 @@ fn lr_schedule_drives_optimizer_lr() {
     );
 }
 
+/// Codex review 2026-04-20 on ad5568b (P1): end-to-end save→resume
+/// roundtrip test. Run trainer with save_every=N to land a real
+/// checkpoint dir, then spin up a fresh trainer pointed at that dir and
+/// confirm `resume_if_configured` accepts the output this code just
+/// produced. Would have caught the format-mismatch + missing-file bugs
+/// that shipped in ad5568b and were fixed in 49512b1.
+#[test]
+fn trainer_save_then_resume_roundtrip() {
+    let tmp = tempdir().expect("tempdir");
+    let save_dir: PathBuf = tmp.path().join("ckpt");
+
+    // --- first run: train for 3 steps, save_every=3 so a checkpoint lands
+    //     at `<save_dir>/step_000003/{trainer_state.json,optimizer.safetensors}`.
+    let (mut store, p) = setup_param(&[0.25, -0.5]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 3,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: Some(3),
+        save_dir: Some(save_dir.clone()),
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+    trainer
+        .run(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+        )
+        .expect("trainer.run (first pass)");
+
+    let produced_dir = save_dir.join("step_000003");
+    assert!(
+        produced_dir.join("trainer_state.json").is_file(),
+        "first-pass trainer must have written trainer_state.json"
+    );
+    assert!(
+        produced_dir.join("optimizer.safetensors").is_file(),
+        "first-pass trainer must have written optimizer.safetensors"
+    );
+
+    // --- second run: fresh trainer, `resume_from = <produced_dir>`.
+    //     Should restore step to 3 so subsequent `run` starts from 3.
+    let (_store_b, p_b) = setup_param(&[0.25, -0.5]);
+    let optim_b = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg_b = TrainerConfig {
+        total_steps: 5,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: Some(produced_dir),
+        rng_seed: 0,
+    };
+    let mut trainer_b = Trainer::new(optim_b, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg_b);
+    let resumed = trainer_b
+        .resume_if_configured(&[(p_b, "p".to_string())])
+        .expect("resume_if_configured on own output");
+    assert_eq!(resumed, 3, "should resume at step 3 from save_every=3");
+    assert_eq!(trainer_b.step(), 3);
+}
+
 /// Hand-craft a TrainerStateDoc with step=42 + AdamWState that matches
 /// param name "p", then resume. `resume_if_configured` should return 42
 /// and `trainer.step()` should read 42.
