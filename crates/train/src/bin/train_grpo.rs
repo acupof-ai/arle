@@ -1,18 +1,21 @@
-use std::{collections::HashSet, env};
+use std::{collections::HashSet, env, path::PathBuf};
 
-use autograd::{AutogradError, Tape, TensorId, TensorStore, module::Module, optim::AdamW};
+use autograd::{
+    AutogradError, ConstantLr, Result as AutogradResult, Tape, TensorId, TensorStore,
+    module::Module, optim::AdamW,
+};
 use thiserror::Error;
 use train::{
+    StepCtx, StepOutcome, Trainer, TrainerConfig,
     cli_args::{ArgError, next_value, parse_value},
     dataset::{CopyDataset, Dataset, LcgRng},
+    grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     lora::LoraConfig,
+    loss::cross_entropy_loss,
     model::{Transformer, TransformerConfig},
     rollout::rollout_group,
-    trainer::{clip_grad_norm, cross_entropy_loss},
 };
-
-const GRAD_CLIP_NORM: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -27,6 +30,8 @@ struct CliArgs {
     lora_rank: usize,
     lora_alpha: f32,
     seed: u64,
+    grad_clip: Option<f32>,
+    metrics_jsonl: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -43,6 +48,8 @@ impl Default for CliArgs {
             lora_rank: 0,
             lora_alpha: 0.0,
             seed: 42,
+            grad_clip: Some(1.0),
+            metrics_jsonl: None,
         }
     }
 }
@@ -53,6 +60,27 @@ enum CliError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Arg(#[from] ArgError),
+    #[error("{0}")]
+    Custom(String),
+}
+
+/// Phase 3 train_grpo migration choice, mirroring `pretrain.rs`:
+/// `Trainer<O, C, S>` is generic on the clip policy, so
+/// `--no-grad-clip` vs `--grad-clip N` needs to collapse to a single
+/// concrete `C`. `NoClip`/`GlobalNorm` forward through this enum so we
+/// don't monomorphise the Trainer twice.
+enum GrpoClip {
+    None(NoClip),
+    Norm(GlobalNorm),
+}
+
+impl GradClip for GrpoClip {
+    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> AutogradResult<f32> {
+        match self {
+            Self::None(c) => c.clip(store, params),
+            Self::Norm(c) => c.clip(store, params),
+        }
+    }
 }
 
 fn main() -> Result<(), CliError> {
@@ -79,40 +107,23 @@ fn main() -> Result<(), CliError> {
     let mut tape = Tape::new();
     let policy = Transformer::new(config, &mut store)?;
     let params = policy.parameters();
-    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
+    let base_params = policy.base_parameter_ids();
     let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4752_504F_5052_4F4D);
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
     };
 
-    for step in 0..args.sft_steps {
-        let (inputs, targets) = dataset.sample();
-        let (batch, seq_len) = dataset.batch_shape();
+    // ---- SFT warm-up phase (migrated onto Trainer) ----
+    //
+    // The hand-written loop also computed a teacher-forced accuracy
+    // `reward` (via `store.to_host(logits)` + `teacher_forced_reward`) and
+    // printed it alongside loss. That value was PRINT-ONLY and cost a full
+    // device→host copy of logits per step; the migrated Trainer-format
+    // metrics line drops it. GRPO-phase reward tracking (via
+    // `mean_reward`) is unaffected.
+    run_sft_phase(&args, &policy, &params, &base_params, &mut store, &mut tape)?;
 
-        tape.entries.clear();
-        tape.set_enabled(true);
-
-        let logits = policy.forward(&inputs, batch, seq_len, &mut store, &mut tape)?;
-        let logits_data = store.to_host(logits)?;
-        let loss = cross_entropy_loss(logits, &targets, &mut store, &mut tape)?;
-        let loss_value = store.to_host(loss)?[0];
-        let reward =
-            teacher_forced_reward(&logits_data, &targets, batch, seq_len, config.vocab_size);
-
-        optimizer.zero_grad(&params, &mut store);
-        tape.backward(loss, &mut store)?;
-        clip_grad_norm(&params, GRAD_CLIP_NORM, &mut store);
-        optimizer.step(&params, &mut store);
-
-        tape.entries.clear();
-        tape.set_enabled(true);
-        let keep = retained_ids(&[&policy], &store);
-        store.retain_ids(&keep);
-
-        println!("sft step {step}: loss {loss_value:.4} reward {reward:.4}");
-    }
-
+    // ---- GRPO phase (hand-written; see commit body for the "why") ----
     let ref_model = policy.clone_frozen(&mut store);
     let baseline_prompts =
         build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut prompt_rng);
@@ -136,6 +147,13 @@ fn main() -> Result<(), CliError> {
         kl_coef: args.kl_coef,
         group_size: args.group_size,
     };
+    // Intentional known imperfection: the SFT-phase Trainer owns its own
+    // AdamW instance and we can't reach it after `trainer.run(...)` returns
+    // (no `Trainer::into_optimizer()` API today). Build a second AdamW for
+    // the GRPO phase with the same hyperparameters — on a 30→20-step
+    // copy-task smoke run the lost warm-start moments are noise vs. the
+    // convergence target. See commit body for the full rationale.
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
     let mut reward_trajectory = Vec::with_capacity(args.grpo_iters);
     let mut last_kl = 0.0_f32;
     let mut best_mean_reward = baseline_reward;
@@ -176,7 +194,14 @@ fn main() -> Result<(), CliError> {
 
         optimizer.zero_grad(&params, &mut store);
         tape.backward(loss_id, &mut store)?;
-        clip_grad_norm(&params, GRAD_CLIP_NORM, &mut store);
+        // `clip_grad_norm` is a no-op when `max_norm` is non-positive / non-
+        // finite (see its sanitize-at-boundary contract landed in 429efc3),
+        // so `--grad-clip 0 / NaN / inf` collapse to "disabled" without
+        // panicking. The `if let Some` gate covers the `--no-grad-clip`
+        // case.
+        if let Some(max_norm) = args.grad_clip {
+            clip_grad_norm(&params, max_norm, &mut store);
+        }
         optimizer.step(&params, &mut store);
 
         tape.entries.clear();
@@ -194,6 +219,97 @@ fn main() -> Result<(), CliError> {
 
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
+    Ok(())
+}
+
+/// SFT warm-up migrated onto `Trainer<AdamW, GrpoClip, ConstantLr>`. The
+/// hand-written loop emitted `sft step N: loss L reward R`; the migrated
+/// loop emits the shared Trainer metric format (`step=N loss=... lr=...
+/// grad_norm=... ms_per_step=... tok_per_sec=...`). The teacher-forced
+/// `reward` print field is dropped — it required a logits device→host
+/// copy per step and only fed the println, no correctness concern.
+fn run_sft_phase(
+    args: &CliArgs,
+    policy: &Transformer,
+    params: &[TensorId],
+    base_params: &[TensorId],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<(), CliError> {
+    let optim = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    // Mirror pretrain.rs: `--grad-clip 0/NaN/inf` warns and falls through
+    // to NoClip instead of panicking in `GlobalNorm::new`.
+    let clip = match args.grad_clip {
+        Some(max_norm) if max_norm > 0.0 && max_norm.is_finite() => {
+            GrpoClip::Norm(GlobalNorm::new(max_norm))
+        }
+        Some(max_norm) => {
+            eprintln!(
+                "[train_grpo] warning: --grad-clip {max_norm} is non-positive/non-finite; disabling gradient clipping"
+            );
+            GrpoClip::None(NoClip)
+        }
+        None => GrpoClip::None(NoClip),
+    };
+    let schedule = ConstantLr(args.lr);
+    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+
+    let trainer_cfg = TrainerConfig {
+        total_steps: args.sft_steps as u64,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: None,
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: args.seed,
+    };
+    let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
+
+    // Transformer doesn't expose named parameters; synthesize stable
+    // names purely to satisfy the Trainer API (no optimizer-state
+    // persistence is wired — save_dir is None).
+    let param_names: Vec<(TensorId, String)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, format!("param.{i:04}")))
+        .collect();
+
+    // keep_extra: frozen base-parameter ids that aren't in the trainable
+    // `params` list (LoRA surface). `Transformer::parameters()` already
+    // returns all trainable ids including LoRA adapters; `base_params`
+    // covers the frozen base matmul weights under LoRA so backward
+    // cleanup doesn't evict them. Matches the hand-written
+    // `retained_ids(&[&policy], &store)` behaviour.
+    let mut keep_extra: HashSet<TensorId> = HashSet::new();
+    for &id in base_params {
+        keep_extra.insert(id);
+    }
+
+    let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
+    let batch_shape = dataset.batch_shape();
+    let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
+        let (input_ids, target_ids) = dataset.sample();
+        let (batch, seq_len) = batch_shape;
+        let token_count = (batch * seq_len) as u64;
+
+        let logits = policy.forward(&input_ids, batch, seq_len, ctx.store, ctx.tape)?;
+        let loss_id = cross_entropy_loss(logits, &target_ids, ctx.store, ctx.tape)?;
+        Ok(StepOutcome {
+            loss_id,
+            token_count,
+        })
+    };
+
+    trainer.run(
+        store,
+        tape,
+        params.to_vec(),
+        param_names,
+        keep_extra,
+        step_fn,
+    )?;
     Ok(())
 }
 
@@ -225,6 +341,13 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--grad-clip" => {
+                args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
+            "--no-grad-clip" => args.grad_clip = None,
+            "--metrics-jsonl" => {
+                args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
@@ -285,46 +408,6 @@ fn copy_reward(prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool])
     } else {
         correct as f32 / total as f32
     }
-}
-
-fn teacher_forced_reward(
-    logits: &[f32],
-    targets: &[usize],
-    batch: usize,
-    seq_len: usize,
-    vocab: usize,
-) -> f32 {
-    let prefix_len = seq_len / 2;
-    let mut correct = 0usize;
-    let mut total = 0usize;
-    for row in 0..batch {
-        for position in prefix_len + 1..seq_len {
-            let logits_row = row * seq_len + (position - 1);
-            let logits_base = logits_row * vocab;
-            let prediction = argmax(&logits[logits_base..logits_base + vocab]);
-            if prediction == targets[row * seq_len + (position - 1)] {
-                correct += 1;
-            }
-            total += 1;
-        }
-    }
-    if total == 0 {
-        0.0
-    } else {
-        correct as f32 / total as f32
-    }
-}
-
-fn argmax(values: &[f32]) -> usize {
-    let mut best_index = 0usize;
-    let mut best_value = f32::NEG_INFINITY;
-    for (index, value) in values.iter().enumerate() {
-        if *value > best_value {
-            best_value = *value;
-            best_index = index;
-        }
-    }
-    best_index
 }
 
 fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
