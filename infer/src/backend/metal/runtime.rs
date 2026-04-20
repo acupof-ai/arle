@@ -1022,6 +1022,19 @@ fn execute_prefill_chunk(
                 {
                     warn!("Metal live prefix publish failed for {:?}: {err:#}", req_id);
                 }
+                // DFlash widens the runtime-side prefill budget to consume
+                // the whole prompt in one FFI call (see budget override
+                // above). The scheduler-side `prefill_progress` still only
+                // advanced by `chunk_cap` per step, so we must re-sync it
+                // before `complete_prefill`, which otherwise rejects with
+                // `WrongPhase` for any prompt > prefill_chunk_size.
+                // See docs/experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md.
+                if let Some(request) = active.get(&req_id)
+                    && request.request_state.is_dflash_enabled()
+                {
+                    let prompt_len = request.request_state.prompt_len();
+                    scheduler.fast_forward_prefill(req_id, prompt_len);
+                }
                 match scheduler.complete_prefill(req_id, token) {
                     Ok(done) => scheduler_finished = done,
                     Err(err) => {
