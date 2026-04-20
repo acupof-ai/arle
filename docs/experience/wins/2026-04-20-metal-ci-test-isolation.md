@@ -18,6 +18,10 @@ deterministic bad assertion.
   truly host-side. The small-shape test still covers `MetalRecurrentState`
   allocation; the Qwen3.5 case now pins only the dimension contract without
   forcing a large device allocation on the default CI runner.
+- Split the direct `rms_norm_no_weight` check into a host-side formula test
+  plus an opt-in GPU smoke test. Hosted Apple runners were still intermittently
+  hanging inside MLX's tiny `fast::rms_norm` dispatch, so the dedicated wrapper
+  smoke no longer blocks default CI.
 - Kept `metal-ci.yml` aligned with release truth by watching the Metal-facing
   support/release docs (`CHANGELOG.md`, `docs/compatibility.md`,
   `docs/stability-policy.md`, `docs/support-matrix.md`) in addition to
@@ -27,4 +31,6 @@ deterministic bad assertion.
 
 When Metal unit tests touch MLX state, serialize them and clear process-global
 Metal caches at test boundaries. Large-dimension "shape" tests should stay
-host-side unless the goal is explicitly to validate a device allocation path.
+host-side unless the goal is explicitly to validate a device allocation path,
+and tiny MLX GPU smoke tests should be opt-in if hosted Apple runners prove
+they are not reliable enough for default CI gating.
