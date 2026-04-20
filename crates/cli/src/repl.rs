@@ -623,7 +623,6 @@ fn run_chat_turn(
     // (see `server_engine.rs` — `complete_stream`'s `on_token` treats a
     // send error as "consumer gone, stop sampling").
     let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
-    let start = Instant::now();
     let mut accumulated = String::new();
     // Buffer for incomplete UTF-8 sequences arriving across deltas.
     let mut partial_bytes: Vec<u8> = Vec::new();

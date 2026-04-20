@@ -12,6 +12,7 @@ use crate::args::Args;
 use crate::banner;
 use crate::download;
 use crate::hardware;
+use crate::hub_discovery;
 use crate::model_catalog;
 use crate::model_picker::{self, PickerResult};
 
@@ -65,6 +66,43 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
             download::download_model_with_progress(&hf_id)?;
             Ok(hf_id)
         }
+    }
+}
+
+/// Fallback wizard: scan the HF hub cache for supported-family snapshots and
+/// show a `dialoguer::Select`. Called from `lib::run` when the main resolve
+/// path returned nothing (no curated candidate matched).
+///
+/// Returns `Ok(Some(path))` on a user selection, `Ok(None)` on Esc / empty
+/// cache, and propagates IO errors only from the picker interaction.
+pub(crate) fn run_hub_wizard() -> Result<Option<String>> {
+    use dialoguer::Select;
+
+    let snapshots = hub_discovery::discover_hub_snapshots();
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+
+    let items: Vec<String> = snapshots
+        .iter()
+        .map(|s| {
+            format!(
+                "{}  {}",
+                style(&s.model_id).bold(),
+                style(s.path.display().to_string()).dim()
+            )
+        })
+        .collect();
+
+    let selection = Select::new()
+        .with_prompt("Select a model (or press Esc to cancel):")
+        .items(&items)
+        .default(0)
+        .interact_opt()?;
+
+    match selection {
+        Some(idx) => Ok(Some(snapshots[idx].path.display().to_string())),
+        None => Ok(None),
     }
 }
 
