@@ -91,7 +91,10 @@ impl ActiveRequest {
             // Use cached prefix byte length instead of re-decoding all prefix tokens.
             // The cache is valid because safe_point == previous decoded_token_count - overlap,
             // which is exactly where the previous call cached the prefix length.
-            self.full_decoded.truncate(self.prefix_byte_len);
+            let prefix_len = self
+                .full_decoded
+                .floor_char_boundary(self.prefix_byte_len.min(self.full_decoded.len()));
+            self.full_decoded.truncate(prefix_len);
             self.full_decoded.push_str(&new_text);
         } else {
             self.full_decoded = new_text;
@@ -105,7 +108,8 @@ impl ActiveRequest {
             let suffix = tokenizer
                 .decode(&self.generated_tokens[new_safe..])
                 .unwrap_or_default();
-            self.prefix_byte_len = self.full_decoded.len().saturating_sub(suffix.len());
+            let prefix_len = self.full_decoded.len().saturating_sub(suffix.len());
+            self.prefix_byte_len = self.full_decoded.floor_char_boundary(prefix_len);
         } else {
             self.prefix_byte_len = 0;
         }
