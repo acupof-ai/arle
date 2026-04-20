@@ -7,9 +7,9 @@
 > This runtime layer is model-family agnostic. The current train-side
 > implementation already includes a generic Qwen-family control plane with
 > Qwen3.5 as the optimized default. `train_sft` and `train_grpo` now
-> dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` runs on the
-> dense/full-attn Qwen3.5 path today, checkpoints are written as HF-style
-> directories, GSPO has not landed, and the hybrid linear-attn train path
+> dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` exposes an
+> explicit stepwise-GRPO vs sequence-level-GSPO objective switch, checkpoints
+> are written as HF-style directories, and the hybrid linear-attn train path
 > has not landed yet. The target train-side model line is the Qwen3.5
 > architecture family.
 

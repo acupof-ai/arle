@@ -343,3 +343,104 @@ fn episode_trajectory_feeds_grpo_loss() {
     });
     assert!(any_grad, "expected non-zero gradient on at least one param");
 }
+
+#[test]
+fn multi_turn_gspo_uses_sequence_level_episode_scores() {
+    let config = tiny_qwen35_config();
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let policy = Qwen35Model::new(&config, &mut store).expect("policy");
+    let ref_model = policy.clone_frozen(&mut store);
+
+    let initial_prompt = vec![1usize, 2, 3, 15];
+    let turns = [
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 2,
+        },
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 0,
+        },
+    ];
+    let env = EchoSeparator(14);
+    let mut rng = LcgRng::seed(29);
+
+    let mut trajectories = Vec::with_capacity(4);
+    let mut sequence_scores = Vec::with_capacity(4);
+    for seed in 0..4 {
+        let mut rng_i = LcgRng::seed(seed + 200);
+        let episode = rollout_episode(
+            &policy,
+            &ref_model,
+            &initial_prompt,
+            &turns,
+            &env,
+            1.0,
+            &mut rng_i,
+            &|_: &Episode| 0.0,
+            &mut store,
+            &mut tape,
+        )
+        .expect("episode");
+        let sequence_score = episode_sequence_score(&episode, &initial_prompt);
+        sequence_scores.push(sequence_score);
+        trajectories.push(episode.into_trajectory());
+        rng.next_u64();
+    }
+
+    let advantages = group_advantages(&sequence_scores, 4);
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let loss = grpo_loss(
+        &policy,
+        &trajectories,
+        &advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 4,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("gspo loss");
+    let loss_value = store.to_host(loss).expect("loss host")[0];
+    assert!(
+        loss_value.is_finite(),
+        "loss should be finite: {loss_value}"
+    );
+
+    tape.backward(loss, &mut store).expect("backward");
+    let params = policy.all_parameter_ids();
+    let any_grad = params.iter().any(|id| {
+        store
+            .get(*id)
+            .and_then(|t| t.grad)
+            .and_then(|g| store.get(g))
+            .is_some_and(|g| g.data.iter().any(|v| v.abs() > 1e-7))
+    });
+    assert!(any_grad, "expected non-zero gradient on at least one param");
+}
+
+fn episode_sequence_score(episode: &Episode, initial_prompt: &[usize]) -> f32 {
+    let prompt_len = initial_prompt.len().max(1);
+    let mut score = 0.0_f32;
+    let mut turns = 0.0_f32;
+    for (turn_idx, (start, end)) in episode.turn_boundaries.iter().enumerate() {
+        let target = initial_prompt[turn_idx % prompt_len];
+        let mut hits = 0.0_f32;
+        let mut total = 0.0_f32;
+        for position in *start..*end {
+            total += 1.0;
+            if episode.full_ids[position] == target {
+                hits += 1.0;
+            }
+        }
+        score += if total == 0.0 { 0.0 } else { hits / total };
+        turns += 1.0;
+    }
+    if turns == 0.0 { 0.0 } else { score / turns }
+}
