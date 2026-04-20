@@ -284,6 +284,7 @@ impl MetalScheduler {
     /// decode work is always emitted before any new or continuing prefill work.
     /// Prefill is chunked so it can be interleaved with decode.
     pub fn step(&mut self, runtime_states: &[MetalRuntimeRequestState]) -> MetalScheduleDecision {
+        self.validate_runtime_snapshots(runtime_states);
         let decode_batch = self.build_decode_batch(runtime_states);
         let prefill_chunk = self.build_prefill_chunk(runtime_states);
 
@@ -348,17 +349,31 @@ impl MetalScheduler {
     }
 
     fn build_decode_batch(&self, runtime_states: &[MetalRuntimeRequestState]) -> MetalDecodeBatch {
-        let mut states: Vec<(&MetalRequestState, u32)> = self
-            .requests
-            .values()
-            .filter_map(|state| {
-                let runtime = runtime_state(runtime_states, state.req_id)?;
-                (state.admitted
-                    && runtime.phase == MetalRequestPhase::Decoding
-                    && runtime.last_token.is_some())
-                .then_some((state, runtime.last_token?))
-            })
-            .collect();
+        let mut states: Vec<(&MetalRequestState, u32)> = Vec::new();
+        for state in self.requests.values() {
+            if !state.admitted {
+                continue;
+            }
+
+            let runtime = runtime_state(runtime_states, state.req_id).unwrap_or_else(|| {
+                panic!(
+                    "Metal scheduler contract violation: admitted request {:?} missing runtime snapshot",
+                    state.req_id
+                )
+            });
+
+            if runtime.phase != MetalRequestPhase::Decoding {
+                continue;
+            }
+
+            let last_token = runtime.last_token.unwrap_or_else(|| {
+                panic!(
+                    "Metal scheduler contract violation: admitted decode request {:?} missing last_token",
+                    state.req_id
+                )
+            });
+            states.push((state, last_token));
+        }
         states.sort_by(|(a, _), (b, _)| compare_decode_order(a, b));
 
         let req_ids = states.iter().map(|(state, _)| state.req_id).collect();
@@ -374,22 +389,33 @@ impl MetalScheduler {
         &mut self,
         runtime_states: &[MetalRuntimeRequestState],
     ) -> Option<MetalPrefillChunk> {
-        let req_id = if let Some(req_id) = self.find_prefilling_request(runtime_states) {
-            req_id
-        } else if self.active_len() < self.config.max_active_requests {
-            self.admit_next_waiting_request()?
-        } else {
-            return None;
-        };
+        let (req_id, newly_admitted) =
+            if let Some(req_id) = self.find_prefilling_request(runtime_states) {
+                (req_id, false)
+            } else if self.active_len() < self.config.max_active_requests {
+                (self.admit_next_waiting_request()?, true)
+            } else {
+                return None;
+            };
 
         let chunk_cap = self.prefill_chunk_budget(Self::count_decode_runtime(runtime_states));
 
         let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
             let state = self.requests.get_mut(&req_id)?;
             let prompt_len = state.prompt_len();
-            let prompt_start = runtime_state(runtime_states, req_id)
-                .map_or(0, |runtime| runtime.prompt_progress)
-                .min(prompt_len);
+            let prompt_start = if newly_admitted {
+                0
+            } else {
+                runtime_state(runtime_states, req_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Metal scheduler contract violation: admitted request {:?} missing runtime snapshot",
+                            req_id
+                        )
+                    })
+                    .prompt_progress
+                    .min(prompt_len)
+            };
             let prompt_end = (prompt_start + chunk_cap).min(prompt_len);
             let input_tokens = state.prompt_tokens[prompt_start..prompt_end].to_vec();
 
@@ -417,6 +443,24 @@ impl MetalScheduler {
             prompt_end,
             prompt_len,
         })
+    }
+
+    fn validate_runtime_snapshots(&self, runtime_states: &[MetalRuntimeRequestState]) {
+        for state in self.requests.values().filter(|state| state.admitted) {
+            let runtime = runtime_state(runtime_states, state.req_id).unwrap_or_else(|| {
+                panic!(
+                    "Metal scheduler contract violation: admitted request {:?} missing runtime snapshot",
+                    state.req_id
+                )
+            });
+
+            if runtime.phase == MetalRequestPhase::Decoding && runtime.last_token.is_none() {
+                panic!(
+                    "Metal scheduler contract violation: admitted decode request {:?} missing last_token",
+                    state.req_id
+                );
+            }
+        }
     }
 
     fn find_prefilling_request(
@@ -782,7 +826,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_batch_skips_requests_missing_runtime_last_token() {
+    #[should_panic(expected = "Metal scheduler contract violation: admitted decode request")]
+    fn decode_batch_requires_runtime_last_token_for_admitted_requests() {
         let mut sched = make_scheduler(1, 4, 4);
         let req = sched
             .submit(vec![10, 11, 12, 13], 3, MetalRequestPriority::Normal)
@@ -800,6 +845,25 @@ mod tests {
             sched.step(&[rt(req, MetalRequestPhase::Decoding, 4, None)]),
             MetalScheduleDecision::Idle
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Metal scheduler contract violation: admitted request")]
+    fn admitted_requests_require_runtime_snapshots() {
+        let mut sched = make_scheduler(1, 4, 4);
+        let req = sched
+            .submit(vec![21, 22, 23, 24], 3, MetalRequestPriority::Normal)
+            .expect("submit");
+
+        match sched.step(&[]) {
+            MetalScheduleDecision::PrefillChunk(prefill) => {
+                assert_eq!(prefill.req_id, req);
+                assert_eq!(prefill.input_tokens, vec![21, 22, 23, 24]);
+            }
+            other => panic!("expected initial prefill, got {other:?}"),
+        }
+
+        let _ = sched.step(&[]);
     }
 
     #[test]
