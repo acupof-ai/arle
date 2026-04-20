@@ -77,6 +77,34 @@ ms_per_step=... tok_per_sec=...`) followed by `grpo iter 0: loss ...
 mean_reward ... mean_kl ...` and a final `kl ... reward trajectory:
 [...]`.
 
+Commit 1a24db1 closes two findings from the 09c5c89 codex review:
+(P1) **AdamW moments silently reset at SFT→GRPO boundary** — the
+migrated `run_sft_phase` consumed its own AdamW inside the Trainer,
+so the GRPO phase started from fresh moments + bias-correction step
+zero. The stated blocker (missing `Trainer::into_optimizer()`) was
+wrong — `Trainer::optim()` + the existing `AdamW::export_state` /
+`import_state` were sufficient. Fix: `run_sft_phase` returns the
+final `AdamWState`, the GRPO-phase AdamW calls `import_state` before
+its first step, so moments and the bias-correction counter flow
+across the phase boundary continuously. (P2) **`CliError` leaked
+through `main() -> Result` with Debug formatting** — users saw
+`Error: Custom("metrics sink: ...")`. Fix: mirror train_sft's
+`ExitCode` wrapper so users see the plain message. Tests:
+`adamw_state_roundtrip_across_trainer_boundary` (4 steps on one
+AdamW vs 3 + export + fresh AdamW + import + 1 step match to 1e-6)
++ `cli_error_display_does_not_leak_debug_wrapper`.
+
+Commit 8c11856 tightens the
+`eval_final_step_forced_even_when_steps_mod_eval_every` test that
+813d4f6 added: the original version fabricated `[2, 4, 5]` from the
+eval call count and would have silently accepted eval firing on the
+wrong steps. Fix: step_fn stashes `ctx.step + 1` into a shared cell
+(StepCtx.step is 0-indexed pre-increment; the eval check in
+run_inner runs on 1-indexed post-increment self.step, so the + 1
+aligns them), eval_fn reads that cell — assertion now pins actual
+trainer.step at each eval boundary. Codex review 813d4f6 (Low)
+closed.
+
 Commit 813d4f6 plugs two regressions from the bd5e277 codex review:
 (1) **High** — multi-window eval in `pretrain_qwen3` cleared
 `tape.entries` per window but never pruned `TensorStore`, so
