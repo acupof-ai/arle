@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -7,16 +8,20 @@ use std::{
 };
 
 use autograd::{
-    AutogradError, Backend, CpuBackend, SafetensorsRegistry, Tape, TensorId, TensorStore,
+    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
 use thiserror::Error;
 use train::{
     CausalLm, GrpoPolicy, GrpoPolicyConfig, StepOutcome, Trainer, TrainerConfig,
-    causal_lm::{build_registry, live_tensor_ids, trainable_params},
+    causal_lm::{
+        build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
+        trainable_params,
+    },
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
+    lora::{LoraAdapterConfig, LoraConfig},
     model_family::{ModelFamily, ModelFamilyError, resolve_model_family},
     qwen3::{Qwen3Config, Qwen3ConfigError, Qwen3Error, Qwen3Model},
     qwen3_checkpoint::{
@@ -100,6 +105,8 @@ struct CliArgs {
     grad_accum_steps: Option<usize>,
     metrics_jsonl: Option<PathBuf>,
     resume_from: Option<PathBuf>,
+    lora_rank: usize,
+    lora_alpha: f32,
 }
 
 impl Default for CliArgs {
@@ -124,6 +131,8 @@ impl Default for CliArgs {
             grad_accum_steps: None,
             metrics_jsonl: None,
             resume_from: None,
+            lora_rank: 16,
+            lora_alpha: 32.0,
         }
     }
 }
@@ -134,6 +143,8 @@ enum CliError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Qwen3Checkpoint(#[from] Qwen3CheckpointError),
     #[error(transparent)]
@@ -160,17 +171,22 @@ trait SftFamily {
 
     fn family_name() -> &'static str;
     fn load_config(config_path: &Path) -> Result<Self::Config, CliError>;
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError>;
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError>;
     fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError>;
     fn save_checkpoint(
         model_dir: &Path,
         out_dir: &Path,
         step: usize,
-        registry: &SafetensorsRegistry,
+        model: &Self::Model,
         store: &mut TensorStore,
         config_path: &Path,
         tokenizer_path: &Path,
         save_dtype: SaveDtype,
+        lora: LoraConfig,
     ) -> Result<(), CliError>;
 }
 
@@ -188,8 +204,12 @@ impl SftFamily for Qwen3Family {
         Qwen3Config::from_json_file(config_path).map_err(Into::into)
     }
 
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
-        Qwen3Model::new(cfg, store).map_err(Into::into)
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError> {
+        Qwen3Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
     }
 
     fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
@@ -200,21 +220,23 @@ impl SftFamily for Qwen3Family {
         model_dir: &Path,
         out_dir: &Path,
         step: usize,
-        registry: &SafetensorsRegistry,
+        model: &Self::Model,
         store: &mut TensorStore,
         config_path: &Path,
         tokenizer_path: &Path,
         save_dtype: SaveDtype,
+        lora: LoraConfig,
     ) -> Result<(), CliError> {
-        save_qwen3_checkpoint_via_registry(
+        save_qwen3_checkpoint(
             model_dir,
             out_dir,
             step,
-            registry,
+            model,
             store,
             config_path,
             tokenizer_path,
             save_dtype,
+            lora,
         )
     }
 }
@@ -233,8 +255,12 @@ impl SftFamily for Qwen35Family {
         Qwen35Config::from_json_file(config_path).map_err(Into::into)
     }
 
-    fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
-        Qwen35Model::new(cfg, store).map_err(Into::into)
+    fn build_model(
+        cfg: &Self::Config,
+        lora: LoraConfig,
+        store: &mut TensorStore,
+    ) -> Result<Self::Model, CliError> {
+        Qwen35Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
     }
 
     fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
@@ -245,21 +271,23 @@ impl SftFamily for Qwen35Family {
         model_dir: &Path,
         out_dir: &Path,
         step: usize,
-        registry: &SafetensorsRegistry,
+        model: &Self::Model,
         store: &mut TensorStore,
         config_path: &Path,
         tokenizer_path: &Path,
         save_dtype: SaveDtype,
+        lora: LoraConfig,
     ) -> Result<(), CliError> {
-        save_qwen35_checkpoint_via_registry(
+        save_qwen35_checkpoint(
             model_dir,
             out_dir,
             step,
-            registry,
+            model,
             store,
             config_path,
             tokenizer_path,
             save_dtype,
+            lora,
         )
     }
 }
@@ -292,6 +320,10 @@ fn run() -> Result<(), CliError> {
 
 fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(), CliError> {
     fs::create_dir_all(&args.out)?;
+    let lora = LoraConfig {
+        rank: args.lora_rank,
+        alpha: args.lora_alpha,
+    };
 
     let tokenizer_path = args.model.join("tokenizer.json");
     let weights_path = args.model.join("model.safetensors");
@@ -309,7 +341,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let cfg = F::load_config(config_path)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let mut store = TensorStore::with_backend(build_backend(args.backend)?);
-    let model = F::build_model(&cfg, &mut store)?;
+    let model = F::build_model(&cfg, lora, &mut store)?;
     let mut registry = build_registry(&model);
     registry.load_into(&mut store, &weights_path)?;
 
@@ -321,12 +353,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
             F::family_name()
         )));
     }
-    let param_names = model
-        .param_name_map()
-        .into_iter()
-        .filter(|(_, id)| params.contains(id))
-        .map(|(name, id)| (id, name.to_string()))
-        .collect::<Vec<_>>();
+    let param_names = trainable_param_names(&model, &params);
 
     let raw_examples = load_jsonl(&args.data)?;
     let dataset = raw_examples
@@ -406,35 +433,38 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
 
     // Resume if `--resume-from` was passed.
     //
-    // Codex review 2026-04-20 on ad5568b (P1): `resume_if_configured` only
-    // restores optimizer state + step counter — the Trainer is
-    // architecture-agnostic and does not know how to reload model weights.
-    // So we first overwrite the base `--model` weights with the checkpoint's
-    // `model.safetensors`, then call the trainer-side restore.
+    // `resume_if_configured` only restores optimizer state + step counter —
+    // the Trainer is architecture-agnostic and does not know how to reload
+    // model weights. For LoRA-only SFT we keep the frozen base weights from
+    // `--model` and reload the adapter tensors from the resume snapshot.
     //
-    // Codex review 2026-04-20 on 49512b1 (#1, High): the bare weight reload
-    // is not enough — (a) `load_into` silently ignores registered tensors
-    // absent from the file, so a partial checkpoint silently hybridises
-    // with base weights; (b) a checkpoint with mismatched architecture
-    // slips through until a shape mismatch crashes mid-training. Use the
-    // strict variant + validate the checkpoint's `config.json` matches the
-    // live `--model` config before letting the run proceed.
+    // The shape/config validation below still matters because a checkpoint
+    // with mismatched architecture would otherwise crash on the next forward
+    // pass or silently mis-route the optimizer state.
     if let Some(resume_dir) = resume_dir_canonical.as_deref() {
-        let resume_weights = resume_dir.join("model.safetensors");
-        if !resume_weights.is_file() {
+        F::validate_resume_config(resume_dir, &cfg)?;
+        validate_adapter_resume_config(resume_dir, &args.model, F::family_name(), lora)?;
+        let resume_adapter = resume_dir.join("adapter_model.safetensors");
+        if !resume_adapter.is_file() {
             return Err(CliError::Custom(format!(
-                "--resume-from {} has no model.safetensors",
+                "--resume-from {} has no adapter_model.safetensors",
                 resume_dir.display(),
             )));
         }
-        F::validate_resume_config(resume_dir, &cfg)?;
-        registry.load_into_strict(&mut store, &resume_weights)?;
+        let mut adapter_registry = build_adapter_registry(&model);
+        if adapter_registry.is_empty() {
+            return Err(CliError::Custom(format!(
+                "{} model exposed no LoRA adapter tensors",
+                F::family_name()
+            )));
+        }
+        adapter_registry.load_into_strict(&mut store, &resume_adapter)?;
         let resumed = trainer
             .resume_if_configured(&param_names)
             .map_err(CliError::Autograd)?;
         eprintln!(
-            "[train_sft] resumed from step {resumed} (weights from {})",
-            resume_weights.display()
+            "[train_sft] resumed from step {resumed} (adapters from {})",
+            resume_adapter.display()
         );
     }
 
@@ -489,7 +519,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let out_path = args.out.clone();
     let cfg_path = config_path;
     let tok_path = tokenizer_path.clone();
-    let registry_ref = &registry;
+    let model_save_ref = &model;
     let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
         let step_usize = step as usize;
         // Gate matches the Trainer's save_every + force-final behavior so the
@@ -501,11 +531,12 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
                 &model_path,
                 &out_path,
                 step_usize,
-                registry_ref,
+                model_save_ref,
                 store,
                 cfg_path,
                 &tok_path,
                 save_dtype,
+                lora,
             )
             .map_err(autograd_from_cli)?;
         }
@@ -579,6 +610,12 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--resume-from" => {
                 args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
+            "--lora-rank" => {
+                args.lora_rank = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--lora-alpha" => {
+                args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
@@ -602,6 +639,7 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ("--seq-len", args.seq_len),
         ("--save-every", args.save_every),
         ("--log-every", args.log_every),
+        ("--lora-rank", args.lora_rank),
     ] {
         if value == 0 {
             return Err(CliError::Arg(ArgError::InvalidValue {
@@ -609,6 +647,12 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
                 value: "0".into(),
             }));
         }
+    }
+    if !(args.lora_alpha.is_finite() && args.lora_alpha > 0.0) {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--lora-alpha".into(),
+            value: args.lora_alpha.to_string(),
+        }));
     }
     Ok(())
 }
@@ -897,16 +941,133 @@ fn validate_qwen35_resume_config(resume_dir: &Path, cfg: &Qwen35Config) -> Resul
     Ok(())
 }
 
-fn save_qwen3_checkpoint_via_registry(
+fn validate_adapter_resume_config(
+    resume_dir: &Path,
+    model_dir: &Path,
+    family: &str,
+    lora: LoraConfig,
+) -> Result<(), CliError> {
+    let adapter_config_path = resume_dir.join("adapter_config.json");
+    if !adapter_config_path.is_file() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no adapter_config.json",
+            resume_dir.display()
+        )));
+    }
+    let value: LoraAdapterConfig = serde_json::from_str(&fs::read_to_string(&adapter_config_path)?)
+        .map_err(|err| {
+            CliError::Custom(format!(
+                "adapter config {} parse error: {err}",
+                adapter_config_path.display()
+            ))
+        })?;
+    let mut mismatches = Vec::new();
+    if value.model_family != family {
+        mismatches.push(format!(
+            "model_family: ckpt={} live={family}",
+            value.model_family
+        ));
+    }
+    if value.peft_type != "LORA" {
+        mismatches.push(format!("peft_type: ckpt={} live=LORA", value.peft_type));
+    }
+    if value.task_type != "CAUSAL_LM" {
+        mismatches.push(format!(
+            "task_type: ckpt={} live=CAUSAL_LM",
+            value.task_type
+        ));
+    }
+    if value.r != lora.rank {
+        mismatches.push(format!("r: ckpt={} live={}", value.r, lora.rank));
+    }
+    if (value.lora_alpha - lora.alpha).abs() > 1.0e-6 {
+        mismatches.push(format!(
+            "lora_alpha: ckpt={} live={}",
+            value.lora_alpha, lora.alpha
+        ));
+    }
+    if value.target_modules != ["all-linear"] {
+        mismatches.push(format!(
+            "target_modules: ckpt={:?} live=[\"all-linear\"]",
+            value.target_modules
+        ));
+    }
+    if !same_model_path(&value.base_model_name_or_path, model_dir) {
+        mismatches.push(format!(
+            "base_model_name_or_path: ckpt={} live={}",
+            value.base_model_name_or_path,
+            model_dir.display()
+        ));
+    }
+    if !mismatches.is_empty() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} adapter mismatch: {}",
+            resume_dir.display(),
+            mismatches.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn same_model_path(saved: &str, live: &Path) -> bool {
+    if saved == live.display().to_string() {
+        return true;
+    }
+    let Ok(saved_path) = PathBuf::from(saved).canonicalize() else {
+        return false;
+    };
+    let Ok(live_path) = live.canonicalize() else {
+        return false;
+    };
+    saved_path == live_path
+}
+
+fn save_adapter_artifacts<M: CausalLm>(
+    step_dir: &Path,
+    model: &M,
+    store: &mut TensorStore,
+    model_dir: &Path,
+    family: &str,
+    lora: LoraConfig,
+) -> Result<(), CliError> {
+    let adapter_registry = build_adapter_registry(model);
+    if adapter_registry.is_empty() {
+        return Ok(());
+    }
+    adapter_registry.save_from(store, &step_dir.join("adapter_model.safetensors"))?;
+    let adapter_config = LoraAdapterConfig::new(model_dir.display().to_string(), family, lora);
+    fs::write(
+        step_dir.join("adapter_config.json"),
+        serde_json::to_string_pretty(&adapter_config)?,
+    )?;
+    Ok(())
+}
+
+fn trainable_param_names<M: CausalLm>(model: &M, params: &[TensorId]) -> Vec<(TensorId, String)> {
+    let param_set = params.iter().copied().collect::<HashSet<_>>();
+    let mut names = model
+        .adapter_name_map()
+        .into_iter()
+        .filter_map(|(name, id)| param_set.contains(&id).then_some((id, name.to_string())))
+        .collect::<Vec<_>>();
+    names.sort_unstable_by(|(id_a, name_a), (id_b, name_b)| {
+        name_a.cmp(name_b).then_with(|| id_a.cmp(id_b))
+    });
+    names
+}
+
+fn save_qwen3_checkpoint(
     model_dir: &Path,
     out_dir: &Path,
     step: usize,
-    registry: &SafetensorsRegistry,
+    model: &Qwen3Model,
     store: &mut TensorStore,
     config_path: &Path,
     tokenizer_path: &Path,
     save_dtype: SaveDtype,
+    lora: LoraConfig,
 ) -> Result<(), CliError> {
+    let keep_ids = live_tensor_ids(store);
     let step_dir = save_step_checkpoint(
         Qwen3StepCheckpoint {
             out_dir,
@@ -918,13 +1079,20 @@ fn save_qwen3_checkpoint_via_registry(
                 fallback_config_path: config_path,
             },
         },
-        |weights_path| match save_dtype {
-            SaveDtype::F32 => registry.save_from(store, weights_path).map_err(Into::into),
-            SaveDtype::Bf16 => registry
-                .save_from_bf16(store, weights_path)
-                .map_err(Into::into),
+        |weights_path| {
+            let mut tape = Tape::new();
+            save_materialized_registry(
+                model,
+                store,
+                &mut tape,
+                weights_path,
+                matches!(save_dtype, SaveDtype::Bf16),
+            )
+            .map_err(Into::into)
         },
     )?;
+    store.retain_ids(&keep_ids);
+    save_adapter_artifacts(&step_dir, model, store, model_dir, "qwen3", lora)?;
 
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
@@ -936,16 +1104,18 @@ fn save_qwen3_checkpoint_via_registry(
     Ok(())
 }
 
-fn save_qwen35_checkpoint_via_registry(
+fn save_qwen35_checkpoint(
     model_dir: &Path,
     out_dir: &Path,
     step: usize,
-    registry: &SafetensorsRegistry,
+    model: &Qwen35Model,
     store: &mut TensorStore,
     config_path: &Path,
     tokenizer_path: &Path,
     save_dtype: SaveDtype,
+    lora: LoraConfig,
 ) -> Result<(), CliError> {
+    let keep_ids = live_tensor_ids(store);
     let step_dir = save_qwen35_step_checkpoint(
         Qwen35StepCheckpoint {
             out_dir,
@@ -957,13 +1127,20 @@ fn save_qwen35_checkpoint_via_registry(
                 fallback_config_path: config_path,
             },
         },
-        |weights_path| match save_dtype {
-            SaveDtype::F32 => registry.save_from(store, weights_path).map_err(Into::into),
-            SaveDtype::Bf16 => registry
-                .save_from_bf16(store, weights_path)
-                .map_err(Into::into),
+        |weights_path| {
+            let mut tape = Tape::new();
+            save_materialized_registry(
+                model,
+                store,
+                &mut tape,
+                weights_path,
+                matches!(save_dtype, SaveDtype::Bf16),
+            )
+            .map_err(Into::into)
         },
     )?;
+    store.retain_ids(&keep_ids);
+    save_adapter_artifacts(&step_dir, model, store, model_dir, "qwen35", lora)?;
 
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",
@@ -1002,6 +1179,153 @@ fn sample_index(seed: u64, upper: usize, step: usize, micro_step: usize) -> usiz
     h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
     h ^= h >> 31;
     (h % upper as u64) as usize
+}
+
+#[cfg(test)]
+mod lora_tests {
+    use super::*;
+    use qwen35_spec::{LayerType, Qwen35AttentionTensorNames};
+    use serde_json::json;
+    use tempfile::tempdir;
+    use train::LoraAdapterConfig;
+    use train::causal_lm::build_materialized_registry;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn tiny_qwen35_config() -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            rms_norm_eps: 1.0e-6,
+            stop_token_ids: vec![2],
+            bos_token_id: Some(1),
+            eos_token_id: 2,
+            tie_word_embeddings: false,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            linear_num_key_heads: 4,
+            linear_key_head_dim: 8,
+            linear_num_value_heads: 4,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 1.0,
+            rotary_dim: 8,
+            rope_cache_len_hint: Some(16),
+            layer_types: vec![LayerType::FullAttention; 2],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn qwen35_save_checkpoint_writes_merged_weights_and_adapter_artifacts() -> TestResult {
+        let tmp = tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+            }))?,
+        )
+        .expect("write config");
+        fs::write(model_dir.join("tokenizer.json"), "{}").expect("write tokenizer");
+
+        let cfg = tiny_qwen35_config();
+        let lora = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+        };
+        let layer_names = cfg.layer_tensor_names(0);
+        let Qwen35AttentionTensorNames::Full(attn_names) = layer_names.attention else {
+            unreachable!("test config uses full attention");
+        };
+
+        let mut expected_store = TensorStore::default();
+        let expected_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut expected_store)?;
+        let mut save_store = TensorStore::default();
+        let save_model = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+
+        for (model, store) in [
+            (&expected_model, &mut expected_store),
+            (&save_model, &mut save_store),
+        ] {
+            let adapter_map = model.adapter_name_map();
+            let q_proj_a = *adapter_map
+                .get(format!("{}.lora_a", attn_names.q_proj).as_str())
+                .expect("adapter a");
+            let q_proj_b = *adapter_map
+                .get(format!("{}.lora_b", attn_names.q_proj).as_str())
+                .expect("adapter b");
+            store.get_mut(q_proj_a).expect("adapter a exists").data[0] = 1.0;
+            store.get_mut(q_proj_b).expect("adapter b exists").data[0] = 2.0;
+        }
+
+        let mut expected_tape = Tape::new();
+        let materialized =
+            build_materialized_registry(&expected_model, &mut expected_store, &mut expected_tape)?;
+        let expected_q = expected_store.to_host(
+            materialized
+                .get(attn_names.q_proj.as_str())
+                .expect("materialized q proj"),
+        )?;
+
+        save_qwen35_checkpoint(
+            &model_dir,
+            &out_dir,
+            3,
+            &save_model,
+            &mut save_store,
+            &model_dir.join("config.json"),
+            &model_dir.join("tokenizer.json"),
+            SaveDtype::F32,
+            lora,
+        )?;
+        let step_dir = out_dir.join("step_000003");
+
+        assert!(step_dir.join("model.safetensors").is_file());
+        assert!(step_dir.join("adapter_model.safetensors").is_file());
+        assert!(step_dir.join("adapter_config.json").is_file());
+        validate_adapter_resume_config(&step_dir, &model_dir, "qwen35", lora)?;
+        let adapter_config: LoraAdapterConfig =
+            serde_json::from_str(&fs::read_to_string(step_dir.join("adapter_config.json"))?)?;
+        assert_eq!(
+            adapter_config.base_model_name_or_path,
+            model_dir.display().to_string()
+        );
+        assert_eq!(adapter_config.peft_type, "LORA");
+        assert_eq!(adapter_config.task_type, "CAUSAL_LM");
+        assert_eq!(
+            adapter_config.target_modules,
+            vec!["all-linear".to_string()]
+        );
+
+        let mut load_store = TensorStore::default();
+        let load_model = Qwen35Model::new_with_lora(&cfg, None, &mut load_store)?;
+        let mut registry = build_registry(&load_model);
+        registry.load_into_strict(&mut load_store, &step_dir.join("model.safetensors"))?;
+        let loaded_q = load_store.to_host(
+            *load_model
+                .param_name_map()
+                .get(attn_names.q_proj.as_str())
+                .expect("loaded q proj"),
+        )?;
+        assert_eq!(loaded_q, expected_q);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
