@@ -88,23 +88,24 @@ impl Qwen3Model {
                     "Config from GGUF metadata: {}×{}, {} layers",
                     gc.hidden_size, gc.intermediate_size, gc.num_hidden_layers
                 );
-                Ok(Config {
-                    hidden_size: gc.hidden_size,
-                    intermediate_size: gc.intermediate_size,
-                    num_hidden_layers: gc.num_hidden_layers,
-                    num_attention_heads: gc.num_attention_heads,
-                    num_key_value_heads: gc.num_key_value_heads,
-                    head_dim: gc.head_dim,
-                    vocab_size: gc.vocab_size,
-                    rms_norm_eps: gc.rms_norm_eps,
-                    rope_theta: gc.rope_theta,
-                    bos_token_id: 0,
-                    eos_token_id: 0,
-                    tie_word_embeddings: true,
-                    max_position_embeddings: Some(gc.context_length),
-                    context_length: Some(gc.context_length),
-                    stop_token_ids: vec![],
-                })
+                Ok(Config::from_parts(
+                    qwen3_spec::Qwen3Config {
+                        hidden_size: gc.hidden_size,
+                        intermediate_size: gc.intermediate_size,
+                        num_hidden_layers: gc.num_hidden_layers,
+                        num_attention_heads: gc.num_attention_heads,
+                        num_key_value_heads: gc.num_key_value_heads,
+                        head_dim: gc.head_dim,
+                        vocab_size: gc.vocab_size,
+                        rms_norm_eps: gc.rms_norm_eps,
+                        rope_theta: gc.rope_theta,
+                        tie_word_embeddings: true,
+                        max_position_embeddings: Some(gc.context_length),
+                    },
+                    0,
+                    0,
+                    vec![],
+                ))
             })?;
             return Self::from_gguf(&ctx, &config, &gguf, runtime);
         }

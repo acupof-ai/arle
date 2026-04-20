@@ -1,4 +1,4 @@
-use std::{collections::HashMap, f32::consts::TAU, fs, path::Path};
+use std::{collections::HashMap, f32::consts::TAU};
 
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
@@ -7,7 +7,7 @@ use autograd::{
         transpose,
     },
 };
-use serde_json::Value;
+use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,11 +15,7 @@ pub enum Qwen3Error {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error("missing or invalid config field `{field}`")]
-    InvalidConfigField { field: &'static str },
+    Config(#[from] Qwen3ConfigError),
     #[error("invalid qwen3 config: {0}")]
     InvalidConfig(&'static str),
     #[error("input_ids len {input_len} does not match position_ids len {position_len}")]
@@ -32,70 +28,6 @@ pub enum Qwen3Error {
 }
 
 pub type Result<T> = std::result::Result<T, Qwen3Error>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Qwen3Config {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub intermediate_size: usize,
-    pub max_position_embeddings: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub tie_word_embeddings: bool,
-}
-
-impl Qwen3Config {
-    pub fn from_json_file(path: &Path) -> Result<Self> {
-        let json = fs::read_to_string(path)?;
-        let value: Value = serde_json::from_str(&json)?;
-        let cfg = Self {
-            vocab_size: read_usize(&value, "vocab_size")?,
-            hidden_size: read_usize(&value, "hidden_size")?,
-            num_hidden_layers: read_usize(&value, "num_hidden_layers")?,
-            num_attention_heads: read_usize(&value, "num_attention_heads")?,
-            num_kv_heads: read_usize_alias(&value, "num_kv_heads", "num_key_value_heads")?,
-            head_dim: read_usize(&value, "head_dim")?,
-            intermediate_size: read_usize(&value, "intermediate_size")?,
-            max_position_embeddings: read_usize(&value, "max_position_embeddings")?,
-            rms_norm_eps: read_f32(&value, "rms_norm_eps")?,
-            rope_theta: read_f32(&value, "rope_theta")?,
-            tie_word_embeddings: read_bool(&value, "tie_word_embeddings")?,
-        };
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> Result<()> {
-        // Qwen3 decouples hidden_size from num_attention_heads * head_dim — e.g.
-        // Qwen3-0.6B has hidden=1024 but q_proj is 16*128=2048 wide. The
-        // projection shapes in Qwen3Model::new already allocate q/k/v/o at the
-        // correct widths, so the only constraint here is that the individual
-        // attention dims are non-zero and compatible.
-        if self.num_attention_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
-            return Err(Qwen3Error::InvalidConfig(
-                "attention heads and head_dim must be non-zero",
-            ));
-        }
-        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
-            return Err(Qwen3Error::InvalidConfig(
-                "num_attention_heads must be divisible by num_kv_heads",
-            ));
-        }
-        if !self.head_dim.is_multiple_of(2) {
-            return Err(Qwen3Error::InvalidConfig("head_dim must be even for RoPE"));
-        }
-        if self.max_position_embeddings == 0 {
-            return Err(Qwen3Error::InvalidConfig(
-                "max_position_embeddings must be non-zero",
-            ));
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Qwen3Attention {
@@ -161,7 +93,7 @@ impl Qwen3Layer {
             q_or_kv_heads_tensor(k),
             1,
             seq_len,
-            cfg.num_kv_heads,
+            cfg.num_key_value_heads,
             cfg.head_dim,
             store,
             tape,
@@ -170,7 +102,7 @@ impl Qwen3Layer {
             q_or_kv_heads_tensor(v),
             1,
             seq_len,
-            cfg.num_kv_heads,
+            cfg.num_key_value_heads,
             cfg.head_dim,
             store,
             tape,
@@ -180,7 +112,7 @@ impl Qwen3Layer {
         let k = rmsnorm(k, self.self_attn.k_norm, cfg.rms_norm_eps, store, tape)?;
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
-        let kv_repeat = cfg.num_attention_heads / cfg.num_kv_heads;
+        let kv_repeat = cfg.num_attention_heads / cfg.num_key_value_heads;
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
         let attn = causal_sdpa(q, k, v, store, tape)?;
@@ -265,13 +197,13 @@ impl Qwen3Model {
             )?;
             let k_proj = normal_parameter(
                 leak_name(format!("{prefix}.self_attn.k_proj.weight")),
-                &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
                 0.02,
                 store,
             )?;
             let v_proj = normal_parameter(
                 leak_name(format!("{prefix}.self_attn.v_proj.weight")),
-                &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                &[cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size],
                 0.02,
                 store,
             )?;
@@ -639,38 +571,6 @@ fn next_uniform(state: &mut u64) -> f32 {
 
 fn leak_name(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
-}
-
-fn read_usize(value: &Value, field: &'static str) -> Result<usize> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .map(|raw| raw as usize)
-        .ok_or(Qwen3Error::InvalidConfigField { field })
-}
-
-fn read_usize_alias(value: &Value, field: &'static str, alias: &'static str) -> Result<usize> {
-    value
-        .get(field)
-        .or_else(|| value.get(alias))
-        .and_then(Value::as_u64)
-        .map(|raw| raw as usize)
-        .ok_or(Qwen3Error::InvalidConfigField { field })
-}
-
-fn read_f32(value: &Value, field: &'static str) -> Result<f32> {
-    value
-        .get(field)
-        .and_then(Value::as_f64)
-        .map(|raw| raw as f32)
-        .ok_or(Qwen3Error::InvalidConfigField { field })
-}
-
-fn read_bool(value: &Value, field: &'static str) -> Result<bool> {
-    value
-        .get(field)
-        .and_then(Value::as_bool)
-        .ok_or(Qwen3Error::InvalidConfigField { field })
 }
 
 fn q_or_kv_heads_tensor(x: TensorId) -> TensorId {

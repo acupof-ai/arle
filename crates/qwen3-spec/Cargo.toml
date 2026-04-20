@@ -1,0 +1,13 @@
+[package]
+name = "qwen3-spec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
