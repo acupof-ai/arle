@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -13,11 +11,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::kv_tier::transport::DiskStore;
-use crate::kv_tier::transport::disk::DiskBlockLocation;
-use crate::prefix_cache::{BlockId, RadixCache, ReconcileReport};
-use crate::server_engine::InferenceEngine;
+use crate::session_persistence::SessionPersistence;
 use crate::types::BlockFingerprint;
+
+#[cfg(test)]
+use crate::kv_tier::transport::DiskStore;
+#[cfg(test)]
+use crate::kv_tier::transport::disk::DiskBlockLocation;
+#[cfg(test)]
+use crate::prefix_cache::{BlockId, RadixCache, ReconcileReport};
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::io;
+#[cfg(test)]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -75,14 +83,18 @@ pub enum SessionSnapshotError {
     /// can translate it into a 503 / retry.
     #[error("pool exhausted while minting block id for {fingerprint_hex}")]
     PoolExhausted { fingerprint_hex: String },
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
+#[cfg(test)]
 pub struct LoadedSession {
     pub radix: RadixCache,
     pub kv_payloads: HashMap<BlockFingerprint, Vec<u8>>,
     pub report: ReconcileReport,
 }
 
+#[cfg(test)]
 fn load_snapshot_payloads(
     snapshot: &SessionSnapshot,
     expected_kv_format_tag: u8,
@@ -149,6 +161,7 @@ fn load_snapshot_payloads(
     Ok((radix, kv_payloads))
 }
 
+#[cfg(test)]
 fn reconcile_loaded_session<F>(
     snapshot: &SessionSnapshot,
     mut radix: RadixCache,
@@ -177,6 +190,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub fn save_session<F>(
     session_id: &str,
     kv_format_tag: u8,
@@ -213,6 +227,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub fn load_session<F>(
     snapshot: &SessionSnapshot,
     expected_kv_format_tag: u8,
@@ -226,6 +241,7 @@ where
     reconcile_loaded_session(snapshot, radix, kv_payloads, allocate_block_id)
 }
 
+#[cfg(test)]
 fn fingerprint_to_hex(fingerprint: BlockFingerprint) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -324,6 +340,9 @@ fn snapshot_error_to_response(err: &SessionSnapshotError) -> (StatusCode, Json<E
             None,
             None,
         ),
+        SessionSnapshotError::Unsupported(_) => {
+            (StatusCode::NOT_IMPLEMENTED, "unsupported", None, None)
+        }
     };
 
     (
@@ -349,67 +368,40 @@ fn unsupported_response(message: impl Into<String>) -> (StatusCode, Json<ErrorBo
     )
 }
 
-async fn handle_save<E: InferenceEngine>(
+async fn handle_save<E: SessionPersistence>(
     Path(session_id): Path<String>,
     State(engine): State<Arc<RwLock<E>>>,
     Json(req): Json<SaveRequestBody>,
 ) -> Result<Json<SessionSnapshot>, (StatusCode, Json<ErrorBody>)> {
     let engine = engine.read().await;
-    let disk = {
-        let store = engine.session_disk_store().map_err(unsupported_response)?;
-        DiskStore::new(store.root().to_path_buf())
-    };
-    let radix = engine.session_radix_cache().map_err(unsupported_response)?;
     let fingerprints = if req.fingerprints.is_empty() {
-        engine.session_fingerprints(&session_id)
+        None
     } else {
-        req.fingerprints
-            .iter()
-            .map(|fingerprint| parse_fingerprint_hex(fingerprint))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| snapshot_error_to_response(&err))?
+        Some(
+            req.fingerprints
+                .iter()
+                .map(|fingerprint| parse_fingerprint_hex(fingerprint))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| snapshot_error_to_response(&err))?,
+        )
     };
 
-    let snapshot = save_session(
-        &session_id,
-        engine.kv_format_tag(),
-        radix,
-        &disk,
-        |fingerprint| engine.read_block_payload(fingerprint),
-        &fingerprints,
-    )
-    .map_err(|err| snapshot_error_to_response(&err))?;
+    let snapshot = engine
+        .save_session_snapshot(&session_id, fingerprints.as_deref())
+        .map_err(|err| snapshot_error_to_response(&err))?;
     Ok(Json(snapshot))
 }
 
-async fn handle_load<E: InferenceEngine>(
+async fn handle_load<E: SessionPersistence>(
     State(engine): State<Arc<RwLock<E>>>,
     Json(snapshot): Json<SessionSnapshot>,
 ) -> Result<Json<LoadResponseBody>, (StatusCode, Json<ErrorBody>)> {
-    let (disk, expected_kv_format_tag) = {
-        let engine = engine.read().await;
-        let disk = engine.session_disk_store().map_err(unsupported_response)?;
-        (
-            DiskStore::new(disk.root().to_path_buf()),
-            engine.kv_format_tag(),
-        )
-    };
-    let (radix, kv_payloads) = load_snapshot_payloads(&snapshot, expected_kv_format_tag, &disk)
+    let mut engine = engine.write().await;
+    let loaded = engine
+        .load_session_snapshot(&snapshot)
         .map_err(|err| snapshot_error_to_response(&err))?;
 
-    let mut engine = engine.write().await;
-    let mut allocate_block_id = engine.install_restored_kv(&kv_payloads);
-    let loaded = reconcile_loaded_session(&snapshot, radix, kv_payloads, |fingerprint| {
-        allocate_block_id(fingerprint)
-    })
-    .map_err(|err| snapshot_error_to_response(&err))?;
-
-    Ok(Json(LoadResponseBody {
-        remapped: loaded.report.remapped,
-        tombstoned: loaded.report.tombstoned,
-        orphans_cleared: loaded.report.orphans_cleared,
-        kv_payloads: loaded.kv_payloads.len(),
-    }))
+    Ok(Json(loaded))
 }
 
 async fn handle_manifest(Path(_session_id): Path<String>) -> (StatusCode, Json<ErrorBody>) {
@@ -426,7 +418,7 @@ async fn handle_delete(Path(_session_id): Path<String>) -> (StatusCode, Json<Err
 
 pub fn session_router<E>(engine: Arc<RwLock<E>>) -> Router
 where
-    E: InferenceEngine + Send + Sync + 'static,
+    E: SessionPersistence + Send + Sync + 'static,
 {
     Router::new()
         .route("/save", post(handle_save::<E>))
@@ -453,14 +445,12 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::{
-        SaveRequestBody, SessionSnapshot, SessionSnapshotError, load_session, save_session,
-        session_router,
+        LoadResponseBody, SaveRequestBody, SessionSnapshot, SessionSnapshotError, load_session,
+        save_session, session_router,
     };
     use crate::kv_tier::transport::DiskStore;
     use crate::prefix_cache::{BlockId, RadixCache};
-    use crate::server_engine::{
-        CompletionOutput, CompletionRequest, CompletionStreamDelta, InferenceEngine,
-    };
+    use crate::session_persistence::SessionPersistence;
     use crate::types::BlockFingerprint;
 
     struct MockEngine {
@@ -472,54 +462,43 @@ mod tests {
         fingerprints: Vec<BlockFingerprint>,
     }
 
-    impl InferenceEngine for MockEngine {
-        fn model_id(&self) -> &'static str {
-            "mock-engine"
+    impl SessionPersistence for MockEngine {
+        fn save_session_snapshot(
+            &self,
+            session_id: &str,
+            fingerprints: Option<&[BlockFingerprint]>,
+        ) -> Result<SessionSnapshot, SessionSnapshotError> {
+            let fingerprints: Vec<BlockFingerprint> =
+                fingerprints.map_or_else(|| self.fingerprints.clone(), |items| items.to_vec());
+            save_session(
+                session_id,
+                self.format_tag,
+                &self.radix,
+                &self.disk,
+                |fingerprint| self.payloads.get(&fingerprint).cloned(),
+                &fingerprints,
+            )
         }
 
-        fn complete(&mut self, _req: CompletionRequest) -> anyhow::Result<CompletionOutput> {
-            panic!("MockEngine::complete is not used in session route tests")
-        }
-
-        fn complete_stream(
+        fn load_session_snapshot(
             &mut self,
-            _req: CompletionRequest,
-            _tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
-        ) -> anyhow::Result<()> {
-            panic!("MockEngine::complete_stream is not used in session route tests")
-        }
-
-        fn session_fingerprints(&self, _session_id: &str) -> Vec<BlockFingerprint> {
-            self.fingerprints.clone()
-        }
-
-        fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
-            self.payloads.get(&fingerprint).cloned()
-        }
-
-        fn install_restored_kv(
-            &mut self,
-            payloads: &HashMap<BlockFingerprint, Vec<u8>>,
-        ) -> Box<dyn FnMut(BlockFingerprint) -> Option<BlockId> + Send> {
-            let mut remapped = HashMap::with_capacity(payloads.len());
-            for (&fingerprint, payload) in payloads {
-                self.payloads.insert(fingerprint, payload.clone());
-                remapped.insert(fingerprint, BlockId(self.next_block_id));
-                self.next_block_id += 1;
-            }
-            Box::new(move |fingerprint| remapped.remove(&fingerprint))
-        }
-
-        fn kv_format_tag(&self) -> u8 {
-            self.format_tag
-        }
-
-        fn session_disk_store(&self) -> Result<&DiskStore, &'static str> {
-            Ok(&self.disk)
-        }
-
-        fn session_radix_cache(&self) -> Result<&crate::prefix_cache::RadixCache, &'static str> {
-            Ok(&self.radix)
+            snapshot: &SessionSnapshot,
+        ) -> Result<LoadResponseBody, SessionSnapshotError> {
+            let mut next_block_id = self.next_block_id;
+            let loaded = load_session(snapshot, self.format_tag, &self.disk, |_| {
+                let block_id = BlockId(next_block_id);
+                next_block_id += 1;
+                Some(block_id)
+            })?;
+            self.next_block_id = next_block_id;
+            self.radix = loaded.radix;
+            self.payloads = loaded.kv_payloads.clone();
+            Ok(LoadResponseBody {
+                remapped: loaded.report.remapped,
+                tombstoned: loaded.report.tombstoned,
+                orphans_cleared: loaded.report.orphans_cleared,
+                kv_payloads: loaded.kv_payloads.len(),
+            })
         }
     }
 
