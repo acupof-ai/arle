@@ -371,6 +371,22 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, &[1, ids.len(), hidden])
     }
 
+    /// Device-handle lazy GELU (erf form), matching `ops::activation::gelu`'s
+    /// CPU body: `0.5 * x * (1 + erf(x / sqrt(2)))`. NOT the tanh-approx
+    /// variant exposed by `gelu_forward` — those two formulas differ at the
+    /// ~1e-3 level, and `gelu_backward` hard-codes the erf-derivative via
+    /// the saved input, so forward must stay on the erf form for the
+    /// saved-input derivative to be consistent. Default implementation
+    /// falls back to `readback → host erf compute → upload`. M5.3b.8.
+    fn gelu(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out: Vec<f32> = host
+            .iter()
+            .map(|&value| 0.5 * value * (1.0 + libm::erff(value * 0.707_106_77)))
+            .collect();
+        self.upload(&out, shape)
+    }
+
     /// Reduce-sum over the last axis. Output has length `product(shape[..-1])`
     /// (or 1 if `shape.len() == 1`).
     fn sum_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {

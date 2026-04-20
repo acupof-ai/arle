@@ -51,7 +51,8 @@ pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Tens
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // Inner dispatcher picks lazy-device vs host-eager; stripping the
+    // eager readback here lets the lazy branch keep x Dirty::Device.
     activation::gelu(x, store, tape)
 }
 

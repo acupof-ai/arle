@@ -11,10 +11,10 @@ use crate::{
 };
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
-    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval,
-    mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply,
-    mlx_negative, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis,
-    mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_erf,
+    mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis,
+    mlx_multiply, mlx_negative, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice,
+    mlx_softmax_axis, mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -557,6 +557,21 @@ impl Backend for MetalBackend {
             ));
         };
         mlx_rope_lazy(x_handle.as_ptr(), x_shape, cos, sin)
+    }
+
+    // Lazy erf-based GELU: `0.5 * x * (1 + erf(x * INV_SQRT_2))`. Matches
+    // `ops::activation::gelu`'s CPU inline formula (NOT the tanh-approx
+    // `gelu_forward` on the trait). `gelu_backward` uses the erf-derivative
+    // against the saved input tensor, so the lazy forward must stay on
+    // the erf form or forward/backward become inconsistent by ~1e-3 per
+    // element. M5.3b.8.
+    fn gelu(&self, x: &DeviceHandle, _shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot gelu a non-metal device handle",
+            ));
+        };
+        mlx_gelu_erf_lazy(x_handle.as_ptr())
     }
 
     // Lazy embedding gather: upload the tiny `[seq]` int32 id array per
@@ -1282,6 +1297,66 @@ fn mlx_rms_norm_lazy(
             ));
         }
         Ok(DeviceHandle::Metal(MlxHandle::from_raw(out_arr)))
+    }
+}
+
+fn mlx_gelu_erf_lazy(x_ptr: *mut mlx_array) -> Result<DeviceHandle> {
+    // GELU_erf(x) = 0.5 * x * (1 + erf(x * INV_SQRT_2))
+    // Composed lazily so it merges with upstream matmul + downstream
+    // rmsnorm in MLX's lazy graph. Formula mirrors `ops::activation::gelu`
+    // CPU body exactly (same constant, same order of operations); the
+    // chosen `mlx_erf` matches `libm::erff` to within the ULP range MLX
+    // uses for f32 erf — parity test gates at 1e-4.
+    const INV_SQRT_2: f32 = 0.707_106_77_f32;
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `x_ptr` is borrowed for the duration of this call. Every
+    // intermediate we allocate is freed before the fn returns. The final
+    // returned handle owns the last `mlx_multiply` result.
+    unsafe {
+        let k_arr = mlx_array_new_float32(INV_SQRT_2);
+        if k_arr.is_null() {
+            return Err(AutogradError::TapeInvariant("gelu lazy: k scalar null"));
+        }
+        let scaled = mlx_multiply(k_arr, x_ptr);
+        mlx_array_free(k_arr);
+        if scaled.is_null() {
+            return Err(AutogradError::TapeInvariant("gelu lazy: scaled null"));
+        }
+        let erf_val = mlx_erf(scaled);
+        mlx_array_free(scaled);
+        if erf_val.is_null() {
+            return Err(AutogradError::TapeInvariant("gelu lazy: erf null"));
+        }
+        let one = mlx_array_new_float32(1.0_f32);
+        if one.is_null() {
+            mlx_array_free(erf_val);
+            return Err(AutogradError::TapeInvariant("gelu lazy: one null"));
+        }
+        let one_plus = mlx_add(one, erf_val);
+        mlx_array_free(one);
+        mlx_array_free(erf_val);
+        if one_plus.is_null() {
+            return Err(AutogradError::TapeInvariant("gelu lazy: 1+erf null"));
+        }
+        let half = mlx_array_new_float32(0.5_f32);
+        if half.is_null() {
+            mlx_array_free(one_plus);
+            return Err(AutogradError::TapeInvariant("gelu lazy: half null"));
+        }
+        let half_x = mlx_multiply(half, x_ptr);
+        mlx_array_free(half);
+        if half_x.is_null() {
+            mlx_array_free(one_plus);
+            return Err(AutogradError::TapeInvariant("gelu lazy: half*x null"));
+        }
+        let out = mlx_multiply(half_x, one_plus);
+        mlx_array_free(half_x);
+        mlx_array_free(one_plus);
+        if out.is_null() {
+            return Err(AutogradError::TapeInvariant("gelu lazy: final null"));
+        }
+        Ok(DeviceHandle::Metal(MlxHandle::from_raw(out)))
     }
 }
 

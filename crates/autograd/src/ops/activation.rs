@@ -81,6 +81,56 @@ fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    // M5.3b.8: route Dirty::Device inputs through the lazy `backend.gelu`
+    // (erf-form, composed from `mlx_multiply → mlx_erf → mlx_add →
+    // mlx_multiply` on the MLX graph). Dispatch covers both Dirty::Device
+    // and Dirty::Both so post-matmul and reshape-reentry inputs both stay
+    // lazy. `gelu_backward` uses the erf derivative of the saved input;
+    // tape.backward's pre-walk batch flush materializes the input before
+    // the backward walk, so saving `x` here is safe.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        gelu_device_lazy(x, store, tape)
+    } else {
+        gelu_host_eager(x, store, tape)
+    }
+}
+
+fn gelu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_device(x)?;
+    let (input_shape, requires_grad) = {
+        let tensor = store.tensor(x)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let input_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "gelu: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store.backend().gelu(&input_handle, &input_shape)?;
+    let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Gelu,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::GeluCtx { x },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn gelu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let output = input
         .data
