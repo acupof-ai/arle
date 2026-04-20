@@ -43,7 +43,9 @@ pub struct TrainerConfig {
     /// progress line and a closing summary regardless of `N`.
     pub log_every: u64,
     /// If `Some(n)`, call the eval closure (if provided) every N optimizer
-    /// steps. Ignored by `run` (only honored by `run_with_eval`).
+    /// steps. Honored by `run_with_eval` and `run_with_eval_and_hooks`;
+    /// ignored by `run` / `run_with_hooks` (those methods don't receive an
+    /// eval closure and internally reset this field to `None` for the run).
     pub eval_every: Option<u64>,
     /// If `Some(n)`, save a checkpoint every N optimizer steps. Requires
     /// `save_dir` to be `Some`. The loop also force-saves on the final step
