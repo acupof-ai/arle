@@ -1,8 +1,8 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
 use autograd::{
-    Tape, TensorStore, ops::exp, ops::log_softmax, ops::matmul, ops::rmsnorm, ops::rope, ops::silu,
-    ops::sum,
+    Tape, TensorStore, ops::embedding, ops::exp, ops::log_softmax, ops::matmul, ops::rmsnorm,
+    ops::rope, ops::silu, ops::sum,
 };
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
@@ -565,6 +565,97 @@ fn metal_rmsnorm_forward_stays_lazy() -> Result<()> {
         assert!(
             diff <= 1e-4,
             "rmsnorm parity: metal={m} cpu={c} diff={diff}"
+        );
+    }
+
+    Ok(())
+}
+
+/// M5.3b.7 acceptance: `embedding` forward must compose into the MLX
+/// lazy graph with no `mlx_eval` when the table is device-resident.
+/// `embedding → rmsnorm → sum` records zero evals through the forward.
+/// Since the table is brought device-resident here via `ensure_device`
+/// (simulating an AdamW step's upload of updated weights), subsequent
+/// forward calls would see it as Dirty::Both and still take the lazy
+/// branch. Backward stays on the host scatter-add path, bounded by
+/// tape.backward's batch flush.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_embedding_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let vocab = 8usize;
+    let hidden = 16usize;
+    let eps = 1e-5f32;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let table_data: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32) * 0.01).collect();
+    let w_data: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.01).collect();
+
+    let table = store.from_slice(&table_data, &[vocab, hidden])?;
+    store.get_mut(table).expect("table exists").requires_grad = true;
+    let w = store.from_slice(&w_data, &[hidden])?;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    // Force the table device-resident so the lazy embedding branch
+    // dispatches. ensure_device uploads but does not call mlx_eval.
+    store.ensure_device(table)?;
+    reset_eval_count();
+
+    let indices = [3usize, 1, 5, 2];
+    let hidden_states = embedding(table, &indices, &mut store, &mut tape)?;
+    let after_embedding = eval_count();
+    let normed = rmsnorm(hidden_states, w, eps, &mut store, &mut tape)?;
+    let after_rmsnorm = eval_count();
+    let loss = sum(normed, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_embedding, 0,
+        "M5.3b.7: lazy embedding forward must not force an eval; saw {after_embedding}"
+    );
+    assert_eq!(
+        after_rmsnorm, 0,
+        "M5.3b.6: lazy rmsnorm forward must not force an eval; saw {after_rmsnorm}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward}. \
+         Budget = tape.backward batch flush + rmsnorm/embedding host \
+         recompute slack."
+    );
+
+    // Parity: metal lazy gather vs CpuBackend::embedding_forward on the
+    // same inputs.
+    let metal_rows = {
+        // rmsnorm is downstream of the embedding, so the tape flush has
+        // already materialized `hidden_states` to host. Read back through
+        // the standard tensor accessor.
+        store
+            .get(hidden_states)
+            .expect("embedding output exists")
+            .data
+            .clone()
+    };
+    let cpu = CpuBackend;
+    let ids_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
+    let cpu_rows = cpu.embedding_forward(&table_data, vocab, hidden, &ids_i32)?;
+    assert_eq!(metal_rows.len(), cpu_rows.len());
+    for (m, c) in metal_rows.iter().zip(cpu_rows.iter()) {
+        let diff: f32 = (m - c).abs();
+        assert!(
+            diff <= 1e-5,
+            "embedding parity: metal={m} cpu={c} diff={diff}"
         );
     }
 

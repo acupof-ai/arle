@@ -345,6 +345,32 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_embedding_forward(weight, vocab, dim, ids)
     }
 
+    /// Device-handle variant of `embedding_forward`. Lazy on backends that
+    /// can compose the row-gather into their eval stream (Metal: upload
+    /// `ids` as a tiny int32 array + `mlx_take_axis` + reshape, no eval).
+    /// Output shape is `[1, ids.len(), dim]` — matching
+    /// `ops::embedding`'s convention of treating raw ids as a single batch
+    /// row. Default implementation falls back to `readback → host compute →
+    /// upload`. M5.3b.7.
+    fn embedding(
+        &self,
+        table: &DeviceHandle,
+        table_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<DeviceHandle> {
+        if table_shape.len() != 2 {
+            return Err(crate::AutogradError::InvalidRank {
+                expected: "2",
+                got: table_shape.len(),
+            });
+        }
+        let vocab = table_shape[0];
+        let hidden = table_shape[1];
+        let host = self.readback(table)?;
+        let out = self.embedding_forward(&host, vocab, hidden, ids)?;
+        self.upload(&out, &[1, ids.len(), hidden])
+    }
+
     /// Reduce-sum over the last axis. Output has length `product(shape[..-1])`
     /// (or 1 if `shape.len() == 1`).
     fn sum_last_axis_forward(&self, x: &[f32], shape: &[usize]) -> Result<Vec<f32>> {

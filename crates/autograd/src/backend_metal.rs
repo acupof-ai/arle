@@ -559,6 +559,27 @@ impl Backend for MetalBackend {
         mlx_rope_lazy(x_handle.as_ptr(), x_shape, cos, sin)
     }
 
+    // Lazy embedding gather: upload the tiny `[seq]` int32 id array per
+    // call (no benefit to caching — ids change every step), `mlx_take_axis`
+    // along axis 0 to pick the rows, then `mlx_reshape` from `[seq, hidden]`
+    // to `[1, seq, hidden]` to match `ops::embedding`'s batch-row
+    // convention. No eval — the whole sequence composes into the MLX
+    // graph. Backward stays on the host scatter-add path (already
+    // `mlx_scatter_add_rows_f32`-backed). M5.3b.7.
+    fn embedding(
+        &self,
+        table: &DeviceHandle,
+        table_shape: &[usize],
+        ids: &[i32],
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(table_handle) = table else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot embedding a non-metal device handle",
+            ));
+        };
+        mlx_embedding_lazy(table_handle.as_ptr(), table_shape, ids)
+    }
+
     fn gather_last_dim_forward(
         &self,
         src: &[f32],
@@ -1261,6 +1282,67 @@ fn mlx_rms_norm_lazy(
             ));
         }
         Ok(DeviceHandle::Metal(MlxHandle::from_raw(out_arr)))
+    }
+}
+
+fn mlx_embedding_lazy(
+    table_ptr: *mut mlx_array,
+    table_shape: &[usize],
+    ids: &[i32],
+) -> Result<DeviceHandle> {
+    if table_shape.len() != 2 {
+        return Err(AutogradError::InvalidRank {
+            expected: "2",
+            got: table_shape.len(),
+        });
+    }
+    let vocab = table_shape[0];
+    let hidden = table_shape[1];
+    let seq = ids.len();
+    for &id in ids {
+        if id < 0 || (id as usize) >= vocab {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: id as usize,
+                upper: vocab,
+            });
+        }
+    }
+
+    let ids_shape = [seq as i32];
+    let reshape_shape = [1i32, seq as i32, hidden as i32];
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `table_ptr` is borrowed for the duration of this call. The
+    // int32 ids array is allocated here and freed before return. The
+    // intermediate `gathered` is freed after reshape; the returned handle
+    // owns the reshape output.
+    unsafe {
+        let ids_arr = mlx_array_from_data(
+            ids.as_ptr() as *const c_void,
+            ids_shape.as_ptr(),
+            1,
+            MLX_INT32,
+        );
+        if ids_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (embedding lazy ids)",
+            ));
+        }
+        let gathered = mlx_take_axis(table_ptr, ids_arr, 0);
+        mlx_array_free(ids_arr);
+        if gathered.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_take_axis returned null (embedding lazy)",
+            ));
+        }
+        let reshaped = mlx_reshape(gathered, reshape_shape.as_ptr(), 3);
+        mlx_array_free(gathered);
+        if reshaped.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_reshape returned null (embedding lazy)",
+            ));
+        }
+        Ok(DeviceHandle::Metal(MlxHandle::from_raw(reshaped)))
     }
 }
 
