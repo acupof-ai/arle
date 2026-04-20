@@ -37,9 +37,9 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::server_engine::{CompletionOutput, FinishReason, InferenceEngine, TokenUsage};
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
-    CompletionRequest as OpenAiCompletionRequest, CompletionResponse, ModelsListResponse,
-    ResponsesInput, ResponsesRequest, ResponsesResponse, ResponsesStreamCreatedEvent,
-    ResponsesStreamDeltaEvent, StreamChunk, StreamUsageChunk,
+    CompletionRequest as OpenAiCompletionRequest, CompletionResponse, DflashStatusPayload,
+    ModelsListResponse, ResponsesInput, ResponsesRequest, ResponsesResponse,
+    ResponsesStreamCreatedEvent, ResponsesStreamDeltaEvent, StreamChunk, StreamUsageChunk,
 };
 
 struct AppState {
@@ -651,7 +651,16 @@ async fn models_handler(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     authorize_v1_request(&headers, state.as_ref())?;
-    let response = ModelsListResponse::single(state.handle.model_id(), now_secs());
+    let dflash = state
+        .handle
+        .dflash_status()
+        .map(|status| DflashStatusPayload {
+            enabled: true,
+            draft: status.draft_model,
+            speculative_tokens: status.speculative_tokens,
+            acceptance_rate: state.metrics.dflash_acceptance_rate_opt(),
+        });
+    let response = ModelsListResponse::single(state.handle.model_id(), now_secs(), dflash);
     Ok(Json(response).into_response())
 }
 
@@ -1249,6 +1258,75 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["object"], "list");
         assert_eq!(payload["data"][0]["id"], "Qwen3-8B");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_omits_dflash_when_handle_reports_none() {
+        let app = build_app(mock_scheduler("Qwen3-8B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Baseline (non-DFlash) runtimes must keep the original JSON shape —
+        // the `dflash` key is skipped entirely, not emitted as `null`.
+        assert!(
+            !payload["data"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("dflash"),
+            "dflash key must be omitted when RequestHandle reports None, got {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_surfaces_dflash_status_when_reported() {
+        use crate::request_handle::{DflashStatus, RequestHandle, SubmitError};
+        use crate::scheduler::IncomingRequest;
+
+        struct DflashHandle;
+        impl RequestHandle for DflashHandle {
+            fn submit(&self, _req: IncomingRequest) -> Result<(), SubmitError> {
+                Ok(())
+            }
+            fn model_id(&self) -> &str {
+                "Qwen3.5-4B-MLX-4bit"
+            }
+            fn dflash_status(&self) -> Option<DflashStatus> {
+                Some(DflashStatus {
+                    draft_model: "z-lab/Qwen3.5-4B-DFlash".to_string(),
+                    speculative_tokens: 5,
+                })
+            }
+        }
+
+        let app = build_app(DflashHandle);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let dflash = &payload["data"][0]["dflash"];
+        assert_eq!(dflash["enabled"], true);
+        assert_eq!(dflash["draft"], "z-lab/Qwen3.5-4B-DFlash");
+        assert_eq!(dflash["speculative_tokens"], 5);
+        // No speculative blocks have run in a test build → `acceptance_rate`
+        // must serialise as JSON `null`, not 0.0, so dashboards can tell
+        // "no data yet" apart from "everything rejected".
+        assert!(
+            dflash["acceptance_rate"].is_null(),
+            "acceptance_rate must be null before any blocks run, got {dflash}"
+        );
     }
 
     #[tokio::test]
