@@ -8,13 +8,21 @@
 
 ## 0. TL;DR
 
-把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码还处在过渡期：训练仍然以独立 `train` crate + 手写 TCP control plane 形式存在，下面描述的是要收敛到的目标态：
+把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码还处在过渡期：训练主体已经落在独立 `train` crate 的 train-side server 上，并通过 `train_multi_turn --serve` 暴露；下面描述的是要收敛到的目标态：
 
 ```
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
 ```
 
 **训练端从零写**（参考 [mni-ml/framework](https://github.com/mni-ml/framework)，分析见 [`docs/research/mni-ml-framework-notes.md`](../research/mni-ml-framework-notes.md)），**推理端复用** agent-infer 现有栈（FlashInfer / Triton AOT / Paged KV / Metal runtime）。这是一次"认知提升 + 产品化"双重目的的主线工作。
+
+> **Current implementation note**
+> 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
+> 2026-04-20 当前树里的训练控制面仍然在 `crates/train`：
+> `train_multi_turn --serve` 会启动 `crates/train/src/server.rs`
+> 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
+> 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
+> [`docs/plans/train-runtime-architecture-v1.md`](../plans/train-runtime-architecture-v1.md)。
 
 ---
 
@@ -53,7 +61,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 |---|---|---|
 | 硬件 | 单机单卡 NVIDIA（L40S/A100/H100 任一） | 分布式、多机、TP/PP/ZeRO |
 | Metal | 本地 dev 支线，M4 里程碑再做 | 和 CUDA 并行推进 |
-| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现仍是独立 `train` crate + TCP control plane，后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
+| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现是独立 `train` crate + train-side server（`train_multi_turn --serve`），后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
 | Autograd | **从零写，参考 mni-ml/framework 结构** | candle / burn / 包 PyTorch |
 | Op 集 | 只实现 LoRA+GRPO 用到的 ~7 个 op | 全量 op（conv/pool/full-attention-bwd） |
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |
@@ -68,7 +76,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 
 ---
 
-## 3. 架构
+## 3. 目标架构
 
 ### 3.1 单机统一数据流（可同进程或异步 worker）
 
@@ -153,7 +161,9 @@ crates/
 | `infer/src/model/` | 新增 LoRA merge hook | `linear_with_lora(x, W_base, A, B)` 可选路径；base 分支走现有 merged-QKV / gate-up |
 | `infer/src/backend/cuda/` | 暴露 `CudaDevice` | trainer 复用同一个 context，零拷贝共权重 |
 | `agent/` | 新增 trajectory 采集 callback | tool loop 每一步记 action + observation，最终形成 step-wise trajectory |
-| `infer/src/http_server/` | 新增 `/v1/train/*` 控制面 | start/stop/status/checkpoint（可选，M2 之后） |
+| `infer/src/http_server/` | 目标态：新增 `/v1/train/*` 控制面 | start/stop/status/checkpoint（可选，M2 之后） |
+
+**当前控制面真相**：训练侧控制面已经在 `crates/train` 内落地，并通过 `train_multi_turn --serve` 暴露；`infer/src/http_server/` 下的 `/v1/train/*` 只是后续统一入口的目标态。
 
 ---
 

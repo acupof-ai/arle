@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现仍是独立 `train` crate + TCP control plane） / 训练端从零写
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`train_multi_turn --serve` 是当前控制面真相） / 训练端从零写
 
 ---
 
@@ -10,6 +10,15 @@
 1. 本文件（任务 + 验收门槛 + 每日颗粒度）
 2. [`docs/projects/agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md) — 架构 + Why + 风险
 3. [`docs/research/mni-ml-framework-notes.md`](../research/mni-ml-framework-notes.md) — 参考分析 + 裁剪清单
+
+> **Current implementation note**
+> 本计划主要描述 Phase 6 的执行路径和目标收敛方向。
+> 2026-04-20 当前 repo 里的训练控制面仍然是 `crates/train`
+> 自己的 train-side server：`train_multi_turn --serve` →
+> `crates/train/src/server.rs`。如果问题是当前 runtime / checkpoint /
+> metrics / server 的真实边界，先看
+> [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
+> 和 [`docs/codebase-map.md`](../codebase-map.md)。
 
 ---
 
@@ -197,7 +206,7 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 | M4.4 | **Reward aggregation**：多 verifier 加权；权重作为 config，方便调 | `train/src/reward/aggregate.rs` | 文档化每个 verifier 的 scale |
 | M4.5 | **基础 curriculum**：任务池分级（easy/medium/hard），base pass@1 > 0.8 的 easy 自动 retire，引入新 hard 任务 | `train/src/curriculum.rs` | 训练 24h 后任务池分布向 harder 移动 |
 | M4.6 | **Task generator**（self-play 雏形）：让 model 自己生成新任务 + 匹配的 verifier（verifier 用模板生成，限定在数学 / 代码 DSL 内） | `train/src/curriculum/gen.rs` | 生成任务可 verifier-grounded（不接受无 verifier 任务） |
-| M4.7 | **/v1/train 控制面**（可选）：HTTP 启停训练、查状态、拉 checkpoint | `infer/src/http_server/train.rs` | curl 调通 |
+| M4.7 | **当前控制面**：train-side server + `train_multi_turn --serve`；**目标统一入口**：`/v1/train`（可选） | `train/src/server.rs` / `infer/src/http_server/train.rs` | curl 调通 |
 | M4.8 | **冒烟自进化**：固定 100 个 base 解决不了的 hard 任务，训练 24h 后能解决 ≥ 30% | `train/tests/e2e_self_evolve.rs` | 验证通过 |
 
 ### 6.3 验收门槛

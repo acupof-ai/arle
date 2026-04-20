@@ -5,6 +5,10 @@ M3a/M3b/M3c local, and Metal M0.2a request-state landing).
 Supplemented 2026-04-20 with Phase 6 `crates/autograd` + `crates/train`
 (from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md))
 and the canonical guidellm bench SSOT alignment.
+Current train control-plane truth: `crates/train` owns the active
+training server, surfaced by `train_multi_turn --serve`; the
+`infer/src/http_server/train.rs` `/v1/train/*` surface is the target
+unified entrypoint, not the current implementation.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -35,7 +39,7 @@ Current workspace members:
 - `crates/cli`
 - `crates/tools`
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
-- `crates/train` (Phase 6 — LoRA + GRPO RL trainer, `train_multi_turn` binary; depends on `autograd`)
+- `crates/train` (Phase 6 — LoRA + GRPO RL trainer, train-side server exposed by `train_multi_turn --serve`; depends on `autograd`)
 
 ## 2. Main execution paths
 
@@ -98,6 +102,26 @@ Key files:
 - `infer/src/backend/metal.rs`: Apple Silicon backend via `mlx-sys`
 - `infer/src/bin/cpu_serve.rs`
 - `infer/src/bin/metal_serve.rs`
+
+### Current train control-plane path
+
+```text
+crates/train/src/bin/train_multi_turn.rs
+  -> train::server::bind_and_serve_on_thread()
+  -> std TcpListener control plane on /v1/train/*
+  -> train::control::TrainingController
+  -> autograd + train runtime loop
+```
+
+This is the **current implementation truth** for train-side control.
+Docs that describe infer-side `/v1/train/*` routes are target architecture,
+not the current repository surface.
+
+Key files:
+
+- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint; `--serve` starts the train-side control plane
+- `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|stop|save`
+- `crates/train/src/control.rs`: shared controller / status state used by the server thread and trainer loop
 
 ## 3. `infer/` crate map
 

@@ -9,7 +9,7 @@ DX; make CLI usable and understandable.)
 | Question | Answer |
 |----------|--------|
 | Does the checkpoint format match what `infer` expects? | ✅ (exact) |
-| Can I serve a trained checkpoint without hand-assembling paths? | ⚠️ FRAGILE — no `latest` marker; user guesses step number. |
+| Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from `train_multi_turn --serve` output or `infer --model-path <out>/latest` without guessing the step number. |
 | Is there a standalone eval binary? | ❌ NO — eval is only inline in `pretrain_qwen3` during training. |
 | Do train binaries have `--help`? | ❌ NO — all hand-roll arg parsing. |
 | Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len`, `--model` vs `--model-path`, `--resume` vs `--resume-from`. |
@@ -25,6 +25,9 @@ Cut order chosen to maximize DX per commit.
 **Acceptance:** after any training run writes a checkpoint, the user
 can run `infer --model-path <out>/latest` (or REPL) without knowing
 the step count or reading directory listings.
+
+**Current state:** DX-1 is already landed in-tree. The remaining work in
+this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
 
 **Work:**
 1. Every trainer save_checkpoint hook (and the hand-written save
