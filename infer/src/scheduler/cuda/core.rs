@@ -966,6 +966,10 @@ impl<M: ModelForward> Scheduler<M> {
         // request could inherit stale paged-KV entries.
         let mut allocated: usize = 0;
         let mut warmed: usize = 0;
+        debug_assert!(
+            self.paged_kv_pool.page_size > 0,
+            "paged KV pool page size must be non-zero"
+        );
 
         'warmup: {
             for slot in 0..max_bs {
@@ -1070,6 +1074,7 @@ impl<M: ModelForward> Scheduler<M> {
         for &bs in warmup_sizes {
             let tokens = &dummy_tokens[..bs];
             let si = &slot_indices[..bs];
+            let page_size = self.paged_kv_pool.page_size;
             let decode_ctx = self
                 .decode_bufs
                 .as_mut()
@@ -1105,7 +1110,7 @@ impl<M: ModelForward> Scheduler<M> {
                     bs,
                     self.model.num_q_heads(),
                     self.model.num_kv_heads(),
-                    1,
+                    page_size,
                     self.model.head_dim(),
                     self.paged_kv_pool.format,
                 ) {
