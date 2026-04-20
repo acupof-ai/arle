@@ -235,6 +235,13 @@ impl Qwen3Model {
             )?;
         }
 
+        // This forward owns both the shared FlashInfer plan workspace and
+        // per-forward GPU metadata buffers (`slot_page_indices`, qo/kv indptrs).
+        // Keep them alive until the compute stream drains; otherwise the next
+        // chunk can re-plan into the same host/device workspace while kernels
+        // from the prior chunk still consume it.
+        self.ctx.sync()?;
+
         Ok(hidden)
     }
 

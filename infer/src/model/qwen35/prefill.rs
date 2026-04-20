@@ -359,6 +359,11 @@ impl Qwen35Model {
             )?;
         }
 
+        // Same lifetime contract as Qwen3 paged prefill: the shared HD256 plan
+        // workspace and the per-forward GPU metadata must remain valid until
+        // the compute stream has consumed every layer launch in this chunk.
+        self.ctx.sync()?;
+
         // Linear-attn state tracking still advances; the pool owns full-attn
         // position tracking directly.
         recurrent.seq_len += seq_len;
