@@ -16,17 +16,26 @@ Commit ad5568b then wired the remaining Phase 2 acceptance flags:
 `impl<T: LrSchedule + ?Sized> LrSchedule for Box<T>` blanket in autograd.
 
 Also landed mid-wave from codex review on 3d9125d, feae23b, bdde441,
-44a7e19: P1 tape/store cleanup hook, P2 schedule-describe persistence,
-P3 NoClip returning true pre-clip norm, legacy-bare-schedule-name
-compat on resume, force-emit metrics on step 1 + final, dropping the
-redundant `step` key from the metrics fields array.
+44a7e19, bd6c871, ad5568b: P1 tape/store cleanup hook, P2
+schedule-describe persistence, P3 NoClip returning true pre-clip norm,
+legacy-bare-schedule-name compat on resume, force-emit metrics on step 1
+\+ final, dropping the redundant `step` key from the metrics fields
+array, final-step force-save in the Trainer so runs that end between
+save boundaries still persist a resumable checkpoint, aligning
+`train_sft`'s bf16 checkpoint directory to `step_{:06}` to share a dir
+with `trainer_state.json + optimizer.safetensors`, and the
+`--resume-from` weight-reload step (without which a resumed SFT run
+combined base `--model` weights with the resume dir's AdamW moments —
+a silently corrupt resume).
 
 ## What Worked
 
-- 12 `test_trainer_loop` unit tests green covering step counts,
+- 14 `test_trainer_loop` unit tests green covering step counts,
   grad-accum, LR schedule wiring, metrics (both log_every + forced),
-  save, resume (fresh / mismatch-reject / legacy-compat ×2), hook
-  firing, activation cleanup.
+  save (including the new final-step force-save for
+  `save_every=5 total_steps=7`), eval-side `step`-field omission,
+  resume (fresh / mismatch-reject / legacy-compat ×2), hook firing,
+  activation cleanup.
 - `test_convergence_smoke` confirms a tiny model (4-token copy task,
   AdamW lr=1e-2) still converges through the new loop: loss[0] - loss[9]
   > 0.5 with deterministic init.

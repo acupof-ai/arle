@@ -226,28 +226,49 @@ fn run() -> Result<(), CliError> {
     .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
     let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    // Enable the Trainer's built-in save path so every checkpoint round
+    // gets `trainer_state.json + optimizer.safetensors` written next to the
+    // bf16 model weights the on_step_end hook produces — without this wiring,
+    // `--resume-from` could not reload optimizer state from our own output
+    // (codex review 2026-04-20 on ad5568b, P1). Trainer lays files out at
+    // `<save_dir>/step_{:06}/`; the hook below matches that format.
     let trainer_cfg = TrainerConfig {
         total_steps: args.steps as u64,
         grad_accum_steps: grad_accum,
         log_every: args.log_every.max(1) as u64,
         eval_every: None,
-        // The Trainer's built-in save_every writes `trainer_state.json +
-        // optimizer.safetensors` but NOT the bf16 model weights that infer
-        // wants — those go through the on_step_end hook below.
-        save_every: None,
-        save_dir: None,
+        save_every: Some(args.save_every as u64),
+        save_dir: Some(args.out.clone()),
         resume_from: args.resume_from.clone(),
         rng_seed: args.seed,
     };
     let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
 
-    // Resume if `--resume-from` was passed. Restores optimizer state +
-    // trainer.step counter from the v2 checkpoint directory.
-    if args.resume_from.is_some() {
+    // Resume if `--resume-from` was passed.
+    //
+    // Codex review 2026-04-20 on ad5568b (P1): `resume_if_configured` only
+    // restores optimizer state + step counter — the Trainer is
+    // architecture-agnostic and does not know how to reload model weights.
+    // So we first overwrite the base `--model` weights with the checkpoint's
+    // `model.safetensors`, then call the trainer-side restore. Without the
+    // explicit weight reload, a resumed run would combine base-model
+    // weights with resumed Adam moments + step state — a corrupt resume.
+    if let Some(resume_dir) = &args.resume_from {
+        let resume_weights = resume_dir.join("model.safetensors");
+        if !resume_weights.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no model.safetensors",
+                resume_dir.display(),
+            )));
+        }
+        registry.load_into(&mut store, &resume_weights)?;
         let resumed = trainer
             .resume_if_configured(&param_names)
             .map_err(CliError::Autograd)?;
-        eprintln!("[train_sft] resumed from step {resumed}");
+        eprintln!(
+            "[train_sft] resumed from step {resumed} (weights from {})",
+            resume_weights.display()
+        );
     }
 
     let mut tape = Tape::new();
@@ -307,6 +328,10 @@ fn run() -> Result<(), CliError> {
     let registry_ref = &registry;
     let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
         let step_usize = step as usize;
+        // Gate matches the Trainer's save_every + force-final behavior so the
+        // bf16 weights file always lands in the same `step_{:06}/` directory
+        // that the Trainer just populated with `trainer_state.json +
+        // optimizer.safetensors`. Keep the two gates in sync.
         if step_usize.is_multiple_of(save_every) || step_usize == total_steps {
             save_checkpoint_via_registry(
                 &model_path,
@@ -555,7 +580,12 @@ fn save_checkpoint_via_registry(
     tokenizer_path: &Path,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let step_dir = out_dir.join(format!("step_{step}"));
+    // Zero-padded 6-digit format matches the Trainer's own save_checkpoint
+    // path (`step_{:06}`), so the bf16 weights file lands next to
+    // `trainer_state.json + optimizer.safetensors` in a single directory —
+    // required for `--resume-from` to roundtrip correctly (codex review
+    // 2026-04-20 on ad5568b, P1).
+    let step_dir = out_dir.join(format!("step_{step:06}"));
     fs::create_dir_all(&step_dir)?;
     fs::copy(config_path, step_dir.join("config.json"))?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
