@@ -61,13 +61,14 @@ for deciding what else must run.
 Current release automation publishes:
 
 - Linux x86_64 CUDA artifacts
-- macOS arm64 Metal artifacts
+- macOS arm64 Metal artifacts with `metal_serve`
 
 Before release, verify:
 
 - `.github/workflows/release.yml` still matches intended support
 - artifact names are correct
-- packaged binaries are the intended ones
+- packaged binaries are the intended ones (`infer` / `bench_serving` on Linux,
+  `metal_serve` on macOS)
 
 ---
 

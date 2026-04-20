@@ -42,7 +42,7 @@ validate; the remote lane is specifically for:
 3. `cargo test --release --test e2e` / `--test e2e_qwen35` — full
    greedy-decode numerical parity regression against baseline JSONs in
    `infer/test_data/`.
-4. `scripts/bench_throughput_sweep.py` and
+4. `scripts/bench_guidellm.sh <label>` and
    `scripts/bench_agent_trace.py` — real throughput and cross-session
    TTFT numbers to feed `docs/experience/wins/`.
 
@@ -327,8 +327,7 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 
 # Throughput sweep for regression detection.
-scripts/bench_throughput_sweep.py --label validate-$(date +%F) \
-    --out docs/experience/wins/$(date +%F)-bench-throughput-sweep.md
+scripts/bench_guidellm.sh validate-$(date +%F)
 
 # Agent trace benchmark for the P1 scoreboard.
 python3 scripts/bench_agent_trace.py \
@@ -418,5 +417,5 @@ running §4.
 - `docs/projects/agent-first-architecture.md` — A1 / B1 / B3 source
   tickets; the local-lane commits above are their implementation.
 - `CLAUDE.md` — the benchmark rules and bench hygiene
-  (`scripts/bench_throughput_sweep.py --label`, immutable history,
+  (`scripts/bench_guidellm.sh <label>`, immutable history,
   environment tables, raw data).

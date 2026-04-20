@@ -6,7 +6,7 @@ limited, and what validation exists for each area.
 If something is not listed as supported here, do not assume it is supported
 just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-17.
+State reflected here is based on repository evidence as of 2026-04-20.
 
 ---
 
@@ -16,7 +16,7 @@ State reflected here is based on repository evidence as of 2026-04-17.
 | --- | --- | --- |
 | CUDA | Supported | Primary serving path. Main runtime, scheduler, and benchmark focus. |
 | Metal | Beta | Usable for local validation and live scheduler-backed serving. Qwen3 ships live prefix reuse with a shared KV pool; Qwen3.5 now ships live prefix reuse via replayed compiled-path snapshots; `scripts/start_metal_serve.sh` is the canonical first-time Apple bring-up path. Metal is still missing full batched-decode parity with CUDA, especially on variable-length Qwen3.5 decode. |
-| Metal DFlash | Experimental | Apple Silicon speculative decode path. Qwen3 shipped; Qwen3.5 correctness landed 2026-04-17 but currently regresses vs baseline (acceptance ~28%, serial across requests). Benchmark before use. |
+| Metal DFlash | Beta | Apple Silicon speculative decode path. Default-on for Qwen3 and Qwen3.5; benchmark before production use. |
 | no-cuda / CPU-only | Development-oriented CPU backend | Build, test, and smoke-validation path for non-GPU logic. Not a production inference target. |
 
 ---
@@ -41,7 +41,7 @@ Notes:
 | Model family | Status | Notes |
 | --- | --- | --- |
 | Qwen3 | Supported | Primary supported family. |
-| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Metal DFlash correctness shipped 2026-04-17 but is currently a perf regression — see §4a. |
+| Qwen3.5 | Supported | Supported on normal runtime paths; Metal live runtime now has a narrow same-length decode batch path with packed-batch concurrent decode (2026-04-16 fix). Metal DFlash is Beta; see §4a for the current validation note. |
 | GLM4 | Limited support | Present in project state, but less established than Qwen paths. |
 | Llama 3/4 | Planned | Not yet supported. |
 | DeepSeek-V3/R1 | Planned | Not yet supported. |
@@ -76,8 +76,8 @@ Backend note:
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Metal DFlash (Qwen3) | Experimental | Apple Silicon speculative decode path. Validated on Qwen3; benchmark before use. |
-| Metal DFlash (Qwen3.5) | Experimental — regression | End-to-end correctness landed 2026-04-17 (commits `4db4fe9`, `439293d`). Current single-stream throughput is ~5× slower than baseline (acceptance ~28%, verify_16 on 4-bit target). Concurrent DFlash requests are serial across sessions. Not recommended for production use yet — see `docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md`. |
+| Metal DFlash (Qwen3) | Beta | Apple Silicon speculative decode path. Validated on Qwen3; benchmark before production use. |
+| Metal DFlash (Qwen3.5) | Beta | End-to-end correctness landed 2026-04-17 (commits `4db4fe9`, `439293d`); benchmark before production use. |
 | CUDA speculative decoding | Not shipped | `infer/src/speculative.rs` is a CPU-only framework; GPU integration pending (see `plans/speculative-decoding-impl.md`). |
 
 ---

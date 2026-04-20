@@ -20,21 +20,25 @@ FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
 Tests compare against JSON baselines in `infer/test_data/` — regenerate
 after any change affecting numerical output.
 
-**Workspace (post 2026-04-15 Route-A):**
+**Workspace (post 2026-04-20 Phase 6 landing):**
 
 ```
 agent-infer/
 ├── src/                       ← thin cli::run() binary
 ├── infer/                     ← runtime crate (scheduler/model/ops/backends/HTTP)
 ├── crates/
-│   ├── cuda-kernels/    ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
-│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
 │   ├── agent/chat/cli/tools
+│   ├── autograd/              ← from-scratch autograd + optimizer core
+│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
+│   └── train/                 ← LoRA + GRPO trainer and control plane
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 
 CUDA kernels live at `crates/cuda-kernels/csrc/`, **not** `infer/csrc/`
 (common mistake — extracted 2026-04-15).
+
+Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 
 ---
 

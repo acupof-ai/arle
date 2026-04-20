@@ -24,7 +24,7 @@ CUDA_HOME=/usr/local/cuda cargo build --release
 cargo test --release --lib
 INFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release --test e2e
 cargo test --release --test e2e_qwen35
-scripts/bench_throughput_sweep.py --label post-route-a-cuda
+scripts/bench_guidellm.sh post-route-a-cuda
 ```
 
 ## What to inspect

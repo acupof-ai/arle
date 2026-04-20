@@ -29,7 +29,7 @@ Every phase below has three subsections:
 |---|---|---|---|
 | **Mac · no-cuda** | `cargo check --no-default-features --features no-cuda` | type/borrow check, non-GPU unit tests | CUDA kernels, FlashInfer link, e2e |
 | **Mac · metal** | `cargo build --release --no-default-features --features metal` | Metal backend, `metal_kv_pool` tests, `mlx-sys` bindings | scheduler/cuda/*, FlashInfer |
-| **Remote CUDA** | `cargo build --release` (default features = `["cuda"]`) | full stack, `e2e`, `e2e_qwen35`, `greedy_consistency`, `bench_throughput_sweep.py` | n/a |
+| **Remote CUDA** | `cargo build --release` (default features = `["cuda"]`) | full stack, `e2e`, `e2e_qwen35`, `greedy_consistency`, `scripts/bench_guidellm.sh <label>` | n/a |
 
 **`#[cfg(feature = "cuda")]` gating that affects local-checkability** (read from
 `infer/src/lib.rs:1-17`):
@@ -181,7 +181,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 - [ ] `[R]` `cargo test --release --test e2e` — qwen3 greedy parity unchanged
 - [ ] `[R]` `cargo test --release --test e2e_qwen35` — qwen35 greedy parity unchanged
 - [ ] `[R]` `cargo test --release --test greedy_consistency` — multi-config sanity unchanged
-- [ ] `[R]` `scripts/bench_throughput_sweep.py --label page16` — perf snapshot
+- [ ] `[R]` `scripts/bench_guidellm.sh page16` — perf snapshot
 - [ ] `[R]` Compare to `--label page1` baseline (parallel-GPU §7.1); write `docs/experience/wins/2026-04-13-bench-page16.md`
 - [ ] `[R]` Watch the short-context tail in the sweep — FlashInfer split-KV scheduler can shed parallelism with larger pages at very short contexts
 
@@ -400,7 +400,7 @@ therefore stays in `infer`. `.cu` and Triton paths moved together:
 - [ ] `[R]` Remote CUDA acceptance for the M3c cleanup via
       `tiered-kv-cache-m3c-remote-acceptance.md`
 - [ ] `[R]` Long-context bench (32k+ cumulative tokens, num_slots=4) that OOMs on main now runs to completion
-- [ ] `[R]` `scripts/bench_throughput_sweep.py --label tier-T2`; ≤3% steady-state regression vs P1 baseline
+- [ ] `[R]` `scripts/bench_guidellm.sh tier-T2`; ≤3% steady-state regression vs P1 baseline
 - [ ] `[R]` Bench markdown in `docs/experience/wins/`
 
 ### 3.2 Industry references
@@ -623,7 +623,7 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 
 #### Remote GPU
 - [ ] `[R]` Cross-session bench, 2-session alternating: prefix hit rate ≥85% (vs ≥70% in P1)
-- [ ] `[R]` `scripts/bench_throughput_sweep.py --label p4-reuse-dist` on 4-agent interleaved workload
+- [ ] `[R]` `scripts/bench_guidellm.sh p4-reuse-dist` on 4-agent interleaved workload
 - [ ] `[R]` Target: ≥1.5× TTFT improvement vs P1's `SessionBiasedLru` (scaled-down from KVFlow paper's 1.83× because we don't have the CPU-tier prefetch leg)
 - [ ] `[R]` If reproduction fails: keep `SessionBiasedLru` as default, ship `ReuseDistancePolicy` behind a flag
 
@@ -808,7 +808,7 @@ Work the remote GPU host can run **while** the local Mac is busy. None of this i
 These should already be running by the time P0 edits land:
 
 - [ ] `[R]` **`--label page1` historical baseline**: explicit pre-M0.3 snapshot from the old `page_size=1` BF16 regime. Keep for delta comparison if the host does not already have a recorded baseline.
-- [ ] `[R]` **Baseline collection**: `scripts/bench_throughput_sweep.py --label baseline-main-2026-04-13` — every model + slot config we ship. Becomes regression gate from P0 onwards. Save to `docs/experience/wins/2026-04-13-bench-baseline.md`.
+- [ ] `[R]` **Baseline collection**: `scripts/bench_guidellm.sh baseline-main-2026-04-13` — every model + slot config we ship. Becomes regression gate from P0 onwards. Save to `docs/experience/wins/2026-04-13-bench-baseline.md`.
 - [ ] `[R]` **Long-context agent baseline**: 32k+ token agent trace, num_slots=4, current main. Numbers we compare against in P2's "must run to completion" gate.
 - [ ] `[R]` **Greedy regression sample**: full `e2e + e2e_qwen35 + greedy_consistency` on current main, capture pass/fail counts as post-merge baseline.
 - [x] `[L+R]` **`scripts/bench_agent_trace.py`** (item C6 from `agent-first-architecture.md`, renamed from `bench_agent.py` to avoid collision with the existing binary-subprocess benchmark of that name): multi-turn tool-calling replayer + input trace under `scripts/data/agent_trace_default.jsonl`. Mostly local Python; GPU validation only. **P1 needs this as a scoreboard.** Landed 2026-04-13.

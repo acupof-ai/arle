@@ -201,8 +201,7 @@ CUDA_HOME=/usr/local/cuda cargo run -p infer --release -- \
 Then, in another shell:
 
 ```bash
-# Replaces the deprecated bench_throughput_sweep.py — use
-# guidellm per infer/CLAUDE.md §Benchmarks.
+# Use the canonical guidellm wrapper per infer/CLAUDE.md §Benchmarks.
 scripts/bench_guidellm.sh tiered-kv-m4-remote
 ```
 
