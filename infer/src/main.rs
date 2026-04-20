@@ -139,8 +139,9 @@ async fn main() {
     };
 
     let metrics = infer::metrics::ServerMetrics::new(model_path);
-    let handle = spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone())
-        .expect("Failed to create scheduler");
+    let (handle, scheduler_runtime) =
+        spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone())
+            .expect("Failed to create scheduler");
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
@@ -148,7 +149,7 @@ async fn main() {
         handle.model_id()
     );
 
-    let app = build_app_with_metrics(handle, metrics);
+    let app = build_app_with_metrics(handle.clone(), metrics);
 
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);
@@ -165,6 +166,11 @@ async fn main() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("Server error");
+
+    // Drop the last submission handle before joining the scheduler thread so
+    // request_rx disconnects and the scheduler can unwind its CUDA resources.
+    drop(handle);
+    scheduler_runtime.wait();
 
     if args.trace_output_path.is_some() {
         info!("Flushing pending traces...");
