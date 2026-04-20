@@ -193,6 +193,16 @@ code      { font-family: inherit; color: var(--coral-dim); }
   color: var(--paper);
   background: var(--ochre);
 }
+.jumps .lang {
+  margin-left: auto;
+  color: var(--ink-dim);
+  padding: 2px 4px;
+  border-left: 1px dashed var(--ochre);
+  padding-left: 10px;
+}
+.jumps .lang b { color: var(--coral-dim); font-weight: 700; }
+.jumps .lang a { color: var(--ochre); padding: 0 2px; }
+.jumps .lang a:hover { color: var(--paper); background: var(--ochre); }
 
 /* ── sections ──────────────────────────────────────────────────────── */
 
