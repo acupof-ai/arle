@@ -47,14 +47,45 @@ it). Smoke: `--dataset copy --steps 10 --vocab-size 300` yields step=1
 + every-2 + final=10 log lines with `grad_norm`/`tok_per_sec`/`lr`
 fields populated and the expected decreasing loss.
 
+Commit 429efc3 closes the tied/untied resume silent-corruption hole
+in `pretrain_qwen3.rs` (config-match check now validates
+`tie_word_embeddings`; weight load switched to `load_into_strict`)
+and hardens `clip_grad_norm` at the free-function boundary so
+non-finite/non-positive `max_norm` is a documented no-op across all
+binaries (NaN previously bypassed the `<= 0.0` gate and poisoned
+every gradient). Commit 613ff3c exposes
+`Trainer::run_with_eval_and_hooks` — the missing combined surface
+that binaries with their own save pipeline AND eval metrics need
+(`run_with_hooks` + `run_with_eval` split the shape). Commit 8f2df76
+upgrades "missing config.json" to a hard error in both `train_sft`
+and `pretrain_qwen3` resume paths (silently skipping the config-match
+check reopened the very hole 429efc3 fixed).
+
+Commit bd5e277 completes the Phase 3 migration of `pretrain_qwen3.rs`
+(~726 → ~890 LOC; actual training-step body shrank substantially —
+growth is closure wiring + design-rationale comments) onto
+`Trainer<AdamW, PretrainClip, ConstantLr>` using
+`run_with_eval_and_hooks`. The held-out eval closure reports
+`train::EvalOutcome` which surfaces as an `eval_loss` metric sample;
+`on_step_end(step, store)` owns the `step_<N>/{config.json,
+tokenizer.json, model.safetensors}` save pipeline, with an absolute-
+step reconstruction from `start_step + trainer_relative_step` because
+metric samples track the Trainer's relative counter. Trainer-side
+`save_every`/`save_dir`/`resume_from` left `None`; trainer_state.json
++ optimizer.safetensors persistence deferred to a follow-up. Tests:
+17 `test_trainer_loop` (+ `run_with_eval_and_hooks_drives_both_surfaces`)
++ 11 `test_grad_clip` (+ `non_finite_max_norm_is_noop` GC-7) green.
+
 ## What Worked
 
-- 15 `test_trainer_loop` unit tests green covering step counts,
+- 17 `test_trainer_loop` unit tests green covering step counts,
   grad-accum, LR schedule wiring, metrics (both log_every + forced),
   save (including the new final-step force-save for
   `save_every=5 total_steps=7`), eval-side `step`-field omission,
-  resume (fresh / mismatch-reject / legacy-compat ×2), hook firing,
-  activation cleanup.
+  resume (fresh / mismatch-reject / legacy-compat ×2 / rng_seed-
+  mismatch), hook firing (alone + combined with eval), activation
+  cleanup. Plus 11 `test_grad_clip` tests including GC-7
+  `non_finite_max_norm_is_noop`.
 - `test_convergence_smoke` confirms a tiny model (4-token copy task,
   AdamW lr=1e-2) still converges through the new loop: loss[0] - loss[9]
   > 0.5 with deterministic init.
