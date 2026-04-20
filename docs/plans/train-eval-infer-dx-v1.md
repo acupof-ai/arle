@@ -44,6 +44,16 @@ the step count or reading directory listings.
 
 **Estimate:** 1 commit, ~50 LOC + 1 script + 1 wins entry.
 
+**Shipped:**
+- `0da212f` — initial `latest` symlink + step padding + wrapper script.
+- `8bde810` — DX-1 follow-up: atomic swap, deferred Trainer publish,
+  symlink-aware resume (3 codex findings on `0da212f`).
+- `d700a24` — DX-1 follow-up #2: canonicalize `--resume`/`--resume-from`
+  once at entry, `publish_latest_after_weights(parent, basename)` helper
+  + 3 unit tests pinning the publish-last contract. Closed both remaining
+  codex findings on `8bde810`. See
+  [`wins/2026-04-20-dx1-publish-last-helper-and-canonicalize.md`](../experience/wins/2026-04-20-dx1-publish-last-helper-and-canonicalize.md).
+
 ### Phase DX-2 — Standalone eval binary
 
 **Acceptance:** `cargo run --release -p train --bin eval_lm --
