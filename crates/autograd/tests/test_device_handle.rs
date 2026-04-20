@@ -1,6 +1,6 @@
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
-use autograd::{Tape, TensorStore, ops::log_softmax, ops::matmul, ops::sum};
+use autograd::{Tape, TensorStore, ops::log_softmax, ops::matmul, ops::silu, ops::sum};
 #[cfg(feature = "metal")]
 use std::sync::{Arc, Mutex};
 
@@ -262,6 +262,68 @@ fn metal_log_softmax_forward_backward_records_current_eval_cost() -> Result<()> 
           after_sum={after_sum}). Budget = tape.backward flush + \
           mlx_matmul_backward FFI eval + 1 slack for log_softmax_backward's \
           host-mul readback of the saved `y`."
+    );
+    Ok(())
+}
+
+/// M5.3b.3 acceptance: `silu` forward must compose into the MLX lazy graph
+/// with no `mlx_eval` for Dirty::Device inputs. The forward chain
+/// `matmul → silu → sum` records zero evals; the backward flush + the
+/// `mlx_matmul_backward` FFI eval + one unit of slack for
+/// `silu_backward`'s host-mul readback of the saved `x` bound the total.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_silu_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    let d_in = 16usize;
+    let d_out = 16usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let x_data: Vec<f32> = (0..d_in).map(|i| (i as f32) * 0.01).collect();
+    let w_data: Vec<f32> = (0..d_in * d_out)
+        .map(|i| ((i % 5) as f32 - 2.0) * 0.05)
+        .collect();
+
+    let x = store.from_slice(&x_data, &[1, d_in])?;
+    let w = store.from_slice(&w_data, &[d_in, d_out])?;
+    store.get_mut(w).expect("w exists").requires_grad = true;
+
+    reset_eval_count();
+
+    // `y` is Dirty::Device (lazy matmul output); silu must stay lazy on it.
+    let y = matmul(x, w, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let act = silu(y, &mut store, &mut tape)?;
+    let after_silu = eval_count();
+    let loss = sum(act, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_silu, 0,
+        "M5.3b.3: lazy silu forward must not force an eval; saw {after_silu}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 3,
+        "forward+backward eval count bounded; saw {after_backward} \
+         (after_matmul={after_matmul} after_silu={after_silu} \
+          after_sum={after_sum}). Budget = tape.backward flush + \
+          mlx_matmul_backward FFI eval + 1 slack for silu_backward's \
+          host readback of the saved `x`."
     );
     Ok(())
 }
