@@ -27,6 +27,7 @@ use serde_json::json;
 use thiserror::Error;
 use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
+    checkpoint::write_latest_symlink,
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
@@ -863,7 +864,12 @@ fn save_checkpoint(
     eos_token_id: u32,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let step_dir = out_dir.join(format!("step_{step}"));
+    // DX-1: zero-padded 6-digit to match Trainer::save_checkpoint and
+    // train_sft::save_checkpoint_via_registry. Consistent padding makes
+    // resume-path lookup a single glob + lex-max pattern instead of
+    // per-binary branches.
+    let step_basename = format!("step_{step:06}");
+    let step_dir = out_dir.join(&step_basename);
     fs::create_dir_all(&step_dir)?;
 
     let config_json = json!({
@@ -895,6 +901,10 @@ fn save_checkpoint(
         SaveDtype::F32 => registry.save_from(store, &weights_path)?,
         SaveDtype::Bf16 => registry.save_from_bf16(store, &weights_path)?,
     }
+    // DX-1: refresh `<out>/latest` symlink after weights write so the
+    // just-written step becomes directly addressable for `infer` / resume.
+    write_latest_symlink(out_dir, &step_basename)?;
+
     println!(
         "[pretrain_qwen3] saved step {} to {} (dtype: {:?})",
         step,

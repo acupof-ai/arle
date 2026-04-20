@@ -275,6 +275,24 @@ fn trainer_save_then_resume_roundtrip() {
         "first-pass trainer must have written optimizer.safetensors"
     );
 
+    // DX-1 (docs/plans/train-eval-infer-dx-v1.md Phase DX-1): Trainer must
+    // also refresh `<save_dir>/latest` to the just-written step dir so
+    // `infer --model-path <out>/latest` roundtrips without the caller
+    // reading directory listings.
+    let latest = save_dir.join("latest");
+    let meta = std::fs::symlink_metadata(&latest)
+        .expect("latest symlink must exist after save_checkpoint");
+    assert!(
+        meta.file_type().is_symlink(),
+        "`latest` must be a symlink, not a regular file/dir"
+    );
+    let target = std::fs::read_link(&latest).expect("read_link(latest)");
+    assert_eq!(
+        target,
+        std::path::Path::new("step_000003"),
+        "latest must be a *relative* basename pointing at the current step"
+    );
+
     // --- second run: fresh trainer, `resume_from = <produced_dir>`.
     //     Should restore step to 3 so subsequent `run` starts from 3.
     let (_store_b, p_b) = setup_param(&[0.25, -0.5]);
