@@ -11,6 +11,16 @@ use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
+#[inline]
+fn paged_prefill_start_pos(pool_seq_len: usize, token_count: usize) -> Result<usize> {
+    anyhow::ensure!(token_count > 0, "paged prefill chunk must not be empty");
+    anyhow::ensure!(
+        pool_seq_len >= token_count,
+        "paged prefill: pool seq_len {pool_seq_len} < chunk len {token_count}"
+    );
+    Ok(pool_seq_len - token_count)
+}
+
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
     pub(crate) decode_bufs: DecodeBuffers,
@@ -166,22 +176,10 @@ impl ModelForward for Qwen3Model {
         slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        if tokens.len() == 1 {
-            // Single-token: use standard decode path (CUDA Graph).
-            self.forward_decode(tokens[0], state)?;
-            return Ok(());
-        }
-
         // Paged prefill. The scheduler has already allocated pool pages for
         // these tokens (pool.seq_len(slot) already includes them), so
         // start_pos is the logical position of the first new token.
-        let pool_seq_len = pool.seq_len(slot);
-        anyhow::ensure!(
-            pool_seq_len >= tokens.len(),
-            "paged prefill: pool seq_len {pool_seq_len} < chunk len {}",
-            tokens.len()
-        );
-        let start_pos = pool_seq_len - tokens.len();
+        let start_pos = paged_prefill_start_pos(pool.seq_len(slot), tokens.len())?;
 
         let hidden = self.get_embeddings_batch(tokens)?;
         let hidden = self.process_all_layers_batch_paged(hidden, start_pos, pool, slot)?;
@@ -472,5 +470,20 @@ impl ModelForward for Qwen3Model {
             ),
             _ => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paged_prefill_start_pos;
+
+    #[test]
+    fn paged_prefill_start_pos_handles_single_token_chunks() {
+        assert_eq!(paged_prefill_start_pos(17, 1).unwrap(), 16);
+    }
+
+    #[test]
+    fn paged_prefill_start_pos_rejects_empty_chunks() {
+        assert!(paged_prefill_start_pos(17, 0).is_err());
     }
 }
