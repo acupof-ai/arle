@@ -344,6 +344,39 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         )
     }
 
+    /// Combined surface: both an `eval_fn` (invoked every `eval_every` steps)
+    /// and an `on_step_end` hook (invoked after every optimizer step). Needed
+    /// by binaries that own their own model-weight save pipeline AND want
+    /// eval-loss metrics — splitting the two would force the caller to
+    /// re-implement one or the other.
+    pub fn run_with_eval_and_hooks<F, E, H>(
+        &mut self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        params: Vec<TensorId>,
+        param_names: Vec<(TensorId, String)>,
+        keep_extra: HashSet<TensorId>,
+        step_fn: F,
+        eval_fn: E,
+        on_step_end: H,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut StepCtx<'_>) -> Result<StepOutcome>,
+        E: FnMut(&mut TensorStore, &mut Tape) -> Result<EvalOutcome>,
+        H: FnMut(u64, &mut TensorStore) -> Result<()>,
+    {
+        self.run_inner(
+            store,
+            tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            eval_fn,
+            on_step_end,
+        )
+    }
+
     // Monomorphised shared body. `run` supplies a no-op eval closure plus
     // `eval_every = None` so the eval branch is never hit.
     fn run_inner<F, E, H>(
