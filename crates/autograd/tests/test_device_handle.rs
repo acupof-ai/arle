@@ -1,8 +1,8 @@
 #[cfg(feature = "metal")]
 use autograd::{
-    AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::embedding, ops::exp,
-    ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul_scalar, ops::reshape,
-    ops::rmsnorm, ops::rope, ops::silu, ops::sum, ops::transpose, tensor::Dirty,
+    AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::causal_sdpa, ops::embedding,
+    ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul_scalar,
+    ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::sum, ops::transpose, tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1469,6 +1469,72 @@ fn metal_add_broadcast_forward_stays_lazy() -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+/// M5.3b.15: composite `causal_sdpa` must stay lazy end-to-end on Metal.
+/// The body decomposes into reshape/transpose/matmul/mul_scalar/
+/// add_broadcast/softmax — all individually lazy post M5.3b.1–14. Stripping
+/// `ensure_host` at the public entry should let the full attention chain
+/// traverse the MLX graph without forcing an eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_causal_sdpa_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    // Shape mirrors one attention layer of a small Qwen3.5-like model.
+    let batch = 1usize;
+    let heads = 2usize;
+    let seq = 4usize;
+    let head_dim = 8usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    let q_data: Vec<f32> = (0..batch * heads * seq * head_dim)
+        .map(|i| (i as f32) * 0.017 - 0.3)
+        .collect();
+    let k_data: Vec<f32> = (0..batch * heads * seq * head_dim)
+        .map(|i| ((i as f32) * 0.029).cos())
+        .collect();
+    let v_data: Vec<f32> = (0..batch * heads * seq * head_dim)
+        .map(|i| ((i as f32) * 0.013).sin())
+        .collect();
+
+    let q = store.from_slice(&q_data, &[batch, heads, seq, head_dim])?;
+    let k = store.from_slice(&k_data, &[batch, heads, seq, head_dim])?;
+    let v = store.from_slice(&v_data, &[batch, heads, seq, head_dim])?;
+    store.get_mut(q).expect("q exists").requires_grad = true;
+
+    reset_eval_count();
+
+    let context = causal_sdpa(q, k, v, &mut store, &mut tape)?;
+    let after_sdpa = eval_count();
+
+    let loss = sum(context, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _grads = tape.backward(loss, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_sdpa, 0,
+        "M5.3b.15: lazy causal_sdpa forward must not force an eval; \
+         saw {after_sdpa}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::causal_sdpa or a regressed inner op in \
+         reshape/transpose/matmul/mul_scalar/add_broadcast/softmax."
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 6,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
 
     Ok(())
 }
