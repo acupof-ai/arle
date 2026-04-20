@@ -6,8 +6,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Qwen3ConfigError {
-    #[error("missing or invalid config field `{field}`")]
-    InvalidConfigField { field: &'static str },
     #[error("invalid qwen3 config: {0}")]
     InvalidConfig(&'static str),
     #[error("io: {0}")]
@@ -31,8 +29,7 @@ pub struct Qwen3Config {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub tie_word_embeddings: bool,
-    #[serde(default)]
-    pub max_position_embeddings: Option<usize>,
+    pub max_position_embeddings: usize,
 }
 
 impl Qwen3Config {
@@ -58,15 +55,20 @@ impl Qwen3Config {
                 "attention heads and head_dim must be non-zero",
             ));
         }
-        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             return Err(Qwen3ConfigError::InvalidConfig(
                 "num_attention_heads must be divisible by num_key_value_heads",
             ));
         }
         if !self.head_dim.is_multiple_of(2) {
-            return Err(Qwen3ConfigError::InvalidConfig("head_dim must be even for RoPE"));
+            return Err(Qwen3ConfigError::InvalidConfig(
+                "head_dim must be even for RoPE",
+            ));
         }
-        if self.max_position_embeddings.is_none_or(|value| value == 0) {
+        if self.max_position_embeddings == 0 {
             return Err(Qwen3ConfigError::InvalidConfig(
                 "max_position_embeddings must be non-zero",
             ));
@@ -83,13 +85,7 @@ impl Qwen3Config {
     }
 
     pub fn rope_cache_len_hint(&self) -> Option<usize> {
-        self.max_position_embeddings
-    }
-
-    pub fn resolved_max_position_embeddings(&self) -> Result<usize> {
-        self.max_position_embeddings.ok_or(Qwen3ConfigError::InvalidConfig(
-            "max_position_embeddings must be non-zero",
-        ))
+        Some(self.max_position_embeddings)
     }
 }
 

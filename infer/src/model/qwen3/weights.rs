@@ -100,7 +100,7 @@ impl Qwen3Model {
                         rms_norm_eps: gc.rms_norm_eps,
                         rope_theta: gc.rope_theta,
                         tie_word_embeddings: true,
-                        max_position_embeddings: Some(gc.context_length),
+                        max_position_embeddings: gc.context_length,
                     },
                     0,
                     0,

@@ -604,7 +604,7 @@ fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), Cl
         ("intermediate_size", cfg.intermediate_size as i64),
         ("num_hidden_layers", cfg.num_hidden_layers as i64),
         ("num_attention_heads", cfg.num_attention_heads as i64),
-        ("num_key_value_heads", cfg.num_kv_heads as i64),
+        ("num_key_value_heads", cfg.num_key_value_heads as i64),
         ("head_dim", cfg.head_dim as i64),
         ("vocab_size", cfg.vocab_size as i64),
     ]
