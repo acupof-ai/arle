@@ -703,6 +703,94 @@ fn run_with_hooks_fires_after_each_optimizer_step() {
     );
 }
 
+/// `run_with_eval_and_hooks` must drive both the eval closure (every
+/// `eval_every` steps) AND the on_step_end hook (every step) in the same
+/// run — this is the surface pretrain_qwen3 uses, which owns its own
+/// weight-save pipeline AND wants eval-loss metrics. Codex review 613ff3c
+/// flagged that the separate `run_with_eval` / `run_with_hooks` coverage
+/// doesn't prove the combined shape works.
+#[test]
+fn run_with_eval_and_hooks_drives_both_surfaces() {
+    let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        buf: Arc::clone(&buf),
+    };
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 4,
+        grad_accum_steps: 1,
+        log_every: 100, // suppress training emits except forced (1 + 4)
+        eval_every: Some(2),
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(sink), cfg);
+
+    let hook_calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls_hook = Arc::clone(&hook_calls);
+    let eval_calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let eval_calls_eval = Arc::clone(&eval_calls);
+    let eval_step_counter = Arc::new(Mutex::new(0u64));
+    let eval_step_counter_eval = Arc::clone(&eval_step_counter);
+
+    trainer
+        .run_with_eval_and_hooks(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+            move |_store, _tape| {
+                let mut counter = eval_step_counter_eval.lock().unwrap();
+                *counter += 1;
+                eval_calls_eval.lock().unwrap().push(*counter);
+                Ok(train::EvalOutcome {
+                    loss: 0.5,
+                    token_count: 42,
+                })
+            },
+            |step, _store| {
+                hook_calls_hook.lock().unwrap().push(step);
+                Ok(())
+            },
+        )
+        .expect("trainer.run_with_eval_and_hooks");
+
+    // Hook must fire every step.
+    assert_eq!(
+        hook_calls.lock().unwrap().as_slice(),
+        &[1, 2, 3, 4],
+        "on_step_end must fire once per optimizer step"
+    );
+    // Eval every 2 steps → steps 2 and 4 (force-emit on final).
+    assert_eq!(
+        eval_calls.lock().unwrap().len(),
+        2,
+        "eval_fn must fire exactly at every eval_every boundary"
+    );
+
+    // Metric sink must receive both eval samples and the forced training
+    // samples (step==1 + step==4).
+    let samples = buf.lock().unwrap();
+    let eval_samples = samples
+        .iter()
+        .filter(|s| s.fields.iter().any(|(k, _)| k == "eval_loss"))
+        .count();
+    assert_eq!(eval_samples, 2, "expected 2 eval metric samples");
+}
+
 /// Codex review P1 (2026-04-20): the Trainer loop must prune `TensorStore`
 /// after every backward + every optimizer step so activation allocations
 /// don't grow linearly with `total_steps * grad_accum_steps`. The toy

@@ -446,8 +446,19 @@ fn resume_from_checkpoint(
 
     // Verify the checkpoint's config.json matches the requested config so a
     // silent shape mismatch doesn't surface as a mid-training crash.
+    // Codex review 429efc3 (Medium): missing config.json was previously a
+    // silent skip, which reopened the tied/untied silent-corruption path
+    // whenever the checkpoint lacked a config file. Hard-error instead.
     let cfg_path = resume_dir.join("config.json");
-    if cfg_path.exists() {
+    if !cfg_path.exists() {
+        return Err(CliError::Custom(format!(
+            "resume path {} has no config.json; refuse to resume without a config-match check \
+             (would otherwise silently miss tie_word_embeddings / shape drift). \
+             Regenerate config.json from the expected live Qwen3Config or fresh-start.",
+            resume_dir.display()
+        )));
+    }
+    {
         let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)?;
         let mut mismatches: Vec<String> = [
             ("hidden_size", cfg.hidden_size as i64),

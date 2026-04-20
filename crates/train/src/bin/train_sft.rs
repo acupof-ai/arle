@@ -580,17 +580,21 @@ fn autograd_from_cli(err: CliError) -> AutogradError {
 /// surface as a mid-training crash on the first forward pass; per the
 /// codex review of 49512b1 (#1 High), fail fast before the run starts.
 ///
-/// Missing `config.json` is treated as a soft warning (consistent with
-/// `pretrain_qwen3::resume_from_checkpoint`) so older checkpoints still
-/// resume under operator responsibility.
+/// Missing `config.json` is a hard error: codex review 429efc3 (Medium)
+/// flagged that silently skipping the config-match check when cfg.json
+/// is absent reopens the tied/untied silent-corruption path this
+/// function is meant to close. Older checkpoints that need to resume
+/// can regenerate their `config.json` from the live `Qwen3Config` and
+/// drop it into the resume dir.
 fn validate_resume_config(resume_dir: &Path, cfg: &Qwen3Config) -> Result<(), CliError> {
     let cfg_path = resume_dir.join("config.json");
     if !cfg_path.exists() {
-        eprintln!(
-            "[train_sft] warning: --resume-from {} has no config.json; skipping config-match check",
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no config.json; refuse to resume without a config-match check \
+             (would otherwise silently miss tie_word_embeddings / shape drift). \
+             Regenerate config.json from the source model or fresh-start without --resume-from.",
             resume_dir.display()
-        );
-        return Ok(());
+        )));
     }
     let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)
         .map_err(|e| CliError::Custom(format!("resume config.json parse error: {e}")))?;
