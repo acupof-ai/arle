@@ -551,6 +551,53 @@ fn resume_rejects_mismatched_schedule() {
     );
 }
 
+/// Legacy-compat (codex review 3d9125d P1): checkpoints written before the P2
+/// describe()-full-match rollout stored a bare prefix (e.g. `"constant"`).
+/// Those must still resume when the live schedule's describe() starts with
+/// that same prefix, otherwise a v2-codec bump would be required.
+#[test]
+fn resume_accepts_legacy_bare_schedule_name() {
+    let tmp = tempdir().expect("tempdir");
+    let ckpt_dir = tmp.path().join("step_000007");
+    std::fs::create_dir_all(&ckpt_dir).unwrap();
+
+    let doc = TrainerStateDoc {
+        step: 7,
+        optim_schema: "adamw-v1".to_string(),
+        // Legacy bare-prefix format — pre-P2 writers produced exactly this.
+        schedule_name: "constant".to_string(),
+        schedule_params: serde_json::json!({}),
+        grad_accum_current: 0,
+        rng_seed: 0,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = AdamWState {
+        step: 7,
+        skipped_export: 0,
+        params: vec![AdamWParamState {
+            name: "p".to_string(),
+            m: vec![0.0],
+            v: vec![0.0],
+            shape: vec![1],
+        }],
+    };
+    save_trainer_state_v2(&ckpt_dir, &doc, &optim_state).expect("save v2");
+
+    let (_store, p) = setup_param(&[0.0]);
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        resume_from: Some(ckpt_dir.clone()),
+        ..default_cfg(100)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    let resumed = trainer
+        .resume_if_configured(&[(p, "p".to_string())])
+        .expect("legacy bare prefix must still resume");
+    assert_eq!(resumed, 7);
+    assert_eq!(trainer.step(), 7);
+}
+
 // ---------------------------------------------------------------------------
 // Small shims on top of `Trainer::optim()` so the assertion-time call sites
 // stay focused on what they're proving.
