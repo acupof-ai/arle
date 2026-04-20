@@ -7,7 +7,7 @@ use autograd::{
         transpose,
     },
 };
-use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
+pub use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -12,13 +12,14 @@ use autograd::{
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
+use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 use train::{
     StepOutcome, Trainer, TrainerConfig,
     checkpoint::write_latest_symlink,
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
-    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    qwen3::{Qwen3Error, Qwen3Model},
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -125,6 +126,8 @@ enum CliError {
     #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
     #[error(transparent)]
+    Qwen3Config(#[from] Qwen3ConfigError),
+    #[error(transparent)]
     Arg(#[from] ArgError),
     #[error("{0}")]
     Custom(String),
@@ -163,7 +166,7 @@ fn run() -> Result<(), CliError> {
         ));
     }
 
-    let cfg = Qwen3Config::from_json_file(&config_path)?;
+    let cfg = Qwen3Config::from_json_file(&config_path).map_err(Qwen3Error::from)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
     let mut store = TensorStore::with_backend(build_backend(args.backend)?);
     let model = Qwen3Model::new(&cfg, &mut store)?;
