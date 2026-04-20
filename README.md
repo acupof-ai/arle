@@ -25,8 +25,8 @@
 
 <!-- Keep this list short (last ~4 weeks). Older entries roll into CHANGELOG.md. -->
 
-- **2026-04-18** — Metal DFlash Layer 2 batched-verify primitives landed: `mlx_tape_replay_varlen` (per-row step counts) and `qwen35_compiled_verify_block_batched` (B>1 single-forward verify, B=1 path bit-identical to the scalar verify against real Qwen3.5-4B-4bit weights). Unblocks Layer 2c — lifting the `open.len() >= 2` DFlash auto-downgrade. Concurrent bench on M4 Max + Qwen3.5-4B-4bit: c=1 27.4 tok/s (DFlash) vs 63.6 tok/s (plain); c≥2 silently flips to packed decode and plateaus at ~145 tok/s regardless of DFlash flag. Step-time fit `t(B) ≈ 4.4 + 6.3·B ms` — per-row GDR recurrent work, not scheduler/HTTP, is the current ceiling.
-- **2026-04-17** — Qwen3.5 DFlash intra-request verify collapsed to a single forward at `seq_len = block_size` (Layer 1). Output matches greedy baseline; single-stream 4-bit is still a structural regression vs plain decode on M4 Max — see [verify-batch plan](docs/plans/metal-dflash-qwen35-verify-batch.md) and [bench note](docs/experience/wins/2026-04-17-metal-qwen35-dflash-correctness-bench.md).
+- **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. See [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md) for the canonical usage guide.
+- **2026-04-19** — DFlash ships default-on for Metal (commit `47f958f`). Qwen3.5-4B-4bit bit-identical parity against scalar path for B≤2 batched verify, concurrent c=1..8 stable.
 - **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
 - **2026-04-15** — [`cuda-kernels`](crates/cuda-kernels/) kernel crate extracted from `infer` (commit `a4e12f5`). One-way dependency `infer → cuda-kernels`.
 - **2026-04-15** — Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c shipped locally and remote-accepted on L4. Radix selector flip, BF16 `page_size=16`, host-tier skeleton, `lookup_or_stage` contract.
@@ -41,8 +41,7 @@ Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 |------|--------|-------|
 | CUDA / Linux — Qwen3 / Qwen3.5 / GLM4 | **Supported** | Primary serving path. |
 | Metal / Apple Silicon — Qwen3 / Qwen3.5 | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length decode not yet batched. |
-| Metal DFlash (Qwen3) | **Experimental** | Validated; benchmark before use. |
-| Metal DFlash (Qwen3.5) | **Experimental — single-session regression** | Correct output; 4-bit single-session ~40% of plain decode on M4 Max. Auto-disabled at concurrency ≥ 2 pending Layer 2c. |
+| Metal DFlash (Qwen3 / Qwen3.5) | **Beta — default-on** | Shipped default-on 2026-04-19; Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-ident parity + long-prompt + c=1..8 validated 2026-04-20. |
 | CPU-only / `no-cuda` | **Development only** | Smoke tests, request-path validation. Not a production target. |
 | `/v1/completions`, `/v1/chat/completions`, `/v1/models` | **Stable** | OpenAI-compatible. |
 | `/v1/responses` | **Beta** | Non-streaming + SSE `output_text.delta`. |
@@ -173,20 +172,17 @@ For operator control on Apple Silicon, `metal_serve`, `metal_bench`, and
 `--wired-limit-bytes` so MLX allocator behavior can be capped before model
 load.
 
-Metal DFlash is available as an experimental Apple Silicon decode path:
+Metal DFlash speculative decode is default-on. The one-command runner
+handles build flags and the default Qwen3.5 target/draft pair:
 
 ```bash
-cargo run -p infer --bin metal_request --release --no-default-features --features metal,no-cuda -- \
-  --model mlx-community/Qwen3-4B-bf16 \
-  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --prompt "write a quicksort in python" \
-  --raw-prompt
+./scripts/run_dflash.sh           # serve on :8000 with DFlash
+./scripts/run_dflash.sh bench     # baseline vs DFlash throughput
+./scripts/run_dflash.sh help      # full menu
 ```
 
-For full usage, limits, and benchmark workflow, see
-[docs/resources/metal-dflash.md](docs/resources/metal-dflash.md). For the
-current DFlash correctness/perf state on Qwen3.5, see
-[§Latest Updates](#-latest-updates) above.
+Full parameter reference and supported model pairs:
+[docs/resources/metal-dflash.md](docs/resources/metal-dflash.md).
 
 ---
 
@@ -352,9 +348,8 @@ for the current package boundaries.
   build/test workflows.
 - **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
   behavior, Metal serving path, GGUF loading, benchmark tooling.
-- **Experimental**: fast-moving quantization paths, speculative decoding,
-  tensor-parallel scaffolding, Metal DFlash, and undocumented flags or
-  environment variables.
+- **Experimental**: fast-moving quantization paths, tensor-parallel
+  scaffolding, and undocumented flags or environment variables.
 
 Current project state lives in [§Status at a glance](#-status-at-a-glance) above
 and in the authoritative [docs/support-matrix.md](docs/support-matrix.md).

@@ -1,203 +1,177 @@
-# Metal DFlash
+# Metal DFlash — single source of truth
 
-User guide for running DFlash speculative decoding on the Metal backend.
+Canonical user and engineering guide for DFlash speculative decode on the
+Metal backend. Supersedes every prior DFlash resource/plan/readme fragment.
 
-Status: experimental.
+**Status:** default-on for all Metal serving paths (as of commit `47f958f`,
+2026-04-19). Qwen3 (bf16) and Qwen3.5 (hybrid 4-bit) are both supported and
+have bit-identical parity tests against the scalar path landed and green.
 
-## What it is
+Last validated on the binary shipped with commits `3bc8802` (prefill
+fast-forward) + `d8cb2f4` (batched `async_eval` defer), 2026-04-20.
 
-Metal DFlash adds a draft-model-assisted decode path on Apple Silicon. The
-target model still produces the final tokens; the draft model proposes a block
-of candidate tokens, and the target verifies them.
+## TL;DR — one command
 
-Today this implementation is intended for:
+```bash
+./scripts/run_dflash.sh                # Qwen3.5-4B-4bit DFlash server, :8000
+./scripts/run_dflash.sh bench          # baseline vs DFlash throughput table
+./scripts/run_dflash.sh request "hi"   # one-shot chat against the running server
+```
 
-- Apple Silicon
-- `--features metal,no-cuda`
-- `Qwen3` targets (production-validated: 5.9× on M4 Pro, Qwen3-4B bf16)
-- `Qwen3.5` targets (runs, but single-session 4-bit is a −35% regression vs
-  plain decode; concurrent is parity via auto-downgrade — see
-  [`../experience/wins/2026-04-17-metal-qwen35-dflash-block-verify.md`](../experience/wins/2026-04-17-metal-qwen35-dflash-block-verify.md))
+The script handles the build flags, default model pair, bind, and DFlash
+draft wiring. Run `./scripts/run_dflash.sh help` for the full menu.
 
-It is not a generic speculative-decoding surface yet.
+## What DFlash is
 
-Parameter reference:
+Draft-assisted speculative decode on Apple Silicon:
 
-- [metal-dflash-params.md](metal-dflash-params.md)
+1. A small draft model proposes `block_size` candidate tokens
+2. The target model runs one forward over the whole block
+3. A verify step accepts the longest prefix that matches greedy target output
+4. The accepted tokens replace that many sequential decode steps
 
-## Current support
+The target model still produces the final output. DFlash is a throughput
+lever, not a model change.
 
-Supported now:
+## Supported today
 
-- Backend: Metal
-- Model families: `Qwen3`, `Qwen3.5` (hybrid GDR + full-attn)
-- Entry points:
-  - `metal_request`
-  - `metal_bench`
-  - `metal_serve`
+| Dimension | Supported |
+|---|---|
+| Backend | Metal (Apple Silicon, M-series) |
+| Build flags | `--no-default-features --features metal,no-cuda` |
+| Target families | `Qwen3` (bf16), `Qwen3.5` (4-bit hybrid GDR + full-attn) |
+| Entry points | `metal_request`, `metal_bench`, `metal_serve` |
+| Default draft pair | `mlx-community/Qwen3.5-4B-MLX-4bit` + `z-lab/Qwen3.5-4B-DFlash` |
+| Concurrency | c=1..8 HTTP clients validated; batched path single-forward verify for B≥1 |
+| Long prompts | ≥4k tokens OK (scheduler `fast_forward_prefill`, commit `3bc8802`) |
 
-Not supported yet:
+Not supported:
 
-- CUDA server scheduler integration
-- Claims of universal speedup on every workload
-- `Qwen3.5-4B-4bit` single-session as a net win (regression, see
-  caveat above)
+- CUDA scheduler (DFlash is Metal-only today)
+- Draft / target with mismatched `hidden_size` (runtime refuses, see `dflash.rs:228-233`)
 
-Important limitation:
+## Validated model pairs
 
-- The current **DFlash** server path still uses the legacy serial runtime.
-  DFlash improves single-request decode, but it does not turn `metal_serve`
-  into a batched serving runtime.
-- Draft checkpoints commonly do not ship tokenizer files. This is expected; the
-  target model tokenizer remains the source of truth, and local HuggingFace
-  cache resolution should use config + weights only.
-
-## Validated model pair
-
-Locally validated pair:
-
-- Target: `mlx-community/Qwen3-4B-bf16`
-- Draft: `z-lab/Qwen3-4B-DFlash-b16`
-
-Observed local result on Apple M4 Pro:
-
-- `prompt=20`, `generation=256`
-- baseline `generation_tps = 25.9`
-- DFlash `generation_tps = 152.0`
-- about `5.9x` decode throughput
-
-Raw benchmark record:
-
-- [experience/wins/2026-04-14-metal-dflash-qwen3.md](../experience/wins/2026-04-14-metal-dflash-qwen3.md)
+| Target | Draft | Provenance |
+|---|---|---|
+| `mlx-community/Qwen3.5-4B-MLX-4bit` | `z-lab/Qwen3.5-4B-DFlash` | [2026-04-19 default-on ship](../experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md), [2026-04-20 prefill fast-forward](../experience/wins/2026-04-20-dflash-prefill-fastforward.md), [2026-04-20 batched `async_eval`](../experience/wins/2026-04-20-dflash-batched-async-eval.md) |
+| `mlx-community/Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` | [2026-04-14 Qwen3 5.9× decode bench](../experience/wins/2026-04-14-metal-dflash-qwen3.md) |
 
 ## Build
 
 ```bash
-cargo build -p infer --release --no-default-features --features metal,no-cuda
+cargo build --release --no-default-features --features metal,no-cuda
 ```
 
-## One-shot generation
+## Running
 
-Use `metal_request` when you want a single prompt/response run:
+### Server (`metal_serve`)
 
 ```bash
-cargo run -p infer --bin metal_request --release --no-default-features --features metal,no-cuda -- \
-  --model mlx-community/Qwen3-4B-bf16 \
-  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
+./target/release/metal_serve \
+  --model-path mlx-community/Qwen3.5-4B-MLX-4bit \
+  --dflash-draft-model z-lab/Qwen3.5-4B-DFlash \
+  --port 8000
+```
+
+OpenAI-compatible endpoints live under `/v1/*`. Point any OpenAI-compatible
+client at `http://127.0.0.1:8000/v1`.
+
+### One-shot request (`metal_request`)
+
+```bash
+./target/release/metal_request \
+  --model mlx-community/Qwen3.5-4B-MLX-4bit \
+  --dflash-draft-model z-lab/Qwen3.5-4B-DFlash \
   --prompt "write a quicksort in python" \
   --raw-prompt \
   --max-new-tokens 128
 ```
 
-## Benchmarking
+### Bench (`metal_bench`)
 
-Use `metal_bench` to compare baseline vs. DFlash on the same workload.
-
-Baseline:
+Baseline — DFlash off:
 
 ```bash
-cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
-  --model mlx-community/Qwen3-4B-bf16 \
-  --prompt-tokens 20 \
-  --generation-tokens 256 \
-  --warmup 1 \
-  --runs 3
+./target/release/metal_bench \
+  --model mlx-community/Qwen3.5-4B-MLX-4bit \
+  --prompt-tokens 32 --generation-tokens 256 --warmup 1 --runs 3
 ```
 
-DFlash:
+DFlash on:
 
 ```bash
-cargo run -p infer --bin metal_bench --release --no-default-features --features metal,no-cuda -- \
-  --model mlx-community/Qwen3-4B-bf16 \
-  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --prompt-tokens 20 \
-  --generation-tokens 256 \
-  --warmup 1 \
-  --runs 3
+./target/release/metal_bench \
+  --model mlx-community/Qwen3.5-4B-MLX-4bit \
+  --dflash-draft-model z-lab/Qwen3.5-4B-DFlash \
+  --prompt-tokens 32 --generation-tokens 256 --warmup 1 --runs 3
 ```
 
-Use generation-heavy workloads first. That is where the current Metal DFlash
-path is already validated.
+## Parameters
 
-## Serving
+See [`metal-dflash-params.md`](metal-dflash-params.md) for the full
+parameter table. The common flags:
 
-`metal_serve` exposes the same DFlash controls as the request/bench tools:
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dflash-draft-model <PATH_OR_REPO>` | unset (off) | Enable DFlash; local path or HF repo id |
+| `--speculative-tokens <N>` | draft-config default | Override block size (rarely needed) |
 
-```bash
-./target/release/metal_serve \
-  --model-path mlx-community/Qwen3-4B-bf16 \
-  --dflash-draft-model z-lab/Qwen3-4B-DFlash-b16 \
-  --warmup 1 \
-  --port 8000
-```
+Rule: unset `--speculative-tokens` unless bench data says otherwise. The
+draft checkpoint ships a trained default; smaller values can reduce
+acceptance and throughput.
 
-## Configuration
+## Known performance ceilings (2026-04-20)
 
-### `--dflash-draft-model`
+- **Qwen3.5-4B-4bit single-stream**: step time ≈ `4.4 + 6.3·B` ms on M4 Max
+  (40 cores) — the GDR recurrent kernel is the limiter, measured at 6.1 ms/row.
+  DFlash is either neutral or a small win depending on workload; concurrency
+  ≥ 2 scales linearly through B=8.
+- **Full-concurrency ceiling**: ~145 tok/s aggregate at c=8 (Qwen3.5-4B-4bit).
+  Further gains require GDR kernel work (profile via Xcode Metal capture —
+  see [`metal-gdr-kernel-xcode-capture.md`](../plans/metal-gdr-kernel-xcode-capture.md)).
+- **Qwen3-4B bf16**: 5.9× decode speedup (25.9 → 152.0 tok/s) on M4 Pro at
+  `prompt=20, generation=256`.
 
-Enables DFlash and points the Metal backend at the draft checkpoint.
+## Debug env vars
 
-Accepted values:
+All are off unless explicitly set. See `infer/src/backend/metal/dflash.rs`
+for definitions; listed here so operators know what's supported:
 
-- local model directory
-- Hugging Face repo id
-
-### `--speculative-tokens`
-
-Optional block-size override.
-
-Recommendation:
-
-- leave this unset unless you have benchmark data
-
-Why:
-
-- the draft checkpoint already carries a trained default block size
-- lowering it can reduce acceptance and throughput
-- current runtime will warn if you force a smaller value than the draft default
-
-## Recommended usage pattern
-
-Use DFlash first when:
-
-- the workload is decode-heavy
-- prompt is modest and generation is long
-- you are validating local Apple Silicon throughput
-
-Do not assume it helps when:
-
-- prompt and generation are balanced
-- the prompt is long enough that prefill dominates total wall time
-- the target is `Qwen3.5`
-
-## Known limitations
-
-- `Qwen3.5-4B-4bit` single-session DFlash is −35% vs plain decode. The
-  root cause is verify-cost ratio (`T_S16 ≈ 7 × T_S1` but speculative math
-  needs `T_S16 < 4.5 × T_S1` at the measured ~28% acceptance). GDR linear-
-  attention layers still do per-step work inside the S=16 forward; closing
-  this is tracked in
-  [`../plans/metal-dflash-qwen35-verify-batch.md`](../plans/metal-dflash-qwen35-verify-batch.md)
-  Layer 2 (cross-request packed verify) and Layer 3 (cross-slot scheduling).
-  Concurrent workloads on `Qwen3.5` auto-downgrade to packed decode when
-  `open.len() >= 2`, so concurrency numbers are safe.
-- The current implementation is validated on `Qwen3-4B`; larger `Qwen3`
-  targets may work, but should be benchmarked explicitly before making claims.
-- Draft-model checkpoints may not ship tokenizer files; this is expected. The
-  target model tokenizer remains the source of truth.
+| Var | Location | Meaning |
+|---|---|---|
+| `DFLASH_DRAFT_MASK=causal` | `dflash.rs:271` | Force causal draft attention (diagnostic only) |
+| `DFLASH_DRAFT_CPP=<path>` | `dflash.rs:534` | Override compiled draft kernel cache path |
+| `QWEN35_DFLASH_PROFILE=1` | `dflash.rs:1870` | Emit per-block profiling to stderr |
+| `INFER_CAPTURE_STEP=N` + `MTL_CAPTURE_ENABLED=1` | GPU capture hook | Xcode trace one step; see [GDR capture runbook](../plans/metal-gdr-kernel-xcode-capture.md) |
 
 ## Troubleshooting
 
-If throughput is poor:
+**"draft hidden size mismatch" at load time**
+Target and draft must share `hidden_size`. The validator at
+`dflash.rs:228-233` enforces this.
 
-1. Remove `--speculative-tokens` and rerun with the draft default.
-2. Re-run the same workload as a baseline without DFlash.
-3. Compare `generation_tps`, not only total wall time.
-4. Prefer `prompt=20`, `generation=256` or another decode-heavy benchmark for
-   first-pass validation.
+**`WrongPhase` errors on long prompts (>512 tokens)**
+Fixed on 2026-04-20 by `fast_forward_prefill` (commit `3bc8802`). If you
+see this on a build older than `3bc8802`, rebuild.
 
-If the backend refuses to load:
+**Throughput worse than plain decode**
+1. Re-run without `--dflash-draft-model` for a fair baseline on the same
+   binary.
+2. Remove `--speculative-tokens` if set.
+3. Compare `generation_tps`, not total wall time.
+4. For small effects (<10%): run matched-A/B in two separate sessions per
+   [`feedback_matched_ab_for_small_bench_effects.md`](../../memory/feedback_matched_ab_for_small_bench_effects.md)
+   before concluding either way.
 
-1. Check that the target model is `Qwen3` or `Qwen3.5`.
-2. Check that the draft hidden size matches the target hidden size.
-3. Rebuild with `--no-default-features --features metal,no-cuda`.
+**No tokenizer in draft repo**
+Expected. The target tokenizer is the source of truth; the draft checkpoint
+needs only config + weights.
+
+## Related docs
+
+- [`metal-dflash-params.md`](metal-dflash-params.md) — full parameter table
+- [`../plans/metal-gdr-kernel-xcode-capture.md`](../plans/metal-gdr-kernel-xcode-capture.md) — GPU profiling runbook
+- [`../experience/wins/2026-04-19-metal-qwen35-final-state.md`](../experience/wins/2026-04-19-metal-qwen35-final-state.md) — terminal state of the Qwen3.5 DFlash arc
+- [`../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md`](../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md) — root cause for the prefill fast-forward fix
+- Code: `infer/src/backend/metal/dflash.rs`, `scheduler.rs::fast_forward_prefill`, `crates/mlx-sys/src/mlx_dflash_draft_model.cpp`

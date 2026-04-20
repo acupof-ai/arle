@@ -35,7 +35,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | **Research** | | |
 | [research/mni-ml-framework-notes.md](research/mni-ml-framework-notes.md) | **Reference analysis (2026-04-18)** | mni-ml/framework dissection: structural map, LOC table, abstractions worth borrowing (TensorId+Store, SavedContext enum, BackwardOp dispatch, embedded optimizer state), pruning list for our LoRA-only scope. Underpins Phase 6 from-scratch autograd |
 | [research/speculative-decoding-feasibility.md](research/speculative-decoding-feasibility.md) | Feasibility | Draft model, EAGLE/EAGLE3, Medusa, MTP — phased integration plan, draft model first |
-| [research/dflash-metal-feasibility.md](research/dflash-metal-feasibility.md) | Feasibility | DFlash (speculative) on Metal: feasible, medium priority. Now partially shipped via the experimental Metal DFlash path |
+| [research/dflash-metal-feasibility.md](research/dflash-metal-feasibility.md) | Feasibility | DFlash (speculative) on Metal: feasible, medium priority. Shipped default-on 2026-04-19 for Qwen3 + Qwen3.5 — see `docs/resources/metal-dflash.md` |
 | [research/kv-quantization-metal.md](research/kv-quantization-metal.md) | Feasibility | KV quant on Metal deprioritized: MLX has no FP8 dtype, BF16-only; defer until C>4 with long contexts |
 | **Reviews** | | |
 | [reviews/2026-04-15-metal-ecosystem-route-correction.md](reviews/2026-04-15-metal-ecosystem-route-correction.md) | Active | External Apple Silicon serving reality check: `vllm-metal` / Docker / `mlx-lm` / Ollama calibration, local serial-server symptoms, and the corrected Metal execution order |
