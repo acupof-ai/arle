@@ -99,6 +99,7 @@ struct ChatPassthrough {
     messages: Vec<Message>,
 }
 
+#[derive(Debug)]
 pub struct ConvertStats {
     pub total_lines: usize,
     pub written: usize,
@@ -275,5 +276,49 @@ mod tests {
         let line = r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]}"#;
         let msgs = convert_line(line, InputFormat::Chat).unwrap();
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn paths_alias_equal_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("same.jsonl");
+        std::fs::write(&p, b"x").unwrap();
+        assert!(paths_alias(&p, &p));
+    }
+
+    #[test]
+    fn paths_alias_canonicalizes_relative_and_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("a.jsonl");
+        std::fs::write(&abs, b"x").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let same = paths_alias(Path::new("a.jsonl"), Path::new("./a.jsonl"));
+        std::env::set_current_dir(prev).unwrap();
+        assert!(same, "./a.jsonl should canonicalize to a.jsonl");
+    }
+
+    #[test]
+    fn paths_alias_different_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.jsonl");
+        let b = tmp.path().join("b.jsonl");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        assert!(!paths_alias(&a, &b));
+    }
+
+    #[test]
+    fn convert_file_refuses_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("inplace.jsonl");
+        std::fs::write(&p, r#"{"instruction":"Q","response":"A"}"#).unwrap();
+        let err = convert_file(&p, &p, InputFormat::Dolly).unwrap_err();
+        assert!(
+            err.to_string().contains("resolve to the same file"),
+            "got: {err}"
+        );
+        let contents = std::fs::read(&p).unwrap();
+        assert!(!contents.is_empty(), "source must be preserved");
     }
 }
