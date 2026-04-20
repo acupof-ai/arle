@@ -41,6 +41,18 @@ impl SafetensorsRegistry {
     }
 
     pub fn load_into(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
+        self.load_into_impl(store, path, false)
+    }
+
+    /// Like [`load_into`], but fails if any tensor currently registered in
+    /// `self` is missing from the file. Use on resume paths where a partial
+    /// or mismatched checkpoint must not silently hybridize with base-model
+    /// weights (codex review 2026-04-20 on 49512b1, #1 High).
+    pub fn load_into_strict(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
+        self.load_into_impl(store, path, true)
+    }
+
+    fn load_into_impl(&mut self, store: &mut TensorStore, path: &Path, strict: bool) -> Result<()> {
         let file = File::open(path).map_err(|err| {
             tape_invariant(format!(
                 "failed to open safetensors file {}: {err}",
@@ -56,6 +68,15 @@ impl SafetensorsRegistry {
         let tensors = SafeTensors::deserialize(&mmap[..])
             .map_err(|err| tape_invariant(format!("failed to deserialize safetensors: {err}")))?;
 
+        // In strict mode we remember which currently-registered names have
+        // been covered by the file, and error on any that are missing after
+        // the loop. Unknown names still auto-register (same as non-strict).
+        let mut seen = if strict {
+            Some(std::collections::HashSet::<String>::new())
+        } else {
+            None
+        };
+
         for (name, view) in tensors.iter() {
             let shape = view.shape().to_vec();
             let data = tensor_view_to_f32(&view)?;
@@ -70,9 +91,41 @@ impl SafetensorsRegistry {
                 }
                 let tensor = store.tensor_mut(id)?;
                 tensor.data = data;
+                if let Some(set) = seen.as_mut() {
+                    set.insert(name.to_owned());
+                }
             } else {
                 let id = store.alloc(Tensor::new(data, shape, true)?);
                 self.insert(name.to_owned(), id);
+                if let Some(set) = seen.as_mut() {
+                    set.insert(name.to_owned());
+                }
+            }
+        }
+
+        if let Some(seen) = seen {
+            let missing: Vec<&str> = self
+                .map
+                .keys()
+                .filter(|k| !seen.contains(k.as_str()))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                let mut sorted = missing;
+                sorted.sort_unstable();
+                let shown: Vec<&str> = sorted.iter().take(5).copied().collect();
+                let suffix = if sorted.len() > 5 {
+                    format!(" (+{} more)", sorted.len() - 5)
+                } else {
+                    String::new()
+                };
+                return Err(tape_invariant(format!(
+                    "safetensors {} is missing {} registered tensor(s): {}{}",
+                    path.display(),
+                    sorted.len(),
+                    shown.join(", "),
+                    suffix,
+                )));
             }
         }
 
