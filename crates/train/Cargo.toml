@@ -13,6 +13,7 @@ cuda = ["autograd/cuda"]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
 hf-hub = { version = "0.5", features = ["tokio"] }
+safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -20,7 +21,6 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-safetensors = { workspace = true }
 
 [[bin]]
 name = "pretrain"

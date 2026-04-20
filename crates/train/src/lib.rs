@@ -10,12 +10,20 @@ pub mod curriculum;
 pub mod data_adapter;
 #[path = "dataset.rs"]
 pub mod dataset;
+#[path = "grad_accum.rs"]
+pub mod grad_accum;
+#[path = "grad_clip.rs"]
+pub mod grad_clip;
 #[path = "grpo.rs"]
 pub mod grpo;
 #[path = "hub_dataset.rs"]
 pub mod hub_dataset;
 #[path = "lora.rs"]
 pub mod lora;
+#[path = "loss.rs"]
+pub mod loss;
+#[path = "metrics.rs"]
+pub mod metrics;
 #[path = "model.rs"]
 pub mod model;
 #[path = "multi_turn.rs"]
@@ -40,3 +48,7 @@ pub mod tokenizer;
 pub mod trainer;
 #[path = "verifier.rs"]
 pub mod verifier;
+
+pub use grad_accum::GradAccumulator;
+pub use metrics::*;
+pub use trainer::{EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig};

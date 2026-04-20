@@ -20,13 +20,27 @@
 //!   data[data_len]: f32 LE
 //! ```
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use autograd::adamw_state::{AdamWParamState, AdamWState};
 use autograd::{TensorId, TensorStore, module::Module};
+use safetensors::{Dtype, SafeTensors, serialize_to_file};
+use serde::{Deserialize, Serialize};
 
 use crate::model::TransformerConfig;
+
+/// Codec version for the v2 directory checkpoint layout.
+pub const TRAINER_STATE_CODEC_VERSION: u32 = 2;
+
+/// Filename for the trainer scalar/schedule JSON under a v2 checkpoint dir.
+pub const TRAINER_STATE_FILENAME: &str = "trainer_state.json";
+
+/// Filename for the AdamW moments safetensors file under a v2 checkpoint dir.
+pub const OPTIMIZER_STATE_FILENAME: &str = "optimizer.safetensors";
 
 // bumped 2026-04-19 when TinyLM was renamed to Transformer (no on-disk format change)
 const MAGIC: &[u8; 8] = b"LMCKP003";
@@ -47,6 +61,14 @@ pub enum CheckpointError {
     },
     #[error("missing tensor id {0}")]
     MissingTensor(TensorId),
+    #[error("trainer state json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing optim tensor pair for param '{0}' (need both .m and .v)")]
+    MissingMomentPair(String),
+    #[error("trainer state v2 codec version mismatch: expected 2, got {0}")]
+    VersionMismatch(u32),
+    #[error("safetensors: {0}")]
+    Safetensors(String),
 }
 
 pub type Result<T> = std::result::Result<T, CheckpointError>;
@@ -171,4 +193,241 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint Codec v2 — directory layout (trainer_state.json + optimizer.safetensors)
+// ---------------------------------------------------------------------------
+
+/// Trainer-side scalar/schedule state persisted alongside optimizer moments.
+///
+/// Serialized pretty to `<dir>/trainer_state.json`. Kept open-schema via
+/// `schedule_params: serde_json::Value` so schedule implementations can own
+/// their own parameter shape without a matching enum in this crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainerStateDoc {
+    pub step: u64,
+    /// Schema tag for the optimizer state. Today: `"adamw-v1"`.
+    pub optim_schema: String,
+    /// `"constant"` | `"linear-warmup"` | `"cosine-with-warmup"`.
+    pub schedule_name: String,
+    pub schedule_params: serde_json::Value,
+    pub grad_accum_current: u64,
+    pub rng_seed: u64,
+    /// On-disk codec version. Must equal [`TRAINER_STATE_CODEC_VERSION`].
+    pub codec_version: u32,
+}
+
+/// Save a v2 directory checkpoint (scalar trainer state + AdamW moments).
+///
+/// Writes:
+/// - `<dir>/trainer_state.json` (pretty-printed JSON)
+/// - `<dir>/optimizer.safetensors` (each param → two tensors `"{name}.m"`,
+///   `"{name}.v"`, f32; top-level metadata carries `step` + `skipped_export`)
+///
+/// Creates `dir` (and any missing parents) on demand.
+pub fn save_trainer_state_v2(
+    dir: &Path,
+    state: &TrainerStateDoc,
+    optim: &AdamWState,
+) -> std::result::Result<(), CheckpointError> {
+    std::fs::create_dir_all(dir)?;
+
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(dir.join(TRAINER_STATE_FILENAME), json)?;
+
+    let mut tensors: Vec<(String, OptimTensorView)> = Vec::with_capacity(optim.params.len() * 2);
+    for param in &optim.params {
+        let expected_len: usize = if param.shape.is_empty() {
+            1
+        } else {
+            param.shape.iter().product()
+        };
+        if param.m.len() != expected_len || param.v.len() != expected_len {
+            return Err(CheckpointError::Safetensors(format!(
+                "AdamW moment length mismatch for '{}' during save: shape {:?} => {} elems, m {} v {}",
+                param.name,
+                param.shape,
+                expected_len,
+                param.m.len(),
+                param.v.len(),
+            )));
+        }
+        tensors.push((
+            format!("{}.m", param.name),
+            OptimTensorView::from_f32(param.shape.clone(), &param.m),
+        ));
+        tensors.push((
+            format!("{}.v", param.name),
+            OptimTensorView::from_f32(param.shape.clone(), &param.v),
+        ));
+    }
+
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    metadata.insert("step".to_string(), optim.step.to_string());
+    metadata.insert(
+        "skipped_export".to_string(),
+        optim.skipped_export.to_string(),
+    );
+
+    serialize_to_file(tensors, Some(metadata), &dir.join(OPTIMIZER_STATE_FILENAME))
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+
+    Ok(())
+}
+
+/// Load a v2 directory checkpoint written by [`save_trainer_state_v2`].
+pub fn load_trainer_state_v2(
+    dir: &Path,
+) -> std::result::Result<(TrainerStateDoc, AdamWState), CheckpointError> {
+    let json_path = dir.join(TRAINER_STATE_FILENAME);
+    let json_bytes = std::fs::read(&json_path)?;
+    let state: TrainerStateDoc = serde_json::from_slice(&json_bytes)?;
+    if state.codec_version != TRAINER_STATE_CODEC_VERSION {
+        return Err(CheckpointError::VersionMismatch(state.codec_version));
+    }
+
+    let optim_path = dir.join(OPTIMIZER_STATE_FILENAME);
+    let optim_bytes = std::fs::read(&optim_path)?;
+    // `SafeTensors::deserialize` gives us tensor views; the top-level
+    // metadata lives on `Metadata` and has to be fetched via `read_metadata`.
+    let (_, header_metadata) = SafeTensors::read_metadata(&optim_bytes)
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+    let st = SafeTensors::deserialize(&optim_bytes)
+        .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+
+    // Group by base name (strip .m/.v suffix), preserving first-seen order so
+    // saved-order round-trips deterministically.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, MomentPair> = BTreeMap::new();
+    for (key, view) in st.tensors() {
+        let (base, which) = split_moment_key(&key).ok_or_else(|| {
+            CheckpointError::Safetensors(format!(
+                "optimizer.safetensors: tensor '{key}' has no .m/.v suffix"
+            ))
+        })?;
+        let entry = groups.entry(base.to_string()).or_insert_with(|| {
+            order.push(base.to_string());
+            MomentPair::default()
+        });
+        let shape = view.shape().to_vec();
+        let data = optim_tensor_view_to_f32(&view)
+            .map_err(|err| CheckpointError::Safetensors(err.to_string()))?;
+        match which {
+            Moment::M => entry.m = Some((shape, data)),
+            Moment::V => entry.v = Some((shape, data)),
+        }
+    }
+
+    let mut params = Vec::with_capacity(order.len());
+    for name in &order {
+        let pair = groups.get(name).expect("just inserted");
+        let (m_shape, m_data) = pair
+            .m
+            .clone()
+            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+        let (v_shape, v_data) = pair
+            .v
+            .clone()
+            .ok_or_else(|| CheckpointError::MissingMomentPair(name.clone()))?;
+        if m_shape != v_shape {
+            return Err(CheckpointError::Safetensors(format!(
+                "optimizer.safetensors: '{name}' .m shape {m_shape:?} != .v shape {v_shape:?}"
+            )));
+        }
+        params.push(AdamWParamState {
+            name: name.clone(),
+            m: m_data,
+            v: v_data,
+            shape: m_shape,
+        });
+    }
+
+    let metadata: &Option<HashMap<String, String>> = header_metadata.metadata();
+    let step = metadata
+        .as_ref()
+        .and_then(|m: &HashMap<String, String>| m.get("step"))
+        .and_then(|s: &String| s.parse::<u64>().ok())
+        .unwrap_or(state.step);
+    let skipped_export = metadata
+        .as_ref()
+        .and_then(|m: &HashMap<String, String>| m.get("skipped_export"))
+        .and_then(|s: &String| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    Ok((
+        state,
+        AdamWState {
+            step,
+            params,
+            skipped_export,
+        },
+    ))
+}
+
+#[derive(Default)]
+struct MomentPair {
+    m: Option<(Vec<usize>, Vec<f32>)>,
+    v: Option<(Vec<usize>, Vec<f32>)>,
+}
+
+enum Moment {
+    M,
+    V,
+}
+
+fn split_moment_key(key: &str) -> Option<(&str, Moment)> {
+    if let Some(base) = key.strip_suffix(".m") {
+        Some((base, Moment::M))
+    } else {
+        key.strip_suffix(".v").map(|base| (base, Moment::V))
+    }
+}
+
+fn optim_tensor_view_to_f32(
+    view: &safetensors::tensor::TensorView<'_>,
+) -> std::result::Result<Vec<f32>, String> {
+    match view.dtype() {
+        Dtype::F32 => Ok(view
+            .data()
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()),
+        dtype => Err(format!("optimizer.safetensors: unsupported dtype {dtype}")),
+    }
+}
+
+/// Thin `safetensors::View` impl that borrows moment data as little-endian f32
+/// bytes without a heap-allocated detour.
+struct OptimTensorView {
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl OptimTensorView {
+    fn from_f32(shape: Vec<usize>, values: &[f32]) -> Self {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        Self { shape, bytes }
+    }
+}
+
+impl safetensors::View for OptimTensorView {
+    fn dtype(&self) -> Dtype {
+        Dtype::F32
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.bytes.as_slice())
+    }
+
+    fn data_len(&self) -> usize {
+        self.bytes.len()
+    }
 }

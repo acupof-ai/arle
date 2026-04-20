@@ -1,3 +1,5 @@
+#[path = "adamw_state.rs"]
+pub mod adamw_state;
 #[path = "backend.rs"]
 pub mod backend;
 #[cfg(feature = "cuda")]
@@ -6,6 +8,8 @@ pub mod backend_cuda;
 #[cfg(feature = "metal")]
 #[path = "backend_metal.rs"]
 pub mod backend_metal;
+#[path = "lr_schedule.rs"]
+pub mod lr_schedule;
 #[path = "module.rs"]
 pub mod module;
 #[path = "ops.rs"]
@@ -23,6 +27,8 @@ pub mod tensor;
 #[cfg(feature = "metal")]
 pub use backend::MlxHandle;
 pub use backend::{Backend, CpuBackend, Device, DeviceHandle};
+pub use lr_schedule::{ConstantLr, CosineWithWarmup, LinearWarmup, LrSchedule, parse_lr_schedule};
+pub use optim::{AdamW, Optimizer};
 #[cfg(feature = "safetensors")]
 pub use safetensors_io::SafetensorsRegistry;
 pub use tape::{BackwardOp, SavedContext, Tape, TapeEntry};
