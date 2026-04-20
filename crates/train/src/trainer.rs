@@ -497,8 +497,10 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 // already, and both StdoutSink and JsonlSink emit it from
                 // there. Redundant "step" produced `step=5 ... step=5.000000`
                 // in stdout + a duplicate JSON key.
-                let fields: [(&str, f64); 5] = [
-                    ("loss", running_loss_sum as f64),
+                let loss_f64 = running_loss_sum as f64;
+                let fields: [(&str, f64); 6] = [
+                    ("loss", loss_f64),
+                    ("ppl", loss_f64.exp()),
                     ("lr", lr as f64),
                     ("grad_norm", grad_norm as f64),
                     ("ms_per_step", ms_per_step),
@@ -533,8 +535,10 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 // Codex review 44a7e19 (low): same redundant-step issue as the
                 // training-metrics emit — drop "step" from fields, sinks read
                 // it from sample.step.
-                let fields: [(&str, f64); 2] = [
-                    ("eval_loss", eval.loss as f64),
+                let eval_loss_f64 = eval.loss as f64;
+                let fields: [(&str, f64); 3] = [
+                    ("eval_loss", eval_loss_f64),
+                    ("eval_ppl", eval_loss_f64.exp()),
                     ("eval_tokens", eval.token_count as f64),
                 ];
                 self.metrics.emit(&MetricSample {

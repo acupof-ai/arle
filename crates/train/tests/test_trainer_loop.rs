@@ -507,7 +507,7 @@ fn eval_metrics_fields_omit_step() {
         "expected at least one eval sample (eval_every=2 total_steps=4)"
     );
     for s in eval_samples {
-        let expected = ["eval_loss", "eval_tokens"];
+        let expected = ["eval_loss", "eval_ppl", "eval_tokens"];
         for k in expected {
             assert!(
                 s.fields.iter().any(|(name, _)| name == k),
@@ -581,7 +581,14 @@ fn metrics_emit_at_log_every() {
     // Every sample carries the documented field set. `"step"` intentionally
     // not in this list anymore — sinks read it from `MetricSample.step`
     // (codex review 44a7e19 low).
-    let expected_keys = ["loss", "lr", "grad_norm", "ms_per_step", "tok_per_sec"];
+    let expected_keys = [
+        "loss",
+        "ppl",
+        "lr",
+        "grad_norm",
+        "ms_per_step",
+        "tok_per_sec",
+    ];
     for s in samples.iter() {
         for k in expected_keys {
             assert!(
@@ -596,6 +603,100 @@ fn metrics_emit_at_log_every() {
             s.step
         );
     }
+}
+
+/// Phase 4 (plan v1 §7): perplexity is derived from loss in the metric
+/// pipeline — `ppl == exp(loss)` on every training sample and `eval_ppl ==
+/// exp(eval_loss)` on every eval sample. Pins the derivation so downstream
+/// tooling can rely on it without doing the exp itself, and catches a
+/// future refactor that drops the field or wires it to the wrong source.
+#[test]
+fn ppl_metric_equals_exp_of_loss_on_every_sample() {
+    let buf: Arc<Mutex<Vec<OwnedSample>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = VecSink {
+        buf: Arc::clone(&buf),
+    };
+
+    let (mut store, p) = setup_param(&[0.3]);
+    let mut tape = Tape::new();
+    let optim = AdamW::new(1e-2, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 3,
+        grad_accum_steps: 1,
+        log_every: 1,
+        eval_every: Some(3),
+        save_every: None,
+        save_dir: None,
+        resume_from: None,
+        rng_seed: 0,
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-2), Box::new(sink), cfg);
+
+    trainer
+        .run_with_eval(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 4,
+                })
+            },
+            |_store, _tape| {
+                Ok(train::EvalOutcome {
+                    loss: 0.75,
+                    token_count: 8,
+                })
+            },
+        )
+        .expect("trainer.run_with_eval");
+
+    let samples = buf.lock().unwrap();
+    let mut train_seen = 0;
+    let mut eval_seen = 0;
+    for s in samples.iter() {
+        let is_eval = s.fields.iter().any(|(k, _)| k == "eval_loss");
+        let (loss_key, ppl_key) = if is_eval {
+            ("eval_loss", "eval_ppl")
+        } else {
+            ("loss", "ppl")
+        };
+        let loss = s
+            .fields
+            .iter()
+            .find(|(k, _)| k == loss_key)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("sample at step {} missing {loss_key}", s.step));
+        let ppl = s
+            .fields
+            .iter()
+            .find(|(k, _)| k == ppl_key)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("sample at step {} missing {ppl_key}", s.step));
+        let expected = loss.exp();
+        assert!(
+            (ppl - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+            "sample step {} {ppl_key}={} != exp({loss_key}={})={}",
+            s.step,
+            ppl,
+            loss,
+            expected
+        );
+        if is_eval {
+            eval_seen += 1;
+        } else {
+            train_seen += 1;
+        }
+    }
+    assert!(train_seen >= 1, "expected at least one training sample");
+    assert_eq!(
+        eval_seen, 1,
+        "expected exactly one eval sample (every=3, final=3)"
+    );
 }
 
 /// Codex review 44a7e19 (medium): the Trainer must always force-emit on
