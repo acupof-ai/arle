@@ -672,6 +672,7 @@ mod tests {
     use super::*;
     use crate::backend::InferenceBackend;
     use crate::sampler::SamplingParams;
+    use chat::{ChatMlMessage, render_chatml};
 
     fn run_bench(model_dir: &std::path::Path, label: &str) {
         if !model_dir.exists() {
@@ -682,18 +683,23 @@ mod tests {
         let mut backend = MetalBackend::new();
         backend.load(model_dir).expect("load model");
 
-        let prompt = "<|im_start|>user\nWrite a short poem about systems programming.\
-                      <|im_end|>\n<|im_start|>assistant\n";
+        let prompt = render_chatml(
+            &[ChatMlMessage {
+                role: "user",
+                content: "Write a short poem about systems programming.",
+            }],
+            true,
+        );
         let params = SamplingParams {
             temperature: 0.0,
             ..Default::default()
         };
 
         // Warm-up pass (fills KV cache, JIT compiles Metal kernels)
-        let _ = backend.generate(prompt, &params).expect("warmup");
+        let _ = backend.generate(&prompt, &params).expect("warmup");
 
         // Timed pass
-        let result = backend.generate(prompt, &params).expect("generate");
+        let result = backend.generate(&prompt, &params).expect("generate");
 
         println!("\n=== Metal Benchmark: {label} ===");
         println!("Model:      {}", model_dir.display());

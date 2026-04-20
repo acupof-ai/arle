@@ -10,6 +10,8 @@ use autograd::{
 pub use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 
+use crate::policy::{GrpoPolicy, GrpoPolicyConfig};
+
 #[derive(Debug, Error)]
 pub enum Qwen3Error {
     #[error(transparent)]
@@ -64,16 +66,20 @@ impl Qwen3Layer {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
-        let seq_len = store
+        let x_shape = store
             .get(x)
             .ok_or(AutogradError::InvalidTensorId(x))?
             .shape
-            .get(1)
-            .copied()
-            .ok_or(AutogradError::InvalidRank {
-                expected: "rank-3 hidden states",
-                got: 0,
-            })?;
+            .clone();
+        if x_shape.len() != 3 {
+            return Err(AutogradError::InvalidRank {
+                expected: "rank-3 hidden states [batch, seq, hidden]",
+                got: x_shape.len(),
+            }
+            .into());
+        }
+        let batch = x_shape[0];
+        let seq_len = x_shape[1];
 
         let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let q = linear_forward(h, self.self_attn.q_proj, store, tape)?;
@@ -82,7 +88,7 @@ impl Qwen3Layer {
 
         let q = split_heads(
             q,
-            1,
+            batch,
             seq_len,
             cfg.num_attention_heads,
             cfg.head_dim,
@@ -91,7 +97,7 @@ impl Qwen3Layer {
         )?;
         let k = split_heads(
             q_or_kv_heads_tensor(k),
-            1,
+            batch,
             seq_len,
             cfg.num_key_value_heads,
             cfg.head_dim,
@@ -100,7 +106,7 @@ impl Qwen3Layer {
         )?;
         let v = split_heads(
             q_or_kv_heads_tensor(v),
-            1,
+            batch,
             seq_len,
             cfg.num_key_value_heads,
             cfg.head_dim,
@@ -118,7 +124,7 @@ impl Qwen3Layer {
         let attn = causal_sdpa(q, k, v, store, tape)?;
         let attn = merge_heads(
             attn,
-            1,
+            batch,
             seq_len,
             cfg.num_attention_heads,
             cfg.head_dim,
@@ -154,6 +160,7 @@ pub struct Qwen3Model {
     cos_cache: TensorId,
     sin_cache: TensorId,
     param_names: HashMap<&'static str, TensorId>,
+    param_ids: Vec<TensorId>,
 }
 
 impl Qwen3Model {
@@ -161,13 +168,21 @@ impl Qwen3Model {
         cfg.validate()?;
 
         let mut param_names = HashMap::new();
+        let mut param_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut register_param = |name: &'static str, id: TensorId| {
+            param_names.insert(name, id);
+            if seen.insert(id) {
+                param_ids.push(id);
+            }
+        };
         let embed_tokens = normal_parameter(
             "model.embed_tokens.weight",
             &[cfg.vocab_size, cfg.hidden_size],
             0.02,
             store,
         )?;
-        param_names.insert("model.embed_tokens.weight", embed_tokens);
+        register_param("model.embed_tokens.weight", embed_tokens);
 
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens
@@ -179,7 +194,7 @@ impl Qwen3Model {
                 store,
             )?
         };
-        param_names.insert("lm_head.weight", lm_head);
+        register_param("lm_head.weight", lm_head);
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
@@ -247,44 +262,44 @@ impl Qwen3Model {
                 store,
             )?;
 
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.input_layernorm.weight")),
                 input_layernorm,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.q_proj.weight")),
                 q_proj,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.k_proj.weight")),
                 k_proj,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.v_proj.weight")),
                 v_proj,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.o_proj.weight")),
                 o_proj,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.q_norm.weight")),
                 q_norm,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.self_attn.k_norm.weight")),
                 k_norm,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.mlp.gate_proj.weight")),
                 gate_proj,
             );
-            param_names.insert(leak_name(format!("{prefix}.mlp.up_proj.weight")), up_proj);
-            param_names.insert(
+            register_param(leak_name(format!("{prefix}.mlp.up_proj.weight")), up_proj);
+            register_param(
                 leak_name(format!("{prefix}.mlp.down_proj.weight")),
                 down_proj,
             );
-            param_names.insert(
+            register_param(
                 leak_name(format!("{prefix}.post_attention_layernorm.weight")),
                 post_attention_layernorm,
             );
@@ -309,9 +324,15 @@ impl Qwen3Model {
         }
 
         let final_norm = ones_parameter("model.norm.weight", &[cfg.hidden_size], store)?;
-        param_names.insert("model.norm.weight", final_norm);
+        register_param("model.norm.weight", final_norm);
 
         let (cos_cache, sin_cache) = build_rope_cache(cfg, store)?;
+        if seen.insert(cos_cache) {
+            param_ids.push(cos_cache);
+        }
+        if seen.insert(sin_cache) {
+            param_ids.push(sin_cache);
+        }
 
         Ok(Self {
             config: cfg.clone(),
@@ -322,25 +343,84 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             param_names,
+            param_ids,
         })
     }
 
-    pub fn forward(
+    pub fn all_parameter_ids(&self) -> Vec<TensorId> {
+        self.param_ids.clone()
+    }
+
+    pub fn clone_frozen(&self, store: &mut TensorStore) -> Self {
+        let cloned = Self::new(&self.config, store).expect("clone_frozen should preserve config");
+        let source_ids = self.all_parameter_ids();
+        let target_ids = cloned.all_parameter_ids();
+        assert_eq!(
+            source_ids.len(),
+            target_ids.len(),
+            "clone_frozen parameter topology drifted",
+        );
+
+        for (source_id, target_id) in source_ids.into_iter().zip(target_ids) {
+            let mut replacement = store
+                .get(source_id)
+                .cloned()
+                .expect("source parameter should remain readable");
+            replacement.requires_grad = false;
+            replacement.grad = None;
+            store.tensors[target_id] = Some(replacement);
+        }
+
+        cloned
+    }
+
+    pub fn forward_tokens(
+        &self,
+        input_ids: &[usize],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        self.forward_batch_tokens(input_ids, 1, input_ids.len(), store, tape)
+    }
+
+    pub fn forward_batch_tokens(
+        &self,
+        input_ids: &[usize],
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        let position_ids = (0..seq_len).map(|index| index as u32).collect::<Vec<_>>();
+        let input_ids = input_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
+        self.forward_batch(store, tape, &input_ids, &position_ids, batch, seq_len)
+            .map_err(qwen3_to_autograd)
+    }
+
+    pub fn forward_batch(
         &self,
         store: &mut TensorStore,
         tape: &mut Tape,
         input_ids: &[u32],
         position_ids: &[u32],
+        batch: usize,
+        seq_len: usize,
     ) -> Result<TensorId> {
-        if input_ids.len() != position_ids.len() {
+        if input_ids.len() != batch * seq_len {
+            return Err(Qwen3Error::InputLenMismatch {
+                input_len: input_ids.len(),
+                position_len: batch * seq_len,
+            });
+        }
+        if position_ids.len() != seq_len {
             return Err(Qwen3Error::InputLenMismatch {
                 input_len: input_ids.len(),
                 position_len: position_ids.len(),
             });
         }
-        if input_ids.is_empty() {
+        if seq_len > self.config.max_position_embeddings {
             return Err(Qwen3Error::InvalidConfig(
-                "forward requires at least one token",
+                "sequence length exceeds context window",
             ));
         }
 
@@ -353,6 +433,12 @@ impl Qwen3Model {
         let sin = select_cache_rows(self.sin_cache, &positions, store)?;
 
         let mut hidden = embedding(self.embed_tokens, &token_indices, store, tape)?;
+        hidden = reshape(
+            hidden,
+            &[batch, seq_len, self.config.hidden_size],
+            store,
+            tape,
+        )?;
         for layer in &self.layers {
             hidden = layer.forward(hidden, &self.config, cos, sin, store, tape)?;
         }
@@ -366,8 +452,53 @@ impl Qwen3Model {
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
+    pub fn forward(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        input_ids: &[u32],
+        position_ids: &[u32],
+    ) -> Result<TensorId> {
+        self.forward_batch(store, tape, input_ids, position_ids, 1, position_ids.len())
+    }
+
     pub fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
         self.param_names.clone()
+    }
+}
+
+impl GrpoPolicyConfig for Qwen3Config {
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+}
+
+impl GrpoPolicy for Qwen3Model {
+    type Config = Qwen3Config;
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn forward_single(
+        &self,
+        input_ids: &[usize],
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        Qwen3Model::forward_tokens(self, input_ids, store, tape)
+    }
+
+    fn all_parameter_ids(&self) -> Vec<TensorId> {
+        Qwen3Model::all_parameter_ids(self)
+    }
+
+    fn clone_frozen(&self, store: &mut TensorStore) -> Self {
+        Qwen3Model::clone_frozen(self, store)
     }
 }
 
@@ -414,6 +545,10 @@ fn linear_forward(
     let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
     output_shape.push(weight_shape[0]);
     Ok(reshape(projected, &output_shape, store, tape)?)
+}
+
+fn qwen3_to_autograd(err: Qwen3Error) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
 }
 
 fn split_heads(
@@ -575,4 +710,48 @@ fn leak_name(name: String) -> &'static str {
 
 fn q_or_kv_heads_tensor(x: TensorId) -> TensorId {
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autograd::{Tape, TensorStore};
+
+    #[test]
+    fn batch_forward_matches_repeated_single_forward() {
+        let cfg = Qwen3Config {
+            vocab_size: 16,
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 16,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1.0e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: false,
+        };
+
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let model = Qwen3Model::new(&cfg, &mut store).expect("model");
+
+        let single_ids = vec![1, 2, 3, 4];
+        let single = model
+            .forward_tokens(&single_ids, &mut store, &mut tape)
+            .expect("single forward");
+        let single_logits = store.to_host(single).expect("single logits");
+
+        tape.entries.clear();
+        let batch_ids = [single_ids.clone(), single_ids.clone()].concat();
+        let batched = model
+            .forward_batch_tokens(&batch_ids, 2, single_ids.len(), &mut store, &mut tape)
+            .expect("batch forward");
+        let batched_logits = store.to_host(batched).expect("batch logits");
+
+        assert_eq!(batched_logits.len(), 2 * single_logits.len());
+        assert_eq!(&batched_logits[..single_logits.len()], &single_logits[..]);
+        assert_eq!(&batched_logits[single_logits.len()..], &single_logits[..]);
+    }
 }

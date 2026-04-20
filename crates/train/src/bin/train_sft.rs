@@ -13,6 +13,7 @@ use autograd::{
     optim::AdamW,
 };
 use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
+use serde_json::json;
 use thiserror::Error;
 use train::{
     StepOutcome, Trainer, TrainerConfig,
@@ -685,6 +686,7 @@ fn save_checkpoint_via_registry(
     fs::create_dir_all(&step_dir)?;
     fs::copy(config_path, step_dir.join("config.json"))?;
     fs::copy(tokenizer_path, step_dir.join("tokenizer.json"))?;
+    write_generation_config(model_dir, config_path, &step_dir)?;
     let weights_path = step_dir.join("model.safetensors");
     match save_dtype {
         SaveDtype::F32 => registry.save_from(store, &weights_path)?,
@@ -710,6 +712,111 @@ fn save_checkpoint_via_registry(
         save_dtype
     );
     Ok(())
+}
+
+fn write_generation_config(
+    model_dir: &Path,
+    config_path: &Path,
+    step_dir: &Path,
+) -> Result<(), CliError> {
+    let target = step_dir.join("generation_config.json");
+    let source = model_dir.join("generation_config.json");
+    if source.is_file() {
+        fs::copy(source, target)?;
+        return Ok(());
+    }
+
+    let config: serde_json::Value = serde_json::from_str(&fs::read_to_string(config_path)?)
+        .map_err(|e| CliError::Custom(format!("save checkpoint config parse error: {e}")))?;
+    let bos_token_id = config
+        .get("bos_token_id")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            CliError::Custom(format!(
+                "source config {} is missing bos_token_id",
+                config_path.display()
+            ))
+        })?;
+    let eos_token_id = config
+        .get("eos_token_id")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            CliError::Custom(format!(
+                "source config {} is missing eos_token_id",
+                config_path.display()
+            ))
+        })?;
+
+    let mut eos_token_ids = vec![eos_token_id];
+    if bos_token_id != eos_token_id {
+        eos_token_ids.push(bos_token_id);
+    }
+    fs::write(
+        target,
+        serde_json::to_string_pretty(&json!({
+            "eos_token_id": eos_token_ids,
+        }))
+        .map_err(|e| CliError::Custom(format!("save checkpoint generation_config json: {e}")))?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn generation_config_is_copied_when_present() {
+        let tmp = tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("model");
+        let step_dir = tmp.path().join("step");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::create_dir_all(&step_dir).expect("create step dir");
+        fs::write(
+            model_dir.join("generation_config.json"),
+            r#"{"eos_token_id":[7,3]}"#,
+        )
+        .expect("write generation config");
+        fs::write(
+            model_dir.join("config.json"),
+            r#"{"bos_token_id":3,"eos_token_id":7}"#,
+        )
+        .expect("write config");
+        fs::write(step_dir.join("dummy"), "").expect("touch step dir");
+
+        write_generation_config(&model_dir, &model_dir.join("config.json"), &step_dir)
+            .expect("copy generation config");
+
+        let copied: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(step_dir.join("generation_config.json")).expect("read file"),
+        )
+        .expect("parse generation config");
+        assert_eq!(copied["eos_token_id"], json!([7, 3]));
+    }
+
+    #[test]
+    fn generation_config_falls_back_to_config_tokens_when_missing() {
+        let tmp = tempdir().expect("tempdir");
+        let model_dir = tmp.path().join("model");
+        let step_dir = tmp.path().join("step");
+        fs::create_dir_all(&model_dir).expect("create model dir");
+        fs::create_dir_all(&step_dir).expect("create step dir");
+        fs::write(
+            model_dir.join("config.json"),
+            r#"{"bos_token_id":3,"eos_token_id":7}"#,
+        )
+        .expect("write config");
+
+        write_generation_config(&model_dir, &model_dir.join("config.json"), &step_dir)
+            .expect("synthesize generation config");
+
+        let generated: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(step_dir.join("generation_config.json")).expect("read file"),
+        )
+        .expect("parse generation config");
+        assert_eq!(generated["eos_token_id"], json!([7, 3]));
+    }
 }
 
 fn has_supervised_target(example: &TokenizedSft) -> bool {

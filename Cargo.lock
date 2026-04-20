@@ -3743,6 +3743,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autograd",
+ "chat",
  "hf-hub",
  "qwen3-spec",
  "safetensors",

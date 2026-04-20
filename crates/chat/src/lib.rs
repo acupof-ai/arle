@@ -11,8 +11,9 @@
 pub mod protocol;
 
 pub use protocol::{
-    ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition, build_tool_block,
-    messages_to_prompt, parse_tool_calls,
+    ChatMessage, ChatMlMessage, ChatMlSpan, ChatRole, ParsedAssistantResponse, RenderedChatMl,
+    ToolCall, ToolDefinition, build_tool_block, messages_to_prompt, parse_tool_calls,
+    render_chatml, render_chatml_with_spans,
 };
 
 use serde::{Deserialize, Serialize};

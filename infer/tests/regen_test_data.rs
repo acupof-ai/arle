@@ -3,6 +3,7 @@
 /// Regenerate model-specific golden data in test_data/<model_name>.json using greedy decoding.
 use std::path::{Path, PathBuf};
 
+use chat::{OpenAiChatMessage, openai_messages_to_prompt};
 use infer::sampler::SamplingParams;
 use infer::server_engine::{CompletionRequest, InferenceEngine, Qwen3InferenceEngine};
 
@@ -82,8 +83,24 @@ fn prompt_style(model_name: &str) -> PromptStyle {
 fn wrap_prompt(prompt: &str, style: PromptStyle) -> String {
     match style {
         PromptStyle::Base => prompt.to_string(),
-        PromptStyle::Instruct => format!(
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        PromptStyle::Instruct => openai_messages_to_prompt(
+            &[
+                OpenAiChatMessage {
+                    role: "system".into(),
+                    content: Some("You are a helpful assistant.".into()),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAiChatMessage {
+                    role: "user".into(),
+                    content: Some(prompt.into()),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            &[],
         ),
     }
 }

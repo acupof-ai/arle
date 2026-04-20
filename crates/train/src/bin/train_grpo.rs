@@ -2,7 +2,7 @@ use std::{collections::HashSet, env, path::PathBuf, process::ExitCode};
 
 use autograd::{
     AutogradError, ConstantLr, Result as AutogradResult, Tape, TensorId, TensorStore,
-    adamw_state::AdamWState, module::Module, optim::AdamW,
+    adamw_state::AdamWState, optim::AdamW,
 };
 use thiserror::Error;
 use train::{
@@ -11,9 +11,8 @@ use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
-    lora::LoraConfig,
     loss::cross_entropy_loss,
-    model::{Transformer, TransformerConfig},
+    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
     rollout::rollout_group,
 };
 
@@ -27,8 +26,6 @@ struct CliArgs {
     lr: f32,
     kl_coef: f32,
     temperature: f32,
-    lora_rank: usize,
-    lora_alpha: f32,
     seed: u64,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
@@ -45,8 +42,6 @@ impl Default for CliArgs {
             lr: 1.0e-4,
             kl_coef: 0.02,
             temperature: 1.0,
-            lora_rank: 0,
-            lora_alpha: 0.0,
             seed: 42,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
@@ -60,6 +55,8 @@ enum CliError {
     Autograd(#[from] AutogradError),
     #[error(transparent)]
     Arg(#[from] ArgError),
+    #[error(transparent)]
+    Qwen3(#[from] Qwen3Error),
     #[error("{0}")]
     Custom(String),
 }
@@ -100,27 +97,16 @@ fn run() -> Result<(), CliError> {
     let args = parse_args()?;
     validate_args(&args)?;
 
-    let mut config = TransformerConfig {
-        max_seq_len: args.seq,
-        ..TransformerConfig::default()
-    };
-    if args.lora_rank > 0 {
-        let alpha = if args.lora_alpha > 0.0 {
-            args.lora_alpha
-        } else {
-            (2 * args.lora_rank) as f32
-        };
-        config.lora = Some(LoraConfig {
-            rank: args.lora_rank,
-            alpha,
-        });
-    }
+    let config = qwen3_config(args.seq);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
-    let policy = Transformer::new(config, &mut store)?;
-    let params = policy.parameters();
-    let base_params = policy.base_parameter_ids();
+    let policy = Qwen3Model::new(&config, &mut store)?;
+    let params = trainable_params(&policy, &store);
+    let keep_extra = policy
+        .all_parameter_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
     let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4752_504F_5052_4F4D);
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
@@ -138,8 +124,14 @@ fn run() -> Result<(), CliError> {
     // We export the final AdamW state so the GRPO-phase optimizer can
     // resume moments + step counter instead of starting cold (codex review
     // on 09c5c89 P1).
-    let sft_optim_state =
-        run_sft_phase(&args, &policy, &params, &base_params, &mut store, &mut tape)?;
+    let sft_optim_state = run_sft_phase(
+        &args,
+        &policy,
+        &params,
+        keep_extra.clone(),
+        &mut store,
+        &mut tape,
+    )?;
 
     // Phase 4 follow-up: extend `--metrics-jsonl` to cover the GRPO phase.
     // `run_sft_phase` already truncated the JSONL file (JsonlSink::create),
@@ -283,9 +275,9 @@ fn run() -> Result<(), CliError> {
 /// copy per step and only fed the println, no correctness concern.
 fn run_sft_phase(
     args: &CliArgs,
-    policy: &Transformer,
+    policy: &Qwen3Model,
     params: &[TensorId],
-    base_params: &[TensorId],
+    keep_extra: HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<AdamWState, CliError> {
@@ -320,7 +312,7 @@ fn run_sft_phase(
     };
     let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
 
-    // Transformer doesn't expose named parameters; synthesize stable
+    // Qwen3 exposes named parameters; synthesize stable
     // names purely to satisfy the Trainer API (no optimizer-state
     // persistence is wired — save_dir is None).
     let param_names: Vec<(TensorId, String)> = params
@@ -329,25 +321,14 @@ fn run_sft_phase(
         .map(|(i, &id)| (id, format!("param.{i:04}")))
         .collect();
 
-    // keep_extra: frozen base-parameter ids that aren't in the trainable
-    // `params` list (LoRA surface). `Transformer::parameters()` already
-    // returns all trainable ids including LoRA adapters; `base_params`
-    // covers the frozen base matmul weights under LoRA so backward
-    // cleanup doesn't evict them. Matches the hand-written
-    // `retained_ids(&[&policy], &store)` behaviour.
-    let mut keep_extra: HashSet<TensorId> = HashSet::new();
-    for &id in base_params {
-        keep_extra.insert(id);
-    }
-
     let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
     let batch_shape = dataset.batch_shape();
     let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
         let (input_ids, target_ids) = dataset.sample();
         let (batch, seq_len) = batch_shape;
         let token_count = (batch * seq_len) as u64;
-
-        let logits = policy.forward(&input_ids, batch, seq_len, ctx.store, ctx.tape)?;
+        let logits =
+            policy.forward_batch_tokens(&input_ids, batch, seq_len, ctx.store, ctx.tape)?;
         let loss_id = cross_entropy_loss(logits, &target_ids, ctx.store, ctx.tape)?;
         Ok(StepOutcome {
             loss_id,
@@ -389,12 +370,6 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--kl-coef" => args.kl_coef = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--temperature" => {
                 args.temperature = parse_value(&flag, next_value(&mut iter, &flag)?)?;
-            }
-            "--lora-rank" => {
-                args.lora_rank = parse_value(&flag, next_value(&mut iter, &flag)?)?;
-            }
-            "--lora-alpha" => {
-                args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--grad-clip" => {
@@ -478,7 +453,39 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
     }
 }
 
-fn retained_ids(models: &[&Transformer], store: &TensorStore) -> HashSet<TensorId> {
+fn qwen3_config(seq: usize) -> Qwen3Config {
+    Qwen3Config {
+        vocab_size: 256,
+        hidden_size: 64,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 16,
+        intermediate_size: 128,
+        max_position_embeddings: seq,
+        rms_norm_eps: 1.0e-6,
+        rope_theta: 1_000_000.0,
+        tie_word_embeddings: false,
+    }
+}
+
+fn trainable_params(model: &Qwen3Model, store: &TensorStore) -> Vec<TensorId> {
+    let mut params = model
+        .param_name_map()
+        .into_values()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|tensor_id| {
+            store
+                .get(*tensor_id)
+                .is_some_and(|tensor| tensor.requires_grad)
+        })
+        .collect::<Vec<_>>();
+    params.sort_unstable();
+    params
+}
+
+fn retained_ids(models: &[&Qwen3Model], store: &TensorStore) -> HashSet<TensorId> {
     let mut keep = HashSet::new();
     for model in models {
         for param_id in model.all_parameter_ids() {
