@@ -78,6 +78,55 @@ fn sum_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
 }
 
 pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    // M5.3b.19: route Dirty::Device inputs through a lazy `sum_all + mul_scalar`
+    // compose on the MLX graph (no new Backend trait method — reuses the
+    // existing lazy `sum_all` from M5.3b.1 and `mul_scalar` from M5.3b.13).
+    // Hot path: CE-loss head `log_softmax → gather_last_dim → mean → mul_scalar`
+    // — without this the CE loss per-step flushes the full log-probs tensor
+    // back to host, reversing every upstream M5.3b lazy win. Dirty::Host and
+    // Dirty::Both stay on the host fast path so host-resident scalars don't
+    // pay an upload+device-reduce+readback.
+    let dirty = store.tensor(a)?.dirty.clone();
+    match dirty {
+        Dirty::Device => mean_device_lazy(a, store, tape),
+        Dirty::Host | Dirty::Both => mean_host_eager(a, store, tape),
+    }
+}
+
+fn mean_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
+    store.ensure_device(a)?;
+    let (input_shape, numel, requires_grad) = {
+        let tensor = store.tensor(a)?;
+        (tensor.shape.clone(), tensor.size, tensor.requires_grad)
+    };
+    let input_handle = store
+        .tensor(a)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "mean: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+
+    let sum_handle = store.backend().sum_all(&input_handle, &input_shape)?;
+    let inv_numel = if numel == 0 { 0.0 } else { 1.0 / numel as f32 };
+    let out_handle = store.backend().mul_scalar(&sum_handle, inv_numel, &[])?;
+    let output_id = store.alloc_device_tensor(Vec::new(), out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Mean,
+            output_id,
+            input_ids: smallvec![a],
+            saved: SavedContext::MeanCtx { input: a, numel },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn mean_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor(a)?.clone();
     let value = input.data.iter().sum::<f32>() / input.size as f32;
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
