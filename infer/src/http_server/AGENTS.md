@@ -70,11 +70,11 @@ implementation detail.
 
 ## Performance verification
 
-External perf measurement of this HTTP surface is done via
-[`vllm-project/guidellm`](https://github.com/vllm-project/guidellm), wrapped
-by [`scripts/bench_guidellm.sh`](../../../scripts/bench_guidellm.sh). That
-wrapper is the **canonical** throughput / TTFT / ITL truth source — do not
-hand-roll alternative load generators when changing anything in this module,
+External perf measurement of this HTTP surface uses
+[`scripts/bench_guidellm.sh`](../../../scripts/bench_guidellm.sh), the
+canonical throughput / TTFT / ITL truth source backed by
+[`vllm-project/guidellm`](https://github.com/vllm-project/guidellm). Do not
+hand-roll alternative load generators when changing anything in this module;
 run the wrapper and snapshot to `docs/experience/wins/`. Canonical params
 and plumbing live in
 [`docs/plans/guidellm-integration.md`](../../../docs/plans/guidellm-integration.md).

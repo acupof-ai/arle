@@ -14,15 +14,20 @@
 
 Everything else is support. If a rule below doesn't serve one of those four, it's optional.
 
-Scope: guidellm sweeps, `scripts/bench_*.py`, and every trace (nsys, ncu,
-Metal capture, MLX instruments, `tracing` spans).
+Scope: canonical guidellm throughput / latency sweeps, supporting
+component-level helper benches, and every trace (nsys, ncu, Metal capture,
+MLX instruments, `tracing` spans). Helper scripts may inform diagnosis, but
+they do not replace `scripts/bench_guidellm.sh` as the throughput / latency
+truth source.
 
 ---
 
 ## 1. Required report sections
 
 Every run produces `docs/experience/wins/YYYY-MM-DD-<kind>-<label>.md` with
-all of these. Missing one → the run doesn't count.
+all of these. Missing one → the run doesn't count. The canonical
+`guidellm` win template mirrors this order so the report and template stay
+aligned.
 
 | # | Section | Content |
 |---|---------|---------|
@@ -42,8 +47,8 @@ reran this?" from §3+§4 alone, the entry is incomplete.
 
 ## 2. Tools
 
-- **`scripts/bench_guidellm.sh <label>`** — canonical e2e sweep. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit.
-- **`scripts/bench_throughput.py` / `bench_kv_cache*.py`** — component-level.
+- **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit.
+- **Helper benches** such as `scripts/bench_throughput.py` and `bench_kv_cache*.py` — legacy or component-level tools for narrower synthetic / diagnostic checks. They cannot replace the canonical wrapper for throughput / latency wins.
 - **`nsys profile` / `ncu --set full`** — CUDA trace → `.nsys-rep` / `.ncu-rep`.
 - **Xcode Metal capture / MLX instruments** — Metal trace → `.gputrace`.
 
