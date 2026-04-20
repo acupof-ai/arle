@@ -1,16 +1,16 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-Hans">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-infer(1) — pure-Rust LLM inference engine</title>
-<meta name="description" content="agent-infer is a pure-Rust LLM inference engine built around multi-turn KV reuse. CUDA primary, Metal on Apple Silicon, OpenAI-compatible HTTP.">
+<title>agent-infer(1) — 纯 Rust LLM 推理引擎</title>
+<meta name="description" content="agent-infer 是一个围绕多轮 KV 复用设计的纯 Rust LLM 推理引擎。CUDA 为主，Apple Silicon 上的 Metal 后端，OpenAI 兼容的 HTTP 接口。">
 <meta name="color-scheme" content="light">
-<meta property="og:title" content="agent-infer — pure-Rust LLM inference engine">
-<meta property="og:description" content="KV-cache-first inference engine for LLM agents. 4.6× faster TTFT than SGLang at c=1. CUDA + Metal backends.">
+<meta property="og:title" content="agent-infer — 纯 Rust LLM 推理引擎">
+<meta property="og:description" content="面向 LLM 智能体的 KV-cache 优先推理引擎。c=1 下 TTFT 比 SGLang 快 4.6×。CUDA + Metal 后端。">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://cklxx.github.io/agent-infer/">
-<link rel="canonical" href="https://cklxx.github.io/agent-infer/">
+<meta property="og:url" content="https://cklxx.github.io/agent-infer/zh-CN.html">
+<link rel="canonical" href="https://cklxx.github.io/agent-infer/zh-CN.html">
 <link rel="alternate" hreflang="en" href="https://cklxx.github.io/agent-infer/">
 <link rel="alternate" hreflang="zh-Hans" href="https://cklxx.github.io/agent-infer/zh-CN.html">
 <link rel="stylesheet" href="./style.css">
@@ -21,12 +21,12 @@
 
 <header class="manhead" aria-label="man page header">
   <span class="manhead-l">AGENT-INFER(1)</span>
-  <span class="manhead-c">General Commands Manual</span>
+  <span class="manhead-c">用户命令手册</span>
   <span class="manhead-r">AGENT-INFER(1)</span>
 </header>
 
 <section class="hero" aria-label="banner">
-<h1 class="sr-only">agent-infer(1) — pure-Rust LLM inference engine</h1>
+<h1 class="sr-only">agent-infer(1) — 纯 Rust LLM 推理引擎</h1>
 <pre class="ascii" aria-hidden="true">
  █████╗  ██████╗ ███████╗███╗   ██╗████████╗       ██╗███╗   ██╗███████╗███████╗██████╗
 ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝       ██║████╗  ██║██╔════╝██╔════╝██╔══██╗
@@ -36,152 +36,152 @@
 ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝          ╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝╚═╝  ╚═╝
 </pre>
 <p class="tagline">
-  pure-Rust LLM inference engine &mdash;
-  <span class="hl">KV-cache-first</span>, built for multi-turn agents.
+  纯 Rust LLM 推理引擎 &mdash;
+  <span class="hl">KV-cache 优先</span>，为多轮智能体而建。
 </p>
 <nav class="jumps" aria-label="sections">
-  <a href="#synopsis">[synopsis]</a>
-  <a href="#performance">[performance]</a>
-  <a href="#backends">[backends]</a>
-  <a href="#quickstart">[quickstart]</a>
-  <a href="#architecture">[architecture]</a>
+  <a href="#synopsis">[概要]</a>
+  <a href="#performance">[性能]</a>
+  <a href="#backends">[后端]</a>
+  <a href="#quickstart">[快速开始]</a>
+  <a href="#architecture">[架构]</a>
   <a href="https://github.com/cklxx/agent-infer">[github]</a>
-  <span class="lang" aria-label="language"><b>en</b> · <a href="./zh-CN.html" hreflang="zh-Hans">zh</a></span>
+  <span class="lang" aria-label="language"><a href="./" hreflang="en">en</a> · <b>zh</b></span>
 </nav>
 </section>
 
 <section id="name">
-<h2>NAME</h2>
+<h2>名称</h2>
 <p class="block">
-  <b>agent-infer</b> &mdash; continuous-batching LLM inference engine in pure
-  Rust. CUDA is the primary serving path; Metal runs on Apple Silicon via an
-  MLX C++ bridge. OpenAI-compatible HTTP API, built-in agent runtime.
+  <b>agent-infer</b> &mdash; 纯 Rust 的持续批处理 LLM 推理引擎。
+  CUDA 为主部署路径；Apple Silicon 通过 MLX C++ 桥接运行 Metal。
+  OpenAI 兼容的 HTTP 接口，内置 agent 运行时。
 </p>
 </section>
 
 <section id="synopsis">
-<h2>SYNOPSIS</h2>
+<h2>概要</h2>
 <pre class="cmd"><span class="p">$</span> infer --model-path <u>Qwen3-4B</u> --port <u>8000</u>      <span class="c"># cuda / linux</span>
 <span class="p">$</span> ./scripts/start_metal_serve.sh               <span class="c"># apple silicon</span>
 <span class="p">$</span> curl localhost:8000/v1/chat/completions \
     -H <i>'content-type: application/json'</i> \
-    -d <i>'{"messages":[{"role":"user","content":"hi"}]}'</i><span class="caret"></span></pre>
+    -d <i>'{"messages":[{"role":"user","content":"你好"}]}'</i><span class="caret"></span></pre>
 </section>
 
 <section id="description">
-<h2>DESCRIPTION</h2>
+<h2>描述</h2>
 <p class="block">
-  Every agent turn pays a prefill tax: system prompt + conversation history +
-  tool results get re-processed as context grows. agent-infer treats prefix-KV
-  reuse as the core problem &mdash; everything else is consequence.
+  智能体每一轮都要付 prefill 税：系统提示 + 历史对话 + 工具结果都会被
+  重新处理。agent-infer 把前缀 KV 复用当成核心问题 &mdash; 其它一切都
+  是结果。
 </p>
 <table class="why">
   <tbody>
-    <tr><td class="cap">Multi-turn KV reuse</td>
-        <td>slot-sticky prefix match; only the new user message prefills.</td></tr>
-    <tr><td class="cap">Token-level KV pool</td>
-        <td>page_size=1, SGLang-style. Zero fragmentation, O(1) alloc/free.</td></tr>
-    <tr><td class="cap">GPU&rarr;CPU offload</td>
-        <td>oldest blocks migrate to host RAM; prefetched before attention.</td></tr>
-    <tr><td class="cap">Copy-on-write blocks</td>
-        <td>paged blocks with ref-counting; N requests share 1&times; prefix.</td></tr>
-    <tr><td class="cap">CUDA Graph decode</td>
-        <td>one captured graph per batch size; 504 launches &rarr; 1 replay.</td></tr>
+    <tr><td class="cap">多轮 KV 复用</td>
+        <td>slot-sticky 前缀匹配；每轮只对新用户消息做 prefill。</td></tr>
+    <tr><td class="cap">Token 级 KV 池</td>
+        <td>page_size=1，SGLang 风格。零碎片，O(1) 分配/释放。</td></tr>
+    <tr><td class="cap">GPU&rarr;CPU 卸载</td>
+        <td>最旧的块迁移到主机内存；注意力前预取回来。</td></tr>
+    <tr><td class="cap">Copy-on-Write 块</td>
+        <td>分页块 + 引用计数；N 个请求共享 1&times; 前缀。</td></tr>
+    <tr><td class="cap">CUDA Graph 解码</td>
+        <td>每个 batch size 一张图；504 次 launch &rarr; 1 次 replay。</td></tr>
   </tbody>
 </table>
 </section>
 
 <section id="performance">
-<h2>PERFORMANCE</h2>
+<h2>性能</h2>
 <p class="block">
-  Qwen3-4B on A100-SXM4-40GB vs SGLang v0.5.9.
+  Qwen3-4B 在 A100-SXM4-40GB 上对比 SGLang v0.5.9。
 </p>
-<pre class="tbl" aria-label="perf table">
+<pre class="tbl" aria-label="性能表">
 ┌─────────────┬──────────────┬────────────┬──────────┬────────────────┐
-│ concurrency │  throughput  │  vs sglang │   ttft   │   vs sglang    │
+│    并发     │     吞吐     │  vs sglang │   ttft   │   vs sglang    │
 ├─────────────┼──────────────┼────────────┼──────────┼────────────────┤
-│      1      │  119.5 tok/s │    0.99×   │   8.6 ms │  <b>4.6× faster</b>   │
-│      4      │  414.8 tok/s │    0.99×   │  53.1 ms │  <b>2.6× faster</b>   │
-│      8      │  811.0 tok/s │    0.92×   │  68.7 ms │  <b>1.1× faster</b>   │
+│      1      │  119.5 tok/s │    0.99×   │   8.6 ms │   <b>快 4.6×</b>      │
+│      4      │  414.8 tok/s │    0.99×   │  53.1 ms │   <b>快 2.6×</b>      │
+│      8      │  811.0 tok/s │    0.92×   │  68.7 ms │   <b>快 1.1×</b>      │
 └─────────────┴──────────────┴────────────┴──────────┴────────────────┘</pre>
 <p class="note">
-  &gt; the cache does the heavy lifting. full methodology + agent benchmark
-  in <a href="https://github.com/cklxx/agent-infer/blob/main/README.md#performance">README</a>.
+  &gt; 重活是缓存在干。完整方法论与 agent 基准见
+  <a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md#%E6%80%A7%E8%83%BD">README</a>。
 </p>
 </section>
 
 <section id="backends">
-<h2>BACKENDS</h2>
+<h2>后端</h2>
 <pre class="tbl">
 ┌───────────────────────────────┬────────────┬──────────────────────────────┐
 │ <b>cuda</b>   · linux / nvidia       │  stable    │ flashinfer · cuda graph      │
-│ <b>metal</b>  · apple silicon        │  beta      │ mlx-sys bridge · dflash on   │
-│ <b>cpu</b>    · smoke tests only     │  dev       │ not a production target      │
+│ <b>metal</b>  · apple silicon        │  beta      │ mlx-sys 桥接 · dflash 默认开 │
+│ <b>cpu</b>    · 仅冒烟测试           │  dev       │ 非部署目标                   │
 └───────────────────────────────┴────────────┴──────────────────────────────┘</pre>
 <p class="note">
-  dflash (speculative decode) is default-on for Qwen3 &amp; Qwen3.5 on Metal
-  since 2026-04-19 &mdash; bit-identical parity vs scalar path, c=1..8 stable.
+  dflash（推测解码）自 2026-04-19 起在 Metal 上对 Qwen3 &amp; Qwen3.5 默认开启 &mdash;
+  与标量路径逐位一致，c=1..8 稳定。
 </p>
 </section>
 
 <section id="models">
-<h2>MODELS</h2>
+<h2>模型</h2>
 <pre class="tbl">
 ┌──────────────────┬───────────────────────────────────┬──────────────┐
-│ Qwen3 (0.5B–72B) │ GQA                               │ ✓ supported  │
-│ Qwen3.5-4B       │ hybrid (linear + full attention)  │ ✓ supported  │
-│ GLM4             │ GQA                               │ ✓ supported  │
-│ Llama 3 / 4      │ GQA                               │ … planned    │
-│ DeepSeek V3 / R1 │ MLA                               │ … planned    │
+│ Qwen3 (0.5B–72B) │ GQA                               │ ✓ 已支持     │
+│ Qwen3.5-4B       │ 混合（线性 + 全注意力）           │ ✓ 已支持     │
+│ GLM4             │ GQA                               │ ✓ 已支持     │
+│ Llama 3 / 4      │ GQA                               │ … 规划中     │
+│ DeepSeek V3 / R1 │ MLA                               │ … 规划中     │
 └──────────────────┴───────────────────────────────────┴──────────────┘</pre>
 </section>
 
 <section id="quickstart">
-<h2>QUICKSTART</h2>
+<h2>快速开始</h2>
 
 <h3>&mdash; CUDA / Linux</h3>
-<pre class="cmd"><span class="c"># docker (recommended)</span>
+<pre class="cmd"><span class="c"># docker（推荐）</span>
 <span class="p">$</span> docker run --gpus all -v $PWD/Qwen3-4B:/model \
     ghcr.io/cklxx/agent-infer:latest --model-path /model --port 8000
 
-<span class="c"># from source</span>
+<span class="c"># 从源码</span>
 <span class="p">$</span> git clone https://github.com/cklxx/agent-infer &amp;&amp; cd agent-infer
 <span class="p">$</span> cargo build -p infer --release
 <span class="p">$</span> ./target/release/infer --model-path /path/to/Qwen3-4B --port 8000</pre>
 
 <h3>&mdash; Metal / Apple Silicon</h3>
-<pre class="cmd"><span class="c"># one-command serve (defaults to Qwen3-0.6B-4bit on :8000)</span>
+<pre class="cmd"><span class="c"># 一条命令起服务（默认 Qwen3-0.6B-4bit，监听 :8000）</span>
 <span class="p">$</span> ./scripts/start_metal_serve.sh
 
-<span class="c"># speculative decode (default-on, Qwen3.5 target + draft)</span>
-<span class="p">$</span> ./scripts/run_dflash.sh              <span class="c"># serve</span>
-<span class="p">$</span> ./scripts/run_dflash.sh bench        <span class="c"># baseline vs dflash</span></pre>
+<span class="c"># 推测解码（Qwen3.5 目标 + 草稿，默认开启）</span>
+<span class="p">$</span> ./scripts/run_dflash.sh              <span class="c"># 起服务</span>
+<span class="p">$</span> ./scripts/run_dflash.sh bench        <span class="c"># 基线 vs dflash</span></pre>
 
 <p class="note">
-  prerequisites: CUDA 12.x · Rust 1.85+ · Python 3.10+ with
-  <code>flashinfer-python</code> (build-time only). Apple Silicon needs only
-  Rust + Xcode CLT.
+  前置要求：CUDA 12.x · Rust 1.85+ · Python 3.10+ 带
+  <code>flashinfer-python</code>（仅构建期）。Apple Silicon 只需
+  Rust + Xcode CLT。
 </p>
 </section>
 
 <section id="api">
 <h2>API</h2>
 <p class="block">
-  OpenAI-compatible. Stable surface:
-  <code>POST /v1/completions</code>,
-  <code>POST /v1/chat/completions</code>,
-  <code>GET  /v1/models</code>.
-  Beta: <code>POST /v1/responses</code> (non-streaming subset + SSE
-  <code>output_text.delta</code>).
-  Ops: <code>GET /metrics</code> (Prometheus), <code>GET /v1/stats</code>.
+  OpenAI 兼容。稳定面：
+  <code>POST /v1/completions</code>、
+  <code>POST /v1/chat/completions</code>、
+  <code>GET  /v1/models</code>。
+  Beta：<code>POST /v1/responses</code>（非流式子集 + SSE
+  <code>output_text.delta</code>）。
+  运维：<code>GET /metrics</code>（Prometheus）、<code>GET /v1/stats</code>。
 </p>
 <pre class="cmd"><span class="p">$</span> curl localhost:8000/v1/chat/completions \
-    -d <i>'{"messages":[{"role":"user","content":"explain kv caching"}],"stream":true}'</i></pre>
+    -d <i>'{"messages":[{"role":"user","content":"解释一下 kv 缓存"}],"stream":true}'</i></pre>
 </section>
 
 <section id="architecture">
-<h2>ARCHITECTURE</h2>
-<pre class="diagram" aria-label="architecture diagram">
+<h2>架构</h2>
+<pre class="diagram" aria-label="架构图">
 ┌────────────────────────────────────────────────────────────────────────┐
 │  HTTP API   /v1/completions · /v1/chat/completions · /v1/models        │
 └────────────────────────────┬───────────────────────────────────────────┘
@@ -205,44 +205,45 @@
 </section>
 
 <section id="files">
-<h2>FILES</h2>
+<h2>文件</h2>
 <pre class="files">
-<a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>           engineering overview · install · api reference
-<a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">/ROADMAP.md</a>          next up · model coverage · architectural bets
-<a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">/CHANGELOG.md</a>        full release history
-<a href="https://github.com/cklxx/agent-infer/tree/main/docs">/docs/</a>               support matrix · stability policy · plans &amp; reviews
-<a href="https://github.com/cklxx/agent-infer/tree/main/crates/cuda-kernels">/crates/cuda-kernels</a> extracted CUDA kernel crate (csrc/ · triton · ffi)
-<a href="https://github.com/cklxx/agent-infer/tree/main/crates/mlx-sys">/crates/mlx-sys</a>      metal backend · mlx c++ bridge</pre>
+<a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md">/README.zh-CN.md</a>     工程概览 · 安装 · API 参考（中文）
+<a href="https://github.com/cklxx/agent-infer/blob/main/README.md">/README.md</a>           engineering overview（English）
+<a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">/ROADMAP.md</a>          接下来 · 模型覆盖 · 架构押注
+<a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">/CHANGELOG.md</a>        完整版本历史
+<a href="https://github.com/cklxx/agent-infer/tree/main/docs">/docs/</a>               支持矩阵 · 稳定性政策 · 计划 &amp; 回顾
+<a href="https://github.com/cklxx/agent-infer/tree/main/crates/cuda-kernels">/crates/cuda-kernels</a> 独立出来的 CUDA kernel crate（csrc/ · triton · ffi）
+<a href="https://github.com/cklxx/agent-infer/tree/main/crates/mlx-sys">/crates/mlx-sys</a>      Metal 后端 · MLX C++ 桥接</pre>
 </section>
 
 <section id="news">
-<h2>NEWS</h2>
+<h2>动态</h2>
 <ul class="news">
-  <li><time class="date" datetime="2026-04-20">2026-04-20</time>&nbsp; Metal DFlash long-prompt prefill fixed; default-on for Qwen3.5 on Metal, validated across guidellm 10-strategy sweep with 5400-token prompts.</li>
-  <li><time class="date" datetime="2026-04-19">2026-04-19</time>&nbsp; DFlash ships default-on for Metal. Qwen3.5-4B-4bit bit-identical parity against scalar path.</li>
-  <li><time class="date" datetime="2026-04-16">2026-04-16</time>&nbsp; Metal packed-batch concurrent decode: <code>extend_kv_cache</code> batch-dim bug repaired; packed decode stable under 4× / 8× concurrency.</li>
+  <li><time class="date" datetime="2026-04-20">2026-04-20</time>&nbsp; Metal DFlash 长提示词 prefill 修复；在 Metal 上对 Qwen3.5 默认开启，通过 guidellm 10-strategy 套件（5400-token 提示词）验证。</li>
+  <li><time class="date" datetime="2026-04-19">2026-04-19</time>&nbsp; DFlash 在 Metal 上默认开启。Qwen3.5-4B-4bit 与标量路径逐位一致。</li>
+  <li><time class="date" datetime="2026-04-16">2026-04-16</time>&nbsp; Metal packed-batch 并发解码：<code>extend_kv_cache</code> batch-dim bug 修好；4× / 8× 并发下 packed decode 稳定。</li>
 </ul>
 <p class="note">
-  full history: <a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a>
+  完整历史：<a href="https://github.com/cklxx/agent-infer/blob/main/CHANGELOG.md">CHANGELOG.md</a>
 </p>
 </section>
 
 <section id="see-also">
-<h2>SEE ALSO</h2>
+<h2>另见</h2>
 <ul class="seealso">
-  <li><a href="https://github.com/cklxx/agent-infer">github.com/cklxx/agent-infer</a> &mdash; source, issues, releases</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/README.md">README.md</a> &mdash; engineering overview</li>
-  <li><a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; next milestones</li>
+  <li><a href="https://github.com/cklxx/agent-infer">github.com/cklxx/agent-infer</a> &mdash; 源码、issue、发版</li>
+  <li><a href="https://github.com/cklxx/agent-infer/blob/main/README.zh-CN.md">README.zh-CN.md</a> &mdash; 中文工程概览</li>
+  <li><a href="https://github.com/cklxx/agent-infer/blob/main/ROADMAP.md">ROADMAP.md</a> &mdash; 接下来的里程碑</li>
   <li><a href="https://github.com/cklxx/agent-infer/blob/main/LICENSE">LICENSE</a> &mdash; MIT</li>
 </ul>
 </section>
 
 <section id="bugs">
-<h2>BUGS</h2>
+<h2>问题反馈</h2>
 <p class="block">
-  report at <a href="https://github.com/cklxx/agent-infer/issues">github.com/cklxx/agent-infer/issues</a>.
-  pull requests welcome &mdash; read
-  <a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> first.
+  到 <a href="https://github.com/cklxx/agent-infer/issues">github.com/cklxx/agent-infer/issues</a> 报告。
+  欢迎 pull request &mdash; 先读一下
+  <a href="https://github.com/cklxx/agent-infer/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>。
 </p>
 </section>
 
@@ -256,7 +257,7 @@
 
 <div class="statusline" role="status" aria-label="status bar">
   <span class="sl-seg sl-mode">NORMAL</span>
-  <span class="sl-seg sl-ok"><span class="dot"></span>&nbsp;online</span>
+  <span class="sl-seg sl-ok"><span class="dot"></span>&nbsp;在线</span>
   <span class="sl-seg">rustc&nbsp;1.85</span>
   <span class="sl-seg">cuda&nbsp;▪&nbsp;metal</span>
   <span class="sl-seg sl-spacer"></span>
