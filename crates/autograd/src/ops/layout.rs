@@ -208,6 +208,105 @@ pub fn slice(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    // M5.3b.16: dispatch on device-handle presence (same gate as reshape /
+    // transpose / rope / embedding). `mlx_slice` is lazy on Metal — fuses
+    // with downstream matmul. Qwen3.5 hits this 2× per attention layer
+    // (q/gate split from the fused q_full projection) × 28 layers = 56
+    // evals/step that previously forced a host readback of q_full.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        slice_device_lazy(x, starts, ends, store, tape)
+    } else {
+        slice_host_eager(x, starts, ends, store, tape)
+    }
+}
+
+fn slice_device_lazy(
+    x: TensorId,
+    starts: &[usize],
+    ends: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(x)?;
+
+    let (input_shape, requires_grad) = {
+        let t = store.tensor(x)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    let rank = input_shape.len();
+    if starts.len() != rank {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: starts.len(),
+        });
+    }
+    if ends.len() != rank {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: rank,
+            got: ends.len(),
+        });
+    }
+    for ((&start, &end), &dim) in starts.iter().zip(ends.iter()).zip(input_shape.iter()) {
+        if start > end {
+            return Err(AutogradError::TapeInvariant(
+                "slice start must be <= end for every axis",
+            ));
+        }
+        if end > dim {
+            return Err(AutogradError::IndexOutOfBounds {
+                index: end,
+                upper: dim,
+            });
+        }
+    }
+    let new_shape: Vec<usize> = starts
+        .iter()
+        .zip(ends.iter())
+        .map(|(&s, &e)| e - s)
+        .collect();
+
+    let x_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "slice: ensure_device left x without a device handle",
+        ))?
+        .clone();
+
+    let out_handle = store
+        .backend()
+        .slice(&x_handle, &input_shape, starts, ends)?;
+    let output_id = store.alloc_device_tensor(new_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::Slice,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::SliceCtx {
+                input_shape,
+                starts: starts.to_vec(),
+                ends: ends.to_vec(),
+            },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn slice_host_eager(
+    x: TensorId,
+    starts: &[usize],
+    ends: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
     let input = store.tensor(x)?.clone();
     let (data, shape) = slice_data(&input.data, &input.shape, starts, ends)?;
     let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);

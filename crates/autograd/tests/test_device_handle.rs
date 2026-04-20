@@ -2,7 +2,8 @@
 use autograd::{
     AdamW, Tape, Tensor, TensorStore, ops::add_broadcast, ops::causal_sdpa, ops::embedding,
     ops::exp, ops::gather_last_dim, ops::gelu, ops::log_softmax, ops::matmul, ops::mul_scalar,
-    ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::sum, ops::transpose, tensor::Dirty,
+    ops::reshape, ops::rmsnorm, ops::rope, ops::silu, ops::slice, ops::sum, ops::transpose,
+    tensor::Dirty,
 };
 use autograd::{Backend, CpuBackend, Result};
 #[cfg(feature = "metal")]
@@ -1468,6 +1469,141 @@ fn metal_add_broadcast_forward_stays_lazy() -> Result<()> {
                 "add_broadcast parity: expected -inf, got metal={a}"
             );
         }
+    }
+
+    Ok(())
+}
+
+/// M5.3b.16: `slice` must stay lazy on Metal. Hot-path use is Qwen3.5's
+/// fused `q_full` projection being split into q + gate per attention layer.
+/// Must not force an eval in forward.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_slice_forward_stays_lazy() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    // Shape mirrors Qwen3.5 q_full projection after reshape:
+    // [batch, seq, heads, head_dim*2] → split into q [..., :head_dim] +
+    // gate [..., head_dim:]
+    let batch = 1usize;
+    let seq = 4usize;
+    let heads = 2usize;
+    let head_dim = 8usize;
+    let k = 5usize;
+
+    let mut store = TensorStore::with_backend(Arc::new(MetalBackend));
+    let mut tape = Tape::new();
+
+    // Feed slice off a matmul so its input is Dirty::Device — this is the
+    // realistic pattern; previously the `ensure_host` at ops.rs::slice
+    // would flush the matmul's lazy graph here.
+    let a_data: Vec<f32> = (0..batch * seq * heads * k)
+        .map(|i| (i as f32) * 0.019 - 0.1)
+        .collect();
+    let w_data: Vec<f32> = (0..k * (head_dim * 2))
+        .map(|i| ((i as f32) * 0.023).cos())
+        .collect();
+    let a = store.from_slice(&a_data, &[batch * seq * heads, k])?;
+    let w = store.from_slice(&w_data, &[k, head_dim * 2])?;
+    store.get_mut(a).expect("a exists").requires_grad = true;
+
+    reset_eval_count();
+
+    let q_full_flat = matmul(a, w, &mut store, &mut tape)?;
+    let after_matmul = eval_count();
+    let q_full = reshape(
+        q_full_flat,
+        &[batch, seq, heads, head_dim * 2],
+        &mut store,
+        &mut tape,
+    )?;
+    let after_reshape = eval_count();
+    let q = slice(
+        q_full,
+        &[0, 0, 0, 0],
+        &[batch, seq, heads, head_dim],
+        &mut store,
+        &mut tape,
+    )?;
+    let after_slice_q = eval_count();
+    let gate = slice(
+        q_full,
+        &[0, 0, 0, head_dim],
+        &[batch, seq, heads, head_dim * 2],
+        &mut store,
+        &mut tape,
+    )?;
+    let after_slice_gate = eval_count();
+    let loss_q = sum(q, &mut store, &mut tape)?;
+    let loss_gate = sum(gate, &mut store, &mut tape)?;
+    let after_sum = eval_count();
+
+    let _g1 = tape.backward(loss_q, &mut store)?;
+    let _g2 = tape.backward(loss_gate, &mut store)?;
+    let after_backward = eval_count();
+
+    assert_eq!(
+        after_matmul, 0,
+        "matmul must stay lazy (M5.3a); saw {after_matmul}"
+    );
+    assert_eq!(
+        after_reshape, 0,
+        "M5.3b.12: reshape must stay lazy; saw {after_reshape}"
+    );
+    assert_eq!(
+        after_slice_q, 0,
+        "M5.3b.16: lazy slice (q window) must not force an eval; saw \
+         {after_slice_q}. Grep for a reintroduced `ensure_host` at \
+         ops.rs::slice or a missing device-lazy dispatch in \
+         layout.rs::slice."
+    );
+    assert_eq!(
+        after_slice_gate, 0,
+        "M5.3b.16: lazy slice (gate window) must not force an eval; saw \
+         {after_slice_gate}"
+    );
+    assert_eq!(
+        after_sum, 0,
+        "M5.3b.1: lazy sum must not force a host readback; saw {after_sum}"
+    );
+    assert!(
+        after_backward <= 6,
+        "forward+backward eval count bounded; saw {after_backward}"
+    );
+
+    // Parity: compare each sliced window element-wise against a CPU slice.
+    let metal_q = store.get(q).expect("q output").data.clone();
+    let metal_gate = store.get(gate).expect("gate output").data.clone();
+
+    let cpu = CpuBackend;
+    let (cpu_q_full_flat, _) = cpu.matmul_forward(
+        &a_data,
+        &[batch * seq * heads, k],
+        &w_data,
+        &[k, head_dim * 2],
+    )?;
+    // cpu_q_full_flat is [batch*seq*heads, head_dim*2]; reshape is a no-op.
+    let row_count = batch * seq * heads;
+    let mut cpu_q = vec![0.0_f32; row_count * head_dim];
+    let mut cpu_gate = vec![0.0_f32; row_count * head_dim];
+    for row in 0..row_count {
+        for col in 0..head_dim {
+            cpu_q[row * head_dim + col] = cpu_q_full_flat[row * (head_dim * 2) + col];
+            cpu_gate[row * head_dim + col] = cpu_q_full_flat[row * (head_dim * 2) + head_dim + col];
+        }
+    }
+    assert_eq!(metal_q.len(), cpu_q.len());
+    assert_eq!(metal_gate.len(), cpu_gate.len());
+    for (a, b) in metal_q.iter().zip(cpu_q.iter()) {
+        assert!((a - b).abs() <= 1e-4, "slice parity (q): metal={a} cpu={b}");
+    }
+    for (a, b) in metal_gate.iter().zip(cpu_gate.iter()) {
+        assert!(
+            (a - b).abs() <= 1e-4,
+            "slice parity (gate): metal={a} cpu={b}"
+        );
     }
 
     Ok(())

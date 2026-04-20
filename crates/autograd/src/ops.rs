@@ -202,7 +202,12 @@ pub fn slice(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(x)?;
+    // M5.3b.16: inner `layout::slice` dispatches on `x.dirty`; a
+    // Dirty::Device input stays lazy via `backend.slice` (composes
+    // `mlx_slice → mlx_contiguous` into the MLX graph), Dirty::Host takes
+    // the host-eager path. Stripping `ensure_host` here is the enabler —
+    // it previously flushed the fused q_full projection's matmul output
+    // to host before every Qwen3.5 attention-layer q/gate split.
     layout::slice(x, starts, ends, store, tape)
 }
 
