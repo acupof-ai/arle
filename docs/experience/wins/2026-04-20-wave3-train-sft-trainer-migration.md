@@ -117,8 +117,11 @@ train_grpo / pretrain_qwen3. Per-iter `mt iter N: ...` println
 replaced by a `MetricSample` emit through the shared sink (which
 tees to stdout when `tee=true`), giving structured JSONL output
 like `{"best_reward":0.125,"loss":..,"mean_kl":..,"mean_reward":..,"step":1}`.
-Codex reviews of 1a24db1 and 8c11856 both came back with no
-findings.
+Codex reviews of 1a24db1, 8c11856, and 13afa3f all came back with no
+findings (13afa3f review fell back to manual patch inspection +
+targeted smoke — `--metrics-jsonl`, `--no-grad-clip`, and `--grad-clip
+NaN` all matched the new code path; residual risk: no automated test
+coverage for the added CLI flags, non-blocking).
 
 Commit 813d4f6 plugs two regressions from the bd5e277 codex review:
 (1) **High** — multi-window eval in `pretrain_qwen3` cleared
