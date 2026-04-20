@@ -1,6 +1,6 @@
 # Doc index
 
-Last refreshed: 2026-04-19. Phase 6 Agent RL 训推一体 through 2026-04-19: M0/M1 autograd, M2a TinyLM + M2b Qwen3 LoRA, M3 GRPO TinyLM, M4.1–M4.8 agent infra, and M5.1 + M5.2 route (b) locked + M5.3-partial (Backend trait + Metal matmul only; remaining M5.3 ops add/mul_scalar/sum/log_softmax/gather/AdamW-Metal + M5.4 Qwen LoRA Mac demo still pending) shipped locally. Remote CUDA acceptance (M3 6 h, M4 24 h hard-set) also still pending.
+Last refreshed: 2026-04-20. Phase 6 Agent RL 训推一体 through 2026-04-20: M0/M1 autograd, M2a TinyLM + M2b Qwen3 LoRA, M3 GRPO TinyLM, M4.1–M4.8 agent infra, and M5.1 + M5.2 route (b) locked + M5.3-partial (Backend trait + Metal matmul only; remaining M5.3 ops add/mul_scalar/sum/log_softmax/gather/AdamW-Metal + M5.4 Qwen LoRA Mac demo still pending) shipped locally. 2026-04-20 also opens the project constitution / SSOT / boundary-tightening refactor as an active cross-cutting plan. Remote CUDA acceptance (M3 6 h, M4 24 h hard-set) also still pending.
 
 PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + execution) · **Research** (feasibility studies) · **Reviews** (standalone audits) · **Resources** (references) · **Areas** (long-running concerns) · **Archives** (inactive). Experience entries (`errors/`, `wins/`, `reviews/`) are listed at the bottom in reverse chronological order; the latest 3 of each are always-loaded per `CLAUDE.md`.
 
@@ -16,6 +16,7 @@ PARA layout: **Projects** (time-bound efforts) · **Plans** (in-flight design + 
 | [projects/xma-future-research.md](projects/xma-future-research.md) | Research radar | Observations on accelerated-model-architecture repos (training/experimental, not serving) |
 | **Plans** | | |
 | [plans/rust-agent-rl-single-node.md](plans/rust-agent-rl-single-node.md) | **Active — opened 2026-04-18** | Phase 6 execution plan. M0 autograd skeleton → M1 core ops → M2 LoRA graft → M3 GRPO closed loop → M4 agent self-evolve → M5 Metal parity. Daily-grain tasks + acceptance gates. Shipped locally through M5.1 + M5.2 route (b) + M5.3-partial (Metal matmul only, see docs/index §Last refreshed); remaining M5.3 Metal ops + M5.4 Mac Qwen LoRA demo + remote CUDA acceptance pending |
+| [plans/2026-04-20-project-constitution-and-refactor-plan.md](plans/2026-04-20-project-constitution-and-refactor-plan.md) | **Active — opened 2026-04-20** | Project-shape refactor: lock identity, define canonical truth surfaces, tighten service/model boundaries, and align docs/bench/release with the runtime spine |
 | [plans/tiered-kv-cache-tasks.md](plans/tiered-kv-cache-tasks.md) | Active | Tiered KV Cache execution split: local Mac / remote GPU / parallel-GPU lanes, milestone-by-milestone |
 | [plans/tiered-kv-cache-m2b-remote-acceptance.md](plans/tiered-kv-cache-m2b-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m2b-remote.md` |
 | [plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md](plans/tiered-kv-cache-m0.3-m3a-remote-acceptance.md) | **Accepted 2026-04-15 on L4** | See `wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md` |

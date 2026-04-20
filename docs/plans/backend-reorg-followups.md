@@ -147,7 +147,7 @@ pub fn capture_decode_graph<F>(...)             // GPU stub: todo!("GPU required
 3. Refactor `scheduler/cuda/decode.rs` to go through `GraphPool::dispatch()` instead of directly deciding Graph vs. Eager based on batch size.
 4. Add a `GraphPool` member to the `Scheduler` struct.
 5. Verify warmup still compiles every pool size (1..128).
-6. Throughput regression check via `scripts/bench_throughput_sweep.py` — this is a hot-path change, any 1% regression is a deal-breaker and means revert.
+6. Throughput regression check via `scripts/bench_guidellm.sh backend-reorg-followup` — this is a hot-path change, any 1% regression is a deal-breaker and means revert.
 
 **Estimated commit count:** 3–5 (scaffold → integration → warmup polish → benchmark snapshot).
 

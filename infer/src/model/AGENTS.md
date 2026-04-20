@@ -70,7 +70,10 @@ O(1) recurrent state.
 4. **`forward_prefill` must populate KV in the state's contiguous cache.**
    The scheduler migrates it into the paged pool after prefill completes.
    Direct paged writes go through `forward_prefill_with_pool` only if you've
-   also wired the scheduler to use it (currently: no).
+   also wired the scheduler to use it (currently: no). When the scheduler
+   does use paged prefill, that path must handle every chunk size, including
+   `len == 1`, and must write KV into the paged pool rather than silently
+   falling back to contiguous decode.
 5. **`DecodeContext` lives on the scheduler for the lifetime of the run.**
    Don't allocate GPU buffers inside `forward_decode_batch` — use the context.
 

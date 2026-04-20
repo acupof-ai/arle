@@ -432,7 +432,7 @@ do_full() {
     echo "  ./target/release/infer --model-path $MODEL_DIR --port 8000"
     echo ""
     echo "  # 5. Run benchmarks"
-    echo "  python scripts/bench_throughput_sweep.py --url http://localhost:8000 --quick"
+    echo "  ./scripts/bench_guidellm.sh cuda-local --target http://localhost:8000"
     echo ""
     echo "  # 6. Run tests"
     echo "  cargo test --release"

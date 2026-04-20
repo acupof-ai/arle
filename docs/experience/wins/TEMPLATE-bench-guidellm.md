@@ -23,7 +23,7 @@ guidellm benchmark \
   --target http://localhost:8000 \
   --model <model> \
   --profile sweep \
-  --data  prompt_tokens=1024,output_tokens=256 \
+  --data  prompt_tokens=4096,output_tokens=256 \
   --max-seconds 60 \
   --random-seed 20260416 \
   --output-dir bench-output/<date>-<label>/ \

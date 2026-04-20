@@ -103,9 +103,7 @@ from the last known page-size-1 BF16 commit and save it as `--label page1`.
 Then run the new build:
 
 ```bash
-python3 scripts/bench_throughput_sweep.py \
-  --label page16 \
-  --model-path models/Qwen3-4B
+scripts/bench_guidellm.sh page16
 ```
 
 Acceptance:

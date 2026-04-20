@@ -863,8 +863,8 @@ the file paths mid-stream; the final local implementation landed on the new
 **Exit**:
 1. `cargo test --release --test e2e` and `--test e2e_qwen35` pass unchanged.
 2. `greedy_consistency` passes unchanged.
-3. `scripts/bench_throughput_sweep.py --label page16` recorded vs
-   `--label page1` baseline in `docs/experience/wins/`.
+3. `scripts/bench_guidellm.sh page16` recorded vs the historical
+   `page1` baseline in `docs/experience/wins/`.
 4. FlashInfer split-KV scheduler does not lose parallelism on short-
    context single-request benches (watch the tail in the sweep).
 
@@ -1057,8 +1057,8 @@ for the stacked M2b + M0.3 + M3a local batches.
 **Exit**:
 1. A long-agent-session benchmark (32k+ cumulative tokens,
    num_slots=4) that OOMs on pre-M3 runs to completion on M3c
-2. `scripts/bench_throughput_sweep.py --label tier-T1` recorded vs a
-   pre-M3 baseline. Steady-state decode throughput regression ≤ 3%.
+2. `scripts/bench_guidellm.sh tier-T1` recorded vs a pre-M3 baseline.
+   Steady-state decode throughput regression ≤ 3%.
 3. `cargo test --release --test e2e_qwen35` unchanged
 4. `grep -rn 'evict_prefix_cache_if_pressured.*evict(' infer/src/`
    returns empty (the watermark loop calls `evict_with_policy`, not

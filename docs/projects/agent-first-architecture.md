@@ -359,7 +359,7 @@ Every item lists: **what** (one-line description), **why** (what it unlocks),
 - **What**: `scripts/bench_agent_trace.py` — replays a multi-turn
   tool-calling trace against a running server, reports TTFT per turn,
   inter-token latency, wall time, and optional JSON snapshot output.
-  Matches `bench_throughput_sweep.py` CLI conventions.
+  Matches the canonical `scripts/bench_guidellm.sh` wrapper conventions.
 - **Why**: The README publishes agent numbers without a reproducible
   script. That is non-falsifiable and blocks honest iteration on A1–A4.
 - **Where**:

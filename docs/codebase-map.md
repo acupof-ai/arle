@@ -2,8 +2,9 @@
 
 Updated 2026-04-15 (post `cuda-kernels` extraction, tiered KV
 M3a/M3b/M3c local, and Metal M0.2a request-state landing).
-Supplemented 2026-04-19 with Phase 6 `crates/autograd` + `crates/train`
-(from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md)).
+Supplemented 2026-04-20 with Phase 6 `crates/autograd` + `crates/train`
+(from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md))
+and the canonical guidellm bench SSOT alignment.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -215,7 +216,8 @@ infer
 
 ### Bench and helper entrypoints
 
-- `scripts/bench_throughput_sweep.py`: standard throughput sweep
+- `scripts/bench_guidellm.sh`: canonical throughput/latency sweep wrapper
+- `scripts/bench_throughput.py`: legacy throughput helper for narrower synthetic/sharegpt runs
 - `scripts/bench_agent_trace.py`: agent-style trace replay
 - `infer/src/bin/metal_bench.rs`: Metal micro/macro benchmark entrypoint
 

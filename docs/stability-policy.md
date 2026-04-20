@@ -55,7 +55,7 @@ Rules:
 
 ## 2. Current Classification
 
-This reflects repository state as of 2026-04-15.
+This reflects repository state as of 2026-04-20.
 
 ### Stable
 
@@ -73,13 +73,13 @@ This reflects repository state as of 2026-04-15.
 - `POST /v1/responses` (current non-streaming subset; streaming parity still pending)
 - CLI agent behavior
 - Metal serving path
+- Metal DFlash speculative decode path
 - GGUF loading path
 - benchmark tooling in `scripts/`
 
 ### Experimental
 
 - fast-moving quantization paths (TurboQuant KV, W2, new quant formats)
-- Metal DFlash speculative decode path
 - speculative decoding framework on CUDA (CPU stubs only today)
 - tensor-parallel scaffolding (sharding math shipped, NCCL comm not wired)
 - undocumented flags or undocumented environment variables

@@ -126,7 +126,7 @@ Verification:
 ```bash
 rg -n "BackendRuntimeHandle" infer/src/bin/metal_serve.rs infer/src/http_server.rs
 cargo test -p infer --no-default-features --features metal,no-cuda metal::scheduler -- --nocapture
-python3 scripts/bench_throughput_sweep.py --url http://127.0.0.1:8000 --quick --label metal-m0.2
+scripts/bench_guidellm.sh metal-m0.2
 ```
 
 Exit signal:

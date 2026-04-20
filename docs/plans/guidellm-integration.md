@@ -1,7 +1,7 @@
 # GuideLLM integration — canonical bench truth source
 
-**Status:** 🟡 planned (2026-04-16) — execution to be delegated to Codex.
-**Owner:** ckl. **Drives:** replaces `scripts/bench_throughput_sweep.py`
+**Status:** 🟡 planned (2026-04-20) — execution to be delegated to Codex.
+**Owner:** ckl. **Drives:** replaces the legacy throughput helper (`scripts/bench_throughput.py`)
 as the project's **canonical throughput/latency measurement tool**.
 **Trigger:** 2026-04-16 discussion — the house-grown sweep script
 overlaps 1:1 with a well-maintained upstream tool ([vllm-project/guidellm](https://github.com/vllm-project/guidellm)),
@@ -14,8 +14,8 @@ stop hand-rolling.
 ## 1 · Why guidellm becomes the truth source
 
 - **LLM-native metrics**: TTFT / ITL / tok-s / request-rate distributions
-  with p50/p90/p95/p99, not generic HTTP RPS. Our existing
-  `bench_throughput_sweep.py` only emits mean + stddev.
+  with p50/p90/p95/p99, not generic HTTP RPS. Our existing throughput
+  helper only emits mean + stddev.
 - **sweep profile** auto-scans from `synchronous` to saturation — one
   command replaces our manual concurrency grid.
 - **HTML report** is shareable; JSON is machine-readable for diffing across
@@ -40,7 +40,7 @@ stop hand-rolling.
 
 | # | Decision | Rationale |
 |---|---|---|
-| 1 | **guidellm = sole truth** for throughput / TTFT / ITL wins. `bench_throughput_sweep.py` is deleted; historical wins that cited it stay readable. | Single canonical tool; no duplicate scripts. |
+| 1 | **guidellm = sole truth** for throughput / TTFT / ITL wins. `bench_throughput.py` is retained only for historical / narrow helper runs; new wins use the guidellm wrapper. | Single canonical tool; no duplicate scripts. |
 | 2 | **Wrapper script assumes the server is already running.** | Avoids "my bench crashed the server" failure mode; keeps concerns orthogonal. |
 | 3 | **Same canonical config for CUDA and Metal backends.** | One `profile=sweep`, one dataset shape — makes cross-backend comparison a pure hardware delta, not a dataset delta. |
 
@@ -62,9 +62,10 @@ subject says so, and new wins reference the date of the change.
 ```
 
 **Why these specific numbers:**
-- `prompt_tokens=1024,output_tokens=256` — midpoint of the shapes already
-  appearing in `docs/experience/wins/` (tiered-KV entries hover around
-  1K prompts; Metal Qwen3.5 decode wins use 512–2048).
+- `prompt_tokens=4096,output_tokens=256` — matches the shipped wrapper and
+  the long-context / parity sweeps already used as canonical truth points.
+  Shorter probes such as `1024/256` remain useful for focused smoke checks,
+  but they are not the baseline.
 - `--max-seconds 60` — sweep visits ~6 rate points, so total ~6–10 min per
   run; short enough to run before lunch, long enough for percentiles to
   stabilise. Do NOT drop below 30s — p99 noise explodes.
@@ -87,7 +88,7 @@ agent-infer/
 ├── requirements-bench.txt                                             # ← + guidellm
 ├── scripts/
 │   ├── bench_guidellm.sh                                              # ← NEW canonical wrapper
-│   └── bench_throughput_sweep.py                                      # ← deprecation banner
+│   └── bench_throughput.py                                            # ← legacy helper / deprecation banner
 ├── bench-output/                                                      # ← gitignored, raw guidellm JSON/HTML
 ├── docs/
 │   ├── experience/wins/
@@ -131,7 +132,7 @@ Behaviour:
         guidellm benchmark \
             --target "$TARGET" --model "$MODEL" \
             --profile sweep \
-            --data "prompt_tokens=1024,output_tokens=256" \
+            --data "prompt_tokens=4096,output_tokens=256" \
             --max-seconds 60 \
             --random-seed 20260416 \
             --output-dir "bench-output/$(date +%Y-%m-%d)-$LABEL/" \
@@ -172,7 +173,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - Non-default flags: <env vars, server flags>
 
 ## Canonical params
-- `--profile sweep  --data prompt_tokens=1024,output_tokens=256  --max-seconds 60  --random-seed 20260416`
+- `--profile sweep  --data prompt_tokens=4096,output_tokens=256  --max-seconds 60  --random-seed 20260416`
 - Wrapper: `scripts/bench_guidellm.sh <label>`
 
 ## Results (headline table)
@@ -198,7 +199,7 @@ the `<date>-<label>` naming enforces it at the filesystem level.
 
 Replace:
 
-> - Tool: `scripts/bench_throughput_sweep.py --label <name>`.
+> - Tool: `scripts/bench_throughput.py --label <name>`.
 
 With:
 
@@ -206,7 +207,7 @@ With:
 >   around [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm)).
 >   Parameters are locked in `docs/plans/guidellm-integration.md` §3;
 >   changing them is a deliberate commit, not a flag flip.
-> - `scripts/bench_throughput_sweep.py` is **deprecated**; kept only so
+> - `scripts/bench_throughput.py` is **deprecated**; kept only so
 >   historical wins remain reproducible. New wins MUST use the guidellm
 >   wrapper.
 
@@ -228,13 +229,13 @@ Codex-executable gates. Implementation is complete when all hold:
    created and is populated with a real metric table (not just the template).
 6. `bench-output/` is ignored by git (not in `git status --porcelain`
    after a run).
-7. `scripts/bench_throughput_sweep.py --help` still works AND prints a
+7. `scripts/bench_throughput.py --help` still works AND prints a
    `DEPRECATED: use scripts/bench_guidellm.sh instead` notice to stderr
    before the normal help.
-8. `CLAUDE.md` §Benchmarks no longer mentions `bench_throughput_sweep.py`
-   as the canonical tool.
-9. `grep -R "bench_throughput_sweep" docs/ | wc -l` drops only where it's
-   called out as deprecated — historical wins must still reference it.
+8. `CLAUDE.md` §Benchmarks points at the canonical `scripts/bench_guidellm.sh`
+   wrapper.
+9. Historical wins may still reference the old sweep script, but active docs
+   must use the canonical wrapper.
 
 No Rust touched. No nvcc touched. This is purely shell + Python deps +
 docs.
@@ -271,8 +272,8 @@ wins template (§6). Reason: planning + docs per CLAUDE.md delegation rule.
 
 **Codex owns**: `scripts/bench_guidellm.sh` (shell + jq), `pyproject.toml`
 bench extra edit, `requirements-bench.txt` edit, `.gitignore` edit, the
-`bench_throughput_sweep.py` deprecation banner, and running the
-acceptance criteria §8 gates on a reachable server.
+`bench_throughput.py` deprecation banner, and running the acceptance
+criteria §8 gates on a reachable server.
 
 **Hand-off order:**
 1. Claude writes this doc (done).
