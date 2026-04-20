@@ -1,5 +1,17 @@
 [workspace]
-members = [".", "infer", "crates/agent", "crates/autograd", "crates/chat", "crates/cli", "crates/cuda-kernels", "crates/mlx-sys", "crates/tools", "crates/train"]
+members = [
+    ".",
+    "infer",
+    "crates/agent",
+    "crates/autograd",
+    "crates/chat",
+    "crates/cli",
+    "crates/cuda-kernels",
+    "crates/mlx-sys",
+    "crates/qwen3-spec",
+    "crates/tools",
+    "crates/train",
+]
 
 [workspace.package]
 version = "0.1.0"

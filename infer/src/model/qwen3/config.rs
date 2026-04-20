@@ -1,35 +1,33 @@
-use anyhow::Result;
-use serde::Deserialize;
 use std::fs;
+use std::ops::Deref;
+use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+use anyhow::Result;
+use qwen3_spec::Qwen3Config as Qwen3Spec;
+use serde_json::{Value, json};
+
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_hidden_layers: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub vocab_size: usize,
-    pub rms_norm_eps: f32,
-    pub rope_theta: f32,
+    pub spec: Qwen3Spec,
     pub bos_token_id: u32,
     pub eos_token_id: u32,
-    pub tie_word_embeddings: bool,
-    #[serde(default)]
-    pub max_position_embeddings: Option<usize>,
-    #[serde(default)]
-    pub context_length: Option<usize>,
-    #[serde(skip)]
     pub stop_token_ids: Vec<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Deref for Config {
+    type Target = Qwen3Spec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct GenerationConfig {
     eos_token_id: EosTokenIds,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum EosTokenIds {
     Single(u32),
@@ -46,32 +44,48 @@ impl EosTokenIds {
 }
 
 impl Config {
-    pub fn from_file(model_path: &str) -> Result<Self> {
-        let config_path = format!("{}/config.json", model_path);
-        let content = fs::read_to_string(&config_path)?;
-        let mut config: Config = serde_json::from_str(&content)?;
-        config.stop_token_ids = Self::load_stop_token_ids(model_path, config.eos_token_id)?;
-        Ok(config)
+    pub fn from_parts(
+        spec: Qwen3Spec,
+        bos_token_id: u32,
+        eos_token_id: u32,
+        stop_token_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            spec,
+            bos_token_id,
+            eos_token_id,
+            stop_token_ids,
+        }
     }
 
-    pub fn lm_head_tensor_name(&self) -> &'static str {
-        if self.tie_word_embeddings {
-            "model.embed_tokens.weight"
-        } else {
-            "lm_head.weight"
+    pub fn from_file(model_path: &str) -> Result<Self> {
+        let config_path = Path::new(model_path).join("config.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
+        if value.get("max_position_embeddings").is_none() {
+            if let Some(context_length) = value.get("context_length").and_then(Value::as_u64) {
+                value["max_position_embeddings"] = json!(context_length as usize);
+            }
         }
+
+        let spec = Qwen3Spec::from_json_value(&value)?;
+        let bos_token_id = read_u32(&value, "bos_token_id")?;
+        let eos_token_id = read_u32(&value, "eos_token_id")?;
+        let stop_token_ids = Self::load_stop_token_ids(model_path, eos_token_id)?;
+
+        Ok(Self {
+            spec,
+            bos_token_id,
+            eos_token_id,
+            stop_token_ids,
+        })
     }
 
     pub fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token_ids.contains(&token_id)
     }
 
-    pub fn rope_cache_len_hint(&self) -> Option<usize> {
-        self.max_position_embeddings.or(self.context_length)
-    }
-
     fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
-        let generation_config_path = format!("{}/generation_config.json", model_path);
+        let generation_config_path = Path::new(model_path).join("generation_config.json");
         match fs::read_to_string(&generation_config_path) {
             Ok(content) => {
                 let generation_config: GenerationConfig = serde_json::from_str(&content)?;
@@ -85,6 +99,14 @@ impl Config {
             Err(err) => Err(err.into()),
         }
     }
+}
+
+fn read_u32(value: &Value, field: &'static str) -> Result<u32> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .map(|raw| raw as u32)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid config field `{field}`"))
 }
 
 #[cfg(test)]
