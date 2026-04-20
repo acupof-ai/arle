@@ -985,3 +985,107 @@ fn metal_adamw_step_stays_device_resident() -> Result<()> {
 
     Ok(())
 }
+
+/// M5.3b.11: per-step eval count must stay at ~1 regardless of parameter
+/// count. Before this milestone, `backend_metal::adamw_step` issued its own
+/// terminal `mlx_eval([new_param, new_m, new_v])` inside every call, so the
+/// total per step scaled with `num_params` — Qwen3.5-class models (~200
+/// trainable params) paid ~200 evals/step from AdamW alone, swamping every
+/// other optimization on this device path.
+///
+/// The fix hoists that eval to `AdamW::step_device`'s post-loop, firing one
+/// `backend.eval(&handles)` over every param's `(new_param, new_m, new_v)`
+/// at the end of the step. Independent per-param MLX chains share no
+/// sub-node, so batching them into one eval is semantically safe.
+///
+/// The assertion below compares N=1 vs N=8 params and fails if the 8-param
+/// case charges more than a small additive slack over the 1-param case. If
+/// this test starts failing, grep `backend_metal::adamw_step` for an
+/// accidental `mlx_eval` reintroduction, or verify that
+/// `AdamW::step_device`'s terminal `backend.eval(&refs)` is still the only
+/// eval-point in the optimizer step.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_adamw_step_batches_eval_across_params() -> Result<()> {
+    use autograd::backend_metal::{MetalBackend, eval_count, reset_eval_count};
+
+    let _lock = METAL_TEST_LOCK.lock().expect("metal test lock poisoned");
+
+    const LR: f32 = 1e-3;
+    const BETAS: (f32, f32) = (0.9, 0.95);
+    const EPS: f32 = 1e-8;
+    const WD: f32 = 0.01;
+
+    let shape = vec![8, 8];
+    let size: usize = shape.iter().product();
+
+    // Measure eval count for N params. Setup is identical to the
+    // single-param test, just parameterized.
+    let measure = |n_params: usize| -> Result<u64> {
+        let backend: Arc<MetalBackend> = Arc::new(MetalBackend);
+        let mut store = TensorStore::with_backend(backend.clone());
+        let mut param_ids = Vec::with_capacity(n_params);
+        for p in 0..n_params {
+            let init: Vec<f32> = (0..size)
+                .map(|i| ((p * 97 + i) as f32 * 0.001) - 0.05)
+                .collect();
+            let param_id =
+                store.alloc(Tensor::new(init, shape.clone(), true).expect("param tensor"));
+            let grad_id = store
+                .alloc(Tensor::new(vec![0.0; size], shape.clone(), false).expect("grad tensor"));
+            store.get_mut(param_id).expect("param exists").grad = Some(grad_id);
+            let grad_tensor = store.get_mut(grad_id).expect("grad exists");
+            for (i, value) in grad_tensor.data.iter_mut().enumerate() {
+                *value = ((p * 13 + i) as f32 * 0.0003) - 0.015;
+            }
+            store.ensure_device(param_id)?;
+            param_ids.push(param_id);
+        }
+
+        let mut opt = AdamW::new_with_device(LR, BETAS, EPS, WD, backend.clone());
+
+        reset_eval_count();
+        opt.step(&param_ids, &mut store);
+        let step_evals = eval_count();
+
+        // Sanity: every param remains Dirty::Device with a live handle.
+        for &pid in &param_ids {
+            let t = store.get(pid).expect("param still present");
+            assert_eq!(
+                t.dirty,
+                Dirty::Device,
+                "M5.3b.11: param {pid} drifted off-device after AdamW step; \
+                 saw dirty={:?}",
+                t.dirty
+            );
+            assert!(
+                t.device_handle.is_some(),
+                "M5.3b.11: param {pid} lost its device handle after AdamW step"
+            );
+        }
+
+        Ok(step_evals)
+    };
+
+    let one = measure(1)?;
+    let eight = measure(8)?;
+
+    // Budget: 1-param case should be ~1 eval (terminal batched eval).
+    // 8-param case should be the SAME eval budget — the batched terminal
+    // eval composes all 8 params' chains into a single `mlx_eval`.
+    assert!(
+        one <= 2,
+        "M5.3b.11: 1-param AdamW step reported {one} evals; expected ≤ 2. \
+         The terminal `backend.eval` should fire exactly once."
+    );
+    assert!(
+        eight <= one + 1,
+        "M5.3b.11: 8-param AdamW step reported {eight} evals vs {one} for 1 \
+         param. Budget is `one + 1` (tiny slack for platform-level jitter); \
+         linear scaling here means the per-op terminal `mlx_eval` crept \
+         back into `backend_metal::adamw_step` and is being re-charged per \
+         param. Grep for `bump_eval_count` / `mlx_eval` inside adamw_step."
+    );
+
+    Ok(())
+}
