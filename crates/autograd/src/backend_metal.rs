@@ -307,6 +307,75 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy row-wise softmax over the last axis. Composes
+    // `mlx_softmax_axis(x, -1, keepdims=true)` into the MLX graph with
+    // no `mlx_eval` — the tape's terminal flush is the single eval
+    // boundary. Mirrors the eager `mlx_softmax_like` path but skips the
+    // upload-from-host + eval+readback tail since `x` is already an MLX
+    // array. M5.3b.2.
+    fn softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot softmax a non-metal device handle",
+            ));
+        };
+        validate_softmax_shape(shape)?;
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // `mlx_softmax_axis` returns a fresh node that we transfer into a
+        // new `MlxHandle`. `MLX_GUARD` serializes MLX state access.
+        let out = unsafe {
+            let out_arr = mlx_softmax_axis(x_handle.as_ptr(), -1_i32, true);
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_softmax_axis returned null (softmax_last_axis)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+
+        Ok(out)
+    }
+
+    // Lazy row-wise log-softmax over the last axis. Composes
+    // `x - mlx_logsumexp_axis(x, -1, keepdims=true)` into the MLX graph
+    // with no `mlx_eval`. The intermediate `lse` node is freed after the
+    // subtract; the returned handle owns the subtract result. M5.3b.2.
+    fn log_softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot log_softmax a non-metal device handle",
+            ));
+        };
+        validate_softmax_shape(shape)?;
+
+        let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+        // Safety: `x_handle` is a live MLX array borrowed for this call;
+        // `lse` is allocated here and freed before return; the `diff`
+        // result is transferred into the returned `MlxHandle`.
+        let out = unsafe {
+            let lse = mlx_logsumexp_axis(x_handle.as_ptr(), -1_i32, true);
+            if lse.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_logsumexp_axis returned null (log_softmax_last_axis)",
+                ));
+            }
+            let diff = mlx_subtract(x_handle.as_ptr(), lse);
+            mlx_array_free(lse);
+            if diff.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_subtract returned null (log_softmax_last_axis)",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(diff))
+        };
+
+        Ok(out)
+    }
+
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         if a.len() != b.len() {
             return Err(AutogradError::ShapeMismatch {
@@ -600,6 +669,25 @@ fn mlx_matmul_backward(
         mlx_array_free(g_arr);
         Ok((grad_a_host, grad_b_host))
     }
+}
+
+// Shared shape validation for the lazy softmax / log_softmax device-handle
+// paths. Pre-M5.3b.2 the eager `mlx_softmax_like` also checked `x.len()`
+// against `product(shape)`; for the lazy path we trust MLX's own shape
+// on the input handle (the caller built it via `upload(shape)`), so we
+// only guard against degenerate rank / last-dim.
+fn validate_softmax_shape(shape: &[usize]) -> Result<()> {
+    let last_dim = *shape.last().ok_or(AutogradError::InvalidRank {
+        expected: "at least 1",
+        got: 0,
+    })?;
+    if last_dim == 0 {
+        return Err(AutogradError::InvalidRank {
+            expected: "non-zero last dim",
+            got: 0,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Copy, Clone)]

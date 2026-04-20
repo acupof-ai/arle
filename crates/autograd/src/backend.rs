@@ -216,6 +216,26 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_log_softmax_forward_last_axis(x, shape)
     }
 
+    /// Device-handle variant of `softmax_forward_last_axis`. Lazy on backends
+    /// that can compose softmax into their graph (Metal: `mlx_softmax_axis`);
+    /// the default implementation falls back to `readback → host compute →
+    /// upload` so CPU/CUDA need no special-case. M5.3b.2.
+    fn softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.softmax_forward_last_axis(&host, shape)?;
+        self.upload(&out, shape)
+    }
+
+    /// Device-handle variant of `log_softmax_forward_last_axis`. Lazy on
+    /// backends that can compose into their graph (Metal uses
+    /// `mlx_logsumexp_axis` + `mlx_subtract`); the default implementation
+    /// falls back to `readback → host compute → upload`. M5.3b.2.
+    fn log_softmax_last_axis(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.log_softmax_forward_last_axis(&host, shape)?;
+        self.upload(&out, shape)
+    }
+
     /// Elementwise `out = a * b` over identically-sized contiguous tensors.
     fn mul_forward(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
         cpu_mul_forward(a, b)
