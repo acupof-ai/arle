@@ -60,6 +60,20 @@ scripts/bench_guidellm.sh metal-qwen36-compiled-moe
 | conc4 | 5165.1 | 12581.4 | 53.52 | 61.64 | 41.35 | 0.073 |
 | conc8 | 8791.5 | 33763.3 | 57.05 | 59.27 | 41.16 | 0.073 |
 
+### Local serial prefill check (`metal_bench`, non-canonical)
+
+All runs below were re-run **serially** with `--warmup 1 --runs 2 --generation-tokens 1`.
+This corrected an earlier false conclusion caused by `warmup=0`, which let
+one-time initialization dominate TTFT and under-report prompt throughput.
+
+| path | prompt tokens | prompt tok/s mean | TTFT mean (ms) |
+|---|---:|---:|---:|
+| direct | 512 | 849.4 | 605 |
+| direct | 1024 | 905.2 | 1133 |
+| direct | 2048 | 917.1 | 2234 |
+| step-driver | 1024 | 896.7 | 1142 |
+| step-driver | 2048 | 900.4 | 2274 |
+
 ## Problems
 
 - The canonical `guidellm` sweep has not been run yet.
@@ -73,15 +87,18 @@ scripts/bench_guidellm.sh metal-qwen36-compiled-moe
   lines at phase boundaries. `guidellm` still reported `Err Tot = 0` for all
   four concurrency levels, so these look like client-side stream teardown
   noise rather than request failures.
+- The earlier `warmup=0` one-shot `metal_bench` runs materially under-reported
+  Qwen3.6 prefill. They are still retained below as historical observations,
+  but they should not be treated as the current best local prefill number.
 
 ## Learnings
 
 - Re-attaching Qwen3.6 MoE to `cpp_model` materially improves prefill/TTFT
   before any DFlash work: the step-driver prefill path switched from
   `rust_scalar_prefill` to `cpp_batch_prefill`.
-- The next gap to close against public MLX/oMLX numbers is still prefill
-  efficiency; compiled MoE improved local TTFT substantially, but not yet to
-  the ~2.6 s public reference level.
+- Under the correct serial/warm local bench shape, Qwen3.6 prefill is already
+  strong: ~`900 tok/s` at `1k-2k` prompt lengths on this M4 Pro box.
+- The remaining performance gap is decode / serving throughput, not prefill.
 - The local quick run completed at concurrency `1,2,4,8` without killing
   `metal_serve`; on this host the practical saturation point for the
   `512 / 128` profile is around `~55 out tok/s` at `conc2`.
@@ -111,11 +128,20 @@ scripts/bench_guidellm.sh metal-qwen36-compiled-moe
 - Local observations:
   - `metal_bench --use-step-driver`: `cpp_batch_prefill`, prompt `125.0 tok/s`, generation `38.8 tok/s`, TTFT `8192.6 ms`
   - `metal_bench` direct path: prompt `205.3 tok/s`, generation `8.4 tok/s`, TTFT `4987.6 ms`
+  - Serial rerun (`warmup=1`, `runs=2`, `gen=1`) corrected the prefill number:
+    - direct `512`: `849.4 tok/s`, `TTFT 605 ms`
+    - direct `1024`: `905.2 tok/s`, `TTFT 1133 ms`
+    - direct `2048`: `917.1 tok/s`, `TTFT 2234 ms`
+    - step-driver `1024`: `896.7 tok/s`, `TTFT 1142 ms`
+    - step-driver `2048`: `900.4 tok/s`, `TTFT 2274 ms`
   - HTTP `/v1/chat/completions`: succeeded; startup log reported `C++ forward model ready (all 40 layers wired through one step call)` and `Metal live prefix cache enabled`
   - `guidellm --quick`: completed all four concurrency levels and wrote:
     - `bench-output/2026-04-20-metal-qwen36-compiled-moe-quick/benchmarks.json`
     - `bench-output/2026-04-20-metal-qwen36-compiled-moe-quick/benchmarks.csv`
     - `bench-output/2026-04-20-metal-qwen36-compiled-moe-quick/benchmarks.html`
+  - `wired_limit` check: raising `iogpu.wired_limit_mb` to `25000` produced no
+    meaningful change in local `1024 / 1` prompt throughput, so it is not the
+    main limiter for this workload on this machine
 - Remote canonical artefacts: pending.
 
 ## Notes
@@ -125,6 +151,9 @@ scripts/bench_guidellm.sh metal-qwen36-compiled-moe
   - `crates/mlx-sys/src/mlx_qwen35_model.cpp`: compiled model stores MoE layer state and runs the sparse-MoE block in `forward_impl`
   - `crates/mlx-sys/src/mlx_qwen35_moe_block.cpp`: array-native helper split from the C ABI wrapper
 - Suspected cause of any remaining regression vs oMLX: compiled MoE removes the Rust fallback, but the packed serving path still needs more prefill optimization to match MLX-native baselines.
+- Updated hypothesis after serial rerun: prefill is already in good shape; the
+  next real target is decode / serving throughput, and DFlash is still the
+  most plausible lever.
 - Follow-ups:
   - Run the canonical `guidellm` sweep on a dedicated Apple Silicon host
   - Compare compiled-MoE prefill against the public oMLX `M4 Pro 48 GB` reference
