@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 同进程训推 / 训练端从零写
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现仍是独立 `train` crate + TCP control plane） / 训练端从零写
 
 ---
 
@@ -166,7 +166,7 @@ M0 结束时 ckl 应该能用一句话说清：
 
 ### 5.3 验收门槛
 
-- ✅ 单进程训练 + 推理共享 GPU，6 小时稳定
+- ✅ 训练与推理共享同一模型权威，6 小时稳定；实现上可同进程，也可通过异步 worker 边界落地
 - ✅ held-out reward 单调不降（允许短时波动，窗口均值上升）
 - ✅ 不是 reward hack：人工抽检 20 个 sample，至少 15 个解题路径合理（而不是"蒙对答案"）
 - ✅ KL 到 ref policy 在合理带内（β 调到 KL 1.0 附近）
