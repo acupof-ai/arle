@@ -186,16 +186,18 @@ Important server limitation:
 
 ## Supported combinations
 
-Working today:
+Working today (both default-on since commit `47f958f`, 2026-04-19):
 
-- target family: `Qwen3`
+- `Qwen3` (bf16) + Metal DFlash
+- `Qwen3.5` (hybrid 4-bit) + Metal DFlash
 - backend: `metal`
 - build flags: `--no-default-features --features metal,no-cuda`
 
-Rejected today:
+Rejected:
 
-- `Qwen3.5` + Metal DFlash
+- CUDA backend (Metal-only today)
 - DFlash without a draft model
+- Draft / target with mismatched `hidden_size`
 
 ## Removed environment variables
 
