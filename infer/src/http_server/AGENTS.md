@@ -11,8 +11,8 @@ implementation detail.
 | `POST /v1/completions` | `http_server.rs` via `openai_v1::CompletionRequest` | Raw prompt. Streaming via SSE, `stream_options.include_usage` adds a final usage chunk. |
 | `POST /v1/chat/completions` | via `openai_v1::ChatCompletionRequest` | Uses `infer_chat::openai_messages_to_prompt` to render ChatML. |
 | `POST /v1/responses` | via `openai_v1::ResponsesRequest` | Newer API surface; uses `max_output_tokens`, not `max_tokens`. |
-| `GET /v1/models` | `ModelsListResponse::single(model_id, ...)` | Always returns the one configured model. `owned_by = "agent-infer"`. |
-| `GET /v1/stats` | scheduler metrics readout | Defined on the request handle, not here directly. |
+| `GET /v1/models` | `ModelsListResponse::single(model_id, ...)` | Reads the boot-time `ServingIdentity` snapshot from `AppState`; `owned_by = "agent-infer"`. |
+| `GET /v1/stats` | scheduler metrics readout | Defined on `AppState.metrics`; not part of the serving-identity snapshot. |
 | Auth | optional `HttpServerConfig.api_key` | Bearer check in `http_server.rs`. |
 
 ## Invariants
@@ -39,11 +39,16 @@ implementation detail.
    response. The order matters: text_delta first, then finish_reason, then
    usage, then logprob-per-token. If you reorder, the non-streaming path
    drops data.
-6. **The handle is `dyn RequestHandle`, not a concrete type.** The HTTP
-   layer must never know whether it's talking to the CUDA scheduler
+6. **Split the HTTP state deliberately.** `RequestHandle` remains the
+   submission path; `AppState.metrics` is the stats path; `AppState.identity`
+   is the boot-time serving identity snapshot (`model_id` + DFlash init
+   metadata). The HTTP handlers must read served identity from `AppState`,
+   not by calling back into the handle on every request.
+7. **The handle is still `dyn RequestHandle`, not a concrete type.** The
+   HTTP layer must never know whether it's talking to the CUDA scheduler
    (`SchedulerHandle`) or `BackendRuntimeHandle` (Metal/CPU). Adding a
    backend-specific path here re-creates the cfg-leak problem.
-7. **`stop`, `stop_token_ids`, `ignore_eos`, `seed`** are all first-class
+8. **`stop`, `stop_token_ids`, `ignore_eos`, `seed`** are all first-class
    sampling inputs. The match between these and `SamplingParams` is
    one-to-one via `sampling_params_from_request` — don't branch.
 

@@ -45,8 +45,19 @@ use openai_v1::{
 
 struct AppState {
     handle: Arc<dyn RequestHandle>,
+    identity: ServingIdentity,
     metrics: ServerMetrics,
     config: HttpServerConfig,
+}
+
+/// Boot-time serving identity captured once when the router is built.
+///
+/// `RequestHandle` remains the submission path; this snapshot owns the
+/// served model metadata that HTTP responses need on every request.
+#[derive(Clone, Debug)]
+struct ServingIdentity {
+    model_id: String,
+    dflash_status: Option<crate::request_handle::DflashStatus>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -524,7 +535,7 @@ async fn completions(
     let max_tokens = options.max_tokens;
     let stream = options.stream;
     let include_usage = options.include_usage;
-    let model_id = state.handle.model_id().to_string();
+    let model_id = state.identity.model_id.clone();
 
     if req.prompt.trim().is_empty() {
         warn!("Rejecting empty prompt request");
@@ -589,7 +600,7 @@ async fn chat_completions(
     let max_tokens = options.max_tokens;
     let do_stream = options.stream;
     let include_usage = options.include_usage;
-    let model_id = state.handle.model_id().to_string();
+    let model_id = state.identity.model_id.clone();
 
     // Convert messages → ChatML prompt.
     let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
@@ -653,15 +664,20 @@ async fn models_handler(
 ) -> Result<Response, ApiError> {
     authorize_v1_request(&headers, state.as_ref())?;
     let dflash = state
-        .handle
-        .dflash_status()
+        .identity
+        .dflash_status
+        .as_ref()
         .map(|status| DflashStatusPayload {
             enabled: true,
-            draft: status.draft_model,
+            draft: status.draft_model.clone(),
             speculative_tokens: status.speculative_tokens,
             acceptance_rate: state.metrics.dflash_acceptance_rate_opt(),
         });
-    let response = ModelsListResponse::single(state.handle.model_id(), now_secs(), dflash);
+    let response = ModelsListResponse::single(
+        state.identity.model_id.as_str(),
+        now_secs(),
+        dflash,
+    );
     Ok(Json(response).into_response())
 }
 
@@ -675,7 +691,7 @@ async fn responses_handler(
     let options = RequestExecutionOptions::from_responses(&req);
     let max_tokens = options.max_tokens;
     let stream = options.stream;
-    let model_id = state.handle.model_id().to_string();
+    let model_id = state.identity.model_id.clone();
 
     info!(
         "responses: prompt_len={}, max_output_tokens={}",
@@ -796,8 +812,13 @@ where
     H: RequestHandle + 'static,
 {
     let session_api_key = config.api_key.clone();
+    let identity = ServingIdentity {
+        model_id: handle.model_id().to_string(),
+        dflash_status: handle.dflash_status(),
+    };
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
+        identity,
         metrics,
         config,
     });
@@ -1259,6 +1280,128 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["object"], "list");
         assert_eq!(payload["data"][0]["id"], "Qwen3-8B");
+    }
+
+    #[tokio::test]
+    async fn serving_identity_is_snapshotted_once_and_reused_by_http_handlers() {
+        use crate::request_handle::{DflashStatus, RequestHandle, SubmitError};
+        use crate::scheduler::IncomingRequest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SnapshotHandle {
+            submit_tx: tokio::sync::mpsc::UnboundedSender<IncomingRequest>,
+            model_id: String,
+            dflash_status: Option<DflashStatus>,
+            model_id_calls: Arc<AtomicUsize>,
+            dflash_calls: Arc<AtomicUsize>,
+        }
+
+        impl RequestHandle for SnapshotHandle {
+            fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError> {
+                self.submit_tx.send(req).map_err(|_| SubmitError)
+            }
+
+            fn model_id(&self) -> &str {
+                let calls = self.model_id_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_eq!(calls, 1, "model_id() should only be called at build time");
+                &self.model_id
+            }
+
+            fn dflash_status(&self) -> Option<DflashStatus> {
+                let calls = self.dflash_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_eq!(
+                    calls, 1,
+                    "dflash_status() should only be called at build time"
+                );
+                self.dflash_status.clone()
+            }
+        }
+
+        let model_id_calls = Arc::new(AtomicUsize::new(0));
+        let dflash_calls = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
+        let model_id = "BootModel".to_string();
+        let dflash_status = Some(DflashStatus {
+            draft_model: "draft/boot-model".to_string(),
+            speculative_tokens: 4,
+        });
+        let handle = SnapshotHandle {
+            submit_tx: tx,
+            model_id: model_id.clone(),
+            dflash_status: dflash_status.clone(),
+            model_id_calls: model_id_calls.clone(),
+            dflash_calls: dflash_calls.clone(),
+        };
+
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let _ = req.delta_tx.send(CompletionStreamDelta {
+                    text_delta: format!("ok:{}", req.prompt),
+                    finish_reason: Some(FinishReason::Stop),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                    logprob: None,
+                });
+            }
+        });
+
+        let app = build_app(handle);
+        assert_eq!(model_id_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dflash_calls.load(Ordering::SeqCst), 1);
+
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/v1/completions",
+                r#"{"prompt":"hello","max_tokens":1}"#,
+            ),
+            (
+                "POST",
+                "/v1/chat/completions",
+                r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#,
+            ),
+            (
+                "POST",
+                "/v1/responses",
+                r#"{"input":"hello","max_output_tokens":1}"#,
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["model"], model_id, "uri={uri}");
+        }
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["data"][0]["id"], model_id);
+        let dflash = &payload["data"][0]["dflash"];
+        assert_eq!(dflash["enabled"], true);
+        assert_eq!(dflash["draft"], "draft/boot-model");
+        assert_eq!(dflash["speculative_tokens"], 4);
+        assert!(dflash["acceptance_rate"].is_null());
+
+        assert_eq!(model_id_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dflash_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
