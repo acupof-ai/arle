@@ -484,16 +484,12 @@ impl BuiltinToolPolicyHooks {
         &self,
         user_input: &str,
         content: String,
-        last_tool_name: Option<&str>,
+        _last_tool_name: Option<&str>,
         last_tool_scalar_result: Option<&str>,
         tool_calls_executed: usize,
     ) -> String {
         if tool_calls_executed == 0 {
             return content;
-        }
-
-        if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
-            return "Listed the current directory above.".to_string();
         }
 
         let Some(tool_result) = last_tool_scalar_result else {
@@ -510,13 +506,9 @@ impl BuiltinToolPolicyHooks {
     pub fn finalize_after_tool_execution(
         &self,
         user_input: &str,
-        last_tool_name: Option<&str>,
+        _last_tool_name: Option<&str>,
         last_tool_scalar_result: Option<&str>,
     ) -> Option<String> {
-        if last_tool_name == Some("shell") && asks_for_file_listing(user_input) {
-            return Some("Listed the current directory above.".to_string());
-        }
-
         if asks_for_exact_scalar_output(user_input)
             && let Some(result) = last_tool_scalar_result
         {
@@ -992,10 +984,7 @@ mod tests {
             Some("shell"),
             Some("ignored"),
         );
-        assert_eq!(
-            shell_result,
-            Some("Listed the current directory above.".to_string())
-        );
+        assert_eq!(shell_result, None);
 
         let tool_call = BuiltinToolPolicyHooks
             .recover_tool_calls_from_draft(

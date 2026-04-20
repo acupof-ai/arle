@@ -10,10 +10,10 @@ chat = { path = "../chat" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tools = { path = "../tools" }
-tokio = { version = "1", features = ["sync"] }
 
 [lints]
 workspace = true
