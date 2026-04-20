@@ -16,7 +16,7 @@ use qwen3_spec::{Qwen3Config, Qwen3ConfigError};
 use thiserror::Error;
 use train::{
     StepOutcome, Trainer, TrainerConfig,
-    checkpoint::write_latest_symlink,
+    checkpoint::publish_latest_after_weights,
     cli_args::{ArgError, next_value, parse_value},
     grad_clip::NoClip,
     qwen3::{Qwen3Error, Qwen3Model},
@@ -227,6 +227,24 @@ fn run() -> Result<(), CliError> {
     .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
     let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+
+    // DX-1 follow-up (codex review 2026-04-20 on 8bde810, High): canonicalize
+    // --resume-from once, up-front, so every subsequent read (weights, config,
+    // trainer_state, optimizer.safetensors loaded via Trainer::resume_if_configured)
+    // targets the same snapshot of the `latest` symlink. Without this, a
+    // concurrent trainer repointing `latest` between our opens could let us
+    // mix step N weights with step N+1 trainer/optimizer state.
+    let resume_dir_canonical: Option<PathBuf> = match &args.resume_from {
+        Some(resume_dir) => Some(resume_dir.canonicalize().map_err(|e| {
+            CliError::Custom(format!(
+                "failed to canonicalize --resume-from {}: {e} \
+                 (is the path / symlink target missing?)",
+                resume_dir.display()
+            ))
+        })?),
+        None => None,
+    };
+
     // Enable the Trainer's built-in save path so every checkpoint round
     // gets `trainer_state.json + optimizer.safetensors` written next to the
     // bf16 model weights the on_step_end hook produces — without this wiring,
@@ -240,7 +258,7 @@ fn run() -> Result<(), CliError> {
         eval_every: None,
         save_every: Some(args.save_every as u64),
         save_dir: Some(args.out.clone()),
-        resume_from: args.resume_from.clone(),
+        resume_from: resume_dir_canonical.clone(),
         rng_seed: args.seed,
     };
     let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
@@ -260,7 +278,7 @@ fn run() -> Result<(), CliError> {
     // slips through until a shape mismatch crashes mid-training. Use the
     // strict variant + validate the checkpoint's `config.json` matches the
     // live `--model` config before letting the run proceed.
-    if let Some(resume_dir) = &args.resume_from {
+    if let Some(resume_dir) = resume_dir_canonical.as_deref() {
         let resume_weights = resume_dir.join("model.safetensors");
         if !resume_weights.is_file() {
             return Err(CliError::Custom(format!(
@@ -675,10 +693,14 @@ fn save_checkpoint_via_registry(
 
     // DX-1: refresh `<out>/latest` symlink so `infer --model-path <out>/latest`
     // and `--resume-from <out>/latest` address the newest checkpoint without
-    // the caller reading directory listings. Trainer::save_checkpoint (for
-    // optimizer/trainer state) writes the same symlink in parallel — last
-    // writer wins, and both point at the same step_dir basename.
-    write_latest_symlink(out_dir, &step_basename)?;
+    // the caller reading directory listings. Trainer::save_checkpoint runs
+    // *first* in `on_step_end` and intentionally does NOT publish `latest`
+    // (that would expose a half-written dir without model.safetensors yet).
+    // `publish_latest_after_weights` asserts the weight file exists before
+    // flipping the symlink, so a future refactor that reorders these calls
+    // fails the targeted unit test in checkpoint.rs instead of silently
+    // publishing an incomplete checkpoint.
+    publish_latest_after_weights(out_dir, &step_basename)?;
 
     println!(
         "[train_sft] saved checkpoint for step {} to {} (source model dir: {}, dtype: {:?})",

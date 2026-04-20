@@ -511,6 +511,36 @@ pub fn write_latest_symlink(_parent: &Path, _target_basename: &str) -> io::Resul
     Ok(())
 }
 
+/// Publish `<parent>/latest` pointing at `<parent>/<target_basename>`,
+/// but **only after** `model.safetensors` has landed in the target dir.
+///
+/// This is the "publish-last" rule from
+/// `docs/experience/wins/2026-04-20-phase-dx1-latest-symlink.md`:
+/// `latest` is a contract that its target directory is complete. Per the
+/// codex review on 0da212f (Medium #1), publishing before the final
+/// artifact exposes readers to an incomplete step dir.
+///
+/// Returns an error if `<parent>/<target_basename>/model.safetensors`
+/// does not exist yet. Both binary save hooks (`pretrain_qwen3::save_checkpoint`
+/// and `train_sft::save_checkpoint_via_registry`) call this instead of
+/// raw `write_latest_symlink` so a future refactor that drops the
+/// ordering-dependent weight write first would fail a targeted unit
+/// test (see `latest_symlink_tests::publish_after_weights_*`).
+pub fn publish_latest_after_weights(parent: &Path, target_basename: &str) -> io::Result<()> {
+    let weights = parent.join(target_basename).join("model.safetensors");
+    if !weights.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "publish_latest_after_weights: {} missing — refusing to publish \
+                 `latest` before the final artifact lands (publish-last contract)",
+                weights.display()
+            ),
+        ));
+    }
+    write_latest_symlink(parent, target_basename)
+}
+
 #[cfg(test)]
 mod latest_symlink_tests {
     use super::*;
@@ -581,5 +611,81 @@ mod latest_symlink_tests {
         let err = write_latest_symlink(dir.path(), "../etc/passwd")
             .expect_err("must reject path-like basename");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // --- publish_latest_after_weights: publish-last contract ------------------
+    // These pin the "no `latest` without model.safetensors" invariant so a
+    // future refactor of the binary save hooks that moves the symlink above
+    // the weight write — or drops the weight write — fails here instead of
+    // silently exposing an incomplete step dir. Paired with the call-site
+    // swaps in `pretrain_qwen3::save_checkpoint` and
+    // `train_sft::save_checkpoint_via_registry` (codex review 2026-04-20 on
+    // 8bde810, Low — restore end-to-end coverage the `latest`-refactor
+    // dropped from `test_trainer_loop.rs:278`).
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_after_weights_writes_symlink_when_weights_present() {
+        let dir = tempdir().expect("tempdir");
+        let step_dir = dir.path().join("step_000001");
+        fs::create_dir_all(&step_dir).unwrap();
+        // Minimal staged checkpoint — `model.safetensors` is the gate.
+        fs::write(step_dir.join("config.json"), "{}").unwrap();
+        fs::write(step_dir.join("model.safetensors"), b"stub-bytes").unwrap();
+
+        publish_latest_after_weights(dir.path(), "step_000001")
+            .expect("publish should succeed with weights present");
+
+        let link = dir.path().join("latest");
+        let meta = fs::symlink_metadata(&link).expect("latest exists");
+        assert!(meta.file_type().is_symlink(), "latest must be a symlink");
+        let resolved = fs::canonicalize(&link).expect("resolve latest");
+        let expected = fs::canonicalize(&step_dir).expect("resolve step");
+        assert_eq!(resolved, expected, "latest must point at step_000001");
+    }
+
+    #[test]
+    fn publish_after_weights_refuses_when_weights_missing() {
+        let dir = tempdir().expect("tempdir");
+        let step_dir = dir.path().join("step_000001");
+        fs::create_dir_all(&step_dir).unwrap();
+        // config.json is present but model.safetensors is NOT — simulates
+        // a refactor that publishes `latest` before `registry.save_from`.
+        fs::write(step_dir.join("config.json"), "{}").unwrap();
+
+        let err = publish_latest_after_weights(dir.path(), "step_000001")
+            .expect_err("must refuse to publish without model.safetensors");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model.safetensors"),
+            "error must name the missing artifact: {msg}"
+        );
+        assert!(
+            msg.contains("publish-last"),
+            "error must cite the publish-last contract: {msg}"
+        );
+
+        // Critically: no `latest` should have been created.
+        let link = dir.path().join("latest");
+        assert!(
+            !link.exists() && fs::symlink_metadata(&link).is_err(),
+            "latest must not exist after a refused publish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_after_weights_refuses_when_weights_is_directory() {
+        // Guard the `.is_file()` check: a directory at the expected path
+        // must not count as "weights present". Catches a regression where
+        // someone loosens the check to `.exists()`.
+        let dir = tempdir().expect("tempdir");
+        let step_dir = dir.path().join("step_000001");
+        fs::create_dir_all(step_dir.join("model.safetensors")).unwrap();
+
+        let err = publish_latest_after_weights(dir.path(), "step_000001")
+            .expect_err("must refuse: model.safetensors is a directory");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
