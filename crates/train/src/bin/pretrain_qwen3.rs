@@ -23,6 +23,7 @@ use autograd::{
     AutogradError, Backend, ConstantLr, CpuBackend, Result as AutogradResult, SafetensorsRegistry,
     Tape, TensorId, TensorStore, optim::AdamW,
 };
+use qwen3_spec::Qwen3Config;
 use serde_json::json;
 use thiserror::Error;
 use train::{
@@ -31,7 +32,7 @@ use train::{
     cli_args::{ArgError, next_value, parse_value},
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
-    qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    qwen3::{Qwen3Error, Qwen3Model},
     tokenizer::ChatTokenizer,
     trainer::cross_entropy_loss,
 };
@@ -220,7 +221,7 @@ fn main() -> Result<(), CliError> {
         hidden_size: args.hidden_size,
         num_hidden_layers: args.num_hidden_layers,
         num_attention_heads: args.num_attention_heads,
-        num_kv_heads: args.num_kv_heads,
+        num_key_value_heads: args.num_kv_heads,
         head_dim: args.head_dim,
         intermediate_size: args.intermediate_size,
         max_position_embeddings: args.max_position_embeddings,
@@ -243,7 +244,7 @@ fn main() -> Result<(), CliError> {
         cfg.hidden_size,
         cfg.num_hidden_layers,
         cfg.num_attention_heads,
-        cfg.num_kv_heads,
+        cfg.num_key_value_heads,
         cfg.head_dim,
         cfg.intermediate_size,
         cfg.max_position_embeddings,
@@ -626,7 +627,7 @@ fn resume_from_checkpoint(
             ("intermediate_size", cfg.intermediate_size as i64),
             ("num_hidden_layers", cfg.num_hidden_layers as i64),
             ("num_attention_heads", cfg.num_attention_heads as i64),
-            ("num_key_value_heads", cfg.num_kv_heads as i64),
+            ("num_key_value_heads", cfg.num_key_value_heads as i64),
             ("head_dim", cfg.head_dim as i64),
             ("vocab_size", cfg.vocab_size as i64),
         ]
@@ -884,7 +885,7 @@ fn save_checkpoint(
         "intermediate_size": cfg.intermediate_size,
         "num_hidden_layers": cfg.num_hidden_layers,
         "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_kv_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
         "head_dim": cfg.head_dim,
         "vocab_size": cfg.vocab_size,
         "rms_norm_eps": cfg.rms_norm_eps,
