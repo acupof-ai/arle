@@ -191,8 +191,11 @@ pub fn rmsnorm(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(x)?;
-    store.ensure_host(weight)?;
+    // Inner dispatcher chooses lazy-device vs host-eager based on x's
+    // dirty bit + device handle; it handles `ensure_host(weight)` and
+    // `ensure_device(x)` on the lazy branch, `store.tensor(x).clone()`
+    // on the eager branch. No eager readback of `x` here — that would
+    // pay an mlx_eval the lazy path is designed to skip.
     norm::rmsnorm(x, weight, eps, store, tape)
 }
 

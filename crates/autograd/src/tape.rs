@@ -36,6 +36,7 @@ pub enum SavedContext {
         x: TensorId,
         weight: TensorId,
         inv_rms: Vec<f32>,
+        eps: f32,
     },
     SiluCtx {
         x: TensorId,

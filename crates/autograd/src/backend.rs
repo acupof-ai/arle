@@ -314,6 +314,24 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_rms_norm_forward(x, weight, shape, eps)
     }
 
+    /// Device-handle variant of `rms_norm_forward`. Lazy on backends with
+    /// a native fused rms-norm op (Metal: `mlx_fast_rms_norm` over a
+    /// borrowed `x` handle + per-call `weight` upload); the default
+    /// implementation falls back to `readback → host compute → upload`.
+    /// Backward path recomputes `inv_rms` host-side — see `ops::norm`
+    /// for the saved-context encoding. M5.3b.6.
+    fn rms_norm(
+        &self,
+        x: &DeviceHandle,
+        weight: &[f32],
+        shape: &[usize],
+        eps: f32,
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.rms_norm_forward(&host, weight, shape, eps)?;
+        self.upload(&out, shape)
+    }
+
     /// Gather embedding rows by token ids.
     /// `weight` is `[vocab, dim]` row-major; `ids` has length `n_ids`.
     /// Returns a contiguous `[n_ids * dim]` buffer shaped by the caller.
