@@ -75,18 +75,22 @@ where
         });
     }
 
-    let mut loss_id = None;
+    let seq_len = trajectories[0].full_ids.len();
+    let mut per_position_advantages = Vec::with_capacity(trajectories.len() * seq_len);
     for (trajectory, advantage) in trajectories.iter().zip(advantages.iter().copied()) {
-        let per_position = vec![advantage; trajectory.full_ids.len()];
-        let trajectory_loss =
-            grpo_loss_single(policy, trajectory, &per_position, cfg, config, store, tape)?;
-        loss_id = Some(match loss_id {
-            Some(current) => add(current, trajectory_loss, store, tape)?,
-            None => trajectory_loss,
-        });
+        per_position_advantages
+            .extend(std::iter::repeat(advantage).take(trajectory.full_ids.len()));
     }
 
-    Ok(loss_id.expect("non-empty trajectories already checked"))
+    grpo_loss_from_flat_advantages(
+        policy,
+        trajectories,
+        &per_position_advantages,
+        cfg,
+        config,
+        store,
+        tape,
+    )
 }
 
 pub fn grpo_loss_per_position<P>(
@@ -105,45 +109,20 @@ where
         return store.from_slice(&[0.0], &[]);
     }
 
-    let mut offset = 0usize;
-    let mut loss_id = None;
-    for trajectory in trajectories {
-        let seq_len = trajectory.full_ids.len();
-        if offset + seq_len > advantages_per_position.len() {
-            return Err(AutogradError::InvalidIndicesLen {
-                expected: offset + seq_len,
-                got: advantages_per_position.len(),
-            });
-        }
-        let trajectory_loss = grpo_loss_single(
-            policy,
-            trajectory,
-            &advantages_per_position[offset..offset + seq_len],
-            cfg,
-            config,
-            store,
-            tape,
-        )?;
-        offset += seq_len;
-        loss_id = Some(match loss_id {
-            Some(current) => add(current, trajectory_loss, store, tape)?,
-            None => trajectory_loss,
-        });
-    }
-
-    if offset != advantages_per_position.len() {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: offset,
-            got: advantages_per_position.len(),
-        });
-    }
-
-    Ok(loss_id.expect("non-empty trajectories already checked"))
+    grpo_loss_from_flat_advantages(
+        policy,
+        trajectories,
+        advantages_per_position,
+        cfg,
+        config,
+        store,
+        tape,
+    )
 }
 
-fn grpo_loss_single<P>(
+fn grpo_loss_from_flat_advantages<P>(
     policy: &P,
-    trajectory: &Trajectory,
+    trajectories: &[Trajectory],
     advantages_per_position: &[f32],
     cfg: &GrpoConfig,
     config: &P::Config,
@@ -159,24 +138,31 @@ where
             got: 0,
         });
     }
-    let seq_len = trajectory.full_ids.len();
-    if advantages_per_position.len() != seq_len {
+    if trajectories.is_empty() {
+        return store.from_slice(&[0.0], &[]);
+    }
+
+    let batch = trajectories.len();
+    let seq_len = trajectories[0].full_ids.len();
+    validate_trajectories(trajectories, seq_len, config.max_seq_len())?;
+    if advantages_per_position.len() != batch * seq_len {
         return Err(AutogradError::InvalidIndicesLen {
-            expected: seq_len,
+            expected: batch * seq_len,
             got: advantages_per_position.len(),
         });
     }
-    validate_trajectory(trajectory, seq_len, config.max_seq_len())?;
-    let batch_data =
-        GrpoBatch::from_trajectory_per_position(trajectory, advantages_per_position, seq_len);
 
-    let logits_id = policy.forward_single(&batch_data.full_ids, store, tape)?;
+    let batch_data =
+        GrpoBatch::from_trajectories(trajectories, advantages_per_position, cfg.kl_coef, seq_len);
+
+    let logits_id =
+        policy.forward_batch_tokens(&batch_data.full_ids, batch, seq_len, store, tape)?;
     let log_probs_id = log_softmax(logits_id, store, tape)?;
     let gathered_next_id = gather_last_dim(log_probs_id, &batch_data.next_token_ids, store, tape)?;
     let shift_id = store.from_slice(&shift_matrix(seq_len), &[seq_len, seq_len])?;
     let new_lp_id = matmul(gathered_next_id, shift_id, store, tape)?;
 
-    let old_lp_tensor = store.from_slice(&batch_data.old_log_probs, &[1, seq_len])?;
+    let old_lp_tensor = store.from_slice(&batch_data.old_log_probs, &[batch, seq_len])?;
     let old_lp_delta = mul_scalar(old_lp_tensor, -1.0, store, tape)?;
     let ratio_input = add(new_lp_id, old_lp_delta, store, tape)?;
     let ratio = exp(ratio_input, store, tape)?;
@@ -194,28 +180,17 @@ where
         cfg.clip_eps,
     );
 
-    let adv_tensor = store.from_slice(&batch_data.advantages, &[1, seq_len])?;
-    let mask_tensor = store.from_slice(&batch_data.mask, &[1, seq_len])?;
-    let active_tensor = store.from_slice(&active_mask_values, &[1, seq_len])?;
-    let masked_adv = mul(adv_tensor, active_tensor, store, tape)?;
-    let masked_pg = mul(ratio, masked_adv, store, tape)?;
-    let loss_pg = mul_scalar(
-        sum(masked_pg, store, tape)?,
-        -1.0 / batch_data.n_response_positions as f32,
-        store,
-        tape,
-    )?;
+    let active_tensor = store.from_slice(&active_mask_values, &[batch, seq_len])?;
+    let pg_scale_tensor = store.from_slice(&batch_data.pg_scales, &[batch, seq_len])?;
+    let masked_scale = mul(pg_scale_tensor, active_tensor, store, tape)?;
+    let masked_pg = mul(ratio, masked_scale, store, tape)?;
+    let loss_pg = mul_scalar(sum(masked_pg, store, tape)?, -1.0, store, tape)?;
 
-    let ref_lp_tensor = store.from_slice(&batch_data.ref_log_probs, &[1, seq_len])?;
+    let ref_lp_tensor = store.from_slice(&batch_data.ref_log_probs, &[batch, seq_len])?;
     let neg_new_lp = mul_scalar(new_lp_id, -1.0, store, tape)?;
     let kl_diff = add(ref_lp_tensor, neg_new_lp, store, tape)?;
-    let masked_kl = mul(kl_diff, mask_tensor, store, tape)?;
-    let kl_term = mul_scalar(
-        sum(masked_kl, store, tape)?,
-        cfg.kl_coef / batch_data.n_response_positions as f32,
-        store,
-        tape,
-    )?;
+    let kl_scale_tensor = store.from_slice(&batch_data.kl_scales, &[batch, seq_len])?;
+    let kl_term = sum(mul(kl_diff, kl_scale_tensor, store, tape)?, store, tape)?;
 
     add(loss_pg, kl_term, store, tape)
 }
@@ -269,17 +244,21 @@ where
     let was_enabled = tape.enabled;
     let result = (|| {
         tape.set_enabled(false);
+        let batch = trajectories.len();
+        let batch_ids = batch_full_ids(trajectories);
+        let logits_id = policy.forward_batch_tokens(&batch_ids, batch, seq_len, store, tape)?;
+        let logits = store.to_host(logits_id)?;
+        let row_stride = seq_len * config.vocab_size();
         let mut total_kl = 0.0_f32;
         let mut count = 0usize;
-        for trajectory in trajectories {
-            let logits_id = policy.forward_single(&trajectory.full_ids, store, tape)?;
-            let logits = store.to_host(logits_id)?;
+        for (row, trajectory) in trajectories.iter().enumerate() {
             for position in 0..seq_len {
                 if !trajectory.response_mask[position] {
                     continue;
                 }
 
-                let logits_base = position.saturating_sub(1) * config.vocab_size();
+                let logits_base =
+                    (row * row_stride) + position.saturating_sub(1) * config.vocab_size();
                 let new_lp = log_prob_at_index(
                     &logits[logits_base..logits_base + config.vocab_size()],
                     1.0,
@@ -307,45 +286,72 @@ struct GrpoBatch {
     ref_log_probs: Vec<f32>,
     advantages: Vec<f32>,
     mask: Vec<f32>,
-    n_response_positions: usize,
+    pg_scales: Vec<f32>,
+    kl_scales: Vec<f32>,
 }
 
 impl GrpoBatch {
-    fn from_trajectory_per_position(
-        trajectory: &Trajectory,
+    fn from_trajectories(
+        trajectories: &[Trajectory],
         advantages_per_position: &[f32],
+        kl_coef: f32,
         seq_len: usize,
     ) -> Self {
-        let mut next_token_ids = Vec::with_capacity(seq_len);
-        let mut old_log_probs = Vec::with_capacity(seq_len);
-        let mut ref_log_probs = Vec::with_capacity(seq_len);
-        let mut mask = Vec::with_capacity(seq_len);
-        let mut n_response_positions = 0usize;
+        let total_positions = trajectories.len() * seq_len;
+        let mut full_ids = Vec::with_capacity(total_positions);
+        let mut next_token_ids = Vec::with_capacity(total_positions);
+        let mut old_log_probs = Vec::with_capacity(total_positions);
+        let mut ref_log_probs = Vec::with_capacity(total_positions);
+        let mut advantages = Vec::with_capacity(total_positions);
+        let mut mask = Vec::with_capacity(total_positions);
+        let mut pg_scales = Vec::with_capacity(total_positions);
+        let mut kl_scales = Vec::with_capacity(total_positions);
 
-        for position in 0..seq_len {
-            next_token_ids.push(if position + 1 < seq_len {
-                trajectory.full_ids[position + 1]
+        let mut offset = 0usize;
+        for trajectory in trajectories {
+            let response_count = trajectory
+                .response_mask
+                .iter()
+                .filter(|masked| **masked)
+                .count();
+            let response_scale = if response_count == 0 {
+                0.0
             } else {
-                0
-            });
-            old_log_probs.push(trajectory.old_log_probs[position]);
-            ref_log_probs.push(trajectory.ref_log_probs[position]);
-            if trajectory.response_mask[position] {
-                mask.push(1.0);
-                n_response_positions += 1;
-            } else {
-                mask.push(0.0);
+                1.0 / response_count as f32
+            };
+            for position in 0..seq_len {
+                full_ids.push(trajectory.full_ids[position]);
+                next_token_ids.push(if position + 1 < seq_len {
+                    trajectory.full_ids[position + 1]
+                } else {
+                    0
+                });
+                old_log_probs.push(trajectory.old_log_probs[position]);
+                ref_log_probs.push(trajectory.ref_log_probs[position]);
+                let response_mask = if trajectory.response_mask[position] {
+                    1.0
+                } else {
+                    0.0
+                };
+                mask.push(response_mask);
+                let advantage = advantages_per_position[offset + position];
+                advantages.push(advantage);
+                let scale = response_mask * response_scale;
+                pg_scales.push(advantage * scale);
+                kl_scales.push(kl_coef * scale);
             }
+            offset += seq_len;
         }
 
         Self {
-            full_ids: trajectory.full_ids.clone(),
+            full_ids,
             next_token_ids,
             old_log_probs,
             ref_log_probs,
-            advantages: advantages_per_position.to_vec(),
+            advantages,
             mask,
-            n_response_positions,
+            pg_scales,
+            kl_scales,
         }
     }
 }
@@ -400,4 +406,16 @@ fn shift_matrix(seq_len: usize) -> Vec<f32> {
         data[((position - 1) * seq_len) + position] = 1.0;
     }
     data
+}
+
+fn batch_full_ids(trajectories: &[Trajectory]) -> Vec<usize> {
+    let total = trajectories
+        .iter()
+        .map(|trajectory| trajectory.full_ids.len())
+        .sum();
+    let mut batch_ids = Vec::with_capacity(total);
+    for trajectory in trajectories {
+        batch_ids.extend_from_slice(&trajectory.full_ids);
+    }
+    batch_ids
 }

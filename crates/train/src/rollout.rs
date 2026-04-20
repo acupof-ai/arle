@@ -47,53 +47,80 @@ where
         let mut trajectories = Vec::with_capacity(prompts.len() * group_size);
         for prompt in prompts {
             for _ in 0..group_size {
-                let mut trajectory = Trajectory {
+                trajectories.push(Trajectory {
                     prompt_ids: prompt.clone(),
                     response_mask: response_mask.clone(),
                     full_ids: prompt.clone(),
                     old_log_probs: vec![0.0; seq_len],
                     ref_log_probs: vec![0.0; seq_len],
                     reward: 0.0,
-                };
-
-                for (position, masked) in trajectory.response_mask.iter().enumerate() {
-                    if !*masked {
-                        continue;
-                    }
-
-                    let logits_id = policy.forward_single(&trajectory.full_ids, store, tape)?;
-                    let logits = store.to_host(logits_id)?;
-                    let logits_base = position.saturating_sub(1) * config.vocab_size();
-                    let slice = &logits[logits_base..logits_base + config.vocab_size()];
-                    let (sampled_ids, sampled_log_probs) =
-                        sample_categorical(slice, (1, 1), config.vocab_size(), temperature, rng);
-                    trajectory.full_ids[position] = sampled_ids[0];
-                    trajectory.old_log_probs[position] = sampled_log_probs[0];
-
-                    let keep = retained_ids(policy, ref_model, store);
-                    store.retain_ids(&keep);
-                }
-
-                let ref_logits_id = ref_model.forward_single(&trajectory.full_ids, store, tape)?;
-                let ref_logits = store.to_host(ref_logits_id)?;
-                for (position, masked) in trajectory.response_mask.iter().enumerate() {
-                    if !*masked {
-                        continue;
-                    }
-                    let logits_base = position.saturating_sub(1) * config.vocab_size();
-                    trajectory.ref_log_probs[position] = log_prob_at_index(
-                        &ref_logits[logits_base..logits_base + config.vocab_size()],
-                        1.0,
-                        trajectory.full_ids[position],
-                    );
-                }
-                trajectory.reward = verifier(
-                    &trajectory.prompt_ids,
-                    &trajectory.full_ids,
-                    &trajectory.response_mask,
-                );
-                trajectories.push(trajectory);
+                });
             }
+        }
+
+        for (position, masked) in response_mask.iter().enumerate() {
+            if !*masked {
+                continue;
+            }
+
+            let batch_ids = batch_full_ids(&trajectories);
+            let logits_id = policy.forward_batch_tokens(
+                &batch_ids,
+                trajectories.len(),
+                seq_len,
+                store,
+                tape,
+            )?;
+            let logits = store.to_host(logits_id)?;
+            let position_logits = batch_position_logits(
+                &logits,
+                trajectories.len(),
+                seq_len,
+                position,
+                config.vocab_size(),
+            );
+            let (sampled_ids, sampled_log_probs) = sample_categorical(
+                &position_logits,
+                (trajectories.len(), 1),
+                config.vocab_size(),
+                temperature,
+                rng,
+            );
+
+            for (trajectory, (sampled_id, sampled_log_prob)) in trajectories
+                .iter_mut()
+                .zip(sampled_ids.into_iter().zip(sampled_log_probs))
+            {
+                trajectory.full_ids[position] = sampled_id;
+                trajectory.old_log_probs[position] = sampled_log_prob;
+            }
+
+            let keep = retained_ids(policy, ref_model, store);
+            store.retain_ids(&keep);
+        }
+
+        let batch_ids = batch_full_ids(&trajectories);
+        let ref_logits_id =
+            ref_model.forward_batch_tokens(&batch_ids, trajectories.len(), seq_len, store, tape)?;
+        let ref_logits = store.to_host(ref_logits_id)?;
+        for (row, trajectory) in trajectories.iter_mut().enumerate() {
+            for (position, masked) in trajectory.response_mask.iter().enumerate() {
+                if !*masked {
+                    continue;
+                }
+                let logits_base =
+                    ((row * seq_len) + position.saturating_sub(1)) * config.vocab_size();
+                trajectory.ref_log_probs[position] = log_prob_at_index(
+                    &ref_logits[logits_base..logits_base + config.vocab_size()],
+                    1.0,
+                    trajectory.full_ids[position],
+                );
+            }
+            trajectory.reward = verifier(
+                &trajectory.prompt_ids,
+                &trajectory.full_ids,
+                &trajectory.response_mask,
+            );
         }
 
         Ok(trajectories)
@@ -105,6 +132,34 @@ where
         store.retain_ids(&keep);
     }
     trajectories
+}
+
+fn batch_full_ids(trajectories: &[Trajectory]) -> Vec<usize> {
+    let total = trajectories
+        .iter()
+        .map(|trajectory| trajectory.full_ids.len())
+        .sum();
+    let mut batch_ids = Vec::with_capacity(total);
+    for trajectory in trajectories {
+        batch_ids.extend_from_slice(&trajectory.full_ids);
+    }
+    batch_ids
+}
+
+fn batch_position_logits(
+    logits: &[f32],
+    batch: usize,
+    seq_len: usize,
+    position: usize,
+    vocab_size: usize,
+) -> Vec<f32> {
+    let row_stride = seq_len * vocab_size;
+    let mut position_logits = Vec::with_capacity(batch * vocab_size);
+    for row in 0..batch {
+        let base = (row * row_stride) + position.saturating_sub(1) * vocab_size;
+        position_logits.extend_from_slice(&logits[base..base + vocab_size]);
+    }
+    position_logits
 }
 
 fn validate_prompt_batch(prompts: &[Vec<usize>], seq_len: usize, max_seq_len: usize) -> Result<()> {

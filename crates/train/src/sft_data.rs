@@ -5,18 +5,13 @@ use std::{
 };
 
 use autograd::{AutogradError, Result};
-use chat::{ChatMlMessage, render_chatml_with_spans};
 use serde::Deserialize;
+
+pub use chat::{ChatMessage, ChatRole, ToolCall, render_structured_chatml_with_spans};
 
 use crate::tokenizer::ChatTokenizer;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SftExample {
     pub messages: Vec<ChatMessage>,
 }
@@ -77,29 +72,22 @@ pub fn tokenize_example(
         // at inference; piecewise-encoded concatenation can diverge. The
         // ChatML assembly itself lives in `crates/chat` so training and serving
         // stay on the same formatter.
-        let rendered = render_chatml_with_spans(
-            &[ChatMlMessage {
-                role: message.role.as_str(),
-                content: message.content.as_str(),
-            }],
-            false,
-        );
+        let rendered = render_structured_chatml_with_spans(std::slice::from_ref(message), false);
         let body_range = rendered
             .spans
             .first()
             .map(|span| span.supervised.clone())
             .expect("single message render always yields one span");
         let (turn_ids, offsets) = tokenizer.encode_with_offsets(&rendered.prompt, false)?;
-        let supervise = message.role == "assistant";
-        let (body_start, body_end) = if supervise {
-            body_span(&offsets, body_range.start, body_range.end, turn_ids.len())
-        } else {
+        let (body_start, body_end) = if body_range.is_empty() {
             (turn_ids.len(), turn_ids.len())
+        } else {
+            body_span(&offsets, body_range.start, body_range.end, turn_ids.len())
         };
 
         for (i, &token_id) in turn_ids.iter().enumerate() {
             input_ids.push(token_id);
-            let supervised_here = supervise && i >= body_start && i < body_end;
+            let supervised_here = i >= body_start && i < body_end;
             labels.push(if supervised_here {
                 token_id as i32
             } else {
@@ -187,17 +175,36 @@ mod tests {
     }
 
     #[test]
-    fn render_chatml_with_spans_covers_assistant_body() {
-        let rendered = chat::render_chatml_with_spans(
-            &[ChatMlMessage {
-                role: "assistant",
-                content: "hello",
-            }],
+    fn render_structured_chatml_with_spans_covers_assistant_body() {
+        let rendered = chat::render_structured_chatml_with_spans(
+            &[ChatMessage::assistant("hello", vec![])],
             false,
         );
 
         assert_eq!(rendered.prompt, "<|im_start|>assistant\nhello<|im_end|>\n");
         assert_eq!(rendered.spans.len(), 1);
         assert_eq!(rendered.spans[0].supervised, 22..37);
+    }
+
+    #[test]
+    fn render_structured_chatml_with_spans_skips_tool_turns() {
+        let rendered = chat::render_structured_chatml_with_spans(
+            &[
+                ChatMessage::assistant(
+                    "",
+                    vec![ToolCall::new(
+                        "shell",
+                        serde_json::json!({ "command": "pwd" }),
+                    )],
+                ),
+                ChatMessage::tool_result("shell", "cwd"),
+            ],
+            false,
+        );
+
+        assert!(rendered.prompt.contains("<tool_call>"));
+        assert!(rendered.prompt.contains("<tool_response>"));
+        assert!(!rendered.spans[0].supervised.is_empty());
+        assert!(rendered.spans[1].supervised.is_empty());
     }
 }

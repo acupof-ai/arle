@@ -493,6 +493,17 @@ impl GrpoPolicy for Qwen3Model {
         Qwen3Model::forward_tokens(self, input_ids, store, tape)
     }
 
+    fn forward_batch_tokens(
+        &self,
+        input_ids: &[usize],
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        Qwen3Model::forward_batch_tokens(self, input_ids, batch, seq_len, store, tape)
+    }
+
     fn all_parameter_ids(&self) -> Vec<TensorId> {
         Qwen3Model::all_parameter_ids(self)
     }
