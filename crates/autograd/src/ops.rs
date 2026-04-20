@@ -142,7 +142,12 @@ pub fn gather_last_dim(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    store.ensure_host(src)?;
+    // M5.3b.9: inner `gather::gather_last_dim` dispatches on `src.dirty`;
+    // a Dirty::Device/Both input stays lazy via `backend.gather_last_dim`
+    // (composes `mlx_reshape → mlx_take_axis → mlx_reshape` into the MLX
+    // graph), while Dirty::Host takes the eager host path. Stripping
+    // `ensure_host` here is the enabler — previously logits coming out of
+    // the final matmul were flushed to host before the gather.
     gather::gather_last_dim(src, indices, store, tape)
 }
 
