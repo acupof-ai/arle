@@ -61,6 +61,40 @@ upgrades "missing config.json" to a hard error in both `train_sft`
 and `pretrain_qwen3` resume paths (silently skipping the config-match
 check reopened the very hole 429efc3 fixed).
 
+Commit 09c5c89 migrates the **SFT warm-up phase** of `train_grpo.rs`
+onto `Trainer<AdamW, GrpoClip, ConstantLr>` (+157/-74 LOC). `GrpoClip`
+mirrors `PretrainClip` — a local enum `None(NoClip) | Norm(GlobalNorm)`
+so `--grad-clip`/`--no-grad-clip` collapse to one concrete `C`. The
+GRPO phase stays hand-written (rollout_group + ref_model +
+mean_sampled_kl mid-step don't fit a single `step_fn` cleanly), but
+uses `args.grad_clip` via the sanitize-at-boundary
+`clip_grad_norm(params, max_norm, store)` free function — no more
+`GRAD_CLIP_NORM = 1.0` constant. New flags: `--grad-clip`,
+`--no-grad-clip`, `--metrics-jsonl`. Smoke: `--sft-steps 1
+--grpo-iters 1 --batch-prompts 2 --group-size 2 --seq 4` emits a
+Trainer-format SFT metric (`step=1 loss=... lr=... grad_norm=...
+ms_per_step=... tok_per_sec=...`) followed by `grpo iter 0: loss ...
+mean_reward ... mean_kl ...` and a final `kl ... reward trajectory:
+[...]`.
+
+Commit 813d4f6 plugs two regressions from the bd5e277 codex review:
+(1) **High** — multi-window eval in `pretrain_qwen3` cleared
+`tape.entries` per window but never pruned `TensorStore`, so
+`--eval-windows N` with large `--seq` accumulated N windows' forward
+temporaries simultaneously. Fix: expose
+`train::cleanup_after_backward` (promoted from `fn` to `pub fn` +
+re-exported at the crate root), call it per window in the
+`pretrain_qwen3` eval closure (re-disabling the tape after each
+call), and also call it once at `Trainer::run_inner` scope after
+`eval_fn` returns as the defensive single-call baseline.
+(2) **Medium** — `Trainer::run_inner`'s eval branch only fired on
+`self.step.is_multiple_of(eval_n)`, dropping the final-step eval
+when `--steps` was not a multiple of `--eval-every`. Mirror the
+save branch's `|| is_final` pattern. Two new tests
+(`eval_final_step_forced_even_when_steps_mod_eval_every` +
+`trainer_cleans_up_after_eval`) lock in the fix; the trainer-loop
+test count is now 19 (was 17).
+
 Commit bd5e277 completes the Phase 3 migration of `pretrain_qwen3.rs`
 (~726 → ~890 LOC; actual training-step body shrank substantially —
 growth is closure wiring + design-rationale comments) onto
