@@ -41,5 +41,9 @@ path = "src/bin/download_dataset.rs"
 name = "convert_dataset"
 path = "src/bin/convert_dataset.rs"
 
+[[bin]]
+name = "eval_lm"
+path = "src/bin/eval_lm.rs"
+
 [lints]
 workspace = true

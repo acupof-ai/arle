@@ -17,7 +17,7 @@ the checkpoint / eval / serve tooling around that reality.
 |----------|--------|
 | Does the checkpoint format match what `infer` expects? | ✅ (exact) |
 | Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from `train_multi_turn --serve` output or `infer --model-path <out>/latest` without guessing the step number. |
-| Is there a standalone eval binary? | ❌ NO — eval is only inline in `pretrain_qwen3` during training. |
+| Is there a standalone eval binary? | ✅ `eval_lm` landed — it evaluates Qwen3/Qwen3.5 checkpoint dirs directly on tokenized or chat JSONL. |
 | Do train binaries have `--help`? | ❌ NO — all hand-roll arg parsing. |
 | Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len`, `--model` vs `--model-path`, `--resume` vs `--resume-from`. |
 | Does `infer` fail early on a malformed `config.json`? | ❌ NO — `is_model_dir` only checks file existence; field schema validated late. |
@@ -70,6 +70,10 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
 --model-path <ckpt> --data <held_out.jsonl>` prints
 `{"loss": ..., "ppl": ..., "tokens": ...}` and optionally writes
 `--metrics-jsonl <path>` with one record.
+
+**Shipped:** `crates/train/src/bin/eval_lm.rs` now loads Qwen3 and
+Qwen3.5 checkpoint dirs, accepts tokenized JSONL or chat JSONL, and
+reports token-mean loss + perplexity as JSON.
 
 **Work:**
 1. Extract the held-out eval loop from `pretrain_qwen3.rs` into a
