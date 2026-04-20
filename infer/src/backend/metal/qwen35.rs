@@ -9,6 +9,7 @@ use super::mlx::{
 };
 
 use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
+use super::weights::{StackedQuantized, load_quantized_with_bits, load_stacked_quantized};
 use super::{
     KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
     MlpInputProjection, WeightTensor, clear_metal_cache, extend_kv_cache, gpu_sample_token, linear,
@@ -32,15 +33,74 @@ pub(super) enum MetalQwen35Attention {
     Linear(MetalLinearAttnWeights),
 }
 
+/// MoE sparse-block weights for one Qwen3.5/3.6 transformer layer.
+///
+/// Shapes follow the mlx-lm `qwen3_5_moe.py sanitize()` output (the MLX
+/// community checkpoints already ship in this layout — no runtime splitting
+/// of `experts.gate_up_proj` is required):
+///
+/// | Weight | Shape (packed) | Purpose |
+/// |---|---|---|
+/// | `router`               | `[E, H/pack]` 8-bit             | token → expert logits |
+/// | `switch_gate`          | `[E, Hmoe, H/pack]` 4-bit       | per-expert SwiGLU gate |
+/// | `switch_up`            | `[E, Hmoe, H/pack]` 4-bit       | per-expert SwiGLU up   |
+/// | `switch_down`          | `[E, H, Hmoe/pack]` 4-bit       | per-expert out projection |
+/// | `shared_gate`          | `[Hshared, H/pack]` 4-bit       | always-on SwiGLU gate  |
+/// | `shared_up`            | `[Hshared, H/pack]` 4-bit       | always-on SwiGLU up    |
+/// | `shared_down`          | `[H, Hshared/pack]` 4-bit       | always-on SwiGLU out   |
+/// | `shared_expert_gate`   | `[1, H/pack]` 8-bit             | scalar shared-expert gate |
+///
+/// All scalars (`num_experts`, `top_k`, `norm_topk_prob`, bits/group_size)
+/// are snapshotted from [`super::config::MetalQwen35MoeConfig`] at load time
+/// so the hot path stays free of config lookups.
+#[cfg(feature = "metal")]
+pub(super) struct MetalQwen35MoeWeights {
+    pub(super) router: WeightTensor,
+    pub(super) switch_gate: StackedQuantized,
+    pub(super) switch_up: StackedQuantized,
+    pub(super) switch_down: StackedQuantized,
+    pub(super) shared_gate: WeightTensor,
+    pub(super) shared_up: WeightTensor,
+    pub(super) shared_down: WeightTensor,
+    pub(super) shared_expert_gate: WeightTensor,
+    pub(super) num_experts: i32,
+    pub(super) top_k: i32,
+    pub(super) norm_topk_prob: bool,
+    pub(super) router_bits: i32,
+    pub(super) router_group_size: i32,
+    pub(super) expert_bits: i32,
+    pub(super) expert_group_size: i32,
+}
+
+/// Dense SwiGLU MLP weights for one Qwen3.5 transformer layer (original
+/// Qwen3.5 path, plus the `mlp_only_layers` escape hatch for future MoE
+/// configs that mix dense layers).
+#[cfg(feature = "metal")]
+pub(super) struct MetalQwen35DenseMlpWeights {
+    pub(super) inputs: MlpInputProjection,
+    pub(super) down_proj: WeightTensor,
+    /// Individual gate/up projections used by the optional C++ step path.
+    /// Kept alongside the (possibly merged) `inputs` because the C++ route
+    /// wants a separate gate_proj/up_proj pair per layer.
+    pub(super) gate_proj: WeightTensor,
+    pub(super) up_proj: WeightTensor,
+}
+
+/// MLP kind for a single Qwen3.5/3.6 transformer layer.
+///
+/// Dense = classic Qwen3.5 SwiGLU. Moe = Qwen3.6 `SparseMoeBlock`. Per-layer
+/// selection follows [`super::config::MetalQwen35MoeConfig::is_moe_layer`].
+#[cfg(feature = "metal")]
+pub(super) enum MlpKind {
+    Dense(MetalQwen35DenseMlpWeights),
+    Moe(MetalQwen35MoeWeights),
+}
+
 pub(super) struct MetalQwen35BlockWeights {
     pub(super) input_layernorm: MlxArray,
     pub(super) attention: MetalQwen35Attention,
     pub(super) post_attention_layernorm: MlxArray,
-    pub(super) mlp_inputs: MlpInputProjection,
-    pub(super) down_proj: WeightTensor,
-    /// Individual gate/up projections used by the optional C++ step path.
-    pub(super) gate_proj: WeightTensor,
-    pub(super) up_proj: WeightTensor,
+    pub(super) mlp: MlpKind,
 }
 
 pub(super) struct Qwen35MetalWeights {
@@ -57,6 +117,12 @@ pub(super) struct Qwen35MetalWeights {
 
 /// RAII wrapper for the C++ Qwen35 forward model.
 pub(crate) struct CppQwen35Model(*mut std::ffi::c_void);
+
+fn metal_qwen35_trace_enabled() -> bool {
+    std::env::var("AGENT_INFER_METAL_QWEN35_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
 
 impl Drop for CppQwen35Model {
     fn drop(&mut self) {
@@ -172,8 +238,14 @@ impl CppQwen35Model {
                 layer.post_attention_layernorm.as_raw(),
             );
 
-            // MLP weights (shared by both attention types)
-            let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) =
+            let (dense, moe) = match &layer.mlp {
+                MlpKind::Dense(d) => (Some(d), None),
+                MlpKind::Moe(m) => (None, Some(m)),
+            };
+            // Dense MLP weights are only needed for non-MoE layers. MoE layers
+            // pass null dense-MLP pointers to the compiled attention push and
+            // receive a separate MoE push below.
+            let (gu_w, gu_s, gu_b, gu_gs, gu_bits, gate_dim) = if let Some(dense) = dense {
                 if let MlpInputProjection::MergedQuantized {
                     gate_up_proj:
                         WeightTensor::Quantized {
@@ -185,7 +257,7 @@ impl CppQwen35Model {
                         },
                     gate_dim,
                     ..
-                } = &layer.mlp_inputs
+                } = &dense.inputs
                 {
                     (
                         w.as_raw(),
@@ -199,15 +271,33 @@ impl CppQwen35Model {
                     log::warn!("C++ forward model requires quantized MLP — falling back to Rust");
                     unsafe { mlx_sys::qwen35_compiled_free(model) };
                     return None;
-                };
-            let (dw_w, dw_s, dw_b) = if let WeightTensor::Quantized {
-                w, scales, biases, ..
-            } = &layer.down_proj
-            {
-                (w.as_raw(), scales.as_raw(), biases.as_raw())
+                }
             } else {
-                unsafe { mlx_sys::qwen35_compiled_free(model) };
-                return None;
+                (
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            };
+            let (dw_w, dw_s, dw_b) = if let Some(dense) = dense {
+                if let WeightTensor::Quantized {
+                    w, scales, biases, ..
+                } = &dense.down_proj
+                {
+                    (w.as_raw(), scales.as_raw(), biases.as_raw())
+                } else {
+                    unsafe { mlx_sys::qwen35_compiled_free(model) };
+                    return None;
+                }
+            } else {
+                (
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
             };
 
             match &layer.attention {
@@ -297,30 +387,78 @@ impl CppQwen35Model {
                             dw_b,
                         );
                     }
-                    let separate_proj = use_qwen35_cpp_separate_proj();
-                    if let (Some(qkv), Some(z), Some(b), Some(a), Some(gp), Some(up)) = (
-                        extract_qw(&attn.in_proj_qkv),
-                        extract_qw(&attn.in_proj_z),
-                        extract_qw(&attn.in_proj_b),
-                        extract_qw(&attn.in_proj_a),
-                        extract_qw(&layer.gate_proj),
-                        extract_qw(&layer.up_proj),
-                    ) {
-                        if separate_proj {
+                    if let Some(dense) = dense {
+                        let separate_proj = use_qwen35_cpp_separate_proj();
+                        if let (Some(qkv), Some(z), Some(b), Some(a), Some(gp), Some(up)) = (
+                            extract_qw(&attn.in_proj_qkv),
+                            extract_qw(&attn.in_proj_z),
+                            extract_qw(&attn.in_proj_b),
+                            extract_qw(&attn.in_proj_a),
+                            extract_qw(&dense.gate_proj),
+                            extract_qw(&dense.up_proj),
+                        ) {
+                            if separate_proj {
+                                unsafe {
+                                    mlx_sys::qwen35_compiled_set_separate_proj(
+                                        model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2,
+                                        b.0, b.1, b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4,
+                                        up.0, up.1, up.2,
+                                    );
+                                }
+                            }
                             unsafe {
-                                mlx_sys::qwen35_compiled_set_separate_proj(
-                                    model, qkv.0, qkv.1, qkv.2, qkv.3, qkv.4, z.0, z.1, z.2, b.0,
-                                    b.1, b.2, a.0, a.1, a.2, gp.0, gp.1, gp.2, gp.3, gp.4, up.0,
-                                    up.1, up.2,
+                                mlx_sys::qwen35_compiled_set_separate_mlp(
+                                    model, gp.0, gp.1, gp.2, gp.3, gp.4, up.0, up.1, up.2,
                                 );
                             }
                         }
-                        unsafe {
-                            mlx_sys::qwen35_compiled_set_separate_mlp(
-                                model, gp.0, gp.1, gp.2, gp.3, gp.4, up.0, up.1, up.2,
-                            );
-                        }
                     }
+                }
+            }
+            if let Some(moe) = moe {
+                let router = extract_qw(&moe.router)?;
+                let switch_gate = extract_stacked_qw(&moe.switch_gate);
+                let switch_up = extract_stacked_qw(&moe.switch_up);
+                let switch_down = extract_stacked_qw(&moe.switch_down);
+                let shared_gate = extract_qw(&moe.shared_gate)?;
+                let shared_up = extract_qw(&moe.shared_up)?;
+                let shared_down = extract_qw(&moe.shared_down)?;
+                let shared_expert_gate = extract_qw(&moe.shared_expert_gate)?;
+                unsafe {
+                    mlx_sys::qwen35_compiled_set_last_moe_mlp(
+                        model,
+                        router.0,
+                        router.1,
+                        router.2,
+                        moe.router_group_size,
+                        moe.router_bits,
+                        switch_gate.0,
+                        switch_gate.1,
+                        switch_gate.2,
+                        switch_up.0,
+                        switch_up.1,
+                        switch_up.2,
+                        switch_down.0,
+                        switch_down.1,
+                        switch_down.2,
+                        moe.expert_group_size,
+                        moe.expert_bits,
+                        shared_gate.0,
+                        shared_gate.1,
+                        shared_gate.2,
+                        shared_up.0,
+                        shared_up.1,
+                        shared_up.2,
+                        shared_down.0,
+                        shared_down.1,
+                        shared_down.2,
+                        shared_expert_gate.0,
+                        shared_expert_gate.1,
+                        shared_expert_gate.2,
+                        moe.num_experts,
+                        moe.top_k,
+                        moe.norm_topk_prob,
+                    );
                 }
             }
         }
@@ -901,6 +1039,16 @@ fn extract_qw(
     }
 }
 
+fn extract_stacked_qw(
+    wt: &StackedQuantized,
+) -> (
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+    *mut mlx_sys::mlx_array,
+) {
+    (wt.weight.as_raw(), wt.scales.as_raw(), wt.biases.as_raw())
+}
+
 pub(super) fn metal_generate_qwen35(
     input_ids: &[u32],
     weights: &Qwen35MetalWeights,
@@ -1034,6 +1182,8 @@ pub(super) fn metal_generate_qwen35(
     };
 
     let mut logits = None;
+    let trace_rust_prefill = weights.cpp_model.is_none() && metal_qwen35_trace_enabled();
+    let prefill_started = trace_rust_prefill.then(Instant::now);
     for (idx, &token) in input_ids.iter().enumerate() {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
         let step_logits = do_step(
@@ -1057,6 +1207,14 @@ pub(super) fn metal_generate_qwen35(
         logits = Some(step_logits);
         cache_len += 1;
         recurrent.seq_len = cache_len as usize;
+    }
+    if let Some(prefill_started) = prefill_started {
+        eprintln!(
+            "metal_trace[qwen35_direct_prefill]: mode=rust_scalar_prefill tokens={} cache_len={} elapsed_ms={:.1}",
+            input_ids.len(),
+            cache_len,
+            prefill_started.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 
     let logits = logits.context("Qwen3.5 prompt produced no logits")?;
@@ -1228,10 +1386,7 @@ pub(super) fn qwen35_forward_step(
             config.rms_norm_eps as f32,
             config.norm_weight_mode.uses_offset(),
         );
-        let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
-        // SwiGLU: silu(gate) * up → compiled kernel. No casts needed.
-        let fused_val = multiply(&silu(&gate_raw), &up);
-        let mlp = linear(&fused_val, &layer.down_proj);
+        let mlp = mlp_forward(&layer.mlp, &xn);
         x = add(&residual2, &mlp);
     }
 
@@ -1314,9 +1469,7 @@ pub(super) fn qwen35_forward_with_hidden_states(
                 config.rms_norm_eps as f32,
                 config.norm_weight_mode.uses_offset(),
             );
-            let (gate_raw, up) = mlp_project(&layer.mlp_inputs, &xn);
-            let fused_val = multiply(&silu(&gate_raw), &up);
-            let mlp = linear(&fused_val, &layer.down_proj);
+            let mlp = mlp_forward(&layer.mlp, &xn);
             x = add(&residual2, &mlp);
 
             if selected.contains(&layer_idx) {
@@ -1527,6 +1680,69 @@ fn rms_norm_last_dim(x: &MlxArray, weight: &MlxArray, eps: f32, offset: bool) ->
     as_dtype(&multiply(&normed, &scale), Dtype::Bfloat16)
 }
 
+fn dense_mlp_forward(mlp: &MetalQwen35DenseMlpWeights, x: &MlxArray) -> MlxArray {
+    let (gate_raw, up) = mlp_project(&mlp.inputs, x);
+    let fused_val = multiply(&silu(&gate_raw), &up);
+    linear(&fused_val, &mlp.down_proj)
+}
+
+fn moe_mlp_forward(x: &MlxArray, moe: &MetalQwen35MoeWeights) -> MlxArray {
+    let router = extract_qw(&moe.router).expect("Qwen3.6 MoE router must be quantized");
+    let shared_gate =
+        extract_qw(&moe.shared_gate).expect("Qwen3.6 shared expert gate_proj must be quantized");
+    let shared_up =
+        extract_qw(&moe.shared_up).expect("Qwen3.6 shared expert up_proj must be quantized");
+    let shared_down =
+        extract_qw(&moe.shared_down).expect("Qwen3.6 shared expert down_proj must be quantized");
+    let shared_expert_gate =
+        extract_qw(&moe.shared_expert_gate).expect("Qwen3.6 shared_expert_gate must be quantized");
+
+    let raw = unsafe {
+        mlx_sys::qwen35_moe_block_forward(
+            x.as_raw(),
+            router.0,
+            router.1,
+            router.2,
+            moe.router_bits,
+            moe.router_group_size,
+            moe.switch_gate.weight.as_raw(),
+            moe.switch_gate.scales.as_raw(),
+            moe.switch_gate.biases.as_raw(),
+            moe.switch_up.weight.as_raw(),
+            moe.switch_up.scales.as_raw(),
+            moe.switch_up.biases.as_raw(),
+            moe.switch_down.weight.as_raw(),
+            moe.switch_down.scales.as_raw(),
+            moe.switch_down.biases.as_raw(),
+            moe.expert_bits,
+            moe.expert_group_size,
+            shared_gate.0,
+            shared_gate.1,
+            shared_gate.2,
+            shared_up.0,
+            shared_up.1,
+            shared_up.2,
+            shared_down.0,
+            shared_down.1,
+            shared_down.2,
+            shared_expert_gate.0,
+            shared_expert_gate.1,
+            shared_expert_gate.2,
+            moe.num_experts,
+            moe.top_k,
+            moe.norm_topk_prob,
+        )
+    };
+    unsafe { MlxArray::from_raw(raw) }
+}
+
+fn mlp_forward(mlp: &MlpKind, x: &MlxArray) -> MlxArray {
+    match mlp {
+        MlpKind::Dense(dense) => dense_mlp_forward(dense, x),
+        MlpKind::Moe(moe) => moe_mlp_forward(x, moe),
+    }
+}
+
 /// MLP projection helper — replaces the mlx_rs method on MlpInputProjection.
 fn mlp_project(mlp: &MlpInputProjection, x: &MlxArray) -> (MlxArray, MlxArray) {
     match mlp {
@@ -1592,10 +1808,13 @@ pub(super) fn load_qwen35_metal_weights(
     )?;
 
     log::info!(
-        "  {} layers ({} full attention, {} GDR)",
+        "  {} layers ({} full attention, {} GDR, {} MoE)",
         config.num_hidden_layers,
         arch.num_full_attention_layers(),
         arch.num_linear_attention_layers(),
+        (0..config.num_hidden_layers)
+            .filter(|&idx| arch.moe.as_ref().is_some_and(|moe| moe.is_moe_layer(idx)))
+            .count(),
     );
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
@@ -1679,12 +1898,20 @@ pub(super) fn load_qwen35_metal_weights(
             }
         };
 
-        let gate_proj = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
-        let up_proj = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
-        let gate_dim = gate_proj.output_dim()?;
-        let up_dim = up_proj.output_dim()?;
-        let mlp_inputs =
-            if let Some(gate_up_proj) = merge_quantized_projection_rows(&[&gate_proj, &up_proj])? {
+        let mlp = if let Some(moe_cfg) = arch.moe.as_ref().filter(|moe| moe.is_moe_layer(i)) {
+            MlpKind::Moe(load_qwen35_moe_layer_weights(
+                &tensors,
+                &layer_prefix,
+                moe_cfg,
+            )?)
+        } else {
+            let gate_proj = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
+            let up_proj = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
+            let gate_dim = gate_proj.output_dim()?;
+            let up_dim = up_proj.output_dim()?;
+            let inputs = if let Some(gate_up_proj) =
+                merge_quantized_projection_rows(&[&gate_proj, &up_proj])?
+            {
                 MlpInputProjection::MergedQuantized {
                     gate_up_proj,
                     gate_dim,
@@ -1693,10 +1920,15 @@ pub(super) fn load_qwen35_metal_weights(
             } else {
                 MlpInputProjection::Split { gate_proj, up_proj }
             };
-
-        // Store individual gate/up projections for the optional C++ step path.
-        let gate_proj_individual = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
-        let up_proj_individual = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
+            let gate_proj_individual = load_proj(&format!("{layer_prefix}.mlp.gate_proj"))?;
+            let up_proj_individual = load_proj(&format!("{layer_prefix}.mlp.up_proj"))?;
+            MlpKind::Dense(MetalQwen35DenseMlpWeights {
+                inputs,
+                down_proj: load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
+                gate_proj: gate_proj_individual,
+                up_proj: up_proj_individual,
+            })
+        };
 
         layers.push(MetalQwen35BlockWeights {
             input_layernorm: get(&format!("{layer_prefix}.input_layernorm.weight"))?,
@@ -1704,10 +1936,7 @@ pub(super) fn load_qwen35_metal_weights(
             post_attention_layernorm: get(&format!(
                 "{layer_prefix}.post_attention_layernorm.weight"
             ))?,
-            mlp_inputs,
-            gate_proj: gate_proj_individual,
-            up_proj: up_proj_individual,
-            down_proj: load_proj(&format!("{layer_prefix}.mlp.down_proj"))?,
+            mlp,
         });
     }
 
@@ -1726,6 +1955,80 @@ pub(super) fn load_qwen35_metal_weights(
     }
 
     Ok(weights)
+}
+
+fn load_qwen35_moe_layer_weights(
+    tensors: &super::TensorMap,
+    layer_prefix: &str,
+    moe_cfg: &super::config::MetalQwen35MoeConfig,
+) -> Result<MetalQwen35MoeWeights> {
+    let mlp_prefix = format!("{layer_prefix}.mlp");
+    let num_experts =
+        i32::try_from(moe_cfg.num_experts).context("Qwen3.6 num_experts does not fit in i32")?;
+    let top_k = i32::try_from(moe_cfg.num_experts_per_tok)
+        .context("Qwen3.6 num_experts_per_tok does not fit in i32")?;
+    anyhow::ensure!(
+        num_experts > 0 && top_k > 0 && top_k <= num_experts,
+        "invalid Qwen3.6 MoE config: num_experts={num_experts}, top_k={top_k}"
+    );
+
+    Ok(MetalQwen35MoeWeights {
+        router: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.gate"),
+            moe_cfg.router_group_size,
+            moe_cfg.router_bits,
+        )?,
+        switch_gate: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.gate_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        switch_up: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.up_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        switch_down: load_stacked_quantized(
+            tensors,
+            &format!("{mlp_prefix}.switch_mlp.down_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_gate: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.gate_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_up: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.up_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_down: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert.down_proj"),
+            moe_cfg.expert_group_size,
+            moe_cfg.expert_bits,
+        )?,
+        shared_expert_gate: load_quantized_with_bits(
+            tensors,
+            &format!("{mlp_prefix}.shared_expert_gate"),
+            moe_cfg.router_group_size,
+            moe_cfg.router_bits,
+        )?,
+        num_experts,
+        top_k,
+        norm_topk_prob: moe_cfg.norm_topk_prob,
+        router_bits: moe_cfg.router_bits,
+        router_group_size: moe_cfg.router_group_size,
+        expert_bits: moe_cfg.expert_bits,
+        expert_group_size: moe_cfg.expert_group_size,
+    })
 }
 
 fn load_lm_head(

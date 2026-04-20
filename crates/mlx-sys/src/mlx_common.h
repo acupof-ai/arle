@@ -17,6 +17,8 @@ static inline void mlx_clear_error() { g_mlx_last_error.clear(); }
 static inline void mlx_set_error(const char* msg) { g_mlx_last_error = msg; }
 static inline void mlx_set_error(const std::string& msg) { g_mlx_last_error = msg; }
 
+extern "C" const char* mlx_last_error();
+
 // Macro for wrapping functions that return mlx_array* — catches C++ exceptions
 // and returns nullptr + sets thread-local error.
 #define MLX_TRY_RETURN(...) \
@@ -49,9 +51,81 @@ static inline void mlx_set_error(const std::string& msg) { g_mlx_last_error = ms
         mlx_set_error(e.what()); \
         return; \
     }
-// Shape = mlx::core::Shape (SmallVector<int> in v0.31+)
 
 struct mlx_array;  // opaque
+
+// Qwen3.5/3.6 sparse-MoE helper shared between the compiled model path and
+// the Rust fallback. `qwen35_moe_block_forward_cpp()` is the internal
+// array-native helper used by the compiled model path; the `extern "C"`
+// wrapper remains for Rust callers.
+array qwen35_moe_block_forward_cpp(
+    const array& hidden,
+    const array& router_w,
+    const array& router_scales,
+    const array& router_biases,
+    int32_t router_bits,
+    int32_t router_group_size,
+    const array& expert_gate_w,
+    const array& expert_gate_scales,
+    const array& expert_gate_biases,
+    const array& expert_up_w,
+    const array& expert_up_scales,
+    const array& expert_up_biases,
+    const array& expert_down_w,
+    const array& expert_down_scales,
+    const array& expert_down_biases,
+    int32_t expert_bits,
+    int32_t expert_group_size,
+    const array& shared_gate_w,
+    const array& shared_gate_scales,
+    const array& shared_gate_biases,
+    const array& shared_up_w,
+    const array& shared_up_scales,
+    const array& shared_up_biases,
+    const array& shared_down_w,
+    const array& shared_down_scales,
+    const array& shared_down_biases,
+    const array& shared_gate_router_w,
+    const array& shared_gate_router_scales,
+    const array& shared_gate_router_biases,
+    int32_t num_experts,
+    int32_t top_k,
+    bool norm_topk_prob);
+
+extern "C" mlx_array* qwen35_moe_block_forward(
+    mlx_array* hidden,
+    mlx_array* router_w,
+    mlx_array* router_scales,
+    mlx_array* router_biases,
+    int32_t router_bits,
+    int32_t router_group_size,
+    mlx_array* expert_gate_w,
+    mlx_array* expert_gate_scales,
+    mlx_array* expert_gate_biases,
+    mlx_array* expert_up_w,
+    mlx_array* expert_up_scales,
+    mlx_array* expert_up_biases,
+    mlx_array* expert_down_w,
+    mlx_array* expert_down_scales,
+    mlx_array* expert_down_biases,
+    int32_t expert_bits,
+    int32_t expert_group_size,
+    mlx_array* shared_gate_w,
+    mlx_array* shared_gate_scales,
+    mlx_array* shared_gate_biases,
+    mlx_array* shared_up_w,
+    mlx_array* shared_up_scales,
+    mlx_array* shared_up_biases,
+    mlx_array* shared_down_w,
+    mlx_array* shared_down_scales,
+    mlx_array* shared_down_biases,
+    mlx_array* shared_gate_router_w,
+    mlx_array* shared_gate_router_scales,
+    mlx_array* shared_gate_router_biases,
+    int32_t num_experts,
+    int32_t top_k,
+    bool norm_topk_prob);
+// Shape = mlx::core::Shape (SmallVector<int> in v0.31+)
 
 static inline array* to_arr(mlx_array* h) {
     return reinterpret_cast<array*>(h);

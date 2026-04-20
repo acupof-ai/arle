@@ -442,6 +442,41 @@ unsafe extern "C" {
         dw_b: *mut mlx_array,
     );
     #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_set_last_moe_mlp(
+        model: *mut std::ffi::c_void,
+        router_w: *mut mlx_array,
+        router_s: *mut mlx_array,
+        router_b: *mut mlx_array,
+        router_gs: i32,
+        router_bits: i32,
+        expert_gate_w: *mut mlx_array,
+        expert_gate_s: *mut mlx_array,
+        expert_gate_b: *mut mlx_array,
+        expert_up_w: *mut mlx_array,
+        expert_up_s: *mut mlx_array,
+        expert_up_b: *mut mlx_array,
+        expert_down_w: *mut mlx_array,
+        expert_down_s: *mut mlx_array,
+        expert_down_b: *mut mlx_array,
+        expert_gs: i32,
+        expert_bits: i32,
+        shared_gate_w: *mut mlx_array,
+        shared_gate_s: *mut mlx_array,
+        shared_gate_b: *mut mlx_array,
+        shared_up_w: *mut mlx_array,
+        shared_up_s: *mut mlx_array,
+        shared_up_b: *mut mlx_array,
+        shared_down_w: *mut mlx_array,
+        shared_down_s: *mut mlx_array,
+        shared_down_b: *mut mlx_array,
+        shared_gate_router_w: *mut mlx_array,
+        shared_gate_router_s: *mut mlx_array,
+        shared_gate_router_b: *mut mlx_array,
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: bool,
+    );
+    #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_set_separate_proj(
         model: *mut std::ffi::c_void,
         qkv_w: *mut mlx_array,
@@ -612,6 +647,64 @@ unsafe extern "C" {
         stop_tokens: *const i32,
         n_stop_tokens: i32,
     ) -> i32;
+
+    // === Qwen3.6 MoE block ===
+
+    /// Qwen3.5/3.6 SparseMoeBlock forward (Metal only).
+    ///
+    /// Composes MLX ops to reproduce `Qwen3NextSparseMoeBlock.__call__` in one
+    /// C++ call: 8-bit-quantized router → top-k (argpartition + slice) →
+    /// take_along_axis scores → optional norm_topk_prob → SwitchGLU over the
+    /// switch-mlp experts (4-bit quantized, stacked) → weighted sum over top_k
+    /// → dense shared expert (4-bit quantized SwiGLU) gated by an 8-bit scalar
+    /// router → sum.
+    ///
+    /// All `*_w/*_scales/*_biases` triples are mlx quantized-linear triples in
+    /// affine mode (`group_size` = 64 for Qwen3.6-A3B, `bits` = 4 for experts
+    /// and 8 for both routers per mlx-community config).
+    ///
+    /// Expert weights are stacked on the expert axis:
+    /// `expert_{gate,up}_w : [E, Hmoe, H/pack]`,
+    /// `expert_down_w : [E, H, Hmoe/pack]`. Shared-expert weights are plain
+    /// 2-D quantized linears matching `mlx_fused_quantized_gated_mlp`.
+    ///
+    /// Returns a newly-allocated array handle (caller must `mlx_array_free`)
+    /// or nullptr on failure (check `mlx_last_error()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_moe_block_forward(
+        hidden: *mut mlx_array,
+        router_w: *mut mlx_array,
+        router_scales: *mut mlx_array,
+        router_biases: *mut mlx_array,
+        router_bits: i32,
+        router_group_size: i32,
+        expert_gate_w: *mut mlx_array,
+        expert_gate_scales: *mut mlx_array,
+        expert_gate_biases: *mut mlx_array,
+        expert_up_w: *mut mlx_array,
+        expert_up_scales: *mut mlx_array,
+        expert_up_biases: *mut mlx_array,
+        expert_down_w: *mut mlx_array,
+        expert_down_scales: *mut mlx_array,
+        expert_down_biases: *mut mlx_array,
+        expert_bits: i32,
+        expert_group_size: i32,
+        shared_gate_w: *mut mlx_array,
+        shared_gate_scales: *mut mlx_array,
+        shared_gate_biases: *mut mlx_array,
+        shared_up_w: *mut mlx_array,
+        shared_up_scales: *mut mlx_array,
+        shared_up_biases: *mut mlx_array,
+        shared_down_w: *mut mlx_array,
+        shared_down_scales: *mut mlx_array,
+        shared_down_biases: *mut mlx_array,
+        shared_gate_router_w: *mut mlx_array,
+        shared_gate_router_scales: *mut mlx_array,
+        shared_gate_router_biases: *mut mlx_array,
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: bool,
+    ) -> *mut mlx_array;
 
     // === Fast ops ===
 

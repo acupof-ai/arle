@@ -152,6 +152,18 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         backends: &[Metal],
         implemented: true,
     },
+    // ── Qwen3.5 / Qwen3.6 Mixture-of-Experts (Metal-only, Phase 1). ──────
+    CatalogEntry {
+        hf_id: "mlx-community/Qwen3.6-35B-A3B-4bit",
+        display_name: "Qwen3.6 35B-A3B",
+        family: "Qwen3.5-MoE",
+        param_count: "35B",
+        quantization: Some("4-bit"),
+        size_gb: 20.4,
+        min_memory_gb: 24.0,
+        backends: &[Metal],
+        implemented: true,
+    },
 ];
 
 /// Return catalog entries that can run on this system, sorted by quality

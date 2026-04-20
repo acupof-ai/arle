@@ -34,6 +34,14 @@ use anyhow::{Context, Result, bail};
 pub enum ModelArch {
     Qwen3,
     Qwen35,
+    /// Qwen3.5 Mixture-of-Experts variant (Qwen3.6-35B-A3B and friends).
+    /// Shares Qwen3.5's hybrid linear+full attention; only the MLP block
+    /// changes to a SparseMoeBlock + shared expert.
+    ///
+    /// Name intentionally mirrors the HuggingFace `Qwen3_5MoeForCausalLM`
+    /// architecture string to make the mapping grep-visible.
+    #[allow(non_camel_case_types)]
+    Qwen3_5_Moe,
     Llama,
     Mistral,
     Mixtral,
@@ -50,6 +58,7 @@ impl ModelArch {
         match self {
             Self::Qwen3 => "Qwen3",
             Self::Qwen35 => "Qwen3.5",
+            Self::Qwen3_5_Moe => "Qwen3.5-MoE",
             Self::Llama => "Llama",
             Self::Mistral => "Mistral",
             Self::Mixtral => "Mixtral",
@@ -64,7 +73,7 @@ impl ModelArch {
     /// Attention variant used by this architecture.
     pub fn attention_variant(self) -> AttentionVariant {
         match self {
-            Self::Qwen35 => AttentionVariant::HybridGqa,
+            Self::Qwen35 | Self::Qwen3_5_Moe => AttentionVariant::HybridGqa,
             Self::DeepSeekV2 | Self::DeepSeekV3 => AttentionVariant::Mla,
             Self::Gemma => AttentionVariant::Mha,
             Self::Qwen3 | Self::Llama | Self::Mistral | Self::Mixtral | Self::Phi | Self::GLM4 => {
@@ -73,9 +82,22 @@ impl ModelArch {
         }
     }
 
-    /// Whether a CUDA implementation is available in this build.
+    /// Whether an implementation is available in this build.
+    ///
+    /// `Qwen3_5_Moe` is Metal-only for now; the CUDA path is a `todo!` stub
+    /// until the CUDA MoE kernel lands (see `docs/plans/qwen36-moe-metal.md`).
     pub fn is_implemented(self) -> bool {
-        matches!(self, Self::Qwen3 | Self::Qwen35 | Self::GLM4)
+        match self {
+            Self::Qwen3 | Self::Qwen35 | Self::GLM4 => true,
+            Self::Qwen3_5_Moe => cfg!(feature = "metal"),
+            Self::Llama
+            | Self::Mistral
+            | Self::Mixtral
+            | Self::DeepSeekV2
+            | Self::DeepSeekV3
+            | Self::Gemma
+            | Self::Phi => false,
+        }
     }
 }
 
@@ -118,6 +140,9 @@ fn architecture_map() -> &'static HashMap<&'static str, ModelArch> {
         m.insert("Qwen2_5_VLForCausalLM", ModelArch::Qwen35);
         m.insert("Qwen3_5ForCausalLM", ModelArch::Qwen35);
         m.insert("Qwen3_5ForConditionalGeneration", ModelArch::Qwen35);
+        // Qwen3.5 / Qwen3.6 Mixture-of-Experts variants.
+        m.insert("Qwen3_5MoeForCausalLM", ModelArch::Qwen3_5_Moe);
+        m.insert("Qwen3_5MoeForConditionalGeneration", ModelArch::Qwen3_5_Moe);
         // Llama
         m.insert("LlamaForCausalLM", ModelArch::Llama);
         m.insert("Llama3ForCausalLM", ModelArch::Llama);
@@ -164,6 +189,18 @@ pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
     let v: serde_json::Value = serde_json::from_str(json_str).context("parsing config.json")?;
     let has_text_config = v.get("text_config").is_some();
 
+    // Qwen3.5-family checkpoints occasionally advertise a generic arch string
+    // but expose MoE fields under `text_config.num_experts`. Treat any such
+    // checkpoint as Qwen3_5_Moe regardless of what the arch string promises.
+    let has_moe_experts = v
+        .get("text_config")
+        .and_then(|tc| tc.get("num_experts"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|n| n > 0)
+        || v.get("num_experts")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|n| n > 0);
+
     // Primary: `architectures` array.
     if let Some(archs) = v.get("architectures").and_then(|a| a.as_array()) {
         let map = architecture_map();
@@ -173,7 +210,15 @@ pub fn detect_arch_from_json(json_str: &str) -> Result<ModelArch> {
                     // Qwen3.5 checkpoints are frequently wrapped as top-level
                     // `Qwen2ForCausalLM` plus a nested `text_config`.
                     if arch == ModelArch::Qwen3 && has_text_config {
+                        if has_moe_experts {
+                            return Ok(ModelArch::Qwen3_5_Moe);
+                        }
                         return Ok(ModelArch::Qwen35);
+                    }
+                    // Promote Qwen3.5 → Qwen3_5_Moe if the config actually
+                    // carries expert fields.
+                    if arch == ModelArch::Qwen35 && has_moe_experts {
+                        return Ok(ModelArch::Qwen3_5_Moe);
                     }
                     return Ok(arch);
                 }
@@ -252,6 +297,14 @@ mod tests {
         r#"{"architectures":["ChatGLMModel"],"hidden_size":4096}"#
     }
 
+    fn qwen35_moe_explicit_arch_config() -> &'static str {
+        r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"text_config":{"hidden_size":2048,"num_experts":256}}"#
+    }
+
+    fn qwen35_moe_via_text_config_experts() -> &'static str {
+        r#"{"architectures":["Qwen2ForCausalLM"],"text_config":{"hidden_size":2048,"num_experts":256,"layer_types":["full_attention","linear_attention"]}}"#
+    }
+
     fn unknown_config() -> &'static str {
         r#"{"architectures":["SomeNewModelForCausalLM"]}"#
     }
@@ -322,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_qwen35_moe_via_explicit_arch() {
+        assert_eq!(
+            detect_arch_from_json(qwen35_moe_explicit_arch_config()).unwrap(),
+            ModelArch::Qwen3_5_Moe
+        );
+    }
+
+    #[test]
+    fn detects_qwen35_moe_via_text_config_experts() {
+        assert_eq!(
+            detect_arch_from_json(qwen35_moe_via_text_config_experts()).unwrap(),
+            ModelArch::Qwen3_5_Moe
+        );
+    }
+
+    #[test]
     fn unknown_arch_returns_err() {
         assert!(detect_arch_from_json(unknown_config()).is_err());
     }
@@ -354,6 +423,10 @@ mod tests {
             ModelArch::Qwen35.attention_variant(),
             AttentionVariant::HybridGqa
         );
+        assert_eq!(
+            ModelArch::Qwen3_5_Moe.attention_variant(),
+            AttentionVariant::HybridGqa
+        );
         assert_eq!(ModelArch::Gemma.attention_variant(), AttentionVariant::Mha);
         assert_eq!(ModelArch::Llama.attention_variant(), AttentionVariant::Gqa);
         assert_eq!(ModelArch::GLM4.attention_variant(), AttentionVariant::Gqa);
@@ -364,6 +437,7 @@ mod tests {
         for arch in [
             ModelArch::Qwen3,
             ModelArch::Qwen35,
+            ModelArch::Qwen3_5_Moe,
             ModelArch::Llama,
             ModelArch::Mistral,
             ModelArch::Mixtral,

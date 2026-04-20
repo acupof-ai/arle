@@ -17,6 +17,41 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <stdexcept>
+
+extern "C" mlx_array* qwen35_moe_block_forward(
+    mlx_array* hidden,
+    mlx_array* router_w,
+    mlx_array* router_scales,
+    mlx_array* router_biases,
+    int32_t router_bits,
+    int32_t router_group_size,
+    mlx_array* expert_gate_w,
+    mlx_array* expert_gate_scales,
+    mlx_array* expert_gate_biases,
+    mlx_array* expert_up_w,
+    mlx_array* expert_up_scales,
+    mlx_array* expert_up_biases,
+    mlx_array* expert_down_w,
+    mlx_array* expert_down_scales,
+    mlx_array* expert_down_biases,
+    int32_t expert_bits,
+    int32_t expert_group_size,
+    mlx_array* shared_gate_w,
+    mlx_array* shared_gate_scales,
+    mlx_array* shared_gate_biases,
+    mlx_array* shared_up_w,
+    mlx_array* shared_up_scales,
+    mlx_array* shared_up_biases,
+    mlx_array* shared_down_w,
+    mlx_array* shared_down_scales,
+    mlx_array* shared_down_biases,
+    mlx_array* shared_gate_router_w,
+    mlx_array* shared_gate_router_scales,
+    mlx_array* shared_gate_router_biases,
+    int32_t num_experts,
+    int32_t top_k,
+    bool norm_topk_prob);
 
 namespace {
 
@@ -389,8 +424,26 @@ struct GdrLayerWeights {
 
 struct LayerWeights {
     bool is_gdr = false;
+    bool has_moe = false;
     FullAttnLayerWeights full;
     GdrLayerWeights gdr;
+    struct MoeLayerWeights {
+        QWeight router;
+        QWeight switch_gate;
+        QWeight switch_up;
+        QWeight switch_down;
+        QWeight shared_gate;
+        QWeight shared_up;
+        QWeight shared_down;
+        QWeight shared_expert_gate;
+        int num_experts = 0;
+        int top_k = 0;
+        bool norm_topk_prob = true;
+        int router_bits = 8;
+        int router_group_size = 64;
+        int expert_bits = 4;
+        int expert_group_size = 64;
+    } moe;
 };
 
 // ── Model struct ───────────────────────────────────────────────────────────
@@ -901,6 +954,24 @@ struct Qwen35CompiledModel {
         return down.apply(h);
     }
 
+    array moe_mlp(const array& x, const LayerWeights::MoeLayerWeights& moe) const {
+        return qwen35_moe_block_forward_cpp(
+            x,
+            moe.router.w, moe.router.scales, moe.router.biases,
+            moe.router_bits, moe.router_group_size,
+            moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
+            moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
+            moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
+            moe.expert_bits, moe.expert_group_size,
+            moe.shared_gate.w, moe.shared_gate.scales, moe.shared_gate.biases,
+            moe.shared_up.w, moe.shared_up.scales, moe.shared_up.biases,
+            moe.shared_down.w, moe.shared_down.scales, moe.shared_down.biases,
+            moe.shared_expert_gate.w,
+            moe.shared_expert_gate.scales,
+            moe.shared_expert_gate.biases,
+            moe.num_experts, moe.top_k, moe.norm_topk_prob);
+    }
+
     // ── Full forward pass ──────────────────────────────────────────────
     // inputs layout:
     //   [0]        : token ids / token batch
@@ -971,7 +1042,9 @@ struct Qwen35CompiledModel {
             auto residual2 = x;
             auto post_ln_w = layer.is_gdr ? layer.gdr.post_attn_ln_w : layer.full.post_attn_ln_w;
             auto xn2 = fast::rms_norm(x, post_ln_w, rms_eps);
-            if (layer.is_gdr && use_separate_mlp_for_current_step(layer.gdr)) {
+            if (layer.has_moe) {
+                x = residual2 + moe_mlp(xn2, layer.moe);
+            } else if (layer.is_gdr && use_separate_mlp_for_current_step(layer.gdr)) {
                 x = residual2 + mlp_separate(xn2, layer.gdr.gate_proj, layer.gdr.up_proj, layer.gdr.down);
             } else {
                 auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
@@ -1159,9 +1232,12 @@ void qwen35_compiled_push_full_attn(
         lw.full.o_proj = {*to_arr(o_w), *to_arr(o_s), *to_arr(o_b), q_gs, q_bits};
         lw.full.q_norm_w = *to_arr(q_norm);
         lw.full.k_norm_w = *to_arr(k_norm);
-        lw.full.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
-        lw.full.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
-        lw.full.gate_dim = gate_dim;
+        if (gu_w != nullptr && gu_s != nullptr && gu_b != nullptr &&
+            dw_w != nullptr && dw_s != nullptr && dw_b != nullptr) {
+            lw.full.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
+            lw.full.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
+            lw.full.gate_dim = gate_dim;
+        }
         m->layers.push_back(std::move(lw));
         m->n_full_attn++;
     });
@@ -1207,11 +1283,58 @@ void qwen35_compiled_push_gdr(
         float inv = 1.0f / std::sqrt((float)key_dim);
         lw.gdr.q_scale_arr = astype(array(inv * inv), bfloat16);
         lw.gdr.k_scale_arr = astype(array(inv), bfloat16);
-        lw.gdr.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
-        lw.gdr.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
-        lw.gdr.gate_dim = gate_dim;
+        if (gu_w != nullptr && gu_s != nullptr && gu_b != nullptr &&
+            dw_w != nullptr && dw_s != nullptr && dw_b != nullptr) {
+            lw.gdr.gate_up = {*to_arr(gu_w), *to_arr(gu_s), *to_arr(gu_b), gu_gs, gu_bits};
+            lw.gdr.down = {*to_arr(dw_w), *to_arr(dw_s), *to_arr(dw_b), gu_gs, gu_bits};
+            lw.gdr.gate_dim = gate_dim;
+        }
         m->layers.push_back(std::move(lw));
         m->n_gdr++;
+    });
+}
+
+void qwen35_compiled_set_last_moe_mlp(
+    void* model,
+    mlx_array* router_w, mlx_array* router_s, mlx_array* router_b, int32_t router_gs, int32_t router_bits,
+    mlx_array* expert_gate_w, mlx_array* expert_gate_s, mlx_array* expert_gate_b,
+    mlx_array* expert_up_w, mlx_array* expert_up_s, mlx_array* expert_up_b,
+    mlx_array* expert_down_w, mlx_array* expert_down_s, mlx_array* expert_down_b,
+    int32_t expert_gs, int32_t expert_bits,
+    mlx_array* shared_gate_w, mlx_array* shared_gate_s, mlx_array* shared_gate_b,
+    mlx_array* shared_up_w, mlx_array* shared_up_s, mlx_array* shared_up_b,
+    mlx_array* shared_down_w, mlx_array* shared_down_s, mlx_array* shared_down_b,
+    mlx_array* shared_gate_router_w, mlx_array* shared_gate_router_s, mlx_array* shared_gate_router_b,
+    int32_t num_experts, int32_t top_k, bool norm_topk_prob
+) {
+    MLX_TRY_VOID({
+        auto* m = static_cast<Qwen35CompiledModel*>(model);
+        if (m->layers.empty()) {
+            throw std::runtime_error("qwen35_compiled_set_last_moe_mlp requires an existing layer");
+        }
+        auto& lw = m->layers.back();
+        lw.has_moe = true;
+        lw.moe.router = {*to_arr(router_w), *to_arr(router_s), *to_arr(router_b), router_gs, router_bits};
+        lw.moe.switch_gate = {*to_arr(expert_gate_w), *to_arr(expert_gate_s), *to_arr(expert_gate_b), expert_gs, expert_bits};
+        lw.moe.switch_up = {*to_arr(expert_up_w), *to_arr(expert_up_s), *to_arr(expert_up_b), expert_gs, expert_bits};
+        lw.moe.switch_down = {*to_arr(expert_down_w), *to_arr(expert_down_s), *to_arr(expert_down_b), expert_gs, expert_bits};
+        lw.moe.shared_gate = {*to_arr(shared_gate_w), *to_arr(shared_gate_s), *to_arr(shared_gate_b), expert_gs, expert_bits};
+        lw.moe.shared_up = {*to_arr(shared_up_w), *to_arr(shared_up_s), *to_arr(shared_up_b), expert_gs, expert_bits};
+        lw.moe.shared_down = {*to_arr(shared_down_w), *to_arr(shared_down_s), *to_arr(shared_down_b), expert_gs, expert_bits};
+        lw.moe.shared_expert_gate = {
+            *to_arr(shared_gate_router_w),
+            *to_arr(shared_gate_router_s),
+            *to_arr(shared_gate_router_b),
+            router_gs,
+            router_bits,
+        };
+        lw.moe.num_experts = num_experts;
+        lw.moe.top_k = top_k;
+        lw.moe.norm_topk_prob = norm_topk_prob;
+        lw.moe.router_bits = router_bits;
+        lw.moe.router_group_size = router_gs;
+        lw.moe.expert_bits = expert_bits;
+        lw.moe.expert_group_size = expert_gs;
     });
 }
 

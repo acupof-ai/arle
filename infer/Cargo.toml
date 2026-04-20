@@ -52,6 +52,7 @@ crossbeam-channel = "0.5"
 chat = { path = "../crates/chat" }
 cuda-kernels = { path = "../crates/cuda-kernels", default-features = false }
 qwen3-spec = { path = "../crates/qwen3-spec" }
+qwen35-spec = { path = "../crates/qwen35-spec" }
 
 [features]
 # Enable CUDA kernel compilation and GPU inference (default on Linux/GPU machines).
