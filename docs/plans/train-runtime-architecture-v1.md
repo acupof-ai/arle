@@ -255,8 +255,10 @@ step_000123/
 
 ### Phase 3 — Migrate remaining 4 binaries
 
-- `pretrain` + `pretrain_qwen3` (corpus + packed-sequence; share a step_fn skeleton).
-- `train_grpo` + `train_multi_turn` (same trainer, richer step_fn including rollout).
+- ✅ **`pretrain.rs` migrated** (commit 6bd0211 + fix ef24ca6 for `--grad-clip 0` panic). Binary ~415 LOC; uses `Trainer<AdamW, PretrainClip, ConstantLr>` with local enum wrapping `NoClip`/`GlobalNorm`. Save/resume deferred pending a Transformer safetensors codec (the hand-written loop also had no checkpoint support).
+- ⏳ `pretrain_qwen3.rs` — larger (~726 LOC) but closest to `train_sft`: shared Qwen3Model + SafetensorsRegistry, existing resume/save/eval. Migration plan: (a) use `Trainer::run_with_eval` for the eval branch, (b) use `Trainer::run_with_hooks` for the weight-save hook at `step_{:06}/`, (c) delete local `resume_from_checkpoint` / duplicate AdamW state round-trip — route through Trainer's built-in resume + the v2 codec, (d) wire `--lr-schedule`/`--metrics-jsonl`/`--warmup-steps`/`--min-lr` same as train_sft. Scope: one commit, follow-up smoke similar to train_sft (pending-remote bench).
+- ⏳ `train_grpo.rs` (~353 LOC) — two distinct phases: SFT warm-up (simple cross-entropy) + GRPO (rollout → advantages → grpo_loss → KL). Migration plan: two back-to-back `Trainer` constructions (different total_steps, same optimizer state reused via a manual `optim.export_state`/`import_state` handoff), or — if the GRPO phase closure captures get awkward — keep the GRPO loop hand-written and only migrate the SFT phase. Decide after prototyping.
+- ⏳ `train_multi_turn.rs` — not yet scoped.
 - Each binary lands as its own commit with a bench entry.
 - Retire duplicated CLI arg handling; extend `cli_args.rs` with shared `trainer_args()` helper.
 
