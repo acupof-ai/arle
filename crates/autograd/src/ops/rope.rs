@@ -3,10 +3,93 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
-    tensor::{Tensor, TensorId, TensorStore},
+    tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
 
 pub fn rope(
+    x: TensorId,
+    cos: TensorId,
+    sin: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // M5.3b.5: route `x` through the lazy `backend.rope` whenever a live
+    // device handle is available — that is, `Dirty::Device` (device is
+    // authoritative) AND `Dirty::Both` (host and device in sync; either
+    // source is valid, device is cheaper). This is wider than the silu /
+    // softmax / exp dispatch (Dirty::Device only) because rope is typically
+    // called on q/k right after a rank-3 matmul + rank-4 reshape; if the
+    // reshape path is ever made lazy too, the output lands Dirty::Both and
+    // we want to stay on-device through rope. cos/sin stay on the host:
+    // Qwen's rope caches are precomputed per seq length and the per-call
+    // uploads are tiny vs. the 4-D rotation. Dirty::Host inputs take the
+    // eager host path for parity with the pre-M5.3b.5 behavior. Backward
+    // stays on the eager `rope_forward(gy, cos, -sin)` path;
+    // `tape.backward`'s pre-walk batch-flush takes care of the
+    // Dirty::Device output tensors before `rope_backward` reads them.
+    let has_device_handle = {
+        let t = store.tensor(x)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    if has_device_handle {
+        rope_device_lazy(x, cos, sin, store, tape)
+    } else {
+        rope_host_eager(x, cos, sin, store, tape)
+    }
+}
+
+fn rope_device_lazy(
+    x: TensorId,
+    cos: TensorId,
+    sin: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    // cos/sin are expected to be host-resident (seq-len-keyed caches).
+    // If a caller made them device-resident, readback pays one eval each
+    // but behavior stays correct.
+    store.ensure_host(cos)?;
+    store.ensure_host(sin)?;
+    store.ensure_device(x)?;
+
+    let (x_shape, requires_grad) = {
+        let tensor = store.tensor(x)?;
+        (tensor.shape.clone(), tensor.requires_grad)
+    };
+    let cos_shape = store.tensor(cos)?.shape.clone();
+    let sin_shape = store.tensor(sin)?.shape.clone();
+    validate_shapes(&x_shape, &cos_shape, &sin_shape)?;
+
+    let x_handle = store
+        .tensor(x)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "rope: ensure_device left x without a device handle",
+        ))?
+        .clone();
+    let cos_data = store.tensor(cos)?.data.clone();
+    let sin_data = store.tensor(sin)?.data.clone();
+
+    let out_handle = store
+        .backend()
+        .rope(&x_handle, &x_shape, &cos_data, &sin_data)?;
+    let output_id = store.alloc_device_tensor(x_shape, out_handle)?;
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::RoPE,
+            output_id,
+            input_ids: smallvec![x],
+            saved: SavedContext::RoPECtx { cos, sin },
+        });
+    }
+
+    Ok(output_id)
+}
+
+fn rope_host_eager(
     x: TensorId,
     cos: TensorId,
     sin: TensorId,

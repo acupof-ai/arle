@@ -10,11 +10,11 @@ use crate::{
     backend::{Backend, Device, DeviceHandle, MlxHandle, matmul_output_shape, validate_broadcast},
 };
 use mlx_sys::{
-    MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array_data_float32, mlx_array_free, mlx_array_from_data,
-    mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval, mlx_exp,
-    mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative,
-    mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_subtract,
-    mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
+    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis, mlx_eval,
+    mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply,
+    mlx_negative, mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis,
+    mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -515,6 +515,27 @@ impl Backend for MetalBackend {
         sin: &[f32],
     ) -> Result<Vec<f32>> {
         mlx_rope(x, x_shape, cos, sin)
+    }
+
+    // Lazy half-split rotation: same graph as `mlx_rope` (slice → multiply →
+    // sub/add → concat) but borrows `x` as an existing MLX handle and skips
+    // the final `eval_and_readback`. cos/sin still upload per call from host
+    // slices — the Qwen caches are precomputed per seq length and rarely
+    // benefit from staying device-resident, and this keeps the API from
+    // needing to merge three device handles. M5.3b.5.
+    fn rope(
+        &self,
+        x: &DeviceHandle,
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(x_handle) = x else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot rope a non-metal device handle",
+            ));
+        };
+        mlx_rope_lazy(x_handle.as_ptr(), x_shape, cos, sin)
     }
 
     fn gather_last_dim_forward(
@@ -1580,6 +1601,157 @@ fn mlx_rope(x: &[f32], x_shape: &[usize], cos: &[f32], sin: &[f32]) -> Result<Ve
             });
         }
         Ok(host)
+    }
+}
+
+// Lazy sibling of `mlx_rope`: borrows an existing MLX `x` handle, uploads
+// cos/sin as temporary arrays, composes the same rotation graph, and
+// returns the final concat node wrapped in an `MlxHandle` without calling
+// `mlx_eval`. Mirrors every shape/null check in `mlx_rope` but is scoped
+// to the device-handle path. M5.3b.5.
+fn mlx_rope_lazy(
+    x_ptr: *mut mlx_array,
+    x_shape: &[usize],
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<DeviceHandle> {
+    if x_shape.len() != 4 {
+        return Err(AutogradError::InvalidRank {
+            expected: "4",
+            got: x_shape.len(),
+        });
+    }
+    let batch = x_shape[0];
+    let heads = x_shape[1];
+    let seq = x_shape[2];
+    let head_dim = x_shape[3];
+    if !head_dim.is_multiple_of(2) {
+        return Err(AutogradError::InvalidRank {
+            expected: "even head dim",
+            got: head_dim,
+        });
+    }
+    let half_dim = head_dim / 2;
+    let expected_cache = seq * half_dim;
+    if cos.len() != expected_cache || sin.len() != expected_cache {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![expected_cache],
+            got: vec![cos.len().min(sin.len())],
+        });
+    }
+
+    let cache_shape_i32: [i32; 4] = [1, 1, seq as i32, half_dim as i32];
+    let _guard = MLX_GUARD.lock().expect("mlx guard poisoned");
+
+    // Safety: `x_ptr` is borrowed for the duration of this call; every
+    // MLX array allocated below is freed before any early return; the
+    // returned `MlxHandle` owns the final concat result.
+    unsafe {
+        let cos_arr = mlx_array_from_data(
+            cos.as_ptr() as *const c_void,
+            cache_shape_i32.as_ptr(),
+            4,
+            MLX_FLOAT32,
+        );
+        if cos_arr.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (rope lazy cos)",
+            ));
+        }
+        let sin_arr = mlx_array_from_data(
+            sin.as_ptr() as *const c_void,
+            cache_shape_i32.as_ptr(),
+            4,
+            MLX_FLOAT32,
+        );
+        if sin_arr.is_null() {
+            mlx_array_free(cos_arr);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_array_from_data returned null (rope lazy sin)",
+            ));
+        }
+
+        let starts_lo: [i32; 4] = [0, 0, 0, 0];
+        let stops_lo: [i32; 4] = [batch as i32, heads as i32, seq as i32, half_dim as i32];
+        let starts_hi: [i32; 4] = [0, 0, 0, half_dim as i32];
+        let stops_hi: [i32; 4] = [batch as i32, heads as i32, seq as i32, head_dim as i32];
+        let strides: [i32; 4] = [1, 1, 1, 1];
+
+        let x0 = mlx_slice(
+            x_ptr,
+            starts_lo.as_ptr(),
+            stops_lo.as_ptr(),
+            strides.as_ptr(),
+            4,
+        );
+        let x1 = mlx_slice(
+            x_ptr,
+            starts_hi.as_ptr(),
+            stops_hi.as_ptr(),
+            strides.as_ptr(),
+            4,
+        );
+        if x0.is_null() || x1.is_null() {
+            if !x0.is_null() {
+                mlx_array_free(x0);
+            }
+            if !x1.is_null() {
+                mlx_array_free(x1);
+            }
+            mlx_array_free(cos_arr);
+            mlx_array_free(sin_arr);
+            return Err(AutogradError::TapeInvariant(
+                "mlx_slice returned null (rope lazy)",
+            ));
+        }
+
+        let x0c = mlx_multiply(x0, cos_arr);
+        let x1s = mlx_multiply(x1, sin_arr);
+        let x1c = mlx_multiply(x1, cos_arr);
+        let x0s = mlx_multiply(x0, sin_arr);
+        mlx_array_free(x0);
+        mlx_array_free(x1);
+        mlx_array_free(cos_arr);
+        mlx_array_free(sin_arr);
+        if x0c.is_null() || x1s.is_null() || x1c.is_null() || x0s.is_null() {
+            for p in [x0c, x1s, x1c, x0s] {
+                if !p.is_null() {
+                    mlx_array_free(p);
+                }
+            }
+            return Err(AutogradError::TapeInvariant(
+                "mlx rope multiply null (lazy)",
+            ));
+        }
+        let out0 = mlx_subtract(x0c, x1s);
+        let out1 = mlx_add(x1c, x0s);
+        mlx_array_free(x0c);
+        mlx_array_free(x1s);
+        mlx_array_free(x1c);
+        mlx_array_free(x0s);
+        if out0.is_null() || out1.is_null() {
+            if !out0.is_null() {
+                mlx_array_free(out0);
+            }
+            if !out1.is_null() {
+                mlx_array_free(out1);
+            }
+            return Err(AutogradError::TapeInvariant(
+                "mlx rope add/subtract null (lazy)",
+            ));
+        }
+
+        let mut parts = [out0, out1];
+        let concat = mlx_concatenate_axis(parts.as_mut_ptr(), 2, 3);
+        mlx_array_free(out0);
+        mlx_array_free(out1);
+        if concat.is_null() {
+            return Err(AutogradError::TapeInvariant(
+                "mlx_concatenate_axis returned null (rope lazy)",
+            ));
+        }
+
+        Ok(DeviceHandle::Metal(MlxHandle::from_raw(concat)))
     }
 }
 

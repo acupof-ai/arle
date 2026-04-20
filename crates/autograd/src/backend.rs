@@ -351,6 +351,26 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         cpu_rope_forward(x, x_shape, cos, sin)
     }
 
+    /// Device-handle variant of `rope_forward`. Lazy on backends that can
+    /// compose the half-split rotation graph into their eval stream (Metal:
+    /// `mlx_slice` → `mlx_multiply` → `mlx_subtract`/`mlx_add` → `mlx_concatenate_axis`,
+    /// no eval). `cos`/`sin` stay as host slices — the caches are precomputed
+    /// per seq length and seldom benefit from being device-resident, and
+    /// keeping them host-side means no merge of device handles is required.
+    /// Default implementation falls back to `readback → host compute →
+    /// upload`. M5.3b.5.
+    fn rope(
+        &self,
+        x: &DeviceHandle,
+        x_shape: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let out = self.rope_forward(&host, x_shape, cos, sin)?;
+        self.upload(&out, x_shape)
+    }
+
     /// Gather along the last axis: `out[prefix] = src[prefix * vocab + ids[prefix]]`.
     /// `src_shape[..-1]` dictates the prefix shape; `ids.len()` must equal the
     /// prefix product. The caller is expected to have bounds-checked the ids.
