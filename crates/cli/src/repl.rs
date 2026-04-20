@@ -584,8 +584,14 @@ fn handle_repl_input(
 ///
 /// Cancellation: `cancel` is polled every `try_recv` iteration. On cancel,
 /// the partial assistant message is still appended (so context stays
-/// consistent), and the worker thread is left to drain into a dropped
-/// receiver — safe for `UnboundedSender` and matches the e2e pattern.
+/// consistent), and the receiver is dropped so the worker's next
+/// `tx.send` fails — `generate_inner` observes `SinkControl::ConsumerDropped`
+/// and exits the sampling loop before the next token, so `worker.join()`
+/// returns promptly instead of waiting for `max_tokens` of decoding
+/// (see `server_engine.rs` `on_token` returning `false` on send failure).
+/// Closes the 76ea6ce codex review High finding: Ctrl-C used to ACK
+/// the keystroke on the UI but block the REPL until the full completion
+/// finished; now it actually short-circuits the engine.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn run_chat_turn(
     engine: &mut dyn InferenceEngine,
@@ -609,13 +615,25 @@ fn run_chat_turn(
         logprobs: false,
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
+    let (tx, rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
+    // `rx` is wrapped in Option so the cancel branch can `take()` + drop it
+    // mid-scope. Dropping the receiver disconnects the unbounded channel,
+    // so the next `tx.send` in the worker fails, `on_token` returns
+    // `false`, and `generate_inner` exits via `SinkControl::ConsumerDropped`
+    // (see `server_engine.rs` — `complete_stream`'s `on_token` treats a
+    // send error as "consumer gone, stop sampling").
+    let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
     let start = Instant::now();
     let mut accumulated = String::new();
     // Buffer for incomplete UTF-8 sequences arriving across deltas.
     let mut partial_bytes: Vec<u8> = Vec::new();
     let mut cancelled = false;
     let mut stream_err: Option<anyhow::Error> = None;
+    let mut tps_meter = crate::tps::TpsMeter::new();
+    // Completion tokens from the final delta's TokenUsage, if populated.
+    // Both CUDA and Metal backends set this at finish_reason; we prefer it
+    // over the rolling counter for the final summary.
+    let mut final_completion_tokens: Option<u64> = None;
 
     // Print a faint marker so the user sees we're generating before the
     // first token arrives. Cleared on first delta.
@@ -628,32 +646,55 @@ fn run_chat_turn(
         loop {
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
+                // Drop the receiver NOW so the worker short-circuits on its
+                // next `tx.send`. Without this, `worker.join()` below would
+                // block until `max_tokens` of decoding finished, negating
+                // the Ctrl-C (76ea6ce codex review High finding).
+                rx = None;
                 break;
             }
-            match rx.try_recv() {
+            // Only the cancel branch above ever takes `rx`; if we reach
+            // here after it was taken, break out defensively rather than
+            // unwrap-panicking in the inner try_recv.
+            let Some(rx_ref) = rx.as_mut() else { break };
+            match rx_ref.try_recv() {
                 Ok(delta) => {
                     if !delta.text_delta.is_empty() {
                         let chunk = decode_chunk(&mut partial_bytes, delta.text_delta.as_bytes());
                         if !chunk.is_empty() {
+                            // Erase the live TPS line (if visible) before
+                            // the next token chunk lands on stdout — keeps
+                            // streamed text uncorrupted on the same row.
+                            tps_meter.hide_before_chunk();
                             accumulated.push_str(&chunk);
                             print!("{}", chunk);
                             let _ = io::stdout().flush();
+                            tps_meter.record_chunk(chunk.len());
                         }
+                    }
+                    if let Some(usage) = delta.usage {
+                        final_completion_tokens = Some(usage.completion_tokens as u64);
                     }
                     if delta.finish_reason.is_some() {
                         break;
                     }
+                    tps_meter.maybe_refresh();
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
+                    tps_meter.maybe_refresh();
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 
-        // Worker may still be running on cancel; we don't try to interrupt
-        // the engine mid-decode (no API for that). Wait for it to finish so
-        // the &mut engine borrow returns cleanly.
+        // On cancel, `rx` was already dropped above, so the worker's next
+        // `tx.send` returns Err → `generate_inner` observes
+        // ConsumerDropped and exits the sampling loop before the next
+        // token. `worker.join()` therefore returns promptly rather than
+        // blocking the REPL for another `max_tokens` of decoding. On the
+        // non-cancel path, the worker has already finished and this is
+        // a no-wait reap.
         if let Ok(res) = worker.join()
             && let Err(e) = res
         {
@@ -682,9 +723,11 @@ fn run_chat_turn(
         cancel.store(false, Ordering::Relaxed);
     } else {
         println!();
-        let elapsed = start.elapsed();
-        println!("\x1b[2m({:.1}s)\x1b[0m", elapsed.as_secs_f64());
     }
+    // Live line clear + final summary (tokens / elapsed / tok-s). Prints to
+    // stderr; on non-TTY stderr the live refresh was already skipped and
+    // this just prints plain text.
+    tps_meter.print_final(final_completion_tokens);
     println!();
 
     // Always record the (possibly partial) assistant turn so subsequent
