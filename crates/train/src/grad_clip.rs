@@ -23,7 +23,10 @@ fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
 }
 
 pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {
-    if max_norm <= 0.0 {
+    // Non-positive / non-finite max_norm is treated as disabling gradient
+    // clipping. NaN/inf used to silently propagate into the scale factor
+    // and poison every gradient (codex review ef24ca6 P2).
+    if !(max_norm > 0.0 && max_norm.is_finite()) {
         return;
     }
 

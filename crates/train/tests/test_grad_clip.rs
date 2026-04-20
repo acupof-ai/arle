@@ -235,3 +235,31 @@ fn norm_on_empty_params_is_zero() {
     // Legacy free-function: empty params → early return, no panic, no mutation.
     clip_grad_norm(&empty, 1.0, &mut store);
 }
+
+// GC-7 — guard non-finite max_norm: NaN / ±Inf used to bypass the
+// `max_norm <= 0.0` gate in `clip_grad_norm` (NaN comparisons always
+// false) and then poison every gradient via `scale = max_norm /
+// total_norm`. Codex review ef24ca6 P2. Any non-finite (or non-positive)
+// value is now a documented no-op — matching the pretrain.rs binary's
+// CLI warning path so all call sites stay consistent.
+#[test]
+fn non_finite_max_norm_is_noop() {
+    for max_norm in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0_f32] {
+        let (mut store, params) = setup_two_params_with_grads();
+        let before = snapshot_grads(&params, &store);
+        clip_grad_norm(&params, max_norm, &mut store);
+        let after = snapshot_grads(&params, &store);
+        assert_eq!(
+            before, after,
+            "clip_grad_norm({max_norm}) must be a no-op, grads mutated"
+        );
+        for (pi, grad) in after.iter().enumerate() {
+            for (i, v) in grad.iter().enumerate() {
+                assert!(
+                    v.is_finite(),
+                    "param {pi} grad[{i}] = {v} after non-finite max_norm={max_norm}"
+                );
+            }
+        }
+    }
+}

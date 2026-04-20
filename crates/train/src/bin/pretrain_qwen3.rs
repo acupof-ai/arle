@@ -449,7 +449,7 @@ fn resume_from_checkpoint(
     let cfg_path = resume_dir.join("config.json");
     if cfg_path.exists() {
         let file_cfg: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cfg_path)?)?;
-        let mismatches: Vec<String> = [
+        let mut mismatches: Vec<String> = [
             ("hidden_size", cfg.hidden_size as i64),
             ("intermediate_size", cfg.intermediate_size as i64),
             ("num_hidden_layers", cfg.num_hidden_layers as i64),
@@ -464,6 +464,26 @@ fn resume_from_checkpoint(
             _ => None,
         })
         .collect();
+
+        // Codex review feb715f (High): `tie_word_embeddings` determines
+        // whether `embed_tokens.weight` and `lm_head.weight` alias to one
+        // TensorId or stay distinct. An untied checkpoint loaded into a
+        // tied live config would pass the numeric-shape check, then
+        // silently merge two file tensors into one live slot.
+        // `load_into_strict` below also rejects missing names, but we
+        // fail fast on the config flag so the error points at the root
+        // cause (config divergence) rather than at a missing tensor.
+        if let Some(saw) = file_cfg
+            .get("tie_word_embeddings")
+            .and_then(|v| v.as_bool())
+            && saw != cfg.tie_word_embeddings
+        {
+            mismatches.push(format!(
+                "tie_word_embeddings: ckpt={saw} cli={}",
+                cfg.tie_word_embeddings
+            ));
+        }
+
         if !mismatches.is_empty() {
             return Err(CliError::Custom(format!(
                 "resume config mismatch: {}",
@@ -472,7 +492,7 @@ fn resume_from_checkpoint(
         }
     }
 
-    registry.load_into(store, &weights)?;
+    registry.load_into_strict(store, &weights)?;
 
     // Derive absolute step from the dir name `step_<N>` if present; otherwise 0.
     let start_step = resume_dir
