@@ -62,7 +62,11 @@ BACKEND="openai_http"
 # guidellm's default backend validation probes GET /health, which
 # metal_serve / cuda-infer do not expose. Point it at /v1/models instead
 # (we already rely on that route being present in preflight below).
-BACKEND_KWARGS='{"validate_backend": "/v1/models"}'
+#
+# Also pin the benchmark path to /v1/completions. The chat endpoint starts
+# with a role-only delta that GuideLLM ignores for TTFT, so relying on its
+# implicit request-format selection makes TTFT/ITL collection brittle.
+BACKEND_KWARGS='{"validate_backend": "/v1/models", "request_format": "/v1/completions"}'
 # ------------------------------------------------------------------------------
 
 TARGET="http://localhost:8000"
