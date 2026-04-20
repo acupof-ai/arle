@@ -23,7 +23,7 @@ use autograd::{
 
 use crate::checkpoint::{
     CheckpointError, TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2,
-    save_trainer_state_v2, write_latest_symlink,
+    save_trainer_state_v2,
 };
 use crate::grad_accum::GradAccumulator;
 use crate::grad_clip::GradClip;
@@ -622,15 +622,14 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
 
         save_trainer_state_v2(&dir, &doc, &optim_state).map_err(wrap_checkpoint_err)?;
 
-        // DX-1: Maintain `<save_dir>/latest` symlink pointing at this step so
-        // `infer --model-path <out>/latest` and `--resume-from <out>/latest`
-        // roundtrip without the caller knowing the step number. On non-unix
-        // this is a no-op; symlink failures on unix surface as a hard error
-        // because the pointer is part of the shipped DX contract.
-        write_latest_symlink(root, &step_basename).map_err(|err| {
-            eprintln!("[trainer] write_latest_symlink({:?}) failed: {err}", root);
-            AutogradError::TapeInvariant("checkpoint: latest symlink failed")
-        })?;
+        // DX-1 note: the `<save_dir>/latest` symlink is refreshed by the
+        // *binary*'s save hook (pretrain_qwen3 / train_sft), NOT here.
+        // Trainer::save_checkpoint only writes trainer_state.json +
+        // optimizer.safetensors; the model weights are written in
+        // `on_step_end` which runs AFTER this function returns. Publishing
+        // `latest` here would briefly expose an incomplete checkpoint dir
+        // (no model.safetensors) to anything watching the symlink.
+        // Codex review 2026-04-20 on 0da212f (Medium).
 
         Ok(())
     }

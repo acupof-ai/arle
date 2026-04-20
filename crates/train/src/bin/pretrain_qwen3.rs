@@ -667,7 +667,12 @@ fn resume_from_checkpoint(
     registry.load_into_strict(store, &weights)?;
 
     // Derive absolute step from the dir name `step_<N>` if present; otherwise 0.
-    let start_step = resume_dir
+    // `--resume <out>/latest` is a DX-1 symlink; canonicalize so file_name()
+    // resolves to the `step_NNNNNN` target, not the literal "latest" string.
+    let canonical = resume_dir
+        .canonicalize()
+        .unwrap_or_else(|_| resume_dir.to_path_buf());
+    let start_step = canonical
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|s| s.strip_prefix("step_"))

@@ -275,22 +275,17 @@ fn trainer_save_then_resume_roundtrip() {
         "first-pass trainer must have written optimizer.safetensors"
     );
 
-    // DX-1 (docs/plans/train-eval-infer-dx-v1.md Phase DX-1): Trainer must
-    // also refresh `<save_dir>/latest` to the just-written step dir so
-    // `infer --model-path <out>/latest` roundtrips without the caller
-    // reading directory listings.
-    let latest = save_dir.join("latest");
-    let meta = std::fs::symlink_metadata(&latest)
-        .expect("latest symlink must exist after save_checkpoint");
+    // DX-1 (docs/plans/train-eval-infer-dx-v1.md Phase DX-1): the `latest`
+    // symlink is intentionally NOT written at Trainer::save_checkpoint time.
+    // Trainer writes only trainer_state.json + optimizer.safetensors; the
+    // binary-level save hook (pretrain_qwen3 / train_sft) writes model.safetensors
+    // and *then* refreshes `<save_dir>/latest`. Asserting the symlink here
+    // would force Trainer to publish a pointer to an incomplete checkpoint.
+    // Codex review 2026-04-20 on 0da212f (Medium).
     assert!(
-        meta.file_type().is_symlink(),
-        "`latest` must be a symlink, not a regular file/dir"
-    );
-    let target = std::fs::read_link(&latest).expect("read_link(latest)");
-    assert_eq!(
-        target,
-        std::path::Path::new("step_000003"),
-        "latest must be a *relative* basename pointing at the current step"
+        !save_dir.join("latest").exists(),
+        "`latest` must NOT be published by Trainer — only by the binary's \
+         save hook (after model.safetensors lands)"
     );
 
     // --- second run: fresh trainer, `resume_from = <produced_dir>`.
