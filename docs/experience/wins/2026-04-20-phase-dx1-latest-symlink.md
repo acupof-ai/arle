@@ -1,7 +1,16 @@
 # Phase DX-1 — `latest` symlink + uniform step padding across save sites
 
-**Commit:** 0da212f (feat(train): DX-1 — `latest` symlink + uniform step
-padding across save sites)
+**Commits:** `0da212f` (initial land) + `8bde810` (follow-up: atomic
+swap, deferred publish, symlink-aware resume — see §Follow-up below for
+the three codex-review findings that shaped the final shape).
+
+> **Read order note.** Sections below describe the *initial attempt*
+> (0da212f) — what we intended, what we wired, and the rationale. Three
+> of those choices (remove-then-create symlink update, Trainer-level
+> `latest` write, bare `file_name()` parse of the resume dir) regressed
+> under `--resume <out>/latest` or races against partial checkpoints
+> and were corrected in 8bde810. For the final post-fix behavior, read
+> §Follow-up first, then come back to the earlier sections for context.
 
 ## Context
 
@@ -31,24 +40,34 @@ glob pattern wouldn't work.
 1. `checkpoint::write_latest_symlink(parent, basename)` writes a *relative*
    symlink. Relative (not absolute) is deliberate: copying / rsync'ing the
    checkpoint root to a new machine preserves the pointer instead of
-   dangling at the original path. Atomic (remove-then-create); refuses to
-   overwrite a regular file or directory at `<parent>/latest` (guards
-   against a user accidentally stashing a final checkpoint under that
-   exact name). Rejects `basename` containing `/` or `\` to keep the
-   pointer scoped to the root. Unix-only; non-unix is a documented no-op
-   with the lex-max `step_*` fallback called out in the doc comment.
+   dangling at the original path. Initial impl used `remove_file +
+   symlink` (non-atomic — fixed in 8bde810 to `symlink(tmp) + rename`).
+   Refuses to overwrite a regular file or directory at `<parent>/latest`
+   (guards against a user accidentally stashing a final checkpoint under
+   that exact name). Rejects `basename` containing `/` or `\` to keep
+   the pointer scoped to the root. Unix-only; non-unix is a documented
+   no-op with the lex-max `step_*` fallback called out in the doc
+   comment.
 
-2. Wired into all three save sites in a single commit so producers don't
-   disagree about the pointer's presence:
-   - `Trainer::save_checkpoint` (runs on `save_every`)
+2. Initially wired into all three save sites in a single commit so
+   producers don't disagree about the pointer's presence:
+   - `Trainer::save_checkpoint` (runs on `save_every`)  ← **removed in
+     8bde810** because Trainer writes trainer_state.json first, then
+     the binary's `on_step_end` writes `model.safetensors`, so
+     publishing from Trainer briefly pointed at an incomplete dir.
    - `pretrain_qwen3::save_checkpoint` (hand-written post-step hook)
    - `train_sft::save_checkpoint_via_registry` (registry-driven save)
 
+   Final shape: only the two binary-level hooks publish `latest`, and
+   they do it AFTER the weights write. See §Follow-up Medium #1.
+
 3. Normalized `pretrain_qwen3`'s `format!("step_{step}")` →
    `format!("step_{step:06}")`. Resume-path lookup now collapses to a
-   single `glob("step_??????/")` pattern across all three binaries;
-   `--resume-from <out>/latest` roundtrips without the caller caring
-   which producer wrote the checkpoint.
+   single `glob("step_??????/")` pattern across all three binaries.
+   `--resume-from <out>/latest` was the intended roundtrip — but the
+   initial impl derived `start_step` from `resume_dir.file_name()`,
+   which returns `"latest"` and falls through to step 0. Fixed in
+   8bde810 by canonicalizing the path first. See §Follow-up High.
 
 4. Extended `trainer_save_then_resume_roundtrip` (tests/test_trainer_loop.rs)
    to assert the symlink exists, **is** a symlink (not a file/dir), and
@@ -77,10 +96,15 @@ glob pattern wouldn't work.
 ## Rule
 
 **Producers of step-versioned artifacts must refresh a `latest`
-pointer.** If three save sites each decided independently whether to
-write `latest`, users would see inconsistent DX depending on which
-binary they ran. Ship the helper, wire every producer, lock it in with
-a roundtrip test that asserts the pointer's contents.
+pointer — but only after the target is durable.** If N save sites each
+decided independently whether to write `latest`, users see inconsistent
+DX depending on which binary they ran. Ship the helper, wire every
+producer, lock it in with a roundtrip test that asserts the pointer's
+contents. **But** the publish site matters: the pointer promises "target
+complete", so it must be written *last*, by whichever producer writes
+the final artifact (model weights), not by an earlier producer that
+writes preliminary state (optimizer / trainer_state). See §Follow-up
+for the concrete failure mode that forced this refinement.
 
 **Format changes ride on top.** The `step_{step}` → `step_{step:06}`
 normalization was a one-character change but it couldn't ship
