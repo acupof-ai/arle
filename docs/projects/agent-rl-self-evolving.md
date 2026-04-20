@@ -1,14 +1,14 @@
 # Project — Agent RL 训推一体 · 自进化栈
 
-**Status**: Proposed · **Started**: 2026-04-18 · **Owner**: ckl
-**Locked scope**: 单机 / CUDA first / LoRA-only / GRPO / 同进程训推
+**Status**: Active · **Started**: 2026-04-18 · **Owner**: ckl
+**Locked scope**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成
 **Core main line**: 是（ROADMAP Phase 6，从 2026-04-18 起成为项目主航道之一）
 
 ---
 
 ## 0. TL;DR
 
-把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是在同一个 Rust 进程内跑通：
+把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码还处在过渡期：训练仍然以独立 `train` crate + 手写 TCP control plane 形式存在，下面描述的是要收敛到的目标态：
 
 ```
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
@@ -25,25 +25,25 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 - 对我们：继续做纯推理会逐渐"管道化"，下游是 Python + Megatron。主动走上训推一体是**不被管道化**的唯一出路。
 
 ### 1.2 我们的差异点
-- **纯 Rust，单进程**：训练 worker 和推理 worker 同进程 `Arc` 共享权重，没有 Python GIL、没有 NCCL IPC dance、没有 weight-sync tax。这是 Rust 生态相对 PyTorch 栈的**结构性优势**。
+- **纯 Rust，统一权重权威**：目标态里训练 worker 和推理 worker 共享同一套 Rust 模型定义、权重注册表与 adapter 协议；实现上可以同进程，也可以通过异步 worker / 进程边界拆分，只要不引入 Python 热路径和额外的 weight-sync tax。当前实现还没完全收敛到这一步，但这仍是 Phase 6 的结构性目标。
 - **agent-infer 已有基建**：FlashInfer HD128/HD256、Paged KV、Radix prefix cache、chunked prefill、continuous batching、OpenAI v1 agent loop、Metal runtime。rollout 侧几乎不用新建。
 - **LoRA-only 起步**：base 冻结 → **不需要穿过 FlashInfer / Marlin / 自研 GEMM 的 backward**，这是"纯 Rust 训推一体可行"的关键前提。
 
 ### 1.3 认知目标（非交付物，但是本项目的显式动机）
 从零写 autograd + AdamW + GRPO，把"LLM 训练到底怎么跑"吃到骨子里。ckl 主动声明：**认知增强 > 抄现成**。本项目的代码质量门槛是"让明年的自己读起来比 PyTorch 源码更懂"。
 
-### 1.4 单进程是护城河，不是临时手段（autoplan 2026-04-18 强化）
+### 1.4 统一训推权威是护城河，异步边界是实现选项（autoplan 2026-04-18 强化）
 
-> 背景：2026-04-18 的 `/autoplan` CEO 评审中，两路外部声音（Claude subagent + Codex outside-voice）都指出 §2 行 3"单进程"被 §1.2 称为"结构性优势"但缺乏明确防御性论证。下面是补上的明确论证。
+> 背景：2026-04-18 的 `/autoplan` CEO 评审中，两路外部声音（Claude subagent + Codex outside-voice）都指出 §2 行 3 的"单进程"写法把实现方式误写成了身份约束。下面把约束收敛回真正要守住的东西：统一权重权威、统一 adapter 协议、统一 trajectory 语义。
 
-**为什么单进程不只是 MVP 的实施选择，而是护城河本身**：
+**为什么统一训推权威是护城河，而不是某个固定进程形态**：
 
-1. **`Arc<BaseWeights>` 零拷贝共权重**：训练 worker 和推理 worker 看到的是同一块 GPU buffer，没有 NCCL all-gather、没有共享内存映射、没有 IPC 字节复制。同行 verl/SGLang 用 server mode 解耦后必须再用 NCCL 把权重同步回 trainer——一次 4B 模型 BF16 weight sync 走 NCCL 是 ~8 GB；我们这一步是 0 字节。
-2. **LoRA 热切是指针 swap，不是 RPC**：`Arc<RwLock<LoRADelta>>` double-buffer 的 hot-swap 路径长度是一次原子指针交换。跨进程的等价物是 RPC + 验证 + 失败回滚 + 状态机。
-3. **没有 weight-sync tax 的认知收益**：跨进程方案要求 trainer 与 rollout 都必须知道权重 schema、版本、对齐策略、同步周期。同进程方案中这些全部消失，于是 ckl 可以把脑容量花在 GRPO 本身和 autograd 数值正确性上。
-4. **不抢"第二个 veRL"的赛道**：veRL/ProRL/SFR-RL 已在做跨进程 + 多租户 + Python 生态。我们的差异化窗口是"**单机内最简洁、Rust 原生、零 Python 热路径**"。一旦把"federable on demand"挂在口边，就把自己挤进它们已经赢的赛道里。
+1. **`Arc<BaseWeights>` 零拷贝共权重**：训练 worker 和推理 worker 看到的是同一套权重 authority；如果后续用异步边界把 worker 拆开，边界上也只能传 trajectory / adapter delta / control message，不能再引入第二份模型真相。
+2. **LoRA 热切是协议级 swap，不是业务 RPC**：`Arc<RwLock<LoRADelta>>` double-buffer 的 hot-swap 路径长度是一次原子指针交换；如果把 worker 拆成异步边界，协议仍然必须保持这一语义，不允许把 adapter 更新变成重状态机。
+3. **没有 weight-sync tax 的认知收益**：无论是同进程还是异步 worker，只要模型 authority 是统一的，trainer 与 rollout 都不需要重复理解权重 schema、版本、对齐策略和同步周期。ckl 可以把脑容量花在 GRPO 本身和 autograd 数值正确性上。
+4. **不抢"第二个 veRL"的赛道**：veRL/ProRL/SFR-RL 已在做跨进程 + 多租户 + Python 生态。我们的差异化窗口是"**单机内最简洁、Rust 原生、零 Python 热路径**"；实现上允许异步边界，但不把自己挤进它们已经赢的赛道。
 
-**因此**：§2 行 3"单进程"的状态从"被锁定的 MVP 实施细节"上升为"**项目身份的一部分**"。任何后续提案要把它改成"可联邦"或"可跨进程"，必须先证明 §6.1 中至少一条触发条件已经被 M3 的真实运行数据满足。
+**因此**：§2 行 3 的状态从"单进程实现"改成"**统一训推权威 + 可异步边界的实现约束**"。任何后续提案如果要把边界拆成多 worker / 多进程，必须先证明 §6.1 中至少一条触发条件已经被 M3 的真实运行数据满足。
 
 ---
 
@@ -53,7 +53,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 |---|---|---|
 | 硬件 | 单机单卡 NVIDIA（L40S/A100/H100 任一） | 分布式、多机、TP/PP/ZeRO |
 | Metal | 本地 dev 支线，M4 里程碑再做 | 和 CUDA 并行推进 |
-| 进程 | 单 Rust binary，训练+推理同进程 | 双进程 + RPC + 权重同步 |
+| 进程 | 目标态是统一 Rust 训练/推理栈，默认单进程起步；当前实现仍是独立 `train` crate + TCP control plane，后续允许异步 worker 边界 | 双栈分叉、各自维护模型真相 |
 | Autograd | **从零写，参考 mni-ml/framework 结构** | candle / burn / 包 PyTorch |
 | Op 集 | 只实现 LoRA+GRPO 用到的 ~7 个 op | 全量 op（conv/pool/full-attention-bwd） |
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |
@@ -196,9 +196,9 @@ crates/
 | Metal MLX autograd 和 CUDA autograd 实现偏离 | 中 | 同一个 `BackwardOp` enum，实现在 `ops::*` 下分 `#[cfg(feature="cuda")]` / `#[cfg(feature="metal")]`；tape 本身共用 |
 | 从零写训练栈"认知得到但交付延误" | 中 | M0 + M1 严格时间盒（< 3 周）；如果 spike 阶段就深陷 autograd 坑，退路是 **M1.5 回退用 candle 做 autograd 壳**，但 ckl 2026-04-18 明确否决该退路 |
 
-### 6.1 跨进程重审触发条件（autoplan 2026-04-18 新增）
+### 6.1 异步边界演进触发条件（autoplan 2026-04-18 新增）
 
-§1.4 把"单进程"上升为项目身份。下面是**唯一允许重审该决策的入口**——不是"以后看看"，而是 M3 6 小时闭环跑出真实数据后，对照下面任何一条触发：
+§1.4 把"统一训推权威"上升为项目身份。下面是**唯一允许把边界从默认实现演进成更显式 worker / 进程拆分的入口**——不是"以后看看"，而是 M3 6 小时闭环跑出真实数据后，对照下面任何一条触发：
 
 | 触发条件 | 测量方法 | 阈值 |
 |---|---|---|
@@ -237,7 +237,7 @@ crates/
 
 ## 8. 成功的样子（1 年后回看）
 
-> "ckl 在 2026-04-18 做了一个技术决策：不借壳，从零在 Rust 里写训练栈，然后和推理合体成单机训推一体 agent 自进化框架。一年后 agent-infer 变成了：一个 OpenAI-compat agent 服务器 + 一个单机 RL trainer，两者共进程。Qwen3-4B 上一个 demo agent 在数学 + 代码两类 verifier 上自进化 24h 后，pass@1 提升了两位数。代码只有 PyTorch+verl 栈的 1/10 行，但是 ckl 读懂了每一行，autograd 出现数值问题时 15 分钟定位。"
+> "ckl 在 2026-04-18 做了一个技术决策：不借壳，从零在 Rust 里写训练栈，然后和推理收敛到统一的训推权威。一年后 agent-infer 变成了：一个 OpenAI-compat agent 服务器 + 一个单机 RL trainer，通过异步边界对接。Qwen3-4B 上一个 demo agent 在数学 + 代码两类 verifier 上自进化 24h 后，pass@1 提升了两位数。代码只有 PyTorch+verl 栈的 1/10 行，但是 ckl 读懂了每一行，autograd 出现数值问题时 15 分钟定位。"
 
 这是本项目的**成功画面**。如果一年后我们还在和 PyTorch/Megatron 的封装打交道，那就是失败。
 
