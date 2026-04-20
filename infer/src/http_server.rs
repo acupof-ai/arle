@@ -34,7 +34,8 @@ use crate::sampler::{SamplingParams, sampling_params_from_request};
 use crate::scheduler::SchedulerHandle;
 use crate::scheduler::{IncomingRequest, RequestPriority};
 use crate::server_engine::CompletionStreamDelta;
-use crate::server_engine::{CompletionOutput, FinishReason, InferenceEngine, TokenUsage};
+use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
+use crate::session_persistence::SessionPersistence;
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest as OpenAiCompletionRequest, CompletionResponse, DflashStatusPayload,
@@ -757,7 +758,7 @@ where
 pub fn build_app_with_session_engine<H, E>(handle: H, engine: Arc<tokio::sync::RwLock<E>>) -> Router
 where
     H: RequestHandle + 'static,
-    E: InferenceEngine + Send + Sync + 'static,
+    E: SessionPersistence + Send + Sync + 'static,
 {
     build_app_inner(
         handle,
@@ -775,7 +776,7 @@ pub fn build_app_with_config_and_session_engine<H, E>(
 ) -> Router
 where
     H: RequestHandle + 'static,
-    E: InferenceEngine + Send + Sync + 'static,
+    E: SessionPersistence + Send + Sync + 'static,
 {
     build_app_inner(
         handle,
