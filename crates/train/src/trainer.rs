@@ -225,16 +225,42 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
     where
         F: FnMut(&mut StepCtx<'_>) -> Result<StepOutcome>,
     {
-        // Supply a no-op eval closure that is never invoked because
-        // `cfg.eval_every` is read below; to be safe we also gate the call
-        // itself on eval_every being set.
+        self.run_with_hooks(
+            store,
+            tape,
+            params,
+            param_names,
+            keep_extra,
+            step_fn,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Same as [`run`] but calls `on_step_end(step, store)` after every
+    /// optimizer step (after cleanup + LR tick, before the next step). Used
+    /// by binaries that need to save model weights or tokenizer caches
+    /// synchronously with the optimizer step — the Trainer's built-in
+    /// `save_every` only writes `trainer_state.json + optimizer.safetensors`.
+    pub fn run_with_hooks<F, H>(
+        &mut self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        params: Vec<TensorId>,
+        param_names: Vec<(TensorId, String)>,
+        keep_extra: HashSet<TensorId>,
+        step_fn: F,
+        on_step_end: H,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut StepCtx<'_>) -> Result<StepOutcome>,
+        H: FnMut(u64, &mut TensorStore) -> Result<()>,
+    {
         let eval_fn = |_: &mut TensorStore, _: &mut Tape| -> Result<EvalOutcome> {
             Ok(EvalOutcome {
                 loss: 0.0,
                 token_count: 0,
             })
         };
-        // Force eval_every off so the no-op eval closure is unreachable.
         let saved_eval_every = self.cfg.eval_every.take();
         let result = self.run_inner(
             store,
@@ -244,6 +270,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             keep_extra,
             step_fn,
             eval_fn,
+            on_step_end,
         );
         self.cfg.eval_every = saved_eval_every;
         result
@@ -273,12 +300,13 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             keep_extra,
             step_fn,
             eval_fn,
+            |_, _| Ok(()),
         )
     }
 
     // Monomorphised shared body. `run` supplies a no-op eval closure plus
     // `eval_every = None` so the eval branch is never hit.
-    fn run_inner<F, E>(
+    fn run_inner<F, E, H>(
         &mut self,
         store: &mut TensorStore,
         tape: &mut Tape,
@@ -287,10 +315,12 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         keep_extra: HashSet<TensorId>,
         mut step_fn: F,
         mut eval_fn: E,
+        mut on_step_end: H,
     ) -> Result<()>
     where
         F: FnMut(&mut StepCtx<'_>) -> Result<StepOutcome>,
         E: FnMut(&mut TensorStore, &mut Tape) -> Result<EvalOutcome>,
+        H: FnMut(u64, &mut TensorStore) -> Result<()>,
     {
         let n = self.cfg.grad_accum_steps;
         let loss_scale = 1.0_f32 / n as f32;
@@ -420,6 +450,12 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
             {
                 self.save_checkpoint(&param_names)?;
             }
+
+            // ---- post-step callback (weight save, custom logging, …) ----
+            // Runs after the Trainer's own save_every hook so both the v2
+            // state file and any binary-supplied weight file land in the
+            // same checkpoint round.
+            on_step_end(self.step, store)?;
         }
 
         self.metrics.flush();

@@ -386,6 +386,55 @@ fn metrics_emit_at_log_every() {
     }
 }
 
+/// `run_with_hooks` must invoke `on_step_end` exactly once per optimizer step
+/// (never per micro-batch), after cleanup, with the post-update step index.
+/// This is the hook train_sft uses to save bf16 model weights.
+#[test]
+fn run_with_hooks_fires_after_each_optimizer_step() {
+    let (mut store, p) = setup_param(&[0.1, 0.2]);
+    let mut tape = Tape::new();
+
+    let optim = AdamW::new(1e-3, (0.9, 0.999), 1e-8, 0.0);
+    let cfg = TrainerConfig {
+        total_steps: 3,
+        grad_accum_steps: 2, // ensure hook is NOT called per micro-batch
+        log_every: 1,
+        ..default_cfg(3)
+    };
+    let mut trainer = Trainer::new(optim, NoClip, ConstantLr(1e-3), Box::new(NullSink), cfg);
+
+    let hook_calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls_hook = Arc::clone(&hook_calls);
+
+    trainer
+        .run_with_hooks(
+            &mut store,
+            &mut tape,
+            vec![p],
+            vec![(p, "p".to_string())],
+            HashSet::new(),
+            |ctx| {
+                let loss = squared_mean_loss(p, ctx.store, ctx.tape)?;
+                Ok(StepOutcome {
+                    loss_id: loss,
+                    token_count: 1,
+                })
+            },
+            |step, _store| {
+                hook_calls_hook.lock().unwrap().push(step);
+                Ok(())
+            },
+        )
+        .expect("run_with_hooks");
+
+    let observed = hook_calls.lock().unwrap();
+    assert_eq!(
+        observed.as_slice(),
+        &[1, 2, 3],
+        "hook must fire once per optimizer step with post-update index"
+    );
+}
+
 /// Codex review P1 (2026-04-20): the Trainer loop must prune `TensorStore`
 /// after every backward + every optimizer step so activation allocations
 /// don't grow linearly with `total_steps * grad_accum_steps`. The toy
