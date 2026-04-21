@@ -1111,6 +1111,7 @@ fn cuda_backend_add_broadcast_matches_cpu() {
 // the CPU reference (`cpu_matmul_backward`).
 // ──────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::type_complexity)]
 fn matmul_backward_cases() -> Vec<(Vec<usize>, Vec<usize>, Vec<usize>, u64, u64, u64)> {
     vec![
         (

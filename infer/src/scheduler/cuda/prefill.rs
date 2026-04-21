@@ -31,18 +31,22 @@ fn should_downgrade_partial_hit_to_miss(
 
 impl<M: ModelForward> Scheduler<M> {
     /// Compute prefix cache for a new request and begin chunked prefill.
-    pub(super) fn step_new(&mut self, idx: usize) {
+    pub(super) fn step_new(&mut self, slot_idx: usize) {
         let default_chunk_size = self.prefill_chunk_size();
-        if self.active[idx].delta_tx.is_closed() {
-            self.active[idx].phase = Phase::Finished;
+        let Some(req) = self.request(slot_idx) else {
+            return;
+        };
+        if req.delta_tx.is_closed() {
+            self.finish_slot(slot_idx);
             return;
         }
 
-        let si = self.active[idx].slot_idx;
-        let req_id = self.active[idx].id;
-        let prompt_len = self.active[idx].prompt_tokens.len();
-        let raw_prefix_len = self.active[idx].reusable_prefix_len;
-        let cached_prompt_len = self.active[idx].reusable_cached_prompt_len;
+        let req_id = req.id;
+        let prompt_tokens = req.prompt_tokens.clone();
+        let prompt_len = prompt_tokens.len();
+        let raw_prefix_len = req.reusable_prefix_len;
+        let cached_prompt_len = req.reusable_cached_prompt_len;
+        let si = slot_idx;
 
         // Hybrid models (e.g. Qwen3.5) cannot truncate recurrent state to an
         // arbitrary prefix length. Downgrade any partial hit (radix match
@@ -53,7 +57,6 @@ impl<M: ModelForward> Scheduler<M> {
         // line 99, which zeroes recurrent state and depends on the snapshot
         // being valid. See docs/plans/paged-prefill-followups-2026-04-18.md §3.
         let (effective, pool_prefix_len) = {
-            let req = &mut self.active[idx];
             let state = &mut self.states[si];
 
             let prefix_len = if should_downgrade_partial_hit_to_miss(
@@ -79,114 +82,118 @@ impl<M: ModelForward> Scheduler<M> {
                     let replay_from = prefix_len.saturating_sub(1);
                     info!(
                         "Request {}: prefix HIT {}/{} tokens (exact full match, replaying final token with {} reused)",
-                        req.id, prefix_len, prompt_len, replay_from
+                        req_id, prefix_len, prompt_len, replay_from
                     );
                     if let Err(e) = state.truncate_to(replay_from) {
                         error!(
                             "Request {}: truncate on full prompt reuse hit failed: {}",
-                            req.id, e
+                            req_id, e
                         );
-                        req.phase = Phase::Finished;
+                        self.finish_slot(slot_idx);
                         return;
                     }
                     self.slot_materialized_prompt_lens[si] = replay_from;
                     pool_prefix_len = replay_from;
-                    req.prompt_tokens[replay_from..].to_vec()
+                    prompt_tokens[replay_from..].to_vec()
                 } else {
                     info!(
                         "Request {}: prefix HIT {}/{} tokens (exact full match, recomputing prompt to refresh logits)",
-                        req.id, prefix_len, prompt_len
+                        req_id, prefix_len, prompt_len
                     );
                     if let Err(e) = state.reset() {
-                        error!("Request {}: reset failed: {}", req.id, e);
-                        req.phase = Phase::Finished;
+                        error!("Request {}: reset failed: {}", req_id, e);
+                        self.finish_slot(slot_idx);
                         return;
                     }
                     self.slot_materialized_prompt_lens[si] = 0;
                     pool_prefix_len = 0;
-                    req.prompt_tokens.clone()
+                    prompt_tokens
                 }
             } else if prompt_prefix_of_cached_hit {
                 info!(
                     "Request {}: prefix HIT {}/{} tokens (cached prompt had extra suffix, recomputing prompt for correctness)",
-                    req.id, prefix_len, prompt_len
+                    req_id, prefix_len, prompt_len
                 );
                 if let Err(e) = state.reset() {
-                    error!("Request {}: reset failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
+                    error!("Request {}: reset failed: {}", req_id, e);
+                    self.finish_slot(slot_idx);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = 0;
                 pool_prefix_len = 0;
-                req.prompt_tokens.clone()
+                prompt_tokens
             } else if prefix_len > 0 && prefix_len == cached_prompt_len {
                 // Truncate contiguous KV cache to prefix length — removes stale
                 // decode tokens from the previous request before migration reads it.
                 if let Err(e) = state.truncate_to(prefix_len) {
-                    error!("Request {}: truncate on prefix hit failed: {}", req.id, e);
+                    error!("Request {}: truncate on prefix hit failed: {}", req_id, e);
                     if let Err(e2) = state.reset() {
-                        error!("Request {}: reset failed: {}", req.id, e2);
+                        error!("Request {}: reset failed: {}", req_id, e2);
                     }
                     self.slot_materialized_prompt_lens[si] = 0;
-                    req.phase = Phase::Prefilling {
-                        effective_tokens: req.prompt_tokens.clone(),
-                        progress: 0,
-                    };
-                    return;
-                }
-
-                // Full prefix hit — restore recurrent state snapshot to undo
-                // decode-token contamination from the previous request.
-                match state.restore_prefix_snapshot() {
-                    Ok(true) => info!(
-                        "Request {}: prefix HIT {}/{} tokens (recurrent state restored)",
-                        req.id, prefix_len, prompt_len
-                    ),
-                    Ok(false) => info!(
-                        "Request {}: prefix HIT {}/{} tokens",
-                        req.id, prefix_len, prompt_len
-                    ),
-                    Err(e) => {
-                        warn!(
-                            "Request {}: prefix hit but snapshot restore failed ({}), falling back to MISS",
-                            req.id, e
-                        );
-                        if let Err(e2) = state.reset() {
-                            error!("Request {}: reset failed: {}", req.id, e2);
-                            req.phase = Phase::Finished;
-                            return;
+                    pool_prefix_len = 0;
+                    prompt_tokens
+                } else {
+                    // Full prefix hit — restore recurrent state snapshot to undo
+                    // decode-token contamination from the previous request.
+                    let restored = match state.restore_prefix_snapshot() {
+                        Ok(true) => {
+                            info!(
+                                "Request {}: prefix HIT {}/{} tokens (recurrent state restored)",
+                                req_id, prefix_len, prompt_len
+                            );
+                            true
                         }
-                        self.slot_materialized_prompt_lens[si] = 0;
-                        req.phase = Phase::Prefilling {
-                            effective_tokens: req.prompt_tokens.clone(),
-                            progress: 0,
-                        };
-                        return;
+                        Ok(false) => {
+                            info!(
+                                "Request {}: prefix HIT {}/{} tokens",
+                                req_id, prefix_len, prompt_len
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Request {}: prefix hit but snapshot restore failed ({}), falling back to MISS",
+                                req_id, e
+                            );
+                            if let Err(e2) = state.reset() {
+                                error!("Request {}: reset failed: {}", req_id, e2);
+                                self.finish_slot(slot_idx);
+                                return;
+                            }
+                            self.slot_materialized_prompt_lens[si] = 0;
+                            pool_prefix_len = 0;
+                            false
+                        }
+                    };
+                    if restored {
+                        self.slot_materialized_prompt_lens[si] = prefix_len;
+                        prompt_tokens[prefix_len..].to_vec()
+                    } else {
+                        prompt_tokens
                     }
                 }
-                self.slot_materialized_prompt_lens[si] = prefix_len;
-                req.prompt_tokens[prefix_len..].to_vec()
             } else if prefix_len > 0 {
                 info!(
                     "Request {}: prefix PARTIAL {}/{} tokens",
-                    req.id, prefix_len, prompt_len
+                    req_id, prefix_len, prompt_len
                 );
                 if let Err(e) = state.truncate_to(prefix_len) {
-                    error!("Request {}: truncate failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
+                    error!("Request {}: truncate failed: {}", req_id, e);
+                    self.finish_slot(slot_idx);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = prefix_len;
-                req.prompt_tokens[prefix_len..].to_vec()
+                prompt_tokens[prefix_len..].to_vec()
             } else {
-                info!("Request {}: prefix MISS", req.id);
+                info!("Request {}: prefix MISS", req_id);
                 if let Err(e) = state.reset() {
-                    error!("Request {}: reset failed: {}", req.id, e);
-                    req.phase = Phase::Finished;
+                    error!("Request {}: reset failed: {}", req_id, e);
+                    self.finish_slot(slot_idx);
                     return;
                 }
                 self.slot_materialized_prompt_lens[si] = 0;
-                req.prompt_tokens.clone()
+                prompt_tokens
             };
 
             (effective, pool_prefix_len)
@@ -224,24 +231,29 @@ impl<M: ModelForward> Scheduler<M> {
             default_chunk_size
         );
 
-        self.active[idx].phase = Phase::Prefilling {
-            effective_tokens: effective,
-            progress: 0,
-        };
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.phase = Phase::Prefilling {
+                effective_tokens: effective,
+                progress: 0,
+            };
+        }
     }
 
     /// Process one chunk of a prefill. When all chunks are done, sample the
     /// first token and transition to Decoding.
-    pub(super) fn step_prefill_chunk(&mut self, idx: usize, chunk_size: usize) -> usize {
-        if self.active[idx].delta_tx.is_closed() {
-            self.active[idx].phase = Phase::Finished;
+    pub(super) fn step_prefill_chunk(&mut self, slot_idx: usize, chunk_size: usize) -> usize {
+        let Some(req) = self.request(slot_idx) else {
+            return 0;
+        };
+        if req.delta_tx.is_closed() {
+            self.finish_slot(slot_idx);
             return 0;
         }
 
-        let slot_idx = self.active[idx].slot_idx;
+        let req_id = req.id;
         // Snapshot chunk inputs as owned values so we can release the phase
         // borrow before calling `&mut self` methods (alloc_pool_tokens_with_retry).
-        let (chunk_tokens, progress_val, total) = match &self.active[idx].phase {
+        let (chunk_tokens, progress_val, total) = match &req.phase {
             Phase::Prefilling {
                 effective_tokens,
                 progress,
@@ -271,7 +283,6 @@ impl<M: ModelForward> Scheduler<M> {
             // implementation reads the page table from the pool itself.
             match self.alloc_pool_tokens_with_retry(slot_idx, chunk_len) {
                 Err(e) => {
-                    let req_id = self.active[idx].id;
                     warn!(
                         "Request {}: deferring paged prefill chunk after pool alloc failed: {}",
                         req_id, e
@@ -298,20 +309,21 @@ impl<M: ModelForward> Scheduler<M> {
         };
 
         if let Err(e) = forward_result {
-            let req_id = self.active[idx].id;
             error!("Request {}: prefill chunk failed: {}", req_id, e);
-            self.active[idx].phase = Phase::Finished;
+            self.finish_slot(slot_idx);
             return 0;
         }
 
         let new_progress = chunk_end;
         if new_progress < total {
-            if let Phase::Prefilling { progress, .. } = &mut self.active[idx].phase {
+            if let Some(req) = self.request_mut(slot_idx)
+                && let Phase::Prefilling { progress, .. } = &mut req.phase
+            {
                 *progress = new_progress;
             }
             info!(
                 "Request {}: prefill chunk {}/{} tokens",
-                self.active[idx].id, new_progress, total
+                req_id, new_progress, total
             );
             return chunk_len;
         }
@@ -322,10 +334,7 @@ impl<M: ModelForward> Scheduler<M> {
             let pool_start = self.paged_kv_pool.seq_len(slot_idx);
             match self.alloc_pool_tokens_with_retry(slot_idx, total) {
                 Err(e) => {
-                    error!(
-                        "Request {}: pool alloc for migration failed: {}",
-                        self.active[idx].id, e
-                    );
+                    error!("Request {}: pool alloc for migration failed: {}", req_id, e);
                 }
                 Ok(_new_pages) => {
                     let ctx = self.model.device_context();
@@ -336,10 +345,7 @@ impl<M: ModelForward> Scheduler<M> {
                         pool_start,
                         total,
                     ) {
-                        error!(
-                            "Request {}: KV migration to pool failed: {}",
-                            self.active[idx].id, e
-                        );
+                        error!("Request {}: KV migration to pool failed: {}", req_id, e);
                     }
                 }
             }
@@ -351,43 +357,72 @@ impl<M: ModelForward> Scheduler<M> {
         if let Err(e) = self.states[slot_idx].save_prefix_snapshot() {
             warn!(
                 "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
-                self.active[idx].id, e
+                req_id, e
             );
-        } else {
-            self.active[idx].mark_prompt_cacheable();
+        } else if let Some(req) = self.request_mut(slot_idx) {
+            req.mark_prompt_cacheable();
         }
 
-        let sampling = self.active[idx].sampling.clone();
+        let sampling = self
+            .request(slot_idx)
+            .map(|req| req.sampling.clone())
+            .expect("prefill completion requires live request");
         match self
             .model
             .select_token(&mut self.states[slot_idx], &sampling, &mut self.rng)
         {
             Ok(token) => {
-                if !self.active[idx].sampling.ignore_eos && self.model.is_stop_token(token) {
-                    self.active[idx].finish(FinishReason::Stop, &self.tokenizer);
-                    return chunk_len;
-                }
-                self.active[idx].generated_tokens.push(token);
-                self.active[idx].emit_delta(&self.tokenizer);
-
-                if matches!(self.active[idx].phase, Phase::Finished) {
-                    return chunk_len;
-                }
-                if self.active[idx].generated_tokens.len() >= self.active[idx].max_tokens {
-                    self.active[idx].finish(FinishReason::Length, &self.tokenizer);
-                } else {
-                    if self.active[idx].first_token_at.is_none() {
-                        self.active[idx].first_token_at = Some(std::time::Instant::now());
+                let ignore_eos = self
+                    .request(slot_idx)
+                    .is_some_and(|req| req.sampling.ignore_eos);
+                if !ignore_eos && self.model.is_stop_token(token) {
+                    let Self {
+                        active, tokenizer, ..
+                    } = self;
+                    if let Some(req) = active[slot_idx].as_mut() {
+                        req.finish(FinishReason::Stop, tokenizer);
                     }
-                    self.active[idx].phase = Phase::Decoding;
+                    self.finish_slot(slot_idx);
+                    return chunk_len;
+                }
+                let Self {
+                    active, tokenizer, ..
+                } = self;
+                if let Some(req) = active[slot_idx].as_mut() {
+                    req.generated_tokens.push(token);
+                    req.emit_delta(tokenizer);
+                }
+
+                if matches!(
+                    self.request(slot_idx).map(|req| &req.phase),
+                    Some(Phase::Finished)
+                ) {
+                    self.finish_slot(slot_idx);
+                    return chunk_len;
+                }
+                let reached_max = self
+                    .request(slot_idx)
+                    .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
+                if reached_max {
+                    let Self {
+                        active, tokenizer, ..
+                    } = self;
+                    if let Some(req) = active[slot_idx].as_mut() {
+                        req.finish(FinishReason::Length, tokenizer);
+                    }
+                    self.finish_slot(slot_idx);
+                } else {
+                    if let Some(req) = self.request_mut(slot_idx)
+                        && req.first_token_at.is_none()
+                    {
+                        req.first_token_at = Some(std::time::Instant::now());
+                    }
+                    self.move_to_decode(slot_idx);
                 }
             }
             Err(e) => {
-                error!(
-                    "Request {}: select_token failed: {}",
-                    self.active[idx].id, e
-                );
-                self.active[idx].phase = Phase::Finished;
+                error!("Request {}: select_token failed: {}", req_id, e);
+                self.finish_slot(slot_idx);
             }
         }
         chunk_len

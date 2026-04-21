@@ -190,7 +190,7 @@ impl<M: ModelForward> Scheduler<M> {
 
             self.drain_coordinator_events();
 
-            if self.active.is_empty() && self.waiting.is_empty() && self.stage_waiting.is_empty() {
+            if self.active_len() == 0 && self.waiting.is_empty() && self.stage_waiting.is_empty() {
                 if let Some(req) = self.request_rx.blocking_recv() {
                     self.waiting_count.fetch_sub(1, Ordering::Relaxed);
                     self.waiting.push_back(req);
@@ -219,7 +219,7 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_t = std::time::Instant::now();
             self.cleanup();
             let clean_us = clean_t.elapsed().as_micros();
-            self.metrics.set_active(self.active.len() as u64);
+            self.metrics.set_active(self.active_len() as u64);
             self.metrics.set_waiting(self.waiting.len() as u64);
             if self.paged_kv_pool.is_active() {
                 // Both in token units so kv_util = (total-free)/total is correct.
@@ -250,7 +250,7 @@ impl<M: ModelForward> Scheduler<M> {
                     step_us,
                     clean_us,
                     total_us,
-                    self.active.len()
+                    self.active_len()
                 );
             }
         }
@@ -404,9 +404,8 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
 
-            self.active.push(ActiveRequest {
+            self.active[slot_idx] = Some(ActiveRequest {
                 id,
-                slot_idx,
                 admitted_at: std::time::Instant::now(),
                 first_token_at: None,
                 prompt: incoming.prompt,
@@ -420,40 +419,58 @@ impl<M: ModelForward> Scheduler<M> {
                 full_decoded: String::new(),
                 decoded_token_count: 0,
                 sent_len: 0,
-                phase: Phase::New,
+                phase: Phase::Prefilling {
+                    effective_tokens: Vec::new(),
+                    progress: 0,
+                },
                 cacheable_prompt_len: 0,
                 prefix_byte_len: 0,
                 latest_logprob: None,
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
             });
+            self.step_new(slot_idx);
+            if matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Prefilling { .. })
+            ) {
+                self.queue_prefill(slot_idx);
+            }
         }
     }
 
     /// Find all free slot indices.
     fn free_slots(&self) -> Vec<usize> {
-        let in_use: Vec<usize> = self.active.iter().map(|a| a.slot_idx).collect();
-        (0..self.states.len())
-            .filter(|i| !in_use.contains(i))
+        self.active
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_idx, req)| req.is_none().then_some(slot_idx))
             .collect()
     }
 
     fn cleanup(&mut self) {
-        let mut i = 0;
-        while i < self.active.len() {
-            if matches!(self.active[i].phase, Phase::Finished) {
-                let req = self.active.remove(i);
+        for slot_idx in 0..self.active.len() {
+            let finished = matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Finished)
+            );
+            if finished {
+                let req = self.active[slot_idx]
+                    .take()
+                    .expect("finished slot must hold a request");
                 let gen_tokens = req.generated_tokens.len() as u64;
-                self.clear_slot_prefix_ownership(req.slot_idx);
+                self.dequeue_prefill(slot_idx);
+                self.dequeue_running(slot_idx);
+                self.clear_slot_prefix_ownership(slot_idx);
 
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
                     let prompt_vec = prompt_tokens.to_vec();
-                    self.slot_materialized_prompt_lens[req.slot_idx] = prompt_vec.len();
-                    self.publish_to_prefix_cache(req.slot_idx, &prompt_vec, req.session_id.clone());
+                    self.slot_materialized_prompt_lens[slot_idx] = prompt_vec.len();
+                    self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.clone());
                 } else {
-                    self.slot_materialized_prompt_lens[req.slot_idx] = 0;
+                    self.slot_materialized_prompt_lens[slot_idx] = 0;
                 }
-                self.paged_kv_pool.free_slot(req.slot_idx);
+                self.paged_kv_pool.free_slot(slot_idx);
 
                 self.total_completed += 1;
                 self.total_generated_tokens += gen_tokens;
@@ -478,7 +495,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Request {} done: {} tokens (active={}, waiting={})",
                     req.id,
                     gen_tokens,
-                    self.active.len(),
+                    self.active_len(),
                     self.waiting.len()
                 );
 
@@ -487,16 +504,10 @@ impl<M: ModelForward> Scheduler<M> {
                         "Scheduler stats: completed={}, generated_tokens={}, active={}, waiting={}",
                         self.total_completed,
                         self.total_generated_tokens,
-                        self.active.len(),
+                        self.active_len(),
                         self.waiting.len()
                     );
                 }
-
-                if self.last_served >= self.active.len() && !self.active.is_empty() {
-                    self.last_served = 0;
-                }
-            } else {
-                i += 1;
             }
         }
 
