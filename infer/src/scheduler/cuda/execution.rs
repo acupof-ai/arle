@@ -130,6 +130,7 @@ impl PrefillBudget {
         self.page_budget.can_fit(reservation.page_reserve)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn reserve(&mut self, reservation: PrefillReservation) {
         debug_assert!(self.can_schedule(reservation));
         self.remaining_prefill_tokens = self
