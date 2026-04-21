@@ -10,8 +10,8 @@ use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 use super::request_state::{
-    DflashBatchOutcome, MetalRequestPhase as RuntimePhase, MetalRequestState,
-    Qwen3MixedBatchResult, Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
+    DflashBatchOutcome, MetalMixedBatchResult, MetalRequestPhase as RuntimePhase,
+    MetalRequestState, Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
     MetalRequestPriority, MetalRuntimeRequestState, MetalScheduleStep, MetalScheduler,
@@ -722,7 +722,7 @@ fn guard_schedule_step(
 ) {
     match (step.decode, step.prefill) {
         (Some(batch), Some(prefill)) => {
-            if !guard_qwen3_mixed_batch(
+            if !guard_mixed_batch(
                 batch.req_ids.clone(),
                 prefill.req_id,
                 prefill.input_tokens.len(),
@@ -783,8 +783,7 @@ fn guard_schedule_step(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn guard_qwen3_mixed_batch(
+fn guard_mixed_batch(
     decode_req_ids: Vec<RequestId>,
     prefill_req_id: RequestId,
     prefill_budget: usize,
@@ -800,7 +799,7 @@ fn guard_qwen3_mixed_batch(
     let mut panic_req_ids = decode_req_ids.clone();
     panic_req_ids.push(prefill_req_id);
     let result = catch_unwind(AssertUnwindSafe(|| {
-        execute_qwen3_mixed_batch(
+        execute_mixed_batch(
             decode_req_ids,
             prefill_req_id,
             prefill_budget,
@@ -819,7 +818,7 @@ fn guard_qwen3_mixed_batch(
         Ok(handled) => handled,
         Err(panic) => {
             error!(
-                "Metal Qwen3 mixed batch panicked for {:?}: {}",
+                "Metal mixed batch panicked for {:?}: {}",
                 panic_req_ids,
                 super::panic_message(panic)
             );
@@ -862,7 +861,7 @@ fn guard_decode_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_qwen3_mixed_batch(
+fn execute_mixed_batch(
     decode_req_ids: Vec<RequestId>,
     prefill_req_id: RequestId,
     prefill_budget: usize,
@@ -949,20 +948,20 @@ fn execute_qwen3_mixed_batch(
             .iter_mut()
             .map(|(_, request)| &mut request.request_state)
             .collect();
-        MetalRequestState::try_qwen3_mixed_batch(
+        MetalRequestState::try_mixed_batch(
             &mut decode_refs,
             &mut prefill_request.request_state,
             prefill_budget,
         )
     };
 
-    let Some(Qwen3MixedBatchResult {
+    let Some(MetalMixedBatchResult {
         decode_tokens,
         prefill,
     }) = (match outcome {
         Ok(result) => result,
         Err(err) => {
-            error!("Metal Qwen3 mixed batch failed: {err:#}");
+            error!("Metal mixed batch failed: {err:#}");
             metrics.record_request_failed();
             cancel_detached_request(prefill_req_id, prefill_request, scheduler);
             for (req_id, request) in decode_rows {
