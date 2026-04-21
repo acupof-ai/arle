@@ -45,8 +45,10 @@ works with any backend. Load before editing any scheduler internals.
 5. **Do not project `batch.rs` policy defaults onto CUDA runtime behavior.**
    `ChunkingPolicy` / `DecodeAwareChunking` belongs to the backend-agnostic
    CPU accounting scheduler only. The production CUDA runtime does not have a
-   "decode active => chunk = 64" rule; it uses `chunked_prefill_size`,
-   `max_prefill_tokens`, `prefill_max_requests`, and `enable_mixed_chunk`.
+   "decode active => chunk = 64" rule; `chunked_prefill_size` is the total
+   prefill-token budget for one planned tick, `max_prefill_tokens` can only
+   tighten it, and `prefill_max_requests` / `enable_mixed_chunk` control
+   request count and mixed launch eligibility.
 6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from

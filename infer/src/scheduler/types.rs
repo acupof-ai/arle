@@ -27,9 +27,12 @@ pub enum PreemptionMode {
 pub struct SchedulerConfig {
     /// Maximum number of concurrently active request slots.
     pub max_slots: usize,
-    /// Maximum number of tokens in a single prefill chunk.
+    /// Maximum prefill tokens admitted into one scheduler tick. A single
+    /// request can consume the full budget; multiple requests share it.
     pub chunked_prefill_size: usize,
-    /// Maximum total prefill tokens to queue in one scheduler step.
+    /// Operator-facing hard cap for total prefill tokens in one scheduler
+    /// step. The effective budget is the tighter of this and
+    /// `chunked_prefill_size`.
     pub max_prefill_tokens: usize,
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
@@ -141,9 +144,6 @@ impl SchedulerConfig {
         }
         if self.max_prefill_tokens == 0 {
             anyhow::bail!("max_prefill_tokens must be ≥ 1");
-        }
-        if self.max_prefill_tokens < self.chunked_prefill_size {
-            anyhow::bail!("max_prefill_tokens must be ≥ chunked_prefill_size");
         }
         if matches!(self.prefill_max_requests, Some(0)) {
             anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
@@ -444,10 +444,10 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_config_rejects_prefill_budget_smaller_than_chunk() {
+    fn scheduler_config_accepts_prefill_budget_smaller_than_chunk() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.max_prefill_tokens = cfg.chunked_prefill_size - 1;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

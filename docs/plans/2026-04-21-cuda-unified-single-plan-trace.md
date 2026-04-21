@@ -30,6 +30,7 @@ Owned state:
 - Waiting-queue admission + radix decision:
   `admit_waiting_prefill_batch()`
 - Slot materialization: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `materialize_waiting_request()`
+- Token budget: `chunked_prefill_size` is the total prefill-token budget for one planned tick; `max_prefill_tokens` may only tighten it.
 
 Owned state:
 

@@ -342,6 +342,9 @@ impl<M: ModelForward> Scheduler<M> {
         let (tx, rx) = mpsc::unbounded_channel();
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
+        let effective_prefill_token_budget =
+            config.max_prefill_tokens.min(config.chunked_prefill_size);
+        let mixed_prefill_enabled = config.enable_mixed_chunk && model.supports_mixed_batch();
 
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
@@ -372,22 +375,33 @@ impl<M: ModelForward> Scheduler<M> {
         let paged_kv_pool = {
             let bytes_per_token = model.kv_cache_bytes_per_token();
             let contiguous_cost = config.max_slots * contiguous_tokens * bytes_per_token;
-            // SGLang-compatible: pool budget = free − contiguous − headroom.
-            // Headroom is derived from mem_fraction_static via the auto-sizer;
-            // here we just subtract contiguous cost from post-weight-load free memory.
+            // SGLang-compatible: size the KV pool after subtracting runtime
+            // workspaces that are allocated after model load. Otherwise a
+            // large pool can leave no contiguous room for mixed prefill/decode
+            // attention workspaces and fail mid-request.
+            let runtime_workspace = model.scheduler_runtime_workspace_bytes(
+                config.max_slots,
+                effective_prefill_token_budget,
+                mixed_prefill_enabled,
+            );
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
                 Ok((free, total)) => {
                     let headroom = ((total as f64) * (1.0 - config.mem_fraction_static)) as usize;
-                    free.saturating_sub(contiguous_cost.saturating_add(headroom))
+                    free.saturating_sub(
+                        contiguous_cost
+                            .saturating_add(headroom)
+                            .saturating_add(runtime_workspace),
+                    )
                 }
                 Err(_) => config.kv_pool_fallback_bytes,
             };
 
             info!(
-                "TokenKVPool budget: {:.1} GB (contiguous={:.1} GB, fraction={:.0}%)",
+                "TokenKVPool budget: {:.1} GB (contiguous={:.1} GB, runtime_workspace={:.1} GB, fraction={:.0}%)",
                 budget_bytes as f64 / 1e9,
                 contiguous_cost as f64 / 1e9,
+                runtime_workspace as f64 / 1e9,
                 config.mem_fraction_static * 100.0,
             );
 
@@ -409,6 +423,21 @@ impl<M: ModelForward> Scheduler<M> {
         let host_pinned_pool = crate::kv_tier::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
         );
+
+        let mut decode_bufs = None;
+        if mixed_prefill_enabled {
+            let mut ctx = model.create_decode_context(config.max_slots, &paged_kv_pool)?;
+            model.prepare_mixed_decode_context(
+                &mut ctx,
+                &paged_kv_pool,
+                effective_prefill_token_budget,
+            )?;
+            info!(
+                "Mixed prefill workspace ready: max_prefill_tokens={}, max_batch={}",
+                effective_prefill_token_budget, config.max_slots
+            );
+            decode_bufs = Some(ctx);
+        }
 
         info!(
             "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}, host_pool={:.1}MB",
@@ -468,7 +497,7 @@ impl<M: ModelForward> Scheduler<M> {
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
-            decode_bufs: None,
+            decode_bufs,
             total_completed: 0,
             total_generated_tokens: 0,
             step_timing_decode_us: 0.0,
