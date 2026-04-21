@@ -7,7 +7,7 @@ use infer::backend::cuda::bootstrap::{
     spawn_scheduler_handle_from_path,
 };
 use infer::hf_hub;
-use infer::http_server::build_app_with_metrics;
+use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
@@ -89,6 +89,10 @@ struct Args {
     /// requested slots × sequence-length envelope.
     #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
+
+    /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
+    #[arg(long)]
+    train_control_url: Option<String>,
 }
 
 #[tokio::main]
@@ -215,7 +219,20 @@ async fn main() {
         handle.model_id()
     );
 
-    let app = build_app_with_metrics(handle.clone(), metrics);
+    let train_control_target = args
+        .train_control_url
+        .as_deref()
+        .map(TrainControlTarget::parse)
+        .transpose()
+        .unwrap_or_else(|err| panic!("invalid --train-control-url: {err}"));
+    let app = build_app_with_config(
+        handle.clone(),
+        metrics,
+        HttpServerConfig {
+            train_control_target,
+            ..Default::default()
+        },
+    );
 
     let addr = format!("0.0.0.0:{}", args.port);
     info!("Server listening on {}", addr);

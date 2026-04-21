@@ -13,8 +13,9 @@
 > the active RL path, `train_multi_turn` exposes an explicit stepwise-GRPO vs
 > sequence-level-GSPO objective switch,
 > checkpoints are written as HF-style directories, and the shared Qwen3.5
-> model path now supports hybrid linear-attn layers for LoRA/frozen eval while
-> scratch pretrain + RL acceptance remain dense/full-attn only. The target train-side
+> model path now supports hybrid linear-attn layers across scratch pretrain,
+> LoRA/frozen eval, and RL on the local CPU + Metal path, while CUDA hybrid
+> runtime acceptance remains pending. The target train-side
 > model line is the Qwen3.5 architecture family.
 
 ---
@@ -25,8 +26,8 @@ The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_mult
 
 - **RL loops still sit partly outside `Trainer<O, C, S>`** — `train_grpo` and `train_multi_turn` still own rollout/reward/objective orchestration by hand because the current closure model is supervised-step shaped.
 - **CLI/runtime composition is still hand-rolled per binary** — flags are not normalized across all train surfaces yet, and `clap` adoption is still open.
-- **Infer-side unified `/v1/train/*` bridge has not landed** — the current truth remains the train-side server inside `crates/train`.
-- **Hybrid Qwen3.5 support is only partial today** — LoRA/frozen-eval is landed, but scratch pretrain and RL acceptance are still dense/full-attn only.
+- **Infer-side unified `/v1/train/*` bridge is now a thin proxy** — current truth still remains the train-side server inside `crates/train`, but `infer` can now forward `/v1/train/status|events|stop|save` to that authority via `--train-control-url`.
+- **Hybrid Qwen3.5 support is no longer trainer/runtime-blocked** — the shared train runtime now accepts hybrid scratch pretrain + RL on the local CPU + Metal path; remaining work is CUDA hybrid runtime acceptance and any further performance tuning, not runtime factoring.
 - **CUDA device-resident optimizer / grad path is still a future seam** — current host-authoritative gradient flow is fine for correctness and local Metal, but not the final CUDA scaling story.
 
 Without a shared runtime, every backend × feature combination becomes 5 binary edits.
@@ -337,7 +338,7 @@ step_000123/
 ## 9. Success criteria
 
 - **Phase 2 done when**: `train_sft --lr-schedule cosine-with-warmup --warmup-steps 100 --grad-accum-steps 4 --metrics-jsonl out.jsonl --resume-from step_50/` runs to completion, resumes correctly, writes JSONL, matches pre-refactor loss curve within bench noise.
-- **Phase 3 done when**: all active train entrypoints (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) run on the shared runtime surfaces, no dead legacy runtime code remains in `crates/train`, and every entrypoint is smoke-tested. This is now true for the dense/full-attn Qwen-family line; the remaining gap is hybrid Qwen3.5 training, not trainer/runtime plumbing.
+- **Phase 3 done when**: all active train entrypoints (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) run on the shared runtime surfaces, no dead legacy runtime code remains in `crates/train`, and every entrypoint is smoke-tested. This is now true for the local Qwen3.5 CPU + Metal path, including hybrid linear-attn; the remaining gap is CUDA hybrid runtime acceptance, not trainer/runtime plumbing.
 - **CUDA readiness done when**: `Backend::optim_adamw_step` trait method added with CPU default, `CudaBackend` overrides it, `train_sft --backend cuda` runs with ≥2× PCIe-bw reduction vs. host-authoritative step. (Gated — lands when CUDA weights bench drives the ask.)
 
 ## 10. Open questions (ckl decides)

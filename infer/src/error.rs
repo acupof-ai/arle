@@ -64,6 +64,18 @@ impl ApiError {
         }
     }
 
+    /// 404 Not Found — route or optional subsystem is not available.
+    pub fn not_found(message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error",
+                code,
+            },
+        }
+    }
+
     /// 504 Gateway Timeout — request took too long.
     pub fn timeout(elapsed_secs: u64) -> Self {
         Self {

@@ -4,7 +4,9 @@ use autograd::{
     Result, Tape, TensorStore,
     ops::{LinearAttentionParams, linear_attention_core, mul, sum},
 };
-use helpers::{max_abs_err, num_grad};
+#[cfg(feature = "metal")]
+use helpers::max_abs_err;
+use helpers::num_grad;
 
 #[cfg(feature = "metal")]
 use autograd::backend_metal::MetalBackend;
@@ -48,7 +50,17 @@ struct LinearAttentionFixture {
     coeff: Vec<f32>,
 }
 
-type LinearAttentionLossAndGrads = (f32, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+type LinearAttentionLossAndGrads = (
+    f32,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+);
 
 impl LinearAttentionFixture {
     fn new(params: LinearAttentionParams) -> Self {
@@ -105,7 +117,16 @@ fn loss_and_grads(
     let norm_weight = store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
     let coeff = store.from_slice(&fixture.coeff, &z_shape)?;
 
-    for tensor_id in [qkv, z, b_proj, a_proj] {
+    for tensor_id in [
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+    ] {
         store
             .get_mut(tensor_id)
             .expect("tensor exists")
@@ -134,6 +155,10 @@ fn loss_and_grads(
         store.to_host(*grads.get(&z).expect("grad for z"))?,
         store.to_host(*grads.get(&b_proj).expect("grad for b_proj"))?,
         store.to_host(*grads.get(&a_proj).expect("grad for a_proj"))?,
+        store.to_host(*grads.get(&conv1d_weight).expect("grad for conv1d_weight"))?,
+        store.to_host(*grads.get(&dt_bias).expect("grad for dt_bias"))?,
+        store.to_host(*grads.get(&a_log).expect("grad for a_log"))?,
+        store.to_host(*grads.get(&norm_weight).expect("grad for norm_weight"))?,
     ))
 }
 
@@ -144,6 +169,10 @@ fn loss_for_variant(
     z: &[f32],
     b_proj: &[f32],
     a_proj: &[f32],
+    conv1d_weight: &[f32],
+    dt_bias: &[f32],
+    a_log: &[f32],
+    norm_weight: &[f32],
 ) -> f32 {
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -155,19 +184,16 @@ fn loss_for_variant(
     let b_proj = store.from_slice(b_proj, &head_shape).expect("b_proj");
     let a_proj = store.from_slice(a_proj, &head_shape).expect("a_proj");
     let conv1d_weight = store
-        .from_slice(
-            &fixture.conv1d_weight,
-            &[qkv_dim(params), params.conv_kernel],
-        )
+        .from_slice(conv1d_weight, &[qkv_dim(params), params.conv_kernel])
         .expect("conv1d_weight");
     let dt_bias = store
-        .from_slice(&fixture.dt_bias, &[params.num_value_heads])
+        .from_slice(dt_bias, &[params.num_value_heads])
         .expect("dt_bias");
     let a_log = store
-        .from_slice(&fixture.a_log, &[params.num_value_heads])
+        .from_slice(a_log, &[params.num_value_heads])
         .expect("a_log");
     let norm_weight = store
-        .from_slice(&fixture.norm_weight, &[params.value_dim])
+        .from_slice(norm_weight, &[params.value_dim])
         .expect("norm_weight");
     let coeff = store.from_slice(&fixture.coeff, &z_shape).expect("coeff");
 
@@ -203,7 +229,17 @@ fn max_err_with_index(lhs: &[f32], rhs: &[f32]) -> (usize, f32) {
 fn linear_attention_grad_matches_numeric() -> Result<()> {
     let params = tiny_params();
     let fixture = LinearAttentionFixture::new(params);
-    let (_, analytic_qkv, analytic_z, analytic_b, analytic_a) = loss_and_grads(&fixture, params)?;
+    let (
+        _,
+        analytic_qkv,
+        analytic_z,
+        analytic_b,
+        analytic_a,
+        analytic_conv,
+        analytic_dt,
+        analytic_a_log,
+        analytic_norm,
+    ) = loss_and_grads(&fixture, params)?;
 
     let mut qkv_numeric_input = fixture.qkv.clone();
     let numeric_qkv = num_grad(
@@ -215,6 +251,10 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
                 &fixture.z,
                 &fixture.b_proj,
                 &fixture.a_proj,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                &fixture.norm_weight,
             )
         },
         &mut qkv_numeric_input,
@@ -230,6 +270,10 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
                 values,
                 &fixture.b_proj,
                 &fixture.a_proj,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                &fixture.norm_weight,
             )
         },
         &mut z_numeric_input,
@@ -245,6 +289,10 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
                 &fixture.z,
                 values,
                 &fixture.a_proj,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                &fixture.norm_weight,
             )
         },
         &mut b_numeric_input,
@@ -260,9 +308,89 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
                 &fixture.z,
                 &fixture.b_proj,
                 values,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                &fixture.norm_weight,
             )
         },
         &mut a_numeric_input,
+        1.0e-3,
+    );
+    let mut conv_numeric_input = fixture.conv1d_weight.clone();
+    let numeric_conv = num_grad(
+        |values| {
+            loss_for_variant(
+                &fixture,
+                params,
+                &fixture.qkv,
+                &fixture.z,
+                &fixture.b_proj,
+                &fixture.a_proj,
+                values,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                &fixture.norm_weight,
+            )
+        },
+        &mut conv_numeric_input,
+        1.0e-3,
+    );
+    let mut dt_numeric_input = fixture.dt_bias.clone();
+    let numeric_dt = num_grad(
+        |values| {
+            loss_for_variant(
+                &fixture,
+                params,
+                &fixture.qkv,
+                &fixture.z,
+                &fixture.b_proj,
+                &fixture.a_proj,
+                &fixture.conv1d_weight,
+                values,
+                &fixture.a_log,
+                &fixture.norm_weight,
+            )
+        },
+        &mut dt_numeric_input,
+        1.0e-3,
+    );
+    let mut a_log_numeric_input = fixture.a_log.clone();
+    let numeric_a_log = num_grad(
+        |values| {
+            loss_for_variant(
+                &fixture,
+                params,
+                &fixture.qkv,
+                &fixture.z,
+                &fixture.b_proj,
+                &fixture.a_proj,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                values,
+                &fixture.norm_weight,
+            )
+        },
+        &mut a_log_numeric_input,
+        1.0e-3,
+    );
+    let mut norm_numeric_input = fixture.norm_weight.clone();
+    let numeric_norm = num_grad(
+        |values| {
+            loss_for_variant(
+                &fixture,
+                params,
+                &fixture.qkv,
+                &fixture.z,
+                &fixture.b_proj,
+                &fixture.a_proj,
+                &fixture.conv1d_weight,
+                &fixture.dt_bias,
+                &fixture.a_log,
+                values,
+            )
+        },
+        &mut norm_numeric_input,
         1.0e-3,
     );
 
@@ -270,6 +398,10 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
     let (z_idx, z_err) = max_err_with_index(&analytic_z, &numeric_z);
     let (b_idx, b_err) = max_err_with_index(&analytic_b, &numeric_b);
     let (a_idx, a_err) = max_err_with_index(&analytic_a, &numeric_a);
+    let (conv_idx, conv_err) = max_err_with_index(&analytic_conv, &numeric_conv);
+    let (dt_idx, dt_err) = max_err_with_index(&analytic_dt, &numeric_dt);
+    let (a_log_idx, a_log_err) = max_err_with_index(&analytic_a_log, &numeric_a_log);
+    let (norm_idx, norm_err) = max_err_with_index(&analytic_norm, &numeric_norm);
 
     assert!(
         qkv_err < 8.0e-3,
@@ -286,6 +418,22 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
     assert!(
         a_err < 8.0e-3,
         "a grad max abs err {a_err} at index {a_idx}"
+    );
+    assert!(
+        conv_err < 8.0e-3,
+        "conv grad max abs err {conv_err} at index {conv_idx}"
+    );
+    assert!(
+        dt_err < 8.0e-3,
+        "dt grad max abs err {dt_err} at index {dt_idx}"
+    );
+    assert!(
+        a_log_err < 8.0e-3,
+        "a_log grad max abs err {a_log_err} at index {a_log_idx}"
+    );
+    assert!(
+        norm_err < 8.0e-3,
+        "norm grad max abs err {norm_err} at index {norm_idx}"
     );
 
     Ok(())
@@ -316,7 +464,9 @@ fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     let cpu_a_log = cpu_store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
     let cpu_norm = cpu_store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
     let cpu_coeff = cpu_store.from_slice(&fixture.coeff, &z_shape)?;
-    for tensor_id in [cpu_qkv, cpu_z, cpu_b, cpu_a] {
+    for tensor_id in [
+        cpu_qkv, cpu_z, cpu_b, cpu_a, cpu_conv, cpu_dt, cpu_a_log, cpu_norm,
+    ] {
         cpu_store
             .get_mut(tensor_id)
             .expect("cpu tensor exists")
@@ -343,6 +493,10 @@ fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     let cpu_z_grad = cpu_store.to_host(*cpu_grads.get(&cpu_z).expect("cpu z grad"))?;
     let cpu_b_grad = cpu_store.to_host(*cpu_grads.get(&cpu_b).expect("cpu b grad"))?;
     let cpu_a_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a).expect("cpu a grad"))?;
+    let cpu_conv_grad = cpu_store.to_host(*cpu_grads.get(&cpu_conv).expect("cpu conv grad"))?;
+    let cpu_dt_grad = cpu_store.to_host(*cpu_grads.get(&cpu_dt).expect("cpu dt grad"))?;
+    let cpu_a_log_grad = cpu_store.to_host(*cpu_grads.get(&cpu_a_log).expect("cpu a_log grad"))?;
+    let cpu_norm_grad = cpu_store.to_host(*cpu_grads.get(&cpu_norm).expect("cpu norm grad"))?;
 
     let mut metal_store = TensorStore::with_backend(Arc::new(MetalBackend));
     let mut metal_tape = Tape::new();
@@ -371,7 +525,16 @@ fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     ] {
         metal_store.ensure_device(tensor_id)?;
     }
-    for tensor_id in [metal_qkv, metal_z, metal_b, metal_a] {
+    for tensor_id in [
+        metal_qkv,
+        metal_z,
+        metal_b,
+        metal_a,
+        metal_conv,
+        metal_dt,
+        metal_a_log,
+        metal_norm,
+    ] {
         metal_store
             .get_mut(tensor_id)
             .expect("metal tensor exists")
@@ -399,12 +562,23 @@ fn metal_linear_attention_matches_cpu_with_device_inputs() -> Result<()> {
     let metal_z_grad = metal_store.to_host(*metal_grads.get(&metal_z).expect("metal z grad"))?;
     let metal_b_grad = metal_store.to_host(*metal_grads.get(&metal_b).expect("metal b grad"))?;
     let metal_a_grad = metal_store.to_host(*metal_grads.get(&metal_a).expect("metal a grad"))?;
+    let metal_conv_grad =
+        metal_store.to_host(*metal_grads.get(&metal_conv).expect("metal conv grad"))?;
+    let metal_dt_grad = metal_store.to_host(*metal_grads.get(&metal_dt).expect("metal dt grad"))?;
+    let metal_a_log_grad =
+        metal_store.to_host(*metal_grads.get(&metal_a_log).expect("metal a_log grad"))?;
+    let metal_norm_grad =
+        metal_store.to_host(*metal_grads.get(&metal_norm).expect("metal norm grad"))?;
 
     assert!(max_abs_err(&metal_out_host, &cpu_out_host) <= 1.0e-6);
     assert!(max_abs_err(&metal_qkv_grad, &cpu_qkv_grad) <= 1.0e-6);
     assert!(max_abs_err(&metal_z_grad, &cpu_z_grad) <= 1.0e-6);
     assert!(max_abs_err(&metal_b_grad, &cpu_b_grad) <= 1.0e-6);
     assert!(max_abs_err(&metal_a_grad, &cpu_a_grad) <= 1.0e-6);
+    assert!(max_abs_err(&metal_conv_grad, &cpu_conv_grad) <= 1.0e-6);
+    assert!(max_abs_err(&metal_dt_grad, &cpu_dt_grad) <= 1.0e-6);
+    assert!(max_abs_err(&metal_a_log_grad, &cpu_a_log_grad) <= 1.0e-6);
+    assert!(max_abs_err(&metal_norm_grad, &cpu_norm_grad) <= 1.0e-6);
 
     Ok(())
 }

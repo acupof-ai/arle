@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; scratch pretrain + RL are validated on dense/full-attn, hybrid linear-attn is landed for LoRA/eval, handwritten Transformer/TinyLM runtime compat deleted
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相，`infer --train-control-url` 可选暴露代理入口） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; hybrid linear-attn is now locally accepted on CPU + Metal across scratch pretrain / LoRA-eval / RL, handwritten Transformer/TinyLM runtime compat deleted
 
 ---
 
@@ -20,7 +20,7 @@
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
 > 和 [`docs/codebase-map.md`](../codebase-map.md)。
-> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线。当前 acceptance 切分也已经明确：scratch pretrain + RL 走 dense/full-attn，hybrid linear-attn 已经落到 LoRA/eval 路径并在 CPU / Metal 上验收。
+> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线。当前 acceptance 切分也已经更新：hybrid linear-attn 已经在 CPU / Metal 上覆盖 scratch pretrain、LoRA/eval、以及 RL；剩余主要是 CUDA hybrid runtime acceptance，而不是本地 runtime 缺口。
 
 ---
 
@@ -208,7 +208,7 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 | M4.4 | **Reward aggregation**：多 verifier 加权；权重作为 config，方便调 | `train/src/reward/aggregate.rs` | 文档化每个 verifier 的 scale |
 | M4.5 | **基础 curriculum**：任务池分级（easy/medium/hard），base pass@1 > 0.8 的 easy 自动 retire，引入新 hard 任务 | `train/src/curriculum.rs` | 训练 24h 后任务池分布向 harder 移动 |
 | M4.6 | **Task generator**（self-play 雏形）：让 model 自己生成新任务 + 匹配的 verifier（verifier 用模板生成，限定在数学 / 代码 DSL 内） | `train/src/curriculum/gen.rs` | 生成任务可 verifier-grounded（不接受无 verifier 任务） |
-| M4.7 | **当前控制面**：train-side server + `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` `--serve`；**目标统一入口**：`/v1/train`（可选） | `train/src/server.rs` / `infer/src/http_server/train.rs` | curl 调通 |
+| M4.7 | **当前控制面**：train-side server + `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` `--serve`；**统一入口补充**：`infer --train-control-url` 可选代理 `/v1/train` | `train/src/server.rs` / `infer/src/http_server.rs` | curl 调通 |
 | M4.8 | **冒烟自进化**：固定 100 个 base 解决不了的 hard 任务，训练 24h 后能解决 ≥ 30% | `train/tests/e2e_self_evolve.rs` | 验证通过 |
 
 ### 6.3 验收门槛

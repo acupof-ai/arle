@@ -15,7 +15,7 @@ use infer::backend::metal::{
     MetalBackendOptions, MetalDflashOptions, MetalRuntimeLimits,
     spawn_metal_scheduler_handle_from_path_with_options_and_metrics,
 };
-use infer::http_server::{HttpServerConfig, build_app_with_config};
+use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::logging;
 use infer::metrics::ServerMetrics;
 use infer::request_handle::RequestHandle;
@@ -98,6 +98,10 @@ struct Args {
     /// Maximum generated tokens per startup warmup request.
     #[arg(long, default_value_t = 1)]
     warmup_max_new_tokens: usize,
+
+    /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
+    #[arg(long)]
+    train_control_url: Option<String>,
 }
 
 impl Args {
@@ -172,8 +176,7 @@ async fn main() -> Result<()> {
             "Metal DFlash enabled: draft_model={} speculative_tokens={}",
             draft_model,
             args.speculative_tokens
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "draft-default".to_string())
+                .map_or_else(|| "draft-default".to_string(), |value| value.to_string(),)
         );
     }
 
@@ -181,6 +184,12 @@ async fn main() -> Result<()> {
     if api_key.is_some() {
         info!("Metal server API auth enabled for /v1/* endpoints");
     }
+    let train_control_target = args
+        .train_control_url
+        .as_deref()
+        .map(TrainControlTarget::parse)
+        .transpose()
+        .unwrap_or_else(|err| panic!("invalid --train-control-url: {err}"));
 
     run_startup_warmup(
         &handle,
@@ -195,6 +204,7 @@ async fn main() -> Result<()> {
         metrics,
         HttpServerConfig {
             api_key: api_key.map(Arc::<str>::from),
+            train_control_target,
         },
     );
     let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))

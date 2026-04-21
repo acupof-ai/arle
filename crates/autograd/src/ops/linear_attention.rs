@@ -91,7 +91,11 @@ pub fn linear_attention_core(
     let requires_grad = qkv_tensor.requires_grad
         || z_tensor.requires_grad
         || b_tensor.requires_grad
-        || a_tensor.requires_grad;
+        || a_tensor.requires_grad
+        || conv_tensor.requires_grad
+        || dt_tensor.requires_grad
+        || a_log_tensor.requires_grad
+        || norm_tensor.requires_grad;
     let output_shape = vec![
         params.batch,
         params.seq_len,
@@ -103,7 +107,16 @@ pub fn linear_attention_core(
         tape.record(TapeEntry {
             op: BackwardOp::LinearAttention,
             output_id,
-            input_ids: smallvec![qkv, z, b_proj, a_proj],
+            input_ids: smallvec![
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv1d_weight,
+                dt_bias,
+                a_log,
+                norm_weight
+            ],
             saved: SavedContext::LinearAttentionCtx {
                 qkv,
                 z,
@@ -231,6 +244,9 @@ pub(crate) fn linear_attention_backward(
     let mut dz = vec![0.0_f32; z_tensor.data.len()];
     let mut db = vec![0.0_f32; b_tensor.data.len()];
     let mut da = vec![0.0_f32; a_tensor.data.len()];
+    let mut ddt = vec![0.0_f32; dt_tensor.data.len()];
+    let mut da_log = vec![0.0_f32; a_log_tensor.data.len()];
+    let mut dnorm = vec![0.0_f32; norm_tensor.data.len()];
 
     for batch_idx in 0..batch {
         for value_head in 0..num_value_heads {
@@ -271,6 +287,10 @@ pub(crate) fn linear_attention_backward(
                     forward.beta[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
                 let exp_g =
                     forward.exp_g[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                let a_value =
+                    a_tensor.data[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
+                let softplus_input = a_value + dt_tensor.data[value_head];
+                let softplus_value = softplus_scalar(softplus_input);
                 let kv_mem = row4(
                     &forward.kv_mem,
                     batch_idx,
@@ -324,6 +344,7 @@ pub(crate) fn linear_attention_backward(
                     )] += gate_grad * silu_grad_scalar(gate_row[value_idx]);
                     dot_beta +=
                         dcore[value_idx] * core_out[value_idx] * norm_tensor.data[value_idx];
+                    dnorm[value_idx] += dcore[value_idx] * core_out[value_idx] * inv_rms;
                 }
                 dcore = rmsnorm_backward_row(
                     &core_out,
@@ -385,11 +406,11 @@ pub(crate) fn linear_attention_backward(
                 }
 
                 let dg = dexp_g * exp_g;
-                let a_value =
-                    a_tensor.data[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)];
-                let softplus_grad = sigmoid_scalar(a_value + dt_tensor.data[value_head]);
+                let softplus_grad = sigmoid_scalar(softplus_input);
                 da[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
                     dg * (-exp_a * softplus_grad);
+                ddt[value_head] += dg * (-exp_a * softplus_grad);
+                da_log[value_head] += dg * (-exp_a * softplus_value);
                 db[idx3(batch_idx, seq_idx, value_head, seq_len, num_value_heads)] +=
                     dbeta_scalar * beta * (1.0 - beta);
 
@@ -441,7 +462,7 @@ pub(crate) fn linear_attention_backward(
         }
     }
 
-    let dqkv = conv1d_backward_input_only(
+    let (dqkv, dconv) = conv1d_backward(
         &dqkv,
         &forward.preact,
         &qkv_tensor.data,
@@ -473,6 +494,30 @@ pub(crate) fn linear_attention_backward(
         grads.push((
             a_proj,
             store.alloc(Tensor::new(da, a_tensor.shape.clone(), false)?),
+        ));
+    }
+    if conv_tensor.requires_grad {
+        grads.push((
+            conv1d_weight,
+            store.alloc(Tensor::new(dconv, conv_tensor.shape.clone(), false)?),
+        ));
+    }
+    if dt_tensor.requires_grad {
+        grads.push((
+            dt_bias,
+            store.alloc(Tensor::new(ddt, dt_tensor.shape.clone(), false)?),
+        ));
+    }
+    if a_log_tensor.requires_grad {
+        grads.push((
+            a_log,
+            store.alloc(Tensor::new(da_log, a_log_tensor.shape.clone(), false)?),
+        ));
+    }
+    if norm_tensor.requires_grad {
+        grads.push((
+            norm_weight,
+            store.alloc(Tensor::new(dnorm, norm_tensor.shape.clone(), false)?),
         ));
     }
     Ok(grads)
@@ -656,13 +701,7 @@ fn linear_attention_forward(
                     params.num_value_heads,
                 )] = exp_g_value;
 
-                let base = state_base(
-                    batch_idx,
-                    value_head,
-                    params.num_value_heads,
-                    params.key_dim,
-                    params.value_dim,
-                );
+                let base = state_head_base(value_head, params.key_dim, params.value_dim);
                 for key_idx in 0..params.key_dim {
                     for value_idx in 0..params.value_dim {
                         state[base + key_idx * params.value_dim + value_idx] *= exp_g_value;
@@ -743,14 +782,14 @@ fn linear_attention_forward(
     }
 }
 
-fn conv1d_backward_input_only(
+fn conv1d_backward(
     grad_out: &[f32],
     preact: &[f32],
     input: &[f32],
     conv1d_weight: &[f32],
     conv1d_shape: &[usize],
     params: LinearAttentionParams,
-) -> Result<Vec<f32>> {
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let q_dim = params.num_key_heads * params.key_dim;
     let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
     if input.len() != params.batch * params.seq_len * qkv_dim {
@@ -761,6 +800,7 @@ fn conv1d_backward_input_only(
     }
 
     let mut grad_input = vec![0.0_f32; input.len()];
+    let mut grad_weight = vec![0.0_f32; conv1d_weight.len()];
     for batch_idx in 0..params.batch {
         for seq_idx in 0..params.seq_len {
             for channel in 0..qkv_dim {
@@ -774,11 +814,13 @@ fn conv1d_backward_input_only(
                     let input_idx = idx3(batch_idx, src_seq, channel, params.seq_len, qkv_dim);
                     grad_input[input_idx] +=
                         dpre * conv_weight_at(conv1d_weight, conv1d_shape, channel, tap);
+                    grad_weight[conv_weight_index(conv1d_shape, channel, tap)] +=
+                        dpre * input[input_idx];
                 }
             }
         }
     }
-    Ok(grad_input)
+    Ok((grad_input, grad_weight))
 }
 
 struct NormalizedVec {
@@ -902,9 +944,13 @@ fn subtract_outer_in_place(
 }
 
 fn conv_weight_at(conv1d_weight: &[f32], shape: &[usize], channel: usize, tap: usize) -> f32 {
+    conv1d_weight[conv_weight_index(shape, channel, tap)]
+}
+
+fn conv_weight_index(shape: &[usize], channel: usize, tap: usize) -> usize {
     match shape {
-        [_, kernel] => conv1d_weight[channel * kernel + tap],
-        [_, kernel, one] if *one == 1 => conv1d_weight[channel * kernel * one + tap * one],
+        [_, kernel] => channel * kernel + tap,
+        [_, kernel, one] if *one == 1 => channel * kernel * one + tap * one,
         _ => unreachable!("validated by shape check"),
     }
 }
@@ -945,4 +991,8 @@ fn row4(
 
 fn state_base(batch: usize, head: usize, heads: usize, key_dim: usize, value_dim: usize) -> usize {
     ((batch * heads + head) * key_dim) * value_dim
+}
+
+fn state_head_base(head: usize, key_dim: usize, value_dim: usize) -> usize {
+    head * key_dim * value_dim
 }

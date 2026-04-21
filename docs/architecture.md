@@ -26,7 +26,7 @@ crate:
 Phase 6 training stack (orthogonal to the inference runtime; see
 [projects/agent-rl-self-evolving.md](projects/agent-rl-self-evolving.md)):
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend` trait, with the current local Metal path already using the device-resident / lazy-eval tranche for the active training-critical ops
-- `train`: generic Qwen-family pretrain/SFT/GRPO stack with Qwen3.5-optimized defaults, exact-resume checkpoint dirs, a train-side `/v1/train/status|events|stop|save` control plane, and shared async observability (JSONL + MLflow + OTLP + optional W&B sidecar). `train_multi_turn` remains the validated dense/full-attn Qwen3.5 RL path with stepwise-GRPO vs sequence-level-GSPO objectives, while `train_sft` and `train_grpo` dispatch across Qwen3 / Qwen3.5 families and the shared Qwen3.5 model path now also supports hybrid linear-attn LoRA/eval. Depends on `autograd`
+- `train`: generic Qwen-family pretrain/SFT/GRPO stack with Qwen3.5-optimized defaults, exact-resume checkpoint dirs, a train-side `/v1/train/status|events|stop|save` control plane, and shared async observability (JSONL + MLflow + OTLP + optional W&B sidecar). `train_multi_turn` supports stepwise-GRPO vs sequence-level-GSPO objectives, `train_sft` / `train_grpo` dispatch across Qwen3 / Qwen3.5 families, and the shared Qwen3.5 model path is now accepted locally on CPU + Metal across dense and hybrid scratch-pretrain / RL / LoRA-eval surfaces. CUDA hybrid runtime acceptance is still pending; the compile surface is checked. Depends on `autograd`
 
 Current reality note: the train-side implementation already includes the
 dense/full-attn Qwen3.5-family path and a generic family-dispatch control
@@ -35,10 +35,11 @@ stepwise-GRPO vs sequence-level-GSPO objective switch, `train_sft` and
 `train_grpo` can dispatch across Qwen3 / Qwen3.5 families, checkpoints are
 written as HF-style directories, the handwritten Transformer/TinyLM runtime
 compatibility path has been deleted, and the shared Qwen3.5 model path now
-supports hybrid linear-attn layers for LoRA/frozen-eval use. Scratch pretrain
-and RL acceptance remain dense/full-attn only. The shared config/tensor-name
-truth now lives in the dedicated `qwen*-spec` crates, and `pretrain` is the
-sole canonical scratch-pretrain entrypoint.
+supports hybrid linear-attn layers across scratch pretrain, LoRA/frozen-eval,
+and RL on the locally accepted CPU + Metal path. The shared config/tensor-name
+truth now lives in the dedicated `qwen*-spec` crates, `pretrain` is the
+sole canonical scratch-pretrain entrypoint, and `infer` can optionally proxy
+the train-side `/v1/train/*` control plane when `--train-control-url` is set.
 
 The 2026-04-15 Route-A refactor folded `infer-core`, `infer-observability`,
 `infer-policy`, and `infer-engine` back into `infer` because the split never

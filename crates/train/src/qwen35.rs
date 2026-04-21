@@ -300,7 +300,7 @@ impl Qwen35Model {
         store: &mut TensorStore,
     ) -> Result<Self> {
         match mode {
-            Qwen35InitMode::ScratchTrain => cfg.validate_train_dense_full_attention_contract()?,
+            Qwen35InitMode::ScratchTrain => cfg.validate_train_scratch_contract()?,
             Qwen35InitMode::LoraOrFrozen => cfg.validate_train_lora_or_frozen_contract()?,
         }
         let mut param_names = HashMap::new();

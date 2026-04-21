@@ -44,6 +44,18 @@ fn tiny_qwen35_config(max_seq_len: usize) -> Qwen35Config {
     }
 }
 
+fn tiny_hybrid_qwen35_config(max_seq_len: usize) -> Qwen35Config {
+    let mut cfg = tiny_qwen35_config(max_seq_len);
+    cfg.partial_rotary_factor = 0.5;
+    cfg.rotary_dim = cfg.head_dim / 2;
+    cfg.linear_key_head_dim = cfg.rotary_dim;
+    cfg.linear_value_head_dim = cfg.rotary_dim;
+    cfg.layer_types = vec![LayerType::FullAttention, LayerType::LinearAttention];
+    cfg.validate_train_scratch_contract()
+        .expect("hybrid scratch config");
+    cfg
+}
+
 #[test]
 fn ppo_active_mask_zeros_out_clipped_positions() {
     // ratio = exp(new_lp - old_lp); eps = 0.2 → active window [0.8, 1.2]
@@ -160,6 +172,81 @@ fn grpo_loss_gradient_non_zero() {
             .is_some_and(|grad| grad.data.iter().any(|value| value.abs() > 1.0e-7))
     });
     assert!(has_non_zero_grad, "expected a non-zero GRPO gradient");
+}
+
+#[test]
+fn hybrid_grpo_loss_gradient_non_zero() {
+    let config = tiny_hybrid_qwen35_config(8);
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let policy = Qwen35Model::new(&config, &mut store).expect("build hybrid policy");
+    let ref_model = policy.clone_frozen(&mut store);
+    let params = policy.all_parameter_ids();
+    {
+        let tensor = store
+            .get_mut(params[0])
+            .expect("first parameter should remain mutable");
+        for value in tensor.data.iter_mut().take(8) {
+            *value += 0.01;
+        }
+    }
+
+    let mut rng = LcgRng::seed(113);
+    let prompts = build_prompt_batch(2, 4, 8, 15, &mut rng);
+    let trajectories = rollout_group(
+        &policy,
+        &ref_model,
+        &config,
+        &prompts,
+        2,
+        1.0,
+        &mut rng,
+        &copy_reward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("hybrid rollout");
+    let rewards = trajectories
+        .iter()
+        .map(|trajectory| trajectory.reward)
+        .collect::<Vec<_>>();
+    let advantages = group_advantages(&rewards, 2);
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let loss = grpo_loss(
+        &policy,
+        &trajectories,
+        &advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 2,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("hybrid grpo loss");
+    let loss_value = store.to_host(loss).expect("loss value")[0];
+    assert!(
+        loss_value.is_finite(),
+        "hybrid loss should be finite, got {loss_value}"
+    );
+
+    tape.backward(loss, &mut store).expect("backward");
+    let has_non_zero_grad = params.iter().any(|&param_id| {
+        store
+            .get(param_id)
+            .and_then(|tensor| tensor.grad)
+            .and_then(|grad_id| store.get(grad_id))
+            .is_some_and(|grad| grad.data.iter().any(|value| value.abs() > 1.0e-7))
+    });
+    assert!(
+        has_non_zero_grad,
+        "expected a non-zero hybrid GRPO gradient"
+    );
 }
 
 #[test]

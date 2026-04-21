@@ -11,9 +11,10 @@ and the canonical guidellm bench SSOT alignment.)
 Current train control-plane truth: `crates/train` owns the active
 training server, surfaced by `pretrain --serve`, `train_sft --serve`,
 `train_grpo --serve`, and `train_multi_turn --serve`; the current
-surface is `/v1/train/status|events|stop|save`. The
-`infer/src/http_server/train.rs` `/v1/train/*` surface is the target
-unified entrypoint, not the current implementation.
+surface is `/v1/train/status|events|stop|save`. `infer` now also exposes
+an optional `/v1/train/*` bridge via `--train-control-url http://...`,
+forwarding those routes to the train-side server instead of duplicating
+trainer control logic.
 Current train-side model reality is a generic Qwen-family control plane
 with Qwen3.5 as the optimized default: `train_sft` and `train_grpo`
 dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` already
@@ -22,9 +23,10 @@ vs sequence-level-GSPO objective switch, `eval_lm` reads the same
 checkpoint dirs for tokenized or chat JSONL evaluation, the canonical
 scratch-pretrain entrypoint is `pretrain`, checkpoints are written as
 HF-style directories, the handwritten Transformer/TinyLM runtime
-compatibility path has been deleted, and the hybrid linear-attn Qwen3.5
-LoRA/eval path is now landed while scratch pretrain + RL acceptance
-remain dense/full-attn only.
+compatibility path has been deleted, and hybrid linear-attn Qwen3.5 is
+now accepted locally across scratch pretrain, LoRA/eval, and RL on CPU
+and Metal; CUDA compile coverage is in place while CUDA hybrid runtime
+acceptance remains pending.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -57,7 +59,7 @@ Current workspace members:
 - `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait; the current local Metal train path already uses the device-resident / lazy-eval tranche for the active training-critical ops, while CUDA remains the primary full-acceptance target)
-- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family with dense/full-attn scratch pretrain + RL, plus hybrid linear-attn support on the LoRA/eval path; HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
+- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family across scratch pretrain + RL, with hybrid linear-attn accepted locally on CPU + Metal and CUDA compile coverage in place; HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
 - `crates/kv-native-sys` (Zig-backed local persistence substrate for `infer/src/kv_tier/transport/disk.rs`; now owns file + block object ABI plus mmap/WAL/shm descriptor primitives used by local validation and by coordinator spill/stage persistence paths)
 
 ## 2. Main execution paths
@@ -135,8 +137,10 @@ crates/train/src/bin/{pretrain,train_sft,train_grpo,train_multi_turn}.rs
 ```
 
 This is the **current implementation truth** for train-side control.
-Docs that describe infer-side `/v1/train/*` routes are target architecture,
-not the current repository surface.
+`infer` now exposes an optional `/v1/train/*` proxy surface when
+`--train-control-url` is configured; docs that imply infer owns a
+separate trainer remain target architecture, not current repository
+surface.
 
 Key files:
 

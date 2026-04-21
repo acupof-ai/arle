@@ -35,7 +35,7 @@ use train::{
     },
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
-    model_family::{ModelFamily, synthetic_qwen35_dense_config},
+    model_family::{ModelFamily, Qwen35AttentionPattern, apply_qwen35_attention_pattern},
     qwen3::{Qwen3ConfigError, Qwen3Error, Qwen3Model},
     qwen3_checkpoint::{
         ConfigJsonSource, GenerationConfigSource, Qwen3CheckpointError, Qwen3StepCheckpoint,
@@ -92,6 +92,7 @@ struct CliArgs {
     rms_norm_eps: f32,
     rope_theta: f32,
     tie_word_embeddings: bool,
+    linear_attn_every: usize,
     bos_token_id: u32,
     eos_token_id: u32,
     metrics_jsonl: Option<PathBuf>,
@@ -130,6 +131,7 @@ impl Default for CliArgs {
             rms_norm_eps: 1.0e-6,
             rope_theta: 1_000_000.0,
             tie_word_embeddings: true,
+            linear_attn_every: 0,
             bos_token_id: DEFAULT_BOS_TOKEN_ID,
             eos_token_id: DEFAULT_EOS_TOKEN_ID,
             metrics_jsonl: None,
@@ -327,36 +329,46 @@ impl PretrainFamily for Qwen35Family {
     }
 
     fn build_config(args: &CliArgs, vocab_size: usize) -> Result<Self::Config, CliError> {
-        let mut cfg = synthetic_qwen35_dense_config(args.max_position_embeddings);
-        cfg.vocab_size = vocab_size;
-        cfg.hidden_size = args.hidden_size;
-        cfg.num_hidden_layers = args.num_hidden_layers;
-        cfg.num_attention_heads = args.num_attention_heads;
-        cfg.num_key_value_heads = args.num_kv_heads.max(1);
-        cfg.head_dim = args.head_dim;
-        cfg.intermediate_size = args.intermediate_size;
-        cfg.rms_norm_eps = args.rms_norm_eps;
-        cfg.rope_theta = args.rope_theta;
-        cfg.tie_word_embeddings = args.tie_word_embeddings;
-        cfg.stop_token_ids = vec![args.eos_token_id];
-        cfg.bos_token_id = Some(args.bos_token_id);
-        cfg.eos_token_id = args.eos_token_id;
-        cfg.rope_cache_len_hint = Some(args.max_position_embeddings);
-        cfg.layer_types = vec![qwen35_spec::LayerType::FullAttention; args.num_hidden_layers];
-        cfg.linear_num_key_heads = args.num_attention_heads;
-        cfg.linear_key_head_dim = args.head_dim;
-        cfg.linear_num_value_heads = args.num_attention_heads;
-        cfg.linear_value_head_dim = args.head_dim;
-        cfg.linear_conv_kernel_dim = cfg.linear_conv_kernel_dim.max(4);
-        cfg.partial_rotary_factor = 1.0;
-        cfg.rotary_dim = args.head_dim;
-        cfg.num_experts = 0;
-        cfg.num_experts_per_tok = 0;
-        cfg.moe_intermediate_size = 0;
-        cfg.shared_expert_intermediate_size = 0;
-        cfg.norm_topk_prob = true;
-        cfg.mlp_only_layers = Vec::new();
-        cfg.validate()?;
+        let mut cfg = Qwen35Config {
+            hidden_size: args.hidden_size,
+            intermediate_size: args.intermediate_size,
+            num_hidden_layers: args.num_hidden_layers,
+            vocab_size,
+            rms_norm_eps: args.rms_norm_eps,
+            stop_token_ids: vec![args.eos_token_id],
+            bos_token_id: Some(args.bos_token_id),
+            eos_token_id: args.eos_token_id,
+            tie_word_embeddings: args.tie_word_embeddings,
+            num_attention_heads: args.num_attention_heads,
+            num_key_value_heads: args.num_kv_heads.max(1),
+            head_dim: args.head_dim,
+            linear_num_key_heads: args.num_attention_heads,
+            linear_key_head_dim: args.head_dim,
+            linear_num_value_heads: args.num_attention_heads,
+            linear_value_head_dim: args.head_dim,
+            linear_conv_kernel_dim: 4,
+            rope_theta: args.rope_theta,
+            partial_rotary_factor: 1.0,
+            rotary_dim: args.head_dim,
+            rope_cache_len_hint: Some(args.max_position_embeddings),
+            layer_types: vec![qwen35_spec::LayerType::FullAttention; args.num_hidden_layers],
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            decoder_sparse_step: 1,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
+            mlp_only_layers: Vec::new(),
+        };
+        let pattern = if args.linear_attn_every == 0 {
+            Qwen35AttentionPattern::Dense
+        } else {
+            Qwen35AttentionPattern::Hybrid {
+                linear_attn_every: args.linear_attn_every,
+            }
+        };
+        apply_qwen35_attention_pattern(&mut cfg, pattern)
+            .map_err(|err| CliError::Custom(format!("qwen3.5 attention pattern invalid: {err}")))?;
         Ok(cfg)
     }
 
@@ -962,6 +974,9 @@ where
             "--rms-eps" => args.rms_norm_eps = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--rope-theta" => args.rope_theta = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--no-tie-embed" => args.tie_word_embeddings = false,
+            "--linear-attn-every" => {
+                args.linear_attn_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             "--bos-token-id" => {
                 args.bos_token_id = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
@@ -1022,6 +1037,11 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             flag: "--eval-windows".into(),
             value: "0".into(),
         }));
+    }
+    if args.model_family == ModelFamily::Qwen3 && args.linear_attn_every > 0 {
+        return Err(CliError::Custom(
+            "--linear-attn-every is only supported for --model-family qwen35".into(),
+        ));
     }
     Ok(())
 }
@@ -1169,6 +1189,7 @@ mod tests {
             rms_norm_eps: 1.0e-6,
             rope_theta: 10_000.0,
             tie_word_embeddings: true,
+            linear_attn_every: 0,
             bos_token_id: 1,
             eos_token_id: 2,
             metrics_jsonl: None,
@@ -1230,6 +1251,20 @@ mod tests {
         assert_eq!(cfg.rope_cache_len_hint, Some(args.max_position_embeddings));
         assert_eq!(cfg.bos_token_id, Some(args.bos_token_id));
         assert_eq!(cfg.eos_token_id, args.eos_token_id);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_family_builds_hybrid_scratch_config() -> Result<(), CliError> {
+        let mut args = tiny_args();
+        args.linear_attn_every = 2;
+        let cfg = Qwen35Family::build_config(&args, args.vocab_size.unwrap())?;
+        assert_eq!(
+            cfg.layer_types,
+            vec![LayerType::FullAttention, LayerType::LinearAttention]
+        );
+        assert!(cfg.rotary_dim < cfg.head_dim);
+        cfg.validate_train_scratch_contract()?;
         Ok(())
     }
 
