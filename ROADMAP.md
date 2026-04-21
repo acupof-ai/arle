@@ -26,7 +26,7 @@ Working: Qwen3/Qwen3.5/GLM4 inference on CUDA + Metal, FlashInfer single prefill
 - **GPTQ/AWQ INT4 production-ready**: format detection, W4A16 GEMV, Marlin W4 prefill (5-25x TTFT speedup)
 - **FP8 KV cache**: custom fused FP8 E4M3 decode attention, 50% KV memory reduction
 - Merged QKV + gate-up GEMM: 96 fewer kernel launches per decode step
-- **Tiered KV Cache M2b + M0.3 + M3a + M3b + M3c locally shipped and remote-accepted on L4 (2026-04-15)**: scheduler selector flip to radix, BF16 `page_size=16`, host-tier spill path, `lookup_or_stage` classification + page-lifecycle state machine, legacy contiguous CPU KV offload retired. See `docs/projects/tiered-kv-cache.md`.
+- **Tiered KV Cache local path extended again on 2026-04-21**: on top of the M2b + M0.3 + M3a + M3b + M3c remote-accepted L4 baseline, paged-prefill models now direct-attach radix-backed GPU pages, `paged_kv` does tail-page COW before append, and T1 host storage moved under the Zig substrate. T1/T2 live readmission is still pending. See `docs/projects/tiered-kv-cache.md`.
 - **`cuda-kernels` kernel crate extracted** (commit `a4e12f5`): CUDA Rust layer (`paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `ffi`, `kv_quant`, `kv_turboquant`) moved to `crates/cuda-kernels/`; `infer/src/backend/cuda/` keeps only `bootstrap.rs`. One-way dependency `infer → cuda-kernels`.
 - **Q4_K native GPU kernel shipped**: `q4k_gemv_kernel` + packed GGUF loader fast path fits Carnice-27B on L4-24GB. See `docs/plans/q4k-native-gpu.md`.
 - **Metal M0.2a resumable request state + M0.2b scheduler-backed serving**: Qwen3 + Qwen3.5 request state objects (prefill-in-chunks, one-step decode, deterministic cleanup); `metal_serve` now routes through `SchedulerHandle` via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics` (`infer/src/backend/metal/runtime.rs:580`). M0.2 throughput exit still pending variable-length decode + per-step batch-state rebuild cost work — see [docs/plans/2026-04-15-metal-backend-acceptance-plan.md](docs/plans/2026-04-15-metal-backend-acceptance-plan.md).
@@ -528,8 +528,8 @@ Focus on performance, robustness, and Metal parity:
 2. ~~**2.1–2.5 Quantization**~~ — ✅ GPTQ/AWQ/FP8/INT8/TurboQuant/GGUF+Q4_K all production-ready
 3. ~~**Scheduler preemption with KV swap**~~ — ✅ recompute mode done (swap mode deferred)
 4. ~~**Overlap scheduling (H2D/D2H with compute)**~~ — ✅ dual-stream + decode-first reordering
-5. ~~**Tiered KV Cache M0–M3**~~ — ✅ M2b+M0.3+M3a+M3b+M3c locally + L4 remote-accepted.
-   Next: M4 disk persistence + session save/load; any live readmission work needs a separate attach/ownership model.
+5. ~~**Tiered KV Cache M0–M3**~~ — ✅ M2b+M0.3+M3a+M3b+M3c locally + L4 remote-accepted, plus 2026-04-21 local follow-on for direct GPU prefix attach, decode-time COW, and Zig-backed T1 storage.
+   Next: M4 disk persistence + session save/load + any T1/T2 live readmission work.
 6. **Metal M0.2 throughput exit** — `metal_serve` routes through `SchedulerHandle` (M0.2b shipped
    via `spawn_metal_scheduler_handle_from_path_with_options_and_metrics`); M0.2a/c/d also landed
    locally. Throughput exit still gated on variable-length decode + per-step batch-state rebuild

@@ -164,6 +164,7 @@ impl<M: ModelForward> Scheduler<M> {
             return None;
         }
         let Phase::Prefilling {
+            materialized_prefix_len: _,
             effective_tokens,
             progress,
         } = &req.phase

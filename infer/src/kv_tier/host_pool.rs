@@ -1,28 +1,16 @@
 //! Host pinned pool for the tiered KV cache T1 tier.
 //!
-//! Owns a **single, allocation-stable** pinned region on the host side —
-//! `cudaHostAlloc`-backed on the CUDA lane, plain `Vec<u8>` on the no-cuda
-//! lane so local unit tests exercise the allocator logic without touching
-//! CUDA. Both backings expose the same `HostPinnedRegion { offset, len }`
-//! shape so callers see one API.
-//!
-//! The "single allocation, never moves" invariant is load-bearing: the
-//! coordinator will eventually hand the base pointer to NIXL / UCX for
-//! registered-memory zero-copy transfers (project doc §4.2 invariant 5 +
-//! §8 pitfall 2). Reallocating the region mid-flight would invalidate
-//! any outstanding memory registration. The free list exists for reuse
-//! of interior holes WITHOUT ever growing or re-basing the region.
+//! The backing storage now lives in `kv-native-sys` as a Zig-managed,
+//! allocation-stable host arena. Rust keeps the existing safe wrapper shape
+//! (`HostPinnedRegion`, `SharedHostPinnedPool`) and, on the CUDA lane, pins the
+//! arena once with `cuMemHostRegister_v2` so scheduler/coordinator call sites do
+//! not need to change.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Result, anyhow};
 
 /// Reservation handed back by [`HostPinnedPool::reserve`].
-///
-/// `offset` is measured from the base of the pool's one pinned region;
-/// it is stable across sends and thread boundaries. `len` is the byte
-/// size of the reservation (not capped to a block size — callers pick
-/// their own granularity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostPinnedRegion {
     pub offset: u64,
@@ -87,116 +75,62 @@ impl PartialEq for SharedHostPinnedPool {
 impl Eq for SharedHostPinnedPool {}
 
 #[derive(Debug)]
-enum Backing {
+struct NativeArena {
+    handle: *mut kv_native_sys::KvHostArenaHandle,
+    base_ptr: *mut u8,
     #[cfg(feature = "cuda")]
-    CudaPinned {
-        /// Base pointer returned by `cuMemAllocHost_v2`. **Never** null
-        /// between `new` and `drop`. Stored as a raw pointer because
-        /// the pool's Send/Sync impls are hand-written.
-        base_ptr: *mut u8,
-    },
-    /// Non-CUDA backing used both on the no-cuda feature lane and in
-    /// scheduler tests on CUDA hosts that do not want to spend real
-    /// pinned memory. Plain `Vec<u8>` — Send + Sync via std.
-    // Only constructed under `not(feature = "cuda")`. Under the `cuda,no-cuda`
-    // Mac typecheck this variant is dead; allow silences the false positive.
-    #[cfg_attr(feature = "cuda", allow(dead_code))]
-    InMemory { buffer: Vec<u8> },
+    cuda_registered: bool,
 }
 
 /// Allocation-stable host pool.
 ///
-/// Layout:
-/// - `capacity_bytes`: total byte capacity of the underlying backing.
-/// - `next_offset`: bump-allocator cursor for fresh allocations.
-/// - `free_list`: interior holes returned via [`Self::release`] that
-///   can be reused without growing the region. **Not coalesced**: for
-///   the M3 local batch, first-fit on exact-or-larger sizes is enough
-///   (the watermark path always frees full blocks whose size matches a
-///   recent reservation). A smarter allocator can replace this without
-///   changing the public API.
-///
-/// The pool is `Send + Sync` by hand: the `Backing::CudaPinned` raw
-/// pointer is the single base address of a `cuMemAllocHost_v2` region
-/// that is allocated once, freed in `Drop`, and otherwise immutable.
-/// Concurrent reads / writes into disjoint [`HostPinnedRegion`] slices
-/// are safe because each reservation owns a non-overlapping byte range.
+/// The arena is created once, never moves, and is internally sub-allocated by
+/// the Zig substrate. Rust exposes typed regions and slice views over that
+/// single stable base pointer.
 #[derive(Debug)]
 pub struct HostPinnedPool {
     capacity_bytes: usize,
-    next_offset: usize,
-    free_list: Vec<HostPinnedRegion>,
-    backing: Backing,
+    arena: NativeArena,
 }
 
-// SAFETY: The `Backing::CudaPinned` raw pointer is a single
-// `cuMemAllocHost_v2` base address that is valid for the lifetime of
-// the pool. Reservations hand out disjoint byte ranges, so concurrent
-// readers/writers of different `HostPinnedRegion`s never alias. The
-// pool itself performs no shared mutation across threads other than
-// the allocator cursor + free list, which higher-level code wraps in
-// `Mutex` / channel synchronization.
 unsafe impl Send for HostPinnedPool {}
 unsafe impl Sync for HostPinnedPool {}
 
 impl HostPinnedPool {
-    /// Allocate a new host pinned pool backing one physically-stable
-    /// region of `capacity_bytes` bytes.
-    ///
-    /// On the `cuda` feature lane this calls `cuMemAllocHost_v2`; on the
-    /// `no-cuda` lane it falls back to a plain `Vec<u8>` so unit tests
-    /// exercise the bookkeeping without needing a GPU. Either way the
-    /// resulting pool honors the "never grow, never move" invariant.
     pub fn new(capacity_bytes: usize) -> Result<Self> {
         if capacity_bytes == 0 {
             return Err(anyhow!("HostPinnedPool capacity must be > 0"));
         }
 
+        let (handle, base_ptr) = kv_native_sys::host_arena_create(capacity_bytes)
+            .map_err(|err| anyhow!("HostPinnedPool native arena create failed: {err}"))?;
+
         #[cfg(feature = "cuda")]
-        let backing = {
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            // SAFETY: `cuMemAllocHost_v2` is the standard CUDA driver
-            // entry point for portable pinned host memory. We pass a
-            // valid `&mut *mut u8` and a non-zero byte count; the call
-            // either writes a non-null pointer on success or returns a
-            // non-success status which we translate into an anyhow
-            // error.
+        let cuda_registered = {
             let status = unsafe {
-                cudarc::driver::sys::cuMemAllocHost_v2(
-                    (&raw mut ptr).cast::<*mut std::ffi::c_void>(),
+                cudarc::driver::sys::cuMemHostRegister_v2(
+                    base_ptr.cast::<std::ffi::c_void>(),
                     capacity_bytes,
+                    0,
                 )
             };
             if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                let _ = unsafe { kv_native_sys::host_arena_destroy(handle) };
                 return Err(anyhow!(
-                    "HostPinnedPool cuMemAllocHost_v2 failed: {status:?}"
+                    "HostPinnedPool cuMemHostRegister_v2 failed: {status:?}"
                 ));
             }
-            if ptr.is_null() {
-                return Err(anyhow!(
-                    "HostPinnedPool cuMemAllocHost_v2 returned null on success"
-                ));
-            }
-            // Zero the region so stale contents cannot leak into a
-            // subsequent reservation. Standard pattern — FlashInfer
-            // workspace does the same on its `plan_info` allocation.
-            // SAFETY: `ptr` is a freshly-allocated CUDA pinned region
-            // of exactly `capacity_bytes` bytes that no other code has
-            // yet observed. `write_bytes` over the full length is
-            // well-defined.
-            unsafe { std::ptr::write_bytes(ptr, 0, capacity_bytes) };
-            Backing::CudaPinned { base_ptr: ptr }
-        };
-        #[cfg(not(feature = "cuda"))]
-        let backing = Backing::InMemory {
-            buffer: vec![0u8; capacity_bytes],
+            true
         };
 
         Ok(Self {
             capacity_bytes,
-            next_offset: 0,
-            free_list: Vec::new(),
-            backing,
+            arena: NativeArena {
+                handle,
+                base_ptr,
+                #[cfg(feature = "cuda")]
+                cuda_registered,
+            },
         })
     }
 
@@ -205,83 +139,42 @@ impl HostPinnedPool {
     }
 
     pub fn reserved_bytes(&self) -> usize {
-        self.next_offset
-            .saturating_sub(self.free_list.iter().map(|r| r.len).sum::<usize>())
+        unsafe { kv_native_sys::host_arena_reserved_bytes(self.arena.handle.cast_const()) }
+            .expect("HostPinnedPool reserved_bytes native query must succeed")
     }
 
     pub fn remaining_bytes(&self) -> usize {
-        self.capacity_bytes.saturating_sub(self.next_offset)
-            + self.free_list.iter().map(|r| r.len).sum::<usize>()
+        self.capacity_bytes.saturating_sub(self.reserved_bytes())
     }
 
-    /// Reserve a contiguous byte range of `len`. Tries the free list
-    /// first (first-fit on exact-or-larger), falls back to bump
-    /// allocation from `next_offset`. Returns `None` on exhaustion so
-    /// callers can respond with a structured error instead of panicking.
     pub fn reserve(&mut self, len: usize) -> Option<HostPinnedRegion> {
-        if len == 0 {
-            return None;
-        }
-        // First-fit scan of the free list.
-        if let Some(idx) = self.free_list.iter().position(|r| r.len >= len) {
-            let mut region = self.free_list.swap_remove(idx);
-            if region.len > len {
-                // Split: keep the tail back on the free list.
-                let tail = HostPinnedRegion {
-                    offset: region.offset + len as u64,
-                    len: region.len - len,
-                };
-                self.free_list.push(tail);
-                region.len = len;
-            }
-            return Some(region);
-        }
-        // Bump-allocate.
-        if self.next_offset + len > self.capacity_bytes {
-            return None;
-        }
-        let region = HostPinnedRegion {
-            offset: self.next_offset as u64,
-            len,
-        };
-        self.next_offset += len;
-        Some(region)
+        let region = unsafe { kv_native_sys::host_arena_reserve(self.arena.handle, len) }
+            .expect("HostPinnedPool reserve native query must succeed")?;
+        Some(HostPinnedRegion {
+            offset: region.offset,
+            len: region.len,
+        })
     }
 
-    /// Release a region back to the free list so future `reserve` calls
-    /// can reuse the same byte range. Does **not** call `cuMemFreeHost`
-    /// — the pool stays exactly one `cuMemAllocHost_v2` region for its
-    /// entire lifetime (project doc §4.2 invariant 5, §8 pitfall 2).
     pub fn release(&mut self, region: HostPinnedRegion) {
-        // Best-effort sanity: a release that doesn't match any past
-        // reservation is silently accepted, but the free list won't
-        // grow past the high water mark of live reservations.
-        if (region.offset as usize) + region.len > self.capacity_bytes {
+        if (region.offset as usize).saturating_add(region.len) > self.capacity_bytes {
             return;
         }
-        self.free_list.push(region);
+        let _ = unsafe {
+            kv_native_sys::host_arena_release(
+                self.arena.handle,
+                kv_native_sys::KvHostArenaRegion {
+                    offset: region.offset,
+                    len: region.len,
+                },
+            )
+        };
     }
 
-    /// Reset the pool to empty. Invalidates every outstanding
-    /// [`HostPinnedRegion`]; callers must not use a region after
-    /// `reset`. Primarily useful for tests and for a full
-    /// session-level restart path.
     pub fn reset(&mut self) {
-        self.next_offset = 0;
-        self.free_list.clear();
+        let _ = unsafe { kv_native_sys::host_arena_reset(self.arena.handle) };
     }
 
-    /// Read-only slice view of a region. Panics if the region is out
-    /// of bounds — that can only happen if the caller fabricated a
-    /// region, which is a contract violation.
-    ///
-    /// # Safety of the cuda path
-    ///
-    /// The pinned region is a single-owner `cuMemAllocHost_v2`
-    /// allocation whose base pointer never moves. Building a `&[u8]`
-    /// over a disjoint byte range is safe for the lifetime of the
-    /// borrow as long as no concurrent writer targets the same range
-    /// — that is the coordinator's responsibility, not this type's.
     pub fn as_slice(&self, region: HostPinnedRegion) -> &[u8] {
         let offset = region.offset as usize;
         assert!(
@@ -290,21 +183,9 @@ impl HostPinnedPool {
             region.len,
             self.capacity_bytes
         );
-        match &self.backing {
-            #[cfg(feature = "cuda")]
-            Backing::CudaPinned { base_ptr } => {
-                // SAFETY: base_ptr is non-null and points at a pinned
-                // allocation of exactly `capacity_bytes`. The asserted
-                // bounds check above guarantees `[offset, offset+len)`
-                // is within that allocation.
-                unsafe { std::slice::from_raw_parts(base_ptr.add(offset), region.len) }
-            }
-            Backing::InMemory { buffer } => &buffer[offset..offset + region.len],
-        }
+        unsafe { std::slice::from_raw_parts(self.arena.base_ptr.add(offset), region.len) }
     }
 
-    /// Mutable slice view of a region. Same safety story as
-    /// [`Self::as_slice`] but for writes.
     pub fn as_mut_slice(&mut self, region: HostPinnedRegion) -> &mut [u8] {
         let offset = region.offset as usize;
         assert!(
@@ -313,59 +194,33 @@ impl HostPinnedPool {
             region.len,
             self.capacity_bytes
         );
-        match &mut self.backing {
-            #[cfg(feature = "cuda")]
-            Backing::CudaPinned { base_ptr } => {
-                // SAFETY: see as_slice. We hold `&mut self`, so no
-                // other view exists for the lifetime of this borrow.
-                unsafe { std::slice::from_raw_parts_mut(base_ptr.add(offset), region.len) }
-            }
-            Backing::InMemory { buffer } => &mut buffer[offset..offset + region.len],
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.arena.base_ptr.add(offset), region.len) }
     }
 
-    /// Raw host pointer for a region, in address-space form.
-    ///
-    /// CUDA transport code uses this to hand off to
-    /// `cudaMemcpyAsync(... host_ptr, len, cudaMemcpyHostToDevice, ...)`
-    /// and similar. The no-cuda lane exposes the `Vec<u8>` address so
-    /// unit tests can still prove the bookkeeping; nothing real reads
-    /// or writes through that pointer under `no-cuda`.
     pub fn host_ptr(&self, region: HostPinnedRegion) -> u64 {
         let offset = region.offset as usize;
         assert!(
             offset + region.len <= self.capacity_bytes,
             "HostPinnedRegion out of bounds"
         );
-        match &self.backing {
-            #[cfg(feature = "cuda")]
-            Backing::CudaPinned { base_ptr } => (*base_ptr as usize + offset) as u64,
-            Backing::InMemory { buffer } => buffer.as_ptr() as u64 + offset as u64,
-        }
+        (self.arena.base_ptr as usize + offset) as u64
     }
 }
 
 impl Drop for HostPinnedPool {
     fn drop(&mut self) {
-        match &mut self.backing {
-            #[cfg(feature = "cuda")]
-            Backing::CudaPinned { base_ptr } => {
-                if !base_ptr.is_null() {
-                    // SAFETY: `base_ptr` was produced by a successful
-                    // `cuMemAllocHost_v2` call in `new` and has not been
-                    // freed yet. Ignoring the return status matches the
-                    // FlashInfer workspace pattern — a failure here
-                    // during shutdown is unrecoverable anyway.
-                    unsafe {
-                        let _ = cudarc::driver::sys::cuMemFreeHost(
-                            (*base_ptr).cast::<std::ffi::c_void>(),
-                        );
-                    }
-                    *base_ptr = std::ptr::null_mut();
-                }
+        #[cfg(feature = "cuda")]
+        if self.arena.cuda_registered && !self.arena.base_ptr.is_null() {
+            unsafe {
+                let _ = cudarc::driver::sys::cuMemHostUnregister(
+                    self.arena.base_ptr.cast::<std::ffi::c_void>(),
+                );
             }
-            Backing::InMemory { .. } => {}
         }
+
+        let _ = unsafe { kv_native_sys::host_arena_destroy(self.arena.handle) };
+        self.arena.handle = std::ptr::null_mut();
+        self.arena.base_ptr = std::ptr::null_mut();
     }
 }
 
@@ -391,11 +246,9 @@ mod tests {
         let a = pool.reserve(128).unwrap();
         let _b = pool.reserve(128).unwrap();
         pool.release(a);
-        // Next same-size reservation should take from the free list,
-        // not bump past `_b`.
         let c = pool.reserve(128).unwrap();
         assert_eq!(c.offset, 0);
-        assert_eq!(pool.next_offset, 256);
+        assert_eq!(pool.reserved_bytes(), 256);
     }
 
     #[test]
@@ -406,7 +259,6 @@ mod tests {
         let b = pool.reserve(64).unwrap();
         assert_eq!(b.offset, 0);
         assert_eq!(b.len, 64);
-        // The tail 192 bytes should still be available.
         let c = pool.reserve(192).unwrap();
         assert_eq!(c.offset, 64);
         assert_eq!(c.len, 192);
@@ -428,16 +280,14 @@ mod tests {
         pool.reset();
         let region = pool.reserve(128).unwrap();
         assert_eq!(region.offset, 0);
-        assert_eq!(pool.free_list.len(), 0);
+        assert_eq!(pool.reserved_bytes(), 128);
     }
 
     #[test]
     fn as_slice_round_trips_bytes_via_mut_write() {
         let mut pool = HostPinnedPool::new(64).unwrap();
         let region = pool.reserve(32).unwrap();
-        // Write through the mutable view.
         pool.as_mut_slice(region).copy_from_slice(&[7u8; 32]);
-        // Read through the shared view.
         assert_eq!(pool.as_slice(region), &[7u8; 32]);
     }
 
@@ -446,7 +296,6 @@ mod tests {
         let mut pool = HostPinnedPool::new(1024).unwrap();
         let a = pool.reserve(128).unwrap();
         let ptr_before = pool.host_ptr(a);
-        // Allocating more bytes must NOT relocate `a`.
         let _b = pool.reserve(128).unwrap();
         let ptr_after = pool.host_ptr(a);
         assert_eq!(ptr_before, ptr_after);

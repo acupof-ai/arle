@@ -245,6 +245,34 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    pub(super) fn attach_gpu_prefix_blocks(
+        &mut self,
+        slot_idx: usize,
+        blocks: &[BlockId],
+        token_count: usize,
+    ) -> Result<()> {
+        if blocks.is_empty() || token_count == 0 {
+            return Ok(());
+        }
+
+        let mut pages = Vec::new();
+        for &block_id in blocks {
+            let block_pages = self.block_to_pages.get(&block_id).ok_or_else(|| {
+                anyhow::anyhow!("missing page span for radix block {:?}", block_id)
+            })?;
+            pages.extend_from_slice(block_pages);
+        }
+
+        self.paged_kv_pool
+            .attach_pages(slot_idx, &pages, token_count)
+    }
+
+    pub(super) fn release_attached_prefix_blocks(&mut self, blocks: &[BlockId]) {
+        if !blocks.is_empty() {
+            self.prefix_cache.release(blocks);
+        }
+    }
+
     /// Create a new scheduler and its handle.
     ///
     /// `num_slots` controls how many concurrent requests can be active (each gets
@@ -1124,6 +1152,10 @@ impl<M: ModelForward> Scheduler<M> {
         slot: usize,
         count: usize,
     ) -> Result<Vec<u32>> {
+        if count > 0 {
+            self.paged_kv_pool
+                .cow_tail_page_for_append(self.model.device_context(), slot)?;
+        }
         match self.paged_kv_pool.alloc_tokens(slot, count) {
             Ok(indices) => Ok(indices),
             Err(first_err) => {

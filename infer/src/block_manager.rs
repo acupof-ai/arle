@@ -26,8 +26,8 @@
 //! # Shared-block accounting
 //!
 //! The batch scheduler can pin the same block table entries across multiple
-//! requests. This module tracks refcounts, but it does not own any production
-//! decode-time COW path.
+//! requests. This module tracks refcounts, but the production decode-time COW
+//! path now lives in `crates/cuda-kernels/src/paged_kv.rs`.
 
 use std::collections::{HashMap, VecDeque};
 

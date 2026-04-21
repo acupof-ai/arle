@@ -27,6 +27,7 @@ const wal_magic = "KVWAL001";
 const shm_magic = "KVSHM001";
 const mmap_path_cap = 512;
 const shm_name_cap = 128;
+const map_anon_flag: c_int = if (@hasDecl(c, "MAP_ANON")) c.MAP_ANON else c.MAP_ANONYMOUS;
 
 pub const KvMmapDescriptor = extern struct {
     len: usize,
@@ -41,10 +42,22 @@ pub const KvSharedMemoryDescriptor = extern struct {
     name: [shm_name_cap]u8,
 };
 
+pub const KvHostArenaRegion = extern struct {
+    offset: u64,
+    len: usize,
+};
+
 const ShmHeader = extern struct {
     magic: [shm_magic.len]u8,
     generation: u64,
     payload_len: u64,
+};
+
+const KvHostArena = struct {
+    mapping: ?*anyopaque,
+    capacity_bytes: usize,
+    next_offset: usize,
+    free_list: std.ArrayListUnmanaged(KvHostArenaRegion),
 };
 
 var shm_generation_counter = std.atomic.Value(u64).init(1);
@@ -528,6 +541,115 @@ fn shmUnlinkInternal(desc: *const KvSharedMemoryDescriptor) KvStatus {
     return .ok;
 }
 
+fn hostArenaFromHandle(handle: ?*KvHostArena) ?*KvHostArena {
+    return handle;
+}
+
+fn hostArenaCreateInternal(
+    capacity_bytes: usize,
+    out_handle: *?*KvHostArena,
+    out_base_ptr: *?[*]u8,
+) KvStatus {
+    if (capacity_bytes == 0) return .invalid_input;
+
+    const mapping = c.mmap(
+        null,
+        capacity_bytes,
+        c.PROT_READ | c.PROT_WRITE,
+        c.MAP_PRIVATE | map_anon_flag,
+        -1,
+        0,
+    );
+    if (mapping == c.MAP_FAILED) return .io;
+    errdefer _ = c.munmap(mapping, capacity_bytes);
+
+    const arena = std.heap.c_allocator.create(KvHostArena) catch return .oom;
+    arena.* = .{
+        .mapping = mapping,
+        .capacity_bytes = capacity_bytes,
+        .next_offset = 0,
+        .free_list = std.ArrayListUnmanaged(KvHostArenaRegion).empty,
+    };
+
+    out_handle.* = arena;
+    out_base_ptr.* = @ptrCast(@alignCast(mapping));
+    return .ok;
+}
+
+fn hostArenaDestroyInternal(handle: ?*KvHostArena) KvStatus {
+    const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
+    arena.free_list.deinit(std.heap.c_allocator);
+    if (c.munmap(arena.mapping, arena.capacity_bytes) != 0) return .io;
+    std.heap.c_allocator.destroy(arena);
+    return .ok;
+}
+
+fn hostArenaReservedBytesInternal(handle: ?*const KvHostArena, out_reserved_bytes: *usize) KvStatus {
+    const arena = handle orelse return .invalid_input;
+    var free_bytes: usize = 0;
+    for (arena.free_list.items) |region| {
+        free_bytes += region.len;
+    }
+    out_reserved_bytes.* = arena.next_offset -| free_bytes;
+    return .ok;
+}
+
+fn hostArenaReserveInternal(
+    handle: ?*KvHostArena,
+    len: usize,
+    out_region: *KvHostArenaRegion,
+) KvStatus {
+    const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
+    if (len == 0) return .invalid_input;
+
+    var idx: usize = 0;
+    while (idx < arena.free_list.items.len) : (idx += 1) {
+        const free_region = arena.free_list.items[idx];
+        if (free_region.len < len) continue;
+
+        _ = arena.free_list.swapRemove(idx);
+        if (free_region.len > len) {
+            arena.free_list.append(
+                std.heap.c_allocator,
+                .{
+                    .offset = free_region.offset + len,
+                    .len = free_region.len - len,
+                },
+            ) catch return .oom;
+        }
+        out_region.* = .{
+            .offset = free_region.offset,
+            .len = len,
+        };
+        return .ok;
+    }
+
+    if (arena.next_offset + len > arena.capacity_bytes) return .oom;
+    out_region.* = .{
+        .offset = arena.next_offset,
+        .len = len,
+    };
+    arena.next_offset += len;
+    return .ok;
+}
+
+fn hostArenaReleaseInternal(handle: ?*KvHostArena, region: KvHostArenaRegion) KvStatus {
+    const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
+    const region_end = std.math.add(usize, @intCast(region.offset), region.len) catch {
+        return .invalid_input;
+    };
+    if (region.len == 0 or region_end > arena.capacity_bytes) return .invalid_input;
+    arena.free_list.append(std.heap.c_allocator, region) catch return .oom;
+    return .ok;
+}
+
+fn hostArenaResetInternal(handle: ?*KvHostArena) KvStatus {
+    const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
+    arena.next_offset = 0;
+    arena.free_list.clearRetainingCapacity();
+    return .ok;
+}
+
 pub export fn kv_native_write_file(
     path_ptr: [*]const u8,
     path_len: usize,
@@ -711,6 +833,44 @@ pub export fn kv_native_shm_read(
 
 pub export fn kv_native_shm_unlink(desc: *const KvSharedMemoryDescriptor) c_int {
     return @intFromEnum(shmUnlinkInternal(desc));
+}
+
+pub export fn kv_native_host_arena_create(
+    capacity_bytes: usize,
+    out_handle: *?*KvHostArena,
+    out_base_ptr: *?[*]u8,
+) c_int {
+    return @intFromEnum(hostArenaCreateInternal(capacity_bytes, out_handle, out_base_ptr));
+}
+
+pub export fn kv_native_host_arena_destroy(handle: ?*KvHostArena) c_int {
+    return @intFromEnum(hostArenaDestroyInternal(handle));
+}
+
+pub export fn kv_native_host_arena_reserved_bytes(
+    handle: ?*const KvHostArena,
+    out_reserved_bytes: *usize,
+) c_int {
+    return @intFromEnum(hostArenaReservedBytesInternal(handle, out_reserved_bytes));
+}
+
+pub export fn kv_native_host_arena_reserve(
+    handle: ?*KvHostArena,
+    len: usize,
+    out_region: *KvHostArenaRegion,
+) c_int {
+    return @intFromEnum(hostArenaReserveInternal(handle, len, out_region));
+}
+
+pub export fn kv_native_host_arena_release(
+    handle: ?*KvHostArena,
+    region: KvHostArenaRegion,
+) c_int {
+    return @intFromEnum(hostArenaReleaseInternal(handle, region));
+}
+
+pub export fn kv_native_host_arena_reset(handle: ?*KvHostArena) c_int {
+    return @intFromEnum(hostArenaResetInternal(handle));
 }
 
 pub export fn kv_native_buffer_free(data: ?*u8) void {

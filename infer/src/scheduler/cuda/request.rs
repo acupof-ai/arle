@@ -4,7 +4,11 @@ use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, To
 pub(crate) enum Phase {
     /// Prefilling in chunks. Decode takes priority between chunks.
     Prefilling {
+        /// Tokens already materialized in the paged pool before
+        /// `effective_tokens[0]` starts. This is zero for cold prefills.
+        materialized_prefix_len: usize,
         effective_tokens: Vec<u32>,
+        /// Progress within `effective_tokens`, not total slot seq_len.
         progress: usize,
     },
     /// Generating tokens.
@@ -53,6 +57,10 @@ pub(crate) struct ActiveRequest {
     /// prompt-prefix-of-cached / extendable-prefix distinctions without keeping
     /// a parallel `cached_prompts: Vec<Vec<u32>>` token store.
     pub(crate) reusable_cached_prompt_len: usize,
+    /// Radix blocks whose refs remain pinned for the lifetime of this active
+    /// request. Used by the direct paged-prefix attachment path so the radix
+    /// will not evict blocks that still back a live slot.
+    pub(crate) attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
 }
 
 impl ActiveRequest {
@@ -268,6 +276,7 @@ mod tests {
             latest_logprob: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
+            attached_prefix_blocks: Vec::new(),
         }
     }
 
