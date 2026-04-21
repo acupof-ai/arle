@@ -3,6 +3,12 @@
 Model implementations (`qwen3`, `qwen35`, `glm4`) + the `ModelForward` and
 `DecodeContextOps` traits. Load before editing any model or adding a new one.
 
+## Refactor posture
+
+- Keep model code simple and uniform. Prefer deletion-style refactors: remove
+  obsolete model-specific detours, collapse duplicate shape/config logic, and
+  keep one canonical contract per runtime behavior.
+
 ## Trait contracts
 
 **`ModelForward`** (`model.rs`) — the deep interface the scheduler calls:

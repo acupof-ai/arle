@@ -10,6 +10,12 @@ Remote transports remain skeletal.
 Load this file before editing anything under `kv_tier/`, and re-read
 `docs/projects/tiered-kv-cache.md` before making any design-visible change.
 
+## Refactor posture
+
+- Keep KV-tier code simple and uniform. Prefer deletion-style refactors:
+  remove speculative side paths, collapse duplicate ownership/state tracking,
+  and keep one canonical spill/readmission story instead of partial shadows.
+
 ## Tier numbering (2026-04-15 revision)
 
 | Tier | Medium            | Latency  | Status in this module |
@@ -33,7 +39,7 @@ kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
 kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
-kv_tier/coordinator.rs  — Coordinator, unified Stage + Spill commands, handle + event channel
+kv_tier/coordinator.rs  — Coordinator, spill-only command/event channel for T1 → T2 persistence
 ```
 
 **Do not reintroduce `directory.rs`.** The former `TierDirectory` /
@@ -48,8 +54,8 @@ kv_tier/coordinator.rs  — Coordinator, unified Stage + Spill commands, handle 
    identity uses `crate::types::BlockFingerprint` and only exists at
    persist (M4) or migrate (M5) boundaries.
 2. **Only the coordinator moves blocks between tiers.** The scheduler decides
-   which blocks should stage or spill; the coordinator owns the byte movement
-   and completion events. Scheduler code **must not** issue `TransferOp`s
+   which blocks should spill; the coordinator owns the byte movement and
+   completion events. Scheduler code **must not** issue `TransferOp`s
    directly.
 3. **MR registration stability.** NIXL requires registered memory regions
    to be allocation-stable. `HostPinnedPool` must be allocated once at

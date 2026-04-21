@@ -5,6 +5,12 @@ compiles the C++ bridge, exposes `extern "C"` FFI consumed by
 `infer::backend::metal`. Load this file before touching the Metal path from
 either side.
 
+## Refactor posture
+
+- Keep the bridge simple and uniform. Prefer deletion-style refactors:
+  remove redundant wrappers, collapse duplicate Rust/C++ glue paths, and keep
+  one canonical bridge contract instead of stacked compatibility layers.
+
 ## What lives here
 
 ```

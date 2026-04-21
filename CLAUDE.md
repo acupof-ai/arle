@@ -20,21 +20,25 @@ FlashInfer drives CUDA prefill HD128 and batched decode HD128+HD256.
 Tests compare against JSON baselines in `infer/test_data/` — regenerate
 after any change affecting numerical output.
 
-**Workspace (post 2026-04-15 Route-A):**
+**Workspace (post 2026-04-20 Phase 6 landing):**
 
 ```
 agent-infer/
 ├── src/                       ← thin cli::run() binary
 ├── infer/                     ← runtime crate (scheduler/model/ops/backends/HTTP)
 ├── crates/
-│   ├── cuda-kernels/    ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
-│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
 │   ├── agent/chat/cli/tools
+│   ├── autograd/              ← from-scratch autograd + optimizer core
+│   ├── cuda-kernels/          ← csrc/{attention,gemm,kv,quant,misc}/, tools/triton/, ffi/
+│   ├── mlx-sys/               ← MLX + C++ bridge (cmake + cc)
+│   └── train/                 ← LoRA + GRPO trainer and control plane
 └── docs/                      ← projects/ plans/ experience/ reviews/ resources/
 ```
 
 CUDA kernels live at `crates/cuda-kernels/csrc/`, **not** `infer/csrc/`
 (common mistake — extracted 2026-04-15).
+
+Workspace topology source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 
 ---
 
@@ -55,6 +59,12 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 ### Editing
 
 - **Preserve by default.** Never delete content not explicitly in scope.
+- **Keep code simple and uniform.** Prefer deletion-style refactors:
+  remove obsolete paths, collapse duplicate helpers/branches, and converge on
+  one canonical flow instead of layering adapters.
+- **`AGENTS.md` is canonical.** If a sibling `CLAUDE.md` exists, keep both
+  files as full rule documents and keep their contents aligned; do not
+  collapse one into a thin pointer.
 - **Approach-first for >3 files or architectural decisions** — outline and wait.
 - **No half-states** (`feedback_no_half_states.md`): finish a refactor unit or
   revert it, never leave parallel old+new paths in the tree.
@@ -152,11 +162,8 @@ changes.
   Canonical params are locked in
   [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3;
   changing them is a deliberate commit, not a flag flip.
-- **Legacy helper:** `scripts/bench_throughput.py` is deprecated; keep it only
-  for historical reproducibility and narrower diagnostic runs.
-- Include: GPU model, CUDA/Metal version, model, weights/processor path,
-  non-default flags, feature set. Raw output table, not summaries. Add VRAM
-  peak / kernel counts only when a paired trace actually produced them.
+- Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
+  feature set. Raw output table, not summaries.
 - Install the Python dep once: `pip install -e .[bench]` (guidellm ships in
   the `bench` extra).
 
@@ -165,6 +172,12 @@ changes.
 - Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
   `scheduler`, `qwen3`, `qwen35`, `glm4`, `http`, `kv-tier`, `docs`.
 - Commit directly to `main` (no feature branches — `feedback_commit_to_main.md`).
+- **Always commit and push from the current branch in the current workspace.**
+  Do not create a separate worktree or alternate checkout to prepare or ship
+  code changes.
+- **Never use `git stash` to move unrelated user changes out of the way.**
+  Leave other people's dirty paths in place, work around them, and commit only
+  your own files by explicit path.
 - After `git mv` + batch Edits, re-check `git status` and re-stage by path —
   the fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).
 

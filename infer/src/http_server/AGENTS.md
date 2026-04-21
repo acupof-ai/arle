@@ -4,6 +4,12 @@ OpenAI-compatible HTTP API built on `axum`. Load before touching any
 HTTP-facing code — the wire format is a product contract, not an
 implementation detail.
 
+## Refactor posture
+
+- Keep HTTP code simple and uniform. Prefer deletion-style refactors: remove
+  duplicate request translation logic, collapse parallel compatibility shims,
+  and keep one canonical mapping from wire format to runtime contract.
+
 ## Endpoints (what wire-format change cost looks like)
 
 | Route | Handler | Notes |

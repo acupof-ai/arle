@@ -3,6 +3,12 @@
 Backend abstraction layer: **cross-backend contract + per-backend dispatch**.
 Load this file before editing anything under `infer/src/backend/`.
 
+## Refactor posture
+
+- Keep backend code simple and uniform. Prefer deletion-style refactors:
+  remove obsolete compatibility paths, collapse duplicate dispatch/helpers,
+  and keep one canonical cross-backend flow instead of layering adapters.
+
 ## What lives here
 
 | File | Role |

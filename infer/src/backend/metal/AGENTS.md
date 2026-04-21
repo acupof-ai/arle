@@ -5,6 +5,12 @@ live hot path: decode-first continuous batching, chunked prefill, Qwen3.5
 packed decode, and optional DFlash all execute through `runtime.rs`. Load
 before touching any Metal code.
 
+## Refactor posture
+
+- Keep the Metal path simple and uniform. Prefer deletion-style refactors:
+  remove stale fallback/policy layers, collapse duplicate scheduler/runtime
+  flows, and keep one canonical hot path instead of stacking special cases.
+
 ## Module map
 
 ```
