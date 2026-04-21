@@ -21,7 +21,10 @@ use train::{
         trainable_params,
     },
     cli_args::{ArgError, next_value, parse_value},
-    control::TrainingController,
+    control::{
+        TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
+        sync_status,
+    },
     grad_clip::NoClip,
     lora::{LoraAdapterConfig, LoraConfig},
     model_family::{ModelFamily, ModelFamilyError, resolve_model_family},
@@ -36,7 +39,6 @@ use train::{
         GenerationConfigSource as Qwen35GenerationConfigSource, Qwen35CheckpointError,
         Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
     },
-    server::bind_and_serve_on_thread,
     sft_data::{TokenizedSft, load_jsonl, tokenize_example},
     tokenizer::ChatTokenizer,
 };
@@ -399,18 +401,9 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         args.min_lr,
     )
     .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
-    let controller = args.serve.map(|_| TrainingController::new());
-    let mut extra_sinks: Vec<Box<dyn train::metrics::MetricSink>> = Vec::new();
-    if let Some(controller) = &controller {
-        extra_sinks.push(Box::new(controller.metric_sink()));
-    }
-    let metrics = train::metrics::open_shared_sink_with_extra(
-        args.metrics_jsonl.as_deref(),
-        true,
-        false,
-        extra_sinks,
-    )
-    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let controller = TrainingController::new();
+    let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_sft");
     let run_timer = Instant::now();
     let backend_name = match args.backend {
@@ -441,8 +434,6 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         .as_ref()
         .map(|path| path.display().to_string());
     let mut run_start_strings = vec![
-        ("run_id", run_id.as_str()),
-        ("job", "train_sft"),
         ("model_family", F::family_name()),
         ("backend", backend_name),
         ("model", model_path_string.as_str()),
@@ -457,35 +448,21 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         ("seq_len", args.seq_len as f64),
     ];
     let run_start_bools = [("resumed", resume_dir_canonical.is_some())];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_start",
-        step: Some(0),
-        strings: &run_start_strings,
-        scalars: &run_start_scalars,
-        bools: &run_start_bools,
+    emit_run_start(
+        &metrics,
+        &run_id,
+        "train_sft",
+        0,
+        &run_start_strings,
+        &run_start_scalars,
+        &run_start_bools,
+    );
+    sync_status(&controller, &metrics, |status| {
+        status.total_iters = args.steps;
+        status.started = true;
     });
-    if let Some(controller) = &controller {
-        controller.update(|status| {
-            status.total_iters = args.steps;
-            status.dropped_metrics = metrics.dropped_metrics();
-            status.started = true;
-        });
-    }
     let _server_handle =
-        if let Some(port) = args.serve {
-            let controller = Arc::clone(
-                controller
-                    .as_ref()
-                    .expect("controller exists when --serve is configured"),
-            );
-            let addr = format!("127.0.0.1:{port}");
-            eprintln!("[train_sft] control plane listening on http://{addr}/v1/train");
-            Some(bind_and_serve_on_thread(controller, addr).map_err(|err| {
-                CliError::Custom(format!("train control server bind failed: {err}"))
-            })?)
-        } else {
-            None
-        };
+        serve_if_requested("train_sft", &controller, args.serve).map_err(CliError::Custom)?;
 
     // Enable the Trainer's built-in save path so every checkpoint round
     // gets `trainer_state.json + optimizer.safetensors` written next to the
@@ -601,12 +578,10 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let tok_path = tokenizer_path.clone();
     let model_save_ref = &model;
     let metrics_for_hooks = metrics.clone();
-    let controller_for_hooks = controller.as_ref().map(Arc::clone);
+    let controller_for_hooks = Arc::clone(&controller);
     let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
         let step_usize = step as usize;
-        let save_requested = controller_for_hooks
-            .as_ref()
-            .is_some_and(|controller| controller.take_save_request());
+        let save_requested = controller_for_hooks.take_save_request();
         // Gate matches the Trainer's save_every + force-final behavior so the
         // bf16 weights file always lands in the same `step_{:06}/` directory
         // that the Trainer just populated with `trainer_state.json +
@@ -643,15 +618,12 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
                 bools: &[],
             });
         }
-        if let Some(controller) = &controller_for_hooks {
-            controller.update(|status| {
-                status.iter = step as usize;
-                status.wall_secs = run_timer.elapsed().as_secs_f32();
-                status.dropped_metrics = metrics_for_hooks.dropped_metrics();
-            });
-            if controller.should_stop() {
-                return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
-            }
+        sync_status(&controller_for_hooks, &metrics_for_hooks, |status| {
+            status.iter = step as usize;
+            status.wall_secs = run_timer.elapsed().as_secs_f32();
+        });
+        if controller_for_hooks.should_stop() {
+            return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
         }
         Ok(())
     };
@@ -681,23 +653,13 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         ("dropped_metrics", metrics.dropped_metrics() as f64),
     ];
     let status = if stopped { "stopped" } else { "completed" };
-    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_end",
-        step: Some(trainer.step()),
-        strings: &run_end_strings,
-        scalars: &run_end_scalars,
-        bools: &[],
+    emit_run_end(&metrics, &run_id, status, trainer.step(), &run_end_scalars);
+    sync_status(&controller, &metrics, |summary| {
+        summary.iter = trainer.step() as usize;
+        summary.total_iters = args.steps;
+        summary.wall_secs = run_timer.elapsed().as_secs_f32();
+        summary.finished = true;
     });
-    if let Some(controller) = &controller {
-        controller.update(|summary| {
-            summary.iter = trainer.step() as usize;
-            summary.total_iters = args.steps;
-            summary.wall_secs = run_timer.elapsed().as_secs_f32();
-            summary.dropped_metrics = metrics.dropped_metrics();
-            summary.finished = true;
-        });
-    }
     metrics.flush_blocking();
 
     Ok(())
@@ -1627,6 +1589,7 @@ mod tests {
             resume_from,
             lora_rank: 4,
             lora_alpha: 8.0,
+            serve: None,
         }
     }
 

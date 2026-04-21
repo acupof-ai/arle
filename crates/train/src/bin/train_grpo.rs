@@ -24,7 +24,10 @@ use train::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
     cli_args::{ArgError, next_value, parse_value},
-    control::TrainingController,
+    control::{
+        TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
+        sync_status,
+    },
     dataset::{CopyDataset, Dataset, LcgRng},
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
@@ -46,7 +49,6 @@ use train::{
         Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
     },
     rollout::rollout_group,
-    server::bind_and_serve_on_thread,
 };
 
 #[derive(Debug, Clone)]
@@ -427,18 +429,9 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .all_parameter_ids()
         .into_iter()
         .collect::<HashSet<_>>();
-    let controller = args.serve.map(|_| TrainingController::new());
-    let mut extra_sinks: Vec<Box<dyn train::metrics::MetricSink>> = Vec::new();
-    if let Some(controller) = &controller {
-        extra_sinks.push(Box::new(controller.metric_sink()));
-    }
-    let metrics = train::metrics::open_shared_sink_with_extra(
-        args.metrics_jsonl.as_deref(),
-        true,
-        false,
-        extra_sinks,
-    )
-    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let controller = TrainingController::new();
+    let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_grpo");
     let run_timer = Instant::now();
     let save_path_string = args
@@ -446,11 +439,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .as_ref()
         .map(|path| path.display().to_string());
     let resume_dir_string = resume_dir.as_ref().map(|path| path.display().to_string());
-    let mut run_start_strings = vec![
-        ("run_id", run_id.as_str()),
-        ("job", "train_grpo"),
-        ("model_family", F::family_name()),
-    ];
+    let mut run_start_strings = vec![("model_family", F::family_name())];
     if let Some(path) = save_path_string.as_deref() {
         run_start_strings.push(("save_path", path));
     }
@@ -464,35 +453,21 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         ("batch_prompts", args.batch_prompts as f64),
     ];
     let run_start_bools = [("resumed", resume_dir.is_some())];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_start",
-        step: Some(0),
-        strings: &run_start_strings,
-        scalars: &run_start_scalars,
-        bools: &run_start_bools,
+    emit_run_start(
+        &metrics,
+        &run_id,
+        "train_grpo",
+        0,
+        &run_start_strings,
+        &run_start_scalars,
+        &run_start_bools,
+    );
+    sync_status(&controller, &metrics, |status| {
+        status.total_iters = args.sft_steps + args.grpo_iters;
+        status.started = true;
     });
-    if let Some(controller) = &controller {
-        controller.update(|status| {
-            status.total_iters = args.sft_steps + args.grpo_iters;
-            status.dropped_metrics = metrics.dropped_metrics();
-            status.started = true;
-        });
-    }
     let _server_handle =
-        if let Some(port) = args.serve {
-            let controller = Arc::clone(
-                controller
-                    .as_ref()
-                    .expect("controller exists when --serve is configured"),
-            );
-            let addr = format!("127.0.0.1:{port}");
-            eprintln!("[train_grpo] control plane listening on http://{addr}/v1/train");
-            Some(bind_and_serve_on_thread(controller, addr).map_err(|err| {
-                CliError::Custom(format!("train control server bind failed: {err}"))
-            })?)
-        } else {
-            None
-        };
+        serve_if_requested("train_grpo", &controller, args.serve).map_err(CliError::Custom)?;
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
     };
@@ -518,7 +493,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             let sft = run_sft_phase(
                 args,
                 metrics.clone(),
-                controller.as_ref().map(Arc::clone),
+                Arc::clone(&controller),
                 &policy,
                 &params,
                 keep_extra.clone(),
@@ -532,10 +507,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             optimizer
                 .import_state(&sft.optim_state, &param_names)
                 .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
-            let baseline_reward = if controller
-                .as_ref()
-                .is_some_and(|controller| controller.should_stop())
-            {
+            let baseline_reward = if controller.should_stop() {
                 0.0
             } else {
                 let mut baseline_rng = seeded_rng(args.seed, GRPO_BASELINE_SALT, 0, 0);
@@ -581,10 +553,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
     let mut completed_grpo_iters = resume.start_iter;
 
     for iter in resume.start_iter..args.grpo_iters {
-        if controller
-            .as_ref()
-            .is_some_and(|controller| controller.should_stop())
-        {
+        if controller.should_stop() {
             break;
         }
         let mut iter_rng = seeded_rng(args.seed, GRPO_ITER_SALT, iter as u64, 0);
@@ -663,21 +632,16 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             phase: "grpo",
             fields: &fields,
         });
-        if let Some(controller) = &controller {
-            controller.update(|status| {
-                status.iter = args.sft_steps + iter + 1;
-                status.mean_reward = mean_reward;
-                status.best_reward = best_mean_reward;
-                status.last_kl = last_kl;
-                status.last_loss = loss_value;
-                status.wall_secs = run_timer.elapsed().as_secs_f32();
-                status.dropped_metrics = metrics.dropped_metrics();
-            });
-        }
+        sync_status(&controller, &metrics, |status| {
+            status.iter = args.sft_steps + iter + 1;
+            status.mean_reward = mean_reward;
+            status.best_reward = best_mean_reward;
+            status.last_kl = last_kl;
+            status.last_loss = loss_value;
+            status.wall_secs = run_timer.elapsed().as_secs_f32();
+        });
 
-        let save_requested = controller
-            .as_ref()
-            .is_some_and(|controller| controller.take_save_request());
+        let save_requested = controller.take_save_request();
         if let Some(save_path) = args.save_path.as_deref() {
             if (args.save_every > 0 && (iter + 1).is_multiple_of(args.save_every)) || save_requested
             {
@@ -727,17 +691,12 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
                 bools: &[("save_requested", true)],
             });
         }
-        if controller
-            .as_ref()
-            .is_some_and(|controller| controller.should_stop())
-        {
+        if controller.should_stop() {
             break;
         }
     }
 
-    let stopped = controller
-        .as_ref()
-        .is_some_and(|controller| controller.should_stop());
+    let stopped = controller.should_stop();
 
     if let Some(save_path) = args.save_path.as_deref() {
         let step_dir = save_grpo_checkpoint::<F>(
@@ -790,23 +749,19 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         ("dropped_metrics", metrics.dropped_metrics() as f64),
     ];
     let status = if stopped { "stopped" } else { "completed" };
-    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_end",
-        step: Some((completed_sft_steps + completed_grpo_iters) as u64),
-        strings: &run_end_strings,
-        scalars: &run_end_scalars,
-        bools: &[],
+    emit_run_end(
+        &metrics,
+        &run_id,
+        status,
+        (completed_sft_steps + completed_grpo_iters) as u64,
+        &run_end_scalars,
+    );
+    sync_status(&controller, &metrics, |summary| {
+        summary.iter = completed_sft_steps + completed_grpo_iters;
+        summary.total_iters = args.sft_steps + args.grpo_iters;
+        summary.wall_secs = run_timer.elapsed().as_secs_f32();
+        summary.finished = true;
     });
-    if let Some(controller) = &controller {
-        controller.update(|summary| {
-            summary.iter = completed_sft_steps + completed_grpo_iters;
-            summary.total_iters = args.sft_steps + args.grpo_iters;
-            summary.wall_secs = run_timer.elapsed().as_secs_f32();
-            summary.dropped_metrics = metrics.dropped_metrics();
-            summary.finished = true;
-        });
-    }
     metrics.flush_blocking();
     Ok(())
 }
@@ -820,7 +775,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 fn run_sft_phase<P>(
     args: &CliArgs,
     metrics: train::metrics::SharedSink,
-    controller: Option<Arc<TrainingController>>,
+    controller: Arc<TrainingController>,
     policy: &P,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
@@ -876,7 +831,7 @@ where
         })
     };
 
-    let controller_for_hooks = controller.as_ref().map(Arc::clone);
+    let controller_for_hooks = Arc::clone(&controller);
     let run_result = trainer.run_with_hooks(
         store,
         tape,
@@ -885,14 +840,11 @@ where
         keep_extra,
         step_fn,
         |step, _store| {
-            if let Some(controller) = &controller_for_hooks {
-                controller.update(|status| {
-                    status.iter = step as usize;
-                    status.dropped_metrics = metrics_for_status.dropped_metrics();
-                });
-                if controller.should_stop() {
-                    return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
-                }
+            sync_status(&controller_for_hooks, &metrics_for_status, |status| {
+                status.iter = step as usize;
+            });
+            if controller_for_hooks.should_stop() {
+                return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
             }
             Ok(())
         },
