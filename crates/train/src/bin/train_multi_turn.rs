@@ -1610,44 +1610,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn resume_qwen35_checkpoint_restores_train_state_exactly() -> TestResult {
+    fn assert_resume_qwen35_checkpoint_restores_train_state_exactly(
+        linear_attn_every: usize,
+    ) -> TestResult {
         let tmp = tempdir().expect("tempdir");
         let out_dir = tmp.path().join("out");
         std::fs::create_dir_all(&out_dir).expect("create out dir");
 
-        let cfg = Qwen35Config {
-            hidden_size: 32,
-            intermediate_size: 64,
-            num_hidden_layers: 2,
-            vocab_size: 128,
-            rms_norm_eps: 1.0e-6,
-            stop_token_ids: vec![2],
-            bos_token_id: Some(1),
-            eos_token_id: 2,
-            tie_word_embeddings: false,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            head_dim: 8,
-            linear_num_key_heads: 4,
-            linear_key_head_dim: 8,
-            linear_num_value_heads: 4,
-            linear_value_head_dim: 8,
-            linear_conv_kernel_dim: 4,
-            rope_theta: 10_000.0,
-            partial_rotary_factor: 1.0,
-            rotary_dim: 8,
-            rope_cache_len_hint: Some(16),
-            layer_types: vec![LayerType::FullAttention; 2],
-            num_experts: 0,
-            num_experts_per_tok: 0,
-            decoder_sparse_step: 1,
-            moe_intermediate_size: 0,
-            shared_expert_intermediate_size: 0,
-            norm_topk_prob: true,
-            mlp_only_layers: Vec::new(),
-        };
-        let args = tiny_args();
+        let mut args = tiny_args();
+        args.linear_attn_every = linear_attn_every;
+        let cfg = qwen35_config(&args, 16, 2)?;
         let lora = LoraConfig {
             rank: 2,
             alpha: 4.0,
@@ -1756,5 +1728,15 @@ mod tests {
         let resumed_state = resumed_optimizer.export_state(&resumed_param_names);
         assert_adamw_state_eq(&saved_state, &resumed_state);
         Ok(())
+    }
+
+    #[test]
+    fn resume_qwen35_checkpoint_restores_train_state_exactly() -> TestResult {
+        assert_resume_qwen35_checkpoint_restores_train_state_exactly(0)
+    }
+
+    #[test]
+    fn resume_hybrid_qwen35_checkpoint_restores_train_state_exactly() -> TestResult {
+        assert_resume_qwen35_checkpoint_restores_train_state_exactly(2)
     }
 }

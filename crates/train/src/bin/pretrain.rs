@@ -1441,9 +1441,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn qwen35_pretrain_resume_restores_checkpoint_state_exactly() -> Result<(), CliError> {
-        let args = tiny_args();
+    fn assert_qwen35_pretrain_resume_restores_checkpoint_state_exactly(
+        linear_attn_every: usize,
+    ) -> Result<(), CliError> {
+        let mut args = tiny_args();
+        args.linear_attn_every = linear_attn_every;
         let cfg = Qwen35Family::build_config(&args, args.vocab_size.unwrap())?;
 
         let train_root = tempdir().expect("tempdir");
@@ -1558,5 +1560,15 @@ mod tests {
         assert_adamw_state_eq(&resume_state, &resumed_state);
 
         Ok(())
+    }
+
+    #[test]
+    fn qwen35_pretrain_resume_restores_checkpoint_state_exactly() -> Result<(), CliError> {
+        assert_qwen35_pretrain_resume_restores_checkpoint_state_exactly(0)
+    }
+
+    #[test]
+    fn qwen35_hybrid_pretrain_resume_restores_checkpoint_state_exactly() -> Result<(), CliError> {
+        assert_qwen35_pretrain_resume_restores_checkpoint_state_exactly(2)
     }
 }
