@@ -64,8 +64,8 @@
 //!    in-memory blocks.
 //!
 //! 3. **Only the coordinator moves blocks between tiers.** The scheduler
-//!    decides *which* blocks should stage or spill; the coordinator owns
-//!    the byte-moving work and emits completion events.
+//!    decides *which* blocks should spill; the coordinator owns the
+//!    byte-moving work and emits completion events.
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
 //!    registered memory regions to be allocation-stable. The planned
@@ -123,11 +123,11 @@ pub mod lookup;
 pub mod tier;
 pub mod transport;
 
-pub use coordinator::{Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle};
+pub use coordinator::{
+    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, SpillRequest, SpillTicket,
+};
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
-pub use lookup::{
-    HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StageRequest, StageTicket,
-};
+pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};

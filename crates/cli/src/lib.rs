@@ -97,10 +97,6 @@ pub fn run() -> Result<()> {
         };
         let backend_name = engine.backend_name().to_string();
 
-        if let Some(max_kv) = args.max_gpu_kv {
-            engine.set_max_gpu_kv(max_kv);
-        }
-
         let load_secs = load_start.elapsed().as_secs_f64();
         banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
 

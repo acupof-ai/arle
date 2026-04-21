@@ -1,12 +1,9 @@
-//! Lookup/staging result types for tiered KV cache M3b.
+//! Lookup result types for tiered KV cache M3b.
 //!
-//! These types let the radix cache describe "ready now" vs "needs staging"
-//! without teaching the scheduler every tier-specific detail.
+//! These types let the radix cache classify reusable prefix blocks without
+//! pretending the runtime already owns a live stage/readmission path.
 
 use crate::types::BlockId;
-
-use super::host_pool::{HostPinnedRegion, SharedHostPinnedPool};
-use super::tier::BlockLocation;
 
 /// Scheduler-visible result of matching one cached block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,24 +25,6 @@ pub struct LookupBlock {
     pub block_id: Option<BlockId>,
     pub hit_kind: HitKind,
 }
-
-/// Concrete staging request handed to the coordinator/planner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageRequest {
-    pub block_id: BlockId,
-    pub from: BlockLocation,
-    pub byte_len: u32,
-    /// Shared host-pinned pool used as the staging buffer owner when bytes
-    /// need to be fetched from a non-GPU tier.
-    pub host_pool: Option<SharedHostPinnedPool>,
-    /// Destination host-pinned region for stage operations that materialize
-    /// bytes into T1 before the scheduler promotes them back into T0.
-    pub host_region: Option<HostPinnedRegion>,
-}
-
-/// Opaque ticket representing one staged batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StageTicket(pub u64);
 
 /// Full lookup result surfaced by `RadixCache::lookup_or_stage`.
 #[derive(Debug, Clone, PartialEq, Eq)]

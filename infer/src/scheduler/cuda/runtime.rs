@@ -1,7 +1,9 @@
 use super::{
-    ActiveRequest, ModelForward, Ordering, Phase, STATS_LOG_INTERVAL, Scheduler, error, info, warn,
+    ActiveRequest, CompletionStreamDelta, FinishReason, ModelForward, Ordering, Phase,
+    STATS_LOG_INTERVAL, Scheduler, TokenUsage, error, info, warn,
 };
 use crate::prefix_cache::BlockMetadataUpdate;
+use crate::scheduler::types::RequestLengthContract;
 
 pub(super) fn best_reusable_slot_for_radix_hit(
     matched_blocks: &[crate::prefix_cache::BlockId],
@@ -43,15 +45,29 @@ pub(super) fn sort_waiting_queue_by_priority(
     waiting.sort_by(|lhs, rhs| rhs.priority.cmp(&lhs.priority));
 }
 
+fn finish_rejected_request(
+    delta_tx: &tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+    reason: FinishReason,
+    prompt_tokens: usize,
+) {
+    let _ = delta_tx.send(CompletionStreamDelta {
+        text_delta: String::new(),
+        finish_reason: Some(reason),
+        usage: Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens: 0,
+            total_tokens: prompt_tokens,
+        }),
+        logprob: None,
+    });
+}
+
 impl<M: ModelForward> Scheduler<M> {
     fn drain_coordinator_events(&mut self) {
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(
                     crate::kv_tier::CoordinatorEvent::CommandQueued(_)
-                    | crate::kv_tier::CoordinatorEvent::StagingQueued { .. }
-                    | crate::kv_tier::CoordinatorEvent::StagingCompleted { .. }
-                    | crate::kv_tier::CoordinatorEvent::StagingFailed { .. }
                     | crate::kv_tier::CoordinatorEvent::SpillQueued { .. },
                 ) => {}
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -173,6 +189,11 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn assign_slots(&mut self) {
+        sort_waiting_queue_by_priority(&mut self.waiting);
+        let length_contract = RequestLengthContract::derive(
+            self.paged_kv_pool.max_total_tokens,
+            self.effective_max_seq_len,
+        );
         while !self.waiting.is_empty() {
             let _ = self.evict_prefix_cache_if_pressured();
             let free_slots = self.free_slots();
@@ -180,18 +201,39 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
 
-            let incoming = self.waiting.pop_front().expect("checked non-empty above");
+            let mut incoming = self.waiting.pop_front().expect("checked non-empty above");
+            if incoming.delta_tx.is_closed() {
+                continue;
+            }
             let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
                 Ok(tokens) if !tokens.is_empty() => tokens,
                 Ok(_) => {
                     error!("Empty prompt after tokenization, skipping");
+                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
                     continue;
                 }
                 Err(e) => {
                     error!("Tokenization error: {}", e);
+                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
                     continue;
                 }
             };
+            if !length_contract.admits_prompt_len(prompt_tokens.len()) {
+                warn!(
+                    "Rejecting prompt with {} tokens: scheduler max_input={} max_request={}",
+                    prompt_tokens.len(),
+                    length_contract.max_request_input_len(),
+                    length_contract.max_request_len(),
+                );
+                finish_rejected_request(
+                    &incoming.delta_tx,
+                    FinishReason::Length,
+                    prompt_tokens.len(),
+                );
+                continue;
+            }
+            incoming.max_tokens =
+                length_contract.clamp_max_tokens(prompt_tokens.len(), incoming.max_tokens);
 
             let lookup = self
                 .prefix_cache
@@ -302,6 +344,10 @@ impl<M: ModelForward> Scheduler<M> {
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
             });
+            if incoming.max_tokens == 0 {
+                self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
+                continue;
+            }
             self.step_new(slot_idx);
             if matches!(
                 self.request(slot_idx).map(|req| &req.phase),
@@ -396,9 +442,11 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::best_reusable_slot_for_radix_hit;
+    use super::{best_reusable_slot_for_radix_hit, finish_rejected_request};
     use crate::prefix_cache::BlockId;
+    use crate::server_engine::FinishReason;
     use std::collections::HashMap;
+    use tokio::sync::mpsc;
 
     #[test]
     fn best_reusable_slot_prefers_deepest_free_owned_block() {
@@ -430,5 +478,18 @@ mod tests {
         let reusable =
             best_reusable_slot_for_radix_hit(&matched_blocks, &free_slots, &owners, &[0, 8], 16);
         assert_eq!(reusable, None);
+    }
+
+    #[test]
+    fn rejected_request_emits_terminal_delta() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        finish_rejected_request(&tx, FinishReason::Length, 17);
+        let delta = rx.try_recv().expect("terminal delta");
+        assert_eq!(delta.text_delta, "");
+        assert_eq!(delta.finish_reason, Some(FinishReason::Length));
+        let usage = delta.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 17);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 17);
     }
 }

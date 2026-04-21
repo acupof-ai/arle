@@ -56,7 +56,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn finish_request(&mut self, slot_idx: usize, reason: FinishReason) {
+    pub(super) fn finish_request(&mut self, slot_idx: usize, reason: FinishReason) {
         {
             let Self {
                 active, tokenizer, ..

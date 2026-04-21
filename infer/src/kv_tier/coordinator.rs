@@ -1,8 +1,9 @@
-//! Tiered KV coordinator skeleton for M3a.
+//! Tiered KV coordinator skeleton for the shipped local spill path.
 //!
-//! The real coordinator owns dedicated CUDA copy streams and drains commands on
-//! an OS thread. This local skeleton keeps the command channel and lifecycle
-//! boundaries explicit without pretending the CUDA path is already wired.
+//! The live local runtime uses the coordinator for one real behavior only:
+//! persisting host-pinned blocks into `DiskStore` and reporting the canonical
+//! disk locations back to the scheduler. Live staged readmission was removed
+//! from the hot path until the runtime grows a real attach/ownership model.
 
 use std::sync::{
     Arc,
@@ -16,20 +17,12 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 
 use crate::types::BlockId;
 
-use super::tier::BlockLocation;
-use super::transport::disk::DiskStore;
-use super::{StageRequest, StageTicket};
+use super::transport::disk::{DiskBlockLocation, DiskStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpillTicket(pub u64);
 
 /// Request handed to the coordinator for a T1 → T2 spill.
-///
-/// Shipped as part of the "coordinator real byte path" batch: spills
-/// LRU host-pinned blocks out to `DiskStore` when the host pinned
-/// retained fraction crosses `SchedulerConfig::t1_host_pinned_high_water`.
-/// The block's live host bytes are packaged by the scheduler and handed
-/// to the coordinator via `host_region`; the coordinator calls
-/// `DiskStore::put_block` and emits `SpillCompleted` with the
-/// resulting `DiskBlockLocation` so the scheduler can point the radix
-/// node at T2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpillRequest {
     pub block_id: BlockId,
@@ -41,15 +34,11 @@ pub struct SpillRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorCommand {
-    Stage {
-        ticket: StageTicket,
-        requests: Vec<StageRequest>,
-    },
     /// T1 → T2 spill ticket. The coordinator routes each `SpillRequest`
-    /// through `DiskStore::put_block` and emits `SpillCompleted` with
-    /// the resulting disk locations on success.
+    /// through `DiskStore::put_block` and emits `SpillCompleted` with the
+    /// resulting disk locations on success.
     Spill {
-        ticket: StageTicket,
+        ticket: SpillTicket,
         blocks: Vec<SpillRequest>,
     },
     Shutdown,
@@ -58,41 +47,25 @@ pub enum CoordinatorCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorEvent {
     CommandQueued(CoordinatorCommand),
-    StagingQueued {
-        ticket: StageTicket,
-        request_count: usize,
-    },
-    /// Stub completes immediately after `StagingQueued` on the local lane; real
-    /// CUDA path must emit this only after the copy stream reports done.
-    StagingCompleted {
-        ticket: StageTicket,
-    },
-    /// Stage request failed before bytes became available in T1 for the
-    /// scheduler to promote back into T0.
-    StagingFailed {
-        ticket: StageTicket,
-        failed_block: BlockId,
-        reason: String,
-    },
     /// T1 → T2 spill enqueued. Informational — the real work happens
     /// asynchronously on the coordinator's disk I/O thread / worker pool.
     SpillQueued {
-        ticket: StageTicket,
+        ticket: SpillTicket,
         block_count: usize,
     },
     /// T1 → T2 spill finished. `locations` gives the scheduler the
     /// canonical disk locations for every block that was persisted so
     /// the radix can flip `tier_location` to `BlockLocation::Disk`.
     SpillCompleted {
-        ticket: StageTicket,
-        locations: Vec<(BlockId, crate::kv_tier::transport::disk::DiskBlockLocation)>,
+        ticket: SpillTicket,
+        locations: Vec<(BlockId, DiskBlockLocation)>,
     },
     /// T1 → T2 spill failed. `failed_block` identifies the first block
     /// that did not persist successfully; any preceding blocks in the
     /// ticket were persisted, so the scheduler has to decide whether
     /// to roll them back or accept a partial spill.
     SpillFailed {
-        ticket: StageTicket,
+        ticket: SpillTicket,
         failed_block: BlockId,
         reason: String,
     },
@@ -128,30 +101,16 @@ impl CoordinatorHandle {
         })
     }
 
-    /// Mint a fresh `StageTicket` for a T1 → T2 spill batch and enqueue
+    /// Mint a fresh `SpillTicket` for a T1 → T2 spill batch and enqueue
     /// the corresponding `Spill` command. Returns `None` if `blocks`
     /// is empty or the command channel is full.
-    pub fn submit_spill(&self, blocks: Vec<SpillRequest>) -> Option<StageTicket> {
+    pub fn submit_spill(&self, blocks: Vec<SpillRequest>) -> Option<SpillTicket> {
         if blocks.is_empty() {
             return None;
         }
-        let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
+        let ticket = SpillTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
         self.try_send(CoordinatorCommand::Spill { ticket, blocks })
             .ok()?;
-        Some(ticket)
-    }
-
-    pub fn stage(&self, requests: &[StageRequest]) -> Option<StageTicket> {
-        if requests.is_empty() {
-            return None;
-        }
-
-        let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Stage {
-            ticket,
-            requests: requests.to_vec(),
-        })
-        .ok()?;
         Some(ticket)
     }
 }
@@ -200,7 +159,7 @@ impl Coordinator {
             .map_err(|e| anyhow!("coordinator event send failed: {e}"))
     }
 
-    fn handle_spill(&self, ticket: StageTicket, blocks: &[SpillRequest]) -> Result<()> {
+    fn handle_spill(&self, ticket: SpillTicket, blocks: &[SpillRequest]) -> Result<()> {
         self.emit_event(CoordinatorEvent::SpillQueued {
             ticket,
             block_count: blocks.len(),
@@ -252,96 +211,10 @@ impl Coordinator {
         self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })
     }
 
-    fn handle_stage(&self, ticket: StageTicket, requests: &[StageRequest]) -> Result<()> {
-        self.emit_event(CoordinatorEvent::StagingQueued {
-            ticket,
-            request_count: requests.len(),
-        })?;
-
-        for request in requests {
-            match &request.from {
-                BlockLocation::HostPinned { .. } | BlockLocation::Gpu { .. } => {}
-                BlockLocation::Disk {
-                    fingerprint,
-                    payload_len,
-                } => {
-                    let Some(disk_store) = &self.disk_store else {
-                        self.emit_event(CoordinatorEvent::StagingFailed {
-                            ticket,
-                            failed_block: request.block_id,
-                            reason: "coordinator disk store not configured".to_string(),
-                        })?;
-                        return Ok(());
-                    };
-                    let (Some(host_pool), Some(host_region)) =
-                        (&request.host_pool, request.host_region)
-                    else {
-                        self.emit_event(CoordinatorEvent::StagingFailed {
-                            ticket,
-                            failed_block: request.block_id,
-                            reason: "disk stage request missing host staging region".to_string(),
-                        })?;
-                        return Ok(());
-                    };
-
-                    let disk_location = crate::kv_tier::transport::disk::DiskBlockLocation {
-                        path: disk_store.block_path_for(*fingerprint)?,
-                        payload_len: *payload_len,
-                        fingerprint: *fingerprint,
-                    };
-                    let payload = match disk_store.get_block(&disk_location, Some(*fingerprint)) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            self.emit_event(CoordinatorEvent::StagingFailed {
-                                ticket,
-                                failed_block: request.block_id,
-                                reason: err.to_string(),
-                            })?;
-                            return Ok(());
-                        }
-                    };
-                    if payload.len() != host_region.len {
-                        self.emit_event(CoordinatorEvent::StagingFailed {
-                            ticket,
-                            failed_block: request.block_id,
-                            reason: format!(
-                                "stage byte length mismatch: disk={} host_region={}",
-                                payload.len(),
-                                host_region.len
-                            ),
-                        })?;
-                        return Ok(());
-                    }
-                    if let Err(err) = host_pool.write_region(host_region, &payload) {
-                        self.emit_event(CoordinatorEvent::StagingFailed {
-                            ticket,
-                            failed_block: request.block_id,
-                            reason: err.to_string(),
-                        })?;
-                        return Ok(());
-                    }
-                }
-                BlockLocation::Remote { .. } => {
-                    self.emit_event(CoordinatorEvent::StagingFailed {
-                        ticket,
-                        failed_block: request.block_id,
-                        reason: "remote staging not implemented".to_string(),
-                    })?;
-                    return Ok(());
-                }
-            }
-        }
-
-        self.emit_event(CoordinatorEvent::StagingCompleted { ticket })
-    }
-
     pub fn run_once(&self) -> Result<bool> {
         match self.rx.recv_timeout(Duration::from_millis(1)) {
             Ok(cmd) => {
                 match &cmd {
-                    CoordinatorCommand::Stage { ticket, requests } => {
-                        self.handle_stage(*ticket, requests)?;
-                    }
                     CoordinatorCommand::Spill { ticket, blocks } => {
                         self.handle_spill(*ticket, blocks)?;
                     }
@@ -372,7 +245,6 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefix_cache::RadixCache;
     use crate::types::BlockFingerprint;
     use tempfile::tempdir;
 
@@ -385,63 +257,6 @@ mod tests {
         assert_eq!(
             evt,
             CoordinatorEvent::CommandQueued(CoordinatorCommand::Shutdown)
-        );
-    }
-
-    #[test]
-    fn coordinator_stage_planner_emits_ticketed_event() {
-        let (coordinator, handle, events) = Coordinator::new(4);
-        let ticket = handle
-            .stage(&[StageRequest {
-                block_id: BlockId(7),
-                from: BlockLocation::HostPinned { offset: 4096 },
-                byte_len: 8192,
-                host_pool: None,
-                host_region: None,
-            }])
-            .expect("stage ticket");
-        assert!(coordinator.run_once().unwrap());
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingQueued {
-                ticket,
-                request_count: 1,
-            }
-        );
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingCompleted { ticket }
-        );
-    }
-
-    #[test]
-    fn stage_command_emits_queued_then_completed_events() {
-        let (coordinator, handle, events) = Coordinator::new(4);
-        let ticket = StageTicket(17);
-        handle
-            .send(CoordinatorCommand::Stage {
-                ticket,
-                requests: vec![StageRequest {
-                    block_id: BlockId(9),
-                    from: BlockLocation::HostPinned { offset: 0 },
-                    byte_len: 4096,
-                    host_pool: None,
-                    host_region: None,
-                }],
-            })
-            .unwrap();
-
-        assert!(coordinator.run_once().unwrap());
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingQueued {
-                ticket,
-                request_count: 1,
-            }
-        );
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingCompleted { ticket }
         );
     }
 
@@ -463,62 +278,27 @@ mod tests {
     }
 
     #[test]
-    fn stage_with_coordinator_emits_queued_then_completed_events() {
-        let mut cache = RadixCache::with_soft_pin_keepalive(4, 64);
-        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        cache.insert(&tokens, &[BlockId(10), BlockId(20)]);
-        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 0 }));
-        assert!(cache.set_block_byte_len(BlockId(10), 8192));
-
-        let (coordinator, handle, events) = Coordinator::new(4);
-        let outcome = cache.lookup_or_stage(&tokens, crate::kv_tier::LookupHeuristics::default());
-        assert_eq!(outcome.matched_len, 8);
-        let ticket = handle
-            .stage(&[StageRequest {
-                block_id: BlockId(10),
-                from: BlockLocation::HostPinned { offset: 0 },
-                byte_len: 8192,
-                host_pool: None,
-                host_region: None,
-            }])
-            .expect("staging ticket");
-
-        assert!(coordinator.run_once().unwrap());
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingQueued {
-                ticket,
-                request_count: 1,
-            }
-        );
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingCompleted { ticket }
-        );
-    }
-
-    #[test]
-    fn spill_and_stage_roundtrip_through_disk_store() {
+    fn spill_roundtrip_through_disk_store() {
         let dir = tempdir().unwrap();
-        let disk_store = Arc::new(crate::kv_tier::transport::disk::DiskStore::new(dir.path()));
-        let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store);
+        let disk_store = Arc::new(DiskStore::new(dir.path()));
+        let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store.clone());
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );
-        let spill_region = {
+        let region = {
             let mut pool = host_pool.lock().unwrap();
             let region = pool.reserve(6).unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"abcdef");
             region
         };
         let fingerprint = BlockFingerprint([0x2A; 16]);
-        let spill_ticket = handle
+        let ticket = handle
             .submit_spill(vec![SpillRequest {
                 block_id: BlockId(7),
                 fingerprint,
                 kv_format_tag: 3,
                 host_pool: host_pool.clone(),
-                host_region: spill_region,
+                host_region: region,
             }])
             .unwrap();
 
@@ -526,13 +306,16 @@ mod tests {
         assert_eq!(
             events.recv().unwrap(),
             CoordinatorEvent::SpillQueued {
-                ticket: spill_ticket,
+                ticket,
                 block_count: 1,
             }
         );
-        let spill_location = match events.recv().unwrap() {
-            CoordinatorEvent::SpillCompleted { ticket, locations } => {
-                assert_eq!(ticket, spill_ticket);
+        let location = match events.recv().unwrap() {
+            CoordinatorEvent::SpillCompleted {
+                ticket: done,
+                locations,
+            } => {
+                assert_eq!(done, ticket);
                 assert_eq!(locations.len(), 1);
                 assert_eq!(locations[0].0, BlockId(7));
                 locations[0].1.clone()
@@ -540,42 +323,10 @@ mod tests {
             other => panic!("unexpected spill event: {other:?}"),
         };
 
-        let rehydrate_region = {
-            let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(6).unwrap();
-            pool.as_mut_slice(region).fill(0);
-            region
-        };
-        let stage_ticket = handle
-            .stage(&[StageRequest {
-                block_id: BlockId(7),
-                from: BlockLocation::Disk {
-                    fingerprint,
-                    payload_len: spill_location.payload_len,
-                },
-                byte_len: spill_location.payload_len as u32,
-                host_pool: Some(host_pool.clone()),
-                host_region: Some(rehydrate_region),
-            }])
-            .unwrap();
-
-        assert!(coordinator.run_once().unwrap());
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingQueued {
-                ticket: stage_ticket,
-                request_count: 1,
-            }
-        );
-        assert_eq!(
-            events.recv().unwrap(),
-            CoordinatorEvent::StagingCompleted {
-                ticket: stage_ticket,
-            }
-        );
-
-        let pool = host_pool.lock().unwrap();
-        assert_eq!(pool.as_slice(rehydrate_region), b"abcdef");
+        let payload = host_pool.read_region(region).unwrap();
+        assert_eq!(payload, b"abcdef");
+        let reloaded = disk_store.get_block(&location, Some(fingerprint)).unwrap();
+        assert_eq!(reloaded, b"abcdef");
     }
 
     #[test]
@@ -652,27 +403,5 @@ mod tests {
             host_region: region,
         }]);
         assert!(second.is_none(), "full queue should not block spill submit");
-    }
-
-    #[test]
-    fn stage_is_non_blocking_when_queue_is_full() {
-        let (_coordinator, handle, _events) = Coordinator::new(1);
-        let first = handle.stage(&[StageRequest {
-            block_id: BlockId(1),
-            from: BlockLocation::HostPinned { offset: 0 },
-            byte_len: 4096,
-            host_pool: None,
-            host_region: None,
-        }]);
-        assert!(first.is_some());
-
-        let second = handle.stage(&[StageRequest {
-            block_id: BlockId(2),
-            from: BlockLocation::HostPinned { offset: 4096 },
-            byte_len: 4096,
-            host_pool: None,
-            host_region: None,
-        }]);
-        assert!(second.is_none(), "full queue should not block stage submit");
     }
 }

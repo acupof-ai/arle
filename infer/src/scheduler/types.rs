@@ -66,10 +66,6 @@ pub struct SchedulerConfig {
     /// call (see `prefix_cache.rs::tick`). Default 64. Re-tune against
     /// real session-trace benches by assigning this field explicitly.
     pub prefix_cache_keepalive_ticks: u64,
-    /// Soft-pin extension applied to blocks while the scheduler waits
-    /// for a `StageTicket` completion. 8x the regular keepalive by
-    /// default (512) to survive any plausible stub completion latency.
-    pub stage_wait_keepalive_ticks: u64,
     /// T1 host-pinned pool eviction high-water mark as a fraction of
     /// the pool's `capacity_bytes`. Above this the coordinator spills
     /// LRU blocks out to T2 disk. Default 0.85. Tuning for T1→T2
@@ -109,7 +105,6 @@ impl Default for SchedulerConfig {
             prefix_cache_low_water: 0.50,
             prefix_cache_retain_hard_cap: 0.90,
             prefix_cache_keepalive_ticks: 64,
-            stage_wait_keepalive_ticks: 512,
             // T1 host-pinned watermarks — mirror T0 policy at a
             // slightly higher retention target because host pinned
             // pool churn is cheaper than GPU pool churn.
@@ -180,9 +175,6 @@ impl SchedulerConfig {
         if self.prefix_cache_keepalive_ticks == 0 {
             anyhow::bail!("prefix_cache_keepalive_ticks must be ≥ 1");
         }
-        if self.stage_wait_keepalive_ticks < self.prefix_cache_keepalive_ticks {
-            anyhow::bail!("stage_wait_keepalive_ticks must be ≥ prefix_cache_keepalive_ticks");
-        }
         if !(0.0 < self.t1_host_pinned_high_water && self.t1_host_pinned_high_water < 1.0) {
             anyhow::bail!("t1_host_pinned_high_water must be in (0, 1)");
         }
@@ -198,19 +190,19 @@ impl SchedulerConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "cuda", test))]
 const REQUEST_INPUT_SLACK_TOKENS: usize = 5;
 
 /// Backend-agnostic request length limits derived from the active scheduler
 /// envelope. Mirrors SGLang's `max_req_len` / `max_req_input_len` contract.
-#[cfg(test)]
+#[cfg(any(feature = "cuda", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestLengthContract {
     max_request_len: usize,
     max_request_input_len: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "cuda", test))]
 impl RequestLengthContract {
     pub(crate) fn derive(
         available_pool_tokens: usize,
@@ -423,7 +415,6 @@ mod tests {
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
         assert_eq!(cfg.prefix_cache_keepalive_ticks, 64);
-        assert_eq!(cfg.stage_wait_keepalive_ticks, 512);
         assert_eq!(cfg.t1_host_pinned_high_water, 0.85);
         assert_eq!(cfg.t1_host_pinned_low_water, 0.70);
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
@@ -496,21 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_config_rejects_stage_wait_below_keepalive() {
-        let mut cfg = SchedulerConfig::runtime_defaults(4);
-        cfg.prefix_cache_keepalive_ticks = 128;
-        cfg.stage_wait_keepalive_ticks = 64;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
     fn scheduler_config_tunable_via_direct_field_assignment() {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.prefix_cache_high_water = 0.80;
         cfg.prefix_cache_low_water = 0.60;
         cfg.prefix_cache_retain_hard_cap = 0.95;
         cfg.prefix_cache_keepalive_ticks = 128;
-        cfg.stage_wait_keepalive_ticks = 1024;
         assert!(cfg.validate().is_ok());
     }
 

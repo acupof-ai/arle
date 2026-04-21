@@ -78,7 +78,7 @@ radix-driven reusable-prefix path, (b) lifted BF16 paged-KV to
 skeleton (`HostPinnedPool`, `LocalCudaTransport`, coordinator command thread,
 and tier-aware `RadixNode` metadata), (d) added the first M3b staged-lookup /
 page-lifecycle contract surface, (e) wired the local scheduler onto a
-plannerless `lookup_or_stage` / live-eviction-signals path, and (f) retired
+plannerless `lookup_or_stage` classification / live-eviction-signals path, and (f) retired
 the legacy contiguous CPU KV offload path locally in the M3c cleanup tranche.
 M2b, M0.3, M3a, M3b, and M3c all have **L4 remote acceptance sign-off as
 of 2026-04-15** — see the per-milestone win notes
@@ -102,12 +102,11 @@ round-trip + runtime-only fields marked `#[serde(skip)]`), and
 unit tests). Combined remote CUDA acceptance for M4 is pending;
 see `docs/plans/tiered-kv-cache-m4-remote-acceptance.md`.
 
-The remaining live gaps are: **a real attach/ownership model for
-staged readmission** (the scheduler hot path no longer parks requests
-behind synchronous `Stage*` echoes because that path was not correct
-under concurrency), the HTTP route wrappers around the M4d session
-module, and the Metal MLX wired-memory bindings that were cut from the
-M4 batch. One constraint is still explicit: **M2b does not do
+The remaining live gaps are: **live staged readmission is still absent**
+until a real attach/ownership model is built, the HTTP route wrappers
+around the M4d session module, and the Metal MLX wired-memory bindings
+that were cut from the M4 batch. One constraint is still explicit:
+**M2b does not do
 cross-slot page aliasing**. Reuse remains limited to the case where the
 radix hit maps to a currently free slot whose contiguous state still
 materialises the matched prefix.
@@ -115,11 +114,11 @@ materialises the matched prefix.
 | Area | State | File:line |
 |---|---|---|
 | CUDA paged pool | **M0.3 accepted 2026-04-15 on L4**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Same-host `page1 → page16` sweep is within noise on C≤4 and recovers C≥8 from the 2026-04-13 zero-throughput regression (see `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`). | `crates/cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
-| CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/cli/src/args.rs` |
+| CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4 and surface cleanup finished locally on 2026-04-21**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, the `prefetch/offload` bridge hooks, the stale `set_max_gpu_kv` shim, and the obsolete offload-memory bench script are deleted from operator-facing code. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/cli/src/{args,lib}.rs`, `scripts/bench_offload_memory.py` |
 | `infer/src/prefix_cache.rs` | Leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`) plus **M2b tombstone GC scaffolding** (`free_nodes`, `alloc_node`, `gc_orphan_tombstones()`). **M3a/M3b local now also land the tier-aware contract surface and runtime metadata mutators**: `hit_count`, `tier_location`, `session_id`, `fingerprint`, `byte_len`, `soft_pin_until`, `lookup_or_stage(...) -> LookupOutcome`, plus public setters so scheduler code can stamp GPU/session/keepalive truth onto published blocks. Tier B/C local follow-on also makes `insert_with_fingerprints(...)` the canonical insert path, keeps `insert(...)` as a zero-fingerprint back-compat shim, and maintains a private `block_index` for O(1) `BlockId` → node lookup. | `infer/src/prefix_cache.rs`, `infer/src/kv_tier/lookup.rs` |
 | CUDA scheduler prefix logic | **Hot path is now honest and deletion-first**: `assign_slots()` still uses `lookup_or_stage(...)` for tier-aware classification, but admission only reuses prefixes that are already runnable on T0. `cleanup()` demotes T0 blocks into T1, spills T1 to T2 under watermarks, and updates radix metadata in one path. The old parked `stage_waiting` readmission path was removed because it was not correct under concurrency and did not produce a runnable admission surface. **Cross-slot page aliasing is intentionally not implemented** — reuse is still safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
-| Legacy API compatibility | `set_max_gpu_kv` remains as a compatibility no-op warning so CLI / external callers do not break in the same batch that deletes the old CPU offload implementation. This shim should be removed in a later surface-cleanup PR, not mixed into the runtime staging work. | `infer/src/server_engine.rs`, `crates/cli/src/lib.rs`, `crates/cli/src/args.rs` |
-| `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). The live local path now keeps one source of truth: `lookup.rs` classifies hits, `host_pool.rs` owns T1 storage, `coordinator.rs` owns `Stage` + `Spill`, and `transport/disk.rs` persists bytes for T2. `NixlTransport` still compiles only as a stub under `rdma-nixl` (stub-api). Real staged completion is still synchronous for local validation; true async copy completion remains later work. | `infer/src/kv_tier/**`, `infer/src/scheduler/cuda/runtime.rs` |
+| Operator-facing surface | **Converged**: there is no longer any CLI or engine entry point for the retired contiguous CPU offload path. Operator-visible KV controls are the live scheduler/tier config and disk/session plumbing only. | `infer/src/server_engine.rs`, `crates/cli/src/{args,lib}.rs`, `infer/src/scheduler/types.rs` |
+| `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). The live local path now keeps one source of truth: `lookup.rs` classifies hits, `host_pool.rs` owns T1 storage, `coordinator.rs` owns spill-only T1→T2 persistence, and `transport/disk.rs` persists bytes for T2. `NixlTransport` still compiles only as a stub under `rdma-nixl` (stub-api). Live staged readmission was deliberately removed from the runtime until an attach/ownership model exists. | `infer/src/kv_tier/**`, `infer/src/scheduler/cuda/runtime.rs` |
 | `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` now has local publish-time call sites via `compute_from_tokens`, but M4 session save/load is still the first consumer that must survive restart / reconciliation. | `infer/src/types.rs:8` |
 | `infer::scheduler::policy` | Trait + 4 impls (`LruEviction`, `ReuseBiasedLru`, `HitCountLru`, `SessionBiasedLru`) plus `EvictionCandidate` data struct + `SchedulerSignals`. **M3b local runtime wire landed**: `RadixCache::evict_with_policy` exists, cleanup/allocation eviction now consumes live queue/decode-derived signals rather than `SchedulerSignals::default()`, and published blocks stamp session/keepalive metadata. Tier C local follow-on promoted the prefix-cache watermarks / keepalive knobs onto `SchedulerConfig`; combined remote CUDA acceptance is still pending. | `infer/src/scheduler/policy.rs`, `infer/src/prefix_cache.rs`, `infer/src/scheduler/cuda/core.rs` |
 | A2 session_id plumbing | `IncomingRequest::session_id` populated from HTTP; scheduler now propagates it onto published radix blocks for keepalive/affinity metadata, but it still does not drive full coordinator routing or cross-request staged promotion. | `infer/src/scheduler/types.rs`, `infer/src/http_server/openai_v1.rs`, `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs` |
@@ -130,11 +129,11 @@ materialises the matched prefix.
 
 Seven facts shape everything below (original fact 6 "P1(a) shipped, P1(b) never did" retired by M1b landing; replaced with the policy.rs / hand-rolled watermark divergence that Codex 2026-04-15 surfaced):
 
-1. **Production data path is still T0-only, but dual residency is now load-bearing inside the safe reuse envelope.** `paged_kv.rs` retains pages through `free_slot`, and `assign_slots` now picks a reusable free slot from radix hits instead of scanning `cached_prompts`. The missing piece is **not** selector wiring anymore; it is remote validation plus the remaining M3b/M3c runtime wiring that turns the new T1 scaffolding into a real promotion/demotion path.
+1. **Production data path is deletion-first and spill-only locally, with no live staged readmission.** `paged_kv.rs` retains pages through `free_slot`, and `assign_slots` now picks a reusable free slot from radix hits instead of scanning `cached_prompts`. The missing piece is **not** selector wiring anymore; it is remote validation plus the attach/ownership model needed before any live readmission can return.
 2. **`RadixCache` is now load-bearing for CUDA admission, publish, and eviction.** The radix is no longer just a shadow observer: it drives reusable-prefix selection, holds the pinned-page ownership map, owns tier/session/keepalive/fingerprint metadata, and now keeps a private `block_index` for O(1) `BlockId` lookup. What it still does **not** own yet is the cross-restart reconciliation logic that turns those fingerprints into durable identity.
 3. **Per-format `page_size` dispatch is accepted remotely and no longer blocks M3.** BF16 lifted to `page_size = 16`; INT8 / FP8 / TurboQuant deliberately remain at `page_size = 1` until their token-granular kernels are rewritten. The remaining CUDA gate is the combined Tier A/B/C follow-on acceptance, not the allocator/kernel rewrite.
 4. **`BlockId` unified, `BlockFingerprint` now computes at publish time with a real BLAKE3 hash over a full domain-tagged input chain.** `BlockFingerprint::compute(KvContentContext, tokens)` mixes `model_fingerprint`, `kv_format_tag`, `parent`, and `tokens` under a version-tagged prefix (`"infer-kv-v2\x00"`), and the reload path uses `RadixCache::reconcile(known)` to remap ids against a fresh pool. **Save format addresses blocks by fingerprint, not by `BlockId`** — pool slot ids do not survive a restart. What is still deferred: a real weight-checksum upgrade for `model_fingerprint` (currently `blake3(model_id)` as a per-engine stable identifier), and the HTTP route wrappers around `save_session` / `load_session`.
-5. **The old contiguous CPU offload is retired locally, but its public compatibility shim remains.** The runtime no longer produces or consumes `k_host/v_host` shadow buffers, so there is now one local truth for CUDA KV residency. What remains is the compatibility no-op surface (`set_max_gpu_kv`) plus the remote CUDA regression pass that proves the deletion did not regress long-session reuse. See §8 pitfall 13.
+5. **The old contiguous CPU offload surface is gone.** The runtime no longer produces or consumes `k_host/v_host` shadow buffers, and there is no surviving CLI/engine shim for that path. Local operator surface now has one truth for CUDA KV residency: the tiered-KV runtime and its scheduler config. Remaining work is remote CUDA regression validation, not API cleanup. See §8 pitfall 13.
 6. **`policy.rs` scoring trait is now wired into live cleanup/allocation eviction, but the knobs moved to `SchedulerConfig`.** The current follow-on work is no longer "converge onto the policy trait"; it is "keep the configured high/low/retain/keepalive values bench-backed while the Tier A/B/C remote CUDA gate is still pending." See §5.4 convergence note.
 7. **`NixlTransport` trait shape is the right bet.** `type Op: Send` + explicit `poll()` + `abort()` — survives the Codex review unchanged. NIXL ↔ Mooncake plugin compatibility confirmed in 2026-04-15 industry research.
 
@@ -394,26 +393,24 @@ pub struct LookupBlock {
 pub struct LookupOutcome {
     pub matched_len: usize,
     pub blocks: Vec<LookupBlock>,
-    pub staging_ticket: Option<StageTicket>, // populated iff any block is Staging*
     pub recompute_advised: bool,             // see §4.5.1
 }
 
 pub fn lookup_or_stage(&mut self, tokens: &[u32]) -> LookupOutcome { ... }
 ```
 
-The scheduler does not know *which* tier holds a staging block, only
-whether it is `ReadyOnGpu` (decode now) or `Staging*` (poll the op
-before scheduling decode). This satisfies "scheduler is not blind" and
-"scheduler is not tier-aware" simultaneously. It also lets the
-coordinator move a block T2 → T1 → T0 in two hops without the scheduler
-seeing two separate staging events — the outer poll just stays
-`Pending` until both hops complete.
+The scheduler does not know *which* tier holds a non-GPU block, only
+whether it is `ReadyOnGpu` (decode now) or some `Staging*` flavor
+(not runnable on T0 right now). In the currently shipped local runtime
+that means a simple rule: only `ReadyOnGpu` contributes reusable prefix
+length; every other hit kind degrades to cold prefill until a real
+attach/ownership model returns live readmission. `lookup_or_stage` is
+classification-only here.
 
-**2026-04-15 local note**: the in-tree contract already uses
-`StageTicket` plus `LookupBlock { block_id: Option<BlockId>, hit_kind }`
-rather than a raw `TransportOp`. That matches the current code reality:
-`KVTransport::Op` is an associated type hidden behind each concrete
-transport, while the scheduler only needs an opaque coordinator ticket.
+**2026-04-21 local note**: the in-tree contract intentionally stops at
+`LookupBlock { block_id: Option<BlockId>, hit_kind }` plus
+`recompute_advised`. The earlier `StageTicket` surface was deleted once
+the parked readmission path was removed from production code.
 
 #### 4.5.1 Recompute-vs-fetch fallback
 
@@ -536,7 +533,7 @@ of writing. The rename to `RadixNode` is not required; keeping `Node`
 matches the existing code.
 
 **Status (2026-04-16, post Tier A/B/C local)**: the tier metadata fields
-below are now in-tree, `lookup_or_stage(...)` is live in scheduler admission,
+below are now in-tree, `lookup_or_stage(...)` is classification-only in scheduler admission,
 and `insert_with_fingerprints(...)` is the canonical publish path. The extra
 follow-on state not shown in the original sketch is a private
 `block_index: HashMap<BlockId, usize>` kept in sync across insert/evict/rebuild
@@ -1035,21 +1032,20 @@ for the stacked M2b + M0.3 + M3a local batches.
   `SchedulerConfig::prefix_cache_retain_hard_cap = 0.90` by default.
   **2026-04-15 local
   status**: the contract/state-machine tranche is now in-tree
-  (`lookup_or_stage`, `LookupOutcome`, `StageTicket`, pure
-  `PageLifecycleState`, ticketed coordinator staging events, and
-  `evict_with_policy` already wired on the cleanup/allocation path), and
-  the first safe runtime wire is now local too: scheduler admission uses
-  plannerless `lookup_or_stage(..., None)` classification, live
-  queue/decode-derived eviction signals, and session/keepalive metadata
-  stamping. The remaining work is **real staged completion / promotion**
-  plus remote CUDA validation. Remote
+  (`lookup_or_stage`, `LookupOutcome`, pure `PageLifecycleState`, the
+  spill-only coordinator/events, and `evict_with_policy` already wired on the
+  cleanup/allocation path), and the first safe runtime wire is now local too:
+  scheduler admission uses plannerless `lookup_or_stage(...)` classification,
+  one priority-ordered waiting queue, and session/keepalive metadata stamping.
+  The remaining work is **a real attach/ownership model before any live
+  readmission / promotion path returns** plus remote CUDA validation. Remote
   checklist: `docs/plans/tiered-kv-cache-m3b-remote-acceptance.md`.
-- **M3c · T1→T0 promotion path + delete legacy CPU offload.**
+- **M3c · T1→T0 promotion wiring + delete legacy CPU offload.**
   The **cleanup half is now shipped locally**: the old contiguous
   `model/kv_cache.rs` CPU-offload implementation (`k_host/v_host`,
-  `OFFLOAD_BLOCK_SIZE = 64`, `prefetch/offload` hooks) is gone, and
-  `set_max_gpu_kv` is only a compatibility no-op warning. The
-  remaining M3c work is the **runtime half**: promotion on radix lookup hit
+  `OFFLOAD_BLOCK_SIZE = 64`, `prefetch/offload` hooks), the stale
+  `set_max_gpu_kv` shim, and the obsolete offload bench entrypoint are gone. The
+  remaining M3c work is the **runtime half**: promotion wiring on radix lookup hit
   when the matched node's `tier_location` is `HostPinned`, plus remote CUDA
   regression validation of the cleanup batch. Remote checklist:
   `docs/plans/tiered-kv-cache-m3c-remote-acceptance.md`.
@@ -1683,9 +1679,9 @@ revision supersedes all three of those as documented above.
    heuristic (§4.5.1). Default policy `SessionBiasedLru`. Watermarks now
    come from `SchedulerConfig` defaults (`prefix_cache_high_water = 0.75`,
    `prefix_cache_low_water = 0.50`, `prefix_cache_retain_hard_cap = 0.90`).
-5. **M3c · T1→T0 promotion path + delete legacy `model/kv_cache.rs`
+5. **M3c · T1→T0 promotion wiring + delete legacy `model/kv_cache.rs`
    CPU offload**. The deletion half is landed locally; the remaining work is
-   runtime promotion + remote CUDA acceptance of that cleanup.
+   runtime wiring + remote CUDA acceptance of that cleanup.
 6. **M4a / M4b** — disk tier + session save/load with
    fingerprint-reconciliation reload. Waits on M3 for the coordinator
    shape.

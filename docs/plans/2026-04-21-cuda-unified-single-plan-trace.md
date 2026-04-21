@@ -9,7 +9,6 @@
 ### 1. Emit / Tokenizer
 
 - Intake tokenization: [`infer/src/scheduler/cuda/runtime.rs`](../../infer/src/scheduler/cuda/runtime.rs) `assign_slots()`
-- Same-tick waiting admission fallback: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `admit_waiting_prefill_candidate()`
 - Incremental stream emit: [`infer/src/scheduler/cuda/request.rs`](../../infer/src/scheduler/cuda/request.rs) `ActiveRequest::emit_delta()`
 - Final flush + usage accounting: [`infer/src/scheduler/cuda/request.rs`](../../infer/src/scheduler/cuda/request.rs) `ActiveRequest::finish()`
 
@@ -22,13 +21,11 @@ Owned state:
 - `ActiveRequest.sent_len`
 - `ActiveRequest.latest_logprob`
 
-### 2. Admission / Prefix / Staging
+### 2. Admission / Prefix / Spill Classification
 
-- Slot assignment + initial radix decision: [`infer/src/scheduler/cuda/runtime.rs`](../../infer/src/scheduler/cuda/runtime.rs) `assign_slots()`
+- Slot assignment + prompt tokenization + length gating + radix decision + slot materialization: [`infer/src/scheduler/cuda/runtime.rs`](../../infer/src/scheduler/cuda/runtime.rs) `assign_slots()`
 - Step planning entry: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `plan_step()`
 - Existing prefill candidate selection: `queued_prefill_candidate()`
-- Waiting-queue admission + radix decision: `admit_waiting_prefill_candidate()`
-- Slot materialization: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `materialize_waiting_request()`
 
 Owned state:
 
@@ -40,6 +37,8 @@ Owned state:
 - `QueuedRequest`
 - `ActiveRequest.reusable_prefix_len`
 - `ActiveRequest.reusable_cached_prompt_len`
+
+Note: the in-tree `lookup_or_stage` surface is a tier-aware classification helper only; it does not imply live staged readmission.
 
 ### 3. GPU Launch
 
@@ -103,7 +102,7 @@ These are still needed after the refactor because a mixed batch still needs one 
 - `Scheduler.prefill_queue`
   - still the single source of truth for prefilling requests; it is no longer scanned for extra launches after a mixed tick
 - `Scheduler.waiting`
-  - still owns unslotted requests and may be consulted during planning when a free slot exists and no queued prefill candidate is ready
+  - still owns unslotted requests, but `assign_slots()` is now the only path that tokenizes them, applies the request-length contract, classifies radix hits, and materializes active slots
 
 ## Resulting Tick Contract
 
@@ -121,4 +120,4 @@ This matches the intended sglang-aligned contract more closely:
 - one readback path
 - one cleanup path
 
-`assign_slots()` can still materialize waiting requests before `step()`, but the old “mixed, then keep filling the stream with more serial prefill work” contract is intentionally gone.
+`assign_slots()` can still materialize waiting requests before `step()`, but the old “mixed, then keep filling the stream with more serial prefill work” contract is intentionally gone, and `lookup_or_stage` in this flow remains classification-only rather than a live staging/readmission API.

@@ -8,8 +8,6 @@ use std::time::Instant;
 use anyhow::Result;
 #[cfg(feature = "cuda")]
 use fastrace::local::LocalSpan;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use log::warn;
 #[cfg(feature = "cuda")]
 use log::{debug, info};
 #[cfg(feature = "cuda")]
@@ -359,7 +357,7 @@ where
     let ttft_start = Instant::now();
     model.forward_prefill(prompt_tokens, state)?;
     if let Err(e) = state.save_prefix_snapshot() {
-        warn!(
+        log::warn!(
             "KV prefix cache snapshot save failed after prefill: {} (exact-hit reuse may fall back later)",
             e
         );
@@ -534,14 +532,6 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
         })
     }
 
-    /// Compatibility no-op. Legacy contiguous CPU KV offload has been retired.
-    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        warn!(
-            "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload has been retired",
-            max_tokens
-        );
-    }
-
     /// Prepare state for a new request, reusing cached KV prefix where possible.
     ///
     /// Returns the tokens that still need to be processed (the non-cached suffix)
@@ -624,7 +614,7 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                         );
                     }
                     Ok(false) => {
-                        warn!(
+                        log::warn!(
                             "KV prefix cache HIT: snapshot missing for non-truncatable state, falling back to full prefill"
                         );
                         self.state.reset()?;
@@ -632,13 +622,13 @@ impl<M: ModelForward> ModelInferenceEngine<M> {
                         return Ok((prompt_tokens.to_vec(), 0));
                     }
                     Err(e) if self.state.supports_partial_prefix() => {
-                        warn!(
+                        log::warn!(
                             "KV prefix cache HIT: snapshot restore failed ({}), continuing with truncation-only reuse",
                             e
                         );
                     }
                     Err(e) => {
-                        warn!(
+                        log::warn!(
                             "KV prefix cache HIT: snapshot restore failed for non-truncatable state ({}), falling back to full prefill",
                             e
                         );
@@ -1344,33 +1334,6 @@ impl LoadedInferenceEngine {
             Self::Metal(_) => unreachable!("model_type is only defined for CUDA engines"),
             #[cfg(feature = "cpu")]
             Self::Cpu(_) => unreachable!("model_type is only defined for CUDA engines"),
-        }
-    }
-
-    pub fn set_max_gpu_kv(&mut self, max_tokens: usize) {
-        match self {
-            #[cfg(feature = "cuda")]
-            Self::Qwen3(engine) => engine.set_max_gpu_kv(max_tokens),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35(engine) => engine.set_max_gpu_kv(max_tokens),
-            #[cfg(feature = "cuda")]
-            Self::Qwen35Moe(engine) => engine.set_max_gpu_kv(max_tokens),
-            #[cfg(feature = "cuda")]
-            Self::GLM4(engine) => engine.set_max_gpu_kv(max_tokens),
-            #[cfg(feature = "metal")]
-            Self::Metal(_) => {
-                warn!(
-                    "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload was CUDA-only and has been retired",
-                    max_tokens
-                );
-            }
-            #[cfg(feature = "cpu")]
-            Self::Cpu(_) => {
-                warn!(
-                    "Ignoring set_max_gpu_kv({}): legacy contiguous CPU KV offload has been retired",
-                    max_tokens
-                );
-            }
         }
     }
 }

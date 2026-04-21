@@ -32,9 +32,19 @@ pub(crate) struct Args {
     /// Inside the REPL, `/agent` and `/chat` switch between modes at any time.
     #[arg(long, default_value_t = false)]
     pub(crate) tools: bool,
+}
 
-    /// Deprecated compatibility flag. Legacy contiguous CPU KV offload has
-    /// been retired, so this value is ignored.
-    #[arg(long)]
-    pub(crate) max_gpu_kv: Option<usize>,
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn rejects_removed_max_gpu_kv_flag() {
+        let err = Args::try_parse_from(["agent-infer", "--max-gpu-kv", "256"])
+            .err()
+            .expect("removed flag should be rejected");
+        let rendered = err.to_string();
+        assert!(rendered.contains("--max-gpu-kv"));
+    }
 }
