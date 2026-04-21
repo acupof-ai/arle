@@ -163,17 +163,19 @@ fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str
 }
 
 fn longest_tag_prefix_suffix(text: &str, tags: &[&str]) -> usize {
+    let text = text.as_bytes();
     let max_len = tags
         .iter()
         .map(|tag| tag.len())
         .max()
         .unwrap_or(0)
         .min(text.len());
+
     (1..=max_len)
         .rev()
         .find(|&len| {
             let suffix = &text[text.len() - len..];
-            tags.iter().any(|tag| tag.starts_with(suffix))
+            tags.iter().any(|tag| tag.as_bytes().starts_with(suffix))
         })
         .unwrap_or(0)
 }
@@ -844,6 +846,15 @@ mod tests {
 
         assert_eq!(stream.push("abc<th"), "abc");
         assert_eq!(stream.push("ink>secret</think>def"), "def");
+        assert_eq!(stream.finish(), "");
+    }
+
+    #[test]
+    fn visible_text_stream_handles_multibyte_text_before_partial_tag() {
+        let mut stream = VisibleTextStream::default();
+
+        assert_eq!(stream.push("User:** \"你<th"), "User:** \"你");
+        assert_eq!(stream.push("ink>secret</think>好"), "好");
         assert_eq!(stream.finish(), "");
     }
 
