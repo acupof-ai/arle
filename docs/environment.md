@@ -18,7 +18,7 @@ debug/diagnostic runtime overrides.**
 `SchedulerConfig` in `infer/src/scheduler/types.rs`: prefix-cache
 watermarks (`prefix_cache_high_water`, `prefix_cache_low_water`,
 `prefix_cache_retain_hard_cap`), keepalive ticks
-(`prefix_cache_keepalive_ticks`, `stage_wait_keepalive_ticks`), and
+(`prefix_cache_keepalive_ticks`, `t1_host_pinned_keepalive_ticks`), and
 chunking caps are struct fields with `validate()` guards. Callers that
 want to tune them construct a `SchedulerConfig::runtime_defaults(..)`
 and assign directly — **there is no `INFER_PREFIX_HIGH_WATER`** or

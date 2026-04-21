@@ -60,7 +60,7 @@ Current workspace members:
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait; the current local Metal train path already uses the device-resident / lazy-eval tranche for the active training-critical ops, while CUDA remains the primary full-acceptance target)
 - `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family across scratch pretrain + RL, with hybrid linear-attn accepted locally on CPU + Metal and CUDA compile coverage in place; HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
-- `crates/kv-native-sys` (Zig-backed local persistence substrate for `infer/src/kv_tier/transport/disk.rs`; now owns file + block object ABI plus mmap/WAL/shm descriptor primitives used by local validation and by coordinator spill/stage persistence paths)
+- `crates/kv-native-sys` (local persistence substrate for `infer/src/kv_tier/transport/disk.rs`; now owns file + block object ABI plus mmap/WAL/shm descriptor primitives used by local validation and by coordinator spill/persist paths)
 
 ## 2. Main execution paths
 
@@ -196,8 +196,8 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 
 - `infer/src/block_manager.rs`: KV block accounting for the batch scheduler
 - `crates/cuda-kernels/src/paged_kv.rs`: token-level KV pool for CUDA paged attention (page-aware, BF16 `page_size=16`)
-- `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse; tier-aware `RadixNode` metadata (`hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`) + `lookup_or_stage` contract
-- `infer/src/kv_tier.rs` + `infer/src/kv_tier/{lookup,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); M3a host-tier skeleton + M3b `lookup_or_stage` contract + page-lifecycle state machine landed locally 2026-04-15
+- `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse; tier-aware `RadixNode` metadata (`hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`) + `lookup_or_stage` classification contract
+- `infer/src/kv_tier.rs` + `infer/src/kv_tier/{lookup,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); local path is now deletion-first and spill-only: `lookup_or_stage` classifies reuse, `HostPinnedPool` backs T1 demotion, `Coordinator` persists T1→T2 spills, and live staged readmission remains intentionally absent until an attach/ownership model exists
 - `infer/src/memory_planner.rs`: memory planning helpers
 - `crates/cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
 - `crates/cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer
@@ -239,7 +239,7 @@ These crates remain independent after Route A:
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
 - `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend
-- `crates/kv-native-sys`: Zig-native persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
+- `crates/kv-native-sys`: local persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations; also exports substrate APIs for WAL append/replay, mmap descriptors, and shared-memory descriptors
 
 Current dependency direction:
 

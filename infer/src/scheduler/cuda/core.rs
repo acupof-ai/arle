@@ -22,14 +22,10 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 /// Prefill chunk size is capped to this value to prevent buffer overflow.
 pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
 
-// Prefix-cache watermark / keepalive tunables moved to
-// `crate::scheduler::types::SchedulerConfig` in Tier C. See the doc
-// comments on `prefix_cache_high_water` / `prefix_cache_low_water` /
-// `prefix_cache_retain_hard_cap` / `prefix_cache_keepalive_ticks` /
-// `stage_wait_keepalive_ticks` there for the defaults and validation
-// semantics. Per the project env-var policy (`docs/environment.md` §0),
-// these are **not** env-driven — callers assign directly to
-// `SchedulerConfig` fields. Env vars are reserved for debug-only knobs.
+// Prefix-cache and T1 watermark / keepalive tunables live on
+// `crate::scheduler::types::SchedulerConfig`. Per the project env-var
+// policy (`docs/environment.md` §0), these are **not** env-driven —
+// callers assign directly to `SchedulerConfig` fields.
 
 fn prefix_cache_retain_hard_cap_pages(total_pages: usize, cap_fraction: f64) -> usize {
     (total_pages as f64 * cap_fraction) as usize
@@ -115,7 +111,7 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     pub(super) spill_waiting:
-        HashMap<crate::kv_tier::StageTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
+        HashMap<crate::kv_tier::SpillTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -123,6 +119,7 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) active: Vec<Option<ActiveRequest>>,
     pub(super) prefill_queue: VecDeque<usize>,
     pub(super) running_batch: VecDeque<usize>,
+    pub(super) effective_max_seq_len: Option<usize>,
     pub(super) next_id: u64,
     pub(super) rng: StdRng,
     /// Paged KV cache pool shared across all slots (for batched decode).
@@ -433,6 +430,7 @@ impl<M: ModelForward> Scheduler<M> {
             active: (0..config.max_slots).map(|_| None).collect(),
             prefill_queue: VecDeque::new(),
             running_batch: VecDeque::new(),
+            effective_max_seq_len,
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
