@@ -415,6 +415,39 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .all_parameter_ids()
         .into_iter()
         .collect::<HashSet<_>>();
+    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let run_id = train::metrics::default_run_id("train_grpo");
+    let save_path_string = args
+        .save_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let resume_dir_string = resume_dir.as_ref().map(|path| path.display().to_string());
+    let mut run_start_strings = vec![
+        ("run_id", run_id.as_str()),
+        ("job", "train_grpo"),
+        ("model_family", F::family_name()),
+    ];
+    if let Some(path) = save_path_string.as_deref() {
+        run_start_strings.push(("save_path", path));
+    }
+    if let Some(path) = resume_dir_string.as_deref() {
+        run_start_strings.push(("resume_from", path));
+    }
+    let run_start_scalars = [
+        ("sft_steps", args.sft_steps as f64),
+        ("grpo_iters", args.grpo_iters as f64),
+        ("group_size", args.group_size as f64),
+        ("batch_prompts", args.batch_prompts as f64),
+    ];
+    let run_start_bools = [("resumed", resume_dir.is_some())];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_start",
+        step: Some(0),
+        strings: &run_start_strings,
+        scalars: &run_start_scalars,
+        bools: &run_start_bools,
+    });
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
     };
@@ -436,6 +469,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         // on 09c5c89 P1).
         let sft_optim_state = run_sft_phase(
             args,
+            metrics.clone(),
             &policy,
             &params,
             keep_extra.clone(),
@@ -477,15 +511,6 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             },
         )
     };
-
-    // Phase 4 follow-up: extend `--metrics-jsonl` to cover the GRPO phase.
-    // `run_sft_phase` already truncated the JSONL file (JsonlSink::create),
-    // so the GRPO phase opens in APPEND mode to extend the same file
-    // instead of clobbering SFT-phase samples. `also_stdout = false` keeps
-    // the human-readable `grpo iter N:` println below as the stdout
-    // contract; the MetricSample emit is JSONL-only tooling output.
-    let mut grpo_metrics = train::metrics::open_sink_append(args.metrics_jsonl.as_deref(), false)
-        .map_err(|e| CliError::Custom(format!("grpo metrics sink: {e}")))?;
 
     let grpo_cfg = GrpoConfig {
         clip_eps: 0.2,
@@ -568,8 +593,9 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             ("best_mean_reward", best_mean_reward as f64),
             ("mean_kl", last_kl as f64),
         ];
-        grpo_metrics.emit(&train::metrics::MetricSample {
+        metrics.emit_metric(&train::metrics::MetricSample {
             step: (args.sft_steps as u64) + (iter as u64) + 1,
+            phase: "grpo",
             fields: &fields,
         });
 
@@ -589,6 +615,27 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
                     last_kl,
                 )?;
                 eprintln!("[train_grpo] checkpoint saved to {}", step_dir.display());
+                let step_dir_string = step_dir.display().to_string();
+                let strings = [
+                    ("path", step_dir_string.as_str()),
+                    ("artifact_model", "model.safetensors"),
+                    ("artifact_train_model", "train_model.safetensors"),
+                    ("artifact_reference_model", "reference_model.safetensors"),
+                    ("artifact_adapter", "adapter_model.safetensors"),
+                    (
+                        "artifact_reference_adapter",
+                        "reference_adapter_model.safetensors",
+                    ),
+                    ("artifact_state", "trainer_state.json"),
+                    ("artifact_optimizer", "optimizer.safetensors"),
+                ];
+                metrics.emit_event(&train::metrics::TrainEvent {
+                    kind: "checkpoint",
+                    step: Some((iter + 1) as u64),
+                    strings: &strings,
+                    scalars: &[],
+                    bools: &[],
+                });
             }
         }
     }
@@ -611,10 +658,46 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             "[train_grpo] final checkpoint saved to {}",
             step_dir.display()
         );
+        let step_dir_string = step_dir.display().to_string();
+        let strings = [
+            ("path", step_dir_string.as_str()),
+            ("artifact_model", "model.safetensors"),
+            ("artifact_train_model", "train_model.safetensors"),
+            ("artifact_reference_model", "reference_model.safetensors"),
+            ("artifact_adapter", "adapter_model.safetensors"),
+            (
+                "artifact_reference_adapter",
+                "reference_adapter_model.safetensors",
+            ),
+            ("artifact_state", "trainer_state.json"),
+            ("artifact_optimizer", "optimizer.safetensors"),
+        ];
+        metrics.emit_event(&train::metrics::TrainEvent {
+            kind: "checkpoint",
+            step: Some(args.grpo_iters as u64),
+            strings: &strings,
+            scalars: &[],
+            bools: &[],
+        });
     }
 
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
+    let run_end_scalars = [
+        ("completed_sft_steps", args.sft_steps as f64),
+        ("completed_grpo_iters", args.grpo_iters as f64),
+        ("best_mean_reward", best_mean_reward as f64),
+        ("last_kl", last_kl as f64),
+    ];
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_end",
+        step: Some((args.sft_steps + args.grpo_iters) as u64),
+        strings: &run_end_strings,
+        scalars: &run_end_scalars,
+        bools: &[],
+    });
+    metrics.flush_blocking();
     Ok(())
 }
 
@@ -626,6 +709,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 /// copy per step and only fed the println, no correctness concern.
 fn run_sft_phase<P>(
     args: &CliArgs,
+    metrics: train::metrics::SharedSink,
     policy: &P,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
@@ -651,9 +735,6 @@ where
         None => GrpoClip::None(NoClip),
     };
     let schedule = ConstantLr(args.lr);
-    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
-        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-
     let trainer_cfg = TrainerConfig {
         total_steps: args.sft_steps as u64,
         grad_accum_steps: 1,
@@ -664,7 +745,7 @@ where
         resume_from: None,
         rng_seed: args.seed,
     };
-    let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
+    let mut trainer = Trainer::new(optim, clip, schedule, Box::new(metrics), trainer_cfg);
 
     let param_names = trainable_param_name_map(policy, store);
 

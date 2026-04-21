@@ -275,8 +275,9 @@ fn run() -> Result<(), CliError> {
     if args.grad_clip.is_none() {
         eprintln!("[train_multi_turn] gradient clipping disabled (--no-grad-clip)");
     }
-    let mut metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let run_id = train::metrics::default_run_id("train_multi_turn");
 
     let total_agent = args.agent_tokens * args.turns;
     let total_obs = args.obs_tokens * (args.turns.saturating_sub(1));
@@ -356,6 +357,40 @@ fn run() -> Result<(), CliError> {
     let mut best_reward = resume.best_reward;
     let mut last_kl = resume.last_kl;
     let loop_start = std::time::Instant::now();
+    let backend_name = match args.backend {
+        BackendChoice::Cpu => "cpu",
+        BackendChoice::Metal => "metal",
+        BackendChoice::Cuda => "cuda",
+    };
+    let save_path_string = args.save_path.as_deref().unwrap_or_default().to_string();
+    let resume_path_string = resume_dir.as_ref().map(|path| path.display().to_string());
+    let mut run_start_strings = vec![
+        ("run_id", run_id.as_str()),
+        ("job", "train_multi_turn"),
+        ("model_family", "qwen35"),
+        ("backend", backend_name),
+        ("objective", args.objective.as_str()),
+    ];
+    if !save_path_string.is_empty() {
+        run_start_strings.push(("save_path", save_path_string.as_str()));
+    }
+    if let Some(path) = resume_path_string.as_deref() {
+        run_start_strings.push(("resume_from", path));
+    }
+    let run_start_scalars = [
+        ("iters", args.iters as f64),
+        ("group_size", args.group_size as f64),
+        ("turns", args.turns as f64),
+        ("prompt_len", args.prompt_len as f64),
+    ];
+    let run_start_bools = [("resumed", resume_dir.is_some())];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_start",
+        step: Some(resume.start_iter as u64),
+        strings: &run_start_strings,
+        scalars: &run_start_scalars,
+        bools: &run_start_bools,
+    });
 
     let controller = TrainingController::new();
     controller.update(|s| {
@@ -380,6 +415,14 @@ fn run() -> Result<(), CliError> {
     for iter in resume.start_iter..args.iters {
         if controller.should_stop() {
             eprintln!("[train_multi_turn] stop requested at iter {iter}");
+            let strings = [("run_id", run_id.as_str()), ("reason", "operator_stop")];
+            metrics.emit_event(&train::metrics::TrainEvent {
+                kind: "status",
+                step: Some(iter as u64),
+                strings: &strings,
+                scalars: &[],
+                bools: &[("stop_requested", true)],
+            });
             stopped_early = true;
             break;
         }
@@ -517,8 +560,9 @@ fn run() -> Result<(), CliError> {
         if let Some(v) = metal_opt_evals {
             metric_fields.push(("metal_evals_opt", v));
         }
-        metrics.emit(&MetricSample {
+        metrics.emit_metric(&MetricSample {
             step: iter as u64 + 1,
+            phase: args.objective.as_str(),
             fields: &metric_fields,
         });
 
@@ -550,10 +594,36 @@ fn run() -> Result<(), CliError> {
                     "[train_multi_turn] save requested → flushed to {}",
                     step_dir.display()
                 );
+                let step_dir_string = step_dir.display().to_string();
+                let strings = [
+                    ("run_id", run_id.as_str()),
+                    ("path", step_dir_string.as_str()),
+                    ("artifact_model", "model.safetensors"),
+                    ("artifact_train_model", "train_model.safetensors"),
+                    ("artifact_adapter", "adapter_model.safetensors"),
+                    ("artifact_adapter_config", "adapter_config.json"),
+                    ("artifact_state", "trainer_state.json"),
+                    ("artifact_optimizer", "optimizer.safetensors"),
+                ];
+                metrics.emit_event(&train::metrics::TrainEvent {
+                    kind: "checkpoint",
+                    step: Some((iter + 1) as u64),
+                    strings: &strings,
+                    scalars: &[],
+                    bools: &[],
+                });
             } else {
                 eprintln!(
                     "[train_multi_turn] save requested but no --save-path configured; ignoring"
                 );
+                let strings = [("run_id", run_id.as_str()), ("reason", "save_without_path")];
+                metrics.emit_event(&train::metrics::TrainEvent {
+                    kind: "status",
+                    step: Some((iter + 1) as u64),
+                    strings: &strings,
+                    scalars: &[],
+                    bools: &[("save_requested", true)],
+                });
             }
         }
 
@@ -582,6 +652,16 @@ fn run() -> Result<(), CliError> {
                  (prompts={}, temperature={:.2})",
                 args.eval_prompts, args.eval_temperature
             );
+            let eval_fields = [
+                ("eval_mean_reward", eval_reward as f64),
+                ("eval_pass_rate", eval_passrate as f64),
+                ("eval_prompts", args.eval_prompts as f64),
+            ];
+            metrics.emit_metric(&MetricSample {
+                step: iter as u64 + 1,
+                phase: "eval",
+                fields: &eval_fields,
+            });
         }
     }
 
@@ -614,6 +694,24 @@ fn run() -> Result<(), CliError> {
             last_kl,
         )?;
         println!("checkpoint saved to {}", step_dir.display());
+        let step_dir_string = step_dir.display().to_string();
+        let strings = [
+            ("run_id", run_id.as_str()),
+            ("path", step_dir_string.as_str()),
+            ("artifact_model", "model.safetensors"),
+            ("artifact_train_model", "train_model.safetensors"),
+            ("artifact_adapter", "adapter_model.safetensors"),
+            ("artifact_adapter_config", "adapter_config.json"),
+            ("artifact_state", "trainer_state.json"),
+            ("artifact_optimizer", "optimizer.safetensors"),
+        ];
+        metrics.emit_event(&train::metrics::TrainEvent {
+            kind: "checkpoint",
+            step: Some(controller.snapshot().iter as u64),
+            strings: &strings,
+            scalars: &[],
+            bools: &[],
+        });
     }
 
     controller.update(|s| {
@@ -626,6 +724,26 @@ fn run() -> Result<(), CliError> {
             controller.snapshot().iter
         );
     }
+    let status = if stopped_early {
+        "stopped"
+    } else {
+        "completed"
+    };
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
+    let run_end_scalars = [
+        ("completed_iters", controller.snapshot().iter as f64),
+        ("best_reward", best_reward as f64),
+        ("last_kl", last_kl as f64),
+        ("wall_secs", wall_secs as f64),
+    ];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_end",
+        step: Some(controller.snapshot().iter as u64),
+        strings: &run_end_strings,
+        scalars: &run_end_scalars,
+        bools: &[],
+    });
+    metrics.flush_blocking();
     Ok(())
 }
 

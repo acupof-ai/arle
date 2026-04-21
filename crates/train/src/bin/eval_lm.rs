@@ -13,7 +13,7 @@ use train::{
     causal_lm::build_registry,
     cli_args::{ArgError, next_value, parse_value},
     eval_lm::{evaluate_examples, load_eval_examples},
-    metrics::{MetricSample, open_sink},
+    metrics::{MetricSample, TrainEvent, default_run_id, open_shared_sink},
     model_family::{ModelFamily, ModelFamilyError, resolve_model_family},
     qwen3::{Qwen3Config, Qwen3ConfigError, Qwen3Error, Qwen3Model},
     qwen35::{Qwen35Config, Qwen35ConfigError, Qwen35Error, Qwen35Model},
@@ -187,18 +187,56 @@ fn run_with_family<F: EvalFamily>(args: &CliArgs, config_path: &Path) -> Result<
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     if let Some(metrics_jsonl) = args.metrics_jsonl.as_deref() {
-        let mut sink = open_sink(Some(metrics_jsonl), false)
+        let sink = open_shared_sink(Some(metrics_jsonl), false)
             .map_err(|err| CliError::Custom(format!("metrics sink: {err}")))?;
+        let run_id = default_run_id("eval_lm");
+        let backend_name = match args.backend {
+            BackendChoice::Cpu => "cpu",
+            BackendChoice::Metal => "metal",
+            BackendChoice::Cuda => "cuda",
+        };
+        let model_path_string = args.model_path.display().to_string();
+        let data_path_string = args.data.display().to_string();
+        let run_start_strings = [
+            ("run_id", run_id.as_str()),
+            ("job", "eval_lm"),
+            ("model_family", F::family_name()),
+            ("backend", backend_name),
+            ("model_path", model_path_string.as_str()),
+            ("data", data_path_string.as_str()),
+        ];
+        let run_start_scalars = [("seq_len", args.seq_len as f64)];
+        sink.emit_event(&TrainEvent {
+            kind: "run_start",
+            step: Some(0),
+            strings: &run_start_strings,
+            scalars: &run_start_scalars,
+            bools: &[],
+        });
         let fields = [
             ("eval_loss", summary.loss),
             ("eval_ppl", summary.ppl()),
             ("eval_tokens", summary.token_count as f64),
         ];
-        sink.emit(&MetricSample {
+        sink.emit_metric(&MetricSample {
             step: 0,
+            phase: "eval",
             fields: &fields,
         });
-        sink.flush();
+        let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+        let run_end_scalars = [
+            ("eval_loss", summary.loss),
+            ("eval_ppl", summary.ppl()),
+            ("eval_tokens", summary.token_count as f64),
+        ];
+        sink.emit_event(&TrainEvent {
+            kind: "run_end",
+            step: Some(0),
+            strings: &run_end_strings,
+            scalars: &run_end_scalars,
+            bools: &[],
+        });
+        sink.flush_blocking();
     }
 
     eprintln!(

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use tempfile::tempdir;
 use train::metrics::{
-    JsonlSink, MetricSample, MetricSink, MultiSink, NullSink, open_sink, open_sink_append,
+    JsonlSink, MetricSample, MetricSink, MultiSink, NullSink, TrainEvent, open_shared_sink,
+    open_shared_sink_append, open_sink, open_sink_append,
 };
 
 fn read_lines(path: &PathBuf) -> Vec<String> {
@@ -23,6 +24,7 @@ fn null_sink_emit_does_not_panic() {
     let fields = [("loss", 1.5f64), ("lr", 1e-4f64)];
     sink.emit(&MetricSample {
         step: 0,
+        phase: "train",
         fields: &fields,
     });
     sink.flush();
@@ -38,16 +40,19 @@ fn jsonl_sink_roundtrip_three_samples() {
         let f1 = [("loss", 2.5f64), ("lr", 3e-4f64)];
         sink.emit(&MetricSample {
             step: 1,
+            phase: "train",
             fields: &f1,
         });
         let f2 = [("loss", 1.25f64), ("grad_norm", 0.875f64)];
         sink.emit(&MetricSample {
             step: 2,
+            phase: "train",
             fields: &f2,
         });
         let f3 = [("tokens_per_s", 1234.5f64)];
         sink.emit(&MetricSample {
             step: 3,
+            phase: "train",
             fields: &f3,
         });
         // drop flushes
@@ -58,6 +63,8 @@ fn jsonl_sink_roundtrip_three_samples() {
 
     let v1: serde_json::Value = serde_json::from_str(&lines[0]).expect("line 1 parses");
     assert_eq!(v1["step"], serde_json::json!(1));
+    assert_eq!(v1["kind"], serde_json::json!("metric"));
+    assert_eq!(v1["phase"], serde_json::json!("train"));
     assert_eq!(v1["loss"].as_f64().unwrap(), 2.5);
     assert_eq!(v1["lr"].as_f64().unwrap(), 3e-4);
 
@@ -84,6 +91,7 @@ fn multi_sink_fans_out_to_two_files() {
         let fields = [("loss", 0.5f64)];
         multi.emit(&MetricSample {
             step: 7,
+            phase: "train",
             fields: &fields,
         });
         multi.flush();
@@ -109,6 +117,7 @@ fn open_sink_none_no_stdout_returns_null_like() {
     // Just assert no panic.
     sink.emit(&MetricSample {
         step: 0,
+        phase: "train",
         fields: &fields,
     });
     sink.flush();
@@ -124,6 +133,7 @@ fn open_sink_jsonl_plus_stdout_emits_without_panic() {
         let fields = [("loss", 0.25f64), ("lr", 1e-3f64), ("step_ms", 12.345f64)];
         sink.emit(&MetricSample {
             step: 42,
+            phase: "train",
             fields: &fields,
         });
         sink.flush();
@@ -161,11 +171,13 @@ fn jsonl_line_is_parseable_by_serde_json() {
         let f1 = [("loss", 2.5f64), ("lr", 3e-4f64)];
         sink.emit(&MetricSample {
             step: 1,
+            phase: "train",
             fields: &f1,
         });
         let f2 = [("loss", -0.125f64), ("grad_norm", 1.5e-12f64)];
         sink.emit(&MetricSample {
             step: 2,
+            phase: "train",
             fields: &f2,
         });
         // NaN + Inf serialise as JSON null per M-4/M-5; the line must still
@@ -178,6 +190,7 @@ fn jsonl_line_is_parseable_by_serde_json() {
         ];
         sink.emit(&MetricSample {
             step: 3,
+            phase: "train",
             fields: &f3,
         });
         sink.flush();
@@ -224,11 +237,13 @@ fn jsonl_sink_open_append_extends_existing_file() {
         let f1 = [("loss", 1.0f64)];
         sink.emit(&MetricSample {
             step: 1,
+            phase: "train",
             fields: &f1,
         });
         let f2 = [("loss", 0.5f64)];
         sink.emit(&MetricSample {
             step: 2,
+            phase: "train",
             fields: &f2,
         });
     }
@@ -239,6 +254,7 @@ fn jsonl_sink_open_append_extends_existing_file() {
         let f3 = [("reward", 0.125f64)];
         sink.emit(&MetricSample {
             step: 3,
+            phase: "grpo",
             fields: &f3,
         });
     }
@@ -275,6 +291,7 @@ fn open_sink_append_factory_extends_and_creates() {
         let f = [("loss", 0.75f64)];
         sink.emit(&MetricSample {
             step: 10,
+            phase: "train",
             fields: &f,
         });
     }
@@ -286,6 +303,7 @@ fn open_sink_append_factory_extends_and_creates() {
         let f = [("loss", 0.25f64)];
         sink.emit(&MetricSample {
             step: 11,
+            phase: "train",
             fields: &f,
         });
     }
@@ -295,4 +313,109 @@ fn open_sink_append_factory_extends_and_creates() {
     let v11: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
     assert_eq!(v10["step"], serde_json::json!(10));
     assert_eq!(v11["step"], serde_json::json!(11));
+}
+
+#[test]
+fn jsonl_sink_serializes_lifecycle_events() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("events.jsonl");
+
+    {
+        let mut sink = JsonlSink::create(&path).expect("create jsonl");
+        let strings = [
+            ("run_id", "run-123"),
+            ("job", "train_sft"),
+            ("artifact_model", "model.safetensors"),
+        ];
+        let scalars = [("total_steps", 5.0), ("best_reward", f64::NAN)];
+        let bools = [("resumed", true)];
+        sink.event(&TrainEvent {
+            kind: "run_start",
+            step: Some(3),
+            strings: &strings,
+            scalars: &scalars,
+            bools: &bools,
+        });
+        sink.flush();
+    }
+
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse event");
+    assert_eq!(value["kind"], serde_json::json!("run_start"));
+    assert_eq!(value["step"], serde_json::json!(3));
+    assert_eq!(value["run_id"], serde_json::json!("run-123"));
+    assert_eq!(value["job"], serde_json::json!("train_sft"));
+    assert_eq!(
+        value["artifact_model"],
+        serde_json::json!("model.safetensors")
+    );
+    assert_eq!(value["total_steps"].as_f64().unwrap(), 5.0);
+    assert!(
+        value["best_reward"].is_null(),
+        "NaN should serialize as null"
+    );
+    assert_eq!(value["resumed"], serde_json::json!(true));
+}
+
+#[test]
+fn shared_sink_flushes_metrics_and_events() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("shared.jsonl");
+
+    let sink = open_shared_sink(Some(&path), false).expect("open shared sink");
+    let fields = [("loss", 0.125f64)];
+    sink.emit_metric(&MetricSample {
+        step: 1,
+        phase: "train",
+        fields: &fields,
+    });
+    sink.emit_event(&TrainEvent {
+        kind: "run_end",
+        step: Some(1),
+        strings: &[("status", "completed")],
+        scalars: &[],
+        bools: &[],
+    });
+    sink.flush_blocking();
+
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 2, "shared sink flush should drain worker");
+    let metric: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse metric");
+    let event: serde_json::Value = serde_json::from_str(&lines[1]).expect("parse event");
+    assert_eq!(metric["kind"], serde_json::json!("metric"));
+    assert_eq!(metric["phase"], serde_json::json!("train"));
+    assert_eq!(event["kind"], serde_json::json!("run_end"));
+    assert_eq!(event["status"], serde_json::json!("completed"));
+}
+
+#[test]
+fn open_shared_sink_append_extends_existing_file() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("shared_append.jsonl");
+
+    let sink = open_shared_sink(Some(&path), false).expect("create shared sink");
+    sink.emit_metric(&MetricSample {
+        step: 1,
+        phase: "train",
+        fields: &[("loss", 1.0)],
+    });
+    sink.flush_blocking();
+    drop(sink);
+
+    let sink = open_shared_sink_append(Some(&path), false).expect("append shared sink");
+    sink.emit_metric(&MetricSample {
+        step: 2,
+        phase: "grpo",
+        fields: &[("mean_reward", 0.5)],
+    });
+    sink.flush_blocking();
+
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse first");
+    let second: serde_json::Value = serde_json::from_str(&lines[1]).expect("parse second");
+    assert_eq!(first["step"], serde_json::json!(1));
+    assert_eq!(second["step"], serde_json::json!(2));
+    assert_eq!(second["phase"], serde_json::json!("grpo"));
 }

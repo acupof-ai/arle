@@ -393,8 +393,14 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         args.min_lr,
     )
     .map_err(|e| CliError::Custom(format!("bad --lr-schedule: {e}")))?;
-    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
+    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let run_id = train::metrics::default_run_id("train_sft");
+    let backend_name = match args.backend {
+        BackendChoice::Cpu => "cpu",
+        BackendChoice::Metal => "metal",
+        BackendChoice::Cuda => "cuda",
+    };
 
     // DX-1 follow-up (codex review 2026-04-20 on 8bde810, High): canonicalize
     // --resume-from once, up-front, so every subsequent read (weights, config,
@@ -412,6 +418,35 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         })?),
         None => None,
     };
+    let model_path_string = args.model.display().to_string();
+    let out_path_string = args.out.display().to_string();
+    let resume_dir_string = resume_dir_canonical
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut run_start_strings = vec![
+        ("run_id", run_id.as_str()),
+        ("job", "train_sft"),
+        ("model_family", F::family_name()),
+        ("backend", backend_name),
+        ("model", model_path_string.as_str()),
+        ("out", out_path_string.as_str()),
+    ];
+    if let Some(path) = resume_dir_string.as_deref() {
+        run_start_strings.push(("resume_from", path));
+    }
+    let run_start_scalars = [
+        ("total_steps", args.steps as f64),
+        ("grad_accum_steps", grad_accum as f64),
+        ("seq_len", args.seq_len as f64),
+    ];
+    let run_start_bools = [("resumed", resume_dir_canonical.is_some())];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_start",
+        step: Some(0),
+        strings: &run_start_strings,
+        scalars: &run_start_scalars,
+        bools: &run_start_bools,
+    });
 
     // Enable the Trainer's built-in save path so every checkpoint round
     // gets `trainer_state.json + optimizer.safetensors` written next to the
@@ -429,7 +464,13 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         resume_from: resume_dir_canonical.clone(),
         rng_seed: args.seed,
     };
-    let mut trainer = Trainer::new(optim, NoClip, schedule, metrics, trainer_cfg);
+    let mut trainer = Trainer::new(
+        optim,
+        NoClip,
+        schedule,
+        Box::new(metrics.clone()),
+        trainer_cfg,
+    );
 
     // Resume if `--resume-from` was passed.
     //
@@ -520,6 +561,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let cfg_path = config_path;
     let tok_path = tokenizer_path.clone();
     let model_save_ref = &model;
+    let metrics_for_hooks = metrics.clone();
     let on_step_end = |step: u64, store: &mut TensorStore| -> autograd::Result<()> {
         let step_usize = step as usize;
         // Gate matches the Trainer's save_every + force-final behavior so the
@@ -539,6 +581,24 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
                 lora,
             )
             .map_err(autograd_from_cli)?;
+            let checkpoint_dir = out_path.join(format!("step_{step:06}"));
+            let checkpoint_dir_string = checkpoint_dir.display().to_string();
+            let strings = [
+                ("path", checkpoint_dir_string.as_str()),
+                ("artifact_model", "model.safetensors"),
+                ("artifact_adapter", "adapter_model.safetensors"),
+                ("artifact_adapter_config", "adapter_config.json"),
+                ("artifact_config", "config.json"),
+                ("artifact_generation_config", "generation_config.json"),
+                ("artifact_tokenizer", "tokenizer.json"),
+            ];
+            metrics_for_hooks.emit_event(&train::metrics::TrainEvent {
+                kind: "checkpoint",
+                step: Some(step),
+                strings: &strings,
+                scalars: &[],
+                bools: &[],
+            });
         }
         Ok(())
     };
@@ -554,6 +614,17 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
             on_step_end,
         )
         .map_err(CliError::Autograd)?;
+
+    let run_end_scalars = [("completed_steps", trainer.step() as f64)];
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_end",
+        step: Some(trainer.step()),
+        strings: &run_end_strings,
+        scalars: &run_end_scalars,
+        bools: &[],
+    });
+    metrics.flush_blocking();
 
     Ok(())
 }

@@ -613,11 +613,44 @@ fn run_with_family<F: PretrainFamily>(
         }
         None => PretrainClip::None(NoClip),
     };
-    let schedule = ConstantLr(args.lr);
-    let metrics = train::metrics::open_sink(args.metrics_jsonl.as_deref(), true)
-        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
-
     let total_steps = start_step as u64 + args.steps as u64;
+    let schedule = ConstantLr(args.lr);
+    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let run_id = train::metrics::default_run_id("pretrain");
+    let backend_name = match args.backend {
+        BackendChoice::Cpu => "cpu",
+        BackendChoice::Metal => "metal",
+        BackendChoice::Cuda => "cuda",
+    };
+    let out_dir_string = args.out.display().to_string();
+    let resume_dir_string = resume_dir_canonical
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut run_start_strings = vec![
+        ("run_id", run_id.as_str()),
+        ("job", "pretrain"),
+        ("model_family", F::family_name()),
+        ("backend", backend_name),
+        ("out", out_dir_string.as_str()),
+    ];
+    if let Some(path) = resume_dir_string.as_deref() {
+        run_start_strings.push(("resume_from", path));
+    }
+    let run_start_scalars = [
+        ("total_steps", total_steps as f64),
+        ("grad_accum_steps", args.batch.max(1) as f64),
+        ("seq", args.seq as f64),
+    ];
+    let run_start_bools = [("resumed", resume_dir_canonical.is_some())];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_start",
+        step: Some(start_step as u64),
+        strings: &run_start_strings,
+        scalars: &run_start_scalars,
+        bools: &run_start_bools,
+    });
+
     let trainer_cfg = TrainerConfig {
         total_steps,
         grad_accum_steps: args.batch.max(1) as u64,
@@ -632,7 +665,13 @@ fn run_with_family<F: PretrainFamily>(
         resume_from: resume_dir_canonical.clone(),
         rng_seed: args.seed,
     };
-    let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
+    let mut trainer = Trainer::new(
+        optim,
+        clip,
+        schedule,
+        Box::new(metrics.clone()),
+        trainer_cfg,
+    );
 
     if let Some(resume_dir) = &resume_dir_canonical {
         let resumed = trainer
@@ -722,6 +761,7 @@ fn run_with_family<F: PretrainFamily>(
     let bos_token_id = args.bos_token_id;
     let eos_token_id = args.eos_token_id;
     let cfg_ref = cfg.clone();
+    let metrics_for_hooks = metrics.clone();
     let on_step_end = |trainer_step: u64, store: &mut TensorStore| -> AutogradResult<()> {
         let is_final = trainer_step == total_steps;
         if trainer_step.is_multiple_of(args.save_every as u64) || is_final {
@@ -737,6 +777,22 @@ fn run_with_family<F: PretrainFamily>(
                 save_dtype,
             )
             .map_err(|err| cli_error_to_autograd(err, family, "save_checkpoint"))?;
+            let checkpoint_dir = out_dir.join(format!("step_{trainer_step:06}"));
+            let checkpoint_dir_string = checkpoint_dir.display().to_string();
+            let strings = [
+                ("path", checkpoint_dir_string.as_str()),
+                ("artifact_model", "model.safetensors"),
+                ("artifact_config", "config.json"),
+                ("artifact_generation_config", "generation_config.json"),
+                ("artifact_tokenizer", "tokenizer.json"),
+            ];
+            metrics_for_hooks.emit_event(&train::metrics::TrainEvent {
+                kind: "checkpoint",
+                step: Some(trainer_step),
+                strings: &strings,
+                scalars: &[],
+                bools: &[],
+            });
         }
         Ok(())
     };
@@ -764,6 +820,17 @@ fn run_with_family<F: PretrainFamily>(
             on_step_end,
         )?;
     }
+
+    let run_end_scalars = [("completed_steps", trainer.step() as f64)];
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+    metrics.emit_event(&train::metrics::TrainEvent {
+        kind: "run_end",
+        step: Some(trainer.step()),
+        strings: &run_end_strings,
+        scalars: &run_end_scalars,
+        bools: &[],
+    });
+    metrics.flush_blocking();
 
     Ok(())
 }
