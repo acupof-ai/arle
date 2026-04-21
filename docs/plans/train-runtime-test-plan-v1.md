@@ -4,7 +4,7 @@ Companion to [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.
 Written 2026-04-20. Scope: the training runtime primitives that land in Phase 1
 (lr_schedule, grad_accum, adamw_state, metrics, grad_clip, checkpoint v2) plus
 the Phase 2 `Trainer<O, C, S>` loop and its integration with the current
-train binaries (`train_sft`, `pretrain_qwen3`, `train_grpo`,
+train binaries (`train_sft`, `pretrain`, `train_grpo`,
 `train_multi_turn`, `eval_lm`) plus legacy compatibility surfaces that
 are being retired.
 
@@ -249,10 +249,10 @@ don't (because every other test uses synthetic loss).
 ### 3.11 Existing binary regressions
 
 The runtime migration has already landed on the main `Trainer<O, C, S>`
-path. The current training binaries (`pretrain_qwen3`, `train_grpo`,
+path. The current training binaries (`pretrain`, `train_grpo`,
 `train_multi_turn`) still compile against the legacy `trainer::*`
-re-exports as compatibility aliases; `pretrain_qwen3` is now a generic
-Qwen-family entrypoint rather than a Qwen3-only path. This section now
+re-exports as compatibility aliases; `pretrain_qwen3` now survives only
+as a compatibility bin alias for the generic `pretrain` entrypoint. This section now
 only guards that surface until the aliases are retired. Regression guard: a `#[test]` in
 `crates/train/tests/test_legacy_imports.rs` that imports each legacy
 symbol by path:

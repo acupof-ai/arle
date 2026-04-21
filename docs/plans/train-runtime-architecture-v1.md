@@ -6,12 +6,12 @@
 > **Current reality note**
 > This runtime layer is model-family agnostic. The current train-side
 > implementation already includes a generic Qwen-family control plane with
-> Qwen3.5 as the optimized default. `pretrain_qwen3` now dispatches across
+> Qwen3.5 as the optimized default. `pretrain` now dispatches across
 > Qwen3 / Qwen3.5 families and resumes both weights and optimizer state,
 > `train_sft` and `train_grpo` dispatch across Qwen3 / Qwen3.5 families,
-> `train_multi_turn` exposes an explicit stepwise-GRPO vs sequence-level-GSPO
-> objective switch and now round-trips exact resume state (merged inference
-> weights + unmerged train weights + adapter weights + trainer state),
+> `train_grpo` and `train_multi_turn` now round-trip exact resume state on
+> the active RL path, `train_multi_turn` exposes an explicit stepwise-GRPO vs
+> sequence-level-GSPO objective switch,
 > checkpoints are written as HF-style directories, and the hybrid linear-attn
 > train path has not landed yet. The target train-side
 > model line is the Qwen3.5 architecture family.
@@ -20,7 +20,7 @@
 
 ## 1. Problem
 
-The active training binaries (`pretrain_qwen3`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. The handwritten Transformer runtime has already been removed from the active train crate, and the current remaining pain is mostly about duplicated family dispatch / checkpoint wiring around the shared loop. Short-term pain shows up as:
+The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. The handwritten Transformer runtime has already been removed from the active train crate, and the current remaining pain is mostly about duplicated family dispatch / checkpoint wiring around the shared loop. Short-term pain shows up as:
 
 - **AdamW is a concrete type, not a trait** — adding Lion/Muon/SGD means forking every binary.
 - **No LR schedule** — all binaries still run constant LR by default; schedule diversity beyond the shared trainer surface is still thin.
@@ -45,7 +45,7 @@ Without a shared runtime, every backend × feature combination becomes 5 binary 
 
 ```
                      ┌──────────────────────────────────────────────┐
- Binaries            │ pretrain_qwen3 (Qwen-family) · train_sft ·   │
+ Binaries            │ pretrain (Qwen-family) · train_sft ·         │
                      │ train_grpo · train_multi_turn                │
  (thin composers)    │                                              │
                      └──────────────────────────────────────────────┘
@@ -274,8 +274,8 @@ step_000123/
 ### Phase 3 — Migrate remaining 4 binaries
 
 - ✅ **Legacy `pretrain` compatibility path retired from the active entrypoint set** (commit 6bd0211 + fix ef24ca6 for `--grad-clip 0` panic). The active train line is the dense/full-attn Qwen3.5-family path.
-- ✅ **`pretrain_qwen3.rs` migrated onto the generic Qwen-family runtime** (commit bd5e277, followed by the 2026-04-20 family/resume tightening). Binary uses `Trainer<AdamW, PretrainClip, ConstantLr>` + `run_with_eval_and_hooks`, dispatches across Qwen3 / Qwen3.5 with Qwen3.5 as the default, writes HF-style `step_{:06}` dirs via the family checkpoint helpers, and now wires `save_every` / `save_dir` / `resume_from` into the trainer so `trainer_state.json + optimizer.safetensors` round-trip alongside model weights. Weight load still happens before `resume_if_configured`, but optimizer moments and step index now restore from the same checkpoint dir instead of resetting on resume. `--grad-clip 0/NaN/inf` still warns + falls through to NoClip. New `--model-family` + `--metrics-jsonl` flags.
-- ✅ **`train_grpo.rs` SFT phase migrated** (commit 09c5c89 + fix 1a24db1). SFT warm-up runs through `Trainer<AdamW, GrpoClip, ConstantLr>` (local enum wrapping `NoClip`/`GlobalNorm` like `PretrainClip`). GRPO phase stays hand-written — rollout_group + ref_model + mid-step `mean_sampled_kl` do not fit the single `step_fn` shape cleanly. AdamW state flows across the SFT→GRPO boundary via `run_sft_phase → AdamWState → import_state` using the existing `Trainer::optim()` + `Optimizer::export_state`/`import_state` (no new public Trainer API needed, contra the original commit body). `CliError` now flows through an `ExitCode` wrapper that prints via `Display` instead of the default Debug format. New `--grad-clip`, `--no-grad-clip`, `--metrics-jsonl` flags; `GRAD_CLIP_NORM = 1.0` constant deleted. Follow-up — ✅ extend `--metrics-jsonl` to cover the GRPO phase (landed 60f7183 + tests 2dd8607): added `JsonlSink::open_append` / `open_sink_append` factory so the GRPO loop extends the JSONL `run_sft_phase` already wrote, with step chained as `sft_steps + iter + 1`. Remaining follow-up: migrate the GRPO phase itself once a GrpoTrainer/closure shape emerges from prototyping.
+- ✅ **`pretrain` migrated onto the generic Qwen-family runtime** (source file `pretrain_qwen3.rs`; commit bd5e277, followed by the 2026-04-20 family/resume tightening). Binary uses `Trainer<AdamW, PretrainClip, ConstantLr>` + `run_with_eval_and_hooks`, dispatches across Qwen3 / Qwen3.5 with Qwen3.5 as the default, writes HF-style `step_{:06}` dirs via the family checkpoint helpers, and now wires `save_every` / `save_dir` / `resume_from` into the trainer so `trainer_state.json + optimizer.safetensors` round-trip alongside model weights. Weight load still happens before `resume_if_configured`, but optimizer moments and step index now restore from the same checkpoint dir instead of resetting on resume. `--grad-clip 0/NaN/inf` still warns + falls through to NoClip. New `--model-family` + `--metrics-jsonl` flags.
+- ✅ **`train_grpo.rs` SFT phase migrated** (commit 09c5c89 + fix 1a24db1, followed by the 2026-04-21 exact-resume follow-up). SFT warm-up runs through `Trainer<AdamW, GrpoClip, ConstantLr>` (local enum wrapping `NoClip`/`GlobalNorm` like `PretrainClip`). GRPO phase stays hand-written — rollout_group + ref_model + mid-step `mean_sampled_kl` do not fit the single `step_fn` shape cleanly. AdamW state flows across the SFT→GRPO boundary via `run_sft_phase → AdamWState → import_state` using the existing `Trainer::optim()` + `Optimizer::export_state`/`import_state` (no new public Trainer API needed, contra the original commit body). The RL path now also saves and resumes exact state: merged inference weights, current train weights, frozen reference-model weights, adapter snapshots, and trainer state. `CliError` now flows through an `ExitCode` wrapper that prints via `Display` instead of the default Debug format. New `--grad-clip`, `--no-grad-clip`, `--metrics-jsonl`, `--save-path`, `--save-every`, and `--resume-from` flags; `GRAD_CLIP_NORM = 1.0` constant deleted. Follow-up — ✅ extend `--metrics-jsonl` to cover the GRPO phase (landed 60f7183 + tests 2dd8607): added `JsonlSink::open_append` / `open_sink_append` factory so the GRPO loop extends the JSONL `run_sft_phase` already wrote, with step chained as `sft_steps + iter + 1`. Remaining follow-up: migrate the GRPO phase itself once a GrpoTrainer/closure shape emerges from prototyping.
 - ✅ **`train_multi_turn.rs` now runs on the dense/full-attn Qwen3.5-family path** while keeping its GRPO rollout loop hand-written. It builds a `Qwen35Model`, saves HF-style step directories through the shared checkpoint helpers, writes merged inference weights plus exact-resume train artifacts (`train_model.safetensors`, `adapter_model.safetensors`, `trainer_state.json`, `optimizer.safetensors`), and supports `--resume-from` with deterministic seed-per-iter replay. It no longer depends on the handwritten Transformer runtime. It still does not fit `Trainer<O, C, S>`'s single-step closure shape cleanly, so the RL loop remains hand-written pending an RL-shaped trainer variant.
 - Each binary lands as its own commit with a bench entry.
 - Retire duplicated CLI arg handling; extend `cli_args.rs` with shared `trainer_args()` helper.
@@ -298,12 +298,12 @@ step_000123/
 ## 9. Success criteria
 
 - **Phase 2 done when**: `train_sft --lr-schedule cosine-with-warmup --warmup-steps 100 --grad-accum-steps 4 --metrics-jsonl out.jsonl --resume-from step_50/` runs to completion, resumes correctly, writes JSONL, matches pre-refactor loss curve within bench noise.
-- **Phase 3 done when**: all active train entrypoints (`pretrain_qwen3`, `train_sft`, `train_grpo`, `train_multi_turn`) run on the shared runtime surfaces, no dead legacy runtime code remains in `crates/train`, and every entrypoint is smoke-tested. This is now true for the dense/full-attn Qwen-family line; the remaining gap is hybrid Qwen3.5 training, not trainer/runtime plumbing.
+- **Phase 3 done when**: all active train entrypoints (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) run on the shared runtime surfaces, no dead legacy runtime code remains in `crates/train`, and every entrypoint is smoke-tested. This is now true for the dense/full-attn Qwen-family line; the remaining gap is hybrid Qwen3.5 training, not trainer/runtime plumbing.
 - **CUDA readiness done when**: `Backend::optim_adamw_step` trait method added with CPU default, `CudaBackend` overrides it, `train_sft --backend cuda` runs with ≥2× PCIe-bw reduction vs. host-authoritative step. (Gated — lands when CUDA weights bench drives the ask.)
 
 ## 10. Open questions (ckl decides)
 
-1. **Checkpoint layout**: directory (HF-style) is the current standard and is already used by the active train-side path (`train_sft` / `train_multi_turn`). Keep this as the canonical layout.
+1. **Checkpoint layout**: directory (HF-style) is the current standard and is already used by the active train-side path (`train_sft` / `train_grpo` / `train_multi_turn`). Keep this as the canonical layout.
 2. **Trainer vs RLTrainer?** Proposed: **one Trainer for supervised paths, with an RL-shaped variant only if rollout loops keep resisting the current closure model**. `train_grpo` and `train_multi_turn` are the decision point.
 3. **Optimizer trait location: `autograd` or new `crates/train-runtime/`?** Proposed: **keep in `autograd`** alongside existing `AdamW`. Extracting a new crate is speculative until ≥2 optimizers exist.
 4. **When to delete generic-but-unused abstractions?** Proposed: keep only abstractions with a current caller or an immediate integration plan; otherwise remove them rather than preserving dead code.

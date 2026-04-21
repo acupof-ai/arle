@@ -19,7 +19,7 @@ the checkpoint / eval / serve tooling around that reality.
 | Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from `train_multi_turn --serve` output or `infer --model-path <out>/latest` without guessing the step number. |
 | Is there a standalone eval binary? | ✅ `eval_lm` landed — it evaluates Qwen3/Qwen3.5 checkpoint dirs directly on tokenized or chat JSONL. |
 | Do train binaries have `--help`? | ❌ NO — all hand-roll arg parsing. |
-| Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len`, `--model` vs `--model-path`, `--resume` vs `--resume-from`. |
+| Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len` and `--model` vs `--model-path` still diverge, though the generic pretrain entrypoint now accepts canonical `--resume-from` (with `--resume` kept only as a compatibility alias). |
 | Does `infer` fail early on a malformed `config.json`? | ❌ NO — `is_model_dir` only checks file existence; field schema validated late. |
 
 ## Phases
@@ -38,7 +38,7 @@ this plan is DX-2 / DX-3 follow-through, not the `latest` marker flow.
 
 **Work:**
 1. Every trainer save_checkpoint hook (and the pretrain
-   Qwen-family save path in `pretrain_qwen3`) writes a `latest` symlink in the
+   Qwen-family save path in `pretrain`) writes a `latest` symlink in the
    parent dir pointing at the just-written `step_N` dir. Atomic via
    `symlink_metadata()` unlink + `symlink()` (or `LATEST` text file
    containing the step dir name if the filesystem refuses symlinks).
@@ -81,7 +81,7 @@ reports token-mean loss + perplexity as JSON.
    checkpoint dirs, accepts tokenized JSONL or chat JSONL, and emits
    `loss`, `ppl`, and `tokens` as JSON.
 3. The helper is wired as a standalone surface rather than staying
-   embedded inside `pretrain_qwen3.rs`.
+   embedded inside the generic `pretrain` entrypoint.
 
 **Acceptance tests:** smoke coverage now pins both Qwen3 and Qwen3.5
 checkpoint-dir loads through `eval_lm`, plus the shared helper path for
@@ -151,7 +151,7 @@ switch loses prior conversation context (`chat_history` and
   `train_multi_turn` have hand-written save paths (if any) — need
   to audit per Explore punch-list P2.
 - Phase DX-2's helper extraction must not regress
-  `pretrain_qwen3`'s inline eval (same tokens, same loss).
+  `pretrain`'s inline eval (same tokens, same loss).
 - Phase DX-3 backward-compat: existing `scripts/` and any user
   muscle-memory break on rename; deprecated aliases buy a release.
 
