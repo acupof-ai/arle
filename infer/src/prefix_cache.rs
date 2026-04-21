@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::kv_tier::{
     BlockLocation, HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StagePlanner,
-    StageRequest,
+    StageRequest, Tier,
 };
 use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
@@ -69,6 +69,18 @@ pub struct BlockMetadataUpdate {
     pub byte_len: Option<u32>,
     pub session_id: Option<Option<SessionId>>,
     pub soft_pin_until: Option<Option<u64>>,
+}
+
+/// Read-only snapshot of one cached block's current metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMetadata {
+    pub location: Option<BlockLocation>,
+    pub byte_len: u32,
+    pub session_id: Option<SessionId>,
+    pub fingerprint: Option<BlockFingerprint>,
+    pub soft_pin_until: Option<u64>,
+    pub hit_count: u32,
+    pub ref_count: u32,
 }
 
 /// Summary of a fingerprint reconciliation pass after deserializing a snapshot.
@@ -428,6 +440,8 @@ impl RadixCache {
                             block_id,
                             from,
                             byte_len,
+                            host_pool: None,
+                            host_region: None,
                         }),
                     ),
                     Some(BlockLocation::Disk { .. } | BlockLocation::Remote { .. }) => (
@@ -436,6 +450,8 @@ impl RadixCache {
                             block_id,
                             from,
                             byte_len,
+                            host_pool: None,
+                            host_region: None,
                         }),
                     ),
                     Some(BlockLocation::Gpu { .. }) | None => (HitKind::ReadyOnGpu, None),
@@ -909,6 +925,67 @@ impl RadixCache {
         freed
     }
 
+    /// Select up to `n` evictable blocks using the provided policy without
+    /// mutating the radix tree.
+    ///
+    /// This is the scheduler's demote/spill picker: it wants the same scoring
+    /// as eviction, but it needs to move blocks across tiers without deleting
+    /// their index entries.
+    pub fn select_blocks_with_policy(
+        &self,
+        policy: &dyn EvictionPolicy,
+        signals: SchedulerSignals,
+        n: usize,
+        tier_filter: Option<Tier>,
+    ) -> Vec<BlockId> {
+        if n == 0 {
+            return vec![];
+        }
+
+        let now = self.clock;
+        let mut candidates = Vec::new();
+        for node in &self.nodes[1..] {
+            let Some(block_id) = node.block_id else {
+                continue;
+            };
+            if node.ref_count != 0 {
+                continue;
+            }
+            if node.soft_pin_until.is_some_and(|deadline| deadline > now) {
+                continue;
+            }
+            if let Some(tier) = tier_filter
+                && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
+            {
+                continue;
+            }
+
+            let slot = match node.tier_location {
+                Some(BlockLocation::Gpu { slot }) => slot,
+                _ => 0,
+            };
+            let candidate = EvictionCandidate {
+                slot,
+                tokens: self.block_size as u32,
+                last_access_step: node.last_access,
+                hit_count: node.hit_count,
+                prefix_depth: node.tokens.len() as u32,
+                pinned: false,
+            };
+            let score = policy.score(candidate, signals);
+            if score.is_finite() {
+                candidates.push((score, block_id));
+            }
+        }
+
+        candidates.sort_by(|(a_score, a_bid), (b_score, b_bid)| {
+            b_score
+                .total_cmp(a_score)
+                .then_with(|| a_bid.0.cmp(&b_bid.0))
+        });
+        candidates.into_iter().take(n).map(|(_, bid)| bid).collect()
+    }
+
     /// Reclaim orphaned tombstones after eviction.
     ///
     /// A node is reclaimable when it is:
@@ -1009,6 +1086,21 @@ impl RadixCache {
                 node.tier_location = Some(location);
             })
             .is_some()
+    }
+
+    /// Read back the current metadata snapshot for a cached block.
+    pub fn block_metadata(&self, block: BlockId) -> Option<BlockMetadata> {
+        let idx = *self.block_index.get(&block)?;
+        let node = self.nodes.get(idx)?;
+        Some(BlockMetadata {
+            location: node.tier_location.clone(),
+            byte_len: node.byte_len,
+            session_id: node.session_id.clone(),
+            fingerprint: node.fingerprint,
+            soft_pin_until: node.soft_pin_until,
+            hit_count: node.hit_count,
+            ref_count: node.ref_count,
+        })
     }
 
     /// Stamp the byte length metadata for a cached block.
@@ -2088,6 +2180,8 @@ mod tests {
                 block_id: BlockId(10),
                 from: BlockLocation::HostPinned { offset: 4096 },
                 byte_len: 8192,
+                host_pool: None,
+                host_region: None,
             }]
         );
     }
@@ -2100,8 +2194,8 @@ mod tests {
         assert!(cache.set_block_location(
             BlockId(10),
             BlockLocation::Disk {
-                file_id: 1,
-                offset: 0,
+                fingerprint: BlockFingerprint([0x11; 16]),
+                payload_len: 2 * 1024 * 1024,
             }
         ));
         assert!(cache.set_block_byte_len(BlockId(10), 2 * 1024 * 1024));
@@ -2141,8 +2235,8 @@ mod tests {
             .unwrap();
         cache.nodes[idx].block_id = None;
         cache.nodes[idx].tier_location = Some(BlockLocation::Disk {
-            file_id: 9,
-            offset: 0,
+            fingerprint: BlockFingerprint([0x22; 16]),
+            payload_len: 4096,
         });
         cache.nodes[idx].byte_len = 4096;
 
@@ -2173,8 +2267,8 @@ mod tests {
             .unwrap();
         cache.nodes[idx].block_id = None;
         cache.nodes[idx].tier_location = Some(BlockLocation::Disk {
-            file_id: 9,
-            offset: 0,
+            fingerprint: BlockFingerprint([0x33; 16]),
+            payload_len: 4096,
         });
         cache.nodes[idx].byte_len = 4096;
 

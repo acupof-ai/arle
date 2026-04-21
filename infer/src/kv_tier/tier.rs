@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::BlockFingerprint;
+
 /// Storage medium for a KV block. Ordering (`Gpu < HostPinned < Disk <
 /// Remote`) reflects the distance from compute — nearer first.
 ///
@@ -29,10 +31,13 @@ pub enum BlockLocation {
     Gpu { slot: u32 },
     /// Byte offset within the pinned host pool.
     HostPinned { offset: u64 },
-    /// `(file_id, offset)` pair within the disk store. The `file_id` is a
-    /// logical handle assigned by the disk transport; the disk store maps
-    /// ids to actual filenames.
-    Disk { file_id: u32, offset: u64 },
+    /// Canonical content-addressed disk location. `fingerprint` is the
+    /// semantic block identity; the disk store derives the concrete path from
+    /// it and validates `payload_len` on load.
+    Disk {
+        fingerprint: BlockFingerprint,
+        payload_len: u64,
+    },
     /// Remote block, opaque per-transport payload.
     Remote { desc: RemoteBlockDesc },
 }
@@ -111,8 +116,8 @@ mod tests {
         let g = BlockLocation::Gpu { slot: 3 };
         let h = BlockLocation::HostPinned { offset: 4096 };
         let d = BlockLocation::Disk {
-            file_id: 1,
-            offset: 0,
+            fingerprint: BlockFingerprint([0x11; 16]),
+            payload_len: 8192,
         };
         let r = BlockLocation::Remote {
             desc: RemoteBlockDesc {

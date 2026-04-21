@@ -20,139 +20,6 @@ use super::tier::BlockLocation;
 use super::transport::disk::DiskStore;
 use super::{StagePlanner, StageRequest, StageTicket};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageLifecycleState {
-    Free,
-    Resident,
-    Demoting {
-        ticket: StageTicket,
-        target: BlockLocation,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PageLifecycleError {
-    UnknownPage {
-        page: usize,
-    },
-    InvalidTransition {
-        page: usize,
-        from: PageLifecycleState,
-        to: PageLifecycleState,
-    },
-}
-
-impl std::fmt::Display for PageLifecycleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PageLifecycleError::UnknownPage { page } => {
-                write!(f, "unknown page {page}")
-            }
-            PageLifecycleError::InvalidTransition { page, from, to } => {
-                write!(f, "invalid page transition on {page}: {from:?} -> {to:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PageLifecycleError {}
-
-#[derive(Debug, Clone)]
-pub struct PageLifecycle {
-    states: Vec<PageLifecycleState>,
-}
-
-impl PageLifecycle {
-    pub fn new(page_count: usize) -> Self {
-        Self {
-            states: vec![PageLifecycleState::Free; page_count],
-        }
-    }
-
-    pub fn state(&self, page: usize) -> Option<PageLifecycleState> {
-        self.states.get(page).cloned()
-    }
-
-    pub fn mark_resident(&mut self, page: usize) -> Result<(), PageLifecycleError> {
-        match self
-            .states
-            .get_mut(page)
-            .ok_or(PageLifecycleError::UnknownPage { page })?
-        {
-            state @ PageLifecycleState::Free => {
-                *state = PageLifecycleState::Resident;
-                Ok(())
-            }
-            state @ PageLifecycleState::Demoting { .. } => {
-                *state = PageLifecycleState::Resident;
-                Ok(())
-            }
-            current @ PageLifecycleState::Resident => Err(PageLifecycleError::InvalidTransition {
-                page,
-                from: current.clone(),
-                to: PageLifecycleState::Resident,
-            }),
-        }
-    }
-
-    pub fn begin_demote(
-        &mut self,
-        page: usize,
-        ticket: StageTicket,
-        target: BlockLocation,
-    ) -> Result<(), PageLifecycleError> {
-        let next = PageLifecycleState::Demoting { ticket, target };
-        match self
-            .states
-            .get_mut(page)
-            .ok_or(PageLifecycleError::UnknownPage { page })?
-        {
-            state @ PageLifecycleState::Resident => {
-                *state = next;
-                Ok(())
-            }
-            current => Err(PageLifecycleError::InvalidTransition {
-                page,
-                from: current.clone(),
-                to: next,
-            }),
-        }
-    }
-
-    pub fn finish_demote(
-        &mut self,
-        page: usize,
-        ticket: StageTicket,
-    ) -> Result<(), PageLifecycleError> {
-        let next = PageLifecycleState::Free;
-        let state = self
-            .states
-            .get_mut(page)
-            .ok_or(PageLifecycleError::UnknownPage { page })?;
-        match state {
-            PageLifecycleState::Demoting {
-                ticket: current, ..
-            } => {
-                if *current == ticket {
-                    *state = next;
-                    Ok(())
-                } else {
-                    Err(PageLifecycleError::InvalidTransition {
-                        page,
-                        from: state.clone(),
-                        to: next,
-                    })
-                }
-            }
-            current => Err(PageLifecycleError::InvalidTransition {
-                page,
-                from: current.clone(),
-                to: next,
-            }),
-        }
-    }
-}
-
 /// Request handed to the coordinator for a T1 → T2 spill.
 ///
 /// Shipped as part of the "coordinator real byte path" batch: spills
@@ -172,32 +39,8 @@ pub struct SpillRequest {
     pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
 }
 
-/// Inverse of [`SpillRequest`]: read a block's bytes back from the disk
-/// tier into a freshly-allocated host-pinned region. The scheduler
-/// passes a `host_region` that already has the right shape; the
-/// coordinator does the `DiskStore::get_block` read and writes into
-/// that region, then emits `RehydrateCompleted`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RehydrateRequest {
-    pub block_id: BlockId,
-    pub fingerprint: crate::types::BlockFingerprint,
-    pub disk_location: crate::kv_tier::transport::disk::DiskBlockLocation,
-    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
-    pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorCommand {
-    Demote {
-        block: BlockId,
-        from: BlockLocation,
-        to: BlockLocation,
-    },
-    Promote {
-        block: BlockId,
-        from: BlockLocation,
-        to: BlockLocation,
-    },
     Stage {
         ticket: StageTicket,
         requests: Vec<StageRequest>,
@@ -208,13 +51,6 @@ pub enum CoordinatorCommand {
     Spill {
         ticket: StageTicket,
         blocks: Vec<SpillRequest>,
-    },
-    /// T2 → T1 rehydrate ticket. The coordinator reads each block from
-    /// `DiskStore::get_block`, writes into the caller-provided host
-    /// region, and emits `RehydrateCompleted`.
-    Rehydrate {
-        ticket: StageTicket,
-        blocks: Vec<RehydrateRequest>,
     },
     Shutdown,
 }
@@ -230,6 +66,13 @@ pub enum CoordinatorEvent {
     /// CUDA path must emit this only after the copy stream reports done.
     StagingCompleted {
         ticket: StageTicket,
+    },
+    /// Stage request failed before bytes became available in T1 for the
+    /// scheduler to promote back into T0.
+    StagingFailed {
+        ticket: StageTicket,
+        failed_block: BlockId,
+        reason: String,
     },
     /// T1 → T2 spill enqueued. Informational — the real work happens
     /// asynchronously on the coordinator's disk I/O thread / worker pool.
@@ -249,24 +92,6 @@ pub enum CoordinatorEvent {
     /// ticket were persisted, so the scheduler has to decide whether
     /// to roll them back or accept a partial spill.
     SpillFailed {
-        ticket: StageTicket,
-        failed_block: BlockId,
-        reason: String,
-    },
-    /// T2 → T1 rehydrate enqueued. Informational.
-    RehydrateQueued {
-        ticket: StageTicket,
-        block_count: usize,
-    },
-    /// T2 → T1 rehydrate finished. The scheduler flips the radix
-    /// node's `tier_location` back to `BlockLocation::HostPinned`.
-    RehydrateCompleted {
-        ticket: StageTicket,
-        rehydrated_blocks: Vec<BlockId>,
-    },
-    /// T2 → T1 rehydrate failed. Same partial-failure semantics as
-    /// `SpillFailed`.
-    RehydrateFailed {
         ticket: StageTicket,
         failed_block: BlockId,
         reason: String,
@@ -316,18 +141,6 @@ impl CoordinatorHandle {
         Some(ticket)
     }
 
-    /// Mint a fresh `StageTicket` for a T2 → T1 rehydrate batch and
-    /// enqueue the corresponding `Rehydrate` command. Returns `None`
-    /// if `blocks` is empty or the command channel is full.
-    pub fn submit_rehydrate(&self, blocks: Vec<RehydrateRequest>) -> Option<StageTicket> {
-        if blocks.is_empty() {
-            return None;
-        }
-        let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Rehydrate { ticket, blocks })
-            .ok()?;
-        Some(ticket)
-    }
 }
 
 impl StagePlanner for CoordinatorHandle {
@@ -442,71 +255,87 @@ impl Coordinator {
         self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })
     }
 
-    fn handle_rehydrate(&self, ticket: StageTicket, blocks: &[RehydrateRequest]) -> Result<()> {
-        self.emit_event(CoordinatorEvent::RehydrateQueued {
+    fn handle_stage(&self, ticket: StageTicket, requests: &[StageRequest]) -> Result<()> {
+        self.emit_event(CoordinatorEvent::StagingQueued {
             ticket,
-            block_count: blocks.len(),
+            request_count: requests.len(),
         })?;
 
-        let Some(disk_store) = &self.disk_store else {
-            if let Some(first) = blocks.first() {
-                self.emit_event(CoordinatorEvent::RehydrateFailed {
-                    ticket,
-                    failed_block: first.block_id,
-                    reason: "coordinator disk store not configured".to_string(),
-                })?;
-            } else {
-                self.emit_event(CoordinatorEvent::RehydrateCompleted {
-                    ticket,
-                    rehydrated_blocks: Vec::new(),
-                })?;
-            }
-            return Ok(());
-        };
+        for request in requests {
+            match &request.from {
+                BlockLocation::HostPinned { .. } | BlockLocation::Gpu { .. } => {}
+                BlockLocation::Disk {
+                    fingerprint,
+                    payload_len,
+                } => {
+                    let Some(disk_store) = &self.disk_store else {
+                        self.emit_event(CoordinatorEvent::StagingFailed {
+                            ticket,
+                            failed_block: request.block_id,
+                            reason: "coordinator disk store not configured".to_string(),
+                        })?;
+                        return Ok(());
+                    };
+                    let (Some(host_pool), Some(host_region)) =
+                        (&request.host_pool, request.host_region)
+                    else {
+                        self.emit_event(CoordinatorEvent::StagingFailed {
+                            ticket,
+                            failed_block: request.block_id,
+                            reason: "disk stage request missing host staging region".to_string(),
+                        })?;
+                        return Ok(());
+                    };
 
-        let mut rehydrated_blocks = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            let payload = match disk_store.get_block(&block.disk_location, Some(block.fingerprint))
-            {
-                Ok(payload) => payload,
-                Err(err) => {
-                    self.emit_event(CoordinatorEvent::RehydrateFailed {
+                    let disk_location = crate::kv_tier::transport::disk::DiskBlockLocation {
+                        path: disk_store.block_path_for(*fingerprint)?,
+                        payload_len: *payload_len,
+                        fingerprint: *fingerprint,
+                    };
+                    let payload = match disk_store.get_block(&disk_location, Some(*fingerprint)) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            self.emit_event(CoordinatorEvent::StagingFailed {
+                                ticket,
+                                failed_block: request.block_id,
+                                reason: err.to_string(),
+                            })?;
+                            return Ok(());
+                        }
+                    };
+                    if payload.len() != host_region.len {
+                        self.emit_event(CoordinatorEvent::StagingFailed {
+                            ticket,
+                            failed_block: request.block_id,
+                            reason: format!(
+                                "stage byte length mismatch: disk={} host_region={}",
+                                payload.len(),
+                                host_region.len
+                            ),
+                        })?;
+                        return Ok(());
+                    }
+                    if let Err(err) = host_pool.write_region(host_region, &payload) {
+                        self.emit_event(CoordinatorEvent::StagingFailed {
+                            ticket,
+                            failed_block: request.block_id,
+                            reason: err.to_string(),
+                        })?;
+                        return Ok(());
+                    }
+                }
+                BlockLocation::Remote { .. } => {
+                    self.emit_event(CoordinatorEvent::StagingFailed {
                         ticket,
-                        failed_block: block.block_id,
-                        reason: err.to_string(),
+                        failed_block: request.block_id,
+                        reason: "remote staging not implemented".to_string(),
                     })?;
                     return Ok(());
                 }
-            };
-
-            if payload.len() != block.host_region.len {
-                self.emit_event(CoordinatorEvent::RehydrateFailed {
-                    ticket,
-                    failed_block: block.block_id,
-                    reason: format!(
-                        "rehydrate byte length mismatch: disk={} host_region={}",
-                        payload.len(),
-                        block.host_region.len
-                    ),
-                })?;
-                return Ok(());
             }
-
-            if let Err(err) = block.host_pool.write_region(block.host_region, &payload) {
-                self.emit_event(CoordinatorEvent::RehydrateFailed {
-                    ticket,
-                    failed_block: block.block_id,
-                    reason: err.to_string(),
-                })?;
-                return Ok(());
-            }
-            rehydrated_blocks.push(block.block_id);
         }
 
-        self.emit_event(CoordinatorEvent::RehydrateCompleted {
-            ticket,
-            rehydrated_blocks,
-        })
+        self.emit_event(CoordinatorEvent::StagingCompleted { ticket })
     }
 
     pub fn run_once(&self) -> Result<bool> {
@@ -514,23 +343,12 @@ impl Coordinator {
             Ok(cmd) => {
                 match &cmd {
                     CoordinatorCommand::Stage { ticket, requests } => {
-                        self.events
-                            .send(CoordinatorEvent::StagingQueued {
-                                ticket: *ticket,
-                                request_count: requests.len(),
-                            })
-                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
-                        self.events
-                            .send(CoordinatorEvent::StagingCompleted { ticket: *ticket })
-                            .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                        self.handle_stage(*ticket, requests)?;
                     }
                     CoordinatorCommand::Spill { ticket, blocks } => {
                         self.handle_spill(*ticket, blocks)?;
                     }
-                    CoordinatorCommand::Rehydrate { ticket, blocks } => {
-                        self.handle_rehydrate(*ticket, blocks)?;
-                    }
-                    _ => {
+                    CoordinatorCommand::Shutdown => {
                         self.events
                             .send(CoordinatorEvent::CommandQueued(cmd.clone()))
                             .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
@@ -581,6 +399,8 @@ mod tests {
                 block_id: BlockId(7),
                 from: BlockLocation::HostPinned { offset: 4096 },
                 byte_len: 8192,
+                host_pool: None,
+                host_region: None,
             }])
             .expect("stage ticket");
         assert!(coordinator.run_once().unwrap());
@@ -608,6 +428,8 @@ mod tests {
                     block_id: BlockId(9),
                     from: BlockLocation::HostPinned { offset: 0 },
                     byte_len: 4096,
+                    host_pool: None,
+                    host_region: None,
                 }],
             })
             .unwrap();
@@ -674,46 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn page_lifecycle_supports_cancel_on_hit() {
-        let mut lifecycle = PageLifecycle::new(2);
-        let ticket = StageTicket(3);
-        lifecycle.mark_resident(0).unwrap();
-        lifecycle
-            .begin_demote(0, ticket, BlockLocation::HostPinned { offset: 128 })
-            .unwrap();
-        lifecycle.mark_resident(0).unwrap();
-        assert_eq!(lifecycle.state(0), Some(PageLifecycleState::Resident));
-    }
-
-    #[test]
-    fn page_lifecycle_finishes_demote_to_free() {
-        let mut lifecycle = PageLifecycle::new(1);
-        let ticket = StageTicket(11);
-        lifecycle.mark_resident(0).unwrap();
-        lifecycle
-            .begin_demote(0, ticket, BlockLocation::HostPinned { offset: 256 })
-            .unwrap();
-        lifecycle.finish_demote(0, ticket).unwrap();
-        assert_eq!(lifecycle.state(0), Some(PageLifecycleState::Free));
-    }
-
-    #[test]
-    fn page_lifecycle_rejects_invalid_transition() {
-        let mut lifecycle = PageLifecycle::new(1);
-        let err = lifecycle
-            .begin_demote(0, StageTicket(1), BlockLocation::HostPinned { offset: 0 })
-            .expect_err("free pages cannot enter demoting directly");
-        assert!(matches!(
-            err,
-            PageLifecycleError::InvalidTransition {
-                from: PageLifecycleState::Free,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn spill_and_rehydrate_roundtrip_through_disk_store() {
+    fn spill_and_stage_roundtrip_through_disk_store() {
         let dir = tempdir().unwrap();
         let disk_store = Arc::new(crate::kv_tier::transport::disk::DiskStore::new(dir.path()));
         let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store);
@@ -761,29 +544,31 @@ mod tests {
             pool.as_mut_slice(region).fill(0);
             region
         };
-        let rehydrate_ticket = handle
-            .submit_rehydrate(vec![RehydrateRequest {
+        let stage_ticket = handle
+            .stage(&[StageRequest {
                 block_id: BlockId(7),
-                fingerprint,
-                disk_location: spill_location,
-                host_pool: host_pool.clone(),
-                host_region: rehydrate_region,
+                from: BlockLocation::Disk {
+                    fingerprint,
+                    payload_len: spill_location.payload_len,
+                },
+                byte_len: spill_location.payload_len as u32,
+                host_pool: Some(host_pool.clone()),
+                host_region: Some(rehydrate_region),
             }])
             .unwrap();
 
         assert!(coordinator.run_once().unwrap());
         assert_eq!(
             events.recv().unwrap(),
-            CoordinatorEvent::RehydrateQueued {
-                ticket: rehydrate_ticket,
-                block_count: 1,
+            CoordinatorEvent::StagingQueued {
+                ticket: stage_ticket,
+                request_count: 1,
             }
         );
         assert_eq!(
             events.recv().unwrap(),
-            CoordinatorEvent::RehydrateCompleted {
-                ticket: rehydrate_ticket,
-                rehydrated_blocks: vec![BlockId(7)],
+            CoordinatorEvent::StagingCompleted {
+                ticket: stage_ticket,
             }
         );
 
@@ -874,6 +659,8 @@ mod tests {
             block_id: BlockId(1),
             from: BlockLocation::HostPinned { offset: 0 },
             byte_len: 4096,
+            host_pool: None,
+            host_region: None,
         }]);
         assert!(first.is_some());
 
@@ -881,6 +668,8 @@ mod tests {
             block_id: BlockId(2),
             from: BlockLocation::HostPinned { offset: 4096 },
             byte_len: 4096,
+            host_pool: None,
+            host_region: None,
         }]);
         assert!(second.is_none(), "full queue should not block stage submit");
     }

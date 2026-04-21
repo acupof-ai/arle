@@ -1,9 +1,9 @@
 # `infer::kv_tier` — Agent Guide
 
-Hierarchical KV cache skeleton: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
-T3 remote (NIXL/Mooncake/UCX). **Status: skeleton only** — no production
-callers today, everything is constructed by unit tests or the in-module
-coordinator plumbing.
+Hierarchical KV cache shape: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
+T3 remote (NIXL/Mooncake/UCX). **Status: partially live on the CUDA lane** —
+the scheduler now uses `prefix_cache + HostPinnedPool + Coordinator + DiskStore`
+for one unified local multilayer path. Remote transports remain skeletal.
 
 Load this file before editing anything under `kv_tier/`, and re-read
 `docs/projects/tiered-kv-cache.md` before making any design-visible change.
@@ -13,8 +13,8 @@ Load this file before editing anything under `kv_tier/`, and re-read
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
-| T1   | Host pinned DRAM  | ~10 µs   | M3 (CUDA only). `host_pool.rs` skeleton exists, locally-verifiable bookkeeping only. |
-| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/rehydrate handling; scheduler watermark callers are still pending. |
+| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into `host_pool.rs` and stages back through the coordinator |
+| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill + stage handling and the scheduler's watermark path |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
 
 **Apple Silicon skips T1.** MLX unified memory makes host↔GPU a self-memcpy.
@@ -31,7 +31,7 @@ kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
 kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
-kv_tier/coordinator.rs  — Coordinator, CoordinatorCommand (Demote/Promote/Shutdown), handle + event channel
+kv_tier/coordinator.rs  — Coordinator, unified Stage + Spill commands, handle + event channel
 ```
 
 **Do not reintroduce `directory.rs`.** The former `TierDirectory` /
