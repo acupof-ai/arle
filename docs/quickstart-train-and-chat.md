@@ -2,7 +2,8 @@
 
 End-to-end recipe for going from a public HuggingFace dataset to a
 trained checkpoint you can chat with via `agent-infer`. Verified on
-2026-04-19 for Qwen3-0.6B on Metal.
+2026-04-19 for Qwen3-0.6B on Metal and on 2026-04-21 for Qwen3-0.6B on
+CUDA via `scripts/train_cuda_e2e.sh`.
 
 ## 0. Build binaries once
 
@@ -57,17 +58,22 @@ target/release/train_sft \
   --steps 2 --batch 1 --seq-len 128 --lr 1e-6 \
   --save-every 2 --log-every 1 --backend metal
 # → step=1 loss=4.47  step=2 loss=2.97
-# → saved checkpoint for step 2 to /tmp/dolly_sft/step_2
+# → saved checkpoint for step 2 to /tmp/dolly_sft/step_000002
+# → /tmp/dolly_sft/latest -> step_000002
 ```
 
-Checkpoint layout: `step_2/{config.json, model.safetensors,
-tokenizer.json}` — HF Qwen3 schema, bf16 weights, verbatim tokenizer.
+Replace `--backend metal` with `--backend cuda` on NVIDIA hosts.
+
+Checkpoint layout: `step_000002/{config.json, model.safetensors,
+tokenizer.json, adapter_model.safetensors, adapter_config.json,
+trainer_state.json, optimizer.safetensors}` plus `latest ->
+step_000002`.
 
 ## 4. Chat with the trained model
 
 ```bash
 echo "What is the capital of France?" | target/release/agent-infer \
-  --model-path /tmp/dolly_sft/step_2 --max-tokens 16 --non-interactive
+  --model-path /tmp/dolly_sft/latest --max-tokens 16 --non-interactive
 # → TTFT 69 ms · 167 tok/s · "Okay, the user is asking for the capital of France. I need"
 ```
 
@@ -92,4 +98,11 @@ breaks, the integration is broken.
 
 ```bash
 INFER_TEST_MODEL_PATH=models/Qwen3-0.6B scripts/train_and_chat.sh
+```
+
+For the canonical CUDA smoke that also covers `eval_lm`, `agent-infer`,
+and resume, run:
+
+```bash
+scripts/train_cuda_e2e.sh
 ```

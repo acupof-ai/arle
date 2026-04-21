@@ -78,6 +78,10 @@ Result:
 
 - loss: `11.937930`
 - ppl: `152959.800651`
+
+See also: [`2026-04-21-cuda-train-rl-validation.md`](./2026-04-21-cuda-train-rl-validation.md)
+for the RL-side follow-up that closed the `train_grpo` backend gap and
+validated both `train_grpo` and `train_multi_turn` CUDA flows end-to-end.
 - tokens: `27`
 
 resume on CUDA also worked:

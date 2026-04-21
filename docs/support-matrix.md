@@ -93,7 +93,7 @@ Backend note:
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
 | `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
-| Train-side `/v1/train/status|events|stop|save` via `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, `train_multi_turn --serve` | Beta | Current control-plane truth lives in `crates/train`. Infer-side unified `/v1/train/*` bridge is still a target architecture item, not the current implementation. |
+| Train-side `/v1/train/status|events|stop|save` via `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, `train_multi_turn --serve` | Beta | Current control-plane truth lives in `crates/train`. Shared control-plane wiring is live on all four binaries, and CUDA has now been validated on all four active train surfaces. `train_grpo` and `train_multi_turn` were both exercised on CUDA for live `/v1/train/{status,events,save,stop}` control-plane behavior on 2026-04-21. Infer-side unified `/v1/train/*` bridge is still a target architecture item, not the current implementation. |
 | Metal runtime memory knobs | Beta | `metal_request`, `metal_bench`, and `metal_serve` expose `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 
@@ -101,10 +101,10 @@ Backend note:
 
 | Surface | Status | Notes |
 | --- | --- | --- |
-| `pretrain` | Supported | Canonical scratch-pretrain entrypoint for the current Qwen-family train stack. HF-style checkpoint dirs + `latest` marker + exact optimizer-state resume. |
-| `train_sft` | Supported | Qwen3 / Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. |
-| `train_grpo` | Supported | Single-turn RL surface with exact checkpoint/resume and shared observability/control-plane wiring. |
-| `train_multi_turn` | Supported on dense/full-attn Qwen3.5 path | Multi-turn RL surface with stepwise GRPO and sequence-level GSPO objectives. Hybrid linear-attn Qwen3.5 training is still not landed. |
+| `pretrain` | Supported | Canonical scratch-pretrain entrypoint for the current Qwen-family train stack. HF-style checkpoint dirs + `latest` marker + exact optimizer-state resume. CUDA save/eval/resume was validated on L4 on 2026-04-21. |
+| `train_sft` | Supported | Qwen3 / Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. CUDA smoke was validated on Qwen3-0.6B for `train_sft -> eval_lm -> agent-infer -> resume` on 2026-04-21. |
+| `train_grpo` | Supported | Single-turn RL surface with exact checkpoint/resume, shared observability/control-plane wiring, and backend selection across `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for `train_grpo -> checkpoint/latest -> eval_lm -> resume` plus live `/v1/train/{status,events,save,stop}` control-plane behavior on the synthetic dense Qwen3.5 path. |
+| `train_multi_turn` | Supported on dense/full-attn Qwen3.5 path | Backend flag supports `cpu|metal|cuda`. CUDA was validated on 2026-04-21 for stepwise GRPO, sequence-level GSPO, exact resume, `/v1/train/{status,events,save,stop}` control-plane endpoints, and checkpoint reload through `eval_lm`. Hybrid linear-attn Qwen3.5 training is still not landed. |
 | `eval_lm` | Supported | Standalone loss / perplexity evaluation for Qwen3 / Qwen3.5 checkpoint dirs on tokenized or chat JSONL. |
 | Hybrid linear-attn Qwen3.5 training | Not shipped | Active remaining gap on the train-side model path. |
 | Infer-side unified `/v1/train/*` bridge | Not shipped | Current train control plane still lives in `crates/train/src/server.rs`. |

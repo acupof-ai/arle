@@ -3,12 +3,14 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    str::FromStr,
     sync::Arc,
     time::Instant,
 };
 
 use autograd::{
-    AutogradError, ConstantLr, Result as AutogradResult, Tape, TensorId, TensorStore,
+    AutogradError, Backend, ConstantLr, CpuBackend, Result as AutogradResult, Tape, TensorId,
+    TensorStore,
     adamw_state::AdamWState,
     optim::{AdamW, Optimizer},
 };
@@ -66,6 +68,7 @@ struct CliArgs {
     seed: u64,
     lora_rank: usize,
     lora_alpha: f32,
+    backend: BackendChoice,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
     save_path: Option<PathBuf>,
@@ -89,12 +92,67 @@ impl Default for CliArgs {
             seed: 42,
             lora_rank: 8,
             lora_alpha: 16.0,
+            backend: BackendChoice::Cpu,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
             save_path: None,
             resume_from: None,
             serve: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendChoice {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl BackendChoice {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+impl FromStr for BackendChoice {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
+            _ => Err(format!("unknown backend: {value}")),
+        }
+    }
+}
+
+fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
+    match choice {
+        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
+        #[cfg(feature = "metal")]
+        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
+        #[cfg(not(feature = "metal"))]
+        BackendChoice::Metal => Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--backend".into(),
+            value: "metal (build with --features metal)".into(),
+        })),
+        #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+        BackendChoice::Cuda => {
+            let backend =
+                autograd::backend_cuda::CudaBackend::new(0).map_err(CliError::Autograd)?;
+            Ok(Arc::new(backend))
+        }
+        #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
+        BackendChoice::Cuda => Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--backend".into(),
+            value: "cuda (build with --features cuda and no no-cuda)".into(),
+        })),
     }
 }
 
@@ -415,7 +473,8 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             })
         })
         .transpose()?;
-    let mut store = TensorStore::default();
+    let backend = build_backend(args.backend)?;
+    let mut store = TensorStore::with_backend(backend);
     let mut tape = Tape::new();
     let policy = F::build_model(&config, lora, &mut store)?;
     let params = trainable_param_ids(&policy, &store);
@@ -439,7 +498,10 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .as_ref()
         .map(|path| path.display().to_string());
     let resume_dir_string = resume_dir.as_ref().map(|path| path.display().to_string());
-    let mut run_start_strings = vec![("model_family", F::family_name())];
+    let mut run_start_strings = vec![
+        ("model_family", F::family_name()),
+        ("backend", args.backend.as_str()),
+    ];
     if let Some(path) = save_path_string.as_deref() {
         run_start_strings.push(("save_path", path));
     }
@@ -1108,6 +1170,15 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--lora-alpha" => {
                 args.lora_alpha = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
+            "--backend" => {
+                let value = next_value(&mut iter, &flag)?;
+                args.backend = value.parse().map_err(|_| {
+                    CliError::Arg(ArgError::InvalidValue {
+                        flag: flag.clone(),
+                        value,
+                    })
+                })?;
+            }
             "--grad-clip" => {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
@@ -1237,6 +1308,7 @@ mod tests {
             seed: 42,
             lora_rank: 2,
             lora_alpha: 4.0,
+            backend: BackendChoice::Cpu,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
             save_path: None,
