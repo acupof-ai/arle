@@ -13,8 +13,8 @@
 //! | Tier | Medium             | Latency class | Status in this module |
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
-//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via `HostPinnedPool` + scheduler/coordinator staging |
-//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill + stage paths |
+//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via `HostPinnedPool` for demotion / spill buffering; no live readmission path yet |
+//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and session restore plumbing |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
@@ -30,13 +30,15 @@
 //! # Current status (what this module actually contains as of 2026-04-15)
 //!
 //! **Partially live on the CUDA lane.** The CUDA scheduler now owns one
-//! multilayer KV path:
+//! multilayer KV spill/persist path:
 //! - radix metadata in `prefix_cache`
 //! - T0 page ownership in `paged_kv`
-//! - T1 staging in `HostPinnedPool`
-//! - T1→T2 spill and T2→T1 stage in `Coordinator` + `DiskStore`
+//! - T1 demotion buffering in `HostPinnedPool`
+//! - T1→T2 spill and disk persistence in `Coordinator` + `DiskStore`
 //!
-//! `KVTransport` and remote tiers remain skeletal.
+//! Live staged readmission was removed from the scheduler hot path until the
+//! runtime grows a real attach/ownership model. `KVTransport` and remote tiers
+//! remain skeletal.
 //!
 //! The former `directory::TierDirectory` / `BlockDescriptor` holding
 //! area was removed in M1 per project doc §5.2. Block metadata that

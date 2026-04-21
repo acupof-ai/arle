@@ -3,7 +3,9 @@
 Hierarchical KV cache shape: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
 T3 remote (NIXL/Mooncake/UCX). **Status: partially live on the CUDA lane** —
 the scheduler now uses `prefix_cache + HostPinnedPool + Coordinator + DiskStore`
-for one unified local multilayer path. Remote transports remain skeletal.
+for one unified local **spill/persist** path. Live staged readmission was
+removed from the scheduler hot path until a real attach/ownership model exists.
+Remote transports remain skeletal.
 
 Load this file before editing anything under `kv_tier/`, and re-read
 `docs/projects/tiered-kv-cache.md` before making any design-visible change.
@@ -13,8 +15,8 @@ Load this file before editing anything under `kv_tier/`, and re-read
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
-| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into `host_pool.rs` and stages back through the coordinator |
-| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill + stage handling and the scheduler's watermark path |
+| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into `host_pool.rs`; no live readmission path yet |
+| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/persist and session restore plumbing; no live readmission path yet |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
 
 **Apple Silicon skips T1.** MLX unified memory makes host↔GPU a self-memcpy.

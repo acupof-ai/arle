@@ -198,16 +198,19 @@ impl SchedulerConfig {
     }
 }
 
+#[cfg(test)]
 const REQUEST_INPUT_SLACK_TOKENS: usize = 5;
 
 /// Backend-agnostic request length limits derived from the active scheduler
 /// envelope. Mirrors SGLang's `max_req_len` / `max_req_input_len` contract.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestLengthContract {
     max_request_len: usize,
     max_request_input_len: usize,
 }
 
+#[cfg(test)]
 impl RequestLengthContract {
     pub(crate) fn derive(
         available_pool_tokens: usize,
