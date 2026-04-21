@@ -40,6 +40,15 @@ fn tiny_full_attn_cfg() -> Qwen35Config {
     }
 }
 
+fn tiny_hybrid_cfg() -> Qwen35Config {
+    Qwen35Config {
+        rotary_dim: 4,
+        partial_rotary_factor: 0.5,
+        layer_types: vec![LayerType::FullAttention, LayerType::LinearAttention],
+        ..tiny_full_attn_cfg()
+    }
+}
+
 #[test]
 fn qwen35_batch_forward_matches_repeated_single_forward() -> TestResult {
     let cfg = tiny_full_attn_cfg();
@@ -87,6 +96,32 @@ fn qwen35_batch_forward_matches_repeated_single_forward() -> TestResult {
     assert_eq!(batched_logits.len(), 2 * single_logits.len());
     assert_eq!(&batched_logits[..single_logits.len()], &single_logits[..]);
     assert_eq!(&batched_logits[single_logits.len()..], &single_logits[..]);
+
+    Ok(())
+}
+
+#[test]
+fn qwen35_hybrid_forward_supports_partial_rope_and_linear_layers() -> TestResult {
+    let cfg = tiny_hybrid_cfg();
+    cfg.validate_train_lora_or_frozen_contract()?;
+    let mut store = TensorStore::default();
+    let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
+
+    let param_map = model.param_name_map();
+    let layer_names = cfg.layer_tensor_names(1);
+    let linear_names = match layer_names.attention {
+        Qwen35AttentionTensorNames::Linear(names) => names,
+        Qwen35AttentionTensorNames::Full(_) => unreachable!("hybrid test expects linear layer"),
+    };
+    assert!(param_map.contains_key(linear_names.in_proj_qkv.as_str()));
+    assert!(param_map.contains_key(linear_names.out_proj.as_str()));
+    assert!(param_map.contains_key(linear_names.conv1d_weight.as_str()));
+
+    let mut tape = Tape::new();
+    let logits = model.forward_tokens(&[1, 2, 3, 4], &mut store, &mut tape)?;
+    let values = store.to_host(logits)?;
+    assert_eq!(values.len(), 4 * cfg.vocab_size);
+    assert!(values.iter().all(|value| value.is_finite()));
 
     Ok(())
 }

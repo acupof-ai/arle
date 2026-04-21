@@ -402,7 +402,7 @@ mod tests {
 
         let cfg = tiny_qwen35_config();
         let mut store = TensorStore::default();
-        let model = Qwen35Model::new(&cfg, &mut store)?;
+        let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
         let registry = build_registry(&model);
         let step_dir = save_qwen35_step_checkpoint(
             Qwen35StepCheckpoint {
@@ -429,7 +429,7 @@ mod tests {
         let examples = load_eval_examples(&data_path, None, 8)?;
 
         let mut load_store = TensorStore::default();
-        let load_model = Qwen35Model::new(&cfg, &mut load_store)?;
+        let load_model = Qwen35Model::new_for_eval(&cfg, &mut load_store)?;
         let mut load_registry = build_registry(&load_model);
         load_registry.load_into(&mut load_store, &step_dir.join("model.safetensors"))?;
         let mut tape = Tape::new();

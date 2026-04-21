@@ -8,8 +8,9 @@ Current reality: the train-side implementation already includes the
 dense/full-attn Qwen3.5-family path, `train_multi_turn` runs on it, and
 checkpoints are already HF-style directories. The handwritten
 Transformer/TinyLM runtime compatibility path has been deleted, and the
-hybrid linear-attn train path has not landed yet. This DX plan tracks
-the checkpoint / eval / serve tooling around that reality.
+shared Qwen3.5 model path now also supports hybrid linear-attn LoRA/eval.
+This DX plan tracks the checkpoint / eval / serve tooling around that
+reality.
 
 **Status today** (from Explore punch-list 2026-04-20):
 

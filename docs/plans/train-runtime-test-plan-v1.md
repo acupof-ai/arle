@@ -11,10 +11,11 @@ are being retired.
 Current reality: the train-side implementation already includes the
 dense/full-attn Qwen3.5-family path, `train_multi_turn` runs on it, and
 checkpoints are already HF-style directories. The handwritten
-Transformer/TinyLM runtime compatibility path has been deleted, and the
-hybrid linear-attn train path has not landed yet. The acceptance
-contract below tracks that current path and the post-legacy train test
-surface.
+Transformer/TinyLM runtime compatibility path has been deleted. Hybrid
+linear-attn Qwen3.5 support is now landed on the LoRA/eval path, while
+scratch pretrain and RL acceptance still track the dense/full-attn
+surface. The acceptance contract below tracks that current path and the
+post-legacy train test surface.
 
 This document is **the acceptance contract for Phase 1 + Phase 2**. A change
 in the train runtime is not "done" until the matching row here is either

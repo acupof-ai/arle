@@ -465,8 +465,10 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Rotary position embedding (NeoX / `rotate_half` layout, matches Qwen3).
-    /// `x` is `[batch, heads, seq, head_dim]`; `cos`/`sin` are `[seq, head_dim/2]`.
-    /// Returns the rotated tensor with the same shape as `x`.
+    /// `x` is `[batch, heads, seq, head_dim]`; `cos`/`sin` are
+    /// `[seq, rotary_dim/2]`, where `rotary_dim <= head_dim`. When
+    /// `rotary_dim < head_dim`, only the prefix is rotated and the suffix is
+    /// copied through unchanged.
     fn rope_forward(
         &self,
         x: &[f32],
@@ -1325,27 +1327,36 @@ pub fn cpu_rope_forward(
             got: vec![x.len()],
         });
     }
-    let expected_cache = seq * half_dim;
-    if cos.len() != expected_cache || sin.len() != expected_cache {
+    if cos.len() != sin.len() || !cos.len().is_multiple_of(seq.max(1)) {
         return Err(AutogradError::ShapeMismatch {
-            expected: vec![expected_cache],
+            expected: vec![seq * half_dim],
             got: vec![cos.len().min(sin.len())],
         });
     }
+    let rotary_half_dim = cos.len() / seq.max(1);
+    if rotary_half_dim == 0 || rotary_half_dim > half_dim {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![seq * half_dim],
+            got: vec![cos.len()],
+        });
+    }
+    let rotary_dim = rotary_half_dim * 2;
     let mut out = vec![0.0_f32; expected_x];
     for b in 0..batch {
         for h in 0..heads {
             for t in 0..seq {
-                let rope_base = t * half_dim;
+                let rope_base = t * rotary_half_dim;
                 let base = (((b * heads) + h) * seq + t) * head_dim;
-                for i in 0..half_dim {
+                for i in 0..rotary_half_dim {
                     let x0 = x[base + i];
-                    let x1 = x[base + i + half_dim];
+                    let x1 = x[base + i + rotary_half_dim];
                     let c = cos[rope_base + i];
                     let s = sin[rope_base + i];
                     out[base + i] = (x0 * c) - (x1 * s);
-                    out[base + i + half_dim] = (x1 * c) + (x0 * s);
+                    out[base + i + rotary_half_dim] = (x1 * c) + (x0 * s);
                 }
+                out[(base + rotary_dim)..(base + head_dim)]
+                    .copy_from_slice(&x[(base + rotary_dim)..(base + head_dim)]);
             }
         }
     }

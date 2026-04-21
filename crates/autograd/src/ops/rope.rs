@@ -31,7 +31,13 @@ pub fn rope(
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
     };
-    if has_device_handle {
+    let can_use_device_rope = {
+        let x_shape = store.tensor(x)?.shape.clone();
+        let cos_shape = store.tensor(cos)?.shape.clone();
+        validate_shapes(&x_shape, &cos_shape, &store.tensor(sin)?.shape)?;
+        cos_shape[1] * 2 == x_shape[3]
+    };
+    if has_device_handle && can_use_device_rope {
         rope_device_lazy(x, cos, sin, store, tape)
     } else {
         rope_host_eager(x, cos, sin, store, tape)
@@ -96,17 +102,29 @@ fn rope_host_eager(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    store.ensure_host(x)?;
+    store.ensure_host(cos)?;
+    store.ensure_host(sin)?;
     let x_tensor = store.tensor(x)?.clone();
     let cos_tensor = store.tensor(cos)?.clone();
     let sin_tensor = store.tensor(sin)?.clone();
     validate_shapes(&x_tensor.shape, &cos_tensor.shape, &sin_tensor.shape)?;
 
-    let output = store.backend().rope_forward(
-        &x_tensor.data,
-        &x_tensor.shape,
-        &cos_tensor.data,
-        &sin_tensor.data,
-    )?;
+    let output = if cos_tensor.shape[1] * 2 == x_tensor.shape[3] {
+        store.backend().rope_forward(
+            &x_tensor.data,
+            &x_tensor.shape,
+            &cos_tensor.data,
+            &sin_tensor.data,
+        )?
+    } else {
+        crate::backend::cpu_rope_forward(
+            &x_tensor.data,
+            &x_tensor.shape,
+            &cos_tensor.data,
+            &sin_tensor.data,
+        )?
+    };
 
     let output_id = store.alloc(Tensor::new(
         output,
@@ -164,10 +182,13 @@ pub(crate) fn rope_backward(
     // Negate on the CPU (cheap; cache only; tiny compared to the 4-D rotation)
     // then dispatch through the backend so Metal / CUDA accelerate the bulk op.
     let neg_sin = store.backend().neg_forward(&sin_tensor.data)?;
-    let grad_x =
+    let grad_x = if cos_tensor.shape[1] * 2 == x_shape[3] {
         store
             .backend()
-            .rope_forward(&upstream.data, &x_shape, &cos_tensor.data, &neg_sin)?;
+            .rope_forward(&upstream.data, &x_shape, &cos_tensor.data, &neg_sin)?
+    } else {
+        crate::backend::cpu_rope_forward(&upstream.data, &x_shape, &cos_tensor.data, &neg_sin)?
+    };
 
     let grad_id = store.alloc(Tensor::new(grad_x, x_shape, false)?);
     Ok(smallvec![(x, grad_id)])
@@ -201,17 +222,23 @@ fn validate_shapes(x_shape: &[usize], cos_shape: &[usize], sin_shape: &[usize]) 
         });
     }
 
-    let expected_cache_shape = vec![x_shape[2], head_dim / 2];
-    if cos_shape != expected_cache_shape {
+    if cos_shape[0] != x_shape[2] {
         return Err(AutogradError::ShapeMismatch {
-            expected: expected_cache_shape.clone(),
+            expected: vec![x_shape[2], head_dim / 2],
             got: cos_shape.to_vec(),
         });
     }
-    if sin_shape != expected_cache_shape {
+    if sin_shape != cos_shape {
         return Err(AutogradError::ShapeMismatch {
-            expected: expected_cache_shape,
+            expected: cos_shape.to_vec(),
             got: sin_shape.to_vec(),
+        });
+    }
+    let rotary_half_dim = cos_shape[1];
+    if rotary_half_dim == 0 || rotary_half_dim > head_dim / 2 {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![x_shape[2], head_dim / 2],
+            got: cos_shape.to_vec(),
         });
     }
 

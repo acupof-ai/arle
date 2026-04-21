@@ -12,6 +12,8 @@ pub mod embed;
 pub mod gather;
 #[path = "ops/layout.rs"]
 pub mod layout;
+#[path = "ops/linear_attention.rs"]
+pub mod linear_attention;
 #[path = "ops/matmul.rs"]
 pub mod matmul;
 #[path = "ops/norm.rs"]
@@ -35,6 +37,7 @@ pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use gather::gather_last_dim_backward;
 pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
+pub(crate) use linear_attention::linear_attention_backward;
 pub(crate) use matmul::matmul_backward;
 pub(crate) use norm::rmsnorm_backward;
 pub(crate) use reduce::{mean_backward, sum_backward};
@@ -227,6 +230,36 @@ pub fn matmul(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     matmul::matmul(a, b, store, tape)
+}
+
+pub use linear_attention::LinearAttentionParams;
+
+pub fn linear_attention_core(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    linear_attention::linear_attention_core(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        store,
+        tape,
+    )
 }
 
 pub fn rmsnorm(

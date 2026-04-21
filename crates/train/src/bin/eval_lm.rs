@@ -111,7 +111,7 @@ impl EvalFamily for Qwen35Family {
     }
 
     fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError> {
-        Qwen35Model::new(cfg, store).map_err(Into::into)
+        Qwen35Model::new_for_eval(cfg, store).map_err(Into::into)
     }
 }
 
