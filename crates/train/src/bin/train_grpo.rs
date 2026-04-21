@@ -1,23 +1,47 @@
-use std::{collections::HashSet, env, path::PathBuf, process::ExitCode};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use autograd::{
     AutogradError, ConstantLr, Result as AutogradResult, Tape, TensorId, TensorStore,
-    adamw_state::AdamWState, optim::AdamW,
+    adamw_state::AdamWState,
+    optim::{AdamW, Optimizer},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use train::{
     CausalLm, StepCtx, StepOutcome, Trainer, TrainerConfig,
+    causal_lm::{
+        build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
+        trainable_param_name_map,
+    },
+    checkpoint::{
+        TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
+    },
     cli_args::{ArgError, next_value, parse_value},
     dataset::{CopyDataset, Dataset, LcgRng},
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
-    lora::LoraConfig,
+    lora::{LoraAdapterConfig, LoraConfig},
     loss::cross_entropy_loss,
     model_family::{ModelFamily, synthetic_qwen3_config, synthetic_qwen35_dense_config},
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
+    qwen3_checkpoint::{
+        ConfigJsonSource as Qwen3ConfigJsonSource,
+        GenerationConfigSource as Qwen3GenerationConfigSource, Qwen3CheckpointError,
+        Qwen3StepCheckpoint, save_step_checkpoint as save_qwen3_step_checkpoint,
+    },
     qwen35::{Qwen35Config, Qwen35Error, Qwen35Model},
+    qwen35_checkpoint::{
+        ConfigJsonSource as Qwen35ConfigJsonSource,
+        GenerationConfigSource as Qwen35GenerationConfigSource, Qwen35CheckpointError,
+        Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
+    },
     rollout::rollout_group,
 };
 
@@ -26,6 +50,7 @@ struct CliArgs {
     model_family: ModelFamily,
     sft_steps: usize,
     grpo_iters: usize,
+    save_every: usize,
     batch_prompts: usize,
     group_size: usize,
     seq: usize,
@@ -37,6 +62,8 @@ struct CliArgs {
     lora_alpha: f32,
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
+    save_path: Option<PathBuf>,
+    resume_from: Option<PathBuf>,
 }
 
 impl Default for CliArgs {
@@ -45,6 +72,7 @@ impl Default for CliArgs {
             model_family: ModelFamily::Qwen35,
             sft_steps: 30,
             grpo_iters: 20,
+            save_every: 0,
             batch_prompts: 4,
             group_size: 4,
             seq: 16,
@@ -56,6 +84,8 @@ impl Default for CliArgs {
             lora_alpha: 16.0,
             grad_clip: Some(1.0),
             metrics_jsonl: None,
+            save_path: None,
+            resume_from: None,
         }
     }
 }
@@ -65,13 +95,48 @@ enum CliError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
     Arg(#[from] ArgError),
     #[error(transparent)]
+    Qwen3Checkpoint(#[from] Qwen3CheckpointError),
+    #[error(transparent)]
     Qwen3(#[from] Qwen3Error),
+    #[error(transparent)]
+    Qwen35Checkpoint(#[from] Qwen35CheckpointError),
     #[error(transparent)]
     Qwen35(#[from] Qwen35Error),
     #[error("{0}")]
     Custom(String),
+}
+
+const GRPO_TRAIN_MODEL_FILENAME: &str = "train_model.safetensors";
+const GRPO_REFERENCE_MODEL_FILENAME: &str = "reference_model.safetensors";
+const GRPO_REFERENCE_ADAPTER_FILENAME: &str = "reference_adapter_model.safetensors";
+const GRPO_BASELINE_SALT: u64 = 0x4752_504F_4241_5345;
+const GRPO_ITER_SALT: u64 = 0x4752_504F_4954_4552;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct GrpoCheckpointMeta {
+    family: String,
+    lr: f32,
+    kl_coef: f32,
+    temperature: f32,
+    batch_prompts: usize,
+    group_size: usize,
+    seq: usize,
+    grad_clip: Option<f32>,
+    best_mean_reward: f32,
+    last_kl: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResumeState {
+    start_iter: usize,
+    best_mean_reward: f32,
+    last_kl: f32,
 }
 
 trait SyntheticGrpoFamily {
@@ -79,12 +144,21 @@ trait SyntheticGrpoFamily {
     type Model: GrpoPolicy<Config = Self::Config> + CausalLm<Config = Self::Config>;
 
     fn family_name() -> &'static str;
+    fn synthetic_model_uri() -> &'static str;
     fn build_config(seq: usize) -> Self::Config;
     fn build_model(
         cfg: &Self::Config,
         lora: LoraConfig,
         store: &mut TensorStore,
     ) -> Result<Self::Model, CliError>;
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError>;
+    fn save_merged_checkpoint(
+        out_dir: &Path,
+        step: usize,
+        cfg: &Self::Config,
+        model: &Self::Model,
+        store: &mut TensorStore,
+    ) -> Result<PathBuf, CliError>;
 }
 
 struct Qwen3GrpoFamily;
@@ -95,6 +169,10 @@ impl SyntheticGrpoFamily for Qwen3GrpoFamily {
 
     fn family_name() -> &'static str {
         "qwen3"
+    }
+
+    fn synthetic_model_uri() -> &'static str {
+        "synthetic://qwen3"
     }
 
     fn build_config(seq: usize) -> Self::Config {
@@ -108,6 +186,61 @@ impl SyntheticGrpoFamily for Qwen3GrpoFamily {
     ) -> Result<Self::Model, CliError> {
         Qwen3Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
     }
+
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
+        let cfg_path = resume_dir.join("config.json");
+        if !cfg_path.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no config.json",
+                resume_dir.display()
+            )));
+        }
+        let saved = qwen3_spec::Qwen3Config::from_json_file(&cfg_path).map_err(|err| {
+            CliError::Custom(format!(
+                "resume config {} does not parse as qwen3-family: {err}",
+                cfg_path.display()
+            ))
+        })?;
+        if saved != *cfg {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} config mismatch with live qwen3 setup",
+                resume_dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn save_merged_checkpoint(
+        out_dir: &Path,
+        step: usize,
+        cfg: &Self::Config,
+        model: &Self::Model,
+        store: &mut TensorStore,
+    ) -> Result<PathBuf, CliError> {
+        save_qwen3_step_checkpoint(
+            Qwen3StepCheckpoint {
+                out_dir,
+                step,
+                tokenizer_path: None,
+                config_json: Qwen3ConfigJsonSource::Synthesize {
+                    cfg,
+                    bos_token_id: 0,
+                    eos_token_id: 255,
+                    torch_dtype: "float32",
+                },
+                generation_config: Qwen3GenerationConfigSource::Synthesize {
+                    bos_token_id: 0,
+                    eos_token_id: 255,
+                },
+            },
+            |weights_path| {
+                let mut tape = Tape::new();
+                save_materialized_registry(model, store, &mut tape, weights_path, false)
+                    .map_err(Into::into)
+            },
+        )
+        .map_err(Into::into)
+    }
 }
 
 struct Qwen35GrpoFamily;
@@ -120,6 +253,10 @@ impl SyntheticGrpoFamily for Qwen35GrpoFamily {
         "qwen35"
     }
 
+    fn synthetic_model_uri() -> &'static str {
+        "synthetic://qwen35"
+    }
+
     fn build_config(seq: usize) -> Self::Config {
         synthetic_qwen35_dense_config(seq)
     }
@@ -130,6 +267,59 @@ impl SyntheticGrpoFamily for Qwen35GrpoFamily {
         store: &mut TensorStore,
     ) -> Result<Self::Model, CliError> {
         Qwen35Model::new_with_lora(cfg, Some(lora), store).map_err(Into::into)
+    }
+
+    fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError> {
+        let cfg_path = resume_dir.join("config.json");
+        if !cfg_path.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no config.json",
+                resume_dir.display()
+            )));
+        }
+        let saved = qwen35_spec::Qwen35Config::from_json_file(&cfg_path).map_err(|err| {
+            CliError::Custom(format!(
+                "resume config {} does not parse as qwen3.5-family: {err}",
+                cfg_path.display()
+            ))
+        })?;
+        if saved != *cfg {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} config mismatch with live qwen3.5 setup",
+                resume_dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn save_merged_checkpoint(
+        out_dir: &Path,
+        step: usize,
+        cfg: &Self::Config,
+        model: &Self::Model,
+        store: &mut TensorStore,
+    ) -> Result<PathBuf, CliError> {
+        save_qwen35_step_checkpoint(
+            Qwen35StepCheckpoint {
+                out_dir,
+                step,
+                tokenizer_path: None,
+                config_json: Qwen35ConfigJsonSource::Synthesize {
+                    cfg,
+                    torch_dtype: "float32",
+                },
+                generation_config: Qwen35GenerationConfigSource::Synthesize {
+                    bos_token_id: cfg.bos_token_id,
+                    eos_token_id: cfg.eos_token_id,
+                },
+            },
+            |weights_path| {
+                let mut tape = Tape::new();
+                save_materialized_registry(model, store, &mut tape, weights_path, false)
+                    .map_err(Into::into)
+            },
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -148,6 +338,24 @@ impl GradClip for GrpoClip {
         match self {
             Self::None(c) => c.clip(store, params),
             Self::Norm(c) => c.clip(store, params),
+        }
+    }
+}
+
+fn seeded_rng(seed: u64, salt: u64, major: u64, minor: u64) -> LcgRng {
+    let mut mixed = seed ^ salt;
+    mixed ^= major.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed = mixed.rotate_left(17);
+    mixed ^= minor.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = mixed.rotate_left(11);
+    LcgRng::seed(mixed)
+}
+
+fn freeze_policy<P: GrpoPolicy>(model: &P, store: &mut TensorStore) {
+    for tensor_id in model.all_parameter_ids() {
+        if let Some(tensor) = store.get_mut(tensor_id) {
+            tensor.requires_grad = false;
+            tensor.grad = None;
         }
     }
 }
@@ -181,6 +389,18 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         rank: args.lora_rank,
         alpha: args.lora_alpha,
     };
+    let resume_dir = args
+        .resume_from
+        .as_ref()
+        .map(|path| {
+            path.canonicalize().map_err(|err| {
+                CliError::Custom(format!(
+                    "failed to canonicalize --resume-from {}: {err}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
     let policy = F::build_model(&config, lora, &mut store)?;
@@ -195,31 +415,68 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .all_parameter_ids()
         .into_iter()
         .collect::<HashSet<_>>();
-    let mut prompt_rng = LcgRng::seed(args.seed ^ 0x4752_504F_5052_4F4D);
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
     };
 
-    // ---- SFT warm-up phase (migrated onto Trainer) ----
-    //
-    // The hand-written loop also computed a teacher-forced accuracy
-    // `reward` (via `store.to_host(logits)` + `teacher_forced_reward`) and
-    // printed it alongside loss. That value was PRINT-ONLY and cost a full
-    // device→host copy of logits per step; the migrated Trainer-format
-    // metrics line drops it. GRPO-phase reward tracking (via
-    // `mean_reward`) is unaffected.
-    //
-    // We export the final AdamW state so the GRPO-phase optimizer can
-    // resume moments + step counter instead of starting cold (codex review
-    // on 09c5c89 P1).
-    let sft_optim_state = run_sft_phase(
-        args,
-        &policy,
-        &params,
-        keep_extra.clone(),
-        &mut store,
-        &mut tape,
-    )?;
+    let (ref_model, mut optimizer, resume) = if let Some(resume_dir) = resume_dir.as_deref() {
+        resume_grpo_checkpoint::<F>(resume_dir, args, &config, &policy, &mut store, lora)?
+    } else {
+        // ---- SFT warm-up phase (migrated onto Trainer) ----
+        //
+        // The hand-written loop also computed a teacher-forced accuracy
+        // `reward` (via `store.to_host(logits)` + `teacher_forced_reward`) and
+        // printed it alongside loss. That value was PRINT-ONLY and cost a full
+        // device→host copy of logits per step; the migrated Trainer-format
+        // metrics line drops it. GRPO-phase reward tracking (via
+        // `mean_reward`) is unaffected.
+        //
+        // We export the final AdamW state so the GRPO-phase optimizer can
+        // resume moments + step counter instead of starting cold (codex review
+        // on 09c5c89 P1).
+        let sft_optim_state = run_sft_phase(
+            args,
+            &policy,
+            &params,
+            keep_extra.clone(),
+            &mut store,
+            &mut tape,
+        )?;
+
+        let ref_model = policy.clone_frozen(&mut store);
+        let mut baseline_rng = seeded_rng(args.seed, GRPO_BASELINE_SALT, 0, 0);
+        let baseline_prompts =
+            build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut baseline_rng);
+        let baseline_trajectories = rollout_group(
+            &policy,
+            &ref_model,
+            &config,
+            &baseline_prompts,
+            args.group_size,
+            args.temperature,
+            &mut baseline_rng,
+            &verifier,
+            &mut store,
+            &mut tape,
+        )?;
+        let baseline_reward = mean_reward(&baseline_trajectories);
+        println!("baseline reward after sft: {baseline_reward:.4}");
+
+        let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+        let param_names = trainable_param_name_map(&policy, &store);
+        optimizer
+            .import_state(&sft_optim_state, &param_names)
+            .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
+        (
+            ref_model,
+            optimizer,
+            ResumeState {
+                start_iter: 0,
+                best_mean_reward: baseline_reward,
+                last_kl: 0.0,
+            },
+        )
+    };
 
     // Phase 4 follow-up: extend `--metrics-jsonl` to cover the GRPO phase.
     // `run_sft_phase` already truncated the JSONL file (JsonlSink::create),
@@ -230,48 +487,19 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
     let mut grpo_metrics = train::metrics::open_sink_append(args.metrics_jsonl.as_deref(), false)
         .map_err(|e| CliError::Custom(format!("grpo metrics sink: {e}")))?;
 
-    // ---- GRPO phase (hand-written; see commit body for the "why") ----
-    let ref_model = policy.clone_frozen(&mut store);
-    let baseline_prompts =
-        build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut prompt_rng);
-    let baseline_trajectories = rollout_group(
-        &policy,
-        &ref_model,
-        &config,
-        &baseline_prompts,
-        args.group_size,
-        args.temperature,
-        &mut prompt_rng,
-        &verifier,
-        &mut store,
-        &mut tape,
-    )?;
-    let baseline_reward = mean_reward(&baseline_trajectories);
-    println!("baseline reward after sft: {baseline_reward:.4}");
-
     let grpo_cfg = GrpoConfig {
         clip_eps: 0.2,
         kl_coef: args.kl_coef,
         group_size: args.group_size,
     };
-    // Hand AdamW's final SFT-phase state (moments + step counter) across
-    // the SFT→GRPO boundary so bias correction keeps counting and the
-    // second-moment buffers are warm-started, matching the pre-migration
-    // single-instance behaviour. Codex review on 09c5c89 correctly rebutted
-    // the earlier "no API" claim — `Trainer::optim()` + `Optimizer::
-    // export_state/import_state` were already sufficient, no Trainer
-    // surface changes needed.
-    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    let param_names = trainable_param_names(&policy, &params)?;
-    optimizer
-        .import_state(&sft_optim_state, &param_names)
-        .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
-    let mut reward_trajectory = Vec::with_capacity(args.grpo_iters);
-    let mut last_kl = 0.0_f32;
-    let mut best_mean_reward = baseline_reward;
+    let mut reward_trajectory =
+        Vec::with_capacity(args.grpo_iters.saturating_sub(resume.start_iter));
+    let mut last_kl = resume.last_kl;
+    let mut best_mean_reward = resume.best_mean_reward;
 
-    for iter in 0..args.grpo_iters {
-        let prompts = build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut prompt_rng);
+    for iter in resume.start_iter..args.grpo_iters {
+        let mut iter_rng = seeded_rng(args.seed, GRPO_ITER_SALT, iter as u64, 0);
+        let prompts = build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut iter_rng);
         let trajectories = rollout_group(
             &policy,
             &ref_model,
@@ -279,7 +507,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             &prompts,
             args.group_size,
             args.temperature,
-            &mut prompt_rng,
+            &mut iter_rng,
             &verifier,
             &mut store,
             &mut tape,
@@ -344,6 +572,45 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             step: (args.sft_steps as u64) + (iter as u64) + 1,
             fields: &fields,
         });
+
+        if let Some(save_path) = args.save_path.as_deref() {
+            if args.save_every > 0 && (iter + 1).is_multiple_of(args.save_every) {
+                let step_dir = save_grpo_checkpoint::<F>(
+                    save_path,
+                    iter + 1,
+                    args,
+                    &config,
+                    &policy,
+                    &ref_model,
+                    &optimizer,
+                    &mut store,
+                    lora,
+                    best_mean_reward,
+                    last_kl,
+                )?;
+                eprintln!("[train_grpo] checkpoint saved to {}", step_dir.display());
+            }
+        }
+    }
+
+    if let Some(save_path) = args.save_path.as_deref() {
+        let step_dir = save_grpo_checkpoint::<F>(
+            save_path,
+            args.grpo_iters,
+            args,
+            &config,
+            &policy,
+            &ref_model,
+            &optimizer,
+            &mut store,
+            lora,
+            best_mean_reward,
+            last_kl,
+        )?;
+        eprintln!(
+            "[train_grpo] final checkpoint saved to {}",
+            step_dir.display()
+        );
     }
 
     println!("final kl {last_kl:.4}");
@@ -399,7 +666,7 @@ where
     };
     let mut trainer = Trainer::new(optim, clip, schedule, metrics, trainer_cfg);
 
-    let param_names = trainable_param_names(policy, params)?;
+    let param_names = trainable_param_name_map(policy, store);
 
     let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
     let batch_shape = dataset.batch_shape();
@@ -430,27 +697,213 @@ where
     Ok(trainer.optim().export_state(&param_names))
 }
 
-fn trainable_param_names<M: CausalLm>(
-    model: &M,
-    params: &[TensorId],
-) -> Result<Vec<(TensorId, String)>, CliError> {
-    let param_set = params.iter().copied().collect::<HashSet<_>>();
-    let mut names = model
-        .adapter_name_map()
-        .into_iter()
-        .filter_map(|(name, id)| param_set.contains(&id).then_some((id, name.to_string())))
-        .collect::<Vec<_>>();
-    names.sort_unstable_by(|(id_a, name_a), (id_b, name_b)| {
-        name_a.cmp(name_b).then_with(|| id_a.cmp(id_b))
-    });
-    if names.len() != params.len() {
+fn validate_adapter_resume_config(
+    resume_dir: &Path,
+    synthetic_model_uri: &str,
+    family: &str,
+    lora: LoraConfig,
+) -> Result<(), CliError> {
+    let adapter_config_path = resume_dir.join("adapter_config.json");
+    if !adapter_config_path.is_file() {
         return Err(CliError::Custom(format!(
-            "missing adapter names for {} trainable tensors (model exposed {} adapter names)",
-            params.len(),
-            names.len()
+            "--resume-from {} has no adapter_config.json",
+            resume_dir.display()
         )));
     }
-    Ok(names)
+    let value: LoraAdapterConfig = serde_json::from_str(&fs::read_to_string(&adapter_config_path)?)
+        .map_err(|err| {
+            CliError::Custom(format!(
+                "adapter config {} parse error: {err}",
+                adapter_config_path.display()
+            ))
+        })?;
+    let expected = LoraAdapterConfig::new(synthetic_model_uri, family, lora);
+    if value != expected {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} adapter mismatch with live LoRA config",
+            resume_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resume_grpo_checkpoint<F: SyntheticGrpoFamily>(
+    resume_dir: &Path,
+    args: &CliArgs,
+    cfg: &F::Config,
+    policy: &F::Model,
+    store: &mut TensorStore,
+    lora: LoraConfig,
+) -> Result<(F::Model, AdamW, ResumeState), CliError> {
+    F::validate_resume_config(resume_dir, cfg)?;
+    validate_adapter_resume_config(resume_dir, F::synthetic_model_uri(), F::family_name(), lora)?;
+
+    let train_model_path = resume_dir.join(GRPO_TRAIN_MODEL_FILENAME);
+    if !train_model_path.is_file() {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} has no {GRPO_TRAIN_MODEL_FILENAME}",
+            resume_dir.display()
+        )));
+    }
+    let mut registry = build_registry(policy);
+    registry.load_into_strict(store, &train_model_path)?;
+
+    let mut adapter_registry = build_adapter_registry(policy);
+    if !adapter_registry.is_empty() {
+        let adapter_path = resume_dir.join("adapter_model.safetensors");
+        if !adapter_path.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no adapter_model.safetensors",
+                resume_dir.display()
+            )));
+        }
+        adapter_registry.load_into_strict(store, &adapter_path)?;
+    }
+
+    let ref_model = {
+        let loaded = F::build_model(cfg, lora, store)?;
+        let mut ref_registry = build_registry(&loaded);
+        let ref_model_path = resume_dir.join(GRPO_REFERENCE_MODEL_FILENAME);
+        if !ref_model_path.is_file() {
+            return Err(CliError::Custom(format!(
+                "--resume-from {} has no {GRPO_REFERENCE_MODEL_FILENAME}",
+                resume_dir.display()
+            )));
+        }
+        ref_registry.load_into_strict(store, &ref_model_path)?;
+        let mut ref_adapter_registry = build_adapter_registry(&loaded);
+        if !ref_adapter_registry.is_empty() {
+            let ref_adapter_path = resume_dir.join(GRPO_REFERENCE_ADAPTER_FILENAME);
+            if !ref_adapter_path.is_file() {
+                return Err(CliError::Custom(format!(
+                    "--resume-from {} has no {GRPO_REFERENCE_ADAPTER_FILENAME}",
+                    resume_dir.display()
+                )));
+            }
+            ref_adapter_registry.load_into_strict(store, &ref_adapter_path)?;
+        }
+        freeze_policy(&loaded, store);
+        loaded
+    };
+
+    let (trainer_doc, optim_state) = load_trainer_state_v2(resume_dir)
+        .map_err(|err| CliError::Custom(format!("resume trainer state: {err}")))?;
+    if trainer_doc.rng_seed != args.seed {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} seed mismatch: checkpoint={} live={}",
+            resume_dir.display(),
+            trainer_doc.rng_seed,
+            args.seed
+        )));
+    }
+    if trainer_doc.schedule_name != "constant" {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} unsupported schedule {}",
+            resume_dir.display(),
+            trainer_doc.schedule_name
+        )));
+    }
+    let meta: GrpoCheckpointMeta =
+        serde_json::from_value(trainer_doc.schedule_params).map_err(|err| {
+            CliError::Custom(format!("resume checkpoint metadata parse error: {err}"))
+        })?;
+    let expected = GrpoCheckpointMeta {
+        family: F::family_name().to_string(),
+        lr: args.lr,
+        kl_coef: args.kl_coef,
+        temperature: args.temperature,
+        batch_prompts: args.batch_prompts,
+        group_size: args.group_size,
+        seq: args.seq,
+        grad_clip: args.grad_clip,
+        best_mean_reward: meta.best_mean_reward,
+        last_kl: meta.last_kl,
+    };
+    if meta != expected {
+        return Err(CliError::Custom(format!(
+            "--resume-from {} GRPO metadata mismatch with live args",
+            resume_dir.display()
+        )));
+    }
+
+    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let param_names = trainable_param_name_map(policy, store);
+    let restored = optimizer
+        .import_state(&optim_state, &param_names)
+        .map_err(|err| CliError::Custom(format!("resume optimizer import failed: {err}")))?;
+    eprintln!(
+        "[train_grpo] resumed step {} with {restored} optimizer entries from {}",
+        trainer_doc.step,
+        resume_dir.display()
+    );
+    Ok((
+        ref_model,
+        optimizer,
+        ResumeState {
+            start_iter: trainer_doc.step as usize,
+            best_mean_reward: meta.best_mean_reward,
+            last_kl: meta.last_kl,
+        },
+    ))
+}
+
+fn save_grpo_checkpoint<F: SyntheticGrpoFamily>(
+    out_dir: &Path,
+    step: usize,
+    args: &CliArgs,
+    cfg: &F::Config,
+    policy: &F::Model,
+    ref_model: &F::Model,
+    optimizer: &AdamW,
+    store: &mut TensorStore,
+    lora: LoraConfig,
+    best_mean_reward: f32,
+    last_kl: f32,
+) -> Result<PathBuf, CliError> {
+    let keep_ids = live_tensor_ids(store);
+    let step_dir = F::save_merged_checkpoint(out_dir, step, cfg, policy, store)?;
+    store.retain_ids(&keep_ids);
+
+    build_registry(policy).save_from(store, &step_dir.join(GRPO_TRAIN_MODEL_FILENAME))?;
+    build_registry(ref_model).save_from(store, &step_dir.join(GRPO_REFERENCE_MODEL_FILENAME))?;
+
+    let adapter_registry = build_adapter_registry(policy);
+    if !adapter_registry.is_empty() {
+        adapter_registry.save_from(store, &step_dir.join("adapter_model.safetensors"))?;
+        build_adapter_registry(ref_model)
+            .save_from(store, &step_dir.join(GRPO_REFERENCE_ADAPTER_FILENAME))?;
+        let adapter_config =
+            LoraAdapterConfig::new(F::synthetic_model_uri(), F::family_name(), lora);
+        fs::write(
+            step_dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&adapter_config)?,
+        )?;
+    }
+
+    let trainer_doc = TrainerStateDoc {
+        step: step as u64,
+        optim_schema: optimizer.state_schema().to_string(),
+        schedule_name: "constant".to_string(),
+        schedule_params: serde_json::to_value(GrpoCheckpointMeta {
+            family: F::family_name().to_string(),
+            lr: args.lr,
+            kl_coef: args.kl_coef,
+            temperature: args.temperature,
+            batch_prompts: args.batch_prompts,
+            group_size: args.group_size,
+            seq: args.seq,
+            grad_clip: args.grad_clip,
+            best_mean_reward,
+            last_kl,
+        })?,
+        grad_accum_current: 0,
+        rng_seed: args.seed,
+        codec_version: TRAINER_STATE_CODEC_VERSION,
+    };
+    let optim_state = optimizer.export_state(&trainable_param_name_map(policy, store));
+    save_trainer_state_v2(&step_dir, &trainer_doc, &optim_state)
+        .map_err(|err| CliError::Custom(format!("save trainer state: {err}")))?;
+    Ok(step_dir)
 }
 
 fn parse_args() -> Result<CliArgs, CliError> {
@@ -466,6 +919,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--sft-steps" => args.sft_steps = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--grpo-iters" => {
                 args.grpo_iters = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
+            "--save-every" => {
+                args.save_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--batch-prompts" => {
                 args.batch_prompts = parse_value(&flag, next_value(&mut iter, &flag)?)?;
@@ -492,6 +948,12 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--no-grad-clip" => args.grad_clip = None,
             "--metrics-jsonl" => {
                 args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--save-path" => {
+                args.save_path = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--resume-from" => {
+                args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
@@ -522,6 +984,12 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         return Err(CliError::Arg(ArgError::InvalidValue {
             flag: "--lora-alpha".into(),
             value: args.lora_alpha.to_string(),
+        }));
+    }
+    if args.save_every > 0 && args.save_path.is_none() {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--save-every".into(),
+            value: "requires --save-path".into(),
         }));
     }
     Ok(())
@@ -581,9 +1049,48 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qwen35_spec::Qwen35AttentionTensorNames;
+    use tempfile::tempdir;
+
+    fn tiny_args() -> CliArgs {
+        CliArgs {
+            model_family: ModelFamily::Qwen35,
+            sft_steps: 2,
+            grpo_iters: 4,
+            save_every: 0,
+            batch_prompts: 2,
+            group_size: 2,
+            seq: 16,
+            lr: 1.0e-4,
+            kl_coef: 0.02,
+            temperature: 1.0,
+            seed: 42,
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            grad_clip: Some(1.0),
+            metrics_jsonl: None,
+            save_path: None,
+            resume_from: None,
+        }
+    }
+
+    fn assert_adamw_state_eq(
+        lhs: &autograd::adamw_state::AdamWState,
+        rhs: &autograd::adamw_state::AdamWState,
+    ) {
+        assert_eq!(lhs.step, rhs.step);
+        assert_eq!(lhs.skipped_export, rhs.skipped_export);
+        assert_eq!(lhs.params.len(), rhs.params.len());
+        for (left, right) in lhs.params.iter().zip(rhs.params.iter()) {
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.shape, right.shape);
+            assert_eq!(left.m, right.m);
+            assert_eq!(left.v, right.v);
+        }
+    }
 
     #[test]
-    fn trainable_param_names_use_adapter_names() -> Result<(), Box<dyn std::error::Error>> {
+    fn trainable_param_name_map_uses_adapter_names() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Qwen3Config {
             vocab_size: 128,
             hidden_size: 32,
@@ -604,10 +1111,132 @@ mod tests {
         let mut store = TensorStore::default();
         let model = Qwen3Model::new_with_lora(&cfg, Some(lora), &mut store)?;
         let params = trainable_param_ids(&model, &store);
-        let names = trainable_param_names(&model, &params)?;
+        let names = trainable_param_name_map(&model, &store);
         assert_eq!(names.len(), params.len());
         assert!(names.iter().all(|(_, name)| name.contains(".lora_")));
         assert!(names.iter().all(|(_, name)| !name.starts_with("param.")));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_grpo_checkpoint_roundtrip_restores_policy_ref_and_optimizer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let args = tiny_args();
+        let cfg = synthetic_qwen35_dense_config(args.seq);
+        let lora = LoraConfig {
+            rank: args.lora_rank,
+            alpha: args.lora_alpha,
+        };
+        let out_dir = tempdir()?;
+        let layer_names = cfg.layer_tensor_names(0);
+        let Qwen35AttentionTensorNames::Full(attn_names) = layer_names.attention else {
+            unreachable!("synthetic qwen35 config uses full attention");
+        };
+
+        let mut save_store = TensorStore::default();
+        let policy = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+        let ref_model = policy.clone_frozen(&mut save_store);
+        let current_names = trainable_param_name_map(&policy, &save_store);
+        let current_adapter_map = policy.adapter_name_map();
+        let current_q = format!("{}.lora_a", attn_names.q_proj);
+        let current_q_id = *policy
+            .adapter_name_map()
+            .get(current_q.as_str())
+            .expect("policy adapter id");
+        save_store
+            .get_mut(current_q_id)
+            .expect("policy adapter")
+            .data[0] = 1.25;
+        assert!(current_adapter_map.contains_key(current_q.as_str()));
+        let ref_q = format!("{}.lora_a", attn_names.q_proj);
+        let ref_q_id = *ref_model
+            .adapter_name_map()
+            .get(ref_q.as_str())
+            .expect("ref adapter id");
+        save_store.get_mut(ref_q_id).expect("ref adapter").data[0] = -0.75;
+
+        let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+        let saved_state = autograd::adamw_state::AdamWState {
+            step: 3,
+            skipped_export: 0,
+            params: current_names
+                .iter()
+                .map(|(tensor_id, name)| {
+                    let shape = save_store
+                        .get(*tensor_id)
+                        .expect("tensor exists")
+                        .shape
+                        .clone();
+                    let len = shape.iter().product::<usize>().max(1);
+                    autograd::adamw_state::AdamWParamState {
+                        name: name.clone(),
+                        m: vec![0.25; len],
+                        v: vec![0.5; len],
+                        shape,
+                    }
+                })
+                .collect(),
+        };
+        optimizer.import_state(&saved_state, &current_names)?;
+
+        let saved_policy_a = save_store.to_host(current_q_id)?;
+        let saved_ref_a = save_store.to_host(ref_q_id)?;
+
+        let step_dir = save_grpo_checkpoint::<Qwen35GrpoFamily>(
+            out_dir.path(),
+            3,
+            &args,
+            &cfg,
+            &policy,
+            &ref_model,
+            &optimizer,
+            &mut save_store,
+            lora,
+            0.8,
+            0.1,
+        )?;
+
+        assert!(step_dir.join(GRPO_TRAIN_MODEL_FILENAME).is_file());
+        assert!(step_dir.join(GRPO_REFERENCE_MODEL_FILENAME).is_file());
+        assert!(step_dir.join(GRPO_REFERENCE_ADAPTER_FILENAME).is_file());
+
+        let mut resumed_store = TensorStore::default();
+        let resumed_policy = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut resumed_store)?;
+        let (resumed_ref, resumed_optim, resume) = resume_grpo_checkpoint::<Qwen35GrpoFamily>(
+            &step_dir,
+            &args,
+            &cfg,
+            &resumed_policy,
+            &mut resumed_store,
+            lora,
+        )?;
+        assert_eq!(resume.start_iter, 3);
+        assert_eq!(resume.best_mean_reward, 0.8);
+        assert_eq!(resume.last_kl, 0.1);
+
+        let resumed_policy_q = format!("{}.lora_a", attn_names.q_proj);
+        let resumed_policy_q_id = *resumed_policy
+            .adapter_name_map()
+            .get(resumed_policy_q.as_str())
+            .expect("resumed policy q id");
+        let resumed_ref_q = format!("{}.lora_a", attn_names.q_proj);
+        let resumed_ref_q_id = *resumed_ref
+            .adapter_name_map()
+            .get(resumed_ref_q.as_str())
+            .expect("resumed ref q id");
+
+        assert_eq!(resumed_store.to_host(resumed_policy_q_id)?, saved_policy_a);
+        assert_eq!(resumed_store.to_host(resumed_ref_q_id)?, saved_ref_a);
+        assert!(
+            resumed_ref
+                .all_parameter_ids()
+                .iter()
+                .all(|tensor_id| !resumed_store.get(*tensor_id).expect("tensor").requires_grad)
+        );
+
+        let resumed_names = trainable_param_name_map(&resumed_policy, &resumed_store);
+        let resumed_state = resumed_optim.export_state(&resumed_names);
+        assert_adamw_state_eq(&saved_state, &resumed_state);
         Ok(())
     }
 

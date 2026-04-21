@@ -14,10 +14,11 @@ with Qwen3.5 as the optimized default: `train_sft` and `train_grpo`
 dispatch across Qwen3 / Qwen3.5 families, `train_multi_turn` already
 runs on the dense/full-attn Qwen3.5 path and now exposes a stepwise-GRPO
 vs sequence-level-GSPO objective switch, `eval_lm` reads the same
-checkpoint dirs for tokenized or chat JSONL evaluation, checkpoints are
-written as HF-style directories, the handwritten Transformer/TinyLM
-runtime compatibility path has been deleted, and the hybrid linear-attn
-Qwen3.5 train path has not landed yet.
+checkpoint dirs for tokenized or chat JSONL evaluation, the canonical
+scratch-pretrain entrypoint is `pretrain`, checkpoints are written as
+HF-style directories, the handwritten Transformer/TinyLM runtime
+compatibility path has been deleted, and the hybrid linear-attn Qwen3.5
+train path has not landed yet.
 This document describes the repository as it exists after the Route-A
 refactor folded the partial runtime split back into `infer`, and after
 the CUDA kernel layer was extracted into `crates/cuda-kernels/`
@@ -50,7 +51,7 @@ Current workspace members:
 - `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
-- `crates/train` (Phase 6 — generic Qwen-family SFT/GRPO trainer, train-side server exposed by `train_multi_turn --serve`; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs; depends on `autograd`)
+- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by `train_multi_turn --serve`; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs; depends on `autograd`)
 
 ## 2. Main execution paths
 
