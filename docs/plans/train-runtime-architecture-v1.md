@@ -20,21 +20,19 @@
 
 ## 1. Problem
 
-The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. The handwritten Transformer runtime has already been removed from the active train crate, and the current remaining pain is mostly about duplicated family dispatch / checkpoint wiring around the shared loop. Short-term pain shows up as:
+The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) historically duplicated the step loop: forward → loss → backward → `optimizer.step()` → `tape.zero_grad()`. That factoring work is now mostly landed: the handwritten Transformer runtime is gone, the active train-side path already shares `Trainer<O, C, S>`, HF-style checkpoint dirs, exact-resume state, and a shared async observability sink. The remaining pain has narrowed to the parts that still resist the current generic runtime shape:
 
-- **AdamW is a concrete type, not a trait** — adding Lion/Muon/SGD means forking every binary.
-- **No LR schedule** — all binaries still run constant LR by default; schedule diversity beyond the shared trainer surface is still thin.
-- **No grad accumulation** — batch size ceilinged by VRAM, no way to simulate larger effective batch.
-- **Optimizer-state checkpointing is still uneven across binaries** — the shared trainer codec exists, but not every train entrypoint consumes it the same way yet.
-- **No metrics sink** — stdout only, unstructured.
-- **No shared checkpoint codec** — each binary rolls its own save path.
-- **CUDA coming up** — `Backend` trait already supports Cuda device; AdamW currently calls `store.to_host(grad_id)` per param per step, which works for Metal (unified memory, cheap) but will be a PCIe bandwidth bottleneck on CUDA at scale.
+- **RL loops still sit partly outside `Trainer<O, C, S>`** — `train_grpo` and `train_multi_turn` still own rollout/reward/objective orchestration by hand because the current closure model is supervised-step shaped.
+- **CLI/runtime composition is still hand-rolled per binary** — flags are not normalized across all train surfaces yet, and `clap` adoption is still open.
+- **Infer-side unified `/v1/train/*` bridge has not landed** — the current truth remains the train-side server inside `crates/train`.
+- **Hybrid linear-attn Qwen3.5 training is still absent** — runtime factoring is no longer the blocker; model-path coverage is.
+- **CUDA device-resident optimizer / grad path is still a future seam** — current host-authoritative gradient flow is fine for correctness and local Metal, but not the final CUDA scaling story.
 
 Without a shared runtime, every backend × feature combination becomes 5 binary edits.
 
 ## 2. Guiding principles
 
-1. **Extract behaviors as traits, keep concrete impls minimal.** Optimizer, LrSchedule, GradClip, MetricSink all become trait boundaries.
+1. **Extract behaviors as traits, keep concrete impls minimal.** Optimizer, LrSchedule, GradClip, and MetricSink became trait boundaries; future abstractions must clear the same "≥2 real call sites" bar.
 2. **Host-authoritative gradients stay the default.** `backend.rs:6` is explicit: "Host `Vec<f32>` stays authoritative; GPU backends upload, compute, download per call." Don't break this invariant — adding CUDA should *not* require device-resident tensors. Device-resident optim step lands later as an **additive** `Backend::optim_adamw_step` trait method with CPU fallback (same pattern as existing ops).
 3. **TrainerLoop owns the loop; plugins are DI'd.** Binaries reduce to: build model + data closure + plugin config → `trainer.run(step_fn)`.
 4. **No half-states** (`feedback_no_half_states.md`). Each phase commits a shippable subset wired end-to-end in ≥1 binary. No parallel "old loop" + "new trainer" drift.

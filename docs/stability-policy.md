@@ -55,7 +55,7 @@ Rules:
 
 ## 2. Current Classification
 
-This reflects repository state as of 2026-04-20.
+This reflects repository state as of 2026-04-21.
 
 ### Stable
 
@@ -72,6 +72,7 @@ This reflects repository state as of 2026-04-20.
 
 - `POST /v1/responses` (current non-streaming subset; streaming parity still pending)
 - CLI agent behavior
+- train-side `/v1/train/status|events|stop|save` control plane exposed by the active training binaries' `--serve` flag
 - Metal serving path
 - Metal DFlash speculative decode path
 - GGUF loading path

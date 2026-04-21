@@ -18,13 +18,13 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 
 > **Current implementation note**
 > 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
-> 2026-04-20 当前树里的训练控制面仍然在 `crates/train`：
+> 2026-04-21 当前树里的训练控制面仍然在 `crates/train`：
 > `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` /
 > `train_multi_turn --serve` 会启动 `crates/train/src/server.rs`
 > 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
 > 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
 > [`docs/plans/train-runtime-architecture-v1.md`](../plans/train-runtime-architecture-v1.md)。
-> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 dense/full-attn 为默认与优化主线；`train_grpo` 和 `train_multi_turn` 都已经支持 exact checkpoint/resume，且 `train_multi_turn` 已经支持 stepwise GRPO 和 sequence-level GSPO 两种 objective，但 hybrid linear-attn 仍是后续目标，不是已经完成的现状。
+> 当前 train-side 训练模型线已经变成通用 Qwen-family 控制面，且以 Qwen3.5 dense/full-attn 为默认与优化主线；`pretrain` 是唯一 canonical scratch-pretrain 入口，`train_grpo` 和 `train_multi_turn` 都已经支持 exact checkpoint/resume，`train_multi_turn` 已经支持 stepwise GRPO 和 sequence-level GSPO 两种 objective，shared async observability 已经落到 train-side event stream / MLflow / OTLP / W&B sidecar，但 hybrid linear-attn 仍是后续目标，不是已经完成的现状。
 
 ---
 

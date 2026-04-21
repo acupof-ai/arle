@@ -6,7 +6,7 @@ limited, and what validation exists for each area.
 If something is not listed as supported here, do not assume it is supported
 just because it compiled locally.
 
-State reflected here is based on repository evidence as of 2026-04-20.
+State reflected here is based on repository evidence as of 2026-04-21.
 
 ---
 
@@ -93,8 +93,21 @@ Backend note:
 | SSE streaming | Stable at high level | Intended to remain OpenAI-style; edge behavior may improve. |
 | `/metrics` | Stable | Prometheus endpoint; Metal now reports live queue / latency / MLX memory gauges. |
 | `/v1/stats` | Stable | Human-readable stats endpoint; Metal now reports live queue / latency / MLX memory gauges. |
+| Train-side `/v1/train/status|events|stop|save` via `pretrain --serve`, `train_sft --serve`, `train_grpo --serve`, `train_multi_turn --serve` | Beta | Current control-plane truth lives in `crates/train`. Infer-side unified `/v1/train/*` bridge is still a target architecture item, not the current implementation. |
 | Metal runtime memory knobs | Beta | `metal_request`, `metal_bench`, and `metal_serve` expose `--memory-limit-bytes`, `--cache-limit-bytes`, and `--wired-limit-bytes` for MLX allocator control. |
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
+
+## 5a. Training Surface Matrix
+
+| Surface | Status | Notes |
+| --- | --- | --- |
+| `pretrain` | Supported | Canonical scratch-pretrain entrypoint for the current Qwen-family train stack. HF-style checkpoint dirs + `latest` marker + exact optimizer-state resume. |
+| `train_sft` | Supported | Qwen3 / Qwen3.5 family dispatch, LoRA-only fine-tune surface, adapter-aware checkpointing and resume. |
+| `train_grpo` | Supported | Single-turn RL surface with exact checkpoint/resume and shared observability/control-plane wiring. |
+| `train_multi_turn` | Supported on dense/full-attn Qwen3.5 path | Multi-turn RL surface with stepwise GRPO and sequence-level GSPO objectives. Hybrid linear-attn Qwen3.5 training is still not landed. |
+| `eval_lm` | Supported | Standalone loss / perplexity evaluation for Qwen3 / Qwen3.5 checkpoint dirs on tokenized or chat JSONL. |
+| Hybrid linear-attn Qwen3.5 training | Not shipped | Active remaining gap on the train-side model path. |
+| Infer-side unified `/v1/train/*` bridge | Not shipped | Current train control plane still lives in `crates/train/src/server.rs`. |
 
 ---
 
