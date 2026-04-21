@@ -12,6 +12,9 @@
 #   --target URL     inference server URL   (default: http://localhost:8000)
 #   --model  NAME    model identifier       (default: Qwen/Qwen3-4B)
 #   --processor PATH tokenizer path / HF id (default: local models/Qwen3-4B)
+#   --trace-interval-ms N
+#                    service trace polling interval for /v1/stats
+#                    (default: 1000ms)
 #
 # Exploration mode (faster, non-canonical; DOES NOT produce a wins entry):
 #   --fast               short c=16 preset: profile=concurrent, rate=16,
@@ -38,6 +41,9 @@
 # Side effects:
 #   * Writes raw artefacts to bench-output/<date>-<label>[-runN]/
 #     (benchmarks.json / .csv / .html, plus guidellm.log and command.txt).
+#   * Always writes service-side trace artefacts in the same output dir:
+#     service_stats_before.txt / service_stats_after.txt /
+#     service_stats_trace.jsonl / service_stats_trace_summary.md.
 #     This dir is gitignored.
 #   * Canonical mode only: seeds a new
 #     docs/experience/wins/<date>-bench-guidellm-<label>.md from the
@@ -84,6 +90,7 @@ LABEL=""
 RATE_OVERRIDE=""
 WARMUP_OVERRIDE=""
 EXPLORATION_MODE=false
+TRACE_INTERVAL_MS=1000
 
 usage() {
     cat <<EOF
@@ -95,6 +102,7 @@ Canonical run (produces a wins entry):
   --target URL           default: $TARGET
   --model NAME           default: $MODEL
   --processor PATH       tokenizer path / HF id (default: local $PROCESSOR_DEFAULT)
+  --trace-interval-ms N  /v1/stats polling interval (default: $TRACE_INTERVAL_MS)
 
 Exploration mode (faster, no wins entry):
   --fast                 short c=16 preset: profile=concurrent, rate=16,
@@ -158,6 +166,9 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { echo "error: --warmup requires a value" >&2; exit 2; }
             EXPLORATION_MODE=true
             WARMUP_OVERRIDE="$2"; shift 2 ;;
+        --trace-interval-ms)
+            [[ $# -ge 2 ]] || { echo "error: --trace-interval-ms requires a value" >&2; exit 2; }
+            TRACE_INTERVAL_MS="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         --*)
@@ -179,6 +190,10 @@ done
 if [[ -z "$LABEL" ]]; then
     echo "error: <backend-label> is required" >&2
     usage >&2
+    exit 2
+fi
+if ! [[ "$TRACE_INTERVAL_MS" =~ ^[0-9]+$ ]] || [[ "$TRACE_INTERVAL_MS" -le 0 ]]; then
+    echo "error: --trace-interval-ms must be a positive integer, got: $TRACE_INTERVAL_MS" >&2
     exit 2
 fi
 
@@ -323,9 +338,168 @@ if errors:
 PY
 }
 
+acquire_bench_lock() {
+    local lock_file="$REPO_ROOT/bench-output/.bench_guidellm.lock"
+    mkdir -p "$REPO_ROOT/bench-output"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$lock_file"
+        if ! flock -n 9; then
+            echo "error: another scripts/bench_guidellm.sh run is active (lock: $lock_file)" >&2
+            echo "       bench runs are forced serial to keep service trace trustworthy." >&2
+            exit 2
+        fi
+    else
+        echo "warning: flock is not installed; serial bench lock is not enforced" >&2
+    fi
+}
+
+capture_service_stats_snapshot() {
+    local out_file="$1"
+    if curl -sS --max-time 5 "$TARGET/v1/stats" > "$out_file"; then
+        return 0
+    fi
+    echo "<unavailable>" > "$out_file"
+    return 1
+}
+
+start_service_stats_trace() {
+    local trace_file="$1"
+    local interval_ms="$2"
+    local interval_s
+    interval_s="$(python3 - "$interval_ms" <<'PY'
+import sys
+ms = int(sys.argv[1])
+print(f"{ms / 1000.0:.3f}")
+PY
+)"
+    (
+        set +e
+        while true; do
+            ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            stats="$(curl -sS --max-time 3 "$TARGET/v1/stats" 2>&1)"
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+                printf '{"ts":"%s","ok":true,"stats":%s}\n' \
+                    "$ts" "$(printf '%s' "$stats" | jq -Rs .)"
+            else
+                printf '{"ts":"%s","ok":false,"error":%s}\n' \
+                    "$ts" "$(printf '%s' "$stats" | jq -Rs .)"
+            fi
+            sleep "$interval_s"
+        done
+    ) > "$trace_file" &
+    SERVICE_TRACE_PID=$!
+}
+
+stop_service_stats_trace() {
+    if [[ -n "${SERVICE_TRACE_PID:-}" ]]; then
+        if kill -0 "$SERVICE_TRACE_PID" >/dev/null 2>&1; then
+            kill "$SERVICE_TRACE_PID" >/dev/null 2>&1 || true
+            wait "$SERVICE_TRACE_PID" >/dev/null 2>&1 || true
+        fi
+        SERVICE_TRACE_PID=""
+    fi
+}
+
+write_service_stats_trace_summary() {
+    local trace_file="$1"
+    local before_file="$2"
+    local after_file="$3"
+    local summary_file="$4"
+    local interval_ms="$5"
+    python3 - "$trace_file" "$before_file" "$after_file" "$summary_file" "$interval_ms" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+trace_path, before_path, after_path, out_path, interval_ms = sys.argv[1:]
+trace_file = pathlib.Path(trace_path)
+before = pathlib.Path(before_path).read_text().strip()
+after = pathlib.Path(after_path).read_text().strip()
+records = []
+if trace_file.exists():
+    for line in trace_file.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+
+token_re = re.compile(r"([^=\s]+)=([^\s]+)")
+
+def parse_fields(raw: str):
+    return dict(token_re.findall(raw))
+
+def parse_int(fields, key):
+    val = fields.get(key)
+    if val is None:
+        return None
+    val = val.rstrip("%")
+    try:
+        return int(float(val))
+    except ValueError:
+        return None
+
+def parse_float(fields, key):
+    val = fields.get(key)
+    if val is None:
+        return None
+    val = val.rstrip("%")
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+ok_records = [r for r in records if r.get("ok") is True and isinstance(r.get("stats"), str)]
+fail_records = [r for r in records if r.get("ok") is False]
+
+parsed = [parse_fields(r["stats"]) for r in ok_records]
+waiting_vals = [v for f in parsed if (v := parse_int(f, "waiting")) is not None]
+active_vals = [v for f in parsed if (v := parse_int(f, "active")) is not None]
+kv_vals = [v for f in parsed if (v := parse_float(f, "kv_util")) is not None]
+
+peak_waiting = max(waiting_vals) if waiting_vals else None
+peak_active = max(active_vals) if active_vals else None
+peak_kv = max(kv_vals) if kv_vals else None
+
+lines = [
+    "# Service Trace Summary",
+    "",
+    f"- Poll interval: `{interval_ms}ms`",
+    f"- Samples: `{len(records)}` (ok: `{len(ok_records)}`, failed: `{len(fail_records)}`)",
+    f"- Peak waiting: `{peak_waiting if peak_waiting is not None else 'n/a'}`",
+    f"- Peak active: `{peak_active if peak_active is not None else 'n/a'}`",
+    f"- Peak kv_util: `{f'{peak_kv:.1f}%' if peak_kv is not None else 'n/a'}`",
+    "",
+    "## Before",
+    "",
+    "```text",
+    before or "<empty>",
+    "```",
+    "",
+    "## After",
+    "",
+    "```text",
+    after or "<empty>",
+    "```",
+]
+pathlib.Path(out_path).write_text("\n".join(lines) + "\n")
+PY
+}
+
 # ---- resolve output paths, never overwrite -----------------------------------
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+acquire_bench_lock
 DATE="$(date +%Y-%m-%d)"
+SERVICE_TRACE_PID=""
+
+cleanup() {
+    stop_service_stats_trace
+}
+trap cleanup EXIT INT TERM
 
 base_dir="$REPO_ROOT/bench-output/${DATE}-${LABEL}"
 OUTPUT_DIR="$base_dir"
@@ -337,6 +511,10 @@ done
 mkdir -p "$OUTPUT_DIR"
 GUIDELLM_LOG="$OUTPUT_DIR/guidellm.log"
 GUIDELLM_CMD="$OUTPUT_DIR/command.txt"
+SERVICE_STATS_BEFORE="$OUTPUT_DIR/service_stats_before.txt"
+SERVICE_STATS_AFTER="$OUTPUT_DIR/service_stats_after.txt"
+SERVICE_STATS_TRACE="$OUTPUT_DIR/service_stats_trace.jsonl"
+SERVICE_STATS_SUMMARY="$OUTPUT_DIR/service_stats_trace_summary.md"
 
 wins_dir="$REPO_ROOT/docs/experience/wins"
 wins_base="$wins_dir/${DATE}-bench-guidellm-${LABEL}"
@@ -377,6 +555,7 @@ fi
 echo "    output : $OUTPUT_DIR"
 echo "    formats: ${OUTPUTS[*]}"
 echo "    log    : $GUIDELLM_LOG"
+echo "    trace  : $SERVICE_STATS_TRACE (interval=${TRACE_INTERVAL_MS}ms)"
 echo
 
 # Tokenizer source: explicit --processor wins, else local path if it
@@ -395,6 +574,10 @@ if ! probe_streaming_completions; then
     echo "       target: $TARGET/v1/completions" >&2
     exit 2
 fi
+if ! capture_service_stats_snapshot "$SERVICE_STATS_BEFORE"; then
+    echo "warning: failed to read pre-bench service stats from $TARGET/v1/stats" >&2
+fi
+start_service_stats_trace "$SERVICE_STATS_TRACE" "$TRACE_INTERVAL_MS"
 
 # guidellm 0.6.0 hangs at "Setup complete, starting benchmarks..." on macOS
 # under the default `fork` mp context (Python 3.11+ deprecates fork on darwin
@@ -439,10 +622,22 @@ guidellm benchmark run "${GUIDELLM_ARGS[@]}" 2>&1 | tee "$GUIDELLM_LOG"
 gdl_rc=${PIPESTATUS[0]}
 set -e
 
+stop_service_stats_trace
+if ! capture_service_stats_snapshot "$SERVICE_STATS_AFTER"; then
+    echo "warning: failed to read post-bench service stats from $TARGET/v1/stats" >&2
+fi
+write_service_stats_trace_summary \
+    "$SERVICE_STATS_TRACE" \
+    "$SERVICE_STATS_BEFORE" \
+    "$SERVICE_STATS_AFTER" \
+    "$SERVICE_STATS_SUMMARY" \
+    "$TRACE_INTERVAL_MS"
+
 if [[ $gdl_rc -ne 0 ]]; then
     echo "error: guidellm exited with status $gdl_rc" >&2
     echo "       raw artefacts (if any): $OUTPUT_DIR" >&2
     echo "       full log: $GUIDELLM_LOG" >&2
+    echo "       service trace: $SERVICE_STATS_SUMMARY" >&2
     exit 3
 fi
 
@@ -450,6 +645,7 @@ if ! validate_guidellm_results "$OUTPUT_DIR/benchmarks.json"; then
     echo "error: guidellm wrote benchmark files, but the result set is invalid" >&2
     echo "       raw artefacts: $OUTPUT_DIR" >&2
     echo "       full log: $GUIDELLM_LOG" >&2
+    echo "       service trace: $SERVICE_STATS_SUMMARY" >&2
     exit 4
 fi
 
@@ -545,6 +741,7 @@ fi
 if [[ "$EXPLORATION_MODE" == true ]]; then
     echo ">>> exploration mode — skipping wins entry seed"
     echo "    raw artefacts: $OUTPUT_DIR"
+    echo "    service trace: $SERVICE_STATS_SUMMARY"
     exit 0
 fi
 
@@ -585,9 +782,21 @@ if len(parts) == 2:
 pathlib.Path(out).write_text(body)
 PY
 
+cat >> "$WINS_FILE" <<EOF
+
+## Service Trace
+
+- Poll interval: \`${TRACE_INTERVAL_MS}ms\`
+- Before: \`${SERVICE_STATS_BEFORE}\`
+- During: \`${SERVICE_STATS_TRACE}\`
+- After: \`${SERVICE_STATS_AFTER}\`
+- Summary: \`${SERVICE_STATS_SUMMARY}\`
+EOF
+
 echo ">>> artefacts"
 echo "    raw  : $OUTPUT_DIR"
 echo "    html : $OUTPUT_DIR/benchmarks.html"
+echo "    trace: $SERVICE_STATS_SUMMARY"
 echo "    wins : $WINS_FILE"
 echo
 echo "Next: fill the hardware / features / non-default flags in $WINS_FILE,"

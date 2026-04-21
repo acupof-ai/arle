@@ -22,6 +22,15 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 /// Prefill chunk size is capped to this value to prevent buffer overflow.
 pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
 
+// SGLang-aligned prefill admission reserve for future decode growth.
+// We reserve `remaining_decode_tokens * ratio` (clipped) in page budgeting.
+const PREFILL_DECODE_RESERVE_RATIO_INIT: f64 = 0.20;
+const PREFILL_DECODE_RESERVE_RATIO_MIN: f64 = 0.05;
+const PREFILL_DECODE_RESERVE_RATIO_MAX: f64 = 1.0;
+const PREFILL_DECODE_RESERVE_RATIO_DECAY: f64 = 0.01;
+const PREFILL_DECODE_RESERVE_RATIO_GROWTH: f64 = 0.05;
+const PREFILL_DECODE_RESERVE_CLIP_TOKENS: usize = 4096;
+
 // Prefix-cache and T1 watermark / keepalive tunables live on
 // `crate::scheduler::types::SchedulerConfig`. Per the project env-var
 // policy (`docs/environment.md` §0), these are **not** env-driven —
@@ -144,6 +153,11 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
+    /// Admission-time estimate of future decode growth, used to reserve page
+    /// headroom while scheduling prefill.
+    pub(super) prefill_decode_reserve_ratio: f64,
+    /// Whether the current scheduler tick retracted decode requests due to KV pressure.
+    pub(super) decode_retracted_this_step: bool,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -507,6 +521,8 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
+            prefill_decode_reserve_ratio: PREFILL_DECODE_RESERVE_RATIO_INIT,
+            decode_retracted_this_step: false,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(
@@ -596,6 +612,46 @@ impl<M: ModelForward> Scheduler<M> {
             self.paged_kv_pool.seq_len(slot_idx),
             additional_tokens,
         )
+    }
+
+    pub(super) fn decode_reserve_tokens(
+        &self,
+        generated_tokens: usize,
+        max_tokens: usize,
+    ) -> usize {
+        let remaining = max_tokens.saturating_sub(generated_tokens);
+        if remaining == 0 {
+            return 0;
+        }
+        let clipped = remaining.min(PREFILL_DECODE_RESERVE_CLIP_TOKENS);
+        let estimated = ((clipped as f64) * self.prefill_decode_reserve_ratio).ceil() as usize;
+        estimated.clamp(1, clipped)
+    }
+
+    pub(super) fn bump_prefill_decode_reserve_ratio(&mut self, retracted_reqs: usize) {
+        if retracted_reqs == 0 {
+            return;
+        }
+        self.decode_retracted_this_step = true;
+        let old = self.prefill_decode_reserve_ratio;
+        let growth = PREFILL_DECODE_RESERVE_RATIO_GROWTH * retracted_reqs as f64;
+        self.prefill_decode_reserve_ratio =
+            (self.prefill_decode_reserve_ratio + growth).min(PREFILL_DECODE_RESERVE_RATIO_MAX);
+        if self.prefill_decode_reserve_ratio > old {
+            info!(
+                "Admission decode reserve ratio bumped: {:.3} -> {:.3} (retracted={})",
+                old, self.prefill_decode_reserve_ratio, retracted_reqs
+            );
+        }
+    }
+
+    pub(super) fn decay_prefill_decode_reserve_ratio_if_stable(&mut self) {
+        if self.decode_retracted_this_step {
+            return;
+        }
+        self.prefill_decode_reserve_ratio = (self.prefill_decode_reserve_ratio
+            - PREFILL_DECODE_RESERVE_RATIO_DECAY)
+            .max(PREFILL_DECODE_RESERVE_RATIO_MIN);
     }
 
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {

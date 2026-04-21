@@ -114,7 +114,7 @@ canonical parameters fit in one heredoc.
 
 ```
 Usage:
-  scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]
+  scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH] [--trace-interval-ms N]
 
 Required:
   <backend-label>      e.g. cuda-h100, cuda-a100, metal-m3max
@@ -124,14 +124,22 @@ Defaults (override with flags):
   --target   http://localhost:8000
   --model    Qwen/Qwen3-4B        (matches default HTTP server startup)
   --processor models/Qwen3-4B     (tokenizer path / HF id)
+  --trace-interval-ms 1000        (/v1/stats polling cadence)
 
 Behaviour:
-  1. Check `guidellm` is on PATH. If not → print `pip install -e .[bench]`
+  1. Acquire a global lock (`bench-output/.bench_guidellm.lock`) so only one
+     bench run executes at a time.
+  2. Check `guidellm` is on PATH. If not → print `pip install -e .[bench]`
      hint and exit 2.
-  2. Check target responds to `/v1/models`. If not → exit 2 with
+  3. Check target responds to `/v1/models`. If not → exit 2 with
      "server not running at <target>, start it with
      scripts/start_infer.sh first".
-  3. Invoke:
+  4. Capture service-side trace around the run:
+        `service_stats_before.txt` (snapshot)
+        `service_stats_trace.jsonl` (/v1/stats polling during run)
+        `service_stats_after.txt` (snapshot)
+        `service_stats_trace_summary.md` (peak waiting/active/kv summary)
+  5. Invoke:
         guidellm benchmark run \
             --target "$TARGET" --model "$MODEL" --processor "$PROCESSOR" \
             --profile sweep \
@@ -142,20 +150,21 @@ Behaviour:
             --outputs json --outputs csv --outputs html \
             --backend openai_http \
             --backend-kwargs '{"validate_backend": "/v1/models"}'
-  4. Extract headline metrics from benchmarks.json:
+  6. Extract headline metrics from benchmarks.json:
         sweep rate points (req/s)
         TTFT p50 / p99 (ms)
         ITL  p50 / p99 (ms)
         output tok/s per rate point
-  5. Print them as a markdown table on stdout, and write the same table
+  7. Print them as a markdown table on stdout, and write the same table
      plus the filesystem path of the HTML report into a new
      `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md`
-     file, seeded from `TEMPLATE-bench-guidellm.md`.
+     file, seeded from `TEMPLATE-bench-guidellm.md`, with service-trace artefacts listed.
 
 Exit codes:
   0   bench completed, wins stub written
-  2   environment not ready (guidellm missing, server down)
+  2   environment not ready (guidellm missing, server down, lock conflict)
   3   guidellm exited non-zero
+  4   invalid/short-circuited benchmark result shape
 ```
 
 Metric extraction is **jq** (already on both dev hosts) — no extra Python.

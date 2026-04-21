@@ -38,7 +38,7 @@ pub struct SchedulerConfig {
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
     /// Allow mixing a prefill batch into a decode batch when the model
-    /// supports it. Mirrors SGLang's `--enable-mixed-chunk`; default stays off.
+    /// supports it. Mirrors SGLang's `--enable-mixed-chunk`.
     pub enable_mixed_chunk: bool,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
@@ -131,6 +131,7 @@ impl SchedulerConfig {
         Self {
             max_slots,
             chunked_prefill_size: 4096,
+            enable_mixed_chunk: true,
             ..Self::default()
         }
     }
@@ -260,6 +261,11 @@ pub enum RequestPriority {
 /// Request sent from HTTP handler to scheduler.
 pub struct IncomingRequest {
     pub prompt: String,
+    /// Optional cached tokenization of `prompt`.
+    ///
+    /// Requests can remain queued across many ticks; caching tokens here avoids
+    /// repeated tokenizer work for the same prompt.
+    pub prompt_tokens: Option<Vec<u32>>,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
     pub stop: Option<Vec<String>>,
@@ -410,7 +416,7 @@ mod tests {
         assert_eq!(cfg.chunked_prefill_size, 4096);
         assert_eq!(cfg.max_prefill_tokens, 16384);
         assert_eq!(cfg.prefill_max_requests, None);
-        assert!(!cfg.enable_mixed_chunk);
+        assert!(cfg.enable_mixed_chunk);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);

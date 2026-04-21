@@ -9,6 +9,7 @@ fn make_request() -> IncomingRequest {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<CompletionStreamDelta>();
     IncomingRequest {
         prompt: "hello".to_string(),
+        prompt_tokens: None,
         max_tokens: 32,
         sampling: SamplingParams::default(),
         stop: None,

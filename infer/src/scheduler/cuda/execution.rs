@@ -188,13 +188,13 @@ impl PrefillBudget {
             ),
         };
         for &slot_idx in &scheduler.running_batch {
-            if scheduler
-                .request(slot_idx)
-                .is_some_and(|req| req.generated_tokens.len() < req.max_tokens)
+            if let Some(req) = scheduler.request(slot_idx)
+                && req.generated_tokens.len() < req.max_tokens
             {
-                budget
-                    .page_budget
-                    .reserve_running_decode_headroom(slot_idx, 1);
+                budget.page_budget.reserve_running_decode_headroom(
+                    slot_idx,
+                    scheduler.decode_reserve_tokens(req.generated_tokens.len(), req.max_tokens),
+                );
             }
         }
         budget
@@ -269,7 +269,8 @@ impl<M: ModelForward> Scheduler<M> {
             page_reserve: SlotPageReserve {
                 slot_idx,
                 prefill_pool_tokens: pool_tokens,
-                decode_headroom_tokens: usize::from(req.generated_tokens.len() < req.max_tokens),
+                decode_headroom_tokens: self
+                    .decode_reserve_tokens(req.generated_tokens.len(), req.max_tokens),
             },
         })
     }
@@ -292,7 +293,7 @@ impl<M: ModelForward> Scheduler<M> {
                 } else {
                     0
                 },
-                decode_headroom_tokens: usize::from(max_tokens > 0),
+                decode_headroom_tokens: self.decode_reserve_tokens(0, max_tokens),
             },
         }
     }
@@ -352,18 +353,26 @@ impl<M: ModelForward> Scheduler<M> {
             }
 
             let _ = self.evict_prefix_cache_if_pressured();
-            let prompt_tokens = match self.tokenizer.encode(&queued.prompt) {
-                Ok(tokens) if !tokens.is_empty() => tokens,
-                Ok(_) => {
-                    error!("Empty prompt after tokenization, skipping");
+            let prompt_tokens = match queued.prompt_tokens.take() {
+                Some(tokens) if !tokens.is_empty() => tokens,
+                Some(_) => {
+                    error!("Empty prompt tokens in waiting request, skipping");
                     finish_rejected_request(&queued.delta_tx, FinishReason::Length, 0);
                     continue;
                 }
-                Err(e) => {
-                    error!("Tokenization error: {}", e);
-                    finish_rejected_request(&queued.delta_tx, FinishReason::Length, 0);
-                    continue;
-                }
+                None => match self.tokenizer.encode(&queued.prompt) {
+                    Ok(tokens) if !tokens.is_empty() => tokens,
+                    Ok(_) => {
+                        error!("Empty prompt after tokenization, skipping");
+                        finish_rejected_request(&queued.delta_tx, FinishReason::Length, 0);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Tokenization error: {}", e);
+                        finish_rejected_request(&queued.delta_tx, FinishReason::Length, 0);
+                        continue;
+                    }
+                },
             };
             if !length_contract.admits_prompt_len(prompt_tokens.len()) {
                 warn!(
@@ -440,6 +449,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.waiting_prefill_reservation(slot_idx, prompt_tokens.len(), queued.max_tokens);
             if !budget.can_schedule(reservation) {
                 self.prefix_cache.release(&radix_blocks);
+                queued.prompt_tokens = Some(prompt_tokens);
                 self.waiting.push_front(queued);
                 break;
             }
@@ -644,6 +654,7 @@ impl<M: ModelForward> Scheduler<M> {
         if num == 0 && self.waiting.is_empty() {
             return;
         }
+        self.decode_retracted_this_step = false;
 
         let plan_t = std::time::Instant::now();
         let schedule_batch = self.plan_schedule_batch();
@@ -687,6 +698,9 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             0
         };
+        if readback_us > 0 {
+            self.decay_prefill_decode_reserve_ratio_if_stable();
+        }
         let decode_us = decode_launch_us + readback_us;
 
         let total_us = decode_us + emit_us + admission_us + prefill_us;
@@ -706,14 +720,15 @@ impl<M: ModelForward> Scheduler<M> {
 
         if total_us > 100_000 {
             info!(
-                "step breakdown: plan={} admission={}us decode={}us emit={}us prefill={}us total={}us batch={}",
+                "step breakdown: plan={} admission={}us decode={}us emit={}us prefill={}us total={}us batch={} reserve_ratio={:.3}",
                 forward_batch.label(),
                 admission_us,
                 decode_us,
                 emit_us,
                 prefill_us,
                 total_us,
-                num
+                num,
+                self.prefill_decode_reserve_ratio
             );
         }
     }
