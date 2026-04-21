@@ -9,6 +9,7 @@
 #   CARGO_TARGET_DIR     default: /tmp/agent-infer-target-cuda
 #   INFER_TEST_MODEL_ID  default: Qwen/Qwen3-0.6B
 #   INFER_TEST_MODEL_PATH default: /tmp/agent-infer-models/Qwen3-0.6B
+#   CUDA_MIN_FREE_MIB    default: 4096
 
 set -euo pipefail
 
@@ -20,6 +21,7 @@ CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/agent-infer-target-cuda}"
 MODEL_ID="${INFER_TEST_MODEL_ID:-Qwen/Qwen3-0.6B}"
 MODEL_PATH="${INFER_TEST_MODEL_PATH:-/tmp/agent-infer-models/Qwen3-0.6B}"
+CUDA_MIN_FREE_MIB="${CUDA_MIN_FREE_MIB:-4096}"
 TRAIN_OUT="${OUT_DIR}/train"
 SFT_DATA="${OUT_DIR}/tiny_sft.jsonl"
 EVAL_DATA="${OUT_DIR}/tiny_eval.jsonl"
@@ -48,6 +50,14 @@ latest_step_name() {
   readlink "$latest" | xargs basename
 }
 
+gpu_free_mib() {
+  nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -n 1
+}
+
+gpu_process_table() {
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader
+}
+
 mkdir -p "$OUT_DIR" "$TRAIN_OUT"
 
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found"
@@ -63,6 +73,13 @@ fi
 info "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
 info "artifacts: $OUT_DIR"
 info "model dir: $MODEL_PATH"
+
+FREE_MIB="$(gpu_free_mib)"
+if [[ "$FREE_MIB" =~ ^[0-9]+$ ]] && (( FREE_MIB < CUDA_MIN_FREE_MIB )); then
+  info "compute apps:"
+  gpu_process_table || true
+  die "only ${FREE_MIB} MiB free on the GPU; need at least ${CUDA_MIN_FREE_MIB} MiB before running CUDA smoke"
+fi
 
 if [[ ! -f "${MODEL_PATH}/model.safetensors" ]]; then
   info "downloading ${MODEL_ID} into ${MODEL_PATH}"

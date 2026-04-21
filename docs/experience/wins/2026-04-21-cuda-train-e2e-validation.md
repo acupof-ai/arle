@@ -126,6 +126,9 @@ Follow-up guardrails also landed for the SFT path:
   downloads `Qwen/Qwen3-0.6B` into a local dir when missing, builds
   `train_sft + eval_lm + agent-infer`, writes tiny SFT/eval JSONL fixtures,
   then runs `train_sft -> eval_lm -> agent-infer -> resume`.
+  The wrapper now also preflights `nvidia-smi` free memory and fails early
+  with the active compute-process table when the card is already full, instead
+  of surfacing a later `cuda htod copy failed`.
 - Added an exact resume-consistency test to `crates/train/src/bin/train_sft.rs`
   that runs a tiny Qwen3 LoRA SFT job continuously and as `2 + resume-to-4`,
   then proves parity by comparing:
@@ -139,15 +142,29 @@ Follow-up guardrails also landed for the SFT path:
     clean
   - `bash -n scripts/train_cuda_e2e.sh`: clean
 
-The one thing that still depended on machine state, not repository state, was
-the "real" `Qwen3-0.6B` CUDA SFT smoke on this shared L4. The new wrapper was
-able to download the model and finish all builds, but the first actual
-`train_sft --backend cuda` failed with `cuda htod copy failed` because an
-already-running `infer` server on the same GPU held ~21.5 GiB of the card,
-leaving only ~760 MiB free. The failure reproduced even against the tiny
-9.8M-parameter local checkpoint, which confirmed the blocker was shared GPU
-headroom rather than the SFT code path. Keep `scripts/train_cuda_e2e.sh` as
-the rerun command once the box is idle.
+Machine-state follow-up on the shared L4:
+
+- first rerun attempt of the "real" `Qwen3-0.6B` CUDA SFT smoke failed early
+  with `cuda htod copy failed` because an already-running `infer` server on
+  the same GPU held ~21.5 GiB of the card, leaving only ~760 MiB free
+  (reproduced even against the tiny 9.8M-parameter local checkpoint)
+- after the shared benchmark released the card and the wrapper's new memory
+  preflight observed >22 GiB free, the full smoke completed successfully:
+  - `train_sft --backend cuda` ran 2 real LoRA steps and published
+    `/tmp/train_cuda_e2e_134086/train/latest -> step_000002`
+  - `eval_lm --backend cuda` reloaded that checkpoint and reported
+    `loss=10.819704`, `ppl=49996.264866`, `tokens=6`
+  - `agent-infer --model-path .../latest --max-tokens 8 --non-interactive`
+    loaded the merged checkpoint on CUDA, printed the REPL banner, and
+    generated a short reply without panicking
+  - `train_sft --resume-from .../latest --backend cuda` resumed from step 2,
+    restored adapters + optimizer state, and advanced to
+    `/tmp/train_cuda_e2e_134086/train/step_000004`
+
+In other words: the prior failure mode was shared-GPU headroom, not a defect
+in the SFT / eval / infer contract. Keep `scripts/train_cuda_e2e.sh` as the
+canonical rerun command on any shared CUDA box because it now detects the
+"GPU already full" condition before starting work.
 
 ## Rule
 
