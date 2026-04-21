@@ -5,7 +5,6 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
-    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -47,6 +46,8 @@ const ShmHeader = extern struct {
     generation: u64,
     payload_len: u64,
 };
+
+var shm_generation_counter = std.atomic.Value(u64).init(1);
 
 fn sliceFromRaw(ptr: [*]const u8, len: usize) []const u8 {
     return ptr[0..len];
@@ -416,16 +417,8 @@ fn shmTotalLen(payload_len: usize) ?usize {
 }
 
 fn nextShmGeneration() u64 {
-    var seed = @as(u64, @intCast(@max(c.getpid(), 1)));
-    var ts: c.struct_timespec = undefined;
-    if (c.clock_gettime(c.CLOCK_REALTIME, &ts) == 0) {
-        seed ^= @as(u64, @intCast(@max(ts.tv_sec, 1)));
-        seed *%= 0x9E3779B185EBCA87;
-        seed ^= @as(u64, @intCast(@max(ts.tv_nsec, 1)));
-    }
-    var prng = std.Random.DefaultPrng.init(seed);
-    const generation = prng.random().int(u64);
-    return if (generation == 0) 1 else generation;
+    const generation = shm_generation_counter.fetchAdd(1, .monotonic);
+    return if (generation == 0) shm_generation_counter.fetchAdd(1, .monotonic) else generation;
 }
 
 fn shmHeaderPtr(mapping: ?*anyopaque) *ShmHeader {

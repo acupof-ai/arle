@@ -5,14 +5,14 @@
 //! boundaries explicit without pretending the CUDA path is already wired.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 
 use crate::types::BlockId;
 
@@ -337,7 +337,7 @@ impl StagePlanner for CoordinatorHandle {
         }
 
         let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.send(CoordinatorCommand::Stage {
+        self.try_send(CoordinatorCommand::Stage {
             ticket,
             requests: requests.to_vec(),
         })
@@ -865,5 +865,23 @@ mod tests {
             host_region: region,
         }]);
         assert!(second.is_none(), "full queue should not block spill submit");
+    }
+
+    #[test]
+    fn stage_is_non_blocking_when_queue_is_full() {
+        let (_coordinator, handle, _events) = Coordinator::new(1);
+        let first = handle.stage(&[StageRequest {
+            block_id: BlockId(1),
+            from: BlockLocation::HostPinned { offset: 0 },
+            byte_len: 4096,
+        }]);
+        assert!(first.is_some());
+
+        let second = handle.stage(&[StageRequest {
+            block_id: BlockId(2),
+            from: BlockLocation::HostPinned { offset: 4096 },
+            byte_len: 4096,
+        }]);
+        assert!(second.is_none(), "full queue should not block stage submit");
     }
 }
