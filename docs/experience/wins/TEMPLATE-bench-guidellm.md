@@ -42,7 +42,7 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model 
 - `--data prompt_tokens=4096,output_tokens=256`
 - `--max-seconds 60`
 - `--random-seed 20260416`
-- `--outputs json,csv,html`
+- `--outputs json --outputs csv --outputs html`
 - Wrapper: `scripts/bench_guidellm.sh <backend-label>`
 
 ## Results — sweep headline table
