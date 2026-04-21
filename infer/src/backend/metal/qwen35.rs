@@ -561,6 +561,31 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    pub(super) fn prefill_session(
+        &self,
+        tokens: &MlxArray,
+        prompt_len: i32,
+        cache_pos: i32,
+    ) -> Result<MlxArray> {
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_prefill_session(
+                self.0,
+                tokens.as_raw(),
+                prompt_len,
+                cache_pos,
+                &raw mut out_logits,
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
     /// Run one decode step. Returns logits. Updates caches in place.
     pub(super) fn step(
         &self,
@@ -729,6 +754,7 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    #[cfg(test)]
     pub(super) fn prefill(
         &self,
         tokens: &MlxArray,
@@ -776,6 +802,63 @@ impl CppQwen35Model {
         for (i, ptr) in out_gdr.into_iter().enumerate() {
             let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
             drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    #[cfg(test)]
+    pub(super) fn prefill_full_attention(
+        &self,
+        tokens: &MlxArray,
+        prompt_len: i32,
+        cache_pos: i32,
+        k_caches: &mut [MlxArray],
+        v_caches: &mut [MlxArray],
+    ) -> Result<MlxArray> {
+        anyhow::ensure!(
+            k_caches.len() == v_caches.len(),
+            "Qwen3 compiled prefill requires matching k/v cache counts"
+        );
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(k_caches.len() * 2);
+        for (k_cache, v_cache) in k_caches.iter().zip(v_caches.iter()) {
+            kv_ptrs.push(k_cache.as_raw());
+            kv_ptrs.push(v_cache.as_raw());
+        }
+
+        let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); kv_ptrs.len()];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_prefill(
+                self.0,
+                tokens.as_raw(),
+                prompt_len,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                kv_ptrs.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                &raw mut out_logits,
+                out_kv.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for ((k_cache, v_cache), out_pair) in k_caches
+            .iter_mut()
+            .zip(v_caches.iter_mut())
+            .zip(out_kv.chunks_exact(2))
+        {
+            let old_k = std::mem::replace(k_cache, unsafe { MlxArray::from_raw(out_pair[0]) });
+            drop(old_k);
+            let old_v = std::mem::replace(v_cache, unsafe { MlxArray::from_raw(out_pair[1]) });
+            drop(old_v);
         }
 
         Ok(unsafe { MlxArray::from_raw(out_logits) })
@@ -2075,11 +2158,13 @@ mod tests {
     use std::{env, path::PathBuf};
 
     use super::*;
-    use crate::backend::metal::sampling::gpu_sample_token_batched;
+    use crate::backend::metal::forward::build_forward_graph;
+    use crate::backend::metal::sampling::{gpu_sample_token, gpu_sample_token_batched};
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
         mlx::{Dtype, as_dtype, concatenate_axis, eval, slice, slice_update, zeros},
+        weights::load_qwen3_metal_weights,
     };
     use crate::test_support::metal_test_guard;
 
@@ -2122,6 +2207,258 @@ mod tests {
             &[1, n_kv, left_pad + cache_len, head_dim],
         );
         padded
+    }
+
+    fn qwen3_model_path() -> Option<PathBuf> {
+        env::var_os("QWEN3_MODEL_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let fallback =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/Qwen3-0.6B");
+                fallback.exists().then_some(fallback)
+            })
+    }
+
+    #[test]
+    fn qwen3_compiled_prefill_matches_rust_prefill_for_long_prompt() -> Result<()> {
+        let Some(model_path) = qwen3_model_path() else {
+            eprintln!(
+                "QWEN3_MODEL_PATH unset and ../models/Qwen3-0.6B missing; skipping Qwen3 compiled prefill equivalence test"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let weights = load_qwen3_metal_weights(&model_path, &config)?;
+        let Some(cpp_model) = weights.cpp_model.as_ref() else {
+            eprintln!(
+                "Qwen3 compiled C++ model unavailable for {}; skipping equivalence test",
+                model_path.display()
+            );
+            return Ok(());
+        };
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let prompt_tokens: Vec<u32> = (1..=64).collect();
+        let prompt_tokens_i32: Vec<i32> = prompt_tokens.iter().map(|&token| token as i32).collect();
+        let prompt_len = i32::try_from(prompt_tokens.len()).expect("prompt len fits in i32");
+        let kv_capacity = prompt_len + KV_CACHE_CHUNK;
+        let n_heads = config.num_attention_heads as i32;
+        let n_kv_heads = config.num_key_value_heads as i32;
+        let head_dim = config.head_dim as i32;
+        let cache_shape = [1_i32, n_kv_heads, kv_capacity, head_dim];
+        let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
+        let init_caches = || {
+            (
+                (0..config.num_hidden_layers)
+                    .map(|_| zeros(&cache_shape, kv_dtype))
+                    .collect::<Vec<_>>(),
+                (0..config.num_hidden_layers)
+                    .map(|_| zeros(&cache_shape, kv_dtype))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let (mut rust_k, mut rust_v) = init_caches();
+        let rust_sampled = build_forward_graph(
+            &prompt_tokens,
+            &weights,
+            &mut rust_k,
+            &mut rust_v,
+            0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1.0f32 / (head_dim as f32).sqrt(),
+            config.rope_theta as f32,
+            config.rms_norm_eps as f32,
+            None,
+            0,
+            &params,
+        )?;
+        let mut rust_refs: Vec<&MlxArray> = Vec::with_capacity(1 + rust_k.len() + rust_v.len());
+        rust_refs.push(&rust_sampled);
+        rust_refs.extend(rust_k.iter());
+        rust_refs.extend(rust_v.iter());
+        eval(&rust_refs);
+        let rust_token = rust_sampled.item_i32();
+
+        let (mut cpp_k, mut cpp_v) = init_caches();
+        let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens_i32, &[prompt_len]);
+        let cpp_logits =
+            cpp_model.prefill_full_attention(&prompt_arr, prompt_len, 0, &mut cpp_k, &mut cpp_v)?;
+        let cpp_sampled = gpu_sample_token(&cpp_logits, &params);
+        let mut cpp_refs: Vec<&MlxArray> = Vec::with_capacity(2 + cpp_k.len() + cpp_v.len());
+        cpp_refs.push(&cpp_logits);
+        cpp_refs.push(&cpp_sampled);
+        cpp_refs.extend(cpp_k.iter());
+        cpp_refs.extend(cpp_v.iter());
+        eval(&cpp_refs);
+        let cpp_token = cpp_sampled.item_i32();
+
+        let (session_k, session_v) = init_caches();
+        let mut session_kv_flat: Vec<MlxArray> = session_k
+            .iter()
+            .zip(session_v.iter())
+            .flat_map(|(k, v)| [k.clone(), v.clone()])
+            .collect();
+        cpp_model.begin_session(&session_kv_flat, &[])?;
+        let session_logits = cpp_model.prefill_session(&prompt_arr, prompt_len, 0)?;
+        let session_sampled = gpu_sample_token(&session_logits, &params);
+        let (session_kv_flat_out, session_gdr_flat_out) =
+            cpp_model.end_session(session_kv_flat.len(), 0)?;
+        anyhow::ensure!(
+            session_gdr_flat_out.is_empty(),
+            "Qwen3 full-attention session prefill unexpectedly returned GDR state"
+        );
+        session_kv_flat = session_kv_flat_out;
+        let mut session_k = Vec::with_capacity(config.num_hidden_layers);
+        let mut session_v = Vec::with_capacity(config.num_hidden_layers);
+        let mut session_iter = session_kv_flat.into_iter();
+        for _ in 0..config.num_hidden_layers {
+            session_k.push(
+                session_iter
+                    .next()
+                    .context("session prefill missing Qwen3 K cache")?,
+            );
+            session_v.push(
+                session_iter
+                    .next()
+                    .context("session prefill missing Qwen3 V cache")?,
+            );
+        }
+        anyhow::ensure!(
+            session_iter.next().is_none(),
+            "session prefill returned unexpected extra Qwen3 KV caches"
+        );
+        let mut session_refs: Vec<&MlxArray> =
+            Vec::with_capacity(2 + session_k.len() + session_v.len());
+        session_refs.push(&session_logits);
+        session_refs.push(&session_sampled);
+        session_refs.extend(session_k.iter());
+        session_refs.extend(session_v.iter());
+        eval(&session_refs);
+        let session_token = session_sampled.item_i32();
+
+        assert_eq!(rust_token, cpp_token);
+        assert_eq!(cpp_token, session_token);
+
+        for (
+            layer_idx,
+            (
+                ((rust_k_layer, rust_v_layer), (cpp_k_layer, cpp_v_layer)),
+                (session_k_layer, session_v_layer),
+            ),
+        ) in rust_k
+            .iter()
+            .zip(rust_v.iter())
+            .zip(cpp_k.iter().zip(cpp_v.iter()))
+            .zip(session_k.iter().zip(session_v.iter()))
+            .enumerate()
+        {
+            let rust_k_valid = slice(
+                rust_k_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let rust_v_valid = slice(
+                rust_v_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let cpp_k_valid = slice(
+                cpp_k_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let cpp_v_valid = slice(
+                cpp_v_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let session_k_valid = slice(
+                session_k_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let session_v_valid = slice(
+                session_v_layer,
+                &[0, 0, 0, 0],
+                &[1, n_kv_heads, prompt_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+
+            let rust_k_f32 = as_dtype(&rust_k_valid, Dtype::Float32);
+            let rust_v_f32 = as_dtype(&rust_v_valid, Dtype::Float32);
+            let cpp_k_f32 = as_dtype(&cpp_k_valid, Dtype::Float32);
+            let cpp_v_f32 = as_dtype(&cpp_v_valid, Dtype::Float32);
+            let session_k_f32 = as_dtype(&session_k_valid, Dtype::Float32);
+            let session_v_f32 = as_dtype(&session_v_valid, Dtype::Float32);
+            eval(&[
+                &rust_k_f32,
+                &rust_v_f32,
+                &cpp_k_f32,
+                &cpp_v_f32,
+                &session_k_f32,
+                &session_v_f32,
+            ]);
+
+            for (idx, (lhs, rhs)) in rust_k_f32
+                .as_slice_f32()
+                .iter()
+                .zip(cpp_k_f32.as_slice_f32().iter())
+                .enumerate()
+            {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "layer {layer_idx} k[{idx}] mismatch: rust={lhs} cpp={rhs}"
+                );
+            }
+            for (idx, (lhs, rhs)) in cpp_k_f32
+                .as_slice_f32()
+                .iter()
+                .zip(session_k_f32.as_slice_f32().iter())
+                .enumerate()
+            {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "layer {layer_idx} k[{idx}] mismatch: cpp={lhs} session={rhs}"
+                );
+            }
+            for (idx, (lhs, rhs)) in rust_v_f32
+                .as_slice_f32()
+                .iter()
+                .zip(cpp_v_f32.as_slice_f32().iter())
+                .enumerate()
+            {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "layer {layer_idx} v[{idx}] mismatch: rust={lhs} cpp={rhs}"
+                );
+            }
+            for (idx, (lhs, rhs)) in cpp_v_f32
+                .as_slice_f32()
+                .iter()
+                .zip(session_v_f32.as_slice_f32().iter())
+                .enumerate()
+            {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "layer {layer_idx} v[{idx}] mismatch: cpp={lhs} session={rhs}"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     #[test]

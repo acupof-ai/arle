@@ -1601,6 +1601,74 @@ int32_t qwen35_compiled_step_session(
     }
 }
 
+int32_t qwen35_compiled_prefill_session(
+    void* model,
+    mlx_array* token_ids,
+    int32_t prompt_len,
+    int32_t cache_pos,
+    mlx_array** out_logits
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (!m->session_active) {
+            throw std::runtime_error("qwen35_compiled_prefill_session requires an active session");
+        }
+
+        const int32_t n_kv = static_cast<int32_t>(m->session_kv_caches.size());
+        const int32_t n_gdr = static_cast<int32_t>(m->session_gdr_states.size());
+
+        m->current_cache_pos = cache_pos;
+        m->current_batch_size = 1;
+        m->current_seq_len = prompt_len;
+        m->current_last_logits_only = use_qwen35_cpp_prefill_last_logits_only();
+        m->clear_optional_batch_inputs();
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (const auto& kv : m->session_kv_caches) {
+            inputs.push_back(kv);
+        }
+        for (const auto& gdr : m->session_gdr_states) {
+            inputs.push_back(gdr);
+        }
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        std::vector<array> next_kv_caches;
+        std::vector<array> next_gdr_states;
+        next_kv_caches.reserve(n_kv);
+        next_gdr_states.reserve(n_gdr);
+        for (int i = 0; i < n_kv; ++i) {
+            next_kv_caches.push_back(std::move(outputs[1 + i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            next_gdr_states.push_back(std::move(outputs[1 + n_kv + i]));
+        }
+
+        auto* logits = from_arr(std::move(outputs[0]));
+        m->session_kv_caches = std::move(next_kv_caches);
+        m->session_gdr_states = std::move(next_gdr_states);
+        *out_logits = logits;
+
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return -1;
+    }
+}
+
 int32_t qwen35_compiled_step_batch(
     void* model,
     mlx_array* token_ids,    // int32 vector [batch]

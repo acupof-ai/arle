@@ -1,7 +1,8 @@
 # `infer::backend::metal` — Agent Guide
 
-Apple Silicon Metal backend via `crates/mlx-sys`. Serial single-request today,
-with an accounting-only scheduler wired for a future hot-path upgrade. Load
+Apple Silicon Metal backend via `crates/mlx-sys`. The scheduler runtime is the
+live hot path: decode-first continuous batching, chunked prefill, Qwen3.5
+packed decode, and optional DFlash all execute through `runtime.rs`. Load
 before touching any Metal code.
 
 ## Module map
@@ -21,7 +22,7 @@ metal/dflash.rs         — Metal DFlash speculative draft runtime
 metal/kv_pool.rs        — KV pool accounting (not yet on the hot path)
 metal/prefix_cache.rs   — Metal prefix cache accounting
 metal/gdr.rs            — Metal draft runtime glue
-metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-priority + chunked prefill)
+metal/scheduler.rs      — MetalScheduler policy (decode-first step + optional prefill chunk)
 ```
 
 ## Feature gating
@@ -49,10 +50,8 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    (Auto-memory: `feedback_mlx_rope_layout.md`, `feedback_mlx_rope_axis.md`;
    incident: `docs/experience/errors/2026-04-02-rope-axis-bug.md`.)
 4. **Metal scheduler is on the hot path** as of `M0.2b` (2026-04-15).
-   `run_metal_scheduler_runtime` (`runtime.rs:639`) drives
-   `MetalScheduler::step()` → `PrefillChunk` / `DecodeBatch` / `Mixed` /
-   `Idle` and dispatches each decision through `execute_prefill_chunk` /
-   `execute_decode_batch`. Qwen3.5 packed decode runs through
+   `run_metal_scheduler_runtime` drives one `MetalScheduleStep` per tick:
+   `decode` first, then an optional `prefill` chunk. Qwen3.5 packed decode runs through
    `CachedQwen35DecodeBatch` (`runtime.rs`) with `retain_rows` (shrink) +
    `admit_rows` (prefix-preserving grow via `admit_row_indices`) and
    supports variable-length rows via a shared `batch_cache_len` cursor plus
@@ -66,13 +65,10 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
 6. **DFlash (speculative decode) is experimental and optional.** Guarded by
    `MetalDflashOptions`; empty draft model = feature off. See
    `docs/resources/metal-dflash.md` for user-facing flags. DFlash dispatches
-   from the scheduler runtime via `execute_decode_single`
-   (`runtime.rs:1051-1056`) — one row at a time. When a multi-row tick has
-   `open.len() >= 2`, the scheduler permanently disables DFlash on every row
-   so they all join the packed batch (`runtime.rs:1040-1045`); this is a
-   policy choice, not a wiring gap, and the Layer 2 verify-batch plan
-   (`docs/plans/metal-dflash-qwen35-verify-batch.md`) lifts it once packed
-   speculative verify lands.
+   from the scheduler runtime as part of the single decode path. A lone
+   DFlash row falls through to `execute_decode_single`; two or more DFlash
+   rows use `execute_qwen35_dflash_packed_batch`. Plain rows still batch
+   through `execute_qwen35_packed_decode_batch`.
 7. **Variable-length decode uses left-padding + additive mask + per-row
    RoPE offsets** (mlx-lm `BatchKVCache` pattern).
    `Qwen35PackedDecodeBatch` carries a shared `batch_cache_len` cursor
@@ -99,8 +95,7 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    `StreamingInferenceBackend::generate_stream`; `metal_serve` routes
    traffic through the scheduler runtime. Concurrency, admission,
    cancellation, prefix reuse, and KV-pool lifecycle all live on the
-   scheduler side. The legacy serial runtime is retained only for DFlash
-   (see invariant #6).
+   scheduler side.
 
 ## Metal vs CUDA: mental model differences
 

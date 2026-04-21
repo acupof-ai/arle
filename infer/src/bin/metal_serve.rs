@@ -52,6 +52,9 @@ struct Args {
     api_key: Option<String>,
 
     /// Maximum waiting requests before rejecting new submissions.
+    /// Single explicit backlog cap for the scheduler runtime.
+    /// Keep this bounded so long-prompt throughput sweeps shed load instead of
+    /// draining an unbounded queue for minutes after the measurement window.
     #[arg(long, default_value_t = 256)]
     max_waiting: usize,
 

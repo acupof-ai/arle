@@ -9,15 +9,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::{error, info, warn};
 use tokio::sync::mpsc;
 
-use super::kv_pool::MetalKVPool;
-use super::prefix_cache::MetalPrefixCache;
 use super::request_state::{
-    DflashBatchOutcome, MetalRequestPhase as RuntimePhase, MetalRequestState, Qwen3PrefixSnapshot,
+    DflashBatchOutcome, MetalRequestPhase as RuntimePhase, MetalRequestState,
     Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
-    MetalRequestPriority, MetalRuntimeRequestState, MetalScheduleDecision, MetalScheduler,
-    MetalSchedulerConfig,
+    MetalRequestPriority, MetalRuntimeRequestState, MetalScheduler, MetalSchedulerConfig,
 };
 use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
@@ -215,13 +212,7 @@ const METAL_PREFIX_BLOCK_SIZE: usize = 16;
 const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
 
 enum MetalLivePrefixRuntime {
-    Qwen3(MetalQwen3PrefixRuntime),
     Qwen35(MetalQwen35PrefixRuntime),
-}
-
-struct MetalQwen3PrefixRuntime {
-    pool: MetalKVPool,
-    cache: MetalPrefixCache,
 }
 
 struct MetalQwen35CachedPrefix {
@@ -244,7 +235,6 @@ struct CachedQwen35DecodeBatch {
 
 impl MetalLivePrefixRuntime {
     fn new(backend: &'static MetalBackend, config: &MetalSchedulerConfig) -> Result<Option<Self>> {
-        let model_config = backend.config.as_ref().context("model not loaded")?;
         let weights = backend.weights.as_ref().context("weights not loaded")?;
         let max_total_tokens = (config
             .max_running_requests
@@ -252,26 +242,11 @@ impl MetalLivePrefixRuntime {
             .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
         .max(METAL_PREFIX_BLOCK_SIZE * 8);
         match weights {
-            MetalWeights::Qwen3(weights) => {
-                let kv_dtype = weights.layers[0].attention_inputs.kv_dtype();
-                let pool = MetalKVPool::new(
-                    model_config.num_hidden_layers,
-                    model_config.num_key_value_heads,
-                    model_config.head_dim,
-                    max_total_tokens,
-                    kv_dtype,
-                )
-                .context("create live Metal prefix KV pool")?;
-
+            MetalWeights::Qwen3(_) => {
                 info!(
-                    "Metal live prefix cache enabled for Qwen3: block_size={}, max_cached_tokens={}",
-                    METAL_PREFIX_BLOCK_SIZE, max_total_tokens
+                    "Metal live prefix cache disabled for Qwen3: long-prompt allocator stability takes priority over prompt-prefix reuse"
                 );
-
-                Ok(Some(Self::Qwen3(MetalQwen3PrefixRuntime {
-                    pool,
-                    cache: MetalPrefixCache::new(METAL_PREFIX_BLOCK_SIZE),
-                })))
+                Ok(None)
             }
             MetalWeights::Qwen35(weights) => {
                 if weights.cpp_model.is_none() {
@@ -298,144 +273,13 @@ impl MetalLivePrefixRuntime {
         metrics: &ServerMetrics,
     ) -> Result<()> {
         match self {
-            MetalLivePrefixRuntime::Qwen3(runtime) => runtime.prepare_request(request, metrics),
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.prepare_request(request, metrics),
         }
     }
 
     fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
         match self {
-            MetalLivePrefixRuntime::Qwen3(runtime) => runtime.publish_prompt_prefix(request),
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.publish_prompt_prefix(request),
-        }
-    }
-}
-
-impl MetalQwen3PrefixRuntime {
-    fn prepare_request(
-        &mut self,
-        request: &mut ActiveMetalRequest,
-        metrics: &ServerMetrics,
-    ) -> Result<()> {
-        let prompt_tokens = &request.prompt_tokens;
-        if prompt_tokens.len() < self.cache.block_size() {
-            metrics.record_prefix_lookup(false);
-            return Ok(());
-        }
-
-        let hit = self
-            .cache
-            .lookup(prompt_tokens)
-            .context("lookup Metal live prefix cache")?;
-        let reusable_len = self.reusable_prefix_len(prompt_tokens.len(), hit.matched_len);
-        if reusable_len > 0 {
-            request
-                .request_state
-                .import_qwen3_prefix_from_pool(
-                    &self.pool,
-                    reusable_len,
-                    &hit.slot_indices[..reusable_len],
-                )
-                .context("import matched Metal prefix into request state")?;
-        }
-        self.cache
-            .release(&hit.slot_indices)
-            .context("release Metal live prefix cache lookup pins")?;
-        metrics.record_prefix_lookup(reusable_len > 0);
-
-        Ok(())
-    }
-
-    fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
-        let publish_len =
-            (request.prompt_len() / self.cache.block_size()) * self.cache.block_size();
-        if publish_len == 0 {
-            return Ok(());
-        }
-
-        let Some(snapshot) = request
-            .request_state
-            .export_qwen3_prompt_prefix(publish_len)
-            .context("export Qwen3 prompt prefix for live prefix cache")?
-        else {
-            return Ok(());
-        };
-
-        self.publish_snapshot(snapshot)
-    }
-
-    fn publish_snapshot(&mut self, snapshot: Qwen3PrefixSnapshot) -> Result<()> {
-        let full_len = snapshot.token_ids.len();
-        if full_len == 0 {
-            return Ok(());
-        }
-
-        let hit = self
-            .cache
-            .lookup(&snapshot.token_ids)
-            .context("lookup cached Metal prefix before publish")?;
-        let matched_len = hit.matched_len.min(full_len);
-        if matched_len == full_len {
-            self.cache
-                .release(&hit.slot_indices)
-                .context("release publish-time Metal prefix lookup pins")?;
-            return Ok(());
-        }
-
-        let new_len = full_len - matched_len;
-        self.ensure_capacity_for(new_len)?;
-        let mut slot_indices = hit.slot_indices.clone();
-        self.cache
-            .release(&hit.slot_indices)
-            .context("release partial publish-time Metal prefix lookup pins")?;
-
-        let new_slots = self
-            .pool
-            .alloc_slots(new_len)
-            .context("alloc Metal prefix cache slots for publish")?;
-        for (layer_idx, (k_rows, v_rows)) in snapshot
-            .k_rows_by_layer
-            .iter()
-            .zip(snapshot.v_rows_by_layer.iter())
-            .enumerate()
-        {
-            let suffix_k = slice_rows(k_rows, matched_len, full_len)?;
-            let suffix_v = slice_rows(v_rows, matched_len, full_len)?;
-            self.pool
-                .write_kv_slots(layer_idx, &new_slots, &suffix_k, &suffix_v)
-                .with_context(|| format!("write Metal prefix cache rows for layer {layer_idx}"))?;
-        }
-        slot_indices.extend_from_slice(&new_slots);
-        self.cache
-            .insert(&snapshot.token_ids, &slot_indices)
-            .context("insert published Qwen3 prompt into Metal prefix cache")?;
-        Ok(())
-    }
-
-    fn ensure_capacity_for(&mut self, needed_tokens: usize) -> Result<()> {
-        while self.pool.available_tokens() < needed_tokens {
-            let freed = self.cache.evict(1);
-            if freed.is_empty() {
-                bail!(
-                    "Metal live prefix cache out of space (need {}, available {})",
-                    needed_tokens,
-                    self.pool.available_tokens()
-                );
-            }
-            self.pool
-                .release_slots(&freed)
-                .context("release evicted Metal prefix-cache slots")?;
-        }
-        Ok(())
-    }
-
-    fn reusable_prefix_len(&self, prompt_len: usize, matched_len: usize) -> usize {
-        let block_size = self.cache.block_size();
-        let aligned = matched_len / block_size * block_size;
-        if aligned >= prompt_len {
-            aligned.saturating_sub(block_size)
-        } else {
-            aligned
         }
     }
 }
@@ -566,22 +410,6 @@ impl MetalQwen35PrefixRuntime {
     }
 }
 
-fn slice_rows(
-    array: &super::mlx::MlxArray,
-    start: usize,
-    end: usize,
-) -> Result<super::mlx::MlxArray> {
-    use super::mlx::slice;
-
-    let end_i32 = i32::try_from(end).context("slice_rows end overflow")?;
-    let start_i32 = i32::try_from(start).context("slice_rows start overflow")?;
-    let width = *array
-        .shape()
-        .get(1)
-        .context("slice_rows expects a rank-2 row-major array")?;
-    Ok(slice(array, &[start_i32, 0], &[end_i32, width], &[1, 1]))
-}
-
 /// Spawn the first live Metal scheduler runtime.
 ///
 /// This runtime uses the request-state API to interleave chunked prefill and
@@ -702,10 +530,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
                 rx,
                 runtime_handle,
                 metrics,
-                MetalSchedulerConfig {
-                    max_waiting_requests: max_waiting,
-                    ..MetalSchedulerConfig::default()
-                },
+                MetalSchedulerConfig::default(),
             )
         }));
 
@@ -744,7 +569,6 @@ fn run_metal_scheduler_runtime(
     metrics: ServerMetrics,
     config: MetalSchedulerConfig,
 ) -> Result<()> {
-    let metal_dflash_concurrency_off = config.metal_dflash_concurrency_off;
     let mut prefix_runtime = MetalLivePrefixRuntime::new(backend, &config)?;
     let mut scheduler = MetalScheduler::new(config)?;
     let mut pending = HashMap::<RequestId, PendingMetalRequest>::new();
@@ -810,9 +634,23 @@ fn run_metal_scheduler_runtime(
         }
 
         let runtime_states = scheduler_runtime_states(&active);
-        match scheduler.step(&runtime_states) {
-            MetalScheduleDecision::Idle => continue,
-            MetalScheduleDecision::PrefillChunk(prefill) => guard_prefill_chunk(
+        let step = scheduler.step(&runtime_states);
+        if step.is_idle() {
+            continue;
+        }
+
+        if let Some(batch) = step.decode {
+            guard_decode_batch(
+                batch.req_ids,
+                &metrics,
+                &mut scheduler,
+                &mut active,
+                &mut qwen35_decode_batch_cache,
+            );
+        }
+
+        if let Some(prefill) = step.prefill {
+            guard_prefill_chunk(
                 prefill.req_id,
                 prefill.input_tokens.len(),
                 backend,
@@ -823,39 +661,7 @@ fn run_metal_scheduler_runtime(
                 &mut scheduler,
                 &mut pending,
                 &mut active,
-            ),
-            MetalScheduleDecision::DecodeBatch(batch) => {
-                guard_decode_batch(
-                    batch.req_ids,
-                    &metrics,
-                    &mut scheduler,
-                    &mut active,
-                    &mut qwen35_decode_batch_cache,
-                    metal_dflash_concurrency_off,
-                );
-            }
-            MetalScheduleDecision::Mixed { decode, prefill } => {
-                guard_decode_batch(
-                    decode.req_ids,
-                    &metrics,
-                    &mut scheduler,
-                    &mut active,
-                    &mut qwen35_decode_batch_cache,
-                    metal_dflash_concurrency_off,
-                );
-                guard_prefill_chunk(
-                    prefill.req_id,
-                    prefill.input_tokens.len(),
-                    backend,
-                    tokenizer,
-                    &handle,
-                    &metrics,
-                    &mut prefix_runtime,
-                    &mut scheduler,
-                    &mut pending,
-                    &mut active,
-                );
-            }
+            );
         }
 
         maybe_refresh_runtime_metrics(
@@ -917,7 +723,6 @@ fn guard_decode_batch(
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
-    dflash_concurrency_off: bool,
 ) {
     let panic_req_ids = req_ids.clone();
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -927,7 +732,6 @@ fn guard_decode_batch(
             scheduler,
             active,
             qwen35_decode_batch_cache,
-            dflash_concurrency_off,
         );
     }));
 
@@ -1227,7 +1031,6 @@ fn execute_decode_batch(
     scheduler: &mut MetalScheduler,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
-    dflash_concurrency_off: bool,
 ) {
     if req_ids.is_empty() {
         return;
@@ -1252,19 +1055,6 @@ fn execute_decode_batch(
         open.push((req_id, request));
     }
 
-    // Default path (flag=false): DFlash rows batch through
-    // `execute_qwen35_dflash_packed_batch` when ≥2 DFlash rows are open;
-    // plain rows batch through `execute_qwen35_packed_decode_batch`; a lone
-    // DFlash row falls through to `execute_decode_single`. The two buckets
-    // run sequentially (no async fan-out) — mixed-mode parallelism is
-    // deferred to Phase 2b.
-    //
-    // Legacy downgrade (flag=true): with ≥2 open sessions, permanently drop
-    // DFlash on every row so they all join the packed plain batch. One-way:
-    // `target_hidden` capture needs a fresh prefill, so we don't try to
-    // resume DFlash when concurrency drops back to 1. Kept as a kill-switch
-    // for the 2026-04-19 concurrent-DFlash flip.
-    //
     // Round-3 codex findings on the partitioner are both closed:
     //   - [P2] "all-or-nothing DFlash demotion on buffered-speculative
     //     rows" — fixed at
@@ -1274,14 +1064,6 @@ fn execute_decode_batch(
     //     retracted; the `invalidate_*` sync on the `Ok(None)` arm is the
     //     only path that propagates `packed_kv_flat`/`packed_gdr_flat`
     //     updates into per-request state.
-    if open.len() >= 2 && dflash_concurrency_off {
-        for (_, request) in open.iter_mut() {
-            if request.request_state.is_dflash_enabled() {
-                request.request_state.disable_dflash();
-            }
-        }
-    }
-
     // Partition into dflash_rows and plain_rows. Dispatch:
     //   - plain_rows (≥1): existing `execute_qwen35_packed_decode_batch`.
     //   - dflash_rows (≥2): new `execute_qwen35_dflash_packed_batch`.

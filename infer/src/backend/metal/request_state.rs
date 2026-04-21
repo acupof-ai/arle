@@ -332,12 +332,6 @@ enum MetalRequestStateInner<'a> {
     Qwen35(ResumableRequestState<Qwen35StepDriver<'a>>),
 }
 
-pub(crate) struct Qwen3PrefixSnapshot {
-    pub token_ids: Vec<u32>,
-    pub k_rows_by_layer: Vec<MlxArray>,
-    pub v_rows_by_layer: Vec<MlxArray>,
-}
-
 pub(crate) struct Qwen35PrefixSnapshot {
     pub token_ids: Vec<u32>,
     pub kv_flat: Vec<MlxArray>,
@@ -835,28 +829,6 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    /// Permanently disable DFlash speculative decode on this request.
-    /// Used by the scheduler runtime when concurrent sessions appear —
-    /// DFlash's serial per-request verify (~230ms/block) dominates step
-    /// latency and starves the packed batch, so ≥2 concurrent sessions
-    /// are always faster going through plain packed decode. The downgrade
-    /// is one-way: `target_hidden` capture requires fresh prefill, so we
-    /// don't try to resume DFlash later.
-    ///
-    /// Drops the per-request draft KV cache and any captured tapes,
-    /// freeing GPU memory. The main target KV cache (`cpp_state.kv_flat`)
-    /// is untouched — it's the same buffer packed decode will use.
-    pub(crate) fn disable_dflash(&mut self) {
-        match &mut self.inner {
-            MetalRequestStateInner::Qwen3(state) => {
-                state.driver.dflash = None;
-            }
-            MetalRequestStateInner::Qwen35(state) => {
-                state.driver.dflash = None;
-            }
-        }
-    }
-
     /// DFlash acceptance rate for this request: fraction of generated tokens
     /// that came from draft predictions (matches reference metric).
     /// Returns None if not DFlash-enabled or no blocks executed yet.
@@ -1042,79 +1014,6 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    pub(crate) fn import_qwen3_prefix_from_pool(
-        &mut self,
-        shared_pool: &MetalKVPool,
-        matched_len: usize,
-        slot_indices: &[u32],
-    ) -> Result<bool> {
-        match &mut self.inner {
-            MetalRequestStateInner::Qwen3(state) => {
-                ensure!(
-                    state.phase == MetalRequestPhase::Prefill,
-                    "Qwen3 prefix import requires Prefill phase, got {:?}",
-                    state.phase
-                );
-                ensure!(
-                    state.prompt_cursor == 0 && state.generated_tokens == 0,
-                    "Qwen3 prefix import requires a fresh request state"
-                );
-                ensure!(
-                    matched_len == slot_indices.len(),
-                    "Qwen3 prefix import length {} does not match {} slot indices",
-                    matched_len,
-                    slot_indices.len()
-                );
-                if matched_len == 0 || matched_len >= state.prompt_tokens.len() {
-                    return Ok(false);
-                }
-
-                state
-                    .driver
-                    .import_prefix_from_pool(shared_pool, slot_indices)
-                    .context("import Qwen3 cached prefix into request state")?;
-                state.prompt_cursor = matched_len;
-                Ok(true)
-            }
-            MetalRequestStateInner::Qwen35(_) => Ok(false),
-        }
-    }
-
-    pub(crate) fn export_qwen3_prompt_prefix(
-        &self,
-        token_count: usize,
-    ) -> Result<Option<Qwen3PrefixSnapshot>> {
-        match &self.inner {
-            MetalRequestStateInner::Qwen3(state) => {
-                if token_count == 0 {
-                    return Ok(None);
-                }
-                ensure!(
-                    token_count <= state.prompt_tokens.len(),
-                    "Qwen3 prefix export requested {} prompt tokens but prompt only has {}",
-                    token_count,
-                    state.prompt_tokens.len()
-                );
-                ensure!(
-                    token_count <= state.prompt_cursor,
-                    "Qwen3 prefix export requested {} tokens but only {} prompt tokens are materialized",
-                    token_count,
-                    state.prompt_cursor
-                );
-                let (k_rows_by_layer, v_rows_by_layer) = state
-                    .driver
-                    .export_prefix_rows(token_count)
-                    .context("export Qwen3 cached prefix rows")?;
-                Ok(Some(Qwen3PrefixSnapshot {
-                    token_ids: state.prompt_tokens[..token_count].to_vec(),
-                    k_rows_by_layer,
-                    v_rows_by_layer,
-                }))
-            }
-            MetalRequestStateInner::Qwen35(_) => Ok(None),
-        }
-    }
-
     pub(crate) fn import_qwen35_prefix_snapshot(
         &mut self,
         snapshot: &Qwen35PrefixSnapshot,
@@ -1239,7 +1138,7 @@ fn decode_qwen3_batch(
             pool.alloc_tokens(METAL_REQUEST_STATE_ID, 1)
                 .context("alloc MetalKVPool slot for batched decode")?;
         } else {
-            driver.ensure_capacity(driver.cache_len + 1);
+            driver.ensure_capacity(driver.cache_len + 1)?;
         }
     }
 
@@ -2363,6 +2262,81 @@ struct Qwen3DFlashState {
     acceptance_lengths: Vec<usize>,
 }
 
+struct Qwen3CppPrefillState {
+    session_active: bool,
+    n_kv: usize,
+}
+
+impl Qwen3CppPrefillState {
+    fn ensure_session_active(
+        &mut self,
+        cpp_model: &CppQwen35Model,
+        k_caches: &[MlxArray],
+        v_caches: &[MlxArray],
+    ) -> Result<()> {
+        if self.session_active {
+            return Ok(());
+        }
+
+        let mut kv_flat = Vec::with_capacity(k_caches.len() * 2);
+        for (k_cache, v_cache) in k_caches.iter().zip(v_caches.iter()) {
+            kv_flat.push(k_cache.clone());
+            kv_flat.push(v_cache.clone());
+        }
+        cpp_model.begin_session(&kv_flat, &[])?;
+        self.n_kv = kv_flat.len();
+        self.session_active = true;
+        Ok(())
+    }
+
+    fn ensure_caches_drained(
+        &mut self,
+        cpp_model: &CppQwen35Model,
+        k_caches: &mut [MlxArray],
+        v_caches: &mut [MlxArray],
+    ) -> Result<()> {
+        if !self.session_active {
+            return Ok(());
+        }
+
+        let (kv_flat, gdr_flat) = cpp_model.end_session(self.n_kv, 0)?;
+        ensure!(
+            gdr_flat.is_empty(),
+            "Qwen3 C++ prefill session unexpectedly returned GDR state"
+        );
+        ensure!(
+            kv_flat.len() == k_caches.len() * 2 && k_caches.len() == v_caches.len(),
+            "Qwen3 C++ prefill session returned {} KV tensors for {} layer pairs",
+            kv_flat.len(),
+            k_caches.len()
+        );
+        let mut kv_iter = kv_flat.into_iter();
+        for (k_cache, v_cache) in k_caches.iter_mut().zip(v_caches.iter_mut()) {
+            let old_k = std::mem::replace(
+                k_cache,
+                kv_iter
+                    .next()
+                    .context("Qwen3 C++ prefill session missing K cache")?,
+            );
+            drop(old_k);
+            let old_v = std::mem::replace(
+                v_cache,
+                kv_iter
+                    .next()
+                    .context("Qwen3 C++ prefill session missing V cache")?,
+            );
+            drop(old_v);
+        }
+        ensure!(
+            kv_iter.next().is_none(),
+            "Qwen3 C++ prefill session returned unexpected extra KV tensors"
+        );
+        self.session_active = false;
+        self.n_kv = 0;
+        Ok(())
+    }
+}
+
 struct Qwen3StepDriver<'a> {
     weights: &'a StandardMetalWeights,
     sample_params: SamplingParams,
@@ -2370,6 +2344,7 @@ struct Qwen3StepDriver<'a> {
     kv_capacity: i32,
     k_caches: Vec<MlxArray>,
     v_caches: Vec<MlxArray>,
+    cpp_prefill: Option<Qwen3CppPrefillState>,
     kv_pool: Option<MetalKVPool>,
     cache_len: i32,
     n_heads: i32,
@@ -2442,6 +2417,14 @@ impl<'a> Qwen3StepDriver<'a> {
             kv_capacity: initial_cap,
             k_caches,
             v_caches,
+            cpp_prefill: weights
+                .cpp_model
+                .as_ref()
+                .filter(|_| !use_kv_pool && !is_dflash)
+                .map(|_| Qwen3CppPrefillState {
+                    session_active: false,
+                    n_kv: 0,
+                }),
             kv_pool: if use_kv_pool {
                 Some(
                     MetalKVPool::new(
@@ -2496,9 +2479,14 @@ impl<'a> Qwen3StepDriver<'a> {
             !tokens.is_empty(),
             "Qwen3 request-state step requires at least one token"
         );
+        // Compiled Qwen3 prefill sessions are model-global state on the C++
+        // bridge. Any fallback to the Rust graph (single-token tail chunk,
+        // decode, prefix import/export paths) must materialize and end that
+        // session first so the next request can safely begin its own session.
+        self.ensure_cpp_prefill_drained()?;
         let token_count =
             i32::try_from(tokens.len()).context("Qwen3 request-state token count overflow")?;
-        self.ensure_capacity(self.cache_len + token_count);
+        self.ensure_capacity(self.cache_len + token_count)?;
         let sampled = build_forward_graph(
             tokens,
             self.weights,
@@ -2519,15 +2507,57 @@ impl<'a> Qwen3StepDriver<'a> {
         Ok(sampled)
     }
 
+    fn run_tokens_cpp_prefill(&mut self, tokens: &[u32]) -> Result<MlxArray> {
+        ensure!(
+            !tokens.is_empty(),
+            "Qwen3 C++ prefill session requires at least one token"
+        );
+        let token_count =
+            i32::try_from(tokens.len()).context("Qwen3 request-state token count overflow")?;
+        self.ensure_capacity(self.cache_len + token_count)?;
+        let token_values: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+        let token_arr = MlxArray::from_slice_i32(&token_values, &[token_count]);
+        let cpp_model = self
+            .weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3 C++ prefill session missing compiled model")?;
+        let cpp_prefill = self
+            .cpp_prefill
+            .as_mut()
+            .context("Qwen3 C++ prefill session state unavailable")?;
+        cpp_prefill.ensure_session_active(cpp_model, &self.k_caches, &self.v_caches)?;
+        let logits = cpp_model.prefill_session(&token_arr, token_count, self.cache_len)?;
+        self.cache_len += token_count;
+        Ok(logits)
+    }
+
+    fn ensure_cpp_prefill_drained(&mut self) -> Result<()> {
+        let Some(cpp_prefill) = self.cpp_prefill.as_mut() else {
+            return Ok(());
+        };
+        let cpp_model = self
+            .weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3 C++ prefill session missing compiled model")?;
+        cpp_prefill.ensure_caches_drained(cpp_model, &mut self.k_caches, &mut self.v_caches)
+    }
+
+    fn can_use_cpp_prefill(&self, tokens: &[u32]) -> bool {
+        tokens.len() > 1 && self.cpp_prefill.is_some()
+    }
+
     fn run_step(&mut self, token: u32, params: &SamplingParams) -> Result<MlxArray> {
         self.run_tokens(&[token], params)
     }
 
-    fn ensure_capacity(&mut self, needed_tokens: i32) {
+    fn ensure_capacity(&mut self, needed_tokens: i32) -> Result<()> {
         if self.kv_pool.is_some() {
-            return;
+            return Ok(());
         }
         while needed_tokens > self.kv_capacity {
+            self.ensure_cpp_prefill_drained()?;
             let new_cap = self.kv_capacity + KV_CACHE_CHUNK;
             for li in 0..self.k_caches.len() {
                 extend_kv_cache(
@@ -2545,134 +2575,7 @@ impl<'a> Qwen3StepDriver<'a> {
             }
             self.kv_capacity = new_cap;
         }
-    }
-
-    fn import_prefix_from_pool(
-        &mut self,
-        shared_pool: &MetalKVPool,
-        slot_indices: &[u32],
-    ) -> Result<()> {
-        use super::mlx::{reshape, slice_update, transpose_axes};
-
-        if slot_indices.is_empty() {
-            return Ok(());
-        }
-        ensure!(
-            self.cache_len == 0,
-            "Qwen3 prefix import requires an empty cache"
-        );
-        ensure!(
-            shared_pool.num_layers() == self.k_caches.len()
-                && shared_pool.num_kv_heads() == self.n_kv_heads as usize
-                && shared_pool.head_dim() == self.head_dim as usize,
-            "Qwen3 prefix import requires matching KV geometry"
-        );
-
-        let prefix_len =
-            i32::try_from(slot_indices.len()).context("Qwen3 prefix import length overflow")?;
-        self.ensure_capacity(prefix_len);
-        if let Some(pool) = self.kv_pool.as_mut() {
-            pool.alloc_tokens(METAL_REQUEST_STATE_ID, slot_indices.len())
-                .context("alloc request-local MetalKVPool slots for imported prefix")?;
-        }
-
-        for layer_idx in 0..self.k_caches.len() {
-            let (k_rows, v_rows) = shared_pool
-                .gather_kv_rows(layer_idx, slot_indices)
-                .with_context(|| {
-                    format!("gather shared Metal prefix rows for layer {layer_idx}")
-                })?;
-
-            if let Some(pool) = self.kv_pool.as_mut() {
-                pool.write_kv(layer_idx, METAL_REQUEST_STATE_ID, &k_rows, &v_rows)
-                    .with_context(|| {
-                        format!(
-                            "write imported Qwen3 prefix into request-local pool layer {layer_idx}"
-                        )
-                    })?;
-            } else {
-                let k = reshape(&k_rows, &[1, prefix_len, self.n_kv_heads, self.head_dim]);
-                let k = transpose_axes(&k, &[0, 2, 1, 3]);
-                let v = reshape(&v_rows, &[1, prefix_len, self.n_kv_heads, self.head_dim]);
-                let v = transpose_axes(&v, &[0, 2, 1, 3]);
-                self.k_caches[layer_idx] = slice_update(
-                    &mut self.k_caches[layer_idx],
-                    &k,
-                    &[0, 0, 0, 0],
-                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
-                );
-                self.v_caches[layer_idx] = slice_update(
-                    &mut self.v_caches[layer_idx],
-                    &v,
-                    &[0, 0, 0, 0],
-                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
-                );
-            }
-        }
-
-        self.cache_len = prefix_len;
         Ok(())
-    }
-
-    fn export_prefix_rows(&self, token_count: usize) -> Result<(Vec<MlxArray>, Vec<MlxArray>)> {
-        use super::mlx::{reshape, slice, transpose_axes};
-
-        ensure!(
-            token_count > 0,
-            "Qwen3 prefix export requires at least one token"
-        );
-        ensure!(
-            token_count <= self.cache_len as usize,
-            "Qwen3 prefix export requested {} tokens but cache_len is {}",
-            token_count,
-            self.cache_len
-        );
-
-        let prefix_len =
-            i32::try_from(token_count).context("Qwen3 prefix export length overflow")?;
-        let kv_dim = self.n_kv_heads * self.head_dim;
-        let mut k_rows_by_layer = Vec::with_capacity(self.k_caches.len());
-        let mut v_rows_by_layer = Vec::with_capacity(self.v_caches.len());
-
-        for layer_idx in 0..self.k_caches.len() {
-            let (k_rows, v_rows) = if let Some(pool) = self.kv_pool.as_ref() {
-                let request_slots = pool
-                    .token_indices(METAL_REQUEST_STATE_ID)
-                    .context("Qwen3 prefix export missing request-local MetalKVPool slots")?;
-                ensure!(
-                    token_count <= request_slots.len(),
-                    "Qwen3 prefix export requested {} tokens but pool only tracks {} slots",
-                    token_count,
-                    request_slots.len()
-                );
-                pool.gather_kv_rows(layer_idx, &request_slots[..token_count])
-                    .with_context(|| {
-                        format!("gather request-local Qwen3 prefix rows for layer {layer_idx}")
-                    })?
-            } else {
-                let k = slice(
-                    &self.k_caches[layer_idx],
-                    &[0, 0, 0, 0],
-                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
-                    &[1, 1, 1, 1],
-                );
-                let k = transpose_axes(&k, &[0, 2, 1, 3]);
-                let k = reshape(&k, &[prefix_len, kv_dim]);
-                let v = slice(
-                    &self.v_caches[layer_idx],
-                    &[0, 0, 0, 0],
-                    &[1, self.n_kv_heads, prefix_len, self.head_dim],
-                    &[1, 1, 1, 1],
-                );
-                let v = transpose_axes(&v, &[0, 2, 1, 3]);
-                let v = reshape(&v, &[prefix_len, kv_dim]);
-                (k, v)
-            };
-            k_rows_by_layer.push(k_rows);
-            v_rows_by_layer.push(v_rows);
-        }
-
-        Ok((k_rows_by_layer, v_rows_by_layer))
     }
 }
 
@@ -2722,8 +2625,31 @@ impl StepDriver for Qwen3StepDriver<'_> {
         } else {
             self.prefill_params.clone()
         };
-        let sampled = self.run_tokens(tokens, &params)?;
-        eval(&[&sampled]);
+        let sampled = if self.can_use_cpp_prefill(tokens) {
+            // Safe to keep the session alive across prefill chunks because the
+            // Metal scheduler admits at most one Prefilling request at a time
+            // and keeps chunking that same request until its prompt completes.
+            let logits = self.run_tokens_cpp_prefill(tokens)?;
+            if terminal_prompt {
+                self.ensure_cpp_prefill_drained()?;
+                let sampled = gpu_sample_token(&logits, &params);
+                let mut outputs: Vec<&MlxArray> =
+                    Vec::with_capacity(2 + self.k_caches.len() + self.v_caches.len());
+                outputs.push(&logits);
+                outputs.push(&sampled);
+                outputs.extend(self.k_caches.iter());
+                outputs.extend(self.v_caches.iter());
+                eval(&outputs);
+                sampled
+            } else {
+                async_eval(&[&logits]);
+                logits
+            }
+        } else {
+            let sampled = self.run_tokens(tokens, &params)?;
+            eval(&[&sampled]);
+            sampled
+        };
 
         if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
             clear_metal_cache();
@@ -2785,6 +2711,7 @@ impl StepDriver for Qwen3StepDriver<'_> {
     }
 
     fn cleanup(&mut self) -> Result<()> {
+        self.ensure_cpp_prefill_drained()?;
         if let Some(pool) = self.kv_pool.as_mut() {
             pool.free_request(METAL_REQUEST_STATE_ID);
         }
@@ -2843,6 +2770,20 @@ struct Qwen35RustState {
 }
 
 impl Qwen35CppState {
+    fn ensure_session_active(&mut self, cpp_model: &CppQwen35Model) -> Result<()> {
+        if self.session_active {
+            return Ok(());
+        }
+
+        cpp_model.begin_session(&self.kv_flat, &self.gdr_flat)?;
+        self.n_kv = self.kv_flat.len();
+        self.n_gdr = self.gdr_flat.len();
+        self.kv_flat.clear();
+        self.gdr_flat.clear();
+        self.session_active = true;
+        Ok(())
+    }
+
     fn ensure_caches_drained(&mut self, cpp_model: &CppQwen35Model) -> Result<()> {
         if !self.session_active {
             return Ok(());
@@ -3060,14 +3001,7 @@ impl<'a> Qwen35StepDriver<'a> {
             .cpp_model
             .as_ref()
             .context("Qwen3.5 C++ step path missing compiled model")?;
-        if !state.session_active {
-            cpp_model.begin_session(&state.kv_flat, &state.gdr_flat)?;
-            state.n_kv = state.kv_flat.len();
-            state.n_gdr = state.gdr_flat.len();
-            state.kv_flat.clear();
-            state.gdr_flat.clear();
-            state.session_active = true;
-        }
+        state.ensure_session_active(cpp_model)?;
         let logits = cpp_model.step_session(token_arr, cache_len)?;
         async_eval(&[&logits]);
         Ok(logits)
@@ -3387,7 +3321,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .cpp_model
                     .as_ref()
                     .context("Qwen3.5 C++ prefill path missing compiled model")?;
-                state.ensure_caches_drained(cpp_model)?;
+                state.ensure_session_active(cpp_model)?;
                 // DFlash: enable hidden state capture during prefill
                 if let Some(ref dflash) = self.dflash {
                     let ids: Vec<i32> = dflash
@@ -3403,19 +3337,9 @@ impl StepDriver for Qwen35StepDriver<'_> {
                         );
                     }
                 }
-                let logits = cpp_model.prefill(
-                    &token_arr,
-                    tokens.len() as i32,
-                    self.cache_len,
-                    &mut state.kv_flat,
-                    &mut state.gdr_flat,
-                )?;
-                let mut step_outputs: Vec<&MlxArray> =
-                    Vec::with_capacity(1 + state.kv_flat.len() + state.gdr_flat.len());
-                step_outputs.push(&logits);
-                step_outputs.extend(state.kv_flat.iter());
-                step_outputs.extend(state.gdr_flat.iter());
-                eval(&step_outputs);
+                let logits =
+                    cpp_model.prefill_session(&token_arr, tokens.len() as i32, self.cache_len)?;
+                async_eval(&[&logits]);
                 self.cache_len += tokens.len() as i32;
                 // DFlash: disable capture after prefill
                 if self.dflash.is_some() {
