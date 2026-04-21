@@ -7,7 +7,7 @@ use super::{
 };
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
-use crate::prefix_cache::{BlockId, BlockMetadataUpdate, RadixCache};
+use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
 use crate::types::{BlockFingerprint, KvContentContext};
 
@@ -50,6 +50,13 @@ pub(super) struct StagedAdmission {
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) block_ids: Vec<BlockId>,
     pub(super) enqueued_at_clock: u64,
+    pub(super) staged_blocks: Vec<StagedBlock>,
+}
+
+pub(super) struct StagedBlock {
+    pub(super) block_id: BlockId,
+    pub(super) host_region: crate::kv_tier::HostPinnedRegion,
+    pub(super) release_on_abort: bool,
 }
 
 /// State preserved between decode launch and readback for GPU/CPU overlap.
@@ -97,6 +104,7 @@ pub struct Scheduler<M: ModelForward> {
     /// materialized; cross-slot page aliasing is intentionally unsupported.
     pub(super) prefix_cache: RadixCache,
     pub(super) disk_store: Arc<DiskStore>,
+    pub(super) host_pinned_pool: crate::kv_tier::SharedHostPinnedPool,
     /// Side map from `BlockId` → full contiguous page span for that
     /// block. The radix stores just the first page of each block
     /// (block id = `slot_pages[i * block_size]`), but the actual
@@ -110,6 +118,7 @@ pub struct Scheduler<M: ModelForward> {
     /// and every page in the value appears in `page_ref_count > 0`.
     /// Entries are removed when eviction releases the block.
     pub(super) block_to_pages: HashMap<BlockId, Vec<u32>>,
+    pub(super) block_to_host_regions: HashMap<BlockId, crate::kv_tier::HostPinnedRegion>,
     /// Best-effort mapping from a radix block to the free slot whose
     /// contiguous state still materializes that prefix. This is intentionally
     /// separate from `prefix_cache`: the radix owns reusable bytes / page pins,
@@ -122,8 +131,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     pub(super) stage_waiting: HashMap<crate::kv_tier::StageTicket, StagedAdmission>,
+    pub(super) spill_waiting:
+        HashMap<crate::kv_tier::StageTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
     pub(super) coordinator_unavailable: bool,
-    pub(super) page_lifecycle: crate::kv_tier::coordinator::PageLifecycle,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -174,7 +184,9 @@ impl<M: ModelForward> Scheduler<M> {
     pub fn read_block_payload(&self, fingerprint: BlockFingerprint) -> Option<Vec<u8>> {
         let block_id = self.prefix_cache.block_id_for_fingerprint(fingerprint)?;
         let pages = self.block_to_pages.get(&block_id)?;
-        self.paged_kv_pool.copy_pages_to_host(pages).ok()
+        self.paged_kv_pool
+            .copy_pages_to_host(self.model.device_context(), pages)
+            .ok()
     }
 
     pub fn install_restored_kv(
@@ -194,7 +206,7 @@ impl<M: ModelForward> Scheduler<M> {
             };
             if self
                 .paged_kv_pool
-                .copy_pages_from_host(&pages, payload)
+                .copy_pages_from_host(self.model.device_context(), &pages, payload)
                 .is_err()
             {
                 continue;
@@ -222,6 +234,103 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub fn session_radix_cache(&self) -> &RadixCache {
         &self.prefix_cache
+    }
+
+    fn block_metadata(&self, block_id: BlockId) -> Option<BlockMetadata> {
+        self.prefix_cache.block_metadata(block_id)
+    }
+
+    fn pages_per_prefix_block(&self) -> usize {
+        self.prefix_cache
+            .block_size()
+            .div_ceil(self.paged_kv_pool.page_size)
+            .max(1)
+    }
+
+    fn host_pool_usage_fraction(&self) -> f64 {
+        let Ok(pool) = self.host_pinned_pool.lock() else {
+            return 1.0;
+        };
+        if pool.capacity_bytes() == 0 {
+            return 0.0;
+        }
+        pool.reserved_bytes() as f64 / pool.capacity_bytes() as f64
+    }
+
+    pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
+        if let Ok(mut pool) = self.host_pinned_pool.lock() {
+            pool.release(region);
+        }
+    }
+
+    pub(super) fn build_stage_requests(
+        &mut self,
+        blocks: &[crate::kv_tier::LookupBlock],
+    ) -> Vec<crate::kv_tier::StageRequest> {
+        let mut requests = Vec::new();
+        for block in blocks {
+            let Some(block_id) = block.block_id else {
+                continue;
+            };
+            let Some(metadata) = self.block_metadata(block_id) else {
+                continue;
+            };
+            let Some(from) = metadata.location.clone() else {
+                continue;
+            };
+            if matches!(from, BlockLocation::Gpu { .. }) {
+                continue;
+            }
+
+            let host_region = match from {
+                BlockLocation::HostPinned { .. } => self.block_to_host_regions.get(&block_id).copied(),
+                BlockLocation::Disk { .. } => match self.host_pinned_pool.lock() {
+                    Ok(mut pool) => pool.reserve(metadata.byte_len as usize),
+                    Err(_) => None,
+                },
+                BlockLocation::Remote { .. } => None,
+                BlockLocation::Gpu { .. } => None,
+            };
+            let Some(host_region) = host_region else {
+                continue;
+            };
+
+            requests.push(crate::kv_tier::StageRequest {
+                block_id,
+                from,
+                byte_len: metadata.byte_len,
+                host_pool: Some(self.host_pinned_pool.clone()),
+                host_region: Some(host_region),
+            });
+        }
+        requests
+    }
+
+    pub(super) fn promote_staged_blocks(&mut self, staged: &StagedAdmission) -> Result<()> {
+        let pages_per_block = self.pages_per_prefix_block();
+        for block in &staged.staged_blocks {
+            let payload = self
+                .host_pinned_pool
+                .read_region(block.host_region)
+                .map_err(|err| anyhow::anyhow!("failed to read staged host region: {err}"))?;
+            let pages = self.paged_kv_pool.alloc_detached_pages(pages_per_block)?;
+            self.paged_kv_pool.copy_pages_from_host(
+                self.model.device_context(),
+                &pages,
+                &payload,
+            )?;
+            self.block_to_pages.insert(block.block_id, pages);
+            self.block_to_host_regions.remove(&block.block_id);
+            let _ = self.prefix_cache.update_block_metadata(
+                block.block_id,
+                BlockMetadataUpdate {
+                    location: Some(BlockLocation::Gpu { slot: u32::MAX }),
+                    ..BlockMetadataUpdate::default()
+                },
+            );
+            self.release_host_region(block.host_region);
+        }
+        Ok(())
     }
 
     /// Create a new scheduler and its handle.
@@ -349,9 +458,16 @@ impl<M: ModelForward> Scheduler<M> {
                 kv_pool_format,
             )?
         };
+        let host_block_bytes = paged_kv_pool.storage_bytes_for_tokens(PREFIX_CACHE_BLOCK_SIZE);
+        let host_pool_capacity = host_block_bytes
+            .saturating_mul(config.max_slots.saturating_mul(16).max(1))
+            .max(64 * 1024 * 1024);
+        let host_pinned_pool = crate::kv_tier::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
+        );
 
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}, host_pool={:.1}MB",
             model_id,
             config.max_slots,
             seed,
@@ -364,11 +480,10 @@ impl<M: ModelForward> Scheduler<M> {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string()),
             config.enable_mixed_chunk,
+            host_pool_capacity as f64 / 1e6,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
-        let page_lifecycle =
-            crate::kv_tier::coordinator::PageLifecycle::new(paged_kv_pool.max_total_pages);
         let disk_store = Arc::new(DiskStore::new(config.disk_store_root.clone()));
         let (coordinator, coordinator_handle, coordinator_events) =
             crate::kv_tier::Coordinator::new_with_disk_store(
@@ -389,15 +504,17 @@ impl<M: ModelForward> Scheduler<M> {
                 config.prefix_cache_keepalive_ticks,
             ),
             disk_store,
+            host_pinned_pool,
             block_to_pages: HashMap::new(),
+            block_to_host_regions: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
             coordinator_handle,
             coordinator_events,
             coordinator_thread,
             stage_waiting: HashMap::new(),
+            spill_waiting: HashMap::new(),
             coordinator_unavailable: false,
-            page_lifecycle,
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
@@ -748,9 +865,8 @@ impl<M: ModelForward> Scheduler<M> {
         self.paged_kv_pool.retain_pages(&slot_pages);
         self.slot_owned_blocks[slot_idx].clear();
         let block_byte_len = self
-            .model
-            .kv_cache_bytes_per_token()
-            .saturating_mul(block_size)
+            .paged_kv_pool
+            .storage_bytes_for_tokens(block_size)
             .min(u32::MAX as usize) as u32;
         let keepalive_deadline = session_id.as_ref().map(|_| {
             self.prefix_cache
@@ -782,25 +898,6 @@ impl<M: ModelForward> Scheduler<M> {
                     soft_pin_until: Some(keepalive_deadline),
                 },
             );
-            for &page in &block_pages[block_i] {
-                if let Err(err) = self.page_lifecycle.mark_resident(page as usize) {
-                    match err {
-                        crate::kv_tier::coordinator::PageLifecycleError::InvalidTransition {
-                            ..
-                        } => log::debug!(
-                            "page lifecycle mark_resident ignored for page {}: {}",
-                            page,
-                            err
-                        ),
-                        crate::kv_tier::coordinator::PageLifecycleError::UnknownPage { .. } => {
-                            warn!(
-                                "page lifecycle unknown page {} during publish: {}",
-                                page, err
-                            );
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -810,6 +907,157 @@ impl<M: ModelForward> Scheduler<M> {
         for bid in self.slot_owned_blocks[slot_idx].drain(..) {
             self.block_owner_slots.remove(&bid);
         }
+    }
+
+    fn demote_block_to_host(&mut self, block_id: BlockId) -> Result<usize> {
+        let Some(metadata) = self.block_metadata(block_id) else {
+            return Ok(0);
+        };
+        if !matches!(metadata.location, Some(BlockLocation::Gpu { .. })) {
+            return Ok(0);
+        }
+        let Some(pages) = self.block_to_pages.remove(&block_id) else {
+            return Ok(0);
+        };
+
+        let payload = self
+            .paged_kv_pool
+            .copy_pages_to_host(self.model.device_context(), &pages)?;
+        let region = {
+            let mut pool = self.host_pinned_pool.lock()?;
+            pool.reserve(payload.len()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "host pinned pool exhausted while demoting block {:?} ({} bytes)",
+                    block_id,
+                    payload.len()
+                )
+            })?
+        };
+        if let Err(err) = self.host_pinned_pool.write_region(region, &payload) {
+            self.release_host_region(region);
+            self.block_to_pages.insert(block_id, pages);
+            return Err(err);
+        }
+
+        self.block_owner_slots.remove(&block_id);
+        self.block_to_host_regions.insert(block_id, region);
+        let _ = self.prefix_cache.update_block_metadata(
+            block_id,
+            BlockMetadataUpdate {
+                location: Some(BlockLocation::HostPinned {
+                    offset: region.offset,
+                }),
+                soft_pin_until: metadata.session_id.as_ref().map(|_| {
+                    Some(
+                        self.prefix_cache
+                            .logical_clock()
+                            .saturating_add(self.config.t1_host_pinned_keepalive_ticks),
+                    )
+                }),
+                ..BlockMetadataUpdate::default()
+            },
+        );
+
+        Ok(self.paged_kv_pool.release_pages(&pages).len())
+    }
+
+    fn delete_disk_block_if_present(&self, metadata: &BlockMetadata) {
+        let Some(BlockLocation::Disk {
+            fingerprint,
+            payload_len,
+        }) = metadata.location.as_ref()
+        else {
+            return;
+        };
+        let location = crate::kv_tier::transport::disk::DiskBlockLocation {
+            path: match self.disk_store.block_path_for(*fingerprint) {
+                Ok(path) => path,
+                Err(_) => return,
+            },
+            payload_len: *payload_len,
+            fingerprint: *fingerprint,
+        };
+        let _ = self.disk_store.delete_block(&location);
+    }
+
+    fn drop_cached_blocks(&mut self, blocks: &[BlockId]) -> usize {
+        let mut reclaimed_pages = 0usize;
+        for &block_id in blocks {
+            let metadata = self.block_metadata(block_id);
+            if let Some(pages) = self.block_to_pages.remove(&block_id) {
+                reclaimed_pages += self.paged_kv_pool.release_pages(&pages).len();
+            }
+            if let Some(region) = self.block_to_host_regions.remove(&block_id) {
+                self.release_host_region(region);
+            }
+            self.block_owner_slots.remove(&block_id);
+            if let Some(meta) = metadata.as_ref() {
+                self.delete_disk_block_if_present(meta);
+            }
+        }
+        reclaimed_pages
+    }
+
+    fn spill_host_blocks_if_pressured(&mut self) -> usize {
+        let usage = self.host_pool_usage_fraction();
+        if usage <= self.config.t1_host_pinned_high_water {
+            return 0;
+        }
+
+        let (reserved_bytes, target_reserved_bytes) = match self.host_pinned_pool.lock() {
+            Ok(pool) => (
+                pool.reserved_bytes(),
+                (pool.capacity_bytes() as f64 * self.config.t1_host_pinned_low_water) as usize,
+            ),
+            Err(_) => return 0,
+        };
+        let bytes_to_spill = reserved_bytes.saturating_sub(target_reserved_bytes);
+        if bytes_to_spill == 0 {
+            return 0;
+        }
+
+        let mut spilled_bytes = 0usize;
+        let candidates = self.prefix_cache.select_blocks_with_policy(
+            &SessionBiasedLru::default(),
+            self.eviction_signals(),
+            self.prefix_cache.cached_block_count(),
+            Some(crate::kv_tier::Tier::HostPinned),
+        );
+        for block_id in candidates {
+            if self
+                .spill_waiting
+                .values()
+                .any(|(pending, _)| *pending == block_id)
+            {
+                continue;
+            }
+            let Some(metadata) = self.block_metadata(block_id) else {
+                continue;
+            };
+            let Some(fingerprint) = metadata.fingerprint else {
+                continue;
+            };
+            let Some(region) = self.block_to_host_regions.get(&block_id).copied() else {
+                continue;
+            };
+            let Some(ticket) = self.coordinator_handle.submit_spill(vec![
+                crate::kv_tier::coordinator::SpillRequest {
+                    block_id,
+                    fingerprint,
+                    kv_format_tag: self.kv_format_tag(),
+                    host_pool: self.host_pinned_pool.clone(),
+                    host_region: region,
+                },
+            ]) else {
+                break;
+            };
+            self.spill_waiting.insert(ticket, (block_id, region));
+            spilled_bytes = spilled_bytes.saturating_add(metadata.byte_len as usize);
+            if spilled_bytes >= bytes_to_spill {
+                break;
+            }
+        }
+        spilled_bytes
     }
 
     /// Release radix-held pool pages back to the free list once the
@@ -851,51 +1099,34 @@ impl<M: ModelForward> Scheduler<M> {
         if blocks_to_evict == 0 {
             return 0;
         }
-        let evicted = self.prefix_cache.evict_with_policy(
+        let candidates = self.prefix_cache.select_blocks_with_policy(
             &SessionBiasedLru::default(),
             self.eviction_signals(),
             blocks_to_evict,
+            Some(crate::kv_tier::Tier::Gpu),
         );
-        let mut reclaimed_pages: usize = 0;
-        let sentinel_ticket = crate::kv_tier::StageTicket(u64::MAX);
-        for bid in evicted {
-            if let Some(pages) = self.block_to_pages.remove(&bid) {
-                self.block_owner_slots.remove(&bid);
-                for &page in &pages {
-                    // A5 stub: sentinel ticket represents "instant demote"
-                    // until coordinator transport lane is wired.
-                    if let Err(err) = self.page_lifecycle.begin_demote(
-                        page as usize,
-                        sentinel_ticket,
-                        BlockLocation::HostPinned { offset: 0 },
-                    ) {
-                        log::debug!(
-                            "page lifecycle begin_demote ignored for page {}: {}",
-                            page,
-                            err
-                        );
-                    } else if let Err(err) = self
-                        .page_lifecycle
-                        .finish_demote(page as usize, sentinel_ticket)
-                    {
-                        log::debug!(
-                            "page lifecycle finish_demote ignored for page {}: {}",
-                            page,
-                            err
-                        );
+        let mut reclaimed_pages = 0usize;
+        for bid in candidates {
+            match self.demote_block_to_host(bid) {
+                Ok(freed_now) => {
+                    reclaimed_pages += freed_now;
+                    if reclaimed_pages >= want_free {
+                        break;
                     }
                 }
-                let freed_now = self.paged_kv_pool.release_pages(&pages);
-                reclaimed_pages += freed_now.len();
+                Err(err) => {
+                    warn!("failed to demote block {:?} to host tier: {}", bid, err);
+                }
             }
         }
+        let _ = self.spill_host_blocks_if_pressured();
         if reclaimed_pages > 0 {
             info!(
-                "prefix cache eviction: released {} pool pages back to free list \
-                 ({} evicted blocks; retained now {})",
+                "prefix cache demotion: released {} pool pages back to free list \
+                 (retained now {}, host usage {:.0}%)",
                 reclaimed_pages,
-                blocks_to_evict,
                 self.paged_kv_pool.retained_count(),
+                self.host_pool_usage_fraction() * 100.0,
             );
         }
         reclaimed_pages
@@ -919,26 +1150,50 @@ impl<M: ModelForward> Scheduler<M> {
         let mut reclaimed_tokens = 0usize;
         let mut remaining = shortage;
         while remaining > 0 {
-            let blocks_to_evict = remaining
+            let blocks_to_move = remaining
+                .div_ceil((pages_per_block * self.paged_kv_pool.page_size).max(1))
+                .max(1);
+            let candidates = self.prefix_cache.select_blocks_with_policy(
+                &SessionBiasedLru::default(),
+                self.eviction_signals(),
+                blocks_to_move,
+                Some(crate::kv_tier::Tier::Gpu),
+            );
+            if candidates.is_empty() {
+                break;
+            }
+            let before = reclaimed_pages;
+            for bid in candidates {
+                match self.demote_block_to_host(bid) {
+                    Ok(freed_now) => {
+                        reclaimed_pages += freed_now;
+                        reclaimed_tokens += freed_now * self.paged_kv_pool.page_size;
+                    }
+                    Err(err) => {
+                        warn!(
+                            "failed to demote block {:?} during alloc reclaim: {}",
+                            bid, err
+                        );
+                    }
+                }
+            }
+            let _ = self.spill_host_blocks_if_pressured();
+            if reclaimed_pages == before {
+                break;
+            }
+            remaining = shortage.saturating_sub(reclaimed_tokens);
+        }
+
+        if reclaimed_tokens < shortage {
+            let blocks_to_drop = remaining
                 .div_ceil((pages_per_block * self.paged_kv_pool.page_size).max(1))
                 .max(1);
             let evicted = self.prefix_cache.evict_with_policy(
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
-                blocks_to_evict,
+                blocks_to_drop,
             );
-            if evicted.is_empty() {
-                break;
-            }
-            for bid in evicted {
-                if let Some(pages) = self.block_to_pages.remove(&bid) {
-                    self.block_owner_slots.remove(&bid);
-                    let freed_now = self.paged_kv_pool.release_pages(&pages);
-                    reclaimed_pages += freed_now.len();
-                    reclaimed_tokens += freed_now.len() * self.paged_kv_pool.page_size;
-                }
-            }
-            remaining = shortage.saturating_sub(reclaimed_tokens);
+            reclaimed_pages += self.drop_cached_blocks(&evicted);
         }
 
         if reclaimed_pages > 0 {

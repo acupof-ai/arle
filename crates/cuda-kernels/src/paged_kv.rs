@@ -166,6 +166,29 @@ fn compute_budget_breakdown(
 }
 
 impl TokenKVPool {
+    fn storage_bytes_per_token(&self) -> usize {
+        let data_bytes = self.kv_dim * self.format.bytes_per_element() * 2;
+        let scale_bytes = if self.format.has_scales() {
+            self.num_kv_heads * std::mem::size_of::<f32>() * 2
+        } else {
+            0
+        };
+        let norm_bytes = if self.format.has_norms() {
+            self.num_kv_heads * std::mem::size_of::<u16>() * 2
+        } else {
+            0
+        };
+        (data_bytes + scale_bytes + norm_bytes) * self.num_layers
+    }
+
+    pub fn storage_bytes_for_tokens(&self, token_count: usize) -> usize {
+        self.storage_bytes_per_token() * token_count
+    }
+
+    fn storage_bytes_per_page(&self) -> usize {
+        self.storage_bytes_for_tokens(self.page_size)
+    }
+
     /// Create a new token-level KV pool.
     ///
     /// `budget_bytes` controls how much GPU memory to allocate for the pool.
@@ -463,15 +486,74 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
-    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
-    pub fn copy_pages_to_host(&self, pages: &[u32]) -> Result<Vec<u8>> {
+    pub fn copy_pages_to_host(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = pages;
-            todo!("PagedKVPool::copy_pages_to_host requires validation on a CUDA host")
+            let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+            let scale_len = self.page_size * self.num_kv_heads;
+            let mut out = Vec::with_capacity(pages.len() * self.storage_bytes_per_page());
+
+            for &page in pages {
+                let page_idx = page as usize;
+                let data_start = page_idx * token_bytes;
+                let data_end = data_start + token_bytes;
+                let scale_start = page_idx * scale_len;
+                let scale_end = scale_start + scale_len;
+
+                for layer in 0..self.num_layers {
+                    out.extend_from_slice(
+                        &ctx.stream
+                            .clone_dtoh(&self.k_data[layer].slice(data_start..data_end))
+                            .map_err(|e| anyhow!("paged_kv copy K page dtoh failed: {e}"))?,
+                    );
+                    out.extend_from_slice(
+                        &ctx.stream
+                            .clone_dtoh(&self.v_data[layer].slice(data_start..data_end))
+                            .map_err(|e| anyhow!("paged_kv copy V page dtoh failed: {e}"))?,
+                    );
+
+                    if self.format.has_scales() {
+                        for value in ctx
+                            .stream
+                            .clone_dtoh(&self.k_scales[layer].slice(scale_start..scale_end))
+                            .map_err(|e| anyhow!("paged_kv copy K scales dtoh failed: {e}"))?
+                        {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                        for value in ctx
+                            .stream
+                            .clone_dtoh(&self.v_scales[layer].slice(scale_start..scale_end))
+                            .map_err(|e| anyhow!("paged_kv copy V scales dtoh failed: {e}"))?
+                        {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+
+                    if self.format.has_norms() {
+                        for value in ctx
+                            .stream
+                            .clone_dtoh(&self.k_norms[layer].slice(scale_start..scale_end))
+                            .map_err(|e| anyhow!("paged_kv copy K norms dtoh failed: {e}"))?
+                        {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                        for value in ctx
+                            .stream
+                            .clone_dtoh(&self.v_norms[layer].slice(scale_start..scale_end))
+                            .map_err(|e| anyhow!("paged_kv copy V norms dtoh failed: {e}"))?
+                        {
+                            out.extend_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                }
+            }
+
+            ctx.sync()?;
+            Ok(out)
         }
         #[cfg(not(feature = "cuda"))]
         {
+            let _ = ctx;
             let _ = pages;
             Err(anyhow!(
                 "PagedKVPool::copy_pages_to_host is unavailable without feature=cuda"
@@ -479,16 +561,121 @@ impl TokenKVPool {
         }
     }
 
-    /// INTENTIONALLY left as `todo!()` in the cuda branch until a CUDA host validates it.
-    pub fn copy_pages_from_host(&self, pages: &[u32], payload: &[u8]) -> Result<()> {
+    pub fn copy_pages_from_host(
+        &mut self,
+        ctx: &DeviceContext,
+        pages: &[u32],
+        payload: &[u8],
+    ) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            let _ = pages;
-            let _ = payload;
-            todo!("PagedKVPool::copy_pages_from_host requires validation on a CUDA host")
+            let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+            let scale_len = self.page_size * self.num_kv_heads;
+            let expected_len = pages.len() * self.storage_bytes_per_page();
+            if payload.len() != expected_len {
+                return Err(anyhow!(
+                    "paged_kv host payload length mismatch: got {} expected {}",
+                    payload.len(),
+                    expected_len
+                ));
+            }
+
+            let mut cursor = 0usize;
+            for &page in pages {
+                let page_idx = page as usize;
+                let data_start = page_idx * token_bytes;
+                let data_end = data_start + token_bytes;
+                let scale_start = page_idx * scale_len;
+                let scale_end = scale_start + scale_len;
+
+                for layer in 0..self.num_layers {
+                    let mut k_view = self.k_data[layer].slice_mut(data_start..data_end);
+                    ctx.stream
+                        .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut k_view)
+                        .map_err(|e| anyhow!("paged_kv copy K page htod failed: {e}"))?;
+                    cursor += token_bytes;
+
+                    let mut v_view = self.v_data[layer].slice_mut(data_start..data_end);
+                    ctx.stream
+                        .memcpy_htod(&payload[cursor..cursor + token_bytes], &mut v_view)
+                        .map_err(|e| anyhow!("paged_kv copy V page htod failed: {e}"))?;
+                    cursor += token_bytes;
+
+                    if self.format.has_scales() {
+                        let mut k_scales = Vec::with_capacity(scale_len);
+                        for chunk in payload
+                            [cursor..cursor + scale_len * std::mem::size_of::<f32>()]
+                            .chunks_exact(std::mem::size_of::<f32>())
+                        {
+                            let bytes: [u8; 4] =
+                                chunk.try_into().expect("f32 chunk size must be exact");
+                            k_scales.push(f32::from_le_bytes(bytes));
+                        }
+                        cursor += scale_len * std::mem::size_of::<f32>();
+                        let mut k_scale_view =
+                            self.k_scales[layer].slice_mut(scale_start..scale_end);
+                        ctx.stream
+                            .memcpy_htod(&k_scales, &mut k_scale_view)
+                            .map_err(|e| anyhow!("paged_kv copy K scales htod failed: {e}"))?;
+
+                        let mut v_scales = Vec::with_capacity(scale_len);
+                        for chunk in payload
+                            [cursor..cursor + scale_len * std::mem::size_of::<f32>()]
+                            .chunks_exact(std::mem::size_of::<f32>())
+                        {
+                            let bytes: [u8; 4] =
+                                chunk.try_into().expect("f32 chunk size must be exact");
+                            v_scales.push(f32::from_le_bytes(bytes));
+                        }
+                        cursor += scale_len * std::mem::size_of::<f32>();
+                        let mut v_scale_view =
+                            self.v_scales[layer].slice_mut(scale_start..scale_end);
+                        ctx.stream
+                            .memcpy_htod(&v_scales, &mut v_scale_view)
+                            .map_err(|e| anyhow!("paged_kv copy V scales htod failed: {e}"))?;
+                    }
+
+                    if self.format.has_norms() {
+                        let mut k_norms = Vec::with_capacity(scale_len);
+                        for chunk in payload
+                            [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
+                            .chunks_exact(std::mem::size_of::<u16>())
+                        {
+                            let bytes: [u8; 2] =
+                                chunk.try_into().expect("u16 chunk size must be exact");
+                            k_norms.push(u16::from_le_bytes(bytes));
+                        }
+                        cursor += scale_len * std::mem::size_of::<u16>();
+                        let mut k_norm_view = self.k_norms[layer].slice_mut(scale_start..scale_end);
+                        ctx.stream
+                            .memcpy_htod(&k_norms, &mut k_norm_view)
+                            .map_err(|e| anyhow!("paged_kv copy K norms htod failed: {e}"))?;
+
+                        let mut v_norms = Vec::with_capacity(scale_len);
+                        for chunk in payload
+                            [cursor..cursor + scale_len * std::mem::size_of::<u16>()]
+                            .chunks_exact(std::mem::size_of::<u16>())
+                        {
+                            let bytes: [u8; 2] =
+                                chunk.try_into().expect("u16 chunk size must be exact");
+                            v_norms.push(u16::from_le_bytes(bytes));
+                        }
+                        cursor += scale_len * std::mem::size_of::<u16>();
+                        let mut v_norm_view = self.v_norms[layer].slice_mut(scale_start..scale_end);
+                        ctx.stream
+                            .memcpy_htod(&v_norms, &mut v_norm_view)
+                            .map_err(|e| anyhow!("paged_kv copy V norms htod failed: {e}"))?;
+                    }
+                }
+            }
+
+            debug_assert_eq!(cursor, payload.len());
+            ctx.sync()?;
+            Ok(())
         }
         #[cfg(not(feature = "cuda"))]
         {
+            let _ = ctx;
             let _ = pages;
             let _ = payload;
             Err(anyhow!(

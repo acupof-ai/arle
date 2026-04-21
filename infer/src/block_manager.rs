@@ -1,37 +1,34 @@
-//! Paged KV cache block manager.
+//! Batch-scheduler-local paged KV block accounting helper.
 //!
 //! # Overview
 //!
-//! Instead of allocating a contiguous buffer per request (which leads to
-//! fragmentation), paged KV stores KV activations in fixed-size **blocks**.
-//! A request holds a **block table** — a mapping from logical block index to a
-//! physical block ID. Blocks from different requests can be interleaved in
-//! GPU memory, and blocks can be swapped between GPU (HBM) and CPU (DRAM).
+//! This module is used by the standalone CPU accounting scheduler in
+//! [`crate::scheduler::batch`]. It tracks fixed-size KV blocks and can
+//! describe swap plans, but it is **not** the production multilayer KV path.
+//! The serving/runtime path uses:
+//! - [`crate::prefix_cache::RadixCache`] for block metadata and reuse
+//! - [`crate::kv_tier`] for tier transitions
+//! - `crates/cuda-kernels/src/paged_kv.rs` for the live CUDA pool
 //!
 //! # Block lifecycle
 //!
 //! ```text
 //! allocate_gpu(n) → Vec<BlockId>      // reserve n GPU blocks
-//! swap_out(blocks)                    // GPU → CPU (before preemption)
-//! swap_in(blocks)                     // CPU → GPU (on resume)
+//! swap_out(blocks)                    // GPU → CPU plan
+//! swap_in(blocks)                     // CPU → GPU plan
 //! free_gpu(blocks)                    // return GPU blocks to free list
 //! free_cpu(blocks)                    // return CPU blocks to free list
 //! ```
 //!
 //! The manager is pure accounting — it tracks which blocks are free or
-//! occupied but does NOT perform the actual CUDA memory copies. The scheduler
-//! uses the manager's decisions and then calls the CUDA swap kernels.
+//! occupied but does NOT perform the actual memory copies.
 //!
-//! # Ref-counting and copy-on-write
+//! # Shared-block accounting
 //!
-//! Blocks can be **shared** across requests via the prefix cache. A shared
-//! block has `ref_count > 1`. Writes (decode steps) must first `cow_clone` the
-//! block, which:
-//! 1. Allocates a fresh physical block.
-//! 2. Schedules a GPU→GPU copy of the old block's contents.
-//! 3. Decrements the original's ref_count.
-//!
-//! This module tracks ref_counts; the actual copy is triggered by the caller.
+//! The batch scheduler can pin the same block table entries across multiple
+//! requests. This module tracks refcounts and can allocate a replacement GPU
+//! block for a detach-on-write flow, but it does not own any production
+//! decode-time COW path.
 
 use std::collections::{HashMap, VecDeque};
 

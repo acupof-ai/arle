@@ -1,6 +1,7 @@
 use super::{
     ActiveRequest, ModelForward, Ordering, Phase, STATS_LOG_INTERVAL, Scheduler, error, info, warn,
 };
+use crate::kv_tier::StagePlanner;
 use crate::prefix_cache::BlockMetadataUpdate;
 
 fn best_reusable_slot_for_radix_hit(
@@ -37,14 +38,23 @@ fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock]) -> bool {
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn abort_staged_admission(&mut self, staged: super::core::StagedAdmission) {
+        for block in &staged.staged_blocks {
+            if block.release_on_abort {
+                self.release_host_region(block.host_region);
+            }
+        }
+        self.prefix_cache.release(&staged.block_ids);
+        self.waiting.push_front(staged.request);
+    }
+
     fn drain_coordinator_events(&mut self) {
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(
                     crate::kv_tier::CoordinatorEvent::CommandQueued(_)
                     | crate::kv_tier::CoordinatorEvent::StagingQueued { .. }
-                    | crate::kv_tier::CoordinatorEvent::SpillQueued { .. }
-                    | crate::kv_tier::CoordinatorEvent::RehydrateQueued { .. },
+                    | crate::kv_tier::CoordinatorEvent::SpillQueued { .. },
                 ) => {}
                 Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
                     let Some(staged) = self.stage_waiting.remove(&ticket) else {
@@ -54,26 +64,18 @@ impl<M: ModelForward> Scheduler<M> {
                         );
                         continue;
                     };
+                    if let Err(err) = self.promote_staged_blocks(&staged) {
+                        warn!(
+                            "Staging promotion failed for ticket {}: {}. Falling back to cold requeue.",
+                            ticket.0, err
+                        );
+                        self.abort_staged_admission(staged);
+                        continue;
+                    }
                     let waited_ticks = self
                         .prefix_cache
                         .logical_clock()
                         .saturating_sub(staged.enqueued_at_clock);
-                    // Flip the staged blocks to ReadyOnGpu so the next
-                    // lookup_or_stage sees them as T0 hits. `u32::MAX` is
-                    // a "ready but not yet owned by a slot" sentinel;
-                    // `publish_to_prefix_cache` will overwrite it with a
-                    // real slot once decode picks up the request.
-                    for &block_id in &staged.block_ids {
-                        let _ = self.prefix_cache.update_block_metadata(
-                            block_id,
-                            BlockMetadataUpdate {
-                                location: Some(crate::kv_tier::BlockLocation::Gpu {
-                                    slot: u32::MAX,
-                                }),
-                                ..BlockMetadataUpdate::default()
-                            },
-                        );
-                    }
                     // Release the stage-era refs but **deliberately leave
                     // `soft_pin_until` at its stage-wait deadline**. The
                     // soft pin keeps eviction off these blocks until the
@@ -125,24 +127,50 @@ impl<M: ModelForward> Scheduler<M> {
                     // is not a new submission, so the counter stays
                     // untouched here.
                     for (ticket, staged) in pending {
-                        self.prefix_cache.release(&staged.block_ids);
                         warn!(
                             "Cold-requeuing ticket {} ({} prompt tokens, {} staged blocks dropped)",
                             ticket.0,
                             staged.prompt_tokens.len(),
                             staged.block_ids.len()
                         );
-                        self.waiting.push_front(staged.request);
+                        self.abort_staged_admission(staged);
                     }
                     self.coordinator_unavailable = true;
                     break;
                 }
-                Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
-                    log::debug!(
-                        "Spill completed for ticket={} ({} persisted blocks)",
-                        ticket.0,
-                        locations.len()
+                Ok(crate::kv_tier::CoordinatorEvent::StagingFailed {
+                    ticket,
+                    failed_block,
+                    reason,
+                }) => {
+                    warn!(
+                        "Staging failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
                     );
+                    if let Some(staged) = self.stage_waiting.remove(&ticket) {
+                        self.abort_staged_admission(staged);
+                    }
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
+                    if let Some((block_id, region)) = self.spill_waiting.remove(&ticket) {
+                        for (completed_block, location) in locations {
+                            if completed_block != block_id {
+                                continue;
+                            }
+                            let _ = self.prefix_cache.update_block_metadata(
+                                block_id,
+                                BlockMetadataUpdate {
+                                    location: Some(crate::kv_tier::BlockLocation::Disk {
+                                        fingerprint: location.fingerprint,
+                                        payload_len: location.payload_len,
+                                    }),
+                                    ..BlockMetadataUpdate::default()
+                                },
+                            );
+                            self.block_to_host_regions.remove(&block_id);
+                            self.release_host_region(region);
+                        }
+                    }
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::SpillFailed {
                     ticket,
@@ -153,26 +181,7 @@ impl<M: ModelForward> Scheduler<M> {
                         "Spill failed for ticket {} on block {:?}: {}",
                         ticket.0, failed_block, reason
                     );
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::RehydrateCompleted {
-                    ticket,
-                    rehydrated_blocks,
-                }) => {
-                    log::debug!(
-                        "Rehydrate completed for ticket={} ({} restored blocks)",
-                        ticket.0,
-                        rehydrated_blocks.len()
-                    );
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::RehydrateFailed {
-                    ticket,
-                    failed_block,
-                    reason,
-                }) => {
-                    warn!(
-                        "Rehydrate failed for ticket {} on block {:?}: {}",
-                        ticket.0, failed_block, reason
-                    );
+                    self.spill_waiting.remove(&ticket);
                 }
             }
         }
@@ -277,25 +286,23 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             };
 
-            let planner = if self.coordinator_unavailable {
-                None
-            } else {
-                Some(&self.coordinator_handle as &dyn crate::kv_tier::StagePlanner)
-            };
             let lookup = self.prefix_cache.lookup_or_stage(
                 &prompt_tokens,
                 crate::kv_tier::LookupHeuristics::default(),
-                planner,
+                None,
             );
             let radix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()
                 .filter_map(|block| block.block_id)
                 .collect();
-            if let Some(ticket) = lookup.staging_ticket {
-                if lookup.recompute_advised {
-                    self.prefix_cache.release(&radix_blocks);
-                } else {
+            let stage_requests = if self.coordinator_unavailable || lookup.recompute_advised {
+                Vec::new()
+            } else {
+                self.build_stage_requests(&lookup.blocks)
+            };
+            if !stage_requests.is_empty() {
+                if let Some(ticket) = self.coordinator_handle.stage(&stage_requests) {
                     let stage_deadline = self
                         .prefix_cache
                         .logical_clock()
@@ -314,7 +321,7 @@ impl<M: ModelForward> Scheduler<M> {
                         self.next_id,
                         ticket.0,
                         prompt_tokens.len(),
-                        radix_blocks.len()
+                        stage_requests.len()
                     );
                     self.stage_waiting.insert(
                         ticket,
@@ -323,9 +330,24 @@ impl<M: ModelForward> Scheduler<M> {
                             prompt_tokens,
                             block_ids: radix_blocks,
                             enqueued_at_clock: self.prefix_cache.logical_clock(),
+                            staged_blocks: stage_requests
+                                .iter()
+                                .map(|request| super::core::StagedBlock {
+                                    block_id: request.block_id,
+                                    host_region: request
+                                        .host_region
+                                        .expect("stage requests must carry host regions"),
+                                    release_on_abort: matches!(
+                                        request.from,
+                                        crate::kv_tier::BlockLocation::Disk { .. }
+                                    ),
+                                })
+                                .collect(),
                         },
                     );
                     continue;
+                } else {
+                    self.prefix_cache.release(&radix_blocks);
                 }
             }
 

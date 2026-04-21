@@ -80,10 +80,9 @@ pub struct SchedulerConfig {
     /// this fraction of the pool's capacity before stopping. Default
     /// 0.70. Must be strictly less than `t1_host_pinned_high_water`.
     pub t1_host_pinned_low_water: f64,
-    /// Soft-pin extension applied to blocks freshly-promoted from T2
-    /// back to T1. Prevents an immediately-rehydrated block from being
-    /// spilled back out by the same cleanup tick. Default 128 radix
-    /// logical clock ticks.
+    /// Soft-pin extension applied to blocks freshly-demoted into T1.
+    /// Prevents a just-demoted host block from being spilled back out by
+    /// the same cleanup tick. Default 128 radix logical clock ticks.
     pub t1_host_pinned_keepalive_ticks: u64,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,

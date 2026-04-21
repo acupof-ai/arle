@@ -142,8 +142,8 @@ mod tests {
         let err = transport
             .put_batch(&[TransferOp {
                 src: BlockLocation::Disk {
-                    file_id: 1,
-                    offset: 0,
+                    fingerprint: crate::types::BlockFingerprint([0x11; 16]),
+                    payload_len: 4096,
                 },
                 dst: BlockLocation::Gpu { slot: 1 },
                 len: 4096,

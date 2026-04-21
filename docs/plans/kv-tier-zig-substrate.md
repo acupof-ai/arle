@@ -206,7 +206,7 @@ Goal: wire the coordinator to the substrate without changing high-level contract
 
 Scope:
 
-- `CoordinatorCommand::Spill` / `Rehydrate` drive the Zig substrate
+- `CoordinatorCommand::Spill` and unified `Stage` drive the Zig substrate
 - `DiskStore` remains a compatibility shim for sessions and tests
 - transport implementations can start consuming descriptor handles instead of only paths
 
@@ -214,21 +214,21 @@ Ordered tasks:
 
 1. add coordinator-side descriptor/object-store plumbing
 2. add spill path from Rust coordinator into Zig object store
-3. add rehydrate path back into Rust-controlled staging flow
+3. route disk restores through the existing `Stage` flow instead of a second command path
 4. keep `CoordinatorCommand` / `CoordinatorEvent` stable where possible
 5. add transport hooks that can graduate from path-based to descriptor-based flows
 
 Completed in-tree:
 
 - `Coordinator::new_with_disk_store(...)` wires a shared `DiskStore` into the coordinator thread
-- `SpillRequest` / `RehydrateRequest` now carry a shared host-pinned pool handle plus region metadata
-- coordinator `Spill` / `Rehydrate` commands now persist and restore real bytes through `DiskStore`
-- local coordinator tests cover spill failure without a disk store and spill→rehydrate round trips through the Zig-backed substrate
+- `SpillRequest` now carries the shared host-pinned pool handle plus region metadata
+- coordinator `Spill` and disk-backed `Stage` now persist and restore real bytes through `DiskStore`
+- local coordinator tests cover spill failure without a disk store and spill→stage round trips through the Zig-backed substrate
 - scheduler CUDA initialization now clones the same `DiskStore` into the coordinator
 
 Acceptance:
 
-- coordinator can spill and rehydrate through the Zig substrate
+- coordinator can spill and stage through the Zig substrate
 - session persistence compatibility remains intact
 - `KVTransport` evolution is additive, not a flag day
 
@@ -236,7 +236,7 @@ Acceptance:
 
 Immediate next steps, in order:
 
-1. teach scheduler watermark logic to emit `submit_spill` / `submit_rehydrate`
+1. teach scheduler watermark logic to emit `submit_spill` and admission-time `stage`
 2. run the pending remote CUDA regression check
 3. decide whether descriptor-backed flows should extend `KVTransport` or stay coordinator-local
 

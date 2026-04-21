@@ -5,6 +5,7 @@
 
 use crate::types::BlockId;
 
+use super::host_pool::{HostPinnedRegion, SharedHostPinnedPool};
 use super::tier::BlockLocation;
 
 /// Scheduler-visible result of matching one cached block.
@@ -34,6 +35,12 @@ pub struct StageRequest {
     pub block_id: BlockId,
     pub from: BlockLocation,
     pub byte_len: u32,
+    /// Shared host-pinned pool used as the staging buffer owner when bytes
+    /// need to be fetched from a non-GPU tier.
+    pub host_pool: Option<SharedHostPinnedPool>,
+    /// Destination host-pinned region for stage operations that materialize
+    /// bytes into T1 before the scheduler promotes them back into T0.
+    pub host_region: Option<HostPinnedRegion>,
 }
 
 /// Opaque ticket representing one staged lookup batch.
