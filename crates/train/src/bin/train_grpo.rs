@@ -3,6 +3,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
+    time::Instant,
 };
 
 use autograd::{
@@ -22,6 +24,7 @@ use train::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
     cli_args::{ArgError, next_value, parse_value},
+    control::TrainingController,
     dataset::{CopyDataset, Dataset, LcgRng},
     grad_clip::{GlobalNorm, GradClip, NoClip, clip_grad_norm},
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
@@ -43,6 +46,7 @@ use train::{
         Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
     },
     rollout::rollout_group,
+    server::bind_and_serve_on_thread,
 };
 
 #[derive(Debug, Clone)]
@@ -64,6 +68,7 @@ struct CliArgs {
     metrics_jsonl: Option<PathBuf>,
     save_path: Option<PathBuf>,
     resume_from: Option<PathBuf>,
+    serve: Option<u16>,
 }
 
 impl Default for CliArgs {
@@ -86,6 +91,7 @@ impl Default for CliArgs {
             metrics_jsonl: None,
             save_path: None,
             resume_from: None,
+            serve: None,
         }
     }
 }
@@ -117,6 +123,7 @@ const GRPO_REFERENCE_MODEL_FILENAME: &str = "reference_model.safetensors";
 const GRPO_REFERENCE_ADAPTER_FILENAME: &str = "reference_adapter_model.safetensors";
 const GRPO_BASELINE_SALT: u64 = 0x4752_504F_4241_5345;
 const GRPO_ITER_SALT: u64 = 0x4752_504F_4954_4552;
+const STOP_REQUESTED_ERR: &str = "train_grpo: operator stop requested";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct GrpoCheckpointMeta {
@@ -137,6 +144,11 @@ struct ResumeState {
     start_iter: usize,
     best_mean_reward: f32,
     last_kl: f32,
+}
+
+struct SftPhaseResult {
+    optim_state: AdamWState,
+    completed_steps: usize,
 }
 
 trait SyntheticGrpoFamily {
@@ -415,9 +427,20 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         .all_parameter_ids()
         .into_iter()
         .collect::<HashSet<_>>();
-    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
-        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let controller = args.serve.map(|_| TrainingController::new());
+    let mut extra_sinks: Vec<Box<dyn train::metrics::MetricSink>> = Vec::new();
+    if let Some(controller) = &controller {
+        extra_sinks.push(Box::new(controller.metric_sink()));
+    }
+    let metrics = train::metrics::open_shared_sink_with_extra(
+        args.metrics_jsonl.as_deref(),
+        true,
+        false,
+        extra_sinks,
+    )
+    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_grpo");
+    let run_timer = Instant::now();
     let save_path_string = args
         .save_path
         .as_ref()
@@ -448,69 +471,103 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         scalars: &run_start_scalars,
         bools: &run_start_bools,
     });
+    if let Some(controller) = &controller {
+        controller.update(|status| {
+            status.total_iters = args.sft_steps + args.grpo_iters;
+            status.dropped_metrics = metrics.dropped_metrics();
+            status.started = true;
+        });
+    }
+    let _server_handle =
+        if let Some(port) = args.serve {
+            let controller = Arc::clone(
+                controller
+                    .as_ref()
+                    .expect("controller exists when --serve is configured"),
+            );
+            let addr = format!("127.0.0.1:{port}");
+            eprintln!("[train_grpo] control plane listening on http://{addr}/v1/train");
+            Some(bind_and_serve_on_thread(controller, addr).map_err(|err| {
+                CliError::Custom(format!("train control server bind failed: {err}"))
+            })?)
+        } else {
+            None
+        };
     let verifier = |prompt_ids: &[usize], full_ids: &[usize], response_mask: &[bool]| {
         copy_reward(prompt_ids, full_ids, response_mask)
     };
 
-    let (ref_model, mut optimizer, resume) = if let Some(resume_dir) = resume_dir.as_deref() {
-        resume_grpo_checkpoint::<F>(resume_dir, args, &config, &policy, &mut store, lora)?
-    } else {
-        // ---- SFT warm-up phase (migrated onto Trainer) ----
-        //
-        // The hand-written loop also computed a teacher-forced accuracy
-        // `reward` (via `store.to_host(logits)` + `teacher_forced_reward`) and
-        // printed it alongside loss. That value was PRINT-ONLY and cost a full
-        // device→host copy of logits per step; the migrated Trainer-format
-        // metrics line drops it. GRPO-phase reward tracking (via
-        // `mean_reward`) is unaffected.
-        //
-        // We export the final AdamW state so the GRPO-phase optimizer can
-        // resume moments + step counter instead of starting cold (codex review
-        // on 09c5c89 P1).
-        let sft_optim_state = run_sft_phase(
-            args,
-            metrics.clone(),
-            &policy,
-            &params,
-            keep_extra.clone(),
-            &mut store,
-            &mut tape,
-        )?;
+    let (ref_model, mut optimizer, resume, completed_sft_steps) =
+        if let Some(resume_dir) = resume_dir.as_deref() {
+            let resumed =
+                resume_grpo_checkpoint::<F>(resume_dir, args, &config, &policy, &mut store, lora)?;
+            (resumed.0, resumed.1, resumed.2, args.sft_steps)
+        } else {
+            // ---- SFT warm-up phase (migrated onto Trainer) ----
+            //
+            // The hand-written loop also computed a teacher-forced accuracy
+            // `reward` (via `store.to_host(logits)` + `teacher_forced_reward`) and
+            // printed it alongside loss. That value was PRINT-ONLY and cost a full
+            // device→host copy of logits per step; the migrated Trainer-format
+            // metrics line drops it. GRPO-phase reward tracking (via
+            // `mean_reward`) is unaffected.
+            //
+            // We export the final AdamW state so the GRPO-phase optimizer can
+            // resume moments + step counter instead of starting cold (codex review
+            // on 09c5c89 P1).
+            let sft = run_sft_phase(
+                args,
+                metrics.clone(),
+                controller.as_ref().map(Arc::clone),
+                &policy,
+                &params,
+                keep_extra.clone(),
+                &mut store,
+                &mut tape,
+            )?;
 
-        let ref_model = policy.clone_frozen(&mut store);
-        let mut baseline_rng = seeded_rng(args.seed, GRPO_BASELINE_SALT, 0, 0);
-        let baseline_prompts =
-            build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut baseline_rng);
-        let baseline_trajectories = rollout_group(
-            &policy,
-            &ref_model,
-            &config,
-            &baseline_prompts,
-            args.group_size,
-            args.temperature,
-            &mut baseline_rng,
-            &verifier,
-            &mut store,
-            &mut tape,
-        )?;
-        let baseline_reward = mean_reward(&baseline_trajectories);
-        println!("baseline reward after sft: {baseline_reward:.4}");
-
-        let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-        let param_names = trainable_param_name_map(&policy, &store);
-        optimizer
-            .import_state(&sft_optim_state, &param_names)
-            .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
-        (
-            ref_model,
-            optimizer,
-            ResumeState {
-                start_iter: 0,
-                best_mean_reward: baseline_reward,
-                last_kl: 0.0,
-            },
-        )
-    };
+            let ref_model = policy.clone_frozen(&mut store);
+            let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+            let param_names = trainable_param_name_map(&policy, &store);
+            optimizer
+                .import_state(&sft.optim_state, &param_names)
+                .map_err(|e| CliError::Custom(format!("adamw sft→grpo handoff: {e}")))?;
+            let baseline_reward = if controller
+                .as_ref()
+                .is_some_and(|controller| controller.should_stop())
+            {
+                0.0
+            } else {
+                let mut baseline_rng = seeded_rng(args.seed, GRPO_BASELINE_SALT, 0, 0);
+                let baseline_prompts =
+                    build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut baseline_rng);
+                let baseline_trajectories = rollout_group(
+                    &policy,
+                    &ref_model,
+                    &config,
+                    &baseline_prompts,
+                    args.group_size,
+                    args.temperature,
+                    &mut baseline_rng,
+                    &verifier,
+                    &mut store,
+                    &mut tape,
+                )?;
+                let baseline_reward = mean_reward(&baseline_trajectories);
+                println!("baseline reward after sft: {baseline_reward:.4}");
+                baseline_reward
+            };
+            (
+                ref_model,
+                optimizer,
+                ResumeState {
+                    start_iter: 0,
+                    best_mean_reward: baseline_reward,
+                    last_kl: 0.0,
+                },
+                sft.completed_steps,
+            )
+        };
 
     let grpo_cfg = GrpoConfig {
         clip_eps: 0.2,
@@ -521,8 +578,15 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         Vec::with_capacity(args.grpo_iters.saturating_sub(resume.start_iter));
     let mut last_kl = resume.last_kl;
     let mut best_mean_reward = resume.best_mean_reward;
+    let mut completed_grpo_iters = resume.start_iter;
 
     for iter in resume.start_iter..args.grpo_iters {
+        if controller
+            .as_ref()
+            .is_some_and(|controller| controller.should_stop())
+        {
+            break;
+        }
         let mut iter_rng = seeded_rng(args.seed, GRPO_ITER_SALT, iter as u64, 0);
         let prompts = build_prompt_batch(args.batch_prompts, args.seq, 64, 255, &mut iter_rng);
         let trajectories = rollout_group(
@@ -576,6 +640,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         store.retain_ids(&keep);
 
         reward_trajectory.push(mean_reward);
+        completed_grpo_iters = iter + 1;
         best_mean_reward = best_mean_reward.max(mean_reward);
         println!(
             "grpo iter {iter}: loss {loss_value:.4} mean_reward {mean_reward:.4} best_mean_reward {best_mean_reward:.4} mean_kl {last_kl:.4}"
@@ -598,9 +663,24 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
             phase: "grpo",
             fields: &fields,
         });
+        if let Some(controller) = &controller {
+            controller.update(|status| {
+                status.iter = args.sft_steps + iter + 1;
+                status.mean_reward = mean_reward;
+                status.best_reward = best_mean_reward;
+                status.last_kl = last_kl;
+                status.last_loss = loss_value;
+                status.wall_secs = run_timer.elapsed().as_secs_f32();
+                status.dropped_metrics = metrics.dropped_metrics();
+            });
+        }
 
+        let save_requested = controller
+            .as_ref()
+            .is_some_and(|controller| controller.take_save_request());
         if let Some(save_path) = args.save_path.as_deref() {
-            if args.save_every > 0 && (iter + 1).is_multiple_of(args.save_every) {
+            if (args.save_every > 0 && (iter + 1).is_multiple_of(args.save_every)) || save_requested
+            {
                 let step_dir = save_grpo_checkpoint::<F>(
                     save_path,
                     iter + 1,
@@ -631,19 +711,38 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
                 ];
                 metrics.emit_event(&train::metrics::TrainEvent {
                     kind: "checkpoint",
-                    step: Some((iter + 1) as u64),
+                    step: Some((completed_sft_steps + iter + 1) as u64),
                     strings: &strings,
                     scalars: &[],
                     bools: &[],
                 });
             }
+        } else if save_requested {
+            let strings = [("run_id", run_id.as_str()), ("reason", "save_without_path")];
+            metrics.emit_event(&train::metrics::TrainEvent {
+                kind: "status",
+                step: Some((args.sft_steps + iter + 1) as u64),
+                strings: &strings,
+                scalars: &[],
+                bools: &[("save_requested", true)],
+            });
+        }
+        if controller
+            .as_ref()
+            .is_some_and(|controller| controller.should_stop())
+        {
+            break;
         }
     }
+
+    let stopped = controller
+        .as_ref()
+        .is_some_and(|controller| controller.should_stop());
 
     if let Some(save_path) = args.save_path.as_deref() {
         let step_dir = save_grpo_checkpoint::<F>(
             save_path,
-            args.grpo_iters,
+            completed_grpo_iters,
             args,
             &config,
             &policy,
@@ -674,7 +773,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         ];
         metrics.emit_event(&train::metrics::TrainEvent {
             kind: "checkpoint",
-            step: Some(args.grpo_iters as u64),
+            step: Some((completed_sft_steps + completed_grpo_iters) as u64),
             strings: &strings,
             scalars: &[],
             bools: &[],
@@ -684,19 +783,30 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
     println!("final kl {last_kl:.4}");
     println!("reward trajectory: {reward_trajectory:?}");
     let run_end_scalars = [
-        ("completed_sft_steps", args.sft_steps as f64),
-        ("completed_grpo_iters", args.grpo_iters as f64),
+        ("completed_sft_steps", completed_sft_steps as f64),
+        ("completed_grpo_iters", completed_grpo_iters as f64),
         ("best_mean_reward", best_mean_reward as f64),
         ("last_kl", last_kl as f64),
+        ("dropped_metrics", metrics.dropped_metrics() as f64),
     ];
-    let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+    let status = if stopped { "stopped" } else { "completed" };
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
     metrics.emit_event(&train::metrics::TrainEvent {
         kind: "run_end",
-        step: Some((args.sft_steps + args.grpo_iters) as u64),
+        step: Some((completed_sft_steps + completed_grpo_iters) as u64),
         strings: &run_end_strings,
         scalars: &run_end_scalars,
         bools: &[],
     });
+    if let Some(controller) = &controller {
+        controller.update(|summary| {
+            summary.iter = completed_sft_steps + completed_grpo_iters;
+            summary.total_iters = args.sft_steps + args.grpo_iters;
+            summary.wall_secs = run_timer.elapsed().as_secs_f32();
+            summary.dropped_metrics = metrics.dropped_metrics();
+            summary.finished = true;
+        });
+    }
     metrics.flush_blocking();
     Ok(())
 }
@@ -710,12 +820,13 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 fn run_sft_phase<P>(
     args: &CliArgs,
     metrics: train::metrics::SharedSink,
+    controller: Option<Arc<TrainingController>>,
     policy: &P,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<AdamWState, CliError>
+) -> Result<SftPhaseResult, CliError>
 where
     P: GrpoPolicy + CausalLm,
 {
@@ -745,6 +856,7 @@ where
         resume_from: None,
         rng_seed: args.seed,
     };
+    let metrics_for_status = metrics.clone();
     let mut trainer = Trainer::new(optim, clip, schedule, Box::new(metrics), trainer_cfg);
 
     let param_names = trainable_param_name_map(policy, store);
@@ -764,18 +876,39 @@ where
         })
     };
 
-    trainer.run(
+    let controller_for_hooks = controller.as_ref().map(Arc::clone);
+    let run_result = trainer.run_with_hooks(
         store,
         tape,
         params.to_vec(),
         param_names.clone(),
         keep_extra,
         step_fn,
-    )?;
+        |step, _store| {
+            if let Some(controller) = &controller_for_hooks {
+                controller.update(|status| {
+                    status.iter = step as usize;
+                    status.dropped_metrics = metrics_for_status.dropped_metrics();
+                });
+                if controller.should_stop() {
+                    return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
+                }
+            }
+            Ok(())
+        },
+    );
+    match run_result {
+        Ok(()) => {}
+        Err(AutogradError::TapeInvariant(msg)) if msg == STOP_REQUESTED_ERR => {}
+        Err(err) => return Err(CliError::Autograd(err)),
+    }
     // Export optimizer state so the caller can re-import it into the
     // GRPO-phase AdamW and preserve moments + step counter across the
     // SFT→GRPO boundary (codex review on 09c5c89 P1).
-    Ok(trainer.optim().export_state(&param_names))
+    Ok(SftPhaseResult {
+        optim_state: trainer.optim().export_state(&param_names),
+        completed_steps: trainer.step() as usize,
+    })
 }
 
 fn validate_adapter_resume_config(
@@ -1036,6 +1169,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--resume-from" => {
                 args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?));
             }
+            "--serve" => {
+                args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
@@ -1131,6 +1267,7 @@ fn mean_reward(trajectories: &[train::rollout::Trajectory]) -> f32 {
 mod tests {
     use super::*;
     use qwen35_spec::Qwen35AttentionTensorNames;
+    use std::fs;
     use tempfile::tempdir;
 
     fn tiny_args() -> CliArgs {
@@ -1152,6 +1289,7 @@ mod tests {
             metrics_jsonl: None,
             save_path: None,
             resume_from: None,
+            serve: None,
         }
     }
 
@@ -1318,6 +1456,39 @@ mod tests {
         let resumed_names = trainable_param_name_map(&resumed_policy, &resumed_store);
         let resumed_state = resumed_optim.export_state(&resumed_names);
         assert_adamw_state_eq(&saved_state, &resumed_state);
+        Ok(())
+    }
+
+    #[test]
+    fn run_end_reports_completed_steps_with_control_plane_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let out = tempdir()?;
+        let metrics_path = out.path().join("metrics.jsonl");
+        let mut args = tiny_args();
+        args.metrics_jsonl = Some(metrics_path.clone());
+        args.serve = Some(0);
+        run_with_family::<Qwen35GrpoFamily>(&args)?;
+
+        let mut run_end = None;
+        for line in fs::read_to_string(&metrics_path)?.lines() {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            if value.get("kind").and_then(serde_json::Value::as_str) == Some("run_end") {
+                run_end = Some(value);
+            }
+        }
+        let run_end = run_end.expect("run_end event");
+        assert_eq!(
+            run_end["completed_sft_steps"].as_f64(),
+            Some(args.sft_steps as f64)
+        );
+        assert_eq!(
+            run_end["completed_grpo_iters"].as_f64(),
+            Some(args.grpo_iters as f64)
+        );
+        assert_eq!(
+            run_end["step"],
+            serde_json::json!(args.sft_steps + args.grpo_iters)
+        );
         Ok(())
     }
 

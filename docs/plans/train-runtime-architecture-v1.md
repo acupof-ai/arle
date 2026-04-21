@@ -148,12 +148,21 @@ Impls now include:
 - `JsonlSink`
 - `MultiSink`
 - `SharedSink` (cloneable async worker-backed handle)
+- `MlflowSink` (REST-backed remote adapter for run metadata, metrics, status,
+  and checkpoint artifacts)
+- `OtlpLogSink` (OTLP/HTTP structured-log adapter for vendor-neutral collectors)
+- `WandbProcessSink` (optional sidecar adapter around the official W&B SDK; offline-first)
 
 Current factories:
 
 - `open_sink(jsonl_path, also_stdout)` → boxed `MetricSink`
 - `open_shared_sink(jsonl_path, also_stdout)` → cloneable async handle for
   binaries that need to emit lifecycle/artifact events outside `Trainer`
+
+`SharedSink` now uses a bounded queue with explicit overload policy: scalar
+metrics are `try_send`ed and may drop with a warning counter under pressure,
+while lifecycle/artifact events still block into the queue so `checkpoint` /
+`run_end` cannot disappear silently.
 
 The active train-side surface now also has `TrainEvent { kind, step, strings,
 scalars, bools }` for lifecycle/artifact records (`run_start`,

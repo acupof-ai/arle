@@ -13,11 +13,15 @@ cuda = ["autograd/cuda"]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
 hf-hub = { version = "0.5", features = ["tokio"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["logs"] }
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["logs"] }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
+ureq = { version = "2.12", features = ["json"] }
 qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
 chat = { path = "../chat" }

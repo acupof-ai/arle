@@ -2,13 +2,22 @@
 
 use std::fs;
 use std::io::BufRead;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use tempfile::tempdir;
 use train::metrics::{
-    JsonlSink, MetricSample, MetricSink, MultiSink, NullSink, TrainEvent, open_shared_sink,
+    JsonlSink, MetricSample, MetricSink, MlflowConfig, MlflowSink, MultiSink, NullSink,
+    OtlpLogConfig, OtlpLogSink, TrainEvent, WandbConfig, WandbProcessSink, open_shared_sink,
     open_shared_sink_append, open_sink, open_sink_append,
 };
+
+type MockMlflowArtifactRequest = (String, String, Vec<u8>);
+type MockOtlpRequest = (String, String, Vec<u8>);
 
 fn read_lines(path: &PathBuf) -> Vec<String> {
     let file = fs::File::open(path).expect("open jsonl");
@@ -418,4 +427,439 @@ fn open_shared_sink_append_extends_existing_file() {
     assert_eq!(first["step"], serde_json::json!(1));
     assert_eq!(second["step"], serde_json::json!(2));
     assert_eq!(second["phase"], serde_json::json!("grpo"));
+}
+
+#[test]
+fn otlp_log_sink_posts_metric_and_event_records() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind otlp mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let requests: Arc<Mutex<Vec<MockOtlpRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_thread = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = buf
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("header terminator");
+            let header = String::from_utf8(buf[..header_end].to_vec()).expect("utf8 header");
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut body = buf[header_end + 4..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            let request_line = header.lines().next().expect("request line");
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .expect("request path")
+                .to_string();
+            requests_thread.lock().expect("requests lock").push((
+                path,
+                header.to_ascii_lowercase(),
+                body,
+            ));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write response");
+        }
+    });
+
+    let mut sink = OtlpLogSink::new(OtlpLogConfig {
+        endpoint: format!("http://{}", addr),
+        service_name: "agent-infer.train.test".into(),
+        timeout: Some(Duration::from_secs(2)),
+        headers: vec![("x-test-token".into(), "abc123".into())],
+    })
+    .expect("otlp sink");
+    sink.emit(&MetricSample {
+        step: 7,
+        phase: "train",
+        fields: &[("loss", 0.25), ("tok_per_sec", 123.0)],
+    });
+    sink.event(&TrainEvent {
+        kind: "run_end",
+        step: Some(7),
+        strings: &[("status", "completed"), ("run_id", "run-otel")],
+        scalars: &[("completed_steps", 7.0)],
+        bools: &[],
+    });
+    sink.flush();
+
+    server.join().expect("server joined");
+    let requests = requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 2);
+    for (path, headers, body) in requests.iter() {
+        assert_eq!(path, "/v1/logs");
+        assert!(
+            headers.contains("content-type: application/x-protobuf"),
+            "expected protobuf content-type, got {headers}"
+        );
+        assert!(
+            headers.contains("x-test-token: abc123"),
+            "expected custom header, got {headers}"
+        );
+        assert!(!body.is_empty(), "otlp request body should not be empty");
+    }
+}
+
+#[test]
+fn wandb_process_sink_forwards_messages_to_helper() {
+    let dir = tempdir().expect("tempdir");
+    let capture_path = dir.path().join("wandb-capture.jsonl");
+    let helper_path = dir.path().join("wandb-helper.py");
+    let helper_body = format!(
+        r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+
+capture = Path(r"{capture}")
+with capture.open("w", encoding="utf-8") as out:
+    out.write(json.dumps({{
+        "type": "env",
+        "project": os.environ.get("WANDB_PROJECT"),
+        "mode": os.environ.get("WANDB_MODE"),
+        "entity": os.environ.get("WANDB_ENTITY"),
+        "group": os.environ.get("WANDB_RUN_GROUP"),
+        "tags": os.environ.get("TRAIN_WANDB_TAGS"),
+        "disable_code": os.environ.get("WANDB_DISABLE_CODE"),
+        "silent": os.environ.get("WANDB_SILENT"),
+    }}) + "\n")
+    out.flush()
+    for raw in os.sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        message = json.loads(raw)
+        out.write(json.dumps(message) + "\n")
+        out.flush()
+        if message.get("type") == "finish":
+            break
+"#,
+        capture = capture_path.display()
+    );
+    fs::write(&helper_path, helper_body).expect("write helper");
+
+    {
+        let mut sink = WandbProcessSink::new(WandbConfig {
+            project: "agent-infer-tests".into(),
+            entity: Some("ci".into()),
+            name: Some("wandb-process-sink".into()),
+            notes: Some("unit-test".into()),
+            group: Some("train".into()),
+            job_type: Some("grpo".into()),
+            run_id: Some("run-123".into()),
+            resume: Some("allow".into()),
+            mode: "offline".into(),
+            dir: Some(dir.path().join("wandb")),
+            base_url: Some("http://localhost:8080".into()),
+            tags: vec!["rust".into(), "rl".into()],
+            helper_program: "python3".into(),
+            helper_script: helper_path.clone(),
+            log_checkpoints: true,
+            disable_code: true,
+            silent: true,
+        })
+        .expect("wandb sink");
+        sink.emit(&MetricSample {
+            step: 4,
+            phase: "grpo",
+            fields: &[("loss", 0.25), ("mean_reward", 0.5)],
+        });
+        sink.event(&TrainEvent {
+            kind: "checkpoint",
+            step: Some(4),
+            strings: &[
+                ("path", "/tmp/run"),
+                ("artifact_model", "model.safetensors"),
+            ],
+            scalars: &[("dropped_metrics", 0.0)],
+            bools: &[("save_requested", true)],
+        });
+    }
+
+    let lines = read_lines(&capture_path);
+    assert_eq!(lines.len(), 4, "env + metric + event + finish");
+    let env: serde_json::Value = serde_json::from_str(&lines[0]).expect("env json");
+    assert_eq!(env["project"], serde_json::json!("agent-infer-tests"));
+    assert_eq!(env["mode"], serde_json::json!("offline"));
+    assert_eq!(env["entity"], serde_json::json!("ci"));
+    assert_eq!(env["group"], serde_json::json!("train"));
+    assert_eq!(env["tags"], serde_json::json!("rust,rl"));
+    assert_eq!(env["disable_code"], serde_json::json!("true"));
+    assert_eq!(env["silent"], serde_json::json!("true"));
+
+    let metric: serde_json::Value = serde_json::from_str(&lines[1]).expect("metric json");
+    assert_eq!(metric["type"], serde_json::json!("metric"));
+    assert_eq!(metric["phase"], serde_json::json!("grpo"));
+    assert_eq!(metric["fields"]["loss"], serde_json::json!(0.25));
+
+    let event: serde_json::Value = serde_json::from_str(&lines[2]).expect("event json");
+    assert_eq!(event["type"], serde_json::json!("event"));
+    assert_eq!(event["kind"], serde_json::json!("checkpoint"));
+    assert_eq!(
+        event["strings"]["artifact_model"],
+        serde_json::json!("model.safetensors")
+    );
+    assert_eq!(event["bools"]["save_requested"], serde_json::json!(true));
+
+    let finish: serde_json::Value = serde_json::from_str(&lines[3]).expect("finish json");
+    assert_eq!(finish["type"], serde_json::json!("finish"));
+}
+
+#[test]
+fn mlflow_sink_posts_run_metrics_and_run_end() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mlflow mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_thread = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(buf).expect("utf8 request");
+            let header_end = request.find("\r\n\r\n").expect("header terminator");
+            let header = &request[..header_end];
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut body = request.as_bytes()[header_end + 4..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            let path = header
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("request path")
+                .to_string();
+            requests_thread
+                .lock()
+                .expect("requests lock")
+                .push((path, String::from_utf8(body).expect("utf8 body")));
+            let response_body = if requests_thread.lock().expect("requests lock").len() == 1 {
+                r#"{"run":{"info":{"run_id":"run-123"}}}"#
+            } else {
+                "{}"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write response");
+        }
+    });
+
+    let mut sink = MlflowSink::new(MlflowConfig {
+        tracking_uri: format!("http://{}", addr),
+        experiment_id: "0".into(),
+        run_name: Some("unit-test".into()),
+        auth_token: None,
+        upload_artifacts: false,
+        artifact_path_prefix: "checkpoints".into(),
+    });
+    sink.event(&TrainEvent {
+        kind: "run_start",
+        step: Some(0),
+        strings: &[("run_id", "local-run"), ("job", "train_sft")],
+        scalars: &[("total_steps", 2.0)],
+        bools: &[("resumed", false)],
+    });
+    sink.emit(&MetricSample {
+        step: 1,
+        phase: "train",
+        fields: &[("loss", 0.5), ("tok_per_sec", 123.0)],
+    });
+    sink.event(&TrainEvent {
+        kind: "run_end",
+        step: Some(2),
+        strings: &[("status", "completed")],
+        scalars: &[("completed_steps", 2.0)],
+        bools: &[],
+    });
+
+    server.join().expect("server joined");
+    let requests = requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[0].0, "/api/2.0/mlflow/runs/create");
+    assert_eq!(requests[1].0, "/api/2.0/mlflow/runs/log-batch");
+    assert_eq!(requests[2].0, "/api/2.0/mlflow/runs/log-batch");
+    assert_eq!(requests[3].0, "/api/2.0/mlflow/runs/log-batch");
+    assert_eq!(requests[4].0, "/api/2.0/mlflow/runs/update");
+    assert!(requests[0].1.contains("\"experiment_id\":\"0\""));
+    assert!(requests[1].1.contains("\"train.total_steps\""));
+    assert!(requests[2].1.contains("\"train.loss\""));
+    assert!(requests[3].1.contains("\"event.run_end.completed_steps\""));
+    assert!(requests[4].1.contains("\"status\":\"FINISHED\""));
+}
+
+#[test]
+fn mlflow_sink_uploads_checkpoint_artifacts_when_enabled() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mlflow mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let requests: Arc<Mutex<Vec<MockMlflowArtifactRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_thread = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(buf).expect("utf8 request");
+            let header_end = request.find("\r\n\r\n").expect("header terminator");
+            let header = &request[..header_end];
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut body = request.as_bytes()[header_end + 4..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            let mut parts = header
+                .lines()
+                .next()
+                .expect("request line")
+                .split_whitespace();
+            let method = parts.next().expect("method").to_string();
+            let path = parts.next().expect("path").to_string();
+            requests_thread
+                .lock()
+                .expect("requests lock")
+                .push((method, path, body));
+            let response_body = if requests_thread.lock().expect("requests lock").len() == 1 {
+                r#"{"run":{"info":{"run_id":"run-456"}}}"#
+            } else {
+                "{}"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write response");
+        }
+    });
+
+    let dir = tempdir().expect("tempdir");
+    let ckpt = dir.path().join("step_000007");
+    fs::create_dir_all(&ckpt).expect("checkpoint dir");
+    fs::write(ckpt.join("model.safetensors"), b"model-bytes").expect("model bytes");
+    fs::write(ckpt.join("trainer_state.json"), b"{\"step\":7}").expect("state bytes");
+
+    let mut sink = MlflowSink::new(MlflowConfig {
+        tracking_uri: format!("http://{}", addr),
+        experiment_id: "0".into(),
+        run_name: Some("artifact-test".into()),
+        auth_token: None,
+        upload_artifacts: true,
+        artifact_path_prefix: "checkpoints".into(),
+    });
+    sink.event(&TrainEvent {
+        kind: "run_start",
+        step: Some(0),
+        strings: &[("run_id", "artifact-run"), ("job", "train_sft")],
+        scalars: &[("total_steps", 2.0)],
+        bools: &[],
+    });
+    let ckpt_path = ckpt.display().to_string();
+    sink.event(&TrainEvent {
+        kind: "checkpoint",
+        step: Some(7),
+        strings: &[
+            ("path", ckpt_path.as_str()),
+            ("artifact_model", "model.safetensors"),
+            ("artifact_state", "trainer_state.json"),
+        ],
+        scalars: &[],
+        bools: &[],
+    });
+
+    server.join().expect("server joined");
+    let requests = requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[0].0, "POST");
+    assert_eq!(requests[0].1, "/api/2.0/mlflow/runs/create");
+    assert_eq!(requests[1].0, "POST");
+    assert_eq!(requests[1].1, "/api/2.0/mlflow/runs/log-batch");
+    assert_eq!(requests[2].0, "POST");
+    assert_eq!(requests[2].1, "/api/2.0/mlflow/runs/log-batch");
+    assert_eq!(requests[3].0, "PUT");
+    assert_eq!(
+        requests[3].1,
+        "/api/2.0/mlflow-artifacts/artifacts/checkpoints/step_000007/model.safetensors?run_id=run-456"
+    );
+    assert_eq!(requests[3].2, b"model-bytes");
+    assert_eq!(requests[4].0, "PUT");
+    assert_eq!(
+        requests[4].1,
+        "/api/2.0/mlflow-artifacts/artifacts/checkpoints/step_000007/trainer_state.json?run_id=run-456"
+    );
+    assert_eq!(requests[4].2, b"{\"step\":7}");
 }

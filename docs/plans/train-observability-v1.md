@@ -13,29 +13,55 @@ Give the Rust training stack a single observability/export contract that:
 - leaves room for trace-first LLM observability stacks (Phoenix, Langfuse,
   Braintrust) without hard-coding a SaaS SDK into the core trainer
 
-This is an architecture plan, not a declaration that every exporter has
-already landed.
+This is still the architecture plan, but it now tracks a partially-landed
+implementation rather than a blank slate: the shared async sink, lifecycle /
+checkpoint events, `/v1/train/events`, the first MLflow adapter, the first
+vendor-neutral OTLP log adapter, and the first W&B sidecar adapter have all
+landed locally on 2026-04-21.
 
 ## Current state
 
-Today the train-side observability surface is intentionally minimal:
+Today the landed train-side observability surface is:
 
-- `crates/train/src/metrics.rs` defines `MetricSample { step, fields }`,
-  `MetricSink`, `NullSink`, `StdoutSink`, `JsonlSink`, and `MultiSink`.
+- `crates/train/src/metrics.rs` defines `MetricSample { step, phase, fields }`,
+  `TrainEvent`, `MetricSink`, `NullSink`, `StdoutSink`, `JsonlSink`,
+  `MultiSink`, `SharedSink`, `MlflowSink`, `OtlpLogSink`, and
+  `WandbProcessSink`.
 - `Trainer` emits shared supervised metrics (`loss`, `ppl`, `lr`,
-  `grad_norm`, `ms_per_step`, `tok_per_sec`, `eval_*`).
-- `train_grpo` appends its RL metrics to JSONL during the GRPO phase.
-- `train_multi_turn` emits its own RL metrics and exposes the only live train
-  control plane (`/v1/train/status|stop|save`).
+  `grad_norm`, `ms_per_step`, `tok_per_sec`, `eval_*`) through the same async
+  sink path as the hand-written RL loops.
+- All active train binaries (`pretrain`, `train_sft`, `train_grpo`,
+  `train_multi_turn`) expose the same live train control plane:
+  `/v1/train/status|events|stop|save`.
+- Operator save / stop requests are recorded into the controller event ring,
+  so `/v1/train/events` carries both trainer-emitted lifecycle records and
+  control-plane intents.
+- MLflow export is now live for:
+  - run creation
+  - param/tag logging from `run_start`
+  - phase metrics
+  - run summaries / terminal status
+  - checkpoint artifact uploads driven by `checkpoint` events
+- OTLP export is now live for:
+  - vendor-neutral log records over OTLP/HTTP
+  - scalar step metrics mapped into structured log attributes
+  - lifecycle / checkpoint / status / run-end events mapped into the same log stream
+  - background-worker export from the same shared sink path the other adapters use
+- W&B export is now live for:
+  - an optional sidecar process around the official W&B SDK
+  - offline-first runs by default (`WANDB_MODE=offline`) with later `wandb sync`
+  - phase-prefixed step metrics and checkpoint artifact uploads driven by the same event stream
+  - run metadata / summary logging from `run_start` + `run_end`
+  - local setup via `pip install -e ".[observe]"`
+- `SharedSink` is now bounded and explicit about overload semantics:
+  - scalar metrics use `try_send` and may drop with a warning counter
+  - lifecycle/artifact events still block into the queue instead of dropping silently
+  - the drop counter is surfaced as `dropped_metrics` in `/v1/train/status` and `run_end`
 
 What is missing:
 
-- no run lifecycle (`run_start`, `run_end`)
-- no checkpoint/artifact events
-- no stable run metadata (`run_id`, `backend`, `model_family`, tags, config)
-- no timestamped event schema
-- no async exporter thread / queue / retry policy
-- no external vendor integration surface
+- no infer-side unified `/v1/train/*` bridge yet
+- no trace-first rollout / tool-call export yet
 
 ## Constraints
 
@@ -60,11 +86,12 @@ The current tool ecosystem splits into two practical buckets:
    - Langfuse
    - Braintrust
 
-For this repository, the right order is:
+For this repository, the right order remains:
 
 - first stabilize a train event/export contract
 - then ship vendor-neutral OTLP export
-- then add experiment/artifact adapters for W&B and MLflow
+- then add experiment/artifact adapters for W&B on top of the already-landed
+  MLflow path
 - then decide which trace-first stack to target for eval / agent traces
 
 This avoids baking provider-specific assumptions into `Trainer`.
@@ -194,18 +221,20 @@ Instead:
 
 ### Phase C — OTLP
 
-- Add `OtlpSink` for metrics/logs/traces as appropriate.
-- Map scalar training metrics into OTLP metrics/log records.
-- Map run/checkpoint lifecycle into structured log records or spans.
+- ✅ `OtlpLogSink` landed for OTLP/HTTP log export.
+- Remaining:
+  - decide whether train-side scalar counters should stay log-shaped or also grow true OTLP metrics
+  - decide whether long-running rollout/eval flows should emit spans in addition to logs
+  - wire the same resource/scope schema into infer-side `/v1/train/*` once that bridge exists
 
 ### Phase D — experiment tracking
 
-- Add W&B adapter:
-  - run config
-  - step metrics
-  - checkpoint artifacts
-  - final summary
-- Add MLflow adapter with the same contract.
+- ✅ MLflow adapter landed for metrics + checkpoint artifact uploads.
+- ✅ W&B adapter landed as an optional sidecar around the official SDK.
+- Remaining:
+  - richer MLflow tags / nested runs if needed
+  - configurable artifact filtering / aliasing
+  - tighter W&B artifact aliasing / grouping once infer-side `/v1/train/*` is unified
 
 ### Phase E — trace-first agent observability
 
@@ -228,7 +257,9 @@ The smallest safe next step is:
 3. introduce a background exporter thread
 4. make checkpoint save emit artifact events
 
-Only after that should we wire W&B / MLflow / OTLP endpoints.
+The MLflow endpoint, OTLP log path, and W&B sidecar path are already wired.
+New exporters should continue to sit on top of the same event stream rather
+than fork the runtime API.
 
 ## Rule
 

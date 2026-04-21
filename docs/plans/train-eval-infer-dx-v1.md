@@ -16,7 +16,7 @@ the checkpoint / eval / serve tooling around that reality.
 | Question | Answer |
 |----------|--------|
 | Does the checkpoint format match what `infer` expects? | ✅ (exact) |
-| Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from `train_multi_turn --serve` output or `infer --model-path <out>/latest` without guessing the step number. |
+| Can I serve a trained checkpoint without hand-assembling paths? | ✅ `latest` marker is landed; serve from any train output (`pretrain`, `train_sft`, `train_grpo`, `train_multi_turn`) via `infer --model-path <out>/latest` without guessing the step number. |
 | Is there a standalone eval binary? | ✅ `eval_lm` landed — it evaluates Qwen3/Qwen3.5 checkpoint dirs directly on tokenized or chat JSONL. |
 | Do train binaries have `--help`? | ❌ NO — all hand-roll arg parsing. |
 | Are flag names consistent across binaries? | ❌ NO — `--seq` vs `--seq-len` and `--model` vs `--model-path` still diverge, though the generic pretrain entrypoint now accepts canonical `--resume-from` (with `--resume` kept only as a compatibility alias). |
