@@ -9,6 +9,7 @@ use crate::sampler::SamplingParams;
 use crate::scheduler::policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use crate::server_engine::CompletionStreamDelta;
 use crate::types::SessionId;
+use crate::kv_tier::ClusterSharedBackendConfig;
 
 /// Preemption strategy when GPU memory is exhausted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
@@ -84,8 +85,9 @@ pub struct SchedulerConfig {
     pub t1_host_pinned_keepalive_ticks: u64,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
-    /// Optional shared-filesystem root used as a minimal cluster-shared T2-remote backend.
-    pub shared_fs_store_root: Option<PathBuf>,
+    /// Optional cluster-shared slower-tier backend config. The current repo-local
+    /// implementation supports shared-fs and the NIXL stub behind `rdma-nixl`.
+    pub cluster_shared_backend: Option<ClusterSharedBackendConfig>,
 }
 
 impl Default for SchedulerConfig {
@@ -116,7 +118,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
-            shared_fs_store_root: None,
+            cluster_shared_backend: None,
         }
     }
 }
@@ -426,7 +428,7 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_high_water, 0.85);
         assert_eq!(cfg.t1_host_pinned_low_water, 0.70);
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
-        assert_eq!(cfg.shared_fs_store_root, None);
+        assert_eq!(cfg.cluster_shared_backend, None);
         assert!(cfg.validate().is_ok());
     }
 

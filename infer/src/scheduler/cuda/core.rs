@@ -7,8 +7,9 @@ use super::{
 };
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::{
+    ClusterSharedBackend,
     BlockLocation, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey, ReadmissionPlan,
-    ReadmissionSource, SharedFsStore, TieredKvPolicy,
+    ReadmissionSource, TieredKvPolicy,
 };
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
@@ -102,7 +103,7 @@ pub struct Scheduler<M: ModelForward> {
     /// materialized; cross-slot page aliasing is intentionally unsupported.
     pub(super) prefix_cache: RadixCache,
     pub(super) disk_store: Arc<DiskStore>,
-    pub(super) remote_store: Option<Arc<SharedFsStore>>,
+    pub(super) cluster_shared_backend: Option<ClusterSharedBackend>,
     pub(super) tier_policy: TieredKvPolicy,
     pub(super) host_pinned_pool: crate::kv_tier::SharedHostPinnedPool,
     /// Side map from `BlockId` → full contiguous page span for that
@@ -578,16 +579,16 @@ impl<M: ModelForward> Scheduler<M> {
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
         let disk_store = Arc::new(DiskStore::new(config.disk_store_root.clone()));
-        let remote_store = config
-            .shared_fs_store_root
+        let cluster_shared_backend = config
+            .cluster_shared_backend
             .as_ref()
-            .map(|root| Arc::new(SharedFsStore::new(root.clone())));
+            .map(crate::kv_tier::ClusterSharedBackendConfig::build);
         let coordinator_queue_capacity = config.max_slots.max(16);
         let (coordinator, coordinator_handle, coordinator_events) =
             crate::kv_tier::Coordinator::new_with_backends(
                 coordinator_queue_capacity,
                 Some(Arc::clone(&disk_store)),
-                remote_store.clone(),
+                cluster_shared_backend.clone(),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
         let max_slots = config.max_slots;
@@ -606,7 +607,7 @@ impl<M: ModelForward> Scheduler<M> {
                 prefix_cache_keepalive_ticks,
             ),
             disk_store,
-            remote_store,
+            cluster_shared_backend,
             tier_policy: TieredKvPolicy::default(),
             host_pinned_pool,
             block_to_pages: HashMap::new(),
@@ -1209,7 +1210,7 @@ impl<M: ModelForward> Scheduler<M> {
             let target = self.tier_policy.choose_store_target(
                 &metadata,
                 self.coordinator_handle.stats(),
-                self.remote_store.is_some(),
+                self.cluster_shared_backend.is_some(),
             );
             let Some(ticket) =
                 self.coordinator_handle

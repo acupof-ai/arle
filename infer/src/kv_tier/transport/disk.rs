@@ -212,6 +212,10 @@ impl DiskStore {
         kv_native_sys::block_path(self.root(), fingerprint.0)
     }
 
+    pub fn contains_block(&self, fingerprint: BlockFingerprint) -> io::Result<bool> {
+        self.block_path_for(fingerprint)?.try_exists()
+    }
+
     /// Writes a content-addressed block file and returns its stable disk
     /// location metadata. Writes are **crash-safe**: the payload is
     /// written to `<path>.tmp` first and then atomically renamed onto
@@ -386,6 +390,20 @@ impl KVBackend for DiskStore {
         Ok(Self::ready_op(Ok(KVBackendCompletion::Deleted(req.handle))))
     }
 
+    fn exists(
+        &self,
+        handle: &super::super::chunk::KVHandle,
+    ) -> Result<bool, TransportError> {
+        match &handle.location {
+            BlockLocation::Disk { fingerprint, .. } => {
+                self.contains_block(*fingerprint).map_err(|err| disk_error(&err))
+            }
+            _ => Err(disk_location_error(
+                "disk backend requires a Disk block location on exists",
+            )),
+        }
+    }
+
     fn poll(&self, op: &mut Self::Op) -> Poll<Result<KVBackendCompletion, TransportError>> {
         match std::mem::replace(&mut op.state, DiskBackendOpState::Exhausted) {
             DiskBackendOpState::Ready(result) => Poll::Ready(result),
@@ -517,6 +535,23 @@ mod tests {
         assert_eq!(header.kv_format_tag, kv_format_tag);
         assert_eq!(header.payload_len, payload.len() as u64);
         assert_eq!(stored_payload, payload);
+    }
+
+    #[test]
+    fn contains_block_tracks_fingerprint_presence() {
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 7;
+        let payload = b"exists-check".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+
+        assert!(!store.contains_block(fingerprint).expect("missing before write"));
+        let location = store
+            .put_block(fingerprint, kv_format_tag, &payload)
+            .expect("put block");
+        assert!(store.contains_block(fingerprint).expect("present after write"));
+        store.delete_block(&location).expect("delete block");
+        assert!(!store.contains_block(fingerprint).expect("missing after delete"));
     }
 
     #[test]
