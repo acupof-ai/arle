@@ -319,6 +319,7 @@ fn submit_warmup_request(
     handle
         .submit(IncomingRequest {
             prompt: prompt.to_string(),
+            prompt_tokens: None,
             max_tokens: max_new_tokens,
             sampling: SamplingParams {
                 temperature: 0.0,

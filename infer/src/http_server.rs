@@ -225,6 +225,7 @@ impl RequestExecutionOptions {
     ) -> IncomingRequest {
         IncomingRequest {
             prompt,
+            prompt_tokens: None,
             max_tokens: self.max_tokens,
             sampling: self.sampling,
             stop: self.stop,

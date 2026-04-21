@@ -21,10 +21,11 @@
 scripts/bench_guidellm.sh <backend-label> \
   [--target http://localhost:8000] \
   [--model Qwen/Qwen3-4B] \
-  [--processor models/Qwen3-4B]
+  [--processor models/Qwen3-4B] \
+  [--trace-interval-ms 1000]
 ```
 
-Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH]`
+Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model NAME] [--processor PATH] [--trace-interval-ms N]`
 
 ## Environment
 
@@ -76,6 +77,10 @@ Invoked via: `scripts/bench_guidellm.sh <backend-label> [--target URL] [--model 
 - Raw: `bench-output/<date>-<label>/benchmarks.json`
 - CSV:  `bench-output/<date>-<label>/benchmarks.csv`
 - HTML: `bench-output/<date>-<label>/benchmarks.html`
+- Service trace (before): `bench-output/<date>-<label>/service_stats_before.txt`
+- Service trace (during): `bench-output/<date>-<label>/service_stats_trace.jsonl`
+- Service trace (after):  `bench-output/<date>-<label>/service_stats_after.txt`
+- Service trace (summary): `bench-output/<date>-<label>/service_stats_trace_summary.md`
 
 ## Notes
 

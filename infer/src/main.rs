@@ -62,7 +62,7 @@ struct Args {
     prefill_max_requests: Option<usize>,
 
     /// Enable mixing a prefill batch into a decode batch when the model supports it.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     enable_mixed_chunk: bool,
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).

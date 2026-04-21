@@ -35,7 +35,7 @@ aligned.
 | 2 | **Hypothesis** | Expected outcome *before* the run. Enables §5 to judge "was this surprising?". |
 | 3 | **Command** | Exact CLI + env vars + seed. Copy-pasteable. |
 | 4 | **Environment** | GPU/SoC model + VRAM, CUDA/Metal version, commit sha (never dirty tree), feature set, model + weights path. |
-| 5 | **Results** | Raw table first (TTFT p50/p99, ITL p50/p99, tok/s, req/s actual). Add VRAM peak / kernel counts only when the wrapper or a paired trace actually produces them. No summaries replacing numbers. Link raw artefacts. |
+| 5 | **Results** | Raw table first (TTFT p50/p99, ITL p50/p99, tok/s, req/s actual). Add VRAM peak / kernel counts only when the wrapper or a paired trace actually produces them. No summaries replacing numbers. Link raw artefacts, including service trace snapshots (`service_stats_before.txt`, `service_stats_trace.jsonl`, `service_stats_after.txt`, summary). |
 | 6 | **Problems** | Anything that degraded, crashed, or deviated from §4 watch-list. Include smallest reproducer. |
 | 7 | **Learnings** | Generalizable rules, not run-specific facts. Each actionable: "X bound by Y → tune Z first". |
 | 8 | **Δ vs baseline** | Link prior entry + Δ% row. "First run" if none exists. |
@@ -47,7 +47,7 @@ reran this?" from §3+§4 alone, the entry is incomplete.
 
 ## 2. Tools
 
-- **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep wrapper. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit.
+- **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep wrapper. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit. Wrapper enforces one-at-a-time (serial) runs and captures `/v1/stats` service trace before/during/after each run.
 - **`scripts/bench_throughput.py`** — legacy helper for narrower synthetic / diagnostic checks; keep it for historical reproducibility only. `bench_kv_cache*.py` remains component-level / internal-only.
 - **`nsys profile` / `ncu --set full`** — CUDA trace → `.nsys-rep` / `.ncu-rep`.
 - **Xcode Metal capture / MLX instruments** — Metal trace → `.gputrace`.

@@ -45,6 +45,7 @@ impl<M: ModelForward> Scheduler<M> {
         token_ids: &mut Vec<u32>,
         extra_pages: usize,
     ) {
+        let mut retracted = 0usize;
         while self.paged_kv_pool.is_active()
             && self
                 .decode_pages_needed(decode_indices)
@@ -57,9 +58,11 @@ impl<M: ModelForward> Scheduler<M> {
             };
             let victim_idx = decode_indices[victim_pos];
             self.requeue_preempted_decode(victim_idx);
+            retracted += 1;
             decode_indices.remove(victim_pos);
             token_ids.remove(victim_pos);
         }
+        self.bump_prefill_decode_reserve_ratio(retracted);
     }
 
     pub(super) fn finish_request(&mut self, slot_idx: usize, reason: FinishReason) {
@@ -101,6 +104,7 @@ impl<M: ModelForward> Scheduler<M> {
             let generated_tokens = victim.generated_tokens.len();
             let requeue = IncomingRequest {
                 prompt: std::mem::take(&mut victim.prompt),
+                prompt_tokens: Some(victim.prompt_tokens.clone()),
                 max_tokens: victim.max_tokens,
                 sampling: victim.sampling.clone(),
                 stop: victim.stop.take(),
@@ -153,6 +157,7 @@ impl<M: ModelForward> Scheduler<M> {
                         "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
                         req_id, slot_idx, e
                     );
+                    self.bump_prefill_decode_reserve_ratio(1);
                     self.finish_request(slot_idx, FinishReason::Length);
                 } else {
                     alloc_ok_indices.push(slot_idx);
@@ -453,6 +458,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Request {}: KV pool exhausted after preemption (slot {}): {} — finishing",
                     req_id, slot_idx, e
                 );
+                self.bump_prefill_decode_reserve_ratio(1);
                 self.finish_request(slot_idx, FinishReason::Length);
             } else {
                 alloc_ok_indices.push(slot_idx);

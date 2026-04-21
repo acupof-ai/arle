@@ -1115,6 +1115,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
         self.handle
             .submit(IncomingRequest {
                 prompt: req.prompt,
+                prompt_tokens: None,
                 max_tokens: req.max_tokens,
                 sampling: req.sampling,
                 stop: req.stop,

@@ -504,6 +504,7 @@ mod tests {
         (
             IncomingRequest {
                 prompt: prompt.to_string(),
+                prompt_tokens: None,
                 max_tokens: 8,
                 sampling: SamplingParams::default(),
                 stop,
