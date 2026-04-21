@@ -178,7 +178,7 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
         #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
         BackendChoice::Cuda => {
             let backend =
-                autograd::backend_cuda::CudaBackend::new(0).map_err(|e| CliError::Autograd(e))?;
+                autograd::backend_cuda::CudaBackend::new(0).map_err(CliError::Autograd)?;
             Ok(Arc::new(backend))
         }
         #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
