@@ -110,7 +110,9 @@ batch. The detailed target design for that next tranche now lives in
 which records the `L0/L1/L2/L3` physical hierarchy, the
 `KVBlock / KVSpan / KVHandle` object model, the three-queue
 prefetch/store pipeline, and the `CacheIndex / CacheIO / CachePolicy /
-CacheOrchestrator` split. One constraint is still explicit:
+CacheOrchestrator` split. The runtime-facing ownership graph and the
+canonical scheduler branch order now live in
+[`tiered-kv-runtime-flow.md`](./tiered-kv-runtime-flow.md). One constraint is still explicit:
 **M2b does not do
 cross-slot page aliasing**. Reuse remains limited to the case where the
 radix hit maps to a currently free slot whose contiguous state still
