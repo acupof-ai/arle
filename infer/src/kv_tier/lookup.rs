@@ -43,7 +43,7 @@ pub struct StageRequest {
     pub host_region: Option<HostPinnedRegion>,
 }
 
-/// Opaque ticket representing one staged lookup batch.
+/// Opaque ticket representing one staged batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StageTicket(pub u64);
 
@@ -53,23 +53,15 @@ pub struct LookupOutcome {
     /// Reusable prefix length in tokens.
     pub matched_len: usize,
     pub blocks: Vec<LookupBlock>,
-    /// Present when a planner/coordinator accepted staging work.
-    pub staging_ticket: Option<StageTicket>,
     /// True when fetching staged blocks is likely slower than recomputing.
     pub recompute_advised: bool,
 }
 
 impl LookupOutcome {
-    pub fn new(
-        matched_len: usize,
-        blocks: Vec<LookupBlock>,
-        staging_ticket: Option<StageTicket>,
-        recompute_advised: bool,
-    ) -> Self {
+    pub fn new(matched_len: usize, blocks: Vec<LookupBlock>, recompute_advised: bool) -> Self {
         Self {
             matched_len,
             blocks,
-            staging_ticket,
             recompute_advised,
         }
     }
@@ -120,10 +112,4 @@ impl LookupHeuristics {
         let recompute_seconds = staging_tokens as f32 / self.prefill_tokens_per_sec;
         fetch_seconds > recompute_seconds
     }
-}
-
-/// Minimal abstraction used by `RadixCache::lookup_or_stage` to request
-/// background staging without depending directly on a concrete coordinator.
-pub trait StagePlanner {
-    fn stage(&self, requests: &[StageRequest]) -> Option<StageTicket>;
 }

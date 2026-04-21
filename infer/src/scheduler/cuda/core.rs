@@ -118,7 +118,6 @@ pub struct Scheduler<M: ModelForward> {
     /// and every page in the value appears in `page_ref_count > 0`.
     /// Entries are removed when eviction releases the block.
     pub(super) block_to_pages: HashMap<BlockId, Vec<u32>>,
-    pub(super) block_to_host_regions: HashMap<BlockId, crate::kv_tier::HostPinnedRegion>,
     /// Best-effort mapping from a radix block to the free slot whose
     /// contiguous state still materializes that prefix. This is intentionally
     /// separate from `prefix_cache`: the radix owns reusable bytes / page pins,
@@ -240,6 +239,18 @@ impl<M: ModelForward> Scheduler<M> {
         self.prefix_cache.block_metadata(block_id)
     }
 
+    fn host_region_from_metadata(
+        metadata: &BlockMetadata,
+    ) -> Option<crate::kv_tier::HostPinnedRegion> {
+        match metadata.location.as_ref() {
+            Some(BlockLocation::HostPinned { offset }) => Some(crate::kv_tier::HostPinnedRegion {
+                offset: *offset,
+                len: metadata.byte_len as usize,
+            }),
+            _ => None,
+        }
+    }
+
     fn pages_per_prefix_block(&self) -> usize {
         self.prefix_cache
             .block_size()
@@ -283,7 +294,7 @@ impl<M: ModelForward> Scheduler<M> {
             }
 
             let host_region = match from {
-                BlockLocation::HostPinned { .. } => self.block_to_host_regions.get(&block_id).copied(),
+                BlockLocation::HostPinned { .. } => Self::host_region_from_metadata(&metadata),
                 BlockLocation::Disk { .. } => match self.host_pinned_pool.lock() {
                     Ok(mut pool) => pool.reserve(metadata.byte_len as usize),
                     Err(_) => None,
@@ -320,7 +331,6 @@ impl<M: ModelForward> Scheduler<M> {
                 &payload,
             )?;
             self.block_to_pages.insert(block.block_id, pages);
-            self.block_to_host_regions.remove(&block.block_id);
             let _ = self.prefix_cache.update_block_metadata(
                 block.block_id,
                 BlockMetadataUpdate {
@@ -506,7 +516,6 @@ impl<M: ModelForward> Scheduler<M> {
             disk_store,
             host_pinned_pool,
             block_to_pages: HashMap::new(),
-            block_to_host_regions: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
             coordinator_handle,
@@ -940,7 +949,6 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         self.block_owner_slots.remove(&block_id);
-        self.block_to_host_regions.insert(block_id, region);
         let _ = self.prefix_cache.update_block_metadata(
             block_id,
             BlockMetadataUpdate {
@@ -987,7 +995,7 @@ impl<M: ModelForward> Scheduler<M> {
             if let Some(pages) = self.block_to_pages.remove(&block_id) {
                 reclaimed_pages += self.paged_kv_pool.release_pages(&pages).len();
             }
-            if let Some(region) = self.block_to_host_regions.remove(&block_id) {
+            if let Some(region) = metadata.as_ref().and_then(Self::host_region_from_metadata) {
                 self.release_host_region(region);
             }
             self.block_owner_slots.remove(&block_id);
@@ -1037,7 +1045,7 @@ impl<M: ModelForward> Scheduler<M> {
             let Some(fingerprint) = metadata.fingerprint else {
                 continue;
             };
-            let Some(region) = self.block_to_host_regions.get(&block_id).copied() else {
+            let Some(region) = Self::host_region_from_metadata(&metadata) else {
                 continue;
             };
             let Some(ticket) = self.coordinator_handle.submit_spill(vec![
@@ -1223,12 +1231,14 @@ impl<M: ModelForward> Scheduler<M> {
                 if reclaimed == 0 {
                     Err(first_err)
                 } else {
-                    self.paged_kv_pool.alloc_tokens(slot, count).map_err(|retry_err| {
-                        anyhow::anyhow!(
+                    self.paged_kv_pool
+                        .alloc_tokens(slot, count)
+                        .map_err(|retry_err| {
+                            anyhow::anyhow!(
                             "TokenKVPool alloc retry failed after reclaiming {reclaimed} pages: \
                              first error: {first_err}; retry error: {retry_err}"
                         )
-                    })
+                        })
                 }
             }
         }

@@ -26,8 +26,7 @@
 //! # Shared-block accounting
 //!
 //! The batch scheduler can pin the same block table entries across multiple
-//! requests. This module tracks refcounts and can allocate a replacement GPU
-//! block for a detach-on-write flow, but it does not own any production
+//! requests. This module tracks refcounts, but it does not own any production
 //! decode-time COW path.
 
 use std::collections::{HashMap, VecDeque};
@@ -265,25 +264,6 @@ impl BlockManager {
     }
 
     // -----------------------------------------------------------------------
-    // Copy-on-write
-    // -----------------------------------------------------------------------
-
-    /// Check if a block needs copy-on-write (ref_count > 1 means it's shared).
-    pub fn needs_cow(&self, id: BlockId) -> bool {
-        self.ref_count(id) > 1
-    }
-
-    /// Reserve a fresh GPU block for CoW. The caller must:
-    /// 1. Schedule a GPU→GPU copy of `src` contents into the new block.
-    /// 2. Call `free(&[src])` to release the reference on the original.
-    ///
-    /// Returns the new block's ID on success, or `AllocationError` if OOM.
-    pub fn cow_allocate_gpu(&mut self) -> Result<BlockId, AllocationError> {
-        let ids = self.allocate_gpu(1)?;
-        Ok(ids[0])
-    }
-
-    // -----------------------------------------------------------------------
     // Swap (preemption support)
     // -----------------------------------------------------------------------
 
@@ -474,32 +454,6 @@ mod tests {
         m.free(&blocks);
         assert_eq!(m.ref_count(blocks[0]), 0);
         assert_eq!(m.free_gpu_blocks(), 8);
-    }
-
-    #[test]
-    fn needs_cow() {
-        let mut m = manager();
-        let blocks = m.allocate_gpu(1).unwrap();
-        assert!(!m.needs_cow(blocks[0]));
-
-        m.pin(&blocks);
-        assert!(m.needs_cow(blocks[0]));
-    }
-
-    #[test]
-    fn cow_allocate_returns_new_block() {
-        let mut m = manager();
-        let shared = m.allocate_gpu(1).unwrap()[0];
-        m.pin(&[shared]);
-        assert!(m.needs_cow(shared));
-
-        let new_block = m.cow_allocate_gpu().unwrap();
-        assert_ne!(new_block, shared);
-        assert_eq!(m.free_gpu_blocks(), 6); // original + new both allocated
-
-        // Simulate caller releasing the shared block.
-        m.free(&[shared]);
-        assert_eq!(m.ref_count(shared), 1); // still held by the other user
     }
 
     #[test]

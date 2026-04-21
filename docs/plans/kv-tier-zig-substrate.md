@@ -16,9 +16,9 @@ Rust keeps:
 
 - `KVTransport`
 - `CoordinatorCommand` / `CoordinatorEvent`
-- `StagePlanner` / `LookupOutcome`
+- lookup outcomes and scheduler policy
 - `BlockLocation`, `Tier`, `RemoteBlockDesc`
-- session persistence and scheduler policy
+- session persistence
 
 Zig owns, in phases:
 

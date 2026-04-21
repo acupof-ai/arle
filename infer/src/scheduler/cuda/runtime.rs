@@ -1,7 +1,6 @@
 use super::{
     ActiveRequest, ModelForward, Ordering, Phase, STATS_LOG_INTERVAL, Scheduler, error, info, warn,
 };
-use crate::kv_tier::StagePlanner;
 use crate::prefix_cache::BlockMetadataUpdate;
 
 fn best_reusable_slot_for_radix_hit(
@@ -167,7 +166,6 @@ impl<M: ModelForward> Scheduler<M> {
                                     ..BlockMetadataUpdate::default()
                                 },
                             );
-                            self.block_to_host_regions.remove(&block_id);
                             self.release_host_region(region);
                         }
                     }
@@ -286,11 +284,9 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             };
 
-            let lookup = self.prefix_cache.lookup_or_stage(
-                &prompt_tokens,
-                crate::kv_tier::LookupHeuristics::default(),
-                None,
-            );
+            let lookup = self
+                .prefix_cache
+                .lookup_or_stage(&prompt_tokens, crate::kv_tier::LookupHeuristics::default());
             let radix_blocks: Vec<_> = lookup
                 .blocks
                 .iter()

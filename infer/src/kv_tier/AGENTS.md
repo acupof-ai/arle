@@ -45,10 +45,10 @@ kv_tier/coordinator.rs  — Coordinator, unified Stage + Spill commands, handle 
    Canonical definition in `crate::types::BlockId`. Content-addressable
    identity uses `crate::types::BlockFingerprint` and only exists at
    persist (M4) or migrate (M5) boundaries.
-2. **Only the coordinator moves blocks between tiers.** The scheduler emits
-   intents (`Demote`, `Promote`, `Pin`, `Unpin`); the coordinator owns the
-   CUDA copy stream and the disk/remote IO queue. Scheduler code **must
-   not** issue `TransferOp`s directly.
+2. **Only the coordinator moves blocks between tiers.** The scheduler decides
+   which blocks should stage or spill; the coordinator owns the byte movement
+   and completion events. Scheduler code **must not** issue `TransferOp`s
+   directly.
 3. **MR registration stability.** NIXL requires registered memory regions
    to be allocation-stable. `HostPinnedPool` must be allocated once at
    engine init and never reallocated. See `tiered-kv-cache.md §4.2` inv 5
