@@ -115,6 +115,11 @@ pub struct PrefillChunkResult {
     pub finish_reason: Option<&'static str>,
 }
 
+pub(crate) struct Qwen3MixedBatchResult {
+    pub(crate) decode_tokens: Vec<u32>,
+    pub(crate) prefill: PrefillChunkResult,
+}
+
 /// Result of `MetalRequestState::try_decode_qwen35_dflash_speculative_batch`:
 /// identifies which rows of the caller's input slice were dispatched through
 /// the batched speculative kernel, and the first sampled token for each.
@@ -129,6 +134,17 @@ pub struct PrefillChunkResult {
 pub(crate) struct DflashBatchOutcome {
     pub(crate) ready_indices: Vec<usize>,
     pub(crate) tokens: Vec<u32>,
+}
+
+enum Qwen3PackedBatchRowKind {
+    Decode,
+    Prefill { terminal_prompt: bool },
+}
+
+struct Qwen3PackedBatchRow<'a> {
+    state: *mut ResumableRequestState<Qwen3StepDriver<'a>>,
+    query_tokens: Vec<u32>,
+    kind: Qwen3PackedBatchRowKind,
 }
 
 trait StepDriver {
@@ -680,6 +696,10 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
+    pub fn is_qwen3(&self) -> bool {
+        matches!(self.inner, MetalRequestStateInner::Qwen3(_))
+    }
+
     pub fn is_qwen35(&self) -> bool {
         matches!(self.inner, MetalRequestStateInner::Qwen35(_))
     }
@@ -752,8 +772,7 @@ impl<'a> MetalRequestState<'a> {
             MetalRequestStateInner::Qwen3(_) => {
                 let mut qwen3_states = Vec::with_capacity(states.len());
                 for state in states.iter_mut() {
-                    let state_ref: &mut MetalRequestState<'a> = state;
-                    match &mut state_ref.inner {
+                    match &mut state.inner {
                         MetalRequestStateInner::Qwen3(qwen3) => {
                             if qwen3.phase() != MetalRequestPhase::Decode {
                                 return Ok(None);
@@ -764,12 +783,17 @@ impl<'a> MetalRequestState<'a> {
                     }
                 }
 
-                let first_cache_len = qwen3_states[0].driver.cache_len;
                 if qwen3_states
                     .iter()
-                    .any(|state| state.driver.cache_len != first_cache_len)
+                    .any(|state| state.driver.kv_pool.is_some())
                 {
-                    return Ok(None);
+                    let first_cache_len = qwen3_states[0].driver.cache_len;
+                    if qwen3_states
+                        .iter()
+                        .any(|state| state.driver.cache_len != first_cache_len)
+                    {
+                        return Ok(None);
+                    }
                 }
 
                 let sampled = decode_qwen3_batch(&mut qwen3_states)?;
@@ -778,8 +802,7 @@ impl<'a> MetalRequestState<'a> {
             MetalRequestStateInner::Qwen35(_) => {
                 let mut qwen35_states = Vec::with_capacity(states.len());
                 for state in states.iter_mut() {
-                    let state_ref: &mut MetalRequestState<'a> = state;
-                    match &mut state_ref.inner {
+                    match &mut state.inner {
                         MetalRequestStateInner::Qwen35(qwen35) => {
                             if qwen35.phase() != MetalRequestPhase::Decode {
                                 return Ok(None);
@@ -807,6 +830,82 @@ impl<'a> MetalRequestState<'a> {
                 Ok(Some(sampled))
             }
         }
+    }
+
+    pub(crate) fn try_qwen3_mixed_batch(
+        decode_states: &mut [&mut MetalRequestState<'a>],
+        prefill_state: &mut MetalRequestState<'a>,
+        budget: usize,
+    ) -> Result<Option<Qwen3MixedBatchResult>> {
+        ensure!(budget > 0, "Qwen3 mixed batch requires budget > 0");
+
+        let mut qwen3_decode_states = Vec::with_capacity(decode_states.len());
+        for state in decode_states.iter_mut() {
+            match &mut state.inner {
+                MetalRequestStateInner::Qwen3(qwen3) => {
+                    if qwen3.phase() != MetalRequestPhase::Decode
+                        || qwen3.driver.kv_pool.is_some()
+                        || qwen3.driver.dflash.is_some()
+                    {
+                        return Ok(None);
+                    }
+                    qwen3_decode_states.push(&mut **qwen3);
+                }
+                MetalRequestStateInner::Qwen35(_) => return Ok(None),
+            }
+        }
+
+        let MetalRequestStateInner::Qwen3(prefill_state) = &mut prefill_state.inner else {
+            return Ok(None);
+        };
+        if prefill_state.phase() != MetalRequestPhase::Prefill
+            || prefill_state.driver.kv_pool.is_some()
+            || prefill_state.driver.dflash.is_some()
+        {
+            return Ok(None);
+        }
+
+        let remaining = prefill_state.prompt_tokens.len() - prefill_state.prompt_cursor;
+        let processed = budget.min(remaining);
+        let prompt_end = prefill_state.prompt_cursor + processed;
+        let terminal_prompt = prompt_end == prefill_state.prompt_tokens.len();
+        let query_tokens =
+            prefill_state.prompt_tokens[prefill_state.prompt_cursor..prompt_end].to_vec();
+        let (decode_tokens, emitted_token) = {
+            let mut rows = Vec::with_capacity(qwen3_decode_states.len() + 1);
+            for state in &mut qwen3_decode_states {
+                let token = state
+                    .last_token
+                    .context("Qwen3 packed batch requires committed decode tokens")?;
+                rows.push(Qwen3PackedBatchRow {
+                    state: std::ptr::from_mut(&mut **state),
+                    query_tokens: vec![token],
+                    kind: Qwen3PackedBatchRowKind::Decode,
+                });
+            }
+            rows.push(Qwen3PackedBatchRow {
+                state: std::ptr::from_mut(&mut **prefill_state),
+                query_tokens,
+                kind: Qwen3PackedBatchRowKind::Prefill { terminal_prompt },
+            });
+            let sampled = execute_qwen3_packed_batch(&mut rows)?;
+            let emitted_token = sampled.last().copied().flatten();
+            let decode_tokens = sampled[..qwen3_decode_states.len()]
+                .iter()
+                .map(|token| token.context("Qwen3 mixed batch missing sampled decode token"))
+                .collect::<Result<Vec<_>>>()?;
+            (decode_tokens, emitted_token)
+        };
+        let prefill = PrefillChunkResult {
+            processed_tokens: processed,
+            emitted_token,
+            phase: prefill_state.phase(),
+            finish_reason: prefill_state.finish_reason(),
+        };
+        Ok(Some(Qwen3MixedBatchResult {
+            decode_tokens,
+            prefill,
+        }))
     }
 
     /// Return this request's Qwen3.5 decode cursor (`cache_len`) if it is a
@@ -1091,6 +1190,25 @@ fn decode_qwen3_batch(
         "decode_qwen3_batch requires at least one request state"
     );
 
+    if states.iter().all(|state| state.driver.kv_pool.is_none()) {
+        let mut rows = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            let token = state
+                .last_token
+                .context("Qwen3 packed batch requires committed decode tokens")?;
+            rows.push(Qwen3PackedBatchRow {
+                state: std::ptr::from_mut(&mut **state),
+                query_tokens: vec![token],
+                kind: Qwen3PackedBatchRowKind::Decode,
+            });
+        }
+        let sampled = execute_qwen3_packed_batch(&mut rows)?;
+        return sampled
+            .into_iter()
+            .map(|token| token.context("Qwen3 packed decode missing sampled token"))
+            .collect();
+    }
+
     let batch = i32::try_from(states.len()).context("decode_qwen3_batch batch size overflow")?;
     let first = &states[0].driver;
     let weights = first.weights;
@@ -1267,6 +1385,294 @@ fn decode_qwen3_batch(
         state.driver.cache_len += 1;
         state.record_sampled_token(token)?;
         sampled_tokens.push(token);
+    }
+
+    Ok(sampled_tokens)
+}
+
+fn execute_qwen3_packed_batch(rows: &mut [Qwen3PackedBatchRow<'_>]) -> Result<Vec<Option<u32>>> {
+    use super::mlx::{
+        build_varlen_verify_mask, eval, reshape, rms_norm, rope_dynamic,
+        scaled_dot_product_attention_masked, take_axis, transpose_axes,
+    };
+    use super::ops::linear;
+
+    let row_count = rows.len();
+    ensure!(
+        row_count > 0,
+        "Qwen3 packed batch requires at least one row"
+    );
+
+    let batch = i32::try_from(rows.len()).context("Qwen3 packed batch size overflow")?;
+    let first = unsafe { &*rows[0].state };
+    let first = &first.driver;
+    let weights = first.weights;
+    let n_heads = first.n_heads;
+    let n_kv_heads = first.n_kv_heads;
+    let head_dim = first.head_dim;
+    let attn_scale = first.attn_scale;
+    let rope_base = first.rope_base;
+    let eps = first.eps;
+    let mut batch_cache_len = 0;
+    let mut target_kv_capacity = 0;
+    let mut max_query_len = 0;
+    let mut query_lens = Vec::with_capacity(rows.len());
+    let mut left_padding = Vec::with_capacity(rows.len());
+    for row in rows.iter_mut() {
+        let state = unsafe { &mut *row.state };
+        ensure!(
+            std::ptr::eq(state.driver.weights, weights),
+            "Qwen3 packed batch requires identical weight handles"
+        );
+        ensure!(
+            state.driver.n_heads == n_heads
+                && state.driver.n_kv_heads == n_kv_heads
+                && state.driver.head_dim == head_dim,
+            "Qwen3 packed batch requires identical geometry"
+        );
+        ensure!(
+            state.driver.kv_pool.is_none() && state.driver.dflash.is_none(),
+            "Qwen3 packed batch requires plain non-DFlash request states without MetalKVPool"
+        );
+        state.driver.ensure_cpp_prefill_drained()?;
+        batch_cache_len = batch_cache_len.max(state.driver.cache_len);
+        target_kv_capacity = target_kv_capacity.max(state.driver.kv_capacity);
+        max_query_len = max_query_len.max(
+            i32::try_from(row.query_tokens.len())
+                .context("Qwen3 packed batch query len overflow")?,
+        );
+    }
+    target_kv_capacity =
+        target_kv_capacity.max(round_up_kv_capacity(batch_cache_len + max_query_len));
+
+    for row in rows.iter_mut() {
+        let state = unsafe { &mut *row.state };
+        state.driver.ensure_capacity(target_kv_capacity)?;
+        state.driver.kv_capacity = target_kv_capacity;
+        let query_len = i32::try_from(row.query_tokens.len())
+            .context("Qwen3 packed batch query len overflow")?;
+        query_lens.push(query_len);
+        left_padding.push(batch_cache_len - state.driver.cache_len);
+    }
+
+    if rows.iter().any(|row| {
+        let state = unsafe { &*row.state };
+        state.driver.cache_len > 0 && state.driver.cache_len % KV_CACHE_CHUNK == 0
+    }) {
+        clear_metal_cache();
+    }
+
+    let mut packed_tokens = Vec::with_capacity(rows.len() * max_query_len as usize);
+    for row in rows.iter() {
+        packed_tokens.extend(row.query_tokens.iter().map(|&token| token as i32));
+        packed_tokens.resize(
+            packed_tokens.len() + (max_query_len as usize - row.query_tokens.len()),
+            0,
+        );
+    }
+    let token_arr = MlxArray::from_slice_i32(&packed_tokens, &[batch, max_query_len]);
+    let token_flat = reshape(&token_arr, &[batch * max_query_len]);
+    let x_flat = take_axis(&weights.embed_tokens, &token_flat, 0);
+    let hidden_size = weights.embed_tokens.shape()[1];
+    let mut x = reshape(&x_flat, &[batch, max_query_len, hidden_size]);
+
+    let rope_offsets_data: Vec<i32> = rows
+        .iter()
+        .map(|row| unsafe { (&*row.state).driver.cache_len })
+        .collect();
+    let rope_offsets = MlxArray::from_slice_i32(&rope_offsets_data, &[batch]);
+    let attn_mask = build_varlen_verify_mask(&left_padding, max_query_len, batch_cache_len);
+    let key_len = batch_cache_len + max_query_len;
+
+    let mut packed_k_caches = Vec::with_capacity(weights.layers.len());
+    let mut packed_v_caches = Vec::with_capacity(weights.layers.len());
+    for layer_idx in 0..weights.layers.len() {
+        let mut k_rows = Vec::with_capacity(rows.len());
+        let mut v_rows = Vec::with_capacity(rows.len());
+        for (row_idx, row) in rows.iter().enumerate() {
+            let state = unsafe { &mut *row.state };
+            let left_pad = left_padding[row_idx];
+            k_rows.push(left_pad_kv_cache_row(
+                &state.driver.k_caches[layer_idx],
+                left_pad,
+                state.driver.cache_len,
+                target_kv_capacity,
+            ));
+            v_rows.push(left_pad_kv_cache_row(
+                &state.driver.v_caches[layer_idx],
+                left_pad,
+                state.driver.cache_len,
+                target_kv_capacity,
+            ));
+        }
+        packed_k_caches.push(concatenate_axis(&k_rows, 0));
+        packed_v_caches.push(concatenate_axis(&v_rows, 0));
+    }
+
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let residual = x.clone();
+        let x_norm = rms_norm(&x, &layer.input_layernorm, eps);
+        let (q_raw, k_raw, v_raw) = layer.attention_inputs.project(&x_norm);
+
+        let q = reshape(&q_raw, &[batch, max_query_len, n_heads, head_dim]);
+        let q = rms_norm(&q, &layer.q_norm, eps);
+        let q = transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = rope_dynamic(&q, head_dim, false, rope_base, 1.0, &rope_offsets);
+
+        let k = reshape(&k_raw, &[batch, max_query_len, n_kv_heads, head_dim]);
+        let k = rms_norm(&k, &layer.k_norm, eps);
+        let k = transpose_axes(&k, &[0, 2, 1, 3]);
+        let k = rope_dynamic(&k, head_dim, false, rope_base, 1.0, &rope_offsets);
+
+        let v = reshape(&v_raw, &[batch, max_query_len, n_kv_heads, head_dim]);
+        let v = transpose_axes(&v, &[0, 2, 1, 3]);
+
+        for (row_idx, query_len) in query_lens.iter().copied().enumerate() {
+            let row = i32::try_from(row_idx).context("Qwen3 packed batch row overflow")?;
+            let k_row = slice(
+                &k,
+                &[row, 0, 0, 0],
+                &[row + 1, n_kv_heads, query_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            let v_row = slice(
+                &v,
+                &[row, 0, 0, 0],
+                &[row + 1, n_kv_heads, query_len, head_dim],
+                &[1, 1, 1, 1],
+            );
+            packed_k_caches[layer_idx] = super::mlx::slice_update(
+                &mut packed_k_caches[layer_idx],
+                &k_row,
+                &[row, 0, batch_cache_len, 0],
+                &[row + 1, n_kv_heads, batch_cache_len + query_len, head_dim],
+            );
+            packed_v_caches[layer_idx] = super::mlx::slice_update(
+                &mut packed_v_caches[layer_idx],
+                &v_row,
+                &[row, 0, batch_cache_len, 0],
+                &[row + 1, n_kv_heads, batch_cache_len + query_len, head_dim],
+            );
+        }
+
+        let k_full = slice(
+            &packed_k_caches[layer_idx],
+            &[0, 0, 0, 0],
+            &[batch, n_kv_heads, key_len, head_dim],
+            &[1, 1, 1, 1],
+        );
+        let v_full = slice(
+            &packed_v_caches[layer_idx],
+            &[0, 0, 0, 0],
+            &[batch, n_kv_heads, key_len, head_dim],
+            &[1, 1, 1, 1],
+        );
+        let attn_out =
+            scaled_dot_product_attention_masked(&q, &k_full, &v_full, attn_scale, &attn_mask);
+        let attn_out = transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = reshape(&attn_out, &[batch, max_query_len, n_heads * head_dim]);
+        let attn_out = linear(&attn_out, &layer.o_proj);
+        x = super::mlx::add(&residual, &attn_out);
+
+        let residual2 = x.clone();
+        let xn = rms_norm(&x, &layer.post_attention_layernorm, eps);
+        let (gate_raw, up) = layer.mlp_inputs.project(&xn);
+        let gate = super::mlx::silu(&gate_raw);
+        let mlp = linear(&super::mlx::multiply(&gate, &up), &layer.down_proj);
+        x = super::mlx::add(&residual2, &mlp);
+    }
+
+    let logits = linear(&rms_norm(&x, &weights.norm, eps), &weights.lm_head);
+    let logits_shape = logits.shape().to_vec();
+    let vocab = *logits_shape
+        .last()
+        .context("Qwen3 packed batch logits missing vocab dim")?;
+    let mut sampled_arrays = Vec::new();
+    let mut sampled_row_indices = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let state = unsafe { &*row.state };
+        let sample_row = match row.kind {
+            Qwen3PackedBatchRowKind::Decode => true,
+            Qwen3PackedBatchRowKind::Prefill { terminal_prompt } => terminal_prompt,
+        };
+        if !sample_row {
+            continue;
+        }
+        let row_i32 = i32::try_from(row_idx).context("Qwen3 packed batch sample row overflow")?;
+        let query_len = query_lens[row_idx];
+        let row_logits = if logits_shape.len() == 2 {
+            slice(&logits, &[row_i32, 0], &[row_i32 + 1, vocab], &[1, 1])
+        } else {
+            slice(
+                &logits,
+                &[row_i32, query_len - 1, 0],
+                &[row_i32 + 1, query_len, vocab],
+                &[1, 1, 1],
+            )
+        };
+        let row_logits = reshape(&row_logits, &[1, vocab]);
+        sampled_arrays.push(gpu_sample_token(&row_logits, &state.driver.sample_params));
+        sampled_row_indices.push(row_idx);
+    }
+    let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
+    let mut outputs: Vec<&MlxArray> =
+        Vec::with_capacity(1 + sample_refs.len() + packed_k_caches.len() + packed_v_caches.len());
+    outputs.push(&logits);
+    outputs.extend(sample_refs.iter().copied());
+    outputs.extend(packed_k_caches.iter());
+    outputs.extend(packed_v_caches.iter());
+    eval(&outputs);
+
+    let mut sampled_tokens = vec![None; rows.len()];
+    for (row_idx, sampled) in sampled_row_indices.into_iter().zip(sampled_arrays.iter()) {
+        sampled_tokens[row_idx] = Some(sampled.item_i32() as u32);
+    }
+
+    for (row_idx, row) in rows.iter_mut().enumerate() {
+        let state = unsafe { &mut *row.state };
+        let row_i32 = i32::try_from(row_idx).context("Qwen3 packed batch row overflow")?;
+        let left_pad = left_padding[row_idx];
+        for layer_idx in 0..weights.layers.len() {
+            let old_k = std::mem::replace(
+                &mut state.driver.k_caches[layer_idx],
+                strip_left_padding_from_packed_row(
+                    &packed_k_caches[layer_idx],
+                    row_i32,
+                    left_pad,
+                    key_len,
+                    target_kv_capacity,
+                ),
+            );
+            drop(old_k);
+            let old_v = std::mem::replace(
+                &mut state.driver.v_caches[layer_idx],
+                strip_left_padding_from_packed_row(
+                    &packed_v_caches[layer_idx],
+                    row_i32,
+                    left_pad,
+                    key_len,
+                    target_kv_capacity,
+                ),
+            );
+            drop(old_v);
+        }
+        state.driver.kv_capacity = target_kv_capacity;
+        state.driver.cache_len += query_lens[row_idx];
+        match row.kind {
+            Qwen3PackedBatchRowKind::Decode => {
+                let token = sampled_tokens[row_idx]
+                    .context("Qwen3 packed batch missing sampled decode token")?;
+                state.record_sampled_token(token)?;
+            }
+            Qwen3PackedBatchRowKind::Prefill { terminal_prompt } => {
+                state.prompt_cursor += row.query_tokens.len();
+                if terminal_prompt {
+                    let token = sampled_tokens[row_idx]
+                        .context("Qwen3 packed batch missing terminal prefill token")?;
+                    state.record_sampled_token(token)?;
+                }
+            }
+        }
     }
 
     Ok(sampled_tokens)

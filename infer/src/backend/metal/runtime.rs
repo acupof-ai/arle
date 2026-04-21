@@ -11,10 +11,11 @@ use tokio::sync::mpsc;
 
 use super::request_state::{
     DflashBatchOutcome, MetalRequestPhase as RuntimePhase, MetalRequestState,
-    Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
+    Qwen3MixedBatchResult, Qwen35PackedDecodeBatch, Qwen35PrefixSnapshot,
 };
 use super::scheduler::{
-    MetalRequestPriority, MetalRuntimeRequestState, MetalScheduler, MetalSchedulerConfig,
+    MetalRequestPriority, MetalRuntimeRequestState, MetalScheduleStep, MetalScheduler,
+    MetalSchedulerConfig,
 };
 use super::weights::MetalWeights;
 use super::{MetalBackend, MetalBackendOptions};
@@ -251,7 +252,7 @@ impl MetalLivePrefixRuntime {
         let weights = backend.weights.as_ref().context("weights not loaded")?;
         let max_total_tokens = (config
             .max_running_requests
-            .saturating_mul(config.prefill_chunk_size)
+            .saturating_mul(config.max_batch_tokens)
             .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
         .max(METAL_PREFIX_BLOCK_SIZE * 8);
         match weights {
@@ -640,30 +641,18 @@ fn run_metal_scheduler_runtime(
             continue;
         }
 
-        if let Some(batch) = step.decode {
-            guard_decode_batch(
-                batch.req_ids,
-                metrics,
-                &mut scheduler,
-                &mut active,
-                &mut qwen35_decode_batch_cache,
-            );
-        }
-
-        if let Some(prefill) = step.prefill {
-            guard_prefill_chunk(
-                prefill.req_id,
-                prefill.input_tokens.len(),
-                backend,
-                tokenizer,
-                handle,
-                metrics,
-                &mut prefix_runtime,
-                &mut scheduler,
-                &mut pending,
-                &mut active,
-            );
-        }
+        guard_schedule_step(
+            step,
+            backend,
+            tokenizer,
+            handle,
+            metrics,
+            &mut prefix_runtime,
+            &mut scheduler,
+            &mut pending,
+            &mut active,
+            &mut qwen35_decode_batch_cache,
+        );
 
         maybe_refresh_runtime_metrics(
             metrics,
@@ -718,6 +707,130 @@ fn guard_prefill_chunk(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn guard_schedule_step(
+    step: MetalScheduleStep,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
+) {
+    match (step.decode, step.prefill) {
+        (Some(batch), Some(prefill)) => {
+            if !guard_qwen3_mixed_batch(
+                batch.req_ids.clone(),
+                prefill.req_id,
+                prefill.input_tokens.len(),
+                backend,
+                tokenizer,
+                handle,
+                metrics,
+                prefix_runtime,
+                scheduler,
+                pending,
+                active,
+            ) {
+                guard_decode_batch(
+                    batch.req_ids,
+                    metrics,
+                    scheduler,
+                    active,
+                    qwen35_decode_batch_cache,
+                );
+                guard_prefill_chunk(
+                    prefill.req_id,
+                    prefill.input_tokens.len(),
+                    backend,
+                    tokenizer,
+                    handle,
+                    metrics,
+                    prefix_runtime,
+                    scheduler,
+                    pending,
+                    active,
+                );
+            }
+        }
+        (Some(batch), None) => {
+            guard_decode_batch(
+                batch.req_ids,
+                metrics,
+                scheduler,
+                active,
+                qwen35_decode_batch_cache,
+            );
+        }
+        (None, Some(prefill)) => {
+            guard_prefill_chunk(
+                prefill.req_id,
+                prefill.input_tokens.len(),
+                backend,
+                tokenizer,
+                handle,
+                metrics,
+                prefix_runtime,
+                scheduler,
+                pending,
+                active,
+            );
+        }
+        (None, None) => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guard_qwen3_mixed_batch(
+    decode_req_ids: Vec<RequestId>,
+    prefill_req_id: RequestId,
+    prefill_budget: usize,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) -> bool {
+    let mut panic_req_ids = decode_req_ids.clone();
+    panic_req_ids.push(prefill_req_id);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        execute_qwen3_mixed_batch(
+            decode_req_ids,
+            prefill_req_id,
+            prefill_budget,
+            backend,
+            tokenizer,
+            handle,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            pending,
+            active,
+        )
+    }));
+
+    match result {
+        Ok(handled) => handled,
+        Err(panic) => {
+            error!(
+                "Metal Qwen3 mixed batch panicked for {:?}: {}",
+                panic_req_ids,
+                super::panic_message(panic)
+            );
+            metrics.record_request_failed();
+            *prefix_runtime = None;
+            abort_runtime_requests(&panic_req_ids, scheduler, active);
+            true
+        }
+    }
+}
+
 fn guard_decode_batch(
     req_ids: Vec<RequestId>,
     metrics: &ServerMetrics,
@@ -746,6 +859,166 @@ fn guard_decode_batch(
         *qwen35_decode_batch_cache = None;
         abort_runtime_requests(&panic_req_ids, scheduler, active);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_qwen3_mixed_batch(
+    decode_req_ids: Vec<RequestId>,
+    prefill_req_id: RequestId,
+    prefill_budget: usize,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) -> bool {
+    if !active.contains_key(&prefill_req_id) {
+        activate_pending_request(
+            prefill_req_id,
+            backend,
+            tokenizer,
+            handle,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            pending,
+            active,
+        );
+    }
+    let Some(prefill_snapshot) = active.get(&prefill_req_id) else {
+        return false;
+    };
+    if prefill_snapshot.delta_closed()
+        || !prefill_snapshot.request_state.is_qwen3()
+        || prefill_snapshot.request_state.is_dflash_enabled()
+    {
+        return false;
+    }
+    if !decode_req_ids.iter().all(|req_id| {
+        active.get(req_id).is_some_and(|request| {
+            !request.delta_closed()
+                && request.request_state.is_qwen3()
+                && !request.request_state.is_dflash_enabled()
+        })
+    }) {
+        return false;
+    }
+
+    let mut decode_rows = Vec::with_capacity(decode_req_ids.len());
+    for req_id in decode_req_ids {
+        let Some(request) = active.remove(&req_id) else {
+            warn!(
+                "Metal mixed batch referenced missing decode request {:?}",
+                req_id
+            );
+            scheduler.finish_request(req_id, None);
+            continue;
+        };
+        if request.delta_closed() {
+            scheduler.finish_request(req_id, request_mode(&request));
+            continue;
+        }
+        decode_rows.push((req_id, request));
+    }
+
+    let Some(mut prefill_request) = active.remove(&prefill_req_id) else {
+        for (req_id, request) in decode_rows {
+            active.insert(req_id, request);
+        }
+        return false;
+    };
+    if prefill_request.delta_closed() {
+        scheduler.finish_request(prefill_req_id, request_mode(&prefill_request));
+        if let Err(err) = prefill_request.cancel() {
+            warn!(
+                "Metal request cancel failed for {:?}: {err:#}",
+                prefill_req_id
+            );
+        }
+        for (req_id, request) in decode_rows {
+            active.insert(req_id, request);
+        }
+        return true;
+    }
+
+    let outcome = {
+        let mut decode_refs: Vec<&mut MetalRequestState<'static>> = decode_rows
+            .iter_mut()
+            .map(|(_, request)| &mut request.request_state)
+            .collect();
+        MetalRequestState::try_qwen3_mixed_batch(
+            &mut decode_refs,
+            &mut prefill_request.request_state,
+            prefill_budget,
+        )
+    };
+
+    let Some(Qwen3MixedBatchResult {
+        decode_tokens,
+        prefill,
+    }) = (match outcome {
+        Ok(result) => result,
+        Err(err) => {
+            error!("Metal Qwen3 mixed batch failed: {err:#}");
+            metrics.record_request_failed();
+            cancel_detached_request(prefill_req_id, prefill_request, scheduler);
+            for (req_id, request) in decode_rows {
+                cancel_detached_request(req_id, request, scheduler);
+            }
+            return true;
+        }
+    })
+    else {
+        active.insert(prefill_req_id, prefill_request);
+        for (req_id, request) in decode_rows {
+            active.insert(req_id, request);
+        }
+        return false;
+    };
+
+    for ((req_id, mut request), sampled_token) in decode_rows.into_iter().zip(decode_tokens) {
+        if let Err(err) = request.process_token(sampled_token) {
+            error!(
+                "Metal mixed decode post-process failed for {:?}: {err:#}",
+                req_id
+            );
+            metrics.record_request_failed();
+            cancel_detached_request(req_id, request, scheduler);
+            continue;
+        }
+        finish_or_requeue_decoded_request(req_id, request, metrics, scheduler, active);
+    }
+
+    if let Some(sampled_token) = prefill.emitted_token {
+        if let Err(err) = prefill_request.process_token(sampled_token) {
+            error!(
+                "Metal mixed prefill post-process failed for {:?}: {err:#}",
+                prefill_req_id
+            );
+            metrics.record_request_failed();
+            cancel_detached_request(prefill_req_id, prefill_request, scheduler);
+            return true;
+        }
+        if let Some(prefix_runtime) = prefix_runtime.as_mut()
+            && let Err(err) = prefix_runtime.publish_prompt_prefix(&prefill_request)
+        {
+            warn!(
+                "Metal live prefix publish failed for {:?}: {err:#}",
+                prefill_req_id
+            );
+        }
+    }
+
+    if prefill_request.phase() == RuntimePhase::Finished || prefill_request.stop_hit() {
+        finalize_detached_request(prefill_req_id, prefill_request, metrics, scheduler);
+    } else {
+        active.insert(prefill_req_id, prefill_request);
+    }
+
+    true
 }
 
 fn abort_runtime_requests(
