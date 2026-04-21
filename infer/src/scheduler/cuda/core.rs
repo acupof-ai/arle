@@ -52,7 +52,6 @@ pub(super) struct PendingDecode {
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
     pub mixed_prefill_request_idx: Option<usize>,
-    pub mixed_prefill_tokens: usize,
     pub mixed_prefill_chunk_complete: bool,
 }
 
@@ -144,8 +143,6 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
-    /// Prefill request consumed by the mixed decode launch in the current step.
-    pub(super) pending_mixed_prefill_idx: Option<usize>,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -449,7 +446,6 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
-            pending_mixed_prefill_idx: None,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(

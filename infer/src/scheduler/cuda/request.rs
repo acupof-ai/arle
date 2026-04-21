@@ -1,18 +1,5 @@
 use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
 
-/// Request normalized once at scheduler intake and kept in the waiting queue
-/// until it is actually admitted into a slot.
-pub(crate) struct QueuedRequest {
-    pub(crate) prompt: String,
-    pub(crate) prompt_tokens: Vec<u32>,
-    pub(crate) max_tokens: usize,
-    pub(crate) sampling: crate::sampler::SamplingParams,
-    pub(crate) stop: Option<Vec<String>>,
-    pub(crate) priority: RequestPriority,
-    pub(crate) session_id: Option<crate::types::SessionId>,
-    pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
-}
-
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
     /// Prefilling in chunks. Decode takes priority between chunks.

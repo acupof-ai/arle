@@ -283,7 +283,6 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: None,
-            mixed_prefill_tokens: 0,
             mixed_prefill_chunk_complete: false,
         });
     }
@@ -499,7 +498,6 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: Some(prefill_slot_idx),
-            mixed_prefill_tokens: prefill_token_count,
             mixed_prefill_chunk_complete: new_progress >= prefill_total,
         });
     }
