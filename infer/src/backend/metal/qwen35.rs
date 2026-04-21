@@ -133,7 +133,7 @@ impl Drop for CppQwen35Model {
 }
 unsafe impl Send for CppQwen35Model {}
 
-fn capture_qwen35_hidden_from_cpp_outputs(
+pub(crate) fn capture_qwen35_hidden_from_cpp_outputs(
     cpp_model_raw: *mut std::ffi::c_void,
     expected_layers: usize,
 ) -> Result<Option<MlxArray>> {

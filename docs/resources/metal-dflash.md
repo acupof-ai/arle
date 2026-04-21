@@ -4,8 +4,8 @@ Canonical user and engineering guide for DFlash speculative decode on the
 Metal backend. Supersedes every prior DFlash resource/plan/readme fragment.
 
 **Status:** default-on for all Metal serving paths (as of commit `47f958f`,
-2026-04-19). Qwen3 (bf16) and Qwen3.5 (hybrid 4-bit) are both supported and
-have bit-identical parity tests against the scalar path landed and green.
+2026-04-19). Qwen3 (bf16), Qwen3.5 (hybrid 4-bit), and Qwen3.6-35B-A3B
+(Qwen3.5-MoE target + DFlash draft) are supported on the Metal lane.
 
 Last validated on the binary shipped with commits `3bc8802` (prefill
 fast-forward) + `d8cb2f4` (batched `async_eval` defer), 2026-04-20.
@@ -39,9 +39,9 @@ lever, not a model change.
 |---|---|
 | Backend | Metal (Apple Silicon, M-series) |
 | Build flags | `--no-default-features --features metal,no-cuda` |
-| Target families | `Qwen3` (bf16), `Qwen3.5` (4-bit hybrid GDR + full-attn) |
+| Target families | `Qwen3` (bf16), `Qwen3.5` (4-bit hybrid GDR + full-attn), `Qwen3.6-35B-A3B` (Qwen3.5-MoE) |
 | Entry points | `metal_request`, `metal_bench`, `metal_serve` |
-| Default draft pair | `mlx-community/Qwen3.5-4B-MLX-4bit` + `z-lab/Qwen3.5-4B-DFlash` |
+| Default draft pair | `mlx-community/Qwen3.5-4B-MLX-4bit` + `z-lab/Qwen3.5-4B-DFlash`; `mlx-community/Qwen3.6-35B-A3B-4bit` + `z-lab/Qwen3.6-35B-A3B-DFlash` |
 | Concurrency | c=1..8 HTTP clients validated; batched path single-forward verify for B≥1 |
 | Long prompts | ≥4k tokens OK (scheduler `fast_forward_prefill`, commit `3bc8802`) |
 
@@ -55,7 +55,42 @@ Not supported:
 | Target | Draft | Provenance |
 |---|---|---|
 | `mlx-community/Qwen3.5-4B-MLX-4bit` | `z-lab/Qwen3.5-4B-DFlash` | [2026-04-19 default-on ship](../experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md), [2026-04-20 prefill fast-forward](../experience/wins/2026-04-20-dflash-prefill-fastforward.md), [2026-04-20 batched `async_eval`](../experience/wins/2026-04-20-dflash-batched-async-eval.md) |
+| `mlx-community/Qwen3.6-35B-A3B-4bit` | `z-lab/Qwen3.6-35B-A3B-DFlash` | local smoke + single-request DFlash landing in `feat(metal): support qwen36 dflash draft` |
 | `mlx-community/Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` | [2026-04-14 Qwen3 5.9× decode bench](../experience/wins/2026-04-14-metal-dflash-qwen3.md) |
+
+## Runtime map
+
+Minimal architecture diagram, directly matching the implementation:
+
+```text
+metal_request / metal_bench / metal_serve
+  -> MetalBackend::generate*                    (infer/src/backend/metal.rs)
+    -> DFlash requested?
+      no  -> Qwen3: generate.rs::metal_generate
+          -> Qwen3.5/Qwen3.6: qwen35.rs::metal_generate_qwen35
+      yes -> target arch check + draft load     (metal/dflash.rs::load_or_fallback)
+          -> Qwen3 target: dflash.rs::metal_generate_dflash_qwen3
+          -> Qwen3.5/Qwen3.6 target:
+             qwen35.rs::metal_generate_qwen35
+               -> metal_generate_qwen35_dflash
+                 -> qwen35_compiled_step prefill for prompt
+                 -> capture_qwen35_hidden_from_cpp_outputs
+                 -> dflash.rs::qwen35_dflash_speculative_block
+```
+
+## Trigger, routing, fallback
+
+- Trigger:
+  `--dflash-draft-model` enables DFlash. Without it, Metal stays on the plain target path.
+- Target routing:
+  `MetalBackend::generate_from_token_ids_with_callback` dispatches by loaded weight family.
+  `MetalWeights::Qwen3` goes to the Qwen3 draft path; `MetalWeights::Qwen35` covers both dense Qwen3.5 and Qwen3.6-MoE.
+- Prefill:
+  Qwen3.5/Qwen3.6 DFlash prefill runs through the compiled C++ target model, then captures the layer-hidden bundle that seeds the first draft block.
+- Verify:
+  Each speculative block uses `qwen35_dflash_speculative_block`, which runs one target verify over the whole block, accepts the longest greedy prefix, rolls back rejected GDR state, and returns the updated target hidden state.
+- Fallback:
+  `metal/dflash.rs::check_compatibility` refuses only true shape mismatches now. For Qwen3.6, rebucketed draft heads are accepted when `q_proj_width` and `kv_proj_width` match the target. Any compatibility failure logs a warning and falls back to standard Metal generation instead of aborting startup.
 
 ## Build
 
