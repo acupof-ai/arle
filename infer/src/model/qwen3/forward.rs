@@ -118,10 +118,12 @@ impl ModelForward for Qwen3Model {
     fn scheduler_runtime_workspace_bytes(
         &self,
         max_batch_size: usize,
-        max_prefill_tokens: usize,
+        prefill_budget_tokens: usize,
+        mixed_prefill_tokens: usize,
         mixed_prefill: bool,
     ) -> usize {
-        let max_prefill_tokens = max_prefill_tokens.max(1);
+        let prefill_budget_tokens = prefill_budget_tokens.max(1);
+        let mixed_prefill_tokens = mixed_prefill_tokens.max(1);
         let num_heads = self.config.num_attention_heads;
         let q_dim = num_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
@@ -145,10 +147,10 @@ impl ModelForward for Qwen3Model {
             .saturating_add(2usize.saturating_mul(kv_dim))
             .saturating_add(3usize.saturating_mul(self.config.intermediate_size));
         let prefill_activation = prefill_activation_dims
-            .saturating_mul(max_prefill_tokens)
+            .saturating_mul(prefill_budget_tokens)
             .saturating_mul(2);
         let prefill_plan = cuda_kernels::flashinfer::FlashInferWorkspace::default_device_bytes(
-            max_prefill_tokens.max(4096),
+            prefill_budget_tokens.max(4096),
             num_heads,
         );
 
@@ -158,7 +160,7 @@ impl ModelForward for Qwen3Model {
                 max_batch_size,
                 1,
                 16,
-                max_prefill_tokens,
+                mixed_prefill_tokens,
             )
         } else {
             0

@@ -364,7 +364,8 @@ pub trait ModelForward: Send {
     fn scheduler_runtime_workspace_bytes(
         &self,
         _max_batch_size: usize,
-        _max_prefill_tokens: usize,
+        _prefill_budget_tokens: usize,
+        _mixed_prefill_tokens: usize,
         _mixed_prefill: bool,
     ) -> usize {
         0

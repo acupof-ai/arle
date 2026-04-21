@@ -459,10 +459,14 @@ fail_records = [r for r in records if r.get("ok") is False]
 parsed = [parse_fields(r["stats"]) for r in ok_records]
 waiting_vals = [v for f in parsed if (v := parse_int(f, "waiting")) is not None]
 active_vals = [v for f in parsed if (v := parse_int(f, "active")) is not None]
+running_batch_vals = [v for f in parsed if (v := parse_int(f, "running_batch")) is not None]
+prefill_queue_vals = [v for f in parsed if (v := parse_int(f, "prefill_queue")) is not None]
 kv_vals = [v for f in parsed if (v := parse_float(f, "kv_util")) is not None]
 
 peak_waiting = max(waiting_vals) if waiting_vals else None
 peak_active = max(active_vals) if active_vals else None
+peak_running_batch = max(running_batch_vals) if running_batch_vals else None
+peak_prefill_queue = max(prefill_queue_vals) if prefill_queue_vals else None
 peak_kv = max(kv_vals) if kv_vals else None
 
 lines = [
@@ -472,6 +476,8 @@ lines = [
     f"- Samples: `{len(records)}` (ok: `{len(ok_records)}`, failed: `{len(fail_records)}`)",
     f"- Peak waiting: `{peak_waiting if peak_waiting is not None else 'n/a'}`",
     f"- Peak active: `{peak_active if peak_active is not None else 'n/a'}`",
+    f"- Peak running_batch: `{peak_running_batch if peak_running_batch is not None else 'n/a'}`",
+    f"- Peak prefill_queue: `{peak_prefill_queue if peak_prefill_queue is not None else 'n/a'}`",
     f"- Peak kv_util: `{f'{peak_kv:.1f}%' if peak_kv is not None else 'n/a'}`",
     "",
     "## Before",

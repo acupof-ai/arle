@@ -455,12 +455,12 @@ impl BatchPrefillPagedPlan {
 
 impl FlashInferWorkspace {
     /// Default float workspace. Sized for HD128 prefill/decode on L4 — the
-    /// size we originally shipped. HD256 paged prefill split-KV on 4096-row
-    /// chunks needs ≥512 MiB on Ampere (`batch_prefill_tmp_v` alone hits
-    /// 256 MiB before `tmp_s` is allocated); callers on that path build the
-    /// workspace via `new_with_float_bytes` instead.
+    /// size we originally shipped. HD256 paged prefill split-KV on c16 /
+    /// 4096-token mixed chunks can exceed 512 MiB on Ampere
+    /// (`batch_prefill_tmp_v` alone reached ~518 MiB in the 2026-04-21 trace),
+    /// so the HD256 callers keep a larger dedicated workspace.
     pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-    pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+    pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 640 * 1024 * 1024; // 640 MiB
     pub const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;

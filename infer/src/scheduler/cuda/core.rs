@@ -22,8 +22,9 @@ pub(super) const PREFIX_CACHE_BLOCK_SIZE: usize = 16;
 /// Prefill chunk size is capped to this value to prevent buffer overflow.
 pub(super) const CONTIGUOUS_KV_TOKENS: usize = 512;
 
-// SGLang-aligned prefill admission reserve for future decode growth.
-// We reserve `remaining_decode_tokens * ratio` (clipped) in page budgeting.
+// SGLang-aligned running-decode reserve for future token growth.
+// This ratio is only used for requests already in the decode batch. Prefill
+// completions reserve their remaining decode budget explicitly.
 const PREFILL_DECODE_RESERVE_RATIO_INIT: f64 = 0.20;
 const PREFILL_DECODE_RESERVE_RATIO_MIN: f64 = 0.05;
 const PREFILL_DECODE_RESERVE_RATIO_MAX: f64 = 1.0;
@@ -153,6 +154,10 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
+    /// Decode-active mixed steps keep a smaller persistent prefill capacity
+    /// than pure prefill admission so long-lived mixed buffers do not reserve
+    /// the entire batch-wide prefill budget.
+    pub(super) mixed_prefill_token_budget: usize,
     /// Admission-time estimate of future decode growth, used to reserve page
     /// headroom while scheduling prefill.
     pub(super) prefill_decode_reserve_ratio: f64,
@@ -257,6 +262,27 @@ impl<M: ModelForward> Scheduler<M> {
         pool.reserved_bytes() as f64 / pool.capacity_bytes() as f64
     }
 
+    fn host_pool_remaining_bytes(&self) -> usize {
+        let Ok(pool) = self.host_pinned_pool.lock() else {
+            return 0;
+        };
+        pool.remaining_bytes()
+    }
+
+    fn demote_block_budget(&self, candidates: &[BlockId]) -> usize {
+        let Some(first_block) = candidates.first().copied() else {
+            return 0;
+        };
+        let Some(metadata) = self.block_metadata(first_block) else {
+            return 0;
+        };
+        let block_bytes = metadata.byte_len as usize;
+        if block_bytes == 0 {
+            return 0;
+        }
+        self.host_pool_remaining_bytes() / block_bytes
+    }
+
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
         if let Ok(mut pool) = self.host_pinned_pool.lock() {
             pool.release(region);
@@ -356,8 +382,10 @@ impl<M: ModelForward> Scheduler<M> {
         let (tx, rx) = mpsc::unbounded_channel();
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
-        let effective_prefill_token_budget =
-            config.max_prefill_tokens.min(config.chunked_prefill_size);
+        let effective_prefill_token_budget = config.max_prefill_tokens;
+        let mixed_prefill_token_budget = config
+            .max_prefill_tokens
+            .min(config.chunked_prefill_size.max(1));
         let mixed_prefill_enabled = config.enable_mixed_chunk && model.supports_mixed_batch();
 
         // When the model writes prefill K/V directly to the paged pool, the
@@ -396,6 +424,7 @@ impl<M: ModelForward> Scheduler<M> {
             let runtime_workspace = model.scheduler_runtime_workspace_bytes(
                 config.max_slots,
                 effective_prefill_token_budget,
+                mixed_prefill_token_budget,
                 mixed_prefill_enabled,
             );
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
@@ -444,11 +473,11 @@ impl<M: ModelForward> Scheduler<M> {
             model.prepare_mixed_decode_context(
                 &mut ctx,
                 &paged_kv_pool,
-                effective_prefill_token_budget,
+                mixed_prefill_token_budget,
             )?;
             info!(
-                "Mixed prefill workspace ready: max_prefill_tokens={}, max_batch={}",
-                effective_prefill_token_budget, config.max_slots
+                "Mixed prefill workspace ready: mixed_prefill_tokens={}, prefill_budget_tokens={}, max_batch={}",
+                mixed_prefill_token_budget, effective_prefill_token_budget, config.max_slots
             );
             decode_bufs = Some(ctx);
         }
@@ -521,6 +550,7 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
+            mixed_prefill_token_budget,
             prefill_decode_reserve_ratio: PREFILL_DECODE_RESERVE_RATIO_INIT,
             decode_retracted_this_step: false,
         };
@@ -626,6 +656,16 @@ impl<M: ModelForward> Scheduler<M> {
         let clipped = remaining.min(PREFILL_DECODE_RESERVE_CLIP_TOKENS);
         let estimated = ((clipped as f64) * self.prefill_decode_reserve_ratio).ceil() as usize;
         estimated.clamp(1, clipped)
+    }
+
+    pub(super) fn prefill_completion_reserve_tokens(
+        &self,
+        generated_tokens: usize,
+        max_tokens: usize,
+    ) -> usize {
+        max_tokens
+            .saturating_sub(generated_tokens)
+            .min(PREFILL_DECODE_RESERVE_CLIP_TOKENS)
     }
 
     pub(super) fn bump_prefill_decode_reserve_ratio(&mut self, retracted_reqs: usize) {
@@ -944,7 +984,7 @@ impl<M: ModelForward> Scheduler<M> {
         if !matches!(metadata.location, Some(BlockLocation::Gpu { .. })) {
             return Ok(0);
         }
-        let Some(pages) = self.block_to_pages.remove(&block_id) else {
+        let Some(pages) = self.block_to_pages.get(&block_id).cloned() else {
             return Ok(0);
         };
 
@@ -963,10 +1003,10 @@ impl<M: ModelForward> Scheduler<M> {
         };
         if let Err(err) = self.host_pinned_pool.write_region(region, &payload) {
             self.release_host_region(region);
-            self.block_to_pages.insert(block_id, pages);
             return Err(err);
         }
 
+        self.block_to_pages.remove(&block_id);
         self.block_owner_slots.remove(&block_id);
         let _ = self.prefix_cache.update_block_metadata(
             block_id,
@@ -1133,7 +1173,8 @@ impl<M: ModelForward> Scheduler<M> {
             Some(crate::kv_tier::Tier::Gpu),
         );
         let mut reclaimed_pages = 0usize;
-        for bid in candidates {
+        let demote_budget = self.demote_block_budget(&candidates);
+        for bid in candidates.iter().take(demote_budget).copied() {
             match self.demote_block_to_host(bid) {
                 Ok(freed_now) => {
                     reclaimed_pages += freed_now;
@@ -1143,6 +1184,35 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 Err(err) => {
                     warn!("failed to demote block {:?} to host tier: {}", bid, err);
+                }
+            }
+        }
+        if reclaimed_pages < want_free {
+            let remaining_pages = want_free.saturating_sub(reclaimed_pages);
+            let blocks_to_drop = remaining_pages.div_ceil(pages_per_block.max(1)).max(1);
+            let evicted = self.prefix_cache.evict_with_policy(
+                &SessionBiasedLru::default(),
+                self.eviction_signals(),
+                blocks_to_drop,
+                Some(crate::kv_tier::Tier::Gpu),
+            );
+            if !evicted.is_empty() {
+                let dropped_pages = self.drop_cached_blocks(&evicted);
+                reclaimed_pages += dropped_pages;
+                if demote_budget == 0 {
+                    warn!(
+                        "prefix cache pressure fallback: host tier full, dropped {} GPU blocks ({} pages) to reclaim immediate T0 headroom",
+                        evicted.len(),
+                        dropped_pages
+                    );
+                } else {
+                    warn!(
+                        "prefix cache pressure fallback: dropped {} GPU blocks ({} pages) after host demotion reclaimed only {}/{} pages",
+                        evicted.len(),
+                        dropped_pages,
+                        reclaimed_pages.saturating_sub(dropped_pages),
+                        want_free
+                    );
                 }
             }
         }
@@ -1190,7 +1260,8 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             }
             let before = reclaimed_pages;
-            for bid in candidates {
+            let demote_budget = self.demote_block_budget(&candidates);
+            for bid in candidates.iter().take(demote_budget).copied() {
                 match self.demote_block_to_host(bid) {
                     Ok(freed_now) => {
                         reclaimed_pages += freed_now;
@@ -1219,6 +1290,7 @@ impl<M: ModelForward> Scheduler<M> {
                 &SessionBiasedLru::default(),
                 self.eviction_signals(),
                 blocks_to_drop,
+                Some(crate::kv_tier::Tier::Gpu),
             );
             reclaimed_pages += self.drop_cached_blocks(&evicted);
         }
