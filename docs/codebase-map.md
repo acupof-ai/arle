@@ -57,6 +57,7 @@ Current workspace members:
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait; the current local Metal train path already uses the device-resident / lazy-eval tranche for the active training-critical ops, while CUDA remains the primary full-acceptance target)
 - `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
+- `crates/kv-native-sys` (Zig-backed local persistence substrate for `infer/src/kv_tier/transport/disk.rs`; today owns thin file + block object ABI, target home for mmap/WAL/shm follow-on work)
 
 ## 2. Main execution paths
 
@@ -233,6 +234,7 @@ These crates remain independent after Route A:
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
 - `crates/cuda-kernels`: CUDA kernel layer extracted from `infer` in commit `a4e12f5` (2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/triton/`, Rust FFI, `paged_kv`, `flashinfer`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend
+- `crates/kv-native-sys`: Zig-native persistence layer used by `infer/src/kv_tier/transport/disk.rs` for local file and content-addressed block object operations
 
 Current dependency direction:
 
