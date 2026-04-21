@@ -24,7 +24,7 @@ use train::{
     checkpoint::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
-    cli_args::{ArgError, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -43,6 +43,7 @@ use train::{
         save_step_checkpoint,
     },
     reward::{discounted_returns, group_normalize, returns_to_per_position},
+    rollout::Trajectory,
 };
 
 #[derive(Debug, Clone)]
@@ -81,28 +82,9 @@ struct CliArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendChoice {
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultiTurnObjective {
     StepwiseGrpo,
     SequenceGspo,
-}
-
-impl FromStr for BackendChoice {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "cpu" => Ok(BackendChoice::Cpu),
-            "metal" => Ok(BackendChoice::Metal),
-            "cuda" => Ok(BackendChoice::Cuda),
-            _ => Err(format!("unknown backend: {s}")),
-        }
-    }
 }
 
 impl Default for CliArgs {
@@ -446,53 +428,37 @@ fn run() -> Result<(), CliError> {
             episodes.push(episode);
         }
 
-        let mut per_turn_rewards: Vec<Vec<f32>> = Vec::with_capacity(args.group_size);
-        for episode in &episodes {
-            per_turn_rewards.push(compute_per_turn_rewards(episode, &initial_prompt));
-        }
+        let per_turn_rewards: Vec<Vec<f32>> = episodes
+            .iter()
+            .map(|episode| compute_per_turn_rewards(episode, &initial_prompt))
+            .collect();
 
         let trajectories: Vec<_> = episodes
             .iter()
             .map(|e| e.clone().into_trajectory())
             .collect();
+        let objective_rewards = shape_objective_rewards(
+            args.objective,
+            &episodes,
+            &per_turn_rewards,
+            args.gamma,
+            args.group_size,
+            seq_len,
+        );
 
         tape.entries.clear();
         tape.set_enabled(true);
         metal_eval_reset();
         let eval_count_loop_start = metal_eval_snapshot();
-        let loss_id = match args.objective {
-            MultiTurnObjective::StepwiseGrpo => {
-                let advantages_per_position = stepwise_advantages(
-                    &episodes,
-                    &per_turn_rewards,
-                    args.gamma,
-                    args.group_size,
-                    seq_len,
-                );
-                grpo_loss_per_position(
-                    &policy,
-                    &trajectories,
-                    &advantages_per_position,
-                    &grpo_cfg,
-                    &config,
-                    &mut store,
-                    &mut tape,
-                )?
-            }
-            MultiTurnObjective::SequenceGspo => {
-                let sequence_scores = sequence_scores(&per_turn_rewards);
-                let advantages = group_advantages(&sequence_scores, args.group_size);
-                grpo_loss(
-                    &policy,
-                    &trajectories,
-                    &advantages,
-                    &grpo_cfg,
-                    &config,
-                    &mut store,
-                    &mut tape,
-                )?
-            }
-        };
+        let loss_id = objective_loss(
+            &policy,
+            &trajectories,
+            &grpo_cfg,
+            &config,
+            &objective_rewards,
+            &mut store,
+            &mut tape,
+        )?;
         let loss_value = store.to_host(loss_id)?[0];
         let eval_count_after_forward = metal_eval_snapshot();
 
@@ -1115,11 +1081,75 @@ fn stepwise_advantages(
     per_position
 }
 
-fn sequence_scores(per_turn_rewards: &[Vec<f32>]) -> Vec<f32> {
-    per_turn_rewards
-        .iter()
-        .map(|rewards| episode_sequence_score(rewards))
-        .collect()
+#[derive(Debug, Clone, PartialEq)]
+enum ObjectiveRewards {
+    Stepwise { advantages_per_position: Vec<f32> },
+    Sequence { advantages: Vec<f32> },
+}
+
+fn shape_objective_rewards(
+    objective: MultiTurnObjective,
+    episodes: &[Episode],
+    per_turn_rewards: &[Vec<f32>],
+    gamma: f32,
+    group: usize,
+    seq_len: usize,
+) -> ObjectiveRewards {
+    match objective {
+        MultiTurnObjective::StepwiseGrpo => ObjectiveRewards::Stepwise {
+            advantages_per_position: stepwise_advantages(
+                episodes,
+                per_turn_rewards,
+                gamma,
+                group,
+                seq_len,
+            ),
+        },
+        MultiTurnObjective::SequenceGspo => {
+            let sequence_scores: Vec<f32> = per_turn_rewards
+                .iter()
+                .map(|rewards| episode_sequence_score(rewards))
+                .collect();
+            ObjectiveRewards::Sequence {
+                advantages: group_advantages(&sequence_scores, group),
+            }
+        }
+    }
+}
+
+fn objective_loss(
+    policy: &Qwen35Model,
+    trajectories: &[Trajectory],
+    grpo_cfg: &GrpoConfig,
+    config: &Qwen35Config,
+    rewards: &ObjectiveRewards,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<autograd::TensorId, CliError> {
+    match rewards {
+        ObjectiveRewards::Stepwise {
+            advantages_per_position,
+        } => grpo_loss_per_position(
+            policy,
+            trajectories,
+            advantages_per_position,
+            grpo_cfg,
+            config,
+            store,
+            tape,
+        )
+        .map_err(CliError::Autograd),
+        ObjectiveRewards::Sequence { advantages } => grpo_loss(
+            policy,
+            trajectories,
+            advantages,
+            grpo_cfg,
+            config,
+            store,
+            tape,
+        )
+        .map_err(CliError::Autograd),
+    }
 }
 
 // GSPO sequence score: the mean per-turn reward for the full episode.
@@ -1355,6 +1385,65 @@ mod tests {
             "gspo".parse::<MultiTurnObjective>().expect("gspo"),
             MultiTurnObjective::SequenceGspo
         );
+    }
+
+    fn synthetic_episode(turn_boundaries: &[(usize, usize)], response_mask: &[bool]) -> Episode {
+        let len = response_mask.len();
+        Episode {
+            initial_prompt: vec![0; len],
+            full_ids: vec![0; len],
+            response_mask: response_mask.to_vec(),
+            old_log_probs: vec![0.0; len],
+            ref_log_probs: vec![0.0; len],
+            reward: 0.0,
+            turn_boundaries: turn_boundaries.to_vec(),
+        }
+    }
+
+    #[test]
+    fn objective_reward_shaping_uses_stepwise_returns_per_position() {
+        let episodes = vec![
+            synthetic_episode(&[(0, 2), (2, 4)], &[false, false, true, true]),
+            synthetic_episode(&[(0, 2), (2, 4)], &[false, false, true, true]),
+        ];
+        let per_turn_rewards = vec![vec![1.0, 0.0], vec![0.0, 0.5]];
+        let shaped = shape_objective_rewards(
+            MultiTurnObjective::StepwiseGrpo,
+            &episodes,
+            &per_turn_rewards,
+            0.5,
+            2,
+            4,
+        );
+        let expected = ObjectiveRewards::Stepwise {
+            advantages_per_position: stepwise_advantages(&episodes, &per_turn_rewards, 0.5, 2, 4),
+        };
+        assert_eq!(shaped, expected);
+    }
+
+    #[test]
+    fn objective_reward_shaping_uses_sequence_mean_per_episode() {
+        let episodes = vec![
+            synthetic_episode(&[(0, 2)], &[false, true, true, false]),
+            synthetic_episode(&[(0, 2)], &[false, true, true, false]),
+        ];
+        let per_turn_rewards = vec![vec![1.0, 0.0], vec![0.0, 0.0]];
+        let shaped = shape_objective_rewards(
+            MultiTurnObjective::SequenceGspo,
+            &episodes,
+            &per_turn_rewards,
+            0.5,
+            2,
+            4,
+        );
+        let expected_scores: Vec<f32> = per_turn_rewards
+            .iter()
+            .map(|rewards| episode_sequence_score(rewards))
+            .collect();
+        let expected = ObjectiveRewards::Sequence {
+            advantages: group_advantages(&expected_scores, 2),
+        };
+        assert_eq!(shaped, expected);
     }
 
     #[test]

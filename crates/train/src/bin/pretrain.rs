@@ -15,21 +15,20 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::Instant,
 };
 
 use autograd::{
-    AutogradError, Backend, ConstantLr, CpuBackend, Result as AutogradResult, SafetensorsRegistry,
-    Tape, TensorId, TensorStore, optim::AdamW,
+    AutogradError, ConstantLr, Result as AutogradResult, SafetensorsRegistry, Tape, TensorId,
+    TensorStore, optim::AdamW,
 };
 use qwen3_spec::Qwen3Config;
 use thiserror::Error;
 use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{build_registry, live_tensor_ids, trainable_param_name_map, trainable_params},
-    cli_args::{ArgError, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, SaveDtype, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -60,42 +59,6 @@ const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
 const DEFAULT_EPS: f32 = 1.0e-8;
 const DEFAULT_WEIGHT_DECAY: f32 = 0.01;
 const STOP_REQUESTED_ERR: &str = "pretrain: operator stop requested";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendChoice {
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-impl FromStr for BackendChoice {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "cpu" => Ok(Self::Cpu),
-            "metal" => Ok(Self::Metal),
-            "cuda" => Ok(Self::Cuda),
-            _ => Err(format!("unknown backend: {value}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaveDtype {
-    F32,
-    Bf16,
-}
-
-impl FromStr for SaveDtype {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "f32" => Ok(Self::F32),
-            "bf16" => Ok(Self::Bf16),
-            _ => Err(format!("unknown save dtype: {value}")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -508,7 +471,7 @@ fn run_with_family<F: PretrainFamily>(
         )));
     }
 
-    let backend = build_backend(args.backend)?;
+    let backend = args.backend.build_backend_or_cpu("pretrain")?;
     println!("backend: {:?}", backend.device());
     println!("family={}", F::family_name());
     println!("config: {}", F::describe_config(&cfg));
@@ -628,11 +591,7 @@ fn run_with_family<F: PretrainFamily>(
     let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("pretrain");
-    let backend_name = match args.backend {
-        BackendChoice::Cpu => "cpu",
-        BackendChoice::Metal => "metal",
-        BackendChoice::Cuda => "cuda",
-    };
+    let backend_name = args.backend.as_str();
     let out_dir_string = args.out.display().to_string();
     let resume_dir_string = resume_dir_canonical
         .as_ref()
@@ -1067,30 +1026,6 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
-    match choice {
-        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
-        #[cfg(feature = "metal")]
-        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
-        #[cfg(not(feature = "metal"))]
-        BackendChoice::Metal => {
-            eprintln!(
-                "[pretrain] warning: metal backend requested without --features metal; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-        #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => Ok(Arc::new(autograd::backend_cuda::CudaBackend::new(0)?)),
-        #[cfg(not(feature = "cuda"))]
-        BackendChoice::Cuda => {
-            eprintln!(
-                "[pretrain] warning: cuda backend requested without --features cuda; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn save_qwen3_checkpoint(
     out_dir: &Path,
@@ -1103,10 +1038,7 @@ fn save_qwen3_checkpoint(
     eos_token_id: u32,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let torch_dtype = match save_dtype {
-        SaveDtype::F32 => "float32",
-        SaveDtype::Bf16 => "bfloat16",
-    };
+    let torch_dtype = save_dtype.torch_dtype();
     let step_dir = save_step_checkpoint(
         Qwen3StepCheckpoint {
             out_dir,
@@ -1159,10 +1091,7 @@ fn save_qwen35_checkpoint(
     eos_token_id: u32,
     save_dtype: SaveDtype,
 ) -> Result<(), CliError> {
-    let torch_dtype = match save_dtype {
-        SaveDtype::F32 => "float32",
-        SaveDtype::Bf16 => "bfloat16",
-    };
+    let torch_dtype = save_dtype.torch_dtype();
     let step_dir = save_qwen35_step_checkpoint(
         Qwen35StepCheckpoint {
             out_dir,

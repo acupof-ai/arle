@@ -223,6 +223,53 @@ pub struct Qwen35Config {
 }
 
 impl Qwen35Config {
+    /// Train-side current truth: the active train stack only supports dense
+    /// MLP layers with full-attention blocks. Infer-side parsing remains
+    /// broader, but train entrypoints use this helper to fail early when a
+    /// hybrid or MoE config is passed in.
+    pub fn is_train_dense_full_attention_only(&self) -> bool {
+        self.num_hidden_layers > 0
+            && self.layer_types.len() == self.num_hidden_layers
+            && !self.is_moe()
+            && self
+                .layer_types
+                .iter()
+                .all(|&layer| layer == LayerType::FullAttention)
+    }
+
+    /// Shared train-side contract validation for the current Qwen3.5 path.
+    /// This intentionally stays narrower than generic `validate()` so infer
+    /// can still parse hybrid configs while train fails fast with a single,
+    /// reusable authority.
+    pub fn validate_train_dense_full_attention_contract(&self) -> Result<()> {
+        self.validate()?;
+        if self.is_moe() {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 currently supports dense MLP layers only",
+            ));
+        }
+        if self
+            .layer_types
+            .iter()
+            .any(|layer_type| *layer_type != LayerType::FullAttention)
+        {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 currently supports full-attention layers only",
+            ));
+        }
+        if self.rotary_dim != self.head_dim {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 requires rotary_dim == head_dim",
+            ));
+        }
+        if self.rope_cache_len_hint.is_none() {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn model_prefix(&self) -> &'static str {
         "model.language_model"
     }
@@ -609,6 +656,38 @@ mod tests {
         }
     }"#;
 
+    const DENSE_FULL_ATTENTION_CONFIG_JSON: &str = r#"{
+        "text_config": {
+            "hidden_size": 2560,
+            "intermediate_size": 9216,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "rms_norm_eps": 1e-6,
+            "layer_types": [
+                "full_attention",
+                "full_attention",
+                "full_attention",
+                "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "rope_parameters": {
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 1.0
+            },
+            "eos_token_id": 248044,
+            "bos_token_id": 248000,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 32768
+        }
+    }"#;
+
     #[test]
     fn parses_nested_qwen35_config() {
         let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
@@ -630,6 +709,47 @@ mod tests {
         assert_eq!(config.full_attn_kv_dim(), 1024);
         assert_eq!(config.linear_attn_qkv_dim(), 8192);
         assert_eq!(config.linear_attn_z_dim(), 4096);
+    }
+
+    #[test]
+    fn validates_dense_full_attention_train_contract() {
+        let config = Qwen35Config::from_json_str(DENSE_FULL_ATTENTION_CONFIG_JSON).unwrap();
+        assert!(config.is_train_dense_full_attention_only());
+        config
+            .validate_train_dense_full_attention_contract()
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_hybrid_configs_for_train_contract() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        assert!(!config.is_train_dense_full_attention_only());
+        let err = config
+            .validate_train_dense_full_attention_contract()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 currently supports full-attention layers only"
+            )
+        ));
+    }
+
+    #[test]
+    fn rejects_moe_configs_for_train_contract() {
+        let mut config = Qwen35Config::from_json_str(DENSE_FULL_ATTENTION_CONFIG_JSON).unwrap();
+        config.num_experts = 8;
+        config.num_experts_per_tok = 2;
+        assert!(!config.is_train_dense_full_attention_only());
+        let err = config
+            .validate_train_dense_full_attention_contract()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 currently supports dense MLP layers only"
+            )
+        ));
     }
 
     #[test]
