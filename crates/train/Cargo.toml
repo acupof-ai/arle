@@ -31,11 +31,7 @@ tempfile = "3"
 
 [[bin]]
 name = "pretrain"
-path = "src/bin/pretrain_qwen3.rs"
-
-[[bin]]
-name = "pretrain_qwen3"
-path = "src/bin/pretrain_qwen3.rs"
+path = "src/bin/pretrain.rs"
 
 [[bin]]
 name = "train_grpo"

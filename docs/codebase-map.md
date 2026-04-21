@@ -120,7 +120,7 @@ Key files:
 ### Current train control-plane path
 
 ```text
-crates/train/src/bin/{pretrain_qwen3,train_sft,train_grpo,train_multi_turn}.rs
+crates/train/src/bin/{pretrain,train_sft,train_grpo,train_multi_turn}.rs
   -> train::server::bind_and_serve_on_thread()
   -> std TcpListener control plane on /v1/train/{status,events,stop,save}
   -> train::control::TrainingController + ControllerSink
@@ -136,7 +136,7 @@ not the current repository surface.
 Key files:
 
 - `crates/train/src/bin/eval_lm.rs`: standalone eval entrypoint for checkpoint dirs written by current train code
-- `crates/train/src/bin/pretrain_qwen3.rs`: canonical `pretrain` entrypoint; `--serve` starts the train-side control plane for scratch pretraining
+- `crates/train/src/bin/pretrain.rs`: canonical `pretrain` entrypoint; `--serve` starts the train-side control plane for scratch pretraining
 - `crates/train/src/bin/train_sft.rs`: supervised fine-tune entrypoint; `--serve` starts the same control plane
 - `crates/train/src/bin/train_grpo.rs`: single-turn GRPO entrypoint; `--serve` starts the same control plane
 - `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint on the Qwen3.5-family dense/full-attn path; `--serve` starts the same control plane

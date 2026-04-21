@@ -251,9 +251,8 @@ don't (because every other test uses synthetic loss).
 The runtime migration has already landed on the main `Trainer<O, C, S>`
 path. The current training binaries (`pretrain`, `train_grpo`,
 `train_multi_turn`) still compile against the legacy `trainer::*`
-re-exports as compatibility aliases; `pretrain_qwen3` now survives only
-as a compatibility bin alias for the generic `pretrain` entrypoint. This section now
-only guards that surface until the aliases are retired. Regression guard: a `#[test]` in
+re-exports as compatibility aliases. This section now only guards that
+surface until the aliases are retired. Regression guard: a `#[test]` in
 `crates/train/tests/test_legacy_imports.rs` that imports each legacy
 symbol by path:
 
