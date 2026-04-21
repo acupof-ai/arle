@@ -5,8 +5,12 @@ use std::sync::Arc;
 use autograd::{
     Backend, Tape, TensorStore, adamw_state::AdamWState, backend_metal::MetalBackend, optim::AdamW,
 };
+use tempfile::tempdir;
 use train::{
-    causal_lm::{live_tensor_ids, retained_ids, trainable_param_name_map, trainable_params},
+    causal_lm::{
+        build_registry, live_tensor_ids, retained_ids, save_materialized_registry,
+        trainable_param_name_map, trainable_params,
+    },
     grpo::{GrpoConfig, group_advantages, grpo_loss},
     lora::LoraConfig,
     loss::cross_entropy_loss,
@@ -26,6 +30,7 @@ const REL_TOL: f32 = 5.0e-4;
 #[derive(Debug)]
 struct StepSnapshot {
     losses: Vec<f32>,
+    reload_logits: Vec<f32>,
     named_params: Vec<(String, Vec<f32>)>,
     optim_state: AdamWState,
 }
@@ -127,6 +132,7 @@ fn run_hybrid_scratch_steps(
 
     Ok(StepSnapshot {
         losses,
+        reload_logits: export_reload_logits(&model, &mut store, &mut tape, cfg)?,
         named_params: export_named_params(&mut store, &param_names)?,
         optim_state: optimizer.export_state(&param_names),
     })
@@ -183,6 +189,7 @@ fn run_hybrid_grpo_steps(
 
     Ok(StepSnapshot {
         losses,
+        reload_logits: export_reload_logits(&model, &mut store, &mut tape, cfg)?,
         named_params: export_named_params(&mut store, &param_names)?,
         optim_state: optimizer.export_state(&param_names),
     })
@@ -197,6 +204,35 @@ fn export_named_params(
         named.push((name.clone(), store.to_host(*tensor_id)?));
     }
     Ok(named)
+}
+
+fn export_reload_logits(
+    model: &Qwen35Model,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    cfg: &train::qwen35::Qwen35Config,
+) -> TestResult<Vec<f32>> {
+    let dir = tempdir()?;
+    let path = dir.path().join("model.safetensors");
+    save_materialized_registry(model, store, tape, &path, false)?;
+    tape.entries.clear();
+    tape.set_enabled(true);
+
+    let mut loaded_store = TensorStore::default();
+    let loaded_model = Qwen35Model::new_for_eval(cfg, &mut loaded_store)?;
+    let mut loaded_registry = build_registry(&loaded_model);
+    loaded_registry.load_into(&mut loaded_store, &path)?;
+
+    let input_ids = [3, 4, 5, 6, 7];
+    let position_ids = [0, 1, 2, 3, 4];
+    let mut loaded_tape = Tape::new();
+    let logits = loaded_model.forward(
+        &mut loaded_store,
+        &mut loaded_tape,
+        &input_ids,
+        &position_ids,
+    )?;
+    Ok(loaded_store.to_host(logits)?)
 }
 
 fn fixed_grpo_trajectories() -> Vec<Trajectory> {
@@ -259,6 +295,11 @@ fn assert_snapshot_close(label: &str, cpu: &StepSnapshot, metal: &StepSnapshot) 
     {
         assert_close_scalar(&format!("{label} loss[{index}]"), cpu_loss, metal_loss);
     }
+    assert_close_slice(
+        &format!("{label} reload_logits"),
+        &cpu.reload_logits,
+        &metal.reload_logits,
+    );
     assert_eq!(cpu.named_params.len(), metal.named_params.len());
     for ((cpu_name, cpu_values), (metal_name, metal_values)) in
         cpu.named_params.iter().zip(metal.named_params.iter())
