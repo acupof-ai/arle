@@ -17,6 +17,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use crate::types::BlockId;
 
 use super::tier::BlockLocation;
+use super::transport::disk::DiskStore;
 use super::{StagePlanner, StageRequest, StageTicket};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +168,7 @@ pub struct SpillRequest {
     pub block_id: BlockId,
     pub fingerprint: crate::types::BlockFingerprint,
     pub kv_format_tag: u8,
+    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
     pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
 }
 
@@ -180,6 +182,7 @@ pub struct RehydrateRequest {
     pub block_id: BlockId,
     pub fingerprint: crate::types::BlockFingerprint,
     pub disk_location: crate::kv_tier::transport::disk::DiskBlockLocation,
+    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
     pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
 }
 
@@ -339,16 +342,32 @@ impl StagePlanner for CoordinatorHandle {
 pub struct Coordinator {
     rx: Receiver<CoordinatorCommand>,
     events: Sender<CoordinatorEvent>,
+    disk_store: Option<Arc<DiskStore>>,
 }
 
 impl Coordinator {
     pub fn new(queue_capacity: usize) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
+        Self::new_with_optional_disk_store(queue_capacity, None)
+    }
+
+    pub fn new_with_disk_store(
+        queue_capacity: usize,
+        disk_store: Arc<DiskStore>,
+    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
+        Self::new_with_optional_disk_store(queue_capacity, Some(disk_store))
+    }
+
+    fn new_with_optional_disk_store(
+        queue_capacity: usize,
+        disk_store: Option<Arc<DiskStore>>,
+    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
         let (tx, rx) = bounded(queue_capacity.max(1));
         let (event_tx, event_rx) = bounded(queue_capacity.max(1));
         (
             Self {
                 rx,
                 events: event_tx,
+                disk_store,
             },
             CoordinatorHandle {
                 tx,
@@ -356,6 +375,131 @@ impl Coordinator {
             },
             event_rx,
         )
+    }
+
+    fn emit_event(&self, event: CoordinatorEvent) -> Result<()> {
+        self.events
+            .send(event)
+            .map_err(|e| anyhow!("coordinator event send failed: {e}"))
+    }
+
+    fn handle_spill(&self, ticket: StageTicket, blocks: &[SpillRequest]) -> Result<()> {
+        self.emit_event(CoordinatorEvent::SpillQueued {
+            ticket,
+            block_count: blocks.len(),
+        })?;
+
+        let Some(disk_store) = &self.disk_store else {
+            if let Some(first) = blocks.first() {
+                self.emit_event(CoordinatorEvent::SpillFailed {
+                    ticket,
+                    failed_block: first.block_id,
+                    reason: "coordinator disk store not configured".to_string(),
+                })?;
+            } else {
+                self.emit_event(CoordinatorEvent::SpillCompleted {
+                    ticket,
+                    locations: Vec::new(),
+                })?;
+            }
+            return Ok(());
+        };
+
+        let mut locations = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let payload = match block.host_pool.read_region(block.host_region) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.emit_event(CoordinatorEvent::SpillFailed {
+                        ticket,
+                        failed_block: block.block_id,
+                        reason: err.to_string(),
+                    })?;
+                    return Ok(());
+                }
+            };
+
+            match disk_store.put_block(block.fingerprint, block.kv_format_tag, &payload) {
+                Ok(location) => locations.push((block.block_id, location)),
+                Err(err) => {
+                    self.emit_event(CoordinatorEvent::SpillFailed {
+                        ticket,
+                        failed_block: block.block_id,
+                        reason: err.to_string(),
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })
+    }
+
+    fn handle_rehydrate(&self, ticket: StageTicket, blocks: &[RehydrateRequest]) -> Result<()> {
+        self.emit_event(CoordinatorEvent::RehydrateQueued {
+            ticket,
+            block_count: blocks.len(),
+        })?;
+
+        let Some(disk_store) = &self.disk_store else {
+            if let Some(first) = blocks.first() {
+                self.emit_event(CoordinatorEvent::RehydrateFailed {
+                    ticket,
+                    failed_block: first.block_id,
+                    reason: "coordinator disk store not configured".to_string(),
+                })?;
+            } else {
+                self.emit_event(CoordinatorEvent::RehydrateCompleted {
+                    ticket,
+                    rehydrated_blocks: Vec::new(),
+                })?;
+            }
+            return Ok(());
+        };
+
+        let mut rehydrated_blocks = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let payload =
+                match disk_store.get_block(&block.disk_location, Some(block.fingerprint)) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        self.emit_event(CoordinatorEvent::RehydrateFailed {
+                            ticket,
+                            failed_block: block.block_id,
+                            reason: err.to_string(),
+                        })?;
+                        return Ok(());
+                    }
+                };
+
+            if payload.len() != block.host_region.len {
+                self.emit_event(CoordinatorEvent::RehydrateFailed {
+                    ticket,
+                    failed_block: block.block_id,
+                    reason: format!(
+                        "rehydrate byte length mismatch: disk={} host_region={}",
+                        payload.len(),
+                        block.host_region.len
+                    ),
+                })?;
+                return Ok(());
+            }
+
+            if let Err(err) = block.host_pool.write_region(block.host_region, &payload) {
+                self.emit_event(CoordinatorEvent::RehydrateFailed {
+                    ticket,
+                    failed_block: block.block_id,
+                    reason: err.to_string(),
+                })?;
+                return Ok(());
+            }
+            rehydrated_blocks.push(block.block_id);
+        }
+
+        self.emit_event(CoordinatorEvent::RehydrateCompleted {
+            ticket,
+            rehydrated_blocks,
+        })
     }
 
     pub fn run_once(&self) -> Result<bool> {
@@ -372,6 +516,12 @@ impl Coordinator {
                         self.events
                             .send(CoordinatorEvent::StagingCompleted { ticket: *ticket })
                             .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                    }
+                    CoordinatorCommand::Spill { ticket, blocks } => {
+                        self.handle_spill(*ticket, blocks)?;
+                    }
+                    CoordinatorCommand::Rehydrate { ticket, blocks } => {
+                        self.handle_rehydrate(*ticket, blocks)?;
                     }
                     _ => {
                         self.events
@@ -401,6 +551,8 @@ impl Coordinator {
 mod tests {
     use super::*;
     use crate::prefix_cache::RadixCache;
+    use crate::types::BlockFingerprint;
+    use tempfile::tempdir;
 
     #[test]
     fn coordinator_receives_commands() {
@@ -551,5 +703,130 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn spill_and_rehydrate_roundtrip_through_disk_store() {
+        let dir = tempdir().unwrap();
+        let disk_store = Arc::new(crate::kv_tier::transport::disk::DiskStore::new(dir.path()));
+        let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store);
+        let host_pool =
+            crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+                crate::kv_tier::HostPinnedPool::new(256).unwrap(),
+            );
+        let spill_region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(6).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"abcdef");
+            region
+        };
+        let fingerprint = BlockFingerprint([0x2A; 16]);
+        let spill_ticket = handle
+            .submit_spill(vec![SpillRequest {
+                block_id: BlockId(7),
+                fingerprint,
+                kv_format_tag: 3,
+                host_pool: host_pool.clone(),
+                host_region: spill_region,
+            }])
+            .unwrap();
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::SpillQueued {
+                ticket: spill_ticket,
+                block_count: 1,
+            }
+        );
+        let spill_location = match events.recv().unwrap() {
+            CoordinatorEvent::SpillCompleted { ticket, locations } => {
+                assert_eq!(ticket, spill_ticket);
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].0, BlockId(7));
+                locations[0].1.clone()
+            }
+            other => panic!("unexpected spill event: {other:?}"),
+        };
+
+        let rehydrate_region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(6).unwrap();
+            pool.as_mut_slice(region).fill(0);
+            region
+        };
+        let rehydrate_ticket = handle
+            .submit_rehydrate(vec![RehydrateRequest {
+                block_id: BlockId(7),
+                fingerprint,
+                disk_location: spill_location,
+                host_pool: host_pool.clone(),
+                host_region: rehydrate_region,
+            }])
+            .unwrap();
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::RehydrateQueued {
+                ticket: rehydrate_ticket,
+                block_count: 1,
+            }
+        );
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::RehydrateCompleted {
+                ticket: rehydrate_ticket,
+                rehydrated_blocks: vec![BlockId(7)],
+            }
+        );
+
+        let pool = host_pool.lock().unwrap();
+        assert_eq!(pool.as_slice(rehydrate_region), b"abcdef");
+    }
+
+    #[test]
+    fn spill_fails_without_configured_disk_store() {
+        let (coordinator, handle, events) = Coordinator::new(4);
+        let host_pool =
+            crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+                crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+            );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(4).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"test");
+            region
+        };
+
+        let ticket = handle
+            .submit_spill(vec![SpillRequest {
+                block_id: BlockId(3),
+                fingerprint: BlockFingerprint([0x44; 16]),
+                kv_format_tag: 1,
+                host_pool,
+                host_region: region,
+            }])
+            .unwrap();
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::SpillQueued {
+                ticket,
+                block_count: 1,
+            }
+        );
+        match events.recv().unwrap() {
+            CoordinatorEvent::SpillFailed {
+                ticket: failed_ticket,
+                failed_block,
+                reason,
+            } => {
+                assert_eq!(failed_ticket, ticket);
+                assert_eq!(failed_block, BlockId(3));
+                assert!(reason.contains("disk store not configured"));
+            }
+            other => panic!("unexpected spill failure event: {other:?}"),
+        }
     }
 }

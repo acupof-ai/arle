@@ -369,8 +369,12 @@ impl<M: ModelForward> Scheduler<M> {
         let waiting_count = Arc::new(AtomicUsize::new(0));
         let page_lifecycle =
             crate::kv_tier::coordinator::PageLifecycle::new(paged_kv_pool.max_total_pages);
+        let disk_store = Arc::new(DiskStore::new(config.disk_store_root.clone()));
         let (coordinator, coordinator_handle, coordinator_events) =
-            crate::kv_tier::Coordinator::new(config.max_slots.max(16));
+            crate::kv_tier::Coordinator::new_with_disk_store(
+                config.max_slots.max(16),
+                Arc::clone(&disk_store),
+            );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
         let scheduler = Self {
             config: config.clone(),
@@ -384,7 +388,7 @@ impl<M: ModelForward> Scheduler<M> {
                 PREFIX_CACHE_BLOCK_SIZE,
                 config.prefix_cache_keepalive_ticks,
             ),
-            disk_store: Arc::new(DiskStore::new(config.disk_store_root.clone())),
+            disk_store,
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
             slot_owned_blocks,
