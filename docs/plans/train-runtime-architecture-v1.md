@@ -12,8 +12,9 @@
 > `train_grpo` and `train_multi_turn` now round-trip exact resume state on
 > the active RL path, `train_multi_turn` exposes an explicit stepwise-GRPO vs
 > sequence-level-GSPO objective switch,
-> checkpoints are written as HF-style directories, and the hybrid linear-attn
-> train path has not landed yet. The target train-side
+> checkpoints are written as HF-style directories, and the shared Qwen3.5
+> model path now supports hybrid linear-attn layers for LoRA/frozen eval while
+> scratch pretrain + RL acceptance remain dense/full-attn only. The target train-side
 > model line is the Qwen3.5 architecture family.
 
 ---
@@ -25,7 +26,7 @@ The active training binaries (`pretrain`, `train_sft`, `train_grpo`, `train_mult
 - **RL loops still sit partly outside `Trainer<O, C, S>`** — `train_grpo` and `train_multi_turn` still own rollout/reward/objective orchestration by hand because the current closure model is supervised-step shaped.
 - **CLI/runtime composition is still hand-rolled per binary** — flags are not normalized across all train surfaces yet, and `clap` adoption is still open.
 - **Infer-side unified `/v1/train/*` bridge has not landed** — the current truth remains the train-side server inside `crates/train`.
-- **Hybrid linear-attn Qwen3.5 training is still absent** — runtime factoring is no longer the blocker; model-path coverage is.
+- **Hybrid Qwen3.5 support is only partial today** — LoRA/frozen-eval is landed, but scratch pretrain and RL acceptance are still dense/full-attn only.
 - **CUDA device-resident optimizer / grad path is still a future seam** — current host-authoritative gradient flow is fine for correctness and local Metal, but not the final CUDA scaling story.
 
 Without a shared runtime, every backend × feature combination becomes 5 binary edits.

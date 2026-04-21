@@ -71,6 +71,24 @@ pub enum SavedContext {
         indices: Vec<usize>,
         table_shape: Vec<usize>,
     },
+    LinearAttentionCtx {
+        qkv: TensorId,
+        z: TensorId,
+        b_proj: TensorId,
+        a_proj: TensorId,
+        conv1d_weight: TensorId,
+        dt_bias: TensorId,
+        a_log: TensorId,
+        norm_weight: TensorId,
+        batch: usize,
+        seq_len: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        eps: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +113,7 @@ pub enum BackwardOp {
     Transpose,
     AddBroadcast,
     Embedding,
+    LinearAttention,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +245,9 @@ impl Tape {
                     }
                     BackwardOp::Embedding => {
                         ops::embedding_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::LinearAttention => {
+                        ops::linear_attention_backward(&entry, output_grad_id, store)?
                     }
                 };
 

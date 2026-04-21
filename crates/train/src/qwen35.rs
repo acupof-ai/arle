@@ -6,8 +6,8 @@ use std::{
 use autograd::{
     AutogradError, Tape, Tensor, TensorId, TensorStore,
     ops::{
-        add, causal_sdpa, embedding, matmul, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        LinearAttentionParams, add, causal_sdpa, embedding, linear_attention_core, matmul, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
 use qwen35_spec::Qwen35AttentionTensorNames;
@@ -50,6 +50,25 @@ struct Qwen35FullAttention {
 }
 
 #[derive(Debug, Clone)]
+struct Qwen35LinearAttention {
+    in_proj_qkv: LinearWithLora,
+    in_proj_z: LinearWithLora,
+    in_proj_b: LinearWithLora,
+    in_proj_a: LinearWithLora,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm: TensorId,
+    out_proj: LinearWithLora,
+}
+
+#[derive(Debug, Clone)]
+enum Qwen35Attention {
+    Full(Qwen35FullAttention),
+    Linear(Qwen35LinearAttention),
+}
+
+#[derive(Debug, Clone)]
 struct Qwen35Mlp {
     gate_proj: LinearWithLora,
     up_proj: LinearWithLora,
@@ -59,7 +78,7 @@ struct Qwen35Mlp {
 #[derive(Debug, Clone)]
 struct Qwen35Layer {
     input_layernorm: TensorId,
-    self_attn: Qwen35FullAttention,
+    self_attn: Qwen35Attention,
     post_attention_layernorm: TensorId,
     mlp: Qwen35Mlp,
 }
@@ -90,7 +109,44 @@ impl Qwen35Layer {
         let seq_len = x_shape[1];
 
         let h = rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
-        let q_full = self.self_attn.q_proj.forward(h, store, tape)?;
+        let attn_out = match &self.self_attn {
+            Qwen35Attention::Full(attn) => {
+                self.forward_full_attention(h, attn, cfg, cos, sin, batch, seq_len, store, tape)?
+            }
+            Qwen35Attention::Linear(attn) => {
+                self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
+            }
+        };
+        let x = add(x, attn_out, store, tape)?;
+
+        let h = rmsnorm(
+            x,
+            self.post_attention_layernorm,
+            cfg.rms_norm_eps,
+            store,
+            tape,
+        )?;
+        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
+        let up = self.mlp.up_proj.forward(h, store, tape)?;
+        let gate = silu(gate, store, tape)?;
+        let act = mul(gate, up, store, tape)?;
+        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
+        Ok(add(x, mlp_out, store, tape)?)
+    }
+
+    fn forward_full_attention(
+        &self,
+        h: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        cos: TensorId,
+        sin: TensorId,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let q_full = attn.q_proj.forward(h, store, tape)?;
         let q_full = reshape(
             q_full,
             &[batch, seq_len, cfg.num_attention_heads, cfg.head_dim * 2],
@@ -114,8 +170,8 @@ impl Qwen35Layer {
         let q = transpose(q, 1, 2, store, tape)?;
         let gate = transpose(gate, 1, 2, store, tape)?;
 
-        let k = self.self_attn.k_proj.forward(h, store, tape)?;
-        let v = self.self_attn.v_proj.forward(h, store, tape)?;
+        let k = attn.k_proj.forward(h, store, tape)?;
+        let v = attn.v_proj.forward(h, store, tape)?;
         let k = split_heads(
             k,
             batch,
@@ -135,8 +191,8 @@ impl Qwen35Layer {
             tape,
         )?;
 
-        let q = rmsnorm(q, self.self_attn.q_norm, cfg.rms_norm_eps, store, tape)?;
-        let k = rmsnorm(k, self.self_attn.k_norm, cfg.rms_norm_eps, store, tape)?;
+        let q = rmsnorm(q, attn.q_norm, cfg.rms_norm_eps, store, tape)?;
+        let k = rmsnorm(k, attn.k_norm, cfg.rms_norm_eps, store, tape)?;
         let q = rope(q, cos, sin, store, tape)?;
         let k = rope(k, cos, sin, store, tape)?;
         let gate = sigmoid(gate, store, tape)?;
@@ -145,10 +201,10 @@ impl Qwen35Layer {
         let k = repeat_kv(k, kv_repeat, store, tape)?;
         let v = repeat_kv(v, kv_repeat, store, tape)?;
 
-        let attn = causal_sdpa(q, k, v, store, tape)?;
-        let attn = mul(attn, gate, store, tape)?;
-        let attn = merge_heads(
-            attn,
+        let attn_hidden = causal_sdpa(q, k, v, store, tape)?;
+        let attn_hidden = mul(attn_hidden, gate, store, tape)?;
+        let attn_hidden = merge_heads(
+            attn_hidden,
             batch,
             seq_len,
             cfg.num_attention_heads,
@@ -156,22 +212,46 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let attn_out = self.self_attn.o_proj.forward(attn, store, tape)?;
-        let x = add(x, attn_out, store, tape)?;
+        Ok(attn.o_proj.forward(attn_hidden, store, tape)?)
+    }
 
-        let h = rmsnorm(
-            x,
-            self.post_attention_layernorm,
-            cfg.rms_norm_eps,
+    fn forward_linear_attention(
+        &self,
+        h: TensorId,
+        attn: &Qwen35LinearAttention,
+        cfg: &Qwen35Config,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let qkv = attn.in_proj_qkv.forward(h, store, tape)?;
+        let z = attn.in_proj_z.forward(h, store, tape)?;
+        let b_proj = attn.in_proj_b.forward(h, store, tape)?;
+        let a_proj = attn.in_proj_a.forward(h, store, tape)?;
+        let linear = linear_attention_core(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            attn.conv1d_weight,
+            attn.dt_bias,
+            attn.a_log,
+            attn.norm,
+            LinearAttentionParams {
+                batch,
+                seq_len,
+                num_key_heads: cfg.linear_num_key_heads,
+                num_value_heads: cfg.linear_num_value_heads,
+                key_dim: cfg.linear_key_head_dim,
+                value_dim: cfg.linear_value_head_dim,
+                conv_kernel: cfg.linear_conv_kernel_dim,
+                eps: cfg.rms_norm_eps,
+            },
             store,
             tape,
         )?;
-        let gate = self.mlp.gate_proj.forward(h, store, tape)?;
-        let up = self.mlp.up_proj.forward(h, store, tape)?;
-        let gate = silu(gate, store, tape)?;
-        let act = mul(gate, up, store, tape)?;
-        let mlp_out = self.mlp.down_proj.forward(act, store, tape)?;
-        Ok(add(x, mlp_out, store, tape)?)
+        Ok(attn.out_proj.forward(linear, store, tape)?)
     }
 }
 
@@ -190,9 +270,19 @@ pub struct Qwen35Model {
     param_ids: Vec<TensorId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen35InitMode {
+    ScratchTrain,
+    LoraOrFrozen,
+}
+
 impl Qwen35Model {
     pub fn new(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
-        Self::new_with_lora(cfg, None, store)
+        Self::new_internal(cfg, None, Qwen35InitMode::ScratchTrain, store)
+    }
+
+    pub fn new_for_eval(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
+        Self::new_internal(cfg, None, Qwen35InitMode::LoraOrFrozen, store)
     }
 
     pub fn new_with_lora(
@@ -200,9 +290,19 @@ impl Qwen35Model {
         lora: Option<LoraConfig>,
         store: &mut TensorStore,
     ) -> Result<Self> {
-        cfg.validate()?;
-        cfg.validate_train_dense_full_attention_contract()?;
+        Self::new_internal(cfg, lora, Qwen35InitMode::LoraOrFrozen, store)
+    }
 
+    fn new_internal(
+        cfg: &Qwen35Config,
+        lora: Option<LoraConfig>,
+        mode: Qwen35InitMode,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        match mode {
+            Qwen35InitMode::ScratchTrain => cfg.validate_train_dense_full_attention_contract()?,
+            Qwen35InitMode::LoraOrFrozen => cfg.validate_train_lora_or_frozen_contract()?,
+        }
         let mut param_names = HashMap::new();
         let mut adapter_names = HashMap::new();
         let mut param_ids = Vec::new();
@@ -214,7 +314,7 @@ impl Qwen35Model {
                     param_ids.push(id);
                 }
             };
-        let base_requires_grad = lora.is_none();
+        let base_requires_grad = matches!(mode, Qwen35InitMode::ScratchTrain) && lora.is_none();
 
         let embed_tokens_name = cfg.embed_tokens_tensor_name();
         let embed_tokens = normal_parameter(
@@ -247,23 +347,11 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for layer_idx in 0..cfg.num_hidden_layers {
             let names = cfg.layer_tensor_names(layer_idx);
-            let Qwen35AttentionTensorNames::Full(attn_names) = names.attention else {
-                return Err(Qwen35Error::InvalidConfig(
-                    "train-side qwen3.5 currently supports full-attention layers only",
-                ));
-            };
-
             let input_layernorm_name = leak_name(names.common.input_layernorm);
             let post_attention_layernorm_name = leak_name(names.common.post_attention_layernorm);
             let gate_proj_name = leak_name(names.common.mlp_gate_proj);
             let up_proj_name = leak_name(names.common.mlp_up_proj);
             let down_proj_name = leak_name(names.common.mlp_down_proj);
-            let q_proj_name = leak_name(attn_names.q_proj);
-            let k_proj_name = leak_name(attn_names.k_proj);
-            let v_proj_name = leak_name(attn_names.v_proj);
-            let o_proj_name = leak_name(attn_names.o_proj);
-            let q_norm_name = leak_name(attn_names.q_norm);
-            let k_norm_name = leak_name(attn_names.k_norm);
 
             let input_layernorm = ones_parameter(
                 input_layernorm_name,
@@ -271,40 +359,6 @@ impl Qwen35Model {
                 base_requires_grad,
                 store,
             )?;
-            let q_proj = LinearWithLora::new(
-                q_proj_name,
-                cfg.hidden_size,
-                cfg.full_attn_q_proj_dim(),
-                base_requires_grad,
-                lora,
-                store,
-            )?;
-            let k_proj = LinearWithLora::new(
-                k_proj_name,
-                cfg.hidden_size,
-                cfg.full_attn_kv_dim(),
-                base_requires_grad,
-                lora,
-                store,
-            )?;
-            let v_proj = LinearWithLora::new(
-                v_proj_name,
-                cfg.hidden_size,
-                cfg.full_attn_kv_dim(),
-                base_requires_grad,
-                lora,
-                store,
-            )?;
-            let o_proj = LinearWithLora::new(
-                o_proj_name,
-                cfg.full_attn_q_dim(),
-                cfg.hidden_size,
-                base_requires_grad,
-                lora,
-                store,
-            )?;
-            let q_norm = ones_parameter(q_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
-            let k_norm = ones_parameter(k_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
             let gate_proj = LinearWithLora::new(
                 gate_proj_name,
                 cfg.hidden_size,
@@ -337,32 +391,6 @@ impl Qwen35Model {
             )?;
 
             register_named(&mut param_names, input_layernorm_name, input_layernorm);
-            for (name, id) in q_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in q_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            for (name, id) in k_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in k_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            for (name, id) in v_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in v_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            for (name, id) in o_proj.parameter_name_map() {
-                register_named(&mut param_names, name, id);
-            }
-            for (name, id) in o_proj.adapter_name_map() {
-                register_named(&mut adapter_names, name, id);
-            }
-            register_named(&mut param_names, q_norm_name, q_norm);
-            register_named(&mut param_names, k_norm_name, k_norm);
             for (name, id) in gate_proj.parameter_name_map() {
                 register_named(&mut param_names, name, id);
             }
@@ -387,16 +415,219 @@ impl Qwen35Model {
                 post_attention_layernorm,
             );
 
+            let self_attn = match names.attention {
+                Qwen35AttentionTensorNames::Full(attn_names) => {
+                    let q_proj_name = leak_name(attn_names.q_proj);
+                    let k_proj_name = leak_name(attn_names.k_proj);
+                    let v_proj_name = leak_name(attn_names.v_proj);
+                    let o_proj_name = leak_name(attn_names.o_proj);
+                    let q_norm_name = leak_name(attn_names.q_norm);
+                    let k_norm_name = leak_name(attn_names.k_norm);
+
+                    let q_proj = LinearWithLora::new(
+                        q_proj_name,
+                        cfg.hidden_size,
+                        cfg.full_attn_q_proj_dim(),
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let k_proj = LinearWithLora::new(
+                        k_proj_name,
+                        cfg.hidden_size,
+                        cfg.full_attn_kv_dim(),
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let v_proj = LinearWithLora::new(
+                        v_proj_name,
+                        cfg.hidden_size,
+                        cfg.full_attn_kv_dim(),
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let o_proj = LinearWithLora::new(
+                        o_proj_name,
+                        cfg.full_attn_q_dim(),
+                        cfg.hidden_size,
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let q_norm =
+                        ones_parameter(q_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
+                    let k_norm =
+                        ones_parameter(k_norm_name, &[cfg.head_dim], base_requires_grad, store)?;
+
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &q_proj,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &k_proj,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &v_proj,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &o_proj,
+                    );
+                    register_named(&mut param_names, q_norm_name, q_norm);
+                    register_named(&mut param_names, k_norm_name, k_norm);
+
+                    Qwen35Attention::Full(Qwen35FullAttention {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                    })
+                }
+                Qwen35AttentionTensorNames::Linear(attn_names) => {
+                    let in_proj_qkv_name = leak_name(attn_names.in_proj_qkv);
+                    let in_proj_z_name = leak_name(attn_names.in_proj_z);
+                    let in_proj_b_name = leak_name(attn_names.in_proj_b);
+                    let in_proj_a_name = leak_name(attn_names.in_proj_a);
+                    let conv1d_weight_name = leak_name(attn_names.conv1d_weight);
+                    let dt_bias_name = leak_name(attn_names.dt_bias);
+                    let a_log_name = leak_name(attn_names.a_log);
+                    let norm_name = leak_name(attn_names.norm);
+                    let out_proj_name = leak_name(attn_names.out_proj);
+
+                    let in_proj_qkv = LinearWithLora::new(
+                        in_proj_qkv_name,
+                        cfg.hidden_size,
+                        cfg.linear_attn_qkv_dim(),
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let in_proj_z = LinearWithLora::new(
+                        in_proj_z_name,
+                        cfg.hidden_size,
+                        cfg.linear_attn_z_dim(),
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let in_proj_b = LinearWithLora::new(
+                        in_proj_b_name,
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let in_proj_a = LinearWithLora::new(
+                        in_proj_a_name,
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+                    let conv1d_weight = normal_parameter(
+                        conv1d_weight_name,
+                        &[cfg.linear_attn_qkv_dim(), cfg.linear_conv_kernel_dim],
+                        0.02,
+                        base_requires_grad,
+                        store,
+                    )?;
+                    let dt_bias = normal_parameter(
+                        dt_bias_name,
+                        &[cfg.linear_num_value_heads],
+                        0.02,
+                        base_requires_grad,
+                        store,
+                    )?;
+                    let a_log = normal_parameter(
+                        a_log_name,
+                        &[cfg.linear_num_value_heads],
+                        0.02,
+                        base_requires_grad,
+                        store,
+                    )?;
+                    let norm = ones_parameter(
+                        norm_name,
+                        &[cfg.linear_value_head_dim],
+                        base_requires_grad,
+                        store,
+                    )?;
+                    let out_proj = LinearWithLora::new(
+                        out_proj_name,
+                        cfg.linear_attn_z_dim(),
+                        cfg.hidden_size,
+                        base_requires_grad,
+                        lora,
+                        store,
+                    )?;
+
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &in_proj_qkv,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &in_proj_z,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &in_proj_b,
+                    );
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &in_proj_a,
+                    );
+                    register_named(&mut param_names, conv1d_weight_name, conv1d_weight);
+                    register_named(&mut param_names, dt_bias_name, dt_bias);
+                    register_named(&mut param_names, a_log_name, a_log);
+                    register_named(&mut param_names, norm_name, norm);
+                    register_linear(
+                        &mut param_names,
+                        &mut adapter_names,
+                        &mut register_named,
+                        &out_proj,
+                    );
+
+                    Qwen35Attention::Linear(Qwen35LinearAttention {
+                        in_proj_qkv,
+                        in_proj_z,
+                        in_proj_b,
+                        in_proj_a,
+                        conv1d_weight,
+                        dt_bias,
+                        a_log,
+                        norm,
+                        out_proj,
+                    })
+                }
+            };
+
             layers.push(Qwen35Layer {
                 input_layernorm,
-                self_attn: Qwen35FullAttention {
-                    q_proj,
-                    k_proj,
-                    v_proj,
-                    o_proj,
-                    q_norm,
-                    k_norm,
-                },
+                self_attn,
                 post_attention_layernorm,
                 mlp: Qwen35Mlp {
                     gate_proj,
@@ -564,22 +795,6 @@ impl Qwen35Model {
         }
         let mut map = self.param_names.clone();
         for layer in &self.layers {
-            let merged_q = {
-                let tensor = layer.self_attn.q_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-            let merged_k = {
-                let tensor = layer.self_attn.k_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-            let merged_v = {
-                let tensor = layer.self_attn.v_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
-            let merged_o = {
-                let tensor = layer.self_attn.o_proj.merged_tensor(store)?;
-                store.alloc(tensor)
-            };
             let merged_gate = {
                 let tensor = layer.mlp.gate_proj.merged_tensor(store)?;
                 store.alloc(tensor)
@@ -593,17 +808,74 @@ impl Qwen35Model {
                 store.alloc(tensor)
             };
 
-            for (name, _) in layer.self_attn.q_proj.parameter_name_map() {
-                map.insert(name, merged_q);
-            }
-            for (name, _) in layer.self_attn.k_proj.parameter_name_map() {
-                map.insert(name, merged_k);
-            }
-            for (name, _) in layer.self_attn.v_proj.parameter_name_map() {
-                map.insert(name, merged_v);
-            }
-            for (name, _) in layer.self_attn.o_proj.parameter_name_map() {
-                map.insert(name, merged_o);
+            match &layer.self_attn {
+                Qwen35Attention::Full(attn) => {
+                    let merged_q = {
+                        let tensor = attn.q_proj.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_k = {
+                        let tensor = attn.k_proj.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_v = {
+                        let tensor = attn.v_proj.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_o = {
+                        let tensor = attn.o_proj.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    for (name, _) in attn.q_proj.parameter_name_map() {
+                        map.insert(name, merged_q);
+                    }
+                    for (name, _) in attn.k_proj.parameter_name_map() {
+                        map.insert(name, merged_k);
+                    }
+                    for (name, _) in attn.v_proj.parameter_name_map() {
+                        map.insert(name, merged_v);
+                    }
+                    for (name, _) in attn.o_proj.parameter_name_map() {
+                        map.insert(name, merged_o);
+                    }
+                }
+                Qwen35Attention::Linear(attn) => {
+                    let merged_qkv = {
+                        let tensor = attn.in_proj_qkv.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_z = {
+                        let tensor = attn.in_proj_z.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_b = {
+                        let tensor = attn.in_proj_b.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_a = {
+                        let tensor = attn.in_proj_a.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    let merged_out = {
+                        let tensor = attn.out_proj.merged_tensor(store)?;
+                        store.alloc(tensor)
+                    };
+                    for (name, _) in attn.in_proj_qkv.parameter_name_map() {
+                        map.insert(name, merged_qkv);
+                    }
+                    for (name, _) in attn.in_proj_z.parameter_name_map() {
+                        map.insert(name, merged_z);
+                    }
+                    for (name, _) in attn.in_proj_b.parameter_name_map() {
+                        map.insert(name, merged_b);
+                    }
+                    for (name, _) in attn.in_proj_a.parameter_name_map() {
+                        map.insert(name, merged_a);
+                    }
+                    for (name, _) in attn.out_proj.parameter_name_map() {
+                        map.insert(name, merged_out);
+                    }
+                }
             }
             for (name, _) in layer.mlp.gate_proj.parameter_name_map() {
                 map.insert(name, merged_gate);
@@ -736,6 +1008,20 @@ fn linear_forward(
     let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
     output_shape.push(weight_shape[0]);
     Ok(reshape(projected, &output_shape, store, tape)?)
+}
+
+fn register_linear(
+    param_names: &mut HashMap<&'static str, TensorId>,
+    adapter_names: &mut HashMap<&'static str, TensorId>,
+    register_named: &mut impl FnMut(&mut HashMap<&'static str, TensorId>, &'static str, TensorId),
+    linear: &LinearWithLora,
+) {
+    for (name, id) in linear.parameter_name_map() {
+        register_named(param_names, name, id);
+    }
+    for (name, id) in linear.adapter_name_map() {
+        register_named(adapter_names, name, id);
+    }
 }
 
 fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {

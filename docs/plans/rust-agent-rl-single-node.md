@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family dense/full-attn path with HF-style checkpoint dirs; handwritten Transformer/TinyLM runtime compat deleted; hybrid linear-attn path not landed yet
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family path with HF-style checkpoint dirs; scratch pretrain + RL are validated on dense/full-attn, hybrid linear-attn is landed for LoRA/eval, handwritten Transformer/TinyLM runtime compat deleted
 
 ---
 
@@ -20,7 +20,7 @@
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
 > 和 [`docs/codebase-map.md`](../codebase-map.md)。
-> 当前 train-side 训练模型实现已经是 Qwen3.5-family dense/full-attn 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线；hybrid linear-attn 还没落地。
+> 当前 train-side 训练模型实现已经是 Qwen3.5-family 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线。当前 acceptance 切分也已经明确：scratch pretrain + RL 走 dense/full-attn，hybrid linear-attn 已经落到 LoRA/eval 路径并在 CPU / Metal 上验收。
 
 ---
 
