@@ -1,8 +1,8 @@
-# KV Tier Zig Phase 1 — guidellm sweep, cuda, 2026-04-21
+# KV Tier Zig Substrate — guidellm sweep, cuda, 2026-04-21
 
 ## Goal
 
-- Pending remote regression check for the Phase 1 `kv-native-sys` integration that moved `DiskStore` low-level file I/O under a Zig-backed substrate.
+- Pending remote regression check for the `kv-native-sys` integration that moved `DiskStore` low-level file and block-object I/O under a Zig-backed substrate.
 
 ## Hypothesis
 
@@ -21,7 +21,7 @@ Invoked via: `pending-remote`
 - **Backend:** cuda
 - **Model:** Qwen/Qwen3-4B
 - **Hardware:** pending-remote
-- **Commit:** `1eae964`
+- **Commit:** `pending-next-push`
 - **Feature set:** `cargo build --release`
 - **Non-default flags / env vars:** pending-remote
 - **Server launch:** pending-remote
@@ -42,7 +42,7 @@ Pending remote CUDA run.
 ## Problems
 
 - Local dev box has no CUDA lane for the required regression run.
-- Zig toolchain installation is still being finalized before local compile verification.
+- CUDA regression still needs a remote Linux/NVIDIA host even though the local Zig toolchain and substrate validation are now complete.
 
 ## Learnings
 
@@ -59,6 +59,6 @@ Pending remote CUDA run.
 
 ## Notes
 
-- What changed in the code since baseline: introduced `crates/kv-native-sys` and routed `infer/src/kv_tier/transport/disk.rs` through it.
+- What changed in the code since baseline: introduced `crates/kv-native-sys`, routed `infer/src/kv_tier/transport/disk.rs` through it, and added local substrate APIs for WAL/mmap/shm plus repository-native Zig setup/validation scripts.
 - Suspected cause of any regression: none expected; change is off hot-path for steady-state decode.
 - Follow-ups: run the canonical CUDA regression check once Zig-backed build verification is complete.

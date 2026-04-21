@@ -13,10 +13,15 @@ cd "${REPO_ROOT}"
 info() { echo "[check_kv_zig] $*"; }
 
 info "validating Zig toolchain"
-./scripts/setup_zig_toolchain.sh
+export ZIG
+ZIG="$(./scripts/setup_zig_toolchain.sh --print-zig)"
+info "using ZIG=${ZIG}"
 
 info "cargo check -p kv-native-sys"
 cargo check -p kv-native-sys
+
+info "cargo test -p kv-native-sys"
+cargo test -p kv-native-sys
 
 info "cargo clippy -p kv-native-sys -- -D warnings"
 cargo clippy -p kv-native-sys -- -D warnings

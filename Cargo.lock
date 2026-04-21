@@ -1815,6 +1815,9 @@ dependencies = [
 [[package]]
 name = "kv-native-sys"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "leb128fmt"
