@@ -18,7 +18,7 @@ use crate::types::BlockId;
 
 use super::tier::BlockLocation;
 use super::transport::disk::DiskStore;
-use super::{StagePlanner, StageRequest, StageTicket};
+use super::{StageRequest, StageTicket};
 
 /// Request handed to the coordinator for a T1 → T2 spill.
 ///
@@ -141,10 +141,7 @@ impl CoordinatorHandle {
         Some(ticket)
     }
 
-}
-
-impl StagePlanner for CoordinatorHandle {
-    fn stage(&self, requests: &[StageRequest]) -> Option<StageTicket> {
+    pub fn stage(&self, requests: &[StageRequest]) -> Option<StageTicket> {
         if requests.is_empty() {
             return None;
         }
@@ -466,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_or_stage_with_coordinator_emits_queued_then_completed_events() {
+    fn stage_with_coordinator_emits_queued_then_completed_events() {
         let mut cache = RadixCache::with_soft_pin_keepalive(4, 64);
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
         cache.insert(&tokens, &[BlockId(10), BlockId(20)]);
@@ -474,12 +471,17 @@ mod tests {
         assert!(cache.set_block_byte_len(BlockId(10), 8192));
 
         let (coordinator, handle, events) = Coordinator::new(4);
-        let outcome = cache.lookup_or_stage(
-            &tokens,
-            crate::kv_tier::LookupHeuristics::default(),
-            Some(&handle),
-        );
-        let ticket = outcome.staging_ticket.expect("staging ticket");
+        let outcome = cache.lookup_or_stage(&tokens, crate::kv_tier::LookupHeuristics::default());
+        assert_eq!(outcome.matched_len, 8);
+        let ticket = handle
+            .stage(&[StageRequest {
+                block_id: BlockId(10),
+                from: BlockLocation::HostPinned { offset: 0 },
+                byte_len: 8192,
+                host_pool: None,
+                host_region: None,
+            }])
+            .expect("staging ticket");
 
         assert!(coordinator.run_once().unwrap());
         assert_eq!(

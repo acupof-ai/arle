@@ -61,10 +61,9 @@
 //!    carry `Option<BlockFingerprint>` — `None` for transient
 //!    in-memory blocks.
 //!
-//! 3. **Only the coordinator (not yet implemented, M3+) moves blocks
-//!    between tiers.** The scheduler's role is to emit intents
-//!    (`Demote`, `Promote`, `Pin`, `Unpin`); the coordinator owns the
-//!    CUDA copy stream and the disk / remote IO queue.
+//! 3. **Only the coordinator moves blocks between tiers.** The scheduler
+//!    decides *which* blocks should stage or spill; the coordinator owns
+//!    the byte-moving work and emits completion events.
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
 //!    registered memory regions to be allocation-stable. The planned
@@ -126,7 +125,7 @@ pub use coordinator::{Coordinator, CoordinatorCommand, CoordinatorEvent, Coordin
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
 pub use lookup::{
-    HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StagePlanner, StageRequest, StageTicket,
+    HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StageRequest, StageTicket,
 };
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};
