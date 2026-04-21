@@ -11,11 +11,13 @@ use super::mlx::{
 use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
 use super::weights::{StackedQuantized, load_quantized_with_bits, load_stacked_quantized};
 use super::{
-    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
-    MlpInputProjection, WeightTensor, clear_metal_cache, extend_kv_cache, gpu_sample_token, linear,
-    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
-    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
+    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig,
+    MetalQwen35LayerType, MlpInputProjection, WeightTensor, clear_metal_cache, dflash,
+    extend_kv_cache, gpu_sample_token, linear, load_embed_tokens_from_tensors,
+    load_proj_from_tensors, load_tensor_map, merge_quantized_projection_rows, tensor_get,
+    tie_lm_head_from_embed_tokens,
 };
+use crate::backend::metal::dflash::MetalDflashRuntime;
 use crate::backend::is_stream_stop_matched;
 use crate::sampler::SamplingParams;
 
@@ -130,6 +132,45 @@ impl Drop for CppQwen35Model {
     }
 }
 unsafe impl Send for CppQwen35Model {}
+
+fn capture_qwen35_hidden_from_cpp_outputs(
+    cpp_model_raw: *mut std::ffi::c_void,
+    expected_layers: usize,
+) -> Result<Option<MlxArray>> {
+    let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model_raw) };
+    if n_cap <= 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        n_cap as usize == expected_layers,
+        "Qwen3.5 DFlash captured hidden mismatch: expected {expected_layers}, got {n_cap}"
+    );
+
+    let mut layers: Vec<MlxArray> = Vec::with_capacity(expected_layers);
+    for ci in 0..n_cap {
+        let mut hidden_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let rc =
+            unsafe { mlx_sys::qwen35_get_captured_hidden(cpp_model_raw, ci, &raw mut hidden_ptr) };
+        anyhow::ensure!(
+            rc == 0 && !hidden_ptr.is_null(),
+            "Qwen3.5 DFlash failed to capture hidden state {ci}"
+        );
+        layers.push(unsafe { MlxArray::from_raw(hidden_ptr) });
+    }
+
+    let squeezed: Vec<MlxArray> = layers
+        .iter()
+        .map(|hidden| {
+            let shape = hidden.shape();
+            if shape.len() == 3 {
+                super::mlx::reshape(hidden, &[shape[1], shape[2]])
+            } else {
+                hidden.clone()
+            }
+        })
+        .collect();
+    Ok(Some(concatenate_axis(&squeezed, 1)))
+}
 
 fn use_qwen35_cpp_separate_proj() -> bool {
     std::env::var("AGENT_INFER_QWEN35_CPP_SEPARATE")
@@ -1136,6 +1177,7 @@ pub(super) fn metal_generate_qwen35(
     input_ids: &[u32],
     weights: &Qwen35MetalWeights,
     config: &MetalModelConfig,
+    dflash_runtime: Option<&MetalDflashRuntime>,
     params: &SamplingParams,
     max_new_tokens: usize,
     t0: Instant,
@@ -1157,6 +1199,20 @@ pub(super) fn metal_generate_qwen35(
     let MetalModelArch::Qwen35(arch) = &config.arch else {
         anyhow::bail!("Qwen3.5 Metal path requires a Qwen3.5 config");
     };
+
+    if let Some(runtime) = dflash_runtime {
+        return metal_generate_qwen35_dflash(
+            runtime,
+            input_ids,
+            weights,
+            config,
+            arch,
+            params,
+            max_new_tokens,
+            t0,
+            on_token,
+        );
+    }
 
     // C++ full generate path — entire decode loop in C++ for maximum GPU buffer reuse.
     if let Some(ref cpp_model) = weights.cpp_model {
@@ -1216,13 +1272,13 @@ pub(super) fn metal_generate_qwen35(
         initial_cap,
         config.head_dim as i32,
     ];
-    let mut kv_capacity = initial_cap;
     let mut k_caches: Vec<MlxArray> = (0..num_full_layers)
         .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
         .collect();
     let mut v_caches: Vec<MlxArray> = (0..num_full_layers)
         .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
         .collect();
+    let mut kv_capacity = cache_shape[2];
 
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
@@ -1408,6 +1464,168 @@ pub(super) fn metal_generate_qwen35(
         finish_reason,
         ttft_ms,
         total_time_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn metal_generate_qwen35_dflash(
+    runtime: &MetalDflashRuntime,
+    input_ids: &[u32],
+    weights: &Qwen35MetalWeights,
+    config: &MetalModelConfig,
+    arch: &MetalQwen35ArchConfig,
+    params: &SamplingParams,
+    max_new_tokens: usize,
+    t0: Instant,
+    on_token: &mut impl FnMut(u32) -> Result<()>,
+) -> Result<super::MetalGenerateOutput> {
+    let cpp_model = weights
+        .cpp_model
+        .as_ref()
+        .context("Qwen3.5/Qwen3.6 DFlash requires the compiled C++ model")?;
+
+    let num_full_layers = arch.num_full_attention_layers();
+    let prefill_len = input_ids.len() as i32;
+    let initial_cap = ((prefill_len + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK + 1) * KV_CACHE_CHUNK;
+    let cache_shape = [
+        1i32,
+        config.num_key_value_heads as i32,
+        initial_cap.max(KV_CACHE_CHUNK),
+        config.head_dim as i32,
+    ];
+    let k_caches: Vec<MlxArray> = (0..num_full_layers)
+        .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+        .collect();
+    let v_caches: Vec<MlxArray> = (0..num_full_layers)
+        .map(|_| zeros(&cache_shape, Dtype::Bfloat16))
+        .collect();
+    let mut kv_capacity = cache_shape[2];
+    let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+    let mut cache_len = 0i32;
+    let mut logits = None;
+    let capture_layer_ids: Vec<i32> = runtime
+        .target_layer_ids()
+        .iter()
+        .map(|&idx| idx as i32)
+        .collect();
+    let mut target_hidden = None;
+
+    let mut kv_flat: Vec<MlxArray> = k_caches
+        .iter()
+        .zip(v_caches.iter())
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    let mut gdr_flat: Vec<MlxArray> = recurrent
+        .states
+        .iter()
+        .zip(recurrent.conv_states.iter())
+        .flat_map(|(s, c)| [s.clone(), c.clone()])
+        .collect();
+
+    for (idx, &token) in input_ids.iter().enumerate() {
+        let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
+        if idx + 1 == input_ids.len() {
+            unsafe {
+                mlx_sys::qwen35_set_capture_layers(
+                    cpp_model.as_raw(),
+                    capture_layer_ids.as_ptr(),
+                    capture_layer_ids.len() as i32,
+                );
+            }
+        }
+        let step_logits = cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)?;
+        if idx + 1 == input_ids.len() {
+            unsafe { mlx_sys::qwen35_set_capture_layers(cpp_model.as_raw(), std::ptr::null(), 0) };
+            target_hidden =
+                capture_qwen35_hidden_from_cpp_outputs(cpp_model.as_raw(), runtime.target_layer_ids().len())?;
+        } else {
+            let mut outputs: Vec<&MlxArray> = Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            outputs.push(&step_logits);
+            outputs.extend(kv_flat.iter());
+            outputs.extend(gdr_flat.iter());
+            super::mlx::eval(&outputs);
+        }
+        logits = Some(step_logits);
+        cache_len += 1;
+        recurrent.seq_len = cache_len as usize;
+    }
+
+    let logits = logits.context("Qwen3.5 prompt produced no logits")?;
+    let mut current_token = gpu_sample_token(&logits, params).item_i32() as u32;
+    let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut generated = vec![current_token];
+    on_token(current_token)?;
+    if config.is_stop_token(current_token) || generated.len() >= max_new_tokens {
+        return Ok(super::MetalGenerateOutput {
+            tokens: generated,
+            finish_reason: if config.is_stop_token(current_token) {
+                "stop"
+            } else {
+                "length"
+            },
+            ttft_ms,
+            total_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    let mut draft_state = dflash::ContiguousKvState::new(
+        runtime.draft_num_hidden_layers(),
+        runtime.draft_n_kv_heads(),
+        runtime.draft_head_dim(),
+        input_ids.len() + max_new_tokens,
+    );
+    let mut target_hidden =
+        target_hidden.context("Qwen3.5/Qwen3.6 DFlash prefill did not capture target_hidden")?;
+
+    let finish_reason = 'decode: loop {
+        let needed_cap = cache_len
+            + i32::try_from(runtime.block_size()).context("Qwen3.5 DFlash block_size overflow")?;
+        if needed_cap > kv_capacity {
+            let new_cap = ((needed_cap + KV_CACHE_CHUNK - 1) / KV_CACHE_CHUNK) * KV_CACHE_CHUNK;
+            for cache in &mut kv_flat {
+                extend_kv_cache(
+                    cache,
+                    config.num_key_value_heads as i32,
+                    config.head_dim as i32,
+                    new_cap,
+                );
+            }
+            kv_capacity = new_cap;
+        }
+
+        let block = dflash::qwen35_dflash_speculative_block(
+            runtime,
+            current_token,
+            &target_hidden,
+            &weights.embed_tokens,
+            &weights.lm_head,
+            config,
+            cpp_model,
+            params,
+            &mut kv_flat,
+            &mut gdr_flat,
+            &mut cache_len,
+            &mut draft_state,
+        )?;
+        target_hidden = block.updated_target_hidden;
+        for token in block.accepted_tokens {
+            current_token = token;
+            generated.push(token);
+            on_token(token)?;
+            if config.is_stop_token(token) {
+                break 'decode "stop";
+            }
+            if generated.len() >= max_new_tokens {
+                break 'decode "length";
+            }
+        }
+    };
+
+    Ok(super::MetalGenerateOutput {
+        tokens: generated,
+        finish_reason,
+        ttft_ms,
+        total_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
 

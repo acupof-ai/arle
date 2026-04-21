@@ -158,6 +158,9 @@ fn default_draft_for_target(model: &str) -> Option<&'static str> {
     if lower.contains("qwen3.5-4b") || lower.contains("qwen35-4b") {
         return Some("z-lab/Qwen3.5-4B-DFlash");
     }
+    if lower.contains("qwen3.6-35b-a3b") || lower.contains("qwen3.5-35b-a3b") {
+        return Some("z-lab/Qwen3.6-35B-A3B-DFlash");
+    }
     // Qwen3-4B-bf16 (or -b16) → z-lab/Qwen3-4B-DFlash-b16
     if lower.contains("qwen3-4b") && (lower.contains("bf16") || lower.contains("-b16")) {
         return Some("z-lab/Qwen3-4B-DFlash-b16");
@@ -1045,6 +1048,14 @@ mod tests {
         assert_eq!(
             super::default_draft_for_target("models/Qwen3.5-4B"),
             Some("z-lab/Qwen3.5-4B-DFlash")
+        );
+    }
+
+    #[test]
+    fn baseline_compare_default_draft_qwen36_a3b() {
+        assert_eq!(
+            super::default_draft_for_target("mlx-community/Qwen3.6-35B-A3B-4bit"),
+            Some("z-lab/Qwen3.6-35B-A3B-DFlash")
         );
     }
 

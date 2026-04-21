@@ -33,8 +33,6 @@ use std::time::Instant;
 
 #[cfg(feature = "metal")]
 use anyhow::anyhow;
-#[cfg(feature = "metal")]
-use anyhow::bail;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "metal")]
@@ -340,25 +338,28 @@ impl MetalBackend {
             let t0 = Instant::now();
 
             let generated = if let Some(runtime) = self.dflash.as_ref() {
-                let weights = match weights {
-                    MetalWeights::Qwen3(weights) => weights,
-                    MetalWeights::Qwen35(_) => {
-                        bail!(
-                            "Metal DFlash draft '{}' is currently available for Qwen3 targets only",
-                            runtime.draft_model_id()
-                        );
-                    }
-                };
-                dflash::metal_generate_dflash_qwen3(
-                    runtime,
-                    input_ids,
-                    weights,
-                    config,
-                    params,
-                    max_new_tokens,
-                    t0,
-                    &mut on_token,
-                )?
+                match weights {
+                    MetalWeights::Qwen3(weights) => dflash::metal_generate_dflash_qwen3(
+                        runtime,
+                        input_ids,
+                        weights,
+                        config,
+                        params,
+                        max_new_tokens,
+                        t0,
+                        &mut on_token,
+                    )?,
+                    MetalWeights::Qwen35(weights) => metal_generate_qwen35(
+                        input_ids,
+                        weights,
+                        config,
+                        Some(runtime),
+                        params,
+                        max_new_tokens,
+                        t0,
+                        &mut on_token,
+                    )?,
+                }
             } else {
                 match weights {
                     MetalWeights::Qwen3(weights) => self::generate::metal_generate(
@@ -383,6 +384,7 @@ impl MetalBackend {
                         },
                         weights,
                         config,
+                        None,
                         params,
                         max_new_tokens,
                         t0,

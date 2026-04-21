@@ -256,6 +256,11 @@ pub(crate) fn check_compatibility(
     draft: &DFlashDraftConfig,
     draft_model_id: &str,
 ) -> std::result::Result<(), DflashCompatError> {
+    let target_q_width = target.num_attention_heads.saturating_mul(target.head_dim);
+    let draft_q_width = draft.num_attention_heads.saturating_mul(draft.head_dim);
+    let target_kv_width = target.num_key_value_heads.saturating_mul(target.head_dim);
+    let draft_kv_width = draft.num_key_value_heads.saturating_mul(draft.head_dim);
+
     if !matches!(
         target.arch,
         MetalModelArch::Qwen3 | MetalModelArch::Qwen35(_)
@@ -296,34 +301,38 @@ pub(crate) fn check_compatibility(
             ),
         });
     }
-    if draft.num_attention_heads != target.num_attention_heads {
+    if draft_q_width != target_q_width {
         return Err(DflashCompatError::FieldMismatch {
-            field: "num_attention_heads",
-            target: target.num_attention_heads.to_string(),
-            draft: draft.num_attention_heads.to_string(),
+            field: "q_proj_width",
+            target: format!(
+                "{}x{}={}",
+                target.num_attention_heads, target.head_dim, target_q_width
+            ),
+            draft: format!(
+                "{}x{}={}",
+                draft.num_attention_heads, draft.head_dim, draft_q_width
+            ),
             suggestion: format!(
-                "use a draft with num_attention_heads={}",
-                target.num_attention_heads
+                "use a draft whose num_attention_heads*head_dim equals {}",
+                target_q_width
             ),
         });
     }
-    if draft.num_key_value_heads != target.num_key_value_heads {
+    if draft_kv_width != target_kv_width {
         return Err(DflashCompatError::FieldMismatch {
-            field: "num_key_value_heads",
-            target: target.num_key_value_heads.to_string(),
-            draft: draft.num_key_value_heads.to_string(),
-            suggestion: format!(
-                "use a draft with num_key_value_heads={}",
-                target.num_key_value_heads
+            field: "kv_proj_width",
+            target: format!(
+                "{}x{}={}",
+                target.num_key_value_heads, target.head_dim, target_kv_width
             ),
-        });
-    }
-    if draft.head_dim != target.head_dim {
-        return Err(DflashCompatError::FieldMismatch {
-            field: "head_dim",
-            target: target.head_dim.to_string(),
-            draft: draft.head_dim.to_string(),
-            suggestion: format!("use a draft with head_dim={}", target.head_dim),
+            draft: format!(
+                "{}x{}={}",
+                draft.num_key_value_heads, draft.head_dim, draft_kv_width
+            ),
+            suggestion: format!(
+                "use a draft whose num_key_value_heads*head_dim equals {}",
+                target_kv_width
+            ),
         });
     }
     Ok(())
@@ -3558,13 +3567,24 @@ mod tests {
     }
 
     #[test]
-    fn compat_check_head_counts_mismatch_named() {
+    fn compat_check_kv_projection_width_mismatch_named() {
         let target = synthetic_target_config();
         let mut draft = synthetic_draft_config();
         draft.num_key_value_heads = 4;
         let err = super::check_compatibility(&target, &draft, "synthetic/draft")
-            .expect_err("should reject mismatched num_key_value_heads");
-        assert!(err.to_string().contains("num_key_value_heads"));
+            .expect_err("should reject mismatched kv projection width");
+        assert!(err.to_string().contains("kv_proj_width"));
+    }
+
+    #[test]
+    fn compat_check_rebucketed_heads_are_accepted_when_widths_match() {
+        let target = synthetic_target_config();
+        let mut draft = synthetic_draft_config();
+        draft.num_attention_heads = 32;
+        draft.num_key_value_heads = 4;
+        draft.head_dim = 64;
+        super::check_compatibility(&target, &draft, "synthetic/draft")
+            .expect("same q/kv projection widths should be accepted");
     }
 
     #[test]
