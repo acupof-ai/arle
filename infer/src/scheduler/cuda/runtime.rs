@@ -15,6 +15,17 @@ struct FetchWaiter {
     staged_prefix: crate::kv_tier::ReadmissionPlan,
 }
 
+#[derive(Clone)]
+struct PrefixAdmissionPlan {
+    radix_blocks: Vec<crate::prefix_cache::BlockId>,
+    lookup: crate::kv_tier::LookupOutcome,
+    reusable: Option<(usize, usize, usize)>,
+    direct_gpu_attach: bool,
+    gpu_ready_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
+    attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
+    staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
+}
+
 pub(super) fn best_reusable_slot_for_radix_hit(
     matched_blocks: &[crate::prefix_cache::BlockId],
     free_slots: &[usize],
@@ -73,6 +84,89 @@ fn finish_rejected_request(
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    /// Canonical admission decision for one incoming prompt.
+    ///
+    /// Order matters and is intentionally centralized here so the runtime and
+    /// docs stay in sync:
+    ///
+    /// 1. `lookup_or_stage()` classifies each matched radix block as
+    ///    `ReadyOnGpu`, `StagingFromHost`, `StagingFromDisk`, or `Miss`.
+    /// 2. If every matched block is already runnable on T0 and the model uses
+    ///    the paged pool, prefer direct GPU page attachment.
+    /// 3. Otherwise, if the model uses the paged pool and some matched blocks
+    ///    live below T0, build a staged readmission plan.
+    /// 4. Otherwise, fall back to the older same-slot contiguous reuse path if
+    ///    a free slot still materializes the radix-owned prefix.
+    /// 5. Any staged / non-runnable hit that cannot progress immediately
+    ///    degrades to cold prefill rather than leaving a second parked path.
+    fn build_prefix_admission_plan(
+        &mut self,
+        prompt_tokens: &[u32],
+        free_slots: &[usize],
+    ) -> PrefixAdmissionPlan {
+        let lookup = self
+            .prefix_cache
+            .lookup_or_stage(prompt_tokens, crate::kv_tier::LookupHeuristics::default());
+        let radix_blocks: Vec<_> = lookup
+            .blocks
+            .iter()
+            .filter_map(|block| block.block_id)
+            .collect();
+        let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
+        let gpu_ready_prefix_blocks: Vec<_> = lookup
+            .blocks
+            .iter()
+            .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+            .filter_map(|block| block.block_id)
+            .collect();
+        let staged_prefix_plan = if self.model.prefill_uses_paged_pool()
+            && !lookup.recompute_advised
+            && !ready_on_gpu
+            && lookup.blocks.iter().any(|block| {
+                matches!(
+                    block.hit_kind,
+                    crate::kv_tier::HitKind::StagingFromHost
+                        | crate::kv_tier::HitKind::StagingFromDisk
+                )
+            }) {
+            self.build_staged_prefix_plan(&lookup)
+        } else {
+            None
+        };
+        let direct_gpu_attach = self.model.prefill_uses_paged_pool()
+            && !lookup.recompute_advised
+            && !gpu_ready_prefix_blocks.is_empty()
+            && ready_on_gpu
+            && staged_prefix_plan.is_none();
+        let reusable_gpu_prefix = if direct_gpu_attach || staged_prefix_plan.is_some() {
+            None
+        } else if ready_on_gpu && !lookup.recompute_advised {
+            best_reusable_slot_for_radix_hit(
+                &gpu_ready_prefix_blocks,
+                free_slots,
+                &self.block_owner_slots,
+                &self.slot_materialized_prompt_lens,
+                self.prefix_cache.block_size(),
+            )
+        } else {
+            None
+        };
+
+        PrefixAdmissionPlan {
+            radix_blocks,
+            lookup,
+            reusable: reusable_gpu_prefix,
+            direct_gpu_attach,
+            gpu_ready_prefix_blocks: gpu_ready_prefix_blocks.clone(),
+            attached_prefix_blocks: if direct_gpu_attach {
+                gpu_ready_prefix_blocks
+            } else {
+                Vec::new()
+            },
+            staged_prefix_plan,
+        }
+    }
+
     fn fallback_to_cold_prefill(&mut self, slot_idx: usize) {
         self.fallback_to_cold_prefill_inner(slot_idx, true);
     }
@@ -341,6 +435,12 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn drain_coordinator_events(&mut self) {
+        // The runtime consumes coordinator results in one place so the request
+        // state machine stays linear:
+        // - `Store*` mutates prefix-cache store state and releases T1 regions
+        // - `FetchCompleted` promotes staged bytes into T0, then re-enters the
+        //   normal prefill path
+        // - `FetchFailed` always falls back to cold prefill
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
@@ -620,89 +720,38 @@ impl<M: ModelForward> Scheduler<M> {
             incoming.max_tokens =
                 length_contract.clamp_max_tokens(prompt_tokens.len(), incoming.max_tokens);
 
-            let lookup = self
-                .prefix_cache
-                .lookup_or_stage(&prompt_tokens, crate::kv_tier::LookupHeuristics::default());
-            let radix_blocks: Vec<_> = lookup
-                .blocks
-                .iter()
-                .filter_map(|block| block.block_id)
-                .collect();
-            let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
-            let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
-                lookup.matched_len
+            let plan = self.build_prefix_admission_plan(&prompt_tokens, &free_slots);
+            let ready_on_gpu = lookup_blocks_ready_on_gpu(&plan.lookup.blocks);
+            let radix_hit_len = if ready_on_gpu && !plan.lookup.recompute_advised {
+                plan.lookup.matched_len
             } else {
                 0
             };
-            let gpu_ready_prefix_blocks: Vec<_> = lookup
-                .blocks
-                .iter()
-                .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
-                .filter_map(|block| block.block_id)
-                .collect();
-            let staged_prefix_plan = if self.model.prefill_uses_paged_pool()
-                && !lookup.recompute_advised
-                && !ready_on_gpu
-                && lookup.blocks.iter().any(|block| {
-                    matches!(
-                        block.hit_kind,
-                        crate::kv_tier::HitKind::StagingFromHost
-                            | crate::kv_tier::HitKind::StagingFromDisk
-                    )
-                }) {
-                self.build_staged_prefix_plan(&lookup)
-            } else {
-                None
-            };
-            let direct_gpu_attach = self.model.prefill_uses_paged_pool()
-                && !lookup.recompute_advised
-                && !gpu_ready_prefix_blocks.is_empty()
-                && ready_on_gpu
-                && staged_prefix_plan.is_none();
-            let reusable_gpu_prefix = best_reusable_slot_for_radix_hit(
-                &gpu_ready_prefix_blocks,
-                &free_slots,
-                &self.block_owner_slots,
-                &self.slot_materialized_prompt_lens,
-                self.prefix_cache.block_size(),
-            );
-            let reusable = if direct_gpu_attach || staged_prefix_plan.is_some() {
-                None
-            } else if ready_on_gpu && !lookup.recompute_advised {
-                reusable_gpu_prefix
-            } else {
-                None
-            };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
-                reusable.unwrap_or((free_slots[0], 0, 0));
-            let attached_prefix_blocks = if direct_gpu_attach {
-                gpu_ready_prefix_blocks.clone()
-            } else {
-                Vec::new()
-            };
-            if attached_prefix_blocks.is_empty() && staged_prefix_plan.is_none() {
-                self.prefix_cache.release(&radix_blocks);
+                plan.reusable.unwrap_or((free_slots[0], 0, 0));
+            if plan.attached_prefix_blocks.is_empty() && plan.staged_prefix_plan.is_none() {
+                self.prefix_cache.release(&plan.radix_blocks);
             }
 
             let id = self.next_id;
             self.next_id += 1;
 
-            if let Some(plan) = staged_prefix_plan.as_ref() {
+            if let Some(staged) = plan.staged_prefix_plan.as_ref() {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, staged_prefix={}, queue={})",
                     id,
                     slot_idx,
                     prompt_tokens.len(),
-                    plan.matched_len,
+                    staged.matched_len,
                     self.waiting.len()
                 );
-            } else if direct_gpu_attach {
+            } else if plan.direct_gpu_attach {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, radix_gpu_attach={}, queue={})",
                     id,
                     slot_idx,
                     prompt_tokens.len(),
-                    lookup.matched_len,
+                    plan.lookup.matched_len,
                     self.waiting.len()
                 );
             } else if reusable_prefix_len > 0 {
@@ -718,10 +767,10 @@ impl<M: ModelForward> Scheduler<M> {
                 );
             } else {
                 let bytes_not_on_gpu =
-                    lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised);
-                let no_reusable_free_slot = lookup.matched_len > 0
-                    && !gpu_ready_prefix_blocks.is_empty()
-                    && reusable_gpu_prefix.is_none();
+                    plan.lookup.matched_len > 0 && (!ready_on_gpu || plan.lookup.recompute_advised);
+                let no_reusable_free_slot = plan.lookup.matched_len > 0
+                    && !plan.gpu_ready_prefix_blocks.is_empty()
+                    && plan.reusable.is_none();
                 // A radix match is only reusable when the bytes already live in
                 // T0 and a free slot still materializes that prefix. When
                 // either precondition fails we degrade to cold prefill, but we
@@ -733,7 +782,7 @@ impl<M: ModelForward> Scheduler<M> {
                         id,
                         slot_idx,
                         prompt_tokens.len(),
-                        lookup.matched_len,
+                        plan.lookup.matched_len,
                         bytes_not_on_gpu,
                         no_reusable_free_slot,
                         self.waiting.len()
@@ -765,7 +814,13 @@ impl<M: ModelForward> Scheduler<M> {
                 full_decoded: String::new(),
                 decoded_token_count: 0,
                 sent_len: 0,
-                phase: if staged_prefix_plan.is_some() {
+                phase: if plan.staged_prefix_plan.is_some() {
+                    // WaitingFetch is the only parked state left in the CUDA
+                    // scheduler. It exists solely for staged KV readmission and
+                    // always resolves to either:
+                    // 1. `FetchCompleted` -> promote into T0 -> Prefilling
+                    // 2. `FetchFailed` / queue saturation / invalid plan ->
+                    //    cold Prefilling fallback
                     Phase::WaitingFetch
                 } else {
                     Phase::Prefilling {
@@ -777,14 +832,14 @@ impl<M: ModelForward> Scheduler<M> {
                 cacheable_prompt_len: 0,
                 prefix_byte_len: 0,
                 latest_logprob: None,
-                reusable_prefix_len: if direct_gpu_attach {
-                    lookup.matched_len
+                reusable_prefix_len: if plan.direct_gpu_attach {
+                    plan.lookup.matched_len
                 } else {
                     reusable_prefix_len
                 },
                 reusable_cached_prompt_len,
-                attached_prefix_blocks,
-                staged_prefix: staged_prefix_plan,
+                attached_prefix_blocks: plan.attached_prefix_blocks.clone(),
+                staged_prefix: plan.staged_prefix_plan.clone(),
             });
             if incoming.max_tokens == 0 {
                 self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
