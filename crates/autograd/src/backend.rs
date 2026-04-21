@@ -32,6 +32,18 @@ struct MlxHandleInner {
 }
 
 #[cfg(feature = "metal")]
+// Safety: `MlxHandleInner` is just an opaque MLX array pointer. All MLX FFI
+// access in this crate is serialized through `backend_metal.rs`'s
+// `MLX_GUARD`, so moving or sharing the pointer wrapper across threads does
+// not introduce unsynchronized MLX calls.
+unsafe impl Send for MlxHandleInner {}
+
+#[cfg(feature = "metal")]
+// Safety: see the `Send` impl above. Shared access only hands the opaque
+// pointer back to MLX while holding `MLX_GUARD`.
+unsafe impl Sync for MlxHandleInner {}
+
+#[cfg(feature = "metal")]
 impl MlxHandle {
     pub(crate) fn from_raw(ptr: *mut mlx_sys::mlx_array) -> Self {
         Self {

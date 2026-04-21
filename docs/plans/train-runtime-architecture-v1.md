@@ -300,7 +300,7 @@ step_000123/
 - ✅ CheckpointCodec v2 directory layout in `crates/train/src/checkpoint.rs`.
 - ✅ **`train_sft.rs` migrated onto Trainer** (commits 44a7e19 + ad5568b + 49512b1). Binary ~250 LOC on the trainer, with `--lr-schedule`, `--warmup-steps`, `--min-lr`, `--grad-accum-steps`, `--metrics-jsonl`, `--resume-from` all wired. `--resume-from` roundtrips end-to-end: Trainer writes `trainer_state.json + optimizer.safetensors`, binary writes `model.safetensors` to the same `step_{:06}/` dir; resume overrides base weights from `<resume_from>/model.safetensors` before restoring optimizer state (fixes P1 flagged in codex review of ad5568b).
 - ✅ Trainer step-level tests (15 tests in `crates/train/tests/test_trainer_loop.rs`) covering step counts, grad-accum, LR schedule wiring, metrics, save (incl. force-save on final step), eval-field omission, resume, legacy resume, force-emit on step 1 + final, hook firing, activation cleanup, full save→resume roundtrip.
-- ⏳ End-to-end 2-step SFT smoke test — pending remote runner w/ current compact fixture weights; historical validation for the Qwen3-era fixture path, not the target Qwen3.5-family line.
+- ✅ End-to-end 2-step SFT smoke test — CUDA remote validation landed on 2026-04-21 for the current Qwen-family train path (`train_sft -> eval_lm -> agent-infer -> resume` on `Qwen3-0.6B` and the generic dense/full-attn Qwen3.5-family flow). See `docs/experience/wins/2026-04-21-cuda-train-e2e-validation.md`.
 - ⏳ Bench: train_sft throughput on Metal before/after — pending remote (stub in `docs/experience/wins/2026-04-20-wave3-train-sft-trainer-migration.md`).
 
 ### Phase 3 — Migrate remaining 4 binaries
