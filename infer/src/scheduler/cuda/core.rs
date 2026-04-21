@@ -7,7 +7,8 @@ use super::{
 };
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::{
-    BlockLocation, ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource,
+    BlockLocation, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey, ReadmissionPlan,
+    ReadmissionSource, SharedFsStore, TieredKvPolicy,
 };
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
@@ -101,6 +102,8 @@ pub struct Scheduler<M: ModelForward> {
     /// materialized; cross-slot page aliasing is intentionally unsupported.
     pub(super) prefix_cache: RadixCache,
     pub(super) disk_store: Arc<DiskStore>,
+    pub(super) remote_store: Option<Arc<SharedFsStore>>,
+    pub(super) tier_policy: TieredKvPolicy,
     pub(super) host_pinned_pool: crate::kv_tier::SharedHostPinnedPool,
     /// Side map from `BlockId` → full contiguous page span for that
     /// block. The radix stores just the first page of each block
@@ -126,8 +129,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_handle: crate::kv_tier::CoordinatorHandle,
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
-    pub(super) spill_waiting:
-        HashMap<crate::kv_tier::SpillTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
+    pub(super) store_waiting:
+        HashMap<crate::kv_tier::StoreTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
     pub(super) fetch_waiting: HashMap<crate::kv_tier::FetchTicket, Vec<(usize, u64)>>,
     pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
     pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
@@ -282,7 +285,10 @@ impl<M: ModelForward> Scheduler<M> {
                         fingerprint: *fingerprint,
                         payload_len: *payload_len,
                     }),
-                    BlockLocation::Remote { .. } => return None,
+                    BlockLocation::Remote { desc } => Some(ReadmissionSource::Remote {
+                        desc: desc.clone(),
+                        payload_len: u64::from(metadata.byte_len),
+                    }),
                     _ => return None,
                 },
                 crate::kv_tier::HitKind::Miss => break,
@@ -351,7 +357,14 @@ impl<M: ModelForward> Scheduler<M> {
             if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                 self.fetch_dedupe.remove(&key);
             }
+            let _ = self.coordinator_handle.cancel_fetch(ticket);
         }
+    }
+
+    pub(super) fn coordinator_queue_stats(&self) -> CoordinatorQueueStats {
+        self.coordinator_handle
+            .stats()
+            .with_fetch_waiters(self.fetch_waiting.values().map(std::vec::Vec::len).sum())
     }
 
     pub(super) fn attach_gpu_prefix_blocks(
@@ -565,10 +578,16 @@ impl<M: ModelForward> Scheduler<M> {
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
         let disk_store = Arc::new(DiskStore::new(config.disk_store_root.clone()));
+        let remote_store = config
+            .shared_fs_store_root
+            .as_ref()
+            .map(|root| Arc::new(SharedFsStore::new(root.clone())));
+        let coordinator_queue_capacity = config.max_slots.max(16);
         let (coordinator, coordinator_handle, coordinator_events) =
-            crate::kv_tier::Coordinator::new_with_disk_store(
-                config.max_slots.max(16),
-                Arc::clone(&disk_store),
+            crate::kv_tier::Coordinator::new_with_backends(
+                coordinator_queue_capacity,
+                Some(Arc::clone(&disk_store)),
+                remote_store.clone(),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
         let max_slots = config.max_slots;
@@ -587,6 +606,8 @@ impl<M: ModelForward> Scheduler<M> {
                 prefix_cache_keepalive_ticks,
             ),
             disk_store,
+            remote_store,
+            tier_policy: TieredKvPolicy::default(),
             host_pinned_pool,
             block_to_pages: HashMap::new(),
             block_owner_slots: HashMap::new(),
@@ -594,7 +615,7 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_handle,
             coordinator_events,
             coordinator_thread,
-            spill_waiting: HashMap::new(),
+            store_waiting: HashMap::new(),
             fetch_waiting: HashMap::new(),
             fetch_dedupe: HashMap::new(),
             fetch_ticket_keys: HashMap::new(),
@@ -1144,6 +1165,11 @@ impl<M: ModelForward> Scheduler<M> {
             return 0;
         }
 
+        let coordinator_stats = self.coordinator_queue_stats();
+        if coordinator_stats.store_backpressured() {
+            return 0;
+        }
+
         let (reserved_bytes, target_reserved_bytes) = match self.host_pinned_pool.lock() {
             Ok(pool) => (
                 pool.reserved_bytes(),
@@ -1165,7 +1191,7 @@ impl<M: ModelForward> Scheduler<M> {
         );
         for block_id in candidates {
             if self
-                .spill_waiting
+                .store_waiting
                 .values()
                 .any(|(pending, _)| *pending == block_id)
             {
@@ -1180,18 +1206,26 @@ impl<M: ModelForward> Scheduler<M> {
             let Some(region) = Self::host_region_from_metadata(&metadata) else {
                 continue;
             };
-            let Some(ticket) = self.coordinator_handle.submit_spill(vec![
-                crate::kv_tier::coordinator::SpillRequest {
-                    block_id,
-                    fingerprint,
-                    kv_format_tag: self.kv_format_tag(),
-                    host_pool: self.host_pinned_pool.clone(),
-                    host_region: region,
-                },
-            ]) else {
+            let target = self.tier_policy.choose_store_target(
+                &metadata,
+                self.coordinator_handle.stats(),
+                self.remote_store.is_some(),
+            );
+            let Some(ticket) =
+                self.coordinator_handle
+                    .submit_store(vec![crate::kv_tier::StoreRequest {
+                        block_id,
+                        fingerprint,
+                        kv_format_tag: self.kv_format_tag(),
+                        host_pool: self.host_pinned_pool.clone(),
+                        host_region: region,
+                        target,
+                    }])
+            else {
                 break;
             };
-            self.spill_waiting.insert(ticket, (block_id, region));
+            let _ = self.prefix_cache.mark_block_store_pending(block_id);
+            self.store_waiting.insert(ticket, (block_id, region));
             spilled_bytes = spilled_bytes.saturating_add(metadata.byte_len as usize);
             if spilled_bytes >= bytes_to_spill {
                 break;
@@ -1723,6 +1757,7 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{can_publish_prefix_pages, prefix_cache_retain_hard_cap_pages};
+    use crate::kv_tier::{CoordinatorQueueStats, QueueControlStats};
 
     const HARD_CAP: f64 = 0.90;
 
@@ -1738,5 +1773,105 @@ mod tests {
         assert!(can_publish_prefix_pages(80, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(81, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(90, 100, 1, HARD_CAP));
+    }
+
+    #[test]
+    fn coordinator_queue_stats_reserve_submit_headroom() {
+        let stats = CoordinatorQueueStats {
+            capacity: 16,
+            total_queued: 14,
+            total_in_flight: 0,
+            plan: QueueControlStats {
+                capacity: 16,
+                queued: 0,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            fetch: QueueControlStats {
+                capacity: 16,
+                queued: 14,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            store: QueueControlStats {
+                capacity: 16,
+                queued: 14,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            fetch_waiters: 19,
+        };
+        assert!(!stats.fetch_backpressured());
+        assert!(!stats.store_backpressured());
+
+        let saturated = CoordinatorQueueStats {
+            fetch: QueueControlStats {
+                queued: 15,
+                ..stats.fetch
+            },
+            store: QueueControlStats {
+                queued: 15,
+                ..stats.store
+            },
+            fetch_waiters: 23,
+            total_queued: 15,
+            ..stats
+        };
+        assert!(saturated.fetch_backpressured());
+        assert!(saturated.store_backpressured());
+    }
+
+    #[test]
+    fn coordinator_queue_stats_ignore_zero_capacity() {
+        let stats = CoordinatorQueueStats {
+            capacity: 0,
+            total_queued: 8,
+            total_in_flight: 0,
+            plan: QueueControlStats {
+                capacity: 0,
+                queued: 0,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            fetch: QueueControlStats {
+                capacity: 0,
+                queued: 8,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            store: QueueControlStats {
+                capacity: 0,
+                queued: 8,
+                in_flight: 0,
+                submitted: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                rejected: 0,
+            },
+            fetch_waiters: 13,
+        };
+        assert!(!stats.fetch_backpressured());
+        assert!(!stats.store_backpressured());
     }
 }

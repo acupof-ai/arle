@@ -18,7 +18,12 @@ CacheOrchestrator` split, the `KVBlock / KVSpan / KVHandle` object model,
 the `PrefetchPlanQueue / FetchQueue / StoreQueue` pipeline, and the
 `L0/L1/L2/L3` physical hierarchy mapping. This task ledger remains the
 historical M0–M5 execution record; the new doc is the design SSOT for
-live readmission and cluster-shared L3 work.
+live readmission and cluster-shared L3 work. As of the current local CUDA
+slice, the shipped path also exposes coordinator fetch/store queue depth,
+waiters, backpressure, and cancellation in `ServerMetrics`, and it now
+includes a minimal shared-filesystem cluster-shared backend on the same
+fetch/store contract. Remaining work is remote CUDA validation plus the
+future RDMA/NIXL backend path.
 
 This doc carves every phase from the project plan into three lanes so the
 local Mac dev box and the remote CUDA host can both stay busy at all times.

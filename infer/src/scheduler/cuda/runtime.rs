@@ -156,7 +156,8 @@ impl<M: ModelForward> Scheduler<M> {
             match &block.source {
                 None => final_block_ids.push(block.block_id),
                 Some(ReadmissionSource::HostPinned { .. })
-                | Some(ReadmissionSource::Disk { .. }) => {
+                | Some(ReadmissionSource::Disk { .. })
+                | Some(ReadmissionSource::Remote { .. }) => {
                     let fetched = fetched_by_id.get(&block.block_id).copied().ok_or_else(|| {
                         anyhow::anyhow!(
                             "missing fetched host staging for staged prefix block {:?}",
@@ -342,32 +343,45 @@ impl<M: ModelForward> Scheduler<M> {
     fn drain_coordinator_events(&mut self) {
         loop {
             match self.coordinator_events.try_recv() {
-                Ok(
-                    crate::kv_tier::CoordinatorEvent::CommandQueued(_)
-                    | crate::kv_tier::CoordinatorEvent::SpillQueued { .. }
-                    | crate::kv_tier::CoordinatorEvent::FetchQueued { .. },
-                ) => {}
+                Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
+                | Ok(crate::kv_tier::CoordinatorEvent::SpillQueued { .. })
+                | Ok(crate::kv_tier::CoordinatorEvent::FetchQueued { .. }) => {}
+                Ok(crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. }) => {
+                    if let Some((block_id, _)) = self.store_waiting.get(&ticket).copied() {
+                        let _ = self.prefix_cache.mark_block_storing(block_id);
+                    }
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     error!("Coordinator event channel disconnected");
                     break;
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
-                    if let Some((block_id, region)) = self.spill_waiting.remove(&ticket) {
+                    if let Some((block_id, region)) = self.store_waiting.remove(&ticket) {
                         for (completed_block, location) in locations {
                             if completed_block != block_id {
                                 continue;
                             }
-                            let _ = self.prefix_cache.update_block_metadata(
+                            let _ = self.prefix_cache.mark_block_stored(
                                 block_id,
-                                BlockMetadataUpdate {
-                                    location: Some(crate::kv_tier::BlockLocation::Disk {
-                                        fingerprint: location.fingerprint,
-                                        payload_len: location.payload_len,
-                                    }),
-                                    ..BlockMetadataUpdate::default()
-                                },
+                                Some(crate::kv_tier::BlockLocation::Disk {
+                                    fingerprint: location.fingerprint,
+                                    payload_len: location.payload_len,
+                                }),
                             );
+                            self.release_host_region(region);
+                        }
+                    }
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations }) => {
+                    if let Some((block_id, region)) = self.store_waiting.remove(&ticket) {
+                        for (completed_block, location) in locations {
+                            if completed_block != block_id {
+                                continue;
+                            }
+                            let _ = self
+                                .prefix_cache
+                                .mark_block_stored(block_id, Some(location));
                             self.release_host_region(region);
                         }
                     }
@@ -381,7 +395,20 @@ impl<M: ModelForward> Scheduler<M> {
                         "Spill failed for ticket {} on block {:?}: {}",
                         ticket.0, failed_block, reason
                     );
-                    self.spill_waiting.remove(&ticket);
+                    self.store_waiting.remove(&ticket);
+                    let _ = self.prefix_cache.mark_block_store_failed(failed_block);
+                }
+                Ok(crate::kv_tier::CoordinatorEvent::StoreFailed {
+                    ticket,
+                    failed_block,
+                    reason,
+                }) => {
+                    warn!(
+                        "Store failed for ticket {} on block {:?}: {}",
+                        ticket.0, failed_block, reason
+                    );
+                    self.store_waiting.remove(&ticket);
+                    let _ = self.prefix_cache.mark_block_store_failed(failed_block);
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks }) => {
                     let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
@@ -502,6 +529,15 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_us = clean_t.elapsed().as_micros();
             self.metrics.set_active(self.active_len() as u64);
             self.metrics.set_waiting(self.waiting.len() as u64);
+            let coordinator_stats = self.coordinator_queue_stats();
+            self.metrics.set_kv_coordinator(
+                coordinator_stats.queue_capacity() as u64,
+                coordinator_stats.fetch_queue_depth() as u64,
+                coordinator_stats.fetch_waiters as u64,
+                coordinator_stats.store_queue_depth() as u64,
+                coordinator_stats.fetch_backpressured(),
+                coordinator_stats.store_backpressured(),
+            );
             if self.paged_kv_pool.is_active() {
                 // Both in token units so kv_util = (total-free)/total is correct.
                 let total =
@@ -777,10 +813,25 @@ impl<M: ModelForward> Scheduler<M> {
                     }
                     Some(fetch_key) => {
                         if let Some(ticket) = self.fetch_dedupe.get(&fetch_key).copied() {
+                            if let Some(req) = self.request_mut(slot_idx) {
+                                if let Some(plan) = req.staged_prefix.as_mut() {
+                                    plan.mark_fetching();
+                                }
+                            }
                             self.fetch_waiting
                                 .entry(ticket)
                                 .or_default()
                                 .push((slot_idx, id));
+                        } else if self.coordinator_queue_stats().fetch_backpressured() {
+                            let coordinator_stats = self.coordinator_queue_stats();
+                            warn!(
+                                "Request {}: staged fetch backpressured (fetch_q={}/{} waiters={}), falling back to cold prefill",
+                                id,
+                                coordinator_stats.fetch_queue_depth(),
+                                coordinator_stats.queue_capacity(),
+                                coordinator_stats.fetch_waiters,
+                            );
+                            self.fallback_to_cold_prefill(slot_idx);
                         } else if let Some(fetch_requests) =
                             staged_prefix.fetch_requests(&self.host_pinned_pool)
                         {
@@ -797,9 +848,13 @@ impl<M: ModelForward> Scheduler<M> {
                                 self.fetch_ticket_keys.insert(ticket, fetch_key);
                                 self.fetch_waiting.insert(ticket, vec![(slot_idx, id)]);
                             } else {
+                                let coordinator_stats = self.coordinator_queue_stats();
                                 warn!(
-                                    "Request {}: fetch queue full, falling back to cold prefill",
-                                    id
+                                    "Request {}: fetch queue full after submit attempt (fetch_q={}/{} waiters={}), falling back to cold prefill",
+                                    id,
+                                    coordinator_stats.fetch_queue_depth(),
+                                    coordinator_stats.queue_capacity(),
+                                    coordinator_stats.fetch_waiters,
                                 );
                                 self.fallback_to_cold_prefill(slot_idx);
                             }

@@ -84,6 +84,8 @@ pub struct SchedulerConfig {
     pub t1_host_pinned_keepalive_ticks: u64,
     /// Root directory used by the session snapshot disk store.
     pub disk_store_root: PathBuf,
+    /// Optional shared-filesystem root used as a minimal cluster-shared T2-remote backend.
+    pub shared_fs_store_root: Option<PathBuf>,
 }
 
 impl Default for SchedulerConfig {
@@ -114,6 +116,7 @@ impl Default for SchedulerConfig {
             t1_host_pinned_low_water: 0.70,
             t1_host_pinned_keepalive_ticks: 128,
             disk_store_root: std::env::temp_dir().join("infer-kv"),
+            shared_fs_store_root: None,
         }
     }
 }
@@ -423,6 +426,7 @@ mod tests {
         assert_eq!(cfg.t1_host_pinned_high_water, 0.85);
         assert_eq!(cfg.t1_host_pinned_low_water, 0.70);
         assert_eq!(cfg.t1_host_pinned_keepalive_ticks, 128);
+        assert_eq!(cfg.shared_fs_store_root, None);
         assert!(cfg.validate().is_ok());
     }
 
