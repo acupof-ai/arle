@@ -197,7 +197,7 @@ after confirming every `Agent*` type exactly duplicated a corresponding
 - `infer/src/block_manager.rs`: KV block accounting for the batch scheduler
 - `crates/cuda-kernels/src/paged_kv.rs`: token-level KV pool for CUDA paged attention (page-aware, BF16 `page_size=16`)
 - `infer/src/prefix_cache.rs`: radix-tree prefix cache for CUDA/runtime reuse; tier-aware `RadixNode` metadata (`hit_count`, `tier_location`, `session_id`, `fingerprint`, `soft_pin_until`, `byte_len`) + `lookup_or_stage` classification contract
-- `infer/src/kv_tier.rs` + `infer/src/kv_tier/{lookup,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); local path now combines radix metadata, direct GPU prefix attachment + decode-time COW in `paged_kv`, Zig-backed `HostPinnedPool` for T1 demotion, and `Coordinator`-driven T1→T2 spills. Live T1/T2 readmission is still intentionally absent.
+- `infer/src/kv_tier.rs` + `infer/src/kv_tier/{backend,chunk,io,lookup,readmission,coordinator,host_pool,transport,tier,id}.rs`: tiered KV cache module (T0 GPU → T1 host pinned → T2 NVMe → T3 NIXL); local path now combines radix metadata, direct GPU prefix attachment + decode-time COW in `paged_kv`, Zig-backed `HostPinnedPool` for T1 demotion, `ReadmissionPlan + WaitingFetch + promote_fetched_prefix` for local staged readmission, and `Coordinator`-driven T1→T2 spills. Cluster-shared backends remain stub-only.
 - `infer/src/memory_planner.rs`: memory planning helpers
 - `crates/cuda-kernels/src/graph_pool.rs`: CUDA graph capture/reuse support
 - `crates/cuda-kernels/src/flashinfer.rs`: paged-KV metadata staging for FlashInfer

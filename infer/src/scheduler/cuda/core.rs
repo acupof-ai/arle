@@ -5,8 +5,10 @@ use super::{
     Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
     error, info, mpsc, warn,
 };
-use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
+use crate::kv_tier::{
+    BlockLocation, ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource,
+};
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
 use crate::types::{BlockFingerprint, KvContentContext};
@@ -126,6 +128,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     pub(super) spill_waiting:
         HashMap<crate::kv_tier::SpillTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
+    pub(super) fetch_waiting: HashMap<crate::kv_tier::FetchTicket, Vec<(usize, u64)>>,
+    pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
+    pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
@@ -252,6 +257,48 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    pub(super) fn build_staged_prefix_plan(
+        &self,
+        lookup: &crate::kv_tier::LookupOutcome,
+    ) -> Option<ReadmissionPlan> {
+        let mut blocks = Vec::new();
+        for block in &lookup.blocks {
+            if matches!(block.hit_kind, crate::kv_tier::HitKind::Miss) {
+                break;
+            }
+            let block_id = block.block_id?;
+            let metadata = self.block_metadata(block_id)?;
+            let fingerprint = metadata.fingerprint?;
+            let source = match block.hit_kind {
+                crate::kv_tier::HitKind::ReadyOnGpu => None,
+                crate::kv_tier::HitKind::StagingFromHost => Some(ReadmissionSource::HostPinned {
+                    region: Self::host_region_from_metadata(&metadata)?,
+                }),
+                crate::kv_tier::HitKind::StagingFromDisk => match metadata.location.as_ref()? {
+                    BlockLocation::Disk {
+                        fingerprint,
+                        payload_len,
+                    } => Some(ReadmissionSource::Disk {
+                        fingerprint: *fingerprint,
+                        payload_len: *payload_len,
+                    }),
+                    BlockLocation::Remote { .. } => return None,
+                    _ => return None,
+                },
+                crate::kv_tier::HitKind::Miss => break,
+            };
+            blocks.push(ReadmissionBlock {
+                block_id,
+                fingerprint,
+                source,
+            });
+        }
+        if blocks.is_empty() {
+            return None;
+        }
+        Some(ReadmissionPlan::new(lookup.matched_len, blocks))
+    }
+
     fn host_pool_usage_fraction(&self) -> f64 {
         let Ok(pool) = self.host_pinned_pool.lock() else {
             return 1.0;
@@ -286,6 +333,24 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
         if let Ok(mut pool) = self.host_pinned_pool.lock() {
             pool.release(region);
+        }
+    }
+
+    pub(super) fn clear_fetch_waiting_for_slot(&mut self, slot_idx: usize, request_id: u64) {
+        let mut emptied = Vec::new();
+        for (ticket, waiters) in &mut self.fetch_waiting {
+            waiters.retain(|&(queued_slot, queued_id)| {
+                !(queued_slot == slot_idx && queued_id == request_id)
+            });
+            if waiters.is_empty() {
+                emptied.push(*ticket);
+            }
+        }
+        for ticket in emptied {
+            self.fetch_waiting.remove(&ticket);
+            if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
+                self.fetch_dedupe.remove(&key);
+            }
         }
     }
 
@@ -530,6 +595,9 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_events,
             coordinator_thread,
             spill_waiting: HashMap::new(),
+            fetch_waiting: HashMap::new(),
+            fetch_dedupe: HashMap::new(),
+            fetch_ticket_keys: HashMap::new(),
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
@@ -695,8 +763,12 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {
+        let request_id = self.request(slot_idx).map(|req| req.id);
         if let Some(req) = self.request_mut(slot_idx) {
             req.phase = Phase::Finished;
+        }
+        if let Some(request_id) = request_id {
+            self.clear_fetch_waiting_for_slot(slot_idx, request_id);
         }
         self.dequeue_prefill(slot_idx);
         self.dequeue_running(slot_idx);
@@ -964,6 +1036,7 @@ impl<M: ModelForward> Scheduler<M> {
                     byte_len: Some(block_byte_len),
                     session_id: Some(session_id.cloned()),
                     soft_pin_until: Some(keepalive_deadline),
+                    entry_state: None,
                 },
             );
         }

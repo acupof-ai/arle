@@ -52,6 +52,10 @@ impl BlockLocation {
             BlockLocation::Remote { .. } => Tier::Remote,
         }
     }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, BlockLocation::Remote { .. })
+    }
 }
 
 /// Opaque remote descriptor. The `transport` tag identifies which

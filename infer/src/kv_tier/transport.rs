@@ -1,4 +1,4 @@
-//! [`KVTransport`] trait — backend-agnostic KV transfer surface.
+//! [`KVTransport`] trait — backend-agnostic data-plane transfer surface.
 //!
 //! Shape frozen per `docs/plans/tiered-kv-cache-tasks.md §6.3`: the trait
 //! exposes `type Op` plus explicit `poll` and `abort` methods, NOT
@@ -7,6 +7,8 @@
 //! own completion model.
 //!
 //! See `crate::kv_tier` for the module-level design notes.
+//! `crate::kv_tier::backend::KVBackend` is the slower-tier object-store
+//! control-plane contract; this file stays focused on byte movement only.
 //!
 //! # Backend submodules
 //!
@@ -31,16 +33,56 @@ pub use nixl::NixlTransport;
 
 use std::task::Poll;
 
-use super::tier::{BlockLocation, MemKind};
+use super::{
+    chunk::KVHandle,
+    io::KVPayloadRef,
+    tier::{BlockLocation, MemKind},
+};
 
 /// One batched transfer instruction handed to the transport. The
 /// coordinator builds these and submits them via
 /// [`KVTransport::put_batch`] or [`KVTransport::get_batch`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferOp {
-    pub src: BlockLocation,
-    pub dst: BlockLocation,
-    pub len: u32,
+    /// Optional control-plane handle describing the logical object this copy
+    /// belongs to. Local copy engines may ignore it; orchestrators can retain
+    /// it for bookkeeping.
+    pub handle: Option<KVHandle>,
+    /// Source byte range.
+    pub src: KVPayloadRef,
+    /// Destination byte range.
+    pub dst: KVPayloadRef,
+}
+
+impl TransferOp {
+    pub fn new(src: BlockLocation, dst: BlockLocation, len: u64) -> Self {
+        Self {
+            handle: None,
+            src: KVPayloadRef::whole(src, len),
+            dst: KVPayloadRef::whole(dst, len),
+        }
+    }
+
+    pub fn with_handle(handle: KVHandle, src: KVPayloadRef, dst: KVPayloadRef) -> Self {
+        debug_assert_eq!(
+            src.len(),
+            dst.len(),
+            "TransferOp src/dst byte lengths should match"
+        );
+        Self {
+            handle: Some(handle),
+            src,
+            dst,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.src.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Transport-layer errors. Intentionally coarse — each impl can decorate

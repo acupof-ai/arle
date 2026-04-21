@@ -4,8 +4,9 @@ Hierarchical KV cache shape: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
 T3 remote (NIXL/Mooncake/UCX). **Status: partially live on the CUDA lane** —
 the scheduler now uses `prefix_cache + paged_kv + HostPinnedPool + Coordinator +
 DiskStore` for one unified local path: direct GPU prefix attachment and
-decode-time COW on T0, Zig-backed spill buffering on T1, and T1→T2 persistence.
-Live T1/T2 readmission is still absent. Remote transports remain skeletal.
+decode-time COW on T0, Zig-backed spill buffering on T1, local staged
+readmission (`host/disk -> host -> T0`), and T1→T2 persistence. Remote
+transports remain skeletal.
 
 Load this file before editing anything under `kv_tier/`, and re-read
 `docs/projects/tiered-kv-cache.md` before making any design-visible change.
@@ -21,8 +22,8 @@ Load this file before editing anything under `kv_tier/`, and re-read
 | Tier | Medium            | Latency  | Status in this module |
 |------|-------------------|----------|-----------------------|
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
-| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into Zig-backed `host_pool.rs`; no live T1→T0 readmission path yet |
-| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/persist and session restore plumbing; no live T2→T0 readmission path yet |
+| T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into Zig-backed `host_pool.rs`, and staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
+| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/persist, session restore plumbing, and local staged readmission (`disk -> host -> T0`) |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
 
 **Apple Silicon skips T1.** MLX unified memory makes host↔GPU a self-memcpy.
@@ -32,14 +33,18 @@ Metal joins at M4 for T2 disk (bounded wired-memory KV pool).
 
 ```
 kv_tier.rs              — module root, public re-exports
+kv_tier/backend.rs      — KVBackend trait (node-local / cluster-shared slower-tier surface)
+kv_tier/chunk.rs        — KVBlock / KVSpan / KVHandle + index/store/request state enums
 kv_tier/id.rs           — re-export of crate::types::BlockId (u32)
+kv_tier/io.rs           — KVPayload / KVPayloadRef / backend request-response payloads
+kv_tier/readmission.rs  — ReadmissionPlan / ReadmissionSource / dedupe keys
 kv_tier/tier.rs         — Tier enum, BlockLocation, RemoteBlockDesc, TransportId, MemKind
 kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (thin Rust wrapper over the Zig host arena)
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
 kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
-kv_tier/coordinator.rs  — Coordinator, command/event channel for T1 → T2 persistence (no live readmission path yet)
+kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/store queues on the local spill/readmission path
 ```
 
 **Do not reintroduce `directory.rs`.** The former `TierDirectory` /

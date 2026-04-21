@@ -10,6 +10,16 @@ detailed task lists per phase below are still largely correct; only the
 phase grouping and the file paths (post Route-A) change. Section §0.5
 translates old P0–P5 references into the new M0–M5 plan.
 
+**Supplemented 2026-04-21**: the next tranche after the current local path
+is now specified in
+[`tiered-kv-hicache-readmission.md`](tiered-kv-hicache-readmission.md).
+That doc defines the HiCache-aligned `CacheIndex / CacheIO / CachePolicy /
+CacheOrchestrator` split, the `KVBlock / KVSpan / KVHandle` object model,
+the `PrefetchPlanQueue / FetchQueue / StoreQueue` pipeline, and the
+`L0/L1/L2/L3` physical hierarchy mapping. This task ledger remains the
+historical M0–M5 execution record; the new doc is the design SSOT for
+live readmission and cluster-shared L3 work.
+
 This doc carves every phase from the project plan into three lanes so the
 local Mac dev box and the remote CUDA host can both stay busy at all times.
 The project doc is the **what + why**; this doc is the **where you do it**,
@@ -86,7 +96,7 @@ milestone plan.
 | P1 (b) behavior (scheduler wire) | **M1** | The atomic PR. Expanded: no longer "wire RadixCache then merge directory" as two steps — instead, **delete `kv_tier/directory.rs`** and move its fields onto `RadixNode` in the same PR. | **done** — M1a (`08718ad`) + M1b (`323aee0`) | §2 below |
 | — (new) | **M0.1** | `BlockId` unification: `types::BlockId(u32)` canonical, `types::BlockFingerprint([u8; 16])` separate. Deletes `kv_tier/id.rs` and `block_manager::BlockId`. Blocks M1. | **done** upstream `d3259cd` | (new, §2.1 addendum) |
 | — (new) | **M2** | Dual residency (T0-only): `RadixCache::evict_into_free_queue`, pool reuses free-queue slots, `lookup` can resurrect. Was implicitly absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. | **M2a done** (`4402ab0` — pool refcount + real page ids + watermark eviction); **M2b accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m2b-remote.md`) (selector flip + safe same-slot resurrection + alloc-OOM retry + retain hard cap + tombstone GC) | (new, §3.5 addendum) |
-| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a + M3b contract + M3c cleanup all accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`, `wins/2026-04-15-tiered-kv-m3b-remote.md`, `wins/2026-04-15-tiered-kv-m3c-remote.md`); **real staged completion / promotion still pending** | §3 below |
+| P2 T2 host pinned + coordinator | **M3** (renamed to T1 host pinned) | Tier numbering T0/T2/T3/T4 → T0/T1/T2/T3 for industry alignment. **Coordinator is an OS thread + crossbeam** (task doc §3.3 course correction, now committed in the project doc §4.4). Split into M3a transport / M3b coordinator / M3c promote. | **M3a + M3b contract + M3c cleanup all accepted 2026-04-15 on L4** (`wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`, `wins/2026-04-15-tiered-kv-m3b-remote.md`, `wins/2026-04-15-tiered-kv-m3c-remote.md`); **local staged completion / promotion landed 2026-04-21, remote CUDA validation still pending** | §3 below |
 | P3 T3 disk + session save/load | **M4** (renamed to T2 disk) | Same renumber. Content unchanged. MLX wired-memory bindings still required for Metal bounding. | **M4 a/b/c/d local landed 2026-04-16** (`66d38ad` BLAKE3 `compute` + input chain, `c7cc0d6` `DiskStore` postcard wire, `7b72d02` `RadixCache::reconcile` + serde round-trip, `c87c68b` pure-Rust `http_server::sessions` save/load); **remote CUDA acceptance pending** (`tiered-kv-cache-m4-remote-acceptance.md`); HTTP route wrappers + Metal MLX wired-memory bindings deferred | §4 below |
 | P4 KVFlow-lite reuse-distance + cache-aware routing | **post-M4 experiment** | Dropped from critical path. LRU / SessionBiasedLru ship in M3; priority-bucket LRU (TRT-LLM style) is the more promising post-M3 experiment. Reuse-distance is deferred until M3's default policy is proven insufficient. | deferred | §5 below (keep for reference) |
 | P5 NIXL trait freeze + stub | **M5 (stub only)** | `NixlTransport` stub and trait shape are already shipped as of 2026-04-15 (`infer/src/kv_tier/transport.rs` + `transport/nixl.rs`, 144 + 205 lines). The "real RDMA" half of M5 is **deferred** until a trigger fires (prefill/decode disaggregation, cross-node session roaming, second consumer of the kernel crate). | stub shipped upstream; real RDMA deferred | §6 below |

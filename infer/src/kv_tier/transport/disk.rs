@@ -43,7 +43,17 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::task::Poll;
 
+use super::super::{
+    backend::{KVBackend, KVBackendScope},
+    io::{
+        KVBackendCompletion, KVBackendDelete, KVBackendFetch, KVBackendStore, KVPayload,
+        KVPayloadRef,
+    },
+    tier::BlockLocation,
+};
+use super::TransportError;
 use crate::types::BlockFingerprint;
 
 const DISK_BLOCK_MAGIC: [u8; 8] = *b"PEGAKV01";
@@ -99,10 +109,29 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn disk_error(err: &io::Error) -> TransportError {
+    TransportError::Transfer(err.to_string())
+}
+
+fn disk_location_error(message: impl Into<String>) -> TransportError {
+    TransportError::Other(message.into())
+}
+
 /// Stable local filesystem backing for persisted KV blobs.
 #[derive(Debug)]
 pub struct DiskStore {
     root: PathBuf,
+}
+
+#[derive(Debug)]
+enum DiskBackendOpState {
+    Ready(Result<KVBackendCompletion, TransportError>),
+    Exhausted,
+}
+
+#[derive(Debug)]
+pub struct DiskBackendOp {
+    state: DiskBackendOpState,
 }
 
 impl DiskStore {
@@ -272,12 +301,110 @@ impl DiskStore {
         }
         kv_native_sys::remove_block(self.root(), location.fingerprint.0, true)
     }
+
+    fn ready_op(result: Result<KVBackendCompletion, TransportError>) -> DiskBackendOp {
+        DiskBackendOp {
+            state: DiskBackendOpState::Ready(result),
+        }
+    }
+
+    fn location_from_handle(
+        &self,
+        handle: &super::super::chunk::KVHandle,
+    ) -> Result<DiskBlockLocation, TransportError> {
+        match &handle.location {
+            BlockLocation::Disk {
+                fingerprint,
+                payload_len,
+            } => {
+                let path = self
+                    .block_path_for(*fingerprint)
+                    .map_err(|err| disk_error(&err))?;
+                Ok(DiskBlockLocation {
+                    path,
+                    payload_len: *payload_len,
+                    fingerprint: *fingerprint,
+                })
+            }
+            _ => Err(disk_location_error(
+                "disk backend requires a Disk block location on fetch/delete",
+            )),
+        }
+    }
+}
+
+impl KVBackend for DiskStore {
+    type Op = DiskBackendOp;
+
+    fn backend_id(&self) -> &'static str {
+        "disk"
+    }
+
+    fn scope(&self) -> KVBackendScope {
+        KVBackendScope::NodeLocal
+    }
+
+    fn tier(&self) -> super::super::tier::Tier {
+        super::super::tier::Tier::Disk
+    }
+
+    fn store(&self, req: KVBackendStore) -> Result<Self::Op, TransportError> {
+        let fingerprint = req.block.fingerprint.ok_or_else(|| {
+            disk_location_error("disk backend store requires a block fingerprint")
+        })?;
+        let payload_len = u64::try_from(req.payload.len())
+            .map_err(|_| disk_location_error("disk backend store payload length exceeds u64"))?;
+        self.put_block(fingerprint, req.kv_format_tag, req.payload.as_slice())
+            .map_err(|err| disk_error(&err))?;
+        let handle = req.handle.with_location(BlockLocation::Disk {
+            fingerprint,
+            payload_len,
+        });
+        Ok(Self::ready_op(Ok(KVBackendCompletion::Stored(handle))))
+    }
+
+    fn fetch(&self, req: KVBackendFetch) -> Result<Self::Op, TransportError> {
+        let location = self.location_from_handle(&req.handle)?;
+        let bytes = self
+            .get_block(&location, Some(location.fingerprint))
+            .map_err(|err| disk_error(&err))?;
+        let payload_len = bytes.len() as u64;
+        let payload = KVPayload::with_reference(
+            bytes,
+            KVPayloadRef::whole(req.handle.location.clone(), payload_len),
+        );
+        Ok(Self::ready_op(Ok(KVBackendCompletion::Loaded {
+            handle: req.handle,
+            payload,
+        })))
+    }
+
+    fn delete(&self, req: KVBackendDelete) -> Result<Self::Op, TransportError> {
+        let location = self.location_from_handle(&req.handle)?;
+        self.delete_block(&location)
+            .map_err(|err| disk_error(&err))?;
+        Ok(Self::ready_op(Ok(KVBackendCompletion::Deleted(req.handle))))
+    }
+
+    fn poll(&self, op: &mut Self::Op) -> Poll<Result<KVBackendCompletion, TransportError>> {
+        match std::mem::replace(&mut op.state, DiskBackendOpState::Exhausted) {
+            DiskBackendOpState::Ready(result) => Poll::Ready(result),
+            DiskBackendOpState::Exhausted => Poll::Ready(Err(TransportError::Other(
+                "disk backend op already completed".into(),
+            ))),
+        }
+    }
+
+    fn abort(&self, op: &mut Self::Op) {
+        op.state = DiskBackendOpState::Ready(Err(TransportError::Aborted));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::task::Poll;
 
     use crate::types::KvContentContext;
     use tempfile::tempdir;
@@ -561,5 +688,68 @@ mod tests {
                 .unwrap(),
             payload_a
         );
+    }
+
+    #[test]
+    fn disk_backend_store_fetch_delete_roundtrip() {
+        use crate::kv_tier::{
+            KVBackend, KVBackendCompletion, KVBackendDelete, KVBackendFetch, KVBackendStore,
+            KVBlock, KVHandle, KVPayload, KVSpanId, LayerRange, TokenRange,
+        };
+
+        let dir = tempdir().unwrap();
+        let store = DiskStore::new(dir.path());
+        let kv_format_tag = 7;
+        let payload = b"hicache-backend!".to_vec();
+        let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
+        let block = KVBlock::new(
+            crate::types::BlockId(4),
+            LayerRange::new(0, 2),
+            TokenRange::new(0, 16),
+            payload.len() as u64,
+        )
+        .with_fingerprint(fingerprint);
+        let host_handle = KVHandle::new(
+            KVSpanId(9),
+            block.block_id,
+            BlockLocation::HostPinned { offset: 0 },
+            1,
+            payload.len() as u64,
+        );
+
+        let mut store_op = store
+            .store(KVBackendStore {
+                handle: host_handle.clone(),
+                block: block.clone(),
+                kv_format_tag,
+                payload: KVPayload::from_vec(payload.clone()),
+            })
+            .unwrap();
+        let stored = match store.poll(&mut store_op) {
+            Poll::Ready(Ok(KVBackendCompletion::Stored(handle))) => handle,
+            other => panic!("expected stored completion, got {other:?}"),
+        };
+
+        let mut fetch_op = store
+            .fetch(KVBackendFetch {
+                handle: stored.clone(),
+            })
+            .unwrap();
+        match store.poll(&mut fetch_op) {
+            Poll::Ready(Ok(KVBackendCompletion::Loaded {
+                handle,
+                payload: got,
+            })) => {
+                assert_eq!(handle, stored);
+                assert_eq!(got.as_slice(), payload.as_slice());
+            }
+            other => panic!("expected loaded completion, got {other:?}"),
+        }
+
+        let mut delete_op = store.delete(KVBackendDelete { handle: stored }).unwrap();
+        match store.poll(&mut delete_op) {
+            Poll::Ready(Ok(KVBackendCompletion::Deleted(_))) => {}
+            other => panic!("expected deleted completion, got {other:?}"),
+        }
     }
 }

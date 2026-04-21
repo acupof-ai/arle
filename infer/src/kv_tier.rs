@@ -13,8 +13,8 @@
 //! | Tier | Medium             | Latency class | Status in this module |
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
-//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool` for demotion / spill buffering; no live T1→T0 readmission path yet |
-//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and session restore plumbing; no live T2→T0 readmission path yet |
+//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool`; staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
+//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and local staged readmission (`disk -> host -> T0`) |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
@@ -34,10 +34,15 @@
 //! - radix metadata in `prefix_cache`
 //! - T0 page ownership plus direct GPU prefix attachment / decode-time COW in `paged_kv`
 //! - T1 demotion buffering in Zig-backed `HostPinnedPool`
+//! - T1/T2 staged readmission planning in `lookup.rs` + `readmission.rs`
+//! - T1/T2 fetch/store queueing in `Coordinator`
 //! - T1→T2 spill and disk persistence in `Coordinator` + `DiskStore`
 //!
-//! Direct GPU prefix attachment is live for paged-prefill models. T1/T2 staged
-//! readmission is still absent; `KVTransport` and remote tiers remain skeletal.
+//! Direct GPU prefix attachment is live for paged-prefill models. Local staged
+//! readmission is also live: `lookup_or_stage(...)` classifies hits, the
+//! scheduler builds a `ReadmissionPlan`, waits in `Phase::WaitingFetch`, and
+//! promotes fetched blocks back into T0 before resuming prefill. `KVTransport`
+//! and remote tiers remain skeletal.
 //!
 //! The former `directory::TierDirectory` / `BlockDescriptor` holding
 //! area was removed in M1 per project doc §5.2. Block metadata that
@@ -83,6 +88,12 @@
 //! # Layout
 //!
 //! Flat submodule layout:
+//! - [`chunk`] — canonical control-plane objects:
+//!   [`chunk::KVBlock`], [`chunk::KVSpan`], [`chunk::KVHandle`].
+//! - [`io`] — data-plane payload refs and backend request/response
+//!   structs. This is where slower-tier byte payloads live.
+//! - [`backend`] — object-backend trait surface for slower tiers
+//!   (`DiskStore` today, cluster-shared backends later).
 //! - [`id`] — re-export of [`crate::types::BlockId`] for backward
 //!   compatibility with code that imports `kv_tier::BlockId`. The
 //!   former `BlockHashCtx` struct was deleted in the 2026-04-15 M0.1
@@ -115,19 +126,34 @@
 //! only source of write contention it referred to, and its
 //! replacement inside `RadixCache` is single-writer by construction.
 
+pub mod backend;
+pub mod chunk;
 #[allow(clippy::match_same_arms)]
 pub mod coordinator;
 pub mod host_pool;
 pub mod id;
+pub mod io;
 pub mod lookup;
+pub mod readmission;
 pub mod tier;
 pub mod transport;
 
+pub use backend::{KVBackend, KVBackendScope};
+pub use chunk::{
+    IndexEntryState, KVBlock, KVHandle, KVSpan, KVSpanId, LayerRange, RequestChunkState,
+    SpanTaskKey, StoreState, TokenRange,
+};
 pub use coordinator::{
-    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, SpillRequest, SpillTicket,
+    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, FetchRequest,
+    FetchTicket, FetchedBlock, SpillRequest, SpillTicket,
 };
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
+pub use io::{
+    KVBackendCompletion, KVBackendDelete, KVBackendFetch, KVBackendStore, KVByteRange, KVBytes,
+    KVPayload, KVPayloadRef,
+};
 pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
+pub use readmission::{ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
 pub use transport::{KVTransport, TransferOp, TransportError};

@@ -57,7 +57,11 @@
 
 use std::task::Poll;
 
-use super::super::tier::MemKind;
+use super::super::{
+    backend::KVBackendScope,
+    io::{KVBackendCompletion, KVBackendDelete, KVBackendFetch, KVBackendStore},
+    tier::{MemKind, Tier},
+};
 use super::{KVTransport, TransferOp, TransportError};
 
 /// M5-stub transport. Holds no state; the real implementation will own
@@ -159,6 +163,51 @@ impl KVTransport for NixlTransport {
     }
 
     fn poll(&self, _op: &mut Self::Op) -> Poll<Result<(), TransportError>> {
+        Poll::Ready(Err(TransportError::Other(
+            "NixlTransport::poll is an M5 stub; real impl calls Agent::get_xfer_status".into(),
+        )))
+    }
+
+    fn abort(&self, _op: &mut Self::Op) {
+        // No-op stub. Real impl records the cancellation; the next poll
+        // will surface TransportError::Aborted.
+    }
+}
+
+impl super::super::backend::KVBackend for NixlTransport {
+    type Op = NixlOp;
+
+    fn backend_id(&self) -> &'static str {
+        "nixl"
+    }
+
+    fn scope(&self) -> KVBackendScope {
+        KVBackendScope::ClusterShared
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::Remote
+    }
+
+    fn store(&self, _req: KVBackendStore) -> Result<Self::Op, TransportError> {
+        Err(TransportError::Other(
+            "NixlTransport::store is an M5 stub; real impl posts a remote write".into(),
+        ))
+    }
+
+    fn fetch(&self, _req: KVBackendFetch) -> Result<Self::Op, TransportError> {
+        Err(TransportError::Other(
+            "NixlTransport::fetch is an M5 stub; real impl posts a remote read".into(),
+        ))
+    }
+
+    fn delete(&self, _req: KVBackendDelete) -> Result<Self::Op, TransportError> {
+        Err(TransportError::Other(
+            "NixlTransport::delete is an M5 stub; real impl deletes remote metadata".into(),
+        ))
+    }
+
+    fn poll(&self, _op: &mut Self::Op) -> Poll<Result<KVBackendCompletion, TransportError>> {
         Poll::Ready(Err(TransportError::Other(
             "NixlTransport::poll is an M5 stub; real impl calls Agent::get_xfer_status".into(),
         )))

@@ -40,7 +40,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::kv_tier::{BlockLocation, HitKind, LookupBlock, LookupHeuristics, LookupOutcome, Tier};
+use crate::kv_tier::{
+    BlockLocation, HitKind, IndexEntryState, LookupBlock, LookupHeuristics, LookupOutcome,
+    StoreState, Tier,
+};
 use crate::scheduler::policy::{EvictionCandidate, EvictionPolicy, SchedulerSignals};
 use crate::types::{BlockFingerprint, SessionId};
 
@@ -66,6 +69,7 @@ pub struct BlockMetadataUpdate {
     pub byte_len: Option<u32>,
     pub session_id: Option<Option<SessionId>>,
     pub soft_pin_until: Option<Option<u64>>,
+    pub entry_state: Option<IndexEntryState>,
 }
 
 /// Read-only snapshot of one cached block's current metadata.
@@ -76,6 +80,8 @@ pub struct BlockMetadata {
     pub session_id: Option<SessionId>,
     pub fingerprint: Option<BlockFingerprint>,
     pub soft_pin_until: Option<u64>,
+    pub entry_state: IndexEntryState,
+    pub store_state: StoreState,
     pub hit_count: u32,
     pub ref_count: u32,
 }
@@ -123,6 +129,13 @@ struct Node {
     /// Runtime-only: the deadline is relative to the process-local clock.
     #[serde(default, skip)]
     soft_pin_until: Option<u64>,
+    /// Control-plane readiness state. Prevents readers from treating partially
+    /// staged or evicting entries as canonical ready bytes.
+    #[serde(default)]
+    entry_state: IndexEntryState,
+    /// Write-side persistence state for background store work.
+    #[serde(default)]
+    store_state: StoreState,
     /// Children, indexed by the first token of their edge.
     children: HashMap<u32, usize>,
 }
@@ -140,6 +153,8 @@ impl Node {
             fingerprint: None,
             byte_len: 0,
             soft_pin_until: None,
+            entry_state: IndexEntryState::Ready,
+            store_state: StoreState::Idle,
             children: HashMap::new(),
         }
     }
@@ -431,6 +446,11 @@ impl RadixCache {
                         HitKind::StagingFromDisk
                     }
                     Some(BlockLocation::Gpu { .. }) | None => HitKind::ReadyOnGpu,
+                };
+                let hit_kind = if child.entry_state == IndexEntryState::Ready {
+                    hit_kind
+                } else {
+                    HitKind::Miss
                 };
 
                 if matches!(
@@ -922,6 +942,9 @@ impl RadixCache {
             if node.soft_pin_until.is_some_and(|deadline| deadline > now) {
                 continue;
             }
+            if node.entry_state != IndexEntryState::Ready {
+                continue;
+            }
             if let Some(tier) = tier_filter
                 && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
             {
@@ -1014,6 +1037,8 @@ impl RadixCache {
             node.block_id = None;
             node.ref_count = 0;
             node.last_access = 0;
+            node.entry_state = IndexEntryState::Ready;
+            node.store_state = StoreState::Idle;
             node.children.clear();
             self.free_nodes.push(idx);
         }
@@ -1066,6 +1091,8 @@ impl RadixCache {
             session_id: node.session_id.clone(),
             fingerprint: node.fingerprint,
             soft_pin_until: node.soft_pin_until,
+            entry_state: node.entry_state,
+            store_state: node.store_state,
             hit_count: node.hit_count,
             ref_count: node.ref_count,
         })
@@ -1119,8 +1146,81 @@ impl RadixCache {
                 if let Some(soft_pin_until) = update.soft_pin_until {
                     node.soft_pin_until = soft_pin_until;
                 }
+                if let Some(entry_state) = update.entry_state {
+                    node.entry_state = entry_state;
+                }
             })
             .is_some()
+    }
+
+    pub fn set_block_index_state(&mut self, block: BlockId, entry_state: IndexEntryState) -> bool {
+        self.find_block_node_mut(block)
+            .map(|node| {
+                node.entry_state = entry_state;
+            })
+            .is_some()
+    }
+
+    pub fn set_block_store_state(&mut self, block: BlockId, store_state: StoreState) -> bool {
+        self.find_block_node_mut(block)
+            .map(|node| {
+                node.store_state = store_state;
+            })
+            .is_some()
+    }
+
+    pub fn insert_pending(&mut self, block: BlockId) -> bool {
+        self.set_block_index_state(block, IndexEntryState::Pending)
+    }
+
+    pub fn mark_block_evicting(&mut self, block: BlockId) -> bool {
+        self.set_block_index_state(block, IndexEntryState::Evicting)
+    }
+
+    pub fn commit_ready(&mut self, block: BlockId, location: Option<BlockLocation>) -> bool {
+        self.update_block_metadata(
+            block,
+            BlockMetadataUpdate {
+                location,
+                entry_state: Some(IndexEntryState::Ready),
+                ..BlockMetadataUpdate::default()
+            },
+        )
+    }
+
+    pub fn mark_block_store_pending(&mut self, block: BlockId) -> bool {
+        self.set_block_store_state(block, StoreState::Pending)
+    }
+
+    pub fn mark_block_storing(&mut self, block: BlockId) -> bool {
+        self.set_block_store_state(block, StoreState::Storing)
+    }
+
+    pub fn mark_block_stored(&mut self, block: BlockId, location: Option<BlockLocation>) -> bool {
+        let updated = if let Some(location) = location {
+            self.set_block_location(block, location)
+        } else {
+            self.block_index.contains_key(&block)
+        };
+        updated && self.set_block_store_state(block, StoreState::Stored)
+    }
+
+    pub fn mark_block_store_failed(&mut self, block: BlockId) -> bool {
+        self.set_block_store_state(block, StoreState::Failed)
+    }
+
+    pub fn batch_lookup_or_stage<'a, I>(
+        &mut self,
+        prefixes: I,
+        heuristics: LookupHeuristics,
+    ) -> Vec<LookupOutcome>
+    where
+        I: IntoIterator<Item = &'a [u32]>,
+    {
+        prefixes
+            .into_iter()
+            .map(|prefix| self.lookup_or_stage(prefix, heuristics))
+            .collect()
     }
 
     /// Extend the deadline of an already-soft-pinned block relative to the
@@ -2120,6 +2220,90 @@ mod tests {
     }
 
     #[test]
+    fn lookup_or_stage_preserves_mixed_gpu_and_host_hits() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 1 }));
+        assert!(cache.set_block_byte_len(BlockId(10), 4096));
+        assert!(cache.set_block_location(BlockId(20), BlockLocation::HostPinned { offset: 8192 }));
+        assert!(cache.set_block_byte_len(BlockId(20), 4096));
+
+        let outcome = cache.lookup_or_stage(&[1, 2, 3, 4, 5, 6, 7, 8], LookupHeuristics::default());
+
+        assert_eq!(outcome.matched_len, 8);
+        assert_eq!(
+            outcome.blocks,
+            vec![
+                LookupBlock {
+                    block_id: Some(BlockId(10)),
+                    hit_kind: HitKind::ReadyOnGpu,
+                },
+                LookupBlock {
+                    block_id: Some(BlockId(20)),
+                    hit_kind: HitKind::StagingFromHost,
+                },
+            ]
+        );
+        assert!(!outcome.recompute_advised);
+    }
+
+    #[test]
+    fn release_before_remap_keeps_shared_prefix_reusable() {
+        let mut cache = RadixCache::new(4);
+        let tokens: Vec<u32> = (1..=8).collect();
+        let old_fingerprints = [BlockFingerprint([0x11; 16]), BlockFingerprint([0x22; 16])];
+        let new_fingerprints = [BlockFingerprint([0x33; 16]), BlockFingerprint([0x44; 16])];
+
+        assert_eq!(
+            cache.insert_with_fingerprints(&tokens, &bids(&[10, 20]), &old_fingerprints),
+            8
+        );
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 1 }));
+        assert!(cache.set_block_byte_len(BlockId(10), 4096));
+        assert!(cache.set_block_location(BlockId(20), BlockLocation::HostPinned { offset: 8192 }));
+        assert!(cache.set_block_byte_len(BlockId(20), 4096));
+
+        let first = cache.lookup_or_stage(&tokens, LookupHeuristics::default());
+        let second = cache.lookup_or_stage(&tokens, LookupHeuristics::default());
+        assert_eq!(first.matched_len, 8);
+        assert_eq!(second.matched_len, 8);
+        assert_eq!(cache.block_metadata(BlockId(10)).unwrap().ref_count, 2);
+        assert_eq!(cache.block_metadata(BlockId(20)).unwrap().ref_count, 2);
+
+        cache.release(&[BlockId(10), BlockId(20)]);
+        cache.release(&[BlockId(10), BlockId(20)]);
+        assert_eq!(cache.block_metadata(BlockId(10)).unwrap().ref_count, 0);
+        assert_eq!(cache.block_metadata(BlockId(20)).unwrap().ref_count, 0);
+
+        assert_eq!(
+            cache.insert_with_fingerprints(&tokens, &bids(&[30, 40]), &new_fingerprints),
+            8
+        );
+        assert!(cache.set_block_location(BlockId(30), BlockLocation::Gpu { slot: 3 }));
+        assert!(cache.set_block_byte_len(BlockId(30), 4096));
+        assert!(cache.set_block_location(BlockId(40), BlockLocation::Gpu { slot: 3 }));
+        assert!(cache.set_block_byte_len(BlockId(40), 4096));
+        assert!(cache.block_metadata(BlockId(10)).is_none());
+        assert!(cache.block_metadata(BlockId(20)).is_none());
+
+        let remapped = cache.lookup_or_stage(&tokens, LookupHeuristics::default());
+        assert_eq!(remapped.matched_len, 8);
+        assert_eq!(
+            remapped.blocks,
+            vec![
+                LookupBlock {
+                    block_id: Some(BlockId(30)),
+                    hit_kind: HitKind::ReadyOnGpu,
+                },
+                LookupBlock {
+                    block_id: Some(BlockId(40)),
+                    hit_kind: HitKind::ReadyOnGpu,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn lookup_or_stage_advises_recompute_for_small_disk_hit() {
         let mut cache = RadixCache::new(16);
         let tokens: Vec<u32> = (0..16).collect();
@@ -2269,6 +2453,7 @@ mod tests {
                 byte_len: Some(4096),
                 session_id: Some(Some(SessionId::from("session-1"))),
                 soft_pin_until: Some(Some(42)),
+                entry_state: Some(IndexEntryState::Pending),
             }
         ));
 
@@ -2287,6 +2472,8 @@ mod tests {
             Some(SessionId::from("session-1"))
         );
         assert_eq!(cache.nodes[idx].soft_pin_until, Some(42));
+        assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Pending);
+        assert_eq!(cache.nodes[idx].store_state, StoreState::Idle);
 
         assert!(cache.update_block_metadata(
             BlockId(10),
@@ -2295,6 +2482,7 @@ mod tests {
                 byte_len: None,
                 session_id: Some(None),
                 soft_pin_until: Some(None),
+                entry_state: Some(IndexEntryState::Ready),
             }
         ));
         assert_eq!(
@@ -2304,6 +2492,58 @@ mod tests {
         assert_eq!(cache.nodes[idx].byte_len, 4096);
         assert_eq!(cache.nodes[idx].session_id, None);
         assert_eq!(cache.nodes[idx].soft_pin_until, None);
+        assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Ready);
+        assert_eq!(cache.nodes[idx].store_state, StoreState::Idle);
+    }
+
+    #[test]
+    fn block_state_helpers_cover_read_and_store_lifecycle() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+
+        assert!(cache.insert_pending(BlockId(10)));
+        assert_eq!(
+            cache.block_metadata(BlockId(10)).unwrap().entry_state,
+            IndexEntryState::Pending
+        );
+
+        assert!(cache.mark_block_evicting(BlockId(10)));
+        assert_eq!(
+            cache.block_metadata(BlockId(10)).unwrap().entry_state,
+            IndexEntryState::Evicting
+        );
+
+        assert!(cache.commit_ready(BlockId(10), Some(BlockLocation::Gpu { slot: 3 })));
+        let metadata = cache.block_metadata(BlockId(10)).unwrap();
+        assert_eq!(metadata.entry_state, IndexEntryState::Ready);
+        assert_eq!(metadata.location, Some(BlockLocation::Gpu { slot: 3 }));
+
+        assert!(cache.mark_block_store_pending(BlockId(10)));
+        assert_eq!(
+            cache.block_metadata(BlockId(10)).unwrap().store_state,
+            StoreState::Pending
+        );
+
+        assert!(cache.mark_block_storing(BlockId(10)));
+        assert_eq!(
+            cache.block_metadata(BlockId(10)).unwrap().store_state,
+            StoreState::Storing
+        );
+
+        let disk_location = BlockLocation::Disk {
+            fingerprint: BlockFingerprint([0x44; 16]),
+            payload_len: 4096,
+        };
+        assert!(cache.mark_block_stored(BlockId(10), Some(disk_location.clone())));
+        let metadata = cache.block_metadata(BlockId(10)).unwrap();
+        assert_eq!(metadata.store_state, StoreState::Stored);
+        assert_eq!(metadata.location, Some(disk_location));
+
+        assert!(cache.mark_block_store_failed(BlockId(10)));
+        assert_eq!(
+            cache.block_metadata(BlockId(10)).unwrap().store_state,
+            StoreState::Failed
+        );
     }
 
     #[test]

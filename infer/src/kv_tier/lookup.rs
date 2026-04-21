@@ -1,7 +1,9 @@
 //! Lookup result types for tiered KV cache M3b.
 //!
 //! These types let the radix cache classify reusable prefix blocks without
-//! pretending the runtime already owns a live stage/readmission path.
+//! dragging raw storage/RDMA calls into the scheduler hot path. The local CUDA
+//! runtime turns staged hits into `ReadmissionPlan + FetchTicket + WaitingFetch`
+//! after this classification step.
 
 use crate::types::BlockId;
 

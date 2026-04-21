@@ -4,6 +4,8 @@ use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, To
 
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
+    /// Waiting for staged T1/T2 bytes to be fetched/promoted back into T0.
+    WaitingFetch,
     /// Prefilling in chunks. Decode takes priority between chunks.
     Prefilling {
         /// Tokens already materialized in the paged pool before
@@ -63,6 +65,10 @@ pub(crate) struct ActiveRequest {
     /// request. Used by the direct paged-prefix attachment path so the radix
     /// will not evict blocks that still back a live slot.
     pub(crate) attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
+    /// Canonical staged-prefix fetch plan for this request while the prefix is
+    /// being promoted back into T0. The scheduler thread owns the fetch queue;
+    /// the request owns only its current plan and held radix refs.
+    pub(crate) staged_prefix: Option<crate::kv_tier::ReadmissionPlan>,
 }
 
 impl ActiveRequest {
@@ -76,6 +82,14 @@ impl ActiveRequest {
         } else {
             None
         }
+    }
+
+    pub(crate) fn held_prefix_blocks(&self) -> Vec<crate::prefix_cache::BlockId> {
+        let mut held = self.attached_prefix_blocks.clone();
+        if let Some(plan) = &self.staged_prefix {
+            held.extend(plan.block_ids());
+        }
+        held
     }
 
     /// Decode newly generated tokens and emit text deltas to the client.
@@ -298,6 +312,7 @@ mod tests {
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
             attached_prefix_blocks: Vec::new(),
+            staged_prefix: None,
         }
     }
 
