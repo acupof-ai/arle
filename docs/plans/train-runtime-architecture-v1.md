@@ -132,15 +132,36 @@ pub struct GlobalNorm { pub max_norm: f32 }
 ```
 Port the existing `clip_grad_norm(...)` helper calls to `GlobalNorm`. Per-parameter value clipping is **not** first-class — can be added later if a real caller needs it.
 
-### 4.5 `MetricSink` (✅ Phase 1 landed)
+### 4.5 `MetricSink` (✅ Phase 1 landed; 2026-04-21 observability widening landed)
 
 ```rust
 pub trait MetricSink: Send {
     fn emit(&mut self, sample: &MetricSample<'_>);
+    fn event(&mut self, event: &TrainEvent<'_>) {}
     fn flush(&mut self) {}
 }
 ```
-Impls: `NullSink`, `StdoutSink`, `JsonlSink`, `MultiSink`. Factory: `open_sink(jsonl_path, also_stdout)`.
+Impls now include:
+
+- `NullSink`
+- `StdoutSink`
+- `JsonlSink`
+- `MultiSink`
+- `SharedSink` (cloneable async worker-backed handle)
+
+Current factories:
+
+- `open_sink(jsonl_path, also_stdout)` → boxed `MetricSink`
+- `open_shared_sink(jsonl_path, also_stdout)` → cloneable async handle for
+  binaries that need to emit lifecycle/artifact events outside `Trainer`
+
+The active train-side surface now also has `TrainEvent { kind, step, strings,
+scalars, bools }` for lifecycle/artifact records (`run_start`,
+`trainer_checkpoint`, `checkpoint`, `status`, `run_end`). JSONL output now
+stores one event stream:
+
+- metric records: `{"kind":"metric","phase":"train|eval|...", ...}`
+- lifecycle/artifact records: `{"kind":"run_start"|... , ...}`
 
 ## 5. CUDA extensibility contracts
 
@@ -151,7 +172,7 @@ Every new trait / codec MUST honor these so CUDA drops in without refactor:
 | `Optimizer::step` | Consumes gradients via `store` (host-authoritative today); backend-specific device-step is selected inside the impl via `backend.device()`. Trait signature **does not** expose device choice. | Current CPU/Metal path unchanged; CUDA impl adds `Backend::optim_adamw_step(...)` as additive trait method with CPU fallback (existing pattern, see `backend.rs:9`). |
 | `OptimStateDoc` | Always `Vec<f32>` on host. Device-resident moments download on `export_state`, upload on `import_state`. | Checkpoints portable across devices (train on Metal, resume on CUDA, or vice versa). |
 | `GradClip::clip` | Returns scalar host `f32` norm. Device-side global-norm reduction is an internal detail. | MetricSink always sees host scalars; no device sync leaks into logging. |
-| `MetricSink::emit` | Expected to be ~microsecond — non-blocking from loop's PoV. JsonlSink buffered; Stdout fire-and-forget. | TrainerLoop calls `emit` only after device work is `eval`'d for the step. No mid-step device stalls. |
+| `MetricSink::emit` / `event` | Foreground path must stay non-blocking from the trainer's point of view. The active binaries now route sink I/O through `SharedSink`'s background worker. | TrainerLoop calls `emit` only after device work is `eval`'d for the step. Lifecycle/artifact events use the same async channel instead of a parallel blocking logger. |
 | `LrSchedule::lr` | Pure host f32; applied via `optimizer.set_lr(...)`. No device side. | Trivial to port. |
 | `GradAccumulator` | Pure bookkeeper; no tensor import. | Device-agnostic by construction. |
 | Checkpoint layout | Directory (HF-style), safetensors for moments. | HF interop, memory-mapped load, skip re-serialization on Metal↔CUDA moves. |
@@ -258,6 +279,10 @@ step_000123/
 - ✅ `LrSchedule` trait + 3 impls (`autograd/src/lr_schedule.rs`)
 - ✅ `GradAccumulator` (`train/src/grad_accum.rs`)
 - ✅ `MetricSink` (`train/src/metrics.rs`) — Null/Stdout/Jsonl/Multi
+- ✅ 2026-04-21 observability widening — `MetricSample.phase`, `TrainEvent`,
+  `SharedSink`, JSONL lifecycle/artifact records, and binary-level
+  `run_start` / `checkpoint` / `run_end` wiring for `pretrain`,
+  `train_sft`, `train_grpo`, `train_multi_turn`, and `eval_lm`
 - 🟡 `AdamWState` export/import codec on the existing concrete `AdamW` (not trait'd yet)
 
 ### Phase 2 — Trait extraction + TrainerLoop skeleton + train_sft migration — ✅ landed 2026-04-20
@@ -283,9 +308,15 @@ step_000123/
 ### Phase 4 — Eval + observability tightening
 
 - ✅ Built-in metrics: `loss`, `lr`, `grad_norm`, `tok_per_sec`, `ms_per_step` land via Trainer emission (44a7e19 + follow-ups). `alloc_mb` deferred (requires a cross-backend RSS probe, separate track).
+- ✅ Lifecycle + artifact events now flow through the same shared async sink as
+  scalar metrics. The active binaries emit `run_start`, `checkpoint`, and
+  `run_end`; `Trainer` emits `trainer_checkpoint`; `train_multi_turn` eval
+  metrics also land through the same sink instead of `println!`.
 - ✅ **Perplexity derived from loss in metric pipeline** — Trainer now emits `ppl = exp(loss)` on training samples and `eval_ppl = exp(eval_loss)` on eval samples, treating `loss` / `eval_loss` as token-mean cross-entropy in natural-log space (see `StepOutcome` / `EvalOutcome` metric contract in `crates/train/src/trainer.rs`). Non-CE callers get a numerically defined `ppl` field and should ignore it at the consumer. Sinks already null-fallback on non-finite f64 (JsonlSink) / render `inf` (StdoutSink), so cold-start overflow stays benign. Test `ppl_field_equals_exp_of_loss_field_in_metric_plumbing` pins the mechanical derivation (not semantic correctness) on both surfaces.
 - ✅ Held-out eval set support via `run_with_eval(...)` / `run_with_eval_and_hooks(...)` landed in 613ff3c + bd5e277 (+ 813d4f6 leak/final-step fix). Eval fields are prefixed `eval_` (underscore, not dot — matches sink-kv convention: `eval_loss`, `eval_ppl`, `eval_tokens`).
-- Additive `Backend::global_grad_norm` with CPU default — opens device-side norm reduction seam without implementing it yet.
+- Remaining follow-up: widen the event schema into a true exporter contract
+  (`TrainObservability` / OTLP / W&B / MLflow adapters) without changing the
+  shared async sink shape now that the lifecycle/artifact stream exists.
 
 ### Phase 5 — Scale features (gated; each a separate project)
 

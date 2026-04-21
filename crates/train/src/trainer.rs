@@ -27,7 +27,7 @@ use crate::checkpoint::{
 };
 use crate::grad_accum::GradAccumulator;
 use crate::grad_clip::GradClip;
-use crate::metrics::{MetricSample, MetricSink};
+use crate::metrics::{MetricSample, MetricSink, TrainEvent};
 
 /// Scalar config that drives the Trainer loop. The public Trainer API takes
 /// ownership of this at construction.
@@ -529,6 +529,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 ];
                 self.metrics.emit(&MetricSample {
                     step: self.step,
+                    phase: "train",
                     fields: &fields,
                 });
 
@@ -566,6 +567,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
                 ];
                 self.metrics.emit(&MetricSample {
                     step: self.step,
+                    phase: "eval",
                     fields: &fields,
                 });
             }
@@ -592,7 +594,7 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         Ok(())
     }
 
-    fn save_checkpoint(&self, param_names: &[(TensorId, String)]) -> Result<()> {
+    fn save_checkpoint(&mut self, param_names: &[(TensorId, String)]) -> Result<()> {
         let root = self.cfg.save_dir.as_ref().ok_or({
             AutogradError::TapeInvariant("checkpoint: save_every set but save_dir is None")
         })?;
@@ -621,6 +623,20 @@ impl<O: Optimizer, C: GradClip, S: LrSchedule> Trainer<O, C, S> {
         };
 
         save_trainer_state_v2(&dir, &doc, &optim_state).map_err(wrap_checkpoint_err)?;
+
+        let path = dir.display().to_string();
+        let strings = [
+            ("path", path.as_str()),
+            ("artifact_optimizer", "optimizer.safetensors"),
+            ("artifact_state", "trainer_state.json"),
+        ];
+        self.metrics.event(&TrainEvent {
+            kind: "trainer_checkpoint",
+            step: Some(self.step),
+            strings: &strings,
+            scalars: &[],
+            bools: &[],
+        });
 
         // DX-1 note: the `<save_dir>/latest` symlink is refreshed by the
         // *binary*'s save hook (pretrain / train_sft), NOT here.
