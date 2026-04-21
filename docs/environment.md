@@ -182,6 +182,36 @@ Explicit include path override for FlashInfer headers.
 
 Status: advanced build override.
 
+### `ZIG`
+
+Override the Zig compiler path used by `crates/kv-native-sys/build.rs`.
+
+Typical value:
+
+```bash
+export ZIG=/opt/homebrew/bin/zig
+```
+
+Current use:
+
+- `crates/kv-native-sys/build.rs`
+- [`scripts/setup_zig_toolchain.sh`](../scripts/setup_zig_toolchain.sh)
+- [`scripts/check_kv_zig.sh`](../scripts/check_kv_zig.sh)
+
+Expected version today: `0.16.0`
+
+First-time setup:
+
+```bash
+./scripts/setup_zig_toolchain.sh
+```
+
+Local validation for the Zig-backed KV substrate:
+
+```bash
+./scripts/check_kv_zig.sh
+```
+
 ---
 
 ## 4. Setup Script Variables

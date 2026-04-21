@@ -25,9 +25,9 @@
 //!     [`DiskBlockLocation`] for later reads/deletes.
 //! - One file per block. The payload is still an opaque raw byte blob
 //!   owned by the caller; only the header is interpreted here.
-//! - Synchronous I/O via `std::fs`. The `KVTransport` trait is sync
-//!   too, so this is the natural fit; the coordinator does its own
-//!   thread management.
+//! - Synchronous I/O via the `kv-native-sys` Zig file engine. The
+//!   `KVTransport` trait is sync too, so this remains the natural fit;
+//!   the coordinator does its own thread management.
 //! - Header validation on read: magic, version, payload length, and
 //!   optional fingerprint match.
 //!
@@ -41,7 +41,6 @@
 //!   I/O from an async context.
 //! - `io_uring` — deferred indefinitely per §4.3 course corrections.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -147,7 +146,7 @@ impl DiskStore {
 
     /// Ensures the store root exists.
     pub fn create_root(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.root)
+        std::fs::create_dir_all(&self.root)
     }
 
     // ── Keyed API ────────────────────────────────────────────────────
@@ -156,39 +155,24 @@ impl DiskStore {
     pub fn write(&self, key: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
         let path = self.path_for(key)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)?;
         }
-        fs::write(path, bytes)
+        kv_native_sys::write_file(&path, bytes)
     }
 
     /// Reads the payload stored at `key`.
     pub fn read(&self, key: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-        fs::read(self.path_for(key)?)
+        let path = self.path_for(key)?;
+        kv_native_sys::read_file(&path)
     }
 
     /// Removes the payload stored at `key`. Missing files are ignored.
     pub fn remove(&self, key: impl AsRef<Path>) -> io::Result<()> {
         let path = self.path_for(key)?;
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        }
+        kv_native_sys::remove_file(&path, true)
     }
 
     // ── Block API (content-addressable) ──────────────────────────────
-
-    fn block_filename(fingerprint: BlockFingerprint) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        let mut filename = String::with_capacity(35);
-        for byte in fingerprint.0 {
-            filename.push(char::from(HEX[(byte >> 4) as usize]));
-            filename.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-        filename.push_str(".kv");
-        filename
-    }
 
     /// Public canonical path for a fingerprinted block. Re-derived on
     /// every read/write from the store root + fingerprint — callers
@@ -196,7 +180,7 @@ impl DiskStore {
     /// `DiskBlockLocation`. This is the defense against session
     /// snapshot–driven path traversal (M4 review finding B2).
     pub fn block_path_for(&self, fingerprint: BlockFingerprint) -> io::Result<PathBuf> {
-        self.path_for(Self::block_filename(fingerprint))
+        kv_native_sys::block_path(self.root(), fingerprint.0)
     }
 
     /// Writes a content-addressed block file and returns its stable disk
@@ -222,18 +206,7 @@ impl DiskStore {
         file_bytes.extend_from_slice(payload);
 
         let path = self.block_path_for(fingerprint)?;
-        // Crash-safe atomic write: stage to a .tmp sibling, then rename.
-        let mut tmp_path = path.clone();
-        let tmp_name = format!(
-            "{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("block")
-        );
-        tmp_path.set_file_name(tmp_name);
-        fs::write(&tmp_path, &file_bytes)?;
-        if let Err(err) = fs::rename(&tmp_path, &path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
+        kv_native_sys::write_block_atomic(self.root(), fingerprint.0, &file_bytes)?;
 
         Ok(DiskBlockLocation {
             path,
@@ -271,7 +244,7 @@ impl DiskStore {
             ));
         }
 
-        let bytes = fs::read(&canonical)?;
+        let bytes = kv_native_sys::read_block(self.root(), location.fingerprint.0)?;
         let (header, payload) = DiskBlockHeader::decode(&bytes)?;
 
         if header.fingerprint != location.fingerprint.0 {
@@ -292,17 +265,20 @@ impl DiskStore {
     /// [`DiskStore::get_block`]).
     pub fn delete_block(&self, location: &DiskBlockLocation) -> io::Result<()> {
         let canonical = self.block_path_for(location.fingerprint)?;
-        match fs::remove_file(&canonical) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+        if location.path != canonical {
+            return Err(invalid_data(
+                "disk store: refused location.path outside canonical root",
+            ));
         }
+        kv_native_sys::remove_block(self.root(), location.fingerprint.0, true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
     use crate::types::KvContentContext;
     use tempfile::tempdir;
 
@@ -337,6 +313,18 @@ mod tests {
         let mut bytes = fingerprint.0;
         bytes[0] ^= 0xFF;
         BlockFingerprint(bytes)
+    }
+
+    fn block_filename(fingerprint: BlockFingerprint) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut filename = String::with_capacity(35);
+        for byte in fingerprint.0 {
+            filename.push(char::from(HEX[(byte >> 4) as usize]));
+            filename.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+        filename.push_str(".kv");
+        filename
     }
 
     fn write_raw_block(path: &Path, header: &DiskBlockHeader, payload: &[u8]) {
@@ -386,10 +374,7 @@ mod tests {
             .put_block(fingerprint, kv_format_tag, &payload)
             .expect("put_block");
 
-        assert_eq!(
-            location.path,
-            dir.path().join(DiskStore::block_filename(fingerprint))
-        );
+        assert_eq!(location.path, dir.path().join(block_filename(fingerprint)));
         assert_eq!(location.payload_len, payload.len() as u64);
         assert_eq!(location.fingerprint, fingerprint);
 
@@ -561,14 +546,14 @@ mod tests {
                 .path
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str),
-            Some(DiskStore::block_filename(fingerprint_a).as_str())
+            Some(block_filename(fingerprint_a).as_str())
         );
         assert_eq!(
             location_b
                 .path
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str),
-            Some(DiskStore::block_filename(fingerprint_b).as_str())
+            Some(block_filename(fingerprint_b).as_str())
         );
         assert_eq!(
             store

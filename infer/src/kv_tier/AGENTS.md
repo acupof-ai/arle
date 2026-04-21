@@ -28,7 +28,7 @@ kv_tier/id.rs           — re-export of crate::types::BlockId (u32)
 kv_tier/tier.rs         — Tier enum, BlockLocation, RemoteBlockDesc, TransportId, MemKind
 kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (bookkeeping-only today)
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
-kv_tier/transport/disk.rs       — DiskStore (pure std::fs; cross-platform)
+kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
 kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
 kv_tier/coordinator.rs  — Coordinator, CoordinatorCommand (Demote/Promote/Shutdown), handle + event channel
