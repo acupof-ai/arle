@@ -26,6 +26,14 @@ chat = { path = "../chat" }
 tempfile = "3"
 
 [[bin]]
+name = "pretrain"
+path = "src/bin/pretrain_qwen3.rs"
+
+[[bin]]
+name = "pretrain_qwen3"
+path = "src/bin/pretrain_qwen3.rs"
+
+[[bin]]
 name = "train_grpo"
 path = "src/bin/train_grpo.rs"
 
