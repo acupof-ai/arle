@@ -5,14 +5,14 @@
 //! boundaries explicit without pretending the CUDA path is already wired.
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use anyhow::{anyhow, Result};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::types::BlockId;
 
@@ -296,6 +296,13 @@ impl CoordinatorHandle {
         let _ = self.tx.try_send(CoordinatorCommand::Shutdown);
     }
 
+    fn try_send(&self, cmd: CoordinatorCommand) -> Result<()> {
+        self.tx.try_send(cmd).map_err(|err| match err {
+            TrySendError::Full(_) => anyhow!("coordinator queue full"),
+            TrySendError::Disconnected(_) => anyhow!("coordinator disconnected"),
+        })
+    }
+
     /// Mint a fresh `StageTicket` for a T1 → T2 spill batch and enqueue
     /// the corresponding `Spill` command. Returns `None` if `blocks`
     /// is empty or the command channel is full.
@@ -304,7 +311,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.send(CoordinatorCommand::Spill { ticket, blocks })
+        self.try_send(CoordinatorCommand::Spill { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -317,7 +324,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = StageTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.send(CoordinatorCommand::Rehydrate { ticket, blocks })
+        self.try_send(CoordinatorCommand::Rehydrate { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -459,18 +466,18 @@ impl Coordinator {
 
         let mut rehydrated_blocks = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let payload =
-                match disk_store.get_block(&block.disk_location, Some(block.fingerprint)) {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        self.emit_event(CoordinatorEvent::RehydrateFailed {
-                            ticket,
-                            failed_block: block.block_id,
-                            reason: err.to_string(),
-                        })?;
-                        return Ok(());
-                    }
-                };
+            let payload = match disk_store.get_block(&block.disk_location, Some(block.fingerprint))
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.emit_event(CoordinatorEvent::RehydrateFailed {
+                        ticket,
+                        failed_block: block.block_id,
+                        reason: err.to_string(),
+                    })?;
+                    return Ok(());
+                }
+            };
 
             if payload.len() != block.host_region.len {
                 self.emit_event(CoordinatorEvent::RehydrateFailed {
@@ -710,10 +717,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let disk_store = Arc::new(crate::kv_tier::transport::disk::DiskStore::new(dir.path()));
         let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store);
-        let host_pool =
-            crate::kv_tier::host_pool::SharedHostPinnedPool::new(
-                crate::kv_tier::HostPinnedPool::new(256).unwrap(),
-            );
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(256).unwrap(),
+        );
         let spill_region = {
             let mut pool = host_pool.lock().unwrap();
             let region = pool.reserve(6).unwrap();
@@ -788,10 +794,9 @@ mod tests {
     #[test]
     fn spill_fails_without_configured_disk_store() {
         let (coordinator, handle, events) = Coordinator::new(4);
-        let host_pool =
-            crate::kv_tier::host_pool::SharedHostPinnedPool::new(
-                crate::kv_tier::HostPinnedPool::new(64).unwrap(),
-            );
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+        );
         let region = {
             let mut pool = host_pool.lock().unwrap();
             let region = pool.reserve(4).unwrap();
@@ -828,5 +833,37 @@ mod tests {
             }
             other => panic!("unexpected spill failure event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_spill_is_non_blocking_when_queue_is_full() {
+        let (_coordinator, handle, _events) = Coordinator::new(1);
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+        );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(4).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"test");
+            region
+        };
+
+        let first = handle.submit_spill(vec![SpillRequest {
+            block_id: BlockId(1),
+            fingerprint: BlockFingerprint([0x11; 16]),
+            kv_format_tag: 1,
+            host_pool: host_pool.clone(),
+            host_region: region,
+        }]);
+        assert!(first.is_some());
+
+        let second = handle.submit_spill(vec![SpillRequest {
+            block_id: BlockId(2),
+            fingerprint: BlockFingerprint([0x22; 16]),
+            kv_format_tag: 1,
+            host_pool,
+            host_region: region,
+        }]);
+        assert!(second.is_none(), "full queue should not block spill submit");
     }
 }
