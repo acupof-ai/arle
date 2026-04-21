@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use chat::{ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition};
+use chat::{
+    ChatMessage, ChatRole, ParsedAssistantResponse, ToolCall, ToolDefinition, VisibleTextStream,
+};
 use infer::sampler::SamplingParams;
 use infer::server_engine::{
     CompletionOutput, CompletionRequest, CompletionStreamDelta, FinishReason, InferenceEngine,
@@ -82,10 +84,6 @@ If the user asks for an exact format, output exactly that.
 Do not expose chain-of-thought.";
 const TOOL_PLANNING_MAX_TOKENS: usize = 256;
 const STREAM_POLL_INTERVAL: Duration = Duration::from_micros(200);
-const TOOL_CALL_OPEN: &str = "<tool_call>";
-const TOOL_CALL_CLOSE: &str = "</tool_call>";
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentSettings {
@@ -131,116 +129,6 @@ pub struct AgentSession {
 pub struct AgentTurnCallbacks<'a> {
     pub on_text_chunk: Option<&'a mut dyn FnMut(&str)>,
     pub on_trace_event: Option<&'a mut dyn FnMut(&AgentTraceEvent)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HiddenBlock {
-    ToolCall,
-    Think,
-}
-
-#[derive(Default)]
-struct VisibleTextStream {
-    pending: String,
-    hidden: Option<HiddenBlock>,
-}
-
-impl VisibleTextStream {
-    fn push(&mut self, chunk: &str) -> String {
-        self.pending.push_str(chunk);
-        self.drain(false)
-    }
-
-    fn finish(&mut self) -> String {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, flush: bool) -> String {
-        let mut visible = String::new();
-
-        loop {
-            match self.hidden {
-                None => {
-                    const VISIBLE_TAGS: [&str; 4] =
-                        [TOOL_CALL_OPEN, TOOL_CALL_CLOSE, THINK_OPEN, THINK_CLOSE];
-                    let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
-                        if flush {
-                            visible.push_str(&self.pending);
-                            self.pending.clear();
-                        } else {
-                            let keep = longest_tag_prefix_suffix(&self.pending, &VISIBLE_TAGS);
-                            let emit_len = self.pending.len().saturating_sub(keep);
-                            visible.push_str(&self.pending[..emit_len]);
-                            self.pending.drain(..emit_len);
-                        }
-                        break;
-                    };
-
-                    visible.push_str(&self.pending[..idx]);
-                    self.pending.drain(..idx + tag.len());
-                    self.hidden = match tag {
-                        TOOL_CALL_OPEN => Some(HiddenBlock::ToolCall),
-                        THINK_OPEN => Some(HiddenBlock::Think),
-                        _ => None,
-                    };
-                }
-                Some(HiddenBlock::ToolCall) => {
-                    if let Some(idx) = self.pending.find(TOOL_CALL_CLOSE) {
-                        self.pending.drain(..idx + TOOL_CALL_CLOSE.len());
-                        self.hidden = None;
-                    } else if flush {
-                        self.pending.clear();
-                        self.hidden = None;
-                        break;
-                    } else {
-                        let keep = longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_CLOSE]);
-                        let drop_len = self.pending.len().saturating_sub(keep);
-                        self.pending.drain(..drop_len);
-                        break;
-                    }
-                }
-                Some(HiddenBlock::Think) => {
-                    if let Some(idx) = self.pending.find(THINK_CLOSE) {
-                        self.pending.drain(..idx + THINK_CLOSE.len());
-                        self.hidden = None;
-                    } else if flush {
-                        self.pending.clear();
-                        self.hidden = None;
-                        break;
-                    } else {
-                        let keep = longest_tag_prefix_suffix(&self.pending, &[THINK_CLOSE]);
-                        let drop_len = self.pending.len().saturating_sub(keep);
-                        self.pending.drain(..drop_len);
-                        break;
-                    }
-                }
-            }
-        }
-
-        visible
-    }
-}
-
-fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
-    tags.iter()
-        .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
-        .min_by_key(|(idx, _)| *idx)
-}
-
-fn longest_tag_prefix_suffix(text: &str, tags: &[&str]) -> usize {
-    let max_len = tags
-        .iter()
-        .map(|tag| tag.len())
-        .max()
-        .unwrap_or(0)
-        .min(text.len());
-    (1..=max_len)
-        .rev()
-        .find(|&len| {
-            let suffix = &text[text.len() - len..];
-            tags.iter().any(|tag| tag.starts_with(suffix))
-        })
-        .unwrap_or(0)
 }
 
 impl Default for AgentSession {
@@ -927,22 +815,6 @@ mod tests {
             max_tokens: 128,
             temperature: 0.0,
         }
-    }
-
-    #[test]
-    fn visible_text_stream_strips_hidden_blocks_across_chunk_boundaries() {
-        let mut stream = super::VisibleTextStream::default();
-        let mut visible = String::new();
-        for chunk in [
-            "Hello<th",
-            "ink>secret</th",
-            "ink> world<tool",
-            "_call>{\"name\":\"shell\"}</tool_call>!",
-        ] {
-            visible.push_str(&stream.push(chunk));
-        }
-        visible.push_str(&stream.finish());
-        assert_eq!(visible, "Hello world!");
     }
 
     struct TestToolExecutor;

@@ -59,6 +59,125 @@ const THINK_BLOCK: TaggedBlock = TaggedBlock {
     close: "</think>",
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HiddenBlock {
+    ToolCall,
+    Think,
+}
+
+/// Incremental text filter for streamed assistant output.
+///
+/// This keeps user-visible text while stripping `<tool_call>...</tool_call>`
+/// and `<think>...</think>` blocks across chunk boundaries.
+#[derive(Default)]
+pub struct VisibleTextStream {
+    pending: String,
+    hidden: Option<HiddenBlock>,
+}
+
+impl VisibleTextStream {
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        self.drain(false)
+    }
+
+    pub fn finish(&mut self) -> String {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> String {
+        let mut visible = String::new();
+
+        loop {
+            match self.hidden {
+                None => {
+                    const VISIBLE_TAGS: [&str; 4] = [
+                        TOOL_CALL_BLOCK.open,
+                        TOOL_CALL_BLOCK.close,
+                        THINK_BLOCK.open,
+                        THINK_BLOCK.close,
+                    ];
+                    let Some((idx, tag)) = find_first_tag(&self.pending, &VISIBLE_TAGS) else {
+                        if flush {
+                            visible.push_str(&self.pending);
+                            self.pending.clear();
+                        } else {
+                            let keep = longest_tag_prefix_suffix(&self.pending, &VISIBLE_TAGS);
+                            let emit_len = self.pending.len().saturating_sub(keep);
+                            visible.push_str(&self.pending[..emit_len]);
+                            self.pending.drain(..emit_len);
+                        }
+                        break;
+                    };
+
+                    visible.push_str(&self.pending[..idx]);
+                    self.pending.drain(..idx + tag.len());
+                    self.hidden = match tag {
+                        tag if tag == TOOL_CALL_BLOCK.open => Some(HiddenBlock::ToolCall),
+                        tag if tag == THINK_BLOCK.open => Some(HiddenBlock::Think),
+                        _ => None,
+                    };
+                }
+                Some(HiddenBlock::ToolCall) => {
+                    if let Some(idx) = self.pending.find(TOOL_CALL_BLOCK.close) {
+                        self.pending.drain(..idx + TOOL_CALL_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep =
+                            longest_tag_prefix_suffix(&self.pending, &[TOOL_CALL_BLOCK.close]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+                Some(HiddenBlock::Think) => {
+                    if let Some(idx) = self.pending.find(THINK_BLOCK.close) {
+                        self.pending.drain(..idx + THINK_BLOCK.close.len());
+                        self.hidden = None;
+                    } else if flush {
+                        self.pending.clear();
+                        self.hidden = None;
+                        break;
+                    } else {
+                        let keep = longest_tag_prefix_suffix(&self.pending, &[THINK_BLOCK.close]);
+                        let drop_len = self.pending.len().saturating_sub(keep);
+                        self.pending.drain(..drop_len);
+                        break;
+                    }
+                }
+            }
+        }
+
+        visible
+    }
+}
+
+fn find_first_tag<'a>(text: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|tag| text.find(tag).map(|idx| (idx, *tag)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn longest_tag_prefix_suffix(text: &str, tags: &[&str]) -> usize {
+    let max_len = tags
+        .iter()
+        .map(|tag| tag.len())
+        .max()
+        .unwrap_or(0)
+        .min(text.len());
+    (1..=max_len)
+        .rev()
+        .find(|&len| {
+            let suffix = &text[text.len() - len..];
+            tags.iter().any(|tag| tag.starts_with(suffix))
+        })
+        .unwrap_or(0)
+}
+
 struct PromptRenderer<'a> {
     prompt: String,
     tool_block: &'a str,
@@ -699,6 +818,33 @@ mod tests {
         let parsed = parse_tool_calls("<think>\nI should check.\n</think>\nHere is the answer.");
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.content, "Here is the answer.");
+    }
+
+    #[test]
+    fn visible_text_stream_strips_hidden_blocks_across_chunk_boundaries() {
+        let mut stream = VisibleTextStream::default();
+        let mut visible = String::new();
+
+        for chunk in [
+            "Hello<th",
+            "ink>secret</th",
+            "ink> world<tool",
+            "_call>{\"name\":\"shell\"}</tool_call>!",
+        ] {
+            visible.push_str(&stream.push(chunk));
+        }
+        visible.push_str(&stream.finish());
+
+        assert_eq!(visible, "Hello world!");
+    }
+
+    #[test]
+    fn visible_text_stream_keeps_partial_tag_prefix_hidden_until_resolved() {
+        let mut stream = VisibleTextStream::default();
+
+        assert_eq!(stream.push("abc<th"), "abc");
+        assert_eq!(stream.push("ink>secret</think>def"), "def");
+        assert_eq!(stream.finish(), "");
     }
 
     #[test]
