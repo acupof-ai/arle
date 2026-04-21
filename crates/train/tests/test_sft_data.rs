@@ -1,10 +1,9 @@
-use std::{collections::HashMap, error::Error, fs, path::Path};
+use std::{error::Error, fs, path::Path};
 
 use tempfile::tempdir;
-use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
 use train::{
     sft_data::{ChatMessage, SftExample, ToolCall, load_jsonl, tokenize_example},
-    tokenizer::ChatTokenizer,
+    tokenizer::{ChatTokenizer, write_chatml_wordlevel_tokenizer, write_wordlevel_tokenizer},
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -201,32 +200,10 @@ fn tokenize_masks_tool_turns_and_labels_assistant_tool_calls() -> TestResult {
 }
 
 fn write_test_tokenizer(path: &Path) -> TestResult {
-    let vocab = HashMap::from([
-        ("[UNK]".to_string(), 0),
-        ("<|im_start|>user\n".to_string(), 1),
-        ("<|im_start|>assistant\n".to_string(), 2),
-        ("<|im_start|>system\n".to_string(), 3),
-        ("<|im_end|>".to_string(), 4),
-        ("\n".to_string(), 5),
-        ("hi".to_string(), 6),
-        ("hello".to_string(), 7),
-        ("alpha".to_string(), 8),
-        ("beta".to_string(), 9),
-        ("policy".to_string(), 10),
-        ("gamma".to_string(), 11),
-    ]);
-    let model = WordLevel::builder()
-        .vocab(vocab.into_iter().collect())
-        .unk_token("[UNK]".into())
-        .build()?;
-    let mut tokenizer = Tokenizer::new(model);
-    tokenizer.add_special_tokens(&[
-        AddedToken::from("<|im_start|>user\n", true),
-        AddedToken::from("<|im_start|>assistant\n", true),
-        AddedToken::from("<|im_start|>system\n", true),
-        AddedToken::from("<|im_end|>", true),
-    ]);
-    tokenizer.save(path, false)?;
+    write_chatml_wordlevel_tokenizer(
+        path,
+        ["\n", "hi", "hello", "alpha", "beta", "policy", "gamma"],
+    )?;
     Ok(())
 }
 
@@ -235,38 +212,17 @@ fn write_tool_turn_tokenizer(path: &Path) -> TestResult {
         "name": "shell",
         "arguments": { "command": "pwd" }
     }))?;
-    let vocab = HashMap::from([
-        ("[UNK]".to_string(), 0),
-        ("<|im_start|>user\nask<|im_end|>\n".to_string(), 1),
-        (
+    write_wordlevel_tokenizer(
+        path,
+        std::iter::empty::<String>(),
+        [
+            "<|im_start|>user\nask<|im_end|>\n".to_string(),
             format!(
                 "<|im_start|>assistant\n\n<tool_call>\n{assistant_payload}\n</tool_call><|im_end|>\n"
             ),
-            2,
-        ),
-        (
             "<|im_start|>tool\n<tool_response>\ncwd\n</tool_response><|im_end|>\n".to_string(),
-            3,
-        ),
-        ("<|im_start|>assistant\ndone<|im_end|>\n".to_string(), 4),
-    ]);
-    let model = WordLevel::builder()
-        .vocab(vocab.into_iter().collect())
-        .unk_token("[UNK]".into())
-        .build()?;
-    let mut tokenizer = Tokenizer::new(model);
-    tokenizer.add_special_tokens(&[
-        AddedToken::from("<|im_start|>user\nask<|im_end|>\n", true),
-        AddedToken::from(
-            format!("<|im_start|>assistant\n\n<tool_call>\n{assistant_payload}\n</tool_call><|im_end|>\n"),
-            true,
-        ),
-        AddedToken::from(
-            "<|im_start|>tool\n<tool_response>\ncwd\n</tool_response><|im_end|>\n",
-            true,
-        ),
-        AddedToken::from("<|im_start|>assistant\ndone<|im_end|>\n", true),
-    ]);
-    tokenizer.save(path, false)?;
+            "<|im_start|>assistant\ndone<|im_end|>\n".to_string(),
+        ],
+    )?;
     Ok(())
 }

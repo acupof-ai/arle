@@ -2,42 +2,20 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::ExitCode,
-    str::FromStr,
-    sync::Arc,
 };
 
-use autograd::{AutogradError, Backend, CpuBackend, Tape, TensorStore};
+use autograd::{AutogradError, Tape, TensorStore};
 use thiserror::Error;
 use train::{
     CausalLm, GrpoPolicyConfig,
     causal_lm::build_registry,
-    cli_args::{ArgError, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, next_value, parse_value},
     eval_lm::{evaluate_examples, load_eval_examples},
     metrics::{MetricSample, TrainEvent, default_run_id, open_shared_sink},
     model_family::{ModelFamily, ModelFamilyError, resolve_model_family},
     qwen3::{Qwen3Config, Qwen3ConfigError, Qwen3Error, Qwen3Model},
     qwen35::{Qwen35Config, Qwen35ConfigError, Qwen35Error, Qwen35Model},
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendChoice {
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-impl FromStr for BackendChoice {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "cpu" => Ok(Self::Cpu),
-            "metal" => Ok(Self::Metal),
-            "cuda" => Ok(Self::Cuda),
-            _ => Err(format!("unknown backend: {value}")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -169,7 +147,7 @@ fn run_with_family<F: EvalFamily>(args: &CliArgs, config_path: &Path) -> Result<
         .unwrap_or_else(|| args.model_path.join("tokenizer.json"));
     let tokenizer_path = tokenizer_path.is_file().then_some(tokenizer_path);
 
-    let mut store = TensorStore::with_backend(build_backend(args.backend)?);
+    let mut store = TensorStore::with_backend(args.backend.build_backend_or_cpu("eval_lm")?);
     let model = F::build_model(&cfg, &mut store)?;
     let mut registry = build_registry(&model);
     let weights_path = args.model_path.join("model.safetensors");
@@ -190,11 +168,7 @@ fn run_with_family<F: EvalFamily>(args: &CliArgs, config_path: &Path) -> Result<
         let sink = open_shared_sink(Some(metrics_jsonl), false)
             .map_err(|err| CliError::Custom(format!("metrics sink: {err}")))?;
         let run_id = default_run_id("eval_lm");
-        let backend_name = match args.backend {
-            BackendChoice::Cpu => "cpu",
-            BackendChoice::Metal => "metal",
-            BackendChoice::Cuda => "cuda",
-        };
+        let backend_name = args.backend.as_str();
         let model_path_string = args.model_path.display().to_string();
         let data_path_string = args.data.display().to_string();
         let run_start_strings = [
@@ -294,28 +268,4 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         }));
     }
     Ok(())
-}
-
-fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
-    match choice {
-        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
-        #[cfg(feature = "metal")]
-        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
-        #[cfg(not(feature = "metal"))]
-        BackendChoice::Metal => {
-            eprintln!(
-                "[eval_lm] warning: metal backend requested without --features metal; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-        #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
-        BackendChoice::Cuda => Ok(Arc::new(autograd::backend_cuda::CudaBackend::new(0)?)),
-        #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
-        BackendChoice::Cuda => {
-            eprintln!(
-                "[eval_lm] warning: cuda backend requested without --features cuda; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-    }
 }

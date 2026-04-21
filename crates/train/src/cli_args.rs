@@ -11,8 +11,13 @@
 //! Error message strings here match the pre-extraction wording verbatim so
 //! the refactor is strictly behavior-preserving.
 
-use std::str::FromStr;
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
+use autograd::{Backend, CpuBackend};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -25,6 +30,117 @@ pub enum ArgError {
     InvalidValue { flag: String, value: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendChoice {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl BackendChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+
+    pub fn build_backend_or_cpu(
+        self,
+        job: &str,
+    ) -> Result<Arc<dyn Backend>, autograd::AutogradError> {
+        match self {
+            Self::Cpu => Ok(Arc::new(CpuBackend)),
+            #[cfg(feature = "metal")]
+            Self::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
+            #[cfg(not(feature = "metal"))]
+            Self::Metal => {
+                eprintln!(
+                    "[{job}] warning: metal backend requested without --features metal; falling back to cpu"
+                );
+                Ok(Arc::new(CpuBackend))
+            }
+            #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+            Self::Cuda => Ok(Arc::new(autograd::backend_cuda::CudaBackend::new(0)?)),
+            #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
+            Self::Cuda => {
+                eprintln!(
+                    "[{job}] warning: cuda backend requested without --features cuda; falling back to cpu"
+                );
+                Ok(Arc::new(CpuBackend))
+            }
+        }
+    }
+
+    pub fn build_backend_or_arg_error(self, flag: &str) -> Result<Arc<dyn Backend>, ArgError> {
+        match self {
+            Self::Cpu => Ok(Arc::new(CpuBackend)),
+            #[cfg(feature = "metal")]
+            Self::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
+            #[cfg(not(feature = "metal"))]
+            Self::Metal => Err(ArgError::InvalidValue {
+                flag: flag.into(),
+                value: "metal (build with --features metal)".into(),
+            }),
+            #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+            Self::Cuda => Ok(Arc::new(
+                autograd::backend_cuda::CudaBackend::new(0).map_err(|_| {
+                    ArgError::InvalidValue {
+                        flag: flag.into(),
+                        value: "cuda backend init failed".into(),
+                    }
+                })?,
+            )),
+            #[cfg(not(all(feature = "cuda", not(feature = "no-cuda"))))]
+            Self::Cuda => Err(ArgError::InvalidValue {
+                flag: flag.into(),
+                value: "cuda (build with --features cuda and no no-cuda)".into(),
+            }),
+        }
+    }
+}
+
+impl FromStr for BackendChoice {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
+            _ => Err(format!("unknown backend: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveDtype {
+    F32,
+    Bf16,
+}
+
+impl SaveDtype {
+    pub fn torch_dtype(self) -> &'static str {
+        match self {
+            Self::F32 => "float32",
+            Self::Bf16 => "bfloat16",
+        }
+    }
+}
+
+impl FromStr for SaveDtype {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "f32" => Ok(Self::F32),
+            "bf16" => Ok(Self::Bf16),
+            _ => Err(format!("unknown save dtype: {value}")),
+        }
+    }
+}
+
 pub fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, ArgError> {
     iter.next()
         .ok_or_else(|| ArgError::MissingValue(flag.to_string()))
@@ -34,6 +150,13 @@ pub fn parse_value<T: FromStr>(flag: &str, value: String) -> Result<T, ArgError>
     value.parse::<T>().map_err(|_| ArgError::InvalidValue {
         flag: flag.to_string(),
         value,
+    })
+}
+
+pub fn canonicalize_path(flag: &str, path: &Path) -> Result<PathBuf, ArgError> {
+    path.canonicalize().map_err(|_| ArgError::InvalidValue {
+        flag: flag.to_string(),
+        value: path.display().to_string(),
     })
 }
 
@@ -81,5 +204,24 @@ mod tests {
     fn unknown_flag_display_matches_legacy_wording() {
         let err = ArgError::UnknownFlag("--bogus".to_string());
         assert_eq!(err.to_string(), "unknown flag --bogus");
+    }
+
+    #[test]
+    fn backend_choice_parser_accepts_supported_values() {
+        assert_eq!("cpu".parse::<BackendChoice>().unwrap(), BackendChoice::Cpu);
+        assert_eq!(
+            "metal".parse::<BackendChoice>().unwrap(),
+            BackendChoice::Metal
+        );
+        assert_eq!(
+            "cuda".parse::<BackendChoice>().unwrap(),
+            BackendChoice::Cuda
+        );
+    }
+
+    #[test]
+    fn save_dtype_parser_accepts_supported_values() {
+        assert_eq!("f32".parse::<SaveDtype>().unwrap(), SaveDtype::F32);
+        assert_eq!("bf16".parse::<SaveDtype>().unwrap(), SaveDtype::Bf16);
     }
 }

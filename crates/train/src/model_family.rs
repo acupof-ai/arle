@@ -71,7 +71,7 @@ pub fn synthetic_qwen3_config(seq: usize) -> Qwen3Config {
 }
 
 pub fn synthetic_qwen35_dense_config(seq: usize) -> Qwen35Config {
-    Qwen35Config {
+    let cfg = Qwen35Config {
         hidden_size: 64,
         intermediate_size: 128,
         num_hidden_layers: 2,
@@ -101,5 +101,9 @@ pub fn synthetic_qwen35_dense_config(seq: usize) -> Qwen35Config {
         shared_expert_intermediate_size: 0,
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
-    }
+    };
+    cfg.validate_train_dense_full_attention_contract().expect(
+        "synthetic_qwen35_dense_config must satisfy the train-side dense/full-attn contract",
+    );
+    cfg
 }

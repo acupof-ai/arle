@@ -3,13 +3,12 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
-    str::FromStr,
     sync::Arc,
     time::Instant,
 };
 
 use autograd::{
-    AutogradError, Backend, CpuBackend, Tape, TensorId, TensorStore,
+    AutogradError, Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
     optim::AdamW,
 };
@@ -20,7 +19,7 @@ use train::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
         trainable_params,
     },
-    cli_args::{ArgError, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, SaveDtype, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -47,47 +46,6 @@ const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
 const DEFAULT_EPS: f32 = 1.0e-8;
 const DEFAULT_WEIGHT_DECAY: f32 = 0.01;
 const STOP_REQUESTED_ERR: &str = "train_sft: operator stop requested";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendChoice {
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-impl FromStr for BackendChoice {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "cpu" => Ok(Self::Cpu),
-            "metal" => Ok(Self::Metal),
-            "cuda" => Ok(Self::Cuda),
-            _ => Err(format!("unknown backend: {value}")),
-        }
-    }
-}
-
-// bf16 is the default because infer/'s DeviceMatrix::from_safetensors
-// reinterprets the safetensors bytes as `&[bf16]`. f32 is kept for bit-exact
-// debugging — it round-trips inside autograd but infer will reject it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaveDtype {
-    F32,
-    Bf16,
-}
-
-impl FromStr for SaveDtype {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "f32" => Ok(Self::F32),
-            "bf16" => Ok(Self::Bf16),
-            _ => Err(format!("unknown save dtype: {value}")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -348,7 +306,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
 
     let cfg = F::load_config(config_path)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
-    let mut store = TensorStore::with_backend(build_backend(args.backend)?);
+    let mut store = TensorStore::with_backend(args.backend.build_backend_or_cpu("train_sft")?);
     let model = F::build_model(&cfg, lora, &mut store)?;
     let mut registry = build_registry(&model);
     registry.load_into(&mut store, &weights_path)?;
@@ -406,11 +364,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
         .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_sft");
     let run_timer = Instant::now();
-    let backend_name = match args.backend {
-        BackendChoice::Cpu => "cpu",
-        BackendChoice::Metal => "metal",
-        BackendChoice::Cuda => "cuda",
-    };
+    let backend_name = args.backend.as_str();
 
     // DX-1 follow-up (codex review 2026-04-20 on 8bde810, High): canonicalize
     // --resume-from once, up-front, so every subsequent read (weights, config,
@@ -765,30 +719,6 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         }));
     }
     Ok(())
-}
-
-fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
-    match choice {
-        BackendChoice::Cpu => Ok(Arc::new(CpuBackend)),
-        #[cfg(feature = "metal")]
-        BackendChoice::Metal => Ok(Arc::new(autograd::backend_metal::MetalBackend)),
-        #[cfg(not(feature = "metal"))]
-        BackendChoice::Metal => {
-            eprintln!(
-                "[train_sft] warning: metal backend requested without --features metal; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-        #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => Ok(Arc::new(autograd::backend_cuda::CudaBackend::new(0)?)),
-        #[cfg(not(feature = "cuda"))]
-        BackendChoice::Cuda => {
-            eprintln!(
-                "[train_sft] warning: cuda backend requested without --features cuda; falling back to cpu"
-            );
-            Ok(Arc::new(CpuBackend))
-        }
-    }
 }
 
 fn assistant_masked_causal_loss(
@@ -1444,7 +1374,6 @@ mod tests {
     use serde_json::json;
     use std::error::Error;
     use tempfile::tempdir;
-    use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -1515,36 +1444,18 @@ mod tests {
     }
 
     fn write_tiny_tokenizer(path: &Path) -> TestResult {
-        let turns = [
-            "<|im_start|>user\nhi<|im_end|>\n",
-            "<|im_start|>assistant\nhello<|im_end|>\n",
-            "<|im_start|>user\nadd<|im_end|>\n",
-            "<|im_start|>assistant\nsum<|im_end|>\n",
-            "<|im_start|>user\nbye<|im_end|>\n",
-            "<|im_start|>assistant\nlater<|im_end|>\n",
-        ];
-
-        let model = WordLevel::builder()
-            .vocab(
-                std::iter::once(("[UNK]".to_string(), 0))
-                    .chain(
-                        turns
-                            .iter()
-                            .enumerate()
-                            .map(|(index, turn)| ((*turn).to_string(), index as u32 + 1)),
-                    )
-                    .collect(),
-            )
-            .unk_token("[UNK]".into())
-            .build()?;
-        let mut tokenizer = Tokenizer::new(model);
-        tokenizer.add_special_tokens(
-            &turns
-                .iter()
-                .map(|turn| AddedToken::from(*turn, true))
-                .collect::<Vec<_>>(),
-        );
-        tokenizer.save(path, false)?;
+        train::tokenizer::write_wordlevel_tokenizer(
+            path,
+            std::iter::empty::<String>(),
+            [
+                "<|im_start|>user\nhi<|im_end|>\n".to_string(),
+                "<|im_start|>assistant\nhello<|im_end|>\n".to_string(),
+                "<|im_start|>user\nadd<|im_end|>\n".to_string(),
+                "<|im_start|>assistant\nsum<|im_end|>\n".to_string(),
+                "<|im_start|>user\nbye<|im_end|>\n".to_string(),
+                "<|im_start|>assistant\nlater<|im_end|>\n".to_string(),
+            ],
+        )?;
         Ok(())
     }
 

@@ -201,7 +201,7 @@ impl Qwen35Model {
         store: &mut TensorStore,
     ) -> Result<Self> {
         cfg.validate()?;
-        validate_train_config(cfg)?;
+        cfg.validate_train_dense_full_attention_contract()?;
 
         let mut param_names = HashMap::new();
         let mut adapter_names = HashMap::new();
@@ -691,34 +691,6 @@ impl CausalLm for Qwen35Model {
     ) -> autograd::Result<HashMap<&'static str, TensorId>> {
         Qwen35Model::materialized_param_name_map(self, store).map_err(qwen35_to_autograd)
     }
-}
-
-fn validate_train_config(cfg: &Qwen35Config) -> Result<()> {
-    if cfg.is_moe() {
-        return Err(Qwen35Error::InvalidConfig(
-            "train-side qwen3.5 currently supports dense MLP layers only",
-        ));
-    }
-    if cfg
-        .layer_types
-        .iter()
-        .any(|layer_type| *layer_type != LayerType::FullAttention)
-    {
-        return Err(Qwen35Error::InvalidConfig(
-            "train-side qwen3.5 currently supports full-attention layers only",
-        ));
-    }
-    if cfg.rotary_dim != cfg.head_dim {
-        return Err(Qwen35Error::InvalidConfig(
-            "train-side qwen3.5 requires rotary_dim == head_dim",
-        ));
-    }
-    if cfg.rope_cache_len_hint.is_none() {
-        return Err(Qwen35Error::InvalidConfig(
-            "train-side qwen3.5 requires rope_cache_len_hint",
-        ));
-    }
-    Ok(())
 }
 
 fn linear_forward(

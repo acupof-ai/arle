@@ -4,11 +4,21 @@
 //! Training needs both encode + decode + chat-template assembly against
 //! pretrained vocabs (Qwen3 family, GLM4 share the `<|im_start|>` template).
 
-use std::path::Path;
+use std::{collections::HashSet, fmt::Display, path::Path};
 
-use tokenizers::Tokenizer;
+use tokenizers::{
+    AddedToken, Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+};
 
 use autograd::{AutogradError, Result};
+
+const CHATML_SPECIAL_TOKENS: [&str; 4] = [
+    "<|im_start|>user\n",
+    "<|im_start|>assistant\n",
+    "<|im_start|>system\n",
+    "<|im_end|>",
+];
+const UNK_TOKEN: &str = "[UNK]";
 
 pub struct ChatTokenizer {
     inner: Tokenizer,
@@ -16,20 +26,15 @@ pub struct ChatTokenizer {
 
 impl ChatTokenizer {
     pub fn from_file(path: &Path) -> Result<Self> {
-        let inner = Tokenizer::from_file(path).map_err(|e| {
-            AutogradError::TapeInvariant(Box::leak(
-                format!("tokenizer load failed: {e}").into_boxed_str(),
-            ))
-        })?;
+        let inner = Tokenizer::from_file(path).map_err(|e| tokenizer_error("load", e))?;
         Ok(Self { inner })
     }
 
     pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
-        let enc = self.inner.encode(text, add_special).map_err(|e| {
-            AutogradError::TapeInvariant(Box::leak(
-                format!("tokenizer encode failed: {e}").into_boxed_str(),
-            ))
-        })?;
+        let enc = self
+            .inner
+            .encode(text, add_special)
+            .map_err(|e| tokenizer_error("encode", e))?;
         Ok(enc.get_ids().to_vec())
     }
 
@@ -43,20 +48,17 @@ impl ChatTokenizer {
         text: &str,
         add_special: bool,
     ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
-        let enc = self.inner.encode(text, add_special).map_err(|e| {
-            AutogradError::TapeInvariant(Box::leak(
-                format!("tokenizer encode failed: {e}").into_boxed_str(),
-            ))
-        })?;
+        let enc = self
+            .inner
+            .encode(text, add_special)
+            .map_err(|e| tokenizer_error("encode", e))?;
         Ok((enc.get_ids().to_vec(), enc.get_offsets().to_vec()))
     }
 
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String> {
-        self.inner.decode(ids, skip_special).map_err(|e| {
-            AutogradError::TapeInvariant(Box::leak(
-                format!("tokenizer decode failed: {e}").into_boxed_str(),
-            ))
-        })
+        self.inner
+            .decode(ids, skip_special)
+            .map_err(|e| tokenizer_error("decode", e))
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -64,10 +66,68 @@ impl ChatTokenizer {
     }
 }
 
+pub fn write_wordlevel_tokenizer(
+    path: &Path,
+    tokens: impl IntoIterator<Item = impl Into<String>>,
+    special_tokens: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<()> {
+    let special_tokens = special_tokens
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<String>>();
+    let mut seen = HashSet::from([UNK_TOKEN.to_string()]);
+    let mut vocab = vec![(UNK_TOKEN.to_string(), 0u32)];
+    for token in tokens
+        .into_iter()
+        .map(Into::into)
+        .chain(special_tokens.iter().cloned())
+    {
+        if !seen.insert(token.clone()) {
+            continue;
+        }
+        let next_id = u32::try_from(vocab.len())
+            .map_err(|_| tokenizer_message("tokenizer vocab length exceeded u32::MAX"))?;
+        vocab.push((token, next_id));
+    }
+
+    let model = WordLevel::builder()
+        .vocab(vocab.into_iter().collect())
+        .unk_token(UNK_TOKEN.into())
+        .build()
+        .map_err(|e| tokenizer_error("build wordlevel", e))?;
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    let special_tokens = special_tokens
+        .into_iter()
+        .map(|token| AddedToken::from(token, true).special(true))
+        .collect::<Vec<_>>();
+    tokenizer.add_special_tokens(&special_tokens);
+    tokenizer
+        .save(path, false)
+        .map_err(|e| tokenizer_error("save", e))?;
+    Ok(())
+}
+
+pub fn write_chatml_wordlevel_tokenizer(
+    path: &Path,
+    tokens: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<()> {
+    write_wordlevel_tokenizer(path, tokens, CHATML_SPECIAL_TOKENS)
+}
+
+fn tokenizer_error(context: &str, err: impl Display) -> AutogradError {
+    tokenizer_message(&format!("tokenizer {context} failed: {err}"))
+}
+
+fn tokenizer_message(message: &str) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(message.to_string().into_boxed_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     /// Only runs when a real HF model directory is pointed at via
     /// `INFER_TEST_MODEL_PATH`. Mirrors the infer-side convention.
@@ -90,5 +150,18 @@ mod tests {
         let text = tok.decode(&ids, true).expect("decode");
         // Tokenizers sometimes add/remove leading whitespace; trim and compare.
         assert_eq!(text.trim(), "hello world");
+    }
+
+    #[test]
+    fn write_chatml_wordlevel_tokenizer_roundtrips_words() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        write_chatml_wordlevel_tokenizer(&path, ["hello", "world", "agent"]).expect("write");
+        let tok = ChatTokenizer::from_file(&path).expect("load tokenizer");
+        let ids = tok.encode("hello world", false).expect("encode");
+        assert_eq!(
+            tok.decode(&ids, true).expect("decode").trim(),
+            "hello world"
+        );
     }
 }
