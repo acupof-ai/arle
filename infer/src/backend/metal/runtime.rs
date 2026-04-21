@@ -78,6 +78,7 @@ struct ActiveMetalRequest {
     decoder: IncrementalDecoder<'static>,
     stop_processor: StopChunkProcessor,
     prompt_tokens: Vec<u32>,
+    enqueued_at: Instant,
     admitted_at: Instant,
     first_token_at: Option<Instant>,
 }
@@ -116,7 +117,8 @@ impl ActiveMetalRequest {
             decoder: tokenizer.incremental_decoder(),
             stop_processor: StopChunkProcessor::new(pending.stop.unwrap_or_default()),
             prompt_tokens,
-            admitted_at: pending.enqueued_at,
+            enqueued_at: pending.enqueued_at,
+            admitted_at: Instant::now(),
             first_token_at: None,
         })
     }
@@ -210,6 +212,17 @@ impl ActiveMetalRequest {
 
 const METAL_PREFIX_BLOCK_SIZE: usize = 16;
 const METAL_PREFIX_POOL_MULTIPLIER: usize = 4;
+const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
+
+enum PrefillChunkOutcome {
+    Progress {
+        emitted_token: Option<u32>,
+        runtime_finished: bool,
+        stop_hit: bool,
+    },
+    ClientDropped,
+    Failed(anyhow::Error),
+}
 
 enum MetalLivePrefixRuntime {
     Qwen35(MetalQwen35PrefixRuntime),
@@ -336,7 +349,7 @@ impl MetalQwen35PrefixRuntime {
             .export_qwen35_prompt_prefixes(self.block_size)
             .context("export Qwen3.5 prompt prefix snapshots")?;
         for snapshot in snapshots {
-            self.insert_snapshot(snapshot)?;
+            self.insert_snapshot(snapshot);
         }
         Ok(())
     }
@@ -354,18 +367,18 @@ impl MetalQwen35PrefixRuntime {
             .cloned()
     }
 
-    fn insert_snapshot(&mut self, snapshot: Qwen35PrefixSnapshot) -> Result<()> {
+    fn insert_snapshot(&mut self, snapshot: Qwen35PrefixSnapshot) {
         let token_count = snapshot.token_ids.len();
         if token_count < self.block_size || !token_count.is_multiple_of(self.block_size) {
-            return Ok(());
+            return;
         }
         let tick = self.bump_tick();
         if let Some(existing) = self.entries.get_mut(&snapshot.token_ids) {
             existing.last_used_tick = tick;
-            return Ok(());
+            return;
         }
         if token_count > self.max_cached_tokens {
-            return Ok(());
+            return;
         }
 
         self.ensure_capacity_for(token_count);
@@ -378,7 +391,6 @@ impl MetalQwen35PrefixRuntime {
                 last_used_tick: tick,
             },
         );
-        Ok(())
     }
 
     fn ensure_capacity_for(&mut self, needed_tokens: usize) {
@@ -514,12 +526,9 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
         // request-state API currently borrows backend internals, so keep the
         // loaded backend stable inside the worker thread until the server exits.
         let backend: &'static MetalBackend = Box::leak(Box::new(backend));
-        let tokenizer = match backend.tokenizer.as_ref() {
-            Some(tokenizer) => tokenizer,
-            None => {
-                error!("Metal scheduler runtime failed: model tokenizer not loaded");
-                return;
-            }
+        let Some(tokenizer) = backend.tokenizer.as_ref() else {
+            error!("Metal scheduler runtime failed: model tokenizer not loaded");
+            return;
         };
         let tokenizer: &'static Tokenizer = tokenizer;
 
@@ -528,8 +537,8 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
                 backend,
                 tokenizer,
                 rx,
-                runtime_handle,
-                metrics,
+                &runtime_handle,
+                &metrics,
                 MetalSchedulerConfig::default(),
             )
         }));
@@ -565,8 +574,8 @@ fn run_metal_scheduler_runtime(
     backend: &'static MetalBackend,
     tokenizer: &'static Tokenizer,
     mut request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
-    handle: SchedulerHandle,
-    metrics: ServerMetrics,
+    handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
     config: MetalSchedulerConfig,
 ) -> Result<()> {
     let mut prefix_runtime = MetalLivePrefixRuntime::new(backend, &config)?;
@@ -575,11 +584,6 @@ fn run_metal_scheduler_runtime(
     let mut active = HashMap::<RequestId, ActiveMetalRequest>::new();
     let mut qwen35_decode_batch_cache: Option<CachedQwen35DecodeBatch> = None;
     let mut request_rx_closed = false;
-    // Rate-limit MLX allocator FFI queries — each `refresh_runtime_metrics`
-    // call issues 3 cross-FFI allocator queries; at c=1 decode this was
-    // firing twice per step and cost ~2 ms/step (HTTP 72 tok/s vs direct
-    // path 84 tok/s). Prom scrape cadence is seconds, 40 ms here is plenty.
-    const METRICS_REFRESH_INTERVAL: Duration = Duration::from_millis(40);
     let mut last_metrics_refresh: Option<Instant> = None;
 
     info!("Metal scheduler runtime started");
@@ -587,17 +591,17 @@ fn run_metal_scheduler_runtime(
     loop {
         drain_incoming_requests(
             tokenizer,
-            &handle,
-            &metrics,
+            handle,
+            metrics,
             &mut request_rx,
             &mut request_rx_closed,
             &mut scheduler,
             &mut pending,
         );
-        reap_closed_clients(&handle, &mut scheduler, &mut pending, &mut active);
+        reap_closed_clients(handle, &mut scheduler, &mut pending, &mut active);
         maybe_refresh_runtime_metrics(
-            &metrics,
-            &handle,
+            metrics,
+            handle,
             &scheduler,
             &pending,
             &active,
@@ -611,25 +615,22 @@ fn run_metal_scheduler_runtime(
         }
 
         if active.is_empty() && scheduler.waiting_len() == 0 {
-            match request_rx.blocking_recv() {
-                Some(incoming) => {
-                    enqueue_request(
-                        &metrics,
-                        tokenizer,
-                        incoming,
-                        &handle,
-                        &mut scheduler,
-                        &mut pending,
-                    );
-                    // Admission is rare enough that an unconditional refresh
-                    // is fine — helps the first metrics scrape after idle.
-                    refresh_runtime_metrics(&metrics, &handle, &scheduler, &pending, &active);
-                    last_metrics_refresh = Some(Instant::now());
-                }
-                None => {
-                    request_rx_closed = true;
-                    continue;
-                }
+            if let Some(incoming) = request_rx.blocking_recv() {
+                enqueue_request(
+                    metrics,
+                    tokenizer,
+                    incoming,
+                    handle,
+                    &mut scheduler,
+                    &mut pending,
+                );
+                // Admission is rare enough that an unconditional refresh
+                // is fine — helps the first metrics scrape after idle.
+                refresh_runtime_metrics(metrics, handle, &scheduler, &pending, &active);
+                last_metrics_refresh = Some(Instant::now());
+            } else {
+                request_rx_closed = true;
+                continue;
             }
         }
 
@@ -642,7 +643,7 @@ fn run_metal_scheduler_runtime(
         if let Some(batch) = step.decode {
             guard_decode_batch(
                 batch.req_ids,
-                &metrics,
+                metrics,
                 &mut scheduler,
                 &mut active,
                 &mut qwen35_decode_batch_cache,
@@ -655,8 +656,8 @@ fn run_metal_scheduler_runtime(
                 prefill.input_tokens.len(),
                 backend,
                 tokenizer,
-                &handle,
-                &metrics,
+                handle,
+                metrics,
                 &mut prefix_runtime,
                 &mut scheduler,
                 &mut pending,
@@ -665,8 +666,8 @@ fn run_metal_scheduler_runtime(
         }
 
         maybe_refresh_runtime_metrics(
-            &metrics,
-            &handle,
+            metrics,
+            handle,
             &scheduler,
             &pending,
             &active,
@@ -957,16 +958,6 @@ fn execute_prefill_chunk(
         }
     }
 
-    enum Outcome {
-        Progress {
-            emitted_token: Option<u32>,
-            runtime_finished: bool,
-            stop_hit: bool,
-        },
-        ClientDropped,
-        Failed(anyhow::Error),
-    }
-
     let outcome = {
         let Some(request) = active.get_mut(&req_id) else {
             warn!(
@@ -978,19 +969,19 @@ fn execute_prefill_chunk(
         };
 
         if request.delta_closed() {
-            Outcome::ClientDropped
+            PrefillChunkOutcome::ClientDropped
         } else {
             match request.prefill_chunk(budget) {
-                Ok(emitted_token) => Outcome::Progress {
+                Ok(emitted_token) => PrefillChunkOutcome::Progress {
                     emitted_token,
                     runtime_finished: request.phase() == RuntimePhase::Finished,
                     stop_hit: request.stop_hit(),
                 },
                 Err(err) => {
                     if request.delta_closed() {
-                        Outcome::ClientDropped
+                        PrefillChunkOutcome::ClientDropped
                     } else {
-                        Outcome::Failed(err)
+                        PrefillChunkOutcome::Failed(err)
                     }
                 }
             }
@@ -998,7 +989,7 @@ fn execute_prefill_chunk(
     };
 
     match outcome {
-        Outcome::Progress {
+        PrefillChunkOutcome::Progress {
             emitted_token,
             runtime_finished,
             stop_hit,
@@ -1016,8 +1007,8 @@ fn execute_prefill_chunk(
                 finalize_request(req_id, metrics, scheduler, active);
             }
         }
-        Outcome::ClientDropped => cancel_request(req_id, scheduler, active),
-        Outcome::Failed(err) => {
+        PrefillChunkOutcome::ClientDropped => cancel_request(req_id, scheduler, active),
+        PrefillChunkOutcome::Failed(err) => {
             error!("Metal prefill chunk failed for {:?}: {err:#}", req_id);
             metrics.record_request_failed();
             cancel_request(req_id, scheduler, active);
@@ -1237,7 +1228,7 @@ fn execute_qwen35_dflash_packed_batch(
 }
 
 fn execute_qwen35_packed_decode_batch(
-    open: &mut Vec<(RequestId, ActiveMetalRequest)>,
+    open: &mut [(RequestId, ActiveMetalRequest)],
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
     cache: &mut Option<CachedQwen35DecodeBatch>,
 ) -> Result<Option<Vec<u32>>> {
@@ -1251,7 +1242,7 @@ fn execute_qwen35_packed_decode_batch(
         if cached.req_ids != current_req_ids {
             if let Some(retained_rows) = retained_row_indices(&cached.req_ids, &current_req_ids) {
                 cached.batch.retain_rows(&retained_rows)?;
-                cached.req_ids = current_req_ids.clone();
+                cached.req_ids.clone_from(&current_req_ids);
             } else if let Some(new_indices) = admit_row_indices(&cached.req_ids, &current_req_ids) {
                 // Prefix-preserving grow: existing rows still first (in
                 // order), new rows appended at the end. Admit when every new
@@ -1320,7 +1311,7 @@ fn execute_qwen35_packed_decode_batch(
 fn invalidate_qwen35_decode_batch_cache(
     cache: &mut Option<CachedQwen35DecodeBatch>,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
-    open: &mut Vec<(RequestId, ActiveMetalRequest)>,
+    open: &mut [(RequestId, ActiveMetalRequest)],
 ) {
     let Some(mut cached) = cache.take() else {
         return;
@@ -1331,12 +1322,12 @@ fn invalidate_qwen35_decode_batch_cache(
     for (row_idx, req_id) in cached.req_ids.iter().enumerate() {
         if let Some((_, request)) = open.iter_mut().find(|(candidate, _)| candidate == req_id) {
             row_indices.push(row_idx);
-            state_ptrs.push((&mut request.request_state) as *mut MetalRequestState<'static>);
+            state_ptrs.push(&raw mut request.request_state);
             continue;
         }
         if let Some(request) = active.get_mut(req_id) {
             row_indices.push(row_idx);
-            state_ptrs.push((&mut request.request_state) as *mut MetalRequestState<'static>);
+            state_ptrs.push(&raw mut request.request_state);
         }
     }
 
@@ -1369,12 +1360,9 @@ fn retained_row_indices(
     let mut indices = Vec::with_capacity(current_req_ids.len());
     let mut cursor = 0usize;
     for req_id in current_req_ids {
-        let Some(relative) = previous_req_ids[cursor..]
+        let relative = previous_req_ids[cursor..]
             .iter()
-            .position(|candidate| candidate == req_id)
-        else {
-            return None;
-        };
+            .position(|candidate| candidate == req_id)?;
         let absolute = cursor + relative;
         indices.push(absolute);
         cursor = absolute + 1;
@@ -1571,19 +1559,30 @@ fn finalize_request(
 
 fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalRequest) {
     let completion_tokens = request.request_state.generated_tokens() as u64;
-    let e2e_s = request.admitted_at.elapsed().as_secs_f64();
-    let ttft_s = request
-        .first_token_at
-        .map(|first| first.duration_since(request.admitted_at).as_secs_f64())
-        .unwrap_or(e2e_s);
+    let completed_at = Instant::now();
+    let queue_wait_s = request
+        .admitted_at
+        .duration_since(request.enqueued_at)
+        .as_secs_f64();
+    let e2e_s = completed_at
+        .duration_since(request.enqueued_at)
+        .as_secs_f64();
+    let active_ttft_s = request.first_token_at.map_or(0.0, |first| {
+        first.duration_since(request.admitted_at).as_secs_f64()
+    });
+    let ttft_s = request.first_token_at.map_or(e2e_s, |first| {
+        first.duration_since(request.enqueued_at).as_secs_f64()
+    });
     let tpot_s = if completion_tokens > 1 {
         (e2e_s - ttft_s).max(0.0) / (completion_tokens - 1) as f64
     } else {
         0.0
     };
-    metrics.record_request_completed(
+    metrics.record_request_completed_detailed(
         request.prompt_len() as u64,
         completion_tokens,
+        queue_wait_s,
+        active_ttft_s,
         ttft_s,
         tpot_s,
         e2e_s,

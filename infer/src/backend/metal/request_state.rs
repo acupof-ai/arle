@@ -328,8 +328,8 @@ pub struct MetalRequestState<'a> {
 }
 
 enum MetalRequestStateInner<'a> {
-    Qwen3(ResumableRequestState<Qwen3StepDriver<'a>>),
-    Qwen35(ResumableRequestState<Qwen35StepDriver<'a>>),
+    Qwen3(Box<ResumableRequestState<Qwen3StepDriver<'a>>>),
+    Qwen35(Box<ResumableRequestState<Qwen35StepDriver<'a>>>),
 }
 
 pub(crate) struct Qwen35PrefixSnapshot {
@@ -358,8 +358,9 @@ impl<'a> Qwen35PackedDecodeBatch<'a> {
         self.packed_kv_flat
             .first()
             .or_else(|| self.packed_gdr_flat.first())
-            .map(|array| array.shape().first().copied().unwrap_or(0).max(0) as usize)
-            .unwrap_or(0)
+            .map_or(0, |array| {
+                array.shape().first().copied().unwrap_or(0).max(0) as usize
+            })
     }
 
     /// Shared column cursor for this packed batch. All rows write their next
@@ -618,7 +619,7 @@ impl<'a> MetalRequestState<'a> {
                     config.eos_token_id,
                     params.ignore_eos,
                 )?;
-                MetalRequestStateInner::Qwen3(state)
+                MetalRequestStateInner::Qwen3(Box::new(state))
             }
             MetalWeights::Qwen35(weights) => {
                 let driver = Qwen35StepDriver::new(
@@ -637,7 +638,7 @@ impl<'a> MetalRequestState<'a> {
                     config.eos_token_id,
                     params.ignore_eos,
                 )?;
-                MetalRequestStateInner::Qwen35(state)
+                MetalRequestStateInner::Qwen35(Box::new(state))
             }
         };
 
@@ -757,7 +758,7 @@ impl<'a> MetalRequestState<'a> {
                             if qwen3.phase() != MetalRequestPhase::Decode {
                                 return Ok(None);
                             }
-                            qwen3_states.push(qwen3);
+                            qwen3_states.push(&mut **qwen3);
                         }
                         MetalRequestStateInner::Qwen35(_) => return Ok(None),
                     }
@@ -783,7 +784,7 @@ impl<'a> MetalRequestState<'a> {
                             if qwen35.phase() != MetalRequestPhase::Decode {
                                 return Ok(None);
                             }
-                            qwen35_states.push(qwen35);
+                            qwen35_states.push(&mut **qwen35);
                         }
                         MetalRequestStateInner::Qwen3(_) => return Ok(None),
                     }
@@ -817,7 +818,7 @@ impl<'a> MetalRequestState<'a> {
             MetalRequestStateInner::Qwen35(state) if state.phase() == MetalRequestPhase::Decode => {
                 Some(state.driver.cache_len)
             }
-            _ => None,
+            MetalRequestStateInner::Qwen3(_) | MetalRequestStateInner::Qwen35(_) => None,
         }
     }
 
@@ -848,7 +849,7 @@ impl<'a> MetalRequestState<'a> {
                 let from_draft = total_accepted.saturating_sub(blocks);
                 Some(from_draft as f64 / total_accepted as f64)
             }
-            _ => None,
+            MetalRequestStateInner::Qwen35(_) => None,
         }
     }
 
@@ -891,7 +892,7 @@ impl<'a> MetalRequestState<'a> {
                     if qwen35.phase() != MetalRequestPhase::Decode {
                         return Ok(None);
                     }
-                    qwen35_states.push(qwen35);
+                    qwen35_states.push(&mut **qwen35);
                 }
                 MetalRequestStateInner::Qwen3(_) => return Ok(None),
             }
@@ -918,7 +919,7 @@ impl<'a> MetalRequestState<'a> {
                     {
                         return Ok(None);
                     }
-                    qwen35_states.push(qwen35);
+                    qwen35_states.push(&mut **qwen35);
                 }
                 MetalRequestStateInner::Qwen3(_) => return Ok(None),
             }
@@ -940,7 +941,7 @@ impl<'a> MetalRequestState<'a> {
         for state in states.iter_mut() {
             let state_ref: &mut MetalRequestState<'a> = state;
             match &mut state_ref.inner {
-                MetalRequestStateInner::Qwen35(qwen35) => qwen35_states.push(qwen35),
+                MetalRequestStateInner::Qwen35(qwen35) => qwen35_states.push(&mut **qwen35),
                 MetalRequestStateInner::Qwen3(_) => {
                     bail!("sync_qwen35_packed_decode_batch received mixed model batch")
                 }
@@ -1589,11 +1590,11 @@ fn decode_qwen35_packed_batch<'a>(
         sampled_i32.into_iter().map(|token| token as u32).collect()
     } else {
         let mut sampled_arrays = Vec::with_capacity(states.len());
-        for row_idx in 0..states.len() {
+        for (row_idx, state) in states.iter().enumerate() {
             let row = i32::try_from(row_idx).context("decode_qwen35_packed_batch row overflow")?;
             sampled_arrays.push(gpu_sample_token(
                 &slice_row(&logits, row),
-                &states[row_idx].driver.params,
+                &state.driver.params,
             ));
         }
         let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
@@ -1948,8 +1949,8 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
 /// the row can join a DFlash batched-speculative block in isolation (cross-row
 /// agreement is checked separately, anchored on the first row that passes
 /// this predicate).
-fn row_passes_dflash_batch_per_row_predicates<'a>(
-    state: &ResumableRequestState<Qwen35StepDriver<'a>>,
+fn row_passes_dflash_batch_per_row_predicates(
+    state: &ResumableRequestState<Qwen35StepDriver<'_>>,
 ) -> bool {
     if state.phase != MetalRequestPhase::Decode {
         return false;
@@ -1973,7 +1974,7 @@ fn row_passes_dflash_batch_per_row_predicates<'a>(
     let Some(target_hidden) = dflash.target_hidden.as_ref() else {
         return false;
     };
-    if target_hidden.shape().first().is_none() {
+    if target_hidden.shape().is_empty() {
         return false;
     }
     if !dflash.runtime.batched_draft_path_eligible() {
@@ -2149,7 +2150,7 @@ fn decode_qwen35_batch(
     );
 
     let mut sampled_arrays = Vec::with_capacity(states.len());
-    for row_idx in 0..states.len() {
+    for (row_idx, state) in states.iter().enumerate() {
         let row = i32::try_from(row_idx).context("decode_qwen35_batch row overflow")?;
         let mut start = vec![0; logits_shape.len()];
         let mut end = logits_shape.clone();
@@ -2157,10 +2158,7 @@ fn decode_qwen35_batch(
         start[0] = row;
         end[0] = row + 1;
         let row_logits = slice(&logits, &start, &end, &strides);
-        sampled_arrays.push(gpu_sample_token(
-            &row_logits,
-            &states[row_idx].driver.params,
-        ));
+        sampled_arrays.push(gpu_sample_token(&row_logits, &state.driver.params));
     }
     let sample_refs: Vec<&MlxArray> = sampled_arrays.iter().collect();
     eval(&sample_refs);
@@ -2172,7 +2170,7 @@ fn decode_qwen35_batch(
     for (state, sampled) in states.iter_mut().zip(sampled_arrays.iter()) {
         match &mut state.driver.mode {
             Qwen35StepMode::Cpp(cpp) => {
-                for slot in cpp.kv_flat.iter_mut() {
+                for slot in &mut cpp.kv_flat {
                     let old = std::mem::replace(
                         slot,
                         kv_iter
@@ -2181,7 +2179,7 @@ fn decode_qwen35_batch(
                     );
                     drop(old);
                 }
-                for slot in cpp.gdr_flat.iter_mut() {
+                for slot in &mut cpp.gdr_flat {
                     let old = std::mem::replace(
                         slot,
                         gdr_iter
@@ -2225,6 +2223,7 @@ fn qwen35_can_batch_sample(states: &[&mut ResumableRequestState<Qwen35StepDriver
         .all(|state| same_sampling_params(&first.driver.params, &state.driver.params))
 }
 
+#[allow(clippy::float_cmp)]
 fn same_sampling_params(a: &SamplingParams, b: &SamplingParams) -> bool {
     a.temperature == b.temperature
         && a.top_k == b.top_k
@@ -2604,8 +2603,7 @@ impl StepDriver for Qwen3StepDriver<'_> {
         // on the terminal chunk to capture target-layer hidden states for the
         // first speculative block. The budget override in execute_prefill_chunk
         // ensures the entire prompt arrives as one terminal chunk.
-        if terminal_prompt && self.dflash.is_some() {
-            let dflash = self.dflash.as_mut().unwrap();
+        if terminal_prompt && let Some(dflash) = self.dflash.as_mut() {
             let (norm_hidden, target_hidden) = dflash::qwen3_forward_with_hidden_states_on_state(
                 tokens,
                 self.weights,
@@ -2695,10 +2693,10 @@ impl StepDriver for Qwen3StepDriver<'_> {
             for &t in &block.accepted_tokens {
                 dflash.token_buffer.push_back(t);
             }
-            return Ok(dflash
+            return dflash
                 .token_buffer
                 .pop_front()
-                .context("DFlash speculative block produced zero tokens")?);
+                .context("DFlash speculative block produced zero tokens");
         }
 
         // ── Standard single-token path ───────────────────────────────────
@@ -3105,8 +3103,8 @@ impl<'a> Qwen35StepDriver<'a> {
         self.ensure_cpp_session_drained()?;
         match &mut self.mode {
             Qwen35StepMode::Cpp(state) => {
-                state.kv_flat = snapshot.kv_flat.clone();
-                state.gdr_flat = snapshot.gdr_flat.clone();
+                state.kv_flat.clone_from(&snapshot.kv_flat);
+                state.gdr_flat.clone_from(&snapshot.gdr_flat);
                 self.kv_capacity = snapshot.kv_capacity;
                 self.cache_len = snapshot.cache_len;
                 self.pending_sampled = None;
@@ -3470,10 +3468,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 for &t in &block.accepted_tokens {
                     dflash.token_buffer.push_back(t);
                 }
-                return Ok(dflash
+                return dflash
                     .token_buffer
                     .pop_front()
-                    .context("Qwen3.5 DFlash block produced zero tokens")?);
+                    .context("Qwen3.5 DFlash block produced zero tokens");
             }
             // Rust mode fallback: fall through to standard decode
         }

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "metal")]
-use super::mlx::MlxArray;
+use super::mlx::{MlxArray, reshape, transpose_axes};
 
 /// Pure Rust token-slot ledger used by the Metal KV pool.
 ///
@@ -403,7 +403,6 @@ impl MetalKVPool {
         let (k_gathered, v_gathered) = self.gather_kv_rows(layer, indices)?;
 
         let seq_len = indices.len() as i32;
-        use super::mlx::{reshape, transpose_axes};
         let n_kv = self.num_kv_heads as i32;
         let hd = self.head_dim as i32;
         let k_out = reshape(&k_gathered, &[1, seq_len, n_kv, hd]);

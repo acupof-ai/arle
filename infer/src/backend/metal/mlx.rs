@@ -109,6 +109,11 @@ impl MlxArray {
         mlx_array_from_raw_or_panic(raw, "MlxArray::from_raw")
     }
     /// Like `from_raw` but returns `Result` instead of panicking on null.
+    ///
+    /// # Safety
+    /// `raw` must be a valid owned MLX array handle returned by the bridge,
+    /// or null with a bridge-side error already recorded for retrieval via
+    /// `check_mlx_error()`.
     pub unsafe fn from_raw_checked(raw: *mut mlx_sys::mlx_array) -> anyhow::Result<Self> {
         if raw.is_null() {
             check_mlx_error()?;

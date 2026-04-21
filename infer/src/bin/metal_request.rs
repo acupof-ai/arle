@@ -29,6 +29,7 @@ fn parse_metal_top_k(raw: &str) -> Result<i32, String> {
     name = "metal_request",
     about = "Single MLX/Metal inference request (greedy or temperature sampling)"
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Model path (local directory) or HuggingFace repo ID.
     #[arg(long, short)]

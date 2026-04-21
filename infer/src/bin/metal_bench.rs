@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
     name = "metal_bench",
     about = "Metal/MLX inference benchmark (Apple Silicon)"
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Model path (local directory) or HuggingFace repo ID.
     #[arg(long, short)]
@@ -927,7 +928,7 @@ fn run_baseline_compare(cli: &Cli) -> Result<()> {
     // ── Phase 2: DFlash (default draft) ─────────────────────────────────────
     let mut dflash_backend = MetalBackend::with_options(MetalBackendOptions {
         dflash: Some(MetalDflashOptions {
-            draft_model: draft_model.clone(),
+            draft_model,
             speculative_tokens: cli.speculative_tokens,
         }),
         kv_pool: cli.kv_pool_override(),
