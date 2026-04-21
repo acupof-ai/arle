@@ -1,3 +1,5 @@
+use log::warn;
+
 use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
 
 /// Newly assigned, needs prefix cache check.
@@ -171,27 +173,46 @@ impl ActiveRequest {
         }
         self.phase = Phase::Finished;
 
+        let mut emitted_visible_text = false;
         if !self.generated_tokens.is_empty() {
-            if let Ok(full_text) = tokenizer.decode(&self.generated_tokens) {
-                let end = if let Some(ref stops) = self.stop {
-                    match check_stop_sequences(&full_text, stops) {
-                        StopCheckResult::StopFound { stop_pos } => stop_pos,
-                        StopCheckResult::NoStop { .. } => full_text.len(),
+            match tokenizer.decode(&self.generated_tokens) {
+                Ok(full_text) => {
+                    let end = if let Some(ref stops) = self.stop {
+                        match check_stop_sequences(&full_text, stops) {
+                            StopCheckResult::StopFound { stop_pos } => stop_pos,
+                            StopCheckResult::NoStop { .. } => full_text.len(),
+                        }
+                    } else {
+                        full_text.len()
+                    };
+                    let start = full_text.floor_char_boundary(self.sent_len);
+                    let end = full_text.floor_char_boundary(end);
+                    emitted_visible_text = end > 0;
+                    if end > start {
+                        let _ = self.delta_tx.send(CompletionStreamDelta {
+                            text_delta: full_text[start..end].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                            logprob: None,
+                        });
                     }
-                } else {
-                    full_text.len()
-                };
-                let start = full_text.floor_char_boundary(self.sent_len);
-                let end = full_text.floor_char_boundary(end);
-                if end > start {
-                    let _ = self.delta_tx.send(CompletionStreamDelta {
-                        text_delta: full_text[start..end].to_string(),
-                        finish_reason: None,
-                        usage: None,
-                        logprob: None,
-                    });
+                }
+                Err(err) => {
+                    warn!(
+                        "Request {}: failed to decode {} generated tokens during finish: {err}",
+                        self.id,
+                        self.generated_tokens.len(),
+                    );
                 }
             }
+        }
+
+        if !self.generated_tokens.is_empty() && !emitted_visible_text {
+            warn!(
+                "Request {}: finishing with {} generated tokens but no visible text delta",
+                self.id,
+                self.generated_tokens.len(),
+            );
         }
 
         self.send_finish(reason);

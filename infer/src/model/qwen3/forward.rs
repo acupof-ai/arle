@@ -3,23 +3,14 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
+use super::prefill::Qwen3PagedPrefillRequest;
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
-use crate::model::{GenerationState, ModelForward};
+use crate::model::{GenerationState, ModelForward, PrefillBatchRequest};
 use crate::ops;
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
-
-#[inline]
-fn paged_prefill_start_pos(pool_seq_len: usize, token_count: usize) -> Result<usize> {
-    anyhow::ensure!(token_count > 0, "paged prefill chunk must not be empty");
-    anyhow::ensure!(
-        pool_seq_len >= token_count,
-        "paged prefill: pool seq_len {pool_seq_len} < chunk len {token_count}"
-    );
-    Ok(pool_seq_len - token_count)
-}
 
 /// Per-request mutable state for Qwen3.
 pub struct Qwen3State {
@@ -176,17 +167,46 @@ impl ModelForward for Qwen3Model {
         slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        // Paged prefill. The scheduler has already allocated pool pages for
-        // these tokens (pool.seq_len(slot) already includes them), so
-        // start_pos is the logical position of the first new token.
-        let start_pos = paged_prefill_start_pos(pool.seq_len(slot), tokens.len())?;
-
-        let hidden = self.get_embeddings_batch(tokens)?;
-        let hidden = self.process_all_layers_batch_paged(hidden, start_pos, pool, slot)?;
-        let logits = self.compute_logits_batch(&hidden)?;
-        state.base.prefill_logits = Some(logits);
-
+        let request = [Qwen3PagedPrefillRequest { tokens, slot }];
+        let mut logits = self.forward_prefill_paged_batch(&request, pool)?;
+        state.base.prefill_logits = Some(logits.pop().expect("single paged prefill result"));
         Ok(())
+    }
+
+    fn forward_prefill_batch_with_pool(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<bool> {
+        if requests.is_empty() {
+            return Ok(false);
+        }
+
+        let mut seen_slots = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.tokens.is_empty() || seen_slots.contains(&request.slot_idx) {
+                return Ok(false);
+            }
+            seen_slots.push(request.slot_idx);
+        }
+
+        for request in requests {
+            pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
+        }
+
+        let paged_requests: Vec<Qwen3PagedPrefillRequest<'_>> = requests
+            .iter()
+            .map(|request| Qwen3PagedPrefillRequest {
+                tokens: request.tokens,
+                slot: request.slot_idx,
+            })
+            .collect();
+        let logits = self.forward_prefill_paged_batch(&paged_requests, pool)?;
+        for (request, request_logits) in requests.iter().zip(logits) {
+            states[request.slot_idx].base.prefill_logits = Some(request_logits);
+        }
+        Ok(true)
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
@@ -430,11 +450,11 @@ impl ModelForward for Qwen3Model {
         }
     }
 
-    fn supports_mixed_batch(&self) -> bool {
+    fn supports_mixed_prefill_batch(&self) -> bool {
         // The fused mixed decode+prefill path does not apply LoRA adapters
         // yet. Reporting `true` would let the scheduler double-reserve
         // decode slots (once in `step_decode_launch_mixed`, again in the
-        // `Ok(false)` fallback inside `decode_batch_with_prefill`), which
+        // `Ok(false)` fallback inside the mixed-batch eager path), which
         // corrupts paged-KV `seq_len`. Opt out entirely when LoRA is live.
         self.lora.is_none()
     }
@@ -446,44 +466,25 @@ impl ModelForward for Qwen3Model {
         self.enable_cuda_graph && self.lora.is_none()
     }
 
-    fn forward_mixed_batch(
+    fn forward_mixed_batch_with_prefill(
         &self,
         decode_tokens: &[u32],
-        prefill_tokens: &[u32],
+        prefill: &[PrefillBatchRequest<'_>],
         states: &mut [Self::State],
         decode_slot_indices: &[usize],
-        prefill_slot_idx: usize,
-        prefill_start_pos: usize,
         paged_kv_pool: Option<&mut PagedKVPool>,
         decode_ctx: &mut Self::DecodeContext,
     ) -> Result<bool> {
         match paged_kv_pool {
-            Some(pool) if pool.is_active() => self.decode_batch_with_prefill(
+            Some(pool) if pool.is_active() => self.decode_batch_with_prefill_batch(
                 decode_tokens,
-                prefill_tokens,
+                prefill,
                 states,
                 decode_slot_indices,
-                prefill_slot_idx,
-                prefill_start_pos,
                 pool,
                 decode_ctx,
             ),
             _ => Ok(false),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::paged_prefill_start_pos;
-
-    #[test]
-    fn paged_prefill_start_pos_handles_single_token_chunks() {
-        assert_eq!(paged_prefill_start_pos(17, 1).unwrap(), 16);
-    }
-
-    #[test]
-    fn paged_prefill_start_pos_rejects_empty_chunks() {
-        assert!(paged_prefill_start_pos(17, 0).is_err());
     }
 }

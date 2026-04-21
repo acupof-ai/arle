@@ -42,13 +42,17 @@ fn can_publish_prefix_pages(
 }
 
 /// State preserved between decode launch and readback for GPU/CPU overlap.
+pub(super) struct MixedPrefillPending {
+    pub slot_idx: usize,
+    pub chunk_complete: bool,
+}
+
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
-    pub mixed_prefill_request_idx: Option<usize>,
-    pub mixed_prefill_chunk_complete: bool,
+    pub mixed_prefill: Vec<MixedPrefillPending>,
 }
 
 /// CUDA-backed scheduler state and initialization.
@@ -417,8 +421,7 @@ impl<M: ModelForward> Scheduler<M> {
             config.max_prefill_tokens,
             config
                 .prefill_max_requests
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".to_string()),
+                .map_or_else(|| "none".to_string(), |v| v.to_string()),
             config.enable_mixed_chunk,
             host_pool_capacity as f64 / 1e6,
         );
@@ -431,8 +434,11 @@ impl<M: ModelForward> Scheduler<M> {
                 Arc::clone(&disk_store),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
+        let max_slots = config.max_slots;
+        let max_waiting_requests = config.max_waiting_requests;
+        let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;
         let scheduler = Self {
-            config: config.clone(),
+            config,
             metrics,
             model,
             tokenizer,
@@ -441,7 +447,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_materialized_prompt_lens,
             prefix_cache: RadixCache::with_soft_pin_keepalive(
                 PREFIX_CACHE_BLOCK_SIZE,
-                config.prefix_cache_keepalive_ticks,
+                prefix_cache_keepalive_ticks,
             ),
             disk_store,
             host_pinned_pool,
@@ -455,7 +461,7 @@ impl<M: ModelForward> Scheduler<M> {
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
-            active: (0..config.max_slots).map(|_| None).collect(),
+            active: (0..max_slots).map(|_| None).collect(),
             prefill_queue: VecDeque::new(),
             running_batch: VecDeque::new(),
             effective_max_seq_len,
@@ -477,7 +483,7 @@ impl<M: ModelForward> Scheduler<M> {
         let handle = SchedulerHandle::with_shared_waiting_count(
             tx,
             model_id,
-            config.max_waiting_requests,
+            max_waiting_requests,
             Arc::clone(&waiting_count),
         );
         debug_assert_eq!(handle.waiting_count(), 0);
@@ -670,7 +676,7 @@ impl<M: ModelForward> Scheduler<M> {
         &mut self,
         slot_idx: usize,
         prompt_tokens: &[u32],
-        session_id: Option<crate::types::SessionId>,
+        session_id: Option<&crate::types::SessionId>,
     ) {
         let block_size = self.prefix_cache.block_size();
         // The slot's `seq_len` is the actual ground truth for how many tokens
@@ -831,7 +837,7 @@ impl<M: ModelForward> Scheduler<M> {
                         slot: slot_idx as u32,
                     }),
                     byte_len: Some(block_byte_len),
-                    session_id: Some(session_id.clone()),
+                    session_id: Some(session_id.cloned()),
                     soft_pin_until: Some(keepalive_deadline),
                 },
             );

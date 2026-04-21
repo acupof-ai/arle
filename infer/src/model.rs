@@ -30,6 +30,13 @@ pub use kv_cache::{KVCacheDtype, KVFormat};
 pub use qwen3::{ModelRuntimeConfig, Qwen3Model, Qwen3State};
 pub use qwen35::{Qwen35Model, Qwen35State};
 
+/// One request worth of prefill work inside a scheduler-planned prefill batch.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillBatchRequest<'a> {
+    pub slot_idx: usize,
+    pub tokens: &'a [u32],
+}
+
 // ============================================================================
 // DecodeContextOps trait — scheduler-level operations on decode buffers
 // ============================================================================
@@ -271,6 +278,67 @@ pub trait ModelForward: Send {
         self.forward_prefill(tokens, state)
     }
 
+    /// Batched prefill: process one or more requests in one scheduler step.
+    ///
+    /// Default implementation keeps a single semantic path by treating batch
+    /// size 1 as the degenerate case and iterating over requests.
+    fn forward_prefill_batch(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        match paged_kv_pool {
+            Some(pool) if self.prefill_uses_paged_pool() && pool.is_active() => {
+                let _ = self.forward_prefill_batch_with_pool(requests, states, pool)?;
+            }
+            _ => {
+                for request in requests {
+                    self.forward_prefill(request.tokens, &mut states[request.slot_idx])?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batched paged prefill: process multiple prefill requests in one scheduler step.
+    ///
+    /// The default implementation keeps behavior correct by falling back to
+    /// sequential per-request paged prefill. Models with a real batched paged
+    /// prefill path should override this.
+    fn forward_prefill_batch_with_pool(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<bool> {
+        if requests.is_empty() {
+            return Ok(false);
+        }
+
+        let dummy_indices = self
+            .device_context()
+            .stream
+            .clone_htod(&[0i32])
+            .map_err(|e| anyhow::anyhow!("dummy indices H2D failed: {e}"))?;
+        for request in requests {
+            pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
+            self.forward_prefill_with_pool(
+                request.tokens,
+                &mut states[request.slot_idx],
+                pool,
+                request.slot_idx,
+                &dummy_indices,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Returns true when this model's `forward_prefill_with_pool` writes K/V
     /// directly to the paged pool. The scheduler uses this to:
     ///  - route prefill through `forward_prefill_with_pool` instead of
@@ -359,8 +427,17 @@ pub trait ModelForward: Send {
         Ok(())
     }
 
-    /// Whether this model has a validated eager mixed decode+prefill path.
+    /// Whether this model has a validated eager mixed decode + prefill path at all.
+    ///
+    /// `supports_mixed_prefill_batch()` implies this, but models that only
+    /// validate the `batch_size = 1` degenerate case can still opt into the
+    /// unified scheduler path without claiming multi-request prefill fusion.
     fn supports_mixed_batch(&self) -> bool {
+        self.supports_mixed_prefill_batch()
+    }
+
+    /// Whether this model has a validated eager mixed decode + batched-prefill path.
+    fn supports_mixed_prefill_batch(&self) -> bool {
         false
     }
 
@@ -372,8 +449,11 @@ pub trait ModelForward: Send {
         true
     }
 
-    /// Mixed-batch forward: B decode tokens + C prefill tokens in one eager forward pass.
-    /// Returns `Ok(true)` if mixed forward was performed, `Ok(false)` if not supported.
+    /// Legacy mixed-batch hook: B decode tokens + one prefill request in one eager forward pass.
+    ///
+    /// The scheduler now targets `forward_mixed_batch_with_prefill()`;
+    /// this method is kept so existing model implementations can treat the
+    /// single-request case as the batch-size-1 degenerate path.
     fn forward_mixed_batch(
         &self,
         _decode_tokens: &[u32],
@@ -386,5 +466,39 @@ pub trait ModelForward: Send {
         _decode_ctx: &mut Self::DecodeContext,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Mixed-batch forward: B decode tokens + N prefill requests in one eager forward pass.
+    ///
+    /// Default falls back to the legacy single-prefill hook when the batch
+    /// contains exactly one request.
+    fn forward_mixed_batch_with_prefill(
+        &self,
+        decode_tokens: &[u32],
+        prefill: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        decode_slot_indices: &[usize],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        decode_ctx: &mut Self::DecodeContext,
+    ) -> Result<bool> {
+        let [request] = prefill else {
+            return Ok(false);
+        };
+
+        let prefill_start_pos = paged_kv_pool
+            .as_ref()
+            .map(|pool| pool.seq_len(request.slot_idx))
+            .unwrap_or_default();
+
+        self.forward_mixed_batch(
+            decode_tokens,
+            request.tokens,
+            states,
+            decode_slot_indices,
+            request.slot_idx,
+            prefill_start_pos,
+            paged_kv_pool,
+            decode_ctx,
+        )
     }
 }

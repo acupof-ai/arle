@@ -1,4 +1,7 @@
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
+use crate::model::PrefillBatchRequest;
+
+use super::execution::PrefillCandidate;
 
 fn is_full_prompt_reuse_hit(prompt_len: usize, prefix_len: usize) -> bool {
     prefix_len > 0 && prefix_len == prompt_len
@@ -290,98 +293,9 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    /// Process one chunk of a prefill. When all chunks are done, sample the
-    /// first token and transition to Decoding.
-    pub(super) fn step_prefill_chunk(&mut self, slot_idx: usize, chunk_size: usize) -> usize {
-        let Some(req) = self.request(slot_idx) else {
-            return 0;
-        };
-        if req.delta_tx.is_closed() {
-            self.finish_slot(slot_idx);
-            return 0;
-        }
+    fn complete_prefill_request(&mut self, slot_idx: usize, total: usize, uses_paged: bool) {
+        let req_id = self.request(slot_idx).map(|req| req.id).unwrap_or_default();
 
-        let req_id = req.id;
-        // Snapshot chunk inputs as owned values so we can release the phase
-        // borrow before calling `&mut self` methods (alloc_pool_tokens_with_retry).
-        let (chunk_tokens, progress_val, total) = match &req.phase {
-            Phase::Prefilling {
-                materialized_prefix_len: _,
-                effective_tokens,
-                progress,
-            } => {
-                let total = effective_tokens.len();
-                let chunk_end = (*progress + chunk_size).min(total);
-                (
-                    effective_tokens[*progress..chunk_end].to_vec(),
-                    *progress,
-                    total,
-                )
-            }
-            _ => return 0,
-        };
-        let chunk_len = chunk_tokens.len();
-        if chunk_len == 0 {
-            return 0;
-        }
-        let chunk_end = progress_val + chunk_len;
-
-        let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
-
-        let forward_result = if uses_paged {
-            // Paged prefill: pre-allocate pool pages for this chunk so the
-            // forward can write K/V directly through the page table. We pass a
-            // dummy CudaSlice for `new_token_indices` — Qwen3's paged
-            // implementation reads the page table from the pool itself.
-            match self.alloc_pool_tokens_with_retry(slot_idx, chunk_len) {
-                Err(e) => {
-                    warn!(
-                        "Request {}: deferring paged prefill chunk after pool alloc failed: {}",
-                        req_id, e
-                    );
-                    return 0;
-                }
-                Ok(_new_pages) => {
-                    let ctx = self.model.device_context();
-                    match ctx.stream.clone_htod(&[0i32]) {
-                        Ok(dummy_indices) => self.model.forward_prefill_with_pool(
-                            &chunk_tokens,
-                            &mut self.states[slot_idx],
-                            &self.paged_kv_pool,
-                            slot_idx,
-                            &dummy_indices,
-                        ),
-                        Err(e) => Err(anyhow::anyhow!("dummy indices H2D failed: {e}")),
-                    }
-                }
-            }
-        } else {
-            self.model
-                .forward_prefill(&chunk_tokens, &mut self.states[slot_idx])
-        };
-
-        if let Err(e) = forward_result {
-            error!("Request {}: prefill chunk failed: {}", req_id, e);
-            self.finish_slot(slot_idx);
-            return 0;
-        }
-
-        let new_progress = chunk_end;
-        if new_progress < total {
-            if let Some(req) = self.request_mut(slot_idx)
-                && let Phase::Prefilling { progress, .. } = &mut req.phase
-            {
-                *progress = new_progress;
-            }
-            info!(
-                "Request {}: prefill chunk {}/{} tokens",
-                req_id, new_progress, total
-            );
-            return chunk_len;
-        }
-
-        // Post-forward KV migration (only when contiguous-KV prefill was used).
-        // Paged prefill already wrote K/V into the pool; nothing to migrate.
         if !uses_paged && self.paged_kv_pool.is_active() {
             let pool_start = self.paged_kv_pool.seq_len(slot_idx);
             match self.alloc_pool_tokens_with_retry(slot_idx, total) {
@@ -403,9 +317,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        // Snapshot auxiliary state (recurrent/SSM) after prefill completes.
-        // On the next full prefix hit for this slot, restore_prefix_snapshot()
-        // reverts to this clean state, avoiding decode-token contamination.
         if let Err(e) = self.states[slot_idx].save_prefix_snapshot() {
             warn!(
                 "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
@@ -435,7 +346,7 @@ impl<M: ModelForward> Scheduler<M> {
                         req.finish(FinishReason::Stop, tokenizer);
                     }
                     self.finish_slot(slot_idx);
-                    return chunk_len;
+                    return;
                 }
                 let Self {
                     active, tokenizer, ..
@@ -450,7 +361,7 @@ impl<M: ModelForward> Scheduler<M> {
                     Some(Phase::Finished)
                 ) {
                     self.finish_slot(slot_idx);
-                    return chunk_len;
+                    return;
                 }
                 let reached_max = self
                     .request(slot_idx)
@@ -477,7 +388,107 @@ impl<M: ModelForward> Scheduler<M> {
                 self.finish_slot(slot_idx);
             }
         }
-        chunk_len
+    }
+
+    /// Process one scheduler-planned prefill batch. Single-request prefill is
+    /// just the batch_size=1 case.
+    pub(super) fn step_prefill_batch(&mut self, candidates: &[PrefillCandidate]) {
+        let mut chunk_tokens = Vec::with_capacity(candidates.len());
+        let mut totals = Vec::with_capacity(candidates.len());
+        let mut new_progress = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            let slot_idx = candidate.slot_idx;
+            let Some(req) = self.request(slot_idx) else {
+                continue;
+            };
+            if req.delta_tx.is_closed() {
+                self.finish_slot(slot_idx);
+                continue;
+            }
+
+            let (tokens, progress, total) = match &req.phase {
+                Phase::Prefilling {
+                    materialized_prefix_len: _,
+                    effective_tokens,
+                    progress,
+                } => {
+                    let total = effective_tokens.len();
+                    let chunk_end = (*progress + candidate.reservation.prefill_tokens).min(total);
+                    (
+                        effective_tokens[*progress..chunk_end].to_vec(),
+                        *progress,
+                        total,
+                    )
+                }
+                _ => continue,
+            };
+            if tokens.is_empty() {
+                continue;
+            }
+            new_progress.push(progress + tokens.len());
+            totals.push(total);
+            chunk_tokens.push((slot_idx, tokens));
+        }
+
+        if chunk_tokens.is_empty() {
+            return;
+        }
+
+        let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
+        let requests: Vec<PrefillBatchRequest<'_>> = chunk_tokens
+            .iter()
+            .map(|(slot_idx, tokens)| PrefillBatchRequest {
+                slot_idx: *slot_idx,
+                tokens,
+            })
+            .collect();
+
+        let forward_result = self
+            .model
+            .forward_prefill_batch(
+                &requests,
+                &mut self.states,
+                uses_paged.then_some(&mut self.paged_kv_pool),
+            )
+            .map(|()| true);
+
+        if let Err(e) = forward_result {
+            for (slot_idx, _) in &chunk_tokens {
+                let req_id = self
+                    .request(*slot_idx)
+                    .map(|req| req.id)
+                    .unwrap_or_default();
+                error!("Request {}: prefill batch failed: {}", req_id, e);
+                self.finish_slot(*slot_idx);
+            }
+            return;
+        }
+
+        for (((slot_idx, _tokens), total), progress) in
+            chunk_tokens.iter().zip(totals).zip(new_progress)
+        {
+            let req_id = self
+                .request(*slot_idx)
+                .map(|req| req.id)
+                .unwrap_or_default();
+            if progress < total {
+                if let Some(req) = self.request_mut(*slot_idx)
+                    && let Phase::Prefilling {
+                        progress: state_progress,
+                        ..
+                    } = &mut req.phase
+                {
+                    *state_progress = progress;
+                }
+                info!(
+                    "Request {}: prefill chunk {}/{} tokens",
+                    req_id, progress, total
+                );
+                continue;
+            }
+            self.complete_prefill_request(*slot_idx, total, uses_paged);
+        }
     }
 }
 

@@ -202,6 +202,127 @@ if ! curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; then
     exit 2
 fi
 
+probe_streaming_completions() {
+    python3 - "$TARGET" "$MODEL" <<'PY'
+import json
+import sys
+from urllib import error, request
+
+target, model = sys.argv[1:]
+payload = json.dumps(
+    {
+        "model": model,
+        "prompt": "Hello world",
+        "max_tokens": 8,
+        "ignore_eos": True,
+        "stream": True,
+        "stream_options": {
+            "include_usage": True,
+            "continuous_usage_stats": True,
+        },
+    }
+).encode("utf-8")
+req = request.Request(
+    f"{target}/v1/completions",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with request.urlopen(req, timeout=30) as resp:
+        saw_text = False
+        saw_usage = False
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line == "data: [DONE]":
+                break
+            if not line.startswith("data:"):
+                continue
+            data = json.loads(line[len("data:") :].strip())
+            choice = (data.get("choices") or [{}])[0]
+            text = choice.get("text")
+            if isinstance(text, str) and text != "":
+                saw_text = True
+            usage = data.get("usage")
+            if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                saw_usage = True
+            if saw_text and saw_usage:
+                break
+except error.HTTPError as exc:
+    print(f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
+    sys.exit(1)
+
+if not saw_text:
+    print(
+        "streaming completions probe failed: no non-empty text chunk arrived from /v1/completions",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if not saw_usage:
+    print(
+        "streaming completions probe failed: terminal usage chunk missing from /v1/completions",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+PY
+}
+
+validate_guidellm_results() {
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+json_path = pathlib.Path(sys.argv[1])
+obj = json.loads(json_path.read_text())
+benchmarks = obj.get("benchmarks") or []
+if not benchmarks:
+    print("guidellm validation failed: no benchmarks found in benchmarks.json", file=sys.stderr)
+    sys.exit(1)
+
+errors = []
+for bm in benchmarks:
+    strategy = bm.get("config", {}).get("strategy", {})
+    rate = strategy.get("type_", "unknown")
+    if rate == "concurrent":
+        rate = f"conc{strategy.get('max_concurrency', '?')}"
+
+    metrics = bm.get("metrics", {})
+    request_totals = metrics.get("request_totals", {})
+    successful = int(request_totals.get("successful") or 0)
+    output_mean = (metrics.get("output_token_count", {}).get("successful", {}) or {}).get("mean") or 0.0
+    ttft_p50 = (metrics.get("time_to_first_token_ms", {}).get("successful", {}).get("percentiles", {}) or {}).get("p50")
+    itl_p50 = (metrics.get("inter_token_latency_ms", {}).get("successful", {}).get("percentiles", {}) or {}).get("p50")
+    outputs = bm.get("requests", {}).get("successful", []) or []
+    nonempty_outputs = sum(1 for req in outputs if (req.get("output") or "") != "")
+
+    if successful <= 0:
+        errors.append(f"{rate}: no successful requests recorded")
+        continue
+
+    if output_mean > 0.0 and nonempty_outputs == 0:
+        errors.append(
+            f"{rate}: successful requests reported {output_mean:.1f} output tokens on average but every sampled output was empty"
+        )
+    if output_mean > 0.0 and (ttft_p50 is None or ttft_p50 <= 0.0):
+        errors.append(
+            f"{rate}: TTFT p50 was {ttft_p50!r} despite successful requests with non-zero output tokens"
+        )
+    if output_mean > 1.0 and (itl_p50 is None or itl_p50 <= 0.0):
+        errors.append(
+            f"{rate}: ITL p50 was {itl_p50!r} despite successful requests averaging more than one output token"
+        )
+
+if errors:
+    print("guidellm validation failed:", file=sys.stderr)
+    for line in errors:
+        print(f"  - {line}", file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
 # ---- resolve output paths, never overwrite -----------------------------------
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATE="$(date +%Y-%m-%d)"
@@ -269,6 +390,12 @@ if [[ -z "$PROCESSOR" ]]; then
 fi
 echo "    processor: $PROCESSOR"
 
+if ! probe_streaming_completions; then
+    echo "error: streaming probe failed before benchmark start" >&2
+    echo "       target: $TARGET/v1/completions" >&2
+    exit 2
+fi
+
 # guidellm 0.6.0 hangs at "Setup complete, starting benchmarks..." on macOS
 # under the default `fork` mp context (Python 3.11+ deprecates fork on darwin
 # and the worker_group spawn deadlocks). `forkserver` boots cleanly. See
@@ -317,6 +444,13 @@ if [[ $gdl_rc -ne 0 ]]; then
     echo "       raw artefacts (if any): $OUTPUT_DIR" >&2
     echo "       full log: $GUIDELLM_LOG" >&2
     exit 3
+fi
+
+if ! validate_guidellm_results "$OUTPUT_DIR/benchmarks.json"; then
+    echo "error: guidellm wrote benchmark files, but the result set is invalid" >&2
+    echo "       raw artefacts: $OUTPUT_DIR" >&2
+    echo "       full log: $GUIDELLM_LOG" >&2
+    exit 4
 fi
 
 # ---- metric extraction (schema pinned to guidellm 0.6.x) ---------------------

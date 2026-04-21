@@ -69,6 +69,11 @@ impl PrefillBuffers {
     }
 }
 
+pub(super) struct Qwen3PagedPrefillRequest<'a> {
+    pub tokens: &'a [u32],
+    pub slot: usize,
+}
+
 impl Qwen3Model {
     #[fastrace::trace(name = "get_embeddings_batch")]
     pub(super) fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
@@ -135,20 +140,116 @@ impl Qwen3Model {
         Ok(hidden)
     }
 
-    /// Paged-KV prefill. Writes K/V directly to the paged pool via
-    /// page-table indirection and runs FlashInfer `BatchPrefillWithPagedKVCache`
-    /// for attention. No contiguous KV cache is touched; the scheduler must
-    /// skip `migrate_kv_range_to_paged` for this forward.
-    ///
-    /// Callable only when the scheduler has already pre-allocated pool pages
-    /// for the chunk (`pool.page_indices(slot)` covers `[0, start_pos+seq_len)`).
+    pub(super) fn build_paged_prefill_sequences(
+        &self,
+        requests: &[Qwen3PagedPrefillRequest<'_>],
+        pool: &TokenKVPool,
+    ) -> Result<(Vec<ops::PagedPrefillSequence>, Vec<i32>)> {
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "paged prefill batch requires at least one request"
+        );
+
+        let mut token_offset = 0usize;
+        let mut page_table_offset = 0usize;
+        let mut sequences = Vec::with_capacity(requests.len());
+        let mut page_indices = Vec::new();
+
+        for req in requests {
+            let seq_len = req.tokens.len();
+            anyhow::ensure!(
+                seq_len > 0,
+                "paged prefill request for slot {} must not be empty",
+                req.slot
+            );
+
+            let pool_seq_len = pool.seq_len(req.slot);
+            anyhow::ensure!(
+                pool_seq_len >= seq_len,
+                "paged prefill: pool seq_len {pool_seq_len} < chunk len {seq_len} for slot {}",
+                req.slot
+            );
+            let start_pos = pool_seq_len - seq_len;
+            let num_pages = (start_pos + seq_len).div_ceil(pool.page_size);
+            let all_pages = pool.page_indices(req.slot);
+            anyhow::ensure!(
+                all_pages.len() >= num_pages,
+                "paged prefill: slot {} has {} pages, expected at least {num_pages}",
+                req.slot,
+                all_pages.len()
+            );
+
+            page_indices.extend(all_pages[..num_pages].iter().map(|&page| page as i32));
+            sequences.push(ops::PagedPrefillSequence {
+                token_offset,
+                seq_len,
+                start_pos,
+                page_table_offset,
+                num_pages,
+            });
+            token_offset += seq_len;
+            page_table_offset += num_pages;
+        }
+
+        Ok((sequences, page_indices))
+    }
+
+    fn compute_logits_batch_packed(
+        &self,
+        hidden: &HiddenStates,
+        sequences: &[ops::PagedPrefillSequence],
+    ) -> Result<Vec<DeviceVec>> {
+        let mut logits = Vec::with_capacity(sequences.len());
+        for seq in sequences {
+            let last_token = seq.token_offset + seq.seq_len - 1;
+            let last_hidden = ops::extract_vec(&self.ctx, hidden, last_token)?;
+            let normed = ops::rms_norm(
+                &self.ctx,
+                &last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+            )?;
+            logits.push(ops::linear(&self.ctx, &normed, self.output_projection())?);
+        }
+        Ok(logits)
+    }
+
+    #[fastrace::trace(name = "forward_prefill_paged_batch")]
+    pub(super) fn forward_prefill_paged_batch(
+        &self,
+        requests: &[Qwen3PagedPrefillRequest<'_>],
+        pool: &TokenKVPool,
+    ) -> Result<Vec<DeviceVec>> {
+        let total_tokens = requests.iter().map(|req| req.tokens.len()).sum();
+        let mut packed_tokens = Vec::with_capacity(total_tokens);
+        for req in requests {
+            packed_tokens.extend_from_slice(req.tokens);
+        }
+
+        let (sequences, page_indices) = self.build_paged_prefill_sequences(requests, pool)?;
+        let page_indices_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&page_indices)
+            .map_err(|e| anyhow::anyhow!("page_indices H2D failed: {e}"))?;
+        let hidden = self.get_embeddings_batch(&packed_tokens)?;
+        let hidden =
+            self.process_all_layers_batch_paged(hidden, pool, &sequences, &page_indices_dev)?;
+        self.compute_logits_batch_packed(&hidden, &sequences)
+    }
+
+    /// Paged-KV prefill over one or more packed requests. Writes K/V directly
+    /// to the paged pool via page-table indirection and runs one FlashInfer
+    /// `BatchPrefillWithPagedKVCache` call per layer over the packed varlen
+    /// batch. No contiguous KV cache is touched; the scheduler must skip
+    /// `migrate_kv_range_to_paged` for this forward.
     #[fastrace::trace(name = "process_all_layers_batch_paged")]
     pub(super) fn process_all_layers_batch_paged(
         &self,
         mut hidden: HiddenStates,
-        start_pos: usize,
         pool: &TokenKVPool,
-        slot: usize,
+        sequences: &[ops::PagedPrefillSequence],
+        page_indices: &CudaSlice<i32>,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
         let num_heads = self.config.num_attention_heads;
@@ -167,22 +268,17 @@ impl Qwen3Model {
             seq_len,
         )?;
 
-        // Per-forward GPU-resident page table (1 i32 per logical page in the
-        // slot). Uploaded once and reused across all 36 layers.
-        let all_pages = pool.page_indices(slot);
-        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
         anyhow::ensure!(
-            all_pages.len() >= num_pages_needed,
-            "paged prefill: slot {slot} has {} pages, expected at least {num_pages_needed}",
-            all_pages.len()
+            !sequences.is_empty(),
+            "paged prefill forward requires at least one sequence"
         );
-        let pages_u32 = &all_pages[..num_pages_needed];
-        let pages_i32: Vec<i32> = pages_u32.iter().map(|&p| p as i32).collect();
-        let slot_page_indices: CudaSlice<i32> = self
-            .ctx
-            .stream
-            .clone_htod(&pages_i32)
-            .map_err(|e| anyhow::anyhow!("slot_page_indices H2D failed: {e}"))?;
+        anyhow::ensure!(
+            sequences
+                .last()
+                .map_or(0, |seq| seq.token_offset + seq.seq_len)
+                == seq_len,
+            "paged prefill token packing does not cover all hidden rows"
+        );
 
         // Lazy-init the shared paged-prefill plan on first call and reuse
         // across all subsequent prefills. Allocating a fresh 264MB
@@ -193,19 +289,21 @@ impl Qwen3Model {
             .paged_prefill_plan
             .lock()
             .map_err(|_| anyhow::anyhow!("paged_prefill_plan mutex poisoned"))?;
-        if plan_guard.is_none() {
-            // Size the plan for the maximum chunk we'll ever see (one
-            // prefill_chunk_size worth of tokens).
-            *plan_guard = Some(BatchPrefillPagedPlan::new(
-                &self.ctx,
-                seq_len.max(4096),
-                num_heads,
-            )?);
+        let required_rows = seq_len.max(4096);
+        let needs_realloc = plan_guard
+            .as_ref()
+            .map(|(max_rows, _)| *max_rows < required_rows)
+            .unwrap_or(true);
+        if needs_realloc {
+            *plan_guard = Some((
+                required_rows,
+                BatchPrefillPagedPlan::new(&self.ctx, required_rows, num_heads)?,
+            ));
         }
-        let plan = plan_guard.as_mut().expect("just initialized");
+        let (_, plan) = plan_guard.as_mut().expect("just initialized");
 
         // Structural invariant: plan ONCE per forward, not per layer.
-        // All 36 layers share the same (batch_size, qo_len, kv_len,
+        // All 36 layers share the same packed (batch_size, qo_indptr, kv_indptr,
         // num_heads, page_size) shape, so one plan call covers them all.
         // Calling plan per layer overwrites `page_locked_workspace`
         // (host pinned) while a prior layer's `cudaMemcpyAsync` is still
@@ -215,8 +313,7 @@ impl Qwen3Model {
         let mut fwd = crate::ops::PagedPrefillForward::new_hd128(
             &self.ctx,
             plan,
-            seq_len,
-            start_pos,
+            sequences,
             num_heads,
             num_kv_heads,
             pool.page_size,
@@ -227,16 +324,16 @@ impl Qwen3Model {
                 layer_idx,
                 layer,
                 &mut hidden,
-                start_pos,
                 &mut bufs,
                 pool,
-                &slot_page_indices,
+                sequences,
+                page_indices,
                 &mut fwd,
             )?;
         }
 
         // This forward owns both the shared FlashInfer plan workspace and
-        // per-forward GPU metadata buffers (`slot_page_indices`, qo/kv indptrs).
+        // per-forward GPU metadata buffers (`page_indices`, qo/kv indptrs).
         // Keep them alive until the compute stream drains; otherwise the next
         // chunk can re-plan into the same host/device workspace while kernels
         // from the prior chunk still consume it.
@@ -257,10 +354,10 @@ impl Qwen3Model {
         layer_idx: usize,
         layer: &TransformerBlock,
         hidden: &mut HiddenStates,
-        start_pos: usize,
         bufs: &mut PrefillBuffers,
         pool: &TokenKVPool,
-        slot_page_indices: &CudaSlice<i32>,
+        sequences: &[ops::PagedPrefillSequence],
+        page_indices: &CudaSlice<i32>,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
@@ -330,8 +427,8 @@ impl Qwen3Model {
         let meta = ops::PagedPrefillMeta {
             pool,
             layer_idx,
-            slot_page_indices,
-            start_pos,
+            page_indices,
+            sequences,
             page_size: pool.page_size,
         };
         ops::prefill_attention_paged_batch(

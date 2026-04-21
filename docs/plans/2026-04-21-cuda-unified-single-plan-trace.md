@@ -8,7 +8,9 @@
 
 ### 1. Emit / Tokenizer
 
-- Intake tokenization: [`infer/src/scheduler/cuda/runtime.rs`](../../infer/src/scheduler/cuda/runtime.rs) `assign_slots()`
+- Waiting admission tokenization:
+  [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs)
+  `admit_waiting_prefill_batch()`
 - Incremental stream emit: [`infer/src/scheduler/cuda/request.rs`](../../infer/src/scheduler/cuda/request.rs) `ActiveRequest::emit_delta()`
 - Final flush + usage accounting: [`infer/src/scheduler/cuda/request.rs`](../../infer/src/scheduler/cuda/request.rs) `ActiveRequest::finish()`
 
@@ -23,9 +25,11 @@ Owned state:
 
 ### 2. Admission / Prefix / Spill Classification
 
-- Slot assignment + prompt tokenization + length gating + radix decision + slot materialization: [`infer/src/scheduler/cuda/runtime.rs`](../../infer/src/scheduler/cuda/runtime.rs) `assign_slots()`
 - Step planning entry: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `plan_step()`
-- Existing prefill candidate selection: `queued_prefill_candidate()`
+- Existing prefill batch selection: `queued_prefill_batch()`
+- Waiting-queue admission + radix decision:
+  `admit_waiting_prefill_batch()`
+- Slot materialization: [`infer/src/scheduler/cuda/execution.rs`](../../infer/src/scheduler/cuda/execution.rs) `materialize_waiting_request()`
 
 Owned state:
 
@@ -44,7 +48,7 @@ Note: the in-tree `lookup_or_stage` surface is a tier-aware classification helpe
 
 - Decode-only launch: [`infer/src/scheduler/cuda/decode.rs`](../../infer/src/scheduler/cuda/decode.rs) `step_decode_launch()`
 - Mixed launch: `step_decode_launch_mixed()`
-- Prefill-only launch: [`infer/src/scheduler/cuda/prefill.rs`](../../infer/src/scheduler/cuda/prefill.rs) `step_prefill_chunk()`
+- Prefill-only launch: [`infer/src/scheduler/cuda/prefill.rs`](../../infer/src/scheduler/cuda/prefill.rs) `step_prefill_batch()`
 
 Owned state:
 
@@ -64,8 +68,7 @@ Owned state:
 - `PendingDecode.decode_indices`
 - `PendingDecode.slot_indices`
 - `PendingDecode.greedy_launched`
-- `PendingDecode.mixed_prefill_request_idx`
-- `PendingDecode.mixed_prefill_chunk_complete`
+- `PendingDecode.mixed_prefill`
 
 ### 5. Cleanup / Release / Publish
 
@@ -95,14 +98,12 @@ These existed only because one tick could first launch a mixed batch and then co
 
 These are still needed after the refactor because a mixed batch still needs one completion handoff:
 
-- `PendingDecode.mixed_prefill_request_idx`
-  - tells readback which prefill slot was merged into the decode launch
-- `PendingDecode.mixed_prefill_chunk_complete`
-  - tells readback whether the mixed prefill chunk finished the prompt and should transition into first-token sampling / decode
+- `PendingDecode.mixed_prefill`
+  - tells readback which prefill slots were merged into the decode launch and whether each chunk completed the prompt
 - `Scheduler.prefill_queue`
   - still the single source of truth for prefilling requests; it is no longer scanned for extra launches after a mixed tick
 - `Scheduler.waiting`
-  - still owns unslotted requests, but `assign_slots()` is now the only path that tokenizes them, applies the request-length contract, classifies radix hits, and materializes active slots
+  - owns unslotted requests until the planner admits them inside `step()`, where tokenization, length gating, radix classification, and slot materialization now happen
 
 ## Resulting Tick Contract
 
@@ -120,4 +121,4 @@ This matches the intended sglang-aligned contract more closely:
 - one readback path
 - one cleanup path
 
-`assign_slots()` can still materialize waiting requests before `step()`, but the old “mixed, then keep filling the stream with more serial prefill work” contract is intentionally gone, and `lookup_or_stage` in this flow remains classification-only rather than a live staging/readmission API.
+`runtime.rs::assign_slots()` is deleted from this contract. Waiting requests are only materialized through the single planner path, and `lookup_or_stage` in this flow remains classification-only rather than a live staging/readmission API.

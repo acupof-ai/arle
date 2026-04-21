@@ -61,10 +61,11 @@ works with any backend. Load before editing any scheduler internals.
    `paged_kv` tail-page COW before append. Keep those two paths explicit: the
    contiguous fallback is model-compatibility glue, the paged attach path is
    the canonical shared-page flow.
-9. **`assign_slots()` owns waiting-queue normalization.** Tokenization,
-   prompt-length rejection/clamping, cancellation skip, and priority ordering
-   all happen before a request becomes an `ActiveRequest`. Do not recreate a
-   second waiting-admission path in `execution.rs`.
+9. **`execution.rs::plan_step()` owns waiting-queue normalization.**
+   Tokenization, prompt-length rejection/clamping, cancellation skip, priority
+   ordering, radix classification, and slot materialization all happen inside
+   the single planned tick path before prefill/decode launch. Do not recreate
+   a pre-step `assign_slots()` path in `runtime.rs`.
 10. **Eviction never touches pages backing an active slot.** Radix eviction
    only frees pages whose `block_owner_slots` entry is either missing (the
    slot has already been freed) or points at a slot currently in `Idle`
