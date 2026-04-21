@@ -37,7 +37,8 @@
 #
 # Side effects:
 #   * Writes raw artefacts to bench-output/<date>-<label>[-runN]/
-#     (benchmarks.json / .csv / .html). This dir is gitignored.
+#     (benchmarks.json / .csv / .html, plus guidellm.log and command.txt).
+#     This dir is gitignored.
 #   * Canonical mode only: seeds a new
 #     docs/experience/wins/<date>-bench-guidellm-<label>.md from the
 #     template with the commit sha, paths, and best-effort headline table.
@@ -52,7 +53,7 @@ PROFILE="sweep"
 DATA="prompt_tokens=4096,output_tokens=256"
 MAX_SECONDS=60
 RANDOM_SEED=20260416
-OUTPUTS="json,csv,html"
+OUTPUTS=(json csv html)
 # **Pin the HTTP backend explicitly.** guidellm 0.6.0's default backend is
 # `vllm_python` (an in-process vLLM import) which silently reports 0
 # successful requests against our infer HTTP server and then crashes the
@@ -213,6 +214,8 @@ while [[ -e "$OUTPUT_DIR" ]]; do
     OUTPUT_DIR="${base_dir}-run${run}"
 done
 mkdir -p "$OUTPUT_DIR"
+GUIDELLM_LOG="$OUTPUT_DIR/guidellm.log"
+GUIDELLM_CMD="$OUTPUT_DIR/command.txt"
 
 wins_dir="$REPO_ROOT/docs/experience/wins"
 wins_base="$wins_dir/${DATE}-bench-guidellm-${LABEL}"
@@ -251,6 +254,8 @@ else
     echo "    mode   : canonical"
 fi
 echo "    output : $OUTPUT_DIR"
+echo "    formats: ${OUTPUTS[*]}"
+echo "    log    : $GUIDELLM_LOG"
 echo
 
 # Tokenizer source: explicit --processor wins, else local path if it
@@ -279,10 +284,13 @@ GUIDELLM_ARGS=(
     --max-seconds "$MAX_SECONDS"
     --random-seed "$RANDOM_SEED"
     --output-dir "$OUTPUT_DIR"
-    --outputs "$OUTPUTS"
     --backend "$BACKEND"
     --backend-kwargs "$BACKEND_KWARGS"
+    --disable-console-interactive
 )
+for output in "${OUTPUTS[@]}"; do
+    GUIDELLM_ARGS+=(--outputs "$output")
+done
 if [[ -n "$RATE_OVERRIDE" ]]; then
     GUIDELLM_ARGS+=(--rate "$RATE_OVERRIDE")
 fi
@@ -290,14 +298,24 @@ if [[ -n "$WARMUP_OVERRIDE" ]]; then
     GUIDELLM_ARGS+=(--warmup "$WARMUP_OVERRIDE")
 fi
 
+{
+    echo "GUIDELLM__MP_CONTEXT_TYPE=${GUIDELLM__MP_CONTEXT_TYPE:-forkserver}"
+    printf 'guidellm benchmark run'
+    for arg in "${GUIDELLM_ARGS[@]}"; do
+        printf ' %q' "$arg"
+    done
+    printf '\n'
+} > "$GUIDELLM_CMD"
+
 set +e
-guidellm benchmark run "${GUIDELLM_ARGS[@]}"
-gdl_rc=$?
+guidellm benchmark run "${GUIDELLM_ARGS[@]}" 2>&1 | tee "$GUIDELLM_LOG"
+gdl_rc=${PIPESTATUS[0]}
 set -e
 
 if [[ $gdl_rc -ne 0 ]]; then
     echo "error: guidellm exited with status $gdl_rc" >&2
     echo "       raw artefacts (if any): $OUTPUT_DIR" >&2
+    echo "       full log: $GUIDELLM_LOG" >&2
     exit 3
 fi
 

@@ -59,7 +59,7 @@ the change.
 --profile sweep
 --data   prompt_tokens=4096,output_tokens=256
 --max-seconds 60
---outputs json,csv,html
+--outputs json --outputs csv --outputs html
 --random-seed 20260416
 ```
 
@@ -139,7 +139,7 @@ Behaviour:
             --max-seconds 60 \
             --random-seed 20260416 \
             --output-dir "bench-output/$(date +%Y-%m-%d)-$LABEL/" \
-            --outputs json,csv,html \
+            --outputs json --outputs csv --outputs html \
             --backend openai_http \
             --backend-kwargs '{"validate_backend": "/v1/models"}'
   4. Extract headline metrics from benchmarks.json:
@@ -191,7 +191,7 @@ The wrapper's only hard dependency is `guidellm` itself + `jq` + `curl`.
 - `--data prompt_tokens=4096,output_tokens=256`
 - `--max-seconds 60`
 - `--random-seed 20260416`
-- `--outputs json,csv,html`
+- `--outputs json --outputs csv --outputs html`
 - Wrapper: `scripts/bench_guidellm.sh <label>`
 
 ## Results — sweep headline table
