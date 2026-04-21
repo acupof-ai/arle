@@ -59,6 +59,6 @@ Pending remote CUDA run.
 
 ## Notes
 
-- What changed in the code since baseline: introduced `crates/kv-native-sys`, routed `infer/src/kv_tier/transport/disk.rs` through it, and added local substrate APIs for WAL/mmap/shm plus repository-native Zig setup/validation scripts.
+- What changed in the code since baseline: introduced `crates/kv-native-sys`, routed `infer/src/kv_tier/transport/disk.rs` through it, added local substrate APIs for WAL/mmap/shm, wired coordinator spill/rehydrate byte paths through the same disk substrate, and added repository-native Zig setup/validation scripts.
 - Suspected cause of any regression: none expected; change is off hot-path for steady-state decode.
 - Follow-ups: run the canonical CUDA regression check once Zig-backed build verification is complete.

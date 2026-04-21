@@ -14,7 +14,7 @@
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
 //! | T1   | Host pinned DRAM   | ~10 µs PCIe   | planned for M3 (CUDA-only) |
-//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` impl exists, not yet wired into a coordinator |
+//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill/rehydrate paths; scheduler watermarks still do not emit those commands |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
@@ -29,12 +29,11 @@
 //!
 //! # Current status (what this module actually contains as of 2026-04-15)
 //!
-//! **Skeleton, zero production callers.** Every type defined here is
-//! either constructed only by unit tests or imported only by in-module
-//! dependencies. No file under `infer/src/scheduler/`,
-//! `infer/src/server_engine.rs`, `infer/src/model/`, or
-//! `infer/src/backend/` calls into `kv_tier::KVTransport` or
-//! `kv_tier::EvictionPolicy` from the hot path.
+//! **Still mostly skeleton, but no longer fully isolated.** The CUDA
+//! scheduler spawns and drains a `Coordinator`, and coordinator
+//! spill/rehydrate commands now route bytes through `DiskStore`.
+//! `KVTransport` and watermark-driven spill callers are still not on
+//! the hot path.
 //!
 //! The former `directory::TierDirectory` / `BlockDescriptor` holding
 //! area was removed in M1 per project doc §5.2. Block metadata that
@@ -121,7 +120,7 @@ pub mod tier;
 pub mod transport;
 
 pub use coordinator::{Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle};
-pub use host_pool::{HostPinnedPool, HostPinnedRegion};
+pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
 pub use lookup::{
     HitKind, LookupBlock, LookupHeuristics, LookupOutcome, StagePlanner, StageRequest, StageTicket,

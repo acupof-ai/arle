@@ -13,6 +13,8 @@
 //! any outstanding memory registration. The free list exists for reuse
 //! of interior holes WITHOUT ever growing or re-basing the region.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use anyhow::{Result, anyhow};
 
 /// Reservation handed back by [`HostPinnedPool::reserve`].
@@ -26,6 +28,63 @@ pub struct HostPinnedRegion {
     pub offset: u64,
     pub len: usize,
 }
+
+/// Cloneable handle for sharing a single allocation-stable host pinned pool
+/// across the scheduler and coordinator.
+#[derive(Clone, Debug)]
+pub struct SharedHostPinnedPool {
+    inner: Arc<Mutex<HostPinnedPool>>,
+}
+
+impl SharedHostPinnedPool {
+    pub fn new(pool: HostPinnedPool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(pool)),
+        }
+    }
+
+    pub fn from_arc(inner: Arc<Mutex<HostPinnedPool>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn as_arc(&self) -> Arc<Mutex<HostPinnedPool>> {
+        Arc::clone(&self.inner)
+    }
+
+    pub fn lock(&self) -> Result<MutexGuard<'_, HostPinnedPool>> {
+        self.inner
+            .lock()
+            .map_err(|err: PoisonError<MutexGuard<'_, HostPinnedPool>>| {
+                anyhow!("SharedHostPinnedPool poisoned: {err}")
+            })
+    }
+
+    pub fn read_region(&self, region: HostPinnedRegion) -> Result<Vec<u8>> {
+        let pool = self.lock()?;
+        Ok(pool.as_slice(region).to_vec())
+    }
+
+    pub fn write_region(&self, region: HostPinnedRegion, bytes: &[u8]) -> Result<()> {
+        if bytes.len() != region.len {
+            return Err(anyhow!(
+                "SharedHostPinnedPool region length mismatch: region={} bytes={}",
+                region.len,
+                bytes.len()
+            ));
+        }
+        let mut pool = self.lock()?;
+        pool.as_mut_slice(region).copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl PartialEq for SharedHostPinnedPool {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for SharedHostPinnedPool {}
 
 #[derive(Debug)]
 enum Backing {

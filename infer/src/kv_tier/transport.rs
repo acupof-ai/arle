@@ -12,7 +12,8 @@
 //!
 //! - [`disk`] — [`DiskStore`], the T3 NVMe / SSD backend. Pure `std::fs`;
 //!   cross-platform (macOS tests run on `tokio::fs`-free paths). The
-//!   Phase-3 follow-up PR will wrap it in a real `KVTransport` impl.
+//!   coordinator now routes spill/rehydrate byte paths through it, but it is
+//!   still not a `KVTransport` impl.
 //! - `nixl` (feature `rdma-nixl`) — `NixlTransport` stub for the T4 remote tier.
 //!   Only compiled under `#[cfg(feature = "rdma-nixl")]`; references
 //!   `nixl-sys` types so a `cargo check --features rdma-nixl` on macOS
@@ -80,8 +81,8 @@ impl std::error::Error for TransportError {}
 /// - **M3** — `LocalCudaTransport` (cudaMemcpyAsync on a dedicated copy
 ///   stream), not yet implemented
 /// - **M4** — `DiskStore` (tokio::fs default, io_uring behind a feature
-///   flag); a skeleton store already lives at [`disk::DiskStore`] but
-///   is not yet wired into a coordinator or this trait
+///   flag); spill/rehydrate coordinator paths route through
+///   [`disk::DiskStore`] today, but it is not yet a `KVTransport` impl
 /// - **M5** — `NixlTransport` stub via `nixl-sys` with `stub-api`
 ///   feature; the real impl behind `rdma-nixl-real` is trigger-gated
 /// - **Post-M5, trigger-gated** — Mooncake `TransferEngine` binding,

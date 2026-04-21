@@ -200,7 +200,7 @@ Acceptance:
 
 ### Phase 5
 
-Status: `planned`
+Status: `done`
 
 Goal: wire the coordinator to the substrate without changing high-level contracts.
 
@@ -218,6 +218,14 @@ Ordered tasks:
 4. keep `CoordinatorCommand` / `CoordinatorEvent` stable where possible
 5. add transport hooks that can graduate from path-based to descriptor-based flows
 
+Completed in-tree:
+
+- `Coordinator::new_with_disk_store(...)` wires a shared `DiskStore` into the coordinator thread
+- `SpillRequest` / `RehydrateRequest` now carry a shared host-pinned pool handle plus region metadata
+- coordinator `Spill` / `Rehydrate` commands now persist and restore real bytes through `DiskStore`
+- local coordinator tests cover spill failure without a disk store and spill→rehydrate round trips through the Zig-backed substrate
+- scheduler CUDA initialization now clones the same `DiskStore` into the coordinator
+
 Acceptance:
 
 - coordinator can spill and rehydrate through the Zig substrate
@@ -228,7 +236,7 @@ Acceptance:
 
 Immediate next steps, in order:
 
-1. wire the completed substrate APIs into coordinator/transport call sites
+1. teach scheduler watermark logic to emit `submit_spill` / `submit_rehydrate`
 2. run the pending remote CUDA regression check
 3. decide whether descriptor-backed flows should extend `KVTransport` or stay coordinator-local
 
@@ -263,3 +271,4 @@ Local validation completed:
 9. `cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer`
 10. `bash -n scripts/setup_zig_toolchain.sh scripts/check_kv_zig.sh setup.sh`
 11. `./scripts/setup_zig_toolchain.sh --check-only --print-zig`
+12. `cargo test -p infer --no-default-features --features no-cuda kv_tier::coordinator -- --nocapture`

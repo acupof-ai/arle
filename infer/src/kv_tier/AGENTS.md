@@ -14,7 +14,7 @@ Load this file before editing anything under `kv_tier/`, and re-read
 |------|-------------------|----------|-----------------------|
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
 | T1   | Host pinned DRAM  | ~10 µs   | M3 (CUDA only). `host_pool.rs` skeleton exists, locally-verifiable bookkeeping only. |
-| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` impl exists, not yet wired into a coordinator. |
+| T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/rehydrate handling; scheduler watermark callers are still pending. |
 | T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
 
 **Apple Silicon skips T1.** MLX unified memory makes host↔GPU a self-memcpy.
