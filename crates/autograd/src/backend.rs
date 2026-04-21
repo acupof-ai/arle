@@ -95,10 +95,6 @@ impl CudaStorage {
     pub(crate) fn slice(&self) -> &cudarc::driver::CudaSlice<f32> {
         self.inner.as_ref()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.inner.len()
-    }
 }
 
 #[derive(Debug, Clone)]

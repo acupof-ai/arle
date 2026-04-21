@@ -1403,7 +1403,11 @@ mod lora_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::error::Error;
     use tempfile::tempdir;
+    use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
     fn resume_cfg() -> Qwen3Config {
         Qwen3Config {
@@ -1425,6 +1429,8 @@ mod tests {
         fs::write(
             dir.join("config.json"),
             serde_json::to_string_pretty(&json!({
+                "bos_token_id": 1,
+                "eos_token_id": 2,
                 "hidden_size": cfg.hidden_size,
                 "intermediate_size": cfg.intermediate_size,
                 "num_hidden_layers": cfg.num_hidden_layers,
@@ -1440,6 +1446,140 @@ mod tests {
             .expect("serialize config"),
         )
         .expect("write config");
+    }
+
+    fn tiny_cli_cfg() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            vocab_size: 32,
+            rms_norm_eps: 1.0e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: false,
+            max_position_embeddings: 64,
+        }
+    }
+
+    fn write_tiny_model_dir(model_dir: &Path, cfg: &Qwen3Config) -> TestResult {
+        fs::create_dir_all(model_dir)?;
+        write_resume_config(model_dir, cfg);
+        write_tiny_tokenizer(&model_dir.join("tokenizer.json"))?;
+
+        let mut store = TensorStore::default();
+        let model = Qwen3Model::new(cfg, &mut store)?;
+        build_registry(&model).save_from(&mut store, &model_dir.join("model.safetensors"))?;
+        Ok(())
+    }
+
+    fn write_tiny_tokenizer(path: &Path) -> TestResult {
+        let turns = [
+            "<|im_start|>user\nhi<|im_end|>\n",
+            "<|im_start|>assistant\nhello<|im_end|>\n",
+            "<|im_start|>user\nadd<|im_end|>\n",
+            "<|im_start|>assistant\nsum<|im_end|>\n",
+            "<|im_start|>user\nbye<|im_end|>\n",
+            "<|im_start|>assistant\nlater<|im_end|>\n",
+        ];
+
+        let model = WordLevel::builder()
+            .vocab(
+                std::iter::once(("[UNK]".to_string(), 0))
+                    .chain(
+                        turns
+                            .iter()
+                            .enumerate()
+                            .map(|(index, turn)| ((*turn).to_string(), index as u32 + 1)),
+                    )
+                    .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()?;
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.add_special_tokens(
+            &turns
+                .iter()
+                .map(|turn| AddedToken::from(*turn, true))
+                .collect::<Vec<_>>(),
+        );
+        tokenizer.save(path, false)?;
+        Ok(())
+    }
+
+    fn write_tiny_sft_jsonl(path: &Path) -> TestResult {
+        fs::write(
+            path,
+            concat!(
+                "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]}\n",
+                "{\"messages\":[{\"role\":\"user\",\"content\":\"add\"},{\"role\":\"assistant\",\"content\":\"sum\"}]}\n",
+                "{\"messages\":[{\"role\":\"user\",\"content\":\"bye\"},{\"role\":\"assistant\",\"content\":\"later\"}]}\n",
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn tiny_cli_args(
+        model_dir: &Path,
+        data_path: &Path,
+        out_dir: &Path,
+        steps: usize,
+        resume_from: Option<PathBuf>,
+    ) -> CliArgs {
+        CliArgs {
+            model_family: ModelFamily::Qwen3,
+            model: model_dir.to_path_buf(),
+            data: data_path.to_path_buf(),
+            out: out_dir.to_path_buf(),
+            steps,
+            batch: 1,
+            lr: 5.0e-3,
+            seq_len: 64,
+            backend: BackendChoice::Cpu,
+            save_every: 2,
+            log_every: 1,
+            seed: 0x5F54_5F53_4D4F_4B45,
+            save_dtype: SaveDtype::F32,
+            lr_schedule: "constant".to_string(),
+            warmup_steps: 0,
+            min_lr: 0.0,
+            grad_accum_steps: None,
+            metrics_jsonl: None,
+            resume_from,
+            lora_rank: 4,
+            lora_alpha: 8.0,
+        }
+    }
+
+    fn latest_step_dir(out_dir: &Path) -> TestResult<PathBuf> {
+        Ok(out_dir.join("latest").canonicalize()?)
+    }
+
+    fn assert_adamw_state_eq(
+        lhs: &autograd::adamw_state::AdamWState,
+        rhs: &autograd::adamw_state::AdamWState,
+    ) {
+        assert_eq!(lhs.step, rhs.step);
+        assert_eq!(lhs.skipped_export, rhs.skipped_export);
+        assert_eq!(lhs.params.len(), rhs.params.len());
+        let mut lhs_params = lhs.params.iter().collect::<Vec<_>>();
+        let mut rhs_params = rhs.params.iter().collect::<Vec<_>>();
+        lhs_params.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        rhs_params.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        for (idx, (left, right)) in lhs_params.iter().zip(rhs_params.iter()).enumerate() {
+            assert_eq!(left.name, right.name, "param name mismatch at {idx}");
+            assert_eq!(left.shape, right.shape, "shape mismatch at {idx}");
+            assert_eq!(left.m.len(), right.m.len(), "m length mismatch at {idx}");
+            assert_eq!(left.v.len(), right.v.len(), "v length mismatch at {idx}");
+            for (elem_idx, (lm, rm)) in left.m.iter().zip(right.m.iter()).enumerate() {
+                assert_eq!(lm.to_bits(), rm.to_bits(), "m drift at {idx}:{elem_idx}");
+            }
+            for (elem_idx, (lv, rv)) in left.v.iter().zip(right.v.iter()).enumerate() {
+                assert_eq!(lv.to_bits(), rv.to_bits(), "v drift at {idx}:{elem_idx}");
+            }
+        }
     }
 
     #[test]
@@ -1488,5 +1628,74 @@ mod tests {
             err.to_string().contains("rope_theta"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn qwen3_sft_resume_matches_uninterrupted_run() -> TestResult {
+        let tmp = tempdir()?;
+        let model_dir = tmp.path().join("model");
+        let data_path = tmp.path().join("tiny_sft.jsonl");
+        let continuous_out = tmp.path().join("continuous");
+        let resumed_out = tmp.path().join("resumed");
+        let cfg = tiny_cli_cfg();
+
+        write_tiny_model_dir(&model_dir, &cfg)?;
+        write_tiny_sft_jsonl(&data_path)?;
+
+        let continuous_args = tiny_cli_args(&model_dir, &data_path, &continuous_out, 4, None);
+        run_with_family::<Qwen3Family>(&continuous_args, &model_dir.join("config.json"))?;
+
+        let first_leg_args = tiny_cli_args(&model_dir, &data_path, &resumed_out, 2, None);
+        run_with_family::<Qwen3Family>(&first_leg_args, &model_dir.join("config.json"))?;
+
+        let resume_args = tiny_cli_args(
+            &model_dir,
+            &data_path,
+            &resumed_out,
+            4,
+            Some(resumed_out.join("latest")),
+        );
+        run_with_family::<Qwen3Family>(&resume_args, &model_dir.join("config.json"))?;
+
+        let continuous_latest = latest_step_dir(&continuous_out)?;
+        let resumed_latest = latest_step_dir(&resumed_out)?;
+        assert_eq!(
+            continuous_latest.file_name().and_then(|name| name.to_str()),
+            Some("step_000004")
+        );
+        assert_eq!(
+            resumed_latest.file_name().and_then(|name| name.to_str()),
+            Some("step_000004")
+        );
+
+        for artifact in [
+            "model.safetensors",
+            "adapter_model.safetensors",
+            "trainer_state.json",
+        ] {
+            assert_eq!(
+                fs::read(continuous_latest.join(artifact))?,
+                fs::read(resumed_latest.join(artifact))?,
+                "resume drifted for {artifact}",
+            );
+        }
+
+        let (continuous_doc, continuous_optim) =
+            train::checkpoint::load_trainer_state_v2(&continuous_latest)?;
+        let (resumed_doc, resumed_optim) =
+            train::checkpoint::load_trainer_state_v2(&resumed_latest)?;
+        assert_eq!(continuous_doc.step, resumed_doc.step);
+        assert_eq!(continuous_doc.optim_schema, resumed_doc.optim_schema);
+        assert_eq!(continuous_doc.schedule_name, resumed_doc.schedule_name);
+        assert_eq!(continuous_doc.schedule_params, resumed_doc.schedule_params);
+        assert_eq!(
+            continuous_doc.grad_accum_current,
+            resumed_doc.grad_accum_current
+        );
+        assert_eq!(continuous_doc.rng_seed, resumed_doc.rng_seed);
+        assert_eq!(continuous_doc.codec_version, resumed_doc.codec_version);
+        assert_adamw_state_eq(&continuous_optim, &resumed_optim);
+
+        Ok(())
     }
 }

@@ -58,7 +58,6 @@ pub(super) struct PendingDecode {
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
-    pub sampling_params_greedy: Vec<bool>,
     pub mixed_prefill_request_idx: Option<usize>,
     pub mixed_prefill_tokens: usize,
     pub mixed_prefill_chunk_complete: bool,
@@ -129,7 +128,9 @@ pub struct Scheduler<M: ModelForward> {
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
     pub(super) waiting: VecDeque<IncomingRequest>,
-    pub(super) active: Vec<ActiveRequest>,
+    pub(super) active: Vec<Option<ActiveRequest>>,
+    pub(super) prefill_queue: VecDeque<usize>,
+    pub(super) running_batch: VecDeque<usize>,
     pub(super) next_id: u64,
     pub(super) rng: StdRng,
     /// Paged KV cache pool shared across all slots (for batched decode).
@@ -137,8 +138,6 @@ pub struct Scheduler<M: ModelForward> {
     /// Pre-allocated buffers for batched decode (reused across steps).
     /// Typed via `M::DecodeContext` — no downcasting needed.
     pub(super) decode_bufs: Option<M::DecodeContext>,
-    /// Round-robin index for fair decode scheduling.
-    pub(super) last_served: usize,
     /// Lifetime stats.
     pub(super) total_completed: u64,
     pub(super) total_generated_tokens: u64,
@@ -158,13 +157,7 @@ pub struct Scheduler<M: ModelForward> {
 
 impl<M: ModelForward> Scheduler<M> {
     fn eviction_signals(&self) -> SchedulerSignals {
-        SchedulerSignals::queue_state(
-            self.waiting.len(),
-            self.active
-                .iter()
-                .filter(|req| matches!(req.phase, Phase::Decoding))
-                .count(),
-        )
+        SchedulerSignals::queue_state(self.waiting.len(), self.running_batch.len())
     }
 
     fn prefix_cache_watermarks_pages(&self) -> (usize, usize) {
@@ -404,12 +397,13 @@ impl<M: ModelForward> Scheduler<M> {
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
-            active: Vec::new(),
+            active: (0..config.max_slots).map(|_| None).collect(),
+            prefill_queue: VecDeque::new(),
+            running_batch: VecDeque::new(),
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
             decode_bufs: None,
-            last_served: 0,
             total_completed: 0,
             total_generated_tokens: 0,
             step_timing_decode_us: 0.0,
@@ -431,6 +425,100 @@ impl<M: ModelForward> Scheduler<M> {
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))
+    }
+
+    pub(super) fn active_len(&self) -> usize {
+        self.active.iter().filter(|req| req.is_some()).count()
+    }
+
+    pub(super) fn request(&self, slot_idx: usize) -> Option<&ActiveRequest> {
+        self.active.get(slot_idx)?.as_ref()
+    }
+
+    pub(super) fn request_mut(&mut self, slot_idx: usize) -> Option<&mut ActiveRequest> {
+        self.active.get_mut(slot_idx)?.as_mut()
+    }
+
+    pub(super) fn queue_prefill(&mut self, slot_idx: usize) {
+        if !self.prefill_queue.contains(&slot_idx) {
+            self.prefill_queue.push_back(slot_idx);
+        }
+    }
+
+    pub(super) fn dequeue_prefill(&mut self, slot_idx: usize) {
+        self.prefill_queue.retain(|&queued| queued != slot_idx);
+    }
+
+    pub(super) fn queue_running(&mut self, slot_idx: usize) {
+        if !self.running_batch.contains(&slot_idx) {
+            self.running_batch.push_back(slot_idx);
+        }
+    }
+
+    pub(super) fn dequeue_running(&mut self, slot_idx: usize) {
+        self.running_batch.retain(|&queued| queued != slot_idx);
+    }
+
+    pub(super) fn pool_partial_tail_capacity(&self) -> usize {
+        let page_size = self.paged_kv_pool.page_size.max(1);
+        (0..self.states.len())
+            .map(|slot_idx| {
+                let used = self.paged_kv_pool.seq_len(slot_idx) % page_size;
+                if used == 0 { 0 } else { page_size - used }
+            })
+            .sum()
+    }
+
+    pub(super) fn pool_free_pages(&self) -> usize {
+        let page_size = self.paged_kv_pool.page_size.max(1);
+        let free_page_tokens = self
+            .paged_kv_pool
+            .free_count()
+            .saturating_sub(self.pool_partial_tail_capacity());
+        free_page_tokens / page_size
+    }
+
+    pub(super) fn additional_pages_needed_for_seq_len(
+        &self,
+        seq_len: usize,
+        additional_tokens: usize,
+    ) -> usize {
+        if additional_tokens == 0 {
+            return 0;
+        }
+        let page_size = self.paged_kv_pool.page_size.max(1);
+        let current_pages = seq_len.div_ceil(page_size);
+        let future_pages = seq_len
+            .saturating_add(additional_tokens)
+            .div_ceil(page_size);
+        future_pages.saturating_sub(current_pages)
+    }
+
+    pub(super) fn additional_pages_needed_for_slot(
+        &self,
+        slot_idx: usize,
+        additional_tokens: usize,
+    ) -> usize {
+        self.additional_pages_needed_for_seq_len(
+            self.paged_kv_pool.seq_len(slot_idx),
+            additional_tokens,
+        )
+    }
+
+    pub(super) fn finish_slot(&mut self, slot_idx: usize) {
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.phase = Phase::Finished;
+        }
+        self.dequeue_prefill(slot_idx);
+        self.dequeue_running(slot_idx);
+    }
+
+    pub(super) fn move_to_decode(&mut self, slot_idx: usize) {
+        self.dequeue_prefill(slot_idx);
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.phase = Phase::Decoding;
+        }
+        self.queue_running(slot_idx);
     }
 
     /// Compute the effective max_seq_len per slot based on available GPU memory.

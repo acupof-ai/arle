@@ -2,7 +2,6 @@ use super::{CompletionStreamDelta, FinishReason, TokenUsage, Tokenizer, mpsc};
 
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
-    New,
     /// Prefilling in chunks. Decode takes priority between chunks.
     Prefilling {
         effective_tokens: Vec<u32>,
@@ -16,7 +15,6 @@ pub(crate) enum Phase {
 
 pub(crate) struct ActiveRequest {
     pub(crate) id: u64,
-    pub(crate) slot_idx: usize,
     pub(crate) admitted_at: std::time::Instant,
     pub(crate) first_token_at: Option<std::time::Instant>,
     /// Original prompt string (kept for preemption re-queue).
@@ -250,7 +248,6 @@ mod tests {
         let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
         ActiveRequest {
             id: 1,
-            slot_idx: 0,
             admitted_at: std::time::Instant::now(),
             first_token_at: None,
             prompt: prompt.to_string(),
@@ -264,7 +261,7 @@ mod tests {
             full_decoded: String::new(),
             decoded_token_count: 0,
             sent_len: 0,
-            phase: Phase::New,
+            phase: Phase::Finished,
             cacheable_prompt_len: 0,
             prefix_byte_len: 0,
             latest_logprob: None,

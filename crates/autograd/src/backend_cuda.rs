@@ -31,7 +31,7 @@ use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::cublas::sys::cublasOperation_t;
 #[cfg(not(feature = "no-cuda"))]
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, PushKernelArg};
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
@@ -357,8 +357,9 @@ impl Backend for CudaBackend {
                 &self.stream,
                 self.kernels.function("add_f32")?,
                 size,
-                |builder| {
+                |mut builder| {
                     builder.arg(&mut out).arg(a).arg(b).arg(&n);
+                    builder
                 },
             )?;
             Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
@@ -745,8 +746,9 @@ fn cuda_softmax_like(
         rows,
         BLOCK,
         SHARED,
-        |builder| {
+        |mut builder| {
             builder.arg(&mut d_out).arg(&d_in).arg(&cols);
+            builder
         },
     )?;
 
@@ -1002,8 +1004,9 @@ fn cuda_unary_1d(backend: &CudaBackend, a: &[f32], kernel_name: &'static str) ->
         &backend.stream,
         backend.kernels.function(kernel_name)?,
         n_usize,
-        |builder| {
+        |mut builder| {
             builder.arg(&mut d_out).arg(&d_in).arg(&n);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, n_usize)
@@ -1031,8 +1034,9 @@ fn cuda_scalar_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
         n_usize,
-        |builder| {
+        |mut builder| {
             builder.arg(&mut d_out).arg(&d_in).arg(&s).arg(&n);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, n_usize)
@@ -1070,8 +1074,9 @@ fn cuda_binary_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
         n_usize,
-        |builder| {
+        |mut builder| {
             builder.arg(&mut d_out).arg(&d_a).arg(&d_b).arg(&n);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, n_usize)
@@ -1129,13 +1134,14 @@ fn cuda_rms_norm(
         rows,
         BLOCK,
         SHARED,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&mut d_out)
                 .arg(&d_x)
                 .arg(&d_w)
                 .arg(&cols)
                 .arg(&eps);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, expected)
@@ -1184,7 +1190,7 @@ fn cuda_embedding(
         n_ids,
         BLOCK,
         0,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&mut d_out)
                 .arg(&d_w)
@@ -1192,6 +1198,7 @@ fn cuda_embedding(
                 .arg(&n_i32)
                 .arg(&vocab_i32)
                 .arg(&dim_i32);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, out_len)
@@ -1238,8 +1245,9 @@ fn cuda_reduce_last_axis(
         rows,
         BLOCK,
         SHARED,
-        |builder| {
+        |mut builder| {
             builder.arg(&mut d_out).arg(&d_in).arg(&cols);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, rows)
@@ -1317,7 +1325,7 @@ fn cuda_rope(
         rows,
         block,
         0,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&mut d_out)
                 .arg(&d_x)
@@ -1327,6 +1335,7 @@ fn cuda_rope(
                 .arg(&heads_i)
                 .arg(&seq_i)
                 .arg(&head_dim_i);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, total)
@@ -1382,13 +1391,14 @@ fn cuda_gather_last_dim(
         &backend.stream,
         backend.kernels.function("gather_last_dim_f32")?,
         prefix,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&mut d_out)
                 .arg(&d_src)
                 .arg(&d_ids)
                 .arg(&n_i32)
                 .arg(&vocab_i32);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, prefix)
@@ -1449,7 +1459,7 @@ fn cuda_scatter_add_rows(
         prefix_rows,
         block,
         0,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&mut d_out)
                 .arg(&d_upstream)
@@ -1457,6 +1467,7 @@ fn cuda_scatter_add_rows(
                 .arg(&prefix_i32)
                 .arg(&feature_i32)
                 .arg(&vocab_i32);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, out_len)
@@ -1543,7 +1554,7 @@ fn cuda_add_broadcast(
         &backend.stream,
         backend.kernels.function("add_broadcast_f32")?,
         total,
-        |builder| {
+        |mut builder| {
             builder
                 .arg(&d_a)
                 .arg(&d_b)
@@ -1552,6 +1563,7 @@ fn cuda_add_broadcast(
                 .arg(&d_b_strides)
                 .arg(&out_rank_i32)
                 .arg(&total_i32);
+            builder
         },
     )?;
     cuda_download(backend, &d_out, total)

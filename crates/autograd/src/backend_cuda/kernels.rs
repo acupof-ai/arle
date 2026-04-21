@@ -95,16 +95,16 @@ impl KernelCache {
     }
 }
 
-pub(super) fn launch_rows<F>(
-    stream: &Arc<CudaStream>,
-    func: &CudaFunction,
+pub(super) fn launch_rows<'a, F>(
+    stream: &'a Arc<CudaStream>,
+    func: &'a CudaFunction,
     rows: usize,
     block: u32,
     shared_bytes: u32,
     build_args: F,
 ) -> Result<()>
 where
-    F: FnOnce(&mut LaunchArgs<'_>),
+    F: FnOnce(LaunchArgs<'a>) -> LaunchArgs<'a>,
 {
     #[cfg(feature = "no-cuda")]
     {
@@ -119,8 +119,7 @@ where
         }
         let grid_x = u32::try_from(rows)
             .map_err(|_| AutogradError::TapeInvariant("cuda launch rows exceeds u32"))?;
-        let mut launch_args = stream.launch_builder(func);
-        build_args(&mut launch_args);
+        let mut launch_args = build_args(stream.launch_builder(func));
         // Safety: caller controls the kernel symbol + argument order, and all
         // device buffers outlive the asynchronous launch.
         unsafe {
@@ -136,14 +135,14 @@ where
     }
 }
 
-pub(super) fn launch_1d<F>(
-    stream: &Arc<CudaStream>,
-    func: &CudaFunction,
+pub(super) fn launch_1d<'a, F>(
+    stream: &'a Arc<CudaStream>,
+    func: &'a CudaFunction,
     n: usize,
     build_args: F,
 ) -> Result<()>
 where
-    F: FnOnce(&mut LaunchArgs<'_>),
+    F: FnOnce(LaunchArgs<'a>) -> LaunchArgs<'a>,
 {
     #[cfg(feature = "no-cuda")]
     {
@@ -159,8 +158,7 @@ where
 
         let grid_x = u32::try_from(n.div_ceil(256))
             .map_err(|_| AutogradError::TapeInvariant("cuda launch grid exceeds u32"))?;
-        let mut launch_args = stream.launch_builder(func);
-        build_args(&mut launch_args);
+        let mut launch_args = build_args(stream.launch_builder(func));
         // Safety: caller controls the kernel symbol + argument order, and all
         // device buffers outlive the asynchronous launch.
         unsafe {
