@@ -195,8 +195,6 @@ impl AttentionInputProjection {
     }
 
     pub(super) fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray, MlxArray) {
-        use super::mlx::slice;
-
         match self {
             Self::Split {
                 q_proj,
@@ -214,15 +212,9 @@ impl AttentionInputProjection {
                 v_dim,
             } => {
                 let qkv = super::linear(x, qkv_proj);
-                let seq = qkv.shape()[0];
-                let q_raw = slice(&qkv, &[0, 0], &[seq, *q_dim], &[1, 1]);
-                let k_raw = slice(&qkv, &[0, *q_dim], &[seq, *q_dim + *k_dim], &[1, 1]);
-                let v_raw = slice(
-                    &qkv,
-                    &[0, *q_dim + *k_dim],
-                    &[seq, *q_dim + *k_dim + *v_dim],
-                    &[1, 1],
-                );
+                let q_raw = slice_last_dim(&qkv, 0, *q_dim);
+                let k_raw = slice_last_dim(&qkv, *q_dim, *k_dim);
+                let v_raw = slice_last_dim(&qkv, *q_dim + *k_dim, *v_dim);
                 (q_raw, k_raw, v_raw)
             }
         }
@@ -248,8 +240,6 @@ pub enum MlpInputProjection {
 #[cfg(feature = "metal")]
 impl MlpInputProjection {
     pub(super) fn project(&self, x: &MlxArray) -> (MlxArray, MlxArray) {
-        use super::mlx::slice;
-
         match self {
             Self::Split { gate_proj, up_proj } => {
                 (super::linear(x, gate_proj), super::linear(x, up_proj))
@@ -260,18 +250,27 @@ impl MlpInputProjection {
                 up_dim,
             } => {
                 let gate_up = super::linear(x, gate_up_proj);
-                let seq = gate_up.shape()[0];
-                let gate_raw = slice(&gate_up, &[0, 0], &[seq, *gate_dim], &[1, 1]);
-                let up_raw = slice(
-                    &gate_up,
-                    &[0, *gate_dim],
-                    &[seq, *gate_dim + *up_dim],
-                    &[1, 1],
-                );
+                let gate_raw = slice_last_dim(&gate_up, 0, *gate_dim);
+                let up_raw = slice_last_dim(&gate_up, *gate_dim, *up_dim);
                 (gate_raw, up_raw)
             }
         }
     }
+}
+
+#[cfg(feature = "metal")]
+fn slice_last_dim(array: &MlxArray, offset: i32, len: i32) -> MlxArray {
+    use super::mlx::slice;
+
+    let ndim = array.shape().len();
+    debug_assert!(ndim >= 1);
+    let mut start = vec![0; ndim];
+    let mut end = array.shape().to_vec();
+    let strides = vec![1; ndim];
+    let last = ndim - 1;
+    start[last] = offset;
+    end[last] = offset + len;
+    slice(array, &start, &end, &strides)
 }
 
 /// Weight tensors loaded from safetensors shards into Metal unified memory.

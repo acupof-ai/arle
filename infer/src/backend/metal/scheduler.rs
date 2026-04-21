@@ -26,15 +26,15 @@ pub enum MetalRequestPriority {
 pub struct MetalSchedulerConfig {
     /// Maximum number of requests admitted into the running set at once.
     pub max_running_requests: usize,
-    /// Maximum tokens processed in one prefill chunk.
-    pub prefill_chunk_size: usize,
+    /// Shared token budget per scheduler tick across decode and prefill work.
+    pub max_batch_tokens: usize,
 }
 
 impl Default for MetalSchedulerConfig {
     fn default() -> Self {
         Self {
             max_running_requests: 4,
-            prefill_chunk_size: 512,
+            max_batch_tokens: 512,
         }
     }
 }
@@ -47,9 +47,9 @@ impl MetalSchedulerConfig {
                 "max_running_requests must be >= 1".to_string(),
             ));
         }
-        if self.prefill_chunk_size == 0 {
+        if self.max_batch_tokens == 0 {
             return Err(MetalSchedulerError::InvalidConfig(
-                "prefill_chunk_size must be >= 1".to_string(),
+                "max_batch_tokens must be >= 1".to_string(),
             ));
         }
         Ok(())
@@ -160,8 +160,8 @@ impl MetalScheduler {
         });
     }
 
-    fn prefill_chunk_budget(&self, _decode_count: usize) -> usize {
-        self.config.prefill_chunk_size
+    fn prefill_chunk_budget(&self, decode_count: usize) -> usize {
+        self.config.max_batch_tokens.saturating_sub(decode_count)
     }
 
     /// Create a new scheduler with the provided config.
@@ -328,6 +328,10 @@ impl MetalScheduler {
         runtime_states: &[MetalRuntimeRequestState],
     ) -> Option<MetalPrefillChunk> {
         let decode_count = Self::count_decode_runtime(runtime_states);
+        let chunk_cap = self.prefill_chunk_budget(decode_count);
+        if chunk_cap == 0 {
+            return None;
+        }
         let (req_id, newly_admitted) =
             if let Some(req_id) = self.find_prefilling_request(runtime_states) {
                 (req_id, false)
@@ -336,8 +340,6 @@ impl MetalScheduler {
             } else {
                 return None;
             };
-
-        let chunk_cap = self.prefill_chunk_budget(decode_count);
 
         let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
             let state = self.requests.get_mut(&req_id)?;
@@ -514,23 +516,23 @@ mod tests {
         }
     }
 
-    fn make_scheduler(max_running_requests: usize, chunk: usize) -> MetalScheduler {
+    fn make_scheduler(max_running_requests: usize, max_batch_tokens: usize) -> MetalScheduler {
         MetalScheduler::new(MetalSchedulerConfig {
             max_running_requests,
-            prefill_chunk_size: chunk,
+            max_batch_tokens,
         })
         .expect("config should be valid")
     }
 
     fn make_scheduler_with_event_sink(
         max_running_requests: usize,
-        chunk: usize,
+        max_batch_tokens: usize,
         event_sink: Arc<dyn EventSink>,
     ) -> MetalScheduler {
         MetalScheduler::with_event_sink(
             MetalSchedulerConfig {
                 max_running_requests,
-                prefill_chunk_size: chunk,
+                max_batch_tokens,
             },
             event_sink,
         )
@@ -563,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_beats_new_prefill_without_shrinking_the_prefill_chunk() {
+    fn decode_and_prefill_share_the_same_token_budget() {
         let mut sched = make_scheduler(2, 4);
         let req0 = sched
             .submit(vec![1, 2, 3, 4], 8, MetalRequestPriority::Normal)
@@ -587,9 +589,29 @@ mod tests {
         assert_eq!(decode.req_ids, vec![req0]);
         assert_eq!(decode.input_tokens, vec![11]);
         assert_eq!(prefill.req_id, req1);
-        assert_eq!(prefill.input_tokens, vec![5, 6, 7, 8]);
+        assert_eq!(prefill.input_tokens, vec![5, 6, 7]);
         assert_eq!(prefill.prompt_start, 0);
-        assert_eq!(prefill.prompt_end, 4);
+        assert_eq!(prefill.prompt_end, 3);
+    }
+
+    #[test]
+    fn decode_can_consume_the_entire_tick_budget() {
+        let mut sched = make_scheduler(2, 1);
+        let req0 = sched
+            .submit(vec![1], 4, MetalRequestPriority::Normal)
+            .expect("submit req0");
+        let req1 = sched
+            .submit(vec![5, 6, 7], 4, MetalRequestPriority::Normal)
+            .expect("submit req1");
+
+        let prefill = expect_prefill_only(sched.step(&[]));
+        assert_eq!(prefill.req_id, req0);
+
+        let decode =
+            expect_decode_only(sched.step(&[rt(req0, MetalRequestPhase::Decoding, 1, Some(11))]));
+        assert_eq!(decode.req_ids, vec![req0]);
+        assert_eq!(decode.input_tokens, vec![11]);
+        assert!(sched.is_waiting(req1));
     }
 
     #[test]

@@ -433,7 +433,7 @@ fn run_bench() -> Result<()> {
         }
     }
 
-    let step_driver_prefill_budget = MetalSchedulerConfig::default().prefill_chunk_size;
+    let step_driver_prefill_budget = MetalSchedulerConfig::default().max_batch_tokens;
 
     // ── Warmup ───────────────────────────────────────────────────────────────
     if !cli.json {
