@@ -94,7 +94,7 @@ Acceptance:
 
 ### Phase 2
 
-Status: `active`
+Status: `done`
 
 Goal: add a real object-store core under the same crate.
 
@@ -115,13 +115,6 @@ Ordered tasks:
 6. leave keyed `write/read/remove` API and header validation stable
 7. re-run local checks and tests
 
-Current landing target:
-
-- native block naming and object operations move to Zig
-- `disk.rs` stops owning production block filename generation
-- Rust still owns `DiskBlockHeader`, semantic validation, and path tamper checks
-- toolchain/bootstrap and local validation scripts are repository-native
-
 Acceptance:
 
 - `DiskStore` block API stays source-compatible
@@ -130,37 +123,50 @@ Acceptance:
 - `no-cuda` and `metal` checks remain green
 - `scripts/check_kv_zig.sh` runs clean locally
 
+Completed in-tree:
+
+- native block naming and object operations moved to Zig
+- `disk.rs` no longer owns production block filename generation
+- Rust still owns `DiskBlockHeader`, semantic validation, and path tamper checks
+- repository-native Zig bootstrap and local validation scripts landed
+
 ### Phase 3
 
-Status: `planned`
+Status: `done`
 
-Goal: add mmap and WAL.
+Goal: add mmap and WAL substrate primitives under `kv-native-sys`.
 
 Scope:
 
 - append-only WAL segments
 - replay on open
-- committed object index
-- crash-safe commit protocol beyond `rename(.tmp)`
+- mmap file descriptors for local reopen/read/write flows
+- WAL append/replay validation for local crash-recovery plumbing
 
 Ordered tasks:
 
 1. define WAL record schema for keyed objects and block objects
 2. add mmap segment abstraction in `kv-native-sys`
 3. add WAL writer with append + fsync boundaries
-4. add WAL replay at object-store open
-5. move crash-consistency policy out of `disk.rs`
-6. add corruption / partial-write tests
+4. add WAL replay validation in the Rust wrapper
+5. add corruption / partial-write tests
+
+Completed in-tree:
+
+- `KvWalRecord` plus `wal_append` / `wal_replay` FFI and Rust wrappers
+- `KvMmapDescriptor` plus `mmap_create` / `mmap_write` / `mmap_read`
+- local round-trip and truncated-record tests in `kv-native-sys`
+- `scripts/check_kv_zig.sh` now runs `cargo test -p kv-native-sys`
 
 Acceptance:
 
-- crash recovery replays committed records and ignores torn ones
-- `DiskStore` keeps the same Rust API while using WAL-backed persistence underneath
+- WAL replay accepts committed records and rejects torn/truncated ones
+- mmap descriptors can be created, reopened, and round-tripped locally
 - local tests cover replay, truncation, and bad-record handling
 
 ### Phase 4
 
-Status: `planned`
+Status: `done`
 
 Goal: add shm-backed local object store and stable descriptors.
 
@@ -177,7 +183,14 @@ Ordered tasks:
 2. add shared-memory segment allocation and open/close
 3. add descriptor-to-mapping resolution
 4. add local export/import hooks for same-host consumers
-5. thread descriptor types back into the Rust adapter surface
+5. thread descriptor types into the Rust substrate surface
+
+Completed in-tree:
+
+- `KvSharedMemoryDescriptor` POD exported across Zig/Rust
+- `shm_create` / `shm_write` / `shm_read` / `shm_unlink` ABI and Rust wrappers
+- local shared-memory round-trip tests
+- same toolchain/bootstrap path used by setup scripts and CI workflows
 
 Acceptance:
 
@@ -215,9 +228,9 @@ Acceptance:
 
 Immediate next steps, in order:
 
-1. finish the Phase 2 block object-store extraction
-2. mark toolchain scripts + env/docs sync complete
-3. land Phase 3 WAL schema design before touching coordinator behavior
+1. wire the completed substrate APIs into coordinator/transport call sites
+2. run the pending remote CUDA regression check
+3. decide whether descriptor-backed flows should extend `KVTransport` or stay coordinator-local
 
 Remote follow-up:
 
@@ -226,20 +239,27 @@ Remote follow-up:
 
 ## Toolchain and validation
 
-Status: `done` for local lanes, `pending-remote` for CUDA benchmark validation.
+Status: `done` for local lanes and repository CI wiring, `pending-remote` for CUDA benchmark validation.
 
 Delivered:
 
-1. `scripts/setup_zig_toolchain.sh` validates or installs Zig `0.16.0`
-2. `scripts/check_kv_zig.sh` runs the local validation sequence
-3. `docs/environment.md` documents `ZIG`
-4. `docs/codebase-map.md` records `crates/kv-native-sys`
+1. `scripts/setup_zig_toolchain.sh` validates or installs Zig `0.16.0`, supports `--print-zig`, and supports repo-local installs on macOS/Linux
+2. `scripts/check_kv_zig.sh` runs the local validation sequence including `cargo test -p kv-native-sys`
+3. `setup.sh` bootstraps the same Zig toolchain for `--deps-only`, `--build-only`, and `--check`
+4. `.github/workflows/{ci,metal-ci,release}.yml` resolve `ZIG` through the repository script
+5. `docs/environment.md` documents `ZIG`, `KV_ZIG_VERSION`, and `KV_ZIG_INSTALL_ROOT`
+6. `docs/codebase-map.md` records `crates/kv-native-sys`
 
 Local validation completed:
 
 1. `cargo check -p kv-native-sys`
-2. `cargo clippy -p kv-native-sys -- -D warnings`
-3. `cargo check -p infer --no-default-features --features no-cuda`
-4. `cargo check -p infer --no-default-features --features metal`
-5. `cargo clippy -p infer --no-default-features --features no-cuda -- -D warnings`
-6. `cargo test -p infer --no-default-features --features no-cuda kv_tier::transport::disk -- --nocapture`
+2. `cargo test -p kv-native-sys`
+3. `cargo clippy -p kv-native-sys -- -D warnings`
+4. `cargo check -p infer --no-default-features --features no-cuda`
+5. `cargo check -p infer --no-default-features --features metal`
+6. `cargo clippy -p infer --no-default-features --features no-cuda -- -D warnings`
+7. `cargo test -p infer --no-default-features --features no-cuda kv_tier::transport::disk -- --nocapture`
+8. `cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer`
+9. `cargo test --no-default-features --features metal,no-cuda,cli -p agent-infer`
+10. `bash -n scripts/setup_zig_toolchain.sh scripts/check_kv_zig.sh setup.sh`
+11. `./scripts/setup_zig_toolchain.sh --check-only --print-zig`

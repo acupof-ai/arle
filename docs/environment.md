@@ -186,7 +186,7 @@ Status: advanced build override.
 
 Override the Zig compiler path used by `crates/kv-native-sys/build.rs`.
 
-Typical value:
+Typical value when using a system installation:
 
 ```bash
 export ZIG=/opt/homebrew/bin/zig
@@ -197,6 +197,7 @@ Current use:
 - `crates/kv-native-sys/build.rs`
 - [`scripts/setup_zig_toolchain.sh`](../scripts/setup_zig_toolchain.sh)
 - [`scripts/check_kv_zig.sh`](../scripts/check_kv_zig.sh)
+- [`setup.sh`](../setup.sh)
 
 Expected version today: `0.16.0`
 
@@ -206,11 +207,39 @@ First-time setup:
 ./scripts/setup_zig_toolchain.sh
 ```
 
+Print the resolved Zig binary path without extra log output:
+
+```bash
+./scripts/setup_zig_toolchain.sh --print-zig
+```
+
+Validate an existing Zig installation without downloading anything:
+
+```bash
+./scripts/setup_zig_toolchain.sh --check-only --print-zig
+```
+
 Local validation for the Zig-backed KV substrate:
 
 ```bash
 ./scripts/check_kv_zig.sh
 ```
+
+By default the setup script installs a repo-local Zig toolchain under
+`.toolchains/zig/` when a matching system `zig` binary is not available.
+
+### `KV_ZIG_VERSION`
+
+Override the Zig version expected by the repository scripts.
+
+Default: `0.16.0`
+
+### `KV_ZIG_INSTALL_ROOT`
+
+Override the repo-local install root used by
+[`scripts/setup_zig_toolchain.sh`](../scripts/setup_zig_toolchain.sh).
+
+Default: `.toolchains/zig`
 
 ---
 

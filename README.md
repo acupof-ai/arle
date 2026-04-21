@@ -170,7 +170,7 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
-**Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only).
+**Prerequisites**: CUDA 12.x, Rust 1.85+, Python 3.10+ with `flashinfer-python` (build-time only). Zig `0.16.0` for `crates/kv-native-sys` is bootstrapped by [`scripts/setup_zig_toolchain.sh`](scripts/setup_zig_toolchain.sh) and `./setup.sh`.
 
 ## Metal on Apple Silicon
 
@@ -375,6 +375,8 @@ Governance references:
 ## Development
 
 ```bash
+./scripts/setup_zig_toolchain.sh                          # Validate/install Zig 0.16.0 for kv-native-sys
+./scripts/check_kv_zig.sh                                 # Zig substrate local validation
 cargo test --no-default-features --features no-cuda   # Unit tests (no GPU)
 cargo clippy --workspace -- -D warnings                # Lint
 cargo fmt --all -- --check                             # Format

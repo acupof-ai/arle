@@ -24,11 +24,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            .toolchains/zig
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
+
+      - name: Set up Zig toolchain
+        run: echo "ZIG=$(./scripts/setup_zig_toolchain.sh --print-zig)" >> "$GITHUB_ENV"
 
       - name: Build metal_serve + infer lib (Metal, no-cuda)
         run: >
@@ -69,11 +73,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            .toolchains/zig
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: linux-x86-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-x86-cargo-
+
+      - name: Set up Zig toolchain
+        run: echo "ZIG=$(./scripts/setup_zig_toolchain.sh --print-zig)" >> "$GITHUB_ENV"
 
       - name: Build infer + bench_serving (CUDA)
         env:
