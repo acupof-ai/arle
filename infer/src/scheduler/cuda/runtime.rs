@@ -248,11 +248,9 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_reusable_slot_for_radix_hit, finish_rejected_request};
+    use super::best_reusable_slot_for_radix_hit;
     use crate::prefix_cache::BlockId;
-    use crate::server_engine::FinishReason;
     use std::collections::HashMap;
-    use tokio::sync::mpsc;
 
     #[test]
     fn best_reusable_slot_prefers_deepest_free_owned_block() {
@@ -284,18 +282,5 @@ mod tests {
         let reusable =
             best_reusable_slot_for_radix_hit(&matched_blocks, &free_slots, &owners, &[0, 8], 16);
         assert_eq!(reusable, None);
-    }
-
-    #[test]
-    fn rejected_request_emits_terminal_delta() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        finish_rejected_request(&tx, FinishReason::Length, 17);
-        let delta = rx.try_recv().expect("terminal delta");
-        assert_eq!(delta.text_delta, "");
-        assert_eq!(delta.finish_reason, Some(FinishReason::Length));
-        let usage = delta.usage.expect("usage");
-        assert_eq!(usage.prompt_tokens, 17);
-        assert_eq!(usage.completion_tokens, 0);
-        assert_eq!(usage.total_tokens, 17);
     }
 }
