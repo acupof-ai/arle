@@ -169,6 +169,12 @@ changes.
 - Commitizen: `<type>(<scope>): <subject>`. Scopes: `metal`, `cuda`,
   `scheduler`, `qwen3`, `qwen35`, `glm4`, `http`, `kv-tier`, `docs`.
 - Commit directly to `main` (no feature branches — `feedback_commit_to_main.md`).
+- **Always commit and push from the current branch in the current workspace.**
+  Do not create a separate worktree or alternate checkout to prepare or ship
+  code changes.
+- **Never use `git stash` to move unrelated user changes out of the way.**
+  Leave other people's dirty paths in place, work around them, and commit only
+  your own files by explicit path.
 - After `git mv` + batch Edits, re-check `git status` and re-stage by path —
   the fmt hook de-stages renames (`feedback_git_mv_with_fmt_hook.md`).
 
