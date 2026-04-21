@@ -102,21 +102,22 @@ round-trip + runtime-only fields marked `#[serde(skip)]`), and
 unit tests). Combined remote CUDA acceptance for M4 is pending;
 see `docs/plans/tiered-kv-cache-m4-remote-acceptance.md`.
 
-The remaining live gaps are: **real async staged completion /
-promotion** (`cudaMemcpyAsync` completion rather than the current
-local synchronous echo), the HTTP route wrappers around the M4d
-session module, and the Metal MLX wired-memory bindings that were
-cut from the M4 batch. One constraint is still explicit: **M2b does
-not do cross-slot page aliasing**. Reuse remains limited to the case
-where the radix hit maps to a currently free slot whose contiguous
-state still materialises the matched prefix.
+The remaining live gaps are: **a real attach/ownership model for
+staged readmission** (the scheduler hot path no longer parks requests
+behind synchronous `Stage*` echoes because that path was not correct
+under concurrency), the HTTP route wrappers around the M4d session
+module, and the Metal MLX wired-memory bindings that were cut from the
+M4 batch. One constraint is still explicit: **M2b does not do
+cross-slot page aliasing**. Reuse remains limited to the case where the
+radix hit maps to a currently free slot whose contiguous state still
+materialises the matched prefix.
 
 | Area | State | File:line |
 |---|---|---|
 | CUDA paged pool | **M0.3 accepted 2026-04-15 on L4**: BF16 now uses `page_size = 16`; INT8 / FP8 / TurboQuant intentionally stay at `page_size = 1`. The pool is page-aware (`free_pages`, `page_indices`, `seq_lens`), range migration has a new BF16 HND kernel, and FlashInfer metadata now reads runtime `page_size`. Same-host `page1 → page16` sweep is within noise on C≤4 and recovers C≥8 from the 2026-04-13 zero-throughput regression (see `docs/experience/wins/2026-04-15-tiered-kv-m0.3-m3a-remote.md`). | `crates/cuda-kernels/src/{kv_types,paged_kv,flashinfer}.rs`, `crates/cuda-kernels/csrc/kv/kv_cache_to_paged.cu` |
 | CUDA legacy contiguous KV offload | **M3c cleanup accepted 2026-04-15 on L4**: the old `k_host/v_host` shadow-buffer path, `OFFLOAD_BLOCK_SIZE = 64`, and the `prefetch/offload` bridge hooks are deleted from production code. `set_max_gpu_kv` survives only as a compatibility no-op warning in the single-request engine / CLI surface. Long-session agent-trace rerun against the post-cleanup build is within noise of the M2b same-host baseline (see `docs/experience/wins/2026-04-15-tiered-kv-m3c-remote.md`). | `infer/src/model/kv_cache.rs`, `infer/src/server_engine.rs`, `crates/cli/src/args.rs` |
 | `infer/src/prefix_cache.rs` | Leaf-LRU + cascaded eviction + ancestor-chain ref bumping (3 historical bugs fixed in `5da8b67`) plus **M2b tombstone GC scaffolding** (`free_nodes`, `alloc_node`, `gc_orphan_tombstones()`). **M3a/M3b local now also land the tier-aware contract surface and runtime metadata mutators**: `hit_count`, `tier_location`, `session_id`, `fingerprint`, `byte_len`, `soft_pin_until`, `lookup_or_stage(...) -> LookupOutcome`, plus public setters so scheduler code can stamp GPU/session/keepalive truth onto published blocks. Tier B/C local follow-on also makes `insert_with_fingerprints(...)` the canonical insert path, keeps `insert(...)` as a zero-fingerprint back-compat shim, and maintains a private `block_index` for O(1) `BlockId` → node lookup. | `infer/src/prefix_cache.rs`, `infer/src/kv_tier/lookup.rs` |
-| CUDA scheduler prefix logic | **Local multilayer path now unified**: `assign_slots()` classifies radix hits via `lookup_or_stage(..., None)`, builds real stage requests itself, parks disk/host restores in `stage_waiting`, and re-enters admission after coordinator completion. `cleanup()` demotes T0 blocks into T1, spills T1 to T2 under watermarks, and updates radix metadata in one path. **Cross-slot page aliasing is intentionally not implemented** — reuse is safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
+| CUDA scheduler prefix logic | **Hot path is now honest and deletion-first**: `assign_slots()` still uses `lookup_or_stage(...)` for tier-aware classification, but admission only reuses prefixes that are already runnable on T0. `cleanup()` demotes T0 blocks into T1, spills T1 to T2 under watermarks, and updates radix metadata in one path. The old parked `stage_waiting` readmission path was removed because it was not correct under concurrency and did not produce a runnable admission surface. **Cross-slot page aliasing is intentionally not implemented** — reuse is still safe same-slot resurrection only. | `infer/src/scheduler/cuda/runtime.rs`, `infer/src/scheduler/cuda/core.rs`, `infer/src/scheduler/cuda/prefill.rs`, `infer/src/scheduler/cuda/decode.rs` |
 | Legacy API compatibility | `set_max_gpu_kv` remains as a compatibility no-op warning so CLI / external callers do not break in the same batch that deletes the old CPU offload implementation. This shim should be removed in a later surface-cleanup PR, not mixed into the runtime staging work. | `infer/src/server_engine.rs`, `crates/cli/src/lib.rs`, `crates/cli/src/args.rs` |
 | `infer/src/kv_tier/` | `directory.rs` **deleted** in M1a (commit `08718ad`). The live local path now keeps one source of truth: `lookup.rs` classifies hits, `host_pool.rs` owns T1 storage, `coordinator.rs` owns `Stage` + `Spill`, and `transport/disk.rs` persists bytes for T2. `NixlTransport` still compiles only as a stub under `rdma-nixl` (stub-api). Real staged completion is still synchronous for local validation; true async copy completion remains later work. | `infer/src/kv_tier/**`, `infer/src/scheduler/cuda/runtime.rs` |
 | `BlockId` unification | **Done (M0.1).** `infer/src/types.rs:8` is canonical `BlockId(u32)`; `prefix_cache::BlockId` and `kv_tier::id::BlockId` re-export. `block_manager::BlockId` deleted. `BlockFingerprint([u8; 16])` now has local publish-time call sites via `compute_from_tokens`, but M4 session save/load is still the first consumer that must survive restart / reconciliation. | `infer/src/types.rs:8` |
@@ -341,13 +342,13 @@ tokio". This revision commits to the course correction:
   backend-specific, not shared across CUDA/Metal. A future cross-backend
   coordinator trait is a post-M5 concern, not in scope now.
 
-**2026-04-16 local status**: this is no longer a type-only scaffold.
-`Scheduler::with_config` now spawns the coordinator OS thread with the name
-`infer-tiered-kv-coord`, `assign_slots` passes `Some(&coordinator_handle)`
-as the `StagePlanner`, and `run()` drains coordinator events every scheduler
-iteration before re-admitting staged requests from `stage_waiting`. The real
-`cudaMemcpyAsync` transport is still pending: the current local stub emits
-`StagingQueued` followed by a synchronous `StagingCompleted` echo.
+**2026-04-21 local status**: this is no longer a type-only scaffold.
+`Scheduler::with_config` still spawns the coordinator OS thread with the name
+`infer-tiered-kv-coord`, and `run()` drains coordinator events every scheduler
+iteration for spill completions. The earlier parked `stage_waiting`
+readmission path has been removed from the scheduler hot path; the current
+runtime only uses the coordinator for spill/persist until a real attach /
+ownership model exists. The real `cudaMemcpyAsync` transport is still pending.
 
 ### 4.5 Lookup interface and recompute-vs-fetch fallback (added 2026-04-15)
 

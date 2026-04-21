@@ -1,6 +1,5 @@
 use super::{ModelForward, Phase, Scheduler, info};
 use crate::model::kv_cache::KVFormat;
-use crate::prefix_cache::BlockMetadataUpdate;
 
 #[derive(Clone, Copy, Debug)]
 struct PrefillReservation {
@@ -257,8 +256,13 @@ impl<M: ModelForward> Scheduler<M> {
             }
 
             let _ = self.evict_prefix_cache_if_pressured();
+            let prompt_tokens = match self.tokenizer.encode(&queued.prompt) {
+                Ok(tokens) if !tokens.is_empty() => tokens,
+                Ok(_) => continue,
+                Err(_) => continue,
+            };
             let lookup = self.prefix_cache.lookup_or_stage(
-                &queued.prompt_tokens,
+                &prompt_tokens,
                 crate::kv_tier::LookupHeuristics::default(),
             );
             let radix_blocks: Vec<_> = lookup
@@ -266,60 +270,6 @@ impl<M: ModelForward> Scheduler<M> {
                 .iter()
                 .filter_map(|block| block.block_id)
                 .collect();
-            let stage_requests = if self.coordinator_unavailable || lookup.recompute_advised {
-                Vec::new()
-            } else {
-                self.build_stage_requests(&lookup.blocks)
-            };
-
-            if !stage_requests.is_empty() {
-                if let Some(ticket) = self.coordinator_handle.stage(&stage_requests) {
-                    let stage_deadline = self
-                        .prefix_cache
-                        .logical_clock()
-                        .saturating_add(self.config.stage_wait_keepalive_ticks);
-                    for &block_id in &radix_blocks {
-                        let _ = self.prefix_cache.update_block_metadata(
-                            block_id,
-                            BlockMetadataUpdate {
-                                soft_pin_until: Some(Some(stage_deadline)),
-                                ..BlockMetadataUpdate::default()
-                            },
-                        );
-                    }
-                    log::info!(
-                        "Request {} staged on ticket={} (prompt={} tokens, staged_blocks={})",
-                        self.next_id,
-                        ticket.0,
-                        queued.prompt_tokens.len(),
-                        stage_requests.len()
-                    );
-                    self.stage_waiting.insert(
-                        ticket,
-                        super::core::StagedAdmission {
-                            request: queued,
-                            block_ids: radix_blocks,
-                            enqueued_at_clock: self.prefix_cache.logical_clock(),
-                            staged_blocks: stage_requests
-                                .iter()
-                                .map(|request| super::core::StagedBlock {
-                                    block_id: request.block_id,
-                                    host_region: request
-                                        .host_region
-                                        .expect("stage requests must carry host regions"),
-                                    release_on_abort: matches!(
-                                        request.from,
-                                        crate::kv_tier::BlockLocation::Disk { .. }
-                                    ),
-                                })
-                                .collect(),
-                        },
-                    );
-                    return None;
-                }
-                self.prefix_cache.release(&radix_blocks);
-            }
-
             let ready_on_gpu = super::runtime::lookup_blocks_ready_on_gpu(&lookup.blocks);
             let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
                 lookup.matched_len
@@ -350,7 +300,7 @@ impl<M: ModelForward> Scheduler<M> {
 
             let reservation = self.waiting_prefill_reservation(
                 slot_idx,
-                queued.prompt_tokens.len(),
+                prompt_tokens.len(),
                 queued.max_tokens,
             );
             if !budget.can_schedule(reservation) {
@@ -363,9 +313,10 @@ impl<M: ModelForward> Scheduler<M> {
             let no_reusable_free_slot = lookup.matched_len > 0
                 && !gpu_ready_prefix_blocks.is_empty()
                 && reusable_gpu_prefix.is_none();
-            self.materialize_queued_request(
+            self.materialize_waiting_request(
                 slot_idx,
                 queued,
+                prompt_tokens,
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
                 radix_hit_len,
@@ -382,6 +333,87 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         None
+    }
+
+    fn materialize_waiting_request(
+        &mut self,
+        slot_idx: usize,
+        queued: super::IncomingRequest,
+        prompt_tokens: Vec<u32>,
+        reusable_prefix_len: usize,
+        reusable_cached_prompt_len: usize,
+        radix_hit_len: usize,
+        bytes_not_on_gpu: bool,
+        no_reusable_free_slot: bool,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        if reusable_prefix_len > 0 {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                radix_hit_len,
+                reusable_prefix_len,
+                reusable_cached_prompt_len,
+                self.waiting.len()
+            );
+        } else if bytes_not_on_gpu || no_reusable_free_slot {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                radix_hit_len,
+                bytes_not_on_gpu,
+                no_reusable_free_slot,
+                self.waiting.len()
+            );
+        } else {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                self.waiting.len()
+            );
+        }
+
+        self.active[slot_idx] = Some(super::ActiveRequest {
+            id,
+            admitted_at: std::time::Instant::now(),
+            first_token_at: None,
+            prompt: queued.prompt,
+            prompt_tokens,
+            generated_tokens: Vec::new(),
+            priority: queued.priority,
+            max_tokens: queued.max_tokens,
+            sampling: queued.sampling,
+            stop: queued.stop,
+            session_id: queued.session_id,
+            delta_tx: queued.delta_tx,
+            full_decoded: String::new(),
+            decoded_token_count: 0,
+            sent_len: 0,
+            phase: Phase::Prefilling {
+                effective_tokens: Vec::new(),
+                progress: 0,
+            },
+            cacheable_prompt_len: 0,
+            prefix_byte_len: 0,
+            latest_logprob: None,
+            reusable_prefix_len,
+            reusable_cached_prompt_len,
+        });
+        self.step_new(slot_idx);
+        if matches!(
+            self.request(slot_idx).map(|req| &req.phase),
+            Some(Phase::Prefilling { .. })
+        ) {
+            self.queue_prefill(slot_idx);
+        }
     }
 
     fn plan_step(&mut self) -> StepPlan {

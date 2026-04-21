@@ -1,6 +1,5 @@
 use super::{
-    ActiveRequest, CompletionStreamDelta, FinishReason, IncomingRequest, ModelForward, Ordering,
-    Phase, QueuedRequest, STATS_LOG_INTERVAL, Scheduler, TokenUsage, error, info, warn,
+    ActiveRequest, ModelForward, Ordering, Phase, STATS_LOG_INTERVAL, Scheduler, error, info, warn,
 };
 use crate::prefix_cache::BlockMetadataUpdate;
 
@@ -38,126 +37,27 @@ pub(super) fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock])
 }
 
 pub(super) fn sort_waiting_queue_by_priority(
-    waiting: &mut std::collections::VecDeque<QueuedRequest>,
+    waiting: &mut std::collections::VecDeque<super::IncomingRequest>,
 ) {
-    waiting
-        .make_contiguous()
-        .sort_by_key(|request| std::cmp::Reverse(request.priority));
+    let waiting = waiting.make_contiguous();
+    waiting.sort_by(|lhs, rhs| rhs.priority.cmp(&lhs.priority));
 }
 
 impl<M: ModelForward> Scheduler<M> {
-    fn abort_staged_admission(&mut self, staged: super::core::StagedAdmission) {
-        for block in &staged.staged_blocks {
-            if block.release_on_abort {
-                self.release_host_region(block.host_region);
-            }
-        }
-        self.prefix_cache.release(&staged.block_ids);
-        self.waiting.push_front(staged.request);
-    }
-
     fn drain_coordinator_events(&mut self) {
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(
                     crate::kv_tier::CoordinatorEvent::CommandQueued(_)
                     | crate::kv_tier::CoordinatorEvent::StagingQueued { .. }
+                    | crate::kv_tier::CoordinatorEvent::StagingCompleted { .. }
+                    | crate::kv_tier::CoordinatorEvent::StagingFailed { .. }
                     | crate::kv_tier::CoordinatorEvent::SpillQueued { .. },
                 ) => {}
-                Ok(crate::kv_tier::CoordinatorEvent::StagingCompleted { ticket }) => {
-                    let Some(staged) = self.stage_waiting.remove(&ticket) else {
-                        log::debug!(
-                            "Dropping staging completion for unknown ticket {}",
-                            ticket.0
-                        );
-                        continue;
-                    };
-                    if let Err(err) = self.promote_staged_blocks(&staged) {
-                        warn!(
-                            "Staging promotion failed for ticket {}: {}. Falling back to cold requeue.",
-                            ticket.0, err
-                        );
-                        self.abort_staged_admission(staged);
-                        continue;
-                    }
-                    let waited_ticks = self
-                        .prefix_cache
-                        .logical_clock()
-                        .saturating_sub(staged.enqueued_at_clock);
-                    // Release the stage-era refs but **deliberately leave
-                    // `soft_pin_until` at its stage-wait deadline**. The
-                    // soft pin keeps eviction off these blocks until the
-                    // re-admission's next `lookup_or_stage` refreshes it
-                    // down to the normal keepalive_ticks. Without this,
-                    // the window between `release` and the second lookup
-                    // is unprotected — the next waiting-queue admission pass runs
-                    // `evict_prefix_cache_if_pressured` before picking
-                    // the parked request back up and could reclaim the
-                    // just-staged blocks.
-                    self.prefix_cache.release(&staged.block_ids);
-                    log::debug!(
-                        "Staging completed for ticket={} (prompt={} tokens, staged_blocks={}, waited_ticks={})",
-                        ticket.0,
-                        staged.request.prompt_tokens.len(),
-                        staged.block_ids.len(),
-                        waited_ticks
-                    );
-                    // `waiting_count` tracks the `request_rx` channel
-                    // depth (decremented at intake, incremented only at
-                    // `SchedulerHandle::submit`). `self.waiting` is the
-                    // scheduler-internal VecDeque; moving a request
-                    // into its front here is NOT a new submission, so
-                    // we MUST NOT `fetch_add(1)` — doing so would
-                    // permanently inflate the counter, break the idle
-                    // exit guard, and saturate backpressure.
-                    self.waiting.push_front(staged.request);
-                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    // Coordinator thread gone — we cannot complete any
-                    // future StageTicket. Cold-requeue every parked
-                    // admission so the idle-exit guard in `run()` can
-                    // fire and waiting requests are not leaked. Release
-                    // stage-era refs but leave soft_pin_until untouched
-                    // (same reasoning as the completion path above —
-                    // the re-admission might still hit the prefix).
-                    let pending = std::mem::take(&mut self.stage_waiting);
-                    if pending.is_empty() {
-                        error!("Coordinator event channel disconnected");
-                    } else {
-                        error!(
-                            "Coordinator event channel disconnected; cold-requeuing {} staged admissions",
-                            pending.len()
-                        );
-                    }
-                    // Same `waiting_count` semantics as the completion
-                    // path: re-queuing into `self.waiting.push_front`
-                    // is not a new submission, so the counter stays
-                    // untouched here.
-                    for (ticket, staged) in pending {
-                        warn!(
-                            "Cold-requeuing ticket {} ({} prompt tokens, {} staged blocks dropped)",
-                            ticket.0,
-                            staged.request.prompt_tokens.len(),
-                            staged.block_ids.len()
-                        );
-                        self.abort_staged_admission(staged);
-                    }
-                    self.coordinator_unavailable = true;
+                    error!("Coordinator event channel disconnected");
                     break;
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::StagingFailed {
-                    ticket,
-                    failed_block,
-                    reason,
-                }) => {
-                    warn!(
-                        "Staging failed for ticket {} on block {:?}: {}",
-                        ticket.0, failed_block, reason
-                    );
-                    if let Some(staged) = self.stage_waiting.remove(&ticket) {
-                        self.abort_staged_admission(staged);
-                    }
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
                     if let Some((block_id, region)) = self.spill_waiting.remove(&ticket) {
@@ -201,19 +101,15 @@ impl<M: ModelForward> Scheduler<M> {
         loop {
             while let Ok(req) = self.request_rx.try_recv() {
                 self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                if let Some(queued) = self.normalize_request(req) {
-                    self.waiting.push_back(queued);
-                }
+                self.waiting.push_back(req);
             }
 
             self.drain_coordinator_events();
 
-            if self.active_len() == 0 && self.waiting.is_empty() && self.stage_waiting.is_empty() {
+            if self.active_len() == 0 && self.waiting.is_empty() {
                 if let Some(req) = self.request_rx.blocking_recv() {
                     self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                    if let Some(queued) = self.normalize_request(req) {
-                        self.waiting.push_back(queued);
-                    }
+                    self.waiting.push_back(req);
                 } else {
                     info!("Scheduler shutting down: all handles dropped");
                     break;
@@ -221,6 +117,9 @@ impl<M: ModelForward> Scheduler<M> {
             }
 
             let step_start = std::time::Instant::now();
+            self.assign_slots();
+            let assign_us = step_start.elapsed().as_micros();
+
             let step_t = std::time::Instant::now();
             // FUTURE WORK (GPU/CPU overlap): `self.step()` already overlaps
             // decode with `emit_delta`, but batched decode itself is still
@@ -262,7 +161,8 @@ impl<M: ModelForward> Scheduler<M> {
             if total_us > 50_000 {
                 // Log slow iterations (>50ms)
                 info!(
-                    "Scheduler step: step={}us cleanup={}us total={}us active={}",
+                    "Scheduler step: assign={}us step={}us cleanup={}us total={}us active={}",
+                    assign_us,
                     step_us,
                     clean_us,
                     total_us,
@@ -272,160 +172,143 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn normalize_request(&mut self, incoming: IncomingRequest) -> Option<QueuedRequest> {
-        let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
-            Ok(tokens) if !tokens.is_empty() => tokens,
-            Ok(_) => {
-                error!("Empty prompt after tokenization, skipping");
-                return None;
+    fn assign_slots(&mut self) {
+        while !self.waiting.is_empty() {
+            let _ = self.evict_prefix_cache_if_pressured();
+            let free_slots = self.free_slots();
+            if free_slots.is_empty() {
+                break;
             }
-            Err(e) => {
-                error!("Tokenization error: {}", e);
-                return None;
+
+            let incoming = self.waiting.pop_front().expect("checked non-empty above");
+            let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
+                Ok(tokens) if !tokens.is_empty() => tokens,
+                Ok(_) => {
+                    error!("Empty prompt after tokenization, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    error!("Tokenization error: {}", e);
+                    continue;
+                }
+            };
+
+            let lookup = self
+                .prefix_cache
+                .lookup_or_stage(&prompt_tokens, crate::kv_tier::LookupHeuristics::default());
+            let radix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .filter_map(|block| block.block_id)
+                .collect();
+            let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
+            let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
+                lookup.matched_len
+            } else {
+                0
+            };
+            let gpu_ready_prefix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+                .filter_map(|block| block.block_id)
+                .collect();
+            let reusable_gpu_prefix = best_reusable_slot_for_radix_hit(
+                &gpu_ready_prefix_blocks,
+                &free_slots,
+                &self.block_owner_slots,
+                &self.slot_materialized_prompt_lens,
+                self.prefix_cache.block_size(),
+            );
+            let reusable = if ready_on_gpu && !lookup.recompute_advised {
+                reusable_gpu_prefix
+            } else {
+                None
+            };
+            let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
+                reusable.unwrap_or((free_slots[0], 0, 0));
+            self.prefix_cache.release(&radix_blocks);
+
+            let id = self.next_id;
+            self.next_id += 1;
+
+            if reusable_prefix_len > 0 {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    radix_hit_len,
+                    reusable_prefix_len,
+                    reusable_cached_prompt_len,
+                    self.waiting.len()
+                );
+            } else {
+                let bytes_not_on_gpu =
+                    lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised);
+                let no_reusable_free_slot = lookup.matched_len > 0
+                    && !gpu_ready_prefix_blocks.is_empty()
+                    && reusable_gpu_prefix.is_none();
+                // A radix match is only reusable when the bytes already live in
+                // T0 and a free slot still materializes that prefix. When
+                // either precondition fails we degrade to cold prefill, but we
+                // keep both blockers in the log so admission debugging does not
+                // lose the "no reusable free slot" signal behind a staging miss.
+                if bytes_not_on_gpu || no_reusable_free_slot {
+                    info!(
+                        "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
+                        id,
+                        slot_idx,
+                        prompt_tokens.len(),
+                        lookup.matched_len,
+                        bytes_not_on_gpu,
+                        no_reusable_free_slot,
+                        self.waiting.len()
+                    );
+                } else {
+                    info!(
+                        "Request {} → slot {} (prompt={} tokens, queue={})",
+                        id,
+                        slot_idx,
+                        prompt_tokens.len(),
+                        self.waiting.len()
+                    );
+                }
             }
-        };
-        if !self
-            .request_length_contract
-            .admits_prompt_len(prompt_tokens.len())
-        {
-            warn!(
-                "Rejecting request {}: prompt length {} exceeds max_req_input_len {}",
-                self.next_id,
-                prompt_tokens.len(),
-                self.request_length_contract.max_request_input_len(),
-            );
-            let _ = incoming.delta_tx.send(CompletionStreamDelta {
-                text_delta: String::new(),
-                finish_reason: Some(FinishReason::Length),
-                usage: Some(TokenUsage {
-                    prompt_tokens: prompt_tokens.len(),
-                    completion_tokens: 0,
-                    total_tokens: prompt_tokens.len(),
-                }),
-                logprob: None,
-            });
-            return None;
-        }
-        let admitted_max_tokens = self
-            .request_length_contract
-            .clamp_max_tokens(prompt_tokens.len(), incoming.max_tokens);
-        if admitted_max_tokens == 0 {
-            warn!(
-                "Rejecting request {}: prompt length {} leaves no room for completion under max_req_len {}",
-                self.next_id,
-                prompt_tokens.len(),
-                self.request_length_contract.max_request_len(),
-            );
-            let _ = incoming.delta_tx.send(CompletionStreamDelta {
-                text_delta: String::new(),
-                finish_reason: Some(FinishReason::Length),
-                usage: Some(TokenUsage {
-                    prompt_tokens: prompt_tokens.len(),
-                    completion_tokens: 0,
-                    total_tokens: prompt_tokens.len(),
-                }),
-                logprob: None,
-            });
-            return None;
-        }
-        if admitted_max_tokens != incoming.max_tokens {
-            info!(
-                "Request {}: clamping max_tokens {} -> {} to fit max_req_len {}",
-                self.next_id,
-                incoming.max_tokens,
-                admitted_max_tokens,
-                self.request_length_contract.max_request_len(),
-            );
-        }
-        Some(QueuedRequest {
-            prompt: incoming.prompt,
-            prompt_tokens,
-            max_tokens: admitted_max_tokens,
-            sampling: incoming.sampling,
-            stop: incoming.stop,
-            priority: incoming.priority,
-            session_id: incoming.session_id,
-            delta_tx: incoming.delta_tx,
-        })
-    }
 
-    pub(super) fn materialize_queued_request(
-        &mut self,
-        slot_idx: usize,
-        queued: QueuedRequest,
-        reusable_prefix_len: usize,
-        reusable_cached_prompt_len: usize,
-        radix_hit_len: usize,
-        bytes_not_on_gpu: bool,
-        no_reusable_free_slot: bool,
-    ) {
-        let id = self.next_id;
-        self.next_id += 1;
-
-        if reusable_prefix_len > 0 {
-            info!(
-                "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
+            self.active[slot_idx] = Some(ActiveRequest {
                 id,
-                slot_idx,
-                queued.prompt_tokens.len(),
-                radix_hit_len,
+                admitted_at: std::time::Instant::now(),
+                first_token_at: None,
+                prompt: incoming.prompt,
+                prompt_tokens,
+                generated_tokens: Vec::new(),
+                priority: incoming.priority,
+                max_tokens: incoming.max_tokens,
+                sampling: incoming.sampling,
+                stop: incoming.stop,
+                session_id: incoming.session_id,
+                delta_tx: incoming.delta_tx,
+                full_decoded: String::new(),
+                decoded_token_count: 0,
+                sent_len: 0,
+                phase: Phase::Prefilling {
+                    effective_tokens: Vec::new(),
+                    progress: 0,
+                },
+                cacheable_prompt_len: 0,
+                prefix_byte_len: 0,
+                latest_logprob: None,
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
-                self.waiting.len()
-            );
-        } else if bytes_not_on_gpu || no_reusable_free_slot {
-            info!(
-                "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
-                id,
-                slot_idx,
-                queued.prompt_tokens.len(),
-                radix_hit_len,
-                bytes_not_on_gpu,
-                no_reusable_free_slot,
-                self.waiting.len()
-            );
-        } else {
-            info!(
-                "Request {} → slot {} (prompt={} tokens, queue={})",
-                id,
-                slot_idx,
-                queued.prompt_tokens.len(),
-                self.waiting.len()
-            );
-        }
-
-        self.active[slot_idx] = Some(ActiveRequest {
-            id,
-            admitted_at: std::time::Instant::now(),
-            first_token_at: None,
-            prompt: queued.prompt,
-            prompt_tokens: queued.prompt_tokens,
-            generated_tokens: Vec::new(),
-            priority: queued.priority,
-            max_tokens: queued.max_tokens,
-            sampling: queued.sampling,
-            stop: queued.stop,
-            session_id: queued.session_id,
-            delta_tx: queued.delta_tx,
-            full_decoded: String::new(),
-            decoded_token_count: 0,
-            sent_len: 0,
-            phase: Phase::Prefilling {
-                effective_tokens: Vec::new(),
-                progress: 0,
-            },
-            cacheable_prompt_len: 0,
-            prefix_byte_len: 0,
-            latest_logprob: None,
-            reusable_prefix_len,
-            reusable_cached_prompt_len,
-        });
-        self.step_new(slot_idx);
-        if matches!(
-            self.request(slot_idx).map(|req| &req.phase),
-            Some(Phase::Prefilling { .. })
-        ) {
-            self.queue_prefill(slot_idx);
+            });
+            self.step_new(slot_idx);
+            if matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Prefilling { .. })
+            ) {
+                self.queue_prefill(slot_idx);
+            }
         }
     }
 
@@ -456,7 +339,7 @@ impl<M: ModelForward> Scheduler<M> {
                 if let Some(prompt_tokens) = req.cached_prompt_to_publish() {
                     let prompt_vec = prompt_tokens.to_vec();
                     self.slot_materialized_prompt_lens[slot_idx] = prompt_vec.len();
-                    self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.as_ref());
+                    self.publish_to_prefix_cache(slot_idx, &prompt_vec, req.session_id.clone());
                 } else {
                     self.slot_materialized_prompt_lens[slot_idx] = 0;
                 }
@@ -508,48 +391,6 @@ impl<M: ModelForward> Scheduler<M> {
         // `PREFIX_CACHE_LOW_WATER`. See
         // `core::Scheduler::evict_prefix_cache_if_pressured`.
         let _reclaimed = self.evict_prefix_cache_if_pressured();
-    }
-}
-
-#[cfg(test)]
-mod priority_tests {
-    use super::sort_waiting_queue_by_priority;
-    use crate::sampler::SamplingParams;
-    use crate::scheduler::RequestPriority;
-    use crate::scheduler::cuda::QueuedRequest;
-    use tokio::sync::mpsc;
-
-    fn waiting_request(label: &str, priority: RequestPriority) -> QueuedRequest {
-        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
-        QueuedRequest {
-            prompt: label.to_string(),
-            prompt_tokens: vec![1, 2, 3],
-            max_tokens: 8,
-            sampling: SamplingParams::default(),
-            stop: None,
-            priority,
-            session_id: None,
-            delta_tx,
-        }
-    }
-
-    #[test]
-    fn waiting_queue_sort_prefers_higher_priority_and_keeps_fifo_within_ties() {
-        let mut waiting = std::collections::VecDeque::from(vec![
-            waiting_request("normal-0", RequestPriority::Normal),
-            waiting_request("high-0", RequestPriority::High),
-            waiting_request("low-0", RequestPriority::Low),
-            waiting_request("high-1", RequestPriority::High),
-            waiting_request("normal-1", RequestPriority::Normal),
-        ]);
-
-        sort_waiting_queue_by_priority(&mut waiting);
-
-        let ordered: Vec<_> = waiting.into_iter().map(|req| req.prompt).collect();
-        assert_eq!(
-            ordered,
-            vec!["high-0", "high-1", "normal-0", "normal-1", "low-0"]
-        );
     }
 }
 

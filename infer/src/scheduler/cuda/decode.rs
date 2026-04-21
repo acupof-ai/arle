@@ -1,5 +1,6 @@
 use super::{
-    FinishReason, GenerationState, ModelForward, Phase, QueuedRequest, Scheduler, error, info, warn,
+    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, info,
+    warn,
 };
 use crate::model::kv_cache::KVFormat;
 use crate::scheduler::cuda::core::PendingDecode;
@@ -92,9 +93,8 @@ impl<M: ModelForward> Scheduler<M> {
                 .request_mut(slot_idx)
                 .expect("preempted decode slot must hold a request");
             let generated_tokens = victim.generated_tokens.len();
-            let requeue = QueuedRequest {
+            let requeue = IncomingRequest {
                 prompt: std::mem::take(&mut victim.prompt),
-                prompt_tokens: std::mem::take(&mut victim.prompt_tokens),
                 max_tokens: victim.max_tokens,
                 sampling: victim.sampling.clone(),
                 stop: victim.stop.take(),
@@ -283,6 +283,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: None,
+            mixed_prefill_tokens: 0,
             mixed_prefill_chunk_complete: false,
         });
     }
@@ -498,6 +499,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: Some(prefill_slot_idx),
+            mixed_prefill_tokens: prefill_token_count,
             mixed_prefill_chunk_complete: new_progress >= prefill_total,
         });
     }
