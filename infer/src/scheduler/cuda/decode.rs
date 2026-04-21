@@ -2,8 +2,10 @@ use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, info,
     warn,
 };
+use crate::model::PrefillBatchRequest;
 use crate::model::kv_cache::KVFormat;
-use crate::scheduler::cuda::core::PendingDecode;
+use crate::scheduler::cuda::core::{MixedPrefillPending, PendingDecode};
+use crate::scheduler::cuda::execution::PrefillCandidate;
 
 fn retract_victim_score(
     generated_tokens: usize,
@@ -286,15 +288,83 @@ impl<M: ModelForward> Scheduler<M> {
             decode_indices,
             slot_indices,
             greedy_launched,
-            mixed_prefill_request_idx: None,
-            mixed_prefill_chunk_complete: false,
+            mixed_prefill: Vec::new(),
         });
     }
 
-    pub(super) fn step_decode_launch_mixed(&mut self, prefill_slot_idx: usize) {
+    fn complete_mixed_prefill_request(&mut self, slot_idx: usize) {
+        let req_id = self.request(slot_idx).map(|req| req.id).unwrap_or_default();
+        if let Err(e) = self.states[slot_idx].save_prefix_snapshot() {
+            warn!(
+                "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
+                req_id, e
+            );
+        } else if let Some(req) = self.request_mut(slot_idx) {
+            req.mark_prompt_cacheable();
+        }
+
+        let sampling = self
+            .request(slot_idx)
+            .map(|req| req.sampling.clone())
+            .expect("mixed prefill completion requires live request");
+        match self
+            .model
+            .select_token(&mut self.states[slot_idx], &sampling, &mut self.rng)
+        {
+            Ok(token) => {
+                let ignore_eos = self
+                    .request(slot_idx)
+                    .is_some_and(|req| req.sampling.ignore_eos);
+                if !ignore_eos && self.model.is_stop_token(token) {
+                    self.finish_request(slot_idx, FinishReason::Stop);
+                    return;
+                }
+                {
+                    let Self {
+                        active, tokenizer, ..
+                    } = self;
+                    if let Some(req) = active[slot_idx].as_mut() {
+                        req.generated_tokens.push(token);
+                        req.emit_delta(tokenizer);
+                    }
+                }
+
+                if matches!(
+                    self.request(slot_idx).map(|req| &req.phase),
+                    Some(Phase::Finished)
+                ) {
+                    self.finish_slot(slot_idx);
+                    return;
+                }
+                let reached_max = self
+                    .request(slot_idx)
+                    .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
+                if reached_max {
+                    self.finish_request(slot_idx, FinishReason::Length);
+                } else {
+                    if let Some(req) = self.request_mut(slot_idx)
+                        && req.first_token_at.is_none()
+                    {
+                        req.first_token_at = Some(std::time::Instant::now());
+                    }
+                    self.move_to_decode(slot_idx);
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Request {}: select_token failed after mixed prefill: {}",
+                    req_id, e
+                );
+                self.finish_slot(slot_idx);
+            }
+        }
+    }
+
+    pub(super) fn step_decode_launch_mixed(&mut self, candidates: &[PrefillCandidate]) {
         let decode_indices = self.running_decode_slots();
 
         if decode_indices.is_empty()
+            || candidates.is_empty()
             || !self.model.supports_mixed_batch()
             || self.paged_kv_pool.format != KVFormat::BF16
         {
@@ -325,50 +395,53 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let (prefill_total, prefill_progress, prefill_tokens) = match self.request(prefill_slot_idx)
-        {
-            Some(req) if !req.delta_tx.is_closed() => {
-                if let Phase::Prefilling {
+        let mut prefill_tokens = Vec::with_capacity(candidates.len());
+        let mut prefill_completion = Vec::with_capacity(candidates.len());
+        let mut mixed_prefill_pages = 0usize;
+        for candidate in candidates {
+            let slot_idx = candidate.slot_idx;
+            let Some(req) = self.request(slot_idx) else {
+                continue;
+            };
+            if req.delta_tx.is_closed() {
+                self.finish_slot(slot_idx);
+                continue;
+            }
+            let (total, progress, tokens) = match &req.phase {
+                Phase::Prefilling {
                     materialized_prefix_len,
                     effective_tokens,
                     progress,
-                } = &req.phase
-                {
-                    let pool_seq = self.paged_kv_pool.seq_len(prefill_slot_idx);
+                } => {
+                    let pool_seq = self.paged_kv_pool.seq_len(slot_idx);
                     let expected_pool_seq =
                         expected_prefill_pool_seq(*materialized_prefix_len, *progress);
                     if *progress >= effective_tokens.len() || pool_seq != expected_pool_seq {
-                        self.step_decode_launch();
-                        return;
+                        continue;
                     }
-                    let mixed_chunk_size = self
-                        .prefill_chunk_size()
-                        .min(self.config.max_prefill_tokens.max(1));
-                    let end = (*progress + mixed_chunk_size).min(effective_tokens.len());
+                    let end = (*progress + candidate.reservation.prefill_tokens)
+                        .min(effective_tokens.len());
                     (
                         effective_tokens.len(),
                         *progress,
                         effective_tokens[*progress..end].to_vec(),
                     )
-                } else {
-                    self.step_decode_launch();
-                    return;
                 }
+                _ => continue,
+            };
+            if tokens.is_empty() {
+                continue;
             }
-            _ => {
-                self.step_decode_launch();
-                return;
-            }
-        };
+            mixed_prefill_pages += self.additional_pages_needed_for_slot(slot_idx, tokens.len());
+            prefill_completion.push((slot_idx, progress + tokens.len(), total));
+            prefill_tokens.push((slot_idx, tokens));
+        }
 
-        let prefill_token_count = prefill_tokens.len();
-        if prefill_token_count == 0 {
+        if prefill_tokens.is_empty() {
             self.step_decode_launch();
             return;
         }
 
-        let mixed_prefill_pages =
-            self.additional_pages_needed_for_slot(prefill_slot_idx, prefill_token_count);
         self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, mixed_prefill_pages);
 
         let mut alloc_ok_indices: Vec<usize> = Vec::with_capacity(decode_indices.len());
@@ -420,14 +493,20 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
         let decode_ctx = self.decode_bufs.as_mut().unwrap();
+        let prefill_requests: Vec<PrefillBatchRequest<'_>> = prefill_tokens
+            .iter()
+            .map(|(slot_idx, tokens)| PrefillBatchRequest {
+                slot_idx: *slot_idx,
+                tokens,
+            })
+            .collect();
+        let total_prefill_tokens: usize = prefill_requests.iter().map(|req| req.tokens.len()).sum();
 
-        let forward_result = self.model.forward_mixed_batch(
+        let forward_result = self.model.forward_mixed_batch_with_prefill(
             &token_ids,
-            &prefill_tokens,
+            &prefill_requests,
             &mut self.states,
             &slot_indices,
-            prefill_slot_idx,
-            prefill_progress,
             Some(&mut self.paged_kv_pool),
             decode_ctx,
         );
@@ -435,10 +514,10 @@ impl<M: ModelForward> Scheduler<M> {
         let mixed_ok = match forward_result {
             Ok(true) => {
                 info!(
-                    "Mixed batch: B={} decode + C={} prefill (slot {})",
+                    "Mixed batch: B={} decode + P={} prefill requests + C={} prefill tokens",
                     token_ids.len(),
-                    prefill_token_count,
-                    prefill_slot_idx
+                    prefill_requests.len(),
+                    total_prefill_tokens,
                 );
                 true
             }
@@ -455,7 +534,9 @@ impl<M: ModelForward> Scheduler<M> {
                 for &slot_idx in &decode_indices {
                     self.finish_slot(slot_idx);
                 }
-                self.finish_slot(prefill_slot_idx);
+                for (slot_idx, _) in &prefill_tokens {
+                    self.finish_slot(*slot_idx);
+                }
                 return;
             }
         };
@@ -493,19 +574,27 @@ impl<M: ModelForward> Scheduler<M> {
             false
         };
 
-        let new_progress = prefill_progress + prefill_token_count;
-        if let Some(req) = self.request_mut(prefill_slot_idx)
-            && let Phase::Prefilling { progress, .. } = &mut req.phase
-        {
-            *progress = new_progress;
+        let mut mixed_prefill = Vec::with_capacity(prefill_completion.len());
+        for (slot_idx, progress, total) in prefill_completion {
+            if let Some(req) = self.request_mut(slot_idx)
+                && let Phase::Prefilling {
+                    progress: state_progress,
+                    ..
+                } = &mut req.phase
+            {
+                *state_progress = progress;
+            }
+            mixed_prefill.push(MixedPrefillPending {
+                slot_idx,
+                chunk_complete: progress >= total,
+            });
         }
 
         self.pending_decode = Some(PendingDecode {
             decode_indices,
             slot_indices,
             greedy_launched,
-            mixed_prefill_request_idx: Some(prefill_slot_idx),
-            mixed_prefill_chunk_complete: new_progress >= prefill_total,
+            mixed_prefill,
         });
     }
 
@@ -635,77 +724,9 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        if let Some(prefill_slot_idx) = pending.mixed_prefill_request_idx {
-            if pending.mixed_prefill_chunk_complete {
-                let req_id = self
-                    .request(prefill_slot_idx)
-                    .map(|req| req.id)
-                    .unwrap_or_default();
-                if let Err(e) = self.states[prefill_slot_idx].save_prefix_snapshot() {
-                    warn!(
-                        "Request {}: save prefix snapshot failed: {} (prefix cache disabled for this slot)",
-                        req_id, e
-                    );
-                } else if let Some(req) = self.request_mut(prefill_slot_idx) {
-                    req.mark_prompt_cacheable();
-                }
-
-                let sampling = self
-                    .request(prefill_slot_idx)
-                    .map(|req| req.sampling.clone())
-                    .expect("mixed prefill completion requires live request");
-                match self.model.select_token(
-                    &mut self.states[prefill_slot_idx],
-                    &sampling,
-                    &mut self.rng,
-                ) {
-                    Ok(token) => {
-                        let ignore_eos = self
-                            .request(prefill_slot_idx)
-                            .is_some_and(|req| req.sampling.ignore_eos);
-                        if !ignore_eos && self.model.is_stop_token(token) {
-                            self.finish_request(prefill_slot_idx, FinishReason::Stop);
-                            return;
-                        }
-                        {
-                            let Self {
-                                active, tokenizer, ..
-                            } = self;
-                            if let Some(req) = active[prefill_slot_idx].as_mut() {
-                                req.generated_tokens.push(token);
-                                req.emit_delta(tokenizer);
-                            }
-                        }
-
-                        if matches!(
-                            self.request(prefill_slot_idx).map(|req| &req.phase),
-                            Some(Phase::Finished)
-                        ) {
-                            self.finish_slot(prefill_slot_idx);
-                            return;
-                        }
-                        let reached_max = self
-                            .request(prefill_slot_idx)
-                            .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
-                        if reached_max {
-                            self.finish_request(prefill_slot_idx, FinishReason::Length);
-                        } else {
-                            if let Some(req) = self.request_mut(prefill_slot_idx)
-                                && req.first_token_at.is_none()
-                            {
-                                req.first_token_at = Some(std::time::Instant::now());
-                            }
-                            self.move_to_decode(prefill_slot_idx);
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Request {}: select_token failed after mixed prefill: {}",
-                            req_id, e
-                        );
-                        self.finish_slot(prefill_slot_idx);
-                    }
-                }
+        for mixed in pending.mixed_prefill {
+            if mixed.chunk_complete {
+                self.complete_mixed_prefill_request(mixed.slot_idx);
             }
         }
     }

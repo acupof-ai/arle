@@ -34,7 +34,7 @@ pub struct SchedulerConfig {
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
-    /// Allow mixing one prefill chunk into a decode batch when the model
+    /// Allow mixing a prefill batch into a decode batch when the model
     /// supports it. Mirrors SGLang's `--enable-mixed-chunk`; default stays off.
     pub enable_mixed_chunk: bool,
     /// Maximum requests allowed in the waiting queue.

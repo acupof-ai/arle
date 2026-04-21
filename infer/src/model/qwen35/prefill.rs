@@ -280,6 +280,14 @@ impl Qwen35Model {
             "paged prefill: pool seq_len {pool_seq_len} < chunk len {seq_len}"
         );
         let start_pos = pool_seq_len - seq_len;
+        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
+        let sequences = [ops::PagedPrefillSequence {
+            token_offset: 0,
+            seq_len,
+            start_pos,
+            page_table_offset: 0,
+            num_pages: num_pages_needed,
+        }];
 
         let mut hidden_batch = crate::model::common::get_embeddings_batch(
             &self.ctx,
@@ -296,7 +304,6 @@ impl Qwen35Model {
         // read past the valid region under concurrent load. Mirrors the
         // Qwen3 fix.
         let all_pages = pool.page_indices(slot);
-        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
         anyhow::ensure!(
             all_pages.len() >= num_pages_needed,
             "paged prefill: slot {slot} has {} pages, expected at least {num_pages_needed}",
@@ -317,14 +324,18 @@ impl Qwen35Model {
             .paged_prefill_plan_hd256
             .lock()
             .map_err(|_| anyhow::anyhow!("paged_prefill_plan_hd256 mutex poisoned"))?;
-        if plan_guard.is_none() {
-            *plan_guard = Some(BatchPrefillPagedPlan::new_hd256(
-                &self.ctx,
-                seq_len.max(4096),
-                c.num_attention_heads,
-            )?);
+        let required_rows = seq_len.max(4096);
+        let needs_realloc = plan_guard
+            .as_ref()
+            .map(|(max_rows, _)| *max_rows < required_rows)
+            .unwrap_or(true);
+        if needs_realloc {
+            *plan_guard = Some((
+                required_rows,
+                BatchPrefillPagedPlan::new_hd256(&self.ctx, required_rows, c.num_attention_heads)?,
+            ));
         }
-        let plan = plan_guard.as_mut().expect("just initialized");
+        let (_, plan) = plan_guard.as_mut().expect("just initialized");
 
         // Structural invariant: plan ONCE per forward, not per layer.
         // All 8 full-attn layers share identical (batch_size, qo_len,
@@ -333,8 +344,7 @@ impl Qwen35Model {
         let mut fwd = crate::ops::PagedPrefillForward::new_hd256(
             &self.ctx,
             plan,
-            seq_len,
-            start_pos,
+            &sequences,
             c.num_attention_heads,
             c.num_key_value_heads,
             pool.page_size,
@@ -352,8 +362,8 @@ impl Qwen35Model {
                 &mut linear_idx,
                 &mut full_idx,
                 pool,
+                &sequences,
                 &slot_page_indices,
-                start_pos,
                 &mut fwd,
                 recurrent,
             )?;
@@ -387,8 +397,8 @@ impl Qwen35Model {
         linear_idx: &mut usize,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        slot_page_indices: &CudaSlice<i32>,
-        start_pos: usize,
+        sequences: &[ops::PagedPrefillSequence],
+        page_indices: &CudaSlice<i32>,
         fwd: &mut crate::ops::PagedPrefillForward,
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
@@ -407,8 +417,8 @@ impl Qwen35Model {
                 &normed_batch,
                 full_idx,
                 pool,
-                slot_page_indices,
-                start_pos,
+                sequences,
+                page_indices,
                 fwd,
                 seq_len,
             )?,
@@ -444,8 +454,8 @@ impl Qwen35Model {
         normed_batch: &HiddenStates,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        slot_page_indices: &CudaSlice<i32>,
-        start_pos: usize,
+        sequences: &[ops::PagedPrefillSequence],
+        page_indices: &CudaSlice<i32>,
         fwd: &mut crate::ops::PagedPrefillForward,
         seq_len: usize,
     ) -> Result<HiddenStates> {
@@ -469,8 +479,8 @@ impl Qwen35Model {
         let meta = ops::PagedPrefillMeta {
             pool,
             layer_idx: *full_idx,
-            slot_page_indices,
-            start_pos,
+            page_indices,
+            sequences,
             page_size: pool.page_size,
         };
         ops::prefill_attention_hd256_paged_batch(

@@ -748,7 +748,8 @@ impl TokenKVPool {
             let src_ptr = unsafe { (base_ptr as *mut T).add(src_elem_start) } as u64;
             let dst_ptr = unsafe { (base_ptr as *mut T).add(dst_elem_start) } as u64;
             let bytes = elem_count * std::mem::size_of::<T>();
-            let result = unsafe { cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, bytes, ctx.stream.cu_stream()) };
+            let result =
+                unsafe { cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, bytes, ctx.stream.cu_stream()) };
             if result != CUDA_SUCCESS {
                 return Err(anyhow!("{label} failed: {result:?}"));
             }

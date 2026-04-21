@@ -14,9 +14,10 @@ use log::info;
 
 use super::config::Config;
 use super::forward::Qwen3State;
+use super::prefill::Qwen3PagedPrefillRequest;
 use super::weights::{Qwen3Model, TransformerBlock};
-use crate::model::ModelForward;
 use crate::model::kv_cache::KVFormat;
+use crate::model::{ModelForward, PrefillBatchRequest};
 use crate::ops;
 use cuda_kernels::ffi;
 use cuda_kernels::kv_quant;
@@ -99,7 +100,8 @@ pub(crate) struct MixedBatchBuffers {
     o_buf: HiddenStates,
     gate_up_out: HiddenStates,
     act_out: HiddenStates,
-    logits: HiddenStates,
+    decode_normed: HiddenStates,
+    prefill_normed: DeviceVec,
     token_ids_gpu: CudaSlice<i32>,
     metadata: FlashInferDecodeMetadata,
     max_prefill_tokens: usize,
@@ -134,7 +136,8 @@ impl MixedBatchBuffers {
             o_buf: HiddenStates::zeros(ctx, model_config.hidden_size, max_tokens)?,
             gate_up_out: HiddenStates::zeros(ctx, 2 * model_config.intermediate_size, max_tokens)?,
             act_out: HiddenStates::zeros(ctx, model_config.intermediate_size, max_tokens)?,
-            logits: HiddenStates::zeros(ctx, model_config.vocab_size, max_tokens)?,
+            decode_normed: HiddenStates::zeros(ctx, model_config.hidden_size, max_batch_size)?,
+            prefill_normed: DeviceVec::zeros(ctx, model_config.hidden_size)?,
             token_ids_gpu: ctx
                 .stream
                 .alloc_zeros(max_tokens)
@@ -164,7 +167,6 @@ impl MixedBatchBuffers {
         self.o_buf.seq_len = seq_len;
         self.gate_up_out.seq_len = seq_len;
         self.act_out.seq_len = seq_len;
-        self.logits.seq_len = seq_len;
     }
 }
 
@@ -336,22 +338,28 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MixedPrefillSlice {
+    slot_idx: usize,
+    token_offset: usize,
+    seq_len: usize,
+    start_pos: usize,
+    page_table_offset: usize,
+}
+
 impl Qwen3Model {
     #[allow(dead_code)]
-    pub(crate) fn decode_batch_with_prefill(
+    pub(crate) fn decode_batch_with_prefill_batch(
         &self,
         decode_tokens: &[u32],
-        prefill_tokens: &[u32],
+        prefill: &[PrefillBatchRequest<'_>],
         states: &mut [Qwen3State],
         decode_slot_indices: &[usize],
-        prefill_slot_idx: usize,
-        prefill_start_pos: usize,
         paged_kv_pool: &mut PagedKVPool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<bool> {
         let b = decode_tokens.len();
-        let c = prefill_tokens.len();
-        if b == 0 || c == 0 {
+        if b == 0 || prefill.is_empty() {
             return Ok(false);
         }
         // The fused mixed prefill+decode path does not apply LoRA adapters
@@ -363,19 +371,11 @@ impl Qwen3Model {
         if paged_kv_pool.format != KVFormat::BF16 {
             return Ok(false);
         }
-        let pool_seq = paged_kv_pool.seq_len(prefill_slot_idx);
-        if pool_seq != prefill_start_pos {
+        let total_prefill_tokens: usize = prefill.iter().map(|request| request.tokens.len()).sum();
+        let total_tokens = b + total_prefill_tokens;
+        if total_prefill_tokens == 0 {
             return Ok(false);
         }
-
-        let prefill_state = &mut states[prefill_slot_idx];
-        if prefill_state.base.kv_cache.k_caches().is_empty()
-            || prefill_start_pos + c > prefill_state.base.kv_cache.max_seq_len()
-        {
-            return Ok(false);
-        }
-
-        paged_kv_pool.alloc_tokens(prefill_slot_idx, c)?;
 
         if bufs.logits_batch.is_none() {
             let vocab_size = self.output_projection().rows;
@@ -387,32 +387,90 @@ impl Qwen3Model {
         }
         let logits_batch_ptr = bufs.logits_batch.as_mut().unwrap() as *mut HiddenStates;
 
-        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool, c)?;
-        let total_tokens = b + c;
-        if c > mixed.max_prefill_tokens || total_tokens > mixed.max_tokens {
+        let mixed = bufs.mixed_buffers_mut(self, paged_kv_pool, total_prefill_tokens)?;
+        if total_prefill_tokens > mixed.max_prefill_tokens || total_tokens > mixed.max_tokens {
             return Ok(false);
         }
         mixed.set_seq_len(total_tokens);
 
+        let mut prefill_slot_indices = Vec::with_capacity(prefill.len());
+        let mut paged_prefill = Vec::with_capacity(prefill.len());
+        for request in prefill {
+            if request.tokens.is_empty()
+                || prefill_slot_indices.contains(&request.slot_idx)
+                || decode_slot_indices.contains(&request.slot_idx)
+            {
+                return Ok(false);
+            }
+
+            let state = &states[request.slot_idx];
+            let start_pos = paged_kv_pool.seq_len(request.slot_idx);
+            if state.base.kv_cache.k_caches().is_empty()
+                || start_pos + request.tokens.len() > state.base.kv_cache.max_seq_len()
+            {
+                return Ok(false);
+            }
+
+            prefill_slot_indices.push(request.slot_idx);
+            paged_prefill.push(Qwen3PagedPrefillRequest {
+                tokens: request.tokens,
+                slot: request.slot_idx,
+            });
+        }
+
+        for request in prefill {
+            paged_kv_pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
+        }
+
+        let (prefill_sequences, prefill_page_indices) =
+            self.build_paged_prefill_sequences(&paged_prefill, paged_kv_pool)?;
+        let prefill_page_indices_dev: CudaSlice<i32> = self
+            .ctx
+            .stream
+            .clone_htod(&prefill_page_indices)
+            .map_err(|e| anyhow::anyhow!("H2D mixed prefill page_indices: {e}"))?;
+        let prefill_start_positions: Vec<usize> = prefill_sequences
+            .iter()
+            .map(|sequence| sequence.start_pos)
+            .collect();
+        let prefill_token_counts: Vec<usize> = prefill_sequences
+            .iter()
+            .map(|sequence| sequence.seq_len)
+            .collect();
+        let prefill_slices: Vec<MixedPrefillSlice> = prefill
+            .iter()
+            .zip(prefill_sequences.iter())
+            .map(|(request, sequence)| MixedPrefillSlice {
+                slot_idx: request.slot_idx,
+                token_offset: sequence.token_offset,
+                seq_len: sequence.seq_len,
+                start_pos: sequence.start_pos,
+                page_table_offset: sequence.page_table_offset,
+            })
+            .collect();
+        let request_count = b + prefill.len();
+
         let mut combined_tokens = Vec::with_capacity(total_tokens);
         combined_tokens.extend(decode_tokens.iter().map(|&tok| tok as i32));
-        combined_tokens.extend(prefill_tokens.iter().map(|&tok| tok as i32));
+        for request in prefill {
+            combined_tokens.extend(request.tokens.iter().map(|&tok| tok as i32));
+        }
         self.ctx
             .stream
             .memcpy_htod(&combined_tokens, &mut mixed.token_ids_gpu)
             .map_err(|e| anyhow::anyhow!("H2D mixed token_ids: {e}"))?;
 
-        let _ = mixed.metadata.update_mixed(
+        let _ = mixed.metadata.update_mixed_batch(
             &self.ctx,
             paged_kv_pool,
             decode_slot_indices,
-            prefill_slot_idx,
-            prefill_start_pos,
-            c,
+            &prefill_slot_indices,
+            &prefill_start_positions,
+            &prefill_token_counts,
         )?;
         mixed.metadata.tc_plan(
             &self.ctx,
-            b + 1,
+            request_count,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             paged_kv_pool.page_size,
@@ -426,12 +484,6 @@ impl Qwen3Model {
             &mut mixed.embedding_out,
         )?;
 
-        let prefill_page_table: Vec<i32> = paged_kv_pool
-            .page_indices(prefill_slot_idx)
-            .iter()
-            .map(|&idx| idx as i32)
-            .collect();
-
         let hidden_ptr = &raw mut mixed.embedding_out;
         let eps = self.config.rms_norm_eps;
         let num_heads = self.config.num_attention_heads;
@@ -441,7 +493,6 @@ impl Qwen3Model {
         let kv_dim = num_kv_heads * head_dim;
         let bf16_size = std::mem::size_of::<u16>();
         let page_size = paged_kv_pool.page_size;
-        let prefill_max_seq_len = prefill_state.base.kv_cache.max_seq_len() as i32;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let hidden = unsafe { &mut *hidden_ptr };
@@ -544,38 +595,57 @@ impl Qwen3Model {
                 .result()?;
             }
 
-            let q_prefill_ptr = (q_ptr as usize + b * q_dim * bf16_size) as *mut ffi::Half;
-            let k_prefill_ptr = (k_ptr as usize + b * kv_dim * bf16_size) as *mut ffi::Half;
-            let v_prefill_ptr = (v_ptr as usize + b * kv_dim * bf16_size) as *const ffi::Half;
-            let (k_cache, v_cache) = prefill_state.base.kv_cache.layer_kv_caches_mut(layer_idx);
-            let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&self.ctx.stream);
-            let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&self.ctx.stream);
+            let (prefill_idx_ptr, _gprefill_idx) =
+                prefill_page_indices_dev.device_ptr(&self.ctx.stream);
+            let i32_size = std::mem::size_of::<i32>();
+            for prefill_slice in &prefill_slices {
+                let q_prefill_ptr = (q_ptr as usize
+                    + (b + prefill_slice.token_offset) * q_dim * bf16_size)
+                    as *mut ffi::Half;
+                let k_prefill_ptr = (k_ptr as usize
+                    + (b + prefill_slice.token_offset) * kv_dim * bf16_size)
+                    as *mut ffi::Half;
+                let v_prefill_ptr = (v_ptr as usize
+                    + (b + prefill_slice.token_offset) * kv_dim * bf16_size)
+                    as *const ffi::Half;
+                let page_table_ptr = (prefill_idx_ptr as usize
+                    + prefill_slice.page_table_offset * i32_size)
+                    as *const i32;
+                let prefill_max_seq_len =
+                    states[prefill_slice.slot_idx].base.kv_cache.max_seq_len() as i32;
+                let (k_cache, v_cache) = states[prefill_slice.slot_idx]
+                    .base
+                    .kv_cache
+                    .layer_kv_caches_mut(layer_idx);
+                let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&self.ctx.stream);
+                let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&self.ctx.stream);
 
-            unsafe {
-                ffi::prefill_attention_prep_dual_write_cuda(
-                    q_prefill_ptr,
-                    k_prefill_ptr,
-                    v_prefill_ptr,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    kc_ptr as *mut ffi::Half,
-                    vc_ptr as *mut ffi::Half,
-                    num_heads as i32,
-                    num_kv_heads as i32,
-                    head_dim as i32,
-                    c as i32,
-                    prefill_start_pos as i32,
-                    prefill_max_seq_len,
-                    eps,
-                    self.ctx.stream.cu_stream(),
-                    prefill_page_table.as_ptr(),
-                    page_size as i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                )
-                .result()?;
+                unsafe {
+                    ffi::prefill_attention_prep_dual_write_cuda(
+                        q_prefill_ptr,
+                        k_prefill_ptr,
+                        v_prefill_ptr,
+                        qn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        head_dim as i32,
+                        prefill_slice.seq_len as i32,
+                        prefill_slice.start_pos as i32,
+                        prefill_max_seq_len,
+                        eps,
+                        self.ctx.stream.cu_stream(),
+                        page_table_ptr,
+                        page_size as i32,
+                        k_pool_ptr as *mut ffi::Half,
+                        v_pool_ptr as *mut ffi::Half,
+                    )
+                    .result()?;
+                }
             }
 
             let ret = {
@@ -611,7 +681,7 @@ impl Qwen3Model {
                         lp_ptr as *const i32,
                         o_ptr as *mut ffi::Half,
                         lse_ptr as *mut f32,
-                        (b + 1) as i32,
+                        request_count as i32,
                         num_heads as i32,
                         num_kv_heads as i32,
                         page_size as i32,
@@ -698,38 +768,53 @@ impl Qwen3Model {
             }
         }
 
-        prefill_state.base.kv_cache.advance_seq_len(c);
+        for request in prefill {
+            states[request.slot_idx]
+                .base
+                .kv_cache
+                .advance_seq_len(request.tokens.len());
+        }
 
         let hidden = unsafe { &*hidden_ptr };
         ops::rms_norm_batch_into(&self.ctx, hidden, &self.norm, eps, &mut mixed.normed);
+
+        let normed_decode_len = b * mixed.normed.hidden_dim;
+        mixed.decode_normed.seq_len = b;
+        let src = mixed.normed.data.slice(0..normed_decode_len);
+        let mut dst = mixed.decode_normed.data.slice_mut(0..normed_decode_len);
+        self.ctx
+            .stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow::anyhow!("D2D mixed decode normed: {e}"))?;
+
+        let logits = unsafe { &mut *logits_batch_ptr };
+        logits.seq_len = b;
         ops::gemm_into(
             &self.ctx,
             self.output_projection(),
-            &mixed.normed,
-            &mut mixed.logits,
+            &mixed.decode_normed,
+            logits,
         );
 
-        {
-            let logits = unsafe { &mut *logits_batch_ptr };
-            logits.seq_len = b;
-            let src = mixed.logits.data.slice(0..b * logits.hidden_dim);
-            let mut dst = logits.data.slice_mut(0..b * logits.hidden_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&src, &mut dst)
-                .map_err(|e| anyhow::anyhow!("D2D mixed decode logits: {e}"))?;
+        for (prefill_slice, request) in prefill_slices.iter().zip(prefill.iter()) {
+            let prefill_state = &mut states[request.slot_idx];
+            if prefill_state.base.prefill_logits.is_none() {
+                prefill_state.base.prefill_logits =
+                    Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
+            }
+            ops::extract_vec_into(
+                &self.ctx,
+                &mixed.normed,
+                b + prefill_slice.token_offset + prefill_slice.seq_len - 1,
+                &mut mixed.prefill_normed,
+            )?;
+            ops::gemv(
+                &self.ctx,
+                self.output_projection(),
+                &mixed.prefill_normed,
+                prefill_state.base.prefill_logits.as_mut().unwrap(),
+            )?;
         }
-
-        if prefill_state.base.prefill_logits.is_none() {
-            prefill_state.base.prefill_logits =
-                Some(DeviceVec::zeros(&self.ctx, self.output_projection().rows)?);
-        }
-        ops::extract_vec_into(
-            &self.ctx,
-            &mixed.logits,
-            total_tokens - 1,
-            prefill_state.base.prefill_logits.as_mut().unwrap(),
-        )?;
 
         Ok(true)
     }

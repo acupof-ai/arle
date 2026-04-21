@@ -61,7 +61,7 @@ struct Args {
     #[arg(long)]
     prefill_max_requests: Option<usize>,
 
-    /// Enable mixing one prefill chunk into a decode batch when the model supports it.
+    /// Enable mixing a prefill batch into a decode batch when the model supports it.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     enable_mixed_chunk: bool,
 

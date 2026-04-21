@@ -12,7 +12,7 @@
 //! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV
 //! attention + online softmax + merge in one kernel launch.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
@@ -360,17 +360,30 @@ pub(crate) fn prefill_attention_hd256_batch_with_scratch(
 // via page-table indirection — no migrate_kv_range_to_paged step needed
 // afterward.
 //
-// For Phase 2 we assume batch_size=1 (single-request prefill). Phase 3
-// scheduler wiring can extend to multi-request mixed batches later.
 // ============================================================================
 
-/// Paged-KV prefill metadata — single-request prefill shape.
+/// One packed prefill sequence inside a paged-prefill forward.
+///
+/// `token_offset` and `page_table_offset` are offsets into the packed token and
+/// page-table buffers for this forward. Callers must pack both contiguously in
+/// request order — `PagedPrefillForward` validates that contract when it builds
+/// the FlashInfer indptr metadata.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PagedPrefillSequence {
+    pub token_offset: usize,
+    pub seq_len: usize,
+    pub start_pos: usize,
+    pub page_table_offset: usize,
+    pub num_pages: usize,
+}
+
+/// Paged-KV prefill metadata for one layer of a packed varlen batch.
 pub(crate) struct PagedPrefillMeta<'a> {
     pub pool: &'a PagedKVPool,
     pub layer_idx: usize,
-    /// Per-slot page indices (GPU-resident, length = num_pages = ceil(kv_len/page_size)).
-    pub slot_page_indices: &'a CudaSlice<i32>,
-    pub start_pos: usize,
+    /// Concatenated page-table rows for every packed sequence in batch order.
+    pub page_indices: &'a CudaSlice<i32>,
+    pub sequences: &'a [PagedPrefillSequence],
     pub page_size: usize,
 }
 
@@ -400,8 +413,8 @@ pub(crate) struct PagedPrefillForward<'a> {
     pub qo_indptr_dev: CudaSlice<i32>,
     pub kv_indptr_dev: CudaSlice<i32>,
     pub kv_last_page_len_dev: CudaSlice<i32>,
-    pub seq_len: usize,
-    pub start_pos: usize,
+    pub batch_size: usize,
+    pub total_qo_rows: usize,
     pub page_size: usize,
 }
 
@@ -410,8 +423,7 @@ impl<'a> PagedPrefillForward<'a> {
     pub(crate) fn new_hd128(
         ctx: &DeviceContext,
         plan: &'a mut BatchPrefillPagedPlan,
-        seq_len: usize,
-        start_pos: usize,
+        sequences: &[PagedPrefillSequence],
         num_q_heads: usize,
         num_kv_heads: usize,
         page_size: usize,
@@ -419,8 +431,7 @@ impl<'a> PagedPrefillForward<'a> {
         Self::new_inner(
             ctx,
             plan,
-            seq_len,
-            start_pos,
+            sequences,
             num_q_heads,
             num_kv_heads,
             page_size,
@@ -432,8 +443,7 @@ impl<'a> PagedPrefillForward<'a> {
     pub(crate) fn new_hd256(
         ctx: &DeviceContext,
         plan: &'a mut BatchPrefillPagedPlan,
-        seq_len: usize,
-        start_pos: usize,
+        sequences: &[PagedPrefillSequence],
         num_q_heads: usize,
         num_kv_heads: usize,
         page_size: usize,
@@ -441,8 +451,7 @@ impl<'a> PagedPrefillForward<'a> {
         Self::new_inner(
             ctx,
             plan,
-            seq_len,
-            start_pos,
+            sequences,
             num_q_heads,
             num_kv_heads,
             page_size,
@@ -454,18 +463,55 @@ impl<'a> PagedPrefillForward<'a> {
     fn new_inner(
         ctx: &DeviceContext,
         plan: &'a mut BatchPrefillPagedPlan,
-        seq_len: usize,
-        start_pos: usize,
+        sequences: &[PagedPrefillSequence],
         num_q_heads: usize,
         num_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
     ) -> Result<Self> {
-        let kv_len = start_pos + seq_len;
-        let num_pages = kv_len.div_ceil(page_size);
-        let last_page_len_i32 = paged_prefill_last_page_len(kv_len, page_size);
-        let qo_indptr = [0i32, seq_len as i32];
-        let kv_indptr = [0i32, num_pages as i32];
+        ensure!(
+            !sequences.is_empty(),
+            "paged prefill forward requires at least one sequence"
+        );
+
+        let mut total_qo_rows = 0usize;
+        let mut total_pages = 0usize;
+        let mut qo_indptr = Vec::with_capacity(sequences.len() + 1);
+        let mut kv_indptr = Vec::with_capacity(sequences.len() + 1);
+        let mut kv_last_page_len = Vec::with_capacity(sequences.len());
+        qo_indptr.push(0);
+        kv_indptr.push(0);
+
+        for seq in sequences {
+            ensure!(seq.seq_len > 0, "paged prefill sequence must not be empty");
+            ensure!(
+                seq.token_offset == total_qo_rows,
+                "paged prefill token packing gap/overlap: expected offset {}, got {}",
+                total_qo_rows,
+                seq.token_offset
+            );
+            ensure!(
+                seq.page_table_offset == total_pages,
+                "paged prefill page-table packing gap/overlap: expected offset {}, got {}",
+                total_pages,
+                seq.page_table_offset
+            );
+
+            let kv_len = seq.start_pos + seq.seq_len;
+            let num_pages = kv_len.div_ceil(page_size);
+            ensure!(
+                seq.num_pages == num_pages,
+                "paged prefill sequence page count mismatch: expected {}, got {}",
+                num_pages,
+                seq.num_pages
+            );
+
+            total_qo_rows += seq.seq_len;
+            total_pages += seq.num_pages;
+            qo_indptr.push(total_qo_rows as i32);
+            kv_indptr.push(total_pages as i32);
+            kv_last_page_len.push(paged_prefill_last_page_len(kv_len, page_size));
+        }
 
         // Single plan call for the whole forward. All layers share the same
         // (batch_size, qo_len, kv_len, page_size, num_heads) shape, so one
@@ -475,7 +521,7 @@ impl<'a> PagedPrefillForward<'a> {
                 ctx,
                 &qo_indptr,
                 &kv_indptr,
-                /* batch_size */ 1,
+                sequences.len(),
                 num_q_heads,
                 num_kv_heads,
                 page_size,
@@ -485,7 +531,7 @@ impl<'a> PagedPrefillForward<'a> {
                 ctx,
                 &qo_indptr,
                 &kv_indptr,
-                /* batch_size */ 1,
+                sequences.len(),
                 num_q_heads,
                 num_kv_heads,
                 page_size,
@@ -502,7 +548,7 @@ impl<'a> PagedPrefillForward<'a> {
             .map_err(|e| anyhow!("kv_indptr H2D failed: {e}"))?;
         let kv_last_page_len_dev: CudaSlice<i32> = ctx
             .stream
-            .clone_htod(&[last_page_len_i32])
+            .clone_htod(&kv_last_page_len)
             .map_err(|e| anyhow!("kv_last_page_len H2D failed: {e}"))?;
 
         Ok(Self {
@@ -510,8 +556,8 @@ impl<'a> PagedPrefillForward<'a> {
             qo_indptr_dev,
             kv_indptr_dev,
             kv_last_page_len_dev,
-            seq_len,
-            start_pos,
+            batch_size: sequences.len(),
+            total_qo_rows,
             page_size,
         })
     }
@@ -551,14 +597,18 @@ pub(crate) fn prefill_attention_paged_batch(
     let head_dim = heads.head_dim;
     assert!(num_kv_heads > 0, "num_kv_heads must be > 0");
     assert_eq!(head_dim, 128, "prefill_attention_paged_batch is HD128 only");
-    assert_eq!(seq_len, fwd.seq_len, "fwd.seq_len mismatch");
-    assert_eq!(meta.start_pos, fwd.start_pos, "fwd.start_pos mismatch");
+    assert_eq!(seq_len, fwd.total_qo_rows, "fwd.total_qo_rows mismatch");
     assert_eq!(meta.page_size, fwd.page_size, "fwd.page_size mismatch");
-
-    let start_pos = meta.start_pos;
+    assert_eq!(
+        meta.sequences.len(),
+        fwd.batch_size,
+        "fwd.batch_size mismatch"
+    );
     let page_size = meta.page_size;
 
-    // Step 1: QK norm + RoPE + paged K/V write. Per-layer.
+    // Step 1: QK norm + RoPE + paged K/V write. The prep kernel is still
+    // single-sequence, so we launch it once per packed sequence before the
+    // single batched FlashInfer run below.
     unsafe {
         let (q_ptr, _gq) = q_batch.data.device_ptr_mut(&ctx.stream);
         let (k_ptr, _gk) = k_batch.data.device_ptr_mut(&ctx.stream);
@@ -567,31 +617,46 @@ pub(crate) fn prefill_attention_paged_batch(
         let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
         let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
         let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
-        let (pt_ptr, _gpt) = meta.slot_page_indices.device_ptr(&ctx.stream);
+        let (pt_ptr, _gpt) = meta.page_indices.device_ptr(&ctx.stream);
         let kp_ptr = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
         let vp_ptr = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
 
-        ffi::prefill_attention_paged_prep_cuda(
-            q_ptr as *mut ffi::Half,
-            k_ptr as *mut ffi::Half,
-            v_ptr as *const ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            pt_ptr as *const i32,
-            page_size as i32,
-            kp_ptr as *mut ffi::Half,
-            vp_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            seq_len as i32,
-            start_pos as i32,
-            nrp.rms_eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
+        let q_stride = q_batch.hidden_dim;
+        let kv_stride = k_batch.hidden_dim;
+        let half_size = std::mem::size_of::<ffi::Half>();
+        let i32_size = std::mem::size_of::<i32>();
+
+        for seq in meta.sequences {
+            let q_ptr_offset =
+                (q_ptr as usize + seq.token_offset * q_stride * half_size) as *mut ffi::Half;
+            let k_ptr_offset =
+                (k_ptr as usize + seq.token_offset * kv_stride * half_size) as *mut ffi::Half;
+            let v_ptr_offset =
+                (v_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
+            let pt_ptr_offset = (pt_ptr as usize + seq.page_table_offset * i32_size) as *const i32;
+
+            ffi::prefill_attention_paged_prep_cuda(
+                q_ptr_offset,
+                k_ptr_offset,
+                v_ptr_offset,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                pt_ptr_offset,
+                page_size as i32,
+                kp_ptr as *mut ffi::Half,
+                vp_ptr as *mut ffi::Half,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                seq.seq_len as i32,
+                seq.start_pos as i32,
+                nrp.rms_eps,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
     }
 
     // Step 2: run FlashInfer paged prefill. Plan was done ONCE outside the
@@ -602,7 +667,7 @@ pub(crate) fn prefill_attention_paged_batch(
     let vp_u64 = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
     let (qoi_u64, _gqoi) = fwd.qo_indptr_dev.device_ptr(&ctx.stream);
     let (kvi_u64, _gkvi) = fwd.kv_indptr_dev.device_ptr(&ctx.stream);
-    let (kvidx_u64, _gkvidx) = meta.slot_page_indices.device_ptr(&ctx.stream);
+    let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
     let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
 
     fwd.plan.run_hd128(
@@ -616,7 +681,7 @@ pub(crate) fn prefill_attention_paged_batch(
         kvlpl_u64,
         o_u64,
         /* lse_ptr */ None,
-        /* batch_size */ 1,
+        fwd.batch_size,
         num_q_heads,
         num_kv_heads,
         page_size,
@@ -660,14 +725,19 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
     assert_eq!(v_batch.hidden_dim, kv_dim);
     assert_eq!(output.hidden_dim, q_dim);
     assert_eq!(q_prepped.hidden_dim, q_dim);
-    assert_eq!(seq_len, fwd.seq_len, "fwd.seq_len mismatch");
-    assert_eq!(meta.start_pos, fwd.start_pos, "fwd.start_pos mismatch");
+    assert_eq!(seq_len, fwd.total_qo_rows, "fwd.total_qo_rows mismatch");
     assert_eq!(meta.page_size, fwd.page_size, "fwd.page_size mismatch");
+    assert_eq!(
+        meta.sequences.len(),
+        fwd.batch_size,
+        "fwd.batch_size mismatch"
+    );
 
-    let start_pos = meta.start_pos;
     let page_size = meta.page_size;
 
-    // Step 1: HD256 fused prep kernel. Per-layer.
+    // Step 1: HD256 fused prep kernel. Like the HD128 path above, this kernel
+    // still consumes one sequence at a time, so the packed forward launches it
+    // per sequence and then runs one batched FlashInfer attention pass.
     unsafe {
         let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
         let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
@@ -677,32 +747,50 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
         let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
         let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
         let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
-        let (pt_ptr, _gpt) = meta.slot_page_indices.device_ptr(&ctx.stream);
+        let (pt_ptr, _gpt) = meta.page_indices.device_ptr(&ctx.stream);
         let kp_ptr = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
         let vp_ptr = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
 
-        ffi::prefill_attention_paged_prep_hd256_cuda(
-            qf_ptr as *const ffi::Half,
-            qp_ptr as *mut ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            qn_ptr as *const ffi::Half,
-            kn_ptr as *const ffi::Half,
-            cos_ptr as *const ffi::Half,
-            sin_ptr as *const ffi::Half,
-            pt_ptr as *const i32,
-            page_size as i32,
-            kp_ptr as *mut ffi::Half,
-            vp_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            seq_len as i32,
-            start_pos as i32,
-            rotary_dim as i32,
-            nrp.rms_eps,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
+        let q_full_stride = q_full_batch.hidden_dim;
+        let q_stride = q_prepped.hidden_dim;
+        let kv_stride = k_batch.hidden_dim;
+        let half_size = std::mem::size_of::<ffi::Half>();
+        let i32_size = std::mem::size_of::<i32>();
+
+        for seq in meta.sequences {
+            let qf_ptr_offset = (qf_ptr as usize + seq.token_offset * q_full_stride * half_size)
+                as *const ffi::Half;
+            let qp_ptr_offset =
+                (qp_ptr as usize + seq.token_offset * q_stride * half_size) as *mut ffi::Half;
+            let k_ptr_offset =
+                (k_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
+            let v_ptr_offset =
+                (v_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
+            let pt_ptr_offset = (pt_ptr as usize + seq.page_table_offset * i32_size) as *const i32;
+
+            ffi::prefill_attention_paged_prep_hd256_cuda(
+                qf_ptr_offset,
+                qp_ptr_offset,
+                k_ptr_offset,
+                v_ptr_offset,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                pt_ptr_offset,
+                page_size as i32,
+                kp_ptr as *mut ffi::Half,
+                vp_ptr as *mut ffi::Half,
+                num_q_heads as i32,
+                num_kv_heads as i32,
+                seq.seq_len as i32,
+                seq.start_pos as i32,
+                rotary_dim as i32,
+                nrp.rms_eps,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
     }
 
     // Step 2: run FlashInfer paged prefill HD256. Plan was done ONCE
@@ -714,7 +802,7 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
         let vp_u64 = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
         let (qoi_u64, _gqoi) = fwd.qo_indptr_dev.device_ptr(&ctx.stream);
         let (kvi_u64, _gkvi) = fwd.kv_indptr_dev.device_ptr(&ctx.stream);
-        let (kvidx_u64, _gkvidx) = meta.slot_page_indices.device_ptr(&ctx.stream);
+        let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
         let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
 
         fwd.plan.run_hd256(
@@ -728,7 +816,7 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
             kvlpl_u64,
             o_u64,
             /* lse_ptr */ None,
-            /* batch_size */ 1,
+            fwd.batch_size,
             num_q_heads,
             num_kv_heads,
             page_size,
@@ -743,7 +831,7 @@ pub(crate) fn prefill_attention_hd256_paged_batch(
             qf_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             num_q_heads as i32,
-            seq_len as i32,
+            fwd.total_qo_rows as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;
