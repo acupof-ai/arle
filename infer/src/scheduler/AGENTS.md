@@ -14,10 +14,10 @@ works with any backend. Load before editing any scheduler internals.
 | `metrics.rs` | Scheduler metrics accounting. |
 | `cuda/core.rs` | CUDA `Scheduler<M: ModelForward>` struct + construction. Owns slots, paged KV pool, radix prefix cache, `block_owner_slots`. |
 | `cuda/prefill.rs` | `step_new` — chunked prefill + prefix-hit paths (exact-full, prompt-prefix-of-cached, partial). |
-| `cuda/decode.rs` | `step_decode_batch` — batched decode + preemption (evicts the request with most generated tokens when pool can't fit). |
-| `cuda/request.rs` | Per-request state (`ActiveRequest`, `Phase`). |
-| `cuda/runtime.rs` | `run_loop` — the single-writer scheduler thread. |
-| `cuda/execution.rs` | Per-step execution glue. |
+| `cuda/decode.rs` | Batched decode + retract/requeue under KV pressure. |
+| `cuda/request.rs` | Per-request state (`QueuedRequest`, `ActiveRequest`, `Phase`). |
+| `cuda/runtime.rs` | Single-writer scheduler thread: intake, normalization, staging completions, cleanup. |
+| `cuda/execution.rs` | Per-step execution glue: decode launch/readback, prefill budgets, waiting-queue admission. |
 
 ## Invariants you will break if you're not careful
 
@@ -45,8 +45,9 @@ works with any backend. Load before editing any scheduler internals.
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from
    `save_prefix_snapshot` / `restore_prefix_snapshot`.
-7. **Preemption policy = highest-KV-cost victim** (most generated tokens),
-   *recompute* mode (re-queue + re-prefill). Do not change without updating
+7. **Decode retract is recompute-mode requeue.** Victim selection now mirrors
+   the current sglang-alignment heuristic: retract the least-progressed request
+   first, tie-breaking toward longer prompts. If you change it, update
    `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md`.
 8. **Slot reuse is single-slot-only.** `block_owner_slots` tracks which free
    slot can reuse a radix block's contiguous state. Cross-slot page aliasing

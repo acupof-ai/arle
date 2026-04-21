@@ -6,6 +6,13 @@ During the 2026-04-13 remote CUDA validation batch (see
 greedy_consistency` failed deterministically on L4 (CUDA 13.0, driver
 580.82.07) at commit `876b986`:
 
+Historical note (2026-04-21): this entry was later used to justify a
+"retract the highest-KV-cost victim" decode heuristic. The active c16
+sglang-alignment work moved away from that policy; current code retracts the
+least-progressed request first, tie-breaking toward longer prompts. Keep this
+file as the rationale for the old policy, not as a claim that the scheduler
+may never change again.
+
 - **Solo run** (B=1): ` about a person who is a master of disguise and
   how they use their skills to solve a mystery. Once upon a time, in a
   bustling city filled`

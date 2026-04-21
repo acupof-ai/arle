@@ -198,6 +198,57 @@ impl SchedulerConfig {
     }
 }
 
+const REQUEST_INPUT_SLACK_TOKENS: usize = 5;
+
+/// Backend-agnostic request length limits derived from the active scheduler
+/// envelope. Mirrors SGLang's `max_req_len` / `max_req_input_len` contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestLengthContract {
+    max_request_len: usize,
+    max_request_input_len: usize,
+}
+
+impl RequestLengthContract {
+    pub(crate) fn derive(
+        available_pool_tokens: usize,
+        effective_max_seq_len: Option<usize>,
+    ) -> Self {
+        let context_len = effective_max_seq_len.unwrap_or(available_pool_tokens);
+        let max_request_len = context_len
+            .saturating_sub(1)
+            .min(available_pool_tokens.saturating_sub(1));
+        let max_request_input_len = max_request_len.saturating_sub(REQUEST_INPUT_SLACK_TOKENS);
+        Self {
+            max_request_len,
+            max_request_input_len,
+        }
+    }
+
+    pub(crate) fn max_request_len(self) -> usize {
+        self.max_request_len
+    }
+
+    pub(crate) fn max_request_input_len(self) -> usize {
+        self.max_request_input_len
+    }
+
+    pub(crate) fn admits_prompt_len(self, prompt_tokens: usize) -> bool {
+        prompt_tokens < self.max_request_input_len
+    }
+
+    pub(crate) fn clamp_max_tokens(
+        self,
+        prompt_tokens: usize,
+        requested_max_tokens: usize,
+    ) -> usize {
+        requested_max_tokens.min(
+            self.max_request_len
+                .saturating_sub(prompt_tokens)
+                .saturating_sub(1),
+        )
+    }
+}
+
 /// Request priority level. Higher-priority requests are scheduled first
 /// when multiple requests are waiting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -458,5 +509,34 @@ mod tests {
         cfg.prefix_cache_keepalive_ticks = 128;
         cfg.stage_wait_keepalive_ticks = 1024;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn request_length_contract_respects_context_and_pool_limits() {
+        let contract = RequestLengthContract::derive(60_064, Some(4_608));
+        assert_eq!(contract.max_request_len(), 4_607);
+        assert_eq!(contract.max_request_input_len(), 4_602);
+        assert!(contract.admits_prompt_len(4_601));
+        assert!(!contract.admits_prompt_len(4_602));
+
+        let pool_bound = RequestLengthContract::derive(2_048, Some(4_608));
+        assert_eq!(pool_bound.max_request_len(), 2_047);
+        assert_eq!(pool_bound.max_request_input_len(), 2_042);
+    }
+
+    #[test]
+    fn request_length_contract_clamps_completion_budget_like_sglang() {
+        let contract = RequestLengthContract::derive(60_064, Some(4_608));
+        assert_eq!(contract.clamp_max_tokens(4_097, 1_024), 509);
+        assert_eq!(contract.clamp_max_tokens(4_097, 128), 128);
+    }
+
+    #[test]
+    fn request_length_contract_saturates_small_envelopes() {
+        let contract = RequestLengthContract::derive(3, Some(2));
+        assert_eq!(contract.max_request_len(), 1);
+        assert_eq!(contract.max_request_input_len(), 0);
+        assert!(!contract.admits_prompt_len(0));
+        assert_eq!(contract.clamp_max_tokens(0, 16), 0);
     }
 }
