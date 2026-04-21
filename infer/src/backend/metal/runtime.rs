@@ -792,7 +792,7 @@ fn run_metal_scheduler_runtime(
         let runtime_states = scheduler_runtime_states(&active);
         match scheduler.step(&runtime_states) {
             MetalScheduleDecision::Idle => continue,
-            MetalScheduleDecision::PrefillChunk(prefill) => execute_prefill_chunk(
+            MetalScheduleDecision::PrefillChunk(prefill) => guard_prefill_chunk(
                 prefill.req_id,
                 prefill.input_tokens.len(),
                 &metrics,
@@ -801,7 +801,7 @@ fn run_metal_scheduler_runtime(
                 &mut active,
             ),
             MetalScheduleDecision::DecodeBatch(batch) => {
-                execute_decode_batch(
+                guard_decode_batch(
                     batch.req_ids,
                     &metrics,
                     &mut scheduler,
@@ -811,7 +811,7 @@ fn run_metal_scheduler_runtime(
                 );
             }
             MetalScheduleDecision::Mixed { decode, prefill } => {
-                execute_decode_batch(
+                guard_decode_batch(
                     decode.req_ids,
                     &metrics,
                     &mut scheduler,
@@ -819,7 +819,7 @@ fn run_metal_scheduler_runtime(
                     &mut qwen35_decode_batch_cache,
                     metal_dflash_concurrency_off,
                 );
-                execute_prefill_chunk(
+                guard_prefill_chunk(
                     prefill.req_id,
                     prefill.input_tokens.len(),
                     &metrics,
@@ -841,6 +841,78 @@ fn run_metal_scheduler_runtime(
     }
 
     Ok(())
+}
+
+fn guard_prefill_chunk(
+    req_id: RequestId,
+    budget: usize,
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        execute_prefill_chunk(req_id, budget, metrics, prefix_runtime, scheduler, active);
+    }));
+
+    if let Err(panic) = result {
+        error!(
+            "Metal prefill chunk panicked for {:?}: {}",
+            req_id,
+            super::panic_message(panic)
+        );
+        metrics.record_request_failed();
+        *prefix_runtime = None;
+        abort_runtime_requests(&[req_id], scheduler, active);
+    }
+}
+
+fn guard_decode_batch(
+    req_ids: Vec<RequestId>,
+    metrics: &ServerMetrics,
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    qwen35_decode_batch_cache: &mut Option<CachedQwen35DecodeBatch>,
+    dflash_concurrency_off: bool,
+) {
+    let panic_req_ids = req_ids.clone();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        execute_decode_batch(
+            req_ids,
+            metrics,
+            scheduler,
+            active,
+            qwen35_decode_batch_cache,
+            dflash_concurrency_off,
+        );
+    }));
+
+    if let Err(panic) = result {
+        error!(
+            "Metal decode batch panicked for {:?}: {}",
+            panic_req_ids,
+            super::panic_message(panic)
+        );
+        metrics.record_request_failed();
+        *qwen35_decode_batch_cache = None;
+        abort_runtime_requests(&panic_req_ids, scheduler, active);
+    }
+}
+
+fn abort_runtime_requests(
+    req_ids: &[RequestId],
+    scheduler: &mut MetalScheduler,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
+    for &req_id in req_ids {
+        let mode = active.get(&req_id).and_then(request_mode);
+        let _ = scheduler.finish_request(req_id, mode);
+        if let Some(mut request) = active.remove(&req_id)
+            && let Err(err) = request.cancel()
+        {
+            warn!("Metal panic cleanup failed for {:?}: {err:#}", req_id);
+        }
+    }
 }
 
 fn maybe_refresh_runtime_metrics(
