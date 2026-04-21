@@ -11,10 +11,12 @@ use train::{
         build_registry, live_tensor_ids, retained_ids, save_materialized_registry,
         trainable_param_name_map, trainable_params,
     },
-    grpo::{GrpoConfig, group_advantages, grpo_loss},
+    grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position},
     lora::LoraConfig,
     loss::cross_entropy_loss,
+    multi_turn::Episode,
     qwen35::Qwen35Model,
+    reward::{discounted_returns, group_normalize, returns_to_per_position},
     rollout::Trajectory,
 };
 
@@ -85,6 +87,27 @@ fn qwen35_hybrid_grpo_longer_sequence_steps_match_cpu_on_metal() -> TestResult {
     let cpu = run_hybrid_grpo_steps(None, &cfg, lora, &trajectories, 3)?;
     let metal = run_hybrid_grpo_steps(Some(Arc::new(MetalBackend)), &cfg, lora, &trajectories, 3)?;
     assert_snapshot_close("hybrid grpo long", &cpu, &metal);
+    Ok(())
+}
+
+#[test]
+fn qwen35_hybrid_multi_turn_stepwise_steps_match_cpu_on_metal() -> TestResult {
+    let cfg = tiny_hybrid_qwen35_scratch_config_with_vocab(16, 64);
+    let episodes = fixed_multi_turn_episodes();
+    let cpu = run_hybrid_multi_turn_stepwise_steps(None, &cfg, &episodes, 3)?;
+    let metal =
+        run_hybrid_multi_turn_stepwise_steps(Some(Arc::new(MetalBackend)), &cfg, &episodes, 3)?;
+    assert_snapshot_close("hybrid multi_turn stepwise", &cpu, &metal);
+    Ok(())
+}
+
+#[test]
+fn qwen35_hybrid_multi_turn_gspo_steps_match_cpu_on_metal() -> TestResult {
+    let cfg = tiny_hybrid_qwen35_scratch_config_with_vocab(16, 64);
+    let episodes = fixed_multi_turn_episodes();
+    let cpu = run_hybrid_multi_turn_gspo_steps(None, &cfg, &episodes, 3)?;
+    let metal = run_hybrid_multi_turn_gspo_steps(Some(Arc::new(MetalBackend)), &cfg, &episodes, 3)?;
+    assert_snapshot_close("hybrid multi_turn gspo", &cpu, &metal);
     Ok(())
 }
 
@@ -172,6 +195,124 @@ fn run_hybrid_grpo_steps(
                 clip_eps: 0.2,
                 kl_coef: 0.02,
                 group_size: 2,
+            },
+            cfg,
+            &mut store,
+            &mut tape,
+        )?;
+        losses.push(store.to_host(loss_id)?[0]);
+        tape.backward(loss_id, &mut store)?;
+        optimizer.step(&params, &mut store);
+
+        tape.entries.clear();
+        tape.set_enabled(true);
+        let keep = retained_ids(&model_ids, &params, &store);
+        store.retain_ids(&keep);
+    }
+
+    Ok(StepSnapshot {
+        losses,
+        reload_logits: export_reload_logits(&model, &mut store, &mut tape, cfg)?,
+        named_params: export_named_params(&mut store, &param_names)?,
+        optim_state: optimizer.export_state(&param_names),
+    })
+}
+
+fn run_hybrid_multi_turn_stepwise_steps(
+    backend: Option<Arc<dyn Backend>>,
+    cfg: &train::qwen35::Qwen35Config,
+    episodes: &[Episode],
+    steps: usize,
+) -> TestResult<StepSnapshot> {
+    let mut store = match backend {
+        Some(backend) => TensorStore::with_backend(backend),
+        None => TensorStore::default(),
+    };
+    let model = Qwen35Model::new(cfg, &mut store)?;
+    let params = trainable_params(&model, &store);
+    let param_names = trainable_param_name_map(&model, &store);
+    let model_ids = live_tensor_ids(&store);
+    let mut optimizer = AdamW::new(TEST_LR, (0.9, 0.999), 1.0e-8, 0.0);
+    let mut tape = Tape::new();
+    let trajectories = episodes
+        .iter()
+        .cloned()
+        .map(Episode::into_trajectory)
+        .collect::<Vec<_>>();
+    let advantages_per_position = stepwise_advantages_for_episodes(episodes);
+    let mut losses = Vec::with_capacity(steps);
+
+    for _ in 0..steps {
+        optimizer.zero_grad(&params, &mut store);
+        let loss_id = grpo_loss_per_position(
+            &model,
+            &trajectories,
+            &advantages_per_position,
+            &GrpoConfig {
+                clip_eps: 0.2,
+                kl_coef: 0.02,
+                group_size: trajectories.len(),
+            },
+            cfg,
+            &mut store,
+            &mut tape,
+        )?;
+        losses.push(store.to_host(loss_id)?[0]);
+        tape.backward(loss_id, &mut store)?;
+        optimizer.step(&params, &mut store);
+
+        tape.entries.clear();
+        tape.set_enabled(true);
+        let keep = retained_ids(&model_ids, &params, &store);
+        store.retain_ids(&keep);
+    }
+
+    Ok(StepSnapshot {
+        losses,
+        reload_logits: export_reload_logits(&model, &mut store, &mut tape, cfg)?,
+        named_params: export_named_params(&mut store, &param_names)?,
+        optim_state: optimizer.export_state(&param_names),
+    })
+}
+
+fn run_hybrid_multi_turn_gspo_steps(
+    backend: Option<Arc<dyn Backend>>,
+    cfg: &train::qwen35::Qwen35Config,
+    episodes: &[Episode],
+    steps: usize,
+) -> TestResult<StepSnapshot> {
+    let mut store = match backend {
+        Some(backend) => TensorStore::with_backend(backend),
+        None => TensorStore::default(),
+    };
+    let model = Qwen35Model::new(cfg, &mut store)?;
+    let params = trainable_params(&model, &store);
+    let param_names = trainable_param_name_map(&model, &store);
+    let model_ids = live_tensor_ids(&store);
+    let mut optimizer = AdamW::new(TEST_LR, (0.9, 0.999), 1.0e-8, 0.0);
+    let mut tape = Tape::new();
+    let trajectories = episodes
+        .iter()
+        .cloned()
+        .map(Episode::into_trajectory)
+        .collect::<Vec<_>>();
+    let sequence_scores = episodes
+        .iter()
+        .map(episode_sequence_score)
+        .collect::<Vec<_>>();
+    let advantages = group_advantages(&sequence_scores, trajectories.len());
+    let mut losses = Vec::with_capacity(steps);
+
+    for _ in 0..steps {
+        optimizer.zero_grad(&params, &mut store);
+        let loss_id = grpo_loss(
+            &model,
+            &trajectories,
+            &advantages,
+            &GrpoConfig {
+                clip_eps: 0.2,
+                kl_coef: 0.02,
+                group_size: trajectories.len(),
             },
             cfg,
             &mut store,
@@ -287,6 +428,120 @@ fn fixed_grpo_trajectories_longer() -> Vec<Trajectory> {
             reward: 0.5,
         },
     ]
+}
+
+fn fixed_multi_turn_episodes() -> Vec<Episode> {
+    let initial_prompt = vec![1usize, 2, 3, 15];
+    let response_mask = vec![
+        false, false, false, false, true, true, false, false, true, true,
+    ];
+    let turn_boundaries = vec![(4, 6), (8, 10)];
+    vec![
+        Episode {
+            initial_prompt: initial_prompt.clone(),
+            full_ids: vec![1, 2, 3, 15, 1, 1, 14, 14, 2, 2],
+            response_mask: response_mask.clone(),
+            old_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.2, -1.1, 0.0, 0.0, -1.0, -0.9],
+            ref_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.0, -0.9, 0.0, 0.0, -0.8, -0.7],
+            reward: 0.0,
+            turn_boundaries: turn_boundaries.clone(),
+        },
+        Episode {
+            initial_prompt: initial_prompt.clone(),
+            full_ids: vec![1, 2, 3, 15, 1, 3, 14, 14, 2, 9],
+            response_mask: response_mask.clone(),
+            old_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.3, -1.2, 0.0, 0.0, -1.1, -1.0],
+            ref_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.1, -1.0, 0.0, 0.0, -0.9, -0.8],
+            reward: 0.0,
+            turn_boundaries: turn_boundaries.clone(),
+        },
+        Episode {
+            initial_prompt: initial_prompt.clone(),
+            full_ids: vec![1, 2, 3, 15, 5, 6, 14, 14, 2, 2],
+            response_mask: response_mask.clone(),
+            old_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.4, -1.3, 0.0, 0.0, -1.2, -1.1],
+            ref_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.2, -1.1, 0.0, 0.0, -1.0, -0.9],
+            reward: 0.0,
+            turn_boundaries: turn_boundaries.clone(),
+        },
+        Episode {
+            initial_prompt,
+            full_ids: vec![1, 2, 3, 15, 7, 8, 14, 14, 10, 11],
+            response_mask,
+            old_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.5, -1.4, 0.0, 0.0, -1.3, -1.2],
+            ref_log_probs: vec![0.0, 0.0, 0.0, 0.0, -1.3, -1.2, 0.0, 0.0, -1.1, -1.0],
+            reward: 0.0,
+            turn_boundaries,
+        },
+    ]
+}
+
+fn stepwise_advantages_for_episodes(episodes: &[Episode]) -> Vec<f32> {
+    let group_size = episodes.len();
+    let n_turns = episodes[0].turn_boundaries.len();
+    let returns_per_ep = episodes
+        .iter()
+        .map(|episode| {
+            let rewards = episode
+                .turn_boundaries
+                .iter()
+                .enumerate()
+                .map(|(turn_idx, (start, end))| per_turn_reward(episode, turn_idx, *start, *end))
+                .collect::<Vec<_>>();
+            discounted_returns(&rewards, 0.9)
+        })
+        .collect::<Vec<_>>();
+
+    let mut stacked = Vec::with_capacity(group_size * n_turns);
+    for turn_idx in 0..n_turns {
+        for ep_returns in &returns_per_ep {
+            stacked.push(ep_returns[turn_idx]);
+        }
+    }
+    let normalized = group_normalize(&stacked, group_size);
+    let mut normalized_per_ep = vec![vec![0.0_f32; n_turns]; group_size];
+    for turn_idx in 0..n_turns {
+        for ep in 0..group_size {
+            normalized_per_ep[ep][turn_idx] = normalized[turn_idx * group_size + ep];
+        }
+    }
+
+    let seq_len = episodes[0].full_ids.len();
+    let mut advantages_per_position = Vec::with_capacity(group_size * seq_len);
+    for (episode, adv_by_turn) in episodes.iter().zip(normalized_per_ep.iter()) {
+        let row = returns_to_per_position(adv_by_turn, &episode.turn_boundaries, seq_len);
+        advantages_per_position.extend_from_slice(&row);
+    }
+    advantages_per_position
+}
+
+fn per_turn_reward(
+    episode: &Episode,
+    turn_idx: usize,
+    agent_start: usize,
+    agent_end: usize,
+) -> f32 {
+    let prompt_len = episode.initial_prompt.len().max(1);
+    let target = episode.initial_prompt[turn_idx % prompt_len];
+    let mut hits = 0.0_f32;
+    let mut total = 0.0_f32;
+    for position in agent_start..agent_end {
+        total += 1.0;
+        if episode.full_ids[position] == target {
+            hits += 1.0;
+        }
+    }
+    if total == 0.0 { 0.0 } else { hits / total }
+}
+
+fn episode_sequence_score(episode: &Episode) -> f32 {
+    let mut score = 0.0_f32;
+    let mut turns = 0.0_f32;
+    for (turn_idx, (start, end)) in episode.turn_boundaries.iter().enumerate() {
+        score += per_turn_reward(episode, turn_idx, *start, *end);
+        turns += 1.0;
+    }
+    if turns == 0.0 { 0.0 } else { score / turns }
 }
 
 fn assert_snapshot_close(label: &str, cpu: &StepSnapshot, metal: &StepSnapshot) {
