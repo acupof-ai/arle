@@ -24,10 +24,56 @@ use super::{MetalBackend, MetalBackendOptions};
 use crate::backend::InferenceBackend;
 use crate::backend::runtime::StopChunkProcessor;
 use crate::metrics::ServerMetrics;
+use crate::sampler::SamplingParams;
 use crate::scheduler::{IncomingRequest, RequestPriority, SchedulerHandle};
 use crate::server_engine::{CompletionStreamDelta, FinishReason, TokenUsage};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 use crate::types::{InferenceMode, RequestId};
+
+struct PendingMetalRequest {
+    delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    sampling: SamplingParams,
+    stop: Option<Vec<String>>,
+    enqueued_at: Instant,
+}
+
+impl PendingMetalRequest {
+    fn from_incoming(
+        tokenizer: &Tokenizer,
+        incoming: IncomingRequest,
+    ) -> Result<(Self, MetalRequestPriority)> {
+        let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
+        if prompt_tokens.is_empty() {
+            bail!("Metal scheduler request requires at least one prompt token");
+        }
+        Ok((
+            Self {
+                delta_tx: incoming.delta_tx,
+                prompt_tokens,
+                max_tokens: incoming.max_tokens,
+                sampling: incoming.sampling,
+                stop: incoming.stop,
+                enqueued_at: Instant::now(),
+            },
+            map_request_priority(incoming.priority),
+        ))
+    }
+
+    fn delta_closed(&self) -> bool {
+        self.delta_tx.is_closed()
+    }
+
+    fn activate(
+        self,
+        backend: &'static MetalBackend,
+        tokenizer: &'static Tokenizer,
+        enable_dflash: bool,
+    ) -> Result<ActiveMetalRequest> {
+        ActiveMetalRequest::from_pending(backend, tokenizer, self, enable_dflash)
+    }
+}
 
 struct ActiveMetalRequest {
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
@@ -40,15 +86,15 @@ struct ActiveMetalRequest {
 }
 
 impl ActiveMetalRequest {
-    fn from_incoming(
+    fn from_pending(
         backend: &'static MetalBackend,
         tokenizer: &'static Tokenizer,
-        incoming: IncomingRequest,
+        pending: PendingMetalRequest,
         enable_dflash: bool,
-    ) -> Result<(Vec<u32>, usize, Self)> {
-        let prompt_tokens = tokenizer.encode(&incoming.prompt)?;
-        let max_tokens = incoming.max_tokens;
-        let mut sampling = incoming.sampling;
+    ) -> Result<Self> {
+        let prompt_tokens = pending.prompt_tokens;
+        let max_tokens = pending.max_tokens;
+        let mut sampling = pending.sampling;
         sampling.max_new_tokens = Some(max_tokens);
         // Thread DFlash runtime into the request state so Qwen3StepDriver
         // can initialize speculative-decode state. Both refs are 'static
@@ -67,19 +113,15 @@ impl ActiveMetalRequest {
         };
         let request_state =
             backend.create_request_state_with_dflash(&prompt_tokens, &sampling, dflash_ref)?;
-        Ok((
-            prompt_tokens.clone(),
-            max_tokens,
-            Self {
-                delta_tx: incoming.delta_tx,
-                request_state,
-                decoder: tokenizer.incremental_decoder(),
-                stop_processor: StopChunkProcessor::new(incoming.stop.unwrap_or_default()),
-                prompt_tokens,
-                admitted_at: Instant::now(),
-                first_token_at: None,
-            },
-        ))
+        Ok(Self {
+            delta_tx: pending.delta_tx,
+            request_state,
+            decoder: tokenizer.incremental_decoder(),
+            stop_processor: StopChunkProcessor::new(pending.stop.unwrap_or_default()),
+            prompt_tokens,
+            admitted_at: pending.enqueued_at,
+            first_token_at: None,
+        })
     }
 
     fn delta_closed(&self) -> bool {
@@ -200,16 +242,12 @@ struct CachedQwen35DecodeBatch {
     batch: Qwen35PackedDecodeBatch<'static>,
 }
 
-struct MetalPrefixAdmission {
-    scheduler_prompt_tokens: Vec<u32>,
-}
-
 impl MetalLivePrefixRuntime {
     fn new(backend: &'static MetalBackend, config: &MetalSchedulerConfig) -> Result<Option<Self>> {
         let model_config = backend.config.as_ref().context("model not loaded")?;
         let weights = backend.weights.as_ref().context("weights not loaded")?;
         let max_total_tokens = (config
-            .max_active_requests
+            .max_running_requests
             .saturating_mul(config.prefill_chunk_size)
             .saturating_mul(METAL_PREFIX_POOL_MULTIPLIER))
         .max(METAL_PREFIX_BLOCK_SIZE * 8);
@@ -258,7 +296,7 @@ impl MetalLivePrefixRuntime {
         &mut self,
         request: &mut ActiveMetalRequest,
         metrics: &ServerMetrics,
-    ) -> Result<MetalPrefixAdmission> {
+    ) -> Result<()> {
         match self {
             MetalLivePrefixRuntime::Qwen3(runtime) => runtime.prepare_request(request, metrics),
             MetalLivePrefixRuntime::Qwen35(runtime) => runtime.prepare_request(request, metrics),
@@ -278,13 +316,11 @@ impl MetalQwen3PrefixRuntime {
         &mut self,
         request: &mut ActiveMetalRequest,
         metrics: &ServerMetrics,
-    ) -> Result<MetalPrefixAdmission> {
+    ) -> Result<()> {
         let prompt_tokens = &request.prompt_tokens;
         if prompt_tokens.len() < self.cache.block_size() {
             metrics.record_prefix_lookup(false);
-            return Ok(MetalPrefixAdmission {
-                scheduler_prompt_tokens: prompt_tokens.clone(),
-            });
+            return Ok(());
         }
 
         let hit = self
@@ -292,7 +328,7 @@ impl MetalQwen3PrefixRuntime {
             .lookup(prompt_tokens)
             .context("lookup Metal live prefix cache")?;
         let reusable_len = self.reusable_prefix_len(prompt_tokens.len(), hit.matched_len);
-        let scheduler_prompt_tokens = if reusable_len > 0 {
+        if reusable_len > 0 {
             request
                 .request_state
                 .import_qwen3_prefix_from_pool(
@@ -301,18 +337,13 @@ impl MetalQwen3PrefixRuntime {
                     &hit.slot_indices[..reusable_len],
                 )
                 .context("import matched Metal prefix into request state")?;
-            prompt_tokens[reusable_len..].to_vec()
-        } else {
-            prompt_tokens.clone()
-        };
+        }
         self.cache
             .release(&hit.slot_indices)
             .context("release Metal live prefix cache lookup pins")?;
         metrics.record_prefix_lookup(reusable_len > 0);
 
-        Ok(MetalPrefixAdmission {
-            scheduler_prompt_tokens,
-        })
+        Ok(())
     }
 
     fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
@@ -424,20 +455,16 @@ impl MetalQwen35PrefixRuntime {
         &mut self,
         request: &mut ActiveMetalRequest,
         metrics: &ServerMetrics,
-    ) -> Result<MetalPrefixAdmission> {
+    ) -> Result<()> {
         let prompt_tokens = &request.prompt_tokens;
         if prompt_tokens.len() < self.block_size {
             metrics.record_prefix_lookup(false);
-            return Ok(MetalPrefixAdmission {
-                scheduler_prompt_tokens: prompt_tokens.clone(),
-            });
+            return Ok(());
         }
 
         let Some(prefix_key) = self.lookup_longest_prefix(prompt_tokens) else {
             metrics.record_prefix_lookup(false);
-            return Ok(MetalPrefixAdmission {
-                scheduler_prompt_tokens: prompt_tokens.clone(),
-            });
+            return Ok(());
         };
 
         let imported =
@@ -452,15 +479,11 @@ impl MetalQwen35PrefixRuntime {
 
         metrics.record_prefix_lookup(imported);
         if !imported {
-            return Ok(MetalPrefixAdmission {
-                scheduler_prompt_tokens: prompt_tokens.clone(),
-            });
+            return Ok(());
         }
 
         self.touch(&prefix_key);
-        Ok(MetalPrefixAdmission {
-            scheduler_prompt_tokens: prompt_tokens[prefix_key.len()..].to_vec(),
-        })
+        Ok(())
     }
 
     fn publish_prompt_prefix(&mut self, request: &ActiveMetalRequest) -> Result<()> {
@@ -680,7 +703,7 @@ pub fn spawn_metal_scheduler_handle_from_path_with_options_and_metrics(
                 runtime_handle,
                 metrics,
                 MetalSchedulerConfig {
-                    max_waiting_requests: 0,
+                    max_waiting_requests: max_waiting,
                     ..MetalSchedulerConfig::default()
                 },
             )
@@ -724,6 +747,7 @@ fn run_metal_scheduler_runtime(
     let metal_dflash_concurrency_off = config.metal_dflash_concurrency_off;
     let mut prefix_runtime = MetalLivePrefixRuntime::new(backend, &config)?;
     let mut scheduler = MetalScheduler::new(config)?;
+    let mut pending = HashMap::<RequestId, PendingMetalRequest>::new();
     let mut active = HashMap::<RequestId, ActiveMetalRequest>::new();
     let mut qwen35_decode_batch_cache: Option<CachedQwen35DecodeBatch> = None;
     let mut request_rx_closed = false;
@@ -738,22 +762,20 @@ fn run_metal_scheduler_runtime(
 
     loop {
         drain_incoming_requests(
-            backend,
             tokenizer,
             &handle,
             &metrics,
-            &mut prefix_runtime,
             &mut request_rx,
             &mut request_rx_closed,
             &mut scheduler,
-            &mut active,
+            &mut pending,
         );
-        reap_closed_clients(&mut scheduler, &mut active);
-        refresh_waiting_prefix_hits(&metrics, &mut prefix_runtime, &mut scheduler, &mut active);
+        reap_closed_clients(&handle, &mut scheduler, &mut pending, &mut active);
         maybe_refresh_runtime_metrics(
             &metrics,
             &handle,
             &scheduler,
+            &pending,
             &active,
             &mut last_metrics_refresh,
             METRICS_REFRESH_INTERVAL,
@@ -767,19 +789,17 @@ fn run_metal_scheduler_runtime(
         if active.is_empty() && scheduler.waiting_len() == 0 {
             match request_rx.blocking_recv() {
                 Some(incoming) => {
-                    handle.consume_one();
-                    admit_request(
-                        backend,
+                    enqueue_request(
+                        &metrics,
                         tokenizer,
                         incoming,
-                        &metrics,
-                        &mut prefix_runtime,
+                        &handle,
                         &mut scheduler,
-                        &mut active,
+                        &mut pending,
                     );
                     // Admission is rare enough that an unconditional refresh
                     // is fine — helps the first metrics scrape after idle.
-                    refresh_runtime_metrics(&metrics, &handle, &scheduler, &active);
+                    refresh_runtime_metrics(&metrics, &handle, &scheduler, &pending, &active);
                     last_metrics_refresh = Some(Instant::now());
                 }
                 None => {
@@ -795,9 +815,13 @@ fn run_metal_scheduler_runtime(
             MetalScheduleDecision::PrefillChunk(prefill) => guard_prefill_chunk(
                 prefill.req_id,
                 prefill.input_tokens.len(),
+                backend,
+                tokenizer,
+                &handle,
                 &metrics,
                 &mut prefix_runtime,
                 &mut scheduler,
+                &mut pending,
                 &mut active,
             ),
             MetalScheduleDecision::DecodeBatch(batch) => {
@@ -822,9 +846,13 @@ fn run_metal_scheduler_runtime(
                 guard_prefill_chunk(
                     prefill.req_id,
                     prefill.input_tokens.len(),
+                    backend,
+                    tokenizer,
+                    &handle,
                     &metrics,
                     &mut prefix_runtime,
                     &mut scheduler,
+                    &mut pending,
                     &mut active,
                 );
             }
@@ -834,6 +862,7 @@ fn run_metal_scheduler_runtime(
             &metrics,
             &handle,
             &scheduler,
+            &pending,
             &active,
             &mut last_metrics_refresh,
             METRICS_REFRESH_INTERVAL,
@@ -846,13 +875,28 @@ fn run_metal_scheduler_runtime(
 fn guard_prefill_chunk(
     req_id: RequestId,
     budget: usize,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
     metrics: &ServerMetrics,
     prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        execute_prefill_chunk(req_id, budget, metrics, prefix_runtime, scheduler, active);
+        execute_prefill_chunk(
+            req_id,
+            budget,
+            backend,
+            tokenizer,
+            handle,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            pending,
+            active,
+        );
     }));
 
     if let Err(panic) = result {
@@ -907,10 +951,11 @@ fn abort_runtime_requests(
     for &req_id in req_ids {
         let mode = active.get(&req_id).and_then(request_mode);
         let _ = scheduler.finish_request(req_id, mode);
-        if let Some(mut request) = active.remove(&req_id)
-            && let Err(err) = request.cancel()
-        {
-            warn!("Metal panic cleanup failed for {:?}: {err:#}", req_id);
+        if let Some(mut request) = active.remove(&req_id) {
+            if let Err(err) = request.cancel() {
+                warn!("Metal panic cleanup failed for {:?}: {err:#}", req_id);
+            }
+            drop(request);
         }
     }
 }
@@ -919,6 +964,7 @@ fn maybe_refresh_runtime_metrics(
     metrics: &ServerMetrics,
     handle: &SchedulerHandle,
     scheduler: &MetalScheduler,
+    pending: &HashMap<RequestId, PendingMetalRequest>,
     active: &HashMap<RequestId, ActiveMetalRequest>,
     last: &mut Option<Instant>,
     interval: Duration,
@@ -929,91 +975,23 @@ fn maybe_refresh_runtime_metrics(
             return;
         }
     }
-    refresh_runtime_metrics(metrics, handle, scheduler, active);
+    refresh_runtime_metrics(metrics, handle, scheduler, pending, active);
     *last = Some(now);
 }
 
-fn refresh_waiting_prefix_hits(
-    metrics: &ServerMetrics,
-    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
-    scheduler: &mut MetalScheduler,
-    active: &mut HashMap<RequestId, ActiveMetalRequest>,
-) {
-    let Some(prefix_runtime) = prefix_runtime.as_mut() else {
-        return;
-    };
-
-    let req_ids: Vec<RequestId> = active
-        .iter()
-        .filter_map(|(req_id, request)| {
-            // DFlash requests own their own target_state KV, not the driver's
-            // k_caches/v_caches. Prefix cache import writes to the driver's
-            // caches, which DFlash never reads. Skip prefix lookup for DFlash.
-            if request.request_state.is_dflash_enabled() {
-                return None;
-            }
-            (request.phase() == RuntimePhase::Prefill
-                && request.request_state.prompt_progress() == 0
-                && scheduler.is_waiting(*req_id))
-            .then_some(*req_id)
-        })
-        .collect();
-
-    for req_id in req_ids {
-        let Some(request) = active.get_mut(&req_id) else {
-            continue;
-        };
-
-        let original_len = request.prompt_len();
-        let admission = match prefix_runtime.prepare_request(request, metrics) {
-            Ok(admission) => admission,
-            Err(err) => {
-                error!(
-                    "Metal waiting-prefix refresh failed for {:?}: {err:#}",
-                    req_id
-                );
-                continue;
-            }
-        };
-        if admission.scheduler_prompt_tokens.len() >= original_len {
-            continue;
-        }
-
-        if let Err(err) =
-            scheduler.rewrite_waiting_prompt(req_id, admission.scheduler_prompt_tokens)
-        {
-            warn!(
-                "Metal waiting-prefix refresh could not rewrite scheduler prompt for {:?}: {err}",
-                req_id
-            );
-        }
-    }
-}
-
 fn drain_incoming_requests(
-    backend: &'static MetalBackend,
     tokenizer: &'static Tokenizer,
     handle: &SchedulerHandle,
     metrics: &ServerMetrics,
-    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     request_rx: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     request_rx_closed: &mut bool,
     scheduler: &mut MetalScheduler,
-    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
 ) {
     loop {
         match request_rx.try_recv() {
             Ok(incoming) => {
-                handle.consume_one();
-                admit_request(
-                    backend,
-                    tokenizer,
-                    incoming,
-                    metrics,
-                    prefix_runtime,
-                    scheduler,
-                    active,
-                );
+                enqueue_request(metrics, tokenizer, incoming, handle, scheduler, pending);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1024,70 +1002,143 @@ fn drain_incoming_requests(
     }
 }
 
-fn admit_request(
-    backend: &'static MetalBackend,
+fn enqueue_request(
+    metrics: &ServerMetrics,
     tokenizer: &'static Tokenizer,
     incoming: IncomingRequest,
-    metrics: &ServerMetrics,
-    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    handle: &SchedulerHandle,
     scheduler: &mut MetalScheduler,
-    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
 ) {
     if incoming.delta_tx.is_closed() {
+        handle.consume_one();
         return;
     }
 
-    let priority = map_request_priority(incoming.priority);
-    // Always initialize DFlash when the backend has a draft model loaded;
-    // `from_incoming` gates this on `backend.dflash_runtime_static()` so
-    // requests without a draft simply get `dflash_ref = None`. Concurrent
-    // DFlash rows are now handled via `execute_qwen35_dflash_packed_batch`
-    // (default-on, see `MetalSchedulerConfig::metal_dflash_concurrency_off`).
-    let enable_dflash = true;
-    let (prompt_tokens, max_tokens, mut request) =
-        match ActiveMetalRequest::from_incoming(backend, tokenizer, incoming, enable_dflash) {
-            Ok(request) => request,
-            Err(err) => {
-                error!("Metal scheduler request init failed: {err:#}");
-                metrics.record_request_failed();
-                return;
-            }
-        };
-
-    let scheduler_prompt_tokens = match prefix_runtime.as_mut() {
-        Some(prefix_runtime) => match prefix_runtime.prepare_request(&mut request, metrics) {
-            Ok(admission) => admission.scheduler_prompt_tokens,
-            Err(err) => {
-                error!("Metal prefix-cache admission failed: {err:#}");
-                metrics.record_request_failed();
-                return;
-            }
-        },
-        None => prompt_tokens.clone(),
-    };
-
-    let req_id = match scheduler.submit(scheduler_prompt_tokens, max_tokens, priority) {
-        Ok(req_id) => req_id,
+    let (pending_request, priority) = match PendingMetalRequest::from_incoming(tokenizer, incoming)
+    {
+        Ok(request) => request,
         Err(err) => {
-            error!("Metal scheduler submit failed: {err}");
+            error!("Metal scheduler request init failed: {err:#}");
             metrics.record_request_failed();
+            handle.consume_one();
             return;
         }
     };
 
-    if active.insert(req_id, request).is_some() {
+    let req_id = match scheduler.submit(
+        pending_request.prompt_tokens.clone(),
+        pending_request.max_tokens,
+        priority,
+    ) {
+        Ok(req_id) => req_id,
+        Err(err) => {
+            error!("Metal scheduler submit failed: {err}");
+            metrics.record_request_failed();
+            handle.consume_one();
+            return;
+        }
+    };
+
+    if pending.insert(req_id, pending_request).is_some() {
         warn!("Metal scheduler request id collision for {:?}", req_id);
+    }
+}
+
+fn activate_pending_request(
+    req_id: RequestId,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
+    metrics: &ServerMetrics,
+    prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
+    scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
+    active: &mut HashMap<RequestId, ActiveMetalRequest>,
+) {
+    let Some(pending_request) = pending.remove(&req_id) else {
+        warn!(
+            "Metal prefill chunk referenced missing pending request {:?}",
+            req_id
+        );
+        scheduler.finish_request(req_id, None);
+        return;
+    };
+
+    if pending_request.delta_closed() {
+        handle.consume_one();
+        scheduler.finish_request(req_id, None);
+        return;
+    }
+
+    // Always initialize DFlash when the backend has a draft model loaded;
+    // concurrent DFlash rows are handled later in decode batching.
+    let enable_dflash = true;
+    let mut request = match pending_request.activate(backend, tokenizer, enable_dflash) {
+        Ok(request) => request,
+        Err(err) => {
+            error!(
+                "Metal scheduler activation failed for {:?}: {err:#}",
+                req_id
+            );
+            metrics.record_request_failed();
+            handle.consume_one();
+            scheduler.finish_request(req_id, None);
+            return;
+        }
+    };
+
+    if let Some(prefix_runtime) = prefix_runtime.as_mut() {
+        if let Err(err) = prefix_runtime.prepare_request(&mut request, metrics) {
+            error!(
+                "Metal prefix-cache activation failed for {:?}: {err:#}",
+                req_id
+            );
+            metrics.record_request_failed();
+            handle.consume_one();
+            scheduler.finish_request(req_id, None);
+            return;
+        }
+    }
+
+    handle.consume_one();
+    if active.insert(req_id, request).is_some() {
+        warn!(
+            "Metal scheduler activation overwrote an existing active request {:?}",
+            req_id
+        );
     }
 }
 
 fn execute_prefill_chunk(
     req_id: RequestId,
     mut budget: usize,
+    backend: &'static MetalBackend,
+    tokenizer: &'static Tokenizer,
+    handle: &SchedulerHandle,
     metrics: &ServerMetrics,
     prefix_runtime: &mut Option<MetalLivePrefixRuntime>,
     scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
+    if !active.contains_key(&req_id) {
+        activate_pending_request(
+            req_id,
+            backend,
+            tokenizer,
+            handle,
+            metrics,
+            prefix_runtime,
+            scheduler,
+            pending,
+            active,
+        );
+    }
+    if !active.contains_key(&req_id) {
+        return;
+    }
+
     // DFlash requires full-prompt prefill in one shot because
     // `qwen3_forward_with_hidden_states` captures hidden states for all
     // positions — chunked KV-only prefill can't produce them. Override the
@@ -1621,6 +1672,7 @@ fn execute_decode_single(
             if let Err(err) = request.cancel() {
                 warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
             }
+            drop(request);
         }
         Outcome::Failed(err) => {
             error!("Metal decode step failed for {:?}: {err:#}", req_id);
@@ -1655,6 +1707,7 @@ fn cancel_detached_request(
     if let Err(err) = request.cancel() {
         warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
     }
+    drop(request);
 }
 
 fn finalize_detached_request(
@@ -1668,12 +1721,25 @@ fn finalize_detached_request(
     if let Err(err) = request.send_final_delta() {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
+    drop(request);
 }
 
 fn reap_closed_clients(
+    handle: &SchedulerHandle,
     scheduler: &mut MetalScheduler,
+    pending: &mut HashMap<RequestId, PendingMetalRequest>,
     active: &mut HashMap<RequestId, ActiveMetalRequest>,
 ) {
+    let pending_closed: Vec<_> = pending
+        .iter()
+        .filter_map(|(req_id, request)| request.delta_closed().then_some(*req_id))
+        .collect();
+    for req_id in pending_closed {
+        handle.consume_one();
+        scheduler.finish_request(req_id, None);
+        pending.remove(&req_id);
+    }
+
     let closed: Vec<_> = active
         .iter()
         .filter_map(|(req_id, request)| request.delta_closed().then_some(*req_id))
@@ -1691,10 +1757,11 @@ fn cancel_request(
 ) {
     let mode = active.get(&req_id).map(request_mode);
     scheduler.finish_request(req_id, mode.flatten());
-    if let Some(mut request) = active.remove(&req_id)
-        && let Err(err) = request.cancel()
-    {
-        warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
+    if let Some(mut request) = active.remove(&req_id) {
+        if let Err(err) = request.cancel() {
+            warn!("Metal request cancel failed for {:?}: {err:#}", req_id);
+        }
+        drop(request);
     }
 }
 
@@ -1717,6 +1784,7 @@ fn finalize_request(
     {
         warn!("Metal request final delta failed for {:?}: {err:#}", req_id);
     }
+    drop(request);
 }
 
 fn record_request_completed(metrics: &ServerMetrics, request: &ActiveMetalRequest) {
@@ -1778,11 +1846,12 @@ fn scheduler_runtime_states(
 fn refresh_runtime_metrics(
     metrics: &ServerMetrics,
     handle: &SchedulerHandle,
-    scheduler: &MetalScheduler,
+    _scheduler: &MetalScheduler,
+    _pending: &HashMap<RequestId, PendingMetalRequest>,
     active: &HashMap<RequestId, ActiveMetalRequest>,
 ) {
     metrics.set_active(active.len() as u64);
-    metrics.set_waiting((handle.waiting_count() + scheduler.waiting_len()) as u64);
+    metrics.set_waiting(handle.waiting_count() as u64);
 
     let (kv_used, kv_total) = active.values().fold((0u64, 0u64), |acc, request| {
         if let Some((used, total)) = request.request_state.kv_pool_usage() {
