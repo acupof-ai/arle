@@ -5,6 +5,7 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
+    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -24,6 +25,7 @@ pub const KvBuffer = extern struct {
 
 const Fingerprint = [16]u8;
 const wal_magic = "KVWAL001";
+const shm_magic = "KVSHM001";
 const mmap_path_cap = 512;
 const shm_name_cap = 128;
 
@@ -35,8 +37,15 @@ pub const KvMmapDescriptor = extern struct {
 
 pub const KvSharedMemoryDescriptor = extern struct {
     len: usize,
+    generation: u64,
     name_len: usize,
     name: [shm_name_cap]u8,
+};
+
+const ShmHeader = extern struct {
+    magic: [shm_magic.len]u8,
+    generation: u64,
+    payload_len: u64,
 };
 
 fn sliceFromRaw(ptr: [*]const u8, len: usize) []const u8 {
@@ -49,6 +58,11 @@ fn dupZ(bytes: []const u8) ?[:0]u8 {
 
 fn closeFd(fd: c_int) void {
     _ = c.close(fd);
+}
+
+fn syncFd(fd: c_int) KvStatus {
+    if (c.fsync(fd) != 0) return .io;
+    return .ok;
 }
 
 fn mapFd(fd: c_int, len: usize, prot: c_int) ?*anyopaque {
@@ -82,6 +96,27 @@ fn writeAll(fd: c_int, bytes: []const u8) KvStatus {
     return .ok;
 }
 
+fn parentDirAlloc(path: []const u8) ?[:0]u8 {
+    const idx = std.mem.lastIndexOfScalar(u8, path, '/') orelse {
+        return std.heap.c_allocator.dupeZ(u8, ".") catch null;
+    };
+    if (idx == 0) {
+        return std.heap.c_allocator.dupeZ(u8, "/") catch null;
+    }
+    return std.heap.c_allocator.dupeZ(u8, path[0..idx]) catch null;
+}
+
+fn fsyncParentDir(path: []const u8) KvStatus {
+    const parent_z = parentDirAlloc(path) orelse return .oom;
+    defer std.heap.c_allocator.free(parent_z);
+
+    const flags: c_int = c.O_RDONLY | c.O_DIRECTORY;
+    const fd = c.open(parent_z.ptr, flags, @as(c_uint, 0));
+    if (fd < 0) return .io;
+    defer closeFd(fd);
+    return syncFd(fd);
+}
+
 fn writeFileInternal(path: []const u8, bytes: []const u8, atomic: bool) KvStatus {
     if (path.len == 0) return .invalid_input;
 
@@ -111,9 +146,11 @@ fn writeFileInternal(path: []const u8, bytes: []const u8, atomic: bool) KvStatus
 
     const write_status = writeAll(tmp_fd, bytes);
     if (write_status != .ok) return write_status;
+    const data_sync_status = syncFd(tmp_fd);
+    if (data_sync_status != .ok) return data_sync_status;
 
     if (c.rename(tmp_path.ptr, path_z.ptr) != 0) return .io;
-    return .ok;
+    return fsyncParentDir(path);
 }
 
 fn readFileInternal(path: []const u8, out: *KvBuffer) KvStatus {
@@ -374,18 +411,64 @@ fn shmNameFromDescriptor(desc: *const KvSharedMemoryDescriptor) ?[]const u8 {
     return desc.name[0..desc.name_len];
 }
 
+fn shmTotalLen(payload_len: usize) ?usize {
+    return std.math.add(usize, @sizeOf(ShmHeader), payload_len) catch null;
+}
+
+fn nextShmGeneration() u64 {
+    var seed = @as(u64, @intCast(@max(c.getpid(), 1)));
+    var ts: c.struct_timespec = undefined;
+    if (c.clock_gettime(c.CLOCK_REALTIME, &ts) == 0) {
+        seed ^= @as(u64, @intCast(@max(ts.tv_sec, 1)));
+        seed *%= 0x9E3779B185EBCA87;
+        seed ^= @as(u64, @intCast(@max(ts.tv_nsec, 1)));
+    }
+    var prng = std.Random.DefaultPrng.init(seed);
+    const generation = prng.random().int(u64);
+    return if (generation == 0) 1 else generation;
+}
+
+fn shmHeaderPtr(mapping: ?*anyopaque) *ShmHeader {
+    return @ptrCast(@alignCast(mapping));
+}
+
+fn shmPayloadBase(mapping: ?*anyopaque) [*]u8 {
+    const base: [*]u8 = @ptrCast(@alignCast(mapping));
+    return base + @sizeOf(ShmHeader);
+}
+
+fn validateShmHeader(desc: *const KvSharedMemoryDescriptor, header: *const ShmHeader) KvStatus {
+    if (!std.mem.eql(u8, header.magic[0..], shm_magic)) return .invalid_data;
+    if (header.generation != desc.generation) return .invalid_data;
+    if (header.payload_len != desc.len) return .invalid_data;
+    return .ok;
+}
+
 fn shmCreateInternal(name: []const u8, len: usize, out: *KvSharedMemoryDescriptor) KvStatus {
     if (name.len == 0 or name[0] != '/' or !ensurePathFits(name, shm_name_cap)) return .invalid_input;
+    const total_len = shmTotalLen(len) orelse return .invalid_input;
     const name_z = dupZ(name) orelse return .oom;
     defer std.heap.c_allocator.free(name_z);
 
-    const fd = c.shm_open(name_z.ptr, c.O_RDWR | c.O_CREAT, @as(c_uint, 0o600));
+    const fd = c.shm_open(name_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
     if (fd < 0) return .io;
     defer closeFd(fd);
-    if (c.ftruncate(fd, @intCast(len)) != 0) return .io;
+    errdefer _ = c.shm_unlink(name_z.ptr);
+    if (c.ftruncate(fd, @intCast(total_len)) != 0) return .io;
+    const mapping = mapFd(fd, total_len, c.PROT_READ | c.PROT_WRITE);
+    if (mapping == c.MAP_FAILED) return .io;
+    defer unmapAddr(mapping, total_len);
+
+    const generation = nextShmGeneration();
+    const header = shmHeaderPtr(mapping);
+    header.* = std.mem.zeroes(ShmHeader);
+    @memcpy(header.magic[0..], shm_magic);
+    header.generation = generation;
+    header.payload_len = len;
 
     out.* = std.mem.zeroes(KvSharedMemoryDescriptor);
     out.len = len;
+    out.generation = generation;
     out.name_len = name.len;
     @memcpy(out.name[0..name.len], name);
     return .ok;
@@ -394,42 +477,60 @@ fn shmCreateInternal(name: []const u8, len: usize, out: *KvSharedMemoryDescripto
 fn shmWriteInternal(desc: *const KvSharedMemoryDescriptor, offset: usize, bytes: []const u8) KvStatus {
     if (offset + bytes.len > desc.len) return .invalid_input;
     const name = shmNameFromDescriptor(desc) orelse return .invalid_input;
+    const total_len = shmTotalLen(desc.len) orelse return .invalid_input;
     const name_z = dupZ(name) orelse return .oom;
     defer std.heap.c_allocator.free(name_z);
     const fd = c.shm_open(name_z.ptr, c.O_RDWR, @as(c_uint, 0o600));
     if (fd < 0) return .io;
     defer closeFd(fd);
-    const mapping = mapFd(fd, desc.len, c.PROT_READ | c.PROT_WRITE);
+    const mapping = mapFd(fd, total_len, c.PROT_READ | c.PROT_WRITE);
     if (mapping == c.MAP_FAILED) return .io;
-    defer unmapAddr(mapping, desc.len);
-    const base: [*]u8 = @ptrCast(@alignCast(mapping));
-    @memcpy(base[offset .. offset + bytes.len], bytes);
-    if (c.msync(mapping, desc.len, c.MS_SYNC) != 0) return .io;
+    defer unmapAddr(mapping, total_len);
+    const header = shmHeaderPtr(mapping);
+    const header_status = validateShmHeader(desc, header);
+    if (header_status != .ok) return header_status;
+    const payload = shmPayloadBase(mapping);
+    @memcpy(payload[offset .. offset + bytes.len], bytes);
+    if (c.msync(mapping, total_len, c.MS_SYNC) != 0) return .io;
     return .ok;
 }
 
 fn shmReadInternal(desc: *const KvSharedMemoryDescriptor, offset: usize, bytes_len: usize, out: *KvBuffer) KvStatus {
     if (offset + bytes_len > desc.len) return .invalid_input;
     const name = shmNameFromDescriptor(desc) orelse return .invalid_input;
+    const total_len = shmTotalLen(desc.len) orelse return .invalid_input;
     const name_z = dupZ(name) orelse return .oom;
     defer std.heap.c_allocator.free(name_z);
     const fd = c.shm_open(name_z.ptr, c.O_RDONLY, @as(c_uint, 0o600));
     if (fd < 0) return .io;
     defer closeFd(fd);
-    const mapping = mapFd(fd, desc.len, c.PROT_READ);
+    const mapping = mapFd(fd, total_len, c.PROT_READ);
     if (mapping == c.MAP_FAILED) return .io;
-    defer unmapAddr(mapping, desc.len);
+    defer unmapAddr(mapping, total_len);
+    const header = shmHeaderPtr(mapping);
+    const header_status = validateShmHeader(desc, header);
+    if (header_status != .ok) return header_status;
     const buffer = std.heap.c_allocator.alloc(u8, bytes_len) catch return .oom;
-    const base: [*]u8 = @ptrCast(@alignCast(mapping));
-    @memcpy(buffer[0..bytes_len], base[offset .. offset + bytes_len]);
+    const payload = shmPayloadBase(mapping);
+    @memcpy(buffer[0..bytes_len], payload[offset .. offset + bytes_len]);
     out.* = .{ .data = buffer.ptr, .len = bytes_len };
     return .ok;
 }
 
 fn shmUnlinkInternal(desc: *const KvSharedMemoryDescriptor) KvStatus {
     const name = shmNameFromDescriptor(desc) orelse return .invalid_input;
+    const total_len = shmTotalLen(desc.len) orelse return .invalid_input;
     const name_z = dupZ(name) orelse return .oom;
     defer std.heap.c_allocator.free(name_z);
+    const fd = c.shm_open(name_z.ptr, c.O_RDONLY, @as(c_uint, 0o600));
+    if (fd < 0) return .io;
+    defer closeFd(fd);
+    const mapping = mapFd(fd, total_len, c.PROT_READ);
+    if (mapping == c.MAP_FAILED) return .io;
+    defer unmapAddr(mapping, total_len);
+    const header = shmHeaderPtr(mapping);
+    const header_status = validateShmHeader(desc, header);
+    if (header_status != .ok) return header_status;
     if (c.shm_unlink(name_z.ptr) != 0) return .io;
     return .ok;
 }

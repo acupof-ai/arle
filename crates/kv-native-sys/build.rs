@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let target = env::var("TARGET").expect("TARGET");
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".to_string());
     let src = manifest_dir.join("zig").join("src").join("kv_native.zig");
     let emit = out_dir.join("libkv_native.a");
@@ -44,6 +45,19 @@ set ZIG=/absolute/path/to/zig if it is installed outside PATH"
         status.success(),
         "zig build-lib failed for kv-native-sys with status {status}"
     );
+
+    if target.contains("apple-darwin") {
+        let ranlib_status = Command::new("ranlib")
+            .arg(&emit)
+            .status()
+            .unwrap_or_else(|err| {
+                panic!("failed to spawn ranlib while fixing kv-native-sys archive: {err}")
+            });
+        assert!(
+            ranlib_status.success(),
+            "ranlib failed for kv-native-sys with status {ranlib_status}"
+        );
+    }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=kv_native");

@@ -37,6 +37,7 @@ pub struct KvMmapDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KvSharedMemoryDescriptor {
     pub len: usize,
+    pub generation: u64,
     pub name_len: usize,
     pub name: [u8; KV_SHM_NAME_CAP],
 }
@@ -62,9 +63,9 @@ unsafe extern "C" {
         bytes_len: usize,
     ) -> c_int;
     fn kv_native_read_file(path_ptr: *const u8, path_len: usize, out: *mut KvNativeBuffer)
-    -> c_int;
+        -> c_int;
     fn kv_native_remove_file(path_ptr: *const u8, path_len: usize, ignore_not_found: bool)
-    -> c_int;
+        -> c_int;
     fn kv_native_block_path(
         root_ptr: *const u8,
         root_len: usize,
@@ -352,6 +353,7 @@ pub fn mmap_read(desc: &KvMmapDescriptor, offset: usize, len: usize) -> io::Resu
 pub fn shm_create(name: &str, len: usize) -> io::Result<KvSharedMemoryDescriptor> {
     let mut out = KvSharedMemoryDescriptor {
         len: 0,
+        generation: 0,
         name_len: 0,
         name: [0; KV_SHM_NAME_CAP],
     };
@@ -405,6 +407,10 @@ impl KvSharedMemoryDescriptor {
                 format!("kv shared memory descriptor contains invalid utf8: {err}"),
             )
         })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -553,6 +559,33 @@ mod tests {
         shm_write(&desc, 8, b"shared").unwrap();
         assert_eq!(shm_read(&desc, 8, 6).unwrap(), b"shared");
         assert_eq!(desc.name().unwrap(), name);
+        assert_ne!(desc.generation(), 0);
         shm_unlink(&desc).unwrap();
+    }
+
+    #[test]
+    fn shm_stale_descriptor_is_rejected_after_recreate() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("/akv{:x}", nonce ^ u128::from(std::process::id()));
+
+        let stale = shm_create(&name, 64).unwrap();
+        shm_write(&stale, 0, b"alpha").unwrap();
+        shm_unlink(&stale).unwrap();
+
+        let fresh = shm_create(&name, 64).unwrap();
+        assert_ne!(stale.generation(), fresh.generation());
+        shm_write(&fresh, 0, b"bravo").unwrap();
+
+        let stale_read = shm_read(&stale, 0, 5).unwrap_err();
+        assert_eq!(stale_read.kind(), io::ErrorKind::InvalidData);
+
+        let stale_unlink = shm_unlink(&stale).unwrap_err();
+        assert_eq!(stale_unlink.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(shm_read(&fresh, 0, 5).unwrap(), b"bravo");
+        shm_unlink(&fresh).unwrap();
     }
 }
