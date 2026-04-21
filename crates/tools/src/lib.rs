@@ -448,6 +448,10 @@ impl BuiltinToolPolicyHooks {
         draft: &str,
         tools: &[ToolDefinition],
     ) -> Option<ParsedAssistantResponse> {
+        if draft.contains("<tools>") || draft.contains("</tools>") {
+            return None;
+        }
+
         if tool_available(tools, "python")
             && let Some(code) = extract_python_code(draft)
         {
@@ -999,5 +1003,20 @@ mod tests {
             tool_call.tool_calls[0].arguments,
             json!({ "code": "print(7 * 8)" })
         );
+    }
+
+    #[test]
+    fn builtin_policy_ignores_internal_tool_markup_in_draft_recovery() {
+        let tools = builtin_tools()
+            .into_iter()
+            .map(|tool| tool.to_definition())
+            .collect::<Vec<_>>();
+
+        let parsed = BuiltinToolPolicyHooks.recover_tool_calls_from_draft(
+            "I have these tools:\n<tools>\n{\"name\":\"shell\"}\n</tools>\nUse shell if needed.",
+            &tools,
+        );
+
+        assert!(parsed.is_none());
     }
 }

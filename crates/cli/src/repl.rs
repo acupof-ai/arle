@@ -83,9 +83,7 @@ enum ReplCommand {
 }
 
 /// Per-session rolling accumulators for `/stats` enrichment. Populated by
-/// streaming chat turns. Agent-mode turns do not contribute tokens here
-/// because agent-mode uses a different code path that doesn't surface
-/// streaming usage deltas to the REPL.
+/// both streaming chat turns and agent-mode turns.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct SessionStats {
@@ -294,19 +292,30 @@ fn print_repl_banner(
     temperature: f32,
     mode: ReplMode,
 ) {
-    println!();
-    println!("=== agent-infer REPL ===");
-    println!("Model: {}", engine.model_id());
-    println!("Backend: {}", backend_name);
-    println!("Mode: {} (use /chat or /agent to switch)", mode.label());
-    println!(
-        "Tools: {}",
+    let tools_label = if tools.is_empty() {
+        "none".to_string()
+    } else if mode == ReplMode::Chat {
+        format!(
+            "{} (/agent mode)",
+            tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
         tools
             .iter()
             .map(|t| t.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
-    );
+    };
+    println!();
+    println!("=== agent-infer REPL ===");
+    println!("Model: {}", engine.model_id());
+    println!("Backend: {}", backend_name);
+    println!("Mode: {} (use /chat or /agent to switch)", mode.label());
+    println!("Tools: {tools_label}");
     println!(
         "Max turns: {}, Max tokens: {}, Temperature: {}",
         max_turns, max_tokens, temperature
@@ -645,6 +654,7 @@ fn handle_repl_input(
                 engine,
                 tools,
                 session,
+                session_stats,
                 input,
                 max_turns,
                 max_tokens,
@@ -928,6 +938,7 @@ fn run_agent_turn(
     engine: &mut dyn InferenceEngine,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
+    session_stats: &mut SessionStats,
     input: &str,
     max_turns: usize,
     max_tokens: usize,
@@ -937,11 +948,13 @@ fn run_agent_turn(
     let start = Instant::now();
     let color_on = io::stdout().is_terminal();
     let render_state = RefCell::new((false, false, false));
+    let mut tps_meter = crate::tps::TpsMeter::new();
     let mut on_text_chunk = |chunk: &str| {
         if chunk.is_empty() {
             return;
         }
         let mut state = render_state.borrow_mut();
+        tps_meter.hide_before_chunk();
         if color_on && !state.0 {
             print!("\x1b[1;34m");
             let _ = io::stdout().flush();
@@ -949,6 +962,7 @@ fn run_agent_turn(
         }
         print!("{chunk}");
         let _ = io::stdout().flush();
+        tps_meter.record_chunk(chunk.len());
         state.1 = true;
         state.2 = true;
     };
@@ -997,9 +1011,9 @@ fn run_agent_turn(
             if result.max_turns_reached {
                 println!("\x1b[2m(agent stopped after reaching max turns)\x1b[0m");
             }
-            println!();
             let elapsed = start.elapsed();
-            println!("\x1b[2m({:.1}s)\x1b[0m", elapsed.as_secs_f64());
+            tps_meter.print_final(Some(result.completion_tokens));
+            session_stats.record_turn(result.prompt_tokens, result.completion_tokens, elapsed);
             println!();
         }
         Ok(None) => {
@@ -1507,7 +1521,7 @@ fn print_repl_help() {
     println!("  /chat            Switch to streaming chat mode (default)");
     println!("  /agent           Switch to tool-calling agent mode");
     println!("  /reset, /clear   Clear conversation history (both modes)");
-    println!("  /tools           Show available tools");
+    println!("  /tools           Show available agent-mode tools");
     println!("  /model           Show active model, backend, and current mode");
     println!("  /models [N]      List local models; /models <N> shows switch hint");
     println!("  /stats           Show session token/throughput rollup");
@@ -1525,7 +1539,7 @@ fn print_repl_help() {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_tools_help(tools: &[ToolDefinition]) {
-    println!("Tools:");
+    println!("Agent tools (available in /agent mode):");
     for tool in tools {
         println!("  {}: {}", tool.name, tool.description);
     }

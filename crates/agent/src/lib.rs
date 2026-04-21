@@ -106,6 +106,8 @@ pub enum AgentTraceEvent {
 pub struct AgentTurnResult {
     pub text: String,
     pub tool_calls_executed: usize,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub max_turns_reached: bool,
     pub trace_events: Vec<AgentTraceEvent>,
 }
@@ -293,6 +295,8 @@ impl AgentSession {
         self.messages.push(Message::user(user_input));
 
         let mut tool_calls_executed = 0usize;
+        let mut prompt_tokens = 0u64;
+        let mut completion_tokens = 0u64;
         let mut last_tool_name = None::<String>;
         let mut last_tool_scalar_result = None::<String>;
         let mut trace_events = Vec::new();
@@ -354,6 +358,9 @@ impl AgentSession {
                 output.text.len(),
                 output.finish_reason
             );
+            prompt_tokens = prompt_tokens.saturating_add(output.usage.prompt_tokens as u64);
+            completion_tokens =
+                completion_tokens.saturating_add(output.usage.completion_tokens as u64);
 
             let mut parsed = parse_tool_calls(&output.text);
             if parsed.tool_calls.is_empty() && tool_calls_executed == 0 && !tools.is_empty() {
@@ -394,6 +401,8 @@ impl AgentSession {
                 return Ok(Some(AgentTurnResult {
                     text: content,
                     tool_calls_executed,
+                    prompt_tokens,
+                    completion_tokens,
                     max_turns_reached: false,
                     trace_events,
                 }));
@@ -425,6 +434,8 @@ impl AgentSession {
                 return Ok(Some(AgentTurnResult {
                     text,
                     tool_calls_executed,
+                    prompt_tokens,
+                    completion_tokens,
                     max_turns_reached: false,
                     trace_events,
                 }));
@@ -434,6 +445,8 @@ impl AgentSession {
         Ok(Some(AgentTurnResult {
             text: "(max turns reached - agent stopped)".to_string(),
             tool_calls_executed,
+            prompt_tokens,
+            completion_tokens,
             max_turns_reached: true,
             trace_events,
         }))
@@ -1237,6 +1250,8 @@ mod tests {
             result.text,
             "I listed the current directory contents above."
         );
+        assert_eq!(result.prompt_tokens, 2);
+        assert_eq!(result.completion_tokens, 2);
         assert_eq!(engine.prompts.len(), 2);
     }
 
