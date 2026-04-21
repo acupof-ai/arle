@@ -30,8 +30,8 @@ pub enum MetalRequestPriority {
 /// Scheduler configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalSchedulerConfig {
-    /// Maximum number of requests admitted into the active set at once.
-    pub max_active_requests: usize,
+    /// Maximum number of requests admitted into the running set at once.
+    pub max_running_requests: usize,
     /// Maximum tokens processed in one prefill chunk.
     pub prefill_chunk_size: usize,
     /// Prefill chunk cap when decode work is already active.
@@ -47,16 +47,16 @@ pub struct MetalSchedulerConfig {
     /// Flag flipped to false 2026-04-19 after bench-proving concurrent
     /// DFlash beats the legacy downgrade at c≥2 (see
     /// `docs/experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md`).
-    /// Admission was flipped in parallel at
-    /// `runtime::admit_request` — all Qwen3.5 requests now acquire DFlash
-    /// state regardless of `active` occupancy.
+    /// Activation was flipped in parallel inside the scheduler runtime —
+    /// all Qwen3.5 requests now acquire DFlash state regardless of current
+    /// running-set occupancy.
     pub metal_dflash_concurrency_off: bool,
 }
 
 impl Default for MetalSchedulerConfig {
     fn default() -> Self {
         Self {
-            max_active_requests: 4,
+            max_running_requests: 4,
             prefill_chunk_size: 512,
             decode_active_prefill_cap: 128,
             max_waiting_requests: 256,
@@ -68,9 +68,9 @@ impl Default for MetalSchedulerConfig {
 impl MetalSchedulerConfig {
     /// Validate runtime configuration.
     pub fn validate(&self) -> Result<(), MetalSchedulerError> {
-        if self.max_active_requests == 0 {
+        if self.max_running_requests == 0 {
             return Err(MetalSchedulerError::InvalidConfig(
-                "max_active_requests must be >= 1".to_string(),
+                "max_running_requests must be >= 1".to_string(),
             ));
         }
         if self.prefill_chunk_size == 0 {
@@ -322,8 +322,8 @@ impl MetalScheduler {
         self.waiting.len()
     }
 
-    /// Number of active requests, including prefilling and decoding requests.
-    pub fn active_len(&self) -> usize {
+    /// Number of running requests, including prefilling and decoding requests.
+    pub fn running_len(&self) -> usize {
         self.requests
             .values()
             .filter(|state| state.admitted)
@@ -389,16 +389,17 @@ impl MetalScheduler {
         &mut self,
         runtime_states: &[MetalRuntimeRequestState],
     ) -> Option<MetalPrefillChunk> {
+        let decode_count = Self::count_decode_runtime(runtime_states);
         let (req_id, newly_admitted) =
             if let Some(req_id) = self.find_prefilling_request(runtime_states) {
                 (req_id, false)
-            } else if self.active_len() < self.config.max_active_requests {
+            } else if self.running_len() < self.config.max_running_requests {
                 (self.admit_next_waiting_request()?, true)
             } else {
                 return None;
             };
 
-        let chunk_cap = self.prefill_chunk_budget(Self::count_decode_runtime(runtime_states));
+        let chunk_cap = self.prefill_chunk_budget(decode_count);
 
         let (prompt_len, prompt_start, prompt_end, input_tokens, emit_prefill_started) = {
             let state = self.requests.get_mut(&req_id)?;
@@ -576,12 +577,12 @@ mod tests {
     }
 
     fn make_scheduler(
-        max_active_requests: usize,
+        max_running_requests: usize,
         chunk: usize,
         decode_cap: usize,
     ) -> MetalScheduler {
         MetalScheduler::new(MetalSchedulerConfig {
-            max_active_requests,
+            max_running_requests,
             prefill_chunk_size: chunk,
             decode_active_prefill_cap: decode_cap,
             max_waiting_requests: 16,
@@ -591,14 +592,14 @@ mod tests {
     }
 
     fn make_scheduler_with_event_sink(
-        max_active_requests: usize,
+        max_running_requests: usize,
         chunk: usize,
         decode_cap: usize,
         event_sink: Arc<dyn EventSink>,
     ) -> MetalScheduler {
         MetalScheduler::with_event_sink(
             MetalSchedulerConfig {
-                max_active_requests,
+                max_running_requests,
                 prefill_chunk_size: chunk,
                 decode_active_prefill_cap: decode_cap,
                 max_waiting_requests: 16,
@@ -710,7 +711,7 @@ mod tests {
         }
 
         assert!(sched.finish_request(req0, Some(InferenceMode::Decode)));
-        assert_eq!(sched.active_len(), 0);
+        assert_eq!(sched.running_len(), 0);
         assert_eq!(sched.waiting_len(), 1);
 
         match sched.step(&[]) {
