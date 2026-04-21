@@ -46,7 +46,57 @@ impl<M: ModelForward> Scheduler<M> {
         let prompt_len = prompt_tokens.len();
         let raw_prefix_len = req.reusable_prefix_len;
         let cached_prompt_len = req.reusable_cached_prompt_len;
+        let attached_prefix_blocks = req.attached_prefix_blocks.clone();
         let si = slot_idx;
+
+        if self.model.prefill_uses_paged_pool() && !attached_prefix_blocks.is_empty() {
+            let attach_prefix_len = if is_full_prompt_reuse_hit(prompt_len, raw_prefix_len) {
+                raw_prefix_len.saturating_sub(1)
+            } else {
+                raw_prefix_len
+            };
+            let effective = prompt_tokens[attach_prefix_len..].to_vec();
+
+            if let Err(e) = self.states[si].reset() {
+                error!(
+                    "Request {}: reset before paged prefix attach failed: {}",
+                    req_id, e
+                );
+                self.finish_slot(slot_idx);
+                return;
+            }
+            self.slot_materialized_prompt_lens[si] = 0;
+
+            if let Err(e) =
+                self.attach_gpu_prefix_blocks(si, &attached_prefix_blocks, attach_prefix_len)
+            {
+                error!(
+                    "Request {}: paged prefix attach failed for {} tokens: {}",
+                    req_id, attach_prefix_len, e
+                );
+                self.finish_slot(slot_idx);
+                return;
+            }
+
+            info!(
+                "Request {}: paged prefix ATTACH {}/{} tokens",
+                req_id, attach_prefix_len, prompt_len
+            );
+            info!(
+                "Request {}: chunked prefill starting ({} effective tokens, chunk_size={})",
+                req_id,
+                effective.len(),
+                default_chunk_size
+            );
+            if let Some(req) = self.request_mut(slot_idx) {
+                req.phase = Phase::Prefilling {
+                    materialized_prefix_len: attach_prefix_len,
+                    effective_tokens: effective,
+                    progress: 0,
+                };
+            }
+            return;
+        }
 
         // Hybrid models (e.g. Qwen3.5) cannot truncate recurrent state to an
         // arbitrary prefix length. Downgrade any partial hit (radix match
@@ -233,6 +283,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         if let Some(req) = self.request_mut(slot_idx) {
             req.phase = Phase::Prefilling {
+                materialized_prefix_len: pool_prefix_len,
                 effective_tokens: effective,
                 progress: 0,
             };
@@ -255,6 +306,7 @@ impl<M: ModelForward> Scheduler<M> {
         // borrow before calling `&mut self` methods (alloc_pool_tokens_with_retry).
         let (chunk_tokens, progress_val, total) = match &req.phase {
             Phase::Prefilling {
+                materialized_prefix_len: _,
                 effective_tokens,
                 progress,
             } => {

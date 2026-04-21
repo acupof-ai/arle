@@ -13,8 +13,8 @@
 //! | Tier | Medium             | Latency class | Status in this module |
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
-//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via `HostPinnedPool` for demotion / spill buffering; no live readmission path yet |
-//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and session restore plumbing |
+//! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool` for demotion / spill buffering; no live T1→T0 readmission path yet |
+//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and session restore plumbing; no live T2→T0 readmission path yet |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
@@ -30,15 +30,14 @@
 //! # Current status (what this module actually contains as of 2026-04-15)
 //!
 //! **Partially live on the CUDA lane.** The CUDA scheduler now owns one
-//! multilayer KV spill/persist path:
+//! unified local KV path:
 //! - radix metadata in `prefix_cache`
-//! - T0 page ownership in `paged_kv`
-//! - T1 demotion buffering in `HostPinnedPool`
+//! - T0 page ownership plus direct GPU prefix attachment / decode-time COW in `paged_kv`
+//! - T1 demotion buffering in Zig-backed `HostPinnedPool`
 //! - T1→T2 spill and disk persistence in `Coordinator` + `DiskStore`
 //!
-//! Live staged readmission was removed from the scheduler hot path until the
-//! runtime grows a real attach/ownership model. `KVTransport` and remote tiers
-//! remain skeletal.
+//! Direct GPU prefix attachment is live for paged-prefill models. T1/T2 staged
+//! readmission is still absent; `KVTransport` and remote tiers remain skeletal.
 //!
 //! The former `directory::TierDirectory` / `BlockDescriptor` holding
 //! area was removed in M1 per project doc §5.2. Block metadata that
@@ -68,9 +67,10 @@
 //!    byte-moving work and emits completion events.
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
-//!    registered memory regions to be allocation-stable. The planned
-//!    T1 `HostPinnedPool` must be allocated once at engine init and
-//!    never reallocated; see project doc §4.2 invariant 5 and §8
+//!    registered memory regions to be allocation-stable. The T1
+//!    `HostPinnedPool` is backed by one Zig-managed arena that is
+//!    allocated once at engine init and never reallocated; see project doc
+//!    §4.2 invariant 5 and §8
 //!    pitfall 2.
 //!
 //! 5. **No cuda dependencies here.** This skeleton is always-on — not

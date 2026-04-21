@@ -42,6 +42,18 @@ pub struct KvSharedMemoryDescriptor {
     pub name: [u8; KV_SHM_NAME_CAP],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvHostArenaRegion {
+    pub offset: u64,
+    pub len: usize,
+}
+
+#[repr(C)]
+pub struct KvHostArenaHandle {
+    _private: [u8; 0],
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KvWalRecord {
     pub kind: u8,
@@ -63,9 +75,9 @@ unsafe extern "C" {
         bytes_len: usize,
     ) -> c_int;
     fn kv_native_read_file(path_ptr: *const u8, path_len: usize, out: *mut KvNativeBuffer)
-        -> c_int;
+    -> c_int;
     fn kv_native_remove_file(path_ptr: *const u8, path_len: usize, ignore_not_found: bool)
-        -> c_int;
+    -> c_int;
     fn kv_native_block_path(
         root_ptr: *const u8,
         root_len: usize,
@@ -146,6 +158,26 @@ unsafe extern "C" {
         out: *mut KvNativeBuffer,
     ) -> c_int;
     fn kv_native_shm_unlink(desc: *const KvSharedMemoryDescriptor) -> c_int;
+    fn kv_native_host_arena_create(
+        capacity_bytes: usize,
+        out_handle: *mut *mut KvHostArenaHandle,
+        out_base_ptr: *mut *mut u8,
+    ) -> c_int;
+    fn kv_native_host_arena_destroy(handle: *mut KvHostArenaHandle) -> c_int;
+    fn kv_native_host_arena_reserved_bytes(
+        handle: *const KvHostArenaHandle,
+        out_reserved_bytes: *mut usize,
+    ) -> c_int;
+    fn kv_native_host_arena_reserve(
+        handle: *mut KvHostArenaHandle,
+        len: usize,
+        out_region: *mut KvHostArenaRegion,
+    ) -> c_int;
+    fn kv_native_host_arena_release(
+        handle: *mut KvHostArenaHandle,
+        region: KvHostArenaRegion,
+    ) -> c_int;
+    fn kv_native_host_arena_reset(handle: *mut KvHostArenaHandle) -> c_int;
     fn kv_native_buffer_free(data: *mut u8);
 }
 
@@ -379,6 +411,91 @@ pub fn shm_unlink(desc: &KvSharedMemoryDescriptor) -> io::Result<()> {
     status_to_result(status, "kv_native_shm_unlink")
 }
 
+pub fn host_arena_create(capacity_bytes: usize) -> io::Result<(*mut KvHostArenaHandle, *mut u8)> {
+    let mut handle = std::ptr::null_mut();
+    let mut base_ptr = std::ptr::null_mut();
+    let status = unsafe { kv_native_host_arena_create(capacity_bytes, &mut handle, &mut base_ptr) };
+    status_to_result(status, "kv_native_host_arena_create")?;
+    if handle.is_null() || base_ptr.is_null() {
+        return Err(io::Error::other(
+            "kv_native_host_arena_create: native layer returned null handle/base_ptr",
+        ));
+    }
+    Ok((handle, base_ptr))
+}
+
+/// Destroy a host arena created by [`host_arena_create`].
+///
+/// # Safety
+/// The caller must ensure `handle` came from [`host_arena_create`], is still
+/// live, and is not used again after this call returns.
+pub unsafe fn host_arena_destroy(handle: *mut KvHostArenaHandle) -> io::Result<()> {
+    if handle.is_null() {
+        return Ok(());
+    }
+    let status = unsafe { kv_native_host_arena_destroy(handle) };
+    status_to_result(status, "kv_native_host_arena_destroy")
+}
+
+/// Query the number of bytes currently reserved inside a live host arena.
+///
+/// # Safety
+/// The caller must ensure `handle` points to a live arena created by
+/// [`host_arena_create`] and remains valid for the duration of this call.
+pub unsafe fn host_arena_reserved_bytes(handle: *const KvHostArenaHandle) -> io::Result<usize> {
+    let mut reserved_bytes = 0usize;
+    let status = unsafe { kv_native_host_arena_reserved_bytes(handle, &mut reserved_bytes) };
+    status_to_result(status, "kv_native_host_arena_reserved_bytes")?;
+    Ok(reserved_bytes)
+}
+
+/// Reserve a contiguous region from a live host arena.
+///
+/// # Safety
+/// The caller must ensure `handle` points to a live arena created by
+/// [`host_arena_create`] and that any returned region is later released back to
+/// the same arena via [`host_arena_release`] or invalidated by
+/// [`host_arena_reset`] / [`host_arena_destroy`].
+pub unsafe fn host_arena_reserve(
+    handle: *mut KvHostArenaHandle,
+    len: usize,
+) -> io::Result<Option<KvHostArenaRegion>> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut region = KvHostArenaRegion { offset: 0, len: 0 };
+    let status = unsafe { kv_native_host_arena_reserve(handle, len, &mut region) };
+    match status_from_code(status) {
+        Some(KvNativeStatus::Ok) => Ok(Some(region)),
+        Some(KvNativeStatus::Oom) => Ok(None),
+        _ => Err(status_to_error(status, "kv_native_host_arena_reserve")),
+    }
+}
+
+/// Release a previously reserved region back to the same host arena.
+///
+/// # Safety
+/// The caller must ensure `handle` points to the live arena that originally
+/// produced `region`, and that `region` is not released more than once.
+pub unsafe fn host_arena_release(
+    handle: *mut KvHostArenaHandle,
+    region: KvHostArenaRegion,
+) -> io::Result<()> {
+    let status = unsafe { kv_native_host_arena_release(handle, region) };
+    status_to_result(status, "kv_native_host_arena_release")
+}
+
+/// Reset a live host arena to its empty state.
+///
+/// # Safety
+/// The caller must ensure `handle` points to a live arena created by
+/// [`host_arena_create`] and that no outstanding borrowers continue using
+/// regions after the reset.
+pub unsafe fn host_arena_reset(handle: *mut KvHostArenaHandle) -> io::Result<()> {
+    let status = unsafe { kv_native_host_arena_reset(handle) };
+    status_to_result(status, "kv_native_host_arena_reset")
+}
+
 impl KvMmapDescriptor {
     pub fn path_buf(&self) -> io::Result<PathBuf> {
         if self.path_len > self.path.len() {
@@ -587,5 +704,45 @@ mod tests {
 
         assert_eq!(shm_read(&fresh, 0, 5).unwrap(), b"bravo");
         shm_unlink(&fresh).unwrap();
+    }
+
+    #[test]
+    fn host_arena_reuses_released_regions() {
+        let (handle, base_ptr) = host_arena_create(256).unwrap();
+        assert!(!handle.is_null());
+        assert!(!base_ptr.is_null());
+
+        let a = unsafe { host_arena_reserve(handle, 64) }.unwrap().unwrap();
+        let b = unsafe { host_arena_reserve(handle, 32) }.unwrap().unwrap();
+        assert_eq!(a.offset, 0);
+        assert_eq!(b.offset, 64);
+        assert_eq!(
+            unsafe { host_arena_reserved_bytes(handle.cast_const()) }.unwrap(),
+            96
+        );
+
+        unsafe {
+            host_arena_release(handle, a).unwrap();
+        }
+        let c = unsafe { host_arena_reserve(handle, 64) }.unwrap().unwrap();
+        assert_eq!(c.offset, 0);
+
+        unsafe {
+            host_arena_destroy(handle).unwrap();
+        }
+    }
+
+    #[test]
+    fn host_arena_reset_rewinds_allocator() {
+        let (handle, _base_ptr) = host_arena_create(128).unwrap();
+        let _ = unsafe { host_arena_reserve(handle, 96) }.unwrap().unwrap();
+        unsafe {
+            host_arena_reset(handle).unwrap();
+        }
+        let region = unsafe { host_arena_reserve(handle, 96) }.unwrap().unwrap();
+        assert_eq!(region.offset, 0);
+        unsafe {
+            host_arena_destroy(handle).unwrap();
+        }
     }
 }

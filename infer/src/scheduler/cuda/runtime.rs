@@ -255,6 +255,10 @@ impl<M: ModelForward> Scheduler<M> {
                 .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
                 .filter_map(|block| block.block_id)
                 .collect();
+            let direct_gpu_attach = self.model.prefill_uses_paged_pool()
+                && !lookup.recompute_advised
+                && !gpu_ready_prefix_blocks.is_empty()
+                && ready_on_gpu;
             let reusable_gpu_prefix = best_reusable_slot_for_radix_hit(
                 &gpu_ready_prefix_blocks,
                 &free_slots,
@@ -262,19 +266,37 @@ impl<M: ModelForward> Scheduler<M> {
                 &self.slot_materialized_prompt_lens,
                 self.prefix_cache.block_size(),
             );
-            let reusable = if ready_on_gpu && !lookup.recompute_advised {
+            let reusable = if direct_gpu_attach {
+                None
+            } else if ready_on_gpu && !lookup.recompute_advised {
                 reusable_gpu_prefix
             } else {
                 None
             };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 reusable.unwrap_or((free_slots[0], 0, 0));
-            self.prefix_cache.release(&radix_blocks);
+            let attached_prefix_blocks = if direct_gpu_attach {
+                gpu_ready_prefix_blocks.clone()
+            } else {
+                Vec::new()
+            };
+            if attached_prefix_blocks.is_empty() {
+                self.prefix_cache.release(&radix_blocks);
+            }
 
             let id = self.next_id;
             self.next_id += 1;
 
-            if reusable_prefix_len > 0 {
+            if direct_gpu_attach {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, radix_gpu_attach={}, queue={})",
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    lookup.matched_len,
+                    self.waiting.len()
+                );
+            } else if reusable_prefix_len > 0 {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
                     id,
@@ -335,14 +357,20 @@ impl<M: ModelForward> Scheduler<M> {
                 decoded_token_count: 0,
                 sent_len: 0,
                 phase: Phase::Prefilling {
+                    materialized_prefix_len: 0,
                     effective_tokens: Vec::new(),
                     progress: 0,
                 },
                 cacheable_prompt_len: 0,
                 prefix_byte_len: 0,
                 latest_logprob: None,
-                reusable_prefix_len,
+                reusable_prefix_len: if direct_gpu_attach {
+                    lookup.matched_len
+                } else {
+                    reusable_prefix_len
+                },
                 reusable_cached_prompt_len,
+                attached_prefix_blocks,
             });
             if incoming.max_tokens == 0 {
                 self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
@@ -378,6 +406,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .take()
                     .expect("finished slot must hold a request");
                 let gen_tokens = req.generated_tokens.len() as u64;
+                self.release_attached_prefix_blocks(&req.attached_prefix_blocks);
                 self.dequeue_prefill(slot_idx);
                 self.dequeue_running(slot_idx);
                 self.clear_slot_prefix_ownership(slot_idx);

@@ -55,10 +55,12 @@ works with any backend. Load before editing any scheduler internals.
    the current sglang-alignment heuristic: retract the least-progressed request
    first, tie-breaking toward longer prompts. If you change it, update
    `docs/experience/errors/2026-04-13-batched-decode-high-concurrency.md`.
-8. **Slot reuse is single-slot-only.** `block_owner_slots` tracks which free
-   slot can reuse a radix block's contiguous state. Cross-slot page aliasing
-   is intentionally unsupported — M2b closed that door deliberately
-   (`docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md`).
+8. **There are now two prefix reuse modes.** `block_owner_slots` still tracks
+   the non-paged same-slot contiguous-state fallback, but paged-prefill models
+   may also directly attach radix-backed GPU pages to a fresh slot and rely on
+   `paged_kv` tail-page COW before append. Keep those two paths explicit: the
+   contiguous fallback is model-compatibility glue, the paged attach path is
+   the canonical shared-page flow.
 9. **`assign_slots()` owns waiting-queue normalization.** Tokenization,
    prompt-length rejection/clamping, cancellation skip, and priority ordering
    all happen before a request becomes an `ActiveRequest`. Do not recreate a

@@ -11,7 +11,7 @@
 //! rewritten around paged layout.
 
 use anyhow::{Result, anyhow};
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use log::info;
 
 use super::ffi;
@@ -69,21 +69,21 @@ pub struct TokenKVPool {
     /// Lets decode metadata distinguish "same slot index, different request".
     slot_epochs: Vec<u64>,
 
-    /// Per-physical-page external reference count for the M2 dual-residency
-    /// path (tiered KV cache project, 2026-04-15 revision §0.5 M2).
+    /// Per-physical-page slot attachment count.
     ///
-    /// A page whose `page_ref_count[p] > 0` is **pinned** outside the slot
-    /// that originally produced it — today only by
-    /// `crate::prefix_cache::RadixCache` on the scheduler thread, tomorrow
-    /// by host / disk tier transports as well. [`free_slot`] honours the
-    /// refcount: pages that still have external refs transition from
-    /// "owned by slot s" to "limbo" (not in any slot, not in the free
-    /// list, still physically live in HBM). [`release_pages`] reclaims
-    /// limbo pages back onto the free list when their refcount hits
-    /// zero. [`retain_pages`] is the corresponding bump.
+    /// `page_attach_count[p]` is how many live slots currently include
+    /// page `p` in their page table. New allocations start at 1, direct
+    /// prefix attachment bumps the count, and `free_slot` drops one attachment
+    /// for every page in the released slot.
+    page_attach_count: Vec<u32>,
+
+    /// Per-physical-page non-slot retain count.
     ///
-    /// The vector is sized to `max_total_pages`, so indexing by a
-    /// physical page id is always in-bounds.
+    /// This is the radix / detached-page pin count: pages with
+    /// `page_ref_count[p] > 0` must not be reclaimed even when no live slot
+    /// currently attaches them. `retain_pages` / `release_pages` manipulate
+    /// this counter; `free_slot` only returns a page to the free list once
+    /// both `page_attach_count[p] == 0` and `page_ref_count[p] == 0`.
     page_ref_count: Vec<u32>,
 
     // Config
@@ -347,6 +347,7 @@ impl TokenKVPool {
         let page_indices = vec![Vec::new(); num_slots];
         let seq_lens = vec![0; num_slots];
         let slot_epochs = vec![0; num_slots];
+        let page_attach_count = vec![0_u32; max_total_pages];
         let page_ref_count = vec![0_u32; max_total_pages];
 
         // Quantized split-KV attention workspace.
@@ -404,6 +405,7 @@ impl TokenKVPool {
             page_indices,
             seq_lens,
             slot_epochs,
+            page_attach_count,
             page_ref_count,
             format,
             dtype,
@@ -452,6 +454,7 @@ impl TokenKVPool {
                 .free_pages
                 .pop()
                 .expect("invariant: free_pages.len() >= new_page_count checked above");
+            self.page_attach_count[idx as usize] = 1;
             new_pages.push(idx);
         }
         self.page_indices[slot].extend_from_slice(&new_pages);
@@ -481,9 +484,49 @@ impl TokenKVPool {
                 .free_pages
                 .pop()
                 .expect("invariant: free_pages.len() >= count checked above");
+            self.page_ref_count[idx as usize] = 1;
             new_pages.push(idx);
         }
         Ok(new_pages)
+    }
+
+    /// Attach already-live pages to an empty slot.
+    ///
+    /// Used by the CUDA scheduler's GPU-prefix admission path: the radix owns
+    /// the retained pages, and a fresh slot borrows them as its prefix KV
+    /// table before suffix prefill / decode appends new tokens.
+    pub fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
+        if !self.page_indices[slot].is_empty() || self.seq_lens[slot] != 0 {
+            return Err(anyhow!(
+                "TokenKVPool::attach_pages requires an empty slot (slot={slot})"
+            ));
+        }
+        if token_count > pages.len().saturating_mul(self.page_size) {
+            return Err(anyhow!(
+                "TokenKVPool::attach_pages token_count={} exceeds page capacity={}",
+                token_count,
+                pages.len().saturating_mul(self.page_size)
+            ));
+        }
+
+        for &page in pages {
+            let idx = page as usize;
+            if idx >= self.max_total_pages {
+                return Err(anyhow!(
+                    "TokenKVPool::attach_pages page index out of bounds: {page}"
+                ));
+            }
+            if self.page_attach_count[idx] == 0 && self.page_ref_count[idx] == 0 {
+                return Err(anyhow!(
+                    "TokenKVPool::attach_pages page {page} is not live in any tier"
+                ));
+            }
+            self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
+        }
+
+        self.page_indices[slot].extend_from_slice(pages);
+        self.seq_lens[slot] = token_count;
+        Ok(())
     }
 
     pub fn copy_pages_to_host(&self, ctx: &DeviceContext, pages: &[u32]) -> Result<Vec<u8>> {
@@ -684,6 +727,153 @@ impl TokenKVPool {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn copy_page_device_to_device(
+        &mut self,
+        ctx: &DeviceContext,
+        src_page: u32,
+        dst_page: u32,
+    ) -> Result<()> {
+        fn copy_same_buffer_region<T>(
+            ctx: &DeviceContext,
+            buffer: &mut CudaSlice<T>,
+            src_elem_start: usize,
+            dst_elem_start: usize,
+            elem_count: usize,
+            label: &str,
+        ) -> Result<()> {
+            use cudarc::driver::sys::{cuMemcpyDtoDAsync_v2, cudaError_enum::CUDA_SUCCESS};
+
+            let (base_ptr, _guard) = buffer.device_ptr_mut(&ctx.stream);
+            let src_ptr = unsafe { (base_ptr as *mut T).add(src_elem_start) } as u64;
+            let dst_ptr = unsafe { (base_ptr as *mut T).add(dst_elem_start) } as u64;
+            let bytes = elem_count * std::mem::size_of::<T>();
+            let result = unsafe { cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, bytes, ctx.stream.cu_stream()) };
+            if result != CUDA_SUCCESS {
+                return Err(anyhow!("{label} failed: {result:?}"));
+            }
+            Ok(())
+        }
+
+        let token_bytes = self.page_size * self.kv_dim * self.format.bytes_per_element();
+        let scale_len = self.page_size * self.num_kv_heads;
+        let src_data_start = src_page as usize * token_bytes;
+        let dst_data_start = dst_page as usize * token_bytes;
+        let src_scale_start = src_page as usize * scale_len;
+        let dst_scale_start = dst_page as usize * scale_len;
+
+        for layer in 0..self.num_layers {
+            copy_same_buffer_region(
+                ctx,
+                &mut self.k_data[layer],
+                src_data_start,
+                dst_data_start,
+                token_bytes,
+                "paged_kv copy K page dtod",
+            )?;
+            copy_same_buffer_region(
+                ctx,
+                &mut self.v_data[layer],
+                src_data_start,
+                dst_data_start,
+                token_bytes,
+                "paged_kv copy V page dtod",
+            )?;
+
+            if self.format.has_scales() {
+                copy_same_buffer_region(
+                    ctx,
+                    &mut self.k_scales[layer],
+                    src_scale_start,
+                    dst_scale_start,
+                    scale_len,
+                    "paged_kv copy K scales dtod",
+                )?;
+                copy_same_buffer_region(
+                    ctx,
+                    &mut self.v_scales[layer],
+                    src_scale_start,
+                    dst_scale_start,
+                    scale_len,
+                    "paged_kv copy V scales dtod",
+                )?;
+            }
+
+            if self.format.has_norms() {
+                copy_same_buffer_region(
+                    ctx,
+                    &mut self.k_norms[layer],
+                    src_scale_start,
+                    dst_scale_start,
+                    scale_len,
+                    "paged_kv copy K norms dtod",
+                )?;
+                copy_same_buffer_region(
+                    ctx,
+                    &mut self.v_norms[layer],
+                    src_scale_start,
+                    dst_scale_start,
+                    scale_len,
+                    "paged_kv copy V norms dtod",
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clone the partially-filled tail page when the current slot would
+    /// otherwise append into a shared prefix page.
+    ///
+    /// Returns `true` only when a copy-on-write clone was performed.
+    pub fn cow_tail_page_for_append(&mut self, ctx: &DeviceContext, slot: usize) -> Result<bool> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = ctx;
+            let _ = slot;
+            return Ok(false);
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let seq_len = self.seq_lens[slot];
+            if seq_len == 0 || seq_len % self.page_size == 0 {
+                return Ok(false);
+            }
+
+            let Some(last_page) = self.page_indices[slot].last().copied() else {
+                return Ok(false);
+            };
+            let last_idx = last_page as usize;
+            let shared = self.page_ref_count[last_idx] > 0 || self.page_attach_count[last_idx] > 1;
+            if !shared {
+                return Ok(false);
+            }
+
+            let new_page = self.free_pages.pop().ok_or_else(|| {
+                anyhow!("TokenKVPool::cow_tail_page_for_append out of free pages")
+            })?;
+            self.page_attach_count[new_page as usize] = 1;
+            self.copy_page_device_to_device(ctx, last_page, new_page)?;
+
+            let last_slot_page = self.page_indices[slot]
+                .last_mut()
+                .expect("slot with seq_len>0 must have a tail page");
+            *last_slot_page = new_page;
+
+            debug_assert!(
+                self.page_attach_count[last_idx] > 0,
+                "cow_tail_page_for_append: detached page had zero slot refs"
+            );
+            self.page_attach_count[last_idx] -= 1;
+            if self.page_attach_count[last_idx] == 0 && self.page_ref_count[last_idx] == 0 {
+                self.free_pages.push(last_page);
+            }
+
+            Ok(true)
+        }
+    }
+
     /// Free all token slots for a request.
     ///
     /// Each page in the slot transitions based on its external reference
@@ -708,12 +898,14 @@ impl TokenKVPool {
         }
         for &idx in &self.page_indices[slot] {
             let usize_idx = idx as usize;
-            if self.page_ref_count[usize_idx] == 0 {
+            debug_assert!(
+                self.page_attach_count[usize_idx] > 0,
+                "free_slot: page {idx} had zero slot refs"
+            );
+            self.page_attach_count[usize_idx] = self.page_attach_count[usize_idx].saturating_sub(1);
+            if self.page_attach_count[usize_idx] == 0 && self.page_ref_count[usize_idx] == 0 {
                 self.free_pages.push(idx);
             }
-            // else: page is pinned by an external reference (today: the
-            // radix cache). Leave it out of the free list; it will
-            // rejoin when `release_pages` drives the refcount to zero.
         }
         self.page_indices[slot].clear();
         self.seq_lens[slot] = 0;
@@ -765,7 +957,7 @@ impl TokenKVPool {
             );
             let next = cur.saturating_sub(1);
             self.page_ref_count[usize_idx] = next;
-            if next == 0 {
+            if next == 0 && self.page_attach_count[usize_idx] == 0 {
                 self.free_pages.push(idx);
                 newly_freed.push(idx);
             }
@@ -1465,6 +1657,7 @@ mod tests {
         page_indices: Vec<Vec<u32>>,
         seq_lens: Vec<usize>,
         slot_epochs: Vec<u64>,
+        page_attach_count: Vec<u32>,
         page_ref_count: Vec<u32>,
     }
 
@@ -1476,6 +1669,7 @@ mod tests {
                 page_indices: vec![Vec::new(); num_slots],
                 seq_lens: vec![0; num_slots],
                 slot_epochs: vec![0; num_slots],
+                page_attach_count: vec![0_u32; max_total_pages],
                 page_ref_count: vec![0_u32; max_total_pages],
             }
         }
@@ -1493,11 +1687,37 @@ mod tests {
 
             let mut new_pages = Vec::with_capacity(new_page_count);
             for _ in 0..new_page_count {
-                new_pages.push(self.free_pages.pop().unwrap());
+                let page = self.free_pages.pop().unwrap();
+                self.page_attach_count[page as usize] = 1;
+                new_pages.push(page);
             }
             self.page_indices[slot].extend_from_slice(&new_pages);
             self.seq_lens[slot] += count;
             new_pages
+        }
+
+        fn alloc_detached_pages(&mut self, count: usize) -> Vec<u32> {
+            let mut new_pages = Vec::with_capacity(count);
+            for _ in 0..count {
+                let page = self.free_pages.pop().unwrap();
+                self.page_ref_count[page as usize] = 1;
+                new_pages.push(page);
+            }
+            new_pages
+        }
+
+        fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) {
+            assert!(self.page_indices[slot].is_empty());
+            assert!(token_count <= pages.len() * self.page_size);
+            for &page in pages {
+                assert!(
+                    self.page_attach_count[page as usize] > 0
+                        || self.page_ref_count[page as usize] > 0
+                );
+                self.page_attach_count[page as usize] += 1;
+            }
+            self.page_indices[slot].extend_from_slice(pages);
+            self.seq_lens[slot] = token_count;
         }
 
         fn retain(&mut self, pages: &[u32]) {
@@ -1512,7 +1732,7 @@ mod tests {
                 let pu = p as usize;
                 let cur = self.page_ref_count[pu];
                 self.page_ref_count[pu] = cur.saturating_sub(1);
-                if self.page_ref_count[pu] == 0 {
+                if self.page_ref_count[pu] == 0 && self.page_attach_count[pu] == 0 {
                     self.free_pages.push(p);
                     freed.push(p);
                 }
@@ -1525,12 +1745,37 @@ mod tests {
                 self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             }
             for &idx in &self.page_indices[slot] {
-                if self.page_ref_count[idx as usize] == 0 {
+                self.page_attach_count[idx as usize] =
+                    self.page_attach_count[idx as usize].saturating_sub(1);
+                if self.page_ref_count[idx as usize] == 0
+                    && self.page_attach_count[idx as usize] == 0
+                {
                     self.free_pages.push(idx);
                 }
             }
             self.page_indices[slot].clear();
             self.seq_lens[slot] = 0;
+        }
+
+        fn cow_tail_page_for_append(&mut self, slot: usize) -> bool {
+            let seq_len = self.seq_lens[slot];
+            if seq_len == 0 || seq_len % self.page_size == 0 {
+                return false;
+            }
+            let last_page = *self.page_indices[slot].last().unwrap();
+            let last_idx = last_page as usize;
+            let shared = self.page_ref_count[last_idx] > 0 || self.page_attach_count[last_idx] > 1;
+            if !shared {
+                return false;
+            }
+            let new_page = self.free_pages.pop().unwrap();
+            self.page_attach_count[new_page as usize] = 1;
+            *self.page_indices[slot].last_mut().unwrap() = new_page;
+            self.page_attach_count[last_idx] -= 1;
+            if self.page_attach_count[last_idx] == 0 && self.page_ref_count[last_idx] == 0 {
+                self.free_pages.push(last_page);
+            }
+            true
         }
 
         fn retained_count(&self) -> usize {
@@ -1765,18 +2010,17 @@ mod tests {
         let pg = alloc[0];
         pool.retain(&[pg]);
         assert_eq!(pool.page_ref_count[pg as usize], 1);
+        assert_eq!(pool.page_attach_count[pg as usize], 1);
         assert_eq!(pool.page_indices[0].len(), 2);
         assert_eq!(pool.free_pages.len(), 2);
 
         let freed = pool.release(&[pg]);
-        // refcount dropped to 0, but the page is still in slot 0 —
-        // `release` unconditionally pushes to free_pages which gives
-        // a duplicate entry. The scheduler contract is that release
-        // only runs on pages that are either in limbo OR still in a
-        // slot that is ALSO about to be released. Document this by
-        // asserting the caller-visible behavior on the freed list.
-        assert_eq!(freed, vec![pg]);
+        assert!(
+            freed.is_empty(),
+            "release must not free a page that is still attached to a live slot",
+        );
         assert_eq!(pool.page_ref_count[pg as usize], 0);
+        assert_eq!(pool.page_attach_count[pg as usize], 1);
     }
 
     #[test]
@@ -1810,5 +2054,30 @@ mod tests {
         );
         assert_eq!(pool.free_pages.len(), 2);
         assert_eq!(pool.retained_count(), 0);
+    }
+
+    #[test]
+    fn attach_pages_keeps_prefix_live_across_multiple_slots() {
+        let mut pool = MockPool::new(4, 2, 16);
+        let pages = pool.alloc_tokens(0, 16);
+        pool.retain(&pages);
+        pool.free_slot(0);
+
+        pool.attach_pages(1, &pages, 16);
+        assert_eq!(pool.page_indices[1], pages);
+        assert_eq!(pool.page_attach_count[pages[0] as usize], 1);
+        assert_eq!(pool.page_ref_count[pages[0] as usize], 1);
+    }
+
+    #[test]
+    fn cow_tail_page_clones_when_appending_into_shared_prefix() {
+        let mut pool = MockPool::new(4, 2, 16);
+        let detached = pool.alloc_detached_pages(1);
+        pool.attach_pages(0, &detached, 15);
+
+        assert!(pool.cow_tail_page_for_append(0));
+        assert_ne!(pool.page_indices[0][0], detached[0]);
+        assert_eq!(pool.page_attach_count[detached[0] as usize], 0);
+        assert_eq!(pool.page_ref_count[detached[0] as usize], 1);
     }
 }

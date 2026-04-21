@@ -12,6 +12,10 @@ fn retract_victim_score(
     (generated_tokens, std::cmp::Reverse(prompt_tokens))
 }
 
+fn expected_prefill_pool_seq(materialized_prefix_len: usize, progress: usize) -> usize {
+    materialized_prefix_len.saturating_add(progress)
+}
+
 impl<M: ModelForward> Scheduler<M> {
     fn decode_pages_needed(&self, slot_indices: &[usize]) -> usize {
         slot_indices
@@ -325,12 +329,15 @@ impl<M: ModelForward> Scheduler<M> {
         {
             Some(req) if !req.delta_tx.is_closed() => {
                 if let Phase::Prefilling {
+                    materialized_prefix_len,
                     effective_tokens,
                     progress,
                 } = &req.phase
                 {
                     let pool_seq = self.paged_kv_pool.seq_len(prefill_slot_idx);
-                    if *progress >= effective_tokens.len() || pool_seq != *progress {
+                    let expected_pool_seq =
+                        expected_prefill_pool_seq(*materialized_prefix_len, *progress);
+                    if *progress >= effective_tokens.len() || pool_seq != expected_pool_seq {
                         self.step_decode_launch();
                         return;
                     }
@@ -706,7 +713,7 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::retract_victim_score;
+    use super::{expected_prefill_pool_seq, retract_victim_score};
 
     #[test]
     fn retract_prefers_less_progress_even_if_other_prompt_is_shorter() {
@@ -722,5 +729,12 @@ mod tests {
             retract_victim_score(3, 1024) < retract_victim_score(3, 128),
             "when decode progress ties, the longer prompt must retract first",
         );
+    }
+
+    #[test]
+    fn mixed_prefill_progress_includes_materialized_prefix_base() {
+        assert_eq!(expected_prefill_pool_seq(0, 3), 3);
+        assert_eq!(expected_prefill_pool_seq(15, 0), 15);
+        assert_eq!(expected_prefill_pool_seq(15, 4), 19);
     }
 }
