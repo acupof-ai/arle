@@ -139,7 +139,10 @@ pub mod readmission;
 pub mod tier;
 pub mod transport;
 
-pub use backend::{KVBackend, KVBackendScope};
+pub use backend::{
+    ClusterSharedBackend, ClusterSharedBackendConfig, ClusterSharedBackendOp, KVBackend,
+    KVBackendScope,
+};
 pub use chunk::{
     IndexEntryState, KVBlock, KVHandle, KVSpan, KVSpanId, LayerRange, RequestChunkState,
     SpanTaskKey, StoreState, TokenRange,

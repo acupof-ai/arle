@@ -124,6 +124,10 @@ impl SharedFsStore {
         self.inner.block_path_for(fingerprint)
     }
 
+    pub fn contains_block(&self, fingerprint: BlockFingerprint) -> io::Result<bool> {
+        self.inner.contains_block(fingerprint)
+    }
+
     pub fn put_block(
         &self,
         fingerprint: BlockFingerprint,
@@ -222,6 +226,12 @@ impl KVBackend for SharedFsStore {
         self.delete_block(location)
             .map_err(|err| TransportError::Transfer(err.to_string()))?;
         Ok(Self::ready_op(Ok(KVBackendCompletion::Deleted(req.handle))))
+    }
+
+    fn exists(&self, handle: &KVHandle) -> Result<bool, TransportError> {
+        let location = Self::location_from_handle(handle)?;
+        self.contains_block(location.fingerprint)
+            .map_err(|err| TransportError::Transfer(err.to_string()))
     }
 
     fn poll(&self, op: &mut Self::Op) -> Poll<Result<KVBackendCompletion, TransportError>> {
@@ -343,6 +353,26 @@ mod tests {
             .get_block(remote_location, Some(fingerprint))
             .expect_err("deleted payload should be gone");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn shared_fs_backend_exists_tracks_remote_presence() {
+        let dir = tempdir().unwrap();
+        let store = SharedFsStore::new(dir.path());
+        let fingerprint = BlockFingerprint([0x52; 16]);
+        let handle = KVHandle::new(
+            KVSpanId(5),
+            crate::types::BlockId(13),
+            SharedFsBlockLocation::new(fingerprint, 6)
+                .into_block_location()
+                .expect("remote location"),
+            1,
+            6,
+        );
+
+        assert!(!store.exists(&handle).expect("missing before write"));
+        store.put_block(fingerprint, 1, b"foobar").expect("put block");
+        assert!(store.exists(&handle).expect("present after write"));
     }
 
     #[test]

@@ -207,6 +207,15 @@ impl super::super::backend::KVBackend for NixlTransport {
         ))
     }
 
+    fn exists(
+        &self,
+        _handle: &super::super::chunk::KVHandle,
+    ) -> Result<bool, TransportError> {
+        Err(TransportError::Other(
+            "NixlTransport::exists is an M5 stub; real impl resolves remote metadata".into(),
+        ))
+    }
+
     fn poll(&self, _op: &mut Self::Op) -> Poll<Result<KVBackendCompletion, TransportError>> {
         Poll::Ready(Err(TransportError::Other(
             "NixlTransport::poll is an M5 stub; real impl calls Agent::get_xfer_status".into(),

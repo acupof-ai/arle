@@ -23,9 +23,11 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 
 use crate::types::BlockId;
 
+use super::backend::ClusterSharedBackend;
+use super::chunk::{KVBlock, KVHandle, KVSpanId, LayerRange, TokenRange};
+use super::io::{KVBackendCompletion, KVBackendFetch, KVBackendStore, KVPayload};
 use super::tier::BlockLocation;
 use super::transport::disk::{DiskBlockLocation, DiskStore};
-use super::transport::shared_fs::{SharedFsBlockLocation, SharedFsStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpillTicket(pub u64);
@@ -659,7 +661,7 @@ pub struct Coordinator {
     events: Sender<CoordinatorEvent>,
     orchestrator_events: Option<Sender<OrchestratorEvent>>,
     disk_store: Option<Arc<DiskStore>>,
-    remote_store: Option<Arc<SharedFsStore>>,
+    cluster_shared_backend: Option<ClusterSharedBackend>,
     control: Arc<CoordinatorControl>,
 }
 
@@ -678,15 +680,15 @@ impl Coordinator {
     pub fn new_with_backends(
         queue_capacity: usize,
         disk_store: Option<Arc<DiskStore>>,
-        remote_store: Option<Arc<SharedFsStore>>,
+        cluster_shared_backend: Option<ClusterSharedBackend>,
     ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_backends(queue_capacity, disk_store, remote_store)
+        Self::new_with_optional_backends(queue_capacity, disk_store, cluster_shared_backend)
     }
 
     pub fn new_with_orchestrator_events(
         queue_capacity: usize,
         disk_store: Option<Arc<DiskStore>>,
-        remote_store: Option<Arc<SharedFsStore>>,
+        cluster_shared_backend: Option<ClusterSharedBackend>,
     ) -> (
         Self,
         CoordinatorHandle,
@@ -704,7 +706,7 @@ impl Coordinator {
                 events: event_tx,
                 orchestrator_events: Some(orchestrator_tx),
                 disk_store,
-                remote_store,
+                cluster_shared_backend,
                 control: control.clone(),
             },
             CoordinatorHandle {
@@ -720,7 +722,7 @@ impl Coordinator {
     fn new_with_optional_backends(
         queue_capacity: usize,
         disk_store: Option<Arc<DiskStore>>,
-        remote_store: Option<Arc<SharedFsStore>>,
+        cluster_shared_backend: Option<ClusterSharedBackend>,
     ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
         let capacity = queue_capacity.max(1);
         let (tx, rx) = bounded(capacity);
@@ -732,7 +734,7 @@ impl Coordinator {
                 events: event_tx,
                 orchestrator_events: None,
                 disk_store,
-                remote_store,
+                cluster_shared_backend,
                 control: control.clone(),
             },
             CoordinatorHandle {
@@ -948,7 +950,7 @@ impl Coordinator {
         }
 
         let disk_store = self.disk_store.as_ref();
-        let remote_store = self.remote_store.as_ref();
+        let cluster_shared_backend = self.cluster_shared_backend.as_ref();
 
         let mut locations = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -983,30 +985,79 @@ impl Coordinator {
                     }
                 }
                 StoreTarget::Remote => {
-                    let Some(remote_store) = remote_store else {
+                    let Some(cluster_shared_backend) = cluster_shared_backend else {
                         return self.store_failed(
                             ticket,
                             block.block_id,
                             "coordinator remote store not configured",
                         );
                     };
-                    let location = match remote_store.put_block(
-                        block.fingerprint,
-                        block.kv_format_tag,
-                        &payload,
-                    ) {
+                    let payload_len = payload.len() as u64;
+                    let location = match cluster_shared_backend
+                        .remote_location_for(block.fingerprint, payload_len)
+                    {
                         Ok(location) => location,
                         Err(err) => {
                             return self.store_failed(ticket, block.block_id, err.to_string());
                         }
                     };
-                    let location = match location.into_block_location() {
-                        Ok(location) => location,
+                    let handle = KVHandle::new(
+                        KVSpanId(u64::from(block.block_id.0)),
+                        block.block_id,
+                        location.clone(),
+                        0,
+                        payload_len,
+                    );
+                    match cluster_shared_backend.exists(&handle) {
+                        Ok(true) => {
+                            locations.push((block.block_id, location));
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            return self.store_failed(ticket, block.block_id, err.to_string());
+                        }
+                    }
+                    let block_meta = KVBlock::new(
+                        block.block_id,
+                        LayerRange::new(0, 0),
+                        TokenRange::new(0, 0),
+                        payload_len,
+                    )
+                    .with_fingerprint(block.fingerprint);
+                    let mut op = match cluster_shared_backend.store(KVBackendStore {
+                        handle: handle.clone(),
+                        block: block_meta,
+                        kv_format_tag: block.kv_format_tag,
+                        payload: KVPayload::from_vec(payload),
+                    }) {
+                        Ok(op) => op,
                         Err(err) => {
                             return self.store_failed(ticket, block.block_id, err.to_string());
                         }
                     };
-                    locations.push((block.block_id, location));
+                    match cluster_shared_backend.poll(&mut op) {
+                        std::task::Poll::Ready(Ok(KVBackendCompletion::Stored(handle))) => {
+                            locations.push((block.block_id, handle.location));
+                        }
+                        std::task::Poll::Ready(Ok(other)) => {
+                            return self.store_failed(
+                                ticket,
+                                block.block_id,
+                                format!("unexpected remote store completion: {other:?}"),
+                            );
+                        }
+                        std::task::Poll::Ready(Err(err)) => {
+                            return self.store_failed(ticket, block.block_id, err.to_string());
+                        }
+                        std::task::Poll::Pending => {
+                            return self.store_failed(
+                                ticket,
+                                block.block_id,
+                                "remote store unexpectedly returned Pending",
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1110,7 +1161,7 @@ impl Coordinator {
                     });
                 }
                 BlockLocation::Remote { .. } => {
-                    let Some(remote_store) = &self.remote_store else {
+                    let Some(cluster_shared_backend) = &self.cluster_shared_backend else {
                         Self::release_allocated_regions(&allocated_regions);
                         return self.fetch_failed(
                             ticket,
@@ -1118,19 +1169,44 @@ impl Coordinator {
                             "coordinator remote store not configured",
                         );
                     };
-                    let location = match SharedFsBlockLocation::from_block_location(&block.source) {
-                        Ok(location) => location,
+                    let handle = KVHandle::new(
+                        KVSpanId(u64::from(block.block_id.0)),
+                        block.block_id,
+                        block.source.clone(),
+                        0,
+                        block.byte_len as u64,
+                    );
+                    let mut op = match cluster_shared_backend.fetch(KVBackendFetch { handle }) {
+                        Ok(op) => op,
                         Err(err) => {
                             Self::release_allocated_regions(&allocated_regions);
                             return self.fetch_failed(ticket, block.block_id, err.to_string());
                         }
                     };
-                    let payload = match remote_store.get_block(location, Some(location.fingerprint))
-                    {
-                        Ok(payload) => payload,
-                        Err(err) => {
+                    let payload = match cluster_shared_backend.poll(&mut op) {
+                        std::task::Poll::Ready(Ok(KVBackendCompletion::Loaded {
+                            payload,
+                            ..
+                        })) => payload,
+                        std::task::Poll::Ready(Ok(other)) => {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(
+                                ticket,
+                                block.block_id,
+                                format!("unexpected remote fetch completion: {other:?}"),
+                            );
+                        }
+                        std::task::Poll::Ready(Err(err)) => {
                             Self::release_allocated_regions(&allocated_regions);
                             return self.fetch_failed(ticket, block.block_id, err.to_string());
+                        }
+                        std::task::Poll::Pending => {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(
+                                ticket,
+                                block.block_id,
+                                "remote fetch unexpectedly returned Pending",
+                            );
                         }
                     };
                     let region = {
@@ -1149,7 +1225,7 @@ impl Coordinator {
                                 "host pinned pool exhausted",
                             );
                         };
-                        pool.as_mut_slice(region).copy_from_slice(&payload);
+                        pool.as_mut_slice(region).copy_from_slice(payload.as_slice());
                         region
                     };
                     allocated_regions.push((block.host_pool.clone(), region));
@@ -1239,6 +1315,8 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_tier::backend::ClusterSharedBackend;
+    use crate::kv_tier::transport::shared_fs::{SharedFsBlockLocation, SharedFsStore};
     use crate::types::BlockFingerprint;
     use tempfile::tempdir;
 
@@ -1773,7 +1851,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let remote_store = Arc::new(SharedFsStore::new(dir.path()));
         let (coordinator, handle, events) =
-            Coordinator::new_with_backends(4, None, Some(remote_store.clone()));
+            Coordinator::new_with_backends(
+                4,
+                None,
+                Some(ClusterSharedBackend::SharedFs(remote_store.clone())),
+            );
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );
@@ -1819,6 +1901,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, b"remote-bytes");
+        let second_store_ticket = handle
+            .submit_store(vec![StoreRequest {
+                block_id: BlockId(31),
+                fingerprint,
+                kv_format_tag: 2,
+                host_pool: host_pool.clone(),
+                host_region: region,
+                target: StoreTarget::Remote,
+            }])
+            .unwrap();
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StoreQueued {
+                ticket: second_store_ticket,
+                block_count: 1,
+            }
+        );
+        match events.recv().unwrap() {
+            CoordinatorEvent::StoreCompleted { ticket, locations } => {
+                assert_eq!(ticket, second_store_ticket);
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].0, BlockId(31));
+                assert_eq!(
+                    locations[0].1,
+                    SharedFsBlockLocation::new(fingerprint, 12)
+                        .into_block_location()
+                        .unwrap()
+                );
+            }
+            other => panic!("unexpected second store event: {other:?}"),
+        }
         let remote_location = SharedFsBlockLocation::new(fingerprint, 12)
             .into_block_location()
             .unwrap();
