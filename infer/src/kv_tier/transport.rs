@@ -25,11 +25,13 @@ pub mod disk;
 pub mod local_cuda;
 #[cfg(feature = "rdma-nixl")]
 pub mod nixl;
+pub mod shared_fs;
 
 pub use disk::DiskStore;
 pub use local_cuda::LocalCudaTransport;
 #[cfg(feature = "rdma-nixl")]
 pub use nixl::NixlTransport;
+pub use shared_fs::SharedFsStore;
 
 use std::task::Poll;
 

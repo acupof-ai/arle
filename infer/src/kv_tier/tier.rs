@@ -81,8 +81,10 @@ pub struct RemoteBlockDesc {
 pub enum TransportId {
     /// NVIDIA NIXL — lands in tiered-kv-cache M5 as a stub.
     Nixl = 0,
+    /// Shared filesystem remote store — minimal cluster-shared backend.
+    SharedFilesystem = 1,
     /// Mooncake `TransferEngine` — post-M5, trigger-gated.
-    Mooncake = 1,
+    Mooncake = 2,
     /// Reserved for future transports (UCX direct, libfabric, etc.).
     Reserved = 255,
 }

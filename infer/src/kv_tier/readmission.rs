@@ -8,7 +8,8 @@
 use crate::types::{BlockFingerprint, BlockId};
 
 use super::{
-    BlockLocation, FetchRequest, HostPinnedRegion, RequestChunkState, SharedHostPinnedPool,
+    BlockLocation, FetchRequest, HostPinnedRegion, RemoteBlockDesc, RequestChunkState,
+    SharedHostPinnedPool,
 };
 
 /// Concrete source for one staged block that must be promoted back into T0.
@@ -19,6 +20,10 @@ pub enum ReadmissionSource {
     },
     Disk {
         fingerprint: BlockFingerprint,
+        payload_len: u64,
+    },
+    Remote {
+        desc: RemoteBlockDesc,
         payload_len: u64,
     },
 }
@@ -52,6 +57,16 @@ impl ReadmissionSource {
                     byte_len,
                     host_pool,
                 }),
+            Self::Remote { desc, payload_len } => {
+                usize::try_from(*payload_len)
+                    .ok()
+                    .map(|byte_len| FetchRequest {
+                        block_id,
+                        source: BlockLocation::Remote { desc: desc.clone() },
+                        byte_len,
+                        host_pool,
+                    })
+            }
         }
     }
 }
@@ -179,6 +194,17 @@ mod tests {
                         payload_len: 8192,
                     }),
                 },
+                ReadmissionBlock {
+                    block_id: BlockId(4),
+                    fingerprint: BlockFingerprint([0x44; 16]),
+                    source: Some(ReadmissionSource::Remote {
+                        desc: RemoteBlockDesc {
+                            transport: crate::kv_tier::TransportId::SharedFilesystem,
+                            payload: vec![9, 8, 7],
+                        },
+                        payload_len: 4096,
+                    }),
+                },
             ],
             state: RequestChunkState::Planned,
         };
@@ -186,7 +212,11 @@ mod tests {
         let key = plan.fetch_key().expect("staged key");
         assert_eq!(
             key.fingerprints(),
-            &[BlockFingerprint([0x22; 16]), BlockFingerprint([0x33; 16])]
+            &[
+                BlockFingerprint([0x22; 16]),
+                BlockFingerprint([0x33; 16]),
+                BlockFingerprint([0x44; 16])
+            ]
         );
     }
 
@@ -213,11 +243,22 @@ mod tests {
                         payload_len: 4096,
                     }),
                 },
+                ReadmissionBlock {
+                    block_id: BlockId(11),
+                    fingerprint: BlockFingerprint([0x66; 16]),
+                    source: Some(ReadmissionSource::Remote {
+                        desc: RemoteBlockDesc {
+                            transport: crate::kv_tier::TransportId::SharedFilesystem,
+                            payload: vec![1, 2, 3],
+                        },
+                        payload_len: 2048,
+                    }),
+                },
             ],
             state: RequestChunkState::Planned,
         };
         let requests = plan.fetch_requests(&pool).unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(
             requests[0].source,
             BlockLocation::HostPinned {
@@ -233,6 +274,16 @@ mod tests {
             }
         );
         assert_eq!(requests[1].byte_len, 4096);
+        assert_eq!(
+            requests[2].source,
+            BlockLocation::Remote {
+                desc: RemoteBlockDesc {
+                    transport: crate::kv_tier::TransportId::SharedFilesystem,
+                    payload: vec![1, 2, 3],
+                },
+            }
+        );
+        assert_eq!(requests[2].byte_len, 2048);
     }
 
     #[test]

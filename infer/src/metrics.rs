@@ -13,6 +13,12 @@
 //! | `infer_requests_waiting` | gauge | Requests waiting in queue |
 //! | `infer_scheduler_running_batch` | gauge | Requests currently in the decode-running batch |
 //! | `infer_scheduler_prefill_queue` | gauge | Requests currently queued for prefill continuation |
+//! | `infer_kv_coordinator_queue_capacity` | gauge | Coordinator queue capacity |
+//! | `infer_kv_fetch_queue_depth` | gauge | In-flight staged KV fetch tickets |
+//! | `infer_kv_fetch_waiters` | gauge | Requests waiting on staged KV fetches |
+//! | `infer_kv_store_queue_depth` | gauge | In-flight staged KV spill/store tickets |
+//! | `infer_kv_fetch_backpressure` | gauge | Staged KV fetch queue backpressure flag (0/1) |
+//! | `infer_kv_store_backpressure` | gauge | Staged KV store queue backpressure flag (0/1) |
 //! | `infer_tokens_generated_total` | counter | Total output tokens generated |
 //! | `infer_tokens_prompt_total` | counter | Total prompt tokens processed |
 //! | `infer_queue_wait_seconds` | histogram | Submit-to-admit queueing latency |
@@ -191,6 +197,12 @@ struct MetricsInner {
     pub requests_waiting: AtomicU64,
     pub scheduler_running_batch: AtomicU64,
     pub scheduler_prefill_queue: AtomicU64,
+    pub kv_coordinator_queue_capacity: AtomicU64,
+    pub kv_fetch_queue_depth: AtomicU64,
+    pub kv_fetch_waiters: AtomicU64,
+    pub kv_store_queue_depth: AtomicU64,
+    pub kv_fetch_backpressure: AtomicU64,
+    pub kv_store_backpressure: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
     pub kv_gpu_blocks_total: AtomicU64,
     pub memory_active_bytes: AtomicU64,
@@ -221,6 +233,12 @@ impl ServerMetrics {
                 requests_waiting: AtomicU64::new(0),
                 scheduler_running_batch: AtomicU64::new(0),
                 scheduler_prefill_queue: AtomicU64::new(0),
+                kv_coordinator_queue_capacity: AtomicU64::new(0),
+                kv_fetch_queue_depth: AtomicU64::new(0),
+                kv_fetch_waiters: AtomicU64::new(0),
+                kv_store_queue_depth: AtomicU64::new(0),
+                kv_fetch_backpressure: AtomicU64::new(0),
+                kv_store_backpressure: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
                 kv_gpu_blocks_total: AtomicU64::new(0),
                 memory_active_bytes: AtomicU64::new(0),
@@ -324,6 +342,36 @@ impl ServerMetrics {
             .store(prefill_queue, Ordering::Relaxed);
     }
 
+    /// Update the staged KV coordinator queue gauges.
+    pub fn set_kv_coordinator(
+        &self,
+        queue_capacity: u64,
+        fetch_queue_depth: u64,
+        fetch_waiters: u64,
+        store_queue_depth: u64,
+        fetch_backpressure: bool,
+        store_backpressure: bool,
+    ) {
+        self.inner
+            .kv_coordinator_queue_capacity
+            .store(queue_capacity, Ordering::Relaxed);
+        self.inner
+            .kv_fetch_queue_depth
+            .store(fetch_queue_depth, Ordering::Relaxed);
+        self.inner
+            .kv_fetch_waiters
+            .store(fetch_waiters, Ordering::Relaxed);
+        self.inner
+            .kv_store_queue_depth
+            .store(store_queue_depth, Ordering::Relaxed);
+        self.inner
+            .kv_fetch_backpressure
+            .store(u64::from(fetch_backpressure), Ordering::Relaxed);
+        self.inner
+            .kv_store_backpressure
+            .store(u64::from(store_backpressure), Ordering::Relaxed);
+    }
+
     /// Update the GPU KV block gauges.
     pub fn set_kv_gpu_blocks(&self, free: u64, total: u64) {
         self.inner.kv_gpu_blocks_free.store(free, Ordering::Relaxed);
@@ -373,6 +421,32 @@ impl ServerMetrics {
 
     pub fn scheduler_prefill_queue(&self) -> u64 {
         self.inner.scheduler_prefill_queue.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_coordinator_queue_capacity(&self) -> u64 {
+        self.inner
+            .kv_coordinator_queue_capacity
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn kv_fetch_queue_depth(&self) -> u64 {
+        self.inner.kv_fetch_queue_depth.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_fetch_waiters(&self) -> u64 {
+        self.inner.kv_fetch_waiters.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_store_queue_depth(&self) -> u64 {
+        self.inner.kv_store_queue_depth.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_fetch_backpressure(&self) -> bool {
+        self.inner.kv_fetch_backpressure.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn kv_store_backpressure(&self) -> bool {
+        self.inner.kv_store_backpressure.load(Ordering::Relaxed) != 0
     }
 
     pub fn kv_gpu_utilization(&self) -> f64 {
@@ -615,6 +689,64 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
+        out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
+        writeln!(
+            out,
+            "infer_kv_coordinator_queue_capacity{{{labels}}} {}",
+            self.inner
+                .kv_coordinator_queue_capacity
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_kv_fetch_queue_depth In-flight staged KV fetch tickets.\n");
+        out.push_str("# TYPE infer_kv_fetch_queue_depth gauge\n");
+        writeln!(
+            out,
+            "infer_kv_fetch_queue_depth{{{labels}}} {}",
+            self.inner.kv_fetch_queue_depth.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_kv_fetch_waiters Requests currently waiting on staged KV fetch completion.\n");
+        out.push_str("# TYPE infer_kv_fetch_waiters gauge\n");
+        writeln!(
+            out,
+            "infer_kv_fetch_waiters{{{labels}}} {}",
+            self.inner.kv_fetch_waiters.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_kv_store_queue_depth In-flight staged KV spill/store tickets.\n",
+        );
+        out.push_str("# TYPE infer_kv_store_queue_depth gauge\n");
+        writeln!(
+            out,
+            "infer_kv_store_queue_depth{{{labels}}} {}",
+            self.inner.kv_store_queue_depth.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_kv_fetch_backpressure Staged KV fetch queue backpressure flag (0 or 1).\n");
+        out.push_str("# TYPE infer_kv_fetch_backpressure gauge\n");
+        writeln!(
+            out,
+            "infer_kv_fetch_backpressure{{{labels}}} {}",
+            self.inner.kv_fetch_backpressure.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_kv_store_backpressure Staged KV store queue backpressure flag (0 or 1).\n");
+        out.push_str("# TYPE infer_kv_store_backpressure gauge\n");
+        writeln!(
+            out,
+            "infer_kv_store_backpressure{{{labels}}} {}",
+            self.inner.kv_store_backpressure.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
         let total = self.inner.kv_gpu_blocks_total.load(Ordering::Relaxed);
         let free = self.inner.kv_gpu_blocks_free.load(Ordering::Relaxed);
         let utilization = if total == 0 {
@@ -737,9 +869,24 @@ impl ServerMetrics {
         } else {
             String::new()
         };
+        let queue_capacity = self.kv_coordinator_queue_capacity();
+        let coordinator_suffix = if queue_capacity > 0 {
+            format!(
+                " kv_fetch_q={}/{} kv_fetch_waiters={} kv_store_q={}/{} kv_bp=fetch:{},store:{}",
+                self.kv_fetch_queue_depth(),
+                queue_capacity,
+                self.kv_fetch_waiters(),
+                self.kv_store_queue_depth(),
+                queue_capacity,
+                u8::from(self.kv_fetch_backpressure()),
+                u8::from(self.kv_store_backpressure()),
+            )
+        } else {
+            String::new()
+        };
 
         format!(
-            "requests={} active={} waiting={} running_batch={} prefill_queue={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}",
+            "requests={} active={} waiting={} running_batch={} prefill_queue={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -758,6 +905,7 @@ impl ServerMetrics {
             service_p50,
             tpot_p50,
             dflash_suffix,
+            coordinator_suffix,
         )
     }
 }
@@ -799,6 +947,7 @@ mod tests {
         m.set_active(2);
         m.set_waiting(5);
         m.set_scheduler_occupancy(3, 4);
+        m.set_kv_coordinator(16, 3, 5, 2, true, false);
         m.set_kv_gpu_blocks(100, 200);
         m.record_prefix_lookup(true);
         m.set_memory_bytes(1234, 5678, 42);
@@ -810,6 +959,12 @@ mod tests {
         assert!(rendered.contains("infer_requests_waiting{model=\"Qwen3-4B\",} 5"));
         assert!(rendered.contains("infer_scheduler_running_batch{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_scheduler_prefill_queue{model=\"Qwen3-4B\",} 4"));
+        assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
+        assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
+        assert!(rendered.contains("infer_kv_fetch_waiters{model=\"Qwen3-4B\",} 5"));
+        assert!(rendered.contains("infer_kv_store_queue_depth{model=\"Qwen3-4B\",} 2"));
+        assert!(rendered.contains("infer_kv_fetch_backpressure{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_kv_store_backpressure{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));

@@ -1,6 +1,6 @@
 # Tiered KV Cache — HiCache-aligned readmission / queue / backend plan
 
-**Status**: active — Phases A/B/C landed locally on the CUDA lane; Phase D has a node-local async store path plus queue vocabulary, and Phase E still stops at the shared-backend trait / stub surface  
+**Status**: active — Phases A/B/C/D landed locally on the CUDA lane, and Phase E now has a minimal shared-filesystem cluster-shared backend wired through the same coordinator fetch/store path; remote CUDA validation still pending  
 **Scope**: implementation SSOT for the current local readmission tranche plus the remaining design for remote/shared backends  
 **Purpose**: keep the local path (`RadixCache + paged_kv + Zig T1 arena + readmission + T1→T2 spill`) on one clean architecture while the remaining queue/backpressure/cluster-L3 work lands without reviving parallel side paths.
 
@@ -33,7 +33,7 @@ The missing half is the rest of the HiCache loop:
 
 - a canonical async pipeline for prefetch and write-back
 - a backend boundary that can grow from local disk to cluster-shared L3
-- queue/backpressure metrics and cancellation beyond the current local fetch/store path
+- cancellation / retry policy beyond the current local fetch/store path
 
 Without that split, every attempt to add readmission risks coupling scheduler admission directly to disk or RDMA I/O.
 
@@ -752,7 +752,7 @@ This follows the public HiCache description: backend integration should stay sma
 
 ### Phase D — asynchronous write-back
 
-**Status**: partially landed (`StoreQueue` vocabulary + local async spill/store path); full policy/backpressure metrics remain follow-on work
+**Status**: landed locally (`StoreQueue` vocabulary + local async spill/store path + queue cancellation + live local ServerMetrics queue/backpressure surface)
 
 - `StoreQueue`
 - `write_through_selective`
@@ -760,11 +760,11 @@ This follows the public HiCache description: backend integration should stay sma
 
 ### Phase E — cluster-shared backend
 
-**Status**: stub surface landed, real backend still planned
+**Status**: minimal shared-filesystem backend landed locally; RDMA / NIXL / Mooncake remain planned
 
 - remote backend trait
-- stub backend implementation
-- orchestrator-level dedupe and backpressure
+- shared-filesystem backend implementation
+- same coordinator fetch/store path for local disk and shared-fs handles
 
 ## 18. Acceptance for the tranche
 

@@ -10,9 +10,10 @@
 //! `ReadmissionPlan`s, submits `FetchRequest`s, waits in `Phase::WaitingFetch`,
 //! and resumes once the coordinator reports `FetchCompleted`.
 
+use std::collections::HashSet;
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -24,6 +25,7 @@ use crate::types::BlockId;
 
 use super::tier::BlockLocation;
 use super::transport::disk::{DiskBlockLocation, DiskStore};
+use super::transport::shared_fs::{SharedFsBlockLocation, SharedFsStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpillTicket(pub u64);
@@ -48,6 +50,299 @@ pub enum QueueTicket {
     Plan(PlanTicket),
     Fetch(FetchTicket),
     Store(StoreTicket),
+}
+
+impl QueueTicket {
+    pub fn kind(self) -> QueueKind {
+        match self {
+            Self::Plan(_) => QueueKind::Plan,
+            Self::Fetch(_) => QueueKind::Fetch,
+            Self::Store(_) => QueueKind::Store,
+        }
+    }
+}
+
+impl From<PlanTicket> for QueueTicket {
+    fn from(value: PlanTicket) -> Self {
+        Self::Plan(value)
+    }
+}
+
+impl From<FetchTicket> for QueueTicket {
+    fn from(value: FetchTicket) -> Self {
+        Self::Fetch(value)
+    }
+}
+
+impl From<StoreTicket> for QueueTicket {
+    fn from(value: StoreTicket) -> Self {
+        Self::Store(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueBackpressure {
+    Normal,
+    Elevated,
+    Saturated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueControlStats {
+    pub capacity: usize,
+    pub queued: usize,
+    pub in_flight: usize,
+    pub submitted: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub rejected: u64,
+}
+
+impl QueueControlStats {
+    pub fn active(&self) -> usize {
+        self.queued.saturating_add(self.in_flight)
+    }
+
+    pub fn soft_saturated(&self, threshold: f64) -> bool {
+        if self.capacity == 0 {
+            return false;
+        }
+        (self.active() as f64 / self.capacity as f64) >= threshold
+    }
+
+    pub fn backpressure(&self) -> QueueBackpressure {
+        pressure_from_load(self.active(), self.capacity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorQueueStats {
+    pub capacity: usize,
+    pub total_queued: usize,
+    pub total_in_flight: usize,
+    pub plan: QueueControlStats,
+    pub fetch: QueueControlStats,
+    pub store: QueueControlStats,
+    pub fetch_waiters: usize,
+}
+
+impl CoordinatorQueueStats {
+    pub fn active(&self) -> usize {
+        self.total_queued.saturating_add(self.total_in_flight)
+    }
+
+    #[must_use]
+    pub fn with_fetch_waiters(mut self, fetch_waiters: usize) -> Self {
+        self.fetch_waiters = fetch_waiters;
+        self
+    }
+
+    pub fn queue_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn fetch_queue_depth(&self) -> usize {
+        self.fetch.active()
+    }
+
+    pub fn store_queue_depth(&self) -> usize {
+        self.store.active()
+    }
+
+    pub fn fetch_backpressured(&self) -> bool {
+        self.fetch.backpressure() != QueueBackpressure::Normal
+    }
+
+    pub fn store_backpressured(&self) -> bool {
+        self.store.backpressure() != QueueBackpressure::Normal
+    }
+
+    pub fn backpressure(&self) -> QueueBackpressure {
+        pressure_from_load(self.active(), self.capacity)
+    }
+}
+
+fn pressure_from_load(active: usize, capacity: usize) -> QueueBackpressure {
+    if active >= capacity {
+        QueueBackpressure::Saturated
+    } else if active.saturating_mul(4) >= capacity.saturating_mul(3) {
+        QueueBackpressure::Elevated
+    } else {
+        QueueBackpressure::Normal
+    }
+}
+
+#[derive(Debug)]
+struct QueueCounters {
+    queued: AtomicUsize,
+    in_flight: AtomicUsize,
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
+    rejected: AtomicU64,
+}
+
+impl QueueCounters {
+    const fn new() -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            submitted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self, capacity: usize) -> QueueControlStats {
+        QueueControlStats {
+            capacity,
+            queued: self.queued.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            submitted: self.submitted.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CoordinatorControl {
+    capacity: usize,
+    plan: QueueCounters,
+    fetch: QueueCounters,
+    store: QueueCounters,
+    live: Mutex<HashSet<QueueTicket>>,
+    cancelled: Mutex<HashSet<QueueTicket>>,
+}
+
+impl CoordinatorControl {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            plan: QueueCounters::new(),
+            fetch: QueueCounters::new(),
+            store: QueueCounters::new(),
+            live: Mutex::new(HashSet::new()),
+            cancelled: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn queue(&self, kind: QueueKind) -> &QueueCounters {
+        match kind {
+            QueueKind::Plan => &self.plan,
+            QueueKind::Fetch => &self.fetch,
+            QueueKind::Store => &self.store,
+        }
+    }
+
+    fn on_submit(&self, ticket: QueueTicket) {
+        let queue = self.queue(ticket.kind());
+        queue.submitted.fetch_add(1, Ordering::Relaxed);
+        queue.queued.fetch_add(1, Ordering::Relaxed);
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.insert(ticket);
+    }
+
+    fn on_reject(&self, kind: QueueKind) {
+        self.queue(kind).rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_start(&self, ticket: QueueTicket) {
+        let queue = self.queue(ticket.kind());
+        queue.queued.fetch_sub(1, Ordering::Relaxed);
+        queue.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_finish(&self, ticket: QueueTicket, outcome: QueueOutcome) {
+        let queue = self.queue(ticket.kind());
+        queue.in_flight.fetch_sub(1, Ordering::Relaxed);
+        match outcome {
+            QueueOutcome::Completed => {
+                queue.completed.fetch_add(1, Ordering::Relaxed);
+            }
+            QueueOutcome::Failed => {
+                queue.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            QueueOutcome::Cancelled => {
+                queue.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.remove(&ticket);
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancelled.remove(&ticket);
+    }
+
+    fn cancel(&self, ticket: QueueTicket) -> bool {
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !live.contains(&ticket) {
+            return false;
+        }
+        drop(live);
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancelled.insert(ticket)
+    }
+
+    fn is_cancelled(&self, ticket: QueueTicket) -> bool {
+        let cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancelled.contains(&ticket)
+    }
+
+    fn stats(&self) -> CoordinatorQueueStats {
+        let plan = self.plan.snapshot(self.capacity);
+        let fetch = self.fetch.snapshot(self.capacity);
+        let store = self.store.snapshot(self.capacity);
+        CoordinatorQueueStats {
+            capacity: self.capacity,
+            total_queued: plan
+                .queued
+                .saturating_add(fetch.queued)
+                .saturating_add(store.queued),
+            total_in_flight: plan
+                .in_flight
+                .saturating_add(fetch.in_flight)
+                .saturating_add(store.in_flight),
+            plan,
+            fetch,
+            store,
+            fetch_waiters: 0,
+        }
+    }
+
+    fn queue_stats(&self, kind: QueueKind) -> QueueControlStats {
+        self.queue(kind).snapshot(self.capacity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOutcome {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 /// Request handed to the coordinator for a T1 → T2 spill.
@@ -185,6 +480,19 @@ pub enum CoordinatorEvent {
         failed_block: BlockId,
         reason: String,
     },
+    StoreQueued {
+        ticket: StoreTicket,
+        block_count: usize,
+    },
+    StoreCompleted {
+        ticket: StoreTicket,
+        locations: Vec<(BlockId, BlockLocation)>,
+    },
+    StoreFailed {
+        ticket: StoreTicket,
+        failed_block: BlockId,
+        reason: String,
+    },
     FetchQueued {
         ticket: FetchTicket,
         block_count: usize,
@@ -238,6 +546,7 @@ pub enum OrchestratorEvent {
 pub struct CoordinatorHandle {
     tx: Sender<CoordinatorCommand>,
     next_ticket: Arc<AtomicU64>,
+    control: Arc<CoordinatorControl>,
 }
 
 impl CoordinatorHandle {
@@ -257,11 +566,47 @@ impl CoordinatorHandle {
         let _ = self.tx.try_send(CoordinatorCommand::Shutdown);
     }
 
-    fn try_send(&self, cmd: CoordinatorCommand) -> Result<()> {
-        self.tx.try_send(cmd).map_err(|err| match err {
-            TrySendError::Full(_) => anyhow!("coordinator queue full"),
-            TrySendError::Disconnected(_) => anyhow!("coordinator disconnected"),
-        })
+    pub fn stats(&self) -> CoordinatorQueueStats {
+        self.control.stats()
+    }
+
+    pub fn queue_stats(&self, kind: QueueKind) -> QueueControlStats {
+        self.control.queue_stats(kind)
+    }
+
+    pub fn backpressure(&self) -> QueueBackpressure {
+        self.stats().backpressure()
+    }
+
+    pub fn cancel(&self, ticket: QueueTicket) -> bool {
+        self.control.cancel(ticket)
+    }
+
+    pub fn cancel_plan(&self, ticket: PlanTicket) -> bool {
+        self.cancel(ticket.into())
+    }
+
+    pub fn cancel_fetch(&self, ticket: FetchTicket) -> bool {
+        self.cancel(ticket.into())
+    }
+
+    pub fn cancel_store(&self, ticket: StoreTicket) -> bool {
+        self.cancel(ticket.into())
+    }
+
+    fn try_send_ticket(&self, ticket: QueueTicket, cmd: CoordinatorCommand) -> Result<()> {
+        self.tx
+            .try_send(cmd)
+            .map(|()| {
+                self.control.on_submit(ticket);
+            })
+            .map_err(|err| match err {
+                TrySendError::Full(_) => {
+                    self.control.on_reject(ticket.kind());
+                    anyhow!("coordinator queue full")
+                }
+                TrySendError::Disconnected(_) => anyhow!("coordinator disconnected"),
+            })
     }
 
     /// Mint a fresh `SpillTicket` for a T1 → T2 spill batch and enqueue
@@ -272,7 +617,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = SpillTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Spill { ticket, blocks })
+        self.try_send_ticket(ticket.into(), CoordinatorCommand::Spill { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -283,7 +628,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = FetchTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Fetch { ticket, blocks })
+        self.try_send_ticket(ticket.into(), CoordinatorCommand::Fetch { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -293,7 +638,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = PlanTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Plan { ticket, blocks })
+        self.try_send_ticket(ticket.into(), CoordinatorCommand::Plan { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -303,7 +648,7 @@ impl CoordinatorHandle {
             return None;
         }
         let ticket = SpillTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send(CoordinatorCommand::Store { ticket, blocks })
+        self.try_send_ticket(ticket.into(), CoordinatorCommand::Store { ticket, blocks })
             .ok()?;
         Some(ticket)
     }
@@ -314,64 +659,86 @@ pub struct Coordinator {
     events: Sender<CoordinatorEvent>,
     orchestrator_events: Option<Sender<OrchestratorEvent>>,
     disk_store: Option<Arc<DiskStore>>,
+    remote_store: Option<Arc<SharedFsStore>>,
+    control: Arc<CoordinatorControl>,
 }
 
 impl Coordinator {
     pub fn new(queue_capacity: usize) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_disk_store(queue_capacity, None)
+        Self::new_with_optional_backends(queue_capacity, None, None)
     }
 
     pub fn new_with_disk_store(
         queue_capacity: usize,
         disk_store: Arc<DiskStore>,
     ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        Self::new_with_optional_disk_store(queue_capacity, Some(disk_store))
+        Self::new_with_optional_backends(queue_capacity, Some(disk_store), None)
+    }
+
+    pub fn new_with_backends(
+        queue_capacity: usize,
+        disk_store: Option<Arc<DiskStore>>,
+        remote_store: Option<Arc<SharedFsStore>>,
+    ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
+        Self::new_with_optional_backends(queue_capacity, disk_store, remote_store)
     }
 
     pub fn new_with_orchestrator_events(
         queue_capacity: usize,
         disk_store: Option<Arc<DiskStore>>,
+        remote_store: Option<Arc<SharedFsStore>>,
     ) -> (
         Self,
         CoordinatorHandle,
         Receiver<CoordinatorEvent>,
         Receiver<OrchestratorEvent>,
     ) {
-        let (tx, rx) = bounded(queue_capacity.max(1));
-        let (event_tx, event_rx) = bounded(queue_capacity.max(1));
-        let (orchestrator_tx, orchestrator_rx) = bounded(queue_capacity.max(1));
+        let capacity = queue_capacity.max(1);
+        let (tx, rx) = bounded(capacity);
+        let (event_tx, event_rx) = bounded(capacity);
+        let (orchestrator_tx, orchestrator_rx) = bounded(capacity);
+        let control = Arc::new(CoordinatorControl::new(capacity));
         (
             Self {
                 rx,
                 events: event_tx,
                 orchestrator_events: Some(orchestrator_tx),
                 disk_store,
+                remote_store,
+                control: control.clone(),
             },
             CoordinatorHandle {
                 tx,
                 next_ticket: Arc::new(AtomicU64::new(1)),
+                control,
             },
             event_rx,
             orchestrator_rx,
         )
     }
 
-    fn new_with_optional_disk_store(
+    fn new_with_optional_backends(
         queue_capacity: usize,
         disk_store: Option<Arc<DiskStore>>,
+        remote_store: Option<Arc<SharedFsStore>>,
     ) -> (Self, CoordinatorHandle, Receiver<CoordinatorEvent>) {
-        let (tx, rx) = bounded(queue_capacity.max(1));
-        let (event_tx, event_rx) = bounded(queue_capacity.max(1));
+        let capacity = queue_capacity.max(1);
+        let (tx, rx) = bounded(capacity);
+        let (event_tx, event_rx) = bounded(capacity);
+        let control = Arc::new(CoordinatorControl::new(capacity));
         (
             Self {
                 rx,
                 events: event_tx,
                 orchestrator_events: None,
                 disk_store,
+                remote_store,
+                control: control.clone(),
             },
             CoordinatorHandle {
                 tx,
                 next_ticket: Arc::new(AtomicU64::new(1)),
+                control,
             },
             event_rx,
         )
@@ -389,11 +756,121 @@ impl Coordinator {
         }
     }
 
-    fn handle_plan(&self, ticket: PlanTicket, blocks: &[PrefetchPlanRequest]) {
+    fn is_cancelled(&self, ticket: QueueTicket) -> bool {
+        self.control.is_cancelled(ticket)
+    }
+
+    fn release_allocated_regions(
+        regions: &[(
+            crate::kv_tier::host_pool::SharedHostPinnedPool,
+            crate::kv_tier::host_pool::HostPinnedRegion,
+        )],
+    ) {
+        for (pool, region) in regions {
+            if let Ok(mut pool) = pool.lock() {
+                pool.release(*region);
+            }
+        }
+    }
+
+    fn plan_failed(
+        &self,
+        ticket: PlanTicket,
+        failed_block: BlockId,
+        reason: impl Into<String>,
+    ) -> QueueOutcome {
+        let reason = reason.into();
+        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
+            queue: QueueKind::Plan,
+            ticket: QueueTicket::Plan(ticket),
+            failed_block,
+            reason: reason.clone(),
+        });
+        if reason.contains("cancelled") {
+            QueueOutcome::Cancelled
+        } else {
+            QueueOutcome::Failed
+        }
+    }
+
+    fn store_failed(
+        &self,
+        ticket: StoreTicket,
+        failed_block: BlockId,
+        reason: impl Into<String>,
+    ) -> QueueOutcome {
+        let reason = reason.into();
+        let _ = self.emit_event(CoordinatorEvent::StoreFailed {
+            ticket,
+            failed_block,
+            reason: reason.clone(),
+        });
+        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
+            queue: QueueKind::Store,
+            ticket: QueueTicket::Store(ticket),
+            failed_block,
+            reason: reason.clone(),
+        });
+        if reason.contains("cancelled") {
+            QueueOutcome::Cancelled
+        } else {
+            QueueOutcome::Failed
+        }
+    }
+
+    fn fetch_failed(
+        &self,
+        ticket: FetchTicket,
+        failed_block: BlockId,
+        reason: impl Into<String>,
+    ) -> Result<QueueOutcome> {
+        let reason = reason.into();
+        self.emit_event(CoordinatorEvent::FetchFailed {
+            ticket,
+            failed_block,
+            reason: reason.clone(),
+        })?;
+        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
+            queue: QueueKind::Fetch,
+            ticket: QueueTicket::Fetch(ticket),
+            failed_block,
+            reason: reason.clone(),
+        });
+        Ok(if reason.contains("cancelled") {
+            QueueOutcome::Cancelled
+        } else {
+            QueueOutcome::Failed
+        })
+    }
+
+    fn spill_failed(
+        &self,
+        ticket: SpillTicket,
+        failed_block: BlockId,
+        reason: impl Into<String>,
+    ) -> Result<QueueOutcome> {
+        let reason = reason.into();
+        self.emit_event(CoordinatorEvent::SpillFailed {
+            ticket,
+            failed_block,
+            reason: reason.clone(),
+        })?;
+        Ok(if reason.contains("cancelled") {
+            QueueOutcome::Cancelled
+        } else {
+            QueueOutcome::Failed
+        })
+    }
+
+    fn handle_plan(&self, ticket: PlanTicket, blocks: &[PrefetchPlanRequest]) -> QueueOutcome {
         self.emit_orchestrator_event(OrchestratorEvent::PlanQueued {
             ticket,
             block_count: blocks.len(),
         });
+        if self.is_cancelled(ticket.into()) {
+            let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
+            return self.plan_failed(ticket, failed_block, "plan cancelled");
+        }
         let plans = blocks
             .iter()
             .map(|block| PrefetchPlan {
@@ -408,93 +885,89 @@ impl Coordinator {
             })
             .collect();
         self.emit_orchestrator_event(OrchestratorEvent::PlanCompleted { ticket, plans });
+        QueueOutcome::Completed
     }
 
-    fn handle_spill(&self, ticket: SpillTicket, blocks: &[SpillRequest]) -> Result<()> {
+    fn handle_spill(&self, ticket: SpillTicket, blocks: &[SpillRequest]) -> Result<QueueOutcome> {
         self.emit_event(CoordinatorEvent::SpillQueued {
             ticket,
             block_count: blocks.len(),
         })?;
+        if self.is_cancelled(ticket.into()) {
+            let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
+            return self.spill_failed(ticket, failed_block, "spill cancelled");
+        }
 
         let Some(disk_store) = &self.disk_store else {
             if let Some(first) = blocks.first() {
-                self.emit_event(CoordinatorEvent::SpillFailed {
+                return self.spill_failed(
                     ticket,
-                    failed_block: first.block_id,
-                    reason: "coordinator disk store not configured".to_string(),
-                })?;
-            } else {
-                self.emit_event(CoordinatorEvent::SpillCompleted {
-                    ticket,
-                    locations: Vec::new(),
-                })?;
+                    first.block_id,
+                    "coordinator disk store not configured",
+                );
             }
-            return Ok(());
+            self.emit_event(CoordinatorEvent::SpillCompleted {
+                ticket,
+                locations: Vec::new(),
+            })?;
+            return Ok(QueueOutcome::Completed);
         };
 
         let mut locations = Vec::with_capacity(blocks.len());
         for block in blocks {
+            if self.is_cancelled(ticket.into()) {
+                return self.spill_failed(ticket, block.block_id, "spill cancelled");
+            }
             let payload = match block.host_pool.read_region(block.host_region) {
                 Ok(payload) => payload,
-                Err(err) => {
-                    self.emit_event(CoordinatorEvent::SpillFailed {
-                        ticket,
-                        failed_block: block.block_id,
-                        reason: err.to_string(),
-                    })?;
-                    return Ok(());
-                }
+                Err(err) => return self.spill_failed(ticket, block.block_id, err.to_string()),
             };
 
             match disk_store.put_block(block.fingerprint, block.kv_format_tag, &payload) {
                 Ok(location) => locations.push((block.block_id, location)),
-                Err(err) => {
-                    self.emit_event(CoordinatorEvent::SpillFailed {
-                        ticket,
-                        failed_block: block.block_id,
-                        reason: err.to_string(),
-                    })?;
-                    return Ok(());
-                }
+                Err(err) => return self.spill_failed(ticket, block.block_id, err.to_string()),
             }
         }
 
-        self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })
+        self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })?;
+        Ok(QueueOutcome::Completed)
     }
 
-    fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) {
+    fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> QueueOutcome {
+        let _ = self.emit_event(CoordinatorEvent::StoreQueued {
+            ticket,
+            block_count: blocks.len(),
+        });
         self.emit_orchestrator_event(OrchestratorEvent::StoreQueued {
             ticket,
             block_count: blocks.len(),
         });
+        if self.is_cancelled(ticket.into()) {
+            let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
+            return self.store_failed(ticket, failed_block, "store cancelled");
+        }
 
         let disk_store = self.disk_store.as_ref();
+        let remote_store = self.remote_store.as_ref();
 
         let mut locations = Vec::with_capacity(blocks.len());
         for block in blocks {
+            if self.is_cancelled(ticket.into()) {
+                return self.store_failed(ticket, block.block_id, "store cancelled");
+            }
             let payload = match block.host_pool.read_region(block.host_region) {
                 Ok(payload) => payload,
-                Err(err) => {
-                    self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                        queue: QueueKind::Store,
-                        ticket: QueueTicket::Store(ticket),
-                        failed_block: block.block_id,
-                        reason: err.to_string(),
-                    });
-                    return;
-                }
+                Err(err) => return self.store_failed(ticket, block.block_id, err.to_string()),
             };
 
             match block.target {
                 StoreTarget::Disk => {
                     let Some(disk_store) = disk_store else {
-                        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                            queue: QueueKind::Store,
-                            ticket: QueueTicket::Store(ticket),
-                            failed_block: block.block_id,
-                            reason: "coordinator disk store not configured".to_string(),
-                        });
-                        return;
+                        return self.store_failed(
+                            ticket,
+                            block.block_id,
+                            "coordinator disk store not configured",
+                        );
                     };
                     match disk_store.put_block(block.fingerprint, block.kv_format_tag, &payload) {
                         Ok(location) => locations.push((
@@ -505,32 +978,48 @@ impl Coordinator {
                             },
                         )),
                         Err(err) => {
-                            self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                                queue: QueueKind::Store,
-                                ticket: QueueTicket::Store(ticket),
-                                failed_block: block.block_id,
-                                reason: err.to_string(),
-                            });
-                            return;
+                            return self.store_failed(ticket, block.block_id, err.to_string());
                         }
                     }
                 }
                 StoreTarget::Remote => {
-                    self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                        queue: QueueKind::Store,
-                        ticket: QueueTicket::Store(ticket),
-                        failed_block: block.block_id,
-                        reason: "remote store not implemented".to_string(),
-                    });
-                    return;
+                    let Some(remote_store) = remote_store else {
+                        return self.store_failed(
+                            ticket,
+                            block.block_id,
+                            "coordinator remote store not configured",
+                        );
+                    };
+                    let location = match remote_store.put_block(
+                        block.fingerprint,
+                        block.kv_format_tag,
+                        &payload,
+                    ) {
+                        Ok(location) => location,
+                        Err(err) => {
+                            return self.store_failed(ticket, block.block_id, err.to_string());
+                        }
+                    };
+                    let location = match location.into_block_location() {
+                        Ok(location) => location,
+                        Err(err) => {
+                            return self.store_failed(ticket, block.block_id, err.to_string());
+                        }
+                    };
+                    locations.push((block.block_id, location));
                 }
             }
         }
 
+        let _ = self.emit_event(CoordinatorEvent::StoreCompleted {
+            ticket,
+            locations: locations.clone(),
+        });
         self.emit_orchestrator_event(OrchestratorEvent::StoreCompleted { ticket, locations });
+        QueueOutcome::Completed
     }
 
-    fn handle_fetch(&self, ticket: FetchTicket, blocks: &[FetchRequest]) -> Result<()> {
+    fn handle_fetch(&self, ticket: FetchTicket, blocks: &[FetchRequest]) -> Result<QueueOutcome> {
         self.emit_event(CoordinatorEvent::FetchQueued {
             ticket,
             block_count: blocks.len(),
@@ -539,9 +1028,18 @@ impl Coordinator {
             ticket,
             block_count: blocks.len(),
         });
+        if self.is_cancelled(ticket.into()) {
+            let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
+            return self.fetch_failed(ticket, failed_block, "fetch cancelled");
+        }
 
         let mut fetched = Vec::with_capacity(blocks.len());
+        let mut allocated_regions = Vec::new();
         for block in blocks {
+            if self.is_cancelled(ticket.into()) {
+                Self::release_allocated_regions(&allocated_regions);
+                return self.fetch_failed(ticket, block.block_id, "fetch cancelled");
+            }
             match &block.source {
                 BlockLocation::HostPinned { offset } => {
                     fetched.push(FetchedBlock {
@@ -559,35 +1057,19 @@ impl Coordinator {
                     payload_len,
                 } => {
                     let Some(disk_store) = &self.disk_store else {
-                        self.emit_event(CoordinatorEvent::FetchFailed {
+                        Self::release_allocated_regions(&allocated_regions);
+                        return self.fetch_failed(
                             ticket,
-                            failed_block: block.block_id,
-                            reason: "coordinator disk store not configured".to_string(),
-                        })?;
-                        self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                            queue: QueueKind::Fetch,
-                            ticket: QueueTicket::Fetch(ticket),
-                            failed_block: block.block_id,
-                            reason: "coordinator disk store not configured".to_string(),
-                        });
-                        return Ok(());
+                            block.block_id,
+                            "coordinator disk store not configured",
+                        );
                     };
                     let location = DiskBlockLocation {
                         path: match disk_store.block_path_for(*fingerprint) {
                             Ok(path) => path,
                             Err(err) => {
-                                self.emit_event(CoordinatorEvent::FetchFailed {
-                                    ticket,
-                                    failed_block: block.block_id,
-                                    reason: err.to_string(),
-                                })?;
-                                self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                                    queue: QueueKind::Fetch,
-                                    ticket: QueueTicket::Fetch(ticket),
-                                    failed_block: block.block_id,
-                                    reason: err.to_string(),
-                                });
-                                return Ok(());
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(ticket, block.block_id, err.to_string());
                             }
                         },
                         payload_len: *payload_len,
@@ -596,55 +1078,30 @@ impl Coordinator {
                     let payload = match disk_store.get_block(&location, Some(*fingerprint)) {
                         Ok(payload) => payload,
                         Err(err) => {
-                            self.emit_event(CoordinatorEvent::FetchFailed {
-                                ticket,
-                                failed_block: block.block_id,
-                                reason: err.to_string(),
-                            })?;
-                            self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                                queue: QueueKind::Fetch,
-                                ticket: QueueTicket::Fetch(ticket),
-                                failed_block: block.block_id,
-                                reason: err.to_string(),
-                            });
-                            return Ok(());
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(ticket, block.block_id, err.to_string());
                         }
                     };
                     let region = {
                         let mut pool = match block.host_pool.lock() {
                             Ok(pool) => pool,
                             Err(err) => {
-                                self.emit_event(CoordinatorEvent::FetchFailed {
-                                    ticket,
-                                    failed_block: block.block_id,
-                                    reason: err.to_string(),
-                                })?;
-                                self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                                    queue: QueueKind::Fetch,
-                                    ticket: QueueTicket::Fetch(ticket),
-                                    failed_block: block.block_id,
-                                    reason: err.to_string(),
-                                });
-                                return Ok(());
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(ticket, block.block_id, err.to_string());
                             }
                         };
                         let Some(region) = pool.reserve(payload.len()) else {
-                            self.emit_event(CoordinatorEvent::FetchFailed {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(
                                 ticket,
-                                failed_block: block.block_id,
-                                reason: "host pinned pool exhausted".to_string(),
-                            })?;
-                            self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                                queue: QueueKind::Fetch,
-                                ticket: QueueTicket::Fetch(ticket),
-                                failed_block: block.block_id,
-                                reason: "host pinned pool exhausted".to_string(),
-                            });
-                            return Ok(());
+                                block.block_id,
+                                "host pinned pool exhausted",
+                            );
                         };
                         pool.as_mut_slice(region).copy_from_slice(&payload);
                         region
                     };
+                    allocated_regions.push((block.host_pool.clone(), region));
                     fetched.push(FetchedBlock {
                         block_id: block.block_id,
                         host_region: region,
@@ -653,32 +1110,63 @@ impl Coordinator {
                     });
                 }
                 BlockLocation::Remote { .. } => {
-                    self.emit_event(CoordinatorEvent::FetchFailed {
-                        ticket,
-                        failed_block: block.block_id,
-                        reason: "remote staging not implemented".to_string(),
-                    })?;
-                    self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                        queue: QueueKind::Fetch,
-                        ticket: QueueTicket::Fetch(ticket),
-                        failed_block: block.block_id,
-                        reason: "remote staging not implemented".to_string(),
+                    let Some(remote_store) = &self.remote_store else {
+                        Self::release_allocated_regions(&allocated_regions);
+                        return self.fetch_failed(
+                            ticket,
+                            block.block_id,
+                            "coordinator remote store not configured",
+                        );
+                    };
+                    let location = match SharedFsBlockLocation::from_block_location(&block.source) {
+                        Ok(location) => location,
+                        Err(err) => {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(ticket, block.block_id, err.to_string());
+                        }
+                    };
+                    let payload = match remote_store.get_block(location, Some(location.fingerprint))
+                    {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(ticket, block.block_id, err.to_string());
+                        }
+                    };
+                    let region = {
+                        let mut pool = match block.host_pool.lock() {
+                            Ok(pool) => pool,
+                            Err(err) => {
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(ticket, block.block_id, err.to_string());
+                            }
+                        };
+                        let Some(region) = pool.reserve(payload.len()) else {
+                            Self::release_allocated_regions(&allocated_regions);
+                            return self.fetch_failed(
+                                ticket,
+                                block.block_id,
+                                "host pinned pool exhausted",
+                            );
+                        };
+                        pool.as_mut_slice(region).copy_from_slice(&payload);
+                        region
+                    };
+                    allocated_regions.push((block.host_pool.clone(), region));
+                    fetched.push(FetchedBlock {
+                        block_id: block.block_id,
+                        host_region: region,
+                        byte_len: payload.len(),
+                        release_after_promote: true,
                     });
-                    return Ok(());
                 }
                 BlockLocation::Gpu { .. } => {
-                    self.emit_event(CoordinatorEvent::FetchFailed {
+                    Self::release_allocated_regions(&allocated_regions);
+                    return self.fetch_failed(
                         ticket,
-                        failed_block: block.block_id,
-                        reason: "gpu source should not go through fetch queue".to_string(),
-                    })?;
-                    self.emit_orchestrator_event(OrchestratorEvent::TaskFailed {
-                        queue: QueueKind::Fetch,
-                        ticket: QueueTicket::Fetch(ticket),
-                        failed_block: block.block_id,
-                        reason: "gpu source should not go through fetch queue".to_string(),
-                    });
-                    return Ok(());
+                        block.block_id,
+                        "gpu source should not go through fetch queue",
+                    );
                 }
             }
         }
@@ -691,30 +1179,44 @@ impl Coordinator {
             ticket,
             blocks: fetched,
         })?;
-        Ok(())
+        Ok(QueueOutcome::Completed)
     }
 
     pub fn run_once(&self) -> Result<bool> {
         match self.rx.recv_timeout(Duration::from_millis(1)) {
             Ok(cmd) => {
-                match &cmd {
+                let queue_ticket = match &cmd {
+                    CoordinatorCommand::Plan { ticket, .. } => Some((*ticket).into()),
+                    CoordinatorCommand::Spill { ticket, .. } => Some((*ticket).into()),
+                    CoordinatorCommand::Store { ticket, .. } => Some((*ticket).into()),
+                    CoordinatorCommand::Fetch { ticket, .. } => Some((*ticket).into()),
+                    CoordinatorCommand::Shutdown => None,
+                };
+                if let Some(ticket) = queue_ticket {
+                    self.control.on_start(ticket);
+                }
+                let outcome = match &cmd {
                     CoordinatorCommand::Plan { ticket, blocks } => {
-                        self.handle_plan(*ticket, blocks);
+                        Some(self.handle_plan(*ticket, blocks))
                     }
                     CoordinatorCommand::Spill { ticket, blocks } => {
-                        self.handle_spill(*ticket, blocks)?;
+                        Some(self.handle_spill(*ticket, blocks)?)
                     }
                     CoordinatorCommand::Store { ticket, blocks } => {
-                        self.handle_store(*ticket, blocks);
+                        Some(self.handle_store(*ticket, blocks))
                     }
                     CoordinatorCommand::Fetch { ticket, blocks } => {
-                        self.handle_fetch(*ticket, blocks)?;
+                        Some(self.handle_fetch(*ticket, blocks)?)
                     }
                     CoordinatorCommand::Shutdown => {
                         self.events
                             .send(CoordinatorEvent::CommandQueued(cmd.clone()))
                             .map_err(|e| anyhow!("coordinator event send failed: {e}"))?;
+                        None
                     }
+                };
+                if let (Some(ticket), Some(outcome)) = (queue_ticket, outcome) {
+                    self.control.on_finish(ticket, outcome);
                 }
                 Ok(!matches!(cmd, CoordinatorCommand::Shutdown))
             }
@@ -1037,9 +1539,109 @@ mod tests {
     }
 
     #[test]
+    fn queue_stats_report_backpressure_and_rejections() {
+        let (_coordinator, handle, _events) = Coordinator::new(1);
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(64).unwrap(),
+        );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(4).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"test");
+            region
+        };
+
+        let first = handle.submit_fetch(vec![FetchRequest {
+            block_id: BlockId(21),
+            source: BlockLocation::HostPinned {
+                offset: region.offset,
+            },
+            byte_len: region.len,
+            host_pool: host_pool.clone(),
+        }]);
+        assert!(first.is_some());
+        let stats = handle.stats();
+        assert_eq!(stats.fetch.queued, 1);
+        assert_eq!(stats.total_queued, 1);
+        assert_eq!(stats.backpressure(), QueueBackpressure::Saturated);
+        assert_eq!(
+            handle.queue_stats(QueueKind::Fetch).backpressure(),
+            QueueBackpressure::Saturated
+        );
+
+        let second = handle.submit_fetch(vec![FetchRequest {
+            block_id: BlockId(22),
+            source: BlockLocation::HostPinned {
+                offset: region.offset,
+            },
+            byte_len: region.len,
+            host_pool,
+        }]);
+        assert!(second.is_none());
+        let stats = handle.stats();
+        assert_eq!(stats.fetch.submitted, 1);
+        assert_eq!(stats.fetch.rejected, 1);
+    }
+
+    #[test]
+    fn cancelled_fetch_updates_stats_and_reports_cancel_reason() {
+        let (coordinator, handle, events) = Coordinator::new(4);
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(128).unwrap(),
+        );
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(5).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"hello");
+            region
+        };
+
+        let ticket = handle
+            .submit_fetch(vec![FetchRequest {
+                block_id: BlockId(23),
+                source: BlockLocation::HostPinned {
+                    offset: region.offset,
+                },
+                byte_len: region.len,
+                host_pool,
+            }])
+            .unwrap();
+        assert!(handle.cancel_fetch(ticket));
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::FetchQueued {
+                ticket,
+                block_count: 1,
+            }
+        );
+        match events.recv().unwrap() {
+            CoordinatorEvent::FetchFailed {
+                ticket: failed_ticket,
+                failed_block,
+                reason,
+            } => {
+                assert_eq!(failed_ticket, ticket);
+                assert_eq!(failed_block, BlockId(23));
+                assert!(reason.contains("cancelled"));
+            }
+            other => panic!("unexpected fetch cancel event: {other:?}"),
+        }
+
+        let stats = handle.stats();
+        assert_eq!(stats.fetch.cancelled, 1);
+        assert_eq!(stats.fetch.failed, 0);
+        assert_eq!(stats.fetch.completed, 0);
+        assert_eq!(stats.fetch.queued, 0);
+        assert_eq!(stats.fetch.in_flight, 0);
+        assert!(!handle.cancel_fetch(ticket));
+    }
+
+    #[test]
     fn orchestrator_plan_classifies_tiers_without_touching_legacy_events() {
         let (coordinator, handle, _events, orchestrator_events) =
-            Coordinator::new_with_orchestrator_events(4, None);
+            Coordinator::new_with_orchestrator_events(4, None, None);
         let ticket = handle
             .submit_prefetch_plan(vec![
                 PrefetchPlanRequest {
@@ -1120,7 +1722,7 @@ mod tests {
     #[test]
     fn orchestrator_store_reports_remote_stub_failure() {
         let (coordinator, handle, _events, orchestrator_events) =
-            Coordinator::new_with_orchestrator_events(4, None);
+            Coordinator::new_with_orchestrator_events(4, None, None);
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
         );
@@ -1160,9 +1762,97 @@ mod tests {
                 assert_eq!(queue, QueueKind::Store);
                 assert_eq!(failed_ticket, QueueTicket::Store(ticket));
                 assert_eq!(failed_block, BlockId(7));
-                assert!(reason.contains("remote store not implemented"));
+                assert!(reason.contains("remote store not configured"));
             }
             other => panic!("unexpected orchestrator event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_store_and_fetch_roundtrip_through_shared_fs_backend() {
+        let dir = tempdir().unwrap();
+        let remote_store = Arc::new(SharedFsStore::new(dir.path()));
+        let (coordinator, handle, events) =
+            Coordinator::new_with_backends(4, None, Some(remote_store.clone()));
+        let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
+            crate::kv_tier::HostPinnedPool::new(256).unwrap(),
+        );
+        let fingerprint = BlockFingerprint([0x31; 16]);
+        let region = {
+            let mut pool = host_pool.lock().unwrap();
+            let region = pool.reserve(12).unwrap();
+            pool.as_mut_slice(region).copy_from_slice(b"remote-bytes");
+            region
+        };
+
+        let store_ticket = handle
+            .submit_store(vec![StoreRequest {
+                block_id: BlockId(31),
+                fingerprint,
+                kv_format_tag: 2,
+                host_pool: host_pool.clone(),
+                host_region: region,
+                target: StoreTarget::Remote,
+            }])
+            .unwrap();
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::StoreQueued {
+                ticket: store_ticket,
+                block_count: 1,
+            }
+        );
+        match events.recv().unwrap() {
+            CoordinatorEvent::StoreCompleted { ticket, locations } => {
+                assert_eq!(ticket, store_ticket);
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].0, BlockId(31));
+            }
+            other => panic!("unexpected store event: {other:?}"),
+        }
+        let stored = remote_store
+            .get_block(
+                SharedFsBlockLocation::new(fingerprint, 12),
+                Some(fingerprint),
+            )
+            .unwrap();
+        assert_eq!(stored, b"remote-bytes");
+        let remote_location = SharedFsBlockLocation::new(fingerprint, 12)
+            .into_block_location()
+            .unwrap();
+        assert_eq!(store_ticket.0, 1);
+
+        let fetch_ticket = handle
+            .submit_fetch(vec![FetchRequest {
+                block_id: BlockId(31),
+                source: remote_location,
+                byte_len: 12,
+                host_pool: host_pool.clone(),
+            }])
+            .unwrap();
+
+        assert!(coordinator.run_once().unwrap());
+        assert_eq!(
+            events.recv().unwrap(),
+            CoordinatorEvent::FetchQueued {
+                ticket: fetch_ticket,
+                block_count: 1,
+            }
+        );
+        match events.recv().unwrap() {
+            CoordinatorEvent::FetchCompleted { ticket, blocks } => {
+                assert_eq!(ticket, fetch_ticket);
+                assert_eq!(blocks.len(), 1);
+                assert!(blocks[0].release_after_promote);
+                assert_eq!(
+                    host_pool.read_region(blocks[0].host_region).unwrap(),
+                    b"remote-bytes"
+                );
+                host_pool.lock().unwrap().release(blocks[0].host_region);
+            }
+            other => panic!("unexpected remote fetch event: {other:?}"),
         }
     }
 }

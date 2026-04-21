@@ -134,6 +134,7 @@ pub mod host_pool;
 pub mod id;
 pub mod io;
 pub mod lookup;
+pub mod policy;
 pub mod readmission;
 pub mod tier;
 pub mod transport;
@@ -144,8 +145,9 @@ pub use chunk::{
     SpanTaskKey, StoreState, TokenRange,
 };
 pub use coordinator::{
-    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, FetchRequest,
-    FetchTicket, FetchedBlock, SpillRequest, SpillTicket,
+    Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, CoordinatorQueueStats,
+    FetchRequest, FetchTicket, FetchedBlock, QueueBackpressure, QueueControlStats, QueueKind,
+    QueueTicket, SpillRequest, SpillTicket, StoreRequest, StoreTarget, StoreTicket,
 };
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;
@@ -154,6 +156,7 @@ pub use io::{
     KVPayload, KVPayloadRef,
 };
 pub use lookup::{HitKind, LookupBlock, LookupHeuristics, LookupOutcome};
+pub use policy::{PrefetchMode, TieredKvPolicy, WriteBackMode};
 pub use readmission::{ReadmissionBlock, ReadmissionKey, ReadmissionPlan, ReadmissionSource};
 pub use tier::{BlockLocation, MemKind, RemoteBlockDesc, Tier, TransportId};
-pub use transport::{KVTransport, TransferOp, TransportError};
+pub use transport::{DiskStore, KVTransport, SharedFsStore, TransferOp, TransportError};

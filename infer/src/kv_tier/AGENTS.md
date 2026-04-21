@@ -1,12 +1,14 @@
 # `infer::kv_tier` — Agent Guide
 
 Hierarchical KV cache shape: T0 GPU HBM → T1 host pinned DRAM → T2 NVMe →
-T3 remote (NIXL/Mooncake/UCX). **Status: partially live on the CUDA lane** —
-the scheduler now uses `prefix_cache + paged_kv + HostPinnedPool + Coordinator +
-DiskStore` for one unified local path: direct GPU prefix attachment and
-decode-time COW on T0, Zig-backed spill buffering on T1, local staged
-readmission (`host/disk -> host -> T0`), and T1→T2 persistence. Remote
-transports remain skeletal.
+T3 remote (shared-fs today; NIXL/Mooncake/UCX later). **Status: partially
+live on the CUDA lane** — the scheduler now uses `prefix_cache + paged_kv +
+HostPinnedPool + Coordinator + DiskStore/SharedFsStore` for one unified local
+path: direct GPU prefix attachment and decode-time COW on T0, Zig-backed spill
+buffering on T1, staged readmission (`host/disk/shared-fs -> host -> T0`),
+T1→T2 persistence, and a live `ServerMetrics` surface for coordinator
+fetch/store queue depth, waiters, backpressure, and cancellation. Only the
+RDMA-class remote transports remain skeletal.
 
 Load this file before editing anything under `kv_tier/`, and re-read
 `docs/projects/tiered-kv-cache.md` before making any design-visible change.
@@ -44,7 +46,7 @@ kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
 kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
-kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/store queues on the local spill/readmission path
+kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/store queues on the local spill/readmission path; queue stats/cancellation/backpressure and shared-fs remote fetch/store live here
 ```
 
 **Do not reintroduce `directory.rs`.** The former `TierDirectory` /
