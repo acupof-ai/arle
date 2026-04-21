@@ -1,4 +1,17 @@
-use super::{CompletionStreamDelta, FinishReason, TokenUsage, Tokenizer, mpsc};
+use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
+
+/// Request normalized once at scheduler intake and kept in the waiting queue
+/// until it is actually admitted into a slot.
+pub(crate) struct QueuedRequest {
+    pub(crate) prompt: String,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) max_tokens: usize,
+    pub(crate) sampling: crate::sampler::SamplingParams,
+    pub(crate) stop: Option<Vec<String>>,
+    pub(crate) priority: RequestPriority,
+    pub(crate) session_id: Option<crate::types::SessionId>,
+    pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+}
 
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
@@ -21,12 +34,12 @@ pub(crate) struct ActiveRequest {
     pub(crate) prompt: String,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) generated_tokens: Vec<u32>,
+    pub(crate) priority: RequestPriority,
     pub(crate) max_tokens: usize,
     pub(crate) sampling: crate::sampler::SamplingParams,
     pub(crate) stop: Option<Vec<String>>,
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
-    /// Consumed by slot-admission once A1 lands; currently informational.
     pub(crate) session_id: Option<crate::types::SessionId>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Full decoded text, maintained incrementally.
@@ -253,6 +266,7 @@ mod tests {
             prompt: prompt.to_string(),
             prompt_tokens,
             generated_tokens: Vec::new(),
+            priority: RequestPriority::Normal,
             max_tokens: 16,
             sampling: SamplingParams::default(),
             stop: None,

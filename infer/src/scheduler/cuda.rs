@@ -23,7 +23,7 @@ mod request;
 mod runtime;
 
 pub use core::Scheduler;
-pub(super) use request::{ActiveRequest, Phase};
+pub(super) use request::{ActiveRequest, Phase, QueuedRequest};
 
 /// Interval (in completed requests) at which stats are logged.
 pub(super) const STATS_LOG_INTERVAL: u64 = 10;

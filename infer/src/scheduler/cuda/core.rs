@@ -2,12 +2,13 @@ use std::collections::HashMap;
 
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
-    Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
-    error, info, mpsc, warn,
+    Phase, QueuedRequest, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer,
+    VecDeque, error, info, mpsc, warn,
 };
 use crate::kv_tier::BlockLocation;
 use crate::kv_tier::transport::DiskStore;
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
+use crate::scheduler::RequestLengthContract;
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
 use crate::types::{BlockFingerprint, KvContentContext};
 
@@ -46,8 +47,7 @@ fn can_publish_prefix_pages(
 }
 
 pub(super) struct StagedAdmission {
-    pub(super) request: IncomingRequest,
-    pub(super) prompt_tokens: Vec<u32>,
+    pub(super) request: QueuedRequest,
     pub(super) block_ids: Vec<BlockId>,
     pub(super) enqueued_at_clock: u64,
     pub(super) staged_blocks: Vec<StagedBlock>,
@@ -66,7 +66,6 @@ pub(super) struct PendingDecode {
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
     pub mixed_prefill_request_idx: Option<usize>,
-    pub mixed_prefill_tokens: usize,
     pub mixed_prefill_chunk_complete: bool,
 }
 
@@ -136,7 +135,7 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
-    pub(super) waiting: VecDeque<IncomingRequest>,
+    pub(super) waiting: VecDeque<QueuedRequest>,
     pub(super) active: Vec<Option<ActiveRequest>>,
     pub(super) prefill_queue: VecDeque<usize>,
     pub(super) running_batch: VecDeque<usize>,
@@ -160,8 +159,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
-    /// Prefill request consumed by the mixed decode launch in the current step.
-    pub(super) pending_mixed_prefill_idx: Option<usize>,
+    /// Backend-agnostic request-length contract after reconciling model
+    /// context length with the realized paged-KV pool capacity.
+    pub(super) request_length_contract: RequestLengthContract,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -476,6 +476,26 @@ impl<M: ModelForward> Scheduler<M> {
             crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
         );
 
+        if let Some(explicit_max_seq_len) = max_seq_len_override {
+            let required_tokens = config.max_slots.saturating_mul(explicit_max_seq_len);
+            let available_tokens = paged_kv_pool.max_total_pages * paged_kv_pool.page_size;
+            anyhow::ensure!(
+                available_tokens >= required_tokens,
+                "requested scheduler envelope needs at least {} KV tokens ({} slots × max_seq_len {}), \
+                 but the paged KV pool only provisioned {} tokens ({} pages @ page_size={}); \
+                 reduce --num-slots / --max-seq-len or use a denser KV format",
+                required_tokens,
+                config.max_slots,
+                explicit_max_seq_len,
+                available_tokens,
+                paged_kv_pool.max_total_pages,
+                paged_kv_pool.page_size,
+            );
+        }
+        let available_pool_tokens = paged_kv_pool.max_total_pages * paged_kv_pool.page_size;
+        let request_length_contract =
+            RequestLengthContract::derive(available_pool_tokens, effective_max_seq_len);
+
         info!(
             "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}, host_pool={:.1}MB",
             model_id,
@@ -487,10 +507,15 @@ impl<M: ModelForward> Scheduler<M> {
             config.max_prefill_tokens,
             config
                 .prefill_max_requests
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".to_string()),
+                .map_or_else(|| "none".to_string(), |v| v.to_string()),
             config.enable_mixed_chunk,
             host_pool_capacity as f64 / 1e6,
+        );
+        info!(
+            "Scheduler request length ceilings: max_req_len={}, max_req_input_len={} (exclusive, pool_tokens={})",
+            request_length_contract.max_request_len(),
+            request_length_contract.max_request_input_len(),
+            available_pool_tokens,
         );
 
         let waiting_count = Arc::new(AtomicUsize::new(0));
@@ -501,8 +526,11 @@ impl<M: ModelForward> Scheduler<M> {
                 Arc::clone(&disk_store),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
+        let max_waiting_requests = config.max_waiting_requests;
+        let max_slots = config.max_slots;
+        let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;
         let scheduler = Self {
-            config: config.clone(),
+            config,
             metrics,
             model,
             tokenizer,
@@ -511,7 +539,7 @@ impl<M: ModelForward> Scheduler<M> {
             slot_materialized_prompt_lens,
             prefix_cache: RadixCache::with_soft_pin_keepalive(
                 PREFIX_CACHE_BLOCK_SIZE,
-                config.prefix_cache_keepalive_ticks,
+                prefix_cache_keepalive_ticks,
             ),
             disk_store,
             host_pinned_pool,
@@ -527,7 +555,7 @@ impl<M: ModelForward> Scheduler<M> {
             request_rx: rx,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
-            active: (0..config.max_slots).map(|_| None).collect(),
+            active: (0..max_slots).map(|_| None).collect(),
             prefill_queue: VecDeque::new(),
             running_batch: VecDeque::new(),
             next_id: 0,
@@ -543,13 +571,13 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
-            pending_mixed_prefill_idx: None,
+            request_length_contract,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count(
             tx,
             model_id,
-            config.max_waiting_requests,
+            max_waiting_requests,
             Arc::clone(&waiting_count),
         );
         debug_assert_eq!(handle.waiting_count(), 0);
@@ -742,7 +770,7 @@ impl<M: ModelForward> Scheduler<M> {
         &mut self,
         slot_idx: usize,
         prompt_tokens: &[u32],
-        session_id: Option<crate::types::SessionId>,
+        session_id: Option<&crate::types::SessionId>,
     ) {
         let block_size = self.prefix_cache.block_size();
         // The slot's `seq_len` is the actual ground truth for how many tokens
@@ -877,7 +905,7 @@ impl<M: ModelForward> Scheduler<M> {
             .paged_kv_pool
             .storage_bytes_for_tokens(block_size)
             .min(u32::MAX as usize) as u32;
-        let keepalive_deadline = session_id.as_ref().map(|_| {
+        let keepalive_deadline = session_id.map(|_| {
             self.prefix_cache
                 .logical_clock()
                 .saturating_add(self.config.prefix_cache_keepalive_ticks)
@@ -903,7 +931,7 @@ impl<M: ModelForward> Scheduler<M> {
                         slot: slot_idx as u32,
                     }),
                     byte_len: Some(block_byte_len),
-                    session_id: Some(session_id.clone()),
+                    session_id: Some(session_id.cloned()),
                     soft_pin_until: Some(keepalive_deadline),
                 },
             );

@@ -1,9 +1,15 @@
 use super::{
-    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, RequestPriority,
-    Scheduler, error, info, warn,
+    FinishReason, GenerationState, ModelForward, Phase, QueuedRequest, Scheduler, error, info, warn,
 };
 use crate::model::kv_cache::KVFormat;
 use crate::scheduler::cuda::core::PendingDecode;
+
+fn retract_victim_score(
+    generated_tokens: usize,
+    prompt_tokens: usize,
+) -> (usize, std::cmp::Reverse<usize>) {
+    (generated_tokens, std::cmp::Reverse(prompt_tokens))
+}
 
 impl<M: ModelForward> Scheduler<M> {
     fn decode_pages_needed(&self, slot_indices: &[usize]) -> usize {
@@ -17,10 +23,11 @@ impl<M: ModelForward> Scheduler<M> {
         decode_indices
             .iter()
             .enumerate()
-            .max_by_key(|(_, slot_idx)| {
+            .min_by_key(|(_, slot_idx)| {
                 self.request(**slot_idx)
-                    .map(|req| req.generated_tokens.len())
-                    .unwrap_or_default()
+                    .map_or((usize::MAX, std::cmp::Reverse(0)), |req| {
+                        retract_victim_score(req.generated_tokens.len(), req.prompt_tokens.len())
+                    })
             })
             .map(|(pos, _)| pos)
     }
@@ -85,12 +92,13 @@ impl<M: ModelForward> Scheduler<M> {
                 .request_mut(slot_idx)
                 .expect("preempted decode slot must hold a request");
             let generated_tokens = victim.generated_tokens.len();
-            let requeue = IncomingRequest {
+            let requeue = QueuedRequest {
                 prompt: std::mem::take(&mut victim.prompt),
+                prompt_tokens: std::mem::take(&mut victim.prompt_tokens),
                 max_tokens: victim.max_tokens,
                 sampling: victim.sampling.clone(),
                 stop: victim.stop.take(),
-                priority: RequestPriority::Normal,
+                priority: victim.priority,
                 session_id: victim.session_id.clone(),
                 delta_tx: victim.delta_tx.clone(),
             };
@@ -275,7 +283,6 @@ impl<M: ModelForward> Scheduler<M> {
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: None,
-            mixed_prefill_tokens: 0,
             mixed_prefill_chunk_complete: false,
         });
     }
@@ -486,13 +493,11 @@ impl<M: ModelForward> Scheduler<M> {
             *progress = new_progress;
         }
 
-        self.pending_mixed_prefill_idx = Some(prefill_slot_idx);
         self.pending_decode = Some(PendingDecode {
             decode_indices,
             slot_indices,
             greedy_launched,
             mixed_prefill_request_idx: Some(prefill_slot_idx),
-            mixed_prefill_tokens: prefill_token_count,
             mixed_prefill_chunk_complete: new_progress >= prefill_total,
         });
     }
@@ -527,9 +532,9 @@ impl<M: ModelForward> Scheduler<M> {
         if decode_indices.is_empty() {
             return;
         }
-        // Preemption: if pool can't fit all decode requests, preempt the
-        // request with the most generated tokens (highest KV cost, preserves
-        // shorter conversations that are closer to completion).
+        // Preemption: if pool can't fit all decode requests, retract the
+        // least-progressed request and, on ties, the one with the longer
+        // prompt. This matches sglang's default decode retract heuristic.
         // Recompute mode: preempted request is re-queued and re-prefilled
         // when GPU memory frees up.
         self.retract_decode_to_fit(&mut decode_indices, &mut token_ids, 0);
@@ -696,5 +701,26 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retract_victim_score;
+
+    #[test]
+    fn retract_prefers_less_progress_even_if_other_prompt_is_shorter() {
+        assert!(
+            retract_victim_score(2, 64) < retract_victim_score(5, 1024),
+            "fewer generated tokens must retract first",
+        );
+    }
+
+    #[test]
+    fn retract_prefers_longer_prompt_when_progress_ties() {
+        assert!(
+            retract_victim_score(3, 1024) < retract_victim_score(3, 128),
+            "when decode progress ties, the longer prompt must retract first",
+        );
     }
 }

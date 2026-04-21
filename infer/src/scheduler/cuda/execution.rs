@@ -1,20 +1,98 @@
 use super::{ModelForward, Phase, Scheduler, info};
+use crate::model::kv_cache::KVFormat;
+use crate::prefix_cache::BlockMetadataUpdate;
 
 #[derive(Clone, Copy, Debug)]
 struct PrefillReservation {
-    slot_idx: usize,
     prefill_tokens: usize,
-    pool_tokens: usize,
+    page_reserve: SlotPageReserve,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlotPageReserve {
+    slot_idx: usize,
+    prefill_pool_tokens: usize,
     decode_headroom_tokens: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrefillCandidate {
+    slot_idx: usize,
+    reservation: PrefillReservation,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StepPlan {
+    Idle,
+    DecodeOnly,
+    Mixed(PrefillCandidate),
+    PrefillOnly(PrefillCandidate),
+}
+
+impl StepPlan {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::DecodeOnly => "decode",
+            Self::Mixed(_) => "mixed",
+            Self::PrefillOnly(_) => "prefill",
+        }
+    }
 }
 
 #[derive(Debug)]
 struct PrefillBudget {
     remaining_prefill_tokens: usize,
     remaining_requests: usize,
+    page_budget: PrefillPageBudget,
+}
+
+#[derive(Debug)]
+struct PrefillPageBudget {
     remaining_free_pages: usize,
     planned_seq_lens: Vec<usize>,
     page_size: usize,
+}
+
+impl PrefillPageBudget {
+    fn new(remaining_free_pages: usize, planned_seq_lens: Vec<usize>, page_size: usize) -> Self {
+        Self {
+            remaining_free_pages,
+            planned_seq_lens,
+            page_size,
+        }
+    }
+
+    fn can_fit(&self, reserve: SlotPageReserve) -> bool {
+        self.additional_pages_needed(reserve) <= self.remaining_free_pages
+    }
+
+    fn reserve_running_decode_headroom(&mut self, slot_idx: usize, decode_tokens: usize) {
+        let reserve = SlotPageReserve {
+            slot_idx,
+            prefill_pool_tokens: 0,
+            decode_headroom_tokens: decode_tokens,
+        };
+        let new_pages = self.additional_pages_needed(reserve);
+        debug_assert!(new_pages <= self.remaining_free_pages);
+        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
+        self.planned_seq_lens[slot_idx] =
+            self.planned_seq_lens[slot_idx].saturating_add(decode_tokens);
+    }
+
+    fn additional_pages_needed(&self, reserve: SlotPageReserve) -> usize {
+        let total_tokens = reserve
+            .prefill_pool_tokens
+            .saturating_add(reserve.decode_headroom_tokens);
+        if total_tokens == 0 {
+            return 0;
+        }
+        let current_pages = self.planned_seq_lens[reserve.slot_idx].div_ceil(self.page_size);
+        let future_pages = self.planned_seq_lens[reserve.slot_idx]
+            .saturating_add(total_tokens)
+            .div_ceil(self.page_size);
+        future_pages.saturating_sub(current_pages)
+    }
 }
 
 impl PrefillBudget {
@@ -22,18 +100,22 @@ impl PrefillBudget {
         let mut budget = Self {
             remaining_prefill_tokens: scheduler.config.max_prefill_tokens,
             remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
-            remaining_free_pages: scheduler.pool_free_pages(),
-            planned_seq_lens: (0..scheduler.states.len())
-                .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
-                .collect(),
-            page_size: scheduler.paged_kv_pool.page_size.max(1),
+            page_budget: PrefillPageBudget::new(
+                scheduler.pool_free_pages(),
+                (0..scheduler.states.len())
+                    .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
+                    .collect(),
+                scheduler.paged_kv_pool.page_size.max(1),
+            ),
         };
         for &slot_idx in &scheduler.running_batch {
             if scheduler
                 .request(slot_idx)
                 .is_some_and(|req| req.generated_tokens.len() < req.max_tokens)
             {
-                budget.reserve_decode_headroom(slot_idx, 1);
+                budget
+                    .page_budget
+                    .reserve_running_decode_headroom(slot_idx, 1);
             }
         }
         budget
@@ -46,11 +128,7 @@ impl PrefillBudget {
         {
             return false;
         }
-        self.additional_pages_needed(
-            reservation.slot_idx,
-            reservation.pool_tokens,
-            reservation.decode_headroom_tokens,
-        ) <= self.remaining_free_pages
+        self.page_budget.can_fit(reservation.page_reserve)
     }
 
     fn reserve(&mut self, reservation: PrefillReservation) {
@@ -59,66 +137,27 @@ impl PrefillBudget {
             .remaining_prefill_tokens
             .saturating_sub(reservation.prefill_tokens);
         self.remaining_requests = self.remaining_requests.saturating_sub(1);
-        self.reserve_tokens(
-            reservation.slot_idx,
-            reservation.pool_tokens,
-            reservation.decode_headroom_tokens,
-        );
-    }
-
-    fn reserve_mixed_prefill(&mut self, prefill_tokens: usize) {
-        if prefill_tokens == 0 {
-            return;
-        }
-        self.remaining_prefill_tokens =
-            self.remaining_prefill_tokens.saturating_sub(prefill_tokens);
-        self.remaining_requests = self.remaining_requests.saturating_sub(1);
-    }
-
-    fn reserve_decode_headroom(&mut self, slot_idx: usize, decode_tokens: usize) {
-        if decode_tokens == 0 {
-            return;
-        }
-        let new_pages = self.additional_pages_needed(slot_idx, 0, decode_tokens);
-        debug_assert!(new_pages <= self.remaining_free_pages);
-        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
-        self.planned_seq_lens[slot_idx] =
-            self.planned_seq_lens[slot_idx].saturating_add(decode_tokens);
-    }
-
-    fn reserve_tokens(
-        &mut self,
-        slot_idx: usize,
-        pool_tokens: usize,
-        decode_headroom_tokens: usize,
-    ) {
-        let new_pages = self.additional_pages_needed(slot_idx, pool_tokens, decode_headroom_tokens);
-        debug_assert!(new_pages <= self.remaining_free_pages);
-        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
-        self.planned_seq_lens[slot_idx] = self.planned_seq_lens[slot_idx]
-            .saturating_add(pool_tokens)
-            .saturating_add(decode_headroom_tokens);
-    }
-
-    fn additional_pages_needed(
-        &self,
-        slot_idx: usize,
-        pool_tokens: usize,
-        decode_headroom_tokens: usize,
-    ) -> usize {
-        let total_tokens = pool_tokens.saturating_add(decode_headroom_tokens);
-        if total_tokens == 0 {
-            return 0;
-        }
-        let current_pages = self.planned_seq_lens[slot_idx].div_ceil(self.page_size);
-        let future_pages = self.planned_seq_lens[slot_idx]
-            .saturating_add(total_tokens)
-            .div_ceil(self.page_size);
-        future_pages.saturating_sub(current_pages)
+        let new_pages = self
+            .page_budget
+            .additional_pages_needed(reservation.page_reserve);
+        self.page_budget.remaining_free_pages = self
+            .page_budget
+            .remaining_free_pages
+            .saturating_sub(new_pages);
+        self.page_budget.planned_seq_lens[reservation.page_reserve.slot_idx] =
+            self.page_budget.planned_seq_lens[reservation.page_reserve.slot_idx]
+                .saturating_add(reservation.page_reserve.prefill_pool_tokens)
+                .saturating_add(reservation.page_reserve.decode_headroom_tokens);
     }
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn can_launch_mixed_batch(&self) -> bool {
+        self.config.enable_mixed_chunk
+            && self.model.supports_mixed_batch()
+            && self.paged_kv_pool.format == KVFormat::BF16
+    }
+
     fn prefill_reservation(&self, slot_idx: usize) -> Option<PrefillReservation> {
         let req = self.request(slot_idx)?;
         if req.delta_tx.is_closed() {
@@ -145,61 +184,257 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
         Some(PrefillReservation {
-            slot_idx,
             prefill_tokens,
-            pool_tokens,
-            decode_headroom_tokens: usize::from(req.generated_tokens.len() < req.max_tokens),
+            page_reserve: SlotPageReserve {
+                slot_idx,
+                prefill_pool_tokens: pool_tokens,
+                decode_headroom_tokens: usize::from(req.generated_tokens.len() < req.max_tokens),
+            },
         })
+    }
+
+    fn waiting_prefill_reservation(
+        &self,
+        slot_idx: usize,
+        prompt_tokens: usize,
+        max_tokens: usize,
+    ) -> PrefillReservation {
+        let prefill_tokens = prompt_tokens.min(self.prefill_chunk_size());
+        PrefillReservation {
+            prefill_tokens,
+            page_reserve: SlotPageReserve {
+                slot_idx,
+                prefill_pool_tokens: if self.model.prefill_uses_paged_pool()
+                    && self.paged_kv_pool.is_active()
+                {
+                    prefill_tokens
+                } else {
+                    0
+                },
+                decode_headroom_tokens: usize::from(max_tokens > 0),
+            },
+        }
+    }
+
+    fn queued_prefill_candidate(&mut self, budget: &PrefillBudget) -> Option<PrefillCandidate> {
+        loop {
+            let slot_idx = self.prefill_queue.front().copied()?;
+            if self
+                .request(slot_idx)
+                .is_some_and(|req| req.delta_tx.is_closed())
+            {
+                self.finish_slot(slot_idx);
+                continue;
+            }
+            let Some(reservation) = self.prefill_reservation(slot_idx) else {
+                self.dequeue_prefill(slot_idx);
+                continue;
+            };
+            return budget
+                .can_schedule(reservation)
+                .then_some(PrefillCandidate {
+                    slot_idx,
+                    reservation,
+                });
+        }
+    }
+
+    fn admit_waiting_prefill_candidate(
+        &mut self,
+        budget: &PrefillBudget,
+    ) -> Option<PrefillCandidate> {
+        super::runtime::sort_waiting_queue_by_priority(&mut self.waiting);
+
+        while let Some(queued) = self.waiting.pop_front() {
+            if queued.delta_tx.is_closed() {
+                continue;
+            }
+
+            let free_slots = self.free_slots();
+            if free_slots.is_empty() {
+                self.waiting.push_front(queued);
+                return None;
+            }
+
+            let _ = self.evict_prefix_cache_if_pressured();
+            let lookup = self.prefix_cache.lookup_or_stage(
+                &queued.prompt_tokens,
+                crate::kv_tier::LookupHeuristics::default(),
+            );
+            let radix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .filter_map(|block| block.block_id)
+                .collect();
+            let stage_requests = if self.coordinator_unavailable || lookup.recompute_advised {
+                Vec::new()
+            } else {
+                self.build_stage_requests(&lookup.blocks)
+            };
+
+            if !stage_requests.is_empty() {
+                if let Some(ticket) = self.coordinator_handle.stage(&stage_requests) {
+                    let stage_deadline = self
+                        .prefix_cache
+                        .logical_clock()
+                        .saturating_add(self.config.stage_wait_keepalive_ticks);
+                    for &block_id in &radix_blocks {
+                        let _ = self.prefix_cache.update_block_metadata(
+                            block_id,
+                            BlockMetadataUpdate {
+                                soft_pin_until: Some(Some(stage_deadline)),
+                                ..BlockMetadataUpdate::default()
+                            },
+                        );
+                    }
+                    log::info!(
+                        "Request {} staged on ticket={} (prompt={} tokens, staged_blocks={})",
+                        self.next_id,
+                        ticket.0,
+                        queued.prompt_tokens.len(),
+                        stage_requests.len()
+                    );
+                    self.stage_waiting.insert(
+                        ticket,
+                        super::core::StagedAdmission {
+                            request: queued,
+                            block_ids: radix_blocks,
+                            enqueued_at_clock: self.prefix_cache.logical_clock(),
+                            staged_blocks: stage_requests
+                                .iter()
+                                .map(|request| super::core::StagedBlock {
+                                    block_id: request.block_id,
+                                    host_region: request
+                                        .host_region
+                                        .expect("stage requests must carry host regions"),
+                                    release_on_abort: matches!(
+                                        request.from,
+                                        crate::kv_tier::BlockLocation::Disk { .. }
+                                    ),
+                                })
+                                .collect(),
+                        },
+                    );
+                    return None;
+                }
+                self.prefix_cache.release(&radix_blocks);
+            }
+
+            let ready_on_gpu = super::runtime::lookup_blocks_ready_on_gpu(&lookup.blocks);
+            let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
+                lookup.matched_len
+            } else {
+                0
+            };
+            let gpu_ready_prefix_blocks: Vec<_> = lookup
+                .blocks
+                .iter()
+                .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+                .filter_map(|block| block.block_id)
+                .collect();
+            let reusable_gpu_prefix = super::runtime::best_reusable_slot_for_radix_hit(
+                &gpu_ready_prefix_blocks,
+                &free_slots,
+                &self.block_owner_slots,
+                &self.slot_materialized_prompt_lens,
+                self.prefix_cache.block_size(),
+            );
+            let reusable = if ready_on_gpu && !lookup.recompute_advised {
+                reusable_gpu_prefix
+            } else {
+                None
+            };
+            let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
+                reusable.unwrap_or((free_slots[0], 0, 0));
+            self.prefix_cache.release(&radix_blocks);
+
+            let reservation = self.waiting_prefill_reservation(
+                slot_idx,
+                queued.prompt_tokens.len(),
+                queued.max_tokens,
+            );
+            if !budget.can_schedule(reservation) {
+                self.waiting.push_front(queued);
+                return None;
+            }
+
+            let bytes_not_on_gpu =
+                lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised);
+            let no_reusable_free_slot = lookup.matched_len > 0
+                && !gpu_ready_prefix_blocks.is_empty()
+                && reusable_gpu_prefix.is_none();
+            self.materialize_queued_request(
+                slot_idx,
+                queued,
+                reusable_prefix_len,
+                reusable_cached_prompt_len,
+                radix_hit_len,
+                bytes_not_on_gpu,
+                no_reusable_free_slot,
+            );
+
+            return self
+                .prefill_reservation(slot_idx)
+                .map(|reservation| PrefillCandidate {
+                    slot_idx,
+                    reservation,
+                });
+        }
+
+        None
+    }
+
+    fn plan_step(&mut self) -> StepPlan {
+        let has_decode = self.running_batch.iter().any(|&slot_idx| {
+            self.request(slot_idx).is_some_and(|req| {
+                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
+            })
+        });
+        let prefill_candidate = if !has_decode || self.can_launch_mixed_batch() {
+            let budget = PrefillBudget::from_scheduler(self);
+            self.queued_prefill_candidate(&budget)
+                .or_else(|| self.admit_waiting_prefill_candidate(&budget))
+        } else {
+            None
+        };
+
+        match (has_decode, prefill_candidate) {
+            (true, Some(candidate)) => StepPlan::Mixed(candidate),
+            (true, None) => StepPlan::DecodeOnly,
+            (false, Some(candidate)) => StepPlan::PrefillOnly(candidate),
+            (false, None) => StepPlan::Idle,
+        }
     }
 
     pub(super) fn step(&mut self) {
         let num = self.active_len();
-        if num == 0 {
+        if num == 0 && self.waiting.is_empty() {
             return;
         }
 
-        // Phase 1: Batched decode (GPU forward pass + sampling)
-        //
-        // Launched BEFORE emit_delta so that GPU compute overlaps with
-        // CPU tokenizer work in Phase 2. emit_delta only needs tokens
-        // from the PREVIOUS step (already in generated_tokens), so
-        // there's no data dependency with the current forward pass.
-        let has_decode = !self.running_batch.is_empty();
+        let plan_t = std::time::Instant::now();
+        let plan = self.plan_step();
+        let admission_us = plan_t.elapsed().as_micros();
+
         assert!(
             self.pending_decode.is_none(),
             "pending decode must be cleared before scheduler step"
         );
-        self.pending_mixed_prefill_idx = None;
-        let decode_launch_us = if has_decode {
-            let t = std::time::Instant::now();
-            let mixed_prefill_idx = if self.config.enable_mixed_chunk {
-                self.prefill_queue.iter().copied().find(|&slot_idx| {
-                    self.request(slot_idx)
-                        .is_some_and(|req| !req.delta_tx.is_closed())
-                })
-            } else {
-                None
-            };
-            if let Some(pi) = mixed_prefill_idx {
-                self.step_decode_launch_mixed(pi);
-            } else {
+
+        let decode_launch_us = match plan {
+            StepPlan::DecodeOnly => {
+                let t = std::time::Instant::now();
                 self.step_decode_launch();
+                t.elapsed().as_micros()
             }
-            t.elapsed().as_micros()
-        } else {
-            0
+            StepPlan::Mixed(candidate) => {
+                let t = std::time::Instant::now();
+                self.step_decode_launch_mixed(candidate.slot_idx);
+                t.elapsed().as_micros()
+            }
+            StepPlan::Idle | StepPlan::PrefillOnly(_) => 0,
         };
 
-        // Phase 2: Overlap window — GPU decode forward is in flight.
-        //
-        // Queue CPU work + prefill on the same stream while decode runs:
-        //   a) emit_delta (CPU tokenizer, no GPU dependency)
-        //   b) admit new requests (CPU)
-        //   c) prefill chunks — GPU kernels queued AFTER decode on same stream,
-        //      eliminating the dead time that existed when prefill ran after readback.
-        //      When step_prefill_chunk internally syncs (for sampling), that sync
-        //      catches both decode argmax AND prefill GPU work. The subsequent
-        //      decode readback sync becomes a no-op.
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
         {
@@ -219,55 +454,14 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
-        // Admissions happen in `assign_slots`; the runtime no longer
-        // carries a transient "new request" phase through `step()`.
-        let new_us = 0;
-
-        // Phase 2c: Prefill chunks — queued on the same GPU stream after decode.
-        // Decode always launches first; prefill work is then bounded by explicit
-        // SGLang-style token/request budgets instead of a decode-active hard cap.
         let prefill_t = std::time::Instant::now();
-        let already_mixed = self.pending_mixed_prefill_idx.take();
-        let mixed_prefill_tokens = self
-            .pending_decode
-            .as_ref()
-            .map_or(0, |pending| pending.mixed_prefill_tokens);
-        let mut budget = PrefillBudget::from_scheduler(self);
-        budget.reserve_mixed_prefill(mixed_prefill_tokens);
-        let prefill_indices: Vec<usize> = self
-            .prefill_queue
-            .iter()
-            .copied()
-            .filter(|&slot_idx| Some(slot_idx) != already_mixed)
-            .collect();
-        for slot_idx in prefill_indices {
-            let Some(reservation) = self.prefill_reservation(slot_idx) else {
-                continue;
-            };
-            if !budget.can_schedule(reservation) {
-                break;
-            }
-            let scheduled = self.step_prefill_chunk(slot_idx, reservation.prefill_tokens);
-            if scheduled == 0 {
-                break;
-            }
-            budget.reserve(PrefillReservation {
-                prefill_tokens: scheduled,
-                pool_tokens: if self.model.prefill_uses_paged_pool()
-                    && self.paged_kv_pool.is_active()
-                {
-                    scheduled
-                } else {
-                    0
-                },
-                ..reservation
-            });
+        if let StepPlan::PrefillOnly(candidate) = plan {
+            let _ =
+                self.step_prefill_chunk(candidate.slot_idx, candidate.reservation.prefill_tokens);
         }
         let prefill_us = prefill_t.elapsed().as_micros();
 
-        // Phase 3: Readback decode results (sync + D2H + token mutation).
-        // If prefill already synced the stream, this sync is a no-op.
-        let readback_us = if has_decode && self.pending_decode.is_some() {
+        let readback_us = if self.pending_decode.is_some() {
             let t = std::time::Instant::now();
             self.step_decode_readback();
             t.elapsed().as_micros()
@@ -276,10 +470,7 @@ impl<M: ModelForward> Scheduler<M> {
         };
         let decode_us = decode_launch_us + readback_us;
 
-        // Step timing — always tracked for /v1/stats and profiling.
-        // EMA (exponential moving average) with α=0.1 smooths noise
-        // while responding quickly to sustained changes.
-        let total_us = decode_us + emit_us + new_us + prefill_us;
+        let total_us = decode_us + emit_us + admission_us + prefill_us;
         let update_ema = |ema: &mut f64, val: u128| {
             const ALPHA: f64 = 0.1;
             let v = val as f64;
@@ -296,8 +487,14 @@ impl<M: ModelForward> Scheduler<M> {
 
         if total_us > 100_000 {
             info!(
-                "step breakdown: decode={}us emit={}us new={}us prefill={}us total={}us batch={}",
-                decode_us, emit_us, new_us, prefill_us, total_us, num
+                "step breakdown: plan={} admission={}us decode={}us emit={}us prefill={}us total={}us batch={}",
+                plan.label(),
+                admission_us,
+                decode_us,
+                emit_us,
+                prefill_us,
+                total_us,
+                num
             );
         }
     }
@@ -305,7 +502,7 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefillBudget, PrefillReservation};
+    use super::{PrefillBudget, PrefillPageBudget, PrefillReservation, SlotPageReserve};
 
     fn collect_schedulable_indices(
         mut budget: PrefillBudget,
@@ -327,36 +524,40 @@ mod tests {
         let budget = PrefillBudget {
             remaining_prefill_tokens: 6,
             remaining_requests: usize::MAX,
-            remaining_free_pages: usize::MAX,
-            planned_seq_lens: vec![0, 0, 0],
-            page_size: 16,
+            page_budget: PrefillPageBudget::new(usize::MAX, vec![0, 0, 0], 16),
         };
         let reservations = vec![
             (
                 0,
                 PrefillReservation {
-                    slot_idx: 0,
                     prefill_tokens: 8,
-                    pool_tokens: 8,
-                    decode_headroom_tokens: 0,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 0,
+                        prefill_pool_tokens: 8,
+                        decode_headroom_tokens: 0,
+                    },
                 },
             ),
             (
                 1,
                 PrefillReservation {
-                    slot_idx: 1,
                     prefill_tokens: 4,
-                    pool_tokens: 4,
-                    decode_headroom_tokens: 0,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 1,
+                        prefill_pool_tokens: 4,
+                        decode_headroom_tokens: 0,
+                    },
                 },
             ),
             (
                 2,
                 PrefillReservation {
-                    slot_idx: 2,
                     prefill_tokens: 2,
-                    pool_tokens: 2,
-                    decode_headroom_tokens: 0,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 2,
+                        prefill_pool_tokens: 2,
+                        decode_headroom_tokens: 0,
+                    },
                 },
             ),
         ];
@@ -372,27 +573,29 @@ mod tests {
         let budget = PrefillBudget {
             remaining_prefill_tokens: 8,
             remaining_requests: usize::MAX,
-            remaining_free_pages: 1,
-            planned_seq_lens: vec![0, 3],
-            page_size: 4,
+            page_budget: PrefillPageBudget::new(1, vec![0, 3], 4),
         };
         let reservations = vec![
             (
                 0,
                 PrefillReservation {
-                    slot_idx: 0,
                     prefill_tokens: 5,
-                    pool_tokens: 5,
-                    decode_headroom_tokens: 0,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 0,
+                        prefill_pool_tokens: 5,
+                        decode_headroom_tokens: 0,
+                    },
                 },
             ),
             (
                 1,
                 PrefillReservation {
-                    slot_idx: 1,
                     prefill_tokens: 1,
-                    pool_tokens: 1,
-                    decode_headroom_tokens: 0,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 1,
+                        prefill_pool_tokens: 1,
+                        decode_headroom_tokens: 0,
+                    },
                 },
             ),
         ];
@@ -408,17 +611,29 @@ mod tests {
         let budget = PrefillBudget {
             remaining_prefill_tokens: 4,
             remaining_requests: 1,
-            remaining_free_pages: 1,
-            planned_seq_lens: vec![4],
-            page_size: 4,
+            page_budget: PrefillPageBudget::new(1, vec![4], 4),
         };
         let reservation = PrefillReservation {
-            slot_idx: 0,
             prefill_tokens: 4,
-            pool_tokens: 4,
-            decode_headroom_tokens: 1,
+            page_reserve: SlotPageReserve {
+                slot_idx: 0,
+                prefill_pool_tokens: 4,
+                decode_headroom_tokens: 1,
+            },
         };
 
         assert!(!budget.can_schedule(reservation));
+    }
+
+    #[test]
+    fn page_budget_reserves_running_decode_headroom_before_prefill() {
+        let mut page_budget = PrefillPageBudget::new(1, vec![4, 0], 4);
+        page_budget.reserve_running_decode_headroom(0, 1);
+
+        assert!(!page_budget.can_fit(SlotPageReserve {
+            slot_idx: 1,
+            prefill_pool_tokens: 4,
+            decode_headroom_tokens: 0,
+        }));
     }
 }

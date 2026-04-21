@@ -6,6 +6,7 @@ use infer::backend::cuda::bootstrap::{
     InferenceEngineOptions, ServerRuntimeConfig, detect_model_type,
     spawn_scheduler_handle_from_path,
 };
+use infer::hf_hub;
 use infer::http_server::build_app_with_metrics;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
@@ -14,7 +15,9 @@ use infer::trace_reporter::FileReporter;
 use log::info;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
-const VALID_KV_CACHE_MODES: &str = "'bf16', 'fp8', 'int8', 'tq2', 'tq3', or 'tq4'";
+const DEFAULT_SEQ_LEN: usize = 4096;
+const VALID_KV_CACHE_MODES: &str = "'auto', 'bf16', 'fp8', 'int8', 'tq2', 'tq3', or 'tq4'";
+const CONTIGUOUS_KV_TOKENS: usize = 512;
 
 #[derive(Parser)]
 #[command(name = "infer", about = "Qwen3/3.5 GPU inference server")]
@@ -77,10 +80,14 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     kv_pool_fallback_mb: usize,
 
-    /// KV cache mode: "bf16" (default), "fp8", "int8", or TurboQuant pool
+    /// KV cache mode: "auto" (default), "bf16", "fp8", "int8", or TurboQuant pool
     /// modes "tq2"/"tq3"/"tq4". FP8 and TurboQuant keep the contiguous prefill
     /// cache in BF16 and quantize when migrating into the paged token pool.
-    #[arg(long, default_value = "bf16")]
+    ///
+    /// `auto` stays BF16 by default, but when `--max-seq-len` is explicit it
+    /// upgrades to a denser paged KV format if BF16 cannot satisfy the
+    /// requested slots × sequence-length envelope.
+    #[arg(long, default_value = "auto")]
     kv_cache_dtype: String,
 }
 
@@ -103,24 +110,92 @@ async fn main() {
         .model_path
         .to_str()
         .expect("Model path must be valid UTF-8");
-    let model_type = detect_model_type(model_path).expect("Failed to detect model type");
+    let resolved_model_path =
+        hf_hub::resolve_model_path(model_path).expect("Failed to resolve model path");
+    let resolved_model_path = resolved_model_path
+        .to_str()
+        .expect("Resolved model path must be valid UTF-8");
+    let model_type = detect_model_type(resolved_model_path).expect("Failed to detect model type");
     info!("=== Infer Server - {} (GPU) ===", model_type);
     info!("Loading model...");
     let start = Instant::now();
-    let (kv_cache_dtype, kv_pool_format) =
+    let requested_kv_mode =
         parse_kv_cache_mode(&args.kv_cache_dtype).unwrap_or_else(|err| panic!("{err}"));
 
     let num_slots = args.num_slots.unwrap_or_else(|| {
         auto_num_slots(
-            model_path,
+            resolved_model_path,
             args.max_seq_len,
-            kv_pool_format,
+            requested_kv_mode.slot_sizing_format(),
             args.mem_fraction_static,
         )
     });
+    let metrics = infer::metrics::ServerMetrics::new(model_path);
+    let kv_candidates = kv_mode_candidates(requested_kv_mode, args.max_seq_len.is_some());
+    let mut last_err = None;
+    let mut selected_mode = None;
+    let mut scheduler = None;
+
+    for (candidate_idx, (kv_cache_dtype, kv_pool_format, kv_mode_label)) in
+        kv_candidates.iter().copied().enumerate()
+    {
+        let runtime = ServerRuntimeConfig {
+            engine: InferenceEngineOptions {
+                enable_cuda_graph: args.cuda_graph,
+            },
+            scheduler: SchedulerConfig {
+                chunked_prefill_size: args.chunked_prefill_size,
+                max_prefill_tokens: args.max_prefill_tokens,
+                prefill_max_requests: args.prefill_max_requests,
+                enable_mixed_chunk: args.enable_mixed_chunk,
+                mem_fraction_static: args.mem_fraction_static,
+                min_seq_len: args.min_seq_len,
+                kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
+                ..SchedulerConfig::runtime_defaults(num_slots)
+            },
+            seed: 42,
+            max_seq_len: args.max_seq_len,
+            kv_cache_dtype,
+            kv_pool_format,
+        };
+
+        match spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone()) {
+            Ok(pair) => {
+                selected_mode = Some((kv_cache_dtype, kv_pool_format, kv_mode_label));
+                scheduler = Some(pair);
+                break;
+            }
+            Err(err) => {
+                let can_retry = candidate_idx + 1 < kv_candidates.len()
+                    && err
+                        .to_string()
+                        .contains("requested scheduler envelope needs at least");
+                if can_retry {
+                    info!(
+                        "KV auto fallback: {} failed to satisfy the requested envelope ({}); retrying denser layout",
+                        kv_mode_label, err
+                    );
+                    last_err = Some(err);
+                    continue;
+                }
+                panic!("Failed to create scheduler: {err}");
+            }
+        }
+    }
+
+    let (kv_cache_dtype, kv_pool_format, kv_mode_label) = selected_mode.unwrap_or_else(|| {
+        panic!(
+            "Failed to create scheduler{}",
+            last_err
+                .as_ref()
+                .map(|err| format!(": {err}"))
+                .unwrap_or_default()
+        )
+    });
+    let (handle, scheduler_runtime) = scheduler.expect("scheduler pair must exist");
 
     info!(
-        "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={}",
+        "Config: model_path={}, cuda_graph={}, num_slots={} ({}), kv_cache_mode={} ({})",
         args.model_path.display(),
         args.cuda_graph,
         num_slots,
@@ -130,33 +205,9 @@ async fn main() {
             "auto"
         },
         args.kv_cache_dtype,
+        kv_mode_label,
     );
     info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
-
-    let runtime = ServerRuntimeConfig {
-        engine: InferenceEngineOptions {
-            enable_cuda_graph: args.cuda_graph,
-        },
-        scheduler: SchedulerConfig {
-            chunked_prefill_size: args.chunked_prefill_size,
-            max_prefill_tokens: args.max_prefill_tokens,
-            prefill_max_requests: args.prefill_max_requests,
-            enable_mixed_chunk: args.enable_mixed_chunk,
-            mem_fraction_static: args.mem_fraction_static,
-            min_seq_len: args.min_seq_len,
-            kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
-            ..SchedulerConfig::runtime_defaults(num_slots)
-        },
-        seed: 42,
-        max_seq_len: args.max_seq_len,
-        kv_cache_dtype,
-        kv_pool_format,
-    };
-
-    let metrics = infer::metrics::ServerMetrics::new(model_path);
-    let (handle, scheduler_runtime) =
-        spawn_scheduler_handle_from_path(model_path, runtime, metrics.clone())
-            .expect("Failed to create scheduler");
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
@@ -200,36 +251,83 @@ async fn shutdown_signal() {
     info!("Shutdown signal received");
 }
 
-fn parse_kv_cache_mode(mode: &str) -> std::result::Result<(KVCacheDtype, KVFormat), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestedKvCacheMode {
+    Auto,
+    Explicit {
+        kv_cache_dtype: KVCacheDtype,
+        kv_pool_format: KVFormat,
+    },
+}
+
+impl RequestedKvCacheMode {
+    fn slot_sizing_format(self) -> KVFormat {
+        match self {
+            Self::Auto => KVFormat::BF16,
+            Self::Explicit { kv_pool_format, .. } => kv_pool_format,
+        }
+    }
+}
+
+fn parse_kv_cache_mode(mode: &str) -> std::result::Result<RequestedKvCacheMode, String> {
     let normalized = mode.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "bf16" => Ok((KVCacheDtype::BF16, KVFormat::BF16)),
-        "fp8" => Ok((KVCacheDtype::BF16, KVFormat::FP8E4M3)),
-        "int8" => Ok((KVCacheDtype::INT8, KVFormat::INT8)),
-        "tq2" => Ok((
-            KVCacheDtype::BF16,
-            KVFormat::TurboQuant {
+        "auto" => Ok(RequestedKvCacheMode::Auto),
+        "bf16" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::BF16,
+        }),
+        "fp8" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::FP8E4M3,
+        }),
+        "int8" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::INT8,
+            kv_pool_format: KVFormat::INT8,
+        }),
+        "tq2" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::TurboQuant {
                 key_bits: 2,
                 val_bits: 2,
             },
-        )),
-        "tq3" => Ok((
-            KVCacheDtype::BF16,
-            KVFormat::TurboQuant {
+        }),
+        "tq3" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::TurboQuant {
                 key_bits: 3,
                 val_bits: 3,
             },
-        )),
-        "tq4" => Ok((
-            KVCacheDtype::BF16,
-            KVFormat::TurboQuant {
+        }),
+        "tq4" => Ok(RequestedKvCacheMode::Explicit {
+            kv_cache_dtype: KVCacheDtype::BF16,
+            kv_pool_format: KVFormat::TurboQuant {
                 key_bits: 4,
                 val_bits: 4,
             },
-        )),
+        }),
         _ => Err(format!(
             "Invalid --kv-cache-dtype '{mode}': expected {VALID_KV_CACHE_MODES}"
         )),
+    }
+}
+
+fn kv_mode_candidates(
+    requested_mode: RequestedKvCacheMode,
+    has_explicit_max_seq_len: bool,
+) -> Vec<(KVCacheDtype, KVFormat, &'static str)> {
+    match requested_mode {
+        RequestedKvCacheMode::Auto if has_explicit_max_seq_len => {
+            vec![
+                (KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16"),
+                (KVCacheDtype::BF16, KVFormat::FP8E4M3, "auto-fp8"),
+            ]
+        }
+        RequestedKvCacheMode::Auto => vec![(KVCacheDtype::BF16, KVFormat::BF16, "auto-bf16")],
+        RequestedKvCacheMode::Explicit {
+            kv_cache_dtype,
+            kv_pool_format,
+        } => vec![(kv_cache_dtype, kv_pool_format, "explicit")],
     }
 }
 
@@ -259,8 +357,6 @@ fn auto_num_slots(
     use infer::backend::cuda::tensor::DeviceContext;
     use std::path::Path;
 
-    const DEFAULT_SEQ_LEN: usize = 4096;
-    const CONTIGUOUS_CHUNK_SIZE: usize = 512;
     const MIN_SLOTS: usize = 4;
     const MAX_SLOTS: usize = 128;
 
@@ -294,7 +390,7 @@ fn auto_num_slots(
         .saturating_sub(weight_bytes as usize);
 
     let per_slot_bytes =
-        estimate_per_slot_bytes(model_path, seq_len, CONTIGUOUS_CHUNK_SIZE, kv_pool_format);
+        estimate_per_slot_bytes(model_path, seq_len, CONTIGUOUS_KV_TOKENS, kv_pool_format);
 
     let slots = if per_slot_bytes > 0 {
         (kv_budget / per_slot_bytes).clamp(MIN_SLOTS, MAX_SLOTS)
@@ -375,48 +471,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_kv_cache_mode_supports_auto() {
+        assert_eq!(
+            parse_kv_cache_mode("auto").unwrap(),
+            RequestedKvCacheMode::Auto
+        );
+    }
+
+    #[test]
     fn parse_kv_cache_mode_supports_all_quantized_pool_modes() {
         assert_eq!(
             parse_kv_cache_mode("bf16").unwrap(),
-            (KVCacheDtype::BF16, KVFormat::BF16)
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::BF16,
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("fp8").unwrap(),
-            (KVCacheDtype::BF16, KVFormat::FP8E4M3)
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::FP8E4M3,
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("int8").unwrap(),
-            (KVCacheDtype::INT8, KVFormat::INT8)
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::INT8,
+                kv_pool_format: KVFormat::INT8,
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("tq2").unwrap(),
-            (
-                KVCacheDtype::BF16,
-                KVFormat::TurboQuant {
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::TurboQuant {
                     key_bits: 2,
                     val_bits: 2
                 }
-            )
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("tq3").unwrap(),
-            (
-                KVCacheDtype::BF16,
-                KVFormat::TurboQuant {
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::TurboQuant {
                     key_bits: 3,
                     val_bits: 3
                 }
-            )
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("tq4").unwrap(),
-            (
-                KVCacheDtype::BF16,
-                KVFormat::TurboQuant {
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::TurboQuant {
                     key_bits: 4,
                     val_bits: 4
                 }
-            )
+            }
         );
     }
 
@@ -424,11 +537,17 @@ mod tests {
     fn parse_kv_cache_mode_is_case_insensitive() {
         assert_eq!(
             parse_kv_cache_mode("FP8").unwrap(),
-            (KVCacheDtype::BF16, KVFormat::FP8E4M3)
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::BF16,
+                kv_pool_format: KVFormat::FP8E4M3,
+            }
         );
         assert_eq!(
             parse_kv_cache_mode("INT8").unwrap(),
-            (KVCacheDtype::INT8, KVFormat::INT8)
+            RequestedKvCacheMode::Explicit {
+                kv_cache_dtype: KVCacheDtype::INT8,
+                kv_pool_format: KVFormat::INT8,
+            }
         );
     }
 
