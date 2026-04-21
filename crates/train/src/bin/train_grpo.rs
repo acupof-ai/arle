@@ -35,7 +35,9 @@ use train::{
     grpo::{GrpoConfig, group_advantages, grpo_loss, mean_sampled_kl},
     lora::{LoraAdapterConfig, LoraConfig},
     loss::cross_entropy_loss,
-    model_family::{ModelFamily, synthetic_qwen3_config, synthetic_qwen35_dense_config},
+    model_family::{
+        ModelFamily, Qwen35AttentionPattern, synthetic_qwen3_config, synthetic_qwen35_config,
+    },
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
     qwen3::{Qwen3Config, Qwen3Error, Qwen3Model},
@@ -52,6 +54,9 @@ use train::{
     },
     rollout::rollout_group,
 };
+
+#[cfg(test)]
+use train::model_family::{synthetic_qwen35_dense_config, synthetic_qwen35_hybrid_config};
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -74,6 +79,7 @@ struct CliArgs {
     save_path: Option<PathBuf>,
     resume_from: Option<PathBuf>,
     serve: Option<u16>,
+    linear_attn_every: usize,
 }
 
 impl Default for CliArgs {
@@ -98,6 +104,7 @@ impl Default for CliArgs {
             save_path: None,
             resume_from: None,
             serve: None,
+            linear_attn_every: 0,
         }
     }
 }
@@ -217,7 +224,7 @@ trait SyntheticGrpoFamily {
 
     fn family_name() -> &'static str;
     fn synthetic_model_uri() -> &'static str;
-    fn build_config(seq: usize) -> Self::Config;
+    fn build_config(args: &CliArgs) -> Result<Self::Config, CliError>;
     fn build_model(
         cfg: &Self::Config,
         lora: LoraConfig,
@@ -247,8 +254,8 @@ impl SyntheticGrpoFamily for Qwen3GrpoFamily {
         "synthetic://qwen3"
     }
 
-    fn build_config(seq: usize) -> Self::Config {
-        synthetic_qwen3_config(seq)
+    fn build_config(args: &CliArgs) -> Result<Self::Config, CliError> {
+        Ok(synthetic_qwen3_config(args.seq))
     }
 
     fn build_model(
@@ -329,8 +336,17 @@ impl SyntheticGrpoFamily for Qwen35GrpoFamily {
         "synthetic://qwen35"
     }
 
-    fn build_config(seq: usize) -> Self::Config {
-        synthetic_qwen35_dense_config(seq)
+    fn build_config(args: &CliArgs) -> Result<Self::Config, CliError> {
+        Ok(synthetic_qwen35_config(
+            args.seq,
+            if args.linear_attn_every == 0 {
+                Qwen35AttentionPattern::Dense
+            } else {
+                Qwen35AttentionPattern::Hybrid {
+                    linear_attn_every: args.linear_attn_every,
+                }
+            },
+        ))
     }
 
     fn build_model(
@@ -456,7 +472,7 @@ fn run() -> Result<(), CliError> {
 }
 
 fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliError> {
-    let config = F::build_config(args.seq);
+    let config = F::build_config(args)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
         alpha: args.lora_alpha,
@@ -1195,6 +1211,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--serve" => {
                 args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
+            "--linear-attn-every" => {
+                args.linear_attn_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
     }
@@ -1231,6 +1250,11 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             flag: "--save-every".into(),
             value: "requires --save-path".into(),
         }));
+    }
+    if args.model_family == ModelFamily::Qwen3 && args.linear_attn_every > 0 {
+        return Err(CliError::Custom(
+            "--linear-attn-every is only supported for --model-family qwen35".into(),
+        ));
     }
     Ok(())
 }
@@ -1314,6 +1338,7 @@ mod tests {
             save_path: None,
             resume_from: None,
             serve: None,
+            linear_attn_every: 0,
         }
     }
 
@@ -1476,6 +1501,116 @@ mod tests {
                 .iter()
                 .all(|tensor_id| !resumed_store.get(*tensor_id).expect("tensor").requires_grad)
         );
+
+        let resumed_names = trainable_param_name_map(&resumed_policy, &resumed_store);
+        let resumed_state = resumed_optim.export_state(&resumed_names);
+        assert_adamw_state_eq(&saved_state, &resumed_state);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35_hybrid_grpo_checkpoint_roundtrip_restores_policy_ref_and_optimizer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let args = tiny_args();
+        let cfg = synthetic_qwen35_hybrid_config(args.seq);
+        let lora = LoraConfig {
+            rank: args.lora_rank,
+            alpha: args.lora_alpha,
+        };
+        let out_dir = tempdir()?;
+        let layer_names = cfg.layer_tensor_names(1);
+        let Qwen35AttentionTensorNames::Linear(attn_names) = layer_names.attention else {
+            unreachable!("synthetic qwen35 hybrid config uses linear attention in layer 1");
+        };
+
+        let mut save_store = TensorStore::default();
+        let policy = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut save_store)?;
+        let ref_model = policy.clone_frozen(&mut save_store);
+        let current_names = trainable_param_name_map(&policy, &save_store);
+        let current_adapter_map = policy.adapter_name_map();
+        let current_q = format!("{}.lora_a", attn_names.in_proj_qkv);
+        let current_q_id = *current_adapter_map
+            .get(current_q.as_str())
+            .expect("policy adapter id");
+        save_store
+            .get_mut(current_q_id)
+            .expect("policy adapter")
+            .data[0] = 1.25;
+        let ref_q = format!("{}.lora_a", attn_names.in_proj_qkv);
+        let ref_q_id = *ref_model
+            .adapter_name_map()
+            .get(ref_q.as_str())
+            .expect("ref adapter id");
+        save_store.get_mut(ref_q_id).expect("ref adapter").data[0] = -0.75;
+
+        let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+        let saved_state = autograd::adamw_state::AdamWState {
+            step: 3,
+            skipped_export: 0,
+            params: current_names
+                .iter()
+                .map(|(tensor_id, name)| {
+                    let shape = save_store
+                        .get(*tensor_id)
+                        .expect("tensor exists")
+                        .shape
+                        .clone();
+                    let len = shape.iter().product::<usize>().max(1);
+                    autograd::adamw_state::AdamWParamState {
+                        name: name.clone(),
+                        m: vec![0.25; len],
+                        v: vec![0.5; len],
+                        shape,
+                    }
+                })
+                .collect(),
+        };
+        optimizer.import_state(&saved_state, &current_names)?;
+
+        let saved_policy_a = save_store.to_host(current_q_id)?;
+        let saved_ref_a = save_store.to_host(ref_q_id)?;
+
+        let step_dir = save_grpo_checkpoint::<Qwen35GrpoFamily>(
+            out_dir.path(),
+            3,
+            &args,
+            &cfg,
+            &policy,
+            &ref_model,
+            &optimizer,
+            &mut save_store,
+            lora,
+            0.8,
+            0.1,
+        )?;
+
+        let mut resumed_store = TensorStore::default();
+        let resumed_policy = Qwen35Model::new_with_lora(&cfg, Some(lora), &mut resumed_store)?;
+        let (resumed_ref, resumed_optim, resume) = resume_grpo_checkpoint::<Qwen35GrpoFamily>(
+            &step_dir,
+            &args,
+            &cfg,
+            &resumed_policy,
+            &mut resumed_store,
+            lora,
+        )?;
+        assert_eq!(resume.start_iter, 3);
+        assert_eq!(resume.best_mean_reward, 0.8);
+        assert_eq!(resume.last_kl, 0.1);
+
+        let resumed_policy_q = format!("{}.lora_a", attn_names.in_proj_qkv);
+        let resumed_policy_q_id = *resumed_policy
+            .adapter_name_map()
+            .get(resumed_policy_q.as_str())
+            .expect("resumed policy q id");
+        let resumed_ref_q = format!("{}.lora_a", attn_names.in_proj_qkv);
+        let resumed_ref_q_id = *resumed_ref
+            .adapter_name_map()
+            .get(resumed_ref_q.as_str())
+            .expect("resumed ref q id");
+
+        assert_eq!(resumed_store.to_host(resumed_policy_q_id)?, saved_policy_a);
+        assert_eq!(resumed_store.to_host(resumed_ref_q_id)?, saved_ref_a);
 
         let resumed_names = trainable_param_name_map(&resumed_policy, &resumed_store);
         let resumed_state = resumed_optim.export_state(&resumed_names);

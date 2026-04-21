@@ -3,6 +3,8 @@ mod openai_v1;
 pub mod sessions;
 
 use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, header},
     middleware,
     routing::{get, post},
@@ -19,6 +21,7 @@ use axum::{
 use chat::openai_messages_to_prompt as chat_messages_to_prompt;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
+use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -63,6 +66,80 @@ struct ServingIdentity {
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerConfig {
     pub api_key: Option<Arc<str>>,
+    pub train_control_target: Option<TrainControlTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainControlTarget {
+    authority: Arc<str>,
+    base_path: Arc<str>,
+}
+
+fn normalize_train_control_base_path(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        return "/".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+impl TrainControlTarget {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let uri = raw
+            .parse::<axum::http::Uri>()
+            .map_err(|err| format!("invalid train control URL '{raw}': {err}"))?;
+        if uri.scheme_str() != Some("http") {
+            return Err(format!("train control URL must use http://, got '{raw}'"));
+        }
+        if uri.query().is_some() {
+            return Err(format!(
+                "train control URL must not include a query string: '{raw}'"
+            ));
+        }
+        let authority = uri
+            .authority()
+            .ok_or_else(|| format!("train control URL is missing host: '{raw}'"))?
+            .as_str();
+        let base_path = normalize_train_control_base_path(uri.path());
+        Ok(Self {
+            authority: Arc::<str>::from(authority),
+            base_path: Arc::<str>::from(base_path),
+        })
+    }
+
+    fn request_path(&self, route_suffix: &str, query: Option<&str>) -> String {
+        let mut path = String::new();
+        if self.base_path.as_ref() != "/" {
+            path.push_str(self.base_path.as_ref());
+        }
+        path.push_str(route_suffix);
+        if let Some(query) = query.filter(|value| !value.is_empty()) {
+            path.push('?');
+            path.push_str(query);
+        }
+        path
+    }
+
+    fn authority(&self) -> &str {
+        self.authority.as_ref()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TrainEventsQuery {
+    after_seq: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ProxiedTrainResponse {
+    status: axum::http::StatusCode,
+    body: Vec<u8>,
 }
 
 struct RequestExecutionOptions {
@@ -734,6 +811,128 @@ async fn stats_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         .into_response()
 }
 
+async fn train_status_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    proxy_train_control(state.as_ref(), "GET", "/v1/train/status", None).await
+}
+
+async fn train_events_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TrainEventsQuery>,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    let query = query
+        .after_seq
+        .map(|after_seq| format!("after_seq={after_seq}"));
+    proxy_train_control(state.as_ref(), "GET", "/v1/train/events", query.as_deref()).await
+}
+
+async fn train_stop_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    proxy_train_control(state.as_ref(), "POST", "/v1/train/stop", None).await
+}
+
+async fn train_save_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_v1_request(&headers, state.as_ref())?;
+    proxy_train_control(state.as_ref(), "POST", "/v1/train/save", None).await
+}
+
+async fn proxy_train_control(
+    state: &AppState,
+    method: &'static str,
+    route_suffix: &'static str,
+    query: Option<&str>,
+) -> Result<Response, ApiError> {
+    let Some(target) = state.config.train_control_target.clone() else {
+        return Err(ApiError::not_found(
+            "Train control plane is not configured on this infer server",
+            "train_control_unconfigured",
+        ));
+    };
+    let path = target.request_path(route_suffix, query);
+    let proxied =
+        tokio::task::spawn_blocking(move || blocking_train_control_request(&target, method, &path))
+            .await
+            .map_err(|err| {
+                error!("train control proxy task failed: {err}");
+                ApiError::service_unavailable("Train control plane task failed")
+            })??;
+    Ok((
+        proxied.status,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        proxied.body,
+    )
+        .into_response())
+}
+
+fn blocking_train_control_request(
+    target: &TrainControlTarget,
+    method: &str,
+    path: &str,
+) -> Result<ProxiedTrainResponse, ApiError> {
+    let mut stream = TcpStream::connect(target.authority()).map_err(|err| {
+        warn!("train control proxy connect failed: {err}");
+        ApiError::service_unavailable("Train control plane is unavailable")
+    })?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+        host = target.authority(),
+    );
+    stream.write_all(request.as_bytes()).map_err(|err| {
+        warn!("train control proxy write failed: {err}");
+        ApiError::service_unavailable("Train control plane write failed")
+    })?;
+    stream.flush().map_err(|err| {
+        warn!("train control proxy flush failed: {err}");
+        ApiError::service_unavailable("Train control plane flush failed")
+    })?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|err| {
+        warn!("train control proxy read failed: {err}");
+        ApiError::service_unavailable("Train control plane read failed")
+    })?;
+    parse_train_control_response(&raw)
+}
+
+fn parse_train_control_response(raw: &[u8]) -> Result<ProxiedTrainResponse, ApiError> {
+    let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Err(ApiError::service_unavailable(
+            "Train control plane returned an invalid HTTP response",
+        ));
+    };
+    let header_bytes = &raw[..header_end];
+    let body = raw[header_end + 4..].to_vec();
+    let header_text = std::str::from_utf8(header_bytes).map_err(|_| {
+        ApiError::service_unavailable("Train control plane returned non-UTF8 headers")
+    })?;
+    let status_code = header_text
+        .lines()
+        .next()
+        .and_then(|status_line| status_line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| axum::http::StatusCode::from_u16(code).ok())
+        .ok_or_else(|| {
+            ApiError::service_unavailable("Train control plane returned an invalid status line")
+        })?;
+    Ok(ProxiedTrainResponse {
+        status: status_code,
+        body,
+    })
+}
+
 /// Build the Axum router with default (empty) metrics.
 pub fn build_app<H>(handle: H) -> Router
 where
@@ -828,6 +1027,10 @@ where
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
+        .route("/v1/train/status", get(train_status_handler))
+        .route("/v1/train/events", get(train_events_handler))
+        .route("/v1/train/stop", post(train_stop_handler))
+        .route("/v1/train/save", post(train_save_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/stats", get(stats_handler));
 
@@ -848,6 +1051,8 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use tower::util::ServiceExt;
 
     fn mock_scheduler(model_id: &str) -> SchedulerHandle {
@@ -902,6 +1107,62 @@ mod tests {
         });
 
         SchedulerHandle::from_parts(tx, &model_id)
+    }
+
+    fn spawn_train_control_stub_once(
+        expected_method: &'static str,
+        expected_target: &'static str,
+        status: u16,
+        body: &'static str,
+    ) -> (TrainControlTarget, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind train control stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept train control stub");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stub stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            assert_eq!(method, expected_method);
+            assert_eq!(target, expected_target);
+
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read header");
+                if bytes == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+
+            write!(
+                stream,
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write stub response");
+        });
+        let target = TrainControlTarget::parse(&format!("http://{addr}"))
+            .expect("parse train control target");
+        (target, handle)
+    }
+
+    #[test]
+    fn train_control_target_parses_and_normalizes_base_path() {
+        let target =
+            TrainControlTarget::parse("http://127.0.0.1:9123/base/child/").expect("parse target");
+        assert_eq!(target.authority(), "127.0.0.1:9123");
+        assert_eq!(
+            target.request_path("/v1/train/status", None),
+            "/base/child/v1/train/status"
+        );
+        assert_eq!(
+            target.request_path("/v1/train/events", Some("after_seq=7")),
+            "/base/child/v1/train/events?after_seq=7"
+        );
     }
 
     #[tokio::test]
@@ -1120,12 +1381,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn train_status_returns_not_found_when_bridge_is_unconfigured() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/train/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn train_status_proxies_json_from_control_plane() {
+        let (target, handle) = spawn_train_control_stub_once(
+            "GET",
+            "/v1/train/status",
+            200,
+            r#"{"iter":3,"finished":false}"#,
+        );
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                train_control_target: Some(target),
+                ..Default::default()
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/train/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"iter":3,"finished":false})
+        );
+        handle.join().expect("join train control stub");
+    }
+
+    #[tokio::test]
+    async fn train_events_proxy_forwards_after_seq_query() {
+        let (target, handle) = spawn_train_control_stub_once(
+            "GET",
+            "/v1/train/events?after_seq=7",
+            200,
+            r#"{"events":[],"latest_seq":7}"#,
+        );
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                train_control_target: Some(target),
+                ..Default::default()
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/train/events?after_seq=7")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"events":[],"latest_seq":7})
+        );
+        handle.join().expect("join train control stub");
+    }
+
+    #[tokio::test]
     async fn completions_reject_missing_api_key_when_auth_enabled() {
         let app = build_app_with_config(
             mock_scheduler("Qwen3-4B"),
             ServerMetrics::new(""),
             HttpServerConfig {
                 api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
             },
         );
         let request = Request::builder()
@@ -1148,6 +1487,7 @@ mod tests {
             ServerMetrics::new(""),
             HttpServerConfig {
                 api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
             },
         );
         let request = Request::builder()
@@ -1171,11 +1511,34 @@ mod tests {
             ServerMetrics::new(""),
             HttpServerConfig {
                 api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
             },
         );
         let request = Request::builder()
             .method("GET")
             .uri("/v1/stats")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn train_status_requires_auth_when_enabled() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+                train_control_target: Some(
+                    TrainControlTarget::parse("http://127.0.0.1:9123").expect("parse target"),
+                ),
+            },
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/train/status")
             .body(Body::empty())
             .unwrap();
 
@@ -1476,6 +1839,7 @@ mod tests {
             ServerMetrics::new(""),
             HttpServerConfig {
                 api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
             },
         );
         let request = Request::builder()
@@ -1573,6 +1937,7 @@ mod tests {
             ServerMetrics::new(""),
             HttpServerConfig {
                 api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
             },
         );
         let request = Request::builder()

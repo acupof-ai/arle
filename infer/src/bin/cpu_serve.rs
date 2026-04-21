@@ -8,7 +8,7 @@
 
 use clap::Parser;
 use infer::backend::runtime::spawn_cpu_runtime_handle_from_path;
-use infer::http_server::build_app;
+use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
 use infer::logging;
 use log::info;
 
@@ -29,6 +29,10 @@ struct Args {
     /// Maximum waiting requests before rejecting new submissions.
     #[arg(long, default_value_t = 256)]
     max_waiting: usize,
+
+    /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
+    #[arg(long)]
+    train_control_url: Option<String>,
 }
 
 #[tokio::main]
@@ -39,7 +43,20 @@ async fn main() {
     let handle = spawn_cpu_runtime_handle_from_path(&args.model_path, args.max_waiting)
         .expect("failed to start CPU runtime");
 
-    let app = build_app(handle);
+    let train_control_target = args
+        .train_control_url
+        .as_deref()
+        .map(TrainControlTarget::parse)
+        .transpose()
+        .unwrap_or_else(|err| panic!("invalid --train-control-url: {err}"));
+    let app = build_app_with_config(
+        handle,
+        infer::metrics::ServerMetrics::new(&args.model_path),
+        HttpServerConfig {
+            train_control_target,
+            ..Default::default()
+        },
+    );
     let addr = format!("0.0.0.0:{}", args.port);
     info!("CPU server listening on {} ({})", addr, args.model_path);
 

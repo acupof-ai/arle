@@ -34,6 +34,7 @@ use train::{
     grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl},
     lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
+    model_family::{Qwen35AttentionPattern, apply_qwen35_attention_pattern},
     multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
@@ -79,6 +80,7 @@ struct CliArgs {
     grad_clip: Option<f32>,
     metrics_jsonl: Option<PathBuf>,
     objective: MultiTurnObjective,
+    linear_attn_every: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +123,7 @@ impl Default for CliArgs {
             grad_clip: Some(1.0),
             metrics_jsonl: None,
             objective: MultiTurnObjective::StepwiseGrpo,
+            linear_attn_every: 0,
         }
     }
 }
@@ -714,11 +717,11 @@ fn qwen35_config(
 ) -> Result<Qwen35Config, CliError> {
     if args.d_model != args.n_heads * args.d_head {
         return Err(CliError::Custom(format!(
-            "--d-model {} must equal --n-heads {} * --d-head {} for qwen3.5-family dense training",
+            "--d-model {} must equal --n-heads {} * --d-head {} for qwen3.5-family training",
             args.d_model, args.n_heads, args.d_head
         )));
     }
-    Ok(Qwen35Config {
+    let mut cfg = Qwen35Config {
         hidden_size: args.d_model,
         intermediate_size: args.d_ff,
         num_hidden_layers: args.n_layers,
@@ -748,7 +751,17 @@ fn qwen35_config(
         shared_expert_intermediate_size: 0,
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
-    })
+    };
+    let pattern = if args.linear_attn_every == 0 {
+        Qwen35AttentionPattern::Dense
+    } else {
+        Qwen35AttentionPattern::Hybrid {
+            linear_attn_every: args.linear_attn_every,
+        }
+    };
+    apply_qwen35_attention_pattern(&mut cfg, pattern)
+        .map_err(|err| CliError::Custom(err.to_string()))?;
+    Ok(cfg)
 }
 
 fn seeded_rng(seed: u64, salt: u64, major: u64, minor: u64) -> LcgRng {
@@ -1236,6 +1249,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
             "--n-heads" => args.n_heads = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--d-head" => args.d_head = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--d-ff" => args.d_ff = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--linear-attn-every" => {
+                args.linear_attn_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+            }
             "--eval-every" => {
                 args.eval_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
@@ -1310,6 +1326,12 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
             value: args.lora_alpha.to_string(),
         }));
     }
+    if args.linear_attn_every > args.n_layers && args.n_layers > 0 {
+        return Err(CliError::Custom(format!(
+            "--linear-attn-every {} produces no linear-attention layers for --n-layers {}",
+            args.linear_attn_every, args.n_layers
+        )));
+    }
     Ok(())
 }
 
@@ -1355,6 +1377,7 @@ mod tests {
             grad_clip: Some(1.0),
             metrics_jsonl: None,
             objective: MultiTurnObjective::SequenceGspo,
+            linear_attn_every: 0,
         }
     }
 
@@ -1385,6 +1408,20 @@ mod tests {
             "gspo".parse::<MultiTurnObjective>().expect("gspo"),
             MultiTurnObjective::SequenceGspo
         );
+    }
+
+    #[test]
+    fn qwen35_config_builds_hybrid_layers() -> TestResult {
+        let mut args = tiny_args();
+        args.linear_attn_every = 2;
+        let cfg = qwen35_config(&args, 16, 31)?;
+        assert_eq!(
+            cfg.layer_types,
+            vec![LayerType::FullAttention, LayerType::LinearAttention]
+        );
+        assert!(cfg.rotary_dim < cfg.head_dim);
+        cfg.validate_train_scratch_contract()?;
+        Ok(())
     }
 
     fn synthetic_episode(turn_boundaries: &[(usize, usize)], response_mask: &[bool]) -> Episode {

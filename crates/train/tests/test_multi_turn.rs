@@ -122,6 +122,18 @@ fn tiny_qwen35_config() -> Qwen35Config {
     }
 }
 
+fn tiny_hybrid_qwen35_config() -> Qwen35Config {
+    let mut cfg = tiny_qwen35_config();
+    cfg.partial_rotary_factor = 0.5;
+    cfg.rotary_dim = cfg.head_dim / 2;
+    cfg.linear_key_head_dim = cfg.rotary_dim;
+    cfg.linear_value_head_dim = cfg.rotary_dim;
+    cfg.layer_types = vec![LayerType::FullAttention, LayerType::LinearAttention];
+    cfg.validate_train_scratch_contract()
+        .expect("hybrid scratch config");
+    cfg
+}
+
 #[test]
 fn rollout_episode_shapes_and_masks() {
     let config = MockPolicyConfig {
@@ -345,6 +357,98 @@ fn episode_trajectory_feeds_grpo_loss() {
 }
 
 #[test]
+fn hybrid_episode_trajectory_feeds_grpo_loss() {
+    let config = tiny_hybrid_qwen35_config();
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let policy = Qwen35Model::new(&config, &mut store).expect("hybrid policy");
+    let ref_model = policy.clone_frozen(&mut store);
+
+    let initial_prompt = vec![1usize, 2, 3, 15];
+    let turns = [
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 2,
+        },
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 0,
+        },
+    ];
+    let env = EchoSeparator(14);
+
+    let mut trajectories = Vec::with_capacity(4);
+    let prompt_len = initial_prompt.len();
+    let verifier = |episode: &Episode| -> f32 {
+        let mut score = 0.0_f32;
+        for (position, masked) in episode.response_mask.iter().enumerate() {
+            if *masked
+                && episode.full_ids[position] == episode.initial_prompt[position % prompt_len]
+            {
+                score += 1.0;
+            }
+        }
+        score / episode.response_mask.iter().filter(|m| **m).count().max(1) as f32
+    };
+    for seed in 0..4 {
+        let mut rng_i = LcgRng::seed(seed + 300);
+        let episode = rollout_episode(
+            &policy,
+            &ref_model,
+            &initial_prompt,
+            &turns,
+            &env,
+            1.0,
+            &mut rng_i,
+            &verifier,
+            &mut store,
+            &mut tape,
+        )
+        .expect("hybrid episode");
+        trajectories.push(episode.into_trajectory());
+    }
+
+    let rewards: Vec<f32> = trajectories.iter().map(|t| t.reward).collect();
+    let advantages = group_advantages(&rewards, 4);
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let loss = grpo_loss(
+        &policy,
+        &trajectories,
+        &advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 4,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("hybrid grpo loss");
+    let loss_value = store.to_host(loss).expect("loss host")[0];
+    assert!(
+        loss_value.is_finite(),
+        "hybrid loss should be finite: {loss_value}"
+    );
+
+    tape.backward(loss, &mut store).expect("backward");
+    let params = policy.all_parameter_ids();
+    let any_grad = params.iter().any(|id| {
+        store
+            .get(*id)
+            .and_then(|t| t.grad)
+            .and_then(|g| store.get(g))
+            .is_some_and(|g| g.data.iter().any(|v| v.abs() > 1e-7))
+    });
+    assert!(
+        any_grad,
+        "expected non-zero gradient on at least one hybrid param"
+    );
+}
+
+#[test]
 fn multi_turn_gspo_uses_sequence_level_episode_scores() {
     let config = tiny_qwen35_config();
     let mut store = TensorStore::default();
@@ -423,6 +527,88 @@ fn multi_turn_gspo_uses_sequence_level_episode_scores() {
             .is_some_and(|g| g.data.iter().any(|v| v.abs() > 1e-7))
     });
     assert!(any_grad, "expected non-zero gradient on at least one param");
+}
+
+#[test]
+fn hybrid_multi_turn_gspo_uses_sequence_level_episode_scores() {
+    let config = tiny_hybrid_qwen35_config();
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let policy = Qwen35Model::new(&config, &mut store).expect("hybrid policy");
+    let ref_model = policy.clone_frozen(&mut store);
+
+    let initial_prompt = vec![1usize, 2, 3, 15];
+    let turns = [
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 2,
+        },
+        TurnSpec {
+            agent_tokens: 2,
+            observation_tokens: 0,
+        },
+    ];
+    let env = EchoSeparator(14);
+
+    let mut trajectories = Vec::with_capacity(4);
+    let mut sequence_scores = Vec::with_capacity(4);
+    for seed in 0..4 {
+        let mut rng_i = LcgRng::seed(seed + 400);
+        let episode = rollout_episode(
+            &policy,
+            &ref_model,
+            &initial_prompt,
+            &turns,
+            &env,
+            1.0,
+            &mut rng_i,
+            &|_: &Episode| 0.0,
+            &mut store,
+            &mut tape,
+        )
+        .expect("hybrid episode");
+        let sequence_score = episode_sequence_score(&episode, &initial_prompt);
+        sequence_scores.push(sequence_score);
+        trajectories.push(episode.into_trajectory());
+    }
+
+    let advantages = group_advantages(&sequence_scores, 4);
+
+    tape.entries.clear();
+    tape.set_enabled(true);
+    let loss = grpo_loss(
+        &policy,
+        &trajectories,
+        &advantages,
+        &GrpoConfig {
+            clip_eps: 0.2,
+            kl_coef: 0.02,
+            group_size: 4,
+        },
+        &config,
+        &mut store,
+        &mut tape,
+    )
+    .expect("hybrid gspo loss");
+    let loss_value = store.to_host(loss).expect("loss host")[0];
+    assert!(
+        loss_value.is_finite(),
+        "hybrid loss should be finite: {loss_value}"
+    );
+
+    tape.backward(loss, &mut store).expect("backward");
+    let params = policy.all_parameter_ids();
+    let any_grad = params.iter().any(|id| {
+        store
+            .get(*id)
+            .and_then(|t| t.grad)
+            .and_then(|g| store.get(g))
+            .is_some_and(|g| g.data.iter().any(|v| v.abs() > 1e-7))
+    });
+    assert!(
+        any_grad,
+        "expected non-zero gradient on at least one hybrid param"
+    );
 }
 
 fn episode_sequence_score(episode: &Episode, initial_prompt: &[usize]) -> f32 {

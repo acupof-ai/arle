@@ -237,17 +237,27 @@ impl Qwen35Config {
                 .all(|&layer| layer == LayerType::FullAttention)
     }
 
-    /// Shared train-side contract validation for the current Qwen3.5 path.
-    /// This intentionally stays narrower than generic `validate()` so infer
-    /// can still parse hybrid configs while train fails fast with a single,
-    /// reusable authority.
-    pub fn validate_train_dense_full_attention_contract(&self) -> Result<()> {
+    /// Shared train-side contract for scratch pretrain. Dense full-attn and
+    /// dense hybrid linear-attn are both allowed; MoE remains rejected.
+    pub fn validate_train_scratch_contract(&self) -> Result<()> {
         self.validate()?;
         if self.is_moe() {
             return Err(Qwen35ConfigError::InvalidConfig(
                 "train-side qwen3.5 currently supports dense MLP layers only",
             ));
         }
+        if self.rope_cache_len_hint.is_none() {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "train-side qwen3.5 requires rope_cache_len_hint",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shared train-side dense/full-attn contract for places that still
+    /// intentionally pin the older scratch acceptance surface.
+    pub fn validate_train_dense_full_attention_contract(&self) -> Result<()> {
+        self.validate_train_scratch_contract()?;
         if self
             .layer_types
             .iter()
@@ -260,11 +270,6 @@ impl Qwen35Config {
         if self.rotary_dim != self.head_dim {
             return Err(Qwen35ConfigError::InvalidConfig(
                 "train-side qwen3.5 requires rotary_dim == head_dim",
-            ));
-        }
-        if self.rope_cache_len_hint.is_none() {
-            return Err(Qwen35ConfigError::InvalidConfig(
-                "train-side qwen3.5 requires rope_cache_len_hint",
             ));
         }
         Ok(())
@@ -733,13 +738,20 @@ mod tests {
     fn validates_dense_full_attention_train_contract() {
         let config = Qwen35Config::from_json_str(DENSE_FULL_ATTENTION_CONFIG_JSON).unwrap();
         assert!(config.is_train_dense_full_attention_only());
+        config.validate_train_scratch_contract().unwrap();
         config
             .validate_train_dense_full_attention_contract()
             .unwrap();
     }
 
     #[test]
-    fn rejects_hybrid_configs_for_train_contract() {
+    fn accepts_hybrid_configs_for_scratch_contract() {
+        let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
+        config.validate_train_scratch_contract().unwrap();
+    }
+
+    #[test]
+    fn rejects_hybrid_configs_for_dense_train_contract() {
         let config = Qwen35Config::from_json_str(NESTED_CONFIG_JSON).unwrap();
         assert!(!config.is_train_dense_full_attention_only());
         let err = config
