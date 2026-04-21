@@ -44,12 +44,12 @@ impl LocalCudaTransport {
             ));
         }
         for op in ops {
-            if op.len == 0 {
+            if op.is_empty() {
                 return Err(TransportError::Other(
                     "LocalCudaTransport rejects zero-length transfers".into(),
                 ));
             }
-            match (&op.src, &op.dst) {
+            match (&op.src.location, &op.dst.location) {
                 (BlockLocation::Gpu { .. }, BlockLocation::HostPinned { .. })
                 | (BlockLocation::HostPinned { .. }, BlockLocation::Gpu { .. }) => {}
                 _ => {
@@ -140,14 +140,14 @@ mod tests {
     fn put_batch_rejects_non_gpu_host_pairs() {
         let transport = LocalCudaTransport::new();
         let err = transport
-            .put_batch(&[TransferOp {
-                src: BlockLocation::Disk {
+            .put_batch(&[TransferOp::new(
+                BlockLocation::Disk {
                     fingerprint: crate::types::BlockFingerprint([0x11; 16]),
                     payload_len: 4096,
                 },
-                dst: BlockLocation::Gpu { slot: 1 },
-                len: 4096,
-            }])
+                BlockLocation::Gpu { slot: 1 },
+                4096,
+            )])
             .expect_err("disk->gpu must stay out of the local CUDA transport");
         assert!(matches!(err, TransportError::Other(_)));
     }
@@ -156,11 +156,11 @@ mod tests {
     fn abort_marks_pending_op_as_aborted() {
         let transport = LocalCudaTransport::new();
         let mut op = transport
-            .put_batch(&[TransferOp {
-                src: BlockLocation::Gpu { slot: 1 },
-                dst: BlockLocation::HostPinned { offset: 7 },
-                len: 4096,
-            }])
+            .put_batch(&[TransferOp::new(
+                BlockLocation::Gpu { slot: 1 },
+                BlockLocation::HostPinned { offset: 7 },
+                4096,
+            )])
             .unwrap();
 
         transport.abort(&mut op);
