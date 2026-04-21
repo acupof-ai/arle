@@ -17,6 +17,7 @@
 - The clean low-pressure sync rerun stayed close to the earlier baseline:
   - previous canonical sync: `TTFT p50 1135.4 ms`, `ITL p50 6.07 ms`, `out 90.42 tok/s`
   - simplified fresh sync: `TTFT p50 1080.7 ms`, `ITL p50 5.91 ms`, `out 80.06 tok/s`
+- The sync rerun still emitted one allocator panic in the server log during the 30-second window, but GuideLLM completed 9 requests and the completed-request medians stayed close to the earlier baseline.
 - That pattern points away from scheduler complexity as the primary cause. The remaining issue is still in the long-prompt MLX allocation lifetime / object-count path under pressure, not in the existence of the deleted admission heuristics.
 
 ## Fix
@@ -30,7 +31,7 @@
   - the Qwen3 `should_cache_prompt_len()` prompt-cache heuristic
   - the request-finish `clear_metal_cache()` heuristic
 - Result:
-  - code is simpler and the low-pressure sync path remains healthy
+  - code is simpler and the completed-request sync path remains near baseline
   - canonical pressure still fails for the same allocator reason
 
 ## Rule

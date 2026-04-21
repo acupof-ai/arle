@@ -252,7 +252,7 @@ fn submit_request(
     let incoming = options.into_incoming_request(prompt, delta_tx);
 
     if let Err(e) = handle.submit(incoming) {
-        error!("Scheduler unavailable or full: {e}");
+        warn!("Scheduler at capacity: {e}");
         return Err(ApiError::service_unavailable(
             "Server is at capacity, please retry later",
         ));
