@@ -2079,7 +2079,7 @@ mod tests {
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
-        mlx::{Dtype, as_dtype, eval, zeros},
+        mlx::{Dtype, as_dtype, concatenate_axis, eval, slice, slice_update, zeros},
     };
     use crate::test_support::metal_test_guard;
 
@@ -2090,6 +2090,38 @@ mod tests {
         start[0] = row;
         end[0] = row + 1;
         slice(array, &start, &end, &strides)
+    }
+
+    fn left_pad_kv_cache_row_for_test(
+        array: &MlxArray,
+        left_pad: i32,
+        cache_len: i32,
+        target_kv_capacity: i32,
+    ) -> MlxArray {
+        let shape = array.shape();
+        assert_eq!(shape.len(), 4);
+        assert_eq!(shape[0], 1);
+
+        let n_kv = shape[1];
+        let head_dim = shape[3];
+        let mut padded = zeros(&[1, n_kv, target_kv_capacity, head_dim], array.dtype());
+        if cache_len == 0 {
+            return padded;
+        }
+
+        let valid = slice(
+            array,
+            &[0, 0, 0, 0],
+            &[1, n_kv, cache_len, head_dim],
+            &[1, 1, 1, 1],
+        );
+        padded = slice_update(
+            &mut padded,
+            &valid,
+            &[0, 0, left_pad, 0],
+            &[1, n_kv, left_pad + cache_len, head_dim],
+        );
+        padded
     }
 
     #[test]
@@ -2523,6 +2555,198 @@ mod tests {
             .collect();
 
         assert_eq!(batched_tokens, scalar_tokens);
+
+        Ok(())
+    }
+
+    #[test]
+    fn packed_decode_varlen_matches_independent_scalar_decode_for_b2() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!(
+                "QWEN35_MODEL_PATH unset; skipping packed decode varlen B=2 equivalence test"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 compiled C++ model unavailable")?;
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let prompt_rows: [&[i32]; 2] = [&[1, 2, 3, 4], &[5, 6]];
+        let prompt_lens: Vec<i32> = prompt_rows
+            .iter()
+            .map(|tokens| i32::try_from(tokens.len()).expect("prompt len fits in i32"))
+            .collect();
+        let batch_size = i32::try_from(prompt_rows.len()).expect("batch size fits in i32");
+        let batch_cache_len = *prompt_lens
+            .iter()
+            .max()
+            .expect("packed decode varlen test requires rows");
+        let kv_capacity = batch_cache_len + KV_CACHE_CHUNK;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let mut per_row_prefill_kv = Vec::with_capacity(prompt_rows.len());
+        let mut per_row_prefill_gdr = Vec::with_capacity(prompt_rows.len());
+        let mut decode_inputs = Vec::with_capacity(prompt_rows.len());
+        let mut scalar_logits_per_row = Vec::with_capacity(prompt_rows.len());
+
+        for (prompt_tokens, &prompt_len) in prompt_rows.iter().zip(prompt_lens.iter()) {
+            let mut kv_flat: Vec<MlxArray> = (0..num_full_layers)
+                .flat_map(|_| {
+                    [
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                        zeros(&cache_shape, Dtype::Bfloat16),
+                    ]
+                })
+                .collect();
+            let recurrent =
+                MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+            let mut gdr_flat: Vec<MlxArray> = recurrent
+                .states
+                .iter()
+                .zip(recurrent.conv_states.iter())
+                .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+                .collect();
+
+            let prompt_arr = MlxArray::from_slice_i32(prompt_tokens, &[prompt_len]);
+            let prompt_logits =
+                cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+            let mut prompt_refs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            prompt_refs.push(&prompt_logits);
+            prompt_refs.extend(kv_flat.iter());
+            prompt_refs.extend(gdr_flat.iter());
+            eval(&prompt_refs);
+
+            let decode_input = gpu_sample_token(&prompt_logits, &params);
+            eval(&[&decode_input]);
+            let decode_input = decode_input.item_i32();
+            decode_inputs.push(decode_input);
+
+            let decode_token_arr = MlxArray::from_slice_i32(&[decode_input], &[1]);
+            let mut scalar_kv = kv_flat.clone();
+            let mut scalar_gdr = gdr_flat.clone();
+            let scalar_logits = cpp_model.step(
+                &decode_token_arr,
+                prompt_len,
+                &mut scalar_kv,
+                &mut scalar_gdr,
+            )?;
+            let mut scalar_refs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + scalar_kv.len() + scalar_gdr.len());
+            scalar_refs.push(&scalar_logits);
+            scalar_refs.extend(scalar_kv.iter());
+            scalar_refs.extend(scalar_gdr.iter());
+            eval(&scalar_refs);
+
+            scalar_logits_per_row.push(as_dtype(&scalar_logits, Dtype::Float32));
+            per_row_prefill_kv.push(kv_flat);
+            per_row_prefill_gdr.push(gdr_flat);
+        }
+
+        let left_padding: Vec<i32> = prompt_lens
+            .iter()
+            .map(|&prompt_len| batch_cache_len - prompt_len)
+            .collect();
+        let n_kv = per_row_prefill_kv[0].len();
+        let n_gdr = per_row_prefill_gdr[0].len();
+
+        let mut packed_kv = Vec::with_capacity(n_kv);
+        for kv_idx in 0..n_kv {
+            let stacked: Vec<MlxArray> = per_row_prefill_kv
+                .iter()
+                .zip(left_padding.iter())
+                .zip(prompt_lens.iter())
+                .map(|((row_kv, &left_pad), &prompt_len)| {
+                    if left_pad == 0 {
+                        row_kv[kv_idx].clone()
+                    } else {
+                        left_pad_kv_cache_row_for_test(
+                            &row_kv[kv_idx],
+                            left_pad,
+                            prompt_len,
+                            kv_capacity,
+                        )
+                    }
+                })
+                .collect();
+            packed_kv.push(concatenate_axis(&stacked, 0));
+        }
+
+        let mut packed_gdr = Vec::with_capacity(n_gdr);
+        for gdr_idx in 0..n_gdr {
+            let stacked: Vec<MlxArray> = per_row_prefill_gdr
+                .iter()
+                .map(|row_gdr| row_gdr[gdr_idx].clone())
+                .collect();
+            packed_gdr.push(concatenate_axis(&stacked, 0));
+        }
+
+        let decode_tokens = MlxArray::from_slice_i32(&decode_inputs, &[batch_size]);
+        let attn_mask =
+            crate::backend::metal::mlx::build_varlen_decode_mask(&left_padding, batch_cache_len);
+        let rope_offsets = MlxArray::from_slice_i32(&prompt_lens, &[batch_size]);
+        let packed_logits = cpp_model.step_batch_packed(
+            &decode_tokens,
+            batch_size,
+            batch_cache_len,
+            &mut packed_kv,
+            i32::try_from(n_kv).expect("kv len fits in i32"),
+            &mut packed_gdr,
+            i32::try_from(n_gdr).expect("gdr len fits in i32"),
+            Some(&attn_mask),
+            Some(&rope_offsets),
+        )?;
+        let packed_logits = as_dtype(&packed_logits, Dtype::Float32);
+        let mut packed_refs: Vec<&MlxArray> =
+            Vec::with_capacity(1 + packed_kv.len() + packed_gdr.len());
+        packed_refs.push(&packed_logits);
+        packed_refs.extend(packed_kv.iter());
+        packed_refs.extend(packed_gdr.iter());
+        eval(&packed_refs);
+
+        assert_eq!(
+            packed_logits.shape(),
+            &[batch_size, 1, config.vocab_size as i32]
+        );
+
+        for (row_idx, scalar_logits) in scalar_logits_per_row.iter().enumerate() {
+            eval(&[scalar_logits]);
+            let packed_row = slice_row_for_sampling(
+                &packed_logits,
+                i32::try_from(row_idx).expect("row index fits in i32"),
+            );
+            let scalar_slice = scalar_logits.as_slice_f32();
+            let packed_slice = packed_row.as_slice_f32();
+            assert_eq!(
+                scalar_slice.len(),
+                packed_slice.len(),
+                "row {row_idx} logits len mismatch"
+            );
+            for (pos, (lhs, rhs)) in scalar_slice.iter().zip(packed_slice.iter()).enumerate() {
+                assert!(
+                    (lhs - rhs).abs() < 1e-3,
+                    "row {row_idx} logit[{pos}] mismatch: scalar={lhs} packed={rhs}"
+                );
+            }
+        }
 
         Ok(())
     }

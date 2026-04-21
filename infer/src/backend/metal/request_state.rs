@@ -2491,10 +2491,16 @@ impl<'a> Qwen3StepDriver<'a> {
         })
     }
 
-    fn run_step(&mut self, token: u32, params: &SamplingParams) -> Result<MlxArray> {
-        self.ensure_capacity(self.cache_len + 1);
+    fn run_tokens(&mut self, tokens: &[u32], params: &SamplingParams) -> Result<MlxArray> {
+        ensure!(
+            !tokens.is_empty(),
+            "Qwen3 request-state step requires at least one token"
+        );
+        let token_count =
+            i32::try_from(tokens.len()).context("Qwen3 request-state token count overflow")?;
+        self.ensure_capacity(self.cache_len + token_count);
         let sampled = build_forward_graph(
-            &[token],
+            tokens,
             self.weights,
             &mut self.k_caches,
             &mut self.v_caches,
@@ -2509,8 +2515,12 @@ impl<'a> Qwen3StepDriver<'a> {
             METAL_REQUEST_STATE_ID,
             params,
         )?;
-        self.cache_len += 1;
+        self.cache_len += token_count;
         Ok(sampled)
+    }
+
+    fn run_step(&mut self, token: u32, params: &SamplingParams) -> Result<MlxArray> {
+        self.run_tokens(&[token], params)
     }
 
     fn ensure_capacity(&mut self, needed_tokens: i32) {
@@ -2683,6 +2693,10 @@ impl StepDriver for Qwen3StepDriver<'_> {
     }
 
     fn prefill_tokens(&mut self, tokens: &[u32], terminal_prompt: bool) -> Result<Option<u32>> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+
         // DFlash path: run the full prompt through qwen3_forward_with_hidden_states
         // on the terminal chunk to capture target-layer hidden states for the
         // first speculative block. The budget override in execute_prefill_chunk
@@ -2703,18 +2717,23 @@ impl StepDriver for Qwen3StepDriver<'_> {
             return Ok(Some(sampled.item_i32() as u32));
         }
 
-        // Default: per-token prefill
-        let mut emitted = None;
-        for (idx, &token) in tokens.iter().enumerate() {
-            let is_terminal = terminal_prompt && idx + 1 == tokens.len();
-            let sampled = self.prefill_token(token, is_terminal)?;
-            if is_terminal {
-                emitted = sampled;
-            } else if sampled.is_some() {
-                bail!("non-terminal prefill step unexpectedly emitted a sampled token");
-            }
+        let params = if terminal_prompt {
+            self.sample_params.clone()
+        } else {
+            self.prefill_params.clone()
+        };
+        let sampled = self.run_tokens(tokens, &params)?;
+        eval(&[&sampled]);
+
+        if self.cache_len > 0 && self.cache_len % KV_CACHE_CHUNK == 0 {
+            clear_metal_cache();
         }
-        Ok(emitted)
+
+        if terminal_prompt {
+            Ok(Some(sampled.item_i32() as u32))
+        } else {
+            Ok(None)
+        }
     }
 
     fn decode_token(&mut self, token: u32) -> Result<u32> {

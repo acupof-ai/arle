@@ -52,14 +52,13 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    `run_metal_scheduler_runtime` (`runtime.rs:639`) drives
    `MetalScheduler::step()` → `PrefillChunk` / `DecodeBatch` / `Mixed` /
    `Idle` and dispatches each decision through `execute_prefill_chunk` /
-   `execute_decode_batch`. Qwen3.5 same-length batched decode runs through
-   `CachedQwen35DecodeBatch` (`runtime.rs:1057`) with `retain_rows` (shrink)
-   + `admit_rows` (prefix-preserving grow via `admit_row_indices`). Qwen3
-   batched decode goes through `MetalRequestState::decode_batch` →
-   `decode_qwen3_batch` and still requires same-length. **Variable-length
-   decode batching is scaffolded but not yet enabled** — see the
-   left-padding pattern in invariant #8 and the open blocker in
-   [`docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md`](../../../docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md).
+   `execute_decode_batch`. Qwen3.5 packed decode runs through
+   `CachedQwen35DecodeBatch` (`runtime.rs`) with `retain_rows` (shrink) +
+   `admit_rows` (prefix-preserving grow via `admit_row_indices`) and
+   supports variable-length rows via a shared `batch_cache_len` cursor plus
+   per-row `left_padding`. Qwen3 batched decode still goes through
+   `MetalRequestState::decode_batch` → `decode_qwen3_batch` and still
+   requires same-length rows.
 5. **Qwen3 and Qwen3.5 take different paths.** Qwen3 runs through the Rust
    `rust_transformer_layer` path in `forward.rs`. Qwen3.5 delegates to the
    dedicated C++ step model in `qwen35.rs` + `mlx-sys/src/mlx_qwen35_model.cpp`
@@ -103,6 +102,45 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
    scheduler side. The legacy serial runtime is retained only for DFlash
    (see invariant #6).
 
+## Metal vs CUDA: mental model differences
+
+- **Metal is not "CUDA with different syntax".** This backend rides on
+  MLX lazy graphs plus the `mlx-sys` C++ bridge; CUDA uses explicit
+  kernels (`cudarc` + FlashInfer + Triton AOT). Porting an optimization
+  from CUDA to Metal verbatim is usually wrong.
+- **In Metal, `.item()` / `eval()` / `async_eval()` are scheduling
+  boundaries.** A stray scalar materialization can turn an overlapped
+  graph into a fully synchronous step and blow up TTFT. Treat every
+  eager boundary as hot-path API design, not harmless plumbing.
+- **Unified memory changes the failure mode.** Apple Silicon does not
+  have the PCIe copy boundaries or host-pinned staging patterns that
+  CUDA code expects. Do not add "prefetch" or host/device mirror logic
+  unless the bridge actually needs it.
+- **Count objects, not just bytes.** MLX/Metal can fail on allocator
+  resource count (`MTLBuffer` count) before resident memory looks scary.
+  Many small temporaries can be worse than one large buffer. Reuse-first
+  beats allocator-cache optimism.
+- **Batching strategy is different.** CUDA/FlashInfer already has a
+  strong varlen story; Metal often needs explicit left-padding,
+  additive masks, and per-row RoPE offsets to make packed decode
+  correct. Same-length assumptions are not portable.
+- **Prefill scalarization is fatal on Metal.** If a scheduler chunk of
+  512 prompt tokens degenerates into 512 one-token graphs, you will pay
+  twice: TTFT collapses and allocator churn spikes. Prefer chunk-batched
+  prefill whenever the model path supports it.
+- **Do not reason from "no memcpy observed" to "cheap".** Unified memory
+  removes explicit copies, but it does not remove page churn, lazy graph
+  materialization cost, or MLX buffer lifetime pressure.
+- **CUDA-style optimization instincts still help, but at a different
+  layer.** On CUDA we usually chase kernel fusion, occupancy, stream
+  overlap, and memory layout. On Metal the first questions are: where is
+  the lazy graph materialized, how many arrays are created per step, and
+  whether the scheduler is forcing unnecessary sync points.
+- **Cross-backend parity must be measured, not assumed.** Sampling,
+  quantization, and batching implementations differ. After changing a
+  Metal hot path, rerun the Metal baseline instead of trusting CUDA-era
+  intuition or numerical equivalence by inspection.
+
 ## Build requirements
 
 - Xcode + Command Line Tools (Apple Silicon host only).
@@ -121,8 +159,8 @@ metal/scheduler.rs      — MetalScheduler (CPU accounting skeleton, decode-prio
 - `docs/experience/errors/2026-04-09-metal-optimization-pitfalls.md` — Metal-specific
   optimization gotchas collected from earlier waves.
 - `docs/experience/errors/2026-04-16-metal-varlen-rope-blocker.md` —
-  why variable-length decode batching is scaffolded but not yet enabled,
-  and what Phase 2 must solve (per-row RoPE via `fast::rope(..., array
-  offset)`).
+  retrospective on the MLX scalar-RoPE bug for `B > 1, S = 1` and why
+  batched decode must always use per-row array offsets even when every row
+  has the same logical position.
 - `docs/experience/wins/2026-04-14-metal-dflash-qwen3.md` — reference win
   (5.9× decode on M4 Pro).
