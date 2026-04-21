@@ -8,8 +8,8 @@
 // The hand-written optimizer-step / clip / backward / cleanup sequence now
 // lives in `train::Trainer`; this binary owns only the data sampler, the
 // forward+loss closure, the eval closure, and the model-weight checkpoint
-// save pipeline (wired via `on_step_end`). See `pretrain.rs` for the
-// template and `docs/plans/train-runtime-architecture-v1.md` for context.
+// save pipeline (wired via `on_step_end`). See
+// `docs/plans/train-runtime-architecture-v1.md` for context.
 
 use std::{
     collections::HashSet,
@@ -106,7 +106,7 @@ struct CliArgs {
     eval_every: usize,
     eval_windows: usize,
     eval_frac: f32,
-    resume: Option<PathBuf>,
+    resume_from: Option<PathBuf>,
     seed: u64,
     grad_clip: Option<f32>,
     backend: BackendChoice,
@@ -144,7 +144,7 @@ impl Default for CliArgs {
             eval_every: 0,
             eval_windows: 8,
             eval_frac: 0.1,
-            resume: None,
+            resume_from: None,
             seed: 0xC0FFEE,
             grad_clip: Some(1.0),
             backend: BackendChoice::Cpu,
@@ -191,10 +191,8 @@ fn cli_error_to_autograd(err: CliError, family: &str, context: &str) -> Autograd
     match err {
         CliError::Autograd(inner) => inner,
         other => {
-            eprintln!("[pretrain_qwen] {family} {context} error: {other}");
-            AutogradError::TapeInvariant(
-                "pretrain_qwen: family callback returned non-autograd error",
-            )
+            eprintln!("[pretrain] {family} {context} error: {other}");
+            AutogradError::TapeInvariant("pretrain: family callback returned non-autograd error")
         }
     }
 }
@@ -513,12 +511,12 @@ fn run_with_family<F: PretrainFamily>(
     let mut registry = build_registry(&model);
 
     let resume_dir_canonical = args
-        .resume
+        .resume_from
         .as_ref()
         .map(|resume_dir| {
             resume_dir.canonicalize().map_err(|e| {
                 CliError::Custom(format!(
-                    "failed to canonicalize --resume {}: {e} (is the path / symlink target missing?)",
+                    "failed to canonicalize --resume-from {}: {e} (is the path / symlink target missing?)",
                     resume_dir.display()
                 ))
             })
@@ -528,7 +526,7 @@ fn run_with_family<F: PretrainFamily>(
     let start_step = if let Some(resume_dir) = &resume_dir_canonical {
         let step = resume_from_checkpoint::<F>(resume_dir, &mut registry, &mut store, &cfg)?;
         println!(
-            "[pretrain_qwen] resumed {} from {} at step {}",
+            "[pretrain] resumed {} from {} at step {}",
             F::family_name(),
             resume_dir.display(),
             step
@@ -609,7 +607,7 @@ fn run_with_family<F: PretrainFamily>(
         }
         Some(max_norm) => {
             eprintln!(
-                "[pretrain_qwen] warning: --grad-clip {max_norm} is non-positive/non-finite; disabling gradient clipping"
+                "[pretrain] warning: --grad-clip {max_norm} is non-positive/non-finite; disabling gradient clipping"
             );
             PretrainClip::None(NoClip)
         }
@@ -647,7 +645,7 @@ fn run_with_family<F: PretrainFamily>(
             )));
         }
         println!(
-            "[pretrain_qwen] trainer optimizer state resumed from {} at step {}",
+            "[pretrain] trainer optimizer state resumed from {} at step {}",
             resume_dir.display(),
             resumed
         );
@@ -778,7 +776,7 @@ fn resume_from_checkpoint<F: PretrainFamily>(
 ) -> Result<usize, CliError> {
     let resume_dir = resume_dir.canonicalize().map_err(|e| {
         CliError::Custom(format!(
-            "failed to canonicalize --resume {}: {e} (is the path / symlink target missing?)",
+            "failed to canonicalize --resume-from {}: {e} (is the path / symlink target missing?)",
             resume_dir.display()
         ))
     })?;
@@ -826,8 +824,14 @@ fn validate_qwen35_resume_config(resume_dir: &Path, cfg: &Qwen35Config) -> Resul
 }
 
 fn parse_args() -> Result<CliArgs, CliError> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
+where
+    I: Iterator<Item = String>,
+{
     let mut args = CliArgs::default();
-    let mut iter = env::args().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--model-family" => {
@@ -852,7 +856,9 @@ fn parse_args() -> Result<CliArgs, CliError> {
                 args.eval_windows = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
             "--eval-frac" => args.eval_frac = parse_value(&flag, next_value(&mut iter, &flag)?)?,
-            "--resume" => args.resume = Some(PathBuf::from(next_value(&mut iter, &flag)?)),
+            "--resume-from" | "--resume" => {
+                args.resume_from = Some(PathBuf::from(next_value(&mut iter, &flag)?))
+            }
             "--seed" => args.seed = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--grad-clip" => {
                 args.grad_clip = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
@@ -964,7 +970,7 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
         #[cfg(not(feature = "metal"))]
         BackendChoice::Metal => {
             eprintln!(
-                "[pretrain_qwen] warning: metal backend requested without --features metal; falling back to cpu"
+                "[pretrain] warning: metal backend requested without --features metal; falling back to cpu"
             );
             Ok(Arc::new(CpuBackend))
         }
@@ -973,7 +979,7 @@ fn build_backend(choice: BackendChoice) -> Result<Arc<dyn Backend>, CliError> {
         #[cfg(not(feature = "cuda"))]
         BackendChoice::Cuda => {
             eprintln!(
-                "[pretrain_qwen] warning: cuda backend requested without --features cuda; falling back to cpu"
+                "[pretrain] warning: cuda backend requested without --features cuda; falling back to cpu"
             );
             Ok(Arc::new(CpuBackend))
         }
@@ -1028,7 +1034,7 @@ fn save_qwen3_checkpoint(
     )?;
 
     println!(
-        "[pretrain_qwen] saved qwen3 step {} to {} (dtype: {:?})",
+        "[pretrain] saved qwen3 step {} to {} (dtype: {:?})",
         step,
         step_dir.display(),
         save_dtype
@@ -1079,7 +1085,7 @@ fn save_qwen35_checkpoint(
     )?;
 
     println!(
-        "[pretrain_qwen] saved qwen35 step {} to {} (dtype: {:?})",
+        "[pretrain] saved qwen35 step {} to {} (dtype: {:?})",
         step,
         step_dir.display(),
         save_dtype
@@ -1113,7 +1119,7 @@ mod tests {
             eval_every: 0,
             eval_windows: 1,
             eval_frac: 0.1,
-            resume: None,
+            resume_from: None,
             seed: 123,
             grad_clip: Some(1.0),
             backend: BackendChoice::Cpu,
@@ -1190,6 +1196,46 @@ mod tests {
         assert_eq!(cfg.bos_token_id, Some(args.bos_token_id));
         assert_eq!(cfg.eos_token_id, args.eos_token_id);
         Ok(())
+    }
+
+    #[test]
+    fn parse_args_accepts_resume_from_and_resume_alias() {
+        let canonical = parse_args_from(
+            vec![
+                "--corpus",
+                "corpus.txt",
+                "--tokenizer",
+                "tok.json",
+                "--out",
+                "ckpt",
+                "--resume-from",
+                "ckpt/step_000007",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("parse canonical resume-from");
+        assert_eq!(
+            canonical.resume_from,
+            Some(PathBuf::from("ckpt/step_000007"))
+        );
+
+        let alias = parse_args_from(
+            vec![
+                "--corpus",
+                "corpus.txt",
+                "--tokenizer",
+                "tok.json",
+                "--out",
+                "ckpt",
+                "--resume",
+                "ckpt/step_000008",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("parse legacy resume alias");
+        assert_eq!(alias.resume_from, Some(PathBuf::from("ckpt/step_000008")));
     }
 
     #[test]

@@ -278,7 +278,7 @@ fn trainer_save_then_resume_roundtrip() {
     // DX-1 (docs/plans/train-eval-infer-dx-v1.md Phase DX-1): the `latest`
     // symlink is intentionally NOT written at Trainer::save_checkpoint time.
     // Trainer writes only trainer_state.json + optimizer.safetensors; the
-    // binary-level save hook (pretrain_qwen3 / train_sft) writes model.safetensors
+    // binary-level save hook (pretrain / train_sft) writes model.safetensors
     // and *then* refreshes `<save_dir>/latest`. Asserting the symlink here
     // would force Trainer to publish a pointer to an incomplete checkpoint.
     // Codex review 2026-04-20 on 0da212f (Medium).
@@ -824,7 +824,7 @@ fn run_with_hooks_fires_after_each_optimizer_step() {
 
 /// `run_with_eval_and_hooks` must drive both the eval closure (every
 /// `eval_every` steps) AND the on_step_end hook (every step) in the same
-/// run — this is the surface pretrain_qwen3 uses, which owns its own
+/// run — this is the surface the pretrain binary uses, which owns its own
 /// weight-save pipeline AND wants eval-loss metrics. Codex review 613ff3c
 /// flagged that the separate `run_with_eval` / `run_with_hooks` coverage
 /// doesn't prove the combined shape works.
