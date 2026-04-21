@@ -6,7 +6,7 @@ use autograd::{
     Backend, Tape, TensorStore, adamw_state::AdamWState, backend_metal::MetalBackend, optim::AdamW,
 };
 use train::{
-    causal_lm::{trainable_param_name_map, trainable_params},
+    causal_lm::{live_tensor_ids, retained_ids, trainable_param_name_map, trainable_params},
     grpo::{GrpoConfig, group_advantages, grpo_loss},
     lora::LoraConfig,
     loss::cross_entropy_loss,
@@ -25,7 +25,7 @@ const REL_TOL: f32 = 5.0e-4;
 
 #[derive(Debug)]
 struct StepSnapshot {
-    loss: f32,
+    losses: Vec<f32>,
     named_params: Vec<(String, Vec<f32>)>,
     optim_state: AdamWState,
 }
@@ -33,8 +33,9 @@ struct StepSnapshot {
 #[test]
 fn qwen35_hybrid_scratch_step_matches_cpu_on_metal() -> TestResult {
     let cfg = tiny_hybrid_qwen35_scratch_config_with_vocab(8, 32);
-    let cpu = run_hybrid_scratch_step(None, &cfg)?;
-    let metal = run_hybrid_scratch_step(Some(Arc::new(MetalBackend)), &cfg)?;
+    let cpu = run_hybrid_scratch_steps(None, &cfg, &[vec![1, 2, 3, 4]], 1)?;
+    let metal =
+        run_hybrid_scratch_steps(Some(Arc::new(MetalBackend)), &cfg, &[vec![1, 2, 3, 4]], 1)?;
     assert_snapshot_close("hybrid scratch", &cpu, &metal);
     Ok(())
 }
@@ -46,15 +47,47 @@ fn qwen35_hybrid_grpo_step_matches_cpu_on_metal() -> TestResult {
         rank: 2,
         alpha: 4.0,
     };
-    let cpu = run_hybrid_grpo_step(None, &cfg, lora)?;
-    let metal = run_hybrid_grpo_step(Some(Arc::new(MetalBackend)), &cfg, lora)?;
+    let trajectories = fixed_grpo_trajectories();
+    let cpu = run_hybrid_grpo_steps(None, &cfg, lora, &trajectories, 1)?;
+    let metal = run_hybrid_grpo_steps(Some(Arc::new(MetalBackend)), &cfg, lora, &trajectories, 1)?;
     assert_snapshot_close("hybrid grpo", &cpu, &metal);
     Ok(())
 }
 
-fn run_hybrid_scratch_step(
+#[test]
+fn qwen35_hybrid_scratch_longer_sequence_steps_match_cpu_on_metal() -> TestResult {
+    let cfg = tiny_hybrid_qwen35_scratch_config_with_vocab(16, 64);
+    let examples = vec![
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        vec![9, 10, 11, 12, 13, 14, 15, 16],
+        vec![17, 18, 19, 20, 21, 22, 23, 24],
+    ];
+    let cpu = run_hybrid_scratch_steps(None, &cfg, &examples, 4)?;
+    let metal = run_hybrid_scratch_steps(Some(Arc::new(MetalBackend)), &cfg, &examples, 4)?;
+    assert_snapshot_close("hybrid scratch long", &cpu, &metal);
+    Ok(())
+}
+
+#[test]
+fn qwen35_hybrid_grpo_longer_sequence_steps_match_cpu_on_metal() -> TestResult {
+    let mut cfg = hybrid_qwen35_config();
+    cfg.rope_cache_len_hint = Some(16);
+    let lora = LoraConfig {
+        rank: 2,
+        alpha: 4.0,
+    };
+    let trajectories = fixed_grpo_trajectories_longer();
+    let cpu = run_hybrid_grpo_steps(None, &cfg, lora, &trajectories, 3)?;
+    let metal = run_hybrid_grpo_steps(Some(Arc::new(MetalBackend)), &cfg, lora, &trajectories, 3)?;
+    assert_snapshot_close("hybrid grpo long", &cpu, &metal);
+    Ok(())
+}
+
+fn run_hybrid_scratch_steps(
     backend: Option<Arc<dyn Backend>>,
     cfg: &train::qwen35::Qwen35Config,
+    examples: &[Vec<u32>],
+    steps: usize,
 ) -> TestResult<StepSnapshot> {
     let mut store = match backend {
         Some(backend) => TensorStore::with_backend(backend),
@@ -63,26 +96,48 @@ fn run_hybrid_scratch_step(
     let model = Qwen35Model::new(cfg, &mut store)?;
     let params = trainable_params(&model, &store);
     let param_names = trainable_param_name_map(&model, &store);
+    let model_ids = live_tensor_ids(&store);
     let mut optimizer = AdamW::new(TEST_LR, (0.9, 0.999), 1.0e-8, 0.0);
     let mut tape = Tape::new();
+    let mut losses = Vec::with_capacity(steps);
 
-    let logits = model.forward(&mut store, &mut tape, &[1, 2, 3], &[0, 1, 2])?;
-    let loss_id = cross_entropy_loss(logits, &[2, 3, 4], &mut store, &mut tape)?;
-    let loss = store.to_host(loss_id)?[0];
-    tape.backward(loss_id, &mut store)?;
-    optimizer.step(&params, &mut store);
+    for step in 0..steps {
+        let example = &examples[step % examples.len()];
+        let input_ids = &example[..example.len() - 1];
+        let targets = example[1..]
+            .iter()
+            .map(|&token| token as usize)
+            .collect::<Vec<_>>();
+        let position_ids = (0..input_ids.len())
+            .map(|idx| idx as u32)
+            .collect::<Vec<_>>();
+
+        optimizer.zero_grad(&params, &mut store);
+        let logits = model.forward(&mut store, &mut tape, input_ids, &position_ids)?;
+        let loss_id = cross_entropy_loss(logits, &targets, &mut store, &mut tape)?;
+        losses.push(store.to_host(loss_id)?[0]);
+        tape.backward(loss_id, &mut store)?;
+        optimizer.step(&params, &mut store);
+
+        tape.entries.clear();
+        tape.set_enabled(true);
+        let keep = retained_ids(&model_ids, &params, &store);
+        store.retain_ids(&keep);
+    }
 
     Ok(StepSnapshot {
-        loss,
+        losses,
         named_params: export_named_params(&mut store, &param_names)?,
         optim_state: optimizer.export_state(&param_names),
     })
 }
 
-fn run_hybrid_grpo_step(
+fn run_hybrid_grpo_steps(
     backend: Option<Arc<dyn Backend>>,
     cfg: &train::qwen35::Qwen35Config,
     lora: LoraConfig,
+    trajectories: &[Trajectory],
+    steps: usize,
 ) -> TestResult<StepSnapshot> {
     let mut store = match backend {
         Some(backend) => TensorStore::with_backend(backend),
@@ -91,34 +146,43 @@ fn run_hybrid_grpo_step(
     let model = Qwen35Model::new_with_lora(cfg, Some(lora), &mut store)?;
     let params = trainable_params(&model, &store);
     let param_names = trainable_param_name_map(&model, &store);
+    let model_ids = live_tensor_ids(&store);
     let mut optimizer = AdamW::new(TEST_LR, (0.9, 0.999), 1.0e-8, 0.0);
     let mut tape = Tape::new();
-
-    let trajectories = fixed_grpo_trajectories();
     let rewards = trajectories
         .iter()
         .map(|trajectory| trajectory.reward)
         .collect::<Vec<_>>();
     let advantages = group_advantages(&rewards, 2);
-    let loss_id = grpo_loss(
-        &model,
-        &trajectories,
-        &advantages,
-        &GrpoConfig {
-            clip_eps: 0.2,
-            kl_coef: 0.02,
-            group_size: 2,
-        },
-        cfg,
-        &mut store,
-        &mut tape,
-    )?;
-    let loss = store.to_host(loss_id)?[0];
-    tape.backward(loss_id, &mut store)?;
-    optimizer.step(&params, &mut store);
+    let mut losses = Vec::with_capacity(steps);
+
+    for _ in 0..steps {
+        optimizer.zero_grad(&params, &mut store);
+        let loss_id = grpo_loss(
+            &model,
+            trajectories,
+            &advantages,
+            &GrpoConfig {
+                clip_eps: 0.2,
+                kl_coef: 0.02,
+                group_size: 2,
+            },
+            cfg,
+            &mut store,
+            &mut tape,
+        )?;
+        losses.push(store.to_host(loss_id)?[0]);
+        tape.backward(loss_id, &mut store)?;
+        optimizer.step(&params, &mut store);
+
+        tape.entries.clear();
+        tape.set_enabled(true);
+        let keep = retained_ids(&model_ids, &params, &store);
+        store.retain_ids(&keep);
+    }
 
     Ok(StepSnapshot {
-        loss,
+        losses,
         named_params: export_named_params(&mut store, &param_names)?,
         optim_state: optimizer.export_state(&param_names),
     })
@@ -156,8 +220,45 @@ fn fixed_grpo_trajectories() -> Vec<Trajectory> {
     ]
 }
 
+fn fixed_grpo_trajectories_longer() -> Vec<Trajectory> {
+    vec![
+        Trajectory {
+            prompt_ids: vec![1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0],
+            response_mask: vec![
+                false, false, false, false, false, false, false, false, true, true, true, true,
+            ],
+            full_ids: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            old_log_probs: vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.3, -1.2, -1.1, -1.0,
+            ],
+            ref_log_probs: vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.1, -1.0, -0.9, -0.8,
+            ],
+            reward: 1.0,
+        },
+        Trajectory {
+            prompt_ids: vec![2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0],
+            response_mask: vec![
+                false, false, false, false, false, false, false, false, true, true, true, true,
+            ],
+            full_ids: vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            old_log_probs: vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.4, -1.3, -1.2, -1.1,
+            ],
+            ref_log_probs: vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.2, -1.1, -1.0, -0.9,
+            ],
+            reward: 0.5,
+        },
+    ]
+}
+
 fn assert_snapshot_close(label: &str, cpu: &StepSnapshot, metal: &StepSnapshot) {
-    assert_close_scalar(&format!("{label} loss"), cpu.loss, metal.loss);
+    assert_eq!(cpu.losses.len(), metal.losses.len(), "{label} loss count");
+    for (index, (&cpu_loss, &metal_loss)) in cpu.losses.iter().zip(metal.losses.iter()).enumerate()
+    {
+        assert_close_scalar(&format!("{label} loss[{index}]"), cpu_loss, metal_loss);
+    }
     assert_eq!(cpu.named_params.len(), metal.named_params.len());
     for ((cpu_name, cpu_values), (metal_name, metal_values)) in
         cpu.named_params.iter().zip(metal.named_params.iter())
