@@ -275,8 +275,14 @@ fn run() -> Result<(), CliError> {
     if args.grad_clip.is_none() {
         eprintln!("[train_multi_turn] gradient clipping disabled (--no-grad-clip)");
     }
-    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
-        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let controller = TrainingController::new();
+    let metrics = train::metrics::open_shared_sink_with_extra(
+        args.metrics_jsonl.as_deref(),
+        true,
+        false,
+        vec![Box::new(controller.metric_sink())],
+    )
+    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_multi_turn");
 
     let total_agent = args.agent_tokens * args.turns;
@@ -392,13 +398,13 @@ fn run() -> Result<(), CliError> {
         bools: &run_start_bools,
     });
 
-    let controller = TrainingController::new();
     controller.update(|s| {
         s.total_iters = args.iters;
         s.started = true;
         s.iter = resume.start_iter;
         s.best_reward = best_reward;
         s.last_kl = last_kl;
+        s.dropped_metrics = metrics.dropped_metrics();
     });
     let _server_handle = if let Some(port) = args.serve {
         let addr = format!("127.0.0.1:{port}");
@@ -574,6 +580,7 @@ fn run() -> Result<(), CliError> {
             s.last_kl = last_kl;
             s.last_loss = loss_value;
             s.wall_secs = wall_so_far;
+            s.dropped_metrics = metrics.dropped_metrics();
         });
 
         if controller.take_save_request() {
@@ -716,6 +723,7 @@ fn run() -> Result<(), CliError> {
 
     controller.update(|s| {
         s.wall_secs = wall_secs;
+        s.dropped_metrics = metrics.dropped_metrics();
         s.finished = true;
     });
     if stopped_early {
@@ -735,6 +743,7 @@ fn run() -> Result<(), CliError> {
         ("best_reward", best_reward as f64),
         ("last_kl", last_kl as f64),
         ("wall_secs", wall_secs as f64),
+        ("dropped_metrics", metrics.dropped_metrics() as f64),
     ];
     metrics.emit_event(&train::metrics::TrainEvent {
         kind: "run_end",

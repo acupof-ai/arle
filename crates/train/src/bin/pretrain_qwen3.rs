@@ -17,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::Instant,
 };
 
 use autograd::{
@@ -29,6 +30,7 @@ use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{build_registry, live_tensor_ids, trainable_param_name_map, trainable_params},
     cli_args::{ArgError, next_value, parse_value},
+    control::TrainingController,
     dataset::LcgRng,
     grad_clip::{GlobalNorm, GradClip, NoClip},
     model_family::{ModelFamily, synthetic_qwen35_dense_config},
@@ -43,6 +45,7 @@ use train::{
         GenerationConfigSource as Qwen35GenerationConfigSource, Qwen35CheckpointError,
         Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
     },
+    server::bind_and_serve_on_thread,
     tokenizer::ChatTokenizer,
     trainer::cross_entropy_loss,
 };
@@ -54,6 +57,7 @@ const DEFAULT_EOS_TOKEN_ID: u32 = 151_645;
 const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
 const DEFAULT_EPS: f32 = 1.0e-8;
 const DEFAULT_WEIGHT_DECAY: f32 = 0.01;
+const STOP_REQUESTED_ERR: &str = "pretrain: operator stop requested";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendChoice {
@@ -126,6 +130,7 @@ struct CliArgs {
     bos_token_id: u32,
     eos_token_id: u32,
     metrics_jsonl: Option<PathBuf>,
+    serve: Option<u16>,
 }
 
 impl Default for CliArgs {
@@ -163,6 +168,7 @@ impl Default for CliArgs {
             bos_token_id: DEFAULT_BOS_TOKEN_ID,
             eos_token_id: DEFAULT_EOS_TOKEN_ID,
             metrics_jsonl: None,
+            serve: None,
         }
     }
 }
@@ -615,8 +621,19 @@ fn run_with_family<F: PretrainFamily>(
     };
     let total_steps = start_step as u64 + args.steps as u64;
     let schedule = ConstantLr(args.lr);
-    let metrics = train::metrics::open_shared_sink(args.metrics_jsonl.as_deref(), true)
-        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let run_timer = Instant::now();
+    let controller = args.serve.map(|_| TrainingController::new());
+    let mut extra_sinks: Vec<Box<dyn train::metrics::MetricSink>> = Vec::new();
+    if let Some(controller) = &controller {
+        extra_sinks.push(Box::new(controller.metric_sink()));
+    }
+    let metrics = train::metrics::open_shared_sink_with_extra(
+        args.metrics_jsonl.as_deref(),
+        true,
+        false,
+        extra_sinks,
+    )
+    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("pretrain");
     let backend_name = match args.backend {
         BackendChoice::Cpu => "cpu",
@@ -650,6 +667,29 @@ fn run_with_family<F: PretrainFamily>(
         scalars: &run_start_scalars,
         bools: &run_start_bools,
     });
+    if let Some(controller) = &controller {
+        controller.update(|status| {
+            status.iter = start_step;
+            status.total_iters = total_steps as usize;
+            status.dropped_metrics = metrics.dropped_metrics();
+            status.started = true;
+        });
+    }
+    let _server_handle =
+        if let Some(port) = args.serve {
+            let controller = Arc::clone(
+                controller
+                    .as_ref()
+                    .expect("controller exists when --serve is configured"),
+            );
+            let addr = format!("127.0.0.1:{port}");
+            eprintln!("[pretrain] control plane listening on http://{addr}/v1/train");
+            Some(bind_and_serve_on_thread(controller, addr).map_err(|err| {
+                CliError::Custom(format!("train control server bind failed: {err}"))
+            })?)
+        } else {
+            None
+        };
 
     let trainer_cfg = TrainerConfig {
         total_steps,
@@ -762,9 +802,13 @@ fn run_with_family<F: PretrainFamily>(
     let eos_token_id = args.eos_token_id;
     let cfg_ref = cfg.clone();
     let metrics_for_hooks = metrics.clone();
+    let controller_for_hooks = controller.as_ref().map(Arc::clone);
     let on_step_end = |trainer_step: u64, store: &mut TensorStore| -> AutogradResult<()> {
         let is_final = trainer_step == total_steps;
-        if trainer_step.is_multiple_of(args.save_every as u64) || is_final {
+        let save_requested = controller_for_hooks
+            .as_ref()
+            .is_some_and(|controller| controller.take_save_request());
+        if trainer_step.is_multiple_of(args.save_every as u64) || is_final || save_requested {
             F::save_checkpoint(
                 &out_dir,
                 trainer_step as usize,
@@ -794,11 +838,21 @@ fn run_with_family<F: PretrainFamily>(
                 bools: &[],
             });
         }
+        if let Some(controller) = &controller_for_hooks {
+            controller.update(|status| {
+                status.iter = trainer_step as usize;
+                status.wall_secs = run_timer.elapsed().as_secs_f32();
+                status.dropped_metrics = metrics_for_hooks.dropped_metrics();
+            });
+            if controller.should_stop() {
+                return Err(AutogradError::TapeInvariant(STOP_REQUESTED_ERR));
+            }
+        }
         Ok(())
     };
 
     let has_eval = !eval_tokens.is_empty() && args.eval_every > 0;
-    if has_eval {
+    let run_result = if has_eval {
         trainer.run_with_eval_and_hooks(
             &mut store,
             &mut tape,
@@ -808,7 +862,7 @@ fn run_with_family<F: PretrainFamily>(
             step_fn,
             eval_fn,
             on_step_end,
-        )?;
+        )
     } else {
         trainer.run_with_hooks(
             &mut store,
@@ -818,11 +872,21 @@ fn run_with_family<F: PretrainFamily>(
             model_ids,
             step_fn,
             on_step_end,
-        )?;
-    }
+        )
+    };
 
-    let run_end_scalars = [("completed_steps", trainer.step() as f64)];
-    let run_end_strings = [("run_id", run_id.as_str()), ("status", "completed")];
+    let stopped = match run_result {
+        Ok(()) => false,
+        Err(AutogradError::TapeInvariant(msg)) if msg == STOP_REQUESTED_ERR => true,
+        Err(err) => return Err(CliError::Autograd(err)),
+    };
+
+    let run_end_scalars = [
+        ("completed_steps", trainer.step() as f64),
+        ("dropped_metrics", metrics.dropped_metrics() as f64),
+    ];
+    let status = if stopped { "stopped" } else { "completed" };
+    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
     metrics.emit_event(&train::metrics::TrainEvent {
         kind: "run_end",
         step: Some(trainer.step()),
@@ -830,6 +894,15 @@ fn run_with_family<F: PretrainFamily>(
         scalars: &run_end_scalars,
         bools: &[],
     });
+    if let Some(controller) = &controller {
+        controller.update(|summary| {
+            summary.iter = trainer.step() as usize;
+            summary.total_iters = total_steps as usize;
+            summary.wall_secs = run_timer.elapsed().as_secs_f32();
+            summary.dropped_metrics = metrics.dropped_metrics();
+            summary.finished = true;
+        });
+    }
     metrics.flush_blocking();
 
     Ok(())
@@ -976,6 +1049,9 @@ where
             }
             "--metrics-jsonl" => {
                 args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
+            }
+            "--serve" => {
+                args.serve = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
             _ => return Err(CliError::Arg(ArgError::UnknownFlag(flag))),
         }
@@ -1205,6 +1281,7 @@ mod tests {
             bos_token_id: 1,
             eos_token_id: 2,
             metrics_jsonl: None,
+            serve: None,
         }
     }
 

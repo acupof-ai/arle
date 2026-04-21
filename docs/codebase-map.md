@@ -6,7 +6,9 @@ Supplemented 2026-04-20 with Phase 6 `crates/autograd` + `crates/train`
 (from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md))
 and the canonical guidellm bench SSOT alignment.
 Current train control-plane truth: `crates/train` owns the active
-training server, surfaced by `train_multi_turn --serve`; the
+training server, surfaced by `pretrain --serve`, `train_sft --serve`,
+`train_grpo --serve`, and `train_multi_turn --serve`; the current
+surface is `/v1/train/status|events|stop|save`. The
 `infer/src/http_server/train.rs` `/v1/train/*` surface is the target
 unified entrypoint, not the current implementation.
 Current train-side model reality is a generic Qwen-family control plane
@@ -51,7 +53,7 @@ Current workspace members:
 - `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
 - `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
-- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by `train_multi_turn --serve`; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs; depends on `autograd`)
+- `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
 
 ## 2. Main execution paths
 
@@ -118,10 +120,12 @@ Key files:
 ### Current train control-plane path
 
 ```text
-crates/train/src/bin/train_multi_turn.rs
+crates/train/src/bin/{pretrain_qwen3,train_sft,train_grpo,train_multi_turn}.rs
   -> train::server::bind_and_serve_on_thread()
-  -> std TcpListener control plane on /v1/train/*
-  -> train::control::TrainingController
+  -> std TcpListener control plane on /v1/train/{status,events,stop,save}
+  -> train::control::TrainingController + ControllerSink
+  -> SharedSink background worker
+  -> local JSONL/stdout + optional MLflow / OTLP / W&B export
   -> autograd + train runtime loop
 ```
 
@@ -132,9 +136,13 @@ not the current repository surface.
 Key files:
 
 - `crates/train/src/bin/eval_lm.rs`: standalone eval entrypoint for checkpoint dirs written by current train code
-- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint on the Qwen3.5-family dense/full-attn path; `--serve` starts the train-side control plane
-- `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|stop|save`
-- `crates/train/src/control.rs`: shared controller / status state used by the server thread and trainer loop
+- `crates/train/src/bin/pretrain_qwen3.rs`: canonical `pretrain` entrypoint; `--serve` starts the train-side control plane for scratch pretraining
+- `crates/train/src/bin/train_sft.rs`: supervised fine-tune entrypoint; `--serve` starts the same control plane
+- `crates/train/src/bin/train_grpo.rs`: single-turn GRPO entrypoint; `--serve` starts the same control plane
+- `crates/train/src/bin/train_multi_turn.rs`: current multi-turn entrypoint on the Qwen3.5-family dense/full-attn path; `--serve` starts the same control plane
+- `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|events|stop|save`
+- `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer used by the server thread and trainer loop
+- `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, bounded-queue backpressure accounting, and MLflow / OTLP / W&B export adapters
 
 ## 3. `infer/` crate map
 

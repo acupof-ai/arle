@@ -8,6 +8,7 @@
 //!
 //! ## Routes
 //! - `GET /v1/train/status` → 200 JSON snapshot of `TrainingStatus`
+//! - `GET /v1/train/events` → 200 recent metrics + lifecycle events as JSON
 //! - `POST /v1/train/stop`  → 200 `{"stop_requested":true}`; trainer
 //!   honours at next iteration boundary.
 //! - `POST /v1/train/save`  → 200 `{"save_requested":true}`; trainer
@@ -118,10 +119,19 @@ fn handle_connection(
         reader.read_exact(&mut sink)?;
     }
 
-    let (method, path) = parse_request_line(&request_line);
-    match (method.as_str(), path.as_str()) {
+    let (method, target) = parse_request_line(&request_line);
+    let (path, query) = split_target(&target);
+    match (method.as_str(), path) {
         ("GET", "/v1/train/status") => {
             let body = render_status_json(&controller.snapshot());
+            write_response(&mut stream, 200, &body)
+        }
+        ("GET", "/v1/train/events") => {
+            let after_seq = query
+                .as_deref()
+                .and_then(parse_after_seq_query)
+                .unwrap_or(None);
+            let body = render_events_json(&controller, after_seq);
             write_response(&mut stream, 200, &body)
         }
         ("POST", "/v1/train/stop") => {
@@ -143,6 +153,24 @@ fn parse_request_line(line: &str) -> (String, String) {
     (method, path)
 }
 
+fn split_target(target: &str) -> (&str, Option<String>) {
+    if let Some((path, query)) = target.split_once('?') {
+        (path, Some(query.to_string()))
+    } else {
+        (target, None)
+    }
+}
+
+fn parse_after_seq_query(query: &str) -> Option<Option<u64>> {
+    for part in query.split('&') {
+        let (key, value) = part.split_once('=')?;
+        if key == "after_seq" {
+            return value.parse::<u64>().ok().map(Some);
+        }
+    }
+    Some(None)
+}
+
 fn write_response<W: Write>(writer: &mut W, status: u16, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -159,7 +187,7 @@ fn write_response<W: Write>(writer: &mut W, status: u16, body: &str) -> std::io:
 
 pub fn render_status_json(status: &TrainingStatus) -> String {
     format!(
-        "{{\"iter\":{iter},\"total_iters\":{total},\"mean_reward\":{mean:.6},\"best_reward\":{best:.6},\"last_kl\":{kl:.6},\"last_loss\":{loss:.6},\"wall_secs\":{wall:.3},\"started\":{started},\"finished\":{finished}}}",
+        "{{\"iter\":{iter},\"total_iters\":{total},\"mean_reward\":{mean:.6},\"best_reward\":{best:.6},\"last_kl\":{kl:.6},\"last_loss\":{loss:.6},\"wall_secs\":{wall:.3},\"dropped_metrics\":{dropped},\"started\":{started},\"finished\":{finished}}}",
         iter = status.iter,
         total = status.total_iters,
         mean = status.mean_reward,
@@ -167,7 +195,16 @@ pub fn render_status_json(status: &TrainingStatus) -> String {
         kl = status.last_kl,
         loss = status.last_loss,
         wall = status.wall_secs,
+        dropped = status.dropped_metrics,
         started = status.started,
         finished = status.finished,
     )
+}
+
+pub fn render_events_json(controller: &TrainingController, after_seq: Option<u64>) -> String {
+    let body = serde_json::json!({
+        "events": controller.recent_records(after_seq),
+        "latest_seq": controller.latest_seq(),
+    });
+    serde_json::to_string(&body).expect("events json should serialize")
 }

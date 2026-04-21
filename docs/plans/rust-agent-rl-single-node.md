@@ -1,7 +1,7 @@
 # Plan — 单机 Rust Agent RL 训推一体（M0–M5）
 
 **Status**: Active · **Opened**: 2026-04-18 · **Project**: [agent-rl-self-evolving.md](../projects/agent-rl-self-evolving.md)
-**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`train_multi_turn --serve` 是当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family dense/full-attn path with HF-style checkpoint dirs; handwritten Transformer/TinyLM runtime compat deleted; hybrid linear-attn path not landed yet
+**Scope lock**: 单机 / CUDA first / LoRA-only / GRPO / 统一训推集成（当前实现是独立 `train` crate + train-side server；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve` 共享当前控制面真相） / 训练端从零写 / sole train-side model line is the Qwen3.5-family dense/full-attn path with HF-style checkpoint dirs; handwritten Transformer/TinyLM runtime compat deleted; hybrid linear-attn path not landed yet
 
 ---
 
@@ -14,7 +14,8 @@
 > **Current implementation note**
 > 本计划主要描述 Phase 6 的执行路径和目标收敛方向。
 > 2026-04-20 当前 repo 里的训练控制面仍然是 `crates/train`
-> 自己的 train-side server：`train_multi_turn --serve` →
+> 自己的 train-side server：`pretrain --serve` / `train_sft --serve` /
+> `train_grpo --serve` / `train_multi_turn --serve` →
 > `crates/train/src/server.rs`。如果问题是当前 runtime / checkpoint /
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
@@ -207,7 +208,7 @@ M3 是**自证"训推一体"概念能跑的标志**。ckl 应能自主判断：
 | M4.4 | **Reward aggregation**：多 verifier 加权；权重作为 config，方便调 | `train/src/reward/aggregate.rs` | 文档化每个 verifier 的 scale |
 | M4.5 | **基础 curriculum**：任务池分级（easy/medium/hard），base pass@1 > 0.8 的 easy 自动 retire，引入新 hard 任务 | `train/src/curriculum.rs` | 训练 24h 后任务池分布向 harder 移动 |
 | M4.6 | **Task generator**（self-play 雏形）：让 model 自己生成新任务 + 匹配的 verifier（verifier 用模板生成，限定在数学 / 代码 DSL 内） | `train/src/curriculum/gen.rs` | 生成任务可 verifier-grounded（不接受无 verifier 任务） |
-| M4.7 | **当前控制面**：train-side server + `train_multi_turn --serve`；**目标统一入口**：`/v1/train`（可选） | `train/src/server.rs` / `infer/src/http_server/train.rs` | curl 调通 |
+| M4.7 | **当前控制面**：train-side server + `pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` `--serve`；**目标统一入口**：`/v1/train`（可选） | `train/src/server.rs` / `infer/src/http_server/train.rs` | curl 调通 |
 | M4.8 | **冒烟自进化**：固定 100 个 base 解决不了的 hard 任务，训练 24h 后能解决 ≥ 30% | `train/tests/e2e_self_evolve.rs` | 验证通过 |
 
 ### 6.3 验收门槛
@@ -341,7 +342,7 @@ M0 Day 5:
 | 2026-04-18 | M4.4 Reward aggregation config | ✅ | `RewardConfig` + `VerifierKind` 数据驱动；`WeightedEnsemble::from_config` 与 fluent builder 语义等价 (测试对拍) |
 | 2026-04-18 | M4.5 基础 curriculum（task pool + auto-retire） | ✅ | `TaskPool` 滚动 pass@1 窗口 + `min_samples_before_retire` 门槛；`sample` 排除 retired；`active_distribution` 导出分级存活数（8 test 全过） |
 | 2026-04-18 | M4.6 Task generator（self-play scaffold） | ✅ | `TaskGenerator` + `TierSpec`：每个 `GeneratedTask` 结构性绑定 `VerifierKind`（verifier-grounded invariant），参数落在 tier bounds 内，权重分布对拍 ±5%（5 test 全过） |
-| 2026-04-18 | M4.7 /v1/train HTTP control plane | ✅ | `train::control::TrainingController`（`Arc<Mutex<TrainingStatus>>` + `AtomicBool` stop/save，save 为 `swap(false)` 边沿触发）+ `train::server`（std `TcpListener`，0 新依赖，8 KiB 请求上限）；routes `GET /v1/train/status` / `POST /v1/train/stop` / `POST /v1/train/save`；`train_multi_turn --serve PORT` 启动控制面，`iter`/`mean_reward`/`best_reward`/`last_kl`/`last_loss`/`wall_secs` 每步回写；curl 三端点 + 404 端到端冒烟通过（5 test 全过） |
+| 2026-04-18 → 2026-04-21 | M4.7 /v1/train HTTP control plane | ✅ | `train::control::TrainingController`（`Arc<Mutex<TrainingStatus>>` + recent event ring + `AtomicBool` stop/save，save 为 `swap(false)` 边沿触发）+ `train::server`（std `TcpListener`，0 新依赖，8 KiB 请求上限）；routes `GET /v1/train/status` / `GET /v1/train/events` / `POST /v1/train/stop` / `POST /v1/train/save`；`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 的 `--serve PORT` 都会启动控制面；operator `save/stop` intent 会进入事件流，`iter`/`mean_reward`/`best_reward`/`last_kl`/`last_loss`/`wall_secs` 每步回写；curl 四端点 + stop/save + checkpoint/`run_end` 端到端冒烟通过 |
 | 2026-04-18 | M4.8 Self-evolve 冒烟 + 训练速度 baseline | ✅ | `train_multi_turn` 内建 `bench:` 行（wall / iter/s / episode/s / token/s）；CPU vs Metal snapshot → `docs/experience/wins/2026-04-18-bench-train-multi-turn.md`；TinyLM-scale CPU 833 tok/s、d_model=256 Metal 1.40× 超 CPU；24h full self-evolve 待 Arithmetic verifier 驱动硬任务后再跑 |
 | 2026-04-18 | M5 Backend trait + Metal matmul + CUDA matmul (标记待验证) | ✅ | `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend`；Metal 对 CPU 参考 ≤1e-3（4 test 全过）；CUDA 路径 Mac typecheck 通过，等 GPU 机器验证；`train_multi_turn --backend metal` 端到端通过 |
 

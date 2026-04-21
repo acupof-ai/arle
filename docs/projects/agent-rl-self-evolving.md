@@ -8,7 +8,7 @@
 
 ## 0. TL;DR
 
-把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码已经有独立 `train` crate 的 train-side server，并通过 `train_multi_turn --serve` 暴露；当前 train-side 真相是通用 Qwen-family 训练架构，以 Qwen3.5 为默认和优化主线：`pretrain` 是通用 scratch-pretrain 入口，`train_sft` / `train_grpo` 已经能在 Qwen3 / Qwen3.5 间切换，训练默认只更新 LoRA adapter，`train_sft` checkpoint 已经是 merged-model + PEFT-style adapter 双轨导出且支持 adapter-only resume，`train_grpo` 和 `train_multi_turn` 都已经支持 exact checkpoint/resume，hybrid linear-attn train path 还没有落地。下面描述的是要收敛到的目标态：
+把 agent-infer 从"推理引擎"升级为"**单机 Rust 原生的 agent RL 训推一体栈**"。目标是把训练与推理收敛到同一套 Rust 模型权威与权重注册表下，允许通过异步边界拆分实现。当前代码已经有独立 `train` crate 的 train-side server，并通过 `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` / `train_multi_turn --serve` 暴露统一的 `/v1/train/status|events|stop|save` 控制面；当前 train-side 真相是通用 Qwen-family 训练架构，以 Qwen3.5 为默认和优化主线：`pretrain` 是通用 scratch-pretrain 入口，`train_sft` / `train_grpo` 已经能在 Qwen3 / Qwen3.5 间切换，训练默认只更新 LoRA adapter，`train_sft` checkpoint 已经是 merged-model + PEFT-style adapter 双轨导出且支持 adapter-only resume，`train_grpo` 和 `train_multi_turn` 都已经支持 exact checkpoint/resume，shared async observability 已经落到 train-side event stream + bounded async sink + `dropped_metrics` control-plane status + MLflow metrics/artifacts + OTLP HTTP log export + offline-first W&B sidecar export，hybrid linear-attn train path 还没有落地。下面描述的是要收敛到的目标态：
 
 ```
 Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on LoRA  →  热切 adapter  →  下一轮 rollout
@@ -19,6 +19,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 > **Current implementation note**
 > 下文的 workspace / 数据流 / `/v1/train/*` 更多是在定义 **目标架构**。
 > 2026-04-20 当前树里的训练控制面仍然在 `crates/train`：
+> `pretrain --serve` / `train_sft --serve` / `train_grpo --serve` /
 > `train_multi_turn --serve` 会启动 `crates/train/src/server.rs`
 > 里的 train-side HTTP control plane。要回答"今天 repo 里已经有什么"，
 > 先看 [`docs/codebase-map.md`](../codebase-map.md) 和
@@ -62,7 +63,7 @@ Agent tool-use rollout  →  verifier reward  →  GRPO loss  →  AdamW step on
 |---|---|---|
 | 硬件 | 单机单卡 NVIDIA（L40S/A100/H100 任一） | 分布式、多机、TP/PP/ZeRO |
 | Metal | 本地 dev 支线，M4 里程碑再做 | 和 CUDA 并行推进 |
-| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现是独立 `train` crate + train-side server（`train_multi_turn --serve`），后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
+| 进程 | 目标态是统一 Rust 训练/推理栈；当前实现是独立 `train` crate + train-side server（`pretrain` / `train_sft` / `train_grpo` / `train_multi_turn` 都可 `--serve`），后续允许同进程或异步 worker 边界，只要模型 authority 仍然唯一 | 双栈分叉、各自维护模型真相 |
 | Autograd | **从零写，参考 mni-ml/framework 结构** | candle / burn / 包 PyTorch |
 | Op 集 | 只实现 LoRA+GRPO 用到的 ~7 个 op | 全量 op（conv/pool/full-attention-bwd） |
 | Device 抽象 | `cudarc` 直接写；Metal 用 `mlx-sys`（支线） | 多 backend 抽象层 |
@@ -164,7 +165,7 @@ crates/
 | `agent/` | 新增 trajectory 采集 callback | tool loop 每一步记 action + observation，最终形成 step-wise trajectory |
 | `infer/src/http_server/` | 目标态：新增 `/v1/train/*` 控制面 | start/stop/status/checkpoint（可选，M2 之后） |
 
-**当前控制面真相**：训练侧控制面已经在 `crates/train` 内落地，并通过 `train_multi_turn --serve` 暴露；`infer/src/http_server/` 下的 `/v1/train/*` 只是后续统一入口的目标态。
+**当前控制面真相**：训练侧控制面已经在 `crates/train` 内落地，并通过所有活跃训练入口的 `--serve` 暴露；当前 surface 是 `/v1/train/status|events|stop|save`，`infer/src/http_server/` 下的 `/v1/train/*` 只是后续统一入口的目标态。
 
 ---
 
