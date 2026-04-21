@@ -461,7 +461,7 @@ impl FlashInferWorkspace {
     /// workspace via `new_with_float_bytes` instead.
     pub const DEFAULT_FLOAT_WORKSPACE_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
     pub const HD256_FLOAT_WORKSPACE_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
-    const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
+    pub const INT_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PAGE_LOCKED_WORKSPACE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
     const PLAN_INFO_BYTES: usize = 256;
 
@@ -470,6 +470,28 @@ impl FlashInferWorkspace {
     pub fn new(ctx: &DeviceContext, max_batch_size: usize, num_qo_heads: usize) -> Result<Self> {
         Self::new_with_float_bytes(
             ctx,
+            max_batch_size,
+            num_qo_heads,
+            Self::DEFAULT_FLOAT_WORKSPACE_BYTES,
+        )
+    }
+
+    pub fn device_bytes(
+        max_batch_size: usize,
+        num_qo_heads: usize,
+        float_workspace_bytes: usize,
+    ) -> usize {
+        float_workspace_bytes
+            .saturating_add(Self::INT_WORKSPACE_BYTES)
+            .saturating_add(
+                max_batch_size
+                    .saturating_mul(num_qo_heads)
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            )
+    }
+
+    pub fn default_device_bytes(max_batch_size: usize, num_qo_heads: usize) -> usize {
+        Self::device_bytes(
             max_batch_size,
             num_qo_heads,
             Self::DEFAULT_FLOAT_WORKSPACE_BYTES,
@@ -663,6 +685,47 @@ impl FlashInferDecodeMetadata {
         max_total_pages: usize,
         num_qheads: usize,
     ) -> Result<Self> {
+        Self::new_with_float_workspace_bytes(
+            ctx,
+            max_batch_size,
+            max_total_pages,
+            num_qheads,
+            FlashInferWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
+        )
+    }
+
+    pub fn device_bytes(max_batch_size: usize, max_total_pages: usize, num_qheads: usize) -> usize {
+        Self::device_bytes_with_float_workspace(
+            max_batch_size,
+            max_total_pages,
+            num_qheads,
+            FlashInferWorkspace::DEFAULT_FLOAT_WORKSPACE_BYTES,
+        )
+    }
+
+    pub fn device_bytes_with_float_workspace(
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+        float_workspace_bytes: usize,
+    ) -> usize {
+        let i32_bytes = std::mem::size_of::<i32>();
+        FlashInferWorkspace::device_bytes(max_batch_size, num_qheads, float_workspace_bytes)
+            .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // positions
+            .saturating_add(max_total_pages.max(1).saturating_mul(i32_bytes)) // kv_indices
+            .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // kv_indptr
+            .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // kv_last_page_len
+            .saturating_add((max_batch_size + 1).saturating_mul(i32_bytes)) // qo_indptr
+            .saturating_add(max_batch_size.saturating_mul(i32_bytes)) // last_token_indices
+    }
+
+    pub fn new_with_float_workspace_bytes(
+        ctx: &DeviceContext,
+        max_batch_size: usize,
+        max_total_pages: usize,
+        num_qheads: usize,
+        float_workspace_bytes: usize,
+    ) -> Result<Self> {
         let qo_indptr: CudaSlice<i32> = ctx
             .stream
             .alloc_zeros(max_batch_size + 1)
@@ -686,7 +749,12 @@ impl FlashInferDecodeMetadata {
                 .alloc_zeros(max_batch_size)
                 .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?,
             qo_indptr,
-            flashinfer_ws: FlashInferWorkspace::new(ctx, max_batch_size, num_qheads)?,
+            flashinfer_ws: FlashInferWorkspace::new_with_float_bytes(
+                ctx,
+                max_batch_size,
+                num_qheads,
+                float_workspace_bytes,
+            )?,
             max_total_pages,
             positions_scratch: Vec::with_capacity(max_batch_size),
             indices_scratch: Vec::with_capacity(max_total_pages.max(1)),

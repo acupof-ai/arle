@@ -117,8 +117,12 @@ impl PrefillPageBudget {
 
 impl PrefillBudget {
     fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
+        let prefill_token_budget = scheduler
+            .config
+            .max_prefill_tokens
+            .min(scheduler.prefill_chunk_size());
         let mut budget = Self {
-            remaining_prefill_tokens: scheduler.config.max_prefill_tokens,
+            remaining_prefill_tokens: prefill_token_budget,
             remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
             page_budget: PrefillPageBudget::new(
                 scheduler.pool_free_pages(),

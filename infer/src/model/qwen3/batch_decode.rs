@@ -20,11 +20,21 @@ use crate::model::kv_cache::KVFormat;
 use crate::model::{ModelForward, PrefillBatchRequest};
 use crate::ops;
 use cuda_kernels::ffi;
+use cuda_kernels::flashinfer::FlashInferWorkspace;
 use cuda_kernels::kv_quant;
 use cuda_kernels::kv_turboquant;
 use cuda_kernels::prelude::{
     DeviceContext, DeviceVec, FlashInferDecodeMetadata, HiddenStates, PagedKVPool,
 };
+
+const BF16_BYTES: usize = 2;
+fn bf16_matrix_bytes(rows: usize, cols: usize) -> usize {
+    rows.saturating_mul(cols).saturating_mul(BF16_BYTES)
+}
+
+fn bytes_for<T>(count: usize) -> usize {
+    count.saturating_mul(std::mem::size_of::<T>())
+}
 
 /// Pre-allocated buffers for batched decode, reused across steps.
 /// Allocated once for `max_batch_size`; smaller batches set `seq_len` on HiddenStates.
@@ -110,15 +120,50 @@ pub(crate) struct MixedBatchBuffers {
 
 #[allow(dead_code)]
 impl MixedBatchBuffers {
+    pub(crate) fn device_bytes(
+        model_config: &Config,
+        max_batch_size: usize,
+        max_total_pages: usize,
+        page_size: usize,
+        max_prefill_tokens: usize,
+    ) -> usize {
+        let max_prefill_tokens = max_prefill_tokens.max(1);
+        let max_tokens = max_batch_size.saturating_add(max_prefill_tokens);
+        let max_prefill_pages = max_prefill_tokens.div_ceil(page_size.max(1));
+        let q_dim = model_config.num_attention_heads * model_config.head_dim;
+        let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
+        let hidden_dim = model_config.hidden_size;
+        let inter_dim = model_config.intermediate_size;
+
+        let activation_dims = 4usize
+            .saturating_mul(hidden_dim)
+            .saturating_add(3usize.saturating_mul(q_dim))
+            .saturating_add(4usize.saturating_mul(kv_dim))
+            .saturating_add(5usize.saturating_mul(inter_dim));
+
+        bf16_matrix_bytes(activation_dims, max_tokens)
+            .saturating_add(bf16_matrix_bytes(hidden_dim, max_batch_size)) // decode_normed
+            .saturating_add(bf16_matrix_bytes(hidden_dim, 1)) // prefill_normed
+            .saturating_add(bytes_for::<i32>(max_tokens)) // token_ids_gpu
+            .saturating_add(FlashInferDecodeMetadata::device_bytes_with_float_workspace(
+                max_tokens,
+                max_total_pages.saturating_add(max_prefill_pages),
+                model_config.num_attention_heads,
+                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
+            ))
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         model_config: &Config,
         max_batch_size: usize,
         max_total_pages: usize,
+        page_size: usize,
         max_prefill_tokens: usize,
     ) -> Result<Self> {
         let max_prefill_tokens = max_prefill_tokens.max(1);
         let max_tokens = max_batch_size + max_prefill_tokens;
+        let max_prefill_pages = max_prefill_tokens.div_ceil(page_size.max(1));
         let q_dim = model_config.num_attention_heads * model_config.head_dim;
         let kv_dim = model_config.num_key_value_heads * model_config.head_dim;
 
@@ -142,11 +187,12 @@ impl MixedBatchBuffers {
                 .stream
                 .alloc_zeros(max_tokens)
                 .map_err(|e| anyhow::anyhow!("Alloc mixed token_ids_gpu failed: {e}"))?,
-            metadata: FlashInferDecodeMetadata::new(
+            metadata: FlashInferDecodeMetadata::new_with_float_workspace_bytes(
                 ctx,
                 max_tokens,
-                max_total_pages + max_prefill_tokens,
+                max_total_pages + max_prefill_pages,
                 model_config.num_attention_heads,
+                FlashInferWorkspace::HD256_FLOAT_WORKSPACE_BYTES,
             )?,
             max_prefill_tokens,
             max_tokens,
@@ -171,6 +217,44 @@ impl MixedBatchBuffers {
 }
 
 impl BatchDecodeBuffers {
+    pub(crate) fn device_bytes(
+        hidden_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        inter_dim: usize,
+        max_batch_size: usize,
+        num_qheads: usize,
+        max_total_pages: usize,
+    ) -> usize {
+        let activation_dims = 4usize
+            .saturating_mul(hidden_dim)
+            .saturating_add(4usize.saturating_mul(q_dim))
+            .saturating_add(4usize.saturating_mul(kv_dim))
+            .saturating_add(5usize.saturating_mul(inter_dim));
+
+        bf16_matrix_bytes(activation_dims, max_batch_size)
+            .saturating_add(bytes_for::<i32>(max_batch_size)) // argmax_out
+            .saturating_add(bytes_for::<f32>(max_batch_size)) // logprobs_gpu
+            .saturating_add(bytes_for::<i32>(max_batch_size)) // token_ids_gpu
+            .saturating_add(bytes_for::<i32>(2 * max_batch_size + 1)) // quantized_kv_meta
+            .saturating_add(FlashInferDecodeMetadata::device_bytes(
+                max_batch_size,
+                max_total_pages,
+                num_qheads,
+            ))
+    }
+
+    pub(crate) fn logits_device_bytes(vocab_size: usize, max_batch_size: usize) -> usize {
+        bf16_matrix_bytes(vocab_size, max_batch_size)
+    }
+
+    pub(crate) fn reserve_logits(&mut self, ctx: &DeviceContext, vocab_size: usize) -> Result<()> {
+        if self.logits_batch.is_none() {
+            self.logits_batch = Some(HiddenStates::zeros(ctx, vocab_size, self.max_batch_size)?);
+        }
+        Ok(())
+    }
+
     /// Allocate buffers for up to `max_batch_size` requests.
     /// `max_total_pages` should be large enough for the worst-case total KV pages.
     #[allow(clippy::too_many_arguments)]
@@ -271,10 +355,21 @@ impl BatchDecodeBuffers {
                 &model.config,
                 self.max_batch_size,
                 kv_pool.max_total_pages,
+                kv_pool.page_size,
                 max_prefill_tokens,
             )?);
         }
         Ok(self.mixed.as_mut().unwrap())
+    }
+
+    pub(crate) fn reserve_mixed_buffers(
+        &mut self,
+        model: &Qwen3Model,
+        kv_pool: &PagedKVPool,
+        max_prefill_tokens: usize,
+    ) -> Result<()> {
+        self.mixed_buffers_mut(model, kv_pool, max_prefill_tokens)
+            .map(|_| ())
     }
 }
 
@@ -340,7 +435,6 @@ impl crate::model::DecodeContextOps for BatchDecodeBuffers {
 
 #[derive(Clone, Copy, Debug)]
 struct MixedPrefillSlice {
-    slot_idx: usize,
     token_offset: usize,
     seq_len: usize,
     start_pos: usize,
@@ -403,14 +497,6 @@ impl Qwen3Model {
                 return Ok(false);
             }
 
-            let state = &states[request.slot_idx];
-            let start_pos = paged_kv_pool.seq_len(request.slot_idx);
-            if state.base.kv_cache.k_caches().is_empty()
-                || start_pos + request.tokens.len() > state.base.kv_cache.max_seq_len()
-            {
-                return Ok(false);
-            }
-
             prefill_slot_indices.push(request.slot_idx);
             paged_prefill.push(Qwen3PagedPrefillRequest {
                 tokens: request.tokens,
@@ -440,8 +526,7 @@ impl Qwen3Model {
         let prefill_slices: Vec<MixedPrefillSlice> = prefill
             .iter()
             .zip(prefill_sequences.iter())
-            .map(|(request, sequence)| MixedPrefillSlice {
-                slot_idx: request.slot_idx,
+            .map(|(_, sequence)| MixedPrefillSlice {
                 token_offset: sequence.token_offset,
                 seq_len: sequence.seq_len,
                 start_pos: sequence.start_pos,
@@ -611,17 +696,8 @@ impl Qwen3Model {
                 let page_table_ptr = (prefill_idx_ptr as usize
                     + prefill_slice.page_table_offset * i32_size)
                     as *const i32;
-                let prefill_max_seq_len =
-                    states[prefill_slice.slot_idx].base.kv_cache.max_seq_len() as i32;
-                let (k_cache, v_cache) = states[prefill_slice.slot_idx]
-                    .base
-                    .kv_cache
-                    .layer_kv_caches_mut(layer_idx);
-                let (kc_ptr, _gkc) = k_cache.data.device_ptr_mut(&self.ctx.stream);
-                let (vc_ptr, _gvc) = v_cache.data.device_ptr_mut(&self.ctx.stream);
-
                 unsafe {
-                    ffi::prefill_attention_prep_dual_write_cuda(
+                    ffi::prefill_attention_paged_prep_cuda(
                         q_prefill_ptr,
                         k_prefill_ptr,
                         v_prefill_ptr,
@@ -629,20 +705,17 @@ impl Qwen3Model {
                         kn_ptr as *const ffi::Half,
                         cos_ptr as *const ffi::Half,
                         sin_ptr as *const ffi::Half,
-                        kc_ptr as *mut ffi::Half,
-                        vc_ptr as *mut ffi::Half,
+                        page_table_ptr,
+                        page_size as i32,
+                        k_pool_ptr as *mut ffi::Half,
+                        v_pool_ptr as *mut ffi::Half,
                         num_heads as i32,
                         num_kv_heads as i32,
                         head_dim as i32,
                         prefill_slice.seq_len as i32,
                         prefill_slice.start_pos as i32,
-                        prefill_max_seq_len,
                         eps,
                         self.ctx.stream.cu_stream(),
-                        page_table_ptr,
-                        page_size as i32,
-                        k_pool_ptr as *mut ffi::Half,
-                        v_pool_ptr as *mut ffi::Half,
                     )
                     .result()?;
                 }
@@ -766,13 +839,6 @@ impl Qwen3Model {
                 ops::add_batch_into(&self.ctx, hidden, &mixed.o_buf, &mut mixed.hidden_out)?;
                 std::mem::swap(hidden, &mut mixed.hidden_out);
             }
-        }
-
-        for request in prefill {
-            states[request.slot_idx]
-                .base
-                .kv_cache
-                .advance_seq_len(request.tokens.len());
         }
 
         let hidden = unsafe { &*hidden_ptr };

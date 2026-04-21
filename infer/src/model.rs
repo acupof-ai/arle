@@ -354,6 +354,36 @@ pub trait ModelForward: Send {
         false
     }
 
+    /// GPU workspace the scheduler must reserve before sizing the KV pool.
+    ///
+    /// This covers model-owned runtime buffers that are allocated after weights
+    /// load but before or during serving: decode context, persistent attention
+    /// workspaces, logits buffers, and optional mixed prefill/decode scratch.
+    /// Returning zero preserves the old behavior for models without a precise
+    /// estimate.
+    fn scheduler_runtime_workspace_bytes(
+        &self,
+        _max_batch_size: usize,
+        _max_prefill_tokens: usize,
+        _mixed_prefill: bool,
+    ) -> usize {
+        0
+    }
+
+    /// Pre-allocate mixed prefill/decode scratch before requests are admitted.
+    ///
+    /// Models that support `forward_mixed_batch_with_prefill()` should override
+    /// this so an insufficient workspace fails at startup instead of after the
+    /// scheduler has already consumed decode-token KV pages.
+    fn prepare_mixed_decode_context(
+        &self,
+        _decode_ctx: &mut Self::DecodeContext,
+        _pool: &PagedKVPool,
+        _max_prefill_tokens: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Fast-path batched greedy sampling on internal contiguous logits.
     ///
     /// Implementations that return `Some(tokens)` should also populate
