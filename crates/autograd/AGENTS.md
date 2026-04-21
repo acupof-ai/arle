@@ -7,6 +7,12 @@ across ops. Two backends: CPU (reference, always on) and Metal (via
 needs a GPU box to execute. Load this file before editing anything under
 `crates/autograd/src/` or adding a `Backend` trait method.
 
+## Refactor posture
+
+- Keep autograd code simple and uniform. Prefer deletion-style refactors:
+  remove obsolete parallel APIs, collapse duplicate backend/plumbing logic,
+  and keep one canonical tensor/tape contract instead of adapter stacks.
+
 ## Module layout
 
 ```

@@ -59,9 +59,12 @@ Skip rules: trivial → Implement + Verify; exploration questions → Explore on
 ### Editing
 
 - **Preserve by default.** Never delete content not explicitly in scope.
-- **`AGENTS.md` is canonical.** If a sibling `CLAUDE.md` exists, keep it as a
-  thin pointer to the same-directory `AGENTS.md` instead of duplicating the
-  instructions in both files.
+- **Keep code simple and uniform.** Prefer deletion-style refactors:
+  remove obsolete paths, collapse duplicate helpers/branches, and converge on
+  one canonical flow instead of layering adapters.
+- **`AGENTS.md` is canonical.** If a sibling `CLAUDE.md` exists, keep both
+  files as full rule documents and keep their contents aligned; do not
+  collapse one into a thin pointer.
 - **Approach-first for >3 files or architectural decisions** — outline and wait.
 - **No half-states** (`feedback_no_half_states.md`): finish a refactor unit or
   revert it, never leave parallel old+new paths in the tree.

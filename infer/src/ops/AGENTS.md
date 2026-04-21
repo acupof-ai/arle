@@ -4,6 +4,12 @@ Tensor ops over `DeviceVec` / `HiddenStates`. Thin Rust wrappers around
 `infer_cuda_kernels::ffi::*` with batched/fused variants for scheduler use.
 Load before adding or modifying any op.
 
+## Refactor posture
+
+- Keep ops simple and uniform. Prefer deletion-style refactors: remove stale
+  wrappers, collapse duplicate batched/scalar helpers when one path can carry
+  both, and keep one canonical entry point per operation family.
+
 ## Module layout
 
 ```

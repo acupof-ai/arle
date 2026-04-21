@@ -5,6 +5,12 @@ tensor/pool/metadata types that `infer` proper consumes. **This is the
 proto-public API for the eventual Option-B split.** Load this file before
 touching anything under `crates/cuda-kernels/`.
 
+## Refactor posture
+
+- Keep kernel-crate code simple and uniform. Prefer deletion-style refactors:
+  remove stale shims, collapse duplicate FFI/kernel entry paths, and keep one
+  canonical ownership boundary between `infer` and `cuda-kernels`.
+
 ## Why this crate exists
 
 See `docs/architecture.md` + `docs/plans/cuda-kernel-crate-extraction.md`.

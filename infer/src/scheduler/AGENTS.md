@@ -3,6 +3,12 @@
 CUDA multi-request continuous batching + policy/accounting scaffolding that
 works with any backend. Load before editing any scheduler internals.
 
+## Refactor posture
+
+- Keep scheduler logic simple and uniform. Prefer deletion-style refactors:
+  remove parked or temporary admission paths, collapse duplicate planning
+  branches, and keep one canonical request flow instead of parallel queues.
+
 ## Module map
 
 | Path | Role |
@@ -16,7 +22,7 @@ works with any backend. Load before editing any scheduler internals.
 | `cuda/prefill.rs` | `step_new` — chunked prefill + prefix-hit paths (exact-full, prompt-prefix-of-cached, partial). |
 | `cuda/decode.rs` | Batched decode + retract/requeue under KV pressure. |
 | `cuda/request.rs` | Per-request state (`QueuedRequest`, `ActiveRequest`, `Phase`). |
-| `cuda/runtime.rs` | Single-writer scheduler thread: intake, normalization, staging completions, cleanup. |
+| `cuda/runtime.rs` | Single-writer scheduler thread: intake, prompt-length normalization, priority-ordered admission, spill completions, cleanup. |
 | `cuda/execution.rs` | Per-step execution glue: decode launch/readback, prefill budgets, waiting-queue admission. |
 
 ## Invariants you will break if you're not careful
@@ -53,7 +59,11 @@ works with any backend. Load before editing any scheduler internals.
    slot can reuse a radix block's contiguous state. Cross-slot page aliasing
    is intentionally unsupported — M2b closed that door deliberately
    (`docs/experience/wins/2026-04-15-tiered-kv-m2b-local.md`).
-9. **Eviction never touches pages backing an active slot.** Radix eviction
+9. **`assign_slots()` owns waiting-queue normalization.** Tokenization,
+   prompt-length rejection/clamping, cancellation skip, and priority ordering
+   all happen before a request becomes an `ActiveRequest`. Do not recreate a
+   second waiting-admission path in `execution.rs`.
+10. **Eviction never touches pages backing an active slot.** Radix eviction
    only frees pages whose `block_owner_slots` entry is either missing (the
    slot has already been freed) or points at a slot currently in `Idle`
    state. The eviction path confirms this before calling
