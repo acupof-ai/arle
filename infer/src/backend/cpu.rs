@@ -66,13 +66,37 @@ impl CpuBackend {
         }
 
         let base = self.build_response(prompt);
-        let words: Vec<&str> = base.split_whitespace().collect();
-        if words.len() <= budget {
-            return (base, "stop".to_string());
+        if let Some(tokenizer) = &self.tokenizer {
+            if let Ok(ids) = tokenizer.encode(&base) {
+                if ids.len() <= budget {
+                    return (base, "stop".to_string());
+                }
+                let clipped = tokenizer
+                    .decode(&ids[..budget])
+                    .unwrap_or_else(|_| fallback_word_clip(&base, budget));
+                return (clipped, "length".to_string());
+            }
         }
 
-        (words[..budget].join(" "), "length".to_string())
+        fallback_generate_text(&base, budget)
     }
+}
+
+fn fallback_generate_text(base: &str, budget: usize) -> (String, String) {
+    if budget == 0 {
+        return (String::new(), "length".to_string());
+    }
+
+    let words: Vec<&str> = base.split_whitespace().collect();
+    if words.len() <= budget {
+        return (base.to_string(), "stop".to_string());
+    }
+
+    (words[..budget].join(" "), "length".to_string())
+}
+
+fn fallback_word_clip(base: &str, budget: usize) -> String {
+    fallback_generate_text(base, budget).0
 }
 
 impl Default for CpuBackend {
@@ -244,6 +268,10 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokenizers::{
+        Tokenizer as HfTokenizer, models::wordlevel::WordLevel,
+        pre_tokenizers::whitespace::Whitespace,
+    };
 
     fn temp_model_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -252,6 +280,49 @@ mod tests {
             r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
         )
         .expect("config");
+        dir
+    }
+
+    fn temp_model_dir_with_tokenizer() -> tempfile::TempDir {
+        let dir = temp_model_dir();
+        let vocab = [
+            ("<unk>", 0u32),
+            ("CPU", 1),
+            ("backend", 2),
+            ("development", 3),
+            ("response", 4),
+            ("from", 5),
+            ("tmp", 6),
+            ("Qwen3ForCausalLM", 7),
+            ("This", 8),
+            ("path", 9),
+            ("validates", 10),
+            ("local", 11),
+            ("request", 12),
+            ("handling", 13),
+            ("without", 14),
+            ("GPU", 15),
+            ("acceleration", 16),
+            ("Prompt", 17),
+            ("preview", 18),
+            ("hello", 19),
+            ("a", 20),
+            ("smoke", 21),
+            ("test", 22),
+        ]
+        .into_iter()
+        .map(|(token, id)| (token.to_string(), id))
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
         dir
     }
 
@@ -298,6 +369,26 @@ mod tests {
 
         assert_eq!(generated.finish_reason, "length");
         assert_eq!(generated.text.split_whitespace().count(), 3);
+    }
+
+    #[test]
+    fn cpu_backend_respects_max_new_tokens_with_tokenizer_budget() {
+        let dir = temp_model_dir_with_tokenizer();
+        let mut backend = CpuBackend::new();
+        backend.load(dir.path()).expect("load");
+
+        let generated = backend
+            .generate(
+                "hello from a local smoke test",
+                &SamplingParams {
+                    max_new_tokens: Some(3),
+                    ..Default::default()
+                },
+            )
+            .expect("generate");
+
+        assert_eq!(generated.finish_reason, "length");
+        assert_eq!(generated.completion_tokens, 3);
     }
 
     #[test]
