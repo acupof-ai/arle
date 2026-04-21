@@ -274,12 +274,7 @@ impl MetalBackend {
         // SAFETY: the scheduler runtime leaks the backend to 'static
         // (`Box::leak(Box::new(backend))` at runtime.rs:591) before any
         // request state is created, so these references outlive all requests.
-        unsafe {
-            Some((
-                &*(rt as *const dflash::MetalDflashRuntime),
-                &*(cfg as *const MetalModelConfig),
-            ))
-        }
+        unsafe { Some((&*std::ptr::from_ref(rt), &*std::ptr::from_ref(cfg))) }
     }
 
     #[cfg(feature = "metal")]

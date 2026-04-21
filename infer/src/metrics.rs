@@ -13,6 +13,9 @@
 //! | `infer_requests_waiting` | gauge | Requests waiting in queue |
 //! | `infer_tokens_generated_total` | counter | Total output tokens generated |
 //! | `infer_tokens_prompt_total` | counter | Total prompt tokens processed |
+//! | `infer_queue_wait_seconds` | histogram | Submit-to-admit queueing latency |
+//! | `infer_active_ttft_seconds` | histogram | Admit-to-first-token service latency |
+//! | `infer_service_seconds` | histogram | First-token-to-finish service latency |
 //! | `infer_ttft_seconds` | histogram | Time-to-first-token latency |
 //! | `infer_tpot_seconds` | histogram | Time-per-output-token latency |
 //! | `infer_e2e_seconds` | histogram | End-to-end request latency |
@@ -74,6 +77,7 @@ impl Histogram {
         for (i, &bound) in self.buckets.iter().enumerate() {
             if value <= bound {
                 self.counts[i] += 1;
+                break;
             }
         }
     }
@@ -128,6 +132,9 @@ impl Histogram {
 // ============================================================================
 
 pub struct HistogramSet {
+    pub queue_wait: Histogram,
+    pub active_ttft: Histogram,
+    pub service: Histogram,
     pub ttft: Histogram,
     pub tpot: Histogram,
     pub e2e: Histogram,
@@ -137,6 +144,9 @@ impl HistogramSet {
     /// Create a new set of TTFT, TPOT, and E2E histograms using the default latency buckets.
     pub fn new() -> Self {
         Self {
+            queue_wait: Histogram::new(LATENCY_BUCKETS),
+            active_ttft: Histogram::new(LATENCY_BUCKETS),
+            service: Histogram::new(LATENCY_BUCKETS),
             ttft: Histogram::new(LATENCY_BUCKETS),
             tpot: Histogram::new(LATENCY_BUCKETS),
             e2e: Histogram::new(LATENCY_BUCKETS),
@@ -229,6 +239,28 @@ impl ServerMetrics {
         tpot_s: f64,
         e2e_s: f64,
     ) {
+        self.record_request_completed_detailed(
+            prompt_tokens,
+            generated_tokens,
+            0.0,
+            ttft_s,
+            ttft_s,
+            tpot_s,
+            e2e_s,
+        );
+    }
+
+    /// Record a completed request with queueing and service phases broken out.
+    pub fn record_request_completed_detailed(
+        &self,
+        prompt_tokens: u64,
+        generated_tokens: u64,
+        queue_wait_s: f64,
+        active_ttft_s: f64,
+        ttft_s: f64,
+        tpot_s: f64,
+        e2e_s: f64,
+    ) {
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
         self.inner
             .tokens_prompt_total
@@ -238,10 +270,13 @@ impl ServerMetrics {
             .fetch_add(generated_tokens, Ordering::Relaxed);
 
         if let Ok(mut h) = self.inner.histograms.lock() {
+            h.queue_wait.observe(queue_wait_s);
+            h.active_ttft.observe(active_ttft_s);
             h.ttft.observe(ttft_s);
             if generated_tokens > 1 {
                 h.tpot.observe(tpot_s);
             }
+            h.service.observe((e2e_s - ttft_s).max(0.0));
             h.e2e.observe(e2e_s);
         }
     }
@@ -583,6 +618,14 @@ impl ServerMetrics {
 
         // Histograms
         if let Ok(h) = self.inner.histograms.lock() {
+            out.push_str("# HELP infer_queue_wait_seconds Submit-to-admit queue latency.\n");
+            out.push_str("# TYPE infer_queue_wait_seconds histogram\n");
+            out.push_str(&h.queue_wait.render("infer_queue_wait_seconds", &labels));
+
+            out.push_str("# HELP infer_active_ttft_seconds Admit-to-first-token latency.\n");
+            out.push_str("# TYPE infer_active_ttft_seconds histogram\n");
+            out.push_str(&h.active_ttft.render("infer_active_ttft_seconds", &labels));
+
             out.push_str("# HELP infer_ttft_seconds Time to first token latency.\n");
             out.push_str("# TYPE infer_ttft_seconds histogram\n");
             out.push_str(&h.ttft.render("infer_ttft_seconds", &labels));
@@ -590,6 +633,10 @@ impl ServerMetrics {
             out.push_str("# HELP infer_tpot_seconds Time per output token latency.\n");
             out.push_str("# TYPE infer_tpot_seconds histogram\n");
             out.push_str(&h.tpot.render("infer_tpot_seconds", &labels));
+
+            out.push_str("# HELP infer_service_seconds First-token-to-finish service latency.\n");
+            out.push_str("# TYPE infer_service_seconds histogram\n");
+            out.push_str(&h.service.render("infer_service_seconds", &labels));
 
             out.push_str("# HELP infer_e2e_seconds End-to-end request latency.\n");
             out.push_str("# TYPE infer_e2e_seconds histogram\n");
@@ -606,6 +653,14 @@ impl ServerMetrics {
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.50))
             .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let queue_p50 = histograms
+            .as_ref()
+            .and_then(|h| h.queue_wait.percentile(0.50))
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let active_ttft_p50 = histograms
+            .as_ref()
+            .and_then(|h| h.active_ttft.percentile(0.50))
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
         let ttft_p99 = histograms
             .as_ref()
             .and_then(|h| h.ttft.percentile(0.99))
@@ -613,6 +668,10 @@ impl ServerMetrics {
         let tpot_p50 = histograms
             .as_ref()
             .and_then(|h| h.tpot.percentile(0.50))
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let service_p50 = histograms
+            .as_ref()
+            .and_then(|h| h.service.percentile(0.50))
             .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
         let active_mb =
             self.inner.memory_active_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
@@ -634,7 +693,7 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB ttft_p50={} ttft_p99={} tpot_p50={}{}",
+            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -644,8 +703,11 @@ impl ServerMetrics {
             active_mb,
             peak_mb,
             cache_mb,
+            queue_p50,
+            active_ttft_p50,
             ttft_p50,
             ttft_p99,
+            service_p50,
             tpot_p50,
             dflash_suffix,
         )
@@ -699,8 +761,11 @@ mod tests {
         assert!(rendered.contains("infer_requests_waiting{model=\"Qwen3-4B\",} 5"));
         assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
+        assert!(rendered.contains("infer_queue_wait_seconds_count"));
+        assert!(rendered.contains("infer_active_ttft_seconds_count"));
         assert!(rendered.contains("infer_ttft_seconds_count"));
         assert!(rendered.contains("infer_tpot_seconds_count"));
+        assert!(rendered.contains("infer_service_seconds_count"));
         assert!(rendered.contains("infer_e2e_seconds_count"));
         assert!(rendered.contains("infer_kv_gpu_blocks_free{model=\"Qwen3-4B\",} 100"));
         assert!(rendered.contains("infer_kv_gpu_blocks_total{model=\"Qwen3-4B\",} 200"));
@@ -712,6 +777,7 @@ mod tests {
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
+        assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=0.0%"));
     }
 

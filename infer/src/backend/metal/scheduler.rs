@@ -28,8 +28,6 @@ pub struct MetalSchedulerConfig {
     pub max_running_requests: usize,
     /// Maximum tokens processed in one prefill chunk.
     pub prefill_chunk_size: usize,
-    /// Prefill chunk cap when decode work is already active.
-    pub decode_active_prefill_cap: usize,
 }
 
 impl Default for MetalSchedulerConfig {
@@ -37,7 +35,6 @@ impl Default for MetalSchedulerConfig {
         Self {
             max_running_requests: 4,
             prefill_chunk_size: 512,
-            decode_active_prefill_cap: 128,
         }
     }
 }
@@ -53,11 +50,6 @@ impl MetalSchedulerConfig {
         if self.prefill_chunk_size == 0 {
             return Err(MetalSchedulerError::InvalidConfig(
                 "prefill_chunk_size must be >= 1".to_string(),
-            ));
-        }
-        if self.decode_active_prefill_cap == 0 {
-            return Err(MetalSchedulerError::InvalidConfig(
-                "decode_active_prefill_cap must be >= 1".to_string(),
             ));
         }
         Ok(())
@@ -168,13 +160,8 @@ impl MetalScheduler {
         });
     }
 
-    fn prefill_chunk_budget(&self, decode_count: usize) -> usize {
-        let budget = if decode_count > 0 {
-            self.config.decode_active_prefill_cap
-        } else {
-            self.config.prefill_chunk_size
-        };
-        budget.max(1).min(self.config.prefill_chunk_size)
+    fn prefill_chunk_budget(&self, _decode_count: usize) -> usize {
+        self.config.prefill_chunk_size
     }
 
     /// Create a new scheduler with the provided config.
@@ -527,15 +514,10 @@ mod tests {
         }
     }
 
-    fn make_scheduler(
-        max_running_requests: usize,
-        chunk: usize,
-        decode_cap: usize,
-    ) -> MetalScheduler {
+    fn make_scheduler(max_running_requests: usize, chunk: usize) -> MetalScheduler {
         MetalScheduler::new(MetalSchedulerConfig {
             max_running_requests,
             prefill_chunk_size: chunk,
-            decode_active_prefill_cap: decode_cap,
         })
         .expect("config should be valid")
     }
@@ -543,14 +525,12 @@ mod tests {
     fn make_scheduler_with_event_sink(
         max_running_requests: usize,
         chunk: usize,
-        decode_cap: usize,
         event_sink: Arc<dyn EventSink>,
     ) -> MetalScheduler {
         MetalScheduler::with_event_sink(
             MetalSchedulerConfig {
                 max_running_requests,
                 prefill_chunk_size: chunk,
-                decode_active_prefill_cap: decode_cap,
             },
             event_sink,
         )
@@ -583,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_beats_new_prefill_and_prefill_is_capped_when_decode_is_active() {
-        let mut sched = make_scheduler(2, 4, 2);
+    fn decode_beats_new_prefill_without_shrinking_the_prefill_chunk() {
+        let mut sched = make_scheduler(2, 4);
         let req0 = sched
             .submit(vec![1, 2, 3, 4], 8, MetalRequestPriority::Normal)
             .expect("submit req0");
@@ -607,14 +587,14 @@ mod tests {
         assert_eq!(decode.req_ids, vec![req0]);
         assert_eq!(decode.input_tokens, vec![11]);
         assert_eq!(prefill.req_id, req1);
-        assert_eq!(prefill.input_tokens, vec![5, 6]);
+        assert_eq!(prefill.input_tokens, vec![5, 6, 7, 8]);
         assert_eq!(prefill.prompt_start, 0);
-        assert_eq!(prefill.prompt_end, 2);
+        assert_eq!(prefill.prompt_end, 4);
     }
 
     #[test]
     fn prefills_are_chunked_until_complete() {
-        let mut sched = make_scheduler(1, 3, 3);
+        let mut sched = make_scheduler(1, 3);
         let req = sched
             .submit(
                 vec![10, 11, 12, 13, 14, 15, 16, 17],
@@ -650,7 +630,7 @@ mod tests {
 
     #[test]
     fn finishing_a_request_releases_the_slot_for_waiting_work() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req0 = sched
             .submit(vec![1, 2, 3, 4], 1, MetalRequestPriority::Normal)
             .expect("submit req0");
@@ -674,7 +654,7 @@ mod tests {
     #[test]
     fn metal_scheduler_emits_lifecycle_events_for_successful_request() {
         let sink = Arc::new(RecordingEventSink::default());
-        let mut sched = make_scheduler_with_event_sink(1, 4, 4, sink.clone());
+        let mut sched = make_scheduler_with_event_sink(1, 4, sink.clone());
         let req = sched
             .submit(vec![1, 2, 3, 4], 1, MetalRequestPriority::Normal)
             .expect("submit");
@@ -709,7 +689,7 @@ mod tests {
 
     #[test]
     fn terminal_prefill_records_first_token_before_decode_loop() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req = sched
             .submit(vec![1, 2, 3, 4], 3, MetalRequestPriority::Normal)
             .expect("submit");
@@ -726,7 +706,7 @@ mod tests {
 
     #[test]
     fn decode_batch_uses_runtime_last_token_for_input() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let prompt = vec![1u32, 2, 3, 4];
         let req = sched
             .submit(prompt.clone(), 3, MetalRequestPriority::Normal)
@@ -745,7 +725,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Metal scheduler contract violation: admitted decode request")]
     fn decode_batch_requires_runtime_last_token_for_admitted_requests() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req = sched
             .submit(vec![10, 11, 12, 13], 3, MetalRequestPriority::Normal)
             .expect("submit");
@@ -764,7 +744,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Metal scheduler contract violation: admitted request")]
     fn admitted_requests_require_runtime_snapshots() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req = sched
             .submit(vec![21, 22, 23, 24], 3, MetalRequestPriority::Normal)
             .expect("submit");
@@ -778,7 +758,7 @@ mod tests {
 
     #[test]
     fn waiting_request_may_be_rewritten_before_admission() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req = sched
             .submit(vec![1, 2, 3, 4, 5, 6], 2, MetalRequestPriority::Normal)
             .expect("submit");
@@ -795,7 +775,7 @@ mod tests {
     #[test]
     fn metal_scheduler_emits_prefill_started_once_for_chunked_request() {
         let sink = Arc::new(RecordingEventSink::default());
-        let mut sched = make_scheduler_with_event_sink(1, 3, 3, sink.clone());
+        let mut sched = make_scheduler_with_event_sink(1, 3, sink.clone());
         let req = sched
             .submit(
                 vec![10, 11, 12, 13, 14, 15, 16, 17],
@@ -835,7 +815,7 @@ mod tests {
 
     #[test]
     fn runtime_prefill_progress_controls_chunk_selection() {
-        let mut sched = make_scheduler(1, 4, 4);
+        let mut sched = make_scheduler(1, 4);
         let req = sched
             .submit(
                 vec![1, 2, 3, 4, 5, 6, 7, 8],

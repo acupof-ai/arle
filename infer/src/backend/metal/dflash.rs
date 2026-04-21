@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     path::Path,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -25,6 +26,7 @@ use crate::{hf_hub, sampler::SamplingParams};
 const DRAFT_CACHE_SINK_SIZE: i32 = 64;
 /// Draft KV cache window size (recent tokens kept at the end).
 const DRAFT_CACHE_WINDOW_SIZE: i32 = 1024;
+const QWEN35_BLOCK_PROFILE_WINDOW_BLOCKS: usize = 50;
 
 /// Rolling aggregate profile over N blocks. Captures the full phase
 /// breakdown + K-histogram so we can read the real bottleneck instead of
@@ -102,10 +104,9 @@ fn record_qwen35_block_profile(
         }
     }
 
-    const WINDOW_BLOCKS: usize = 50;
-    if state.blocks >= WINDOW_BLOCKS {
+    if state.blocks >= QWEN35_BLOCK_PROFILE_WINDOW_BLOCKS {
         let mean = |v: &[Duration]| -> f64 {
-            v.iter().map(|d| d.as_secs_f64()).sum::<f64>() / v.len() as f64 * 1000.0
+            v.iter().map(Duration::as_secs_f64).sum::<f64>() / v.len() as f64 * 1000.0
         };
         let quantile = |v: &mut Vec<Duration>, q: f64| -> f64 {
             v.sort();
@@ -126,7 +127,7 @@ fn record_qwen35_block_profile(
         for (k, count) in state.k_hist.iter().enumerate() {
             if *count > 0 {
                 let pct = 100.0 * *count as f64 / state.blocks as f64;
-                hist_s.push_str(&format!(" K{k}:{count}({pct:.0}%)"));
+                let _ = write!(hist_s, " K{k}:{count}({pct:.0}%)");
             }
         }
 
@@ -154,7 +155,7 @@ fn record_qwen35_block_profile(
         let mut pos_s = String::new();
         for (i, hits) in state.pos_match.iter().enumerate() {
             let pct = 100.0 * *hits as f64 / state.blocks as f64;
-            pos_s.push_str(&format!(" p{}:{:.0}%", i + 1, pct));
+            let _ = write!(pos_s, " p{}:{pct:.0}%", i + 1);
         }
         log::info!("qwen35_dflash[agg pos-agree]:{pos_s}");
         state.reset(block_size);
@@ -2216,16 +2217,22 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_total = t_start.elapsed();
 
     if profile {
+        let snapshot_ms = t_snapshot.saturating_sub(t_draft).as_secs_f32() * 1000.0;
+        let verify_ms = t_verify.saturating_sub(t_snapshot).as_secs_f32() * 1000.0;
+        let sample_ms = t_sample.saturating_sub(t_verify).as_secs_f32() * 1000.0;
+        let rollback_ms = t_rollback.saturating_sub(t_sample).as_secs_f32() * 1000.0;
+        let eval_ms = t_total.saturating_sub(t_rollback).as_secs_f32() * 1000.0;
+
         log::debug!(
             "qwen35_dflash: accept={}/{} draft={:.1}ms snapshot={:.1}ms verify={:.1}ms sample={:.1}ms rollback={:.1}ms eval={:.1}ms total={:.1}ms",
             accepted_inputs,
             runtime.block_size,
             t_draft.as_secs_f32() * 1000.0,
-            (t_snapshot - t_draft).as_secs_f32() * 1000.0,
-            (t_verify - t_snapshot).as_secs_f32() * 1000.0,
-            (t_sample - t_verify).as_secs_f32() * 1000.0,
-            (t_rollback - t_sample).as_secs_f32() * 1000.0,
-            (t_total - t_rollback).as_secs_f32() * 1000.0,
+            snapshot_ms,
+            verify_ms,
+            sample_ms,
+            rollback_ms,
+            eval_ms,
             t_total.as_secs_f32() * 1000.0,
         );
         // `matched` = number of draft positions that agreed with the
@@ -2237,10 +2244,10 @@ pub(crate) fn qwen35_dflash_speculative_block(
             runtime.block_size,
             matched,
             t_draft,
-            t_verify - t_snapshot,
-            t_sample - t_verify,
-            t_rollback - t_sample,
-            t_total - t_rollback,
+            t_verify.saturating_sub(t_snapshot),
+            t_sample.saturating_sub(t_verify),
+            t_rollback.saturating_sub(t_sample),
+            t_total.saturating_sub(t_rollback),
             t_total,
             &per_pos_match,
         );
@@ -2316,7 +2323,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     // ── 1. Pack block tokens ─ [B, block_size] int32. ──
     let mut packed_block_tokens: Vec<i32> = Vec::with_capacity(batch * runtime.block_size);
     let mut per_row_block_tokens: Vec<Vec<u32>> = Vec::with_capacity(batch);
-    for &cur in current_tokens.iter() {
+    for &cur in current_tokens {
         let mut row = vec![runtime.mask_token_id; runtime.block_size];
         row[0] = cur;
         for &tok in &row {
@@ -2622,7 +2629,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         &captured_hiddens,
         n_capture_layers,
         &accepted_inputs,
-        &target_hidden_per_row,
+        target_hidden_per_row,
     );
     ensure!(
         updated_per_row.len() == batch,
