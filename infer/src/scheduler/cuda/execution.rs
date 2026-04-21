@@ -25,21 +25,76 @@ pub(super) struct PrefillCandidate {
 }
 
 #[derive(Debug)]
-enum StepPlan {
+enum BatchPhase {
     Idle,
     DecodeOnly,
-    Mixed(Vec<PrefillCandidate>),
-    PrefillOnly(Vec<PrefillCandidate>),
+    Mixed,
+    PrefillOnly,
 }
 
-impl StepPlan {
+impl BatchPhase {
     fn label(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::DecodeOnly => "decode",
-            Self::Mixed(_) => "mixed",
-            Self::PrefillOnly(_) => "prefill",
+            Self::Mixed => "mixed",
+            Self::PrefillOnly => "prefill",
         }
+    }
+}
+
+/// Control-plane batch produced by the scheduler admission pass.
+///
+/// This object intentionally carries scheduling semantics only
+/// (which phase to run and which prefill requests were admitted).
+#[derive(Debug)]
+struct ScheduleBatch {
+    phase: BatchPhase,
+    prefill_candidates: Vec<PrefillCandidate>,
+}
+
+impl ScheduleBatch {
+    fn idle() -> Self {
+        Self {
+            phase: BatchPhase::Idle,
+            prefill_candidates: Vec::new(),
+        }
+    }
+
+    fn decode_only() -> Self {
+        Self {
+            phase: BatchPhase::DecodeOnly,
+            prefill_candidates: Vec::new(),
+        }
+    }
+
+    fn mixed(prefill_candidates: Vec<PrefillCandidate>) -> Self {
+        Self {
+            phase: BatchPhase::Mixed,
+            prefill_candidates,
+        }
+    }
+
+    fn prefill_only(prefill_candidates: Vec<PrefillCandidate>) -> Self {
+        Self {
+            phase: BatchPhase::PrefillOnly,
+            prefill_candidates,
+        }
+    }
+}
+
+/// Execution-plane batch lowered from `ScheduleBatch`.
+///
+/// This is the last host-side representation before GPU work is launched.
+#[derive(Debug)]
+struct ForwardBatch {
+    phase: BatchPhase,
+    prefill_candidates: Vec<PrefillCandidate>,
+}
+
+impl ForwardBatch {
+    fn label(&self) -> &'static str {
+        self.phase.label()
     }
 }
 
@@ -527,7 +582,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn plan_step(&mut self) -> StepPlan {
+    fn plan_schedule_batch(&mut self) -> ScheduleBatch {
         let has_decode = self.running_batch.iter().any(|&slot_idx| {
             self.request(slot_idx).is_some_and(|req| {
                 matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
@@ -543,17 +598,44 @@ impl<M: ModelForward> Scheduler<M> {
                 prefill_candidates.truncate(1);
             }
             return if prefill_candidates.is_empty() {
-                StepPlan::DecodeOnly
+                ScheduleBatch::decode_only()
             } else {
-                StepPlan::Mixed(prefill_candidates)
+                ScheduleBatch::mixed(prefill_candidates)
             };
         }
 
         let prefill_candidates = self.prefill_batch();
         if prefill_candidates.is_empty() {
-            StepPlan::Idle
+            ScheduleBatch::idle()
         } else {
-            StepPlan::PrefillOnly(prefill_candidates)
+            ScheduleBatch::prefill_only(prefill_candidates)
+        }
+    }
+
+    fn lower_schedule_batch(&self, schedule: ScheduleBatch) -> ForwardBatch {
+        let phase = match schedule.phase {
+            BatchPhase::Mixed if schedule.prefill_candidates.is_empty() => BatchPhase::DecodeOnly,
+            other => other,
+        };
+        ForwardBatch {
+            phase,
+            prefill_candidates: schedule.prefill_candidates,
+        }
+    }
+
+    fn launch_forward_batch(&mut self, forward: &ForwardBatch) -> u128 {
+        let t = std::time::Instant::now();
+        match forward.phase {
+            BatchPhase::DecodeOnly => self.step_decode_launch(),
+            BatchPhase::Mixed => self.step_decode_launch_mixed(&forward.prefill_candidates),
+            BatchPhase::Idle | BatchPhase::PrefillOnly => {}
+        }
+        t.elapsed().as_micros()
+    }
+
+    fn execute_prefill_forward_batch(&mut self, forward: &ForwardBatch) {
+        if matches!(forward.phase, BatchPhase::PrefillOnly) {
+            self.step_prefill_batch(&forward.prefill_candidates);
         }
     }
 
@@ -564,7 +646,8 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let plan_t = std::time::Instant::now();
-        let plan = self.plan_step();
+        let schedule_batch = self.plan_schedule_batch();
+        let forward_batch = self.lower_schedule_batch(schedule_batch);
         let admission_us = plan_t.elapsed().as_micros();
 
         assert!(
@@ -572,19 +655,7 @@ impl<M: ModelForward> Scheduler<M> {
             "pending decode must be cleared before scheduler step"
         );
 
-        let decode_launch_us = match &plan {
-            StepPlan::DecodeOnly => {
-                let t = std::time::Instant::now();
-                self.step_decode_launch();
-                t.elapsed().as_micros()
-            }
-            StepPlan::Mixed(candidates) => {
-                let t = std::time::Instant::now();
-                self.step_decode_launch_mixed(candidates);
-                t.elapsed().as_micros()
-            }
-            StepPlan::Idle | StepPlan::PrefillOnly(_) => 0,
-        };
+        let decode_launch_us = self.launch_forward_batch(&forward_batch);
 
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
@@ -606,9 +677,7 @@ impl<M: ModelForward> Scheduler<M> {
         let emit_us = emit_t.elapsed().as_micros();
 
         let prefill_t = std::time::Instant::now();
-        if let StepPlan::PrefillOnly(candidates) = &plan {
-            self.step_prefill_batch(candidates);
-        }
+        self.execute_prefill_forward_batch(&forward_batch);
         let prefill_us = prefill_t.elapsed().as_micros();
 
         let readback_us = if self.pending_decode.is_some() {
@@ -638,7 +707,7 @@ impl<M: ModelForward> Scheduler<M> {
         if total_us > 100_000 {
             info!(
                 "step breakdown: plan={} admission={}us decode={}us emit={}us prefill={}us total={}us batch={}",
-                plan.label(),
+                forward_batch.label(),
                 admission_us,
                 decode_us,
                 emit_us,
