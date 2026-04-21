@@ -21,7 +21,7 @@ use agent::{
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
+use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition, VisibleTextStream};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::sampler::SamplingParams;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -733,6 +733,7 @@ fn run_chat_turn_with_history(
     // send error as "consumer gone, stop sampling").
     let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
     let mut accumulated = String::new();
+    let mut visible_stream = VisibleTextStream::default();
     // Buffer for incomplete UTF-8 sequences arriving across deltas.
     let mut partial_bytes: Vec<u8> = Vec::new();
     let mut cancelled = false;
@@ -777,15 +778,16 @@ fn run_chat_turn_with_history(
                 Ok(delta) => {
                     if !delta.text_delta.is_empty() {
                         let chunk = decode_chunk(&mut partial_bytes, delta.text_delta.as_bytes());
-                        if !chunk.is_empty() {
+                        let visible = visible_stream.push(&chunk);
+                        if !visible.is_empty() {
                             // Erase the live TPS line (if visible) before
                             // the next token chunk lands on stdout — keeps
                             // streamed text uncorrupted on the same row.
                             tps_meter.hide_before_chunk();
-                            accumulated.push_str(&chunk);
-                            print!("{}", chunk);
+                            accumulated.push_str(&visible);
+                            print!("{}", visible);
                             let _ = io::stdout().flush();
-                            tps_meter.record_chunk(chunk.len());
+                            tps_meter.record_chunk(visible.len());
                         }
                     }
                     if let Some(usage) = delta.usage {
@@ -823,11 +825,21 @@ fn run_chat_turn_with_history(
     if !partial_bytes.is_empty() {
         let tail = String::from_utf8_lossy(&partial_bytes).to_string();
         if !tail.is_empty() {
-            accumulated.push_str(&tail);
-            print!("{}", tail);
-            let _ = io::stdout().flush();
+            let visible = visible_stream.push(&tail);
+            if !visible.is_empty() {
+                accumulated.push_str(&visible);
+                print!("{}", visible);
+                let _ = io::stdout().flush();
+            }
         }
         partial_bytes.clear();
+    }
+
+    let tail = visible_stream.finish();
+    if !tail.is_empty() {
+        accumulated.push_str(&tail);
+        print!("{}", tail);
+        let _ = io::stdout().flush();
     }
 
     if color_on {
