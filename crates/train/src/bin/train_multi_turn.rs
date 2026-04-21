@@ -25,7 +25,10 @@ use train::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
     cli_args::{ArgError, next_value, parse_value},
-    control::TrainingController,
+    control::{
+        TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
+        sync_status,
+    },
     dataset::LcgRng,
     grad_clip::clip_grad_norm,
     grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, mean_sampled_kl},
@@ -40,7 +43,6 @@ use train::{
         save_step_checkpoint,
     },
     reward::{discounted_returns, group_normalize, returns_to_per_position},
-    server::bind_and_serve_on_thread,
 };
 
 #[derive(Debug, Clone)]
@@ -276,13 +278,8 @@ fn run() -> Result<(), CliError> {
         eprintln!("[train_multi_turn] gradient clipping disabled (--no-grad-clip)");
     }
     let controller = TrainingController::new();
-    let metrics = train::metrics::open_shared_sink_with_extra(
-        args.metrics_jsonl.as_deref(),
-        true,
-        false,
-        vec![Box::new(controller.metric_sink())],
-    )
-    .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
+    let metrics = open_run_metrics(args.metrics_jsonl.as_deref(), &controller)
+        .map_err(|e| CliError::Custom(format!("metrics sink: {e}")))?;
     let run_id = train::metrics::default_run_id("train_multi_turn");
 
     let total_agent = args.agent_tokens * args.turns;
@@ -371,8 +368,6 @@ fn run() -> Result<(), CliError> {
     let save_path_string = args.save_path.as_deref().unwrap_or_default().to_string();
     let resume_path_string = resume_dir.as_ref().map(|path| path.display().to_string());
     let mut run_start_strings = vec![
-        ("run_id", run_id.as_str()),
-        ("job", "train_multi_turn"),
         ("model_family", "qwen35"),
         ("backend", backend_name),
         ("objective", args.objective.as_str()),
@@ -390,32 +385,25 @@ fn run() -> Result<(), CliError> {
         ("prompt_len", args.prompt_len as f64),
     ];
     let run_start_bools = [("resumed", resume_dir.is_some())];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_start",
-        step: Some(resume.start_iter as u64),
-        strings: &run_start_strings,
-        scalars: &run_start_scalars,
-        bools: &run_start_bools,
-    });
+    emit_run_start(
+        &metrics,
+        &run_id,
+        "train_multi_turn",
+        resume.start_iter as u64,
+        &run_start_strings,
+        &run_start_scalars,
+        &run_start_bools,
+    );
 
-    controller.update(|s| {
+    sync_status(&controller, &metrics, |s| {
         s.total_iters = args.iters;
         s.started = true;
         s.iter = resume.start_iter;
         s.best_reward = best_reward;
         s.last_kl = last_kl;
-        s.dropped_metrics = metrics.dropped_metrics();
     });
-    let _server_handle = if let Some(port) = args.serve {
-        let addr = format!("127.0.0.1:{port}");
-        eprintln!("[train_multi_turn] control plane listening on {addr}");
-        Some(
-            bind_and_serve_on_thread(Arc::clone(&controller), addr)
-                .map_err(|e| CliError::Custom(format!("train server bind failed: {e}")))?,
-        )
-    } else {
-        None
-    };
+    let _server_handle = serve_if_requested("train_multi_turn", &controller, args.serve)
+        .map_err(CliError::Custom)?;
 
     let mut stopped_early = false;
     for iter in resume.start_iter..args.iters {
@@ -573,14 +561,13 @@ fn run() -> Result<(), CliError> {
         });
 
         let wall_so_far = loop_start.elapsed().as_secs_f32();
-        controller.update(|s| {
+        sync_status(&controller, &metrics, |s| {
             s.iter = iter + 1;
             s.mean_reward = mean_turn_reward;
             s.best_reward = best_reward;
             s.last_kl = last_kl;
             s.last_loss = loss_value;
             s.wall_secs = wall_so_far;
-            s.dropped_metrics = metrics.dropped_metrics();
         });
 
         if controller.take_save_request() {
@@ -721,9 +708,8 @@ fn run() -> Result<(), CliError> {
         });
     }
 
-    controller.update(|s| {
+    sync_status(&controller, &metrics, |s| {
         s.wall_secs = wall_secs;
-        s.dropped_metrics = metrics.dropped_metrics();
         s.finished = true;
     });
     if stopped_early {
@@ -737,7 +723,6 @@ fn run() -> Result<(), CliError> {
     } else {
         "completed"
     };
-    let run_end_strings = [("run_id", run_id.as_str()), ("status", status)];
     let run_end_scalars = [
         ("completed_iters", controller.snapshot().iter as f64),
         ("best_reward", best_reward as f64),
@@ -745,13 +730,13 @@ fn run() -> Result<(), CliError> {
         ("wall_secs", wall_secs as f64),
         ("dropped_metrics", metrics.dropped_metrics() as f64),
     ];
-    metrics.emit_event(&train::metrics::TrainEvent {
-        kind: "run_end",
-        step: Some(controller.snapshot().iter as u64),
-        strings: &run_end_strings,
-        scalars: &run_end_scalars,
-        bools: &[],
-    });
+    emit_run_end(
+        &metrics,
+        &run_id,
+        status,
+        controller.snapshot().iter as u64,
+        &run_end_scalars,
+    );
     metrics.flush_blocking();
     Ok(())
 }

@@ -9,14 +9,19 @@
 //! contended section.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::metrics::{MetricSample, MetricSink, TrainEvent};
+use crate::metrics::{
+    MetricSample, MetricSink, SharedSink, TrainEvent, open_shared_sink_with_extra,
+};
+use crate::server::bind_and_serve_on_thread;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrainingStatus {
@@ -231,6 +236,86 @@ impl TrainingController {
             _ => {}
         }
     }
+}
+
+pub fn open_run_metrics(
+    metrics_jsonl: Option<&Path>,
+    controller: &Arc<TrainingController>,
+) -> anyhow::Result<SharedSink> {
+    open_shared_sink_with_extra(
+        metrics_jsonl,
+        true,
+        /* append = */ false,
+        vec![Box::new(controller.metric_sink())],
+    )
+}
+
+pub fn sync_status(
+    controller: &TrainingController,
+    metrics: &SharedSink,
+    f: impl FnOnce(&mut TrainingStatus),
+) {
+    controller.update(|status| {
+        f(status);
+        status.dropped_metrics = metrics.dropped_metrics();
+    });
+}
+
+pub fn emit_run_start(
+    metrics: &SharedSink,
+    run_id: &str,
+    job: &str,
+    step: u64,
+    extra_strings: &[(&str, &str)],
+    scalars: &[(&str, f64)],
+    bools: &[(&str, bool)],
+) {
+    let mut strings = Vec::with_capacity(extra_strings.len() + 2);
+    strings.push(("run_id", run_id));
+    strings.push(("job", job));
+    strings.extend(extra_strings.iter().copied());
+    metrics.emit_event(&TrainEvent {
+        kind: "run_start",
+        step: Some(step),
+        strings: &strings,
+        scalars,
+        bools,
+    });
+}
+
+pub fn emit_run_end(
+    metrics: &SharedSink,
+    run_id: &str,
+    status: &str,
+    step: u64,
+    scalars: &[(&str, f64)],
+) {
+    let strings = [("run_id", run_id), ("status", status)];
+    metrics.emit_event(&TrainEvent {
+        kind: "run_end",
+        step: Some(step),
+        strings: &strings,
+        scalars,
+        bools: &[],
+    });
+}
+
+pub fn serve_if_requested(
+    job: &str,
+    controller: &Arc<TrainingController>,
+    port: Option<u16>,
+) -> Result<Option<JoinHandle<()>>, String> {
+    let Some(port) = port else {
+        return Ok(None);
+    };
+    if port == 0 {
+        return Ok(None);
+    }
+    let addr = format!("127.0.0.1:{port}");
+    eprintln!("[{job}] control plane listening on http://{addr}/v1/train");
+    bind_and_serve_on_thread(Arc::clone(controller), addr)
+        .map(Some)
+        .map_err(|err| format!("train control server bind failed: {err}"))
 }
 
 fn now_ms() -> u64 {
