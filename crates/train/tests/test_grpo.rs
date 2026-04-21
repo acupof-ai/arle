@@ -5,56 +5,14 @@ use train::{
     dataset::{CopyDataset, Dataset, LcgRng},
     grpo::{GrpoConfig, group_advantages, grpo_loss, grpo_loss_per_position, ppo_active_mask},
     policy_support::retained_ids,
-    qwen35::{LayerType, Qwen35Config, Qwen35Model},
+    qwen35::Qwen35Model,
     rollout::{Trajectory, rollout_group},
     trainer::{clip_grad_norm, cross_entropy_loss},
 };
 
-fn tiny_qwen35_config(max_seq_len: usize) -> Qwen35Config {
-    Qwen35Config {
-        hidden_size: 16,
-        intermediate_size: 32,
-        num_hidden_layers: 2,
-        vocab_size: 16,
-        rms_norm_eps: 1.0e-6,
-        stop_token_ids: vec![15],
-        bos_token_id: Some(1),
-        eos_token_id: 15,
-        tie_word_embeddings: false,
-        num_attention_heads: 2,
-        num_key_value_heads: 1,
-        head_dim: 8,
-        linear_num_key_heads: 2,
-        linear_key_head_dim: 8,
-        linear_num_value_heads: 2,
-        linear_value_head_dim: 8,
-        linear_conv_kernel_dim: 4,
-        rope_theta: 10_000.0,
-        partial_rotary_factor: 1.0,
-        rotary_dim: 8,
-        rope_cache_len_hint: Some(max_seq_len),
-        layer_types: vec![LayerType::FullAttention; 2],
-        num_experts: 0,
-        num_experts_per_tok: 0,
-        decoder_sparse_step: 1,
-        moe_intermediate_size: 0,
-        shared_expert_intermediate_size: 0,
-        norm_topk_prob: true,
-        mlp_only_layers: Vec::new(),
-    }
-}
+mod common;
 
-fn tiny_hybrid_qwen35_config(max_seq_len: usize) -> Qwen35Config {
-    let mut cfg = tiny_qwen35_config(max_seq_len);
-    cfg.partial_rotary_factor = 0.5;
-    cfg.rotary_dim = cfg.head_dim / 2;
-    cfg.linear_key_head_dim = cfg.rotary_dim;
-    cfg.linear_value_head_dim = cfg.rotary_dim;
-    cfg.layer_types = vec![LayerType::FullAttention, LayerType::LinearAttention];
-    cfg.validate_train_scratch_contract()
-        .expect("hybrid scratch config");
-    cfg
-}
+use common::qwen35_test_support::{tiny_hybrid_qwen35_scratch_config, tiny_qwen35_scratch_config};
 
 #[test]
 fn ppo_active_mask_zeros_out_clipped_positions() {
@@ -104,7 +62,7 @@ fn group_advantages_normalizes_per_group() {
 
 #[test]
 fn grpo_loss_gradient_non_zero() {
-    let config = tiny_qwen35_config(8);
+    let config = tiny_qwen35_scratch_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -176,7 +134,7 @@ fn grpo_loss_gradient_non_zero() {
 
 #[test]
 fn hybrid_grpo_loss_gradient_non_zero() {
-    let config = tiny_hybrid_qwen35_config(8);
+    let config = tiny_hybrid_qwen35_scratch_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -251,7 +209,7 @@ fn hybrid_grpo_loss_gradient_non_zero() {
 
 #[test]
 fn gspo_scalar_advantages_broadcast_like_per_position_inputs() {
-    let config = tiny_qwen35_config(8);
+    let config = tiny_qwen35_scratch_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();
@@ -330,7 +288,7 @@ fn gspo_scalar_advantages_broadcast_like_per_position_inputs() {
 #[test]
 fn grpo_smoke_reward_nondecreasing_on_trivial_task() {
     let started = Instant::now();
-    let config = tiny_qwen35_config(8);
+    let config = tiny_qwen35_scratch_config(8);
 
     let mut store = TensorStore::default();
     let mut tape = Tape::new();

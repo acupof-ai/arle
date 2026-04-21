@@ -2,56 +2,19 @@ use std::collections::HashSet;
 
 use autograd::{Tape, TensorStore};
 use qwen35_spec::Qwen35AttentionTensorNames;
-use train::qwen35::{LayerType, Qwen35Config, Qwen35Model};
+use train::qwen35::Qwen35Model;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-fn tiny_full_attn_cfg() -> Qwen35Config {
-    Qwen35Config {
-        hidden_size: 16,
-        intermediate_size: 32,
-        num_hidden_layers: 2,
-        vocab_size: 64,
-        rms_norm_eps: 1.0e-6,
-        stop_token_ids: vec![2],
-        bos_token_id: Some(1),
-        eos_token_id: 2,
-        tie_word_embeddings: false,
-        num_attention_heads: 2,
-        num_key_value_heads: 1,
-        head_dim: 8,
-        linear_num_key_heads: 2,
-        linear_key_head_dim: 8,
-        linear_num_value_heads: 2,
-        linear_value_head_dim: 8,
-        linear_conv_kernel_dim: 4,
-        rope_theta: 10_000.0,
-        partial_rotary_factor: 1.0,
-        rotary_dim: 8,
-        rope_cache_len_hint: Some(16),
-        layer_types: vec![LayerType::FullAttention; 2],
-        num_experts: 0,
-        num_experts_per_tok: 0,
-        decoder_sparse_step: 1,
-        moe_intermediate_size: 0,
-        shared_expert_intermediate_size: 0,
-        norm_topk_prob: true,
-        mlp_only_layers: Vec::new(),
-    }
-}
+mod common;
 
-fn tiny_hybrid_cfg() -> Qwen35Config {
-    Qwen35Config {
-        rotary_dim: 4,
-        partial_rotary_factor: 0.5,
-        layer_types: vec![LayerType::FullAttention, LayerType::LinearAttention],
-        ..tiny_full_attn_cfg()
-    }
-}
+use common::qwen35_test_support::{
+    tiny_hybrid_qwen35_scratch_config_with_vocab, tiny_qwen35_scratch_config_with_vocab,
+};
 
 #[test]
 fn qwen35_batch_forward_matches_repeated_single_forward() -> TestResult {
-    let cfg = tiny_full_attn_cfg();
+    let cfg = tiny_qwen35_scratch_config_with_vocab(16, 64);
     let mut store = TensorStore::default();
     let model = Qwen35Model::new(&cfg, &mut store)?;
 
@@ -102,7 +65,7 @@ fn qwen35_batch_forward_matches_repeated_single_forward() -> TestResult {
 
 #[test]
 fn qwen35_hybrid_forward_supports_partial_rope_and_linear_layers() -> TestResult {
-    let cfg = tiny_hybrid_cfg();
+    let cfg = tiny_hybrid_qwen35_scratch_config_with_vocab(16, 64);
     cfg.validate_train_lora_or_frozen_contract()?;
     let mut store = TensorStore::default();
     let model = Qwen35Model::new_for_eval(&cfg, &mut store)?;
