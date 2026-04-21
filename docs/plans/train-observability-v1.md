@@ -62,6 +62,7 @@ What is missing:
 
 - no infer-side unified `/v1/train/*` bridge yet
 - no trace-first rollout / tool-call export yet
+- no run/span model for long multi-turn rollouts beyond the current event stream
 
 ## Constraints
 
@@ -250,14 +251,14 @@ less urgent for scalar supervised training than for agent/eval workflows.
 
 ## Immediate implementation target
 
-The smallest safe next step is:
+The smallest safe next step is now:
 
-1. widen the event schema beyond `step + &[(&str, f64)]`
-2. normalize metrics across `Trainer`, `train_grpo`, and `train_multi_turn`
-3. introduce a background exporter thread
-4. make checkpoint save emit artifact events
+1. define the trace-first event/span schema for rollout / tool-call / verifier flows
+2. bridge the current train-side event stream into the infer-side unified `/v1/train/*` surface once that route lands
+3. decide whether OTLP export remains log-shaped only or also grows first-class metrics / spans for long-running runs
+4. keep the run/checkpoint schema stable while the remaining CLI normalization and hybrid-train work lands
 
-The MLflow endpoint, OTLP log path, and W&B sidecar path are already wired.
+The shared sink, background worker, checkpoint events, MLflow adapter, OTLP log path, and W&B sidecar path are already wired.
 New exporters should continue to sit on top of the same event stream rather
 than fork the runtime API.
 

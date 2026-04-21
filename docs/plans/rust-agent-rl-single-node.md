@@ -13,14 +13,14 @@
 
 > **Current implementation note**
 > 本计划主要描述 Phase 6 的执行路径和目标收敛方向。
-> 2026-04-20 当前 repo 里的训练控制面仍然是 `crates/train`
+> 2026-04-21 当前 repo 里的训练控制面仍然是 `crates/train`
 > 自己的 train-side server：`pretrain --serve` / `train_sft --serve` /
 > `train_grpo --serve` / `train_multi_turn --serve` →
 > `crates/train/src/server.rs`。如果问题是当前 runtime / checkpoint /
 > metrics / server 的真实边界，先看
 > [`train-runtime-architecture-v1.md`](train-runtime-architecture-v1.md)
 > 和 [`docs/codebase-map.md`](../codebase-map.md)。
-> 当前 train-side 训练模型实现已经是 Qwen3.5-family dense/full-attn 路径；HF-style checkpoint 目录已在用。手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线；hybrid linear-attn 还没落地。
+> 当前 train-side 训练模型实现已经是 Qwen3.5-family dense/full-attn 路径；HF-style checkpoint 目录、exact resume、以及 shared async observability 都已在用。`pretrain` 是唯一 canonical scratch-pretrain 入口，手写 Transformer/TinyLM runtime compatibility 路径已经删除，不再是并列主线；hybrid linear-attn 还没落地。
 
 ---
 

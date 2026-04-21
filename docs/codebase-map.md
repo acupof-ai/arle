@@ -1,10 +1,13 @@
 # agent-infer Codebase Map
 
-Updated 2026-04-15 (post `cuda-kernels` extraction, tiered KV
-M3a/M3b/M3c local, and Metal M0.2a request-state landing).
-Supplemented 2026-04-20 with Phase 6 `crates/autograd` + `crates/train`
+Updated 2026-04-21 (post `cuda-kernels` extraction, tiered KV
+M3a/M3b/M3c local, the current Phase 6 `crates/autograd` + `crates/train`
+landing, and the train-side control-plane / observability refresh).
+Supplemented 2026-04-21 with the canonical `pretrain` entrypoint and
+the latest Phase 6 runtime truth.
+(Earlier 2026-04-20 supplement introduced Phase 6 `crates/autograd` + `crates/train`
 (from-scratch autograd + LoRA/GRPO trainer; see [`docs/plans/rust-agent-rl-single-node.md`](plans/rust-agent-rl-single-node.md))
-and the canonical guidellm bench SSOT alignment.
+and the canonical guidellm bench SSOT alignment.)
 Current train control-plane truth: `crates/train` owns the active
 training server, surfaced by `pretrain --serve`, `train_sft --serve`,
 `train_grpo --serve`, and `train_multi_turn --serve`; the current
@@ -52,7 +55,7 @@ Current workspace members:
 - `crates/tools`
 - `crates/qwen3-spec` (shared Qwen3 config + canonical tensor-name contract)
 - `crates/qwen35-spec` (shared Qwen3.5 config + canonical tensor-name contract)
-- `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait + `CpuBackend`/`MetalBackend`/`CudaBackend` matmul)
+- `crates/autograd` (Phase 6 — from-scratch autograd with `Backend` trait; the current local Metal train path already uses the device-resident / lazy-eval tranche for the active training-critical ops, while CUDA remains the primary full-acceptance target)
 - `crates/train` (Phase 6 — generic Qwen-family pretrain/SFT/GRPO trainer, train-side server exposed by the active train binaries' `--serve` flag; current optimized path is Qwen3.5-family dense/full-attn with HF-style checkpoint dirs and shared async observability, bounded backpressure + `dropped_metrics` status reporting, MLflow export, OTLP log export, and optional W&B sidecar export; depends on `autograd`)
 
 ## 2. Main execution paths
