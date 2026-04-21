@@ -1449,16 +1449,18 @@ int32_t qwen35_session_begin(
     mlx_array** gdr_states, int32_t n_gdr
 ) {
     auto* m = static_cast<Qwen35CompiledModel*>(model);
+    mlx_clear_error();
+
+    if (m->session_active) {
+        mlx_set_error("qwen35_session_begin requires an inactive session");
+        return -1;
+    }
+    if (n_kv < 0 || n_gdr < 0) {
+        mlx_set_error("qwen35_session_begin received negative cache counts");
+        return -1;
+    }
+
     try {
-        mlx_clear_error();
-
-        if (m->session_active) {
-            throw std::runtime_error("qwen35_session_begin requires an inactive session");
-        }
-        if (n_kv < 0 || n_gdr < 0) {
-            throw std::runtime_error("qwen35_session_begin received negative cache counts");
-        }
-
         std::vector<array> session_kv_caches;
         std::vector<array> session_gdr_states;
         session_kv_caches.reserve(n_kv);
@@ -1476,9 +1478,6 @@ int32_t qwen35_session_begin(
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
-        m->session_kv_caches.clear();
-        m->session_gdr_states.clear();
-        m->session_active = false;
         return -1;
     }
 }
@@ -1489,20 +1488,23 @@ int32_t qwen35_session_end(
     mlx_array** out_gdr_states, int32_t n_gdr
 ) {
     auto* m = static_cast<Qwen35CompiledModel*>(model);
+    mlx_clear_error();
+
+    if (!m->session_active) {
+        mlx_set_error("qwen35_session_end requires an active session");
+        return -1;
+    }
+    if (n_kv < 0 || n_gdr < 0) {
+        mlx_set_error("qwen35_session_end received negative cache counts");
+        return -1;
+    }
+    if (static_cast<int32_t>(m->session_kv_caches.size()) != n_kv ||
+        static_cast<int32_t>(m->session_gdr_states.size()) != n_gdr) {
+        mlx_set_error("qwen35_session_end cache counts do not match the active session");
+        return -1;
+    }
+
     try {
-        mlx_clear_error();
-
-        if (!m->session_active) {
-            throw std::runtime_error("qwen35_session_end requires an active session");
-        }
-        if (n_kv < 0 || n_gdr < 0) {
-            throw std::runtime_error("qwen35_session_end received negative cache counts");
-        }
-        if (static_cast<int32_t>(m->session_kv_caches.size()) != n_kv ||
-            static_cast<int32_t>(m->session_gdr_states.size()) != n_gdr) {
-            throw std::runtime_error("qwen35_session_end cache counts do not match the active session");
-        }
-
         for (int i = 0; i < n_kv; ++i) {
             out_kv_caches[i] = from_arr(std::move(m->session_kv_caches[i]));
         }
@@ -1516,9 +1518,6 @@ int32_t qwen35_session_end(
         return 0;
     } catch (const std::exception& e) {
         mlx_set_error(e.what());
-        m->session_kv_caches.clear();
-        m->session_gdr_states.clear();
-        m->session_active = false;
         return -1;
     }
 }

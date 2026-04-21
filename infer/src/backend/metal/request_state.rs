@@ -115,7 +115,14 @@ pub struct PrefillChunkResult {
     pub finish_reason: Option<&'static str>,
 }
 
-pub(crate) struct Qwen3MixedBatchResult {
+/// Result of `MetalRequestState::try_mixed_batch`.
+///
+/// The contract is intentionally backend-generic: the caller gets the
+/// sampled decode tokens for the rows that participated in the mixed batch
+/// plus the prefill chunk outcome for the single prefill request that shared
+/// the step. The current fused implementation is still Qwen3-only, but the
+/// entrypoint and result type are Metal-wide so the runtime can stay uniform.
+pub(crate) struct MetalMixedBatchResult {
     pub(crate) decode_tokens: Vec<u32>,
     pub(crate) prefill: PrefillChunkResult,
 }
@@ -832,12 +839,22 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    pub(crate) fn try_qwen3_mixed_batch(
+    /// Try to execute one mixed Metal batch.
+    ///
+    /// This is the generic runtime-facing entrypoint. The current fused
+    /// implementation still only accepts Qwen3 decode rows paired with a
+    /// Qwen3 prefill row; other model mixes return `Ok(None)` so the caller
+    /// can fall back to the scalar path without changing behavior.
+    pub(crate) fn try_mixed_batch(
         decode_states: &mut [&mut MetalRequestState<'a>],
         prefill_state: &mut MetalRequestState<'a>,
         budget: usize,
-    ) -> Result<Option<Qwen3MixedBatchResult>> {
-        ensure!(budget > 0, "Qwen3 mixed batch requires budget > 0");
+    ) -> Result<Option<MetalMixedBatchResult>> {
+        ensure!(budget > 0, "Metal mixed batch requires budget > 0");
+
+        if decode_states.is_empty() {
+            return Ok(None);
+        }
 
         let mut qwen3_decode_states = Vec::with_capacity(decode_states.len());
         for state in decode_states.iter_mut() {
@@ -892,7 +909,7 @@ impl<'a> MetalRequestState<'a> {
             let emitted_token = sampled.last().copied().flatten();
             let decode_tokens = sampled[..qwen3_decode_states.len()]
                 .iter()
-                .map(|token| token.context("Qwen3 mixed batch missing sampled decode token"))
+                .map(|token| token.context("Metal mixed batch missing sampled decode token"))
                 .collect::<Result<Vec<_>>>()?;
             (decode_tokens, emitted_token)
         };
@@ -902,7 +919,7 @@ impl<'a> MetalRequestState<'a> {
             phase: prefill_state.phase(),
             finish_reason: prefill_state.finish_reason(),
         };
-        Ok(Some(Qwen3MixedBatchResult {
+        Ok(Some(MetalMixedBatchResult {
             decode_tokens,
             prefill,
         }))
@@ -1661,14 +1678,14 @@ fn execute_qwen3_packed_batch(rows: &mut [Qwen3PackedBatchRow<'_>]) -> Result<Ve
         match row.kind {
             Qwen3PackedBatchRowKind::Decode => {
                 let token = sampled_tokens[row_idx]
-                    .context("Qwen3 packed batch missing sampled decode token")?;
+                    .context("Metal packed batch missing sampled decode token")?;
                 state.record_sampled_token(token)?;
             }
             Qwen3PackedBatchRowKind::Prefill { terminal_prompt } => {
                 state.prompt_cursor += row.query_tokens.len();
                 if terminal_prompt {
                     let token = sampled_tokens[row_idx]
-                        .context("Qwen3 packed batch missing terminal prefill token")?;
+                        .context("Metal packed batch missing terminal prefill token")?;
                     state.record_sampled_token(token)?;
                 }
             }
@@ -3395,6 +3412,10 @@ impl<'a> Qwen35StepDriver<'a> {
         }
     }
 
+    fn cpp_session_active(&self) -> bool {
+        matches!(&self.mode, Qwen35StepMode::Cpp(state) if state.session_active)
+    }
+
     fn run_cpp_step(
         weights: &Qwen35MetalWeights,
         cache_len: i32,
@@ -3557,6 +3578,16 @@ impl<'a> Qwen35StepDriver<'a> {
             "Qwen3.5 prefix snapshot build requires a block-aligned prompt"
         );
         if !matches!(self.mode, Qwen35StepMode::Cpp(_)) || prompt_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The compiled Qwen3.5/Qwen3.6 model owns exactly one live session.
+        // A replay driver built on the same `CppQwen35Model` would attempt a
+        // nested `session_begin`, which is both invalid and, before the C++
+        // fix in this wave, could tear down the active session on error.
+        // Prefix publish is opportunistic, so skip replay-based export while
+        // the live request still owns the compiled session.
+        if self.cpp_session_active() {
             return Ok(Vec::new());
         }
 
