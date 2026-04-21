@@ -27,12 +27,11 @@ pub enum PreemptionMode {
 pub struct SchedulerConfig {
     /// Maximum number of concurrently active request slots.
     pub max_slots: usize,
-    /// Maximum prefill tokens admitted into one scheduler tick. A single
-    /// request can consume the full budget; multiple requests share it.
+    /// Maximum number of tokens advanced for one prefilling request in a
+    /// single scheduler tick.
     pub chunked_prefill_size: usize,
-    /// Operator-facing hard cap for total prefill tokens in one scheduler
-    /// step. The effective budget is the tighter of this and
-    /// `chunked_prefill_size`.
+    /// Maximum total prefill tokens admitted across the whole scheduler tick.
+    /// Multiple requests share this budget.
     pub max_prefill_tokens: usize,
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.

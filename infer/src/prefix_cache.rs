@@ -806,6 +806,7 @@ impl RadixCache {
         policy: &dyn EvictionPolicy,
         signals: SchedulerSignals,
         n: usize,
+        tier_filter: Option<Tier>,
     ) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
@@ -825,6 +826,11 @@ impl RadixCache {
                 }
 
                 if node.block_id.is_none() {
+                    continue;
+                }
+                if let Some(tier) = tier_filter
+                    && node.tier_location.as_ref().map(BlockLocation::tier) != Some(tier)
+                {
                     continue;
                 }
 
@@ -1665,6 +1671,7 @@ mod tests {
             &crate::scheduler::policy::LruEviction,
             SchedulerSignals::default(),
             1,
+            None,
         );
         assert_eq!(freed, bids(&[100]));
     }
@@ -1697,6 +1704,7 @@ mod tests {
                 ..SchedulerSignals::default()
             },
             1,
+            None,
         );
         assert_eq!(freed, bids(&[100]));
     }
@@ -1726,6 +1734,7 @@ mod tests {
             &crate::scheduler::policy::LruEviction,
             SchedulerSignals::default(),
             1,
+            None,
         );
         assert_eq!(freed, bids(&[200]));
     }

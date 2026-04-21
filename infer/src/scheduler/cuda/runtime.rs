@@ -129,6 +129,10 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_us = clean_t.elapsed().as_micros();
             self.metrics.set_active(self.active_len() as u64);
             self.metrics.set_waiting(self.waiting.len() as u64);
+            self.metrics.set_scheduler_occupancy(
+                self.running_batch.len() as u64,
+                self.prefill_queue.len() as u64,
+            );
             if self.paged_kv_pool.is_active() {
                 // Both in token units so kv_util = (total-free)/total is correct.
                 let total =

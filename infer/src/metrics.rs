@@ -11,6 +11,8 @@
 //! | `infer_requests_total` | counter | Total completed requests |
 //! | `infer_requests_active` | gauge | Currently-running requests |
 //! | `infer_requests_waiting` | gauge | Requests waiting in queue |
+//! | `infer_scheduler_running_batch` | gauge | Requests currently in the decode-running batch |
+//! | `infer_scheduler_prefill_queue` | gauge | Requests currently queued for prefill continuation |
 //! | `infer_tokens_generated_total` | counter | Total output tokens generated |
 //! | `infer_tokens_prompt_total` | counter | Total prompt tokens processed |
 //! | `infer_queue_wait_seconds` | histogram | Submit-to-admit queueing latency |
@@ -187,6 +189,8 @@ struct MetricsInner {
     // Gauges (atomic).
     pub requests_active: AtomicU64,
     pub requests_waiting: AtomicU64,
+    pub scheduler_running_batch: AtomicU64,
+    pub scheduler_prefill_queue: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
     pub kv_gpu_blocks_total: AtomicU64,
     pub memory_active_bytes: AtomicU64,
@@ -215,6 +219,8 @@ impl ServerMetrics {
                 dflash_draft_tokens_total: AtomicU64::new(0),
                 requests_active: AtomicU64::new(0),
                 requests_waiting: AtomicU64::new(0),
+                scheduler_running_batch: AtomicU64::new(0),
+                scheduler_prefill_queue: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
                 kv_gpu_blocks_total: AtomicU64::new(0),
                 memory_active_bytes: AtomicU64::new(0),
@@ -308,6 +314,16 @@ impl ServerMetrics {
         self.inner.requests_waiting.store(n, Ordering::Relaxed);
     }
 
+    /// Set scheduler-owned queue occupancy counters.
+    pub fn set_scheduler_occupancy(&self, running_batch: u64, prefill_queue: u64) {
+        self.inner
+            .scheduler_running_batch
+            .store(running_batch, Ordering::Relaxed);
+        self.inner
+            .scheduler_prefill_queue
+            .store(prefill_queue, Ordering::Relaxed);
+    }
+
     /// Update the GPU KV block gauges.
     pub fn set_kv_gpu_blocks(&self, free: u64, total: u64) {
         self.inner.kv_gpu_blocks_free.store(free, Ordering::Relaxed);
@@ -349,6 +365,14 @@ impl ServerMetrics {
 
     pub fn requests_waiting(&self) -> u64 {
         self.inner.requests_waiting.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_running_batch(&self) -> u64 {
+        self.inner.scheduler_running_batch.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_prefill_queue(&self) -> u64 {
+        self.inner.scheduler_prefill_queue.load(Ordering::Relaxed)
     }
 
     pub fn kv_gpu_utilization(&self) -> f64 {
@@ -569,6 +593,28 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        out.push_str(
+            "# HELP infer_scheduler_running_batch Requests currently held in the running decode batch.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_running_batch gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_running_batch{{{labels}}} {}",
+            self.inner.scheduler_running_batch.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_prefill_queue Requests currently queued for prefill continuation.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_prefill_queue gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_prefill_queue{{{labels}}} {}",
+            self.inner.scheduler_prefill_queue.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
         let total = self.inner.kv_gpu_blocks_total.load(Ordering::Relaxed);
         let free = self.inner.kv_gpu_blocks_free.load(Ordering::Relaxed);
         let utilization = if total == 0 {
@@ -693,10 +739,12 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}",
+            "requests={} active={} waiting={} running_batch={} prefill_queue={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
+            self.scheduler_running_batch(),
+            self.scheduler_prefill_queue(),
             self.tokens_generated_total(),
             self.kv_gpu_utilization() * 100.0,
             self.prefix_hit_rate() * 100.0,
@@ -750,6 +798,7 @@ mod tests {
         m.record_request_completed(128, 256, 0.05, 0.02, 1.5);
         m.set_active(2);
         m.set_waiting(5);
+        m.set_scheduler_occupancy(3, 4);
         m.set_kv_gpu_blocks(100, 200);
         m.record_prefix_lookup(true);
         m.set_memory_bytes(1234, 5678, 42);
@@ -759,6 +808,8 @@ mod tests {
         assert!(rendered.contains("infer_requests_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_requests_active{model=\"Qwen3-4B\",} 2"));
         assert!(rendered.contains("infer_requests_waiting{model=\"Qwen3-4B\",} 5"));
+        assert!(rendered.contains("infer_scheduler_running_batch{model=\"Qwen3-4B\",} 3"));
+        assert!(rendered.contains("infer_scheduler_prefill_queue{model=\"Qwen3-4B\",} 4"));
         assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));

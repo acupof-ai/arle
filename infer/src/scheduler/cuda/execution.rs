@@ -98,6 +98,28 @@ impl ForwardBatch {
     }
 }
 
+fn planned_prefill_tokens(
+    remaining_request_tokens: usize,
+    chunk_size: usize,
+    remaining_batch_budget: usize,
+) -> usize {
+    remaining_request_tokens
+        .min(chunk_size)
+        .min(remaining_batch_budget)
+}
+
+fn planned_decode_headroom_tokens(
+    remaining_request_tokens: usize,
+    scheduled_prefill_tokens: usize,
+    decode_headroom_tokens: usize,
+) -> usize {
+    if scheduled_prefill_tokens == 0 || scheduled_prefill_tokens < remaining_request_tokens {
+        0
+    } else {
+        decode_headroom_tokens
+    }
+}
+
 fn finish_rejected_request(
     delta_tx: &tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
     reason: FinishReason,
@@ -156,9 +178,12 @@ impl PrefillPageBudget {
     }
 
     fn additional_pages_needed(&self, reserve: SlotPageReserve) -> usize {
-        let total_tokens = reserve
+        let mut total_tokens = reserve
             .prefill_pool_tokens
             .saturating_add(reserve.decode_headroom_tokens);
+        if reserve.prefill_pool_tokens > 0 {
+            total_tokens = total_tokens.saturating_add(self.page_size);
+        }
         if total_tokens == 0 {
             return 0;
         }
@@ -171,13 +196,12 @@ impl PrefillPageBudget {
 }
 
 impl PrefillBudget {
-    fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
-        let prefill_token_budget = scheduler
-            .config
-            .max_prefill_tokens
-            .min(scheduler.prefill_chunk_size());
+    fn from_scheduler<M: ModelForward>(
+        scheduler: &Scheduler<M>,
+        total_prefill_tokens: usize,
+    ) -> Self {
         let mut budget = Self {
-            remaining_prefill_tokens: prefill_token_budget,
+            remaining_prefill_tokens: total_prefill_tokens,
             remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
             page_budget: PrefillPageBudget::new(
                 scheduler.pool_free_pages(),
@@ -238,7 +262,11 @@ impl<M: ModelForward> Scheduler<M> {
             && self.paged_kv_pool.format == KVFormat::BF16
     }
 
-    fn prefill_reservation(&self, slot_idx: usize) -> Option<PrefillReservation> {
+    fn prefill_reservation(
+        &self,
+        slot_idx: usize,
+        remaining_batch_budget: usize,
+    ) -> Option<PrefillReservation> {
         let req = self.request(slot_idx)?;
         if req.delta_tx.is_closed() {
             return None;
@@ -257,7 +285,16 @@ impl<M: ModelForward> Scheduler<M> {
             return None;
         }
 
-        let prefill_tokens = remaining_tokens.min(self.prefill_chunk_size());
+        let prefill_tokens = planned_prefill_tokens(
+            remaining_tokens,
+            self.prefill_chunk_size(),
+            remaining_batch_budget,
+        );
+        let decode_headroom_tokens = planned_decode_headroom_tokens(
+            remaining_tokens,
+            prefill_tokens,
+            self.prefill_completion_reserve_tokens(req.generated_tokens.len(), req.max_tokens),
+        );
         let pool_tokens = if self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active()
         {
             prefill_tokens
@@ -269,8 +306,7 @@ impl<M: ModelForward> Scheduler<M> {
             page_reserve: SlotPageReserve {
                 slot_idx,
                 prefill_pool_tokens: pool_tokens,
-                decode_headroom_tokens: self
-                    .decode_reserve_tokens(req.generated_tokens.len(), req.max_tokens),
+                decode_headroom_tokens,
             },
         })
     }
@@ -280,8 +316,18 @@ impl<M: ModelForward> Scheduler<M> {
         slot_idx: usize,
         prompt_tokens: usize,
         max_tokens: usize,
+        remaining_batch_budget: usize,
     ) -> PrefillReservation {
-        let prefill_tokens = prompt_tokens.min(self.prefill_chunk_size());
+        let prefill_tokens = planned_prefill_tokens(
+            prompt_tokens,
+            self.prefill_chunk_size(),
+            remaining_batch_budget,
+        );
+        let decode_headroom_tokens = planned_decode_headroom_tokens(
+            prompt_tokens,
+            prefill_tokens,
+            self.prefill_completion_reserve_tokens(0, max_tokens),
+        );
         PrefillReservation {
             prefill_tokens,
             page_reserve: SlotPageReserve {
@@ -293,7 +339,7 @@ impl<M: ModelForward> Scheduler<M> {
                 } else {
                     0
                 },
-                decode_headroom_tokens: self.decode_reserve_tokens(0, max_tokens),
+                decode_headroom_tokens,
             },
         }
     }
@@ -311,7 +357,9 @@ impl<M: ModelForward> Scheduler<M> {
                 continue;
             }
 
-            let Some(reservation) = self.prefill_reservation(slot_idx) else {
+            let Some(reservation) =
+                self.prefill_reservation(slot_idx, budget.remaining_prefill_tokens)
+            else {
                 self.dequeue_prefill(slot_idx);
                 continue;
             };
@@ -445,8 +493,12 @@ impl<M: ModelForward> Scheduler<M> {
                 Vec::new()
             };
 
-            let reservation =
-                self.waiting_prefill_reservation(slot_idx, prompt_tokens.len(), queued.max_tokens);
+            let reservation = self.waiting_prefill_reservation(
+                slot_idx,
+                prompt_tokens.len(),
+                queued.max_tokens,
+                budget.remaining_prefill_tokens,
+            );
             if !budget.can_schedule(reservation) {
                 self.prefix_cache.release(&radix_blocks);
                 queued.prompt_tokens = Some(prompt_tokens);
@@ -475,7 +527,9 @@ impl<M: ModelForward> Scheduler<M> {
                 attached_prefix_blocks,
             );
 
-            let Some(reservation) = self.prefill_reservation(slot_idx) else {
+            let Some(reservation) =
+                self.prefill_reservation(slot_idx, budget.remaining_prefill_tokens)
+            else {
                 continue;
             };
             budget.reserve(reservation);
@@ -491,8 +545,8 @@ impl<M: ModelForward> Scheduler<M> {
         candidates
     }
 
-    fn prefill_batch(&mut self) -> Vec<PrefillCandidate> {
-        let mut budget = PrefillBudget::from_scheduler(self);
+    fn prefill_batch(&mut self, total_prefill_tokens: usize) -> Vec<PrefillCandidate> {
+        let mut budget = PrefillBudget::from_scheduler(self, total_prefill_tokens);
         let mut candidates = self.queued_prefill_batch(&mut budget);
         candidates.extend(self.admit_waiting_prefill_batch(&mut budget));
         candidates
@@ -600,7 +654,7 @@ impl<M: ModelForward> Scheduler<M> {
         });
         if has_decode {
             let mut prefill_candidates = if self.can_launch_mixed_batch() {
-                self.prefill_batch()
+                self.prefill_batch(self.mixed_prefill_token_budget)
             } else {
                 Vec::new()
             };
@@ -614,7 +668,7 @@ impl<M: ModelForward> Scheduler<M> {
             };
         }
 
-        let prefill_candidates = self.prefill_batch();
+        let prefill_candidates = self.prefill_batch(self.config.max_prefill_tokens);
         if prefill_candidates.is_empty() {
             ScheduleBatch::idle()
         } else {
@@ -736,7 +790,10 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrefillBudget, PrefillPageBudget, PrefillReservation, SlotPageReserve};
+    use super::{
+        PrefillBudget, PrefillPageBudget, PrefillReservation, SlotPageReserve,
+        planned_decode_headroom_tokens, planned_prefill_tokens,
+    };
 
     fn collect_schedulable_indices(
         mut budget: PrefillBudget,
@@ -967,5 +1024,31 @@ mod tests {
             collect_schedulable_indices(budget, &reservations),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn planned_prefill_tokens_respects_chunk_and_batch_budget() {
+        assert_eq!(planned_prefill_tokens(8192, 4096, 16384), 4096);
+        assert_eq!(planned_prefill_tokens(8192, 4096, 2048), 2048);
+        assert_eq!(planned_prefill_tokens(1024, 4096, 16384), 1024);
+        assert_eq!(planned_prefill_tokens(0, 4096, 16384), 0);
+    }
+
+    #[test]
+    fn planned_decode_headroom_only_applies_on_final_prefill_chunk() {
+        assert_eq!(planned_decode_headroom_tokens(4097, 4096, 256), 0);
+        assert_eq!(planned_decode_headroom_tokens(4096, 4096, 256), 256);
+        assert_eq!(planned_decode_headroom_tokens(1, 1, 256), 256);
+        assert_eq!(planned_decode_headroom_tokens(1, 0, 256), 0);
+    }
+
+    #[test]
+    fn page_budget_reserves_extra_page_for_prefill_request() {
+        let page_budget = PrefillPageBudget::new(1, vec![0], 4);
+        assert!(!page_budget.can_fit(SlotPageReserve {
+            slot_idx: 0,
+            prefill_pool_tokens: 1,
+            decode_headroom_tokens: 0,
+        }));
     }
 }
