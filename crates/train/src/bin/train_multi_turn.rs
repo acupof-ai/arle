@@ -35,7 +35,7 @@ use train::{
     lora::{LoraAdapterConfig, LoraConfig},
     metrics::MetricSample,
     model_family::{Qwen35AttentionPattern, apply_qwen35_attention_pattern},
-    multi_turn::{Environment, Episode, TurnSpec, rollout_episode},
+    multi_turn::{Environment, Episode, TurnSpec, rollout_episode, rollout_episode_group},
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::{retained_ids, trainable_param_ids},
     qwen35::{LayerType, Qwen35Config, Qwen35Error, Qwen35Model},
@@ -408,28 +408,28 @@ fn run() -> Result<(), CliError> {
         let mut prompt_rng = seeded_rng(args.seed, MULTI_TURN_PROMPT_SALT, iter as u64, 0);
         let initial_prompt =
             build_prompt(args.prompt_len, separator, target_range, &mut prompt_rng);
-        let mut episodes = Vec::with_capacity(args.group_size);
-        for episode_idx in 0..args.group_size {
-            let mut sample_rng = seeded_rng(
-                args.seed,
-                MULTI_TURN_SAMPLE_SALT,
-                iter as u64,
-                episode_idx as u64,
-            );
-            let episode = rollout_episode(
-                &policy,
-                &ref_model,
-                &initial_prompt,
-                &turns,
-                &env,
-                args.temperature,
-                &mut sample_rng,
-                &|_: &Episode| 0.0,
-                &mut store,
-                &mut tape,
-            )?;
-            episodes.push(episode);
-        }
+        let mut sample_rngs = (0..args.group_size)
+            .map(|episode_idx| {
+                seeded_rng(
+                    args.seed,
+                    MULTI_TURN_SAMPLE_SALT,
+                    iter as u64,
+                    episode_idx as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let episodes = rollout_episode_group(
+            &policy,
+            &ref_model,
+            &initial_prompt,
+            &turns,
+            &env,
+            args.temperature,
+            &mut sample_rngs,
+            &|_: &Episode| 0.0,
+            &mut store,
+            &mut tape,
+        )?;
 
         let per_turn_rewards: Vec<Vec<f32>> = episodes
             .iter()
