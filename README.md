@@ -233,7 +233,9 @@ OpenAI-compatible. Current HTTP surface:
 - `DELETE /v1/sessions/{session_id}`
 
 Streaming today is available on both `/v1/chat/completions` and
-`/v1/responses`.
+`/v1/responses`. On `/v1/chat/completions`, tool definitions are currently
+non-streaming only: `stream=true` requests with `tools` are rejected until
+the server can emit structured `delta.tool_calls` chunks.
 
 HTTP boundary guarantees:
 
@@ -243,6 +245,7 @@ HTTP boundary guarantees:
 - `model` is optional on request bodies, but when present it must match the currently served model reported by `GET /v1/models` (case-insensitive, final path segment match allowed); mismatches return `404 model_not_found`.
 - Streaming completions/chat accept `stream_options.include_usage`; `/v1/completions` also accepts `stream_options.continuous_usage_stats` as a compatibility hint, and it requires `stream_options.include_usage=true`.
 - Chat / responses message validation is explicit: supported roles are `system`, `user`, `assistant`, and `tool`; `content` part arrays must be text-only; tool definitions must use `type=function`; malformed assistant `tool_calls` and tool messages without `tool_call_id` are rejected with structured `invalid_parameter` errors.
+- `/v1/chat/completions` rejects `stream=true` when `tools` are present instead of pretending to support streamed tool-call deltas it cannot emit yet.
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
 - Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
