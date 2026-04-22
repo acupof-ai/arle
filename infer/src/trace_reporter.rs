@@ -154,17 +154,15 @@ impl TracingConfig {
             .or_else(|| std::env::var(ENV_TRACE_LEVEL).ok())
             .map(|value| TraceLevel::from_str(&value))
             .transpose()?
-            .unwrap_or_else(|| {
-                if has_sink {
-                    TraceLevel::Basic
-                } else {
-                    TraceLevel::Off
-                }
+            .unwrap_or(if has_sink {
+                TraceLevel::Basic
+            } else {
+                TraceLevel::Off
             });
         let sample_rate = startup
             .sample_rate
             .or_else(|| env_parse_f64(ENV_TRACE_SAMPLE_RATE))
-            .unwrap_or_else(|| if level == TraceLevel::Off { 0.0 } else { 1.0 });
+            .unwrap_or(if level == TraceLevel::Off { 0.0 } else { 1.0 });
         if !(0.0..=1.0).contains(&sample_rate) {
             bail!("trace sample rate must be between 0.0 and 1.0; got {sample_rate}");
         }
@@ -291,9 +289,9 @@ impl TraceRuntime {
 
     pub fn set_slow_request_threshold(&self, threshold: Option<Duration>) {
         self.shared.slow_request_ms.store(
-            threshold
-                .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
-                .unwrap_or(0),
+            threshold.map_or(0, |value| {
+                value.as_millis().min(u128::from(u64::MAX)) as u64
+            }),
             Ordering::Relaxed,
         );
     }
