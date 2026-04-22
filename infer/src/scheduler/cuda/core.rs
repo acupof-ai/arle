@@ -7,9 +7,8 @@ use super::{
 };
 use crate::kv_tier::transport::DiskStore;
 use crate::kv_tier::{
-    ClusterSharedBackend,
-    BlockLocation, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey, ReadmissionPlan,
-    ReadmissionSource, TieredKvPolicy,
+    BlockLocation, ClusterSharedBackend, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey,
+    ReadmissionPlan, ReadmissionSource, TieredKvPolicy,
 };
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};

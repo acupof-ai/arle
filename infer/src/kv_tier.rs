@@ -14,7 +14,7 @@
 //! |------|--------------------|---------------|------------------------|
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
 //! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool`; staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
-//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator spill / persist and local staged readmission (`disk -> host -> T0`) |
+//! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator store / persist and local staged readmission (`disk -> host -> T0`) |
 //! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
@@ -36,7 +36,7 @@
 //! - T1 demotion buffering in Zig-backed `HostPinnedPool`
 //! - T1/T2 staged readmission planning in `lookup.rs` + `readmission.rs`
 //! - T1/T2 fetch/store queueing in `Coordinator`
-//! - T1→T2 spill and disk persistence in `Coordinator` + `DiskStore`
+//! - T1→T2 store and disk persistence in `Coordinator` + `DiskStore`
 //!
 //! Direct GPU prefix attachment is live for paged-prefill models. Local staged
 //! readmission is also live: `lookup_or_stage(...)` classifies hits, the
@@ -68,7 +68,7 @@
 //!    in-memory blocks.
 //!
 //! 3. **Only the coordinator moves blocks between tiers.** The scheduler
-//!    decides *which* blocks should spill; the coordinator owns the
+//!    decides *which* blocks should store or readmit; the coordinator owns the
 //!    byte-moving work and emits completion events.
 //!
 //! 4. **MR registration stability.** The NIXL transport requires
@@ -150,7 +150,7 @@ pub use chunk::{
 pub use coordinator::{
     Coordinator, CoordinatorCommand, CoordinatorEvent, CoordinatorHandle, CoordinatorQueueStats,
     FetchRequest, FetchTicket, FetchedBlock, QueueBackpressure, QueueControlStats, QueueKind,
-    QueueTicket, SpillRequest, SpillTicket, StoreRequest, StoreTarget, StoreTicket,
+    QueueTicket, StoreRequest, StoreTarget, StoreTicket,
 };
 pub use host_pool::{HostPinnedPool, HostPinnedRegion, SharedHostPinnedPool};
 pub use id::BlockId;

@@ -444,7 +444,6 @@ impl<M: ModelForward> Scheduler<M> {
         loop {
             match self.coordinator_events.try_recv() {
                 Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
-                | Ok(crate::kv_tier::CoordinatorEvent::SpillQueued { .. })
                 | Ok(crate::kv_tier::CoordinatorEvent::FetchQueued { .. }) => {}
                 Ok(crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. }) => {
                     if let Some((block_id, _)) = self.store_waiting.get(&ticket).copied() {
@@ -455,23 +454,6 @@ impl<M: ModelForward> Scheduler<M> {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     error!("Coordinator event channel disconnected");
                     break;
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::SpillCompleted { ticket, locations }) => {
-                    if let Some((block_id, region)) = self.store_waiting.remove(&ticket) {
-                        for (completed_block, location) in locations {
-                            if completed_block != block_id {
-                                continue;
-                            }
-                            let _ = self.prefix_cache.mark_block_stored(
-                                block_id,
-                                Some(crate::kv_tier::BlockLocation::Disk {
-                                    fingerprint: location.fingerprint,
-                                    payload_len: location.payload_len,
-                                }),
-                            );
-                            self.release_host_region(region);
-                        }
-                    }
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations }) => {
                     if let Some((block_id, region)) = self.store_waiting.remove(&ticket) {
@@ -485,18 +467,6 @@ impl<M: ModelForward> Scheduler<M> {
                             self.release_host_region(region);
                         }
                     }
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::SpillFailed {
-                    ticket,
-                    failed_block,
-                    reason,
-                }) => {
-                    warn!(
-                        "Spill failed for ticket {} on block {:?}: {}",
-                        ticket.0, failed_block, reason
-                    );
-                    self.store_waiting.remove(&ticket);
-                    let _ = self.prefix_cache.mark_block_store_failed(failed_block);
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::StoreFailed {
                     ticket,

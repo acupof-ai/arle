@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::kv_tier::ClusterSharedBackendConfig;
 use crate::sampler::SamplingParams;
 use crate::scheduler::policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use crate::server_engine::CompletionStreamDelta;
 use crate::types::SessionId;
-use crate::kv_tier::ClusterSharedBackendConfig;
 
 /// Preemption strategy when GPU memory is exhausted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
