@@ -21,40 +21,18 @@ use agent::{
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use anyhow::Result;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition, VisibleTextStream};
+use chat::{ChatMessage, ParsedAssistantResponse, ToolCall, ToolDefinition};
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::sampler::SamplingParams;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use infer::server_engine::{CompletionRequest, CompletionStreamDelta, InferenceEngine};
+use infer::server_engine::InferenceEngine;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::DefaultEditor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use rustyline::error::ReadlineError;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-use tokio::sync::mpsc;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use tools::{BuiltinToolPolicyHooks, builtin_tools, execute_tool_call};
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-const SYSTEM_PROMPT_CHAT: &str =
-    "You are a helpful AI assistant. Be concise unless the user asks for detail.";
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplMode {
-    Chat,
-    Agent,
-}
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-impl ReplMode {
-    fn label(self) -> &'static str {
-        match self {
-            ReplMode::Chat => "chat",
-            ReplMode::Agent => "agent",
-        }
-    }
-}
+const REPL_PROMPT: &str = "\x1b[1;35m> \x1b[0m";
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +44,6 @@ enum ReplCommand {
     Stats,
     Save(String),
     Load(String),
-    SwitchChat,
-    SwitchAgent,
     /// `/models` with no arg lists discovered hub snapshots; `/models N` is
     /// reserved for engine hot-swap which is currently unsupported (owner
     /// pattern requires an owned `LoadedInferenceEngine` instead of the
@@ -76,18 +52,15 @@ enum ReplCommand {
     Models(Option<usize>),
     /// `/export` → default path; `/export <path>` → explicit path/dir.
     Export(String),
-    /// `/retry` — drop last assistant turn, re-run the prior user turn.
-    Retry,
     Exit,
     Unknown(String),
 }
 
-/// Per-session rolling accumulators for `/stats` enrichment. Populated by
-/// both streaming chat turns and agent-mode turns.
+/// Per-session rolling accumulators for `/stats` enrichment.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 #[derive(Debug, Default, Clone, Copy)]
 struct SessionStats {
-    /// Number of chat turns (one user + one assistant reply each).
+    /// Number of completed turns.
     turn_count: usize,
     /// Sum of prompt_tokens reported by each turn's final TokenUsage, when
     /// populated. Falls back to chars/4 for the most recent user message
@@ -253,33 +226,12 @@ pub(crate) fn run_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
-    start_in_tools_mode: bool,
 ) -> Result<()> {
-    let initial_mode = if start_in_tools_mode {
-        ReplMode::Agent
-    } else {
-        ReplMode::Chat
-    };
-
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return run_interactive_repl(
-            engine,
-            backend_name,
-            max_turns,
-            max_tokens,
-            temperature,
-            initial_mode,
-        );
+        return run_interactive_repl(engine, backend_name, max_turns, max_tokens, temperature);
     }
 
-    run_piped_repl(
-        engine,
-        backend_name,
-        max_turns,
-        max_tokens,
-        temperature,
-        initial_mode,
-    )
+    run_piped_repl(engine, backend_name, max_turns, max_tokens, temperature)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -290,19 +242,9 @@ fn print_repl_banner(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
-    mode: ReplMode,
 ) {
     let tools_label = if tools.is_empty() {
         "none".to_string()
-    } else if mode == ReplMode::Chat {
-        format!(
-            "{} (/agent mode)",
-            tools
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
     } else {
         tools
             .iter()
@@ -314,7 +256,6 @@ fn print_repl_banner(
     println!("=== agent-infer REPL ===");
     println!("Model: {}", engine.model_id());
     println!("Backend: {}", backend_name);
-    println!("Mode: {} (use /chat or /agent to switch)", mode.label());
     println!("Tools: {tools_label}");
     println!(
         "Max turns: {}, Max tokens: {}, Temperature: {}",
@@ -332,30 +273,22 @@ fn history_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".agent-infer-history"))
 }
 
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn prompt_for(mode: ReplMode) -> &'static str {
-    match mode {
-        ReplMode::Chat => "\x1b[1;32m> \x1b[0m",
-        ReplMode::Agent => "\x1b[1;35m> \x1b[0m",
-    }
-}
-
 /// Read one logical input from rustyline. Lines ending with `\` are joined
 /// with `\n` until a line without a trailing backslash is entered.
 ///
 /// Returns `Ok(Some(_))` for a complete input, `Ok(None)` for EOF, and
 /// propagates `ReadlineError::Interrupted` upward (REPL turns it into ^C).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn read_multiline(
-    editor: &mut DefaultEditor,
-    mode: ReplMode,
-) -> Result<Option<String>, ReadlineError> {
+fn read_multiline(editor: &mut DefaultEditor) -> Result<Option<String>, ReadlineError> {
     let mut accumulated: Option<String> = None;
-    let primary = prompt_for(mode);
     let cont = "\x1b[2m… \x1b[0m";
 
     loop {
-        let prompt = if accumulated.is_some() { cont } else { primary };
+        let prompt = if accumulated.is_some() {
+            cont
+        } else {
+            REPL_PROMPT
+        };
         let line = editor.readline(prompt)?;
         if let Some(stripped) = line.strip_suffix('\\') {
             let acc = accumulated.get_or_insert_with(String::new);
@@ -428,16 +361,13 @@ fn run_interactive_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
-    initial_mode: ReplMode,
 ) -> Result<()> {
     let tools = builtin_tools()
         .into_iter()
         .map(|tool| tool.to_definition())
         .collect::<Vec<_>>();
     let mut session = AgentSession::new();
-    let mut chat_history: Vec<ChatMessage> = vec![ChatMessage::system(SYSTEM_PROMPT_CHAT)];
     let mut session_stats = SessionStats::default();
-    let mut mode = initial_mode;
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
 
@@ -459,7 +389,6 @@ fn run_interactive_repl(
         max_turns,
         max_tokens,
         temperature,
-        mode,
     );
 
     loop {
@@ -467,7 +396,7 @@ fn run_interactive_repl(
         // been left set by a Ctrl-C that landed at a blank prompt.
         cancel.store(false, Ordering::Relaxed);
 
-        match read_multiline(&mut editor, mode) {
+        match read_multiline(&mut editor) {
             Ok(Some(line)) => {
                 let input = line.trim();
                 if input.is_empty() {
@@ -479,9 +408,7 @@ fn run_interactive_repl(
                     backend_name,
                     &tools,
                     &mut session,
-                    &mut chat_history,
                     &mut session_stats,
-                    &mut mode,
                     input,
                     max_turns,
                     max_tokens,
@@ -535,7 +462,6 @@ fn run_piped_repl(
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
-    initial_mode: ReplMode,
 ) -> Result<()> {
     let tools = builtin_tools()
         .into_iter()
@@ -544,9 +470,7 @@ fn run_piped_repl(
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut session = AgentSession::new();
-    let mut chat_history: Vec<ChatMessage> = vec![ChatMessage::system(SYSTEM_PROMPT_CHAT)];
     let mut session_stats = SessionStats::default();
-    let mut mode = initial_mode;
 
     let (cancel, exit) = install_ctrlc_handler();
     cancel.store(false, Ordering::Relaxed);
@@ -559,12 +483,11 @@ fn run_piped_repl(
         max_turns,
         max_tokens,
         temperature,
-        mode,
     );
 
     loop {
         cancel.store(false, Ordering::Relaxed);
-        match read_multiline_piped(&mut reader, "\x1b[1;32m> \x1b[0m")? {
+        match read_multiline_piped(&mut reader, REPL_PROMPT)? {
             Some(line) => {
                 let input = line.trim();
                 if input.is_empty() {
@@ -575,9 +498,7 @@ fn run_piped_repl(
                     backend_name,
                     &tools,
                     &mut session,
-                    &mut chat_history,
                     &mut session_stats,
-                    &mut mode,
                     input,
                     max_turns,
                     max_tokens,
@@ -608,9 +529,7 @@ fn handle_repl_input(
     backend_name: &str,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
-    chat_history: &mut Vec<ChatMessage>,
     session_stats: &mut SessionStats,
-    mode: &mut ReplMode,
     input: &str,
     max_turns: usize,
     max_tokens: usize,
@@ -627,310 +546,26 @@ fn handle_repl_input(
             backend_name,
             tools,
             session,
-            chat_history,
             session_stats,
-            mode,
             max_turns,
             max_tokens,
             temperature,
-            cancel,
         ));
     }
 
-    match *mode {
-        ReplMode::Chat => {
-            run_chat_turn(
-                engine,
-                chat_history,
-                session_stats,
-                input,
-                max_tokens,
-                temperature,
-                cancel,
-            )?;
-        }
-        ReplMode::Agent => {
-            run_agent_turn(
-                engine,
-                tools,
-                session,
-                session_stats,
-                input,
-                max_turns,
-                max_tokens,
-                temperature,
-                cancel,
-            );
-        }
-    }
-
-    Ok(true)
-}
-
-/// Streaming chat turn. Builds a ChatML prompt from `history`, kicks off
-/// `engine.complete_stream` on a worker thread, drains deltas on the main
-/// thread, prints them with line-buffered flushes, and appends the final
-/// assistant message to history.
-///
-/// Cancellation: `cancel` is polled every `try_recv` iteration. On cancel,
-/// the partial assistant message is still appended (so context stays
-/// consistent), and the receiver is dropped so the worker's next
-/// `tx.send` fails — `generate_inner` observes `SinkControl::ConsumerDropped`
-/// and exits the sampling loop before the next token, so `worker.join()`
-/// returns promptly instead of waiting for `max_tokens` of decoding
-/// (see `server_engine.rs` `on_token` returning `false` on send failure).
-/// Closes the 76ea6ce codex review High finding: Ctrl-C used to ACK
-/// the keystroke on the UI but block the REPL until the full completion
-/// finished; now it actually short-circuits the engine.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-#[allow(clippy::too_many_arguments)]
-fn run_chat_turn(
-    engine: &mut dyn InferenceEngine,
-    history: &mut Vec<ChatMessage>,
-    session_stats: &mut SessionStats,
-    user_input: &str,
-    max_tokens: usize,
-    temperature: f32,
-    cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    // `/retry` pushes the user message itself and calls this variant so the
-    // history is not duplicated. The common path still builds history here.
-    history.push(ChatMessage::user(user_input));
-    run_chat_turn_with_history(
+    run_agent_turn(
         engine,
-        history,
+        tools,
+        session,
         session_stats,
-        user_input,
+        input,
+        max_turns,
         max_tokens,
         temperature,
         cancel,
-    )
-}
+    );
 
-/// Same as `run_chat_turn` but assumes the caller has already appended the
-/// user message to `history`. Used by `/retry` to avoid a duplicate user
-/// turn after popping the prior assistant reply.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-#[allow(clippy::too_many_arguments)]
-fn run_chat_turn_with_history(
-    engine: &mut dyn InferenceEngine,
-    history: &mut Vec<ChatMessage>,
-    session_stats: &mut SessionStats,
-    user_input: &str,
-    max_tokens: usize,
-    temperature: f32,
-    cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    let turn_start = Instant::now();
-    let prompt = chat::messages_to_prompt(history, &[]);
-    let req = CompletionRequest {
-        prompt,
-        max_tokens,
-        sampling: SamplingParams {
-            temperature,
-            ..SamplingParams::default()
-        },
-        stop: Some(vec!["<|im_end|>".to_string()]),
-        logprobs: false,
-    };
-
-    let (tx, rx) = mpsc::unbounded_channel::<CompletionStreamDelta>();
-    // `rx` is wrapped in Option so the cancel branch can `take()` + drop it
-    // mid-scope. Dropping the receiver disconnects the unbounded channel,
-    // so the next `tx.send` in the worker fails, `on_token` returns
-    // `false`, and `generate_inner` exits via `SinkControl::ConsumerDropped`
-    // (see `server_engine.rs` — `complete_stream`'s `on_token` treats a
-    // send error as "consumer gone, stop sampling").
-    let mut rx: Option<mpsc::UnboundedReceiver<CompletionStreamDelta>> = Some(rx);
-    let mut accumulated = String::new();
-    let mut visible_stream = VisibleTextStream::default();
-    // Buffer for incomplete UTF-8 sequences arriving across deltas.
-    let mut partial_bytes: Vec<u8> = Vec::new();
-    let mut cancelled = false;
-    let mut stream_err: Option<anyhow::Error> = None;
-    let mut tps_meter = crate::tps::TpsMeter::new();
-    // Completion tokens from the final delta's TokenUsage, if populated.
-    // Both CUDA and Metal backends set this at finish_reason; we prefer it
-    // over the rolling counter for the final summary.
-    let mut final_completion_tokens: Option<u64> = None;
-    // Prompt tokens reported by the final delta (exact from the backend).
-    let mut final_prompt_tokens: Option<u64> = None;
-
-    // Assistant-text styling: dim green on TTY, nothing on piped stdout
-    // (matches the brief — "just the assistant streamed output"). We only
-    // print the opening SGR here; the close SGR lands at end-of-turn.
-    let color_on = io::stdout().is_terminal();
-    if color_on {
-        // 0;32 = normal-weight green. Readable on both light and dark
-        // terminals. (Bright green 1;32 ends up washed-out on light bg.)
-        print!("\x1b[32m");
-        let _ = io::stdout().flush();
-    }
-
-    std::thread::scope(|s| {
-        let worker = s.spawn(|| engine.complete_stream(req, tx));
-
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                cancelled = true;
-                // Drop the receiver NOW so the worker short-circuits on its
-                // next `tx.send`. Without this, `worker.join()` below would
-                // block until `max_tokens` of decoding finished, negating
-                // the Ctrl-C (76ea6ce codex review High finding).
-                rx = None;
-                break;
-            }
-            // Only the cancel branch above ever takes `rx`; if we reach
-            // here after it was taken, break out defensively rather than
-            // unwrap-panicking in the inner try_recv.
-            let Some(rx_ref) = rx.as_mut() else { break };
-            match rx_ref.try_recv() {
-                Ok(delta) => {
-                    if !delta.text_delta.is_empty() {
-                        let chunk = decode_chunk(&mut partial_bytes, delta.text_delta.as_bytes());
-                        let visible = visible_stream.push(&chunk);
-                        if !visible.is_empty() {
-                            // Erase the live TPS line (if visible) before
-                            // the next token chunk lands on stdout — keeps
-                            // streamed text uncorrupted on the same row.
-                            tps_meter.hide_before_chunk();
-                            accumulated.push_str(&visible);
-                            print!("{}", visible);
-                            let _ = io::stdout().flush();
-                            tps_meter.record_chunk(visible.len());
-                        }
-                    }
-                    if let Some(usage) = delta.usage {
-                        final_completion_tokens = Some(usage.completion_tokens as u64);
-                        final_prompt_tokens = Some(usage.prompt_tokens as u64);
-                    }
-                    if delta.finish_reason.is_some() {
-                        break;
-                    }
-                    tps_meter.maybe_refresh();
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    tps_meter.maybe_refresh();
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-
-        // On cancel, `rx` was already dropped above, so the worker's next
-        // `tx.send` returns Err → `generate_inner` observes
-        // ConsumerDropped and exits the sampling loop before the next
-        // token. `worker.join()` therefore returns promptly rather than
-        // blocking the REPL for another `max_tokens` of decoding. On the
-        // non-cancel path, the worker has already finished and this is
-        // a no-wait reap.
-        if let Ok(res) = worker.join()
-            && let Err(e) = res
-        {
-            stream_err = Some(e);
-        }
-    });
-
-    // Flush any remaining undecoded bytes as lossy UTF-8 (last resort).
-    if !partial_bytes.is_empty() {
-        let tail = String::from_utf8_lossy(&partial_bytes).to_string();
-        if !tail.is_empty() {
-            let visible = visible_stream.push(&tail);
-            if !visible.is_empty() {
-                accumulated.push_str(&visible);
-                print!("{}", visible);
-                let _ = io::stdout().flush();
-            }
-        }
-        partial_bytes.clear();
-    }
-
-    let tail = visible_stream.finish();
-    if !tail.is_empty() {
-        accumulated.push_str(&tail);
-        print!("{}", tail);
-        let _ = io::stdout().flush();
-    }
-
-    if color_on {
-        print!("\x1b[0m");
-        let _ = io::stdout().flush();
-    }
-
-    if cancelled {
-        println!();
-        println!("\x1b[2m^C (generation cancelled)\x1b[0m");
-        // Reset cancel flag now that we've handled it.
-        cancel.store(false, Ordering::Relaxed);
-    } else {
-        println!();
-    }
-    // Live line clear + final summary (tokens / elapsed / tok-s). Prints to
-    // stderr; on non-TTY stderr the live refresh was already skipped and
-    // this just prints plain text.
-    tps_meter.print_final(final_completion_tokens);
-    println!();
-
-    // Always record the (possibly partial) assistant turn so subsequent
-    // turns see consistent context.
-    history.push(ChatMessage::assistant(&accumulated, vec![]));
-
-    // Accumulate into session-level /stats. Prefer the backend's exact
-    // usage; fall back to the chars/4 heuristic for prompt tokens when
-    // the stream closed without a finish_reason (cancelled, stream_err).
-    let prompt_tokens = final_prompt_tokens.unwrap_or_else(|| approx_tokens(user_input));
-    let completion_tokens = final_completion_tokens.unwrap_or(0);
-    session_stats.record_turn(prompt_tokens, completion_tokens, turn_start.elapsed());
-
-    if let Some(err) = stream_err {
-        eprintln!("\x1b[1;31mError: {err:#}\x1b[0m");
-        println!();
-    }
-
-    Ok(())
-}
-
-/// Rough chars/4 estimator. Used as a fallback input-token count when the
-/// backend didn't report an exact value (e.g. streaming closed before the
-/// final usage delta). Standard industry heuristic.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn approx_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64).div_ceil(4)
-}
-
-/// Decode bytes into a String, buffering an incomplete trailing multi-byte
-/// UTF-8 sequence into `partial`. Returns whatever portion is now valid.
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn decode_chunk(partial: &mut Vec<u8>, new_bytes: &[u8]) -> String {
-    partial.extend_from_slice(new_bytes);
-    match std::str::from_utf8(partial) {
-        Ok(s) => {
-            let out = s.to_string();
-            partial.clear();
-            out
-        }
-        Err(e) => {
-            let valid_up_to = e.valid_up_to();
-            // Safe: valid_up_to is by definition a valid UTF-8 prefix length.
-            let head = std::str::from_utf8(&partial[..valid_up_to])
-                .expect("valid_up_to bounds")
-                .to_string();
-            // Keep the trailing bytes for the next chunk; if they are
-            // unambiguously invalid (not just incomplete), drop them as
-            // lossy U+FFFD so we don't grow the buffer forever.
-            let remainder = partial[valid_up_to..].to_vec();
-            partial.clear();
-            if e.error_len().is_some() {
-                // Definite invalid byte — emit replacement chars and skip.
-                let lossy = String::from_utf8_lossy(&remainder).into_owned();
-                head + &lossy
-            } else {
-                // Incomplete sequence — buffer and wait for more bytes.
-                partial.extend_from_slice(&remainder);
-                head
-            }
-        }
-    }
+    Ok(true)
 }
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
@@ -1080,9 +715,6 @@ fn parse_repl_command(input: &str) -> Option<ReplCommand> {
         "/save" => Some(ReplCommand::Save(arg.to_string())),
         "/load" => Some(ReplCommand::Load(arg.to_string())),
         "/export" => Some(ReplCommand::Export(arg.to_string())),
-        "/retry" => Some(ReplCommand::Retry),
-        "/chat" => Some(ReplCommand::SwitchChat),
-        "/agent" => Some(ReplCommand::SwitchAgent),
         "/quit" | "/exit" => Some(ReplCommand::Exit),
         _ => Some(ReplCommand::Unknown(command.to_string())),
     }
@@ -1096,13 +728,10 @@ fn execute_repl_command(
     backend_name: &str,
     tools: &[ToolDefinition],
     session: &mut AgentSession,
-    chat_history: &mut Vec<ChatMessage>,
     session_stats: &mut SessionStats,
-    mode: &mut ReplMode,
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
-    cancel: Arc<AtomicBool>,
 ) -> bool {
     match command {
         ReplCommand::Help => {
@@ -1112,7 +741,6 @@ fn execute_repl_command(
         }
         ReplCommand::Reset => {
             session.reset();
-            chat_history.truncate(1);
             *session_stats = SessionStats::default();
             println!("\x1b[2m(conversation reset)\x1b[0m");
             println!();
@@ -1126,7 +754,6 @@ fn execute_repl_command(
         ReplCommand::Model => {
             println!("\x1b[2mbackend: {backend_name}\x1b[0m");
             println!("\x1b[2mmodel: {}\x1b[0m", engine.model_id());
-            println!("\x1b[2mmode: {}\x1b[0m", mode.label());
             println!();
             true
         }
@@ -1138,10 +765,8 @@ fn execute_repl_command(
         ReplCommand::Stats => {
             print_session_stats(
                 engine.model_id(),
-                *mode,
                 *session_stats,
                 session.stats(),
-                chat_history.len().saturating_sub(1),
                 max_turns,
                 max_tokens,
                 temperature,
@@ -1187,38 +812,7 @@ fn execute_repl_command(
             true
         }
         ReplCommand::Export(path_arg) => {
-            handle_export_command(engine.model_id(), chat_history, &path_arg);
-            println!();
-            true
-        }
-        ReplCommand::Retry => {
-            match *mode {
-                ReplMode::Chat => handle_retry_command(
-                    engine,
-                    chat_history,
-                    session_stats,
-                    max_tokens,
-                    temperature,
-                    cancel,
-                ),
-                ReplMode::Agent => {
-                    println!("\x1b[2m(/retry only works in chat mode)\x1b[0m");
-                    println!();
-                }
-            }
-            true
-        }
-        ReplCommand::SwitchChat => {
-            *mode = ReplMode::Chat;
-            println!("\x1b[2m(switched to chat mode — streaming, no tools)\x1b[0m");
-            println!();
-            true
-        }
-        ReplCommand::SwitchAgent => {
-            *mode = ReplMode::Agent;
-            println!(
-                "\x1b[2m(switched to agent mode — tool-calling loop, visible streaming)\x1b[0m"
-            );
+            handle_export_command(engine.model_id(), session.messages(), &path_arg);
             println!();
             true
         }
@@ -1395,7 +989,7 @@ fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let mut out = String::new();
     out.push_str(&format!("# agent-infer conversation — {model_id}\n\n"));
     out.push_str(&format!("> Started: {ts}\n"));
-    out.push_str("> Mode: chat\n");
+    out.push_str("> Mode: agent\n");
     out.push_str(&format!("> Turns: {turns}\n\n"));
 
     for msg in history.iter().skip(1) {
@@ -1456,79 +1050,20 @@ fn format_iso8601_utc(unix_secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// /retry — drop last assistant reply, re-run prior user turn.
-// ─────────────────────────────────────────────────────────────────────────
-
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
-fn handle_retry_command(
-    engine: &mut dyn InferenceEngine,
-    history: &mut Vec<ChatMessage>,
-    session_stats: &mut SessionStats,
-    max_tokens: usize,
-    temperature: f32,
-    cancel: Arc<AtomicBool>,
-) {
-    // history[0] is the system prompt; anything past that is conversational.
-    let last = history.last();
-    let Some(last_msg) = last else {
-        println!("nothing to retry");
-        return;
-    };
-    match last_msg.role {
-        chat::ChatRole::Assistant => {
-            // Pop the assistant reply. The prior user message remains in
-            // history — `run_chat_turn_with_history` re-runs it in place.
-            history.pop();
-            // The prior turn's stats were already accumulated. We let the
-            // re-run add another turn rather than subtract the prior —
-            // simpler and more honest (time was genuinely spent).
-            let Some(last_user) = history
-                .iter()
-                .rev()
-                .find(|m| matches!(m.role, chat::ChatRole::User))
-            else {
-                // Consistency guard: assistant without a preceding user is
-                // an invariant violation, but fail soft rather than panic.
-                println!("nothing to retry");
-                return;
-            };
-            let user_text = last_user.content.clone();
-            if let Err(err) = run_chat_turn_with_history(
-                engine,
-                history,
-                session_stats,
-                &user_text,
-                max_tokens,
-                temperature,
-                cancel,
-            ) {
-                eprintln!("\x1b[1;31mError: {err:#}\x1b[0m");
-                println!();
-            }
-        }
-        _ => {
-            // System or user as last entry — nothing to retry yet.
-            println!("nothing to retry");
-        }
-    }
-}
-
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_repl_help() {
     println!("Commands:");
     println!("  /help            Show this help");
-    println!("  /chat            Switch to streaming chat mode (default)");
-    println!("  /agent           Switch to tool-calling agent mode");
-    println!("  /reset, /clear   Clear conversation history (both modes)");
-    println!("  /tools           Show available agent-mode tools");
-    println!("  /model           Show active model, backend, and current mode");
+    println!("  /reset, /clear   Clear conversation history");
+    println!("  /tools           Show available built-in tools");
+    println!("  /model           Show the active model and backend");
     println!("  /models [N]      List local models; /models <N> shows switch hint");
     println!("  /stats           Show session token/throughput rollup");
     println!("  /save <path>     Save the current agent session to JSON");
     println!("  /load <path>     Load a saved agent session JSON");
-    println!("  /export [path]   Dump chat history to markdown (default: ./agent-infer-<ts>.md)");
-    println!("  /retry           Re-run the last user turn (chat mode only)");
+    println!(
+        "  /export [path]   Dump the conversation to markdown (default: ./agent-infer-<ts>.md)"
+    );
     println!("  /quit, /exit     Leave the REPL");
     println!();
     println!("Input:");
@@ -1539,7 +1074,7 @@ fn print_repl_help() {
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn print_tools_help(tools: &[ToolDefinition]) {
-    println!("Agent tools (available in /agent mode):");
+    println!("Built-in tools:");
     for tool in tools {
         println!("  {}: {}", tool.name, tool.description);
     }
@@ -1577,10 +1112,8 @@ fn print_trace_event(event: &AgentTraceEvent) {
 #[allow(clippy::too_many_arguments)]
 fn print_session_stats(
     model_id: &str,
-    mode: ReplMode,
     session: SessionStats,
     agent_stats: AgentSessionStats,
-    chat_messages: usize,
     max_turns: usize,
     max_tokens: usize,
     temperature: f32,
@@ -1588,7 +1121,6 @@ fn print_session_stats(
 ) {
     println!("Session stats:");
     println!("  Model:      {model_id}");
-    println!("  Mode:       {}", mode.label());
     println!("  Turns:      {}", session.turn_count);
     println!("  Tokens in:  {}", session.prompt_tokens);
     println!("  Tokens out: {}", session.completion_tokens);
@@ -1602,9 +1134,8 @@ fn print_session_stats(
     println!("  tool results:{}", agent_stats.tool_messages);
     println!("  tool calls:  {}", agent_stats.tool_calls);
     println!("  chars:       {}", agent_stats.content_chars);
-    println!("  chat turns:  {}", chat_messages);
     println!("Runtime:");
-    println!("  tools enabled: {}", tool_count);
+    println!("  tools: {}", tool_count);
     println!("  max turns: {}", max_turns);
     println!("  max tokens: {}", max_tokens);
     println!("  temperature: {}", temperature);
@@ -1613,9 +1144,9 @@ fn print_session_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplCommand, SessionStats, count_export_turns, decode_chunk, detect_family,
-        format_iso8601_utc, handle_export_command, handle_models_command, parse_repl_command,
-        render_history_markdown, resolve_export_path,
+        ReplCommand, SessionStats, count_export_turns, detect_family, format_iso8601_utc,
+        handle_export_command, handle_models_command, parse_repl_command, render_history_markdown,
+        resolve_export_path,
     };
     use chat::ChatMessage;
     use std::time::Duration;
@@ -1642,55 +1173,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_repl_command_supports_mode_toggles() {
-        assert_eq!(parse_repl_command("/chat"), Some(ReplCommand::SwitchChat));
-        assert_eq!(parse_repl_command("/agent"), Some(ReplCommand::SwitchAgent));
-    }
-
-    #[test]
-    fn parse_repl_command_ignores_normal_chat_input() {
+    fn parse_repl_command_ignores_normal_input() {
         assert_eq!(parse_repl_command("list files"), None);
     }
 
     #[test]
-    fn decode_chunk_passes_clean_ascii() {
-        let mut partial = Vec::new();
-        let s = decode_chunk(&mut partial, b"hello");
-        assert_eq!(s, "hello");
-        assert!(partial.is_empty());
-    }
-
-    #[test]
-    fn decode_chunk_buffers_incomplete_utf8() {
-        // "你" = E4 BD A0; deliver the first two bytes, then the third.
-        let mut partial = Vec::new();
-        let s1 = decode_chunk(&mut partial, &[0xE4, 0xBD]);
-        assert_eq!(s1, "");
-        assert_eq!(partial, vec![0xE4, 0xBD]);
-        let s2 = decode_chunk(&mut partial, &[0xA0]);
-        assert_eq!(s2, "你");
-        assert!(partial.is_empty());
-    }
-
-    #[test]
-    fn decode_chunk_drops_definitively_invalid_bytes() {
-        let mut partial = Vec::new();
-        // 0xFF is never valid in UTF-8.
-        let s = decode_chunk(&mut partial, &[b'a', 0xFF, b'b']);
-        assert!(s.starts_with('a'));
-        assert!(s.ends_with('b'));
-        assert!(partial.is_empty());
-    }
-
-    // ── Wave-2 polish: new command parse coverage ───────────────────────
-
-    #[test]
-    fn parse_retry_command() {
-        assert_eq!(parse_repl_command("/retry"), Some(ReplCommand::Retry));
+    fn parse_removed_mode_commands_as_unknown() {
         assert_eq!(
-            parse_repl_command("  /retry  "),
-            Some(ReplCommand::Retry),
-            "leading/trailing whitespace should not disturb parsing"
+            parse_repl_command("/chat"),
+            Some(ReplCommand::Unknown("/chat".to_string()))
+        );
+        assert_eq!(
+            parse_repl_command("/agent"),
+            Some(ReplCommand::Unknown("/agent".to_string()))
         );
     }
 
@@ -1756,6 +1251,7 @@ mod tests {
 
         let md = render_history_markdown("Qwen/Qwen3-4B", &history);
         assert!(md.starts_with("# agent-infer conversation — Qwen/Qwen3-4B"));
+        assert!(md.contains("> Mode: agent"));
         assert!(md.contains("> Turns: 4"));
         assert!(md.contains("## You\n\nhello"));
         assert!(md.contains("## Assistant\n\nhi there"));
