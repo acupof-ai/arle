@@ -1000,37 +1000,72 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn wait_for_wakeup(&mut self) -> bool {
-        if self.is_fetch_wait_bound() {
-            match self
-                .coordinator_events
-                .recv_timeout(std::time::Duration::from_millis(2))
-            {
+    fn drain_wakeup_rx(&mut self) {
+        while self.wakeup_rx.try_recv().is_ok() {}
+    }
+
+    fn handle_wakeup_disconnect(&mut self) {
+        self.wakeup_live = false;
+        self.drain_request_rx();
+    }
+
+    fn wait_for_fetch_or_request(&mut self) -> bool {
+        if !self.wakeup_live {
+            match self.coordinator_events.recv() {
                 Ok(event) => {
                     self.handle_coordinator_event(event);
-                    self.drain_request_rx();
                     return true;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    self.drain_request_rx();
-                    return true;
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(_) => {
                     error!("Coordinator event channel disconnected");
-                    self.drain_request_rx();
                     return true;
                 }
             }
         }
 
-        if self.active_len() == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
-            if let Some(req) = self.request_rx.blocking_recv() {
-                self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                self.waiting.push_back(req);
-                return true;
+        crossbeam_channel::select! {
+            recv(self.coordinator_events) -> event => {
+                match event {
+                    Ok(event) => self.handle_coordinator_event(event),
+                    Err(_) => error!("Coordinator event channel disconnected"),
+                }
+                true
             }
-            info!("Scheduler shutting down: all handles dropped");
-            return false;
+            recv(self.wakeup_rx) -> wakeup => {
+                match wakeup {
+                    Ok(()) => {
+                        self.drain_request_rx();
+                        self.drain_wakeup_rx();
+                    }
+                    Err(_) => self.handle_wakeup_disconnect(),
+                }
+                true
+            }
+        }
+    }
+
+    fn wait_for_wakeup(&mut self) -> bool {
+        if self.is_fetch_wait_bound() {
+            return self.wait_for_fetch_or_request();
+        }
+
+        if self.active_len() == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
+            if !self.wakeup_live {
+                info!("Scheduler shutting down: all handles dropped");
+                return false;
+            }
+            match self.wakeup_rx.recv() {
+                Ok(()) => {
+                    self.drain_request_rx();
+                    self.drain_wakeup_rx();
+                    return true;
+                }
+                Err(_) => {
+                    self.handle_wakeup_disconnect();
+                    info!("Scheduler shutting down: all handles dropped");
+                    return false;
+                }
+            }
         }
 
         true
