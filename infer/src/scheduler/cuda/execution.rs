@@ -486,10 +486,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(
-            collect_schedulable_indices(budget, &reservations),
-            vec![1]
-        );
+        assert_eq!(collect_schedulable_indices(budget, &reservations), vec![1]);
     }
 
     #[test]

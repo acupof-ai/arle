@@ -1,7 +1,7 @@
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-use super::prefill_buffers::GdrChunkwiseScratch35;
+use super::prefill_buffers::{GdrChunkwiseScratch35, PagedPrefillBuffers35};
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::{
@@ -10,9 +10,8 @@ use super::weights::{
 use crate::model::cuda_graph::CudaGraphState;
 use crate::model::kv_cache::KVCache;
 use crate::ops;
-use cuda_kernels::TokenKVPool;
-use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
-use cuda_kernels::prelude::{DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
+use cuda_kernels::{TokenKVPool, ffi};
 
 impl Qwen35Model {
     pub(super) fn prefill_forward(
@@ -269,205 +268,272 @@ impl Qwen35Model {
         pool: &TokenKVPool,
         slot: usize,
         recurrent: &mut RecurrentState,
-    ) -> Result<DeviceVec> {
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<()> {
         let seq_len = token_ids.len();
         anyhow::ensure!(seq_len > 0, "prefill_forward_paged requires ≥1 token");
-        let c = &self.config;
+        anyhow::ensure!(
+            bufs.matches_shape(seq_len, pool.page_size),
+            "paged prefill buffers expect seq_len={} page_size={}, got seq_len={} page_size={}",
+            bufs.seq_len,
+            bufs.page_size,
+            seq_len,
+            pool.page_size
+        );
 
+        let start_pos = self.prepare_paged_prefill(token_ids, pool, slot, bufs)?;
+        bufs.clear_logits();
+
+        let use_graph = self.supports_paged_prefill_graph() && start_pos == 0;
+        if use_graph {
+            let mut graph_state = std::mem::replace(&mut bufs.graph_state, CudaGraphState::new());
+            graph_state.run_or_capture(&self.ctx, || {
+                self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, true)
+            })?;
+            bufs.graph_state = graph_state;
+        } else {
+            self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, false)?;
+        }
+
+        recurrent.seq_len += seq_len;
+        bufs.logits_valid = true;
+        Ok(())
+    }
+
+    fn supports_paged_prefill_graph(&self) -> bool {
+        self.enable_cuda_graph
+            && self.layers.iter().all(|layer| {
+                let attn_safe = match &layer.attn {
+                    LayerKind::FullAttention(attn) => {
+                        Self::graphsafe_batched_weight(&attn.q_proj)
+                            && Self::graphsafe_batched_weight(&attn.k_proj)
+                            && Self::graphsafe_batched_weight(&attn.v_proj)
+                            && Self::graphsafe_batched_weight(&attn.o_proj)
+                    }
+                    LayerKind::LinearAttention(attn) => {
+                        Self::graphsafe_batched_weight(&attn.in_proj_qkv)
+                            && Self::graphsafe_batched_weight(&attn.in_proj_z)
+                            && Self::graphsafe_batched_weight(&attn.in_proj_b)
+                            && Self::graphsafe_batched_weight(&attn.in_proj_a)
+                            && Self::graphsafe_batched_weight(&attn.out_proj)
+                    }
+                };
+                attn_safe
+                    && Self::graphsafe_batched_weight(&layer.mlp.gate_proj)
+                    && Self::graphsafe_batched_weight(&layer.mlp.up_proj)
+                    && Self::graphsafe_batched_weight(&layer.mlp.down_proj)
+            })
+    }
+
+    fn graphsafe_batched_weight(weight: &DeviceMatrix) -> bool {
+        !weight.is_quantized() && !weight.has_marlin() && !weight.has_tq()
+    }
+
+    fn prefill_gemm_into(
+        &self,
+        weight: &DeviceMatrix,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+        graphsafe: bool,
+    ) -> Result<()> {
+        if graphsafe {
+            ops::gemm_graphsafe_batched_into(&self.ctx, weight, x, out)
+        } else {
+            ops::gemm_into(&self.ctx, weight, x, out);
+            Ok(())
+        }
+    }
+
+    fn prepare_paged_prefill(
+        &self,
+        token_ids: &[u32],
+        pool: &TokenKVPool,
+        slot: usize,
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<usize> {
+        let seq_len = token_ids.len();
         let pool_seq_len = pool.seq_len(slot);
         anyhow::ensure!(
             pool_seq_len >= seq_len,
             "paged prefill: pool seq_len {pool_seq_len} < chunk len {seq_len}"
         );
         let start_pos = pool_seq_len - seq_len;
-        let num_pages_needed = (start_pos + seq_len).div_ceil(pool.page_size);
-        let sequences = [ops::PagedPrefillSequence {
-            token_offset: 0,
-            seq_len,
-            start_pos,
-            page_table_offset: 0,
-            num_pages: num_pages_needed,
-        }];
-
-        let mut hidden_batch = crate::model::common::get_embeddings_batch(
-            &self.ctx,
-            &self.embed_tokens,
-            token_ids,
-            c.hidden_size,
-        )?;
-
-        // Per-forward GPU-resident page table (1 i32 per logical page in the
-        // slot). Uploaded once and reused across all 8 full-attn layers.
-        // Slice the page table down to exactly `num_pages_needed` — reused
-        // slots can carry stale tail pages from the prior request, and the
-        // prep kernel's `page_table[pos/page_size]` indexing would otherwise
-        // read past the valid region under concurrent load. Mirrors the
-        // Qwen3 fix.
+        let num_pages = (start_pos + seq_len).div_ceil(pool.page_size);
         let all_pages = pool.page_indices(slot);
         anyhow::ensure!(
-            all_pages.len() >= num_pages_needed,
-            "paged prefill: slot {slot} has {} pages, expected at least {num_pages_needed}",
+            all_pages.len() >= num_pages,
+            "paged prefill: slot {slot} has {} pages, expected at least {num_pages}",
             all_pages.len()
         );
-        let pages_u32 = &all_pages[..num_pages_needed];
-        let pages_i32: Vec<i32> = pages_u32.iter().map(|&p| p as i32).collect();
-        let slot_page_indices: CudaSlice<i32> = self
-            .ctx
-            .stream
-            .clone_htod(&pages_i32)
-            .map_err(|e| anyhow::anyhow!("slot_page_indices H2D failed: {e}"))?;
-
-        // Lazy-init the shared HD256 paged-prefill plan on first call. Sized
-        // for the maximum chunk we'll ever see; reused across all subsequent
-        // prefills to avoid per-forward 264MB FlashInferWorkspace churn.
-        let mut plan_guard = self
-            .paged_prefill_plan_hd256
-            .lock()
-            .map_err(|_| anyhow::anyhow!("paged_prefill_plan_hd256 mutex poisoned"))?;
-        let required_rows = seq_len.max(4096);
-        let needs_realloc = plan_guard
-            .as_ref()
-            .map(|(max_rows, _)| *max_rows < required_rows)
-            .unwrap_or(true);
-        if needs_realloc {
-            *plan_guard = Some((
-                required_rows,
-                BatchPrefillPagedPlan::new_hd256(&self.ctx, required_rows, c.num_attention_heads)?,
-            ));
-        }
-        let (_, plan) = plan_guard.as_mut().expect("just initialized");
-
-        // Structural invariant: plan ONCE per forward, not per layer.
-        // All 8 full-attn layers share identical (batch_size, qo_len,
-        // kv_len, num_heads, page_size). See `PagedPrefillForward` docs
-        // for why per-layer plan calls race on the host pinned buffer.
-        let mut fwd = crate::ops::PagedPrefillForward::new_hd256(
+        let page_indices_reallocated = bufs.metadata.update(
             &self.ctx,
-            plan,
-            &sequences,
-            c.num_attention_heads,
-            c.num_key_value_heads,
+            token_ids,
+            &all_pages[..num_pages],
+            seq_len,
             pool.page_size,
+            start_pos,
+        )?;
+        if page_indices_reallocated {
+            bufs.invalidate_graph();
+        }
+
+        let qo_indptr = [0_i32, seq_len as i32];
+        let kv_indptr = [0_i32, num_pages as i32];
+        bufs.plan.plan_hd256(
+            &self.ctx,
+            &qo_indptr,
+            &kv_indptr,
+            1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            pool.page_size,
+        )?;
+        Ok(start_pos)
+    }
+
+    fn prefill_forward_paged_kernels(
+        &self,
+        pool: &TokenKVPool,
+        start_pos: usize,
+        recurrent: &mut RecurrentState,
+        bufs: &mut PagedPrefillBuffers35,
+        graphsafe: bool,
+    ) -> Result<()> {
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.metadata.token_ids_gpu,
+            &mut bufs.hidden,
         )?;
 
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
-        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
-
         for layer in &self.layers {
-            hidden_batch = self.prefill_layer_paged(
+            self.prefill_layer_paged(
                 layer,
-                &hidden_batch,
-                &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 pool,
-                &sequences,
-                &slot_page_indices,
-                &mut fwd,
+                start_pos,
                 recurrent,
+                bufs,
+                graphsafe,
             )?;
         }
 
-        // Same lifetime contract as Qwen3 paged prefill: the shared HD256 plan
-        // workspace and the per-forward GPU metadata must remain valid until
-        // the compute stream has consumed every layer launch in this chunk.
-        self.ctx.sync()?;
-
-        // Linear-attn state tracking still advances; the pool owns full-attn
-        // position tracking directly.
-        recurrent.seq_len += seq_len;
-
-        crate::model::common::compute_logits_batch(
+        ops::extract_vec_into(
             &self.ctx,
-            &hidden_batch,
+            &bufs.hidden,
+            bufs.seq_len - 1,
+            &mut bufs.last_hidden,
+        )?;
+        ops::rms_norm_offset_into(
+            &self.ctx,
+            &bufs.last_hidden,
             &self.norm,
+            self.config.rms_norm_eps,
+            &mut bufs.last_normed,
+        )?;
+        ops::gemv(
+            &self.ctx,
             &self.embed_tokens,
-            c.rms_norm_eps,
-            true,
-        )
+            &bufs.last_normed,
+            &mut bufs.logits,
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn prefill_layer_paged(
         &self,
         layer: &TransformerBlock35,
-        hidden_batch: &HiddenStates,
-        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        sequences: &[ops::PagedPrefillSequence],
-        page_indices: &CudaSlice<i32>,
-        fwd: &mut crate::ops::PagedPrefillForward,
+        start_pos: usize,
         recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
+        bufs: &mut PagedPrefillBuffers35,
+        graphsafe: bool,
+    ) -> Result<()> {
         let c = &self.config;
         let eps = c.rms_norm_eps;
-        let seq_len = hidden_batch.seq_len;
 
-        // 1. Input layernorm (1+weight offset)
-        let mut normed_batch =
-            self.batched_rms_norm_offset(hidden_batch, &layer.input_layernorm, eps)?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden,
+            &layer.input_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
 
-        // 2. Attention — paged for full-attn, unchanged for linear
-        let attn_results = match &layer.attn {
-            LayerKind::FullAttention(attn) => self.prefill_full_attention_paged(
-                attn,
-                &normed_batch,
-                full_idx,
-                pool,
-                sequences,
-                page_indices,
-                fwd,
-                seq_len,
-            )?,
-            LayerKind::LinearAttention(attn) => self.prefill_linear_attention(
-                attn,
-                &normed_batch,
-                linear_idx,
-                recurrent,
-                gdr_chunkwise_scratch,
-                seq_len,
-            )?,
+        match &layer.attn {
+            LayerKind::FullAttention(attn) => {
+                self.prefill_full_attention_paged(attn, full_idx, pool, start_pos, bufs, graphsafe)?
+            }
+            LayerKind::LinearAttention(attn) => {
+                self.prefill_linear_attention_paged(attn, linear_idx, recurrent, bufs, graphsafe)?
+            }
         };
 
-        // 3. Residual + post-attention layernorm
-        let hidden_plus_attn = ops::add_batch(&self.ctx, hidden_batch, &attn_results)?;
-        normed_batch =
-            self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden,
+            &bufs.attn_results,
+            &mut bufs.hidden_mid,
+        )?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut bufs.normed,
+        )?;
 
-        // 4. MLP (batched)
-        let gate_out = ops::gemm(&self.ctx, &layer.mlp.gate_proj, &normed_batch)?;
-        let up_out = ops::gemm(&self.ctx, &layer.mlp.up_proj, &normed_batch)?;
-        let act_out = ops::silu_mul_batch(&self.ctx, &gate_out, &up_out)?;
-        let mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
-
-        // 5. Residual
-        ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
+        self.prefill_gemm_into(
+            &layer.mlp.gate_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            graphsafe,
+        )?;
+        self.prefill_gemm_into(
+            &layer.mlp.up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+            graphsafe,
+        )?;
+        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        self.prefill_gemm_into(
+            &layer.mlp.down_proj,
+            &bufs.act_out,
+            &mut bufs.mlp_out,
+            graphsafe,
+        )?;
+        ops::add_batch_into(
+            &self.ctx,
+            &bufs.hidden_mid,
+            &bufs.mlp_out,
+            &mut bufs.hidden_next,
+        )?;
+        std::mem::swap(&mut bufs.hidden, &mut bufs.hidden_next);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn prefill_full_attention_paged(
         &self,
         attn: &FullAttentionLayer,
-        normed_batch: &HiddenStates,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        sequences: &[ops::PagedPrefillSequence],
-        page_indices: &CudaSlice<i32>,
-        fwd: &mut crate::ops::PagedPrefillForward,
-        seq_len: usize,
-    ) -> Result<HiddenStates> {
+        start_pos: usize,
+        bufs: &mut PagedPrefillBuffers35,
+        graphsafe: bool,
+    ) -> Result<()> {
         let c = &self.config;
-        let attn_out_dim = c.full_attn_q_dim();
         let eps = c.rms_norm_eps;
 
-        let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
-        let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;
-        let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;
-        let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
-        let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
+        self.prefill_gemm_into(&attn.q_proj, &bufs.normed, &mut bufs.q_full, graphsafe)?;
+        self.prefill_gemm_into(&attn.k_proj, &bufs.normed, &mut bufs.k_attn, graphsafe)?;
+        self.prefill_gemm_into(&attn.v_proj, &bufs.normed, &mut bufs.v_attn, graphsafe)?;
 
         let nrp = ops::NormRopeParams {
             q_norm: &attn.q_norm,
@@ -476,31 +542,154 @@ impl Qwen35Model {
             sin_cache: &self.sin_cache,
             rms_eps: eps,
         };
-        let meta = ops::PagedPrefillMeta {
-            pool,
-            layer_idx: *full_idx,
-            page_indices,
-            sequences,
-            page_size: pool.page_size,
-        };
-        ops::prefill_attention_hd256_paged_batch(
-            &self.ctx,
-            &q_full_batch,
-            &k_batch,
-            &v_batch,
-            &nrp,
-            &meta,
-            fwd,
-            &mut q_prepped,
-            &mut attn_out_batch,
-            c.num_attention_heads,
-            c.num_key_value_heads,
-            c.rotary_dim,
-        )?;
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _gqp) = bufs.q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _gk) = bufs.k_attn.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _gv) = bufs.v_attn.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (pt_ptr, _gpt) = bufs.metadata.page_indices_gpu.device_ptr(&self.ctx.stream);
+            let kp_ptr = pool.k_ptr(*full_idx, &self.ctx.stream);
+            let vp_ptr = pool.v_ptr(*full_idx, &self.ctx.stream);
+
+            ffi::prefill_attention_paged_prep_hd256_cuda(
+                qf_ptr as *const ffi::Half,
+                qp_ptr as *mut ffi::Half,
+                k_ptr as *const ffi::Half,
+                v_ptr as *const ffi::Half,
+                qn_ptr as *const ffi::Half,
+                kn_ptr as *const ffi::Half,
+                cos_ptr as *const ffi::Half,
+                sin_ptr as *const ffi::Half,
+                pt_ptr as *const i32,
+                pool.page_size as i32,
+                kp_ptr as *mut ffi::Half,
+                vp_ptr as *mut ffi::Half,
+                c.num_attention_heads as i32,
+                c.num_key_value_heads as i32,
+                bufs.seq_len as i32,
+                start_pos as i32,
+                c.rotary_dim as i32,
+                nrp.rms_eps,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+
+        {
+            let (q_u64, _gq) = bufs.q_prepped.data.device_ptr(&self.ctx.stream);
+            let (o_u64, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            let (qoi_u64, _gqoi) = bufs.metadata.qo_indptr_gpu.device_ptr(&self.ctx.stream);
+            let (kvi_u64, _gkvi) = bufs.metadata.kv_indptr_gpu.device_ptr(&self.ctx.stream);
+            let (kvidx_u64, _gkvidx) = bufs.metadata.page_indices_gpu.device_ptr(&self.ctx.stream);
+            let (kvlpl_u64, _gkvlpl) = bufs
+                .metadata
+                .kv_last_page_len_gpu
+                .device_ptr(&self.ctx.stream);
+            bufs.plan.run_hd256(
+                &self.ctx,
+                q_u64,
+                qoi_u64,
+                pool.k_ptr(*full_idx, &self.ctx.stream),
+                pool.v_ptr(*full_idx, &self.ctx.stream),
+                kvi_u64,
+                kvidx_u64,
+                kvlpl_u64,
+                o_u64,
+                None,
+                1,
+                c.num_attention_heads,
+                c.num_key_value_heads,
+                pool.page_size,
+            )?;
+        }
+
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            ffi::attention_gate_batch_hd256_cuda(
+                qf_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                c.num_attention_heads as i32,
+                bufs.seq_len as i32,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
 
         *full_idx += 1;
+        self.prefill_gemm_into(
+            &attn.o_proj,
+            &bufs.attn_out_full,
+            &mut bufs.attn_results,
+            graphsafe,
+        )
+    }
 
-        ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)
+    fn prefill_linear_attention_paged(
+        &self,
+        attn: &LinearAttentionLayer,
+        linear_idx: &mut usize,
+        recurrent: &mut RecurrentState,
+        bufs: &mut PagedPrefillBuffers35,
+        graphsafe: bool,
+    ) -> Result<()> {
+        let c = &self.config;
+
+        self.prefill_gemm_into(&attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv, graphsafe)?;
+        self.prefill_gemm_into(&attn.in_proj_z, &bufs.normed, &mut bufs.z, graphsafe)?;
+        self.prefill_gemm_into(&attn.in_proj_b, &bufs.normed, &mut bufs.b_proj, graphsafe)?;
+        self.prefill_gemm_into(&attn.in_proj_a, &bufs.normed, &mut bufs.a_proj, graphsafe)?;
+
+        let layer_state = &mut recurrent.layers[*linear_idx];
+        ops::conv1d_prefill_batch_into(
+            &self.ctx,
+            &bufs.qkv,
+            &attn.conv1d_weight,
+            &mut layer_state.conv_state,
+            &mut bufs.qkv_conv,
+            c.linear_conv_kernel_dim,
+        );
+        ops::gated_delta_rule_prefill_chunkwise_into(
+            &self.ctx,
+            &bufs.qkv_conv,
+            &bufs.b_proj,
+            &bufs.a_proj,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
+            &mut layer_state.state,
+            &mut bufs.gdr_chunkwise_scratch,
+            &mut bufs.gdr_out,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
+        )?;
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &bufs.gdr_out,
+            &attn.norm_weight,
+            &bufs.z,
+            &mut bufs.normed_gated,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+
+        *linear_idx += 1;
+        self.prefill_gemm_into(
+            &attn.out_proj,
+            &bufs.normed_gated,
+            &mut bufs.attn_results,
+            graphsafe,
+        )
     }
 
     fn batched_rms_norm_offset(
