@@ -52,6 +52,22 @@ unless the operator passes `--speculative-tokens` explicitly.
   - log printed `Metal DFlash auto-tuning block_size ... 16 -> 2`
   - log printed `Metal DFlash enabled ... block_size=2`
   - request completed with `exit 0`
+- Long-output synthetic service-path rerun (`prompt_tokens=20`,
+  `generation_tokens=1024`, `runs=1`):
+  - baseline step-driver: `generation_tps = 80.69 tok/s`,
+    `repo_e2e_tps = 80.25 tok/s`, `ttft_ms = 68.28`
+  - DFlash step-driver: `generation_tps = 69.05 tok/s`,
+    `repo_e2e_tps = 68.72 tok/s`, `ttft_ms = 69.35`,
+    `acceptance_rate = 50.0%`, `avg_accepted_inputs = 2.0`
+- Long-output local reasoning prompt rerun via `metal_request`
+  (`"How many positive whole-number divisors does 196 have? Solve it step by step."`,
+  ChatML prompt, `max_new_tokens=512`, `ignore_eos=true`):
+  - baseline: `Prompt tokens = 28`, `Gen TPS = 83.0 tok/s`,
+    `TTFT = 83.0 ms`, `Total time = 6253.5 ms`
+  - DFlash: `Prompt tokens = 28`, `Gen TPS = 58.5 tok/s`,
+    `TTFT = 394.5 ms`, `Total time = 9148.4 ms`
+  - The model emitted `<think>...</think>` in both runs, so the local gap is
+    not explained by a totally non-reasoning output distribution alone.
 
 ## Rule
 
@@ -60,4 +76,8 @@ Status: `pending-remote`
 Local serial data says the A3B draft's shipped `block_size=16` is too large for
 the current Metal runtime. Keep the pair-specific default at `2` until a remote
 guidellm sweep proves a better default or a runtime/kernel change shifts the
-acceptance curve materially.
+acceptance curve materially. Matching the public `2.4x-2.9x` Qwen3.6 numbers
+will require more than longer outputs: the local Metal lane still sits at about
+`2.0` accepted inputs per speculative round, far below the public B16
+acceptance range, and the single-request Metal DFlash path still carries much
+higher prompt/TTFT overhead than the baseline path.
