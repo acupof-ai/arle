@@ -219,6 +219,22 @@ auto& prefix_match_len_i32_batched_kernel() {
     return kernel;
 }
 
+auto& gather_axis1_i32_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "gather_axis1_i32",
+        {"values", "indices", "T"},
+        {"out"},
+        R"(
+        uint b_idx = thread_position_in_grid.x;
+        int col = indices[b_idx];
+        out[b_idx] = values[b_idx * T + col];
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
 auto& tape_replay_varlen_kernel() {
     static auto kernel = fast::metal_kernel(
         "tape_replay_varlen",
@@ -719,6 +735,42 @@ mlx_array* mlx_prefix_match_len_i32_batched(mlx_array* lhs, mlx_array* rhs) {
             {int32},
             std::make_tuple(256, 1, B),
             std::make_tuple(256, 1, 1),
+            {},
+            std::nullopt,
+            false,
+            {});
+        return from_arr(std::move(result[0]));
+    }());
+}
+
+mlx_array* mlx_gather_axis1_i32(mlx_array* values, mlx_array* indices) {
+    MLX_TRY_RETURN([&]() {
+        auto values_arr = contiguous(*to_arr(values));
+        auto indices_arr = contiguous(*to_arr(indices));
+        require_rank(values_arr, 2, "values");
+        require_rank(indices_arr, 1, "indices");
+        require_dtype(values_arr, int32, "values");
+        require_dtype(indices_arr, int32, "indices");
+        if (values_arr.shape(0) != indices_arr.shape(0)) {
+            throw std::invalid_argument(
+                "mlx_gather_axis1_i32 requires values[B, T] and indices[B]");
+        }
+
+        int B = values_arr.shape(0);
+        int T = values_arr.shape(1);
+        if (B <= 0) {
+            return from_arr(zeros({std::max(B, 0)}, int32));
+        }
+        if (T <= 0) {
+            throw std::invalid_argument("mlx_gather_axis1_i32 requires T > 0");
+        }
+
+        auto result = gather_axis1_i32_kernel()(
+            {values_arr, indices_arr, array(T)},
+            {{B}},
+            {int32},
+            std::make_tuple(B, 1, 1),
+            std::make_tuple(1, 1, 1),
             {},
             std::nullopt,
             false,

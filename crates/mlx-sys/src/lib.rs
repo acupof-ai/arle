@@ -73,6 +73,7 @@ unsafe extern "C" {
         lhs: *mut mlx_array,
         rhs: *mut mlx_array,
     ) -> *mut mlx_array;
+    pub fn mlx_gather_axis1_i32(values: *mut mlx_array, indices: *mut mlx_array) -> *mut mlx_array;
 
     // === Unary ops ===
 
