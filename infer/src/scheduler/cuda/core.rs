@@ -698,6 +698,20 @@ impl<M: ModelForward> Scheduler<M> {
         (fetch_wait_s, store_wait_s)
     }
 
+    pub(super) fn has_pending_store_work(&self) -> bool {
+        !self.store_waiting.is_empty()
+    }
+
+    pub(super) fn trigger_background_store_drain(&mut self) -> bool {
+        if !self.has_pending_store_work()
+            && self.host_pool_usage_fraction() <= self.config.t1_host_pinned_high_water
+        {
+            return false;
+        }
+        let _ = self.spill_host_blocks_if_pressured();
+        self.has_pending_store_work()
+    }
+
     pub(super) fn attach_gpu_prefix_blocks(
         &mut self,
         slot_idx: usize,

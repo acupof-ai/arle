@@ -1934,7 +1934,7 @@ fn refresh_runtime_metrics(
         .filter(|request| request.phase() == RuntimePhase::Prefill)
         .count() as u64;
     metrics.set_scheduler_occupancy(running_batch, prefill_queue);
-    metrics.set_kv_coordinator(0, 0, 0, 0, false, false);
+    metrics.set_kv_coordinator(0, 0, 0, 0, false, false, 0, 0, 0);
     metrics.set_tier_wait_seconds(0.0, 0.0);
 
     let (kv_used, kv_total) = active.values().fold((0u64, 0u64), |acc, request| {

@@ -25,6 +25,9 @@
 //! | `infer_kv_store_queue_depth` | gauge | In-flight staged KV spill/store tickets |
 //! | `infer_kv_fetch_backpressure` | gauge | Staged KV fetch queue backpressure flag (0/1) |
 //! | `infer_kv_store_backpressure` | gauge | Staged KV store queue backpressure flag (0/1) |
+//! | `infer_kv_store_submitted_total` | counter | Submitted staged KV spill/store tickets |
+//! | `infer_kv_store_completed_total` | counter | Completed staged KV spill/store tickets |
+//! | `infer_kv_store_failed_total` | counter | Failed staged KV spill/store tickets |
 //! | `infer_tier_fetch_wait_seconds` | gauge | Oldest outstanding staged fetch wait |
 //! | `infer_tier_store_wait_seconds` | gauge | Oldest outstanding staged store wait |
 //! | `infer_tokens_generated_total` | counter | Total output tokens generated |
@@ -229,6 +232,9 @@ struct MetricsInner {
     pub kv_store_queue_depth: AtomicU64,
     pub kv_fetch_backpressure: AtomicU64,
     pub kv_store_backpressure: AtomicU64,
+    pub kv_store_submitted_total: AtomicU64,
+    pub kv_store_completed_total: AtomicU64,
+    pub kv_store_failed_total: AtomicU64,
     pub tier_fetch_wait_us: AtomicU64,
     pub tier_store_wait_us: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
@@ -274,6 +280,9 @@ impl ServerMetrics {
                 kv_store_queue_depth: AtomicU64::new(0),
                 kv_fetch_backpressure: AtomicU64::new(0),
                 kv_store_backpressure: AtomicU64::new(0),
+                kv_store_submitted_total: AtomicU64::new(0),
+                kv_store_completed_total: AtomicU64::new(0),
+                kv_store_failed_total: AtomicU64::new(0),
                 tier_fetch_wait_us: AtomicU64::new(0),
                 tier_store_wait_us: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
@@ -419,7 +428,7 @@ impl ServerMetrics {
         }
     }
 
-    /// Update the staged KV coordinator queue gauges.
+    /// Update the staged KV coordinator queue gauges and cumulative store counters.
     pub fn set_kv_coordinator(
         &self,
         queue_capacity: u64,
@@ -428,6 +437,9 @@ impl ServerMetrics {
         store_queue_depth: u64,
         fetch_backpressure: bool,
         store_backpressure: bool,
+        store_submitted_total: u64,
+        store_completed_total: u64,
+        store_failed_total: u64,
     ) {
         self.inner
             .kv_coordinator_queue_capacity
@@ -447,6 +459,15 @@ impl ServerMetrics {
         self.inner
             .kv_store_backpressure
             .store(u64::from(store_backpressure), Ordering::Relaxed);
+        self.inner
+            .kv_store_submitted_total
+            .store(store_submitted_total, Ordering::Relaxed);
+        self.inner
+            .kv_store_completed_total
+            .store(store_completed_total, Ordering::Relaxed);
+        self.inner
+            .kv_store_failed_total
+            .store(store_failed_total, Ordering::Relaxed);
     }
 
     /// Update oldest outstanding tier wait gauges.
@@ -566,6 +587,18 @@ impl ServerMetrics {
 
     pub fn kv_store_backpressure(&self) -> bool {
         self.inner.kv_store_backpressure.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn kv_store_submitted_total(&self) -> u64 {
+        self.inner.kv_store_submitted_total.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_store_completed_total(&self) -> u64 {
+        self.inner.kv_store_completed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn kv_store_failed_total(&self) -> u64 {
+        self.inner.kv_store_failed_total.load(Ordering::Relaxed)
     }
 
     pub fn tier_fetch_wait_seconds(&self) -> f64 {
@@ -936,6 +969,34 @@ impl ServerMetrics {
             self.inner.kv_store_queue_depth.load(Ordering::Relaxed)
         )
         .unwrap();
+        out.push_str(
+            "# HELP infer_kv_store_submitted_total Submitted staged KV spill/store tickets.\n",
+        );
+        out.push_str("# TYPE infer_kv_store_submitted_total counter\n");
+        writeln!(
+            out,
+            "infer_kv_store_submitted_total{{{labels}}} {}",
+            self.inner.kv_store_submitted_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+        out.push_str(
+            "# HELP infer_kv_store_completed_total Completed staged KV spill/store tickets.\n",
+        );
+        out.push_str("# TYPE infer_kv_store_completed_total counter\n");
+        writeln!(
+            out,
+            "infer_kv_store_completed_total{{{labels}}} {}",
+            self.inner.kv_store_completed_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
+        out.push_str("# HELP infer_kv_store_failed_total Failed staged KV spill/store tickets.\n");
+        out.push_str("# TYPE infer_kv_store_failed_total counter\n");
+        writeln!(
+            out,
+            "infer_kv_store_failed_total{{{labels}}} {}",
+            self.inner.kv_store_failed_total.load(Ordering::Relaxed)
+        )
+        .unwrap();
 
         out.push_str("# HELP infer_kv_fetch_backpressure Staged KV fetch queue backpressure flag (0 or 1).\n");
         out.push_str("# TYPE infer_kv_fetch_backpressure gauge\n");
@@ -1115,12 +1176,15 @@ impl ServerMetrics {
         let queue_capacity = self.kv_coordinator_queue_capacity();
         let coordinator_suffix = if queue_capacity > 0 {
             format!(
-                " kv_fetch_q={}/{} kv_fetch_waiters={} kv_store_q={}/{} kv_bp=fetch:{},store:{}",
+                " kv_fetch_q={}/{} kv_fetch_waiters={} kv_store_q={}/{} kv_store=sub:{},done:{},fail:{} kv_bp=fetch:{},store:{}",
                 self.kv_fetch_queue_depth(),
                 queue_capacity,
                 self.kv_fetch_waiters(),
                 self.kv_store_queue_depth(),
                 queue_capacity,
+                self.kv_store_submitted_total(),
+                self.kv_store_completed_total(),
+                self.kv_store_failed_total(),
                 u8::from(self.kv_fetch_backpressure()),
                 u8::from(self.kv_store_backpressure()),
             )
@@ -1202,7 +1266,7 @@ mod tests {
         m.set_scheduler_occupancy(3, 4);
         m.set_scheduler_step(4, 3, 1, 3, 128, 4);
         m.observe_scheduler_step(0.012);
-        m.set_kv_coordinator(16, 3, 5, 2, true, false);
+        m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
         m.record_prefix_lookup(true);
@@ -1225,6 +1289,9 @@ mod tests {
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_kv_fetch_waiters{model=\"Qwen3-4B\",} 5"));
         assert!(rendered.contains("infer_kv_store_queue_depth{model=\"Qwen3-4B\",} 2"));
+        assert!(rendered.contains("infer_kv_store_submitted_total{model=\"Qwen3-4B\",} 7"));
+        assert!(rendered.contains("infer_kv_store_completed_total{model=\"Qwen3-4B\",} 5"));
+        assert!(rendered.contains("infer_kv_store_failed_total{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_kv_fetch_backpressure{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_kv_store_backpressure{model=\"Qwen3-4B\",} 0"));
         assert!(rendered.contains("infer_tier_fetch_wait_seconds{model=\"Qwen3-4B\",} 0.250000"));
@@ -1245,12 +1312,14 @@ mod tests {
     #[test]
     fn server_metrics_render_summary() {
         let m = ServerMetrics::new("Qwen3-8B");
+        m.set_kv_coordinator(16, 0, 0, 0, false, false, 3, 2, 1);
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
         assert!(s.contains("scheduled=0"));
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=0.0%"));
+        assert!(s.contains("kv_store=sub:3,done:2,fail:1"));
     }
 
     #[test]
