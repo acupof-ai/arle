@@ -381,9 +381,14 @@ struct QWeight {
     int bits = 4;
     bool is_dense = false;  // if true, w is already transposed, use matmul directly
 
-    array apply(const array& x) const {
+    array apply(const array& x, bool prefer_verify_m16 = false) const {
         if (is_dense) {
             return matmul(x, w);  // w is already transposed at load time
+        }
+        if (prefer_verify_m16 && x.ndim() == 3 && x.shape(0) == 1 && x.shape(1) == 16) {
+            auto x_2d = reshape(x, {16, x.shape(2)});
+            auto out_2d = quantized_matmul(x_2d, w, scales, biases, true, group_size, bits);
+            return reshape(out_2d, {1, 16, out_2d.shape(1)});
         }
         return quantized_matmul(x, w, scales, biases, true, group_size, bits);
     }
@@ -563,6 +568,10 @@ struct Qwen35CompiledModel {
         return std::find(layer_ids->begin(), layer_ids->end(), layer_id) != layer_ids->end();
     }
 
+    static bool should_prefer_verify_m16(const ForwardContext& ctx) {
+        return ctx.is_verify && ctx.batch_size == 1 && ctx.seq_len == 16;
+    }
+
     void clear_optional_batch_inputs() {
         current_attn_mask = array(0);
         current_has_attn_mask = false;
@@ -622,10 +631,11 @@ struct Qwen35CompiledModel {
         int S = ctx.seq_len;
         float attn_scale = 1.0f / std::sqrt((float)hd);
         bool keep_intermediates = ctx.keep_intermediates && artifacts;
+        bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
 
-        auto q_proj_out = lw.q_proj.apply(x);
-        auto k_raw = lw.k_proj.apply(x);
-        auto v_raw = lw.v_proj.apply(x);
+        auto q_proj_out = lw.q_proj.apply(x, prefer_verify_m16);
+        auto k_raw = lw.k_proj.apply(x, prefer_verify_m16);
+        auto v_raw = lw.v_proj.apply(x, prefer_verify_m16);
 
         array q(0), gate_val(0);
         if (lw.has_qk_gate) {
@@ -756,9 +766,11 @@ struct Qwen35CompiledModel {
         array result(0);
         if (lw.has_qk_gate) {
             auto gate = reshape(gate_val, {B, S, nh*hd});
-            result = lw.o_proj.apply(compiled_precise_sigmoid_mul()({gate, attn_out})[0]);
+            result = lw
+                .o_proj
+                .apply(compiled_precise_sigmoid_mul()({gate, attn_out})[0], prefer_verify_m16);
         } else {
-            result = lw.o_proj.apply(attn_out);
+            result = lw.o_proj.apply(attn_out, prefer_verify_m16);
         }
 
         // Keep intermediates alive for GPU buffer reuse
@@ -789,22 +801,23 @@ struct Qwen35CompiledModel {
         int qkv_dim = q_dim + k_dim + v_dim;
         int S = ctx.seq_len;
         bool keep_intermediates = ctx.keep_intermediates && artifacts;
+        bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
 
         auto x_3d = reshape(x, {B, S, hidden_size});
 
         // Projections
         array qkv(0), z_raw(0), b_raw(0), a_raw(0);
         if (lw.use_separate_proj) {
-            qkv = lw.qkv_proj.apply(x_3d);
-            z_raw = reshape(lw.z_proj.apply(x_3d), {B, S, hv, dv});
-            b_raw = lw.b_proj.apply(x_3d);
-            a_raw = lw.a_proj.apply(x_3d);
+            qkv = lw.qkv_proj.apply(x_3d, prefer_verify_m16);
+            z_raw = reshape(lw.z_proj.apply(x_3d, prefer_verify_m16), {B, S, hv, dv});
+            b_raw = lw.b_proj.apply(x_3d, prefer_verify_m16);
+            a_raw = lw.a_proj.apply(x_3d, prefer_verify_m16);
         } else {
-            auto qkvz = lw.qkvz_proj.apply(x_3d);
+            auto qkvz = lw.qkvz_proj.apply(x_3d, prefer_verify_m16);
             auto qkv_z = split(qkvz, Shape{lw.qkv_split}, -1);
             qkv = qkv_z[0];
             z_raw = qkv_z[1];
-            auto ba = lw.ba_proj.apply(x_3d);
+            auto ba = lw.ba_proj.apply(x_3d, prefer_verify_m16);
             auto ba_parts = split(ba, Shape{lw.ba_num_heads}, -1);
             b_raw = ba_parts[0];
             a_raw = ba_parts[1];
@@ -954,7 +967,7 @@ struct Qwen35CompiledModel {
         auto normed = fast::rms_norm(y_heads, lw.norm_w, lw.rms_eps);
         auto z_gated = reshape(z_raw, {B * S * hv, dv});
         auto out = compiled_precise_silu_mul()({z_gated, normed})[0];
-        auto result = lw.out_proj.apply(reshape(out, {B, S, hv*dv}));
+        auto result = lw.out_proj.apply(reshape(out, {B, S, hv*dv}), prefer_verify_m16);
 
         // Keep ALL available intermediates alive for GPU buffer reuse.
         if (keep_intermediates) {
@@ -977,21 +990,33 @@ struct Qwen35CompiledModel {
     // ── MLP block ──────────────────────────────────────────────────────
 
     // Separate MLP: 2 matmul (matching mlx_lm, no split overhead)
-    array mlp_separate(const array& x, const QWeight& gate, const QWeight& up, const QWeight& down) const {
-        auto g = gate.apply(x);
-        auto u = up.apply(x);
+    array mlp_separate(
+        const array& x,
+        const QWeight& gate,
+        const QWeight& up,
+        const QWeight& down,
+        bool prefer_verify_m16
+    ) const {
+        auto g = gate.apply(x, prefer_verify_m16);
+        auto u = up.apply(x, prefer_verify_m16);
         auto h = compiled_swiglu()({g, u})[0];
-        return down.apply(h);
+        return down.apply(h, prefer_verify_m16);
     }
 
     // Fused MLP: 1 matmul + split
-    array mlp(const array& x, const QWeight& gate_up, const QWeight& down, int gate_dim) const {
-        auto gu = gate_up.apply(x);
+    array mlp(
+        const array& x,
+        const QWeight& gate_up,
+        const QWeight& down,
+        int gate_dim,
+        bool prefer_verify_m16
+    ) const {
+        auto gu = gate_up.apply(x, prefer_verify_m16);
         auto gu_parts = split(gu, Shape{gate_dim}, -1);
         auto& g = gu_parts[0];
         auto& u = gu_parts[1];
         auto h = compiled_swiglu()({g, u})[0]; // SiLU(gate) * up (compiled)
-        return down.apply(h);
+        return down.apply(h, prefer_verify_m16);
     }
 
     array moe_mlp(const array& x, const LayerWeights::MoeLayerWeights& moe) const {
@@ -1036,6 +1061,7 @@ struct Qwen35CompiledModel {
         auto x = take(embed_tokens, flatten(token_id), 0);
         x = reshape(x, {B, S, hidden_size});
         bool keep_intermediates = ctx.keep_intermediates && artifacts;
+        bool prefer_verify_m16 = should_prefer_verify_m16(ctx);
         auto gdr_t_arr = array(S);
 
         std::vector<array> new_kv_caches(2 * F, array(0));
@@ -1085,12 +1111,18 @@ struct Qwen35CompiledModel {
             if (layer.has_moe) {
                 x = residual2 + moe_mlp(xn2, layer.moe);
             } else if (layer.is_gdr && use_separate_mlp_for_current_step(layer.gdr)) {
-                x = residual2 + mlp_separate(xn2, layer.gdr.gate_proj, layer.gdr.up_proj, layer.gdr.down);
+                x = residual2
+                    + mlp_separate(
+                        xn2,
+                        layer.gdr.gate_proj,
+                        layer.gdr.up_proj,
+                        layer.gdr.down,
+                        prefer_verify_m16);
             } else {
                 auto& gu = layer.is_gdr ? layer.gdr.gate_up : layer.full.gate_up;
                 auto& dw = layer.is_gdr ? layer.gdr.down : layer.full.down;
                 int gd = layer.is_gdr ? layer.gdr.gate_dim : layer.full.gate_dim;
-                x = residual2 + mlp(xn2, gu, dw, gd);
+                x = residual2 + mlp(xn2, gu, dw, gd, prefer_verify_m16);
             }
 
             // Keep key intermediates alive for GPU buffer reuse.
@@ -1119,8 +1151,8 @@ struct Qwen35CompiledModel {
         // Use quantized matmul for tied lm_head (same as mlx_lm's as_linear).
         // Dense bf16 matmul reads 1.2GB vs quantized reads 0.3GB — 7.5ms difference.
         auto logits = use_embed_as_linear
-            ? embed_as_linear.apply(final_x)
-            : lm_head.apply(final_x);
+            ? embed_as_linear.apply(final_x, prefer_verify_m16)
+            : lm_head.apply(final_x, prefer_verify_m16);
 
         // Build output: [logits, kv_caches..., gdr_states..., captured_hidden...]
         std::vector<array> outputs;

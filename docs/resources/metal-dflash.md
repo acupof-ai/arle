@@ -120,8 +120,13 @@ metal scheduler runtime:
   same rollback rule row-wise. On the compiled full-attention sublayers, the
   packed path may use the verify-only `batched_sdpa_2pass` kernel when the
   verify block is mask-free, truly batched (`B > 1`), and `block_size == 16`;
-  otherwise it falls back to stock MLX SDPA. Both paths return the same
-  accepted-token contract and updated target hidden state.
+  otherwise it falls back to stock MLX SDPA. For single-row `B=1, S=16`
+  verify, the compiled Qwen3.5/Qwen3.6 target model now threads one
+  `prefer_verify_m16` bit from `ForwardContext` down through full-attention,
+  GDR, MLP, and final logits, so eligible quantized linears reshape
+  `[1, 16, H] -> [16, H]` once and stay on one canonical `quantized_matmul`
+  path instead of bouncing through per-layer special cases. Both paths return
+  the same accepted-token contract and updated target hidden state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
   terminal prefill did not seed `target_hidden` yet, or the request is on the
