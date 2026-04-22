@@ -514,9 +514,7 @@ impl<M: ModelForward> Scheduler<M> {
             stop: incoming.stop,
             session_id: incoming.session_id,
             delta_tx: incoming.delta_tx,
-            full_decoded: String::new(),
-            decoded_token_count: 0,
-            sent_len: 0,
+            stream: super::request::StreamDecodeState::default(),
             phase: if plan.staged_prefix_plan.is_some() {
                 Phase::WaitingFetch
             } else {
@@ -526,7 +524,6 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             },
             cacheable_prompt_len: 0,
-            prefix_byte_len: 0,
             latest_logprob: None,
             reusable_prefix_len: if plan.direct_gpu_attach {
                 plan.lookup.matched_len
@@ -595,6 +592,8 @@ impl<M: ModelForward> Scheduler<M> {
                         if let Some(ticket) = self.coordinator_handle.submit_fetch(fetch_requests) {
                             self.fetch_dedupe.insert(fetch_key.clone(), ticket);
                             self.fetch_ticket_keys.insert(ticket, fetch_key);
+                            self.fetch_ticket_started_at
+                                .insert(ticket, std::time::Instant::now());
                             self.fetch_waiting.insert(ticket, vec![(slot_idx, id)]);
                         } else {
                             let coordinator_stats = self.coordinator_queue_stats();
@@ -910,6 +909,7 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
             crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations } => {
+                self.store_ticket_started_at.remove(&ticket);
                 if let Some(key) = self.store_ticket_keys.remove(&ticket) {
                     self.store_dedupe.remove(&key);
                 }
@@ -937,6 +937,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Store failed for ticket {} on block {:?}: {}",
                     ticket.0, failed_block, reason
                 );
+                self.store_ticket_started_at.remove(&ticket);
                 if let Some(key) = self.store_ticket_keys.remove(&ticket) {
                     self.store_dedupe.remove(&key);
                 }
@@ -950,6 +951,7 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
             crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks } => {
+                self.fetch_ticket_started_at.remove(&ticket);
                 let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
                     self.release_unclaimed_fetch_regions(&blocks);
                     return;
@@ -1008,6 +1010,7 @@ impl<M: ModelForward> Scheduler<M> {
                     "Fetch failed for ticket {} on block {:?}: {}",
                     ticket.0, failed_block, reason
                 );
+                self.fetch_ticket_started_at.remove(&ticket);
                 let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();
                 if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                     self.fetch_dedupe.remove(&key);
@@ -1143,6 +1146,10 @@ impl<M: ModelForward> Scheduler<M> {
             let clean_us = clean_t.elapsed().as_micros();
             self.metrics.set_active(self.active_len() as u64);
             self.metrics.set_waiting(self.waiting.len() as u64);
+            self.metrics.set_scheduler_occupancy(
+                self.running_batch.len() as u64,
+                self.prefill_queue.len() as u64,
+            );
             let coordinator_stats = self.coordinator_queue_stats();
             self.metrics.set_kv_coordinator(
                 coordinator_stats.queue_capacity() as u64,
@@ -1152,6 +1159,9 @@ impl<M: ModelForward> Scheduler<M> {
                 coordinator_stats.fetch_backpressured(),
                 coordinator_stats.store_backpressured(),
             );
+            let (fetch_wait_s, store_wait_s) = self.current_tier_wait_seconds();
+            self.metrics
+                .set_tier_wait_seconds(fetch_wait_s, store_wait_s);
             if self.paged_kv_pool.is_active() {
                 // Both in token units so kv_util = (total-free)/total is correct.
                 let total =

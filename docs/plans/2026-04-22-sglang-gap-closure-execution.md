@@ -156,6 +156,7 @@ That pointed at one bottleneck cluster:
 - `b76c4bf` `feat(qwen35): override paged prefill batch path`
 - `94c7df6` `refactor(scheduler): keep waiting queue incrementally ordered`
 - `a01a124` `refactor(scheduler): pretokenize cuda http admissions`
+- `pending` `feat(scheduler): async emit worker for stopless streaming`
 - `pending` `fix(scheduler): align admission page budget with active-slot headroom`
 
 ## Parallelization shape used
@@ -212,8 +213,10 @@ Expected order of impact after local landing:
 Still open in-repo follow-ons before these five items can be called fully
 terminal:
 
-- scheduler overlap still keeps detokenize / `emit_delta()` work on the
-  scheduler thread; it is improved, but not at the final zero-overhead shape
+- stop-sensitive requests still run text stop matching on the scheduler
+  thread; stopless streaming has moved off-thread, but the final zero-overhead
+  overlap shape would need either cheaper stop gating or a second-stage
+  stop-sensitive worker without reintroducing divergent request flows
 
 External follow-up remains mandatory once the in-repo closure is finished:
 

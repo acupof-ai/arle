@@ -2,6 +2,196 @@ use log::warn;
 
 use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
 
+#[derive(Default)]
+pub(crate) struct StreamDecodeState {
+    pub(crate) full_decoded: String,
+    /// Number of generated tokens already decoded or dispatched for streaming.
+    pub(crate) decoded_token_count: usize,
+    /// Number of characters already sent to the client.
+    pub(crate) sent_len: usize,
+    /// Cached byte length of the decoded prefix (tokens[0..safe_point]).
+    pub(crate) prefix_byte_len: usize,
+}
+
+pub(crate) enum EmitOutcome {
+    Continue,
+    Finished,
+}
+
+impl StreamDecodeState {
+    pub(crate) fn has_pending_emit(&self, generated_tokens_len: usize) -> bool {
+        self.decoded_token_count < generated_tokens_len
+    }
+
+    pub(crate) fn mark_dispatched(&mut self, generated_tokens_len: usize) {
+        self.decoded_token_count = generated_tokens_len;
+    }
+
+    pub(crate) fn emit_delta(
+        &mut self,
+        generated_tokens: &[u32],
+        tokenizer: &Tokenizer,
+        delta_tx: &mpsc::UnboundedSender<CompletionStreamDelta>,
+        logprob: Option<f32>,
+        stops: Option<&[String]>,
+        prompt_tokens: usize,
+    ) -> EmitOutcome {
+        let n = generated_tokens.len();
+        if n == 0 {
+            return EmitOutcome::Continue;
+        }
+
+        let overlap = 4;
+        let safe_point = self.decoded_token_count.saturating_sub(overlap);
+        let Ok(new_text) = tokenizer.decode(&generated_tokens[safe_point..]) else {
+            return EmitOutcome::Continue;
+        };
+
+        if safe_point > 0 {
+            let prefix_len = self
+                .full_decoded
+                .floor_char_boundary(self.prefix_byte_len.min(self.full_decoded.len()));
+            self.full_decoded.truncate(prefix_len);
+            self.full_decoded.push_str(&new_text);
+        } else {
+            self.full_decoded = new_text;
+        }
+
+        let new_safe = n.saturating_sub(overlap);
+        if new_safe > 0 {
+            let suffix = tokenizer
+                .decode(&generated_tokens[new_safe..])
+                .unwrap_or_default();
+            let prefix_len = self.full_decoded.len().saturating_sub(suffix.len());
+            self.prefix_byte_len = self.full_decoded.floor_char_boundary(prefix_len);
+        } else {
+            self.prefix_byte_len = 0;
+        }
+
+        self.decoded_token_count = n;
+
+        if let Some(stops) = stops {
+            match check_stop_sequences(&self.full_decoded, stops) {
+                StopCheckResult::StopFound { stop_pos } => {
+                    if stop_pos > self.sent_len {
+                        let _ = delta_tx.send(CompletionStreamDelta {
+                            text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                            logprob,
+                        });
+                    }
+                    self.sent_len = stop_pos;
+                    self.send_finish(
+                        delta_tx,
+                        prompt_tokens,
+                        generated_tokens.len(),
+                        FinishReason::Stop,
+                    );
+                    EmitOutcome::Finished
+                }
+                StopCheckResult::NoStop { safe_len } => {
+                    if safe_len > self.sent_len {
+                        let _ = delta_tx.send(CompletionStreamDelta {
+                            text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                            logprob,
+                        });
+                        self.sent_len = safe_len;
+                    }
+                    EmitOutcome::Continue
+                }
+            }
+        } else {
+            if self.full_decoded.len() > self.sent_len {
+                let start = self.full_decoded.floor_char_boundary(self.sent_len);
+                if start < self.full_decoded.len() {
+                    let _ = delta_tx.send(CompletionStreamDelta {
+                        text_delta: self.full_decoded[start..].to_string(),
+                        finish_reason: None,
+                        usage: None,
+                        logprob,
+                    });
+                }
+                self.sent_len = self.full_decoded.len();
+            }
+            EmitOutcome::Continue
+        }
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        generated_tokens: &[u32],
+        tokenizer: &Tokenizer,
+        delta_tx: &mpsc::UnboundedSender<CompletionStreamDelta>,
+        prompt_tokens: usize,
+        reason: FinishReason,
+        stops: Option<&[String]>,
+    ) {
+        let mut emitted_visible_text = false;
+        if !generated_tokens.is_empty() {
+            match tokenizer.decode(generated_tokens) {
+                Ok(full_text) => {
+                    let end = if let Some(stops) = stops {
+                        match check_stop_sequences(&full_text, stops) {
+                            StopCheckResult::StopFound { stop_pos } => stop_pos,
+                            StopCheckResult::NoStop { .. } => full_text.len(),
+                        }
+                    } else {
+                        full_text.len()
+                    };
+                    let start = full_text.floor_char_boundary(self.sent_len);
+                    let end = full_text.floor_char_boundary(end);
+                    emitted_visible_text = end > 0;
+                    if end > start {
+                        let _ = delta_tx.send(CompletionStreamDelta {
+                            text_delta: full_text[start..end].to_string(),
+                            finish_reason: None,
+                            usage: None,
+                            logprob: None,
+                        });
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to decode {} generated tokens during finish: {err}",
+                        generated_tokens.len(),
+                    );
+                }
+            }
+        }
+
+        if !generated_tokens.is_empty() && !emitted_visible_text {
+            warn!(
+                "finishing with {} generated tokens but no visible text delta",
+                generated_tokens.len(),
+            );
+        }
+
+        self.send_finish(delta_tx, prompt_tokens, generated_tokens.len(), reason);
+    }
+
+    pub(crate) fn send_finish(
+        &self,
+        delta_tx: &mpsc::UnboundedSender<CompletionStreamDelta>,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        reason: FinishReason,
+    ) {
+        let _ = delta_tx.send(CompletionStreamDelta {
+            text_delta: String::new(),
+            finish_reason: Some(reason),
+            usage: Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
+            logprob: None,
+        });
+    }
+}
+
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
     /// Waiting for staged T1/T2 bytes to be fetched/promoted back into T0.
@@ -34,19 +224,12 @@ pub(crate) struct ActiveRequest {
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
-    /// Full decoded text, maintained incrementally.
-    pub(crate) full_decoded: String,
-    /// Number of tokens already decoded into full_decoded.
-    pub(crate) decoded_token_count: usize,
-    /// Number of characters already sent to the client.
-    pub(crate) sent_len: usize,
+    /// Streaming decode / emit bookkeeping.
+    pub(crate) stream: StreamDecodeState,
     pub(crate) phase: Phase,
     /// Prompt length that is known to be fully materialized in this slot's state.
     /// Zero means the slot must not publish a cached prefix on cleanup.
     pub(crate) cacheable_prompt_len: usize,
-    /// Cached byte length of the decoded prefix (tokens[0..safe_point]).
-    /// Avoids O(N) re-decode of prefix in emit_delta.
-    pub(crate) prefix_byte_len: usize,
     /// Latest token's log-probability (greedy only, set by scheduler decode step).
     pub(crate) latest_logprob: Option<f32>,
     /// Block-aligned prefix length that was proven reusable at admission time.
@@ -71,13 +254,41 @@ pub(crate) struct ActiveRequest {
 impl ActiveRequest {
     pub(crate) fn has_pending_emit(&self) -> bool {
         matches!(self.phase, Phase::Decoding)
-            && self.decoded_token_count < self.generated_tokens.len()
+            && self.stream.has_pending_emit(self.generated_tokens.len())
     }
 
     pub(crate) fn requires_prelaunch_emit_gate(&self) -> bool {
         self.stop
             .as_ref()
             .is_some_and(|stops| stops.iter().any(|stop| !stop.is_empty()))
+    }
+
+    pub(crate) fn uses_async_emit(&self) -> bool {
+        !self.requires_prelaunch_emit_gate()
+    }
+
+    pub(crate) fn pending_async_emit_tokens(&self) -> Vec<(u32, Option<f32>)> {
+        let start = self
+            .stream
+            .decoded_token_count
+            .min(self.generated_tokens.len());
+        self.generated_tokens[start..]
+            .iter()
+            .enumerate()
+            .map(|(idx, &token)| {
+                let absolute = start + idx + 1;
+                let logprob = if absolute == self.generated_tokens.len() {
+                    self.latest_logprob
+                } else {
+                    None
+                };
+                (token, logprob)
+            })
+            .collect()
+    }
+
+    pub(crate) fn mark_async_emit_dispatched(&mut self) {
+        self.stream.mark_dispatched(self.generated_tokens.len());
     }
 
     pub(crate) fn mark_prompt_cacheable(&mut self) {
@@ -100,91 +311,19 @@ impl ActiveRequest {
         held
     }
 
-    /// Decode newly generated tokens and emit text deltas to the client.
-    ///
-    /// Uses incremental decode: only re-decodes a small suffix (4 tokens)
-    /// to handle multi-byte character boundaries, instead of all tokens.
-    /// Cost per call: O(1) instead of O(N) where N = generated token count.
     pub(crate) fn emit_delta(&mut self, tokenizer: &Tokenizer) {
-        let n = self.generated_tokens.len();
-        if n == 0 {
-            return;
-        }
-
-        let overlap = 4;
-        let safe_point = self.decoded_token_count.saturating_sub(overlap);
-        let Ok(new_text) = tokenizer.decode(&self.generated_tokens[safe_point..]) else {
-            return;
-        };
-
-        if safe_point > 0 {
-            // Use cached prefix byte length instead of re-decoding all prefix tokens.
-            // The cache is valid because safe_point == previous decoded_token_count - overlap,
-            // which is exactly where the previous call cached the prefix length.
-            let prefix_len = self
-                .full_decoded
-                .floor_char_boundary(self.prefix_byte_len.min(self.full_decoded.len()));
-            self.full_decoded.truncate(prefix_len);
-            self.full_decoded.push_str(&new_text);
-        } else {
-            self.full_decoded = new_text;
-        }
-
-        // Cache prefix byte length for next call: the prefix is tokens[0..n-overlap],
-        // which in full_decoded starts at byte 0 and has the length we just computed.
-        let new_safe = n.saturating_sub(overlap);
-        if new_safe > 0 {
-            // prefix byte len = total decoded len - suffix len (suffix = tokens[new_safe..n])
-            let suffix = tokenizer
-                .decode(&self.generated_tokens[new_safe..])
-                .unwrap_or_default();
-            let prefix_len = self.full_decoded.len().saturating_sub(suffix.len());
-            self.prefix_byte_len = self.full_decoded.floor_char_boundary(prefix_len);
-        } else {
-            self.prefix_byte_len = 0;
-        }
-
-        self.decoded_token_count = n;
-
-        if let Some(ref stops) = self.stop {
-            match check_stop_sequences(&self.full_decoded, stops) {
-                StopCheckResult::StopFound { stop_pos } => {
-                    if stop_pos > self.sent_len {
-                        let _ = self.delta_tx.send(CompletionStreamDelta {
-                            text_delta: self.full_decoded[self.sent_len..stop_pos].to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: self.latest_logprob,
-                        });
-                    }
-                    self.sent_len = stop_pos;
-                    self.phase = Phase::Finished;
-                    self.send_finish(FinishReason::Stop);
-                }
-                StopCheckResult::NoStop { safe_len } => {
-                    if safe_len > self.sent_len {
-                        let _ = self.delta_tx.send(CompletionStreamDelta {
-                            text_delta: self.full_decoded[self.sent_len..safe_len].to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: self.latest_logprob,
-                        });
-                        self.sent_len = safe_len;
-                    }
-                }
-            }
-        } else if self.full_decoded.len() > self.sent_len {
-            // Snap to char boundary to avoid panic on multi-byte characters.
-            let start = self.full_decoded.floor_char_boundary(self.sent_len);
-            if start < self.full_decoded.len() {
-                let _ = self.delta_tx.send(CompletionStreamDelta {
-                    text_delta: self.full_decoded[start..].to_string(),
-                    finish_reason: None,
-                    usage: None,
-                    logprob: self.latest_logprob,
-                });
-            }
-            self.sent_len = self.full_decoded.len();
+        if matches!(
+            self.stream.emit_delta(
+                &self.generated_tokens,
+                tokenizer,
+                &self.delta_tx,
+                self.latest_logprob,
+                self.stop.as_deref(),
+                self.prompt_tokens.len(),
+            ),
+            EmitOutcome::Finished
+        ) {
+            self.phase = Phase::Finished;
         }
     }
 
@@ -194,63 +333,14 @@ impl ActiveRequest {
             return;
         }
         self.phase = Phase::Finished;
-
-        let mut emitted_visible_text = false;
-        if !self.generated_tokens.is_empty() {
-            match tokenizer.decode(&self.generated_tokens) {
-                Ok(full_text) => {
-                    let end = if let Some(ref stops) = self.stop {
-                        match check_stop_sequences(&full_text, stops) {
-                            StopCheckResult::StopFound { stop_pos } => stop_pos,
-                            StopCheckResult::NoStop { .. } => full_text.len(),
-                        }
-                    } else {
-                        full_text.len()
-                    };
-                    let start = full_text.floor_char_boundary(self.sent_len);
-                    let end = full_text.floor_char_boundary(end);
-                    emitted_visible_text = end > 0;
-                    if end > start {
-                        let _ = self.delta_tx.send(CompletionStreamDelta {
-                            text_delta: full_text[start..end].to_string(),
-                            finish_reason: None,
-                            usage: None,
-                            logprob: None,
-                        });
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "Request {}: failed to decode {} generated tokens during finish: {err}",
-                        self.id,
-                        self.generated_tokens.len(),
-                    );
-                }
-            }
-        }
-
-        if !self.generated_tokens.is_empty() && !emitted_visible_text {
-            warn!(
-                "Request {}: finishing with {} generated tokens but no visible text delta",
-                self.id,
-                self.generated_tokens.len(),
-            );
-        }
-
-        self.send_finish(reason);
-    }
-
-    fn send_finish(&self, reason: FinishReason) {
-        let _ = self.delta_tx.send(CompletionStreamDelta {
-            text_delta: String::new(),
-            finish_reason: Some(reason),
-            usage: Some(TokenUsage {
-                prompt_tokens: self.prompt_tokens.len(),
-                completion_tokens: self.generated_tokens.len(),
-                total_tokens: self.prompt_tokens.len() + self.generated_tokens.len(),
-            }),
-            logprob: None,
-        });
+        self.stream.finish(
+            &self.generated_tokens,
+            tokenizer,
+            &self.delta_tx,
+            self.prompt_tokens.len(),
+            reason,
+            self.stop.as_deref(),
+        );
     }
 }
 
@@ -284,7 +374,6 @@ pub(crate) fn check_stop_sequences(text: &str, stops: &[String]) -> StopCheckRes
         .max()
         .unwrap_or(0);
     let raw_safe = text.len().saturating_sub(max_stop_len);
-    // Snap to a char boundary so slicing never panics on multi-byte chars.
     let safe_len = text.floor_char_boundary(raw_safe);
     StopCheckResult::NoStop { safe_len }
 }
@@ -310,12 +399,9 @@ mod tests {
             stop: None,
             session_id: None,
             delta_tx,
-            full_decoded: String::new(),
-            decoded_token_count: 0,
-            sent_len: 0,
+            stream: StreamDecodeState::default(),
             phase: Phase::Finished,
             cacheable_prompt_len: 0,
-            prefix_byte_len: 0,
             latest_logprob: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
@@ -351,7 +437,7 @@ mod tests {
         req.generated_tokens.push(42);
         assert!(req.has_pending_emit());
 
-        req.decoded_token_count = 1;
+        req.stream.decoded_token_count = 1;
         assert!(!req.has_pending_emit());
     }
 
