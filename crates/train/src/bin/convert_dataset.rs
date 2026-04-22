@@ -17,6 +17,7 @@ fn main() -> ExitCode {
     dispatch_from_args(std::env::args().skip(1).collect::<Vec<_>>())
 }
 
+#[allow(dead_code)]
 pub(crate) fn dispatch_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,

@@ -466,6 +466,7 @@ fn run() -> Result<(), CliError> {
     run_with_args(args)
 }
 
+#[allow(dead_code)]
 pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
