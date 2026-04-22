@@ -46,7 +46,7 @@ pub(crate) fn decode_hub_snapshot_path(path: &Path) -> Option<String> {
 
 /// Return the user's HuggingFace hub cache dir, honouring `HF_HOME` /
 /// `HUGGINGFACE_HUB_CACHE` if present.
-fn hub_cache_root() -> Option<PathBuf> {
+pub(crate) fn hub_cache_root() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
         return Some(PathBuf::from(v));
     }

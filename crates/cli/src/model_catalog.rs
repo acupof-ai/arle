@@ -182,6 +182,7 @@ pub(crate) fn recommend_models(info: &SystemInfo) -> Vec<&'static CatalogEntry> 
 
 /// Return all catalog entries compatible with this backend (regardless of
 /// RAM), for display with "insufficient memory" notes.
+#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 pub(crate) fn all_for_backend(info: &SystemInfo) -> Vec<&'static CatalogEntry> {
     CATALOG
         .iter()
@@ -205,6 +206,8 @@ mod tests {
                 vram_gb: memory_gb,
             },
             CompiledBackend::Cpu => GpuInfo::None,
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            CompiledBackend::None => GpuInfo::None,
         };
         SystemInfo {
             cpu_name: "test".to_string(),

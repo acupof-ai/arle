@@ -31,6 +31,10 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) model_path: Option<String>,
 
+    /// Print a local environment/model-resolution diagnostic report and exit.
+    #[arg(long, default_value_t = false)]
+    pub(crate) doctor: bool,
+
     /// Maximum agent turns (generate-execute cycles) per query
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
     pub(crate) max_turns: usize,
@@ -106,5 +110,12 @@ mod tests {
             .err()
             .expect("NaN temperature should be rejected");
         assert!(err.to_string().contains("temperature must be finite"));
+    }
+
+    #[test]
+    fn accepts_doctor_flag() {
+        let args =
+            Args::try_parse_from(["agent-infer", "--doctor"]).expect("doctor flag should parse");
+        assert!(args.doctor);
     }
 }

@@ -1,15 +1,13 @@
 mod args;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod banner;
+mod doctor;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod download;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod hardware;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod hf_search;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod hub_discovery;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod model_catalog;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod model_picker;
@@ -27,9 +25,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use args::Args;
-#[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
@@ -45,6 +41,13 @@ pub fn run() -> ExitCode {
 }
 
 fn run_impl() -> Result<()> {
+    let args = Args::parse();
+
+    if args.doctor {
+        doctor::run(&args)?;
+        return Ok(());
+    }
+
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
@@ -59,7 +62,6 @@ fn run_impl() -> Result<()> {
         use std::io::IsTerminal;
 
         infer::logging::init_default();
-        let args = Args::parse();
 
         // Interactive startup: hardware detection + model picker + download.
         // Falls back to resolve_model_source() when non-interactive.
