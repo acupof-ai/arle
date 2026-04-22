@@ -278,3 +278,7 @@ External follow-up remains mandatory:
   `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-unified-budget-bottleneck.md`
 - prefill-completion batching + prefix-aware deferral local regression check:
   `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-prefill-overlap-prefix-aware-7f8d9c8.md`
+- async prefill overlap local rewrite plan:
+  `docs/plans/2026-04-22-cuda-async-prefill-overlap.md`
+- async prefill overlap local regression check:
+  `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-18c116d-async-prefill-overlap.md`

@@ -111,3 +111,15 @@ This is a delete-style refactor. The end state keeps exactly one prefill flow.
 - Baseline: `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-4eddda8-unified-budget.md`
 - Latest trace diagnosis: `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-unified-budget-bottleneck.md`
 - Prior overlap attempt: `docs/plans/2026-04-22-cuda-prefill-overlap-and-prefix-aware-queue.md`
+
+## Outcome
+
+- Landed on `18c116d`.
+- Local `c16` regression check moved from `106.72 tok/s` to `123.38 tok/s`
+  (mean of two runs, `+15.6%`).
+- Trace evidence on the same workload shows the scheduler now holds `active=10`
+  for `43s / 64s` loaded wall time vs `35s / 64s` on the prior baseline, with
+  no `waiting>0 && decode_rows=0 && prefill_rows=0` idle gaps.
+- Remaining gap vs `sglang` is now about `10%`, with the next bottleneck still
+  visible in prefix-cache demotion / host-tier fallback under backlog.
+- Bench entry: `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-18c116d-async-prefill-overlap.md`

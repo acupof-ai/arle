@@ -133,3 +133,5 @@
 - 最新 `c8/c16` 零 token 诊断见 `docs/experience/errors/2026-04-22-cuda-l4-zero-token-trace-root-cause.md`。
 - 最新 `ede0daa` trace smoke + `c8/c16` rerun见 `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c8-c16-trace-ede0daa.md`。
 - 最新 `39152ac + localfix` `c16` 端到端瓶颈 trace 见 `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-end-to-end-bottleneck-39152ac-localfix.md`。
+- latest async-prefill-overlap `c16` paired bench + service-trace diagnosis:
+  `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-18c116d-async-prefill-overlap.md`
