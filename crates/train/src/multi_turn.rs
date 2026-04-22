@@ -132,6 +132,7 @@ where
     let mut response_mask = vec![false; seq_len];
     let mut old_log_probs = vec![0.0f32; seq_len];
     let mut turn_boundaries = Vec::with_capacity(turns.len());
+    let position_ids = (0..seq_len).collect::<Vec<_>>();
 
     let was_enabled = tape.enabled;
     let rollout_result = (|| {
@@ -152,8 +153,13 @@ where
                 // Only the known prefix up to the current token matters for
                 // autoregressive sampling; avoid re-forwarding the padded
                 // future tail of the episode.
-                let logits_id =
-                    policy.forward_batch_tokens(&full_ids[..position], 1, position, store, tape)?;
+                let logits_id = policy.forward_batch_tokens_with_positions(
+                    &full_ids[..position],
+                    &position_ids[..position],
+                    1,
+                    store,
+                    tape,
+                )?;
                 let logits = store.to_host(logits_id)?;
                 let logits_base = (position - 1) * vocab_size;
                 let slice = &logits[logits_base..logits_base + vocab_size];
@@ -186,7 +192,13 @@ where
         }
         debug_assert_eq!(cursor, seq_len);
 
-        let ref_logits_id = ref_model.forward_batch_tokens(&full_ids, 1, seq_len, store, tape)?;
+        let ref_logits_id = ref_model.forward_batch_tokens_with_positions(
+            &full_ids,
+            &position_ids,
+            1,
+            store,
+            tape,
+        )?;
         let ref_logits = store.to_host(ref_logits_id)?;
         let mut ref_log_probs = vec![0.0f32; seq_len];
         for (position, masked) in response_mask.iter().enumerate() {

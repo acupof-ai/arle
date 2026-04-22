@@ -39,6 +39,7 @@ where
     let seq_len = prompts[0].len();
     validate_prompt_batch(prompts, seq_len, config.max_seq_len())?;
     let response_mask = response_mask(seq_len)?;
+    let position_ids = (0..seq_len).collect::<Vec<_>>();
     let was_enabled = tape.enabled;
     let trajectories = (|| {
         tape.set_enabled(false);
@@ -63,10 +64,10 @@ where
             }
 
             let batch_ids = batch_full_ids(&trajectories);
-            let logits_id = policy.forward_batch_tokens(
+            let logits_id = policy.forward_batch_tokens_with_positions(
                 &batch_ids,
+                &position_ids,
                 trajectories.len(),
-                seq_len,
                 store,
                 tape,
             )?;
@@ -99,8 +100,13 @@ where
         }
 
         let batch_ids = batch_full_ids(&trajectories);
-        let ref_logits_id =
-            ref_model.forward_batch_tokens(&batch_ids, trajectories.len(), seq_len, store, tape)?;
+        let ref_logits_id = ref_model.forward_batch_tokens_with_positions(
+            &batch_ids,
+            &position_ids,
+            trajectories.len(),
+            store,
+            tape,
+        )?;
         let ref_logits = store.to_host(ref_logits_id)?;
         for (row, trajectory) in trajectories.iter_mut().enumerate() {
             for (position, masked) in trajectory.response_mask.iter().enumerate() {
