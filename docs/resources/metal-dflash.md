@@ -175,6 +175,13 @@ Rule: unset `--speculative-tokens` unless bench data says otherwise. The
 draft checkpoint ships a trained default; smaller values can reduce
 acceptance and throughput.
 
+Qwen3.6 / Qwen3.5-35B-A3B exception:
+the published `z-lab/Qwen3.6-35B-A3B-DFlash` draft currently auto-tunes its
+effective default block size down to `2` on the Metal lane. The draft config
+ships `16`, but local step-driver measurements showed that `16` over-verifies
+badly for this pair while `2` recovers most of the regression. Passing
+`--speculative-tokens` still overrides this auto-tuned default explicitly.
+
 ## Known performance ceilings (2026-04-20)
 
 - **Qwen3.5-4B-4bit single-stream**: step time ≈ `4.4 + 6.3·B` ms on M4 Max
