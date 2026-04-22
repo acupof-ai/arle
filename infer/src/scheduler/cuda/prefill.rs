@@ -1,5 +1,6 @@
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
 use crate::model::PrefillBatchRequest;
+use crate::sampler::SamplingParams;
 
 use super::execution::PrefillCandidate;
 
@@ -30,6 +31,28 @@ fn should_downgrade_partial_hit_to_miss(
     supports_partial_prefix: bool,
 ) -> bool {
     raw_prefix_len > 0 && raw_prefix_len < prompt_len && !supports_partial_prefix
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillCompletionAction {
+    Stop,
+    FinishLength,
+    MoveToDecode,
+}
+
+fn prefill_completion_action(
+    ignore_eos: bool,
+    saw_stop_token: bool,
+    generated_tokens_after_push: usize,
+    max_tokens: usize,
+) -> PrefillCompletionAction {
+    if !ignore_eos && saw_stop_token {
+        PrefillCompletionAction::Stop
+    } else if generated_tokens_after_push >= max_tokens {
+        PrefillCompletionAction::FinishLength
+    } else {
+        PrefillCompletionAction::MoveToDecode
+    }
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -302,7 +325,12 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    fn complete_prefill_request(&mut self, slot_idx: usize, total: usize, uses_paged: bool) {
+    fn prepare_prefill_completion(
+        &mut self,
+        slot_idx: usize,
+        total: usize,
+        uses_paged: bool,
+    ) -> SamplingParams {
         let req_id = self.request(slot_idx).map(|req| req.id).unwrap_or_default();
 
         if !uses_paged && self.paged_kv_pool.is_active() {
@@ -335,46 +363,55 @@ impl<M: ModelForward> Scheduler<M> {
             req.mark_prompt_cacheable();
         }
 
-        let sampling = self
-            .request(slot_idx)
+        self.request(slot_idx)
             .map(|req| req.sampling.clone())
-            .expect("prefill completion requires live request");
-        match self
-            .model
-            .select_token(&mut self.states[slot_idx], &sampling, &mut self.rng)
-        {
-            Ok(token) => {
-                let ignore_eos = self
-                    .request(slot_idx)
-                    .is_some_and(|req| req.sampling.ignore_eos);
-                if !ignore_eos && self.model.is_stop_token(token) {
-                    self.finish_request(slot_idx, FinishReason::Stop);
-                    return;
-                }
+            .expect("prefill completion requires live request")
+    }
+
+    fn apply_prefill_completion_token(&mut self, slot_idx: usize, token: u32) {
+        let Some((ignore_eos, generated_tokens_after_push, max_tokens)) =
+            self.request(slot_idx).map(|req| {
+                (
+                    req.sampling.ignore_eos,
+                    req.generated_tokens.len().saturating_add(1),
+                    req.max_tokens,
+                )
+            })
+        else {
+            return;
+        };
+
+        match prefill_completion_action(
+            ignore_eos,
+            self.model.is_stop_token(token),
+            generated_tokens_after_push,
+            max_tokens,
+        ) {
+            PrefillCompletionAction::Stop => {
+                self.finish_request(slot_idx, FinishReason::Stop);
+            }
+            PrefillCompletionAction::FinishLength => {
                 let Self { active, .. } = self;
                 if let Some(req) = active[slot_idx].as_mut() {
                     req.generated_tokens.push(token);
                 }
                 self.dispatch_emit(slot_idx);
-                let reached_max = self
-                    .request(slot_idx)
-                    .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
-                if reached_max {
-                    if !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
-                        self.finish_request(slot_idx, FinishReason::Length);
-                    }
-                } else {
-                    if let Some(req) = self.request_mut(slot_idx)
-                        && req.first_token_at.is_none()
-                    {
-                        req.first_token_at = Some(std::time::Instant::now());
-                    }
-                    self.move_to_decode(slot_idx);
+                if !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
+                    self.finish_request(slot_idx, FinishReason::Length);
                 }
             }
-            Err(e) => {
-                error!("Request {}: select_token failed: {}", req_id, e);
-                self.finish_slot(slot_idx);
+            PrefillCompletionAction::MoveToDecode => {
+                let Self { active, .. } = self;
+                if let Some(req) = active[slot_idx].as_mut() {
+                    req.generated_tokens.push(token);
+                }
+                self.dispatch_emit(slot_idx);
+                if let Some(req) = self.request_mut(slot_idx)
+                    && req.first_token_at.is_none()
+                {
+                    req.first_token_at = Some(std::time::Instant::now());
+                }
+                self.move_to_decode(slot_idx);
             }
         }
     }
@@ -479,6 +516,8 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
+        let mut completed_slots = Vec::new();
+        let mut completed_sampling = Vec::new();
         for (((slot_idx, _tokens), total), progress) in
             chunk_tokens.iter().zip(totals).zip(new_progress)
         {
@@ -501,7 +540,36 @@ impl<M: ModelForward> Scheduler<M> {
                 );
                 continue;
             }
-            self.complete_prefill_request(*slot_idx, total, uses_paged);
+            completed_slots.push(*slot_idx);
+            completed_sampling.push(self.prepare_prefill_completion(*slot_idx, total, uses_paged));
+        }
+
+        if completed_slots.is_empty() {
+            return;
+        }
+
+        let completed_sampling_refs: Vec<&SamplingParams> = completed_sampling.iter().collect();
+        match self.model.select_tokens_batch(
+            &mut self.states,
+            &completed_slots,
+            &completed_sampling_refs,
+            &mut self.rng,
+        ) {
+            Ok(tokens) => {
+                for (slot_idx, token) in completed_slots.into_iter().zip(tokens) {
+                    self.apply_prefill_completion_token(slot_idx, token);
+                }
+            }
+            Err(e) => {
+                for slot_idx in completed_slots {
+                    let req_id = self.request(slot_idx).map(|req| req.id).unwrap_or_default();
+                    error!(
+                        "Request {}: batched prefill completion failed: {}",
+                        req_id, e
+                    );
+                    self.finish_slot(slot_idx);
+                }
+            }
         }
     }
 }
@@ -509,7 +577,8 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_exact_full_prefix_hit, is_full_prompt_reuse_hit, is_prompt_prefix_of_cached_hit,
+        PrefillCompletionAction, is_exact_full_prefix_hit, is_full_prompt_reuse_hit,
+        is_prompt_prefix_of_cached_hit, prefill_completion_action,
         should_downgrade_partial_hit_to_miss,
     };
 
@@ -574,5 +643,33 @@ mod tests {
         // block-aligned equal to raw; the new `raw < prompt_len` check fires.
         assert!(should_downgrade_partial_hit_to_miss(16, 32, false));
         assert!(should_downgrade_partial_hit_to_miss(32, 48, false));
+    }
+
+    #[test]
+    fn prefill_completion_stop_beats_length_when_eos_is_active() {
+        assert_eq!(
+            prefill_completion_action(false, true, 1, 1),
+            PrefillCompletionAction::Stop,
+        );
+    }
+
+    #[test]
+    fn prefill_completion_can_ignore_stop_tokens() {
+        assert_eq!(
+            prefill_completion_action(true, true, 1, 4),
+            PrefillCompletionAction::MoveToDecode,
+        );
+    }
+
+    #[test]
+    fn prefill_completion_finishes_on_length_without_stop_token() {
+        assert_eq!(
+            prefill_completion_action(false, false, 2, 2),
+            PrefillCompletionAction::FinishLength,
+        );
+        assert_eq!(
+            prefill_completion_action(false, false, 1, 4),
+            PrefillCompletionAction::MoveToDecode,
+        );
     }
 }
