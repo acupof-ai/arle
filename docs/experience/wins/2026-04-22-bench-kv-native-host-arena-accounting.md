@@ -16,26 +16,30 @@
 
 ## Command
 
-Baseline before the optimization:
+Historical baseline reference captured before the optimization:
 
 ```bash
 cargo test -p kv-native-sys --release \
-  tests::bench_host_arena_reserved_bytes_fragmented \
+  tests::host_arena_bench_reserved_bytes_fragmented \
   -- --ignored --exact --nocapture
 ```
 
-Validation after the optimization:
+Focused validation reproduced after the optimization:
 
 ```bash
-cargo test -p kv-native-sys host_arena --release
+cargo test -p kv-native-sys --release host_arena -- --nocapture
 ```
+
+```bash
+cargo test -p kv-native-sys --release \
+  tests::host_arena_bench_reserved_bytes_fragmented \
+  -- --ignored --exact --nocapture
+```
+
+Package-level validation reproduced on the same workstation:
 
 ```bash
 cargo test -p kv-native-sys --release
-```
-
-```bash
-cargo test -p kv-native-sys host_arena_bench --release -- --ignored --nocapture
 ```
 
 ## Environment
@@ -50,7 +54,15 @@ cargo test -p kv-native-sys host_arena_bench --release -- --ignored --nocapture
 
 ## Results
 
-Microbench workload:
+Baseline reference workload before the optimization:
+
+- arena capacity: `8192 * 64 = 524288` bytes
+- live holes after fragmentation: `4096`
+- timed queries: `200000`
+- warmup queries: `20000`
+- expected reserved bytes: `262144`
+
+Post-change workload reproduced in this entry:
 
 - arena capacity: `8192 * 64 = 524288` bytes
 - live holes after fragmentation: `4096`
@@ -60,19 +72,23 @@ Microbench workload:
 
 Raw timings:
 
-| run | code state | total ns | ns/query |
-| --- | --- | ---: | ---: |
-| 1 | pre-change baseline | `218733709` | `1093.67` |
-| 2 | post-change | `16062083` | `3.21` |
-| 3 | post-change rerun | `5916709` | `1.18` |
-| 4 | post-change rerun | `4972083` | `0.99` |
+| run | code state | workload | ns/query |
+| --- | --- | --- | ---: |
+| 1 | historical pre-change reference | `200000` timed queries | `1093.67` |
+| 2 | post-change | `5000000` timed queries | `3.21` |
+| 3 | post-change rerun | `5000000` timed queries | `1.18` |
+| 4 | post-change rerun | `5000000` timed queries | `0.99` |
+| 5 | post-change rerun | `5000000` timed queries | `1.09` |
 
 Correctness / regression checks:
 
-- `cargo test -p kv-native-sys host_arena --release`: `3 passed, 0 failed, 1 ignored`
-- `cargo test -p kv-native-sys --release`: `9 passed, 0 failed, 1 ignored`
-- reverse-release regression now verifies `reserved_bytes()` rewinds
+- `cargo test -p kv-native-sys --release host_arena -- --nocapture`: `4 passed, 0 failed, 1 ignored`
+- `cargo test -p kv-native-sys --release`: `10 passed, 0 failed, 1 ignored`
+- reverse-release regression verifies `reserved_bytes()` rewinds
   `192 -> 128 -> 64 -> 0` before a full-capacity reserve from offset `0`
+- tail-collapse regression now verifies a free-list hole chain (`64..128`,
+  `128..192`) is folded into the tail when the adjacent tail block is
+  released, allowing a single `192`-byte reserve from offset `64`
 
 ## Problems
 
@@ -82,8 +98,8 @@ Correctness / regression checks:
   is not tied to a prior committed wins entry.
 - The pre-change baseline came from the earlier shorter-loop version of the
   same microbench (`200000` timed queries). The comparison is still meaningful
-  because the reported unit is `ns/query`, but the raw total-ns rows are not a
-  same-loop apples-to-apples wall-time comparison.
+  as a directional order-of-magnitude reference because the reported unit is
+  `ns/query`, but it is not a same-workload A/B.
 - After the optimization, one query is so cheap that `ns/query` now sits close
   to timer / scheduler noise. The stable conclusion is the order-of-magnitude
   drop into the low-single-digit-nanosecond range, not the exact last decimal.
@@ -98,15 +114,6 @@ Correctness / regression checks:
   common LIFO lifetimes.
 - For this substrate, the clean cut is not a smarter global allocator; it is
   constant-time accounting plus opportunistic tail collapse.
-
-## Δ vs baseline
-
-- Prior wins entry: first local host-arena microbench for this path
-
-| metric | baseline | now | Δ% |
-| --- | ---: | ---: | ---: |
-| `host_arena_reserved_bytes` ns/query | `1093.67` | `1.18` median of post runs | `-99.89%` |
-| total timed query wall time | `218733709 ns` | `5916709 ns` median-like post run | `-97.29%` |
 
 ## Notes
 
