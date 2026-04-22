@@ -14,7 +14,7 @@ use super::{
     forward::rust_transformer_layer,
     generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, concatenate_axis, eval, reshape, rms_norm, slice, take_axis, zeros},
+    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
