@@ -615,7 +615,8 @@ impl<M: ModelForward> Scheduler<M> {
             model_id,
             max_waiting_requests,
             Arc::clone(&waiting_count),
-        );
+        )
+        .with_tokenizer(scheduler.tokenizer.clone());
         debug_assert_eq!(handle.waiting_count(), 0);
 
         Ok((scheduler, handle))

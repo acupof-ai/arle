@@ -9,6 +9,7 @@ use crate::kv_tier::ClusterSharedBackendConfig;
 use crate::sampler::SamplingParams;
 use crate::scheduler::policy::{AdmissionPolicy, QueueBoundAdmission, SchedulerSignals};
 use crate::server_engine::CompletionStreamDelta;
+use crate::tokenizer::Tokenizer;
 use crate::types::SessionId;
 
 /// Preemption strategy when GPU memory is exhausted.
@@ -325,6 +326,7 @@ pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<IncomingRequest>,
     wakeup_tx: crossbeam_channel::Sender<()>,
     model_id: Arc<str>,
+    tokenizer: Option<Tokenizer>,
     /// Shared count of items currently in the waiting channel.
     waiting_count: Arc<AtomicUsize>,
     /// Maximum allowed waiting requests (0 = unlimited).
@@ -350,6 +352,7 @@ impl SchedulerHandle {
             tx,
             wakeup_tx,
             model_id: Arc::from(model_id),
+            tokenizer: None,
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting: 0,
         }
@@ -366,6 +369,7 @@ impl SchedulerHandle {
             tx,
             wakeup_tx,
             model_id: Arc::from(model_id),
+            tokenizer: None,
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting,
         }
@@ -383,6 +387,7 @@ impl SchedulerHandle {
             tx,
             wakeup_tx,
             model_id: Arc::from(model_id),
+            tokenizer: None,
             waiting_count,
             max_waiting,
         }
@@ -399,9 +404,16 @@ impl SchedulerHandle {
             tx,
             wakeup_tx,
             model_id: Arc::from(model_id),
+            tokenizer: None,
             waiting_count,
             max_waiting,
         }
+    }
+
+    #[must_use]
+    pub fn with_tokenizer(mut self, tokenizer: Tokenizer) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
     }
 
     /// Submit a request to the scheduler.
@@ -445,6 +457,10 @@ impl SchedulerHandle {
     /// Returns the model identifier string for this scheduler.
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    pub fn tokenizer_clone(&self) -> Option<Tokenizer> {
+        self.tokenizer.clone()
     }
 
     /// Whether the queue is currently full.

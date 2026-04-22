@@ -39,6 +39,7 @@ use crate::scheduler::{IncomingRequest, RequestPriority};
 use crate::server_engine::CompletionStreamDelta;
 use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
 use crate::session_persistence::SessionPersistence;
+use crate::tokenizer::Tokenizer;
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest as OpenAiCompletionRequest, CompletionResponse, DflashStatusPayload,
@@ -48,6 +49,7 @@ use openai_v1::{
 
 struct AppState {
     handle: Arc<dyn RequestHandle>,
+    tokenizer: Option<Tokenizer>,
     identity: ServingIdentity,
     metrics: ServerMetrics,
     config: HttpServerConfig,
@@ -221,11 +223,12 @@ impl RequestExecutionOptions {
     fn into_incoming_request(
         self,
         prompt: String,
+        prompt_tokens: Option<Vec<u32>>,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
     ) -> IncomingRequest {
         IncomingRequest {
             prompt,
-            prompt_tokens: None,
+            prompt_tokens,
             max_tokens: self.max_tokens,
             sampling: self.sampling,
             stop: self.stop,
@@ -322,14 +325,21 @@ async fn collect_buffered_response(
 }
 
 fn submit_request(
-    handle: &dyn RequestHandle,
+    state: &AppState,
     options: RequestExecutionOptions,
     prompt: String,
 ) -> Result<UnboundedReceiver<CompletionStreamDelta>, ApiError> {
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
-    let incoming = options.into_incoming_request(prompt, delta_tx);
+    let prompt_tokens = match state.tokenizer.as_ref() {
+        Some(tokenizer) => Some(tokenizer.encode(&prompt).map_err(|err| {
+            error!("Prompt tokenization failed before scheduler submission: {err}");
+            ApiError::service_unavailable("Failed to tokenize request prompt")
+        })?),
+        None => None,
+    };
+    let incoming = options.into_incoming_request(prompt, prompt_tokens, delta_tx);
 
-    if let Err(e) = handle.submit(incoming) {
+    if let Err(e) = state.handle.submit(incoming) {
         warn!("Scheduler at capacity: {e}");
         return Err(ApiError::service_unavailable(
             "Server is at capacity, please retry later",
@@ -630,7 +640,7 @@ async fn completions(
         stream,
     );
 
-    let delta_rx = submit_request(state.handle.as_ref(), options, req.prompt)?;
+    let delta_rx = submit_request(state.as_ref(), options, req.prompt)?;
 
     if stream {
         let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
@@ -691,7 +701,7 @@ async fn chat_completions(
         do_stream,
     );
 
-    let delta_rx = submit_request(state.handle.as_ref(), options, prompt)?;
+    let delta_rx = submit_request(state.as_ref(), options, prompt)?;
 
     if do_stream {
         let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -773,7 +783,7 @@ async fn responses_handler(
         max_tokens,
     );
 
-    let delta_rx = submit_request(state.handle.as_ref(), options, prompt)?;
+    let delta_rx = submit_request(state.as_ref(), options, prompt)?;
     if stream {
         let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
         let created_at = now_secs();
@@ -1008,12 +1018,14 @@ where
     H: RequestHandle + 'static,
 {
     let session_api_key = config.api_key.clone();
+    let tokenizer = handle.tokenizer_clone();
     let identity = ServingIdentity {
         model_id: handle.model_id().to_string(),
         dflash_status: handle.dflash_status(),
     };
     let state = Arc::new(AppState {
         handle: Arc::new(handle),
+        tokenizer,
         identity,
         metrics,
         config,

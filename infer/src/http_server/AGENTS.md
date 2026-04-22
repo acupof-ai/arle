@@ -48,8 +48,10 @@ implementation detail.
 6. **Split the HTTP state deliberately.** `RequestHandle` remains the
    submission path; `AppState.metrics` is the stats path; `AppState.identity`
    is the boot-time serving identity snapshot (`model_id` + DFlash init
-   metadata). The HTTP handlers must read served identity from `AppState`,
-   not by calling back into the handle on every request.
+   metadata); `AppState.tokenizer` is an optional pretokenization snapshot for
+   runtimes that can provide one. HTTP handlers must read served identity and
+   optional tokenizer from `AppState`, not by calling back into the handle on
+   every request.
 7. **The handle is still `dyn RequestHandle`, not a concrete type.** The
    HTTP layer must never know whether it's talking to the CUDA scheduler
    (`SchedulerHandle`) or `BackendRuntimeHandle` (Metal/CPU). Adding a
