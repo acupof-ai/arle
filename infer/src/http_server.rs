@@ -421,7 +421,8 @@ fn json_data_rejection_to_api_error(err: &axum::extract::rejection::JsonDataErro
         return ApiError::bad_request(
             format!("Invalid `{field}`: is not supported on this server yet"),
             "invalid_parameter",
-        );
+        )
+        .with_param(field);
     }
     ApiError::bad_request(
         format!("Invalid JSON request body: {detail}"),
@@ -1640,6 +1641,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert_eq!(payload["error"]["param"], "prompt");
         assert!(
             payload["error"]["message"]
                 .as_str()
@@ -1877,6 +1879,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert_eq!(payload["error"]["param"], "response_format");
         assert!(
             payload["error"]["message"]
                 .as_str()
@@ -2423,6 +2426,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert_eq!(payload["error"]["param"], "stream");
         assert!(
             payload["error"]["message"].as_str().is_some_and(|message| {
                 message.contains("stream=true") && message.contains("tool calls")
