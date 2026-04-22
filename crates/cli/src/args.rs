@@ -32,8 +32,12 @@ pub(crate) struct Args {
     pub(crate) model_path: Option<String>,
 
     /// Print a local environment/model-resolution diagnostic report and exit.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "list_models")]
     pub(crate) doctor: bool,
+
+    /// Print discovered and recommended models, then exit.
+    #[arg(long, default_value_t = false, conflicts_with = "doctor")]
+    pub(crate) list_models: bool,
 
     /// Maximum agent turns (generate-execute cycles) per query
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
@@ -117,5 +121,20 @@ mod tests {
         let args =
             Args::try_parse_from(["agent-infer", "--doctor"]).expect("doctor flag should parse");
         assert!(args.doctor);
+    }
+
+    #[test]
+    fn accepts_list_models_flag() {
+        let args = Args::try_parse_from(["agent-infer", "--list-models"])
+            .expect("list-models flag should parse");
+        assert!(args.list_models);
+    }
+
+    #[test]
+    fn rejects_doctor_and_list_models_together() {
+        let err = Args::try_parse_from(["agent-infer", "--doctor", "--list-models"])
+            .err()
+            .expect("doctor and list-models should conflict");
+        assert!(err.to_string().contains("--list-models"));
     }
 }
