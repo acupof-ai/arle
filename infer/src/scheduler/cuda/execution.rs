@@ -19,6 +19,17 @@ pub(super) struct PrefillCandidate {
     pub reservation: PrefillReservation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PrefillCandidateScore {
+    queue_rank: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScoredPrefillCandidate {
+    candidate: PrefillCandidate,
+    score: PrefillCandidateScore,
+}
+
 #[derive(Clone, Debug, Default)]
 struct StepPlan {
     launch_decode: bool,
@@ -42,8 +53,7 @@ impl StepPlan {
 
 #[derive(Debug)]
 struct PrefillBudget {
-    remaining_step_tokens: usize,
-    remaining_prefill_tokens: usize,
+    remaining_tokens: usize,
     remaining_requests: usize,
     long_prefill_token_threshold: usize,
     decode_active: bool,
@@ -109,16 +119,13 @@ impl PrefillBudget {
                 })
             })
             .count();
-        let remaining_step_tokens = scheduler
+        let remaining_tokens = scheduler
             .config
             .max_num_batched_tokens
-            .saturating_sub(running_decode_tokens);
+            .saturating_sub(running_decode_tokens)
+            .min(scheduler.config.max_prefill_tokens);
         let mut budget = Self {
-            remaining_step_tokens,
-            remaining_prefill_tokens: scheduler
-                .config
-                .max_prefill_tokens
-                .min(remaining_step_tokens),
+            remaining_tokens,
             remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
             long_prefill_token_threshold: scheduler.config.long_prefill_token_threshold,
             decode_active: running_decode_tokens > 0,
@@ -143,8 +150,7 @@ impl PrefillBudget {
 
     fn can_schedule(&self, reservation: PrefillReservation) -> bool {
         if reservation.prefill_tokens == 0
-            || reservation.prefill_tokens > self.remaining_step_tokens
-            || reservation.prefill_tokens > self.remaining_prefill_tokens
+            || reservation.prefill_tokens > self.remaining_tokens
             || self.remaining_requests == 0
         {
             return false;
@@ -155,11 +161,8 @@ impl PrefillBudget {
     #[cfg_attr(not(test), allow(dead_code))]
     fn reserve(&mut self, reservation: PrefillReservation) {
         debug_assert!(self.can_schedule(reservation));
-        self.remaining_step_tokens = self
-            .remaining_step_tokens
-            .saturating_sub(reservation.prefill_tokens);
-        self.remaining_prefill_tokens = self
-            .remaining_prefill_tokens
+        self.remaining_tokens = self
+            .remaining_tokens
             .saturating_sub(reservation.prefill_tokens);
         self.remaining_requests = self.remaining_requests.saturating_sub(1);
         let new_pages = self
@@ -176,12 +179,27 @@ impl PrefillBudget {
     }
 }
 
+fn score_prefill_candidates(
+    queued_candidates: Vec<PrefillCandidate>,
+) -> Vec<ScoredPrefillCandidate> {
+    let mut scored = Vec::with_capacity(queued_candidates.len());
+    for (queue_rank, candidate) in queued_candidates.into_iter().enumerate() {
+        scored.push(ScoredPrefillCandidate {
+            candidate,
+            score: PrefillCandidateScore { queue_rank },
+        });
+    }
+    scored
+}
+
 fn select_prefill_candidates(
     budget: &mut PrefillBudget,
-    queued_candidates: Vec<PrefillCandidate>,
+    mut scored_candidates: Vec<ScoredPrefillCandidate>,
 ) -> Vec<PrefillCandidate> {
-    let mut selected = Vec::with_capacity(queued_candidates.len());
-    for candidate in queued_candidates {
+    scored_candidates.sort_by_key(|scored| scored.score);
+    let mut selected = Vec::with_capacity(scored_candidates.len());
+    for scored in scored_candidates {
+        let candidate = scored.candidate;
         if !budget.can_schedule(candidate.reservation) {
             continue;
         }
@@ -238,7 +256,10 @@ impl<M: ModelForward> Scheduler<M> {
         })
     }
 
-    fn collect_prefill_candidates(&mut self, budget: &mut PrefillBudget) -> Vec<PrefillCandidate> {
+    fn collect_prefill_candidates(
+        &mut self,
+        budget: &PrefillBudget,
+    ) -> Vec<ScoredPrefillCandidate> {
         let mut queued_candidates = Vec::new();
         let queued_slots: Vec<usize> = self.prefill_queue.iter().copied().collect();
         for slot_idx in queued_slots {
@@ -262,7 +283,7 @@ impl<M: ModelForward> Scheduler<M> {
                 reservation,
             });
         }
-        select_prefill_candidates(budget, queued_candidates)
+        score_prefill_candidates(queued_candidates)
     }
 
     fn plan_step(&mut self) -> StepPlan {
@@ -272,7 +293,8 @@ impl<M: ModelForward> Scheduler<M> {
             })
         });
         let mut budget = PrefillBudget::from_scheduler(self);
-        let candidates = self.collect_prefill_candidates(&mut budget);
+        let scored_candidates = self.collect_prefill_candidates(&budget);
+        let candidates = select_prefill_candidates(&mut budget, scored_candidates);
         StepPlan {
             launch_decode: has_decode,
             prefill: candidates,
@@ -373,7 +395,8 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrefillBudget, PrefillCandidate, PrefillPageBudget, PrefillReservation, SlotPageReserve,
+        PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillPageBudget,
+        PrefillReservation, ScoredPrefillCandidate, SlotPageReserve, score_prefill_candidates,
         select_prefill_candidates,
     };
 
@@ -388,7 +411,8 @@ mod tests {
                 reservation,
             })
             .collect();
-        select_prefill_candidates(&mut budget, candidates)
+        let scored_candidates = score_prefill_candidates(candidates);
+        select_prefill_candidates(&mut budget, scored_candidates)
             .into_iter()
             .map(|candidate| candidate.slot_idx)
             .collect()
@@ -397,8 +421,7 @@ mod tests {
     #[test]
     fn budget_skips_first_token_budget_miss() {
         let budget = PrefillBudget {
-            remaining_step_tokens: 6,
-            remaining_prefill_tokens: 6,
+            remaining_tokens: 6,
             remaining_requests: usize::MAX,
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
@@ -452,8 +475,7 @@ mod tests {
     #[test]
     fn budget_skips_first_page_budget_miss() {
         let budget = PrefillBudget {
-            remaining_step_tokens: 8,
-            remaining_prefill_tokens: 8,
+            remaining_tokens: 8,
             remaining_requests: usize::MAX,
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
@@ -492,8 +514,7 @@ mod tests {
     #[test]
     fn budget_reserves_decode_headroom_for_prefill_completion() {
         let budget = PrefillBudget {
-            remaining_step_tokens: 4,
-            remaining_prefill_tokens: 4,
+            remaining_tokens: 4,
             remaining_requests: 1,
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
@@ -527,8 +548,7 @@ mod tests {
     #[test]
     fn budget_honors_whole_step_token_cap_before_prefill_cap() {
         let budget = PrefillBudget {
-            remaining_step_tokens: 3,
-            remaining_prefill_tokens: 8,
+            remaining_tokens: 3,
             remaining_requests: usize::MAX,
             long_prefill_token_threshold: usize::MAX,
             decode_active: true,
@@ -562,5 +582,97 @@ mod tests {
         ];
 
         assert_eq!(collect_schedulable_indices(budget, &reservations), vec![1]);
+    }
+
+    #[test]
+    fn score_prefill_candidates_preserves_queue_order_as_canonical_rank() {
+        let reservations = vec![
+            PrefillCandidate {
+                slot_idx: 9,
+                reservation: PrefillReservation {
+                    prefill_tokens: 1,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 9,
+                        prefill_pool_tokens: 1,
+                        decode_headroom_tokens: 0,
+                    },
+                },
+            },
+            PrefillCandidate {
+                slot_idx: 3,
+                reservation: PrefillReservation {
+                    prefill_tokens: 2,
+                    page_reserve: SlotPageReserve {
+                        slot_idx: 3,
+                        prefill_pool_tokens: 2,
+                        decode_headroom_tokens: 0,
+                    },
+                },
+            },
+        ];
+
+        let scored = score_prefill_candidates(reservations);
+        assert_eq!(
+            scored
+                .iter()
+                .map(|candidate| candidate.score)
+                .collect::<Vec<_>>(),
+            vec![
+                PrefillCandidateScore { queue_rank: 0 },
+                PrefillCandidateScore { queue_rank: 1 }
+            ]
+        );
+    }
+
+    #[test]
+    fn select_prefill_candidates_orders_by_score_before_fit() {
+        let mut budget = PrefillBudget {
+            remaining_tokens: 3,
+            remaining_requests: usize::MAX,
+            long_prefill_token_threshold: usize::MAX,
+            decode_active: false,
+            page_budget: PrefillPageBudget::new(usize::MAX, vec![0, 0], 16),
+        };
+        let selected = select_prefill_candidates(
+            &mut budget,
+            vec![
+                ScoredPrefillCandidate {
+                    candidate: PrefillCandidate {
+                        slot_idx: 1,
+                        reservation: PrefillReservation {
+                            prefill_tokens: 2,
+                            page_reserve: SlotPageReserve {
+                                slot_idx: 1,
+                                prefill_pool_tokens: 2,
+                                decode_headroom_tokens: 0,
+                            },
+                        },
+                    },
+                    score: PrefillCandidateScore { queue_rank: 1 },
+                },
+                ScoredPrefillCandidate {
+                    candidate: PrefillCandidate {
+                        slot_idx: 0,
+                        reservation: PrefillReservation {
+                            prefill_tokens: 2,
+                            page_reserve: SlotPageReserve {
+                                slot_idx: 0,
+                                prefill_pool_tokens: 2,
+                                decode_headroom_tokens: 0,
+                            },
+                        },
+                    },
+                    score: PrefillCandidateScore { queue_rank: 0 },
+                },
+            ],
+        );
+
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|candidate| candidate.slot_idx)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 }
