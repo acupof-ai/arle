@@ -4,10 +4,10 @@
 and the landed DX-1 `latest` marker flow. Kept as a record of the original
 bridge decomposition.
 
-**Directive (2026-04-19):** User approved the 5-step critical path in
-`docs/experience/wins/2026-04-19-m5.3a-m5.3b-add-device-resident-tensor.md`
-follow-up chat: wire up a real pretrained weight → autograd training → serve
-loop so "能训出有用模型" is reachable, not blocked on M5.3 kernel phases.
+**Directive (2026-04-19):** User approved the 5-step critical path in the
+follow-up chat around the train-side device-resident Metal work: wire up a
+real pretrained weight → autograd training → serve loop so "能训出有用模型"
+is reachable, not blocked on M5.3 kernel phases.
 
 This plan is **orthogonal to M5.3b CUDA kernels** (`m5.3b-cuda-autograd-kernels.md`).
 M5.3b makes training faster on GPU; this plan makes training **useful at all**
