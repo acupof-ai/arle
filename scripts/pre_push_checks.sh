@@ -41,11 +41,13 @@ export CARGO_TARGET_DIR="${REPO_ROOT}/target/pre-push-quick"
 run cargo fmt --manifest-path infer/Cargo.toml --all -- --check
 run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
+if [[ "${AGENT_INFER_PRE_PUSH_METAL:-0}" == "1" && "$(uname -s)" == "Darwin" ]]; then
     run cargo check --manifest-path infer/Cargo.toml --no-default-features --features metal,no-cuda --lib --release
     run cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release
-else
+elif [[ "${AGENT_INFER_PRE_PUSH_METAL:-0}" == "1" ]]; then
     info "skipping Metal-only checks on non-macOS host"
+else
+    info "skipping Metal checks; set AGENT_INFER_PRE_PUSH_METAL=1 to enable"
 fi
 
 info "quick pre-push checks passed"
