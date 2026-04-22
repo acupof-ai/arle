@@ -34,6 +34,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 /// Streaming responses have natural per-chunk flow control and are not capped here.
 const RESPONSE_TIMEOUT: Duration = Duration::from_mins(5);
 pub(super) const HTTP_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const HTTP_REQUEST_ID_HEADER: &str = "x-request-id";
 
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
@@ -434,6 +435,26 @@ async fn route_not_found_handler(request: AxumRequest) -> ApiError {
 
 async fn method_not_allowed_handler(request: AxumRequest) -> ApiError {
     method_not_allowed_error(request.method(), request.uri().path())
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get(HTTP_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), ToOwned::to_owned)
+}
+
+async fn attach_request_id(mut request: AxumRequest, next: middleware::Next) -> Response {
+    let request_id = request_id_from_headers(request.headers());
+    request.extensions_mut().insert(request_id.clone());
+
+    let mut response = next.run(request).await;
+    if let Ok(value) = header::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(HTTP_REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 fn submit_request(
@@ -1262,6 +1283,7 @@ where
         .method_not_allowed_fallback(method_not_allowed_handler)
         .fallback(route_not_found_handler)
         .layer(DefaultBodyLimit::max(HTTP_REQUEST_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(attach_request_id))
         .with_state(state)
 }
 
@@ -1327,6 +1349,36 @@ mod tests {
         });
 
         SchedulerHandle::from_parts(tx, &model_id)
+    }
+
+    struct MockSessionEngine;
+
+    impl SessionPersistence for MockSessionEngine {
+        fn save_session_snapshot(
+            &self,
+            session_id: &str,
+            _fingerprints: Option<&[crate::types::BlockFingerprint]>,
+        ) -> Result<sessions::SessionSnapshot, sessions::SessionSnapshotError> {
+            Ok(sessions::SessionSnapshot {
+                version: 1,
+                session_id: session_id.to_string(),
+                kv_format_tag: 1,
+                radix_bytes: Vec::new(),
+                persisted_blocks: Vec::new(),
+            })
+        }
+
+        fn load_session_snapshot(
+            &mut self,
+            _snapshot: &sessions::SessionSnapshot,
+        ) -> Result<sessions::LoadResponseBody, sessions::SessionSnapshotError> {
+            Ok(sessions::LoadResponseBody {
+                remapped: 0,
+                tombstoned: 0,
+                orphans_cleared: 0,
+                kv_payloads: 0,
+            })
+        }
     }
 
     fn spawn_train_control_stub_once(
@@ -1405,6 +1457,47 @@ mod tests {
 
         assert_eq!(payload["model"], "Qwen3-4B");
         assert_eq!(payload["choices"][0]["text"], "ok:hello");
+    }
+
+    #[tokio::test]
+    async fn completion_response_includes_generated_request_id_header() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(HTTP_REQUEST_ID_HEADER)
+            .expect("generated x-request-id header")
+            .to_str()
+            .expect("request id header ascii");
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn response_preserves_client_supplied_request_id_header() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header(HTTP_REQUEST_ID_HEADER, "req-client-42")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[HTTP_REQUEST_ID_HEADER], "req-client-42");
     }
 
     #[tokio::test]
@@ -1580,6 +1673,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/unknown")
+            .header(HTTP_REQUEST_ID_HEADER, "req-404")
             .body(Body::empty())
             .unwrap();
 
@@ -1589,6 +1683,7 @@ mod tests {
             response.headers()["content-type"],
             "application/json; charset=utf-8"
         );
+        assert_eq!(response.headers()[HTTP_REQUEST_ID_HEADER], "req-404");
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1606,6 +1701,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/completions")
+            .header(HTTP_REQUEST_ID_HEADER, "req-405")
             .body(Body::empty())
             .unwrap();
 
@@ -1616,6 +1712,7 @@ mod tests {
             "application/json; charset=utf-8"
         );
         assert_eq!(response.headers()["allow"], "POST");
+        assert_eq!(response.headers()[HTTP_REQUEST_ID_HEADER], "req-405");
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1639,6 +1736,25 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()["allow"], "GET, HEAD");
+    }
+
+    #[tokio::test]
+    async fn session_routes_preserve_request_id_header() {
+        let app = build_app_with_session_engine(
+            mock_scheduler("Qwen3-4B"),
+            Arc::new(tokio::sync::RwLock::new(MockSessionEngine)),
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/sessions/demo/save")
+            .header(HTTP_REQUEST_ID_HEADER, "req-session-1")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[HTTP_REQUEST_ID_HEADER], "req-session-1");
+        assert_eq!(response.headers()["allow"], "POST");
     }
 
     #[tokio::test]
