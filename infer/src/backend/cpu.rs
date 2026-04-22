@@ -59,22 +59,23 @@ impl CpuBackend {
         )
     }
 
-    fn generate_text(&self, prompt: &str, params: &SamplingParams) -> (String, String) {
+    fn generate_text(&self, prompt: &str, params: &SamplingParams) -> (String, String, usize) {
         let budget = params.max_new_tokens.unwrap_or(DEFAULT_COMPLETION_BUDGET);
         if budget == 0 {
-            return (String::new(), "length".to_string());
+            return (String::new(), "length".to_string(), 0);
         }
 
         let base = self.build_response(prompt);
         if let Some(tokenizer) = &self.tokenizer {
             if let Ok(ids) = tokenizer.encode(&base) {
                 if ids.len() <= budget {
-                    return (base, "stop".to_string());
+                    return (base, "stop".to_string(), ids.len());
                 }
+                let clipped_ids = &ids[..budget];
                 let clipped = tokenizer
-                    .decode(&ids[..budget])
-                    .unwrap_or_else(|_| fallback_word_clip(&base, budget));
-                return (clipped, "length".to_string());
+                    .decode(clipped_ids)
+                    .unwrap_or_else(|_| fallback_generate_text(&base, budget).0);
+                return (clipped, "length".to_string(), clipped_ids.len());
             }
         }
 
@@ -82,21 +83,17 @@ impl CpuBackend {
     }
 }
 
-fn fallback_generate_text(base: &str, budget: usize) -> (String, String) {
+fn fallback_generate_text(base: &str, budget: usize) -> (String, String, usize) {
     if budget == 0 {
-        return (String::new(), "length".to_string());
+        return (String::new(), "length".to_string(), 0);
     }
 
     let words: Vec<&str> = base.split_whitespace().collect();
     if words.len() <= budget {
-        return (base.to_string(), "stop".to_string());
+        return (base.to_string(), "stop".to_string(), words.len());
     }
 
-    (words[..budget].join(" "), "length".to_string())
-}
-
-fn fallback_word_clip(base: &str, budget: usize) -> String {
-    fallback_generate_text(base, budget).0
+    (words[..budget].join(" "), "length".to_string(), budget)
 }
 
 impl Default for CpuBackend {
@@ -119,8 +116,7 @@ impl InferenceBackend for CpuBackend {
         self.ensure_loaded()?;
 
         let prompt_tokens = self.count_tokens(prompt);
-        let (text, finish_reason) = self.generate_text(prompt, params);
-        let completion_tokens = self.count_tokens(&text);
+        let (text, finish_reason, completion_tokens) = self.generate_text(prompt, params);
 
         Ok(GenerateResult {
             text,
@@ -369,6 +365,7 @@ mod tests {
 
         assert_eq!(generated.finish_reason, "length");
         assert_eq!(generated.text.split_whitespace().count(), 3);
+        assert_eq!(generated.completion_tokens, 3);
     }
 
     #[test]
@@ -389,6 +386,58 @@ mod tests {
 
         assert_eq!(generated.finish_reason, "length");
         assert_eq!(generated.completion_tokens, 3);
+    }
+
+    fn temp_model_dir_with_unknown_heavy_tokenizer() -> tempfile::TempDir {
+        let dir = temp_model_dir();
+        let vocab = [
+            ("[UNK]".to_string(), 0u32),
+            ("hello".to_string(), 1u32),
+            ("world".to_string(), 2u32),
+            ("agent".to_string(), 3u32),
+            ("<|im_start|>user\n".to_string(), 4u32),
+            ("<|im_start|>assistant\n".to_string(), 5u32),
+            ("<|im_start|>system\n".to_string(), 6u32),
+            ("<|im_end|>".to_string(), 7u32),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("save tokenizer");
+        dir
+    }
+
+    #[test]
+    fn cpu_backend_preserves_budget_even_when_decoded_text_reencodes_longer() {
+        let dir = temp_model_dir_with_unknown_heavy_tokenizer();
+        let mut backend = CpuBackend::new();
+        backend.load(dir.path()).expect("load");
+
+        let generated = backend
+            .generate(
+                "hello from a local smoke test",
+                &SamplingParams {
+                    max_new_tokens: Some(8),
+                    ..Default::default()
+                },
+            )
+            .expect("generate");
+
+        assert_eq!(generated.finish_reason, "length");
+        assert_eq!(generated.completion_tokens, 8);
+        assert_eq!(
+            generated.text,
+            "[UNK] [UNK] [UNK] [UNK] [UNK] [UNK] [UNK] [UNK]"
+        );
+        assert!(backend.count_tokens(&generated.text) > generated.completion_tokens);
     }
 
     #[test]
