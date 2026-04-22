@@ -1294,6 +1294,7 @@ impl<M: ModelForward> Scheduler<M> {
                 coordinator_stats.store.submitted,
                 coordinator_stats.store.completed,
                 coordinator_stats.store.failed,
+                coordinator_stats.store.rejected,
             );
             let (fetch_wait_s, store_wait_s) = self.current_tier_wait_seconds();
             self.metrics

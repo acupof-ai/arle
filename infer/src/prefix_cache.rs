@@ -63,7 +63,8 @@ pub use crate::types::BlockId;
 
 /// Coalesced metadata update for one cached block.
 ///
-/// `session_id` / `soft_pin_until` use `Option<Option<T>>` so callers can
+/// `session_id` / `soft_pin_until` / `host_spill_pin_until` use
+/// `Option<Option<T>>` so callers can
 /// distinguish "leave untouched" from "explicitly clear".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockMetadataUpdate {
@@ -71,6 +72,7 @@ pub struct BlockMetadataUpdate {
     pub byte_len: Option<u32>,
     pub session_id: Option<Option<SessionId>>,
     pub soft_pin_until: Option<Option<u64>>,
+    pub host_spill_pin_until: Option<Option<u64>>,
     pub entry_state: Option<IndexEntryState>,
 }
 
@@ -82,10 +84,18 @@ pub struct BlockMetadata {
     pub session_id: Option<SessionId>,
     pub fingerprint: Option<BlockFingerprint>,
     pub soft_pin_until: Option<u64>,
+    pub host_spill_pin_until: Option<u64>,
     pub entry_state: IndexEntryState,
     pub store_state: StoreState,
     pub hit_count: u32,
     pub ref_count: u32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BlockSelectionIntent {
+    Evict,
+    Spill,
+    Drain,
 }
 
 /// Summary of a fingerprint reconciliation pass after deserializing a snapshot.
@@ -131,6 +141,11 @@ struct Node {
     /// Runtime-only: the deadline is relative to the process-local clock.
     #[serde(default, skip)]
     soft_pin_until: Option<u64>,
+    /// One-shot anti-thrash pin for freshly demoted host blocks.
+    ///
+    /// Unlike `soft_pin_until`, lookup hits never refresh this deadline.
+    #[serde(default, skip)]
+    host_spill_pin_until: Option<u64>,
     /// Control-plane readiness state. Prevents readers from treating partially
     /// staged or evicting entries as canonical ready bytes.
     #[serde(default)]
@@ -155,6 +170,7 @@ impl Node {
             fingerprint: None,
             byte_len: 0,
             soft_pin_until: None,
+            host_spill_pin_until: None,
             entry_state: IndexEntryState::Ready,
             store_state: StoreState::Idle,
             children: HashMap::new(),
@@ -167,7 +183,8 @@ impl Node {
                 || self.session_id.is_some()
                 || self.fingerprint.is_some()
                 || self.byte_len != 0
-                || self.soft_pin_until.is_some())
+                || self.soft_pin_until.is_some()
+                || self.host_spill_pin_until.is_some())
     }
 }
 
@@ -943,6 +960,7 @@ impl RadixCache {
         signals: SchedulerSignals,
         n: usize,
         tier_filter: Option<Tier>,
+        intent: BlockSelectionIntent,
     ) -> Vec<BlockId> {
         if n == 0 {
             return vec![];
@@ -957,10 +975,17 @@ impl RadixCache {
             if node.ref_count != 0 {
                 continue;
             }
-            if node.soft_pin_until.is_some_and(|deadline| deadline > now) {
+            if self.selection_pin_active(node, tier_filter, intent, now) {
                 continue;
             }
             if node.entry_state != IndexEntryState::Ready {
+                continue;
+            }
+            if matches!(
+                intent,
+                BlockSelectionIntent::Spill | BlockSelectionIntent::Drain
+            ) && !matches!(node.store_state, StoreState::Idle | StoreState::Failed)
+            {
                 continue;
             }
             if let Some(tier) = tier_filter
@@ -988,11 +1013,32 @@ impl RadixCache {
         }
 
         candidates.sort_by(|(a_score, a_bid), (b_score, b_bid)| {
-            b_score
-                .total_cmp(a_score)
+            a_score
+                .total_cmp(b_score)
                 .then_with(|| a_bid.0.cmp(&b_bid.0))
         });
         candidates.into_iter().take(n).map(|(_, bid)| bid).collect()
+    }
+
+    fn selection_pin_active(
+        &self,
+        node: &Node,
+        tier_filter: Option<Tier>,
+        intent: BlockSelectionIntent,
+        now: u64,
+    ) -> bool {
+        match intent {
+            BlockSelectionIntent::Evict => {
+                node.soft_pin_until.is_some_and(|deadline| deadline > now)
+            }
+            BlockSelectionIntent::Spill => match tier_filter {
+                Some(Tier::HostPinned) => node
+                    .host_spill_pin_until
+                    .is_some_and(|deadline| deadline > now),
+                _ => node.soft_pin_until.is_some_and(|deadline| deadline > now),
+            },
+            BlockSelectionIntent::Drain => false,
+        }
     }
 
     /// Reclaim orphaned tombstones after eviction.
@@ -1095,6 +1141,9 @@ impl RadixCache {
         self.find_block_node_mut(block)
             .map(|node| {
                 node.tier_location = Some(location);
+                if !matches!(node.tier_location, Some(BlockLocation::HostPinned { .. })) {
+                    node.host_spill_pin_until = None;
+                }
             })
             .is_some()
     }
@@ -1109,6 +1158,7 @@ impl RadixCache {
             session_id: node.session_id.clone(),
             fingerprint: node.fingerprint,
             soft_pin_until: node.soft_pin_until,
+            host_spill_pin_until: node.host_spill_pin_until,
             entry_state: node.entry_state,
             store_state: node.store_state,
             hit_count: node.hit_count,
@@ -1147,6 +1197,18 @@ impl RadixCache {
             .is_some()
     }
 
+    pub fn set_block_host_spill_pin_until(
+        &mut self,
+        block: BlockId,
+        host_spill_pin_until: Option<u64>,
+    ) -> bool {
+        self.find_block_node_mut(block)
+            .map(|node| {
+                node.host_spill_pin_until = host_spill_pin_until;
+            })
+            .is_some()
+    }
+
     /// Update multiple metadata fields for one cached block with a single node
     /// lookup in the radix backing store.
     pub fn update_block_metadata(&mut self, block: BlockId, update: BlockMetadataUpdate) -> bool {
@@ -1154,6 +1216,9 @@ impl RadixCache {
             .map(|node| {
                 if let Some(location) = update.location {
                     node.tier_location = Some(location);
+                    if !matches!(node.tier_location, Some(BlockLocation::HostPinned { .. })) {
+                        node.host_spill_pin_until = None;
+                    }
                 }
                 if let Some(byte_len) = update.byte_len {
                     node.byte_len = byte_len;
@@ -1163,6 +1228,9 @@ impl RadixCache {
                 }
                 if let Some(soft_pin_until) = update.soft_pin_until {
                     node.soft_pin_until = soft_pin_until;
+                }
+                if let Some(host_spill_pin_until) = update.host_spill_pin_until {
+                    node.host_spill_pin_until = host_spill_pin_until;
                 }
                 if let Some(entry_state) = update.entry_state {
                     node.entry_state = entry_state;
@@ -1273,6 +1341,7 @@ mod tests {
 
     use super::*;
     use crate::kv_tier::LookupHeuristics;
+    use crate::scheduler::policy::LruEviction;
 
     fn bids(ids: &[u32]) -> Vec<BlockId> {
         ids.iter().map(|&id| BlockId(id)).collect()
@@ -2526,6 +2595,7 @@ mod tests {
                 byte_len: Some(4096),
                 session_id: Some(Some(SessionId::from("session-1"))),
                 soft_pin_until: Some(Some(42)),
+                host_spill_pin_until: Some(Some(84)),
                 entry_state: Some(IndexEntryState::Pending),
             }
         ));
@@ -2545,6 +2615,7 @@ mod tests {
             Some(SessionId::from("session-1"))
         );
         assert_eq!(cache.nodes[idx].soft_pin_until, Some(42));
+        assert_eq!(cache.nodes[idx].host_spill_pin_until, Some(84));
         assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Pending);
         assert_eq!(cache.nodes[idx].store_state, StoreState::Idle);
 
@@ -2555,6 +2626,7 @@ mod tests {
                 byte_len: None,
                 session_id: Some(None),
                 soft_pin_until: Some(None),
+                host_spill_pin_until: Some(None),
                 entry_state: Some(IndexEntryState::Ready),
             }
         ));
@@ -2565,8 +2637,125 @@ mod tests {
         assert_eq!(cache.nodes[idx].byte_len, 4096);
         assert_eq!(cache.nodes[idx].session_id, None);
         assert_eq!(cache.nodes[idx].soft_pin_until, None);
+        assert_eq!(cache.nodes[idx].host_spill_pin_until, None);
         assert_eq!(cache.nodes[idx].entry_state, IndexEntryState::Ready);
         assert_eq!(cache.nodes[idx].store_state, StoreState::Idle);
+    }
+
+    #[test]
+    fn spill_selection_ignores_lookup_soft_pin_for_host_blocks() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+        assert!(cache.set_block_soft_pin_until(BlockId(10), Some(32)));
+        cache.clock = 16;
+
+        let selected = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            1,
+            Some(Tier::HostPinned),
+            BlockSelectionIntent::Spill,
+        );
+
+        assert_eq!(selected, vec![BlockId(10)]);
+    }
+
+    #[test]
+    fn spill_selection_respects_host_spill_pin() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+        assert!(cache.set_block_host_spill_pin_until(BlockId(10), Some(32)));
+        cache.clock = 16;
+
+        let pinned = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            1,
+            Some(Tier::HostPinned),
+            BlockSelectionIntent::Spill,
+        );
+        assert!(pinned.is_empty());
+
+        cache.clock = 32;
+        let released = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            1,
+            Some(Tier::HostPinned),
+            BlockSelectionIntent::Spill,
+        );
+        assert_eq!(released, vec![BlockId(10)]);
+    }
+
+    #[test]
+    fn drain_selection_ignores_host_spill_pin() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+        assert!(cache.set_block_host_spill_pin_until(BlockId(10), Some(32)));
+        cache.clock = 16;
+
+        let selected = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            1,
+            Some(Tier::HostPinned),
+            BlockSelectionIntent::Drain,
+        );
+
+        assert_eq!(selected, vec![BlockId(10)]);
+    }
+
+    #[test]
+    fn spill_selection_skips_non_idle_store_states() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::HostPinned { offset: 4096 }));
+        assert!(cache.set_block_location(BlockId(20), BlockLocation::HostPinned { offset: 8192 }));
+        assert!(cache.set_block_store_state(BlockId(10), StoreState::Storing));
+
+        let selected = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            2,
+            Some(Tier::HostPinned),
+            BlockSelectionIntent::Spill,
+        );
+
+        assert_eq!(selected, vec![BlockId(20)]);
+    }
+
+    #[test]
+    fn selection_sorts_lowest_score_first() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &bids(&[10, 20]));
+        assert!(cache.set_block_location(BlockId(10), BlockLocation::Gpu { slot: 0 }));
+        assert!(cache.set_block_location(BlockId(20), BlockLocation::Gpu { slot: 1 }));
+
+        let idx10 = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(10)))
+            .unwrap();
+        let idx20 = cache
+            .nodes
+            .iter()
+            .position(|node| node.block_id == Some(BlockId(20)))
+            .unwrap();
+        cache.nodes[idx10].last_access = 5;
+        cache.nodes[idx20].last_access = 10;
+
+        let selected = cache.select_blocks_with_policy(
+            &LruEviction,
+            SchedulerSignals::default(),
+            1,
+            Some(Tier::Gpu),
+            BlockSelectionIntent::Evict,
+        );
+
+        assert_eq!(selected, vec![BlockId(10)]);
     }
 
     #[test]

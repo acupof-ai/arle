@@ -17,7 +17,9 @@ use crate::kv_tier::{
     BlockLocation, ClusterSharedBackend, CoordinatorQueueStats, ReadmissionBlock, ReadmissionKey,
     ReadmissionPlan, ReadmissionSource, TieredKvPolicy,
 };
-use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
+use crate::prefix_cache::{
+    BlockId, BlockMetadata, BlockMetadataUpdate, BlockSelectionIntent, RadixCache,
+};
 use crate::scheduler::cuda::request::StreamDecodeState;
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
 use crate::server_engine::{CompletionStreamDelta, FinishReason};
@@ -534,6 +536,7 @@ impl<M: ModelForward> Scheduler<M> {
                     session_id: Some(session_id.cloned()),
                     soft_pin_until: Some(keepalive_deadline),
                     entry_state: None,
+                    ..BlockMetadataUpdate::default()
                 },
             );
         }
@@ -640,7 +643,7 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let store_submit_headroom = coordinator_submit_headroom(
             self.coordinator_queue_stats().capacity,
-            self.coordinator_queue_stats().store.active(),
+            self.coordinator_queue_stats().active(),
         );
         let host_demote_headroom = self.host_pool_demote_headroom_bytes() / block_bytes;
         store_submit_headroom.min(host_demote_headroom)
@@ -708,7 +711,7 @@ impl<M: ModelForward> Scheduler<M> {
         {
             return false;
         }
-        let _ = self.spill_host_blocks_if_pressured();
+        let _ = self.spill_host_blocks_if_pressured(BlockSelectionIntent::Drain);
         self.has_pending_store_work()
     }
 
@@ -1479,7 +1482,7 @@ impl<M: ModelForward> Scheduler<M> {
                 location: Some(BlockLocation::HostPinned {
                     offset: region.offset,
                 }),
-                soft_pin_until: metadata.session_id.as_ref().map(|_| {
+                host_spill_pin_until: metadata.session_id.as_ref().map(|_| {
                     Some(
                         self.prefix_cache
                             .logical_clock()
@@ -1530,17 +1533,15 @@ impl<M: ModelForward> Scheduler<M> {
         reclaimed_pages
     }
 
-    fn spill_host_blocks_if_pressured(&mut self) -> usize {
+    fn spill_host_blocks_if_pressured(&mut self, intent: BlockSelectionIntent) -> usize {
         let usage = self.host_pool_usage_fraction();
         if usage <= self.config.t1_host_pinned_high_water {
             return 0;
         }
 
         let coordinator_stats = self.coordinator_queue_stats();
-        let mut store_submit_headroom = coordinator_submit_headroom(
-            coordinator_stats.capacity,
-            coordinator_stats.store.active(),
-        );
+        let mut store_submit_headroom =
+            coordinator_submit_headroom(coordinator_stats.capacity, coordinator_stats.active());
         if store_submit_headroom == 0 {
             return 0;
         }
@@ -1571,6 +1572,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.eviction_signals(),
             self.prefix_cache.cached_block_count(),
             Some(crate::kv_tier::Tier::HostPinned),
+            intent,
         );
         for block_id in candidates {
             if self.store_waiting.values().any(|pending| {
@@ -1692,6 +1694,7 @@ impl<M: ModelForward> Scheduler<M> {
             self.eviction_signals(),
             blocks_to_evict,
             Some(crate::kv_tier::Tier::Gpu),
+            BlockSelectionIntent::Evict,
         );
         let mut reclaimed_pages = 0usize;
         let demote_budget = self.demote_block_budget(&candidates);
@@ -1737,7 +1740,7 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
-        let _ = self.spill_host_blocks_if_pressured();
+        let _ = self.spill_host_blocks_if_pressured(BlockSelectionIntent::Spill);
         if reclaimed_pages > 0 {
             info!(
                 "prefix cache demotion: released {} pool pages back to free list \
@@ -1776,6 +1779,7 @@ impl<M: ModelForward> Scheduler<M> {
                 self.eviction_signals(),
                 blocks_to_move,
                 Some(crate::kv_tier::Tier::Gpu),
+                BlockSelectionIntent::Evict,
             );
             if candidates.is_empty() {
                 break;
@@ -1796,7 +1800,7 @@ impl<M: ModelForward> Scheduler<M> {
                     }
                 }
             }
-            let _ = self.spill_host_blocks_if_pressured();
+            let _ = self.spill_host_blocks_if_pressured(BlockSelectionIntent::Spill);
             if reclaimed_pages == before {
                 break;
             }
