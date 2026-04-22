@@ -44,8 +44,24 @@ That pointed at one bottleneck cluster:
 ## Current truth after landing
 
 - `Qwen3` still uses paged prefill on the canonical path.
-- `Qwen3.5` now ships through paged prefill on the canonical path:
+- `Qwen3.5` now also ships through paged prefill on the canonical path:
   `prefill_uses_paged_pool() == true`.
+- Scheduler/admission/page sizing is mostly unified across `Qwen3` and
+  `Qwen3.5`:
+  - both go through the same CUDA scheduler and paged-KV admission flow
+  - shipped paged/block size is `16` on the main KV formats used here
+  - MixedBatch scheduling no longer forks by model family
+- Model-side prefill execution is **not fully unified** yet:
+  - `Qwen3` has a real packed batched paged-prefill path
+  - `Qwen3.5` now overrides `forward_prefill_batch_with_pool()` and no longer
+    falls back to the trait default, but the current override still allocates
+    pages for the batch and then iterates requests one by one through
+    `prefill_forward_paged(...)`
+  - so `Qwen3.5` is shipped on paged prefill, but it is **not yet** the same
+    packed varlen batched prefill shape as `Qwen3`
+- `Qwen3.5` also remains a real capability outlier because it is hybrid:
+  `supports_partial_prefix() == false` is a model constraint, not just an
+  implementation gap.
 - The old mixed prefill+decode legacy surface is gone:
   - no shipped `step_decode_launch_mixed`
   - no shipped dual-write helper path
@@ -84,6 +100,9 @@ That pointed at one bottleneck cluster:
   prefill path
 - graph replay is invalidated only when a pointer-stable prerequisite such as
   the page-index buffer storage changes
+- this track does **not** by itself claim parity with `Qwen3`'s packed batched
+  paged-prefill implementation; the current `Qwen3.5` batch override is still
+  model-local sequential replay over a batched allocation
 
 **Primary files**
 
@@ -183,6 +202,7 @@ Integration pass resolves the shared seam between:
 ### Correctness
 
 - `Qwen3.5` shipped path reports `prefill_uses_paged_pool() == true`
+- `Qwen3.5` no longer falls back to the trait-default paged-prefill batch path
 - no shipped path uses `step_decode_launch_mixed`
 - no shipped path uses the legacy dual-write helper for mixed prefill+decode
 - scheduler keeps one canonical launch/prepare/readback flow
@@ -215,8 +235,14 @@ Expected order of impact after local landing:
 
 ## Remaining work
 
-The in-repo runtime closure for these five items is now down to integration /
-bench confirmation rather than another architectural gap.
+The high-priority in-repo closure for the five commissioned items is landed,
+but one model-shape boundary remains important to state accurately:
+
+- `Qwen3.5` is now on paged prefill and has its own batch override
+- `Qwen3.5` still does **not** use the same packed varlen batched paged-prefill
+  implementation shape as `Qwen3`
+- the remaining gap is therefore no longer "contiguous fallback vs paged
+  prefill", but "model-side packed batched prefill unification"
 
 External follow-up remains mandatory:
 

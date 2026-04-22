@@ -37,6 +37,29 @@ pub struct PrefillBatchRequest<'a> {
     pub tokens: &'a [u32],
 }
 
+pub(crate) fn prepare_paged_prefill_batch(
+    requests: &[PrefillBatchRequest<'_>],
+    pool: &mut PagedKVPool,
+) -> Result<bool> {
+    if requests.is_empty() {
+        return Ok(false);
+    }
+
+    let mut seen_slots = Vec::with_capacity(requests.len());
+    for request in requests {
+        if request.tokens.is_empty() || seen_slots.contains(&request.slot_idx) {
+            return Ok(false);
+        }
+        seen_slots.push(request.slot_idx);
+    }
+
+    for request in requests {
+        pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
+    }
+
+    Ok(true)
+}
+
 // ============================================================================
 // DecodeContextOps trait — scheduler-level operations on decode buffers
 // ============================================================================
