@@ -70,6 +70,7 @@ struct CliArgs {
     batch: usize,
     seq: usize,
     lr: f32,
+    grad_accum_steps: Option<usize>,
     log_every: usize,
     save_every: usize,
     eval_every: usize,
@@ -110,6 +111,7 @@ impl Default for CliArgs {
             batch: 1,
             seq: 128,
             lr: 3.0e-4,
+            grad_accum_steps: None,
             log_every: 5,
             save_every: 50,
             eval_every: 0,
@@ -593,6 +595,11 @@ fn run_with_family<F: PretrainFamily>(
         DEFAULT_WEIGHT_DECAY,
         backend,
     );
+    // `--batch` controls the true micro-batch size. `--grad-accum-steps`
+    // layers extra accumulation on top so scratch-pretrain can scale its
+    // effective tokens/optimizer-step without having to inflate one forward.
+    let batch_size = args.batch.max(1);
+    let grad_accum = args.grad_accum_steps.unwrap_or(1).max(1) as u64;
     let clip = match args.grad_clip {
         Some(max_norm) if max_norm > 0.0 && max_norm.is_finite() => {
             PretrainClip::Norm(GlobalNorm::new(max_norm))
@@ -627,8 +634,8 @@ fn run_with_family<F: PretrainFamily>(
     }
     let run_start_scalars = [
         ("total_steps", total_steps as f64),
-        ("batch_size", args.batch.max(1) as f64),
-        ("grad_accum_steps", 1.0),
+        ("batch_size", batch_size as f64),
+        ("grad_accum_steps", grad_accum as f64),
         ("seq", args.seq as f64),
     ];
     let run_start_bools = [("resumed", resume_dir_canonical.is_some())];
@@ -651,7 +658,7 @@ fn run_with_family<F: PretrainFamily>(
 
     let trainer_cfg = TrainerConfig {
         total_steps,
-        grad_accum_steps: 1,
+        grad_accum_steps: grad_accum,
         log_every: args.log_every.max(1) as u64,
         eval_every: if eval_tokens.is_empty() || args.eval_every == 0 {
             None
@@ -695,7 +702,6 @@ fn run_with_family<F: PretrainFamily>(
     let window = args.seq + 1;
     let upper = train_tokens.len().saturating_sub(window) + 1;
     let eval_upper = eval_tokens.len().saturating_sub(window) + 1;
-    let batch_size = args.batch.max(1);
     let position_ids = (0..args.seq).collect::<Vec<_>>();
     let token_count_per_micro = (batch_size * args.seq) as u64;
     let model_ref = &model;
@@ -962,6 +968,9 @@ where
             "--batch" => args.batch = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--seq" => args.seq = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--lr" => args.lr = parse_value(&flag, next_value(&mut iter, &flag)?)?,
+            "--grad-accum-steps" => {
+                args.grad_accum_steps = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
+            }
             "--log-every" => args.log_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--save-every" => args.save_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
             "--eval-every" => args.eval_every = parse_value(&flag, next_value(&mut iter, &flag)?)?,
@@ -1065,6 +1074,14 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
                 value: "0".into(),
             }));
         }
+    }
+    if let Some(value) = args.grad_accum_steps
+        && value == 0
+    {
+        return Err(CliError::Arg(ArgError::InvalidValue {
+            flag: "--grad-accum-steps".into(),
+            value: "0".into(),
+        }));
     }
     if !(0.0..1.0).contains(&args.eval_frac) {
         return Err(CliError::Arg(ArgError::InvalidValue {
@@ -1208,6 +1225,7 @@ mod tests {
             batch: 1,
             seq: 3,
             lr: 1.0e-3,
+            grad_accum_steps: None,
             log_every: 1,
             save_every: 1,
             eval_every: 0,
@@ -1346,6 +1364,41 @@ mod tests {
         )
         .expect("parse legacy resume alias");
         assert_eq!(alias.resume_from, Some(PathBuf::from("ckpt/step_000008")));
+    }
+
+    #[test]
+    fn parse_args_accepts_grad_accum_steps() {
+        let args = parse_args_from(
+            vec![
+                "--corpus",
+                "corpus.txt",
+                "--tokenizer",
+                "tok.json",
+                "--out",
+                "ckpt",
+                "--grad-accum-steps",
+                "4",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("parse grad-accum-steps");
+        assert_eq!(args.grad_accum_steps, Some(4));
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_grad_accum_steps() {
+        let mut args = tiny_args();
+        args.corpus = PathBuf::from("corpus.txt");
+        args.tokenizer = PathBuf::from("tok.json");
+        args.out = PathBuf::from("out");
+        args.grad_accum_steps = Some(0);
+        let err = validate_args(&args).expect_err("zero grad_accum_steps should fail");
+        assert!(matches!(
+            err,
+            CliError::Arg(ArgError::InvalidValue { flag, value })
+                if flag == "--grad-accum-steps" && value == "0"
+        ));
     }
 
     #[test]
