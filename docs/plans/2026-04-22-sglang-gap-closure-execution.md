@@ -270,3 +270,7 @@ External follow-up remains mandatory:
   `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-end-to-end-bottleneck-39152ac-localfix.md`
 - latest waiting-aware reclaim bench on the same local tree:
   `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c8-c16-39152ac-waiting-reclaim.md`
+- unified scheduler budget follow-up plan on the same local tree:
+  `docs/plans/2026-04-22-cuda-unified-budget.md`
+- unified scheduler budget local regression check:
+  `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-4eddda8-unified-budget.md`

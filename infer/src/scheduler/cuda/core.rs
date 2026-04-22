@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use fastrace::Span;
 use fastrace::collector::SpanContext;
 
+use super::budget::{
+    additional_pages_needed, coordinator_submit_headroom, partial_tail_capacity,
+    prefix_cache_reclaim_goal_pages, waiting_admission_shortage_pages,
+};
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
     Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
@@ -49,12 +53,6 @@ fn can_publish_prefix_pages(
         <= prefix_cache_retain_hard_cap_pages(total_pages, cap_fraction)
 }
 
-fn full_request_pages(prompt_tokens: usize, max_tokens: usize, page_size: usize) -> usize {
-    prompt_tokens
-        .saturating_add(max_tokens)
-        .div_ceil(page_size.max(1))
-}
-
 pub(super) fn sealed_block_token_count(block_size: usize, block_count: usize) -> usize {
     block_size.saturating_mul(block_count)
 }
@@ -66,56 +64,6 @@ pub(super) fn is_full_sealed_prefix(
 ) -> bool {
     block_count > 0 && matched_len == sealed_block_token_count(block_size, block_count)
 }
-
-fn waiting_admission_shortage_pages<I>(
-    free_pages: usize,
-    page_size: usize,
-    free_slots: usize,
-    waiting_requests: usize,
-    waiting: I,
-) -> usize
-where
-    I: IntoIterator<Item = (Option<usize>, usize)>,
-{
-    if free_slots == 0 && waiting_requests == 0 {
-        return 0;
-    }
-    let mut requested_pages = 0usize;
-    let mut considered = 0usize;
-    let admission_window = free_slots.max(waiting_requests);
-    for (prompt_tokens, max_tokens) in waiting {
-        let Some(prompt_tokens) = prompt_tokens else {
-            continue;
-        };
-        requested_pages = requested_pages.saturating_add(full_request_pages(
-            prompt_tokens,
-            max_tokens,
-            page_size,
-        ));
-        considered += 1;
-        if considered >= admission_window {
-            break;
-        }
-    }
-    requested_pages.saturating_sub(free_pages)
-}
-
-fn prefix_cache_reclaim_goal_pages(
-    retained_pages: usize,
-    high_water_pages: usize,
-    low_water_pages: usize,
-    waiting_shortage_pages: usize,
-) -> usize {
-    let watermark_goal = if retained_pages > high_water_pages {
-        retained_pages.saturating_sub(low_water_pages)
-    } else {
-        0
-    };
-    watermark_goal
-        .max(waiting_shortage_pages)
-        .min(retained_pages)
-}
-
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
@@ -641,11 +589,16 @@ impl<M: ModelForward> Scheduler<M> {
         pool.reserved_bytes() as f64 / pool.capacity_bytes() as f64
     }
 
-    fn host_pool_remaining_bytes(&self) -> usize {
+    fn host_pool_demote_headroom_bytes(&self) -> usize {
         let Ok(pool) = self.host_pinned_pool.lock() else {
             return 0;
         };
-        pool.remaining_bytes()
+        let capacity = pool.capacity_bytes();
+        if capacity == 0 {
+            return 0;
+        }
+        let demote_high_water = (capacity as f64 * self.config.t1_host_pinned_high_water) as usize;
+        demote_high_water.saturating_sub(pool.reserved_bytes())
     }
 
     fn demote_block_budget(&self, candidates: &[BlockId]) -> usize {
@@ -659,7 +612,12 @@ impl<M: ModelForward> Scheduler<M> {
         if block_bytes == 0 {
             return 0;
         }
-        self.host_pool_remaining_bytes() / block_bytes
+        let store_submit_headroom = coordinator_submit_headroom(
+            self.coordinator_queue_stats().capacity,
+            self.coordinator_queue_stats().store.active(),
+        );
+        let host_demote_headroom = self.host_pool_demote_headroom_bytes() / block_bytes;
+        store_submit_headroom.min(host_demote_headroom)
     }
 
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
@@ -1045,13 +1003,10 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn pool_partial_tail_capacity(&self) -> usize {
-        let page_size = self.paged_kv_pool.page_size.max(1);
-        (0..self.states.len())
-            .map(|slot_idx| {
-                let used = self.paged_kv_pool.seq_len(slot_idx) % page_size;
-                if used == 0 { 0 } else { page_size - used }
-            })
-            .sum()
+        partial_tail_capacity(
+            (0..self.states.len()).map(|slot_idx| self.paged_kv_pool.seq_len(slot_idx)),
+            self.paged_kv_pool.page_size,
+        )
     }
 
     pub(super) fn pool_free_pages(&self) -> usize {
@@ -1068,15 +1023,7 @@ impl<M: ModelForward> Scheduler<M> {
         seq_len: usize,
         additional_tokens: usize,
     ) -> usize {
-        if additional_tokens == 0 {
-            return 0;
-        }
-        let page_size = self.paged_kv_pool.page_size.max(1);
-        let current_pages = seq_len.div_ceil(page_size);
-        let future_pages = seq_len
-            .saturating_add(additional_tokens)
-            .div_ceil(page_size);
-        future_pages.saturating_sub(current_pages)
+        additional_pages_needed(seq_len, additional_tokens, self.paged_kv_pool.page_size)
     }
 
     pub(super) fn additional_pages_needed_for_slot(
@@ -1528,7 +1475,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let coordinator_stats = self.coordinator_queue_stats();
-        if coordinator_stats.store_backpressured() {
+        let mut store_submit_headroom = coordinator_submit_headroom(
+            coordinator_stats.capacity,
+            coordinator_stats.store.active(),
+        );
+        if store_submit_headroom == 0 {
             return 0;
         }
 
@@ -1589,6 +1540,9 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 continue;
             }
+            if store_submit_headroom == 0 {
+                break;
+            }
             let Some(ticket) =
                 self.coordinator_handle
                     .submit_store(vec![crate::kv_tier::StoreRequest {
@@ -1602,6 +1556,7 @@ impl<M: ModelForward> Scheduler<M> {
             else {
                 break;
             };
+            store_submit_headroom = store_submit_headroom.saturating_sub(1);
             let _ = self.prefix_cache.mark_block_store_pending(block_id);
             self.store_waiting.insert(ticket, vec![(block_id, region)]);
             self.store_dedupe.insert(store_key, ticket);
@@ -2155,11 +2110,9 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_publish_prefix_pages, is_full_sealed_prefix, prefix_cache_reclaim_goal_pages,
-        prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
-        waiting_admission_shortage_pages,
+        can_publish_prefix_pages, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
+        sealed_block_token_count,
     };
-    use crate::kv_tier::{CoordinatorQueueStats, QueueControlStats};
 
     const HARD_CAP: f64 = 0.90;
 
@@ -2183,147 +2136,5 @@ mod tests {
         assert!(is_full_sealed_prefix(48, 16, 3));
         assert!(!is_full_sealed_prefix(47, 16, 3));
         assert!(!is_full_sealed_prefix(0, 16, 0));
-    }
-
-    #[test]
-    fn waiting_admission_shortage_expands_beyond_free_slots_for_backlog() {
-        let waiting = std::iter::repeat_n((Some(4_097usize), 256usize), 11);
-        assert_eq!(
-            waiting_admission_shortage_pages(1_385, 16, 5, 11, waiting),
-            1_618
-        );
-    }
-
-    #[test]
-    fn waiting_admission_shortage_reclaims_even_when_no_slots_are_free() {
-        let waiting = vec![(Some(4_097usize), 256usize)];
-        assert_eq!(waiting_admission_shortage_pages(0, 16, 0, 1, waiting), 273);
-    }
-
-    #[test]
-    fn waiting_admission_shortage_skips_untokenized_entries() {
-        let waiting = vec![
-            (None, 256usize),
-            (Some(4_097usize), 256usize),
-            (Some(2_048usize), 128usize),
-        ];
-        assert_eq!(waiting_admission_shortage_pages(0, 16, 2, 3, waiting), 409);
-    }
-
-    #[test]
-    fn reclaim_goal_can_trigger_below_watermark_when_waiting_needs_headroom() {
-        assert_eq!(prefix_cache_reclaim_goal_pages(1_384, 2_076, 1_384, 0), 0);
-        assert_eq!(
-            prefix_cache_reclaim_goal_pages(1_384, 2_076, 1_384, 1_345),
-            1_345
-        );
-        assert_eq!(
-            prefix_cache_reclaim_goal_pages(2_408, 2_076, 1_384, 1_345),
-            1_345
-        );
-        assert_eq!(
-            prefix_cache_reclaim_goal_pages(2_408, 2_076, 1_384, 2_369),
-            2_369
-        );
-    }
-
-    #[test]
-    fn coordinator_queue_stats_reserve_submit_headroom() {
-        let stats = CoordinatorQueueStats {
-            capacity: 16,
-            total_queued: 14,
-            total_in_flight: 0,
-            plan: QueueControlStats {
-                capacity: 16,
-                queued: 0,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            fetch: QueueControlStats {
-                capacity: 16,
-                queued: 14,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            store: QueueControlStats {
-                capacity: 16,
-                queued: 14,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            fetch_waiters: 19,
-        };
-        assert!(!stats.fetch_backpressured());
-        assert!(!stats.store_backpressured());
-
-        let saturated = CoordinatorQueueStats {
-            fetch: QueueControlStats {
-                queued: 15,
-                ..stats.fetch
-            },
-            store: QueueControlStats {
-                queued: 15,
-                ..stats.store
-            },
-            fetch_waiters: 23,
-            total_queued: 15,
-            ..stats
-        };
-        assert!(saturated.fetch_backpressured());
-        assert!(saturated.store_backpressured());
-    }
-
-    #[test]
-    fn coordinator_queue_stats_ignore_zero_capacity() {
-        let stats = CoordinatorQueueStats {
-            capacity: 0,
-            total_queued: 8,
-            total_in_flight: 0,
-            plan: QueueControlStats {
-                capacity: 0,
-                queued: 0,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            fetch: QueueControlStats {
-                capacity: 0,
-                queued: 8,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            store: QueueControlStats {
-                capacity: 0,
-                queued: 8,
-                in_flight: 0,
-                submitted: 0,
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                rejected: 0,
-            },
-            fetch_waiters: 13,
-        };
-        assert!(!stats.fetch_backpressured());
-        assert!(!stats.store_backpressured());
     }
 }
