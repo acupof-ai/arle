@@ -55,6 +55,8 @@ That pointed at one bottleneck cluster:
   - event-driven fetch-wait sleep instead of `recv_timeout(2ms)` polling
   - incrementally priority-ordered waiting queue, so `assign_slots()` no
     longer sorts the whole queue every tick
+  - HTTP-originated CUDA requests now arrive with cached `prompt_tokens`, so
+    scheduler-side tokenization is a fallback path rather than the normal hot path
 - Deterministic admission now has:
   - full-ISL reservation in `assign_slots()`
   - explicit prefill planner `score -> fit` structure
@@ -149,6 +151,7 @@ That pointed at one bottleneck cluster:
 - `5dfde31` `fix(qwen35): guard paged-prefill graph start-pos reuse`
 - `0c49fca` `fix(qwen35): make paged-prefill graph start-pos device-backed`
 - `pending` `refactor(scheduler): keep waiting queue incrementally ordered`
+- `pending` `refactor(scheduler): pretokenize cuda http admissions`
 
 ## Parallelization shape used
 

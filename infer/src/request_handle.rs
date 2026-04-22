@@ -32,6 +32,9 @@ pub struct DflashStatus {
 pub trait RequestHandle: Send + Sync {
     fn submit(&self, req: IncomingRequest) -> Result<(), SubmitError>;
     fn model_id(&self) -> &str;
+    fn tokenizer_clone(&self) -> Option<crate::tokenizer::Tokenizer> {
+        None
+    }
 
     /// DFlash init-time metadata, if speculative decode is active for this
     /// runtime. Default `None` — CUDA and non-DFlash Metal paths return it
@@ -50,6 +53,10 @@ impl RequestHandle for SchedulerHandle {
     fn model_id(&self) -> &str {
         SchedulerHandle::model_id(self)
     }
+
+    fn tokenizer_clone(&self) -> Option<crate::tokenizer::Tokenizer> {
+        SchedulerHandle::tokenizer_clone(self)
+    }
 }
 
 impl<T> RequestHandle for Arc<T>
@@ -62,6 +69,10 @@ where
 
     fn model_id(&self) -> &str {
         (**self).model_id()
+    }
+
+    fn tokenizer_clone(&self) -> Option<crate::tokenizer::Tokenizer> {
+        (**self).tokenizer_clone()
     }
 
     fn dflash_status(&self) -> Option<DflashStatus> {

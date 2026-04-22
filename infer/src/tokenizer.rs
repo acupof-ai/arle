@@ -15,6 +15,7 @@ type InnerDecodeStream<'a> = HfDecodeStream<
     DecoderWrapper,
 >;
 
+#[derive(Clone)]
 pub struct Tokenizer {
     inner: HfTokenizer,
 }
