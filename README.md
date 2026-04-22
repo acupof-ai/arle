@@ -31,9 +31,9 @@
 
 <!-- Keep this list to the last 3 entries. Older history lives in CHANGELOG.md. -->
 
-- **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. See [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md) for the canonical usage guide.
-- **2026-04-19** — DFlash ships default-on for Metal (commit `47f958f`). Qwen3.5-4B-4bit bit-identical parity against scalar path for B≤2 batched verify, concurrent c=1..8 stable.
-- **2026-04-16** — Metal packed-batch concurrent decode fix: `extend_kv_cache` batch-dim bug repaired, varlen additive mask now emitted in bf16 for MLX ≥ 0.32 SDPA. Packed decode stable under 4× / 8× concurrency.
+- **2026-04-22** — CUDA `Qwen3.5` now ships through a true packed multi-request paged-prefill path. Full-attention layers write directly into the paged pool, hybrid linear-attention layers use packed recurrent-state launches, and paged-prefill logits now land on the canonical sampling surface. See [`docs/plans/2026-04-22-sglang-gap-closure-execution.md`](docs/plans/2026-04-22-sglang-gap-closure-execution.md).
+- **2026-04-22** — CUDA scheduler overlap was tightened again: decode launch/readback is split across iterations, fetch waits are event-driven instead of hot polling, and streaming emit now goes through a dedicated emit worker with gate results fed back into the scheduler loop. Runtime ownership graph: [`docs/projects/tiered-kv-runtime-flow.md`](docs/projects/tiered-kv-runtime-flow.md).
+- **2026-04-20** — Metal DFlash long-prompt prefill fixed (`fast_forward_prefill`, commit `3bc8802`) and batched terminal `eval` deferred via `async_eval` (commit `d8cb2f4`). DFlash is now default-on for Qwen3.5 on Metal, validated across guidellm's 10-strategy sweep with 5400-token prompts — zero `WrongPhase` errors, 100% request success. Canonical usage: [`docs/resources/metal-dflash.md`](docs/resources/metal-dflash.md).
 
 Full history: [CHANGELOG.md](CHANGELOG.md) · Next up: [ROADMAP.md](ROADMAP.md)
 
@@ -48,8 +48,8 @@ Four axes, each answering one question. Authoritative matrix lives in
 
 | Backend | Platform | Status | What ships |
 |---------|----------|:------:|------------|
-| **CUDA** | Linux + NVIDIA | **Stable** | Primary serving path. Continuous batching, prefix cache, CUDA Graph, FlashInfer. |
-| **Metal** | Apple Silicon | **Beta** | Live scheduler, chunked prefill, narrow same-length packed decode. Variable-length batched decode pending. |
+| **CUDA** | Linux + NVIDIA | **Stable** | Primary serving path. Continuous batching, paged KV, radix-backed reuse, tiered-KV readmission, FlashInfer, CUDA Graph decode, packed paged-prefill for Qwen3 and Qwen3.5. |
+| **Metal** | Apple Silicon | **Beta** | Live scheduler-backed serving, chunked prefill, replay-backed prefix reuse. Still behind CUDA on serving-grade batched decode and long-context parity. |
 | **Metal DFlash** | Apple Silicon | **Beta — default-on** | Speculative decode for Qwen3 / Qwen3.5. Qwen3-4B bf16 5.9× decode, Qwen3.5-4B-4bit bit-identical parity, c=1..8 validated (2026-04-20). |
 | **CPU** | Portable | **Dev only** | Smoke tests and request-path validation. Not a serving target. |
 
@@ -96,25 +96,34 @@ agent-infer treats this as the core problem:
 
 | Capability | What it does | Impact |
 |---|---|---|
-| **Multi-turn KV reuse** | Slot-sticky prefix matching reuses the previous turn's KV in place. Shared system prompts and conversation prefixes skip prefill entirely. Cross-session radix-tree reuse wiring lands in the tiered-kv-cache M1 milestone; today's fast path is a per-slot linear compare. | Only the new user message prefills each turn — prior conversation KV is never re-computed |
-| **Token-level KV pool** | page_size=1 pooling (SGLang-style). Zero fragmentation, instant alloc/free. | Eliminates memory waste from fixed-page padding |
-| **Transparent GPU-CPU offload** | Oldest KV blocks migrate to host RAM; prefetch back before attention. | Contexts beyond GPU VRAM capacity |
-| **Copy-on-write block sharing** | Paged blocks with ref-counting. Shared prefixes across concurrent requests use one copy. | N requests, 1x prefix memory |
-| **CUDA Graph batched decode** | One captured graph per batch size (1-32). 504 kernel launches → 1 replay. | Eliminates CPU-GPU dispatch overhead |
+| **Multi-turn KV reuse** | Slot-sticky reuse keeps prior-turn KV hot for the next turn. CUDA also carries a radix-backed tiered-KV path (`T0 GPU -> T1 host pinned -> T2 local disk -> T3 cluster-shared backend surface`) for full-block reuse and staged readmission. | Only the new user message prefills each turn when the prefix stays reusable |
+| **Paged KV pool** | Main CUDA KV formats use `page_size=16`, with direct GPU page attach and tail-page CoW on shared prefixes. | Predictable KV accounting, reusable full blocks, cheaper prefix sharing |
+| **Transparent slower-tier spill / promote** | Cold blocks can spill from GPU to host pinned memory and local disk, then promote back before use. The in-tree cluster-shared path is currently a minimal shared-fs backend. | Longer contexts and cached-prefix reuse beyond pure GPU residency |
+| **Shared-prefix CoW** | Shared full blocks stay immutable on the radix path; writes split only the active tail page. | Shared prefixes across concurrent requests do not multiply base KV memory |
+| **Scheduler overlap** | CUDA scheduler overlaps decode launch/readback across iterations, sleeps on fetch waits instead of spinning, and uses an emit worker for streaming text decode and stop scanning. | Better CPU/GPU overlap and less scheduler-side overhead at concurrency |
 
-**The result**: 4.6x faster time-to-first-token than SGLang, with matching throughput — because the cache does the heavy lifting.
+Current benchmark closure work is focused on high-concurrency CUDA parity
+(`c4/c8/c16`) against SGLang; treat the dated headline snapshots below as
+historical records, not as the current public claim.
 
 ---
 
 ## Performance
 
-Qwen3-4B on A100-SXM4-40GB vs SGLang v0.5.9:
+Canonical benchmark source of truth is the dated snapshot log under
+[`docs/experience/wins/`](docs/experience/wins/), produced via
+[`scripts/bench_guidellm.sh`](scripts/bench_guidellm.sh).
 
-| Concurrency | Throughput | vs SGLang | TTFT | vs SGLang |
-|:-----------:|:----------:|:---------:|:----:|:---------:|
-| 1 | 119.5 tok/s | 0.99x | **8.6ms** | **4.6x faster** |
-| 4 | 414.8 tok/s | 0.99x | **53.1ms** | **2.6x faster** |
-| 8 | 811 tok/s | 0.92x | **68.7ms** | **1.1x faster** |
+The current CUDA benchmark program is not "publish one timeless headline
+number"; it is an active closure effort against SGLang focused on the
+remaining high-concurrency gap:
+
+- `c1`: near parity
+- `c2`: small throughput deficit
+- `c4/c8/c16`: still the main open optimization target
+
+Active execution plan:
+[`docs/plans/2026-04-22-sglang-gap-closure-execution.md`](docs/plans/2026-04-22-sglang-gap-closure-execution.md)
 
 <details>
 <summary>Agent benchmark (multi-turn tool calling)</summary>
@@ -287,8 +296,9 @@ If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then aut
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). The
 KV prefix cache reuses the full prior-turn KV in place for every subsequent
 turn of a session — only the new user message (and any tool-result content)
-runs prefill (slot-sticky match; cross-session reuse via radix tree lands in
-the tiered-kv-cache M1 milestone).
+runs prefill. CUDA runtime reuse now sits on top of the same radix / tiered-KV
+surface used by the HTTP scheduler; the main remaining model-specific limit is
+that hybrid `Qwen3.5` does not yet support cross-slot partial-prefix restore.
 On macOS, tool execution uses `sandbox-exec` automatically when `nsjail` is unavailable; Linux keeps using `nsjail` when installed.
 
 On Apple Silicon, build the same CLI against the Metal backend:
@@ -324,26 +334,46 @@ See [docs/architecture.md](docs/architecture.md), [docs/codebase-map.md](docs/co
 for the current package boundaries.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  HTTP API  (/v1/completions, /v1/chat/completions, /v1/models, /v1/responses)  │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│  Scheduler  (decode-priority, chunked prefill)           │
-│  ┌──────────────┐  ┌─────────────┐  ┌────────────────┐  │
-│  │ Prefix Cache │  │ Token KV    │  │ Block Manager  │  │
-│  │ (radix tree) │  │ Pool (p=1)  │  │ (CoW paging)   │  │
-│  └──────────────┘  └─────────────┘  └────────────────┘  │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│  ModelForward trait                                       │
-│  Qwen3 (GQA) · Qwen3.5 (Hybrid recurrent + attention)   │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-      FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
-         (CUDA C + Triton AOT, crates/cuda-kernels/)
+┌───────────────────────────────────────────────────────────────────────┐
+│ HTTP / agent request ingress                                         │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ CUDA scheduler runtime                                               │
+│ runtime.rs / execution.rs / core.rs                                  │
+│ - assign_slots()  - plan_step()  - step()  - cleanup()               │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │ prefix lookup / publish
+                                ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ RadixCache / CacheIndex                                              │
+│ prefix_cache.rs                                                      │
+└───────────────┬───────────────────────────────┬───────────────────────┘
+                │ ready on T0                   │ staged below T0
+                ▼                               ▼
+      ┌──────────────────────┐        ┌──────────────────────────────┐
+      │ paged_kv / T0 GPU    │        │ ReadmissionPlan + Coordinator│
+      │ direct attach + CoW  │        │ PlanQueue / Fetch / Store    │
+      └──────────┬───────────┘        └──────────────┬───────────────┘
+                 │                                   │
+                 ▼                                   ▼
+      ┌──────────────────────┐      ┌─────────────────────────────────┐
+      │ ModelForward         │      │ T1 host pinned / T2 disk / T3   │
+      │ Qwen3 · Qwen3.5      │      │ cluster-shared backend surface  │
+      └──────────┬───────────┘      └────────────────┬────────────────┘
+                 │                                    │ promote / restore
+                 └──────────────────┬─────────────────┘
+                                    ▼
+                     FlashInfer · RMSNorm · cuBLAS GEMM · CUDA Graph
+                        (CUDA C + Triton AOT, crates/cuda-kernels/)
+
+Separate from the scheduler hot path:
+- emit worker: UTF-8 decode, delta emission, stop-sequence scan
+- kv-native-sys: Zig substrate for host/disk KV plumbing
 ```
+
+Detailed runtime ownership graph:
+[docs/projects/tiered-kv-runtime-flow.md](docs/projects/tiered-kv-runtime-flow.md).
 
 ---
 
