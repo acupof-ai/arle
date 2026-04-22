@@ -314,20 +314,27 @@ If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then aut
 Use `--doctor` to print a self-check report for the current CLI build without
 loading a model. It shows the compiled backend, detected hardware, TTY state,
 HuggingFace cache root, model-resolution source, and curated model
-recommendations.
+recommendations. Add `--json` for machine-readable output in scripts and CI.
 
 ```bash
 cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,cli -- \
   --doctor
+
+cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+  --doctor --json
 ```
 
 Use `--list-models` for the lighter-weight discovery view when you only want
 the resolved model source, supported local hub snapshots, and curated
-recommendations without the full environment report.
+recommendations without the full environment report. It also supports
+`--json`.
 
 ```bash
 cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
   --list-models
+
+cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+  --list-models --json
 ```
 
 Invalid `--max-turns`, `--max-tokens`, and `--temperature` values fail during
