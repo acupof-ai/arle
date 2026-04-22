@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, Method, header},
     middleware,
     routing::{get, post},
 };
@@ -383,6 +383,25 @@ fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, A
             "invalid_json",
         ),
     })
+}
+
+fn route_not_found_error(path: &str) -> ApiError {
+    ApiError::not_found(format!("Route `{path}` was not found"), "route_not_found")
+}
+
+fn method_not_allowed_error(method: &Method, path: &str) -> ApiError {
+    ApiError::method_not_allowed(
+        format!("Method `{method}` is not allowed for `{path}`"),
+        "method_not_allowed",
+    )
+}
+
+async fn route_not_found_handler(request: AxumRequest) -> ApiError {
+    route_not_found_error(request.uri().path())
+}
+
+async fn method_not_allowed_handler(request: AxumRequest) -> ApiError {
+    method_not_allowed_error(request.method(), request.uri().path())
 }
 
 fn submit_request(
@@ -1139,7 +1158,7 @@ where
         handle,
         ServerMetrics::new(""),
         HttpServerConfig::default(),
-        Some(Router::new().nest("/{session_id}", sessions::session_router(engine))),
+        Some(sessions::session_router(engine)),
     )
 }
 
@@ -1157,7 +1176,7 @@ where
         handle,
         metrics,
         config,
-        Some(Router::new().nest("/{session_id}", sessions::session_router(engine))),
+        Some(sessions::session_router(engine)),
     )
 }
 
@@ -1184,9 +1203,8 @@ where
         config,
     });
 
-    // The session subtree (if present) is already fully-stated by
-    // `sessions::session_router(engine)` and wrapped at `/{session_id}`
-    // before entering this function, so we apply the auth middleware
+    // The session subtree (if present) is already fully-routed by
+    // `sessions::session_router(engine)`, so we apply the auth middleware
     // via `.layer(...)` and mount the whole subtree as a service.
     let mut router: Router<Arc<AppState>> = Router::new()
         .route("/v1/completions", post(completions))
@@ -1208,7 +1226,10 @@ where
         router = router.nest_service("/v1/sessions", guarded);
     }
 
-    router.with_state(state)
+    router
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .fallback(route_not_found_handler)
+        .with_state(state)
 }
 
 #[cfg(test)]
@@ -1449,6 +1470,58 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("Invalid JSON request body")),
             "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_structured_not_found_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/unknown")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert_eq!(payload["error"]["code"], "route_not_found");
+        assert_eq!(
+            payload["error"]["message"],
+            "Route `/v1/unknown` was not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_method_returns_structured_method_not_allowed_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/completions")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert_eq!(payload["error"]["code"], "method_not_allowed");
+        assert_eq!(
+            payload["error"]["message"],
+            "Method `GET` is not allowed for `/v1/completions`"
         );
     }
 

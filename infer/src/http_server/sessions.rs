@@ -4,10 +4,10 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Path, State,
+        DefaultBodyLimit, Path, Request as AxumRequest, State,
         rejection::{BytesRejection, JsonRejection},
     },
-    http::StatusCode,
+    http::{Method, StatusCode},
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -385,6 +385,34 @@ fn unsupported_response(message: impl Into<String>) -> SessionRouteError {
     )
 }
 
+fn route_not_found_response(path: &str) -> SessionRouteError {
+    session_error(
+        StatusCode::NOT_FOUND,
+        format!("Route `{path}` was not found"),
+        "not_found",
+        None,
+        None,
+    )
+}
+
+fn method_not_allowed_response(method: &Method, path: &str) -> SessionRouteError {
+    session_error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        format!("Method `{method}` is not allowed for `{path}`"),
+        "method_not_allowed",
+        None,
+        None,
+    )
+}
+
+async fn route_not_found_handler(request: AxumRequest) -> SessionRouteError {
+    route_not_found_response(request.uri().path())
+}
+
+async fn method_not_allowed_handler(request: AxumRequest) -> SessionRouteError {
+    method_not_allowed_response(request.method(), request.uri().path())
+}
+
 fn bytes_rejection_to_response(err: &BytesRejection) -> SessionRouteError {
     let status = err.status();
     let body_text = err.body_text();
@@ -491,10 +519,12 @@ where
     E: SessionPersistence + Send + Sync + 'static,
 {
     Router::new()
-        .route("/save", post(handle_save::<E>))
-        .route("/load", post(handle_load::<E>))
-        .route("/manifest", get(handle_manifest))
-        .route("/", delete(handle_delete))
+        .route("/{session_id}/save", post(handle_save::<E>))
+        .route("/{session_id}/load", post(handle_load::<E>))
+        .route("/{session_id}/manifest", get(handle_manifest))
+        .route("/{session_id}", delete(handle_delete))
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .fallback(route_not_found_handler)
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(engine)
 }
@@ -602,10 +632,7 @@ mod tests {
     fn mounted_session_app(engine: MockEngine) -> Router {
         Router::new().nest_service(
             "/v1/sessions",
-            Router::new().nest(
-                "/{session_id}",
-                session_router(Arc::new(RwLock::new(engine))),
-            ),
+            session_router(Arc::new(RwLock::new(engine))),
         )
     }
 
@@ -951,6 +978,52 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("Content-Type")),
             "body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_unknown_route_returns_structured_not_found() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/sessions/session-missing/unknown")
+                    .body(Body::empty())
+                    .expect("build unknown-route request"),
+            )
+            .await
+            .expect("unknown-route response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "not_found");
+        assert_eq!(
+            body["error"],
+            "Route `/session-missing/unknown` was not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_wrong_method_returns_structured_method_not_allowed() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/sessions/session-load/load")
+                    .body(Body::empty())
+                    .expect("build wrong-method request"),
+            )
+            .await
+            .expect("wrong-method response");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "method_not_allowed");
+        assert_eq!(
+            body["error"],
+            "Method `GET` is not allowed for `/session-load/load`"
         );
     }
 }
