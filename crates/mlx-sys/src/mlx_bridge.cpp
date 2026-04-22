@@ -183,6 +183,42 @@ auto& prefix_match_len_i32_kernel() {
     return kernel;
 }
 
+auto& prefix_match_len_i32_batched_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "prefix_match_len_i32_batched",
+        {"lhs", "rhs", "T"},
+        {"out"},
+        R"(
+        uint tid = thread_position_in_threadgroup.x;
+        uint b_idx = thread_position_in_grid.z;
+        threadgroup int flags[256];
+
+        auto lhs_row = lhs + b_idx * T;
+        auto rhs_row = rhs + b_idx * T;
+
+        if (tid < T) {
+            flags[tid] = (lhs_row[tid] == rhs_row[tid]) ? 1 : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            int count = 0;
+            for (int i = 0; i < T; ++i) {
+                if (flags[i] != 0) {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            out[b_idx] = count;
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
 auto& tape_replay_varlen_kernel() {
     static auto kernel = fast::metal_kernel(
         "tape_replay_varlen",
@@ -646,6 +682,42 @@ mlx_array* mlx_prefix_match_len_i32(mlx_array* lhs, mlx_array* rhs) {
             {{1}},
             {int32},
             std::make_tuple(256, 1, 1),
+            std::make_tuple(256, 1, 1),
+            {},
+            std::nullopt,
+            false,
+            {});
+        return from_arr(std::move(result[0]));
+    }());
+}
+
+mlx_array* mlx_prefix_match_len_i32_batched(mlx_array* lhs, mlx_array* rhs) {
+    MLX_TRY_RETURN([&]() {
+        auto lhs_arr = contiguous(*to_arr(lhs));
+        auto rhs_arr = contiguous(*to_arr(rhs));
+        require_rank(lhs_arr, 2, "lhs");
+        require_rank(rhs_arr, 2, "rhs");
+        require_dtype(lhs_arr, int32, "lhs");
+        require_dtype(rhs_arr, int32, "rhs");
+        if (lhs_arr.shape(0) != rhs_arr.shape(0) || lhs_arr.shape(1) != rhs_arr.shape(1)) {
+            throw std::invalid_argument(
+                "mlx_prefix_match_len_i32_batched requires equal [B, T] inputs");
+        }
+        int B = lhs_arr.shape(0);
+        int T = lhs_arr.shape(1);
+        if (B <= 0 || T <= 0) {
+            return from_arr(zeros({std::max(B, 0)}, int32));
+        }
+        if (T > 256) {
+            throw std::invalid_argument(
+                "mlx_prefix_match_len_i32_batched supports at most 256 elements per row");
+        }
+
+        auto result = prefix_match_len_i32_batched_kernel()(
+            {lhs_arr, rhs_arr, array(T)},
+            {{B}},
+            {int32},
+            std::make_tuple(256, 1, B),
             std::make_tuple(256, 1, 1),
             {},
             std::nullopt,

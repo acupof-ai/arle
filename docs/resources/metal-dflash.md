@@ -124,9 +124,10 @@ metal scheduler runtime:
   loop and the extra MLX `cache_pos_arr` materialization fence inside
   `full_attn_step`. The packed verifier also no longer reads back the full
   `[B, block_size]` posterior token matrix to CPU just to find the accepted
-  prefix: it slices each row on device, computes prefix match there, and only
-  materializes the per-row posterior token that survives acceptance. On the
-  compiled full-attention sublayers, the packed path may use the verify-only
+  prefix: it slices the packed draft/target prefixes once, runs a dedicated
+  `[B, T] -> [B]` `prefix_match_len_i32_batched` kernel on GPU, and only
+  materializes the matched-length vector plus the per-row posterior token that
+  survives acceptance. On the compiled full-attention sublayers, the packed path may use the verify-only
   `batched_sdpa_2pass` kernel when the verify block is mask-free, truly
   batched (`B > 1`), and `block_size == 16`; otherwise it falls back to stock
   MLX SDPA. For single-row `B=1, S=16` verify, the compiled Qwen3.5/Qwen3.6

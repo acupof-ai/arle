@@ -69,6 +69,10 @@ unsafe extern "C" {
     pub fn mlx_matmul(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_greater(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_prefix_match_len_i32(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_prefix_match_len_i32_batched(
+        lhs: *mut mlx_array,
+        rhs: *mut mlx_array,
+    ) -> *mut mlx_array;
 
     // === Unary ops ===
 
