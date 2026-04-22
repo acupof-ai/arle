@@ -227,6 +227,8 @@ Hard gates:
 - block has fingerprint
 - block has a valid host region
 - no store for that block is already in flight
+- if another block already submitted the same `fingerprint + target`, scheduler
+  joins that existing `StoreTicket` instead of enqueueing a duplicate write
 
 ### 3. Store target selection
 
