@@ -213,6 +213,7 @@ impl<M: ModelForward> Scheduler<M> {
     fn emit_decode_deltas(&mut self, require_prelaunch_gate: bool) -> u128 {
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
+        let mut async_emit_slots = Vec::new();
         {
             let Self {
                 active, tokenizer, ..
@@ -226,8 +227,15 @@ impl<M: ModelForward> Scheduler<M> {
                 {
                     continue;
                 }
-                req.emit_delta(tokenizer);
+                if !require_prelaunch_gate && req.uses_async_emit() {
+                    async_emit_slots.push(slot_idx);
+                } else {
+                    req.emit_delta(tokenizer);
+                }
             }
+        }
+        for slot_idx in async_emit_slots {
+            self.dispatch_async_emit(slot_idx);
         }
         emit_t.elapsed().as_micros()
     }
@@ -325,6 +333,7 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn step(&mut self) {
         let num = self.active_len();
         if num == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
+            self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             return;
         }
 
@@ -349,6 +358,12 @@ impl<M: ModelForward> Scheduler<M> {
         let plan_t = std::time::Instant::now();
         let plan = self.plan_step();
         let admission_us = plan_t.elapsed().as_micros();
+        let scheduled_prefill_rows = plan.prefill.len() as u64;
+        let scheduled_prefill_tokens: u64 = plan
+            .prefill
+            .iter()
+            .map(|candidate| candidate.reservation.prefill_tokens as u64)
+            .sum();
 
         assert!(
             self.pending_decode.is_none(),
@@ -368,11 +383,26 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             0
         };
+        let scheduled_decode_rows = self
+            .pending_decode
+            .as_ref()
+            .map_or(0, |pending| pending.decode_indices.len() as u64);
         let postlaunch_emit_us = self.emit_decode_deltas(false);
         let emit_us = prelaunch_emit_us + postlaunch_emit_us;
         let decode_us = decode_launch_us + readback_us;
+        let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
 
         let total_us = decode_us + emit_us + admission_us + prefill_us;
+        self.metrics.set_scheduler_step(
+            scheduled_rows,
+            scheduled_decode_rows,
+            scheduled_prefill_rows,
+            scheduled_decode_rows,
+            scheduled_prefill_tokens,
+            scheduled_rows,
+        );
+        self.metrics
+            .observe_scheduler_step(total_us as f64 / 1_000_000.0);
         let update_ema = |ema: &mut f64, val: u128| {
             const ALPHA: f64 = 0.1;
             let v = val as f64;

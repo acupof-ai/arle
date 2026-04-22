@@ -337,13 +337,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .request(slot_idx)
                     .is_some_and(|req| req.sampling.ignore_eos);
                 if !ignore_eos && self.model.is_stop_token(token) {
-                    let Self {
-                        active, tokenizer, ..
-                    } = self;
-                    if let Some(req) = active[slot_idx].as_mut() {
-                        req.finish(FinishReason::Stop, tokenizer);
-                    }
-                    self.finish_slot(slot_idx);
+                    self.finish_request(slot_idx, FinishReason::Stop);
                     return;
                 }
                 let Self {
@@ -351,8 +345,11 @@ impl<M: ModelForward> Scheduler<M> {
                 } = self;
                 if let Some(req) = active[slot_idx].as_mut() {
                     req.generated_tokens.push(token);
-                    req.emit_delta(tokenizer);
+                    if !req.uses_async_emit() {
+                        req.emit_delta(tokenizer);
+                    }
                 }
+                self.dispatch_async_emit(slot_idx);
 
                 if matches!(
                     self.request(slot_idx).map(|req| &req.phase),
@@ -365,13 +362,7 @@ impl<M: ModelForward> Scheduler<M> {
                     .request(slot_idx)
                     .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
                 if reached_max {
-                    let Self {
-                        active, tokenizer, ..
-                    } = self;
-                    if let Some(req) = active[slot_idx].as_mut() {
-                        req.finish(FinishReason::Length, tokenizer);
-                    }
-                    self.finish_slot(slot_idx);
+                    self.finish_request(slot_idx, FinishReason::Length);
                 } else {
                     if let Some(req) = self.request_mut(slot_idx)
                         && req.first_token_at.is_none()

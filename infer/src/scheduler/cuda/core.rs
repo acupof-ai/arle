@@ -11,7 +11,9 @@ use crate::kv_tier::{
     ReadmissionPlan, ReadmissionSource, TieredKvPolicy,
 };
 use crate::prefix_cache::{BlockId, BlockMetadata, BlockMetadataUpdate, RadixCache};
+use crate::scheduler::cuda::request::StreamDecodeState;
 use crate::scheduler::policy::{SchedulerSignals, SessionBiasedLru};
+use crate::server_engine::{CompletionStreamDelta, FinishReason};
 use crate::types::{BlockFingerprint, KvContentContext};
 
 /// Block size (in tokens) for the global `RadixCache` prefix observer.
@@ -49,6 +51,109 @@ pub(super) struct PendingDecode {
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
+}
+
+enum EmitCommand {
+    Append {
+        request_id: u64,
+        prompt_tokens: usize,
+        token: u32,
+        logprob: Option<f32>,
+        delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+    },
+    Finish {
+        request_id: u64,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        reason: FinishReason,
+        delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+    },
+    Abort {
+        request_id: u64,
+    },
+}
+
+struct EmitWorkerRequest {
+    prompt_tokens: usize,
+    generated_tokens: Vec<u32>,
+    latest_logprob: Option<f32>,
+    delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+    stream: StreamDecodeState,
+}
+
+fn spawn_emit_worker(
+    tokenizer: Tokenizer,
+) -> (
+    crossbeam_channel::Sender<EmitCommand>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let thread = std::thread::Builder::new()
+        .name("infer-cuda-emit".to_string())
+        .spawn(move || {
+            let mut active = HashMap::<u64, EmitWorkerRequest>::new();
+            while let Ok(command) = rx.recv() {
+                match command {
+                    EmitCommand::Append {
+                        request_id,
+                        prompt_tokens,
+                        token,
+                        logprob,
+                        delta_tx,
+                    } => {
+                        let state = active
+                            .entry(request_id)
+                            .or_insert_with(|| EmitWorkerRequest {
+                                prompt_tokens,
+                                generated_tokens: Vec::new(),
+                                latest_logprob: None,
+                                delta_tx,
+                                stream: StreamDecodeState::default(),
+                            });
+                        state.generated_tokens.push(token);
+                        state.latest_logprob = logprob;
+                        let _ = state.stream.emit_delta(
+                            &state.generated_tokens,
+                            &tokenizer,
+                            &state.delta_tx,
+                            state.latest_logprob,
+                            None,
+                            state.prompt_tokens,
+                        );
+                    }
+                    EmitCommand::Finish {
+                        request_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        reason,
+                        delta_tx,
+                    } => {
+                        if let Some(mut state) = active.remove(&request_id) {
+                            state.stream.finish(
+                                &state.generated_tokens,
+                                &tokenizer,
+                                &state.delta_tx,
+                                state.prompt_tokens,
+                                reason,
+                                None,
+                            );
+                        } else {
+                            StreamDecodeState::default().send_finish(
+                                &delta_tx,
+                                prompt_tokens,
+                                completion_tokens,
+                                reason,
+                            );
+                        }
+                    }
+                    EmitCommand::Abort { request_id } => {
+                        active.remove(&request_id);
+                    }
+                }
+            }
+        })
+        .expect("emit worker thread");
+    (tx, thread)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -118,13 +223,17 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_handle: crate::kv_tier::CoordinatorHandle,
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    emit_tx: crossbeam_channel::Sender<EmitCommand>,
+    emit_thread: Option<std::thread::JoinHandle<()>>,
     pub(super) store_waiting:
         HashMap<crate::kv_tier::StoreTicket, Vec<(BlockId, crate::kv_tier::HostPinnedRegion)>>,
     pub(super) store_dedupe: HashMap<StoreDedupKey, crate::kv_tier::StoreTicket>,
     pub(super) store_ticket_keys: HashMap<crate::kv_tier::StoreTicket, StoreDedupKey>,
+    pub(super) store_ticket_started_at: HashMap<crate::kv_tier::StoreTicket, std::time::Instant>,
     pub(super) fetch_waiting: HashMap<crate::kv_tier::FetchTicket, Vec<(usize, u64)>>,
     pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
     pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
+    pub(super) fetch_ticket_started_at: HashMap<crate::kv_tier::FetchTicket, std::time::Instant>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     pub(super) wakeup_rx: crossbeam_channel::Receiver<()>,
     pub(super) wakeup_live: bool,
@@ -341,6 +450,7 @@ impl<M: ModelForward> Scheduler<M> {
             if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
                 self.fetch_dedupe.remove(&key);
             }
+            self.fetch_ticket_started_at.remove(&ticket);
             let _ = self.coordinator_handle.cancel_fetch(ticket);
         }
     }
@@ -349,6 +459,21 @@ impl<M: ModelForward> Scheduler<M> {
         self.coordinator_handle
             .stats()
             .with_fetch_waiters(self.fetch_waiting.values().map(std::vec::Vec::len).sum())
+    }
+
+    pub(super) fn current_tier_wait_seconds(&self) -> (f64, f64) {
+        let now = std::time::Instant::now();
+        let fetch_wait_s = self
+            .fetch_ticket_started_at
+            .values()
+            .map(|started_at| now.duration_since(*started_at).as_secs_f64())
+            .fold(0.0, f64::max);
+        let store_wait_s = self
+            .store_ticket_started_at
+            .values()
+            .map(|started_at| now.duration_since(*started_at).as_secs_f64())
+            .fold(0.0, f64::max);
+        (fetch_wait_s, store_wait_s)
     }
 
     pub(super) fn attach_gpu_prefix_blocks(
@@ -554,6 +679,7 @@ impl<M: ModelForward> Scheduler<M> {
                 cluster_shared_backend.clone(),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
+        let (emit_tx, emit_thread) = spawn_emit_worker(tokenizer.clone());
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;
@@ -579,12 +705,16 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_handle,
             coordinator_events,
             coordinator_thread,
+            emit_tx,
+            emit_thread: Some(emit_thread),
             store_waiting: HashMap::new(),
             store_dedupe: HashMap::new(),
             store_ticket_keys: HashMap::new(),
+            store_ticket_started_at: HashMap::new(),
             fetch_waiting: HashMap::new(),
             fetch_dedupe: HashMap::new(),
             fetch_ticket_keys: HashMap::new(),
+            fetch_ticket_started_at: HashMap::new(),
             request_rx: rx,
             wakeup_rx,
             wakeup_live: true,
@@ -720,13 +850,79 @@ impl<M: ModelForward> Scheduler<M> {
         )
     }
 
+    pub(super) fn dispatch_async_emit(&mut self, slot_idx: usize) {
+        let Some((request_id, prompt_tokens, delta_tx, pending_tokens)) =
+            self.request(slot_idx).and_then(|req| {
+                req.uses_async_emit().then(|| {
+                    (
+                        req.id,
+                        req.prompt_tokens.len(),
+                        req.delta_tx.clone(),
+                        req.pending_async_emit_tokens(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        if pending_tokens.is_empty() {
+            return;
+        }
+        for (token, logprob) in pending_tokens {
+            let _ = self.emit_tx.send(EmitCommand::Append {
+                request_id,
+                prompt_tokens,
+                token,
+                logprob,
+                delta_tx: delta_tx.clone(),
+            });
+        }
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.mark_async_emit_dispatched();
+        }
+    }
+
+    pub(super) fn queue_async_finish(&mut self, slot_idx: usize, reason: FinishReason) -> bool {
+        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, uses_async_emit)) =
+            self.request(slot_idx).map(|req| {
+                (
+                    req.id,
+                    req.prompt_tokens.len(),
+                    req.generated_tokens.len(),
+                    req.delta_tx.clone(),
+                    req.uses_async_emit(),
+                )
+            })
+        else {
+            return false;
+        };
+        if !uses_async_emit {
+            return false;
+        }
+        self.dispatch_async_emit(slot_idx);
+        let _ = self.emit_tx.send(EmitCommand::Finish {
+            request_id,
+            prompt_tokens,
+            completion_tokens,
+            reason,
+            delta_tx,
+        });
+        true
+    }
+
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {
         let request_id = self.request(slot_idx).map(|req| req.id);
+        let async_emit_request = self
+            .request(slot_idx)
+            .and_then(|req| req.uses_async_emit().then_some(req.id));
         if let Some(req) = self.request_mut(slot_idx) {
             req.phase = Phase::Finished;
         }
         if let Some(request_id) = request_id {
             self.clear_fetch_waiting_for_slot(slot_idx, request_id);
+        }
+        if let Some(request_id) = async_emit_request {
+            let _ = self.emit_tx.send(EmitCommand::Abort { request_id });
         }
         self.dequeue_prefill(slot_idx);
         self.dequeue_running(slot_idx);
@@ -1181,6 +1377,8 @@ impl<M: ModelForward> Scheduler<M> {
             self.store_waiting.insert(ticket, vec![(block_id, region)]);
             self.store_dedupe.insert(store_key, ticket);
             self.store_ticket_keys.insert(ticket, store_key);
+            self.store_ticket_started_at
+                .insert(ticket, std::time::Instant::now());
             spilled_bytes = spilled_bytes.saturating_add(metadata.byte_len as usize);
             if spilled_bytes >= bytes_to_spill {
                 break;
@@ -1704,6 +1902,15 @@ impl<M: ModelForward> Drop for Scheduler<M> {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => warn!("Coordinator thread shutdown failed: {}", err),
                 Err(_) => warn!("Coordinator thread panicked during shutdown"),
+            }
+        }
+        let (dummy_emit_tx, dummy_emit_rx) = crossbeam_channel::unbounded();
+        drop(dummy_emit_rx);
+        let old_emit_tx = std::mem::replace(&mut self.emit_tx, dummy_emit_tx);
+        drop(old_emit_tx);
+        if let Some(thread) = self.emit_thread.take() {
+            if thread.join().is_err() {
+                warn!("Emit worker thread panicked during shutdown");
             }
         }
     }
