@@ -1,12 +1,11 @@
 //! [`NixlTransport`] — M5 stub impl of [`KVTransport`] over NVIDIA NIXL.
 //!
-//! Compiled only under `#[cfg(feature = "rdma-nixl")]`. The `rdma-nixl`
-//! feature transitively enables `nixl-sys`'s `stub-api` feature, so
-//! `cargo check --features rdma-nixl` succeeds on macOS without
-//! `libnixl.so` installed — the stub compiles a small C++ wrapper and
-//! defers symbol resolution to `dlopen` at runtime. On production CUDA
-//! hosts with the real library, enable the sibling `rdma-nixl-real`
-//! feature instead (it pulls the same dep without `stub-api`).
+//! Compiled under either `rdma-nixl` or `rdma-nixl-real`.
+//! - `rdma-nixl` wires in the explicit `nixl-sys-stub` dependency so
+//!   `cargo check --features rdma-nixl` succeeds on macOS without
+//!   `libnixl.so` installed.
+//! - `rdma-nixl-real` wires in the explicit `nixl-sys-real` dependency
+//!   for CUDA hosts that should link the native library.
 //!
 //! # Status — M5 stub only
 //!
@@ -56,6 +55,14 @@
 //! discipline and the migration shape from stub to real impl.
 
 use std::task::Poll;
+
+#[cfg(all(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
+compile_error!("enable only one of `rdma-nixl` or `rdma-nixl-real`");
+
+#[cfg(feature = "rdma-nixl")]
+use nixl_sys_stub as nixl_api;
+#[cfg(all(not(feature = "rdma-nixl"), feature = "rdma-nixl-real"))]
+use nixl_sys_real as nixl_api;
 
 use super::super::{
     backend::KVBackendScope,
@@ -129,10 +136,10 @@ fn _assert_nixl_sys_types_resolve() {
     // compiles fine; on CUDA + real NIXL it also compiles fine. At
     // runtime neither path calls into NIXL, so there is no dlopen
     // failure to worry about.
-    type _AgentAlias = nixl_sys::Agent;
-    type _XferStatus = nixl_sys::XferStatus;
-    type _XferOp = nixl_sys::XferOp;
-    type _MemType = nixl_sys::MemType;
+    type _AgentAlias = nixl_api::Agent;
+    type _XferStatus = nixl_api::XferStatus;
+    type _XferOp = nixl_api::XferOp;
+    type _MemType = nixl_api::MemType;
 }
 
 impl KVTransport for NixlTransport {

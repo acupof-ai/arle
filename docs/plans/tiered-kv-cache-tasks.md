@@ -692,12 +692,12 @@ Filename = blake3 of `(model_uid, tokenizer_uid, token_ids)`.
 ### 6.1 Lane breakdown
 
 #### Local (Mac) — entirely `[L]`
-- [ ] `[L]` Add `infer/src/kv_tier/transport/nixl.rs` — `NixlTransport` skeleton; `register / deregister` fully implemented (just calls into `nixl-sys::Agent::register_memory`); `put_batch / get_batch / poll / abort` return `todo!("P6")`
-- [ ] `[L]` Edit `infer/Cargo.toml` — add `nixl-sys = { version = "1.0", optional = true, features = ["stub-api"] }`; add features `rdma-nixl = ["dep:nixl-sys"]` (default = stub-api active) and `rdma-nixl-real = ["dep:nixl-sys"]` (no stub-api, links real libnixl.so on remote CUDA box)
+- [x] `[L]` Add `infer/src/kv_tier/transport/nixl.rs` — `NixlTransport` skeleton shipped; compile-only stub path stays intentionally non-functional at runtime until the real transport trigger fires
+- [x] `[L]` Edit `infer/Cargo.toml` — split the dependency into `nixl-sys-stub` (`rdma-nixl`) and `nixl-sys-real` (`rdma-nixl-real`) so the real feature no longer silently inherits `stub-api`
 - [ ] `[L]` `infer/src/events.rs` — add new variant of `RequestEventKind` for `TierTransition { from: Tier, to: Tier, bytes: u64, micros: u64 }`. Keep `EventSink::emit` signature stable
 - [ ] `[L]` Verify trait surface has not changed since P2 — if it has, go back and fix P2 instead of forking
-- [ ] `[L]` `cargo check --no-default-features --features no-cuda` — default still compiles (no nixl-sys dep)
-- [ ] `[L]` `cargo check --no-default-features --features no-cuda,rdma-nixl` — stub-api path compiles on Mac WITHOUT `libnixl.so`
+- [x] `[L]` `cargo check --no-default-features --features no-cuda` — default still compiles (no nixl dep selected)
+- [x] `[L]` `cargo check --no-default-features --features no-cuda,rdma-nixl` — stub path compiles on Mac WITHOUT `libnixl.so`
 
 #### Remote (optional manual smoke; not a CI gate)
 - [ ] `[R]` On a CUDA + NIXL native lib box: `cargo check --features cuda,rdma-nixl-real` with `NIXL_PREFIX=/opt/nvidia/nvda_nixl`

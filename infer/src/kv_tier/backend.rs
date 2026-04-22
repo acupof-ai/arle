@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::Poll;
 
-#[cfg(feature = "rdma-nixl")]
+#[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 use super::transport::nixl::{NixlOp, NixlTransport};
 use super::transport::shared_fs::SharedFsBackendOp;
 use super::{
@@ -53,7 +53,7 @@ pub enum ClusterSharedBackendConfig {
     SharedFilesystem {
         root: PathBuf,
     },
-    #[cfg(feature = "rdma-nixl")]
+    #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
     Nixl {
         agent_name: String,
     },
@@ -65,7 +65,7 @@ impl ClusterSharedBackendConfig {
             Self::SharedFilesystem { root } => {
                 ClusterSharedBackend::SharedFs(Arc::new(SharedFsStore::new(root.clone())))
             }
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl { agent_name } => {
                 ClusterSharedBackend::Nixl(Arc::new(NixlTransport::new(agent_name.clone())))
             }
@@ -76,14 +76,14 @@ impl ClusterSharedBackendConfig {
 #[derive(Debug)]
 pub enum ClusterSharedBackendOp {
     SharedFs(SharedFsBackendOp),
-    #[cfg(feature = "rdma-nixl")]
+    #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
     Nixl(NixlOp),
 }
 
 #[derive(Clone, Debug)]
 pub enum ClusterSharedBackend {
     SharedFs(Arc<SharedFsStore>),
-    #[cfg(feature = "rdma-nixl")]
+    #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
     Nixl(Arc<NixlTransport>),
 }
 
@@ -91,7 +91,7 @@ impl ClusterSharedBackend {
     pub fn backend_id(&self) -> &'static str {
         match self {
             Self::SharedFs(store) => store.backend_id(),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.backend_id(),
         }
     }
@@ -99,7 +99,7 @@ impl ClusterSharedBackend {
     pub fn tier(&self) -> Tier {
         match self {
             Self::SharedFs(store) => store.tier(),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.tier(),
         }
     }
@@ -107,7 +107,7 @@ impl ClusterSharedBackend {
     pub fn exists(&self, handle: &KVHandle) -> Result<bool, TransportError> {
         match self {
             Self::SharedFs(store) => store.exists(handle),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.exists(handle),
         }
     }
@@ -121,7 +121,7 @@ impl ClusterSharedBackend {
             Self::SharedFs(_) => {
                 SharedFsBlockLocation::new(fingerprint, payload_len).into_block_location()
             }
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(_) => Err(TransportError::Other(
                 "nixl remote descriptor synthesis requires real backend metadata".into(),
             )),
@@ -131,7 +131,7 @@ impl ClusterSharedBackend {
     pub fn store(&self, req: KVBackendStore) -> Result<ClusterSharedBackendOp, TransportError> {
         match self {
             Self::SharedFs(store) => store.store(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.store(req).map(ClusterSharedBackendOp::Nixl),
         }
     }
@@ -139,7 +139,7 @@ impl ClusterSharedBackend {
     pub fn fetch(&self, req: KVBackendFetch) -> Result<ClusterSharedBackendOp, TransportError> {
         match self {
             Self::SharedFs(store) => store.fetch(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.fetch(req).map(ClusterSharedBackendOp::Nixl),
         }
     }
@@ -147,7 +147,7 @@ impl ClusterSharedBackend {
     pub fn delete(&self, req: KVBackendDelete) -> Result<ClusterSharedBackendOp, TransportError> {
         match self {
             Self::SharedFs(store) => store.delete(req).map(ClusterSharedBackendOp::SharedFs),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             Self::Nixl(store) => store.delete(req).map(ClusterSharedBackendOp::Nixl),
         }
     }
@@ -158,7 +158,7 @@ impl ClusterSharedBackend {
     ) -> Poll<Result<KVBackendCompletion, TransportError>> {
         match (self, op) {
             (Self::SharedFs(store), ClusterSharedBackendOp::SharedFs(op)) => store.poll(op),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             (Self::Nixl(store), ClusterSharedBackendOp::Nixl(op)) => store.poll(op),
             #[allow(unreachable_patterns)]
             _ => Poll::Ready(Err(TransportError::Other(
@@ -170,7 +170,7 @@ impl ClusterSharedBackend {
     pub fn abort(&self, op: &mut ClusterSharedBackendOp) {
         match (self, op) {
             (Self::SharedFs(store), ClusterSharedBackendOp::SharedFs(op)) => store.abort(op),
-            #[cfg(feature = "rdma-nixl")]
+            #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
             (Self::Nixl(store), ClusterSharedBackendOp::Nixl(op)) => store.abort(op),
             #[allow(unreachable_patterns)]
             _ => {}
@@ -204,7 +204,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rdma-nixl")]
+    #[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
     #[test]
     fn nixl_config_builds_cluster_backend() {
         let backend = ClusterSharedBackendConfig::Nixl {

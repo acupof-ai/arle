@@ -34,12 +34,11 @@ hf-hub = { version = "0.5", features = ["tokio"] }
 mlx-sys = { path = "../crates/mlx-sys", optional = true }
 # libc: peak RSS via getrusage for metal_bench
 libc = { version = "0.2", optional = true }
-# NIXL (NVIDIA Inference Transfer Library) — optional dep for the Tiered KV
-# Cache §P5 remote-tier stub. `stub-api` disables link-time dependency on
-# libnixl.so so `cargo check --features rdma-nixl` succeeds on macOS CI.
-# Production CUDA deployments that want to link the real native library
-# should instead enable `rdma-nixl-real`.
-nixl-sys = { version = "1.0", optional = true, features = ["stub-api"] }
+# NIXL (NVIDIA Inference Transfer Library) — split into an explicit stub dep and
+# an explicit real-link dep so `rdma-nixl` and `rdma-nixl-real` are not the same
+# Cargo feature under two names.
+nixl-sys-stub = { package = "nixl-sys", version = "1.0", optional = true, features = ["stub-api"] }
+nixl-sys-real = { package = "nixl-sys", version = "1.0", optional = true }
 log = "0.4"
 logforth = { version = "0.29", features = ["starter-log", "layout-text", "diagnostic-task-local"] }
 colored = "3"
@@ -64,15 +63,11 @@ no-cuda = ["cuda-kernels/no-cuda"]
 cpu = []
 # Metal backend via mlx-sys direct C++ bridge (Apple Silicon).
 metal = ["dep:mlx-sys", "dep:libc"]
-# Tiered KV cache §P5: `NixlTransport` stub. Pulls in `nixl-sys` with its
-# `stub-api` enabled so `cargo check --features rdma-nixl` compiles on
-# macOS without `libnixl.so` installed (the stub calls `dlopen` at runtime
-# and fails gracefully; only types and C++ stubs are linked at build time).
-# On a production CUDA host with the real NIXL library, enable
-# `rdma-nixl-real` instead — it pulls the same dep without `stub-api` so
-# the build links the actual `libnixl.so`.
-rdma-nixl = ["dep:nixl-sys"]
-rdma-nixl-real = ["dep:nixl-sys"]
+# Tiered KV cache §P5:
+# - `rdma-nixl` = compile against `nixl-sys` stub-api for Mac/dev CI
+# - `rdma-nixl-real` = compile against the real native link surface
+rdma-nixl = ["dep:nixl-sys-stub"]
+rdma-nixl-real = ["dep:nixl-sys-real"]
 default = ["cuda"]
 reference = []
 
