@@ -401,11 +401,31 @@ fn route_not_found_error(path: &str) -> ApiError {
     ApiError::not_found(format!("Route `{path}` was not found"), "route_not_found")
 }
 
+fn allow_header_value_for_path(path: &str) -> Option<axum::http::HeaderValue> {
+    let allow = match path {
+        "/v1/completions"
+        | "/v1/chat/completions"
+        | "/v1/responses"
+        | "/v1/train/stop"
+        | "/v1/train/save" => "POST",
+        "/v1/models" | "/metrics" | "/v1/stats" | "/v1/train/status" | "/v1/train/events" => {
+            "GET, HEAD"
+        }
+        _ => return None,
+    };
+    Some(axum::http::HeaderValue::from_static(allow))
+}
+
 fn method_not_allowed_error(method: &Method, path: &str) -> ApiError {
-    ApiError::method_not_allowed(
+    let error = ApiError::method_not_allowed(
         format!("Method `{method}` is not allowed for `{path}`"),
         "method_not_allowed",
-    )
+    );
+    if let Some(allow) = allow_header_value_for_path(path) {
+        error.with_header(header::ALLOW, allow)
+    } else {
+        error
+    }
 }
 
 async fn route_not_found_handler(request: AxumRequest) -> ApiError {
@@ -1595,6 +1615,7 @@ mod tests {
             response.headers()["content-type"],
             "application/json; charset=utf-8"
         );
+        assert_eq!(response.headers()["allow"], "POST");
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1604,6 +1625,20 @@ mod tests {
             payload["error"]["message"],
             "Method `GET` is not allowed for `/v1/completions`"
         );
+    }
+
+    #[tokio::test]
+    async fn get_route_method_errors_include_allow_header() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["allow"], "GET, HEAD");
     }
 
     #[tokio::test]

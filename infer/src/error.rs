@@ -111,6 +111,12 @@ impl ApiError {
         )
     }
 
+    #[must_use]
+    pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
     /// 504 Gateway Timeout — request took too long.
     pub fn timeout(elapsed_secs: u64) -> Self {
         Self::new(
