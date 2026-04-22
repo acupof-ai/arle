@@ -1,6 +1,7 @@
 use anyhow::Result;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
+use super::forward::Qwen35State;
 use super::prefill_buffers::{GdrChunkwiseScratch35, PagedPrefillBuffers35};
 use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
@@ -12,6 +13,11 @@ use crate::model::kv_cache::KVCache;
 use crate::ops;
 use cuda_kernels::prelude::{DeviceMatrix, DeviceVec, HiddenStates};
 use cuda_kernels::{TokenKVPool, ffi};
+
+pub(super) struct Qwen35PagedPrefillRequest<'a> {
+    pub tokens: &'a [u32],
+    pub slot: usize,
+}
 
 impl Qwen35Model {
     pub(super) fn prefill_forward(
@@ -304,6 +310,507 @@ impl Qwen35Model {
         Ok(())
     }
 
+    pub(super) fn prefill_forward_paged_batch(
+        &self,
+        requests: &[Qwen35PagedPrefillRequest<'_>],
+        states: &mut [Qwen35State],
+        pool: &TokenKVPool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "paged prefill batch requires at least one request"
+        );
+
+        let request_lens: Vec<usize> = requests
+            .iter()
+            .map(|request| request.tokens.len())
+            .collect();
+        let total_tokens = request_lens.iter().sum();
+        let mut packed_tokens = Vec::with_capacity(total_tokens);
+        for request in requests {
+            packed_tokens.extend_from_slice(request.tokens);
+        }
+
+        let (sequences, page_indices) = self.build_paged_prefill_sequences(requests, pool)?;
+        let mut batch_guard = self.ensure_paged_prefill_batch(total_tokens, pool.page_size)?;
+        let bufs = batch_guard
+            .as_mut()
+            .expect("paged prefill batch buffers initialized");
+        let metadata_reallocated = bufs.metadata.update(
+            &self.ctx,
+            &packed_tokens,
+            &page_indices,
+            &sequences,
+            pool.page_size,
+        )?;
+        if metadata_reallocated {
+            bufs.invalidate_graph();
+        }
+        bufs.plan.plan_hd256(
+            &self.ctx,
+            &bufs.metadata.qo_indptr_host,
+            &bufs.metadata.kv_indptr_host,
+            bufs.metadata.batch_size,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            pool.page_size,
+        )?;
+
+        self.prefill_forward_paged_batch_kernels(requests, states, pool, &sequences, bufs)?;
+
+        for (request, seq) in requests.iter().zip(sequences.iter()) {
+            let state = &mut states[request.slot];
+            let last_token_idx = seq.token_offset + seq.seq_len - 1;
+            ops::extract_vec_into(
+                &self.ctx,
+                &bufs.hidden,
+                last_token_idx,
+                &mut bufs.last_hidden,
+            )?;
+            ops::rms_norm_offset_into(
+                &self.ctx,
+                &bufs.last_hidden,
+                &self.norm,
+                self.config.rms_norm_eps,
+                &mut bufs.last_normed,
+            )?;
+            ops::gemv(
+                &self.ctx,
+                &self.embed_tokens,
+                &bufs.last_normed,
+                &mut bufs.logits,
+            )?;
+            state.base.prefill_logits =
+                Some(DeviceVec {
+                    data: self.ctx.stream.clone_dtod(&bufs.logits.data).map_err(|e| {
+                        anyhow::anyhow!("clone batch prefill logits D2D failed: {e}")
+                    })?,
+                    len: bufs.logits.len,
+                    label: "qwen35_paged_prefill_logits",
+                });
+            state.recurrent_state.seq_len += request.tokens.len();
+        }
+
+        Ok(())
+    }
+
+    fn prefill_forward_paged_batch_kernels(
+        &self,
+        requests: &[Qwen35PagedPrefillRequest<'_>],
+        states: &mut [Qwen35State],
+        pool: &TokenKVPool,
+        sequences: &[ops::PagedPrefillSequence],
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<()> {
+        ops::embedding_batch(
+            &self.ctx,
+            &self.embed_tokens,
+            &bufs.metadata.token_ids_gpu,
+            &mut bufs.hidden,
+        )?;
+        let request_lens: Vec<usize> = requests
+            .iter()
+            .map(|request| request.tokens.len())
+            .collect();
+        bufs.ensure_batch_gdr_scratch(&self.ctx, &self.config, &request_lens)?;
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for layer in &self.layers {
+            let eps = self.config.rms_norm_eps;
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden,
+                &layer.input_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+
+            match &layer.attn {
+                LayerKind::FullAttention(attn) => self.prefill_full_attention_paged_batch(
+                    attn,
+                    &mut full_idx,
+                    pool,
+                    sequences,
+                    bufs,
+                )?,
+                LayerKind::LinearAttention(attn) => self.prefill_linear_attention_paged_batch(
+                    attn,
+                    &mut linear_idx,
+                    requests,
+                    states,
+                    bufs,
+                )?,
+            }
+
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden,
+                &bufs.attn_results,
+                &mut bufs.hidden_mid,
+            )?;
+            ops::rms_norm_batch_offset_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                &mut bufs.normed,
+            )?;
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.gate_proj,
+                &bufs.normed,
+                &mut bufs.gate_out,
+            );
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.up_proj,
+                &bufs.normed,
+                &mut bufs.up_out,
+            );
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            ops::gemm_into(
+                &self.ctx,
+                &layer.mlp.down_proj,
+                &bufs.act_out,
+                &mut bufs.mlp_out,
+            );
+            ops::add_batch_into(
+                &self.ctx,
+                &bufs.hidden_mid,
+                &bufs.mlp_out,
+                &mut bufs.hidden_next,
+            )?;
+            std::mem::swap(&mut bufs.hidden, &mut bufs.hidden_next);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_full_attention_paged_batch(
+        &self,
+        attn: &FullAttentionLayer,
+        full_idx: &mut usize,
+        pool: &TokenKVPool,
+        sequences: &[ops::PagedPrefillSequence],
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<()> {
+        let c = &self.config;
+        let eps = c.rms_norm_eps;
+
+        ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
+        ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
+        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+
+        let nrp = ops::NormRopeParams {
+            q_norm: &attn.q_norm,
+            k_norm: &attn.k_norm,
+            cos_cache: &self.cos_cache,
+            sin_cache: &self.sin_cache,
+            rms_eps: eps,
+        };
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _gqp) = bufs.q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _gk) = bufs.k_attn.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _gv) = bufs.v_attn.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (pt_ptr, _gpt) = bufs.metadata.page_indices_gpu.device_ptr(&self.ctx.stream);
+            let (sp_ptr, _gsp) = bufs.metadata.start_pos_gpu.device_ptr(&self.ctx.stream);
+            let kp_ptr = pool.k_ptr(*full_idx, &self.ctx.stream);
+            let vp_ptr = pool.v_ptr(*full_idx, &self.ctx.stream);
+
+            let q_full_stride = bufs.q_full.hidden_dim;
+            let q_out_stride = bufs.q_prepped.hidden_dim;
+            let kv_stride = bufs.k_attn.hidden_dim;
+            let half_size = std::mem::size_of::<ffi::Half>();
+            let i32_size = std::mem::size_of::<i32>();
+
+            for (batch_idx, seq) in sequences.iter().enumerate() {
+                let qf_ptr_offset = (qf_ptr as usize + seq.token_offset * q_full_stride * half_size)
+                    as *const ffi::Half;
+                let qp_ptr_offset = (qp_ptr as usize + seq.token_offset * q_out_stride * half_size)
+                    as *mut ffi::Half;
+                let k_ptr_offset =
+                    (k_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
+                let v_ptr_offset =
+                    (v_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
+                let pt_ptr_offset =
+                    (pt_ptr as usize + seq.page_table_offset * i32_size) as *const i32;
+                let sp_ptr_offset = (sp_ptr as usize + batch_idx * i32_size) as *const i32;
+
+                ffi::prefill_attention_paged_prep_hd256_cuda(
+                    qf_ptr_offset,
+                    qp_ptr_offset,
+                    k_ptr_offset,
+                    v_ptr_offset,
+                    qn_ptr as *const ffi::Half,
+                    kn_ptr as *const ffi::Half,
+                    cos_ptr as *const ffi::Half,
+                    sin_ptr as *const ffi::Half,
+                    pt_ptr_offset,
+                    pool.page_size as i32,
+                    kp_ptr as *mut ffi::Half,
+                    vp_ptr as *mut ffi::Half,
+                    c.num_attention_heads as i32,
+                    c.num_key_value_heads as i32,
+                    seq.seq_len as i32,
+                    sp_ptr_offset,
+                    c.rotary_dim as i32,
+                    nrp.rms_eps,
+                    self.ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+
+        {
+            let (q_u64, _gq) = bufs.q_prepped.data.device_ptr(&self.ctx.stream);
+            let (o_u64, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            let (qoi_u64, _gqoi) = bufs.metadata.qo_indptr_gpu.device_ptr(&self.ctx.stream);
+            let (kvi_u64, _gkvi) = bufs.metadata.kv_indptr_gpu.device_ptr(&self.ctx.stream);
+            let (kvidx_u64, _gkvidx) = bufs.metadata.page_indices_gpu.device_ptr(&self.ctx.stream);
+            let (kvlpl_u64, _gkvlpl) = bufs
+                .metadata
+                .kv_last_page_len_gpu
+                .device_ptr(&self.ctx.stream);
+            bufs.plan.run_hd256(
+                &self.ctx,
+                q_u64,
+                qoi_u64,
+                pool.k_ptr(*full_idx, &self.ctx.stream),
+                pool.v_ptr(*full_idx, &self.ctx.stream),
+                kvi_u64,
+                kvidx_u64,
+                kvlpl_u64,
+                o_u64,
+                None,
+                bufs.metadata.batch_size,
+                c.num_attention_heads,
+                c.num_key_value_heads,
+                pool.page_size,
+            )?;
+        }
+
+        unsafe {
+            let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
+            let (o_ptr, _go) = bufs.attn_out_full.data.device_ptr_mut(&self.ctx.stream);
+            ffi::attention_gate_batch_hd256_cuda(
+                qf_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                c.num_attention_heads as i32,
+                bufs.seq_len as i32,
+                self.ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+
+        *full_idx += 1;
+        ops::gemm_into(
+            &self.ctx,
+            &attn.o_proj,
+            &bufs.attn_out_full,
+            &mut bufs.attn_results,
+        );
+        Ok(())
+    }
+
+    fn prefill_linear_attention_paged_batch(
+        &self,
+        attn: &LinearAttentionLayer,
+        linear_idx: &mut usize,
+        requests: &[Qwen35PagedPrefillRequest<'_>],
+        states: &mut [Qwen35State],
+        bufs: &mut PagedPrefillBuffers35,
+    ) -> Result<()> {
+        let c = &self.config;
+
+        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
+        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
+        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
+        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
+
+        for (batch_idx, request) in requests.iter().enumerate() {
+            let state = &mut states[request.slot];
+            let layer_state = &mut state.recurrent_state.layers[*linear_idx];
+            let scratch = &mut bufs.gdr_batch_scratch[batch_idx];
+
+            let (conv_state_ptr, _gconv) =
+                layer_state.conv_state.data.device_ptr_mut(&self.ctx.stream);
+            let (state_ptr, _gstate) = layer_state.state.device_ptr_mut(&self.ctx.stream);
+            let (q_ptr, _gq) = scratch.q_expanded.data.device_ptr_mut(&self.ctx.stream);
+            let (k_ptr, _gk) = scratch.k_expanded.data.device_ptr_mut(&self.ctx.stream);
+            let (v_ptr, _gv) = scratch.v_raw.data.device_ptr_mut(&self.ctx.stream);
+            let (g_cumsum_ptr, _gg) = scratch.g_cumsum.device_ptr_mut(&self.ctx.stream);
+            let (beta_ptr, _gbeta) = scratch.beta.device_ptr_mut(&self.ctx.stream);
+            let (a_tril_ptr, _ga) = scratch.a_tril.device_ptr_mut(&self.ctx.stream);
+            let (a_inv_ptr, _gainv) = scratch.a_inv.device_ptr_mut(&self.ctx.stream);
+            let (w_ptr, _gw) = scratch.w.data.device_ptr_mut(&self.ctx.stream);
+            let (u_ptr, _gu) = scratch.u.data.device_ptr_mut(&self.ctx.stream);
+            let (chunk_state_ptr, _gchunk) = scratch.chunk_state.device_ptr_mut(&self.ctx.stream);
+            let (v_new_ptr, _gvnew) = scratch.v_new.data.device_ptr_mut(&self.ctx.stream);
+
+            bufs.gdr_launch.conv_state_ptrs[batch_idx] = conv_state_ptr;
+            bufs.gdr_launch.state_ptrs[batch_idx] = state_ptr;
+            bufs.gdr_launch.q_ptrs[batch_idx] = q_ptr;
+            bufs.gdr_launch.k_ptrs[batch_idx] = k_ptr;
+            bufs.gdr_launch.v_ptrs[batch_idx] = v_ptr;
+            bufs.gdr_launch.g_cumsum_ptrs[batch_idx] = g_cumsum_ptr;
+            bufs.gdr_launch.beta_ptrs[batch_idx] = beta_ptr;
+            bufs.gdr_launch.a_tril_ptrs[batch_idx] = a_tril_ptr;
+            bufs.gdr_launch.a_inv_ptrs[batch_idx] = a_inv_ptr;
+            bufs.gdr_launch.w_ptrs[batch_idx] = w_ptr;
+            bufs.gdr_launch.u_ptrs[batch_idx] = u_ptr;
+            bufs.gdr_launch.chunk_state_ptrs[batch_idx] = chunk_state_ptr;
+            bufs.gdr_launch.v_new_ptrs[batch_idx] = v_new_ptr;
+        }
+
+        ops::conv1d_prefill_packed_batch_into(
+            &self.ctx,
+            &bufs.qkv,
+            &attn.conv1d_weight,
+            &ops::Conv1dPrefillBatchLaunch {
+                conv_state_ptrs: &bufs.gdr_launch.conv_state_ptrs,
+                seq_indptr: &bufs.metadata.qo_indptr_host,
+            },
+            &mut bufs.qkv_conv,
+            c.linear_conv_kernel_dim,
+        )?;
+        ops::gated_delta_rule_prefill_chunkwise_batch_into(
+            &self.ctx,
+            &bufs.qkv_conv,
+            &bufs.b_proj,
+            &bufs.a_proj,
+            &ops::GdrWeights {
+                dt_bias: &attn.dt_bias,
+                a_log: &attn.a_log,
+            },
+            &ops::GdrPrefillBatchLaunch {
+                state_ptrs: &bufs.gdr_launch.state_ptrs,
+                q_ptrs: &bufs.gdr_launch.q_ptrs,
+                k_ptrs: &bufs.gdr_launch.k_ptrs,
+                v_ptrs: &bufs.gdr_launch.v_ptrs,
+                g_cumsum_ptrs: &bufs.gdr_launch.g_cumsum_ptrs,
+                beta_ptrs: &bufs.gdr_launch.beta_ptrs,
+                a_tril_ptrs: &bufs.gdr_launch.a_tril_ptrs,
+                a_inv_ptrs: &bufs.gdr_launch.a_inv_ptrs,
+                w_ptrs: &bufs.gdr_launch.w_ptrs,
+                u_ptrs: &bufs.gdr_launch.u_ptrs,
+                chunk_state_ptrs: &bufs.gdr_launch.chunk_state_ptrs,
+                v_new_ptrs: &bufs.gdr_launch.v_new_ptrs,
+                seq_indptr: &bufs.metadata.qo_indptr_host,
+            },
+            &mut bufs.gdr_out,
+            &ops::GdrHeadConfig {
+                num_key_heads: c.linear_num_key_heads,
+                num_value_heads: c.linear_num_value_heads,
+                key_dim: c.linear_key_head_dim,
+                val_dim: c.linear_value_head_dim,
+            },
+        )?;
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &bufs.gdr_out,
+            &attn.norm_weight,
+            &bufs.z,
+            &mut bufs.normed_gated,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+
+        *linear_idx += 1;
+        ops::gemm_into(
+            &self.ctx,
+            &attn.out_proj,
+            &bufs.normed_gated,
+            &mut bufs.attn_results,
+        );
+        Ok(())
+    }
+
+    pub(super) fn build_paged_prefill_sequences(
+        &self,
+        requests: &[Qwen35PagedPrefillRequest<'_>],
+        pool: &TokenKVPool,
+    ) -> Result<(Vec<ops::PagedPrefillSequence>, Vec<i32>)> {
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "paged prefill batch requires at least one request"
+        );
+
+        let mut token_offset = 0usize;
+        let mut page_table_offset = 0usize;
+        let mut sequences = Vec::with_capacity(requests.len());
+        let mut page_indices = Vec::new();
+
+        for req in requests {
+            let seq_len = req.tokens.len();
+            anyhow::ensure!(
+                seq_len > 0,
+                "paged prefill request for slot {} must not be empty",
+                req.slot
+            );
+
+            let pool_seq_len = pool.seq_len(req.slot);
+            anyhow::ensure!(
+                pool_seq_len >= seq_len,
+                "paged prefill: pool seq_len {pool_seq_len} < chunk len {seq_len} for slot {}",
+                req.slot
+            );
+            let start_pos = pool_seq_len - seq_len;
+            let num_pages = (start_pos + seq_len).div_ceil(pool.page_size);
+            let all_pages = pool.page_indices(req.slot);
+            anyhow::ensure!(
+                all_pages.len() >= num_pages,
+                "paged prefill: slot {} has {} pages, expected at least {num_pages}",
+                req.slot,
+                all_pages.len()
+            );
+
+            page_indices.extend(all_pages[..num_pages].iter().map(|&page| page as i32));
+            sequences.push(ops::PagedPrefillSequence {
+                token_offset,
+                seq_len,
+                start_pos,
+                page_table_offset,
+                num_pages,
+            });
+            token_offset += seq_len;
+            page_table_offset += num_pages;
+        }
+
+        Ok((sequences, page_indices))
+    }
+
+    fn ensure_paged_prefill_batch(
+        &self,
+        seq_len: usize,
+        page_size: usize,
+    ) -> Result<std::sync::MutexGuard<'_, Option<PagedPrefillBuffers35>>> {
+        let mut batch_guard = self
+            .paged_prefill_batch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged_prefill_batch mutex poisoned"))?;
+        let needs_realloc = batch_guard
+            .as_ref()
+            .map(|bufs| !bufs.matches_shape(seq_len, page_size))
+            .unwrap_or(true);
+        if needs_realloc {
+            *batch_guard = Some(PagedPrefillBuffers35::new(
+                &self.ctx,
+                &self.config,
+                seq_len,
+                page_size,
+            )?);
+        }
+        Ok(batch_guard)
+    }
+
     fn supports_paged_prefill_graph(&self) -> bool {
         self.enable_cuda_graph
             && self.layers.iter().all(|layer| {
@@ -369,25 +876,32 @@ impl Qwen35Model {
             "paged prefill: slot {slot} has {} pages, expected at least {num_pages}",
             all_pages.len()
         );
+        let sequences = [ops::PagedPrefillSequence {
+            token_offset: 0,
+            seq_len,
+            start_pos,
+            page_table_offset: 0,
+            num_pages,
+        }];
+        let page_indices: Vec<i32> = all_pages[..num_pages]
+            .iter()
+            .map(|&page| page as i32)
+            .collect();
         let page_indices_reallocated = bufs.metadata.update(
             &self.ctx,
             token_ids,
-            &all_pages[..num_pages],
-            seq_len,
+            &page_indices,
+            &sequences,
             pool.page_size,
-            start_pos,
         )?;
         if page_indices_reallocated {
             bufs.invalidate_graph();
         }
-
-        let qo_indptr = [0_i32, seq_len as i32];
-        let kv_indptr = [0_i32, num_pages as i32];
         bufs.plan.plan_hd256(
             &self.ctx,
-            &qo_indptr,
-            &kv_indptr,
-            1,
+            &bufs.metadata.qo_indptr_host,
+            &bufs.metadata.kv_indptr_host,
+            bufs.metadata.batch_size,
             self.config.num_attention_heads,
             self.config.num_key_value_heads,
             pool.page_size,

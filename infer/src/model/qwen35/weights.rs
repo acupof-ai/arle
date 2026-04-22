@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use super::config::{Config35, LayerType};
 use crate::model::common::{self, MLP};
+use crate::model::qwen35::prefill_buffers::PagedPrefillBuffers35;
 use crate::weight_loader::{
     load_tensor_1d, load_tensor_1d_f32, load_tensor_2d, precompute_rope, resolve_rope_cache_len,
 };
@@ -72,6 +73,7 @@ pub struct Qwen35Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
+    pub(super) paged_prefill_batch: std::sync::Mutex<Option<PagedPrefillBuffers35>>,
 }
 
 impl Qwen35Model {
@@ -297,6 +299,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph,
+            paged_prefill_batch: std::sync::Mutex::new(None),
         })
     }
 
@@ -717,6 +720,7 @@ impl Qwen35Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph,
+            paged_prefill_batch: std::sync::Mutex::new(None),
         })
     }
 }
