@@ -8,6 +8,7 @@ use infer::backend::cuda::bootstrap::{
 };
 use infer::hf_hub;
 use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_config};
+use infer::kv_tier::ClusterSharedBackendConfig;
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
@@ -126,6 +127,26 @@ struct Args {
     /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
     #[arg(long)]
     train_control_url: Option<String>,
+
+    /// Host-pinned T1 high-water mark as a fraction of host-pool capacity.
+    #[arg(long)]
+    t1_host_pinned_high_water: Option<f64>,
+
+    /// Host-pinned T1 low-water mark as a fraction of host-pool capacity.
+    #[arg(long)]
+    t1_host_pinned_low_water: Option<f64>,
+
+    /// Anti-thrash keepalive in radix logical ticks for freshly demoted T1 blocks.
+    #[arg(long)]
+    t1_host_pinned_keepalive_ticks: Option<u64>,
+
+    /// Root directory for the node-local T2 disk store.
+    #[arg(long)]
+    disk_store_root: Option<PathBuf>,
+
+    /// Root directory for the cluster-shared T3 shared-fs backend.
+    #[arg(long)]
+    cluster_shared_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -187,16 +208,7 @@ async fn main() {
             engine: InferenceEngineOptions {
                 enable_cuda_graph: args.cuda_graph,
             },
-            scheduler: SchedulerConfig {
-                chunked_prefill_size: args.chunked_prefill_size,
-                max_num_batched_tokens: args.max_num_batched_tokens,
-                max_prefill_tokens: args.max_prefill_tokens,
-                prefill_max_requests: args.prefill_max_requests,
-                mem_fraction_static: args.mem_fraction_static,
-                min_seq_len: args.min_seq_len,
-                kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
-                ..SchedulerConfig::runtime_defaults(num_slots)
-            },
+            scheduler: scheduler_config_from_args(&args, num_slots),
             seed: 42,
             max_seq_len: args.max_seq_len,
             kv_cache_dtype,
@@ -252,6 +264,7 @@ async fn main() {
         kv_mode_label,
     );
     info!("KV cache layout: contiguous={kv_cache_dtype:?}, paged_pool={kv_pool_format:?}");
+    log_tier_config_overrides(&args);
 
     info!(
         "Model loaded: elapsed_ms={}, model_id={}",
@@ -386,6 +399,68 @@ fn kv_mode_candidates(
             kv_pool_format,
         } => vec![(kv_cache_dtype, kv_pool_format, "explicit")],
     }
+}
+
+fn scheduler_config_from_args(args: &Args, num_slots: usize) -> SchedulerConfig {
+    let mut config = SchedulerConfig {
+        chunked_prefill_size: args.chunked_prefill_size,
+        max_num_batched_tokens: args.max_num_batched_tokens,
+        max_prefill_tokens: args.max_prefill_tokens,
+        prefill_max_requests: args.prefill_max_requests,
+        mem_fraction_static: args.mem_fraction_static,
+        min_seq_len: args.min_seq_len,
+        kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),
+        ..SchedulerConfig::runtime_defaults(num_slots)
+    };
+    if let Some(high_water) = args.t1_host_pinned_high_water {
+        config.t1_host_pinned_high_water = high_water;
+    }
+    if let Some(low_water) = args.t1_host_pinned_low_water {
+        config.t1_host_pinned_low_water = low_water;
+    }
+    if let Some(keepalive_ticks) = args.t1_host_pinned_keepalive_ticks {
+        config.t1_host_pinned_keepalive_ticks = keepalive_ticks;
+    }
+    if let Some(root) = args.disk_store_root.as_ref() {
+        config.disk_store_root = root.clone();
+    }
+    config.cluster_shared_backend = args
+        .cluster_shared_root
+        .as_ref()
+        .map(|root| ClusterSharedBackendConfig::SharedFilesystem { root: root.clone() });
+    config
+}
+
+fn log_tier_config_overrides(args: &Args) {
+    if args.t1_host_pinned_high_water.is_none()
+        && args.t1_host_pinned_low_water.is_none()
+        && args.t1_host_pinned_keepalive_ticks.is_none()
+        && args.disk_store_root.is_none()
+        && args.cluster_shared_root.is_none()
+    {
+        return;
+    }
+
+    info!(
+        "Tier config: t1_high_water={}, t1_low_water={}, t1_keepalive_ticks={}, disk_store_root={}, cluster_shared_root={}",
+        args.t1_host_pinned_high_water
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.t1_host_pinned_low_water
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.t1_host_pinned_keepalive_ticks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.disk_store_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "default".to_string()),
+        args.cluster_shared_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+    );
 }
 
 /// Auto-calculate num_slots from GPU memory and model config.

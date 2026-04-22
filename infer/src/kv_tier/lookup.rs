@@ -59,7 +59,12 @@ pub struct LookupHeuristics {
 impl Default for LookupHeuristics {
     fn default() -> Self {
         Self {
-            prefill_tokens_per_sec: 30_000.0,
+            // Use end-to-end long-prefill throughput rather than an optimistic
+            // kernel-only number. The scheduler compares staged slower-tier
+            // recall against a full cold-prefill fallback; on current Qwen3
+            // CUDA hosts that path is in the low-thousands tok/s once queueing,
+            // launch, and model overheads are included.
+            prefill_tokens_per_sec: 5_000.0,
             host_bandwidth_bytes_per_sec: 25.0 * 1024.0 * 1024.0 * 1024.0,
             disk_bandwidth_bytes_per_sec: 3.0 * 1024.0 * 1024.0 * 1024.0,
         }
@@ -92,5 +97,29 @@ impl LookupHeuristics {
         let fetch_seconds = staging_bytes as f32 / bandwidth;
         let recompute_seconds = staging_tokens as f32 / self.prefill_tokens_per_sec;
         fetch_seconds > recompute_seconds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HitKind, LookupHeuristics};
+
+    #[test]
+    fn default_heuristics_stage_qwen3_sized_disk_blocks() {
+        let heuristics = LookupHeuristics::default();
+        assert!(
+            !heuristics.advise_recompute(HitKind::StagingFromDisk, 16, 2 * 1024 * 1024),
+            "default heuristics should prefer staged recall over cold recompute for a 2MiB / 16-token disk block",
+        );
+    }
+
+    #[test]
+    fn explicit_fast_prefill_and_slow_disk_can_still_recompute() {
+        let heuristics = LookupHeuristics {
+            prefill_tokens_per_sec: 200_000.0,
+            host_bandwidth_bytes_per_sec: 25.0 * 1024.0 * 1024.0 * 1024.0,
+            disk_bandwidth_bytes_per_sec: 50.0 * 1024.0 * 1024.0,
+        };
+        assert!(heuristics.advise_recompute(HitKind::StagingFromDisk, 16, 2 * 1024 * 1024));
     }
 }

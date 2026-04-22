@@ -45,6 +45,32 @@ fn prefix_cache_retain_hard_cap_pages(total_pages: usize, cap_fraction: f64) -> 
     (total_pages as f64 * cap_fraction) as usize
 }
 
+fn watermark_bytes(capacity_bytes: usize, fraction: f64) -> usize {
+    (capacity_bytes as f64 * fraction) as usize
+}
+
+fn host_spill_target_bytes(
+    reserved_bytes: usize,
+    capacity_bytes: usize,
+    high_water: f64,
+    low_water: f64,
+    intent: BlockSelectionIntent,
+) -> usize {
+    let low_water_bytes = watermark_bytes(capacity_bytes, low_water);
+    match intent {
+        BlockSelectionIntent::Evict => 0,
+        BlockSelectionIntent::Spill => {
+            let high_water_bytes = watermark_bytes(capacity_bytes, high_water);
+            if reserved_bytes < high_water_bytes {
+                0
+            } else {
+                reserved_bytes.saturating_sub(low_water_bytes)
+            }
+        }
+        BlockSelectionIntent::Drain => reserved_bytes.saturating_sub(low_water_bytes),
+    }
+}
+
 fn can_publish_prefix_pages(
     retained_pages: usize,
     total_pages: usize,
@@ -705,9 +731,33 @@ impl<M: ModelForward> Scheduler<M> {
         !self.store_waiting.is_empty()
     }
 
+    fn host_pool_spill_target_bytes(&self, intent: BlockSelectionIntent) -> usize {
+        let Ok(pool) = self.host_pinned_pool.lock() else {
+            return 0;
+        };
+        let capacity_bytes = pool.capacity_bytes();
+        if capacity_bytes == 0 {
+            return 0;
+        }
+        let reserved_bytes = match pool.reserved_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::warn!("failed to query host pool reserved bytes for spill target: {err}");
+                return 0;
+            }
+        };
+        host_spill_target_bytes(
+            reserved_bytes,
+            capacity_bytes,
+            self.config.t1_host_pinned_high_water,
+            self.config.t1_host_pinned_low_water,
+            intent,
+        )
+    }
+
     pub(super) fn trigger_background_store_drain(&mut self) -> bool {
         if !self.has_pending_store_work()
-            && self.host_pool_usage_fraction() <= self.config.t1_host_pinned_high_water
+            && self.host_pool_spill_target_bytes(BlockSelectionIntent::Drain) == 0
         {
             return false;
         }
@@ -1534,8 +1584,8 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn spill_host_blocks_if_pressured(&mut self, intent: BlockSelectionIntent) -> usize {
-        let usage = self.host_pool_usage_fraction();
-        if usage <= self.config.t1_host_pinned_high_water {
+        let bytes_to_spill = self.host_pool_spill_target_bytes(intent);
+        if bytes_to_spill == 0 {
             return 0;
         }
 
@@ -1543,26 +1593,6 @@ impl<M: ModelForward> Scheduler<M> {
         let mut store_submit_headroom =
             coordinator_submit_headroom(coordinator_stats.capacity, coordinator_stats.active());
         if store_submit_headroom == 0 {
-            return 0;
-        }
-
-        let (reserved_bytes, target_reserved_bytes) = match self.host_pinned_pool.lock() {
-            Ok(pool) => (
-                match pool.reserved_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        log::warn!(
-                            "failed to query host pool reserved bytes for spill target: {err}"
-                        );
-                        return 0;
-                    }
-                },
-                (pool.capacity_bytes() as f64 * self.config.t1_host_pinned_low_water) as usize,
-            ),
-            Err(_) => return 0,
-        };
-        let bytes_to_spill = reserved_bytes.saturating_sub(target_reserved_bytes);
-        if bytes_to_spill == 0 {
             return 0;
         }
 
@@ -2184,8 +2214,8 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_publish_prefix_pages, is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages,
-        sealed_block_token_count,
+        BlockSelectionIntent, can_publish_prefix_pages, host_spill_target_bytes,
+        is_full_sealed_prefix, prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
     };
 
     const HARD_CAP: f64 = 0.90;
@@ -2210,5 +2240,29 @@ mod tests {
         assert!(is_full_sealed_prefix(48, 16, 3));
         assert!(!is_full_sealed_prefix(47, 16, 3));
         assert!(!is_full_sealed_prefix(0, 16, 0));
+    }
+
+    #[test]
+    fn spill_target_requires_high_water_on_hot_path() {
+        assert_eq!(
+            host_spill_target_bytes(199, 1000, 0.20, 0.10, BlockSelectionIntent::Spill),
+            0
+        );
+        assert_eq!(
+            host_spill_target_bytes(200, 1000, 0.20, 0.10, BlockSelectionIntent::Spill),
+            100
+        );
+    }
+
+    #[test]
+    fn drain_target_uses_low_water_even_below_high_water() {
+        assert_eq!(
+            host_spill_target_bytes(199, 1000, 0.20, 0.10, BlockSelectionIntent::Drain),
+            99
+        );
+        assert_eq!(
+            host_spill_target_bytes(100, 1000, 0.20, 0.10, BlockSelectionIntent::Drain),
+            0
+        );
     }
 }
