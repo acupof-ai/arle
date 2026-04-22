@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn sampled_log_prob_matches_reference_at_temperature() {
         let logits = [0.1, 1.7, -0.4, 0.8, 0.0, 2.2];
-        let mut rng = LcgRng::new(12345);
+        let mut rng = LcgRng::seed(12345);
         let (ids, log_probs) = sample_categorical(&logits, (1, 1), logits.len(), 0.7, &mut rng);
         assert_eq!(ids.len(), 1);
         assert_eq!(log_probs.len(), 1);
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn greedy_sampled_log_prob_matches_reference() {
         let logits = [0.5, 0.25, 3.0, -1.0];
-        let mut rng = LcgRng::new(7);
+        let mut rng = LcgRng::seed(7);
         let (ids, log_probs) = sample_categorical(&logits, (1, 1), logits.len(), 0.0, &mut rng);
         assert_eq!(ids, vec![2]);
         let expected = log_prob_at_index(&logits, 1.0, 2);
