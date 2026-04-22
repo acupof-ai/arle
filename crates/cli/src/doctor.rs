@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use console::style;
+use serde::Serialize;
 
 use crate::args::Args;
 use crate::hardware::{self, GpuInfo};
@@ -11,15 +12,28 @@ use crate::model_catalog;
 
 struct DoctorSnapshot {
     info: hardware::SystemInfo,
+    tty: TtyState,
     env_model: Option<String>,
+    arg_model_path: Option<String>,
+    hf_cache_root: Option<PathBuf>,
     discovered: Option<(String, PathBuf)>,
     snapshots: Vec<hub_discovery::HubSnapshot>,
     recommendations: Vec<&'static model_catalog::CatalogEntry>,
     selected: Result<SelectedModelSource>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+struct TtyState {
+    stdin: bool,
+    stdout: bool,
+    stderr: bool,
+}
+
 pub(crate) fn run(args: &Args) -> Result<()> {
     let snapshot = collect_snapshot(args);
+    if args.json {
+        return print_json(&doctor_report(&snapshot));
+    }
 
     println!("{}", style("agent-infer doctor").bold().cyan());
     println!();
@@ -36,9 +50,9 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!(
         "{} stdin={} stdout={} stderr={}",
         style("tty").dim(),
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-        std::io::stderr().is_terminal()
+        snapshot.tty.stdin,
+        snapshot.tty.stdout,
+        snapshot.tty.stderr
     );
     println!(
         "{} {} · {} cores",
@@ -68,12 +82,14 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!(
         "{} {}",
         style("arg --model-path").dim(),
-        args.model_path.as_deref().unwrap_or("<unset>")
+        snapshot.arg_model_path.as_deref().unwrap_or("<unset>")
     );
     println!(
         "{} {}",
         style("hf cache").dim(),
-        hub_discovery::hub_cache_root()
+        snapshot
+            .hf_cache_root
+            .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<unavailable>".to_string())
     );
@@ -129,6 +145,9 @@ pub(crate) fn run(args: &Args) -> Result<()> {
 
 pub(crate) fn list_models(args: &Args) -> Result<()> {
     let snapshot = collect_snapshot(args);
+    if args.json {
+        return print_json(&models_report(&snapshot));
+    }
 
     println!("{}", style("agent-infer models").bold().cyan());
     println!();
@@ -156,24 +175,319 @@ pub(crate) fn list_models(args: &Args) -> Result<()> {
 
 fn collect_snapshot(args: &Args) -> DoctorSnapshot {
     let info = hardware::detect_system();
+    let tty = TtyState {
+        stdin: std::io::stdin().is_terminal(),
+        stdout: std::io::stdout().is_terminal(),
+        stderr: std::io::stderr().is_terminal(),
+    };
     let env_model =
         non_empty_value(std::env::var("AGENT_INFER_MODEL").ok().as_deref()).map(ToOwned::to_owned);
+    let arg_model_path = non_empty_value(args.model_path.as_deref()).map(ToOwned::to_owned);
+    let hf_cache_root = hub_discovery::hub_cache_root();
     let discovered = infer::hf_hub::discover_local_model();
     let snapshots = hub_discovery::discover_hub_snapshots();
     let recommendations = model_catalog::recommend_models(&info);
     let selected = select_model_source(
-        args.model_path.as_deref(),
+        arg_model_path.as_deref(),
         env_model.as_deref(),
         discovered.clone(),
     );
     DoctorSnapshot {
         info,
+        tty,
         env_model,
+        arg_model_path,
+        hf_cache_root,
         discovered,
         snapshots,
         recommendations,
         selected,
     }
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorJsonReport {
+    mode: &'static str,
+    version: &'static str,
+    compiled_backend: String,
+    supports_inference: bool,
+    tty: TtyState,
+    cpu: CpuReport,
+    ram_gb: RamReport,
+    gpu: GpuReport,
+    inputs: InputsReport,
+    resolution: ResolutionReport,
+    discovery: DiscoveryReport,
+    recommendations: Vec<ModelRecommendationReport>,
+    checks: Vec<CheckReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelsJsonReport {
+    mode: &'static str,
+    version: &'static str,
+    compiled_backend: String,
+    resolution: ResolutionReport,
+    discovery: DiscoveryReport,
+    recommendations: Vec<ModelRecommendationReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct CpuReport {
+    name: String,
+    cores: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RamReport {
+    total: f64,
+    available: f64,
+    effective: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct GpuReport {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_gb: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct InputsReport {
+    env_model: Option<String>,
+    model_path_arg: Option<String>,
+    hf_cache_root: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolutionReport {
+    selected: Option<SelectedModelReport>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SelectedModelReport {
+    origin: &'static str,
+    value: String,
+    local_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryReport {
+    preferred_local_model: Option<DiscoveredModelReport>,
+    supported_hub_snapshots: Vec<HubSnapshotReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveredModelReport {
+    model_id: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HubSnapshotReport {
+    model_id: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRecommendationReport {
+    hf_id: String,
+    display_name: String,
+    quantization: Option<String>,
+    size_gb: f64,
+    min_memory_gb: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckReport {
+    name: &'static str,
+    status: &'static str,
+    message: String,
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn doctor_report(snapshot: &DoctorSnapshot) -> DoctorJsonReport {
+    DoctorJsonReport {
+        mode: "doctor",
+        version: env!("CARGO_PKG_VERSION"),
+        compiled_backend: snapshot.info.compiled_backend.name().to_string(),
+        supports_inference: snapshot.info.compiled_backend.supports_inference(),
+        tty: snapshot.tty,
+        cpu: CpuReport {
+            name: snapshot.info.cpu_name.clone(),
+            cores: snapshot.info.cpu_cores,
+        },
+        ram_gb: RamReport {
+            total: snapshot.info.total_ram_gb,
+            available: snapshot.info.available_ram_gb,
+            effective: snapshot.info.effective_memory_gb(),
+        },
+        gpu: gpu_report(&snapshot.info.gpu),
+        inputs: InputsReport {
+            env_model: snapshot.env_model.clone(),
+            model_path_arg: snapshot.arg_model_path.clone(),
+            hf_cache_root: snapshot
+                .hf_cache_root
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        },
+        resolution: resolution_report(&snapshot.selected),
+        discovery: discovery_report(snapshot),
+        recommendations: recommendation_reports(snapshot),
+        checks: checks_report(snapshot),
+    }
+}
+
+fn models_report(snapshot: &DoctorSnapshot) -> ModelsJsonReport {
+    ModelsJsonReport {
+        mode: "list_models",
+        version: env!("CARGO_PKG_VERSION"),
+        compiled_backend: snapshot.info.compiled_backend.name().to_string(),
+        resolution: resolution_report(&snapshot.selected),
+        discovery: discovery_report(snapshot),
+        recommendations: recommendation_reports(snapshot),
+    }
+}
+
+fn gpu_report(gpu: &GpuInfo) -> GpuReport {
+    match gpu {
+        GpuInfo::Cuda { name, vram_gb } => GpuReport {
+            kind: "cuda",
+            name: Some(name.clone()),
+            memory_gb: Some(*vram_gb),
+        },
+        GpuInfo::Metal {
+            chip,
+            unified_memory_gb,
+        } => GpuReport {
+            kind: "metal",
+            name: Some(chip.clone()),
+            memory_gb: Some(*unified_memory_gb),
+        },
+        GpuInfo::None => GpuReport {
+            kind: "none",
+            name: None,
+            memory_gb: None,
+        },
+    }
+}
+
+fn resolution_report(selected: &Result<SelectedModelSource>) -> ResolutionReport {
+    match selected {
+        Ok(source) => ResolutionReport {
+            selected: Some(SelectedModelReport {
+                origin: source.origin_key(),
+                value: source.value().to_string(),
+                local_path: source.local_path().map(|path| path.display().to_string()),
+            }),
+            error: None,
+        },
+        Err(err) => ResolutionReport {
+            selected: None,
+            error: Some(format!("{err:#}")),
+        },
+    }
+}
+
+fn discovery_report(snapshot: &DoctorSnapshot) -> DiscoveryReport {
+    DiscoveryReport {
+        preferred_local_model: snapshot.discovered.as_ref().map(|(model_id, path)| {
+            DiscoveredModelReport {
+                model_id: model_id.clone(),
+                path: path.display().to_string(),
+            }
+        }),
+        supported_hub_snapshots: snapshot
+            .snapshots
+            .iter()
+            .map(|item| HubSnapshotReport {
+                model_id: item.model_id.clone(),
+                path: item.path.display().to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn recommendation_reports(snapshot: &DoctorSnapshot) -> Vec<ModelRecommendationReport> {
+    snapshot
+        .recommendations
+        .iter()
+        .map(|entry| ModelRecommendationReport {
+            hf_id: entry.hf_id.to_string(),
+            display_name: entry.display_name.to_string(),
+            quantization: entry.quantization.map(ToOwned::to_owned),
+            size_gb: entry.size_gb,
+            min_memory_gb: entry.min_memory_gb,
+        })
+        .collect()
+}
+
+fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
+    let mut checks = Vec::new();
+    let supports_inference = snapshot.info.compiled_backend.supports_inference();
+    if supports_inference {
+        checks.push(CheckReport {
+            name: "backend",
+            status: "ok",
+            message: format!(
+                "{} backend is available in this binary",
+                snapshot.info.compiled_backend.name()
+            ),
+        });
+    } else {
+        checks.push(CheckReport {
+            name: "backend",
+            status: "warn",
+            message: "rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference"
+                .to_string(),
+        });
+    }
+    if !supports_inference {
+        checks.push(CheckReport {
+            name: "catalog",
+            status: "warn",
+            message:
+                "backend-specific recommendations require a build with `cuda`, `metal,no-cuda`, or `cpu,no-cuda`"
+                    .to_string(),
+        });
+    } else if snapshot.recommendations.is_empty() {
+        checks.push(CheckReport {
+            name: "catalog",
+            status: "warn",
+            message: "detected memory does not fit any curated model for this backend".to_string(),
+        });
+    } else {
+        checks.push(CheckReport {
+            name: "catalog",
+            status: "ok",
+            message: format!(
+                "{} curated recommendations available",
+                snapshot.recommendations.len()
+            ),
+        });
+    }
+    if snapshot.selected.is_ok() {
+        checks.push(CheckReport {
+            name: "resolution",
+            status: "ok",
+            message: "resolved a model source".to_string(),
+        });
+    } else {
+        checks.push(CheckReport {
+            name: "resolution",
+            status: "warn",
+            message: "set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model"
+                .to_string(),
+        });
+    }
+    checks
 }
 
 fn print_discovery_section(snapshot: &DoctorSnapshot) {
@@ -247,6 +561,14 @@ impl SelectedModelSource {
         }
     }
 
+    fn origin_key(&self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "arg_model_path",
+            Self::Environment(_) => "env_model",
+            Self::AutoDiscovered { .. } => "auto_discovered_local_model",
+        }
+    }
+
     fn value(&self) -> &str {
         match self {
             Self::Explicit(value) | Self::Environment(value) => value,
@@ -301,8 +623,44 @@ fn gpu_summary(gpu: &GpuInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectedModelSource, select_model_source};
+    use super::{
+        DoctorSnapshot, SelectedModelSource, TtyState, doctor_report, models_report,
+        select_model_source,
+    };
+    use crate::hardware::{CompiledBackend, GpuInfo, SystemInfo};
+    use crate::{hub_discovery, model_catalog};
     use std::path::PathBuf;
+
+    fn test_snapshot(selected: anyhow::Result<SelectedModelSource>) -> DoctorSnapshot {
+        let snapshots = (0..6)
+            .map(|index| hub_discovery::HubSnapshot {
+                model_id: format!("Qwen/Qwen3-{}B", index + 1),
+                path: PathBuf::from(format!("/tmp/hub/{index}")),
+            })
+            .collect();
+        DoctorSnapshot {
+            info: SystemInfo {
+                cpu_name: "test-cpu".to_string(),
+                cpu_cores: 8,
+                total_ram_gb: 32.0,
+                available_ram_gb: 24.0,
+                gpu: GpuInfo::None,
+                compiled_backend: CompiledBackend::Cpu,
+            },
+            tty: TtyState {
+                stdin: false,
+                stdout: true,
+                stderr: true,
+            },
+            env_model: Some("Qwen/Qwen3-4B".to_string()),
+            arg_model_path: None,
+            hf_cache_root: Some(PathBuf::from("/tmp/hf-cache")),
+            discovered: Some(("Qwen/Qwen3-0.6B".to_string(), PathBuf::from("/tmp/auto"))),
+            snapshots,
+            recommendations: vec![&model_catalog::CATALOG[2], &model_catalog::CATALOG[3]],
+            selected,
+        }
+    }
 
     #[test]
     fn prefers_explicit_model_path() {
@@ -358,5 +716,48 @@ mod tests {
             err.to_string()
                 .contains("no model selected; pass --model-path")
         );
+    }
+
+    #[test]
+    fn doctor_report_serializes_machine_readable_fields() {
+        let snapshot = test_snapshot(Ok(SelectedModelSource::Environment(
+            "Qwen/Qwen3-4B".to_string(),
+        )));
+        let value = serde_json::to_value(doctor_report(&snapshot)).expect("serialize doctor json");
+
+        assert_eq!(value["mode"], "doctor");
+        assert_eq!(
+            value["compiled_backend"],
+            snapshot.info.compiled_backend.name()
+        );
+        assert_eq!(value["resolution"]["selected"]["origin"], "env_model");
+        assert_eq!(value["inputs"]["hf_cache_root"], "/tmp/hf-cache");
+        assert_eq!(
+            value["discovery"]["supported_hub_snapshots"]
+                .as_array()
+                .expect("snapshot list")
+                .len(),
+            6
+        );
+        assert_eq!(value["checks"][0]["name"], "backend");
+        assert_eq!(
+            value["checks"][0]["status"],
+            if snapshot.info.compiled_backend.supports_inference() {
+                "ok"
+            } else {
+                "warn"
+            }
+        );
+    }
+
+    #[test]
+    fn models_report_serializes_without_doctor_only_checks() {
+        let snapshot = test_snapshot(Err(anyhow::anyhow!("no model selected")));
+        let value = serde_json::to_value(models_report(&snapshot)).expect("serialize models json");
+
+        assert_eq!(value["mode"], "list_models");
+        assert!(value.get("checks").is_none());
+        assert!(value["resolution"]["selected"].is_null());
+        assert_eq!(value["resolution"]["error"], "no model selected");
     }
 }

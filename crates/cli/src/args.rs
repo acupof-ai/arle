@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
@@ -24,7 +24,11 @@ fn parse_temperature(value: &str) -> Result<f32, String> {
 }
 
 #[derive(Parser)]
-#[command(name = "agent-infer", about = "Local LLM agent with tool use")]
+#[command(
+    name = "agent-infer",
+    about = "Local LLM agent with tool use",
+    group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
+)]
 pub(crate) struct Args {
     /// Path to model directory or HuggingFace model ID.
     /// If omitted, the CLI auto-detects a local model from common directories and HF cache.
@@ -32,12 +36,16 @@ pub(crate) struct Args {
     pub(crate) model_path: Option<String>,
 
     /// Print a local environment/model-resolution diagnostic report and exit.
-    #[arg(long, default_value_t = false, conflicts_with = "list_models")]
+    #[arg(long, default_value_t = false)]
     pub(crate) doctor: bool,
 
     /// Print discovered and recommended models, then exit.
-    #[arg(long, default_value_t = false, conflicts_with = "doctor")]
+    #[arg(long, default_value_t = false)]
     pub(crate) list_models: bool,
+
+    /// Render `--doctor` / `--list-models` output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false, requires = "inspection_mode")]
+    pub(crate) json: bool,
 
     /// Maximum agent turns (generate-execute cycles) per query
     #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
@@ -136,5 +144,29 @@ mod tests {
             .err()
             .expect("doctor and list-models should conflict");
         assert!(err.to_string().contains("--list-models"));
+    }
+
+    #[test]
+    fn accepts_doctor_json_flag() {
+        let args = Args::try_parse_from(["agent-infer", "--doctor", "--json"])
+            .expect("doctor json flag should parse");
+        assert!(args.doctor);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn accepts_list_models_json_flag() {
+        let args = Args::try_parse_from(["agent-infer", "--list-models", "--json"])
+            .expect("list-models json flag should parse");
+        assert!(args.list_models);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn rejects_json_without_inspection_mode() {
+        let err = Args::try_parse_from(["agent-infer", "--json"])
+            .err()
+            .expect("--json without inspection mode should fail");
+        assert!(err.to_string().contains("--doctor"));
     }
 }
