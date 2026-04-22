@@ -365,24 +365,8 @@ pub trait ModelForward: Send {
         &self,
         _max_batch_size: usize,
         _prefill_budget_tokens: usize,
-        _mixed_prefill_tokens: usize,
-        _mixed_prefill: bool,
     ) -> usize {
         0
-    }
-
-    /// Pre-allocate mixed prefill/decode scratch before requests are admitted.
-    ///
-    /// Models that support `forward_mixed_batch_with_prefill()` should override
-    /// this so an insufficient workspace fails at startup instead of after the
-    /// scheduler has already consumed decode-token KV pages.
-    fn prepare_mixed_decode_context(
-        &self,
-        _decode_ctx: &mut Self::DecodeContext,
-        _pool: &PagedKVPool,
-        _max_prefill_tokens: usize,
-    ) -> Result<()> {
-        Ok(())
     }
 
     /// Fast-path batched greedy sampling on internal contiguous logits.
@@ -458,78 +442,11 @@ pub trait ModelForward: Send {
         Ok(())
     }
 
-    /// Whether this model has a validated eager mixed decode + prefill path at all.
-    ///
-    /// `supports_mixed_prefill_batch()` implies this, but models that only
-    /// validate the `batch_size = 1` degenerate case can still opt into the
-    /// unified scheduler path without claiming multi-request prefill fusion.
-    fn supports_mixed_batch(&self) -> bool {
-        self.supports_mixed_prefill_batch()
-    }
-
-    /// Whether this model has a validated eager mixed decode + batched-prefill path.
-    fn supports_mixed_prefill_batch(&self) -> bool {
-        false
-    }
-
     /// Whether batched decode for this model can be replayed via a captured
     /// CUDA Graph. Returns `false` when the model forces an eager decode
     /// path (e.g. LoRA adapters allocate per-call temps which stream
     /// capture rejects). Scheduler skips warmup/autotune in that case.
     fn supports_cuda_graph_decode(&self) -> bool {
         true
-    }
-
-    /// Legacy mixed-batch hook: B decode tokens + one prefill request in one eager forward pass.
-    ///
-    /// The scheduler now targets `forward_mixed_batch_with_prefill()`;
-    /// this method is kept so existing model implementations can treat the
-    /// single-request case as the batch-size-1 degenerate path.
-    fn forward_mixed_batch(
-        &self,
-        _decode_tokens: &[u32],
-        _prefill_tokens: &[u32],
-        _states: &mut [Self::State],
-        _decode_slot_indices: &[usize],
-        _prefill_slot_idx: usize,
-        _prefill_start_pos: usize,
-        _paged_kv_pool: Option<&mut PagedKVPool>,
-        _decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        Ok(false)
-    }
-
-    /// Mixed-batch forward: B decode tokens + N prefill requests in one eager forward pass.
-    ///
-    /// Default falls back to the legacy single-prefill hook when the batch
-    /// contains exactly one request.
-    fn forward_mixed_batch_with_prefill(
-        &self,
-        decode_tokens: &[u32],
-        prefill: &[PrefillBatchRequest<'_>],
-        states: &mut [Self::State],
-        decode_slot_indices: &[usize],
-        paged_kv_pool: Option<&mut PagedKVPool>,
-        decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        let [request] = prefill else {
-            return Ok(false);
-        };
-
-        let prefill_start_pos = paged_kv_pool
-            .as_ref()
-            .map(|pool| pool.seq_len(request.slot_idx))
-            .unwrap_or_default();
-
-        self.forward_mixed_batch(
-            decode_tokens,
-            request.tokens,
-            states,
-            decode_slot_indices,
-            request.slot_idx,
-            prefill_start_pos,
-            paged_kv_pool,
-            decode_ctx,
-        )
     }
 }

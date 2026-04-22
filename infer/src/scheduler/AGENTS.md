@@ -46,9 +46,10 @@ works with any backend. Load before editing any scheduler internals.
    `ChunkingPolicy` / `DecodeAwareChunking` belongs to the backend-agnostic
    CPU accounting scheduler only. The production CUDA runtime does not have a
    "decode active => chunk = 64" rule; `chunked_prefill_size` caps one
-   request's prefill chunk, `max_prefill_tokens` caps the total prefill tokens
-   admitted in one planned tick, and `prefill_max_requests` /
-   `enable_mixed_chunk` control request count and mixed launch eligibility.
+   request's prefill chunk, `max_num_batched_tokens` caps the whole step token
+   budget, `max_prefill_tokens` caps the prefill share of that budget, and
+   `prefill_max_requests` limits how many prefilling requests advance in one
+   planned tick.
 6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from

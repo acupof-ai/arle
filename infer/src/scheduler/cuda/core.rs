@@ -443,10 +443,6 @@ impl<M: ModelForward> Scheduler<M> {
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
         let effective_prefill_token_budget = config.max_prefill_tokens;
-        let mixed_prefill_token_budget = config
-            .max_prefill_tokens
-            .min(config.chunked_prefill_size.max(1));
-        let mixed_prefill_enabled = config.enable_mixed_chunk && model.supports_mixed_batch();
 
         // When the model writes prefill K/V directly to the paged pool, the
         // per-slot contiguous scratch buffer is unused by prefill. Shrink it
@@ -479,13 +475,11 @@ impl<M: ModelForward> Scheduler<M> {
             let contiguous_cost = config.max_slots * contiguous_tokens * bytes_per_token;
             // SGLang-compatible: size the KV pool after subtracting runtime
             // workspaces that are allocated after model load. Otherwise a
-            // large pool can leave no contiguous room for mixed prefill/decode
+            // large pool can leave no contiguous room for decode / prefill
             // attention workspaces and fail mid-request.
             let runtime_workspace = model.scheduler_runtime_workspace_bytes(
                 config.max_slots,
                 effective_prefill_token_budget,
-                mixed_prefill_token_budget,
-                mixed_prefill_enabled,
             );
             let budget_bytes = match crate::backend::cuda::tensor::DeviceContext::gpu_memory_info()
             {
@@ -527,34 +521,19 @@ impl<M: ModelForward> Scheduler<M> {
             crate::kv_tier::HostPinnedPool::new(host_pool_capacity)?,
         );
 
-        let mut decode_bufs = None;
-        if mixed_prefill_enabled {
-            let mut ctx = model.create_decode_context(config.max_slots, &paged_kv_pool)?;
-            model.prepare_mixed_decode_context(
-                &mut ctx,
-                &paged_kv_pool,
-                mixed_prefill_token_budget,
-            )?;
-            info!(
-                "Mixed prefill workspace ready: mixed_prefill_tokens={}, prefill_budget_tokens={}, max_batch={}",
-                mixed_prefill_token_budget, effective_prefill_token_budget, config.max_slots
-            );
-            decode_bufs = Some(ctx);
-        }
-
         info!(
-            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_prefill_tokens={}, prefill_max_requests={}, mixed_chunk={}, host_pool={:.1}MB",
+            "Scheduler ready: model={}, slots={}, seed={}, max_seq_len={}, max_waiting={}, chunked_prefill_size={}, max_num_batched_tokens={}, max_prefill_tokens={}, prefill_max_requests={}, host_pool={:.1}MB",
             model_id,
             config.max_slots,
             seed,
             effective_max_seq_len.map_or_else(|| "32768 (default)".to_string(), |n| n.to_string()),
             config.max_waiting_requests,
             config.chunked_prefill_size,
+            config.max_num_batched_tokens,
             config.max_prefill_tokens,
             config
                 .prefill_max_requests
                 .map_or_else(|| "none".to_string(), |v| v.to_string()),
-            config.enable_mixed_chunk,
             host_pool_capacity as f64 / 1e6,
         );
 
@@ -613,7 +592,7 @@ impl<M: ModelForward> Scheduler<M> {
             next_id: 0,
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
-            decode_bufs,
+            decode_bufs: None,
             total_completed: 0,
             total_generated_tokens: 0,
             step_timing_decode_us: 0.0,

@@ -52,6 +52,11 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     chunked_prefill_size: usize,
 
+    /// Maximum total tokens to advance in one scheduler step.
+    /// Decode rows consume one token each; prefill rows consume their admitted chunk.
+    #[arg(long, default_value_t = 16384)]
+    max_num_batched_tokens: usize,
+
     /// Maximum total prefill tokens to queue in one scheduler step.
     #[arg(long, default_value_t = 16384)]
     max_prefill_tokens: usize,
@@ -60,10 +65,6 @@ struct Args {
     /// If omitted, the scheduler only enforces the token budget.
     #[arg(long)]
     prefill_max_requests: Option<usize>,
-
-    /// Enable mixing a prefill batch into a decode batch when the model supports it.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    enable_mixed_chunk: bool,
 
     /// Fraction of total GPU memory for weights + KV cache (SGLang-compatible).
     /// The remaining (1 - fraction) is headroom for activations, CUDA graphs,
@@ -149,9 +150,9 @@ async fn main() {
             },
             scheduler: SchedulerConfig {
                 chunked_prefill_size: args.chunked_prefill_size,
+                max_num_batched_tokens: args.max_num_batched_tokens,
                 max_prefill_tokens: args.max_prefill_tokens,
                 prefill_max_requests: args.prefill_max_requests,
-                enable_mixed_chunk: args.enable_mixed_chunk,
                 mem_fraction_static: args.mem_fraction_static,
                 min_seq_len: args.min_seq_len,
                 kv_pool_fallback_bytes: args.kv_pool_fallback_mb.saturating_mul(1024 * 1024),

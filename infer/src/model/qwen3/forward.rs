@@ -119,11 +119,8 @@ impl ModelForward for Qwen3Model {
         &self,
         max_batch_size: usize,
         prefill_budget_tokens: usize,
-        mixed_prefill_tokens: usize,
-        mixed_prefill: bool,
     ) -> usize {
         let prefill_budget_tokens = prefill_budget_tokens.max(1);
-        let mixed_prefill_tokens = mixed_prefill_tokens.max(1);
         let num_heads = self.config.num_attention_heads;
         let q_dim = num_heads * self.config.head_dim;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
@@ -154,33 +151,11 @@ impl ModelForward for Qwen3Model {
             num_heads,
         );
 
-        let mixed_activation = if mixed_prefill {
-            super::batch_decode::MixedBatchBuffers::device_bytes(
-                &self.config,
-                max_batch_size,
-                1,
-                16,
-                mixed_prefill_tokens,
-            )
-        } else {
-            0
-        };
-
         decode_context
             .saturating_add(decode_logits)
             .saturating_add(prefill_plan)
-            .saturating_add(prefill_activation.max(mixed_activation))
+            .saturating_add(prefill_activation)
             .saturating_add(128 * 1024 * 1024)
-    }
-
-    fn prepare_mixed_decode_context(
-        &self,
-        decode_ctx: &mut Self::DecodeContext,
-        pool: &PagedKVPool,
-        max_prefill_tokens: usize,
-    ) -> Result<()> {
-        decode_ctx.reserve_logits(&self.ctx, self.config.vocab_size)?;
-        decode_ctx.reserve_mixed_buffers(self, pool, max_prefill_tokens)
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {
@@ -518,41 +493,10 @@ impl ModelForward for Qwen3Model {
         }
     }
 
-    fn supports_mixed_prefill_batch(&self) -> bool {
-        // The fused mixed decode+prefill path does not apply LoRA adapters
-        // yet. Reporting `true` would let the scheduler double-reserve
-        // decode slots (once in `step_decode_launch_mixed`, again in the
-        // `Ok(false)` fallback inside the mixed-batch eager path), which
-        // corrupts paged-KV `seq_len`. Opt out entirely when LoRA is live.
-        self.lora.is_none()
-    }
-
     fn supports_cuda_graph_decode(&self) -> bool {
         // LoRA decode allocates per-call temp DeviceVecs inside
         // `apply_lora_{gemv,gemm}_add`; CUDA stream capture rejects those.
         // The LoRA-aware batched decode runs eagerly, so skip warmup.
         self.enable_cuda_graph && self.lora.is_none()
-    }
-
-    fn forward_mixed_batch_with_prefill(
-        &self,
-        decode_tokens: &[u32],
-        prefill: &[PrefillBatchRequest<'_>],
-        states: &mut [Self::State],
-        decode_slot_indices: &[usize],
-        paged_kv_pool: Option<&mut PagedKVPool>,
-        decode_ctx: &mut Self::DecodeContext,
-    ) -> Result<bool> {
-        match paged_kv_pool {
-            Some(pool) if pool.is_active() => self.decode_batch_with_prefill_batch(
-                decode_tokens,
-                prefill,
-                states,
-                decode_slot_indices,
-                pool,
-                decode_ctx,
-            ),
-            _ => Ok(false),
-        }
     }
 }
