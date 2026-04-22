@@ -18,6 +18,18 @@ explicitly.
   A3B drafts; no pair-specific auto-tune branch remains in `dflash.rs`.
 - The user-facing Metal DFlash doc no longer claims an A3B-only auto-tuned
   default of `2`.
+- Comparison table, local Apple Silicon serial runs:
+
+| workload | mode | block_size | gen tok/s | repo e2e tok/s | TTFT ms | avg accepted inputs | acceptance rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| step-driver, prompt=20, gen=128 | baseline | n/a | 88.49 | 84.57 | 66.96 | n/a | n/a |
+| step-driver, prompt=20, gen=128 | DFlash autotuned | 2 | 77.40 | 74.50 | 64.43 | 2.00 | 50.0% |
+| step-driver, prompt=20, gen=128 | DFlash restored default | 16 | 53.15 | 51.49 | 77.68 | 4.41 | 77.34% |
+| step-driver, prompt=20, gen=1024 | baseline | n/a | 80.69 | 80.25 | 68.28 | n/a | n/a |
+| step-driver, prompt=20, gen=1024 | DFlash autotuned | 2 | 69.05 | 68.72 | 69.35 | 2.00 | 50.0% |
+| metal_request, math reasoning prompt, gen=512 | baseline | n/a | 83.0 | n/a | 83.0 | n/a | n/a |
+| metal_request, math reasoning prompt, gen=512 | DFlash autotuned | 2 | 58.5 | n/a | 394.5 | n/a | n/a |
+
 - Local smoke:
   - `metal_request` logged
     `Metal DFlash enabled: ... block_size=16 ...`
