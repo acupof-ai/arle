@@ -59,10 +59,10 @@ use std::task::Poll;
 #[cfg(all(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 compile_error!("enable only one of `rdma-nixl` or `rdma-nixl-real`");
 
-#[cfg(feature = "rdma-nixl")]
-use nixl_sys_stub as nixl_api;
 #[cfg(all(not(feature = "rdma-nixl"), feature = "rdma-nixl-real"))]
 use nixl_sys_real as nixl_api;
+#[cfg(feature = "rdma-nixl")]
+use nixl_sys_stub as nixl_api;
 
 use super::super::{
     backend::KVBackendScope,
