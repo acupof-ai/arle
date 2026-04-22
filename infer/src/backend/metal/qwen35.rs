@@ -3,19 +3,18 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use super::mlx::{
-    add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
+    Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
-    zeros, Dtype, MlxArray,
+    zeros,
 };
 
-use super::gdr::{metal_gdr_decode_step, MetalLinearAttnWeights, MetalRecurrentState};
-use super::weights::{load_quantized_with_bits, load_stacked_quantized, StackedQuantized};
+use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
+use super::weights::{StackedQuantized, load_quantized_with_bits, load_stacked_quantized};
 use super::{
-    clear_metal_cache, dflash, extend_kv_cache, gpu_sample_token, linear,
-    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
-    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens, MetalModelArch,
-    MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType, MlpInputProjection,
-    WeightTensor, KV_CACHE_CHUNK,
+    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
+    MlpInputProjection, WeightTensor, clear_metal_cache, dflash, extend_kv_cache, gpu_sample_token,
+    linear, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
+    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
 };
 use crate::backend::is_stream_stop_matched;
 use crate::backend::metal::dflash::MetalDflashRuntime;
@@ -931,6 +930,7 @@ impl CppQwen35Model {
     /// draft in a single pass. Tape/hidden capture flags on the model are
     /// respected — one call emits the full per-step GDR innovation tape and the
     /// full hidden-state capture for the block.
+    #[cfg(test)]
     pub(super) fn verify_block(
         &self,
         tokens: &MlxArray,
@@ -1066,6 +1066,7 @@ impl CppQwen35Model {
     /// Returns logits `[B, block_size, vocab]`. Tape and hidden-state
     /// capture settings on the underlying C++ model are respected; each
     /// tape entry becomes `[B, block_size, …]`.
+    #[cfg(test)]
     pub(super) fn verify_block_batched(
         &self,
         tokens: &MlxArray,
@@ -2525,7 +2526,7 @@ mod tests {
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
-        mlx::{as_dtype, concatenate_axis, eval, slice, slice_update, zeros, Dtype},
+        mlx::{Dtype, as_dtype, concatenate_axis, eval, slice, slice_update, zeros},
         weights::load_qwen3_metal_weights,
     };
     use crate::test_support::metal_test_guard;
