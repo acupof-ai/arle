@@ -309,6 +309,10 @@ impl ModelForward for Qwen35Model {
         true
     }
 
+    fn supports_cross_slot_prefix_attach(&self) -> bool {
+        false
+    }
+
     fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()> {
         state.drop_paged_prefill();
         self.prefill_forward_single_token(

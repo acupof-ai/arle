@@ -377,6 +377,17 @@ pub trait ModelForward: Send {
         false
     }
 
+    /// Returns true when a model can resume a cached prefix on a fresh slot
+    /// using only shared paged-KV pages plus the newly supplied suffix tokens.
+    ///
+    /// Pure-attention models can do this because the shared KV pages fully
+    /// capture their prefix state. Hybrid models with auxiliary recurrent state
+    /// must return `false` until they can restore or reconstruct that
+    /// auxiliary state at the reused prefix length.
+    fn supports_cross_slot_prefix_attach(&self) -> bool {
+        self.prefill_uses_paged_pool()
+    }
+
     /// GPU workspace the scheduler must reserve before sizing the KV pool.
     ///
     /// This covers model-owned runtime buffers that are allocated after weights

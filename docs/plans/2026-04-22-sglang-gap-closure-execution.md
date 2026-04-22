@@ -53,13 +53,18 @@ That pointed at one bottleneck cluster:
   - MixedBatch scheduling no longer forks by model family
 - Model-side prefill execution is **not fully unified** yet:
   - `Qwen3` has a real packed batched paged-prefill path
-  - `Qwen3.5` now also has a true packed multi-request paged-prefill path:
-    the scheduler-visible batch override builds one packed token/page-table
-    layout, runs one packed layer loop, and uses packed recurrent-state
-    launches for the hybrid linear-attention layers
-  - model-side batching is still not perfectly identical between `Qwen3` and
-    `Qwen3.5` because `Qwen3.5` remains hybrid and therefore retains its real
-    `supports_partial_prefix() == false` capability difference
+- `Qwen3.5` now also has a true packed multi-request paged-prefill path:
+  the scheduler-visible batch override builds one packed token/page-table
+  layout, runs one packed layer loop, and uses packed recurrent-state
+  launches for the hybrid linear-attention layers
+- model-side batching is still not perfectly identical between `Qwen3` and
+  `Qwen3.5` because `Qwen3.5` remains hybrid and therefore retains its real
+  `supports_partial_prefix() == false` capability difference
+- `Qwen3.5` therefore does **not** currently take the cross-slot paged-prefix
+  attach / staged-readmission reuse path. Shared paged KV pages alone are not
+  sufficient to reconstruct its hybrid recurrent state on a fresh slot, so the
+  scheduler now routes it through same-slot stateful reuse or cold prefill
+  instead of pretending the shared pages are enough.
 - `Qwen3.5` also remains a real capability outlier because it is hybrid:
   `supports_partial_prefix() == false` is a model constraint, not just an
   implementation gap.
