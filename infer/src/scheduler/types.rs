@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -38,7 +38,11 @@ pub struct SchedulerConfig {
     /// prefill-only cap.
     pub max_num_batched_tokens: usize,
     /// Maximum total prefill tokens admitted across the whole scheduler tick.
-    /// Multiple requests share this budget.
+    ///
+    /// The CUDA scheduler folds this into one canonical mutable prefill budget:
+    /// `min(max_num_batched_tokens - running_decode_rows, max_prefill_tokens)`.
+    /// This remains a separate operator-facing cap so serving can clamp the
+    /// prefill share of a step without introducing a second planner path.
     pub max_prefill_tokens: usize,
     /// Per-request prefill cap once decode rows are active in the same step.
     ///
@@ -319,6 +323,7 @@ impl std::error::Error for SchedulerFull {}
 #[derive(Clone)]
 pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<IncomingRequest>,
+    wakeup_tx: crossbeam_channel::Sender<()>,
     model_id: Arc<str>,
     /// Shared count of items currently in the waiting channel.
     waiting_count: Arc<AtomicUsize>,
@@ -340,8 +345,10 @@ impl SchedulerHandle {
 
     /// Create a handle from raw parts (useful for testing).
     pub fn from_parts(tx: mpsc::UnboundedSender<IncomingRequest>, model_id: &str) -> Self {
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            wakeup_tx,
             model_id: Arc::from(model_id),
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting: 0,
@@ -354,8 +361,10 @@ impl SchedulerHandle {
         model_id: &str,
         max_waiting: usize,
     ) -> Self {
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            wakeup_tx,
             model_id: Arc::from(model_id),
             waiting_count: Arc::new(AtomicUsize::new(0)),
             max_waiting,
@@ -369,8 +378,26 @@ impl SchedulerHandle {
         max_waiting: usize,
         waiting_count: Arc<AtomicUsize>,
     ) -> Self {
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            wakeup_tx,
+            model_id: Arc::from(model_id),
+            waiting_count,
+            max_waiting,
+        }
+    }
+
+    pub fn with_shared_waiting_count_and_wakeup(
+        tx: mpsc::UnboundedSender<IncomingRequest>,
+        wakeup_tx: crossbeam_channel::Sender<()>,
+        model_id: &str,
+        max_waiting: usize,
+        waiting_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            tx,
+            wakeup_tx,
             model_id: Arc::from(model_id),
             waiting_count,
             max_waiting,
@@ -400,7 +427,9 @@ impl SchedulerHandle {
         self.tx.send(req).map_err(|_| {
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
             SchedulerFull
-        })
+        })?;
+        let _ = self.wakeup_tx.send(());
+        Ok(())
     }
 
     /// Decrement the waiting count (called by the scheduler when it consumes a request).

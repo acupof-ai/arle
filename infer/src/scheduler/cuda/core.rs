@@ -126,6 +126,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
     pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
     pub(super) request_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    pub(super) wakeup_rx: crossbeam_channel::Receiver<()>,
+    pub(super) wakeup_live: bool,
     /// Shared waiting count with the handle (for backpressure decrement).
     pub(super) waiting_count: Arc<AtomicUsize>,
     pub(super) waiting: VecDeque<IncomingRequest>,
@@ -440,6 +442,7 @@ impl<M: ModelForward> Scheduler<M> {
         config.validate()?;
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded();
         let effective_max_seq_len =
             Self::compute_max_seq_len(&model, &config, max_seq_len_override);
         let effective_prefill_token_budget = config.max_prefill_tokens;
@@ -583,6 +586,8 @@ impl<M: ModelForward> Scheduler<M> {
             fetch_dedupe: HashMap::new(),
             fetch_ticket_keys: HashMap::new(),
             request_rx: rx,
+            wakeup_rx,
+            wakeup_live: true,
             waiting_count: Arc::clone(&waiting_count),
             waiting: VecDeque::new(),
             active: (0..max_slots).map(|_| None).collect(),
@@ -604,8 +609,9 @@ impl<M: ModelForward> Scheduler<M> {
             pending_decode: None,
         };
 
-        let handle = SchedulerHandle::with_shared_waiting_count(
+        let handle = SchedulerHandle::with_shared_waiting_count_and_wakeup(
             tx,
+            wakeup_tx,
             model_id,
             max_waiting_requests,
             Arc::clone(&waiting_count),
