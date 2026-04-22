@@ -68,7 +68,7 @@ Four axes, each answering one question. Authoritative matrix lives in
 | Endpoint | Status | Notes |
 |----------|:------:|-------|
 | `POST /v1/completions` · `POST /v1/chat/completions` · `GET /v1/models` | **Stable** | OpenAI-compatible. Chat supports SSE streaming. |
-| `POST /v1/responses` | **Beta** | Non-streaming subset + SSE `output_text.delta`. |
+| `POST /v1/responses` | **Beta** | Text/tool-call subset with both non-streaming and SSE forms. |
 | `GET /metrics` · `GET /v1/stats` | **Stable** | Prometheus + human-readable ops surface. |
 
 ### Quantization — *how small does it get?*
@@ -239,6 +239,7 @@ HTTP boundary guarantees:
 
 - JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
 - Unsupported top-level parameters on `/v1/completions`, `/v1/chat/completions`, and `/v1/responses` return structured `invalid_parameter` errors instead of being silently ignored.
+- Chat / responses message validation is explicit: supported roles are `system`, `user`, `assistant`, and `tool`; `content` part arrays must be text-only; tool definitions must use `type=function`; malformed assistant `tool_calls` and tool messages without `tool_call_id` are rejected with structured `invalid_parameter` errors.
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
 - Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
@@ -437,8 +438,9 @@ Detailed runtime ownership graph:
 - **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
   `GET /v1/models`, `GET /healthz`, `GET /readyz`), `GET /metrics`,
   `GET /v1/stats`, and the main documented build/test workflows.
-- **Beta**: `POST /v1/responses` (current text/tool-call subset), CLI agent
-  behavior, Metal serving path, GGUF loading, benchmark tooling.
+- **Beta**: `POST /v1/responses` (current text/tool-call subset with
+  non-streaming and SSE forms), CLI agent behavior, Metal serving path, GGUF
+  loading, benchmark tooling.
 - **Experimental**: fast-moving quantization paths, tensor-parallel
   scaffolding, and undocumented flags or environment variables.
 

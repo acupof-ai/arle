@@ -63,6 +63,8 @@ This reflects repository state as of 2026-04-21.
   - `POST /v1/completions`
   - `POST /v1/chat/completions`
   - `GET /v1/models`
+  - `GET /healthz`
+  - `GET /readyz`
 - `GET /metrics`
 - `GET /v1/stats`
 - documented build, test, lint, and format workflows in `README.md` and
@@ -70,7 +72,7 @@ This reflects repository state as of 2026-04-21.
 
 ### Beta
 
-- `POST /v1/responses` (current non-streaming subset; streaming parity still pending)
+- `POST /v1/responses` (current text/tool-call subset with non-streaming and SSE forms; structured outputs still pending)
 - CLI agent behavior
 - train-side `/v1/train/status|events|stop|save` control plane exposed by the active training binaries' `--serve` flag
 - Metal serving path
