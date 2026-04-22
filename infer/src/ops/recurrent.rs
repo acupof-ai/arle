@@ -19,6 +19,57 @@ pub struct GdrHeadConfig {
     pub val_dim: usize,
 }
 
+fn validate_packed_prefill_seq_indptr(
+    op_name: &str,
+    batch_size: usize,
+    seq_indptr: &[i32],
+) -> Result<()> {
+    ensure!(
+        batch_size > 0,
+        "{op_name} packed prefill launch requires at least one request"
+    );
+    ensure!(
+        seq_indptr.len() == batch_size + 1,
+        "{op_name} packed prefill launch seq_indptr len {} must equal batch size {} + 1",
+        seq_indptr.len(),
+        batch_size
+    );
+    ensure!(
+        seq_indptr.first().copied() == Some(0),
+        "{op_name} packed prefill launch seq_indptr must start at 0"
+    );
+    for window in seq_indptr.windows(2) {
+        ensure!(
+            window[1] > window[0],
+            "{op_name} packed prefill launch seq_indptr must be strictly increasing"
+        );
+    }
+    Ok(())
+}
+
+/// Host-side launch metadata for packed multi-request conv1d prefill.
+///
+/// Packed activations stay contiguous on device. Per-request conv state remains
+/// request-private, so the launch ABI is a host pointer array plus packed
+/// `seq_indptr`.
+#[allow(dead_code)]
+pub(crate) struct Conv1dPrefillBatchLaunch<'a> {
+    pub conv_state_ptrs: &'a [u64],
+    /// Prefix sums over packed token rows. Length must be `batch_size + 1`.
+    pub seq_indptr: &'a [i32],
+}
+
+#[allow(dead_code)]
+impl<'a> Conv1dPrefillBatchLaunch<'a> {
+    fn batch_size(&self) -> usize {
+        self.conv_state_ptrs.len()
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_packed_prefill_seq_indptr("conv1d", self.batch_size(), self.seq_indptr)
+    }
+}
+
 /// Host-side launch metadata for packed multi-request GDR prefill.
 ///
 /// The packed `qkv`/`b_proj`/`a_proj`/`output` tensors stay contiguous on the
@@ -52,10 +103,6 @@ impl<'a> GdrPrefillBatchLaunch<'a> {
     fn validate(&self) -> Result<()> {
         let batch_size = self.batch_size();
         ensure!(
-            batch_size > 0,
-            "gdr packed prefill launch requires at least one request"
-        );
-        ensure!(
             self.q_ptrs.len() == batch_size
                 && self.k_ptrs.len() == batch_size
                 && self.v_ptrs.len() == batch_size
@@ -70,23 +117,7 @@ impl<'a> GdrPrefillBatchLaunch<'a> {
             "gdr packed prefill launch pointer arrays must all match batch size {}",
             batch_size
         );
-        ensure!(
-            self.seq_indptr.len() == batch_size + 1,
-            "gdr packed prefill launch seq_indptr len {} must equal batch size {} + 1",
-            self.seq_indptr.len(),
-            batch_size
-        );
-        ensure!(
-            self.seq_indptr.first().copied() == Some(0),
-            "gdr packed prefill launch seq_indptr must start at 0"
-        );
-        for window in self.seq_indptr.windows(2) {
-            ensure!(
-                window[1] > window[0],
-                "gdr packed prefill launch seq_indptr must be strictly increasing"
-            );
-        }
-        Ok(())
+        validate_packed_prefill_seq_indptr("gdr", batch_size, self.seq_indptr)
     }
 }
 
@@ -225,7 +256,7 @@ pub(crate) fn gdr_decode_batch_into(
     Ok(())
 }
 
-/// Causal depthwise conv1d prefill over a HiddenStates batch.
+/// Single-request causal depthwise conv1d prefill over one contiguous sequence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conv1d_prefill_batch_into(
     ctx: &DeviceContext,
@@ -260,6 +291,63 @@ pub(crate) fn conv1d_prefill_batch_into(
         .result()
         .expect("conv1d_prefill_cuda failed");
     }
+}
+
+/// Packed multi-request conv1d prefill.
+///
+/// This mirrors the packed GDR surface: packed activations stay contiguous,
+/// while per-request conv state remains request-private and is addressed
+/// through host pointer arrays plus `seq_indptr`.
+#[allow(dead_code)]
+pub(crate) fn conv1d_prefill_packed_batch_into(
+    ctx: &DeviceContext,
+    x_batch: &HiddenStates,
+    conv_weight: &DeviceVec,
+    launch: &Conv1dPrefillBatchLaunch<'_>,
+    out_batch: &mut HiddenStates,
+    kernel_size: usize,
+) -> Result<()> {
+    launch.validate()?;
+
+    let num_channels = x_batch.hidden_dim;
+    ensure!(
+        x_batch.seq_len == out_batch.seq_len && out_batch.hidden_dim == num_channels,
+        "conv1d packed prefill tensors must share the same packed shape"
+    );
+    ensure!(
+        conv_weight.len == num_channels * kernel_size,
+        "conv1d packed prefill weight len {} must equal num_channels {} * kernel_size {}",
+        conv_weight.len,
+        num_channels,
+        kernel_size
+    );
+    ensure!(
+        launch.seq_indptr.last().copied() == Some(out_batch.seq_len as i32),
+        "conv1d packed prefill seq_indptr last {} must equal packed seq_len {}",
+        launch.seq_indptr.last().copied().unwrap_or_default(),
+        out_batch.seq_len
+    );
+
+    let (x_ptr, _gx) = x_batch.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = out_batch.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::conv1d_prefill_packed_batch_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            launch.conv_state_ptrs.as_ptr(),
+            launch.seq_indptr.as_ptr(),
+            o_ptr as *mut ffi::Half,
+            num_channels as i32,
+            kernel_size as i32,
+            launch.batch_size() as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
 }
 
 fn gated_delta_rule_prefill_chunk_prepare_into(
