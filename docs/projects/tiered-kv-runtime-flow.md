@@ -21,57 +21,74 @@ The descriptions below are intended to match the current implementation in:
 ## Architecture Graph
 
 ```text
-                           request submit
-                                |
-                                v
-                    +--------------------------+
-                    | CUDA scheduler runtime   |
-                    | runtime.rs::assign_slots |
-                    +------------+-------------+
-                                 |
-                  prefix lookup / stage classify
-                                 |
-                                 v
-                    +--------------------------+
-                    | RadixCache / CacheIndex  |
-                    | prefix_cache.rs          |
-                    | lookup_or_stage()        |
-                    +------------+-------------+
-                                 |
-                +----------------+----------------+
-                |                                 |
-         ready on T0                        staged below T0
-                |                                 |
-                v                                 v
-   +---------------------------+      +---------------------------+
-   | paged_kv / scheduler T0   |      | ReadmissionPlan           |
-   | direct attach + tail COW  |      | readmission.rs            |
-   +-------------+-------------+      +-------------+-------------+
-                 |                                  |
-                 |                            submit_fetch()
-                 |                                  |
-                 |                                  v
-                 |                    +-----------------------------+
-                 |                    | Coordinator / Orchestrator  |
-                 |                    | coordinator.rs              |
-                 |                    | plan / fetch / store queues |
-                 |                    +-------------+---------------+
-                 |                                  |
-                 |                       fetch/store via CacheIO
-                 |                                  |
-                 v                                  v
-   +-----------------------------+      +------------------------------+
-   | T0 GPU pages                |      | slower-tier backends         |
-   | paged_kv.rs                 |      | disk.rs / shared_fs.rs /     |
-   | attach_pages / copy_from    |      | nixl.rs(stub)                |
-   +-----------------------------+      +------------------------------+
-                                                    |
-                           +------------------------+------------------------+
-                           |                         |                        |
-                           v                         v                        v
-                     T1 host pinned             T2 local disk          T3 cluster-shared
-                     HostPinnedPool             DiskStore              ClusterSharedBackend
-                     host_pool.rs               transport/disk.rs      backend.rs
+                                         request submit
+                                              |
+                                              v
+                    +------------------------------------------------------+
+                    | CUDA scheduler runtime                               |
+                    | runtime.rs / execution.rs / core.rs                  |
+                    | - assign_slots()                                     |
+                    | - plan_step()                                        |
+                    | - step()                                             |
+                    | - cleanup()                                          |
+                    +-----------------------------+------------------------+
+                                                  |
+                                prefix lookup / stage classify / publish
+                                                  |
+                                                  v
+                    +------------------------------------------------------+
+                    | RadixCache / CacheIndex                               |
+                    | prefix_cache.rs                                       |
+                    | - lookup_or_stage()                                   |
+                    | - publish metadata / tier location / block refs       |
+                    +-------------------+-------------------+---------------+
+                                        |                   |
+                           ready on T0  |                   | staged below T0
+                                        |                   |
+                                        v                   v
+                    +---------------------------+   +---------------------------+
+                    | paged_kv / scheduler T0   |   | ReadmissionPlan           |
+                    | direct attach + tail COW  |   | readmission.rs            |
+                    +-------------+-------------+   +-------------+-------------+
+                                  |                                 |
+                                  |                           submit_fetch()
+                                  |                                 |
+                                  v                                 v
+                    +------------------------------------------------------+
+                    | Coordinator / Orchestrator                           |
+                    | coordinator.rs                                       |
+                    | - PlanQueue                                          |
+                    | - FetchQueue                                         |
+                    | - StoreQueue                                         |
+                    +----------------------+-------------------------------+
+                                           |
+                                fetch/store via CacheIO
+                                           |
+                 +-------------------------+--------------------------+
+                 |                         |                          |
+                 v                         v                          v
+         +---------------+       +------------------+      +----------------------+
+         | T1 host pinned|       | T2 local disk    |      | T3 cluster-shared    |
+         | HostPinnedPool|       | DiskStore        |      | ClusterSharedBackend |
+         | host_pool.rs  |       | transport/disk.rs|      | backend.rs           |
+         +-------+-------+       +------------------+      +----------+-----------+
+                 |                                                       |
+                 +-------------------- promote / restore -----------------+
+                                              |
+                                              v
+                                  +---------------------------+
+                                  | T0 GPU pages              |
+                                  | paged_kv.rs               |
+                                  | attach_pages / copy_from  |
+                                  +---------------------------+
+
+                    +------------------------------------------------------+
+                    | Emit worker                                           |
+                    | core.rs::spawn_emit_worker()                          |
+                    | - UTF-8 decode / delta emission                       |
+                    | - stop-sequence scan                                  |
+                    | - gate result channel back to scheduler               |
+                    +------------------------------------------------------+
 ```
 
 ## Scheduler Decision Order
@@ -98,12 +115,14 @@ Current order inside `runtime.rs::run()` is:
 Current order inside `execution.rs::step()` is:
 
 1. read back the previous iteration's pending decode
-2. emit text deltas for tokens materialized by that readback
+2. wait for any outstanding stop-sensitive emit gate results
 3. plan the next batch shape (`Idle` / `DecodeOnly` / `Mixed` / `PrefillOnly`)
 4. launch the next decode batch or prefill chunk
+5. dispatch newly materialized decode tokens to the emit worker
 
 That keeps `pending_decode` alive across loop turns so CPU-side intake and
-admission can overlap the previous GPU decode launch.
+admission can overlap the previous GPU decode launch, while text decode /
+streaming stays off the scheduler hot path.
 
 ### 1. Lookup first
 

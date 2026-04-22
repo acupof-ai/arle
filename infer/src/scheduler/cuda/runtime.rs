@@ -514,7 +514,7 @@ impl<M: ModelForward> Scheduler<M> {
             stop: incoming.stop,
             session_id: incoming.session_id,
             delta_tx: incoming.delta_tx,
-            stream: super::request::StreamDecodeState::default(),
+            emit_cursor: super::request::EmitCursor::default(),
             phase: if plan.staged_prefix_plan.is_some() {
                 Phase::WaitingFetch
             } else {
@@ -1040,6 +1040,44 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    fn handle_emit_event(&mut self, event: crate::scheduler::cuda::core::EmitEvent) {
+        match event {
+            crate::scheduler::cuda::core::EmitEvent::GateReady {
+                request_id,
+                finished,
+            } => {
+                let Some(slot_idx) = self.emit_gate_waiting.remove(&request_id) else {
+                    return;
+                };
+                if !self
+                    .request(slot_idx)
+                    .is_some_and(|req| req.id == request_id)
+                {
+                    return;
+                }
+                if finished {
+                    if let Some(req) = self.request_mut(slot_idx) {
+                        req.phase = Phase::Finished;
+                    }
+                    self.finish_slot(slot_idx);
+                }
+            }
+        }
+    }
+
+    fn drain_emit_events(&mut self) {
+        loop {
+            match self.emit_events.try_recv() {
+                Ok(event) => self.handle_emit_event(event),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    error!("Emit event channel disconnected");
+                    break;
+                }
+            }
+        }
+    }
+
     fn drain_request_rx(&mut self) {
         while let Ok(req) = self.request_rx.try_recv() {
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
@@ -1054,6 +1092,43 @@ impl<M: ModelForward> Scheduler<M> {
     fn handle_wakeup_disconnect(&mut self) {
         self.wakeup_live = false;
         self.drain_request_rx();
+    }
+
+    pub(super) fn wait_for_emit_gates(&mut self) -> u128 {
+        if self.emit_gate_waiting.is_empty() {
+            return 0;
+        }
+
+        let wait_t = std::time::Instant::now();
+        while !self.emit_gate_waiting.is_empty() {
+            crossbeam_channel::select! {
+                recv(self.emit_events) -> event => {
+                    match event {
+                        Ok(event) => self.handle_emit_event(event),
+                        Err(_) => {
+                            error!("Emit event channel disconnected");
+                            break;
+                        }
+                    }
+                }
+                recv(self.coordinator_events) -> event => {
+                    match event {
+                        Ok(event) => self.handle_coordinator_event(event),
+                        Err(_) => error!("Coordinator event channel disconnected"),
+                    }
+                }
+                recv(self.wakeup_rx) -> wakeup => {
+                    match wakeup {
+                        Ok(()) => {
+                            self.drain_request_rx();
+                            self.drain_wakeup_rx();
+                        }
+                        Err(_) => self.handle_wakeup_disconnect(),
+                    }
+                }
+            }
+        }
+        wait_t.elapsed().as_micros()
     }
 
     fn wait_for_fetch_or_request(&mut self) -> bool {
@@ -1125,6 +1200,7 @@ impl<M: ModelForward> Scheduler<M> {
         loop {
             self.drain_request_rx();
             self.drain_coordinator_events();
+            self.drain_emit_events();
             if !self.wait_for_wakeup() {
                 break;
             }

@@ -18,15 +18,12 @@ pub(crate) enum EmitOutcome {
     Finished,
 }
 
+#[derive(Default)]
+pub(crate) struct EmitCursor {
+    dispatched_token_count: usize,
+}
+
 impl StreamDecodeState {
-    pub(crate) fn has_pending_emit(&self, generated_tokens_len: usize) -> bool {
-        self.decoded_token_count < generated_tokens_len
-    }
-
-    pub(crate) fn mark_dispatched(&mut self, generated_tokens_len: usize) {
-        self.decoded_token_count = generated_tokens_len;
-    }
-
     pub(crate) fn emit_delta(
         &mut self,
         generated_tokens: &[u32],
@@ -192,6 +189,21 @@ impl StreamDecodeState {
     }
 }
 
+impl EmitCursor {
+    pub(crate) fn has_pending_emit(&self, generated_tokens_len: usize) -> bool {
+        self.dispatched_token_count < generated_tokens_len
+    }
+
+    pub(crate) fn pending_tokens<'a>(&self, generated_tokens: &'a [u32]) -> &'a [u32] {
+        let start = self.dispatched_token_count.min(generated_tokens.len());
+        &generated_tokens[start..]
+    }
+
+    pub(crate) fn mark_dispatched(&mut self, generated_tokens_len: usize) {
+        self.dispatched_token_count = generated_tokens_len;
+    }
+}
+
 /// Newly assigned, needs prefix cache check.
 pub(crate) enum Phase {
     /// Waiting for staged T1/T2 bytes to be fetched/promoted back into T0.
@@ -224,8 +236,8 @@ pub(crate) struct ActiveRequest {
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
-    /// Streaming decode / emit bookkeeping.
-    pub(crate) stream: StreamDecodeState,
+    /// Streaming emit dispatch bookkeeping.
+    pub(crate) emit_cursor: EmitCursor,
     pub(crate) phase: Phase,
     /// Prompt length that is known to be fully materialized in this slot's state.
     /// Zero means the slot must not publish a cached prefix on cleanup.
@@ -253,42 +265,25 @@ pub(crate) struct ActiveRequest {
 
 impl ActiveRequest {
     pub(crate) fn has_pending_emit(&self) -> bool {
-        matches!(self.phase, Phase::Decoding)
-            && self.stream.has_pending_emit(self.generated_tokens.len())
+        self.emit_cursor
+            .has_pending_emit(self.generated_tokens.len())
     }
 
-    pub(crate) fn requires_prelaunch_emit_gate(&self) -> bool {
+    pub(crate) fn has_stop_sequences(&self) -> bool {
         self.stop
             .as_ref()
             .is_some_and(|stops| stops.iter().any(|stop| !stop.is_empty()))
     }
 
-    pub(crate) fn uses_async_emit(&self) -> bool {
-        !self.requires_prelaunch_emit_gate()
+    pub(crate) fn pending_emit_tokens(&self) -> Vec<u32> {
+        self.emit_cursor
+            .pending_tokens(&self.generated_tokens)
+            .to_vec()
     }
 
-    pub(crate) fn pending_async_emit_tokens(&self) -> Vec<(u32, Option<f32>)> {
-        let start = self
-            .stream
-            .decoded_token_count
-            .min(self.generated_tokens.len());
-        self.generated_tokens[start..]
-            .iter()
-            .enumerate()
-            .map(|(idx, &token)| {
-                let absolute = start + idx + 1;
-                let logprob = if absolute == self.generated_tokens.len() {
-                    self.latest_logprob
-                } else {
-                    None
-                };
-                (token, logprob)
-            })
-            .collect()
-    }
-
-    pub(crate) fn mark_async_emit_dispatched(&mut self) {
-        self.stream.mark_dispatched(self.generated_tokens.len());
+    pub(crate) fn mark_emit_dispatched(&mut self) {
+        self.emit_cursor
+            .mark_dispatched(self.generated_tokens.len());
     }
 
     pub(crate) fn mark_prompt_cacheable(&mut self) {
@@ -309,38 +304,6 @@ impl ActiveRequest {
             held.extend(plan.block_ids());
         }
         held
-    }
-
-    pub(crate) fn emit_delta(&mut self, tokenizer: &Tokenizer) {
-        if matches!(
-            self.stream.emit_delta(
-                &self.generated_tokens,
-                tokenizer,
-                &self.delta_tx,
-                self.latest_logprob,
-                self.stop.as_deref(),
-                self.prompt_tokens.len(),
-            ),
-            EmitOutcome::Finished
-        ) {
-            self.phase = Phase::Finished;
-        }
-    }
-
-    /// Flush remaining buffered text and send the final finish delta.
-    pub(crate) fn finish(&mut self, reason: FinishReason, tokenizer: &Tokenizer) {
-        if matches!(self.phase, Phase::Finished) {
-            return;
-        }
-        self.phase = Phase::Finished;
-        self.stream.finish(
-            &self.generated_tokens,
-            tokenizer,
-            &self.delta_tx,
-            self.prompt_tokens.len(),
-            reason,
-            self.stop.as_deref(),
-        );
     }
 }
 
@@ -399,7 +362,7 @@ mod tests {
             stop: None,
             session_id: None,
             delta_tx,
-            stream: StreamDecodeState::default(),
+            emit_cursor: EmitCursor::default(),
             phase: Phase::Finished,
             cacheable_prompt_len: 0,
             latest_logprob: None,
@@ -429,28 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn pending_emit_requires_decode_phase_and_new_tokens() {
+    fn pending_emit_requires_new_tokens() {
         let mut req = test_request("hello", vec![1, 2, 3]);
-        req.phase = Phase::Decoding;
         assert!(!req.has_pending_emit());
 
         req.generated_tokens.push(42);
         assert!(req.has_pending_emit());
 
-        req.stream.decoded_token_count = 1;
+        req.emit_cursor.dispatched_token_count = 1;
         assert!(!req.has_pending_emit());
     }
 
     #[test]
-    fn prelaunch_emit_gate_only_for_non_empty_stop_sequences() {
+    fn stop_gate_only_for_non_empty_stop_sequences() {
         let mut req = test_request("hello", vec![1, 2, 3]);
-        req.phase = Phase::Decoding;
-        assert!(!req.requires_prelaunch_emit_gate());
+        assert!(!req.has_stop_sequences());
 
         req.stop = Some(vec![String::new()]);
-        assert!(!req.requires_prelaunch_emit_gate());
+        assert!(!req.has_stop_sequences());
 
         req.stop = Some(vec!["</tool>".to_string()]);
-        assert!(req.requires_prelaunch_emit_gate());
+        assert!(req.has_stop_sequences());
     }
 }

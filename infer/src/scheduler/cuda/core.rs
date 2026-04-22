@@ -57,20 +57,27 @@ enum EmitCommand {
     Append {
         request_id: u64,
         prompt_tokens: usize,
-        token: u32,
-        logprob: Option<f32>,
+        tokens: Vec<u32>,
+        latest_logprob: Option<f32>,
         delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+        stops: Option<Vec<String>>,
+        gated: bool,
     },
     Finish {
         request_id: u64,
         prompt_tokens: usize,
-        completion_tokens: usize,
+        generated_tokens: Vec<u32>,
         reason: FinishReason,
         delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+        stops: Option<Vec<String>>,
     },
     Abort {
         request_id: u64,
     },
+}
+
+pub(super) enum EmitEvent {
+    GateReady { request_id: u64, finished: bool },
 }
 
 struct EmitWorkerRequest {
@@ -79,15 +86,18 @@ struct EmitWorkerRequest {
     latest_logprob: Option<f32>,
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     stream: StreamDecodeState,
+    stops: Option<Vec<String>>,
 }
 
 fn spawn_emit_worker(
     tokenizer: Tokenizer,
 ) -> (
     crossbeam_channel::Sender<EmitCommand>,
+    crossbeam_channel::Receiver<EmitEvent>,
     std::thread::JoinHandle<()>,
 ) {
     let (tx, rx) = crossbeam_channel::unbounded();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let thread = std::thread::Builder::new()
         .name("infer-cuda-emit".to_string())
         .spawn(move || {
@@ -97,9 +107,11 @@ fn spawn_emit_worker(
                     EmitCommand::Append {
                         request_id,
                         prompt_tokens,
-                        token,
-                        logprob,
+                        tokens,
+                        latest_logprob,
                         delta_tx,
+                        stops,
+                        gated,
                     } => {
                         let state = active
                             .entry(request_id)
@@ -109,24 +121,39 @@ fn spawn_emit_worker(
                                 latest_logprob: None,
                                 delta_tx,
                                 stream: StreamDecodeState::default(),
+                                stops,
                             });
-                        state.generated_tokens.push(token);
-                        state.latest_logprob = logprob;
-                        let _ = state.stream.emit_delta(
+                        state.generated_tokens.extend(tokens);
+                        state.latest_logprob = latest_logprob;
+                        let outcome = state.stream.emit_delta(
                             &state.generated_tokens,
                             &tokenizer,
                             &state.delta_tx,
                             state.latest_logprob,
-                            None,
+                            state.stops.as_deref(),
                             state.prompt_tokens,
                         );
+                        if gated {
+                            let finished = matches!(
+                                outcome,
+                                crate::scheduler::cuda::request::EmitOutcome::Finished
+                            );
+                            let _ = event_tx.send(EmitEvent::GateReady {
+                                request_id,
+                                finished,
+                            });
+                            if finished {
+                                active.remove(&request_id);
+                            }
+                        }
                     }
                     EmitCommand::Finish {
                         request_id,
                         prompt_tokens,
-                        completion_tokens,
+                        generated_tokens,
                         reason,
                         delta_tx,
+                        stops,
                     } => {
                         if let Some(mut state) = active.remove(&request_id) {
                             state.stream.finish(
@@ -135,14 +162,17 @@ fn spawn_emit_worker(
                                 &state.delta_tx,
                                 state.prompt_tokens,
                                 reason,
-                                None,
+                                state.stops.as_deref(),
                             );
                         } else {
-                            StreamDecodeState::default().send_finish(
+                            let mut stream = StreamDecodeState::default();
+                            stream.finish(
+                                &generated_tokens,
+                                &tokenizer,
                                 &delta_tx,
                                 prompt_tokens,
-                                completion_tokens,
                                 reason,
+                                stops.as_deref(),
                             );
                         }
                     }
@@ -153,7 +183,7 @@ fn spawn_emit_worker(
             }
         })
         .expect("emit worker thread");
-    (tx, thread)
+    (tx, event_rx, thread)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -224,7 +254,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     emit_tx: crossbeam_channel::Sender<EmitCommand>,
+    pub(super) emit_events: crossbeam_channel::Receiver<EmitEvent>,
     emit_thread: Option<std::thread::JoinHandle<()>>,
+    pub(super) emit_gate_waiting: HashMap<u64, usize>,
     pub(super) store_waiting:
         HashMap<crate::kv_tier::StoreTicket, Vec<(BlockId, crate::kv_tier::HostPinnedRegion)>>,
     pub(super) store_dedupe: HashMap<StoreDedupKey, crate::kv_tier::StoreTicket>,
@@ -679,7 +711,7 @@ impl<M: ModelForward> Scheduler<M> {
                 cluster_shared_backend.clone(),
             );
         let coordinator_thread = Some(coordinator.spawn("infer-tiered-kv-coord"));
-        let (emit_tx, emit_thread) = spawn_emit_worker(tokenizer.clone());
+        let (emit_tx, emit_events, emit_thread) = spawn_emit_worker(tokenizer.clone());
         let max_slots = config.max_slots;
         let max_waiting_requests = config.max_waiting_requests;
         let prefix_cache_keepalive_ticks = config.prefix_cache_keepalive_ticks;
@@ -706,7 +738,9 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_events,
             coordinator_thread,
             emit_tx,
+            emit_events,
             emit_thread: Some(emit_thread),
+            emit_gate_waiting: HashMap::new(),
             store_waiting: HashMap::new(),
             store_dedupe: HashMap::new(),
             store_ticket_keys: HashMap::new(),
@@ -850,78 +884,74 @@ impl<M: ModelForward> Scheduler<M> {
         )
     }
 
-    pub(super) fn dispatch_async_emit(&mut self, slot_idx: usize) {
-        let Some((request_id, prompt_tokens, delta_tx, pending_tokens)) =
-            self.request(slot_idx).and_then(|req| {
-                req.uses_async_emit().then(|| {
-                    (
-                        req.id,
-                        req.prompt_tokens.len(),
-                        req.delta_tx.clone(),
-                        req.pending_async_emit_tokens(),
-                    )
-                })
-            })
-        else {
-            return;
-        };
-        if pending_tokens.is_empty() {
-            return;
-        }
-        for (token, logprob) in pending_tokens {
-            let _ = self.emit_tx.send(EmitCommand::Append {
-                request_id,
-                prompt_tokens,
-                token,
-                logprob,
-                delta_tx: delta_tx.clone(),
-            });
-        }
-        if let Some(req) = self.request_mut(slot_idx) {
-            req.mark_async_emit_dispatched();
-        }
-    }
-
-    pub(super) fn queue_async_finish(&mut self, slot_idx: usize, reason: FinishReason) -> bool {
-        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, uses_async_emit)) =
+    pub(super) fn dispatch_emit(&mut self, slot_idx: usize) {
+        let Some((request_id, prompt_tokens, tokens, latest_logprob, delta_tx, stops, gated)) =
             self.request(slot_idx).map(|req| {
                 (
                     req.id,
                     req.prompt_tokens.len(),
-                    req.generated_tokens.len(),
+                    req.pending_emit_tokens(),
+                    req.latest_logprob,
                     req.delta_tx.clone(),
-                    req.uses_async_emit(),
+                    req.stop.clone(),
+                    req.has_stop_sequences(),
                 )
             })
         else {
-            return false;
+            return;
         };
-        if !uses_async_emit {
-            return false;
+        if tokens.is_empty() {
+            return;
         }
-        self.dispatch_async_emit(slot_idx);
+        let _ = self.emit_tx.send(EmitCommand::Append {
+            request_id,
+            prompt_tokens,
+            tokens,
+            latest_logprob,
+            delta_tx,
+            stops,
+            gated,
+        });
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.mark_emit_dispatched();
+        }
+        if gated {
+            self.emit_gate_waiting.insert(request_id, slot_idx);
+        }
+    }
+
+    pub(super) fn queue_emit_finish(&mut self, slot_idx: usize, reason: FinishReason) {
+        let Some((request_id, prompt_tokens, generated_tokens, delta_tx, stops)) =
+            self.request(slot_idx).map(|req| {
+                (
+                    req.id,
+                    req.prompt_tokens.len(),
+                    req.generated_tokens.clone(),
+                    req.delta_tx.clone(),
+                    req.stop.clone(),
+                )
+            })
+        else {
+            return;
+        };
         let _ = self.emit_tx.send(EmitCommand::Finish {
             request_id,
             prompt_tokens,
-            completion_tokens,
+            generated_tokens,
             reason,
             delta_tx,
+            stops,
         });
-        true
     }
 
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {
         let request_id = self.request(slot_idx).map(|req| req.id);
-        let async_emit_request = self
-            .request(slot_idx)
-            .and_then(|req| req.uses_async_emit().then_some(req.id));
         if let Some(req) = self.request_mut(slot_idx) {
             req.phase = Phase::Finished;
         }
         if let Some(request_id) = request_id {
             self.clear_fetch_waiting_for_slot(slot_idx, request_id);
-        }
-        if let Some(request_id) = async_emit_request {
+            self.emit_gate_waiting.remove(&request_id);
             let _ = self.emit_tx.send(EmitCommand::Abort { request_id });
         }
         self.dequeue_prefill(slot_idx);

@@ -57,6 +57,9 @@ That pointed at one bottleneck cluster:
     longer sorts the whole queue every tick
   - HTTP-originated CUDA requests now arrive with cached `prompt_tokens`, so
     scheduler-side tokenization is a fallback path rather than the normal hot path
+  - a dedicated emit worker that owns streaming text decode, delta emission,
+    and stop-sequence scanning; the scheduler now only waits on gate results
+    before the next decode launch
 - Deterministic admission now has:
   - full-ISL reservation in `assign_slots()`
   - explicit prefill planner `score -> fit` structure
@@ -158,6 +161,8 @@ That pointed at one bottleneck cluster:
 - `a01a124` `refactor(scheduler): pretokenize cuda http admissions`
 - `14b4db6` `feat(scheduler): offload stopless streaming emit`
 - `d2e29bd` `fix(scheduler): align admission with active headroom`
+- latest local tranche: unify all streaming emit behind one worker and consume
+  stop-sensitive gate results on the scheduler side before the next decode launch
 
 ## Parallelization shape used
 
@@ -210,15 +215,10 @@ Expected order of impact after local landing:
 
 ## Remaining work
 
-Still open in-repo follow-ons before these five items can be called fully
-terminal:
+The in-repo runtime closure for these five items is now down to integration /
+bench confirmation rather than another architectural gap.
 
-- stop-sensitive requests still run text stop matching on the scheduler
-  thread; stopless streaming has moved off-thread, but the final zero-overhead
-  overlap shape would need either cheaper stop gating or a second-stage
-  stop-sensitive worker without reintroducing divergent request flows
-
-External follow-up remains mandatory once the in-repo closure is finished:
+External follow-up remains mandatory:
 
 - non-local CUDA before/after `scripts/bench_guidellm.sh` parity sweep
 - delta table vs SGLang for `c1/c2/c4/c8/c16`

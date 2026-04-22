@@ -340,24 +340,11 @@ impl<M: ModelForward> Scheduler<M> {
                     self.finish_request(slot_idx, FinishReason::Stop);
                     return;
                 }
-                let Self {
-                    active, tokenizer, ..
-                } = self;
+                let Self { active, .. } = self;
                 if let Some(req) = active[slot_idx].as_mut() {
                     req.generated_tokens.push(token);
-                    if !req.uses_async_emit() {
-                        req.emit_delta(tokenizer);
-                    }
                 }
-                self.dispatch_async_emit(slot_idx);
-
-                if matches!(
-                    self.request(slot_idx).map(|req| &req.phase),
-                    Some(Phase::Finished)
-                ) {
-                    self.finish_slot(slot_idx);
-                    return;
-                }
+                self.dispatch_emit(slot_idx);
                 let reached_max = self
                     .request(slot_idx)
                     .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
