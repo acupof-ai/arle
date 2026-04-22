@@ -85,7 +85,7 @@ metal scheduler runtime:
       -> ensure_dflash_target_hidden_for_terminal_prefill
       -> qwen35_dflash_speculative_block
          single-row: sampled full-block verify via
-         `verify_block_batched_sampled(B=1)` + GPU prefix-match acceptance
+         `verify_block_sampled(cache_pos)` + GPU prefix-match acceptance
          + GDR rollback on rejection
       -> qwen35_dflash_speculative_block_batched
          multi-row: packed full-block verify over `[B, block_size]`
@@ -109,15 +109,16 @@ metal scheduler runtime:
 - Verify:
   `qwen35_dflash_speculative_block` and
   `qwen35_dflash_speculative_block_batched` now diverge deliberately:
-  single-row DFlash now reuses the sampled packed verifier with `B=1`, then
-  accepts the longest matching prefix and rolls back rejected GDR state.
-  That acceptance path stays GPU-resident until the very end of the block:
-  `sample_rows_array` returns sampled token ids as an MLX array,
-  `prefix_match_len_i32` computes the longest accepted prefix on GPU, and Rust
-  materializes only the accepted output slice that has to be emitted back to
-  the request state. Batched DFlash still verifies the whole packed block in
-  one forward and applies the same rollback rule row-wise. Both return the
-  same accepted-token contract and updated target hidden state.
+  single-row DFlash now uses a native scalar-cache sampled verify entrypoint,
+  `CppQwen35Model::verify_block_sampled`, then accepts the longest matching
+  prefix and rolls back rejected GDR state. That acceptance path stays
+  GPU-resident until the very end of the block: `sample_rows_array` returns
+  sampled token ids as an MLX array, `prefix_match_len_i32` computes the
+  longest accepted prefix on GPU, and Rust materializes only the accepted
+  output slice that has to be emitted back to the request state. Batched
+  DFlash still verifies the whole packed block in one forward and applies the
+  same rollback rule row-wise. Both return the same accepted-token contract
+  and updated target hidden state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
   terminal prefill did not seed `target_hidden` yet, or the request is on the

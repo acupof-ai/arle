@@ -2179,10 +2179,11 @@ pub(crate) fn qwen35_dflash_speculative_block(
 
     // ── 2. Sampled full-block verify ──
     //
-    // Trace showed the previous scalar prefix path stalling on
-    // `sample_last_token -> eval` for every accepted step. Reuse the sampled
-    // packed-verify kernel with `B=1`: one target forward, one GPU-side sample,
-    // then accept the longest matching prefix and rollback rejected suffix.
+    // Single-row Qwen3.5/Qwen3.6 verify now uses the native scalar-cache C++
+    // entrypoint rather than routing through the packed `cache_pos_arr`
+    // verifier with `B=1`. That keeps the hot path aligned with the single-row
+    // decode/session contract while still sampling the whole posterior block in
+    // one target forward.
     let gdr_snapshot: Vec<Arr> = target_gdr_flat.to_vec();
     let layer_ids_i32: Vec<i32> = runtime
         .target_layer_ids
@@ -2201,23 +2202,16 @@ pub(crate) fn qwen35_dflash_speculative_block(
         raw: cpp_model.as_raw(),
     };
 
-    let tokens_arr = super::mlx::reshape(&block_tokens, &[1, block_size_i32]);
-    let cache_pos_arr = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
-    let rope_offsets = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
-    let posterior_tokens = cpp_model.verify_block_batched_sampled(
-        &tokens_arr,
-        1,
+    let posterior_tokens = cpp_model.verify_block_sampled(
+        &block_tokens,
         block_size_i32,
-        &cache_pos_arr,
+        *target_cache_len,
         target_kv_flat,
         target_gdr_flat,
-        None,
-        &rope_offsets,
         params,
     )?;
     let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let captured_hiddens = drain_captured_hidden(cpp_model)?;
-    let posterior_tokens = super::mlx::reshape(&posterior_tokens, &[block_size_i32]);
     ensure!(
         posterior_tokens.shape() == [block_size_i32],
         "Qwen3.5 DFlash sampled verify returned shape {:?} for block_size={}",

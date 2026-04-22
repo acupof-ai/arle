@@ -983,6 +983,65 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// Single-row DFlash verify fast path: same scalar-cache verify as
+    /// `verify_block`, but samples the posterior inside C++ and returns token
+    /// ids `[block_size]` instead of logits.
+    pub(super) fn verify_block_sampled(
+        &self,
+        tokens: &MlxArray,
+        block_size: i32,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray],
+        gdr_states: &mut [MlxArray],
+        params: &SamplingParams,
+    ) -> Result<MlxArray> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+        let greedy = params.temperature <= 1e-6 || params.top_k == 1;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_sampled: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_sampled(
+                self.0,
+                tokens.as_raw(),
+                block_size,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                params.temperature,
+                greedy,
+                &raw mut out_sampled,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_sampled) })
+    }
+
     /// Batched DFlash verify: run `block_size` draft tokens for `batch_size`
     /// rows in a single forward. Mirrors `verify_block` but feeds the packed
     /// KV/GDR states and per-row `cache_pos_arr` / `rope_offsets` that
@@ -2866,6 +2925,109 @@ mod tests {
                 "logit[{idx}] mismatch: {lhs} vs {rhs}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_block_sampled_matches_batched_sampled_for_b1() -> Result<()> {
+        let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!(
+                "QWEN35_MODEL_PATH unset; skipping verify_block_sampled B=1 equivalence test"
+            );
+            return Ok(());
+        };
+        let _guard = metal_test_guard();
+
+        let config = load_metal_config(&model_path)?;
+        let MetalModelArch::Qwen35(arch) = &config.arch else {
+            anyhow::bail!("QWEN35_MODEL_PATH must point to a Qwen3.5 model");
+        };
+        let weights = load_qwen35_metal_weights(&model_path, &config)?;
+        let cpp_model = weights
+            .cpp_model
+            .as_ref()
+            .context("Qwen3.5 compiled C++ model unavailable")?;
+
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let prompt_tokens = [1_i32, 2, 3, 4];
+        let block_tokens = [5_i32, 6];
+        let prompt_len = prompt_tokens.len() as i32;
+        let block_size = block_tokens.len() as i32;
+        let kv_capacity = prompt_len + block_size + 4;
+        let cache_shape = [
+            1_i32,
+            config.num_key_value_heads as i32,
+            kv_capacity,
+            config.head_dim as i32,
+        ];
+
+        let num_full_layers = arch.num_full_attention_layers();
+        let mut kv_flat: Vec<MlxArray> = (0..num_full_layers)
+            .flat_map(|_| {
+                [
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                    zeros(&cache_shape, Dtype::Bfloat16),
+                ]
+            })
+            .collect();
+        let recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
+        let mut gdr_flat: Vec<MlxArray> = recurrent
+            .states
+            .iter()
+            .zip(recurrent.conv_states.iter())
+            .flat_map(|(state, conv)| [state.clone(), conv.clone()])
+            .collect();
+
+        let prompt_arr = MlxArray::from_slice_i32(&prompt_tokens, &[prompt_len]);
+        let prompt_logits =
+            cpp_model.prefill(&prompt_arr, prompt_len, 0, &mut kv_flat, &mut gdr_flat)?;
+        let mut prompt_refs: Vec<&MlxArray> =
+            Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+        prompt_refs.push(&prompt_logits);
+        prompt_refs.extend(kv_flat.iter());
+        prompt_refs.extend(gdr_flat.iter());
+        eval(&prompt_refs);
+
+        let cache_pos = prompt_len;
+        let mut scalar_kv = kv_flat.clone();
+        let mut scalar_gdr = gdr_flat.clone();
+        let verify_tokens = MlxArray::from_slice_i32(&block_tokens, &[block_size]);
+        let scalar_sampled = cpp_model.verify_block_sampled(
+            &verify_tokens,
+            block_size,
+            cache_pos,
+            &mut scalar_kv,
+            &mut scalar_gdr,
+            &params,
+        )?;
+
+        let mut batched_kv = kv_flat.clone();
+        let mut batched_gdr = gdr_flat.clone();
+        let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
+        let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
+        let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
+        let batched_sampled = cpp_model.verify_block_batched_sampled(
+            &batched_tokens,
+            1,
+            block_size,
+            &cache_pos_arr,
+            &mut batched_kv,
+            &mut batched_gdr,
+            None,
+            &rope_offsets,
+            &params,
+        )?;
+        let batched_sampled = reshape(&batched_sampled, &[block_size]);
+
+        eval(&[&scalar_sampled, &batched_sampled]);
+        assert_eq!(
+            scalar_sampled.as_slice_i32(),
+            batched_sampled.as_slice_i32()
+        );
 
         Ok(())
     }
