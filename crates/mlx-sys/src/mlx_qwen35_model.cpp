@@ -2046,6 +2046,97 @@ int32_t qwen35_compiled_verify_block_batched(
     }
 }
 
+int32_t qwen35_compiled_verify_block_batched_sampled(
+    void* model,
+    mlx_array* token_ids,           // int32 [B, block_size]
+    int32_t batch_size,
+    int32_t block_size,
+    mlx_array* cache_pos_arr,       // int32 [B] per-row cache_pos
+    mlx_array** packed_kv_caches, int32_t n_kv,
+    mlx_array** packed_gdr_states, int32_t n_gdr,
+    mlx_array* attn_mask,           // additive [B, 1, block_size, key_len], nullable
+    mlx_array* rope_offsets,        // int32 [B] per-row RoPE base offset
+    float temperature,
+    bool greedy,
+    mlx_array** out_sampled,        // [B, block_size]
+    mlx_array** out_packed_kv_caches,
+    mlx_array** out_packed_gdr_states
+) {
+    auto* m = static_cast<Qwen35CompiledModel*>(model);
+    try {
+        mlx_clear_error();
+
+        if (batch_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched_sampled requires batch_size > 0");
+        }
+        if (block_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched_sampled requires block_size > 0");
+        }
+        if (cache_pos_arr == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched_sampled requires cache_pos_arr");
+        }
+        if (rope_offsets == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_batched_sampled requires rope_offsets");
+        }
+
+        m->current_cache_pos = 0;
+        m->current_batch_size = batch_size;
+        m->current_seq_len = block_size;
+        m->current_last_logits_only = false;
+        m->current_has_attn_mask = attn_mask != nullptr;
+        if (m->current_has_attn_mask) {
+            m->current_attn_mask = *to_arr(attn_mask);
+        } else {
+            m->current_attn_mask = array(0);
+        }
+        m->current_has_cache_pos_arr = true;
+        m->current_cache_pos_arr = *to_arr(cache_pos_arr);
+        m->current_has_rope_offsets = true;
+        m->current_rope_offsets = *to_arr(rope_offsets);
+
+        std::vector<array> inputs;
+        inputs.reserve(1 + n_kv + n_gdr);
+        inputs.push_back(*to_arr(token_ids));
+        for (int i = 0; i < n_kv; ++i) inputs.push_back(*to_arr(packed_kv_caches[i]));
+        for (int i = 0; i < n_gdr; ++i) inputs.push_back(*to_arr(packed_gdr_states[i]));
+
+        m->prev_outputs = m->forward(inputs);
+        auto& outputs = m->prev_outputs;
+
+        auto logits = outputs[0];
+        auto sampled = greedy
+            ? argmax(logits, -1, false)
+            : random::categorical(logits * array(1.0f / temperature), -1);
+
+        *out_sampled = from_arr(std::move(sampled));
+        for (int i = 0; i < n_kv; ++i) {
+            out_packed_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
+        }
+        for (int i = 0; i < n_gdr; ++i) {
+            out_packed_gdr_states[i] = from_arr(std::move(outputs[1 + n_kv + i]));
+        }
+
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return 0;
+    } catch (const std::exception& e) {
+        mlx_set_error(e.what());
+        m->current_cache_pos = 0;
+        m->current_batch_size = 1;
+        m->current_seq_len = 1;
+        m->current_last_logits_only = false;
+        m->clear_optional_batch_inputs();
+        return -1;
+    }
+}
+
 // ── Full decode loop in C++ ────────────────────────────────────────────────
 // Keeps ALL intermediate arrays alive within the loop body, matching
 // Python's behavior where locals survive until the next loop iteration.

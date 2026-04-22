@@ -84,6 +84,9 @@ metal scheduler runtime:
       -> qwen35.rs::with_qwen35_capture_layers
       -> ensure_dflash_target_hidden_for_terminal_prefill
       -> qwen35_dflash_speculative_block
+         single-row: prefix verify via `cpp_model.step()` until first mismatch
+      -> qwen35_dflash_speculative_block_batched
+         multi-row: packed full-block verify over `[B, block_size]`
       -> fallback to standard decode when target_hidden is still missing
          or the request is on the Rust step path
 ```
@@ -102,7 +105,12 @@ metal scheduler runtime:
   then `capture_qwen35_hidden_from_cpp_outputs` builds the layer-hidden bundle
   that seeds the first draft block.
 - Verify:
-  Each speculative block uses `qwen35_dflash_speculative_block`, which runs one target verify over the whole block, accepts the longest greedy prefix, rolls back rejected GDR state, and returns the updated target hidden state.
+  `qwen35_dflash_speculative_block` and
+  `qwen35_dflash_speculative_block_batched` now diverge deliberately:
+  single-row DFlash verifies one target step at a time and stops at the first
+  mismatch-inclusive position, while batched DFlash still verifies the whole
+  packed block in one forward and rolls back rejected GDR state. Both return
+  the same accepted-token contract and updated target hidden state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
   terminal prefill did not seed `target_hidden` yet, or the request is on the
