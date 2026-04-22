@@ -1019,7 +1019,31 @@ struct Qwen35CompiledModel {
         return down.apply(h, prefer_verify_m16);
     }
 
-    array moe_mlp(const array& x, const LayerWeights::MoeLayerWeights& moe) const {
+    array moe_mlp(
+        const array& x,
+        const LayerWeights::MoeLayerWeights& moe,
+        bool prefer_verify_m16
+    ) const {
+        if (prefer_verify_m16 && x.ndim() == 3 && x.shape(0) == 1 && x.shape(1) == 16) {
+            auto x_2d = reshape(x, {16, x.shape(2)});
+            auto y_2d = qwen35_moe_block_forward_cpp(
+                x_2d,
+                moe.router.w, moe.router.scales, moe.router.biases,
+                moe.router_bits, moe.router_group_size,
+                moe.switch_gate.w, moe.switch_gate.scales, moe.switch_gate.biases,
+                moe.switch_up.w, moe.switch_up.scales, moe.switch_up.biases,
+                moe.switch_down.w, moe.switch_down.scales, moe.switch_down.biases,
+                moe.expert_bits, moe.expert_group_size,
+                moe.shared_gate.w, moe.shared_gate.scales, moe.shared_gate.biases,
+                moe.shared_up.w, moe.shared_up.scales, moe.shared_up.biases,
+                moe.shared_down.w, moe.shared_down.scales, moe.shared_down.biases,
+                moe.shared_expert_gate.w,
+                moe.shared_expert_gate.scales,
+                moe.shared_expert_gate.biases,
+                moe.num_experts, moe.top_k, moe.norm_topk_prob);
+            return reshape(y_2d, {1, 16, y_2d.shape(1)});
+        }
+
         return qwen35_moe_block_forward_cpp(
             x,
             moe.router.w, moe.router.scales, moe.router.biases,
@@ -1109,7 +1133,7 @@ struct Qwen35CompiledModel {
             auto post_ln_w = layer.is_gdr ? layer.gdr.post_attn_ln_w : layer.full.post_attn_ln_w;
             auto xn2 = fast::rms_norm(x, post_ln_w, rms_eps);
             if (layer.has_moe) {
-                x = residual2 + moe_mlp(xn2, layer.moe);
+                x = residual2 + moe_mlp(xn2, layer.moe, prefer_verify_m16);
             } else if (layer.is_gdr && use_separate_mlp_for_current_step(layer.gdr)) {
                 x = residual2
                     + mlp_separate(
