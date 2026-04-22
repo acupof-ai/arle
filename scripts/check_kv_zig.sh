@@ -14,7 +14,7 @@ SCOPE="${CHECK_KV_ZIG_SCOPE:-full}"
 info() { echo "[check_kv_zig] $*"; }
 
 case "${SCOPE}" in
-    full | kv-only) ;;
+    full | kv-only | check-only) ;;
     *)
         echo "[check_kv_zig] unsupported CHECK_KV_ZIG_SCOPE=${SCOPE}" >&2
         exit 64
@@ -30,11 +30,13 @@ info "scope=${SCOPE}"
 info "cargo check -p kv-native-sys"
 cargo check -p kv-native-sys
 
-info "cargo test -p kv-native-sys"
-cargo test -p kv-native-sys
+if [[ "${SCOPE}" != "check-only" ]]; then
+    info "cargo test -p kv-native-sys"
+    cargo test -p kv-native-sys
 
-info "cargo clippy -p kv-native-sys -- -D warnings"
-cargo clippy -p kv-native-sys -- -D warnings
+    info "cargo clippy -p kv-native-sys -- -D warnings"
+    cargo clippy -p kv-native-sys -- -D warnings
+fi
 
 if [[ "${SCOPE}" == "full" ]]; then
     info "cargo check -p infer --no-default-features --features no-cuda"

@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNAPSHOT_ROOT=""
+MODE="${AGENT_INFER_PRE_PUSH_MODE:-quick}"
 
 info() { echo "[pre-push] $*"; }
 
@@ -25,6 +26,14 @@ cleanup() {
 
 trap cleanup EXIT
 
+case "${MODE}" in
+    quick | full) ;;
+    *)
+        echo "[pre-push] unsupported AGENT_INFER_PRE_PUSH_MODE=${MODE}" >&2
+        exit 64
+        ;;
+esac
+
 SNAPSHOT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agent-infer-pre-push.XXXXXX")"
 info "exporting HEAD snapshot to ${SNAPSHOT_ROOT}"
 git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${SNAPSHOT_ROOT}"
@@ -38,6 +47,21 @@ export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 
 run cargo fmt --manifest-path infer/Cargo.toml --all -- --check
+if [[ "${MODE}" == "quick" ]]; then
+    run env CHECK_KV_ZIG_SCOPE=check-only ./scripts/check_kv_zig.sh
+    run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        run cargo check --manifest-path infer/Cargo.toml --no-default-features --features metal,no-cuda --lib --release
+        run cargo check --no-default-features --features metal,no-cuda,cli -p agent-infer --release
+    else
+        info "skipping Metal-only checks on non-macOS host"
+    fi
+
+    info "quick pre-push checks passed"
+    exit 0
+fi
+
 run env CHECK_KV_ZIG_SCOPE=kv-only ./scripts/check_kv_zig.sh
 run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
 run cargo clippy --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib -- -D warnings
