@@ -371,7 +371,9 @@ mod tests {
         );
 
         assert!(!store.exists(&handle).expect("missing before write"));
-        store.put_block(fingerprint, 1, b"foobar").expect("put block");
+        store
+            .put_block(fingerprint, 1, b"foobar")
+            .expect("put block");
         assert!(store.exists(&handle).expect("present after write"));
     }
 

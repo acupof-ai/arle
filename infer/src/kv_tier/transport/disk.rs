@@ -390,14 +390,11 @@ impl KVBackend for DiskStore {
         Ok(Self::ready_op(Ok(KVBackendCompletion::Deleted(req.handle))))
     }
 
-    fn exists(
-        &self,
-        handle: &super::super::chunk::KVHandle,
-    ) -> Result<bool, TransportError> {
+    fn exists(&self, handle: &super::super::chunk::KVHandle) -> Result<bool, TransportError> {
         match &handle.location {
-            BlockLocation::Disk { fingerprint, .. } => {
-                self.contains_block(*fingerprint).map_err(|err| disk_error(&err))
-            }
+            BlockLocation::Disk { fingerprint, .. } => self
+                .contains_block(*fingerprint)
+                .map_err(|err| disk_error(&err)),
             _ => Err(disk_location_error(
                 "disk backend requires a Disk block location on exists",
             )),
@@ -545,13 +542,25 @@ mod tests {
         let payload = b"exists-check".to_vec();
         let fingerprint = fingerprint_for_payload(&payload, kv_format_tag);
 
-        assert!(!store.contains_block(fingerprint).expect("missing before write"));
+        assert!(
+            !store
+                .contains_block(fingerprint)
+                .expect("missing before write")
+        );
         let location = store
             .put_block(fingerprint, kv_format_tag, &payload)
             .expect("put block");
-        assert!(store.contains_block(fingerprint).expect("present after write"));
+        assert!(
+            store
+                .contains_block(fingerprint)
+                .expect("present after write")
+        );
         store.delete_block(&location).expect("delete block");
-        assert!(!store.contains_block(fingerprint).expect("missing after delete"));
+        assert!(
+            !store
+                .contains_block(fingerprint)
+                .expect("missing after delete")
+        );
     }
 
     #[test]

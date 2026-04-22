@@ -1,4 +1,4 @@
-//! Tiered KV coordinator for the shipped local spill/readmission path.
+//! Tiered KV coordinator for the shipped local store/readmission path.
 //!
 //! The live local runtime uses the coordinator for three concrete behaviors:
 //! - persist host-pinned blocks into `DiskStore`
@@ -30,15 +30,13 @@ use super::tier::BlockLocation;
 use super::transport::disk::{DiskBlockLocation, DiskStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SpillTicket(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlanTicket(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FetchTicket(pub u64);
 
-pub type StoreTicket = SpillTicket;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoreTicket(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueueKind {
@@ -347,16 +345,6 @@ enum QueueOutcome {
     Cancelled,
 }
 
-/// Request handed to the coordinator for a T1 → T2 spill.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpillRequest {
-    pub block_id: BlockId,
-    pub fingerprint: crate::types::BlockFingerprint,
-    pub kv_format_tag: u8,
-    pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
-    pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreTarget {
     Disk,
@@ -371,19 +359,6 @@ pub struct StoreRequest {
     pub host_pool: crate::kv_tier::host_pool::SharedHostPinnedPool,
     pub host_region: crate::kv_tier::host_pool::HostPinnedRegion,
     pub target: StoreTarget,
-}
-
-impl From<SpillRequest> for StoreRequest {
-    fn from(request: SpillRequest) -> Self {
-        Self {
-            block_id: request.block_id,
-            fingerprint: request.fingerprint,
-            kv_format_tag: request.kv_format_tag,
-            host_pool: request.host_pool,
-            host_region: request.host_region,
-            target: StoreTarget::Disk,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,13 +411,6 @@ pub enum CoordinatorCommand {
         ticket: PlanTicket,
         blocks: Vec<PrefetchPlanRequest>,
     },
-    /// T1 → T2 spill ticket. The coordinator routes each `SpillRequest`
-    /// through `DiskStore::put_block` and emits `SpillCompleted` with the
-    /// resulting disk locations on success.
-    Spill {
-        ticket: SpillTicket,
-        blocks: Vec<SpillRequest>,
-    },
     Store {
         ticket: StoreTicket,
         blocks: Vec<StoreRequest>,
@@ -460,28 +428,6 @@ pub enum CoordinatorCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorEvent {
     CommandQueued(CoordinatorCommand),
-    /// T1 → T2 spill enqueued. Informational — the real work happens
-    /// asynchronously on the coordinator's disk I/O thread / worker pool.
-    SpillQueued {
-        ticket: SpillTicket,
-        block_count: usize,
-    },
-    /// T1 → T2 spill finished. `locations` gives the scheduler the
-    /// canonical disk locations for every block that was persisted so
-    /// the radix can flip `tier_location` to `BlockLocation::Disk`.
-    SpillCompleted {
-        ticket: SpillTicket,
-        locations: Vec<(BlockId, DiskBlockLocation)>,
-    },
-    /// T1 → T2 spill failed. `failed_block` identifies the first block
-    /// that did not persist successfully; any preceding blocks in the
-    /// ticket were persisted, so the scheduler has to decide whether
-    /// to roll them back or accept a partial spill.
-    SpillFailed {
-        ticket: SpillTicket,
-        failed_block: BlockId,
-        reason: String,
-    },
     StoreQueued {
         ticket: StoreTicket,
         block_count: usize,
@@ -611,19 +557,6 @@ impl CoordinatorHandle {
             })
     }
 
-    /// Mint a fresh `SpillTicket` for a T1 → T2 spill batch and enqueue
-    /// the corresponding `Spill` command. Returns `None` if `blocks`
-    /// is empty or the command channel is full.
-    pub fn submit_spill(&self, blocks: Vec<SpillRequest>) -> Option<SpillTicket> {
-        if blocks.is_empty() {
-            return None;
-        }
-        let ticket = SpillTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
-        self.try_send_ticket(ticket.into(), CoordinatorCommand::Spill { ticket, blocks })
-            .ok()?;
-        Some(ticket)
-    }
-
     /// Mint a fresh `FetchTicket` and enqueue a non-blocking readmission fetch.
     pub fn submit_fetch(&self, blocks: Vec<FetchRequest>) -> Option<FetchTicket> {
         if blocks.is_empty() {
@@ -649,7 +582,7 @@ impl CoordinatorHandle {
         if blocks.is_empty() {
             return None;
         }
-        let ticket = SpillTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
+        let ticket = StoreTicket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
         self.try_send_ticket(ticket.into(), CoordinatorCommand::Store { ticket, blocks })
             .ok()?;
         Some(ticket)
@@ -845,25 +778,6 @@ impl Coordinator {
         })
     }
 
-    fn spill_failed(
-        &self,
-        ticket: SpillTicket,
-        failed_block: BlockId,
-        reason: impl Into<String>,
-    ) -> Result<QueueOutcome> {
-        let reason = reason.into();
-        self.emit_event(CoordinatorEvent::SpillFailed {
-            ticket,
-            failed_block,
-            reason: reason.clone(),
-        })?;
-        Ok(if reason.contains("cancelled") {
-            QueueOutcome::Cancelled
-        } else {
-            QueueOutcome::Failed
-        })
-    }
-
     fn handle_plan(&self, ticket: PlanTicket, blocks: &[PrefetchPlanRequest]) -> QueueOutcome {
         self.emit_orchestrator_event(OrchestratorEvent::PlanQueued {
             ticket,
@@ -888,51 +802,6 @@ impl Coordinator {
             .collect();
         self.emit_orchestrator_event(OrchestratorEvent::PlanCompleted { ticket, plans });
         QueueOutcome::Completed
-    }
-
-    fn handle_spill(&self, ticket: SpillTicket, blocks: &[SpillRequest]) -> Result<QueueOutcome> {
-        self.emit_event(CoordinatorEvent::SpillQueued {
-            ticket,
-            block_count: blocks.len(),
-        })?;
-        if self.is_cancelled(ticket.into()) {
-            let failed_block = blocks.first().map_or(BlockId(0), |block| block.block_id);
-            return self.spill_failed(ticket, failed_block, "spill cancelled");
-        }
-
-        let Some(disk_store) = &self.disk_store else {
-            if let Some(first) = blocks.first() {
-                return self.spill_failed(
-                    ticket,
-                    first.block_id,
-                    "coordinator disk store not configured",
-                );
-            }
-            self.emit_event(CoordinatorEvent::SpillCompleted {
-                ticket,
-                locations: Vec::new(),
-            })?;
-            return Ok(QueueOutcome::Completed);
-        };
-
-        let mut locations = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            if self.is_cancelled(ticket.into()) {
-                return self.spill_failed(ticket, block.block_id, "spill cancelled");
-            }
-            let payload = match block.host_pool.read_region(block.host_region) {
-                Ok(payload) => payload,
-                Err(err) => return self.spill_failed(ticket, block.block_id, err.to_string()),
-            };
-
-            match disk_store.put_block(block.fingerprint, block.kv_format_tag, &payload) {
-                Ok(location) => locations.push((block.block_id, location)),
-                Err(err) => return self.spill_failed(ticket, block.block_id, err.to_string()),
-            }
-        }
-
-        self.emit_event(CoordinatorEvent::SpillCompleted { ticket, locations })?;
-        Ok(QueueOutcome::Completed)
     }
 
     fn handle_store(&self, ticket: StoreTicket, blocks: &[StoreRequest]) -> QueueOutcome {
@@ -1185,8 +1054,7 @@ impl Coordinator {
                     };
                     let payload = match cluster_shared_backend.poll(&mut op) {
                         std::task::Poll::Ready(Ok(KVBackendCompletion::Loaded {
-                            payload,
-                            ..
+                            payload, ..
                         })) => payload,
                         std::task::Poll::Ready(Ok(other)) => {
                             Self::release_allocated_regions(&allocated_regions);
@@ -1225,7 +1093,8 @@ impl Coordinator {
                                 "host pinned pool exhausted",
                             );
                         };
-                        pool.as_mut_slice(region).copy_from_slice(payload.as_slice());
+                        pool.as_mut_slice(region)
+                            .copy_from_slice(payload.as_slice());
                         region
                     };
                     allocated_regions.push((block.host_pool.clone(), region));
@@ -1263,7 +1132,6 @@ impl Coordinator {
             Ok(cmd) => {
                 let queue_ticket = match &cmd {
                     CoordinatorCommand::Plan { ticket, .. } => Some((*ticket).into()),
-                    CoordinatorCommand::Spill { ticket, .. } => Some((*ticket).into()),
                     CoordinatorCommand::Store { ticket, .. } => Some((*ticket).into()),
                     CoordinatorCommand::Fetch { ticket, .. } => Some((*ticket).into()),
                     CoordinatorCommand::Shutdown => None,
@@ -1274,9 +1142,6 @@ impl Coordinator {
                 let outcome = match &cmd {
                     CoordinatorCommand::Plan { ticket, blocks } => {
                         Some(self.handle_plan(*ticket, blocks))
-                    }
-                    CoordinatorCommand::Spill { ticket, blocks } => {
-                        Some(self.handle_spill(*ticket, blocks)?)
                     }
                     CoordinatorCommand::Store { ticket, blocks } => {
                         Some(self.handle_store(*ticket, blocks))
@@ -1350,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn spill_roundtrip_through_disk_store() {
+    fn store_roundtrip_through_disk_store() {
         let dir = tempdir().unwrap();
         let disk_store = Arc::new(DiskStore::new(dir.path()));
         let (coordinator, handle, events) = Coordinator::new_with_disk_store(4, disk_store.clone());
@@ -1365,34 +1230,45 @@ mod tests {
         };
         let fingerprint = BlockFingerprint([0x2A; 16]);
         let ticket = handle
-            .submit_spill(vec![SpillRequest {
+            .submit_store(vec![StoreRequest {
                 block_id: BlockId(7),
                 fingerprint,
                 kv_format_tag: 3,
                 host_pool: host_pool.clone(),
                 host_region: region,
+                target: StoreTarget::Disk,
             }])
             .unwrap();
 
         assert!(coordinator.run_once().unwrap());
         assert_eq!(
             events.recv().unwrap(),
-            CoordinatorEvent::SpillQueued {
+            CoordinatorEvent::StoreQueued {
                 ticket,
                 block_count: 1,
             }
         );
         let location = match events.recv().unwrap() {
-            CoordinatorEvent::SpillCompleted {
+            CoordinatorEvent::StoreCompleted {
                 ticket: done,
                 locations,
             } => {
                 assert_eq!(done, ticket);
                 assert_eq!(locations.len(), 1);
                 assert_eq!(locations[0].0, BlockId(7));
-                locations[0].1.clone()
+                match locations[0].1.clone() {
+                    BlockLocation::Disk {
+                        fingerprint,
+                        payload_len,
+                    } => crate::kv_tier::transport::disk::DiskBlockLocation {
+                        path: disk_store.block_path_for(fingerprint).unwrap(),
+                        fingerprint,
+                        payload_len,
+                    },
+                    other => panic!("expected disk location, got {other:?}"),
+                }
             }
-            other => panic!("unexpected spill event: {other:?}"),
+            other => panic!("unexpected store event: {other:?}"),
         };
 
         let payload = host_pool.read_region(region).unwrap();
@@ -1402,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn spill_fails_without_configured_disk_store() {
+    fn store_to_disk_fails_without_configured_disk_store() {
         let (coordinator, handle, events) = Coordinator::new(4);
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
@@ -1415,24 +1291,25 @@ mod tests {
         };
 
         let ticket = handle
-            .submit_spill(vec![SpillRequest {
+            .submit_store(vec![StoreRequest {
                 block_id: BlockId(3),
                 fingerprint: BlockFingerprint([0x44; 16]),
                 kv_format_tag: 1,
                 host_pool,
                 host_region: region,
+                target: StoreTarget::Disk,
             }])
             .unwrap();
         assert!(coordinator.run_once().unwrap());
         assert_eq!(
             events.recv().unwrap(),
-            CoordinatorEvent::SpillQueued {
+            CoordinatorEvent::StoreQueued {
                 ticket,
                 block_count: 1,
             }
         );
         match events.recv().unwrap() {
-            CoordinatorEvent::SpillFailed {
+            CoordinatorEvent::StoreFailed {
                 ticket: failed_ticket,
                 failed_block,
                 reason,
@@ -1441,7 +1318,7 @@ mod tests {
                 assert_eq!(failed_block, BlockId(3));
                 assert!(reason.contains("disk store not configured"));
             }
-            other => panic!("unexpected spill failure event: {other:?}"),
+            other => panic!("unexpected store failure event: {other:?}"),
         }
     }
 
@@ -1585,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_spill_is_non_blocking_when_queue_is_full() {
+    fn submit_store_is_non_blocking_when_queue_is_full() {
         let (_coordinator, handle, _events) = Coordinator::new(1);
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(64).unwrap(),
@@ -1597,23 +1474,25 @@ mod tests {
             region
         };
 
-        let first = handle.submit_spill(vec![SpillRequest {
+        let first = handle.submit_store(vec![StoreRequest {
             block_id: BlockId(1),
             fingerprint: BlockFingerprint([0x11; 16]),
             kv_format_tag: 1,
             host_pool: host_pool.clone(),
             host_region: region,
+            target: StoreTarget::Disk,
         }]);
         assert!(first.is_some());
 
-        let second = handle.submit_spill(vec![SpillRequest {
+        let second = handle.submit_store(vec![StoreRequest {
             block_id: BlockId(2),
             fingerprint: BlockFingerprint([0x22; 16]),
             kv_format_tag: 1,
             host_pool,
             host_region: region,
+            target: StoreTarget::Disk,
         }]);
-        assert!(second.is_none(), "full queue should not block spill submit");
+        assert!(second.is_none(), "full queue should not block store submit");
     }
 
     #[test]
@@ -1850,12 +1729,11 @@ mod tests {
     fn remote_store_and_fetch_roundtrip_through_shared_fs_backend() {
         let dir = tempdir().unwrap();
         let remote_store = Arc::new(SharedFsStore::new(dir.path()));
-        let (coordinator, handle, events) =
-            Coordinator::new_with_backends(
-                4,
-                None,
-                Some(ClusterSharedBackend::SharedFs(remote_store.clone())),
-            );
+        let (coordinator, handle, events) = Coordinator::new_with_backends(
+            4,
+            None,
+            Some(ClusterSharedBackend::SharedFs(remote_store.clone())),
+        );
         let host_pool = crate::kv_tier::host_pool::SharedHostPinnedPool::new(
             crate::kv_tier::HostPinnedPool::new(256).unwrap(),
         );

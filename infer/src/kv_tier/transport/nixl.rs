@@ -207,10 +207,7 @@ impl super::super::backend::KVBackend for NixlTransport {
         ))
     }
 
-    fn exists(
-        &self,
-        _handle: &super::super::chunk::KVHandle,
-    ) -> Result<bool, TransportError> {
+    fn exists(&self, _handle: &super::super::chunk::KVHandle) -> Result<bool, TransportError> {
         Err(TransportError::Other(
             "NixlTransport::exists is an M5 stub; real impl resolves remote metadata".into(),
         ))

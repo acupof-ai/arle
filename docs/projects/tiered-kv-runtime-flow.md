@@ -204,7 +204,10 @@ This keeps one runnable path instead of parallel recovery branches.
 
 ## Write / Demotion Order
 
-The write-side trigger lives in `core.rs::spill_host_blocks_if_pressured()`.
+The write-side trigger currently starts in
+`core.rs::spill_host_blocks_if_pressured()`, but it submits a single
+`StoreRequest` path. There is no separate runtime `Spill*` queue surface
+anymore.
 
 ### 1. Only T1 pressure starts store work
 
@@ -243,8 +246,8 @@ Current remote policy:
 `runtime.rs::drain_coordinator_events()` handles:
 
 - `StoreQueued` -> `mark_block_storing`
-- `StoreCompleted` / `SpillCompleted` -> `mark_block_stored` + release T1 region
-- `StoreFailed` / `SpillFailed` -> `mark_block_store_failed`
+- `StoreCompleted` -> `mark_block_stored` + release T1 region
+- `StoreFailed` -> `mark_block_store_failed`
 
 ## Queue Ownership
 

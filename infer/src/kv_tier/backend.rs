@@ -7,15 +7,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::Poll;
 
+#[cfg(feature = "rdma-nixl")]
+use super::transport::nixl::{NixlOp, NixlTransport};
+use super::transport::shared_fs::SharedFsBackendOp;
 use super::{
     chunk::KVHandle,
     io::{KVBackendCompletion, KVBackendDelete, KVBackendFetch, KVBackendStore},
     tier::{BlockLocation, Tier},
-    transport::{TransportError, shared_fs::{SharedFsBlockLocation, SharedFsStore}},
+    transport::{
+        TransportError,
+        shared_fs::{SharedFsBlockLocation, SharedFsStore},
+    },
 };
-#[cfg(feature = "rdma-nixl")]
-use super::transport::nixl::{NixlOp, NixlTransport};
-use super::transport::shared_fs::SharedFsBackendOp;
 use crate::types::BlockFingerprint;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -47,9 +50,13 @@ pub trait KVBackend: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClusterSharedBackendConfig {
-    SharedFilesystem { root: PathBuf },
+    SharedFilesystem {
+        root: PathBuf,
+    },
     #[cfg(feature = "rdma-nixl")]
-    Nixl { agent_name: String },
+    Nixl {
+        agent_name: String,
+    },
 }
 
 impl ClusterSharedBackendConfig {
@@ -111,8 +118,9 @@ impl ClusterSharedBackend {
         payload_len: u64,
     ) -> Result<BlockLocation, TransportError> {
         match self {
-            Self::SharedFs(_) => SharedFsBlockLocation::new(fingerprint, payload_len)
-                .into_block_location(),
+            Self::SharedFs(_) => {
+                SharedFsBlockLocation::new(fingerprint, payload_len).into_block_location()
+            }
             #[cfg(feature = "rdma-nixl")]
             Self::Nixl(_) => Err(TransportError::Other(
                 "nixl remote descriptor synthesis requires real backend metadata".into(),
