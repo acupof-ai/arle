@@ -238,6 +238,7 @@ HTTP boundary guarantees:
 - JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
+- Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
 - `405 Method Not Allowed` responses keep structured JSON bodies and now also include the standard `Allow` header on both top-level and session routes.
 
 ```bash
