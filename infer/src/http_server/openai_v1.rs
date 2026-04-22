@@ -238,6 +238,7 @@ impl ModelsListResponse {
 
 // OpenAI-compatible /v1/completions request
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CompletionRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,
@@ -279,6 +280,7 @@ pub(super) struct CompletionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct StreamOptions {
     pub(super) include_usage: Option<bool>,
 }
@@ -460,6 +462,7 @@ impl StreamUsageChunk {
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChatCompletionRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,
@@ -737,6 +740,7 @@ pub(super) enum ResponsesInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ResponsesRequest {
     #[allow(dead_code)]
     pub(super) model: Option<String>,

@@ -402,16 +402,33 @@ fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, A
             format!("Malformed JSON request body: {inner}"),
             "invalid_json",
         ),
-        JsonRejection::JsonDataError(inner) => ApiError::bad_request(
-            format!("Invalid JSON request body: {inner}"),
-            "invalid_json",
-        ),
+        JsonRejection::JsonDataError(inner) => json_data_rejection_to_api_error(&inner),
         JsonRejection::BytesRejection(inner) => bytes_rejection_to_api_error(&inner),
         other => ApiError::bad_request(
             format!("Failed to decode JSON request body: {other}"),
             "invalid_json",
         ),
     })
+}
+
+fn json_data_rejection_to_api_error(err: &axum::extract::rejection::JsonDataError) -> ApiError {
+    let detail = err.to_string();
+    if let Some(field) = unsupported_json_field(&detail) {
+        return ApiError::bad_request(
+            format!("Invalid `{field}`: is not supported on this server yet"),
+            "invalid_parameter",
+        );
+    }
+    ApiError::bad_request(
+        format!("Invalid JSON request body: {detail}"),
+        "invalid_json",
+    )
+}
+
+fn unsupported_json_field(message: &str) -> Option<&str> {
+    let (_, tail) = message.split_once("unknown field `")?;
+    let (field, _) = tail.split_once('`')?;
+    Some(field).filter(|field| !field.is_empty())
 }
 
 fn bytes_rejection_to_api_error(err: &BytesRejection) -> ApiError {
@@ -1816,6 +1833,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn completion_rejects_unsupported_parameter_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"prompt":"hello","max_tokens":1,"response_format":{"type":"json_object"}}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("response_format")),
+            "payload={payload}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // /v1/chat/completions tests
     // -----------------------------------------------------------------------
@@ -1890,6 +1933,32 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("stream_options")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_rejects_unsupported_parameter_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("tool_choice")),
+            "payload={payload}"
         );
     }
 
@@ -2576,6 +2645,32 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("top_p")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_unsupported_parameter_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"input":"hello","max_output_tokens":1,"parallel_tool_calls":true}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("parallel_tool_calls")),
+            "payload={payload}"
         );
     }
 
