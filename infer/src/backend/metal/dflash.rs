@@ -15,8 +15,8 @@ use super::{
     generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
     mlx::{
-        Dtype, MlxArray, as_dtype, async_eval, concatenate_axis, eval, prefix_match_len_i32,
-        prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
+        Dtype, MlxArray, as_dtype, async_eval, concatenate_axis, eval, gather_axis1_i32,
+        prefix_match_len_i32, prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
     },
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params},
@@ -1734,7 +1734,7 @@ fn prefix_match_len_tokens(lhs: &MlxArray, rhs: &MlxArray) -> Result<usize> {
     Ok(matched as usize)
 }
 
-fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> Result<Vec<i32>> {
+fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
     let lhs_i32 = if lhs.dtype() == Dtype::Int32 {
         lhs.clone()
     } else {
@@ -1745,14 +1745,7 @@ fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> Result<Vec
     } else {
         as_dtype(rhs, Dtype::Int32)
     };
-    let matched = prefix_match_len_i32_batched(&lhs_i32, &rhs_i32);
-    eval(&[&matched]);
-    let matched = matched.as_slice_i32();
-    ensure!(
-        matched.iter().all(|&value| value >= 0),
-        "mlx_prefix_match_len_i32_batched returned a negative prefix length: {matched:?}"
-    );
-    Ok(matched)
+    prefix_match_len_i32_batched(&lhs_i32, &rhs_i32)
 }
 
 fn build_accepted_tokens_from_arrays(
@@ -2676,38 +2669,40 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
             && posterior_shape[1] == block_size_i32,
         "Qwen3.5 DFlash batched sampled verify tokens unexpected shape {posterior_shape:?}"
     );
+    let posterior_tokens_i32 = if posterior_tokens.dtype() == Dtype::Int32 {
+        posterior_tokens.clone()
+    } else {
+        as_dtype(&posterior_tokens, Dtype::Int32)
+    };
 
     let drafted_prefix = slice(&tokens_arr, &[0, 1], &[batch_i32, block_size_i32], &[1, 1]);
     let posterior_prefix = slice(
-        &posterior_tokens,
+        &posterior_tokens_i32,
         &[0, 0],
         &[batch_i32, draft_suffix_len],
         &[1, 1],
     );
-    let matched_per_row = prefix_match_len_tokens_batched(&drafted_prefix, &posterior_prefix)?;
+    let matched_per_row = prefix_match_len_tokens_batched(&drafted_prefix, &posterior_prefix);
+    let posterior_token_per_row = gather_axis1_i32(&posterior_tokens_i32, &matched_per_row);
+    eval(&[&matched_per_row, &posterior_token_per_row]);
 
-    let mut accepted_inputs: Vec<i32> = Vec::with_capacity(batch);
-    let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
-    for (b, &matched) in matched_per_row.iter().enumerate() {
-        let b_i32 = b as i32;
-        let row_posterior = slice(
-            &posterior_tokens,
-            &[b_i32, 0],
-            &[b_i32 + 1, block_size_i32],
-            &[1, 1],
-        );
-        let row_posterior = reshape(&row_posterior, &[block_size_i32]);
-        let accepted = matched + 1;
-        let matched_i32 = matched;
-        let posterior_token = slice(&row_posterior, &[matched_i32], &[matched_i32 + 1], &[1]);
-        let posterior_token = materialize_token_array(&posterior_token)
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("Qwen3.5 DFlash batched posterior token row {b} was empty"))?;
-
-        accepted_inputs.push(accepted);
-        posterior_token_per_row.push(posterior_token);
-    }
+    let matched_per_row = matched_per_row.as_slice_i32();
+    ensure!(
+        matched_per_row.iter().all(|&value| value >= 0),
+        "mlx_prefix_match_len_i32_batched returned a negative prefix length: {matched_per_row:?}"
+    );
+    let accepted_inputs: Vec<i32> = matched_per_row.iter().map(|&matched| matched + 1).collect();
+    let posterior_token_per_row: Vec<u32> = posterior_token_per_row
+        .as_slice_i32()
+        .into_iter()
+        .map(|token| token as u32)
+        .collect();
+    ensure!(
+        matched_per_row.len() == batch && posterior_token_per_row.len() == batch,
+        "Qwen3.5 DFlash batched gather returned matched={} posterior={} rows, expected {batch}",
+        matched_per_row.len(),
+        posterior_token_per_row.len()
+    );
 
     // ── 9. Rollback packed GDR state on partial accept. ──
     if accepted_inputs.iter().any(|&k| k < block_size_i32) {

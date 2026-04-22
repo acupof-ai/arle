@@ -341,6 +341,13 @@ pub fn prefix_match_len_i32_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray 
     )
 }
 
+pub fn gather_axis1_i32(values: &MlxArray, indices: &MlxArray) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_gather_axis1_i32(values.0, indices.0) },
+        "mlx_gather_axis1_i32",
+    )
+}
+
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(
@@ -969,6 +976,17 @@ mod tests {
         let matched = prefix_match_len_i32_batched(&lhs, &rhs);
         eval(&[&matched]);
         assert_eq!(matched.as_slice_i32(), vec![2, 4]);
+    }
+
+    #[test]
+    fn gather_axis1_i32_picks_one_value_per_row() {
+        let _guard = metal_test_guard();
+        let values = MlxArray::from_slice_i32(&[10, 11, 12, 13, 20, 21, 22, 23], &[2, 4]);
+        let indices = MlxArray::from_slice_i32(&[1, 3], &[2]);
+        let gathered = gather_axis1_i32(&values, &indices);
+        eval(&[&gathered]);
+        assert_eq!(gathered.shape(), [2]);
+        assert_eq!(gathered.as_slice_i32(), vec![11, 23]);
     }
 
     #[test]
