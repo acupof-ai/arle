@@ -197,6 +197,12 @@ fn use_qwen35_cpp_separate_proj() -> bool {
         .unwrap_or(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Qwen35VerifySummary {
+    pub(super) matched_prefix_len: usize,
+    pub(super) next_token: u32,
+}
+
 impl CppQwen35Model {
     /// Wrap a raw C++ model pointer (takes ownership).
     pub(crate) fn from_raw(ptr: *mut std::ffi::c_void) -> Self {
@@ -983,10 +989,9 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
-    /// Single-row DFlash verify fast path: same scalar-cache verify as
-    /// `verify_block`, but samples the posterior inside C++ and returns token
-    /// ids `[block_size]` instead of logits.
-    pub(super) fn verify_block_sampled(
+    /// Single-row DFlash verify fast path: samples the posterior inside C++
+    /// and returns only the acceptance summary needed by Rust.
+    pub(super) fn verify_block_summary(
         &self,
         tokens: &MlxArray,
         block_size: i32,
@@ -994,7 +999,7 @@ impl CppQwen35Model {
         kv_caches: &mut [MlxArray],
         gdr_states: &mut [MlxArray],
         params: &SamplingParams,
-    ) -> Result<MlxArray> {
+    ) -> Result<Qwen35VerifySummary> {
         let n_kv = kv_caches.len() as i32;
         let n_gdr = gdr_states.len() as i32;
         let greedy = params.temperature <= 1e-6 || params.top_k == 1;
@@ -1004,12 +1009,13 @@ impl CppQwen35Model {
         let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
             gdr_states.iter().map(MlxArray::as_raw).collect();
 
-        let mut out_sampled: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut matched_prefix_len = 0i32;
+        let mut next_token = 0i32;
         let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
         let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
 
         let rc = unsafe {
-            mlx_sys::qwen35_compiled_verify_block_sampled(
+            mlx_sys::qwen35_compiled_verify_block_summary(
                 self.0,
                 tokens.as_raw(),
                 block_size,
@@ -1020,7 +1026,8 @@ impl CppQwen35Model {
                 n_gdr,
                 params.temperature,
                 greedy,
-                &raw mut out_sampled,
+                &raw mut matched_prefix_len,
+                &raw mut next_token,
                 out_kv.as_mut_ptr(),
                 out_gdr.as_mut_ptr(),
             )
@@ -1039,7 +1046,19 @@ impl CppQwen35Model {
             drop(old);
         }
 
-        Ok(unsafe { MlxArray::from_raw(out_sampled) })
+        anyhow::ensure!(
+            (0..block_size).contains(&matched_prefix_len),
+            "Qwen3.5 DFlash verify summary returned invalid matched_prefix_len={matched_prefix_len} for block_size={block_size}"
+        );
+        anyhow::ensure!(
+            next_token >= 0,
+            "Qwen3.5 DFlash verify summary returned negative next_token={next_token}"
+        );
+
+        Ok(Qwen35VerifySummary {
+            matched_prefix_len: matched_prefix_len as usize,
+            next_token: next_token as u32,
+        })
     }
 
     /// Batched DFlash verify: run `block_size` draft tokens for `batch_size`
@@ -1729,6 +1748,7 @@ fn metal_generate_qwen35_dflash(
         runtime.draft_head_dim(),
         input_ids.len() + max_new_tokens,
     );
+    let mut prefetched_draft = None;
     let mut target_hidden =
         target_hidden.context("Qwen3.5/Qwen3.6 DFlash prefill did not capture target_hidden")?;
 
@@ -1761,7 +1781,9 @@ fn metal_generate_qwen35_dflash(
             &mut gdr_flat,
             &mut cache_len,
             &mut draft_state,
+            prefetched_draft.take(),
         )?;
+        prefetched_draft = block.prefetched_next_draft;
         target_hidden = block.updated_target_hidden;
         for token in block.accepted_tokens {
             current_token = token;
@@ -2941,10 +2963,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_block_sampled_matches_batched_sampled_for_b1() -> Result<()> {
+    fn verify_block_summary_matches_batched_sampled_for_b1() -> Result<()> {
         let Some(model_path) = env::var_os("QWEN35_MODEL_PATH").map(PathBuf::from) else {
             eprintln!(
-                "QWEN35_MODEL_PATH unset; skipping verify_block_sampled B=1 equivalence test"
+                "QWEN35_MODEL_PATH unset; skipping verify_block_summary B=1 equivalence test"
             );
             return Ok(());
         };
@@ -3007,7 +3029,7 @@ mod tests {
         let mut scalar_kv = kv_flat.clone();
         let mut scalar_gdr = gdr_flat.clone();
         let verify_tokens = MlxArray::from_slice_i32(&block_tokens, &[block_size]);
-        let scalar_sampled = cpp_model.verify_block_sampled(
+        let scalar_summary = cpp_model.verify_block_summary(
             &verify_tokens,
             block_size,
             cache_pos,
@@ -3033,10 +3055,21 @@ mod tests {
         )?;
         let batched_sampled = reshape(&batched_sampled, &[block_size]);
 
-        eval(&[&scalar_sampled, &batched_sampled]);
+        eval(&[&batched_sampled]);
+        let batched_sampled = batched_sampled.as_slice_i32();
+        let expected_matched_prefix_len = block_tokens
+            .iter()
+            .skip(1)
+            .zip(batched_sampled.iter())
+            .take_while(|(draft, sampled)| draft == sampled)
+            .count();
         assert_eq!(
-            scalar_sampled.as_slice_i32(),
-            batched_sampled.as_slice_i32()
+            scalar_summary.matched_prefix_len,
+            expected_matched_prefix_len
+        );
+        assert_eq!(
+            scalar_summary.next_token,
+            batched_sampled[expected_matched_prefix_len] as u32
         );
 
         Ok(())

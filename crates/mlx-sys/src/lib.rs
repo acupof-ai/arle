@@ -628,7 +628,7 @@ unsafe extern "C" {
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
-    pub fn qwen35_compiled_verify_block_sampled(
+    pub fn qwen35_compiled_verify_block_summary(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,
         block_size: i32,
@@ -639,7 +639,8 @@ unsafe extern "C" {
         n_gdr: i32,
         temperature: f32,
         greedy: bool,
-        out_sampled: *mut *mut mlx_array,
+        out_matched_prefix_len: *mut i32,
+        out_next_token: *mut i32,
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
