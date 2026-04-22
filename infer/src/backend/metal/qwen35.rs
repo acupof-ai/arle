@@ -11,14 +11,13 @@ use super::mlx::{
 use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
 use super::weights::{StackedQuantized, load_quantized_with_bits, load_stacked_quantized};
 use super::{
-    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig,
-    MetalQwen35LayerType, MlpInputProjection, WeightTensor, clear_metal_cache, dflash,
-    extend_kv_cache, gpu_sample_token, linear, load_embed_tokens_from_tensors,
-    load_proj_from_tensors, load_tensor_map, merge_quantized_projection_rows, tensor_get,
-    tie_lm_head_from_embed_tokens,
+    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
+    MlpInputProjection, WeightTensor, clear_metal_cache, dflash, extend_kv_cache, gpu_sample_token,
+    linear, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
+    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
 };
-use crate::backend::metal::dflash::MetalDflashRuntime;
 use crate::backend::is_stream_stop_matched;
+use crate::backend::metal::dflash::MetalDflashRuntime;
 use crate::sampler::SamplingParams;
 
 pub(super) struct MetalQwen35FullAttentionWeights {
@@ -170,6 +169,26 @@ pub(crate) fn capture_qwen35_hidden_from_cpp_outputs(
         })
         .collect();
     Ok(Some(concatenate_axis(&squeezed, 1)))
+}
+
+pub(crate) fn with_qwen35_capture_layers<T>(
+    cpp_model_raw: *mut std::ffi::c_void,
+    target_layer_ids: &[usize],
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let capture_layer_ids: Vec<i32> = target_layer_ids.iter().map(|&idx| idx as i32).collect();
+    unsafe {
+        mlx_sys::qwen35_set_capture_layers(
+            cpp_model_raw,
+            capture_layer_ids.as_ptr(),
+            capture_layer_ids.len() as i32,
+        );
+    }
+    let result = f();
+    unsafe {
+        mlx_sys::qwen35_set_capture_layers(cpp_model_raw, std::ptr::null(), 0);
+    }
+    result
 }
 
 fn use_qwen35_cpp_separate_proj() -> bool {
@@ -1503,11 +1522,6 @@ fn metal_generate_qwen35_dflash(
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
     let mut logits = None;
-    let capture_layer_ids: Vec<i32> = runtime
-        .target_layer_ids()
-        .iter()
-        .map(|&idx| idx as i32)
-        .collect();
     let mut target_hidden = None;
 
     let mut kv_flat: Vec<MlxArray> = k_caches
@@ -1524,22 +1538,21 @@ fn metal_generate_qwen35_dflash(
 
     for (idx, &token) in input_ids.iter().enumerate() {
         let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        if idx + 1 == input_ids.len() {
-            unsafe {
-                mlx_sys::qwen35_set_capture_layers(
-                    cpp_model.as_raw(),
-                    capture_layer_ids.as_ptr(),
-                    capture_layer_ids.len() as i32,
-                );
-            }
-        }
-        let step_logits = cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)?;
-        if idx + 1 == input_ids.len() {
-            unsafe { mlx_sys::qwen35_set_capture_layers(cpp_model.as_raw(), std::ptr::null(), 0) };
-            target_hidden =
-                capture_qwen35_hidden_from_cpp_outputs(cpp_model.as_raw(), runtime.target_layer_ids().len())?;
+        let step_logits = if idx + 1 == input_ids.len() {
+            with_qwen35_capture_layers(cpp_model.as_raw(), runtime.target_layer_ids(), || {
+                cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)
+            })?
         } else {
-            let mut outputs: Vec<&MlxArray> = Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
+            cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)?
+        };
+        if idx + 1 == input_ids.len() {
+            target_hidden = capture_qwen35_hidden_from_cpp_outputs(
+                cpp_model.as_raw(),
+                runtime.target_layer_ids().len(),
+            )?;
+        } else {
+            let mut outputs: Vec<&MlxArray> =
+                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
             outputs.push(&step_logits);
             outputs.extend(kv_flat.iter());
             outputs.extend(gdr_flat.iter());
