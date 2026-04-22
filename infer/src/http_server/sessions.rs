@@ -525,7 +525,7 @@ where
         .route("/{session_id}", delete(handle_delete))
         .method_not_allowed_fallback(method_not_allowed_handler)
         .fallback(route_not_found_handler)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(super::HTTP_REQUEST_BODY_LIMIT_BYTES))
         .with_state(engine)
 }
 
