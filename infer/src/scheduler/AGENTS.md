@@ -65,10 +65,13 @@ works with any backend. Load before editing any scheduler internals.
    contiguous fallback is model-compatibility glue, the paged attach path is
    the canonical shared-page flow.
 9. **`runtime.rs::assign_slots()` owns waiting-queue normalization/admission.**
-   Tokenization, prompt-length rejection/clamping, cancellation skip, priority
-   ordering, radix classification, and slot materialization happen there before
+   Tokenization, prompt-length rejection/clamping, cancellation skip, radix
+   classification, and slot materialization happen there before
    `execution.rs::plan_step()` decides the current tick's prefill/decode mix.
-   Do not recreate a second waiting-queue planner in `execution.rs`.
+   The waiting queue itself now stays priority-ordered incrementally on
+   ingress/requeue; `assign_slots()` is no longer allowed to re-sort the whole
+   queue every tick. Do not recreate a second waiting-queue planner in
+   `execution.rs`.
 10. **Eviction never touches pages backing an active slot.** Radix eviction
    only frees pages whose `block_owner_slots` entry is either missing (the
    slot has already been freed) or points at a slot currently in `Idle`
