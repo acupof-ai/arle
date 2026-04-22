@@ -14,7 +14,7 @@ use super::{
     forward::rust_transformer_layer,
     generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
+    mlx::{MlxArray, async_eval, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
@@ -2047,6 +2047,20 @@ fn qwen35_build_updated_target_hidden(
     out
 }
 
+#[allow(clippy::float_cmp)]
+fn qwen35_same_sampling_params(a: &SamplingParams, b: &SamplingParams) -> bool {
+    // Batched DFlash shares one sampled verify call across rows, so the
+    // sampling contract must be bit-identical rather than approximately equal.
+    a.temperature == b.temperature
+        && a.top_k == b.top_k
+        && a.top_p == b.top_p
+        && a.min_p == b.min_p
+        && a.repetition_penalty == b.repetition_penalty
+        && a.frequency_penalty == b.frequency_penalty
+        && a.presence_penalty == b.presence_penalty
+        && a.seed == b.seed
+}
+
 // ── Qwen3.5 DFlash speculative block ─────────────────────────────────────
 
 /// Qwen3.5 single-row verify: run target decode steps until the first
@@ -2070,7 +2084,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // Draft model state
     draft_state: &mut ContiguousKvState,
 ) -> Result<DFlashBlockResult> {
-    use super::mlx::{MlxArray as Arr, eval};
+    use super::mlx::MlxArray as Arr;
 
     let profile = std::env::var("QWEN35_DFLASH_PROFILE").is_ok();
     let t_start = std::time::Instant::now();
@@ -2101,74 +2115,101 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_draft = t_start.elapsed();
 
     let n_capture_layers = runtime.target_layer_ids.len();
-    let mut matched = 0usize;
-    let mut accepted_tokens_out = Vec::with_capacity(runtime.block_size);
-    let mut captured_per_layer: Vec<Vec<Arr>> = vec![Vec::new(); n_capture_layers];
+    let expected_tape_count = target_gdr_flat.len() / 2;
     let mut per_pos_match = vec![false; runtime.block_size.saturating_sub(1)];
     let t_snapshot = t_start.elapsed();
 
-    // ── 2. Prefix verify via scalar decode steps ──
+    // ── 2. Sampled full-block verify ──
     //
-    // On Apple/MLX the stock M=16 verify path is still expensive. Most Qwen3.6
-    // blocks on this workload reject at the second draft position, so paying a
-    // full block verify wastes the target pass. Verify only until the first
-    // mismatch (inclusive): every executed step is accepted, so we avoid both
-    // over-verification and GDR rollback.
-    cpp_model.begin_session(target_kv_flat, target_gdr_flat)?;
-    let verify_result = super::qwen35::with_qwen35_capture_layers(
-        cpp_model.as_raw(),
-        &runtime.target_layer_ids,
-        || {
-            for step_idx in 0..runtime.block_size {
-                let token = MlxArray::from_slice_i32(&[block_tokens[step_idx] as i32], &[1]);
-                let logits = cpp_model.step_session(&token, *target_cache_len)?;
-                let posterior = sample_last_token(&logits, params)?;
-                let captured = drain_captured_hidden(cpp_model)?;
-                ensure!(
-                    captured.len() == n_capture_layers || n_capture_layers == 0,
-                    "Qwen3.5 DFlash captured hidden count mismatch: expected {n_capture_layers}, got {}",
-                    captured.len()
-                );
-                for (layer_idx, hidden) in captured.into_iter().enumerate() {
-                    captured_per_layer[layer_idx].push(hidden);
-                }
+    // Trace showed the previous scalar prefix path stalling on
+    // `sample_last_token -> eval` for every accepted step. Reuse the sampled
+    // packed-verify kernel with `B=1`: one target forward, one GPU-side sample,
+    // then accept the longest matching prefix and rollback rejected suffix.
+    let gdr_snapshot: Vec<Arr> = target_gdr_flat.to_vec();
+    let layer_ids_i32: Vec<i32> = runtime
+        .target_layer_ids
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+    unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true) };
+    unsafe {
+        mlx_sys::qwen35_set_capture_layers(
+            cpp_model.as_raw(),
+            layer_ids_i32.as_ptr(),
+            layer_ids_i32.len() as i32,
+        );
+    };
+    let _verify_state_guard = Qwen35VerifyStateGuard {
+        raw: cpp_model.as_raw(),
+    };
 
-                *target_cache_len += 1;
-                accepted_tokens_out.push(posterior);
-
-                let Some(&draft_token) = block_tokens.get(step_idx + 1) else {
-                    break;
-                };
-                let is_match = posterior == draft_token;
-                per_pos_match[step_idx] = is_match;
-                if is_match {
-                    matched += 1;
-                    continue;
-                }
-                break;
-            }
-            Ok(())
-        },
+    let block_tokens_i32: Vec<i32> = block_tokens.iter().map(|&token| token as i32).collect();
+    let tokens_arr = MlxArray::from_slice_i32(&block_tokens_i32, &[1, block_size_i32]);
+    let cache_pos_arr = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
+    let rope_offsets = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
+    let posterior_tokens = cpp_model.verify_block_batched_sampled(
+        &tokens_arr,
+        1,
+        block_size_i32,
+        &cache_pos_arr,
+        target_kv_flat,
+        target_gdr_flat,
+        None,
+        &rope_offsets,
+        params,
+    )?;
+    let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
+    let captured_hiddens = drain_captured_hidden(cpp_model)?;
+    eval(&[&posterior_tokens]);
+    let posterior_tokens = posterior_tokens.as_slice_i32();
+    ensure!(
+        posterior_tokens.len() == runtime.block_size,
+        "Qwen3.5 DFlash sampled verify returned {} tokens for block_size={}",
+        posterior_tokens.len(),
+        runtime.block_size
     );
-    let (session_kv, session_gdr) =
-        cpp_model.end_session(target_kv_flat.len(), target_gdr_flat.len())?;
-    for (dst, src) in target_kv_flat.iter_mut().zip(session_kv) {
-        let old = std::mem::replace(dst, src);
-        drop(old);
+    let posterior: Vec<u32> = posterior_tokens.iter().map(|&tok| tok as u32).collect();
+
+    for (offset, (&target, &draft)) in posterior
+        .iter()
+        .zip(block_tokens.iter().skip(1))
+        .take(runtime.block_size.saturating_sub(1))
+        .enumerate()
+    {
+        per_pos_match[offset] = target == draft;
     }
-    for (dst, src) in target_gdr_flat.iter_mut().zip(session_gdr) {
-        let old = std::mem::replace(dst, src);
-        drop(old);
+
+    let matched = posterior
+        .iter()
+        .zip(block_tokens.iter().skip(1))
+        .take(runtime.block_size.saturating_sub(1))
+        .take_while(|(target, draft)| target == draft)
+        .count();
+    let accepted_inputs = matched + 1;
+    if accepted_inputs < runtime.block_size {
+        qwen35_rollback_to_accepted_varlen(
+            target_gdr_flat,
+            &gdr_snapshot,
+            &tapes,
+            &[accepted_inputs as i32],
+        )?;
     }
-    verify_result?;
+    *target_cache_len += accepted_inputs as i32;
     let t_verify = t_start.elapsed();
     let t_sample = t_verify;
 
-    let accepted_inputs = accepted_tokens_out.len();
-    ensure!(
-        accepted_inputs > 0,
-        "Qwen3.5 DFlash prefix verify produced no accepted tokens"
+    let posterior_token = *posterior
+        .get(matched)
+        .ok_or_else(|| anyhow!("Qwen3.5 DFlash sampled verify produced too few tokens"))?;
+    let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
+    accepted_tokens_out.extend(
+        block_tokens
+            .iter()
+            .skip(1)
+            .take(accepted_inputs.saturating_sub(1))
+            .copied(),
     );
+    accepted_tokens_out.push(posterior_token);
 
     log::debug!(
         "qwen35_dflash: accepted={}/{} draft={:?} posterior={:?}",
@@ -2178,21 +2219,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
         &accepted_tokens_out[..accepted_inputs.min(accepted_tokens_out.len())]
     );
 
-    // ── 3. Build updated_target_hidden from accepted per-step captures ──
-    let captured_hiddens: Vec<Arr> = captured_per_layer
-        .into_iter()
-        .map(|mut per_layer| {
-            ensure!(
-                !per_layer.is_empty(),
-                "Qwen3.5 DFlash missing captured hidden for an accepted layer"
-            );
-            Ok(if per_layer.len() == 1 {
-                per_layer.pop().expect("checked non-empty")
-            } else {
-                concatenate_axis(&per_layer, 1)
-            })
-        })
-        .collect::<Result<_>>()?;
+    // ── 3. Build updated_target_hidden from accepted verify positions. ──
     let updated_target_hidden = qwen35_build_updated_target_hidden(
         &captured_hiddens,
         n_capture_layers,
@@ -2205,10 +2232,13 @@ pub(crate) fn qwen35_dflash_speculative_block(
 
     let t_rollback = t_start.elapsed();
 
-    // Eval all modified state to materialize
-    let mut to_eval: Vec<&Arr> = target_gdr_flat.iter().collect();
+    // Queue all modified state for materialization. The caller drains
+    // `token_buffer` for accepted tokens before the next GPU block, so a
+    // blocking fence here is unnecessary.
+    let mut to_eval: Vec<&Arr> = vec![&updated_target_hidden];
+    to_eval.extend(target_gdr_flat.iter());
     to_eval.extend(target_kv_flat.iter());
-    eval(&to_eval);
+    async_eval(&to_eval);
     let t_total = t_start.elapsed();
 
     if profile {
@@ -2310,16 +2340,8 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     );
     if let Some((first, rest)) = params_per_row.split_first() {
         ensure!(
-            rest.iter().all(|params| {
-                params.temperature == first.temperature
-                    && params.top_k == first.top_k
-                    && params.top_p == first.top_p
-                    && params.min_p == first.min_p
-                    && params.repetition_penalty == first.repetition_penalty
-                    && params.frequency_penalty == first.frequency_penalty
-                    && params.presence_penalty == first.presence_penalty
-                    && params.seed == first.seed
-            }),
+            rest.iter()
+                .all(|params| qwen35_same_sampling_params(params, first)),
             "Qwen3.5 DFlash batched block requires identical sampling params per row"
         );
     }
