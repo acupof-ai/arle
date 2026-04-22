@@ -8,7 +8,7 @@ use super::recurrent_state::RecurrentState;
 use super::single_token_buffers::SingleTokenBuffers;
 use super::weights::Qwen35Model;
 use crate::model::generation_state::GenerationStateBase;
-use crate::model::{GenerationState, ModelForward};
+use crate::model::{GenerationState, ModelForward, PrefillBatchRequest};
 use crate::ops;
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
@@ -76,6 +76,17 @@ impl Qwen35State {
             self.paged_prefill = Some(PagedPrefillBuffers35::new(ctx, config, seq_len, page_size)?);
         }
         Ok(())
+    }
+
+    fn prepare_paged_prefill(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &super::config::Config35,
+        seq_len: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        self.clear_prefill_logits();
+        self.ensure_paged_prefill(ctx, config, seq_len, page_size)
     }
 }
 
@@ -241,8 +252,7 @@ impl ModelForward for Qwen35Model {
         slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        state.clear_prefill_logits();
-        state.ensure_paged_prefill(&self.ctx, &self.config, tokens.len(), pool.page_size)?;
+        state.prepare_paged_prefill(&self.ctx, &self.config, tokens.len(), pool.page_size)?;
         let recurrent = &mut state.recurrent_state;
         let prefill_bufs = state
             .paged_prefill
@@ -250,6 +260,56 @@ impl ModelForward for Qwen35Model {
             .expect("paged prefill buffers initialized");
         self.prefill_forward_paged(tokens, pool, slot, recurrent, prefill_bufs)?;
         Ok(())
+    }
+
+    fn forward_prefill_batch_with_pool(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        pool: &mut PagedKVPool,
+    ) -> Result<bool> {
+        if requests.is_empty() {
+            return Ok(false);
+        }
+
+        let mut seen_slots = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.tokens.is_empty() || seen_slots.contains(&request.slot_idx) {
+                return Ok(false);
+            }
+            seen_slots.push(request.slot_idx);
+        }
+
+        for request in requests {
+            pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
+        }
+
+        for request in requests {
+            states[request.slot_idx].prepare_paged_prefill(
+                &self.ctx,
+                &self.config,
+                request.tokens.len(),
+                pool.page_size,
+            )?;
+        }
+
+        for request in requests {
+            let state = &mut states[request.slot_idx];
+            let recurrent = &mut state.recurrent_state;
+            let prefill_bufs = state
+                .paged_prefill
+                .as_mut()
+                .expect("paged prefill buffers initialized");
+            self.prefill_forward_paged(
+                request.tokens,
+                pool,
+                request.slot_idx,
+                recurrent,
+                prefill_bufs,
+            )?;
+        }
+
+        Ok(true)
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
