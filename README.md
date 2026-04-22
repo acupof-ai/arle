@@ -328,7 +328,10 @@ If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then aut
 Use `--doctor` to print a self-check report for the current CLI build without
 loading a model. It shows the compiled backend, detected hardware, TTY state,
 HuggingFace cache root, model-resolution source, and curated model
-recommendations. Add `--json` for machine-readable output in scripts and CI.
+recommendations. Add `--json` for machine-readable output in scripts and CI;
+inspection JSON now includes a `schema_version`, top-level `status`, and
+stable per-check / resolution codes so callers do not need to infer health
+from prose.
 
 ```bash
 cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,cli -- \
