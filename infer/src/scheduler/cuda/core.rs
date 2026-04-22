@@ -44,18 +44,11 @@ fn can_publish_prefix_pages(
         <= prefix_cache_retain_hard_cap_pages(total_pages, cap_fraction)
 }
 
-/// State preserved between decode launch and readback for GPU/CPU overlap.
-pub(super) struct MixedPrefillPending {
-    pub slot_idx: usize,
-    pub chunk_complete: bool,
-}
-
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
-    pub mixed_prefill: Vec<MixedPrefillPending>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
