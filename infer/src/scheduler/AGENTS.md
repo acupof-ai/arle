@@ -47,9 +47,9 @@ works with any backend. Load before editing any scheduler internals.
    CPU accounting scheduler only. The production CUDA runtime does not have a
    "decode active => chunk = 64" rule; `chunked_prefill_size` caps one
    request's prefill chunk, `max_num_batched_tokens` caps the whole step token
-   budget, `max_prefill_tokens` caps the prefill share of that budget, and
-   `prefill_max_requests` limits how many prefilling requests advance in one
-   planned tick.
+   budget, and the planner derives one mutable prefill budget by clamping that
+   step budget with `max_prefill_tokens`. `prefill_max_requests` then limits
+   how many prefilling requests advance in one planned tick.
 6. **Hybrid models (Qwen3.5) cannot truncate recurrent state.** `prefill.rs`
    downgrades partial prefix hits to full MISS when
    `!state.supports_partial_prefix()`. Only full-prefix hits benefit from
@@ -64,11 +64,11 @@ works with any backend. Load before editing any scheduler internals.
    `paged_kv` tail-page COW before append. Keep those two paths explicit: the
    contiguous fallback is model-compatibility glue, the paged attach path is
    the canonical shared-page flow.
-9. **`execution.rs::plan_step()` owns waiting-queue normalization.**
+9. **`runtime.rs::assign_slots()` owns waiting-queue normalization/admission.**
    Tokenization, prompt-length rejection/clamping, cancellation skip, priority
-   ordering, radix classification, and slot materialization all happen inside
-   the single planned tick path before prefill/decode launch. Do not recreate
-   a pre-step `assign_slots()` path in `runtime.rs`.
+   ordering, radix classification, and slot materialization happen there before
+   `execution.rs::plan_step()` decides the current tick's prefill/decode mix.
+   Do not recreate a second waiting-queue planner in `execution.rs`.
 10. **Eviction never touches pages backing an active slot.** Radix eviction
    only frees pages whose `block_owner_slots` entry is either missing (the
    slot has already been freed) or points at a slot currently in `Idle`
