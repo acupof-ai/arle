@@ -7,14 +7,16 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use autograd::ops::{mul_scalar, sum};
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
-    ops::{gather_last_dim, log_softmax, matmul, mean, mul, mul_scalar, sum},
+    ops::{gather_last_dim, log_softmax, matmul, mean, mul},
     optim::AdamW,
 };
 use thiserror::Error;
 use train::{
-    CausalLm, GrpoPolicy, GrpoPolicyConfig, StepOutcome, Trainer, TrainerConfig,
+    CausalLm, GrpoPolicy, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
         trainable_params,
@@ -311,7 +313,9 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let mut registry = build_registry(&model);
     registry.load_into(&mut store, &weights_path)?;
 
-    let model_ids = live_tensor_ids(&store);
+    let ones_by_seq = build_prefix_ones(&mut store, args.seq_len)?;
+    let mut model_ids = live_tensor_ids(&store);
+    model_ids.extend(ones_by_seq.iter().copied());
     let params = trainable_params(&model, &store);
     if params.is_empty() {
         return Err(CliError::Custom(format!(
@@ -500,6 +504,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     // the same sequence it would have seen in a single uninterrupted run.
     let model_ref = &model;
     let dataset_ref = &dataset;
+    let ones_by_seq_ref = &ones_by_seq;
     let mut batch_examples = Vec::with_capacity(batch_size);
     let mut collated = BatchedTokenizedSft::with_capacity(batch_size, args.seq_len);
     let mut input_ids = Vec::with_capacity(batch_size * args.seq_len);
@@ -524,14 +529,16 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
             ctx.store,
             ctx.tape,
         )?;
-        let loss_id = assistant_masked_causal_loss_batch(
+        let loss_id = assistant_masked_causal_loss_batch_precomputed(
             logits,
-            &collated.labels,
+            &collated.gather_indices,
+            &collated.mask_values,
+            &collated.inv_counts,
             batch_examples.len(),
             collated.seq_len,
+            ones_by_seq_ref[collated.seq_len],
             ctx.store,
             ctx.tape,
-            model_ref.config().vocab_size(),
         )?;
         Ok(StepOutcome {
             loss_id,
@@ -739,7 +746,9 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
 
 struct BatchedTokenizedSft {
     input_ids: Vec<u32>,
-    labels: Vec<i32>,
+    gather_indices: Vec<usize>,
+    mask_values: Vec<f32>,
+    inv_counts: Vec<f32>,
     seq_len: usize,
     token_count: u64,
 }
@@ -748,7 +757,9 @@ impl BatchedTokenizedSft {
     fn with_capacity(batch: usize, seq_len: usize) -> Self {
         Self {
             input_ids: Vec::with_capacity(batch * seq_len),
-            labels: Vec::with_capacity(batch * seq_len),
+            gather_indices: Vec::with_capacity(batch * seq_len),
+            mask_values: Vec::with_capacity(batch * seq_len),
+            inv_counts: Vec::with_capacity(batch),
             seq_len: 0,
             token_count: 0,
         }
@@ -764,9 +775,13 @@ fn collate_tokenized_batch_into(out: &mut BatchedTokenizedSft, examples: &[&Toke
         .max(1);
     let batch_elems = examples.len() * seq_len;
     out.input_ids.clear();
-    out.labels.clear();
     out.input_ids.resize(batch_elems, 0);
-    out.labels.resize(batch_elems, -100);
+    out.gather_indices.clear();
+    out.mask_values.clear();
+    out.inv_counts.clear();
+    out.gather_indices.resize(batch_elems, 0);
+    out.mask_values.resize(batch_elems, 0.0);
+    out.inv_counts.resize(examples.len(), 0.0);
     out.seq_len = seq_len;
     out.token_count = 0;
 
@@ -774,11 +789,34 @@ fn collate_tokenized_batch_into(out: &mut BatchedTokenizedSft, examples: &[&Toke
         let input_len = example.input_ids.len().saturating_sub(1);
         let base = row * seq_len;
         out.input_ids[base..base + input_len].copy_from_slice(&example.input_ids[..input_len]);
-        out.labels[base..base + input_len].copy_from_slice(&example.labels[1..1 + input_len]);
+        let row_labels = &example.labels[1..1 + input_len];
+        let valid_count = row_labels.iter().filter(|&&label| label >= 0).count();
+        if valid_count > 0 {
+            out.inv_counts[row] = -1.0 / valid_count as f32;
+        }
+        for (offset, &label) in row_labels.iter().enumerate() {
+            if let Ok(index) = usize::try_from(label) {
+                out.gather_indices[base + offset] = index;
+                out.mask_values[base + offset] = 1.0;
+            }
+        }
         out.token_count += input_len as u64;
     }
 }
 
+fn build_prefix_ones(
+    store: &mut TensorStore,
+    max_seq_len: usize,
+) -> autograd::Result<Vec<TensorId>> {
+    let mut ones_by_seq = Vec::with_capacity(max_seq_len + 1);
+    for seq_len in 0..=max_seq_len {
+        let len = seq_len.max(1);
+        ones_by_seq.push(store.from_slice(&vec![1.0f32; len], &[len, 1])?);
+    }
+    Ok(ones_by_seq)
+}
+
+#[cfg(test)]
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
@@ -841,6 +879,7 @@ fn assistant_masked_causal_loss(
     mul_scalar(total, -1.0 / valid_count as f32, store, tape)
 }
 
+#[cfg(test)]
 fn assistant_masked_causal_loss_batch(
     logits: TensorId,
     labels: &[i32],
@@ -850,10 +889,6 @@ fn assistant_masked_causal_loss_batch(
     tape: &mut Tape,
     vocab_size: usize,
 ) -> autograd::Result<TensorId> {
-    if batch == 1 {
-        return assistant_masked_causal_loss(logits, labels, store, tape, vocab_size);
-    }
-
     if labels.len() != batch * seq_len {
         return Err(leak_autograd_err(format!(
             "train_sft: batched label count {} does not match batch*seq {}",
@@ -889,13 +924,56 @@ fn assistant_masked_causal_loss_batch(
         }
     }
 
+    let ones = store.from_slice(&vec![1.0f32; seq_len.max(1)], &[seq_len.max(1), 1])?;
+    assistant_masked_causal_loss_batch_precomputed(
+        logits,
+        &gather_indices,
+        &mask_values,
+        &inv_counts,
+        batch,
+        seq_len,
+        ones,
+        store,
+        tape,
+    )
+}
+
+fn assistant_masked_causal_loss_batch_precomputed(
+    logits: TensorId,
+    gather_indices: &[usize],
+    mask_values: &[f32],
+    inv_counts: &[f32],
+    batch: usize,
+    seq_len: usize,
+    ones: TensorId,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> autograd::Result<TensorId> {
+    if gather_indices.len() != batch * seq_len || mask_values.len() != batch * seq_len {
+        return Err(leak_autograd_err(format!(
+            "train_sft: precomputed buffers do not match batch*seq {}",
+            batch * seq_len
+        )));
+    }
+    if inv_counts.len() != batch {
+        return Err(leak_autograd_err(format!(
+            "train_sft: inv_counts len {} does not match batch {}",
+            inv_counts.len(),
+            batch
+        )));
+    }
+    if inv_counts.iter().any(|&count| count >= 0.0) {
+        return Err(AutogradError::TapeInvariant(
+            "train_sft: batched example has no supervised assistant tokens after shifting",
+        ));
+    }
+
     let log_probs = log_softmax(logits, store, tape)?;
-    let target_log_probs = gather_last_dim(log_probs, &gather_indices, store, tape)?;
-    let mask = store.from_slice(&mask_values, &[batch, seq_len])?;
+    let target_log_probs = gather_last_dim(log_probs, gather_indices, store, tape)?;
+    let mask = store.from_slice(mask_values, &[batch, seq_len])?;
     let masked = mul(target_log_probs, mask, store, tape)?;
-    let ones = store.from_slice(&vec![1.0f32; seq_len], &[seq_len, 1])?;
     let row_sums = matmul(masked, ones, store, tape)?;
-    let inv_counts = store.from_slice(&inv_counts, &[batch, 1])?;
+    let inv_counts = store.from_slice(inv_counts, &[batch, 1])?;
     let per_example_loss = mul(row_sums, inv_counts, store, tape)?;
     mean(per_example_loss, store, tape)
 }
