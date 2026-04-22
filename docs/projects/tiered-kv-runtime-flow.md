@@ -79,6 +79,32 @@ The descriptions below are intended to match the current implementation in:
 The canonical order lives in `runtime.rs::build_prefix_admission_plan()` and
 `runtime.rs::assign_slots()`.
 
+## Scheduler Iteration Timeline
+
+The live CUDA scheduler is iteration-level, but it no longer performs decode
+launch and decode readback in the same logical turn.
+
+Current order inside `runtime.rs::run()` is:
+
+1. drain newly arrived requests
+2. drain coordinator fetch/store completions
+3. if every active request is parked in `Phase::WaitingFetch`, block on a
+   coordinator event with a short timeout instead of busy-spinning
+4. `assign_slots()`
+5. `step()`
+6. `cleanup()`
+7. `spill_host_blocks_if_pressured()`
+
+Current order inside `execution.rs::step()` is:
+
+1. read back the previous iteration's pending decode
+2. emit text deltas for tokens materialized by that readback
+3. plan the next batch shape (`Idle` / `DecodeOnly` / `Mixed` / `PrefillOnly`)
+4. launch the next decode batch or prefill chunk
+
+That keeps `pending_decode` alive across loop turns so CPU-side intake and
+admission can overlap the previous GPU decode launch.
+
 ### 1. Lookup first
 
 `RadixCache::lookup_or_stage()` classifies each matched block as:
@@ -129,6 +155,8 @@ Path:
 - coordinator loads bytes into T1 host memory
 - `FetchCompleted` promotes bytes into T0
 - request re-enters `Phase::Prefilling`
+- if all active work is parked in `Phase::WaitingFetch`, `run()` sleeps on the
+  coordinator event channel instead of spinning a hot scheduler loop
 
 Implementation:
 

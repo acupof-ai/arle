@@ -669,6 +669,26 @@ impl<M: ModelForward> Scheduler<M> {
         self.active.iter().filter(|req| req.is_some()).count()
     }
 
+    pub(super) fn has_decode_work(&self) -> bool {
+        self.running_batch.iter().any(|&slot_idx| {
+            self.request(slot_idx).is_some_and(|req| {
+                matches!(req.phase, Phase::Decoding) && !req.delta_tx.is_closed()
+            })
+        })
+    }
+
+    pub(super) fn is_fetch_wait_bound(&self) -> bool {
+        self.active_len() > 0
+            && self.pending_decode.is_none()
+            && self.prefill_queue.is_empty()
+            && !self.has_decode_work()
+            && self
+                .active
+                .iter()
+                .flatten()
+                .all(|req| matches!(req.phase, Phase::WaitingFetch))
+    }
+
     pub(super) fn request(&self, slot_idx: usize) -> Option<&ActiveRequest> {
         self.active.get(slot_idx)?.as_ref()
     }
@@ -1200,11 +1220,11 @@ impl<M: ModelForward> Scheduler<M> {
             Some(crate::kv_tier::Tier::HostPinned),
         );
         for block_id in candidates {
-            if self
-                .store_waiting
-                .values()
-                .any(|pending| pending.iter().any(|(waiting_block, _)| *waiting_block == block_id))
-            {
+            if self.store_waiting.values().any(|pending| {
+                pending
+                    .iter()
+                    .any(|(waiting_block, _)| *waiting_block == block_id)
+            }) {
                 continue;
             }
             let Some(metadata) = self.block_metadata(block_id) else {

@@ -434,142 +434,186 @@ impl<M: ModelForward> Scheduler<M> {
         ready
     }
 
-    fn drain_coordinator_events(&mut self) {
+    fn handle_coordinator_event(&mut self, event: crate::kv_tier::CoordinatorEvent) {
         // The runtime consumes coordinator results in one place so the request
         // state machine stays linear:
         // - `Store*` mutates prefix-cache store state and releases T1 regions
         // - `FetchCompleted` promotes staged bytes into T0, then re-enters the
         //   normal prefill path
         // - `FetchFailed` always falls back to cold prefill
-        loop {
-            match self.coordinator_events.try_recv() {
-                Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
-                | Ok(crate::kv_tier::CoordinatorEvent::FetchQueued { .. }) => {}
-                Ok(crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. }) => {
-                    if let Some(waiters) = self.store_waiting.get(&ticket) {
-                        for (block_id, _) in waiters {
-                            let _ = self.prefix_cache.mark_block_storing(*block_id);
+        match event {
+            crate::kv_tier::CoordinatorEvent::CommandQueued(_)
+            | crate::kv_tier::CoordinatorEvent::FetchQueued { .. } => {}
+            crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. } => {
+                if let Some(waiters) = self.store_waiting.get(&ticket) {
+                    for (block_id, _) in waiters {
+                        let _ = self.prefix_cache.mark_block_storing(*block_id);
+                    }
+                }
+            }
+            crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations } => {
+                if let Some(key) = self.store_ticket_keys.remove(&ticket) {
+                    self.store_dedupe.remove(&key);
+                }
+                if let Some(waiters) = self.store_waiting.remove(&ticket) {
+                    let canonical_location = locations.first().map(|(_, location)| location.clone());
+                    for (block_id, region) in waiters {
+                        if let Some(location) = canonical_location.clone() {
+                            let _ = self.prefix_cache.mark_block_stored(block_id, Some(location));
+                        } else {
+                            let _ = self.prefix_cache.mark_block_store_failed(block_id);
+                        }
+                        self.release_host_region(region);
+                    }
+                }
+            }
+            crate::kv_tier::CoordinatorEvent::StoreFailed {
+                ticket,
+                failed_block,
+                reason,
+            } => {
+                warn!(
+                    "Store failed for ticket {} on block {:?}: {}",
+                    ticket.0, failed_block, reason
+                );
+                if let Some(key) = self.store_ticket_keys.remove(&ticket) {
+                    self.store_dedupe.remove(&key);
+                }
+                if let Some(waiters) = self.store_waiting.remove(&ticket) {
+                    for (block_id, region) in waiters {
+                        let _ = self.prefix_cache.mark_block_store_failed(block_id);
+                        self.release_host_region(region);
+                    }
+                } else {
+                    let _ = self.prefix_cache.mark_block_store_failed(failed_block);
+                }
+            }
+            crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks } => {
+                let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
+                    self.release_unclaimed_fetch_regions(&blocks);
+                    return;
+                };
+                if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
+                    self.fetch_dedupe.remove(&key);
+                }
+                let ready_waiters = self.collect_fetch_waiters(waiters);
+                if ready_waiters.is_empty() {
+                    self.release_unclaimed_fetch_regions(&blocks);
+                    return;
+                }
+                for waiter in &ready_waiters {
+                    self.prefix_cache.release(&waiter.staged_prefix.block_ids());
+                }
+                if let Err(err) = self.promote_fetched_prefix(&ready_waiters[0], &blocks) {
+                    warn!(
+                        "Request {}: staged prefix fetch failed, falling back to cold prefill: {}",
+                        ready_waiters[0].request_id, err
+                    );
+                    for waiter in ready_waiters {
+                        self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
+                    }
+                    self.release_unclaimed_fetch_regions(&blocks);
+                    return;
+                }
+                for waiter in ready_waiters {
+                    match self.adopt_promoted_prefix(&waiter) {
+                        Ok(true) => {
+                            self.step_new(waiter.slot_idx);
+                            if matches!(
+                                self.request(waiter.slot_idx).map(|req| &req.phase),
+                                Some(Phase::Prefilling { .. })
+                            ) {
+                                self.queue_prefill(waiter.slot_idx);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            warn!(
+                                "Request {}: staged prefix adopt failed, falling back to cold prefill: {}",
+                                waiter.request_id, err
+                            );
+                            self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
                         }
                     }
                 }
+                self.release_unclaimed_fetch_regions(&blocks);
+            }
+            crate::kv_tier::CoordinatorEvent::FetchFailed {
+                ticket,
+                failed_block,
+                reason,
+            } => {
+                warn!(
+                    "Fetch failed for ticket {} on block {:?}: {}",
+                    ticket.0, failed_block, reason
+                );
+                let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();
+                if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
+                    self.fetch_dedupe.remove(&key);
+                }
+                for (slot_idx, request_id) in waiters {
+                    if self.request(slot_idx).is_some_and(|req| req.id == request_id) {
+                        self.fallback_to_cold_prefill(slot_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_coordinator_events(&mut self) {
+        loop {
+            match self.coordinator_events.try_recv() {
+                Ok(event) => self.handle_coordinator_event(event),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     error!("Coordinator event channel disconnected");
                     break;
                 }
-                Ok(crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations }) => {
-                    if let Some(key) = self.store_ticket_keys.remove(&ticket) {
-                        self.store_dedupe.remove(&key);
-                    }
-                    if let Some(waiters) = self.store_waiting.remove(&ticket) {
-                        let canonical_location = locations.first().map(|(_, location)| location.clone());
-                        for (block_id, region) in waiters {
-                            if let Some(location) = canonical_location.clone() {
-                                let _ = self
-                                    .prefix_cache
-                                    .mark_block_stored(block_id, Some(location));
-                            } else {
-                                let _ = self.prefix_cache.mark_block_store_failed(block_id);
-                            }
-                            self.release_host_region(region);
-                        }
-                    }
+            }
+        }
+    }
+
+    fn drain_request_rx(&mut self) {
+        while let Ok(req) = self.request_rx.try_recv() {
+            self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+            self.waiting.push_back(req);
+        }
+    }
+
+    fn wait_for_wakeup(&mut self) -> bool {
+        if self.is_fetch_wait_bound() {
+            match self
+                .coordinator_events
+                .recv_timeout(std::time::Duration::from_millis(2))
+            {
+                Ok(event) => {
+                    self.handle_coordinator_event(event);
+                    self.drain_request_rx();
+                    return true;
                 }
-                Ok(crate::kv_tier::CoordinatorEvent::StoreFailed {
-                    ticket,
-                    failed_block,
-                    reason,
-                }) => {
-                    warn!(
-                        "Store failed for ticket {} on block {:?}: {}",
-                        ticket.0, failed_block, reason
-                    );
-                    if let Some(key) = self.store_ticket_keys.remove(&ticket) {
-                        self.store_dedupe.remove(&key);
-                    }
-                    if let Some(waiters) = self.store_waiting.remove(&ticket) {
-                        for (block_id, region) in waiters {
-                            let _ = self.prefix_cache.mark_block_store_failed(block_id);
-                            self.release_host_region(region);
-                        }
-                    } else {
-                        let _ = self.prefix_cache.mark_block_store_failed(failed_block);
-                    }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    self.drain_request_rx();
+                    return true;
                 }
-                Ok(crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks }) => {
-                    let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
-                        self.release_unclaimed_fetch_regions(&blocks);
-                        continue;
-                    };
-                    if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
-                        self.fetch_dedupe.remove(&key);
-                    }
-                    let ready_waiters = self.collect_fetch_waiters(waiters);
-                    if ready_waiters.is_empty() {
-                        self.release_unclaimed_fetch_regions(&blocks);
-                        continue;
-                    }
-                    for waiter in &ready_waiters {
-                        self.prefix_cache.release(&waiter.staged_prefix.block_ids());
-                    }
-                    if let Err(err) = self.promote_fetched_prefix(&ready_waiters[0], &blocks) {
-                        warn!(
-                            "Request {}: staged prefix fetch failed, falling back to cold prefill: {}",
-                            ready_waiters[0].request_id, err
-                        );
-                        for waiter in ready_waiters {
-                            self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
-                        }
-                        self.release_unclaimed_fetch_regions(&blocks);
-                        continue;
-                    }
-                    for waiter in ready_waiters {
-                        match self.adopt_promoted_prefix(&waiter) {
-                            Ok(true) => {
-                                self.step_new(waiter.slot_idx);
-                                if matches!(
-                                    self.request(waiter.slot_idx).map(|req| &req.phase),
-                                    Some(Phase::Prefilling { .. })
-                                ) {
-                                    self.queue_prefill(waiter.slot_idx);
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(err) => {
-                                warn!(
-                                    "Request {}: staged prefix adopt failed, falling back to cold prefill: {}",
-                                    waiter.request_id, err
-                                );
-                                self.fallback_to_cold_prefill_without_release(waiter.slot_idx);
-                            }
-                        }
-                    }
-                    self.release_unclaimed_fetch_regions(&blocks);
-                }
-                Ok(crate::kv_tier::CoordinatorEvent::FetchFailed {
-                    ticket,
-                    failed_block,
-                    reason,
-                }) => {
-                    warn!(
-                        "Fetch failed for ticket {} on block {:?}: {}",
-                        ticket.0, failed_block, reason
-                    );
-                    let waiters = self.fetch_waiting.remove(&ticket).unwrap_or_default();
-                    if let Some(key) = self.fetch_ticket_keys.remove(&ticket) {
-                        self.fetch_dedupe.remove(&key);
-                    }
-                    for (slot_idx, request_id) in waiters {
-                        if self
-                            .request(slot_idx)
-                            .is_some_and(|req| req.id == request_id)
-                        {
-                            self.fallback_to_cold_prefill(slot_idx);
-                        }
-                    }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    error!("Coordinator event channel disconnected");
+                    self.drain_request_rx();
+                    return true;
                 }
             }
         }
+
+        if self.active_len() == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
+            if let Some(req) = self.request_rx.blocking_recv() {
+                self.waiting_count.fetch_sub(1, Ordering::Relaxed);
+                self.waiting.push_back(req);
+                return true;
+            }
+            info!("Scheduler shutting down: all handles dropped");
+            return false;
+        }
+
+        true
     }
 
     /// Run the scheduler loop. Blocks until all handles are dropped.
@@ -577,21 +621,10 @@ impl<M: ModelForward> Scheduler<M> {
         self.warmup_cuda_graphs();
         info!("Scheduler run loop started");
         loop {
-            while let Ok(req) = self.request_rx.try_recv() {
-                self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                self.waiting.push_back(req);
-            }
-
+            self.drain_request_rx();
             self.drain_coordinator_events();
-
-            if self.active_len() == 0 && self.waiting.is_empty() {
-                if let Some(req) = self.request_rx.blocking_recv() {
-                    self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-                    self.waiting.push_back(req);
-                } else {
-                    info!("Scheduler shutting down: all handles dropped");
-                    break;
-                }
+            if !self.wait_for_wakeup() {
+                break;
             }
 
             let step_start = std::time::Instant::now();
@@ -599,14 +632,10 @@ impl<M: ModelForward> Scheduler<M> {
             let assign_us = step_start.elapsed().as_micros();
 
             let step_t = std::time::Instant::now();
-            // FUTURE WORK (GPU/CPU overlap): `self.step()` already overlaps
-            // decode with `emit_delta`, but batched decode itself is still
-            // serial because `step_decode_batch()` runs
-            // `forward_decode_batch(...)` and then immediately
-            // `sample_batch_greedy(...)`, whose fast path launches argmax,
-            // `ctx.sync()`s, and reads tokens/logprobs back. Real overlap
-            // needs a `step_launch()` / `step_readback()` split at that
-            // boundary; loop reordering alone does not create it.
+            // `step()` keeps decode readback pending across loop turns so this
+            // iteration's intake/admission work can overlap the previous
+            // iteration's GPU compute. The remaining sync point is
+            // `sample_batch_greedy_readback()`.
             self.step();
             let step_us = step_t.elapsed().as_micros();
 
