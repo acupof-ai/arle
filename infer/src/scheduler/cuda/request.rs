@@ -69,6 +69,17 @@ pub(crate) struct ActiveRequest {
 }
 
 impl ActiveRequest {
+    pub(crate) fn has_pending_emit(&self) -> bool {
+        matches!(self.phase, Phase::Decoding)
+            && self.decoded_token_count < self.generated_tokens.len()
+    }
+
+    pub(crate) fn requires_prelaunch_emit_gate(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stops| stops.iter().any(|stop| !stop.is_empty()))
+    }
+
     pub(crate) fn mark_prompt_cacheable(&mut self) {
         self.cacheable_prompt_len = self.prompt_tokens.len();
     }
@@ -329,5 +340,31 @@ mod tests {
         req.prompt.clear();
 
         assert_eq!(req.cached_prompt_to_publish(), None);
+    }
+
+    #[test]
+    fn pending_emit_requires_decode_phase_and_new_tokens() {
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.phase = Phase::Decoding;
+        assert!(!req.has_pending_emit());
+
+        req.generated_tokens.push(42);
+        assert!(req.has_pending_emit());
+
+        req.decoded_token_count = 1;
+        assert!(!req.has_pending_emit());
+    }
+
+    #[test]
+    fn prelaunch_emit_gate_only_for_non_empty_stop_sequences() {
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.phase = Phase::Decoding;
+        assert!(!req.requires_prelaunch_emit_gate());
+
+        req.stop = Some(vec![String::new()]);
+        assert!(!req.requires_prelaunch_emit_gate());
+
+        req.stop = Some(vec!["</tool>".to_string()]);
+        assert!(req.requires_prelaunch_emit_gate());
     }
 }

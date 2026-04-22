@@ -210,6 +210,28 @@ fn select_prefill_candidates(
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn emit_decode_deltas(&mut self, require_prelaunch_gate: bool) -> u128 {
+        let emit_t = std::time::Instant::now();
+        let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
+        {
+            let Self {
+                active, tokenizer, ..
+            } = self;
+            for slot_idx in decode_slots {
+                let Some(req) = active[slot_idx].as_mut() else {
+                    continue;
+                };
+                if !req.has_pending_emit()
+                    || req.requires_prelaunch_emit_gate() != require_prelaunch_gate
+                {
+                    continue;
+                }
+                req.emit_delta(tokenizer);
+            }
+        }
+        emit_t.elapsed().as_micros()
+    }
+
     fn remaining_decode_tokens(&self, slot_idx: usize) -> usize {
         self.request(slot_idx)
             .map(|req| req.max_tokens.saturating_sub(req.generated_tokens.len()))
@@ -318,24 +340,11 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        let emit_t = std::time::Instant::now();
-        let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
-        {
-            let Self {
-                active, tokenizer, ..
-            } = self;
-            for slot_idx in decode_slots {
-                let Some(req) = active[slot_idx].as_mut() else {
-                    continue;
-                };
-                if matches!(req.phase, Phase::Decoding)
-                    && req.decoded_token_count < req.generated_tokens.len()
-                {
-                    req.emit_delta(tokenizer);
-                }
-            }
-        }
-        let emit_us = emit_t.elapsed().as_micros();
+        // Textual stop-sequence detection remains pre-launch because it can
+        // finish requests and must gate whether the next decode launch should
+        // include that row. Pure streaming/detokenize work moves after launch
+        // so it overlaps the current step's GPU decode.
+        let prelaunch_emit_us = self.emit_decode_deltas(true);
 
         let plan_t = std::time::Instant::now();
         let plan = self.plan_step();
@@ -359,6 +368,8 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             0
         };
+        let postlaunch_emit_us = self.emit_decode_deltas(false);
+        let emit_us = prelaunch_emit_us + postlaunch_emit_us;
         let decode_us = decode_launch_us + readback_us;
 
         let total_us = decode_us + emit_us + admission_us + prefill_us;
