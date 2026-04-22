@@ -7,7 +7,8 @@ use axum::{
         DefaultBodyLimit, Path, Request as AxumRequest, State,
         rejection::{BytesRejection, JsonRejection},
     },
-    http::{Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -313,20 +314,47 @@ pub struct ErrorBody {
     pub got: Option<u8>,
 }
 
-type SessionRouteError = (StatusCode, Json<ErrorBody>);
+#[derive(Debug)]
+struct SessionRouteError {
+    status: StatusCode,
+    body: ErrorBody,
+    headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl SessionRouteError {
+    #[must_use]
+    fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+}
+
+impl IntoResponse for SessionRouteError {
+    fn into_response(self) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        for (name, value) in self.headers {
+            headers.insert(name, value);
+        }
+        (self.status, headers, Json(self.body)).into_response()
+    }
+}
 
 fn error_body(
     error: impl Into<String>,
     kind: &'static str,
     expected: Option<u8>,
     got: Option<u8>,
-) -> Json<ErrorBody> {
-    Json(ErrorBody {
+) -> ErrorBody {
+    ErrorBody {
         error: error.into(),
         kind,
         expected,
         got,
-    })
+    }
 }
 
 fn session_error(
@@ -336,7 +364,11 @@ fn session_error(
     expected: Option<u8>,
     got: Option<u8>,
 ) -> SessionRouteError {
-    (status, error_body(error, kind, expected, got))
+    SessionRouteError {
+        status,
+        body: error_body(error, kind, expected, got),
+        headers: Vec::new(),
+    }
 }
 
 fn snapshot_error_to_response(err: &SessionSnapshotError) -> SessionRouteError {
@@ -395,14 +427,32 @@ fn route_not_found_response(path: &str) -> SessionRouteError {
     )
 }
 
+fn allow_header_value_for_path(path: &str) -> Option<HeaderValue> {
+    let allow = if path.ends_with("/save") || path.ends_with("/load") {
+        "POST"
+    } else if path.ends_with("/manifest") {
+        "GET, HEAD"
+    } else if path.starts_with('/') && path.matches('/').count() == 1 {
+        "DELETE"
+    } else {
+        return None;
+    };
+    Some(HeaderValue::from_static(allow))
+}
+
 fn method_not_allowed_response(method: &Method, path: &str) -> SessionRouteError {
-    session_error(
+    let error = session_error(
         StatusCode::METHOD_NOT_ALLOWED,
         format!("Method `{method}` is not allowed for `{path}`"),
         "method_not_allowed",
         None,
         None,
-    )
+    );
+    if let Some(allow) = allow_header_value_for_path(path) {
+        error.with_header(header::ALLOW, allow)
+    } else {
+        error
+    }
 }
 
 async fn route_not_found_handler(request: AxumRequest) -> SessionRouteError {
@@ -1019,11 +1069,30 @@ mod tests {
             .expect("wrong-method response");
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["allow"], "POST");
         let body: serde_json::Value = response_json(response).await;
         assert_eq!(body["kind"], "method_not_allowed");
         assert_eq!(
             body["error"],
             "Method `GET` is not allowed for `/session-load/load`"
         );
+    }
+
+    #[tokio::test]
+    async fn session_get_route_method_errors_include_allow_header() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-manifest/manifest")
+                    .body(Body::empty())
+                    .expect("build manifest wrong-method request"),
+            )
+            .await
+            .expect("manifest wrong-method response");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()["allow"], "GET, HEAD");
     }
 }
