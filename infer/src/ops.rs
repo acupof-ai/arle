@@ -29,7 +29,7 @@ pub use attention::{
 pub(crate) use attention::{
     decode_prep_paged, decode_prep_paged_fused_qkv, prefill_attention_batch,
     prefill_attention_hd256_batch, prefill_attention_hd256_batch_with_scratch,
-    prefill_attention_hd256_paged_batch, prefill_attention_paged_batch,
+    prefill_attention_paged_batch,
 };
 pub use elementwise::{add_batch, silu_mul_batch};
 pub use embedding::{embedding_batch, embedding_decode_into};
@@ -59,7 +59,7 @@ pub(crate) use elementwise::{
     add_batch_into, add_bias_batch_into, extract_vec, extract_vec_into, silu_mul_batch_into,
     silu_mul_fused_batch_into, split_qkv_batch, vec_add_inplace,
 };
-pub(crate) use linear::{gemm_into, linear};
+pub(crate) use linear::{gemm_graphsafe_batched_into, gemm_into, linear};
 pub(crate) use norm::{
     add_bf16_into_f32, cast_bf16_to_f32, cast_f32_to_bf16, fused_add_rms_norm_batch_into, rms_norm,
     rms_norm_batch_f32_in_into, rms_norm_batch_into, rms_norm_gated_batch_into,
