@@ -80,3 +80,5 @@ reclaim throughput and does not regress active-set occupancy.
 
 - Local refactor + targeted `c16` regression check:
   `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-4eddda8-unified-budget.md`
+- Unified-budget bottleneck trace on the rebased/pushed tree:
+  `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-unified-budget-bottleneck.md`
