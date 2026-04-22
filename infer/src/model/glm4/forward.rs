@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rand::rngs::StdRng;
 use rand::RngExt;
+use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::GLM4Model;
