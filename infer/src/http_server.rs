@@ -2877,6 +2877,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_endpoint_rejects_streaming_tools_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "input":"hello",
+                    "stream":true,
+                    "tools":[{"type":"function","function":{"name":"shell"}}]
+                }"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert_eq!(payload["error"]["param"], "stream");
+        assert!(
+            payload["error"]["message"].as_str().is_some_and(|message| {
+                message.contains("stream=true") && message.contains("tool calls")
+            }),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
     async fn responses_endpoint_streams_deltas_and_final_event_before_done() {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
