@@ -2659,12 +2659,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     let mut accepted_inputs: Vec<i32> = Vec::with_capacity(batch);
     let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
     for b in 0..batch_i32 {
-        let row_tokens = slice(
-            &tokens_arr,
-            &[b, 0],
-            &[b + 1, block_size_i32],
-            &[1, 1],
-        );
+        let row_tokens = slice(&tokens_arr, &[b, 0], &[b + 1, block_size_i32], &[1, 1]);
         let row_tokens = reshape(&row_tokens, &[block_size_i32]);
         let drafted_prefix = slice(&row_tokens, &[1], &[block_size_i32], &[1]);
 
@@ -2680,12 +2675,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         let accepted = (matched + 1) as i32;
         let matched_i32 =
             i32::try_from(matched).context("Qwen3.5 DFlash batched matched prefix overflow")?;
-        let posterior_token = slice(
-            &row_posterior,
-            &[matched_i32],
-            &[matched_i32 + 1],
-            &[1],
-        );
+        let posterior_token = slice(&row_posterior, &[matched_i32], &[matched_i32 + 1], &[1]);
         let posterior_token = materialize_token_array(&posterior_token)
             .into_iter()
             .next()
