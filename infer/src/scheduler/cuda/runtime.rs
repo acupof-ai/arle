@@ -1,3 +1,4 @@
+use super::budget::{PageBudget, full_request_target};
 use super::core::{is_full_sealed_prefix, sealed_block_token_count};
 use super::{
     ActiveRequest, CompletionStreamDelta, FinishReason, ModelForward, Ordering, Phase,
@@ -21,7 +22,6 @@ struct PrefixAdmissionPlan {
     lookup: crate::kv_tier::LookupOutcome,
     reusable: Option<(usize, usize, usize)>,
     direct_gpu_attach: bool,
-    gpu_ready_sealed_blocks: Vec<crate::prefix_cache::BlockId>,
     attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
     staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
 }
@@ -30,103 +30,6 @@ struct QueuedAdmissionCandidate {
     incoming: super::IncomingRequest,
     prompt_tokens: Vec<u32>,
     plan: PrefixAdmissionPlan,
-}
-
-#[derive(Debug)]
-struct AdmissionPageBudget {
-    remaining_free_pages: usize,
-    planned_seq_lens: Vec<usize>,
-    page_size: usize,
-    active: bool,
-}
-
-impl AdmissionPageBudget {
-    fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
-        let mut budget = Self {
-            remaining_free_pages: scheduler.pool_free_pages(),
-            planned_seq_lens: (0..scheduler.states.len())
-                .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
-                .collect(),
-            page_size: scheduler.paged_kv_pool.page_size.max(1),
-            active: scheduler.paged_kv_pool.is_active(),
-        };
-        if !budget.active {
-            return budget;
-        }
-        // Keep admission aligned with execution's effective page claims.
-        // Once a request owns a slot, later admissions must continue reserving
-        // enough pages for that request's remaining prompt + decode tail, not
-        // just the pages already materialized in `seq_len`.
-        for (slot_idx, req) in scheduler.active.iter().enumerate() {
-            let Some(req) = req.as_ref() else {
-                continue;
-            };
-            if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
-                continue;
-            }
-            budget.reserve(
-                slot_idx,
-                req.prompt_tokens.len(),
-                req.max_tokens,
-                req.reusable_prefix_len,
-            );
-        }
-        budget
-    }
-
-    fn additional_pages_needed(
-        &self,
-        slot_idx: usize,
-        prompt_tokens: usize,
-        max_tokens: usize,
-        reserved_prefix_tokens: usize,
-    ) -> usize {
-        if !self.active {
-            return 0;
-        }
-        let current_seq = self.planned_seq_lens[slot_idx].max(reserved_prefix_tokens);
-        let target_seq = prompt_tokens.saturating_add(max_tokens);
-        if target_seq <= current_seq {
-            return 0;
-        }
-        let current_pages = current_seq.div_ceil(self.page_size);
-        let target_pages = target_seq.div_ceil(self.page_size);
-        target_pages.saturating_sub(current_pages)
-    }
-
-    fn can_fit(
-        &self,
-        slot_idx: usize,
-        prompt_tokens: usize,
-        max_tokens: usize,
-        reserved_prefix_tokens: usize,
-    ) -> bool {
-        self.additional_pages_needed(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens)
-            <= self.remaining_free_pages
-    }
-
-    fn reserve(
-        &mut self,
-        slot_idx: usize,
-        prompt_tokens: usize,
-        max_tokens: usize,
-        reserved_prefix_tokens: usize,
-    ) {
-        if !self.active {
-            return;
-        }
-        let new_pages = self.additional_pages_needed(
-            slot_idx,
-            prompt_tokens,
-            max_tokens,
-            reserved_prefix_tokens,
-        );
-        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
-        let target_seq = prompt_tokens
-            .saturating_add(max_tokens)
-            .max(reserved_prefix_tokens);
-        self.planned_seq_lens[slot_idx] = self.planned_seq_lens[slot_idx].max(target_seq);
-    }
 }
 
 pub(super) fn best_reusable_slot_for_radix_hit(
@@ -219,11 +122,7 @@ impl<M: ModelForward> Scheduler<M> {
         insert_waiting_request_by_priority(&mut self.waiting, incoming, bias);
     }
 
-    fn full_isl_reserved_tokens(
-        &self,
-        plan: &PrefixAdmissionPlan,
-        reusable_prefix_len: usize,
-    ) -> usize {
+    fn full_isl_reserved_tokens(plan: &PrefixAdmissionPlan, reusable_prefix_len: usize) -> usize {
         if plan.direct_gpu_attach {
             plan.lookup.matched_len
         } else if reusable_prefix_len > 0 {
@@ -234,14 +133,18 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn can_reserve_full_isl(
-        &self,
-        budget: &AdmissionPageBudget,
+        budget: &PageBudget,
         slot_idx: usize,
         prompt_tokens: usize,
         max_tokens: usize,
         reserved_prefix_tokens: usize,
     ) -> bool {
-        budget.can_fit(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens)
+        budget.can_fit_target(full_request_target(
+            slot_idx,
+            prompt_tokens,
+            max_tokens,
+            reserved_prefix_tokens,
+        ))
     }
 
     fn normalize_waiting_request(
@@ -296,7 +199,6 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn choose_admission_slot(
-        &self,
         plan: &PrefixAdmissionPlan,
         free_slots: &[usize],
     ) -> Option<(usize, usize, usize)> {
@@ -409,7 +311,6 @@ impl<M: ModelForward> Scheduler<M> {
             lookup,
             reusable: reusable_gpu_prefix,
             direct_gpu_attach,
-            gpu_ready_sealed_blocks: gpu_ready_sealed_blocks.clone(),
             attached_prefix_blocks: if direct_gpu_attach {
                 gpu_ready_sealed_blocks
             } else {
@@ -458,16 +359,24 @@ impl<M: ModelForward> Scheduler<M> {
         reusable_prefix_len: usize,
         reusable_cached_prompt_len: usize,
     ) {
-        let ready_on_gpu = lookup_blocks_ready_on_gpu(&plan.lookup.blocks);
-        let radix_hit_len = if ready_on_gpu && !plan.lookup.recompute_advised {
-            plan.lookup.matched_len
+        let PrefixAdmissionPlan {
+            lookup,
+            direct_gpu_attach,
+            attached_prefix_blocks,
+            staged_prefix_plan,
+            ..
+        } = plan;
+        let waiting_fetch = staged_prefix_plan.is_some();
+        let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
+        let radix_hit_len = if ready_on_gpu && !lookup.recompute_advised {
+            lookup.matched_len
         } else {
             0
         };
         let id = self.next_id;
         self.next_id += 1;
 
-        if let Some(staged) = plan.staged_prefix_plan.as_ref() {
+        if let Some(staged) = staged_prefix_plan.as_ref() {
             info!(
                 "Request {} → slot {} (prompt={} tokens, staged_prefix={}, queue={})",
                 id,
@@ -476,13 +385,13 @@ impl<M: ModelForward> Scheduler<M> {
                 staged.matched_len,
                 self.waiting.len()
             );
-        } else if plan.direct_gpu_attach {
+        } else if direct_gpu_attach {
             info!(
                 "Request {} → slot {} (prompt={} tokens, radix_gpu_attach={}, queue={})",
                 id,
                 slot_idx,
                 prompt_tokens.len(),
-                plan.lookup.matched_len,
+                lookup.matched_len,
                 self.waiting.len()
             );
         } else if reusable_prefix_len > 0 {
@@ -498,17 +407,15 @@ impl<M: ModelForward> Scheduler<M> {
             );
         } else {
             let bytes_not_on_gpu =
-                plan.lookup.matched_len > 0 && (!ready_on_gpu || plan.lookup.recompute_advised);
-            let no_reusable_free_slot = plan.lookup.matched_len > 0
-                && !plan.gpu_ready_sealed_blocks.is_empty()
-                && plan.reusable.is_none();
+                lookup.matched_len > 0 && (!ready_on_gpu || lookup.recompute_advised);
+            let no_reusable_free_slot = lookup.matched_len > 0 && !ready_on_gpu;
             if bytes_not_on_gpu || no_reusable_free_slot {
                 info!(
                     "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
                     id,
                     slot_idx,
                     prompt_tokens.len(),
-                    plan.lookup.matched_len,
+                    lookup.matched_len,
                     bytes_not_on_gpu,
                     no_reusable_free_slot,
                     self.waiting.len()
@@ -539,7 +446,7 @@ impl<M: ModelForward> Scheduler<M> {
             trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,
             emit_cursor: super::request::EmitCursor::default(),
-            phase: if plan.staged_prefix_plan.is_some() {
+            phase: if waiting_fetch {
                 Phase::WaitingFetch
             } else {
                 Phase::Prefilling {
@@ -550,14 +457,14 @@ impl<M: ModelForward> Scheduler<M> {
             cacheable_prompt_len: 0,
             latest_logprob: None,
             pending_finish_reason: None,
-            reusable_prefix_len: if plan.direct_gpu_attach {
-                plan.lookup.matched_len
+            reusable_prefix_len: if direct_gpu_attach {
+                lookup.matched_len
             } else {
                 reusable_prefix_len
             },
             reusable_cached_prompt_len,
-            attached_prefix_blocks: plan.attached_prefix_blocks.clone(),
-            staged_prefix: plan.staged_prefix_plan.clone(),
+            attached_prefix_blocks,
+            staged_prefix: staged_prefix_plan,
         });
         if incoming.max_tokens == 0 {
             self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
@@ -662,7 +569,11 @@ impl<M: ModelForward> Scheduler<M> {
     fn fallback_to_cold_prefill_inner(&mut self, slot_idx: usize, release_held_blocks: bool) {
         let held_blocks = self
             .request(slot_idx)
-            .and_then(|req| req.staged_prefix.as_ref().map(|plan| plan.block_ids()))
+            .and_then(|req| {
+                req.staged_prefix
+                    .as_ref()
+                    .map(crate::kv_tier::ReadmissionPlan::block_ids)
+            })
             .unwrap_or_default();
         if release_held_blocks && !held_blocks.is_empty() {
             self.prefix_cache.release(&held_blocks);
@@ -804,9 +715,11 @@ impl<M: ModelForward> Scheduler<M> {
             fingerprints.push(block.fingerprint);
             match &block.source {
                 None => final_block_ids.push(block.block_id),
-                Some(ReadmissionSource::HostPinned { .. })
-                | Some(ReadmissionSource::Disk { .. })
-                | Some(ReadmissionSource::Remote { .. }) => {
+                Some(
+                    ReadmissionSource::HostPinned { .. }
+                    | ReadmissionSource::Disk { .. }
+                    | ReadmissionSource::Remote { .. },
+                ) => {
                     let fetched = fetched_by_id.get(&block.block_id).copied().ok_or_else(|| {
                         anyhow::anyhow!(
                             "missing fetched host staging for staged prefix block {:?}",
@@ -1101,9 +1014,9 @@ impl<M: ModelForward> Scheduler<M> {
                 let Some(slot_idx) = self.emit_gate_waiting.remove(&request_id) else {
                     return;
                 };
-                if !self
+                if self
                     .request(slot_idx)
-                    .is_some_and(|req| req.id == request_id)
+                    .is_none_or(|req| req.id != request_id)
                 {
                     return;
                 }
@@ -1129,7 +1042,7 @@ impl<M: ModelForward> Scheduler<M> {
                 Ok(event) => self.handle_emit_event(event),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    panic!("emit event channel disconnected");
+                    panic!("emit event channel disconnected")
                 }
             }
         }
@@ -1162,7 +1075,7 @@ impl<M: ModelForward> Scheduler<M> {
                 recv(self.emit_events) -> event => {
                     match event {
                         Ok(event) => self.handle_emit_event(event),
-                        Err(_) => panic!("emit event channel disconnected"),
+                        Err(err) => panic!("emit event channel disconnected: {err}"),
                     }
                 }
                 recv(self.coordinator_events) -> event => {
@@ -1187,15 +1100,12 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn wait_for_fetch_or_request(&mut self) -> bool {
         if !self.wakeup_live {
-            match self.coordinator_events.recv() {
-                Ok(event) => {
-                    self.handle_coordinator_event(event);
-                    return true;
-                }
-                Err(_) => {
-                    error!("Coordinator event channel disconnected");
-                    return true;
-                }
+            if let Ok(event) = self.coordinator_events.recv() {
+                self.handle_coordinator_event(event);
+                return true;
+            } else {
+                error!("Coordinator event channel disconnected");
+                return true;
             }
         }
 
@@ -1230,17 +1140,14 @@ impl<M: ModelForward> Scheduler<M> {
                 info!("Scheduler shutting down: all handles dropped");
                 return false;
             }
-            match self.wakeup_rx.recv() {
-                Ok(()) => {
-                    self.drain_request_rx();
-                    self.drain_wakeup_rx();
-                    return true;
-                }
-                Err(_) => {
-                    self.handle_wakeup_disconnect();
-                    info!("Scheduler shutting down: all handles dropped");
-                    return false;
-                }
+            if let Ok(()) = self.wakeup_rx.recv() {
+                self.drain_request_rx();
+                self.drain_wakeup_rx();
+                return true;
+            } else {
+                self.handle_wakeup_disconnect();
+                info!("Scheduler shutting down: all handles dropped");
+                return false;
             }
         }
 
@@ -1339,18 +1246,32 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
-        let mut admission_budget = AdmissionPageBudget::from_scheduler(self);
+        let mut admission_budget = PageBudget::from_scheduler(self, self.paged_kv_pool.is_active());
+        for (slot_idx, req) in self.active.iter().enumerate() {
+            let Some(req) = req.as_ref() else {
+                continue;
+            };
+            if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
+                continue;
+            }
+            admission_budget.reserve_target(full_request_target(
+                slot_idx,
+                req.prompt_tokens.len(),
+                req.max_tokens,
+                req.reusable_prefix_len,
+            ));
+        }
         for candidate in candidates {
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
-                self.choose_admission_slot(&candidate.plan, &available_free_slots)
+                Self::choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
                 self.release_admission_plan(&candidate.plan);
                 self.defer_waiting_request(candidate.incoming, candidate.prompt_tokens);
                 continue;
             };
             let reserved_prefix_tokens =
-                self.full_isl_reserved_tokens(&candidate.plan, reusable_prefix_len);
-            if !self.can_reserve_full_isl(
+                Self::full_isl_reserved_tokens(&candidate.plan, reusable_prefix_len);
+            if !Self::can_reserve_full_isl(
                 &admission_budget,
                 slot_idx,
                 candidate.prompt_tokens.len(),
@@ -1366,12 +1287,12 @@ impl<M: ModelForward> Scheduler<M> {
             {
                 self.release_admission_plan(&candidate.plan);
             }
-            admission_budget.reserve(
+            admission_budget.reserve_target(full_request_target(
                 slot_idx,
                 candidate.prompt_tokens.len(),
                 candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
-            );
+            ));
             if let Some(pos) = available_free_slots
                 .iter()
                 .position(|&slot| slot == slot_idx)
@@ -1476,11 +1397,12 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmissionPageBudget, WaitingInsertBias, best_reusable_slot_for_radix_hit,
-        finish_rejected_request, insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
+        WaitingInsertBias, best_reusable_slot_for_radix_hit, finish_rejected_request,
+        insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
         matched_sealed_lookup_blocks,
     };
     use crate::prefix_cache::BlockId;
+    use crate::scheduler::cuda::budget::{PageBudget, full_request_target};
     use crate::scheduler::cuda::core::is_full_sealed_prefix;
     use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
@@ -1593,57 +1515,42 @@ mod tests {
 
     #[test]
     fn admission_budget_accounts_for_prior_reservations_in_same_pass() {
-        let mut budget = AdmissionPageBudget {
-            remaining_free_pages: 3,
-            planned_seq_lens: vec![0, 0],
-            page_size: 4,
-            active: true,
-        };
+        let mut budget = PageBudget::new(3, vec![0, 0], 4, true);
 
-        assert!(budget.can_fit(0, 8, 4, 0));
-        budget.reserve(0, 8, 4, 0);
+        assert!(budget.can_fit_target(full_request_target(0, 8, 4, 0)));
+        budget.reserve_target(full_request_target(0, 8, 4, 0));
 
         assert!(
-            !budget.can_fit(1, 8, 8, 0),
+            !budget.can_fit_target(full_request_target(1, 8, 8, 0)),
             "later admissions must see pages reserved by earlier ones in the same assign pass",
         );
     }
 
     #[test]
     fn admission_budget_honors_attached_prefix_as_existing_seq() {
-        let mut budget = AdmissionPageBudget {
-            remaining_free_pages: 1,
-            planned_seq_lens: vec![0],
-            page_size: 4,
-            active: true,
-        };
+        let mut budget = PageBudget::new(1, vec![0], 4, true);
 
-        assert!(budget.can_fit(0, 4, 4, 4));
-        budget.reserve(0, 4, 4, 4);
-        assert_eq!(budget.remaining_free_pages, 0);
-        assert_eq!(budget.planned_seq_lens[0], 8);
+        assert!(budget.can_fit_target(full_request_target(0, 4, 4, 4)));
+        budget.reserve_target(full_request_target(0, 4, 4, 4));
+        assert_eq!(budget.remaining_free_pages(), 0);
+        assert_eq!(budget.planned_seq_len(0), 8);
     }
 
     #[test]
     fn admission_budget_keeps_full_request_headroom_for_active_slots() {
-        let mut budget = AdmissionPageBudget {
-            remaining_free_pages: 2,
-            planned_seq_lens: vec![4, 0],
-            page_size: 4,
-            active: true,
-        };
+        let mut budget = PageBudget::new(2, vec![4, 0], 4, true);
 
         // An already-admitted slot with a 4-token prompt and 4-token decode
         // tail must keep the extra decode page reserved across scheduler
         // iterations; new admissions cannot borrow it away.
-        budget.reserve(0, 4, 4, 0);
-        assert_eq!(budget.remaining_free_pages, 1);
+        budget.reserve_target(full_request_target(0, 4, 4, 0));
+        assert_eq!(budget.remaining_free_pages(), 1);
 
         assert!(
-            !budget.can_fit(1, 4, 4, 0),
+            !budget.can_fit_target(full_request_target(1, 4, 4, 0)),
             "later admissions must respect full-request headroom held by active slots",
         );
-        assert!(budget.can_fit(1, 4, 0, 0));
+        assert!(budget.can_fit_target(full_request_target(1, 4, 0, 0)));
     }
 
     #[test]

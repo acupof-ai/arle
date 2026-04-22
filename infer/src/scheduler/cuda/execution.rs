@@ -1,16 +1,10 @@
+use super::budget::{PageBudget, PageGrowth, StepTokenBudget};
 use super::{ModelForward, Phase, Scheduler, info};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PrefillReservation {
     pub prefill_tokens: usize,
-    pub page_reserve: SlotPageReserve,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SlotPageReserve {
-    pub slot_idx: usize,
-    pub prefill_pool_tokens: usize,
-    pub decode_headroom_tokens: usize,
+    pub page_growth: PageGrowth,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,59 +47,10 @@ impl StepPlan {
 
 #[derive(Debug)]
 struct PrefillBudget {
-    remaining_tokens: usize,
-    remaining_requests: usize,
+    token_budget: StepTokenBudget,
     long_prefill_token_threshold: usize,
     decode_active: bool,
-    page_budget: PrefillPageBudget,
-}
-
-#[derive(Debug)]
-struct PrefillPageBudget {
-    remaining_free_pages: usize,
-    planned_seq_lens: Vec<usize>,
-    page_size: usize,
-}
-
-impl PrefillPageBudget {
-    fn new(remaining_free_pages: usize, planned_seq_lens: Vec<usize>, page_size: usize) -> Self {
-        Self {
-            remaining_free_pages,
-            planned_seq_lens,
-            page_size,
-        }
-    }
-
-    fn can_fit(&self, reserve: SlotPageReserve) -> bool {
-        self.additional_pages_needed(reserve) <= self.remaining_free_pages
-    }
-
-    fn reserve_running_decode_headroom(&mut self, slot_idx: usize, decode_tokens: usize) {
-        let reserve = SlotPageReserve {
-            slot_idx,
-            prefill_pool_tokens: 0,
-            decode_headroom_tokens: decode_tokens,
-        };
-        let new_pages = self.additional_pages_needed(reserve);
-        debug_assert!(new_pages <= self.remaining_free_pages);
-        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
-        self.planned_seq_lens[slot_idx] =
-            self.planned_seq_lens[slot_idx].saturating_add(decode_tokens);
-    }
-
-    fn additional_pages_needed(&self, reserve: SlotPageReserve) -> usize {
-        let total_tokens = reserve
-            .prefill_pool_tokens
-            .saturating_add(reserve.decode_headroom_tokens);
-        if total_tokens == 0 {
-            return 0;
-        }
-        let current_pages = self.planned_seq_lens[reserve.slot_idx].div_ceil(self.page_size);
-        let future_pages = self.planned_seq_lens[reserve.slot_idx]
-            .saturating_add(total_tokens)
-            .div_ceil(self.page_size);
-        future_pages.saturating_sub(current_pages)
-    }
+    page_budget: PageBudget,
 }
 
 impl PrefillBudget {
@@ -119,63 +64,41 @@ impl PrefillBudget {
                 })
             })
             .count();
-        let remaining_tokens = scheduler
-            .config
-            .max_num_batched_tokens
-            .saturating_sub(running_decode_tokens)
-            .min(scheduler.config.max_prefill_tokens);
         let mut budget = Self {
-            remaining_tokens,
-            remaining_requests: scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
+            token_budget: StepTokenBudget::for_prefill(
+                scheduler.config.max_num_batched_tokens,
+                scheduler.config.max_prefill_tokens,
+                running_decode_tokens,
+                scheduler.config.prefill_max_requests.unwrap_or(usize::MAX),
+            ),
             long_prefill_token_threshold: scheduler.config.long_prefill_token_threshold,
             decode_active: running_decode_tokens > 0,
-            page_budget: PrefillPageBudget::new(
-                scheduler.pool_free_pages(),
-                (0..scheduler.states.len())
-                    .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
-                    .collect(),
-                scheduler.paged_kv_pool.page_size.max(1),
-            ),
+            page_budget: PageBudget::from_scheduler(scheduler, true),
         };
         for &slot_idx in &scheduler.running_batch {
             let remaining = scheduler.remaining_decode_tokens(slot_idx);
             if remaining > 0 {
-                budget
-                    .page_budget
-                    .reserve_running_decode_headroom(slot_idx, remaining);
+                budget.page_budget.reserve_growth(PageGrowth {
+                    slot_idx,
+                    tokens: remaining,
+                });
             }
         }
         budget
     }
 
     fn can_schedule(&self, reservation: PrefillReservation) -> bool {
-        if reservation.prefill_tokens == 0
-            || reservation.prefill_tokens > self.remaining_tokens
-            || self.remaining_requests == 0
-        {
+        if !self.token_budget.can_fit(reservation.prefill_tokens) {
             return false;
         }
-        self.page_budget.can_fit(reservation.page_reserve)
+        self.page_budget.can_fit_growth(reservation.page_growth)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn reserve(&mut self, reservation: PrefillReservation) {
         debug_assert!(self.can_schedule(reservation));
-        self.remaining_tokens = self
-            .remaining_tokens
-            .saturating_sub(reservation.prefill_tokens);
-        self.remaining_requests = self.remaining_requests.saturating_sub(1);
-        let new_pages = self
-            .page_budget
-            .additional_pages_needed(reservation.page_reserve);
-        self.page_budget.remaining_free_pages = self
-            .page_budget
-            .remaining_free_pages
-            .saturating_sub(new_pages);
-        self.page_budget.planned_seq_lens[reservation.page_reserve.slot_idx] =
-            self.page_budget.planned_seq_lens[reservation.page_reserve.slot_idx]
-                .saturating_add(reservation.page_reserve.prefill_pool_tokens)
-                .saturating_add(reservation.page_reserve.decode_headroom_tokens);
+        self.token_budget.reserve(reservation.prefill_tokens);
+        self.page_budget.reserve_growth(reservation.page_growth);
     }
 }
 
@@ -261,10 +184,10 @@ impl<M: ModelForward> Scheduler<M> {
         let prefill_tokens = remaining_tokens.min(per_request_cap.max(1));
         Some(PrefillReservation {
             prefill_tokens,
-            page_reserve: SlotPageReserve {
+            page_growth: PageGrowth {
                 slot_idx,
-                prefill_pool_tokens: prefill_tokens,
-                decode_headroom_tokens: req.max_tokens.saturating_sub(req.generated_tokens.len()),
+                tokens: prefill_tokens
+                    .saturating_add(req.max_tokens.saturating_sub(req.generated_tokens.len())),
             },
         })
     }
@@ -415,10 +338,10 @@ impl<M: ModelForward> Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillPageBudget,
-        PrefillReservation, ScoredPrefillCandidate, SlotPageReserve, score_prefill_candidates,
-        select_prefill_candidates,
+        PrefillBudget, PrefillCandidate, PrefillCandidateScore, PrefillReservation,
+        ScoredPrefillCandidate, score_prefill_candidates, select_prefill_candidates,
     };
+    use crate::scheduler::cuda::budget::{PageBudget, PageGrowth, StepTokenBudget};
 
     fn collect_schedulable_indices(
         mut budget: PrefillBudget,
@@ -441,21 +364,19 @@ mod tests {
     #[test]
     fn budget_skips_first_token_budget_miss() {
         let budget = PrefillBudget {
-            remaining_tokens: 6,
-            remaining_requests: usize::MAX,
+            token_budget: StepTokenBudget::new(6, usize::MAX),
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
-            page_budget: PrefillPageBudget::new(usize::MAX, vec![0, 0, 0], 16),
+            page_budget: PageBudget::new(usize::MAX, vec![0, 0, 0], 16, true),
         };
         let reservations = vec![
             (
                 0,
                 PrefillReservation {
                     prefill_tokens: 8,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 0,
-                        prefill_pool_tokens: 8,
-                        decode_headroom_tokens: 0,
+                        tokens: 8,
                     },
                 },
             ),
@@ -463,10 +384,9 @@ mod tests {
                 1,
                 PrefillReservation {
                     prefill_tokens: 4,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 1,
-                        prefill_pool_tokens: 4,
-                        decode_headroom_tokens: 0,
+                        tokens: 4,
                     },
                 },
             ),
@@ -474,10 +394,9 @@ mod tests {
                 2,
                 PrefillReservation {
                     prefill_tokens: 2,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 2,
-                        prefill_pool_tokens: 2,
-                        decode_headroom_tokens: 0,
+                        tokens: 2,
                     },
                 },
             ),
@@ -492,21 +411,19 @@ mod tests {
     #[test]
     fn budget_skips_first_page_budget_miss() {
         let budget = PrefillBudget {
-            remaining_tokens: 8,
-            remaining_requests: usize::MAX,
+            token_budget: StepTokenBudget::new(8, usize::MAX),
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
-            page_budget: PrefillPageBudget::new(1, vec![0, 3], 4),
+            page_budget: PageBudget::new(1, vec![0, 3], 4, true),
         };
         let reservations = vec![
             (
                 0,
                 PrefillReservation {
                     prefill_tokens: 5,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 0,
-                        prefill_pool_tokens: 5,
-                        decode_headroom_tokens: 0,
+                        tokens: 5,
                     },
                 },
             ),
@@ -514,10 +431,9 @@ mod tests {
                 1,
                 PrefillReservation {
                     prefill_tokens: 1,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 1,
-                        prefill_pool_tokens: 1,
-                        decode_headroom_tokens: 0,
+                        tokens: 1,
                     },
                 },
             ),
@@ -529,18 +445,16 @@ mod tests {
     #[test]
     fn budget_reserves_decode_headroom_for_prefill_completion() {
         let budget = PrefillBudget {
-            remaining_tokens: 4,
-            remaining_requests: 1,
+            token_budget: StepTokenBudget::new(4, 1),
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
-            page_budget: PrefillPageBudget::new(1, vec![4], 4),
+            page_budget: PageBudget::new(1, vec![4], 4, true),
         };
         let reservation = PrefillReservation {
             prefill_tokens: 4,
-            page_reserve: SlotPageReserve {
+            page_growth: PageGrowth {
                 slot_idx: 0,
-                prefill_pool_tokens: 4,
-                decode_headroom_tokens: 1,
+                tokens: 5,
             },
         };
 
@@ -549,34 +463,34 @@ mod tests {
 
     #[test]
     fn page_budget_reserves_running_decode_headroom_before_prefill() {
-        let mut page_budget = PrefillPageBudget::new(1, vec![4, 0], 4);
-        page_budget.reserve_running_decode_headroom(0, 1);
+        let mut page_budget = PageBudget::new(1, vec![4, 0], 4, true);
+        page_budget.reserve_growth(PageGrowth {
+            slot_idx: 0,
+            tokens: 1,
+        });
 
-        assert!(!page_budget.can_fit(SlotPageReserve {
+        assert!(!page_budget.can_fit_growth(PageGrowth {
             slot_idx: 1,
-            prefill_pool_tokens: 4,
-            decode_headroom_tokens: 0,
+            tokens: 4,
         }));
     }
 
     #[test]
     fn budget_honors_whole_step_token_cap_before_prefill_cap() {
         let budget = PrefillBudget {
-            remaining_tokens: 3,
-            remaining_requests: usize::MAX,
+            token_budget: StepTokenBudget::new(3, usize::MAX),
             long_prefill_token_threshold: usize::MAX,
             decode_active: true,
-            page_budget: PrefillPageBudget::new(usize::MAX, vec![0, 0], 16),
+            page_budget: PageBudget::new(usize::MAX, vec![0, 0], 16, true),
         };
         let reservations = vec![
             (
                 0,
                 PrefillReservation {
                     prefill_tokens: 4,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 0,
-                        prefill_pool_tokens: 4,
-                        decode_headroom_tokens: 0,
+                        tokens: 4,
                     },
                 },
             ),
@@ -584,10 +498,9 @@ mod tests {
                 1,
                 PrefillReservation {
                     prefill_tokens: 2,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 1,
-                        prefill_pool_tokens: 2,
-                        decode_headroom_tokens: 0,
+                        tokens: 2,
                     },
                 },
             ),
@@ -603,10 +516,9 @@ mod tests {
                 slot_idx: 9,
                 reservation: PrefillReservation {
                     prefill_tokens: 1,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 9,
-                        prefill_pool_tokens: 1,
-                        decode_headroom_tokens: 0,
+                        tokens: 1,
                     },
                 },
             },
@@ -614,10 +526,9 @@ mod tests {
                 slot_idx: 3,
                 reservation: PrefillReservation {
                     prefill_tokens: 2,
-                    page_reserve: SlotPageReserve {
+                    page_growth: PageGrowth {
                         slot_idx: 3,
-                        prefill_pool_tokens: 2,
-                        decode_headroom_tokens: 0,
+                        tokens: 2,
                     },
                 },
             },
@@ -639,11 +550,10 @@ mod tests {
     #[test]
     fn select_prefill_candidates_orders_by_score_before_fit() {
         let mut budget = PrefillBudget {
-            remaining_tokens: 3,
-            remaining_requests: usize::MAX,
+            token_budget: StepTokenBudget::new(3, usize::MAX),
             long_prefill_token_threshold: usize::MAX,
             decode_active: false,
-            page_budget: PrefillPageBudget::new(usize::MAX, vec![0, 0], 16),
+            page_budget: PageBudget::new(usize::MAX, vec![0, 0], 16, true),
         };
         let selected = select_prefill_candidates(
             &mut budget,
@@ -653,10 +563,9 @@ mod tests {
                         slot_idx: 1,
                         reservation: PrefillReservation {
                             prefill_tokens: 2,
-                            page_reserve: SlotPageReserve {
+                            page_growth: PageGrowth {
                                 slot_idx: 1,
-                                prefill_pool_tokens: 2,
-                                decode_headroom_tokens: 0,
+                                tokens: 2,
                             },
                         },
                     },
@@ -667,10 +576,9 @@ mod tests {
                         slot_idx: 0,
                         reservation: PrefillReservation {
                             prefill_tokens: 2,
-                            page_reserve: SlotPageReserve {
+                            page_growth: PageGrowth {
                                 slot_idx: 0,
-                                prefill_pool_tokens: 2,
-                                decode_headroom_tokens: 0,
+                                tokens: 2,
                             },
                         },
                     },

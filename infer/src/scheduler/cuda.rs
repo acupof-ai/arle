@@ -15,6 +15,7 @@ use crate::tokenizer::Tokenizer;
 
 use super::{IncomingRequest, RequestPriority, SchedulerConfig, SchedulerHandle};
 
+mod budget;
 mod core;
 mod decode;
 mod execution;
