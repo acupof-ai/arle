@@ -923,6 +923,7 @@ M0.3's exit gate has a comparison point when it unblocks.
 
 ## 10 · Changelog
 
+- **2026-04-22**: Local CUDA validation closed the remaining tiered-KV correctness gaps on Qwen3-4B/L4: T1 drain now uses byte-level watermarks, slower-tier lookup defaults now use realistic long-prefill throughput, and forced traces now confirm `T1 host`, `T2 disk`, and `T3 shared-fs` store+recall. See `docs/experience/wins/2026-04-22-profile-kv-tier-qwen3-t1-t2-t3-readmission-b70c03b.md` and `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c16-tier-readmission-b70c03b.md`.
 - **2026-04-15**: Major revision after internal survey + 7-system industry comparison. Project doc re-architected around three corrections; this doc gains §0.5 remapping + §8 rewrite + path updates. Summary of changes:
   - **P0-P5 → M0-M5**: phase remapping. M0 now holds three pre-reqs (M0.1 BlockId unify, M0.2 prefix_cache bug fixes, M0.3 page_size lift). M1 is the single atomic PR that wires RadixCache into the scheduler **and** deletes `kv_tier/directory.rs` (the old P1(a) structural / P1(b) behavior split is superseded because the midway state is uncompilable).
   - **New M2 (dual residency)** — the SGLang / vLLM / TRT-LLM "evict into free queue, pool reuses, lookup resurrects" pattern. Previously absorbed into "P2 behavior"; now first-class because it is the single biggest prefix-hit lever and is orthogonal to tiering. Industry reference: SGLang Novita 40% → 80% prefix hit rate, -56% TTFT.
