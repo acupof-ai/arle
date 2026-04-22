@@ -3,18 +3,19 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result};
 
 use super::mlx::{
-    Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
+    add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
     scaled_dot_product_attention, sigmoid, silu, slice, slice_update, take_axis, transpose_axes,
-    zeros,
+    zeros, Dtype, MlxArray,
 };
 
-use super::gdr::{MetalLinearAttnWeights, MetalRecurrentState, metal_gdr_decode_step};
-use super::weights::{StackedQuantized, load_quantized_with_bits, load_stacked_quantized};
+use super::gdr::{metal_gdr_decode_step, MetalLinearAttnWeights, MetalRecurrentState};
+use super::weights::{load_quantized_with_bits, load_stacked_quantized, StackedQuantized};
 use super::{
-    KV_CACHE_CHUNK, MetalModelArch, MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType,
-    MlpInputProjection, WeightTensor, clear_metal_cache, dflash, extend_kv_cache, gpu_sample_token,
-    linear, load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
-    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens,
+    clear_metal_cache, dflash, extend_kv_cache, gpu_sample_token, linear,
+    load_embed_tokens_from_tensors, load_proj_from_tensors, load_tensor_map,
+    merge_quantized_projection_rows, tensor_get, tie_lm_head_from_embed_tokens, MetalModelArch,
+    MetalModelConfig, MetalQwen35ArchConfig, MetalQwen35LayerType, MlpInputProjection,
+    WeightTensor, KV_CACHE_CHUNK,
 };
 use crate::backend::is_stream_stop_matched;
 use crate::backend::metal::dflash::MetalDflashRuntime;
@@ -982,6 +983,67 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
+    /// DFlash verify fast path: parallel forward over a draft block plus
+    /// posterior sampling inside the C++ graph. Returns sampled token ids
+    /// `[1, block_size]` instead of full logits, cutting the `[S, vocab]`
+    /// materialization / transfer that the Rust DFlash loop used to pay.
+    #[allow(dead_code)]
+    pub(super) fn verify_block_sampled(
+        &self,
+        tokens: &MlxArray,
+        block_size: i32,
+        cache_pos: i32,
+        kv_caches: &mut [MlxArray],
+        gdr_states: &mut [MlxArray],
+        params: &SamplingParams,
+    ) -> Result<MlxArray> {
+        let n_kv = kv_caches.len() as i32;
+        let n_gdr = gdr_states.len() as i32;
+        let greedy = params.temperature <= 1e-6 || params.top_k == 1;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_sampled: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_sampled(
+                self.0,
+                tokens.as_raw(),
+                block_size,
+                cache_pos,
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                params.temperature,
+                greedy,
+                &raw mut out_sampled,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_sampled) })
+    }
+
     /// Batched DFlash verify: run `block_size` draft tokens for `batch_size`
     /// rows in a single forward. Mirrors `verify_block` but feeds the packed
     /// KV/GDR states and per-row `cache_pos_arr` / `rope_offsets` that
@@ -1063,6 +1125,75 @@ impl CppQwen35Model {
         }
 
         Ok(unsafe { MlxArray::from_raw(out_logits) })
+    }
+
+    /// Batched DFlash verify fast path: same packed-KV/GDR update as
+    /// `verify_block_batched`, but samples the posterior inside C++ and
+    /// returns token ids `[B, block_size]` instead of logits.
+    #[allow(dead_code)]
+    pub(super) fn verify_block_batched_sampled(
+        &self,
+        tokens: &MlxArray,
+        batch_size: i32,
+        block_size: i32,
+        cache_pos_arr: &MlxArray,
+        packed_kv_caches: &mut [MlxArray],
+        packed_gdr_states: &mut [MlxArray],
+        attn_mask: Option<&MlxArray>,
+        rope_offsets: &MlxArray,
+        params: &SamplingParams,
+    ) -> Result<MlxArray> {
+        let n_kv = packed_kv_caches.len() as i32;
+        let n_gdr = packed_gdr_states.len() as i32;
+        let greedy = params.temperature <= 1e-6 || params.top_k == 1;
+
+        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_kv_caches.iter().map(MlxArray::as_raw).collect();
+        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            packed_gdr_states.iter().map(MlxArray::as_raw).collect();
+
+        let mut out_sampled: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
+        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+
+        let rc = unsafe {
+            mlx_sys::qwen35_compiled_verify_block_batched_sampled(
+                self.0,
+                tokens.as_raw(),
+                batch_size,
+                block_size,
+                cache_pos_arr.as_raw(),
+                kv_ptrs.as_mut_ptr(),
+                n_kv,
+                gdr_ptrs.as_mut_ptr(),
+                n_gdr,
+                attn_mask.map_or(std::ptr::null_mut(), MlxArray::as_raw),
+                rope_offsets.as_raw(),
+                params.temperature,
+                greedy,
+                &raw mut out_sampled,
+                out_kv.as_mut_ptr(),
+                out_gdr.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(super::mlx::check_mlx_error().unwrap_err());
+        }
+
+        for (i, ptr) in out_kv.into_iter().enumerate() {
+            let old =
+                std::mem::replace(&mut packed_kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
+            drop(old);
+        }
+        for (i, ptr) in out_gdr.into_iter().enumerate() {
+            let old = std::mem::replace(&mut packed_gdr_states[i], unsafe {
+                MlxArray::from_raw(ptr)
+            });
+            drop(old);
+        }
+
+        Ok(unsafe { MlxArray::from_raw(out_sampled) })
     }
 
     /// Full decode loop in C++ — all intermediates stay alive within the loop.
@@ -2394,7 +2525,7 @@ mod tests {
     use crate::backend::metal::{
         config::load_metal_config,
         gdr::MetalRecurrentState,
-        mlx::{Dtype, as_dtype, concatenate_axis, eval, slice, slice_update, zeros},
+        mlx::{as_dtype, concatenate_axis, eval, slice, slice_update, zeros, Dtype},
         weights::load_qwen3_metal_weights,
     };
     use crate::test_support::metal_test_guard;
