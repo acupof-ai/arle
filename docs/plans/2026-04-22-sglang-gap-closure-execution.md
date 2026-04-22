@@ -156,8 +156,8 @@ That pointed at one bottleneck cluster:
 - `b76c4bf` `feat(qwen35): override paged prefill batch path`
 - `94c7df6` `refactor(scheduler): keep waiting queue incrementally ordered`
 - `a01a124` `refactor(scheduler): pretokenize cuda http admissions`
-- `pending` `feat(scheduler): async emit worker for stopless streaming`
-- `pending` `fix(scheduler): align admission page budget with active-slot headroom`
+- `14b4db6` `feat(scheduler): offload stopless streaming emit`
+- `d2e29bd` `fix(scheduler): align admission with active headroom`
 
 ## Parallelization shape used
 
