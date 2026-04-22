@@ -62,7 +62,7 @@ pub(crate) fn print_startup_banner(info: &SystemInfo) {
     // Backend
     eprintln!(
         "  {}  {}",
-        style("mode").dim(),
+        style("backend").dim(),
         style(info.compiled_backend.name()).bold().cyan()
     );
     eprintln!();

@@ -205,8 +205,7 @@ impl AgentSession {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn messages(&self) -> &[Message] {
+    pub fn messages(&self) -> &[Message] {
         &self.messages
     }
 

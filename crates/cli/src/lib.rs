@@ -17,6 +17,7 @@ mod repl;
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod tps;
+mod train_cli;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
 
@@ -50,6 +51,11 @@ fn run_impl() -> Result<()> {
 
     if args.list_models {
         doctor::list_models(&args)?;
+        return Ok(());
+    }
+
+    if let Some(command) = args.command {
+        train_cli::run(command)?;
         return Ok(());
     }
 
@@ -115,13 +121,12 @@ fn run_impl() -> Result<()> {
         banner::print_model_loaded(engine.model_id(), &backend_name, load_secs);
 
         // First-run welcome banner (interactive only). On subsequent runs
-        // this degrades to a 1-line model+mode reminder.
+        // this degrades to a 1-line model reminder.
         if !args.non_interactive
             && std::io::stdin().is_terminal()
             && std::io::stderr().is_terminal()
         {
-            let mode_label = if args.tools { "agent" } else { "chat" };
-            welcome::print_welcome_banner(engine.model_id(), mode_label);
+            welcome::print_welcome_banner(engine.model_id());
         }
 
         repl::run_repl(
@@ -130,7 +135,6 @@ fn run_impl() -> Result<()> {
             args.max_turns,
             args.max_tokens,
             args.temperature,
-            args.tools,
         )?;
 
         Ok(())

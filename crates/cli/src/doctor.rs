@@ -33,8 +33,10 @@ struct TtyState {
 
 pub(crate) fn run(args: &Args) -> Result<()> {
     let snapshot = collect_snapshot(args);
+    let report = doctor_report(&snapshot);
     if args.json {
-        return print_json(&doctor_report(&snapshot));
+        print_json(&report)?;
+        return enforce_strict(args, &report);
     }
 
     println!("{}", style("agent-infer doctor").bold().cyan());
@@ -142,7 +144,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         );
     }
 
-    Ok(())
+    enforce_strict(args, &report)
 }
 
 pub(crate) fn list_models(args: &Args) -> Result<()> {
@@ -319,6 +321,16 @@ struct CheckReport {
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn enforce_strict(args: &Args, report: &DoctorJsonReport) -> Result<()> {
+    if args.strict && report.status != "ok" {
+        anyhow::bail!(
+            "doctor reported status={} under --strict; inspect the checks above",
+            report.status
+        );
+    }
     Ok(())
 }
 

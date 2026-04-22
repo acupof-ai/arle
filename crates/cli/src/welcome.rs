@@ -2,8 +2,7 @@
 //!
 //! - First launch: prints a 3-line banner and writes
 //!   `${XDG_CONFIG_HOME:-$HOME/.config}/agent-infer/seen` with a timestamp.
-//! - Subsequent launches: prints a single info line so model + mode stays
-//!   visible.
+//! - Subsequent launches: prints a single info line so the model stays visible.
 //! - Non-writable config dir → silently fall back to the short one-liner.
 
 use std::fs;
@@ -43,9 +42,9 @@ fn write_marker(path: &Path) -> std::io::Result<()> {
 }
 
 /// Print the welcome banner. First run: 3-line banner + marker write.
-/// Subsequent runs: 1-line model+mode reminder. Non-writable config dir
-/// falls back to the 1-liner.
-pub(crate) fn print_welcome_banner(model_id: &str, mode_label: &str) {
+/// Subsequent runs: 1-line model reminder. Non-writable config dir falls
+/// back to the 1-liner.
+pub(crate) fn print_welcome_banner(model_id: &str) {
     let dim = Style::new().dim();
     let marker = banner_marker_path();
     let first_run = match marker.as_ref() {
@@ -56,15 +55,11 @@ pub(crate) fn print_welcome_banner(model_id: &str, mode_label: &str) {
     if first_run {
         eprintln!(
             "{}",
-            dim.apply_to(format!(
-                "▎ agent-infer · {mode_label} mode · model: {model_id}"
-            ))
+            dim.apply_to(format!("▎ agent-infer · model: {model_id}"))
         );
         eprintln!(
             "{}",
-            dim.apply_to(
-                "▎ commands: /help  /agent  /chat  /reset  /quit      \\ at EOL = multi-line",
-            )
+            dim.apply_to("▎ commands: /help  /reset  /tools  /quit      \\ at EOL = multi-line")
         );
         eprintln!(
             "{}",
@@ -82,9 +77,7 @@ pub(crate) fn print_welcome_banner(model_id: &str, mode_label: &str) {
     } else {
         eprintln!(
             "{}",
-            dim.apply_to(format!(
-                "▎ agent-infer · {mode_label} mode · model: {model_id}"
-            ))
+            dim.apply_to(format!("▎ agent-infer · model: {model_id}"))
         );
     }
 }
