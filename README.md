@@ -375,6 +375,8 @@ Governance references:
 ## Development
 
 ```bash
+make install-hooks                                      # Install repo-managed Git hooks (.githooks/pre-push)
+make pre-push                                           # Run the CI-aligned local pre-push checks
 ./scripts/setup_zig_toolchain.sh                          # Validate/install Zig 0.16.0 for kv-native-sys
 ./scripts/check_kv_zig.sh                                 # Zig substrate local validation
 cargo test --no-default-features --features no-cuda   # Unit tests (no GPU)
@@ -398,6 +400,10 @@ Before opening a PR: [CONTRIBUTING.md](CONTRIBUTING.md),
 [compatibility](docs/compatibility.md),
 [environment](docs/environment.md). Release work:
 [release-checklist](docs/release-checklist.md).
+
+After `make install-hooks`, every `git push` runs `.githooks/pre-push`, which
+delegates to `scripts/pre_push_checks.sh`. Set
+`AGENT_INFER_SKIP_PRE_PUSH=1` only when you explicitly need to bypass the hook.
 
 ---
 

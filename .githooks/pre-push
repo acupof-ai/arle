@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ "${AGENT_INFER_SKIP_PRE_PUSH:-0}" == "1" ]]; then
+    echo "[pre-push] AGENT_INFER_SKIP_PRE_PUSH=1; skipping"
+    exit 0
+fi
+
+exec "${REPO_ROOT}/scripts/pre_push_checks.sh"

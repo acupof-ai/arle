@@ -14,7 +14,7 @@
 METAL_MODEL ?= models/Qwen3-0.6B-4bit
 CUDA_MODEL ?= models/Qwen3-4B
 
-.PHONY: build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py
+.PHONY: build-metal build-agent-metal check-metal test-metal bench-metal bench-metal-compare build-cuda bench-cuda test test-py pre-push install-hooks
 
 # ── Metal (macOS / Apple Silicon) ────────────────────────────────────────────
 build-metal:
@@ -51,3 +51,9 @@ test:
 
 test-py:
 	pytest tests/ -x
+
+pre-push:
+	./scripts/pre_push_checks.sh
+
+install-hooks:
+	./scripts/install_git_hooks.sh
