@@ -42,14 +42,36 @@ struct AdmissionPageBudget {
 
 impl AdmissionPageBudget {
     fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
-        Self {
+        let mut budget = Self {
             remaining_free_pages: scheduler.pool_free_pages(),
             planned_seq_lens: (0..scheduler.states.len())
                 .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
                 .collect(),
             page_size: scheduler.paged_kv_pool.page_size.max(1),
             active: scheduler.paged_kv_pool.is_active(),
+        };
+        if !budget.active {
+            return budget;
         }
+        // Keep admission aligned with execution's effective page claims.
+        // Once a request owns a slot, later admissions must continue reserving
+        // enough pages for that request's remaining prompt + decode tail, not
+        // just the pages already materialized in `seq_len`.
+        for (slot_idx, req) in scheduler.active.iter().enumerate() {
+            let Some(req) = req.as_ref() else {
+                continue;
+            };
+            if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
+                continue;
+            }
+            budget.reserve(
+                slot_idx,
+                req.prompt_tokens.len(),
+                req.max_tokens,
+                req.reusable_prefix_len,
+            );
+        }
+        budget
     }
 
     fn additional_pages_needed(
@@ -1457,5 +1479,27 @@ mod tests {
         budget.reserve(0, 4, 4, 4);
         assert_eq!(budget.remaining_free_pages, 0);
         assert_eq!(budget.planned_seq_lens[0], 8);
+    }
+
+    #[test]
+    fn admission_budget_keeps_full_request_headroom_for_active_slots() {
+        let mut budget = AdmissionPageBudget {
+            remaining_free_pages: 2,
+            planned_seq_lens: vec![4, 0],
+            page_size: 4,
+            active: true,
+        };
+
+        // An already-admitted slot with a 4-token prompt and 4-token decode
+        // tail must keep the extra decode page reserved across scheduler
+        // iterations; new admissions cannot borrow it away.
+        budget.reserve(0, 4, 4, 0);
+        assert_eq!(budget.remaining_free_pages, 1);
+
+        assert!(
+            !budget.can_fit(1, 4, 4, 0),
+            "later admissions must respect full-request headroom held by active slots",
+        );
+        assert!(budget.can_fit(1, 4, 0, 0));
     }
 }

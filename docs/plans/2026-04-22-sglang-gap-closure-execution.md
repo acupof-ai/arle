@@ -1,6 +1,6 @@
 # SGLang Gap Closure — Execution Plan
 
-**Status:** code landed locally, remote CUDA bench pending (2026-04-22)  
+**Status:** partially landed; in-repo runtime follow-ons still active, remote CUDA bench pending (2026-04-22)  
 **Commissioned by:** benchmark gap sweep (`c1/c2/c4/c8/c16`) + repo-grounded `nlm` review  
 **Complements:** [`p99-unified-mixed-batch.md`](p99-unified-mixed-batch.md), [`qwen35-single-graph-prefill.md`](qwen35-single-graph-prefill.md), [`scheduler-gpu-cpu-overlap.md`](scheduler-gpu-cpu-overlap.md)
 
@@ -61,6 +61,9 @@ That pointed at one bottleneck cluster:
   - full-ISL reservation in `assign_slots()`
   - explicit prefill planner `score -> fit` structure
   - one canonical mutable prefill token budget
+  - active-slot future page headroom reserved in admission, so later waiting
+    requests can no longer over-admit against pages already promised to
+    prefilling/decoding slots
 - Qwen3.5 paged-prefill full-forward graph now reuses safely across chunk
   offsets because `start_pos` is uploaded through stable device-backed metadata
   instead of being baked into the prep-kernel launch parameters.
@@ -150,8 +153,10 @@ That pointed at one bottleneck cluster:
 - `50ab021` `refactor(scheduler): canonicalize prefill planner budget`
 - `5dfde31` `fix(qwen35): guard paged-prefill graph start-pos reuse`
 - `0c49fca` `fix(qwen35): make paged-prefill graph start-pos device-backed`
-- `pending` `refactor(scheduler): keep waiting queue incrementally ordered`
-- `pending` `refactor(scheduler): pretokenize cuda http admissions`
+- `b76c4bf` `feat(qwen35): override paged prefill batch path`
+- `94c7df6` `refactor(scheduler): keep waiting queue incrementally ordered`
+- `a01a124` `refactor(scheduler): pretokenize cuda http admissions`
+- `pending` `fix(scheduler): align admission page budget with active-slot headroom`
 
 ## Parallelization shape used
 
@@ -202,10 +207,15 @@ Expected order of impact after local landing:
 2. Track B removes mixed-path duplication and should move `c4+` throughput
 3. Track C reduces scheduler-side bubbles and admission thrash, improving both TTFT and tail throughput
 
-## Remaining external-only work
+## Remaining work
 
-All in-repo code work for these five items is landed. Remaining work is
-external-only:
+Still open in-repo follow-ons before these five items can be called fully
+terminal:
+
+- scheduler overlap still keeps detokenize / `emit_delta()` work on the
+  scheduler thread; it is improved, but not at the final zero-overhead shape
+
+External follow-up remains mandatory once the in-repo closure is finished:
 
 - non-local CUDA before/after `scripts/bench_guidellm.sh` parity sweep
 - delta table vs SGLang for `c1/c2/c4/c8/c16`
