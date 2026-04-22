@@ -806,6 +806,33 @@ mod tests {
     }
 
     #[test]
+    fn host_arena_tail_release_collapses_adjacent_free_list_regions() {
+        let arena = TestHostArena::new(256);
+        let a = arena.reserve(64);
+        let b = arena.reserve(64);
+        let c = arena.reserve(64);
+        let d = arena.reserve(64);
+        assert_eq!(a.offset, 0);
+        assert_eq!(b.offset, 64);
+        assert_eq!(c.offset, 128);
+        assert_eq!(d.offset, 192);
+        assert_eq!(arena.reserved_bytes(), 256);
+
+        arena.release(b);
+        assert_eq!(arena.reserved_bytes(), 192);
+        arena.release(c);
+        assert_eq!(arena.reserved_bytes(), 128);
+
+        arena.release(d);
+        assert_eq!(arena.reserved_bytes(), 64);
+
+        let stitched_tail = arena.reserve(192);
+        assert_eq!(stitched_tail.offset, 64);
+        assert_eq!(stitched_tail.len, 192);
+        assert_eq!(arena.reserved_bytes(), 256);
+    }
+
+    #[test]
     #[ignore = "microbench: cargo test -p kv-native-sys host_arena_bench --release -- --ignored --nocapture"]
     fn host_arena_bench_reserved_bytes_fragmented() {
         const REGION_LEN: usize = 64;
