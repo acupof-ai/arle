@@ -46,16 +46,42 @@ pub fn sample_categorical_into(
     for row in 0..rows {
         let base = row * vocab;
         let slice = &logits_data[base..base + vocab];
-        let (index, log_prob) = if temperature <= 0.0 {
-            let index = argmax(slice);
-            (index, log_prob_at_index(slice, 1.0, index))
-        } else {
-            let index = sample_row(slice, temperature, rng);
-            (index, log_prob_at_index(slice, temperature, index))
-        };
+        let (index, log_prob) = sample_row_with_log_prob(slice, temperature, rng);
         sampled_ids.push(index);
         chosen_log_probs.push(log_prob);
     }
+}
+
+fn sample_row_with_log_prob(logits: &[f32], temperature: f32, rng: &mut LcgRng) -> (usize, f32) {
+    if temperature <= 0.0 {
+        let index = argmax(logits);
+        return (index, log_prob_at_index(logits, 1.0, index));
+    }
+
+    let inv_temp = 1.0 / temperature;
+    let max_scaled = logits
+        .iter()
+        .map(|value| *value * inv_temp)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let denom = logits
+        .iter()
+        .map(|value| ((*value * inv_temp) - max_scaled).exp())
+        .sum::<f32>();
+
+    let target = rng.next_u64() as f64 / (u64::MAX as f64 + 1.0);
+    let mut cumulative = 0.0_f64;
+    for (index, value) in logits.iter().enumerate() {
+        let scaled = (*value * inv_temp) - max_scaled;
+        let prob = (scaled.exp() / denom) as f64;
+        cumulative += prob;
+        if target < cumulative {
+            return (index, scaled - denom.ln());
+        }
+    }
+
+    let index = logits.len().saturating_sub(1);
+    let scaled = (logits[index] * inv_temp) - max_scaled;
+    (index, scaled - denom.ln())
 }
 
 pub(crate) fn log_prob_at_index(logits: &[f32], temperature: f32, index: usize) -> f32 {
@@ -71,30 +97,6 @@ pub(crate) fn log_prob_at_index(logits: &[f32], temperature: f32, index: usize) 
     (logits[index] * inv_temp) - max_scaled - denom.ln()
 }
 
-fn sample_row(logits: &[f32], temperature: f32, rng: &mut LcgRng) -> usize {
-    let inv_temp = 1.0 / temperature;
-    let max_scaled = logits
-        .iter()
-        .map(|value| *value * inv_temp)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let denom = logits
-        .iter()
-        .map(|value| ((*value * inv_temp) - max_scaled).exp())
-        .sum::<f32>();
-
-    let target = rng.next_u64() as f64 / (u64::MAX as f64 + 1.0);
-    let mut cumulative = 0.0_f64;
-    for (index, value) in logits.iter().enumerate() {
-        let prob = (((*value * inv_temp) - max_scaled).exp() / denom) as f64;
-        cumulative += prob;
-        if target < cumulative {
-            return index;
-        }
-    }
-
-    logits.len().saturating_sub(1)
-}
-
 fn argmax(logits: &[f32]) -> usize {
     let mut best_index = 0usize;
     let mut best_value = f32::NEG_INFINITY;
@@ -105,4 +107,31 @@ fn argmax(logits: &[f32]) -> usize {
         }
     }
     best_index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{log_prob_at_index, sample_categorical};
+    use crate::dataset::LcgRng;
+
+    #[test]
+    fn sampled_log_prob_matches_reference_at_temperature() {
+        let logits = [0.1, 1.7, -0.4, 0.8, 0.0, 2.2];
+        let mut rng = LcgRng::new(12345);
+        let (ids, log_probs) = sample_categorical(&logits, (1, 1), logits.len(), 0.7, &mut rng);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(log_probs.len(), 1);
+        let expected = log_prob_at_index(&logits, 0.7, ids[0]);
+        assert!((log_probs[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn greedy_sampled_log_prob_matches_reference() {
+        let logits = [0.5, 0.25, 3.0, -1.0];
+        let mut rng = LcgRng::new(7);
+        let (ids, log_probs) = sample_categorical(&logits, (1, 1), logits.len(), 0.0, &mut rng);
+        assert_eq!(ids, vec![2]);
+        let expected = log_prob_at_index(&logits, 1.0, 2);
+        assert!((log_probs[0] - expected).abs() < 1e-6);
+    }
 }
