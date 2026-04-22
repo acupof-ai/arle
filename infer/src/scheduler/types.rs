@@ -48,9 +48,6 @@ pub struct SchedulerConfig {
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
-    /// Allow mixing a prefill batch into a decode batch when the model
-    /// supports it. Mirrors SGLang's `--enable-mixed-chunk`.
-    pub enable_mixed_chunk: bool,
     /// Maximum requests allowed in the waiting queue.
     /// `submit()` returns `Err(SchedulerFull)` when the queue is at capacity.
     pub max_waiting_requests: usize,
@@ -110,7 +107,6 @@ impl Default for SchedulerConfig {
             max_prefill_tokens: 16384,
             long_prefill_token_threshold: 512,
             prefill_max_requests: None,
-            enable_mixed_chunk: false,
             max_waiting_requests: 256,
             preemption_mode: PreemptionMode::Recompute,
             mem_fraction_static: 0.88,
@@ -150,7 +146,6 @@ impl SchedulerConfig {
             chunked_prefill_size: 4096,
             max_num_batched_tokens: 16384,
             long_prefill_token_threshold: 4096,
-            enable_mixed_chunk: true,
             ..Self::default()
         }
     }
@@ -443,7 +438,6 @@ mod tests {
         assert_eq!(cfg.max_prefill_tokens, 16384);
         assert_eq!(cfg.long_prefill_token_threshold, 4096);
         assert_eq!(cfg.prefill_max_requests, None);
-        assert!(cfg.enable_mixed_chunk);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
         assert_eq!(cfg.prefix_cache_low_water, 0.50);
         assert_eq!(cfg.prefix_cache_retain_hard_cap, 0.90);
