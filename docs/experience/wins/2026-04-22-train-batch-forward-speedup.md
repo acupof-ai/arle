@@ -18,6 +18,8 @@ knob for extra accumulation on top.
 - `train_sft` now collates tokenized examples into one padded batch, runs a
   single `forward_batch_tokens(...)`, and computes the assistant-only loss in
   one batched pass.
+- The batched path now also reuses hot-loop buffers and precomputed position
+  indices instead of rebuilding them every step.
 - The new batched SFT loss is numerically pinned against the old single-example
   loss: the batch loss equals the arithmetic mean of the per-example losses.
 - The dead single-sample `PretrainFamily::forward(...)` entrypoint was removed,
@@ -77,6 +79,16 @@ Results:
 | `train_sft` | `4` | `225.836355` |
 
 Speedup: **2.08×**
+
+### Follow-up buffer / position reuse
+
+Same 10-step Metal smoke after reusing step-local buffers and precomputed
+position indices in the batched forward path:
+
+| Job | `--batch` | Before | After | Delta |
+| --- | --- | --- | --- | --- |
+| `pretrain` | `4` | `457.243673 tok/s` | `492.611812 tok/s` | **+7.7%** |
+| `train_sft` | `4` | `225.836355 tok/s` | `232.056994 tok/s` | **+2.8%** |
 
 ## Rule
 

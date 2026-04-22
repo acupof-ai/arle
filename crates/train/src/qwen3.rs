@@ -439,9 +439,19 @@ impl Qwen3Model {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> autograd::Result<TensorId> {
-        let position_ids = (0..seq_len).map(|index| index as u32).collect::<Vec<_>>();
-        let input_ids = input_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
-        self.forward_batch(store, tape, &input_ids, &position_ids, batch, seq_len)
+        let position_ids = (0..seq_len).collect::<Vec<_>>();
+        self.forward_batch_tokens_with_positions(input_ids, &position_ids, batch, store, tape)
+    }
+
+    pub fn forward_batch_tokens_with_positions(
+        &self,
+        input_ids: &[usize],
+        position_ids: &[usize],
+        batch: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        self.forward_batch_indices(store, tape, input_ids, position_ids, batch)
             .map_err(qwen3_to_autograd)
     }
 
@@ -477,10 +487,28 @@ impl Qwen3Model {
             .iter()
             .map(|&id| id as usize)
             .collect::<Vec<_>>();
-        let cos = select_cache_rows(self.cos_cache, &positions, store)?;
-        let sin = select_cache_rows(self.sin_cache, &positions, store)?;
+        self.forward_batch_indices(store, tape, &token_indices, &positions, batch)
+    }
 
-        let mut hidden = embedding(self.embed_tokens, &token_indices, store, tape)?;
+    fn forward_batch_indices(
+        &self,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        token_indices: &[usize],
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<TensorId> {
+        let seq_len = positions.len();
+        if token_indices.len() != batch * seq_len {
+            return Err(Qwen3Error::InputLenMismatch {
+                input_len: token_indices.len(),
+                position_len: batch * seq_len,
+            });
+        }
+        let cos = select_cache_rows(self.cos_cache, positions, store)?;
+        let sin = select_cache_rows(self.sin_cache, positions, store)?;
+
+        let mut hidden = embedding(self.embed_tokens, token_indices, store, tape)?;
         hidden = reshape(
             hidden,
             &[batch, seq_len, self.config.hidden_size],
@@ -617,6 +645,24 @@ impl GrpoPolicy for Qwen3Model {
         tape: &mut Tape,
     ) -> autograd::Result<TensorId> {
         Qwen3Model::forward_batch_tokens(self, input_ids, batch, seq_len, store, tape)
+    }
+
+    fn forward_batch_tokens_with_positions(
+        &self,
+        input_ids: &[usize],
+        position_ids: &[usize],
+        batch: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        Qwen3Model::forward_batch_tokens_with_positions(
+            self,
+            input_ids,
+            position_ids,
+            batch,
+            store,
+            tape,
+        )
     }
 
     fn all_parameter_ids(&self) -> Vec<TensorId> {
