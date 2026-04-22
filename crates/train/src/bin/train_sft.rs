@@ -486,9 +486,10 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let save_every = args.save_every;
     let save_dtype = args.save_dtype;
     let seed = args.seed;
+    let position_ids = (0..args.seq_len).collect::<Vec<_>>();
 
     // Step closure: forward + assistant-masked cross-entropy. Trainer handles
-    // the `1/batch` loss-scale + backward + optimizer.step + cleanup.
+    // any extra `--grad-accum-steps` scaling plus backward/step/cleanup.
     //
     // Codex review 2026-04-20 on 49512b1 (#2, Medium): sample_index is
     // keyed on `(seed, step, micro_idx)` alone — NOT on a shared stateful
@@ -499,8 +500,11 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     // the same sequence it would have seen in a single uninterrupted run.
     let model_ref = &model;
     let dataset_ref = &dataset;
+    let mut batch_examples = Vec::with_capacity(batch_size);
+    let mut collated = BatchedTokenizedSft::with_capacity(batch_size, args.seq_len);
+    let mut input_ids = Vec::with_capacity(batch_size * args.seq_len);
     let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
-        let mut batch_examples = Vec::with_capacity(batch_size);
+        batch_examples.clear();
         for row in 0..batch_size {
             let example_index = sample_index(
                 seed,
@@ -510,16 +514,13 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
             );
             batch_examples.push(&dataset_ref[example_index]);
         }
-        let collated = collate_tokenized_batch(&batch_examples);
-        let input_ids = collated
-            .input_ids
-            .iter()
-            .map(|&token_id| token_id as usize)
-            .collect::<Vec<_>>();
-        let logits = model_ref.forward_batch_tokens(
+        collate_tokenized_batch_into(&mut collated, &batch_examples);
+        input_ids.clear();
+        input_ids.extend(collated.input_ids.iter().map(|&token_id| token_id as usize));
+        let logits = model_ref.forward_batch_tokens_with_positions(
             &input_ids,
+            &position_ids[..collated.seq_len],
             batch_examples.len(),
-            collated.seq_len,
             ctx.store,
             ctx.tape,
         )?;
@@ -743,30 +744,38 @@ struct BatchedTokenizedSft {
     token_count: u64,
 }
 
-fn collate_tokenized_batch(examples: &[&TokenizedSft]) -> BatchedTokenizedSft {
+impl BatchedTokenizedSft {
+    fn with_capacity(batch: usize, seq_len: usize) -> Self {
+        Self {
+            input_ids: Vec::with_capacity(batch * seq_len),
+            labels: Vec::with_capacity(batch * seq_len),
+            seq_len: 0,
+            token_count: 0,
+        }
+    }
+}
+
+fn collate_tokenized_batch_into(out: &mut BatchedTokenizedSft, examples: &[&TokenizedSft]) {
     let seq_len = examples
         .iter()
         .map(|example| example.input_ids.len().saturating_sub(1))
         .max()
         .unwrap_or(0)
         .max(1);
-    let mut input_ids = vec![0u32; examples.len() * seq_len];
-    let mut labels = vec![-100i32; examples.len() * seq_len];
-    let mut token_count = 0_u64;
+    let batch_elems = examples.len() * seq_len;
+    out.input_ids.clear();
+    out.labels.clear();
+    out.input_ids.resize(batch_elems, 0);
+    out.labels.resize(batch_elems, -100);
+    out.seq_len = seq_len;
+    out.token_count = 0;
 
     for (row, example) in examples.iter().enumerate() {
         let input_len = example.input_ids.len().saturating_sub(1);
         let base = row * seq_len;
-        input_ids[base..base + input_len].copy_from_slice(&example.input_ids[..input_len]);
-        labels[base..base + input_len].copy_from_slice(&example.labels[1..1 + input_len]);
-        token_count += input_len as u64;
-    }
-
-    BatchedTokenizedSft {
-        input_ids,
-        labels,
-        seq_len,
-        token_count,
+        out.input_ids[base..base + input_len].copy_from_slice(&example.input_ids[..input_len]);
+        out.labels[base..base + input_len].copy_from_slice(&example.labels[1..1 + input_len]);
+        out.token_count += input_len as u64;
     }
 }
 

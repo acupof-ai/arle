@@ -205,13 +205,13 @@ trait PretrainFamily {
     fn build_model(cfg: &Self::Config, store: &mut TensorStore) -> Result<Self::Model, CliError>;
     fn max_seq_len(cfg: &Self::Config) -> usize;
     fn describe_config(cfg: &Self::Config) -> String;
-    fn forward_batch_tokens(
+    fn forward_batch_tokens_with_positions(
         model: &Self::Model,
         store: &mut TensorStore,
         tape: &mut Tape,
         input_ids: &[usize],
+        position_ids: &[usize],
         batch: usize,
-        seq_len: usize,
     ) -> Result<TensorId, CliError>;
     fn validate_resume_config(resume_dir: &Path, cfg: &Self::Config) -> Result<(), CliError>;
     fn save_checkpoint(
@@ -278,16 +278,16 @@ impl PretrainFamily for Qwen3Family {
         )
     }
 
-    fn forward_batch_tokens(
+    fn forward_batch_tokens_with_positions(
         model: &Self::Model,
         store: &mut TensorStore,
         tape: &mut Tape,
         input_ids: &[usize],
+        position_ids: &[usize],
         batch: usize,
-        seq_len: usize,
     ) -> Result<TensorId, CliError> {
         model
-            .forward_batch_tokens(input_ids, batch, seq_len, store, tape)
+            .forward_batch_tokens_with_positions(input_ids, position_ids, batch, store, tape)
             .map_err(Into::into)
     }
 
@@ -397,16 +397,16 @@ impl PretrainFamily for Qwen35Family {
         )
     }
 
-    fn forward_batch_tokens(
+    fn forward_batch_tokens_with_positions(
         model: &Self::Model,
         store: &mut TensorStore,
         tape: &mut Tape,
         input_ids: &[usize],
+        position_ids: &[usize],
         batch: usize,
-        seq_len: usize,
     ) -> Result<TensorId, CliError> {
         model
-            .forward_batch_tokens(input_ids, batch, seq_len, store, tape)
+            .forward_batch_tokens_with_positions(input_ids, position_ids, batch, store, tape)
             .map_err(Into::into)
     }
 
@@ -690,27 +690,36 @@ fn run_with_family<F: PretrainFamily>(
     let upper = train_tokens.len().saturating_sub(window) + 1;
     let eval_upper = eval_tokens.len().saturating_sub(window) + 1;
     let batch_size = args.batch.max(1);
+    let position_ids = (0..args.seq).collect::<Vec<_>>();
     let token_count_per_micro = (batch_size * args.seq) as u64;
     let model_ref = &model;
     let train_tokens_ref: &[u32] = &train_tokens;
     let eval_tokens_ref: &[u32] = &eval_tokens;
+    let position_ids_ref: &[usize] = &position_ids;
     let family = F::family_name();
+    let mut train_input_ids = Vec::with_capacity(batch_size * args.seq);
+    let mut train_targets = Vec::with_capacity(batch_size * args.seq);
 
     let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
-        let mut input_ids = Vec::with_capacity(batch_size * args.seq);
-        let mut targets = Vec::with_capacity(batch_size * args.seq);
+        train_input_ids.clear();
+        train_targets.clear();
         for _ in 0..batch_size {
             let start = (rng.next_u64() % upper as u64) as usize;
             let slice = &train_tokens_ref[start..start + window];
-            input_ids.extend(slice[..args.seq].iter().map(|&t| t as usize));
-            targets.extend(slice[1..].iter().map(|&t| t as usize));
+            train_input_ids.extend(slice[..args.seq].iter().map(|&t| t as usize));
+            train_targets.extend(slice[1..].iter().map(|&t| t as usize));
         }
 
-        let logits = F::forward_batch_tokens(
-            model_ref, ctx.store, ctx.tape, &input_ids, batch_size, args.seq,
+        let logits = F::forward_batch_tokens_with_positions(
+            model_ref,
+            ctx.store,
+            ctx.tape,
+            &train_input_ids,
+            position_ids_ref,
+            batch_size,
         )
         .map_err(|err| cli_error_to_autograd(err, family, "forward"))?;
-        let loss_id = cross_entropy_loss(logits, &targets, ctx.store, ctx.tape)?;
+        let loss_id = cross_entropy_loss(logits, &train_targets, ctx.store, ctx.tape)?;
         Ok(StepOutcome {
             loss_id,
             token_count: token_count_per_micro,
@@ -719,6 +728,8 @@ fn run_with_family<F: PretrainFamily>(
 
     let eval_windows = args.eval_windows;
     let seq = args.seq;
+    let mut eval_input_ids = Vec::with_capacity(batch_size * seq);
+    let mut eval_targets = Vec::with_capacity(batch_size * seq);
     let eval_fn = move |store: &mut TensorStore, tape: &mut Tape| -> AutogradResult<EvalOutcome> {
         if eval_upper == 0 || eval_tokens_ref.is_empty() {
             return Ok(EvalOutcome {
@@ -733,18 +744,25 @@ fn run_with_family<F: PretrainFamily>(
         let mut remaining = eval_windows;
         while remaining > 0 {
             let chunk = remaining.min(batch_size);
-            let mut input_ids = Vec::with_capacity(chunk * seq);
-            let mut targets = Vec::with_capacity(chunk * seq);
+            eval_input_ids.clear();
+            eval_targets.clear();
             for _ in 0..chunk {
                 let start = (eval_rng.next_u64() % eval_upper as u64) as usize;
                 let slice = &eval_tokens_ref[start..start + window];
-                input_ids.extend(slice[..seq].iter().map(|&t| t as usize));
-                targets.extend(slice[1..].iter().map(|&t| t as usize));
+                eval_input_ids.extend(slice[..seq].iter().map(|&t| t as usize));
+                eval_targets.extend(slice[1..].iter().map(|&t| t as usize));
             }
 
-            let logits = F::forward_batch_tokens(model_ref, store, tape, &input_ids, chunk, seq)
-                .map_err(|err| cli_error_to_autograd(err, family, "eval forward"))?;
-            let loss_id = cross_entropy_loss(logits, &targets, store, tape)?;
+            let logits = F::forward_batch_tokens_with_positions(
+                model_ref,
+                store,
+                tape,
+                &eval_input_ids,
+                &position_ids_ref[..seq],
+                chunk,
+            )
+            .map_err(|err| cli_error_to_autograd(err, family, "eval forward"))?;
+            let loss_id = cross_entropy_loss(logits, &eval_targets, store, tape)?;
             sum += store.to_host(loss_id)?[0] * chunk as f32;
             count += chunk as u64;
             tape.entries.clear();

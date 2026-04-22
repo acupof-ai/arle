@@ -26,6 +26,17 @@ pub trait GrpoPolicy: Sized {
         tape: &mut Tape,
     ) -> Result<TensorId>;
 
+    fn forward_batch_tokens_with_positions(
+        &self,
+        input_ids: &[usize],
+        position_ids: &[usize],
+        batch: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        self.forward_batch_tokens(input_ids, batch, position_ids.len(), store, tape)
+    }
+
     fn all_parameter_ids(&self) -> Vec<TensorId>;
 
     fn clone_frozen(&self, store: &mut TensorStore) -> Self;
