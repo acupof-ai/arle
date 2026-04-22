@@ -896,12 +896,18 @@ where
 
     let mut dataset = CopyDataset::with_vocab(args.batch_prompts, args.seq, args.seed, 64, 255);
     let batch_shape = dataset.batch_shape();
+    let position_ids = (0..args.seq).collect::<Vec<_>>();
     let step_fn = |ctx: &mut StepCtx<'_>| -> AutogradResult<StepOutcome> {
         let (input_ids, target_ids) = dataset.sample();
         let (batch, seq_len) = batch_shape;
         let token_count = (batch * seq_len) as u64;
-        let logits =
-            policy.forward_batch_tokens(&input_ids, batch, seq_len, ctx.store, ctx.tape)?;
+        let logits = policy.forward_batch_tokens_with_positions(
+            &input_ids,
+            &position_ids[..seq_len],
+            batch,
+            ctx.store,
+            ctx.tape,
+        )?;
         let loss_id = cross_entropy_loss(logits, &target_ids, ctx.store, ctx.tape)?;
         Ok(StepOutcome {
             loss_id,
