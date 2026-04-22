@@ -619,7 +619,6 @@ unsafe extern "C" {
         out_kv_caches: *mut *mut mlx_array,
         out_gdr_states: *mut *mut mlx_array,
     ) -> i32;
-    #[allow(clippy::too_many_arguments)]
     pub fn qwen35_compiled_verify_block_batched(
         model: *mut std::ffi::c_void,
         token_ids: *mut mlx_array,
@@ -633,6 +632,25 @@ unsafe extern "C" {
         attn_mask: *mut mlx_array,
         rope_offsets: *mut mlx_array,
         out_logits: *mut *mut mlx_array,
+        out_packed_kv_caches: *mut *mut mlx_array,
+        out_packed_gdr_states: *mut *mut mlx_array,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_compiled_verify_block_batched_sampled(
+        model: *mut std::ffi::c_void,
+        token_ids: *mut mlx_array,
+        batch_size: i32,
+        block_size: i32,
+        cache_pos_arr: *mut mlx_array,
+        packed_kv_caches: *mut *mut mlx_array,
+        n_kv: i32,
+        packed_gdr_states: *mut *mut mlx_array,
+        n_gdr: i32,
+        attn_mask: *mut mlx_array,
+        rope_offsets: *mut mlx_array,
+        temperature: f32,
+        greedy: bool,
+        out_sampled: *mut *mut mlx_array,
         out_packed_kv_caches: *mut *mut mlx_array,
         out_packed_gdr_states: *mut *mut mlx_array,
     ) -> i32;

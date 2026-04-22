@@ -1667,11 +1667,14 @@ fn embed_tokens(embed_table: &MlxArray, input_ids: &[u32]) -> MlxArray {
 
 fn sample_last_token(logits: &MlxArray, params: &SamplingParams) -> Result<u32> {
     let shape = logits.shape();
-    ensure!(
-        shape.len() == 2,
-        "expected rank-2 logits, got shape {shape:?}"
-    );
-    let last_row = slice(logits, &[shape[0] - 1, 0], &[shape[0], shape[1]], &[1, 1]);
+    let last_row = match shape {
+        [rows, vocab] => slice(logits, &[rows - 1, 0], &[*rows, *vocab], &[1, 1]),
+        [1, rows, vocab] => {
+            let squeezed = super::mlx::reshape(logits, &[*rows, *vocab]);
+            slice(&squeezed, &[rows - 1, 0], &[*rows, *vocab], &[1, 1])
+        }
+        _ => anyhow::bail!("expected rank-2 logits or [1, T, vocab], got shape {shape:?}"),
+    };
     let token = gpu_sample_token(&last_row, params);
     eval(&[&token]);
     Ok(token.item_i32() as u32)
@@ -1800,8 +1803,9 @@ fn slice_prefix_axis1(arr: &MlxArray, count: i32) -> MlxArray {
     slice(arr, &start, &stop, &strides)
 }
 
-/// Drain the capture_layer_ids hidden states recorded by the C++ verify forward.
-/// Each captured array is shape `[1, block_size, hidden_size]`.
+/// Drain the capture_layer_ids hidden states recorded by the latest C++ target
+/// step / verify forward. Captured arrays are rank-3 `[B, T, hidden_size]`,
+/// where `T` is `1` for scalar prefix verify and `block_size` for packed verify.
 fn drain_captured_hidden(cpp_model: &super::qwen35::CppQwen35Model) -> Result<Vec<MlxArray>> {
     let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(cpp_model.as_raw()) };
     ensure!(
@@ -1827,6 +1831,7 @@ fn drain_captured_hidden(cpp_model: &super::qwen35::CppQwen35Model) -> Result<Ve
 ///
 /// Layout of `gdr_flat`: `[gdr_state_0, conv_state_0, gdr_state_1, conv_state_1, …]`.
 /// Each `tapes[i]` corresponds to gdr layer `i` (pair index `2i` / `2i+1` in `gdr_flat`).
+#[cfg(test)]
 fn qwen35_rollback_to_accepted(
     gdr_flat: &mut [MlxArray],
     gdr_snapshot: &[MlxArray],
@@ -2044,8 +2049,9 @@ fn qwen35_build_updated_target_hidden(
 
 // ── Qwen3.5 DFlash speculative block ─────────────────────────────────────
 
-/// Qwen3.5 verify: run N tokens through the target C++ model with tape mode,
-/// then match against drafted tokens and rollback GDR state on partial rejection.
+/// Qwen3.5 single-row verify: run target decode steps until the first
+/// mismatch-inclusive position, accepting every executed step and reusing the
+/// captured hidden states to seed the next draft block.
 ///
 /// Returns the same `DFlashBlockResult` as the Qwen3 variant.
 pub(crate) fn qwen35_dflash_speculative_block(
@@ -2064,7 +2070,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // Draft model state
     draft_state: &mut ContiguousKvState,
 ) -> Result<DFlashBlockResult> {
-    use super::mlx::{MlxArray as Arr, eval, reshape};
+    use super::mlx::{MlxArray as Arr, eval};
 
     let profile = std::env::var("QWEN35_DFLASH_PROFILE").is_ok();
     let t_start = std::time::Instant::now();
@@ -2094,119 +2100,88 @@ pub(crate) fn qwen35_dflash_speculative_block(
     }
     let t_draft = t_start.elapsed();
 
-    // ── 2. Snapshot GDR states before verify ──
-    let gdr_snapshot: Vec<Arr> = target_gdr_flat.to_vec();
+    let n_capture_layers = runtime.target_layer_ids.len();
+    let mut matched = 0usize;
+    let mut accepted_tokens_out = Vec::with_capacity(runtime.block_size);
+    let mut captured_per_layer: Vec<Vec<Arr>> = vec![Vec::new(); n_capture_layers];
+    let mut per_pos_match = vec![false; runtime.block_size.saturating_sub(1)];
     let t_snapshot = t_start.elapsed();
 
-    // ── 3. Enable tape mode + hidden capture, verify via C++ model ──
+    // ── 2. Prefix verify via scalar decode steps ──
     //
-    // Previously this loop did 16 × `cpp_model.step(seq_len=1)` — paying the
-    // decode-pipeline fixed cost per position and producing 16 compile graphs.
-    // The tape kernel already supports T>1 in a single launch (see
-    // `gated_delta_tape_kernel` in mlx_qwen35_model.cpp), so one forward at
-    // seq_len=block_size emits the full block's logits, GDR tapes, and
-    // capture-layer hidden states.
-    unsafe { mlx_sys::qwen35_set_tape_mode(cpp_model.as_raw(), true) };
-    let layer_ids_i32: Vec<i32> = runtime
-        .target_layer_ids
-        .iter()
-        .map(|&id| id as i32)
-        .collect();
-    unsafe {
-        mlx_sys::qwen35_set_capture_layers(
-            cpp_model.as_raw(),
-            layer_ids_i32.as_ptr(),
-            layer_ids_i32.len() as i32,
-        );
-    };
-    let _verify_state_guard = Qwen35VerifyStateGuard {
-        raw: cpp_model.as_raw(),
-    };
+    // On Apple/MLX the stock M=16 verify path is still expensive. Most Qwen3.6
+    // blocks on this workload reject at the second draft position, so paying a
+    // full block verify wastes the target pass. Verify only until the first
+    // mismatch (inclusive): every executed step is accepted, so we avoid both
+    // over-verification and GDR rollback.
+    super::qwen35::with_qwen35_capture_layers(
+        cpp_model.as_raw(),
+        &runtime.target_layer_ids,
+        || {
+            for step_idx in 0..runtime.block_size {
+                let token = MlxArray::from_slice_i32(&[block_tokens[step_idx] as i32], &[1]);
+                let logits =
+                    cpp_model.step(&token, *target_cache_len, target_kv_flat, target_gdr_flat)?;
+                let posterior = sample_last_token(&logits, params)?;
+                let captured = drain_captured_hidden(cpp_model)?;
+                ensure!(
+                    captured.len() == n_capture_layers || n_capture_layers == 0,
+                    "Qwen3.5 DFlash captured hidden count mismatch: expected {n_capture_layers}, got {}",
+                    captured.len()
+                );
+                for (layer_idx, hidden) in captured.into_iter().enumerate() {
+                    captured_per_layer[layer_idx].push(hidden);
+                }
 
-    let n_capture_layers = runtime.target_layer_ids.len();
-    let expected_tape_count = target_gdr_flat.len() / 2;
-    // 3a. Single parallel verify forward. Returns sampled posterior tokens
-    //     [1, block_size], so Rust no longer materializes `[block_size, vocab]`
-    //     just to sample it immediately afterwards.
-    let block_tokens_i32: Vec<i32> = block_tokens.iter().map(|&tok| tok as i32).collect();
-    let tokens_arr = MlxArray::from_slice_i32(&block_tokens_i32, &[block_size_i32]);
-    let posterior_tokens = cpp_model.verify_block_sampled(
-        &tokens_arr,
-        block_size_i32,
-        *target_cache_len,
-        target_kv_flat,
-        target_gdr_flat,
-        params,
+                *target_cache_len += 1;
+                accepted_tokens_out.push(posterior);
+
+                let Some(&draft_token) = block_tokens.get(step_idx + 1) else {
+                    break;
+                };
+                let is_match = posterior == draft_token;
+                per_pos_match[step_idx] = is_match;
+                if is_match {
+                    matched += 1;
+                    continue;
+                }
+                break;
+            }
+            Ok(())
+        },
     )?;
-    if profile {
-        eval(&[&posterior_tokens]);
-    }
     let t_verify = t_start.elapsed();
+    let t_sample = t_verify;
 
-    // 3b. Drain tapes + captured hidden produced by this single forward.
-    //     Each tape: innovation_tape/k/g/qkv shaped [1, block_size, …] — one
-    //     entry per GDR layer. Each captured hidden: [1, block_size, hidden_size]
-    //     — one entry per capture layer.
-    let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
-    let captured_hiddens = drain_captured_hidden(cpp_model)?;
-
-    // 3c. Read sampled posterior tokens [1, S] → [S].
-    let posterior_shape = posterior_tokens.shape();
+    let accepted_inputs = accepted_tokens_out.len();
     ensure!(
-        posterior_shape.len() == 2
-            && posterior_shape[0] == 1
-            && posterior_shape[1] == block_size_i32,
-        "Qwen3.5 DFlash sampled verify tokens unexpected shape {posterior_shape:?}"
+        accepted_inputs > 0,
+        "Qwen3.5 DFlash prefix verify produced no accepted tokens"
     );
-    let posterior_tokens = reshape(&posterior_tokens, &[block_size_i32]);
-    eval(&[&posterior_tokens]);
-    let posterior_tokens: Vec<u32> = posterior_tokens
-        .as_slice_i32()
-        .into_iter()
-        .map(|tok| tok as u32)
-        .collect();
-    let t_sample = t_start.elapsed();
-
-    // ── 4. Token matching ──
-    // Full per-position agreement (no early-stop) — feeds the diagnostic
-    // window so we can see whether rejections are concentrated at the first
-    // draft step or spread across the block.
-    let per_pos_match: Vec<bool> = block_tokens
-        .iter()
-        .skip(1)
-        .zip(posterior_tokens.iter())
-        .take(runtime.block_size.saturating_sub(1))
-        .map(|(draft, target)| draft == target)
-        .collect();
-    let matched = per_pos_match.iter().take_while(|hit| **hit).count();
-    let accepted_inputs = matched + 1;
-    let posterior_token = *posterior_tokens
-        .get(matched)
-        .ok_or_else(|| anyhow!("Qwen3.5 DFlash verifier produced too few tokens"))?;
 
     log::debug!(
         "qwen35_dflash: accepted={}/{} draft={:?} posterior={:?}",
         accepted_inputs,
         runtime.block_size,
         &block_tokens[1..(matched + 2).min(block_tokens.len())],
-        &posterior_tokens[..(matched + 1).min(posterior_tokens.len())]
+        &accepted_tokens_out[..accepted_inputs.min(accepted_tokens_out.len())]
     );
 
-    // ── 5. Rollback rejected tokens (partial accept only) ──
-    //
-    // Full attention KV: the C++ forward wrote `block_size` positions into each
-    // layer's KV cache; on partial accept we leave them — `target_cache_len` only
-    // advances by `accepted_inputs`, so the next forward overwrites rejected slots.
-    // GDR state: the verify forward advanced it by `block_size` steps. Restore the
-    // pre-verify snapshot, then tape-replay exactly `accepted_inputs` accepted steps
-    // sliced out of the single `[1, block_size, …]` tape captured above.
-    if accepted_inputs < runtime.block_size {
-        qwen35_rollback_to_accepted(target_gdr_flat, &gdr_snapshot, &tapes, accepted_inputs)?;
-    }
-
-    *target_cache_len += accepted_inputs as i32;
-
-    // ── 6. Build updated_target_hidden from the block's captured hidden states ──
+    // ── 3. Build updated_target_hidden from accepted per-step captures ──
+    let captured_hiddens: Vec<Arr> = captured_per_layer
+        .into_iter()
+        .map(|mut per_layer| {
+            ensure!(
+                !per_layer.is_empty(),
+                "Qwen3.5 DFlash missing captured hidden for an accepted layer"
+            );
+            Ok(if per_layer.len() == 1 {
+                per_layer.pop().expect("checked non-empty")
+            } else {
+                concatenate_axis(&per_layer, 1)
+            })
+        })
+        .collect::<Result<_>>()?;
     let updated_target_hidden = qwen35_build_updated_target_hidden(
         &captured_hiddens,
         n_capture_layers,
@@ -2216,16 +2191,6 @@ pub(crate) fn qwen35_dflash_speculative_block(
     .into_iter()
     .next()
     .ok_or_else(|| anyhow!("qwen35_build_updated_target_hidden returned empty Vec"))?;
-
-    let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
-    for &tok in block_tokens
-        .iter()
-        .skip(1)
-        .take(accepted_inputs.saturating_sub(1))
-    {
-        accepted_tokens_out.push(tok);
-    }
-    accepted_tokens_out.push(posterior_token);
 
     let t_rollback = t_start.elapsed();
 

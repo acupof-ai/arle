@@ -983,67 +983,6 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
-    /// DFlash verify fast path: parallel forward over a draft block plus
-    /// posterior sampling inside the C++ graph. Returns sampled token ids
-    /// `[1, block_size]` instead of full logits, cutting the `[S, vocab]`
-    /// materialization / transfer that the Rust DFlash loop used to pay.
-    #[allow(dead_code)]
-    pub(super) fn verify_block_sampled(
-        &self,
-        tokens: &MlxArray,
-        block_size: i32,
-        cache_pos: i32,
-        kv_caches: &mut [MlxArray],
-        gdr_states: &mut [MlxArray],
-        params: &SamplingParams,
-    ) -> Result<MlxArray> {
-        let n_kv = kv_caches.len() as i32;
-        let n_gdr = gdr_states.len() as i32;
-        let greedy = params.temperature <= 1e-6 || params.top_k == 1;
-
-        let mut kv_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            kv_caches.iter().map(MlxArray::as_raw).collect();
-        let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            gdr_states.iter().map(MlxArray::as_raw).collect();
-
-        let mut out_sampled: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
-        let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
-
-        let rc = unsafe {
-            mlx_sys::qwen35_compiled_verify_block_sampled(
-                self.0,
-                tokens.as_raw(),
-                block_size,
-                cache_pos,
-                kv_ptrs.as_mut_ptr(),
-                n_kv,
-                gdr_ptrs.as_mut_ptr(),
-                n_gdr,
-                params.temperature,
-                greedy,
-                &raw mut out_sampled,
-                out_kv.as_mut_ptr(),
-                out_gdr.as_mut_ptr(),
-            )
-        };
-
-        if rc != 0 {
-            return Err(super::mlx::check_mlx_error().unwrap_err());
-        }
-
-        for (i, ptr) in out_kv.into_iter().enumerate() {
-            let old = std::mem::replace(&mut kv_caches[i], unsafe { MlxArray::from_raw(ptr) });
-            drop(old);
-        }
-        for (i, ptr) in out_gdr.into_iter().enumerate() {
-            let old = std::mem::replace(&mut gdr_states[i], unsafe { MlxArray::from_raw(ptr) });
-            drop(old);
-        }
-
-        Ok(unsafe { MlxArray::from_raw(out_sampled) })
-    }
-
     /// Batched DFlash verify: run `block_size` draft tokens for `batch_size`
     /// rows in a single forward. Mirrors `verify_block` but feeds the packed
     /// KV/GDR states and per-row `cache_pos_arr` / `rope_offsets` that
