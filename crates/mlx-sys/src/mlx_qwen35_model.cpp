@@ -461,6 +461,7 @@ struct Qwen35CompiledModel {
         int seq_len = 1;
         int batch_size = 1;
         bool last_logits_only = false;
+        bool is_verify = false;
         bool has_attn_mask = false;
         array attn_mask = array(0);
         bool has_cache_pos_arr = false;
@@ -503,6 +504,7 @@ struct Qwen35CompiledModel {
     int current_seq_len = 1;  // 1 for decode, >1 for batch prefill
     int current_batch_size = 1;
     bool current_last_logits_only = false;
+    bool current_is_verify = false;
     mutable array current_gdr_t_arr = array(1);
     mutable array current_attn_mask = array(0);
     mutable bool current_has_attn_mask = false;
@@ -568,6 +570,42 @@ struct Qwen35CompiledModel {
         current_has_cache_pos_arr = false;
         current_rope_offsets = array(0);
         current_has_rope_offsets = false;
+        current_is_verify = false;
+    }
+
+    bool can_use_verify_sdpa_2pass(
+        const ForwardContext& ctx,
+        const array& q,
+        const array& k_full,
+        const array& v_full,
+        int nh,
+        int nkv,
+        int hd
+    ) const {
+        if (!ctx.is_verify || ctx.has_attn_mask || ctx.seq_len != 16) {
+            return false;
+        }
+        if (!ctx.has_cache_pos_arr || ctx.batch_size <= 1) {
+            return false;
+        }
+        if ((hd != 128 && hd != 256) || nkv <= 0 || (nh % nkv) != 0) {
+            return false;
+        }
+        if (q.ndim() != 4 || k_full.ndim() != 4 || v_full.ndim() != 4) {
+            return false;
+        }
+        if (q.dtype() != bfloat16 || k_full.dtype() != bfloat16 || v_full.dtype() != bfloat16) {
+            return false;
+        }
+        return q.shape(0) == k_full.shape(0)
+            && q.shape(0) == v_full.shape(0)
+            && q.shape(1) == nh
+            && k_full.shape(1) == nkv
+            && v_full.shape(1) == nkv
+            && q.shape(2) == 16
+            && q.shape(3) == hd
+            && k_full.shape(3) == hd
+            && v_full.shape(3) == hd;
     }
 
     // ── Full attention decode step ─────────────────────────────────────
@@ -694,7 +732,9 @@ struct Qwen35CompiledModel {
         }
 
         array attn_out(0);
-        if (ctx.has_attn_mask) {
+        if (can_use_verify_sdpa_2pass(ctx, q, k_full, v_full, nh, nkv, hd)) {
+            attn_out = batched_sdpa_2pass_cpp(q, k_full, v_full, attn_scale, nh / nkv);
+        } else if (ctx.has_attn_mask) {
             attn_out = fast::scaled_dot_product_attention(
                 q,
                 k_full,
@@ -1101,6 +1141,7 @@ struct Qwen35CompiledModel {
         ctx.seq_len = current_seq_len;
         ctx.batch_size = current_batch_size;
         ctx.last_logits_only = current_last_logits_only;
+        ctx.is_verify = current_is_verify;
         ctx.has_attn_mask = current_has_attn_mask;
         ctx.attn_mask = current_attn_mask;
         ctx.has_cache_pos_arr = current_has_cache_pos_arr;
@@ -1928,6 +1969,7 @@ int32_t qwen35_compiled_verify_block(
         m->current_seq_len = block_size;
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
+        m->current_is_verify = true;
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -1981,6 +2023,7 @@ int32_t qwen35_compiled_verify_block_sampled(
         m->current_seq_len = block_size;
         m->current_last_logits_only = false;
         m->clear_optional_batch_inputs();
+        m->current_is_verify = true;
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -2072,6 +2115,7 @@ int32_t qwen35_compiled_verify_block_batched(
         m->current_cache_pos_arr = *to_arr(cache_pos_arr);
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
+        m->current_is_verify = true;
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);
@@ -2158,6 +2202,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
         m->current_cache_pos_arr = *to_arr(cache_pos_arr);
         m->current_has_rope_offsets = true;
         m->current_rope_offsets = *to_arr(rope_offsets);
+        m->current_is_verify = true;
 
         std::vector<array> inputs;
         inputs.reserve(1 + n_kv + n_gdr);

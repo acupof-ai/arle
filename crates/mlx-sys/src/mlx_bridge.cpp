@@ -423,6 +423,108 @@ auto& batched_sdpa_2pass_reduce_kernel() {
 
 } // namespace
 
+array batched_sdpa_2pass_cpp(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    float scale,
+    int32_t gqa_factor) {
+    constexpr int blocks = 128;
+
+    auto queries_arr = contiguous(queries);
+    auto keys_arr = contiguous(keys);
+    auto values_arr = contiguous(values);
+
+    require_rank(queries_arr, 4, "queries");
+    require_rank(keys_arr, 4, "keys");
+    require_rank(values_arr, 4, "values");
+    require_dtype(queries_arr, bfloat16, "queries");
+    require_dtype(keys_arr, bfloat16, "keys");
+    require_dtype(values_arr, bfloat16, "values");
+
+    int bsz = queries_arr.shape(0);
+    int Hq = queries_arr.shape(1);
+    int q_len = queries_arr.shape(2);
+    int D = queries_arr.shape(3);
+    int Hk = keys_arr.shape(1);
+    int N = keys_arr.shape(2);
+    int V = values_arr.shape(3);
+
+    if (bsz != keys_arr.shape(0) || bsz != values_arr.shape(0)) {
+        throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched batch dimensions");
+    }
+    if (Hk != values_arr.shape(1) || N != values_arr.shape(2)) {
+        throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched kv shapes");
+    }
+    if (q_len != 16) {
+        throw std::invalid_argument("mlx_batched_sdpa_2pass requires query length 16");
+    }
+    if ((D != 128 && D != 256) || D != V) {
+        throw std::invalid_argument("mlx_batched_sdpa_2pass requires D == V and D in {128, 256}");
+    }
+    if (Hk <= 0 || gqa_factor <= 0 || Hq != Hk * gqa_factor) {
+        throw std::invalid_argument("mlx_batched_sdpa_2pass got an invalid gqa_factor");
+    }
+
+    int k_head_stride = keys_arr.shape(2) * keys_arr.shape(3);
+    int k_seq_stride = keys_arr.shape(3);
+    int v_head_stride = values_arr.shape(2) * values_arr.shape(3);
+    int v_seq_stride = values_arr.shape(3);
+
+    std::vector<array> partial_inputs = {
+        queries_arr,
+        keys_arr,
+        values_arr,
+        array(gqa_factor),
+        array(N),
+        array(k_head_stride),
+        array(k_seq_stride),
+        array(v_head_stride),
+        array(v_seq_stride),
+        array(scale),
+        array(blocks),
+    };
+    Shape partial_shape{bsz * Hq, q_len, blocks, V};
+    Shape stats_shape{bsz * Hq, q_len, blocks};
+    std::vector<std::pair<std::string, fast::TemplateArg>> partial_tmpl = {
+        {"InT", fast::TemplateArg(bfloat16)},
+        {"D", fast::TemplateArg(D)},
+        {"V", fast::TemplateArg(V)},
+        {"Hk", fast::TemplateArg(Hk)},
+        {"M_FIXED", fast::TemplateArg(q_len)},
+    };
+
+    auto partials_result = batched_sdpa_2pass_partials_kernel()(
+        partial_inputs,
+        {partial_shape, stats_shape, stats_shape},
+        {bfloat16, float32, float32},
+        std::make_tuple(Hq * 32, bsz, blocks * q_len),
+        std::make_tuple(32, 1, q_len),
+        partial_tmpl,
+        std::nullopt,
+        false,
+        {});
+
+    std::vector<std::pair<std::string, fast::TemplateArg>> reduce_tmpl = {
+        {"InT", fast::TemplateArg(bfloat16)},
+        {"V", fast::TemplateArg(V)},
+        {"M_FIXED", fast::TemplateArg(q_len)},
+    };
+
+    auto out_result = batched_sdpa_2pass_reduce_kernel()(
+        {partials_result[0], partials_result[1], partials_result[2], array(blocks)},
+        {queries_arr.shape()},
+        {bfloat16},
+        std::make_tuple((bsz * Hq) * 1024, q_len, 1),
+        std::make_tuple(1024, 1, 1),
+        reduce_tmpl,
+        std::nullopt,
+        false,
+        {});
+
+    return std::move(out_result[0]);
+}
+
 extern "C" {
 
 // === Error handling ===
@@ -1052,102 +1154,13 @@ mlx_array* mlx_tape_replay_varlen(
 mlx_array* mlx_batched_sdpa_2pass(
     mlx_array* queries, mlx_array* keys, mlx_array* values,
     float scale, int gqa_factor) {
-    MLX_TRY_RETURN([&]() {
-        constexpr int blocks = 128;
-
-        auto queries_arr = contiguous(*to_arr(queries));
-        auto keys_arr = contiguous(*to_arr(keys));
-        auto values_arr = contiguous(*to_arr(values));
-
-        require_rank(queries_arr, 4, "queries");
-        require_rank(keys_arr, 4, "keys");
-        require_rank(values_arr, 4, "values");
-        require_dtype(queries_arr, bfloat16, "queries");
-        require_dtype(keys_arr, bfloat16, "keys");
-        require_dtype(values_arr, bfloat16, "values");
-
-        int bsz = queries_arr.shape(0);
-        int Hq = queries_arr.shape(1);
-        int q_len = queries_arr.shape(2);
-        int D = queries_arr.shape(3);
-        int Hk = keys_arr.shape(1);
-        int N = keys_arr.shape(2);
-        int V = values_arr.shape(3);
-
-        if (bsz != keys_arr.shape(0) || bsz != values_arr.shape(0)) {
-            throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched batch dimensions");
-        }
-        if (Hk != values_arr.shape(1) || N != values_arr.shape(2)) {
-            throw std::invalid_argument("mlx_batched_sdpa_2pass got mismatched kv shapes");
-        }
-        if (q_len != 16) {
-            throw std::invalid_argument("mlx_batched_sdpa_2pass requires query length 16");
-        }
-        if ((D != 128 && D != 256) || D != V) {
-            throw std::invalid_argument("mlx_batched_sdpa_2pass requires D == V and D in {128, 256}");
-        }
-        if (Hk <= 0 || gqa_factor <= 0 || Hq != Hk * gqa_factor) {
-            throw std::invalid_argument("mlx_batched_sdpa_2pass got an invalid gqa_factor");
-        }
-
-        int k_head_stride = keys_arr.shape(2) * keys_arr.shape(3);
-        int k_seq_stride = keys_arr.shape(3);
-        int v_head_stride = values_arr.shape(2) * values_arr.shape(3);
-        int v_seq_stride = values_arr.shape(3);
-
-        std::vector<array> partial_inputs = {
-            queries_arr,
-            keys_arr,
-            values_arr,
-            array(gqa_factor),
-            array(N),
-            array(k_head_stride),
-            array(k_seq_stride),
-            array(v_head_stride),
-            array(v_seq_stride),
-            array(scale),
-            array(blocks),
-        };
-        Shape partial_shape{bsz * Hq, q_len, blocks, V};
-        Shape stats_shape{bsz * Hq, q_len, blocks};
-        std::vector<std::pair<std::string, fast::TemplateArg>> partial_tmpl = {
-            {"InT", fast::TemplateArg(bfloat16)},
-            {"D", fast::TemplateArg(D)},
-            {"V", fast::TemplateArg(V)},
-            {"Hk", fast::TemplateArg(Hk)},
-            {"M_FIXED", fast::TemplateArg(q_len)},
-        };
-
-        auto partials_result = batched_sdpa_2pass_partials_kernel()(
-            partial_inputs,
-            {partial_shape, stats_shape, stats_shape},
-            {bfloat16, float32, float32},
-            std::make_tuple(Hq * 32, bsz, blocks * q_len),
-            std::make_tuple(32, 1, q_len),
-            partial_tmpl,
-            std::nullopt,
-            false,
-            {});
-
-        std::vector<std::pair<std::string, fast::TemplateArg>> reduce_tmpl = {
-            {"InT", fast::TemplateArg(bfloat16)},
-            {"V", fast::TemplateArg(V)},
-            {"M_FIXED", fast::TemplateArg(q_len)},
-        };
-
-        auto out_result = batched_sdpa_2pass_reduce_kernel()(
-            {partials_result[0], partials_result[1], partials_result[2], array(blocks)},
-            {queries_arr.shape()},
-            {bfloat16},
-            std::make_tuple((bsz * Hq) * 1024, q_len, 1),
-            std::make_tuple(1024, 1, 1),
-            reduce_tmpl,
-            std::nullopt,
-            false,
-            {});
-
-        return from_arr(std::move(out_result[0]));
-    }());
+    MLX_TRY_RETURN(from_arr(batched_sdpa_2pass_cpp(
+        *to_arr(queries),
+        *to_arr(keys),
+        *to_arr(values),
+        scale,
+        gqa_factor
+    )));
 }
 
 // === Random ===
