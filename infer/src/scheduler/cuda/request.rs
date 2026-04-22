@@ -1,3 +1,5 @@
+use fastrace::Span;
+use fastrace::collector::SpanContext;
 use log::warn;
 
 use super::{CompletionStreamDelta, FinishReason, RequestPriority, TokenUsage, Tokenizer, mpsc};
@@ -202,6 +204,10 @@ impl EmitCursor {
     pub(crate) fn mark_dispatched(&mut self, generated_tokens_len: usize) {
         self.dispatched_token_count = generated_tokens_len;
     }
+
+    pub(crate) fn is_initial_dispatch(&self) -> bool {
+        self.dispatched_token_count == 0
+    }
 }
 
 /// Newly assigned, needs prefix cache check.
@@ -235,6 +241,8 @@ pub(crate) struct ActiveRequest {
     /// Optional client session identifier forwarded from `IncomingRequest`.
     /// Preserved across preemption so requeued work stays session-sticky.
     pub(crate) session_id: Option<crate::types::SessionId>,
+    /// Most recent trace context used to chain request-level spans across threads.
+    pub(crate) trace_context: Option<SpanContext>,
     pub(crate) delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     /// Streaming emit dispatch bookkeeping.
     pub(crate) emit_cursor: EmitCursor,
@@ -244,6 +252,9 @@ pub(crate) struct ActiveRequest {
     pub(crate) cacheable_prompt_len: usize,
     /// Latest token's log-probability (greedy only, set by scheduler decode step).
     pub(crate) latest_logprob: Option<f32>,
+    /// Deferred terminal reason that must wait for a stop-sensitive emit gate
+    /// result before the scheduler can finalize the request.
+    pub(crate) pending_finish_reason: Option<FinishReason>,
     /// Block-aligned prefix length that was proven reusable at admission time.
     /// This is derived from the global radix lookup, not a slot-local token
     /// compare. Zero means the request should start cold.
@@ -264,6 +275,16 @@ pub(crate) struct ActiveRequest {
 }
 
 impl ActiveRequest {
+    pub(crate) fn begin_trace_span(&self, name: &'static str) -> Option<Span> {
+        self.trace_context.map(|parent| Span::root(name, parent))
+    }
+
+    pub(crate) fn update_trace_context(&mut self, span: Option<&Span>) {
+        if let Some(span) = span {
+            self.trace_context = SpanContext::from_span(span).or(self.trace_context);
+        }
+    }
+
     pub(crate) fn has_pending_emit(&self) -> bool {
         self.emit_cursor
             .has_pending_emit(self.generated_tokens.len())
@@ -273,6 +294,14 @@ impl ActiveRequest {
         self.stop
             .as_ref()
             .is_some_and(|stops| stops.iter().any(|stop| !stop.is_empty()))
+    }
+
+    pub(crate) fn stops_for_emit_dispatch(&self) -> Option<Vec<String>> {
+        if self.emit_cursor.is_initial_dispatch() {
+            self.stop.clone()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn pending_emit_tokens(&self) -> Vec<u32> {
@@ -361,11 +390,13 @@ mod tests {
             sampling: SamplingParams::default(),
             stop: None,
             session_id: None,
+            trace_context: None,
             delta_tx,
             emit_cursor: EmitCursor::default(),
             phase: Phase::Finished,
             cacheable_prompt_len: 0,
             latest_logprob: None,
+            pending_finish_reason: None,
             reusable_prefix_len: 0,
             reusable_cached_prompt_len: 0,
             attached_prefix_blocks: Vec::new(),
@@ -413,5 +444,17 @@ mod tests {
 
         req.stop = Some(vec!["</tool>".to_string()]);
         assert!(req.has_stop_sequences());
+    }
+
+    #[test]
+    fn stop_sequences_are_only_cloned_for_initial_emit_dispatch() {
+        let mut req = test_request("hello", vec![1, 2, 3]);
+        req.stop = Some(vec!["</tool>".to_string()]);
+
+        assert_eq!(req.stops_for_emit_dispatch(), req.stop);
+
+        req.generated_tokens.push(42);
+        req.mark_emit_dispatched();
+        assert_eq!(req.stops_for_emit_dispatch(), None);
     }
 }

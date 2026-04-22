@@ -19,6 +19,10 @@ use axum::{
     routing::{get, post},
 };
 use chat::openai_messages_to_prompt as chat_messages_to_prompt;
+use fastrace::Span;
+use fastrace::collector::SpanContext;
+use fastrace::future::FutureExt;
+use fastrace::local::LocalSpan;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
 use serde::Deserialize;
@@ -40,6 +44,7 @@ use crate::server_engine::CompletionStreamDelta;
 use crate::server_engine::{CompletionOutput, FinishReason, TokenUsage};
 use crate::session_persistence::SessionPersistence;
 use crate::tokenizer::Tokenizer;
+use crate::trace_reporter::trace_runtime;
 use openai_v1::{
     ChatCompletionRequest, ChatCompletionResponse, ChatStreamChunk, ChatStreamUsageChunk,
     CompletionRequest as OpenAiCompletionRequest, CompletionResponse, DflashStatusPayload,
@@ -225,6 +230,7 @@ impl RequestExecutionOptions {
         prompt: String,
         prompt_tokens: Option<Vec<u32>>,
         delta_tx: tokio::sync::mpsc::UnboundedSender<CompletionStreamDelta>,
+        trace_context: Option<SpanContext>,
     ) -> IncomingRequest {
         IncomingRequest {
             prompt,
@@ -235,6 +241,7 @@ impl RequestExecutionOptions {
             priority: RequestPriority::default(),
             session_id: self.session_id,
             delta_tx,
+            trace_context,
         }
     }
 }
@@ -292,6 +299,39 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn request_parent_context(headers: &HeaderMap) -> SpanContext {
+    headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(SpanContext::decode_w3c_traceparent)
+        .unwrap_or_else(SpanContext::random)
+}
+
+fn http_request_span(
+    route: &'static str,
+    stream: bool,
+    max_tokens: usize,
+    session_id: Option<&crate::types::SessionId>,
+    headers: &HeaderMap,
+) -> Span {
+    let decision = trace_runtime().decide_request(uuid::Uuid::new_v4().as_bytes());
+    let parent = request_parent_context(headers).sampled(decision.sampled);
+    Span::root("http", parent).with_properties(|| {
+        [
+            ("route", route.to_string()),
+            ("stream", stream.to_string()),
+            ("max_tokens", max_tokens.to_string()),
+            ("trace_level", decision.effective_level().to_string()),
+            (
+                "session_id",
+                session_id
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_default(),
+            ),
+        ]
+    })
+}
+
 // ============================================================================
 // SSE helpers — shared between /v1/completions and /v1/chat/completions
 // ============================================================================
@@ -330,14 +370,21 @@ fn submit_request(
     prompt: String,
 ) -> Result<UnboundedReceiver<CompletionStreamDelta>, ApiError> {
     let (delta_tx, delta_rx) = tokio::sync::mpsc::unbounded_channel();
-    let prompt_tokens = match state.tokenizer.as_ref() {
-        Some(tokenizer) => Some(tokenizer.encode(&prompt).map_err(|err| {
-            error!("Prompt tokenization failed before scheduler submission: {err}");
-            ApiError::service_unavailable("Failed to tokenize request prompt")
-        })?),
-        None => None,
+    let prompt_tokens = {
+        let _tokenize_span = LocalSpan::enter_with_local_parent("tokenize");
+        match state.tokenizer.as_ref() {
+            Some(tokenizer) => Some(tokenizer.encode(&prompt).map_err(|err| {
+                error!("Prompt tokenization failed before scheduler submission: {err}");
+                ApiError::service_unavailable("Failed to tokenize request prompt")
+            })?),
+            None => None,
+        }
     };
-    let incoming = options.into_incoming_request(prompt, prompt_tokens, delta_tx);
+    let enqueue_context = {
+        let _enqueue_span = LocalSpan::enter_with_local_parent("enqueue");
+        SpanContext::current_local_parent()
+    };
+    let incoming = options.into_incoming_request(prompt, prompt_tokens, delta_tx, enqueue_context);
 
     if let Err(e) = state.handle.submit(incoming) {
         warn!("Scheduler at capacity: {e}");
@@ -618,56 +665,81 @@ async fn completions(
     headers: HeaderMap,
     Json(req): Json<OpenAiCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    authorize_v1_request(&headers, state.as_ref())?;
     let options = RequestExecutionOptions::from_completion(&req);
-    let max_tokens = options.max_tokens;
-    let stream = options.stream;
-    let include_usage = options.include_usage;
-    let model_id = state.identity.model_id.clone();
-
-    if req.prompt.trim().is_empty() {
-        warn!("Rejecting empty prompt request");
-        return Err(ApiError::bad_request(
-            "Prompt must not be empty",
-            "empty_prompt",
-        ));
-    }
-
-    info!(
-        "Received request: prompt_len={}, max_tokens={}, stream={}",
-        req.prompt.len(),
-        max_tokens,
-        stream,
+    let http_span = http_request_span(
+        "/v1/completions",
+        options.stream,
+        options.max_tokens,
+        options.session_id.as_ref(),
+        &headers,
     );
 
-    let delta_rx = submit_request(state.as_ref(), options, req.prompt)?;
+    async move {
+        authorize_v1_request(&headers, state.as_ref())?;
+        let max_tokens = options.max_tokens;
+        let stream = options.stream;
+        let include_usage = options.include_usage;
+        let model_id = state.identity.model_id.clone();
 
-    if stream {
-        let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-        let created = now_secs();
-
-        let sse_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-            stream::iter(delta_sse_events(
-                delta,
-                include_usage,
-                |d| StreamChunk::from_delta(&request_id, created, &model_id, d),
-                |u| StreamUsageChunk::from_usage(&request_id, created, &model_id, u),
-            ))
-        });
-
-        Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
-    } else {
-        let buffered = collect_buffered_response(delta_rx, "request").await?;
+        if req.prompt.trim().is_empty() {
+            warn!("Rejecting empty prompt request");
+            return Err(ApiError::bad_request(
+                "Prompt must not be empty",
+                "empty_prompt",
+            ));
+        }
 
         info!(
-            "Request completed: prompt_tokens={}, completion_tokens={}",
-            buffered.usage.prompt_tokens, buffered.usage.completion_tokens
+            "Received request: prompt_len={}, max_tokens={}, stream={}",
+            req.prompt.len(),
+            max_tokens,
+            stream,
         );
 
-        let response =
-            CompletionResponse::from_output(model_id, now_secs(), buffered.into_output());
-        Ok(Json(response).into_response())
+        let delta_rx = submit_request(state.as_ref(), options, req.prompt)?;
+
+        if stream {
+            let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+            let created = now_secs();
+
+            let sse_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
+                stream::iter(delta_sse_events(
+                    delta,
+                    include_usage,
+                    |d| StreamChunk::from_delta(&request_id, created, &model_id, d),
+                    |u| StreamUsageChunk::from_usage(&request_id, created, &model_id, u),
+                ))
+            });
+
+            Ok(Sse::new(sse_stream.chain(sse_done_stream())).into_response())
+        } else {
+            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
+            let stream_span = Span::root("stream_flush", stream_parent)
+                .with_properties(|| [("route", "/v1/completions".to_string())]);
+            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
+            let buffered = async move { collect_buffered_response(delta_rx, "request").await }
+                .in_span(stream_span)
+                .await?;
+
+            info!(
+                "Request completed: prompt_tokens={}, completion_tokens={}",
+                buffered.usage.prompt_tokens, buffered.usage.completion_tokens
+            );
+
+            async move {
+                let response =
+                    CompletionResponse::from_output(model_id, now_secs(), buffered.into_output());
+                Ok(Json(response).into_response())
+            }
+            .in_span(
+                Span::root("finish", finish_parent)
+                    .with_properties(|| [("route", "/v1/completions".to_string())]),
+            )
+            .await
+        }
     }
+    .in_span(http_span)
+    .await
 }
 
 async fn chat_completions(
@@ -675,75 +747,99 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    authorize_v1_request(&headers, state.as_ref())?;
-    if req.messages.is_empty() {
-        warn!("Rejecting empty messages request");
-        return Err(ApiError::bad_request(
-            "Messages array must not be empty",
-            "empty_messages",
-        ));
-    }
-
     let options = RequestExecutionOptions::from_chat(&req);
-    let max_tokens = options.max_tokens;
-    let do_stream = options.stream;
-    let include_usage = options.include_usage;
-    let model_id = state.identity.model_id.clone();
-
-    // Convert messages → ChatML prompt.
-    let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
-
-    info!(
-        "chat/completions: messages={}, prompt_len={}, max_tokens={}, stream={}",
-        req.messages.len(),
-        prompt.len(),
-        max_tokens,
-        do_stream,
+    let http_span = http_request_span(
+        "/v1/chat/completions",
+        options.stream,
+        options.max_tokens,
+        options.session_id.as_ref(),
+        &headers,
     );
 
-    let delta_rx = submit_request(state.as_ref(), options, prompt)?;
+    async move {
+        authorize_v1_request(&headers, state.as_ref())?;
+        if req.messages.is_empty() {
+            warn!("Rejecting empty messages request");
+            return Err(ApiError::bad_request(
+                "Messages array must not be empty",
+                "empty_messages",
+            ));
+        }
 
-    if do_stream {
-        let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-        let created = now_secs();
+        let max_tokens = options.max_tokens;
+        let do_stream = options.stream;
+        let include_usage = options.include_usage;
+        let model_id = state.identity.model_id.clone();
 
-        // First chunk carries the role field.
-        let role_event = {
-            let chunk = ChatStreamChunk::role_chunk(&request_id, created, &model_id);
-            Ok::<_, Infallible>(
-                Event::default()
-                    .data(serde_json::to_string(&chunk).expect("ChatStreamChunk serialization")),
-            )
-        };
-
-        let req_id = request_id;
-        let mid = model_id.clone();
-        let content_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
-            stream::iter(delta_sse_events(
-                delta,
-                include_usage,
-                |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
-                |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
-            ))
-        });
-
-        let full_stream = stream::once(async move { role_event })
-            .chain(content_stream)
-            .chain(sse_done_stream());
-
-        Ok(Sse::new(full_stream).into_response())
-    } else {
-        let buffered = collect_buffered_response(delta_rx, "chat request").await?;
+        // Convert messages → ChatML prompt.
+        let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
 
         info!(
-            "chat/completions done: prompt_tokens={}, completion_tokens={}",
-            buffered.usage.prompt_tokens, buffered.usage.completion_tokens
+            "chat/completions: messages={}, prompt_len={}, max_tokens={}, stream={}",
+            req.messages.len(),
+            prompt.len(),
+            max_tokens,
+            do_stream,
         );
 
-        let output = buffered.into_output();
-        let response = ChatCompletionResponse::from_output(model_id, now_secs(), &output);
-        Ok(Json(response).into_response())
+        let delta_rx = submit_request(state.as_ref(), options, prompt)?;
+
+        if do_stream {
+            let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+            let created = now_secs();
+
+            let role_event =
+                {
+                    let chunk = ChatStreamChunk::role_chunk(&request_id, created, &model_id);
+                    Ok::<_, Infallible>(Event::default().data(
+                        serde_json::to_string(&chunk).expect("ChatStreamChunk serialization"),
+                    ))
+                };
+
+            let req_id = request_id;
+            let mid = model_id.clone();
+            let content_stream = UnboundedReceiverStream::new(delta_rx).flat_map(move |delta| {
+                stream::iter(delta_sse_events(
+                    delta,
+                    include_usage,
+                    |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
+                    |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
+                ))
+            });
+
+            let full_stream = stream::once(async move { role_event })
+                .chain(content_stream)
+                .chain(sse_done_stream());
+
+            Ok(Sse::new(full_stream).into_response())
+        } else {
+            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
+            let stream_span = Span::root("stream_flush", stream_parent)
+                .with_properties(|| [("route", "/v1/chat/completions".to_string())]);
+            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
+            let buffered = async move { collect_buffered_response(delta_rx, "chat request").await }
+                .in_span(stream_span)
+                .await?;
+
+            info!(
+                "chat/completions done: prompt_tokens={}, completion_tokens={}",
+                buffered.usage.prompt_tokens, buffered.usage.completion_tokens
+            );
+
+            async move {
+                let output = buffered.into_output();
+                let response = ChatCompletionResponse::from_output(model_id, now_secs(), &output);
+                Ok(Json(response).into_response())
+            }
+            .in_span(
+                Span::root("finish", finish_parent)
+                    .with_properties(|| [("route", "/v1/chat/completions".to_string())]),
+            )
+            .await
+        }
     }
+    .in_span(http_span)
+    .await
 }
 
 async fn models_handler(
@@ -770,30 +866,57 @@ async fn responses_handler(
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Result<Response, ApiError> {
-    authorize_v1_request(&headers, state.as_ref())?;
-    let prompt = build_responses_prompt(&req)?;
     let options = RequestExecutionOptions::from_responses(&req);
-    let max_tokens = options.max_tokens;
-    let stream = options.stream;
-    let model_id = state.identity.model_id.clone();
-
-    info!(
-        "responses: prompt_len={}, max_output_tokens={}",
-        prompt.len(),
-        max_tokens,
+    let http_span = http_request_span(
+        "/v1/responses",
+        options.stream,
+        options.max_tokens,
+        options.session_id.as_ref(),
+        &headers,
     );
 
-    let delta_rx = submit_request(state.as_ref(), options, prompt)?;
-    if stream {
-        let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-        let created_at = now_secs();
-        let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
-        Ok(Sse::new(stream.chain(sse_done_stream())).into_response())
-    } else {
-        let buffered = collect_buffered_response(delta_rx, "responses request").await?;
-        let response = ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
-        Ok(Json(response).into_response())
+    async move {
+        authorize_v1_request(&headers, state.as_ref())?;
+        let prompt = build_responses_prompt(&req)?;
+        let max_tokens = options.max_tokens;
+        let stream = options.stream;
+        let model_id = state.identity.model_id.clone();
+
+        info!(
+            "responses: prompt_len={}, max_output_tokens={}",
+            prompt.len(),
+            max_tokens,
+        );
+
+        let delta_rx = submit_request(state.as_ref(), options, prompt)?;
+        if stream {
+            let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+            let created_at = now_secs();
+            let stream = responses_sse_stream(delta_rx, response_id, created_at, model_id);
+            Ok(Sse::new(stream.chain(sse_done_stream())).into_response())
+        } else {
+            let stream_parent = SpanContext::current_local_parent().unwrap_or_default();
+            let stream_span = Span::root("stream_flush", stream_parent)
+                .with_properties(|| [("route", "/v1/responses".to_string())]);
+            let finish_parent = SpanContext::from_span(&stream_span).unwrap_or(stream_parent);
+            let buffered =
+                async move { collect_buffered_response(delta_rx, "responses request").await }
+                    .in_span(stream_span)
+                    .await?;
+            async move {
+                let response =
+                    ResponsesResponse::from_output(model_id, now_secs(), buffered.into_output());
+                Ok(Json(response).into_response())
+            }
+            .in_span(
+                Span::root("finish", finish_parent)
+                    .with_properties(|| [("route", "/v1/responses".to_string())]),
+            )
+            .await
+        }
     }
+    .in_span(http_span)
+    .await
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

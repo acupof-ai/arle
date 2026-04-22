@@ -330,6 +330,7 @@ fn submit_warmup_request(
             priority: RequestPriority::High,
             session_id: None,
             delta_tx,
+            trace_context: None,
         })
         .map_err(|_| anyhow::anyhow!("backend warmup queue rejected the request"))?;
     Ok(delta_rx)

@@ -51,6 +51,15 @@ impl<M: ModelForward> Scheduler<M> {
         let cached_prompt_len = req.reusable_cached_prompt_len;
         let attached_prefix_blocks = req.attached_prefix_blocks.clone();
         let si = slot_idx;
+        let prefix_trace = req.begin_trace_span("prefix").map(|span| {
+            span.with_properties(|| {
+                [
+                    ("request_id", req_id.to_string()),
+                    ("slot_idx", slot_idx.to_string()),
+                    ("prompt_tokens", prompt_len.to_string()),
+                ]
+            })
+        });
 
         if self.model.prefill_uses_paged_pool() && !attached_prefix_blocks.is_empty() {
             let attach_prefix_len = if is_full_prompt_reuse_hit(prompt_len, raw_prefix_len) {
@@ -96,6 +105,7 @@ impl<M: ModelForward> Scheduler<M> {
                     effective_tokens: effective,
                     progress: 0,
                 };
+                req.update_trace_context(prefix_trace.as_ref());
             }
             return;
         }
@@ -288,6 +298,7 @@ impl<M: ModelForward> Scheduler<M> {
                 effective_tokens: effective,
                 progress: 0,
             };
+            req.update_trace_context(prefix_trace.as_ref());
         }
     }
 
@@ -349,7 +360,9 @@ impl<M: ModelForward> Scheduler<M> {
                     .request(slot_idx)
                     .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
                 if reached_max {
-                    self.finish_request(slot_idx, FinishReason::Length);
+                    if !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
+                        self.finish_request(slot_idx, FinishReason::Length);
+                    }
                 } else {
                     if let Some(req) = self.request_mut(slot_idx)
                         && req.first_token_at.is_none()
@@ -411,6 +424,26 @@ impl<M: ModelForward> Scheduler<M> {
         }
 
         let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
+        let batch_size = chunk_tokens.len();
+        let prefill_spans: Vec<(usize, fastrace::Span)> = chunk_tokens
+            .iter()
+            .filter_map(|(slot_idx, tokens)| {
+                self.request(*slot_idx).and_then(|req| {
+                    req.begin_trace_span("prefill").map(|span| {
+                        (
+                            *slot_idx,
+                            span.with_properties(|| {
+                                [
+                                    ("slot_idx", slot_idx.to_string()),
+                                    ("chunk_tokens", tokens.len().to_string()),
+                                    ("batch_size", batch_size.to_string()),
+                                ]
+                            }),
+                        )
+                    })
+                })
+            })
+            .collect();
         let requests: Vec<PrefillBatchRequest<'_>> = chunk_tokens
             .iter()
             .map(|(slot_idx, tokens)| PrefillBatchRequest {
@@ -438,6 +471,12 @@ impl<M: ModelForward> Scheduler<M> {
                 self.finish_slot(*slot_idx);
             }
             return;
+        }
+
+        for (slot_idx, span) in &prefill_spans {
+            if let Some(req) = self.request_mut(*slot_idx) {
+                req.update_trace_context(Some(span));
+            }
         }
 
         for (((slot_idx, _tokens), total), progress) in

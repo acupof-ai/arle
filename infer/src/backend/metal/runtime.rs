@@ -638,8 +638,27 @@ fn run_metal_scheduler_runtime(
         let runtime_states = scheduler_runtime_states(&active);
         let step = scheduler.step(&runtime_states);
         if step.is_idle() {
+            metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             continue;
         }
+
+        let scheduled_decode_rows =
+            step.decode.as_ref().map_or(0, |batch| batch.req_ids.len()) as u64;
+        let scheduled_prefill_rows = u64::from(step.prefill.is_some());
+        let scheduled_prefill_tokens = step
+            .prefill
+            .as_ref()
+            .map_or(0, |prefill| prefill.input_tokens.len() as u64);
+        let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
+        metrics.set_scheduler_step(
+            scheduled_rows,
+            scheduled_decode_rows,
+            scheduled_prefill_rows,
+            scheduled_decode_rows,
+            scheduled_prefill_tokens,
+            scheduled_rows,
+        );
+        let step_started_at = Instant::now();
 
         guard_schedule_step(
             step,
@@ -653,6 +672,7 @@ fn run_metal_scheduler_runtime(
             &mut active,
             &mut qwen35_decode_batch_cache,
         );
+        metrics.observe_scheduler_step(step_started_at.elapsed().as_secs_f64());
 
         maybe_refresh_runtime_metrics(
             metrics,
@@ -1905,6 +1925,17 @@ fn refresh_runtime_metrics(
 ) {
     metrics.set_active(active.len() as u64);
     metrics.set_waiting(handle.waiting_count() as u64);
+    let running_batch = active
+        .values()
+        .filter(|request| request.phase() == RuntimePhase::Decode)
+        .count() as u64;
+    let prefill_queue = active
+        .values()
+        .filter(|request| request.phase() == RuntimePhase::Prefill)
+        .count() as u64;
+    metrics.set_scheduler_occupancy(running_batch, prefill_queue);
+    metrics.set_kv_coordinator(0, 0, 0, 0, false, false);
+    metrics.set_tier_wait_seconds(0.0, 0.0);
 
     let (kv_used, kv_total) = active.values().fold((0u64, 0u64), |acc, request| {
         if let Some((used, total)) = request.request_state.kv_pool_usage() {

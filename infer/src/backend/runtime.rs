@@ -511,6 +511,7 @@ mod tests {
                 priority: crate::scheduler::RequestPriority::default(),
                 session_id: None,
                 delta_tx,
+                trace_context: None,
             },
             delta_rx,
         )

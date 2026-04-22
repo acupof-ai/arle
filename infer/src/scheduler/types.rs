@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use fastrace::collector::SpanContext;
 use tokio::sync::mpsc;
 
 use crate::kv_tier::ClusterSharedBackendConfig;
@@ -306,6 +307,8 @@ pub struct IncomingRequest {
     pub session_id: Option<SessionId>,
     /// Channel to send streaming deltas back to the HTTP handler.
     pub delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
+    /// Parent tracing context captured from the request ingress path.
+    pub trace_context: Option<SpanContext>,
 }
 
 /// Error returned when the scheduler's waiting queue is full.

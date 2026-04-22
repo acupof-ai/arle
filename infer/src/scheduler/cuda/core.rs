@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use fastrace::Span;
+use fastrace::collector::SpanContext;
+
 use super::{
     ActiveRequest, Arc, AtomicUsize, GenerationState, IncomingRequest, ModelForward, PagedKVPool,
     Phase, Result, SchedulerConfig, SchedulerHandle, SeedableRng, StdRng, Tokenizer, VecDeque,
@@ -51,6 +54,7 @@ pub(super) struct PendingDecode {
     pub slot_indices: Vec<usize>,
     /// True only when `sample_batch_greedy_launch` actually fired the argmax kernel.
     pub greedy_launched: bool,
+    pub decode_spans: Vec<(usize, Span)>,
 }
 
 enum EmitCommand {
@@ -62,14 +66,15 @@ enum EmitCommand {
         delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
         stops: Option<Vec<String>>,
         gated: bool,
+        trace_context: Option<SpanContext>,
     },
     Finish {
         request_id: u64,
         prompt_tokens: usize,
-        generated_tokens: Vec<u32>,
+        completion_tokens: usize,
         reason: FinishReason,
         delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
-        stops: Option<Vec<String>>,
+        trace_context: Option<SpanContext>,
     },
     Abort {
         request_id: u64,
@@ -87,6 +92,7 @@ struct EmitWorkerRequest {
     delta_tx: mpsc::UnboundedSender<CompletionStreamDelta>,
     stream: StreamDecodeState,
     stops: Option<Vec<String>>,
+    stream_flush_span: Option<Span>,
 }
 
 fn spawn_emit_worker(
@@ -112,6 +118,7 @@ fn spawn_emit_worker(
                         delta_tx,
                         stops,
                         gated,
+                        trace_context,
                     } => {
                         let state = active
                             .entry(request_id)
@@ -122,6 +129,14 @@ fn spawn_emit_worker(
                                 delta_tx,
                                 stream: StreamDecodeState::default(),
                                 stops,
+                                stream_flush_span: trace_context.map(|parent| {
+                                    Span::root("stream_flush", parent).with_properties(|| {
+                                        [
+                                            ("request_id", request_id.to_string()),
+                                            ("prompt_tokens", prompt_tokens.to_string()),
+                                        ]
+                                    })
+                                }),
                             });
                         state.generated_tokens.extend(tokens);
                         state.latest_logprob = latest_logprob;
@@ -138,6 +153,18 @@ fn spawn_emit_worker(
                                 outcome,
                                 crate::scheduler::cuda::request::EmitOutcome::Finished
                             );
+                            if finished {
+                                let finish_parent = state
+                                    .stream_flush_span
+                                    .as_ref()
+                                    .and_then(SpanContext::from_span)
+                                    .or(trace_context);
+                                let _finish_span = finish_parent.map(|parent| {
+                                    Span::root("finish", parent).with_properties(|| {
+                                        [("request_id", request_id.to_string())]
+                                    })
+                                });
+                            }
                             let _ = event_tx.send(EmitEvent::GateReady {
                                 request_id,
                                 finished,
@@ -150,12 +177,21 @@ fn spawn_emit_worker(
                     EmitCommand::Finish {
                         request_id,
                         prompt_tokens,
-                        generated_tokens,
+                        completion_tokens,
                         reason,
                         delta_tx,
-                        stops,
+                        trace_context,
                     } => {
                         if let Some(mut state) = active.remove(&request_id) {
+                            let finish_parent = state
+                                .stream_flush_span
+                                .as_ref()
+                                .and_then(SpanContext::from_span)
+                                .or(trace_context);
+                            let _finish_span = finish_parent.map(|parent| {
+                                Span::root("finish", parent)
+                                    .with_properties(|| [("request_id", request_id.to_string())])
+                            });
                             state.stream.finish(
                                 &state.generated_tokens,
                                 &tokenizer,
@@ -165,14 +201,15 @@ fn spawn_emit_worker(
                                 state.stops.as_deref(),
                             );
                         } else {
-                            let mut stream = StreamDecodeState::default();
-                            stream.finish(
-                                &generated_tokens,
-                                &tokenizer,
+                            let _finish_span = trace_context.map(|parent| {
+                                Span::root("finish", parent)
+                                    .with_properties(|| [("request_id", request_id.to_string())])
+                            });
+                            StreamDecodeState::default().send_finish(
                                 &delta_tx,
                                 prompt_tokens,
+                                completion_tokens,
                                 reason,
-                                stops.as_deref(),
                             );
                         }
                     }
@@ -885,25 +922,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn dispatch_emit(&mut self, slot_idx: usize) {
-        let Some((request_id, prompt_tokens, tokens, latest_logprob, delta_tx, stops, gated)) =
-            self.request(slot_idx).map(|req| {
-                (
-                    req.id,
-                    req.prompt_tokens.len(),
-                    req.pending_emit_tokens(),
-                    req.latest_logprob,
-                    req.delta_tx.clone(),
-                    req.stop.clone(),
-                    req.has_stop_sequences(),
-                )
-            })
-        else {
-            return;
-        };
-        if tokens.is_empty() {
-            return;
-        }
-        let _ = self.emit_tx.send(EmitCommand::Append {
+        let Some((
             request_id,
             prompt_tokens,
             tokens,
@@ -911,7 +930,37 @@ impl<M: ModelForward> Scheduler<M> {
             delta_tx,
             stops,
             gated,
-        });
+            trace_context,
+        )) = self.request(slot_idx).map(|req| {
+            (
+                req.id,
+                req.prompt_tokens.len(),
+                req.pending_emit_tokens(),
+                req.latest_logprob,
+                req.delta_tx.clone(),
+                req.stops_for_emit_dispatch(),
+                req.has_stop_sequences(),
+                req.trace_context,
+            )
+        })
+        else {
+            return;
+        };
+        if tokens.is_empty() {
+            return;
+        }
+        self.emit_tx
+            .send(EmitCommand::Append {
+                request_id,
+                prompt_tokens,
+                tokens,
+                latest_logprob,
+                delta_tx,
+                stops,
+                gated,
+                trace_context,
+            })
+            .expect("emit worker channel disconnected during append dispatch");
         if let Some(req) = self.request_mut(slot_idx) {
             req.mark_emit_dispatched();
         }
@@ -921,32 +970,50 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn queue_emit_finish(&mut self, slot_idx: usize, reason: FinishReason) {
-        let Some((request_id, prompt_tokens, generated_tokens, delta_tx, stops)) =
+        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, stops, trace_context)) =
             self.request(slot_idx).map(|req| {
                 (
                     req.id,
                     req.prompt_tokens.len(),
-                    req.generated_tokens.clone(),
+                    req.generated_tokens.len(),
                     req.delta_tx.clone(),
-                    req.stop.clone(),
+                    req.trace_context,
                 )
             })
         else {
             return;
         };
-        let _ = self.emit_tx.send(EmitCommand::Finish {
-            request_id,
-            prompt_tokens,
-            generated_tokens,
-            reason,
-            delta_tx,
-            stops,
-        });
+        self.emit_tx
+            .send(EmitCommand::Finish {
+                request_id,
+                prompt_tokens,
+                completion_tokens,
+                reason,
+                delta_tx,
+                trace_context,
+            })
+            .expect("emit worker channel disconnected during finish dispatch");
+    }
+
+    pub(super) fn defer_finish_until_emit_gate(
+        &mut self,
+        slot_idx: usize,
+        reason: FinishReason,
+    ) -> bool {
+        let Some(req) = self.request_mut(slot_idx) else {
+            return false;
+        };
+        if !req.has_stop_sequences() {
+            return false;
+        }
+        req.pending_finish_reason = Some(reason);
+        true
     }
 
     pub(super) fn finish_slot(&mut self, slot_idx: usize) {
         let request_id = self.request(slot_idx).map(|req| req.id);
         if let Some(req) = self.request_mut(slot_idx) {
+            req.pending_finish_reason = None;
             req.phase = Phase::Finished;
         }
         if let Some(request_id) = request_id {
