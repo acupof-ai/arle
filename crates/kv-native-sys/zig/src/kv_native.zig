@@ -27,6 +27,8 @@ const wal_magic = "KVWAL001";
 const shm_magic = "KVSHM001";
 const mmap_path_cap = 512;
 const shm_name_cap = 128;
+const shm_create_retry_limit = 64;
+const shm_create_retry_sleep_us: c_uint = 1_000;
 const map_anon_flag: c_int = if (@hasDecl(c, "MAP_ANON")) c.MAP_ANON else c.MAP_ANONYMOUS;
 
 pub const KvMmapDescriptor = extern struct {
@@ -451,13 +453,32 @@ fn validateShmHeader(desc: *const KvSharedMemoryDescriptor, header: *const ShmHe
     return .ok;
 }
 
+fn shmOpenCreateExclusiveRetrying(name_z: [:0]const u8) c_int {
+    var retry_count: usize = 0;
+    while (true) {
+        const fd = c.shm_open(name_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+        if (fd >= 0) return fd;
+
+        const err: std.posix.E = @enumFromInt(std.c._errno().*);
+        switch (err) {
+            .INTR => continue,
+            .EXIST => {
+                if (retry_count >= shm_create_retry_limit) return fd;
+                retry_count += 1;
+                _ = c.usleep(shm_create_retry_sleep_us);
+            },
+            else => return fd,
+        }
+    }
+}
+
 fn shmCreateInternal(name: []const u8, len: usize, out: *KvSharedMemoryDescriptor) KvStatus {
     if (name.len == 0 or name[0] != '/' or !ensurePathFits(name, shm_name_cap)) return .invalid_input;
     const total_len = shmTotalLen(len) orelse return .invalid_input;
     const name_z = dupZ(name) orelse return .oom;
     defer std.heap.c_allocator.free(name_z);
 
-    const fd = c.shm_open(name_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+    const fd = shmOpenCreateExclusiveRetrying(name_z);
     if (fd < 0) return .io;
     defer closeFd(fd);
     errdefer _ = c.shm_unlink(name_z.ptr);
