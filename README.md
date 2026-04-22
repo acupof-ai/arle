@@ -225,17 +225,30 @@ OpenAI-compatible. Current HTTP surface:
 - `POST /v1/chat/completions`
 - `GET /v1/models`
 - `POST /v1/responses` for the current non-streaming subset
+- `POST /v1/sessions/{session_id}/save`
+- `POST /v1/sessions/{session_id}/load`
+- `GET /v1/sessions/{session_id}/manifest`
+- `DELETE /v1/sessions/{session_id}`
 
 Streaming today remains on `/v1/chat/completions`; `/v1/responses` returns a
 clear `400` when `stream=true`.
 
+HTTP boundary guarantees:
+
+- JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
+- Request body limit for JSON routes is an explicit `16 MiB`.
+- Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
+- `405 Method Not Allowed` responses keep structured JSON bodies and now also include the standard `Allow` header on both top-level and session routes.
+
 ```bash
 # Streaming
 curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Explain KV caching"}],"stream":true}'
 
 # Completions
 curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
   -d '{"prompt":"The quick brown fox","max_tokens":64,"temperature":0.7}'
 
 # Model discovery
