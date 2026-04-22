@@ -1064,6 +1064,12 @@ impl ResponsesRequest {
                 validate_supported_messages(messages, "input")?;
             }
         }
+        if self.stream_or_default() && !self.tools.is_empty() {
+            return Err(invalid_parameter(
+                "stream",
+                "stream=true is not supported when tools are present; use non-streaming responses for tool calls",
+            ));
+        }
         Ok(())
     }
 
@@ -1549,6 +1555,25 @@ mod tests {
             .expect_err("tool messages without tool_call_id should fail");
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("input[0].tool_call_id"));
+    }
+
+    #[test]
+    fn responses_request_rejects_streaming_tools() {
+        let req: ResponsesRequest = serde_json::from_str(
+            r#"{
+                "input":"hello",
+                "stream":true,
+                "tools":[{"type":"function","function":{"name":"shell"}}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("streaming responses tools should fail until function-call deltas exist");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert_eq!(err.body.param.as_deref(), Some("stream"));
+        assert!(err.body.message.contains("stream=true"));
+        assert!(err.body.message.contains("tool calls"));
     }
 
     #[test]
