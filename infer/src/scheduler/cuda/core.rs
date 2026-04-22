@@ -68,6 +68,12 @@ pub(super) struct PendingDecode {
     pub mixed_prefill: Vec<MixedPrefillPending>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(super) struct StoreDedupKey {
+    pub fingerprint: BlockFingerprint,
+    pub target: crate::kv_tier::StoreTarget,
+}
+
 /// CUDA-backed scheduler state and initialization.
 pub struct Scheduler<M: ModelForward> {
     pub(super) config: SchedulerConfig,
@@ -130,7 +136,9 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) coordinator_events: crossbeam_channel::Receiver<crate::kv_tier::CoordinatorEvent>,
     pub(super) coordinator_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     pub(super) store_waiting:
-        HashMap<crate::kv_tier::StoreTicket, (BlockId, crate::kv_tier::HostPinnedRegion)>,
+        HashMap<crate::kv_tier::StoreTicket, Vec<(BlockId, crate::kv_tier::HostPinnedRegion)>>,
+    pub(super) store_dedupe: HashMap<StoreDedupKey, crate::kv_tier::StoreTicket>,
+    pub(super) store_ticket_keys: HashMap<crate::kv_tier::StoreTicket, StoreDedupKey>,
     pub(super) fetch_waiting: HashMap<crate::kv_tier::FetchTicket, Vec<(usize, u64)>>,
     pub(super) fetch_dedupe: HashMap<ReadmissionKey, crate::kv_tier::FetchTicket>,
     pub(super) fetch_ticket_keys: HashMap<crate::kv_tier::FetchTicket, ReadmissionKey>,
@@ -616,6 +624,8 @@ impl<M: ModelForward> Scheduler<M> {
             coordinator_events,
             coordinator_thread,
             store_waiting: HashMap::new(),
+            store_dedupe: HashMap::new(),
+            store_ticket_keys: HashMap::new(),
             fetch_waiting: HashMap::new(),
             fetch_dedupe: HashMap::new(),
             fetch_ticket_keys: HashMap::new(),
@@ -1193,7 +1203,7 @@ impl<M: ModelForward> Scheduler<M> {
             if self
                 .store_waiting
                 .values()
-                .any(|(pending, _)| *pending == block_id)
+                .any(|pending| pending.iter().any(|(waiting_block, _)| *waiting_block == block_id))
             {
                 continue;
             }
@@ -1211,6 +1221,22 @@ impl<M: ModelForward> Scheduler<M> {
                 self.coordinator_handle.stats(),
                 self.cluster_shared_backend.is_some(),
             );
+            let store_key = StoreDedupKey {
+                fingerprint,
+                target,
+            };
+            if let Some(ticket) = self.store_dedupe.get(&store_key).copied() {
+                let _ = self.prefix_cache.mark_block_store_pending(block_id);
+                self.store_waiting
+                    .entry(ticket)
+                    .or_default()
+                    .push((block_id, region));
+                spilled_bytes = spilled_bytes.saturating_add(metadata.byte_len as usize);
+                if spilled_bytes >= bytes_to_spill {
+                    break;
+                }
+                continue;
+            }
             let Some(ticket) =
                 self.coordinator_handle
                     .submit_store(vec![crate::kv_tier::StoreRequest {
@@ -1225,7 +1251,9 @@ impl<M: ModelForward> Scheduler<M> {
                 break;
             };
             let _ = self.prefix_cache.mark_block_store_pending(block_id);
-            self.store_waiting.insert(ticket, (block_id, region));
+            self.store_waiting.insert(ticket, vec![(block_id, region)]);
+            self.store_dedupe.insert(store_key, ticket);
+            self.store_ticket_keys.insert(ticket, store_key);
             spilled_bytes = spilled_bytes.saturating_add(metadata.byte_len as usize);
             if spilled_bytes >= bytes_to_spill {
                 break;

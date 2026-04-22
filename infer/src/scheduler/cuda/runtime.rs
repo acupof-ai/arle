@@ -446,8 +446,10 @@ impl<M: ModelForward> Scheduler<M> {
                 Ok(crate::kv_tier::CoordinatorEvent::CommandQueued(_))
                 | Ok(crate::kv_tier::CoordinatorEvent::FetchQueued { .. }) => {}
                 Ok(crate::kv_tier::CoordinatorEvent::StoreQueued { ticket, .. }) => {
-                    if let Some((block_id, _)) = self.store_waiting.get(&ticket).copied() {
-                        let _ = self.prefix_cache.mark_block_storing(block_id);
+                    if let Some(waiters) = self.store_waiting.get(&ticket) {
+                        for (block_id, _) in waiters {
+                            let _ = self.prefix_cache.mark_block_storing(*block_id);
+                        }
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -456,14 +458,19 @@ impl<M: ModelForward> Scheduler<M> {
                     break;
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::StoreCompleted { ticket, locations }) => {
-                    if let Some((block_id, region)) = self.store_waiting.remove(&ticket) {
-                        for (completed_block, location) in locations {
-                            if completed_block != block_id {
-                                continue;
+                    if let Some(key) = self.store_ticket_keys.remove(&ticket) {
+                        self.store_dedupe.remove(&key);
+                    }
+                    if let Some(waiters) = self.store_waiting.remove(&ticket) {
+                        let canonical_location = locations.first().map(|(_, location)| location.clone());
+                        for (block_id, region) in waiters {
+                            if let Some(location) = canonical_location.clone() {
+                                let _ = self
+                                    .prefix_cache
+                                    .mark_block_stored(block_id, Some(location));
+                            } else {
+                                let _ = self.prefix_cache.mark_block_store_failed(block_id);
                             }
-                            let _ = self
-                                .prefix_cache
-                                .mark_block_stored(block_id, Some(location));
                             self.release_host_region(region);
                         }
                     }
@@ -477,8 +484,17 @@ impl<M: ModelForward> Scheduler<M> {
                         "Store failed for ticket {} on block {:?}: {}",
                         ticket.0, failed_block, reason
                     );
-                    self.store_waiting.remove(&ticket);
-                    let _ = self.prefix_cache.mark_block_store_failed(failed_block);
+                    if let Some(key) = self.store_ticket_keys.remove(&ticket) {
+                        self.store_dedupe.remove(&key);
+                    }
+                    if let Some(waiters) = self.store_waiting.remove(&ticket) {
+                        for (block_id, region) in waiters {
+                            let _ = self.prefix_cache.mark_block_store_failed(block_id);
+                            self.release_host_region(region);
+                        }
+                    } else {
+                        let _ = self.prefix_cache.mark_block_store_failed(failed_block);
+                    }
                 }
                 Ok(crate::kv_tier::CoordinatorEvent::FetchCompleted { ticket, blocks }) => {
                     let Some(waiters) = self.fetch_waiting.remove(&ticket) else {
