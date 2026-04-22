@@ -18,6 +18,8 @@ pub struct ApiErrorBody {
     #[serde(rename = "type")]
     pub error_type: &'static str,
     pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
 }
 
 /// HTTP error response with status code and OpenAI-compatible JSON body.
@@ -41,6 +43,7 @@ impl ApiError {
                 message: message.into(),
                 error_type,
                 code,
+                param: None,
             },
             headers: Vec::new(),
         }
@@ -114,6 +117,12 @@ impl ApiError {
     #[must_use]
     pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.push((name, value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_param(mut self, param: impl Into<String>) -> Self {
+        self.body.param = Some(param.into());
         self
     }
 

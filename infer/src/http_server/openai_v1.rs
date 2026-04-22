@@ -26,6 +26,7 @@ fn invalid_parameter(field: impl AsRef<str>, detail: impl Into<String>) -> ApiEr
         format!("Invalid `{field}`: {}", detail.into()),
         "invalid_parameter",
     )
+    .with_param(field)
 }
 
 fn canonical_model_id(model: &str) -> &str {
@@ -1366,6 +1367,7 @@ mod tests {
         let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"   "}"#).unwrap();
         let err = req.validate().expect_err("empty prompt should fail");
         assert_eq!(err.body.code, "invalid_parameter");
+        assert_eq!(err.body.param.as_deref(), Some("prompt"));
         assert!(err.body.message.contains("prompt"));
     }
 
@@ -1503,6 +1505,7 @@ mod tests {
             .validate()
             .expect_err("streaming chat tools should fail until delta.tool_calls exist");
         assert_eq!(err.body.code, "invalid_parameter");
+        assert_eq!(err.body.param.as_deref(), Some("stream"));
         assert!(err.body.message.contains("stream=true"));
         assert!(err.body.message.contains("tool calls"));
     }
