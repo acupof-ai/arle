@@ -6,12 +6,13 @@
 //! arena once with `cuMemHostRegister_v2` so scheduler/coordinator call sites do
 //! not need to change.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Result, anyhow};
 
 /// Reservation handed back by [`HostPinnedPool::reserve`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostPinnedRegion {
     pub offset: u64,
     pub len: usize,
@@ -49,7 +50,11 @@ impl SharedHostPinnedPool {
 
     pub fn read_region(&self, region: HostPinnedRegion) -> Result<Vec<u8>> {
         let pool = self.lock()?;
-        Ok(pool.as_slice(region).to_vec())
+        let offset = pool.validate_live_region(region)?;
+        Ok(
+            unsafe { std::slice::from_raw_parts(pool.arena.base_ptr.add(offset), region.len) }
+                .to_vec(),
+        )
     }
 
     pub fn write_region(&self, region: HostPinnedRegion, bytes: &[u8]) -> Result<()> {
@@ -60,9 +65,16 @@ impl SharedHostPinnedPool {
                 bytes.len()
             ));
         }
-        let mut pool = self.lock()?;
-        pool.as_mut_slice(region).copy_from_slice(bytes);
+        let pool = self.lock()?;
+        let offset = pool.validate_live_region(region)?;
+        unsafe { std::slice::from_raw_parts_mut(pool.arena.base_ptr.add(offset), region.len) }
+            .copy_from_slice(bytes);
         Ok(())
+    }
+
+    pub fn release_region(&self, region: HostPinnedRegion) -> Result<()> {
+        let mut pool = self.lock()?;
+        pool.release(region)
     }
 }
 
@@ -91,6 +103,7 @@ struct NativeArena {
 pub struct HostPinnedPool {
     capacity_bytes: usize,
     arena: NativeArena,
+    live_regions: HashSet<HostPinnedRegion>,
 }
 
 unsafe impl Send for HostPinnedPool {}
@@ -131,6 +144,7 @@ impl HostPinnedPool {
                 #[cfg(feature = "cuda")]
                 cuda_registered,
             },
+            live_regions: HashSet::new(),
         })
     }
 
@@ -150,17 +164,22 @@ impl HostPinnedPool {
     pub fn reserve(&mut self, len: usize) -> Option<HostPinnedRegion> {
         let region = unsafe { kv_native_sys::host_arena_reserve(self.arena.handle, len) }
             .expect("HostPinnedPool reserve native query must succeed")?;
-        Some(HostPinnedRegion {
+        let region = HostPinnedRegion {
             offset: region.offset,
             len: region.len,
-        })
+        };
+        assert!(
+            self.live_regions.insert(region),
+            "HostPinnedPool reserve returned a duplicate live region: offset={} len={}",
+            region.offset,
+            region.len
+        );
+        Some(region)
     }
 
-    pub fn release(&mut self, region: HostPinnedRegion) {
-        if (region.offset as usize).saturating_add(region.len) > self.capacity_bytes {
-            return;
-        }
-        let _ = unsafe {
+    pub fn release(&mut self, region: HostPinnedRegion) -> Result<()> {
+        self.validate_live_region(region)?;
+        unsafe {
             kv_native_sys::host_arena_release(
                 self.arena.handle,
                 kv_native_sys::KvHostArenaRegion {
@@ -168,42 +187,72 @@ impl HostPinnedPool {
                     len: region.len,
                 },
             )
-        };
+        }
+        .map_err(|err| {
+            anyhow!(
+                "HostPinnedPool release native call failed for offset={} len={}: {err}",
+                region.offset,
+                region.len
+            )
+        })?;
+        let removed = self.live_regions.remove(&region);
+        debug_assert!(removed, "validated live region disappeared before removal");
+        Ok(())
     }
 
-    pub fn reset(&mut self) {
-        let _ = unsafe { kv_native_sys::host_arena_reset(self.arena.handle) };
+    pub fn reset(&mut self) -> Result<()> {
+        unsafe { kv_native_sys::host_arena_reset(self.arena.handle) }
+            .map_err(|err| anyhow!("HostPinnedPool reset native call failed: {err}"))?;
+        self.live_regions.clear();
+        Ok(())
     }
 
     pub fn as_slice(&self, region: HostPinnedRegion) -> &[u8] {
-        let offset = region.offset as usize;
-        assert!(
-            offset + region.len <= self.capacity_bytes,
-            "HostPinnedRegion out of bounds: offset={offset} len={} cap={}",
-            region.len,
-            self.capacity_bytes
-        );
+        let offset = self
+            .validate_live_region(region)
+            .expect("HostPinnedPool as_slice requires a live region");
         unsafe { std::slice::from_raw_parts(self.arena.base_ptr.add(offset), region.len) }
     }
 
     pub fn as_mut_slice(&mut self, region: HostPinnedRegion) -> &mut [u8] {
-        let offset = region.offset as usize;
-        assert!(
-            offset + region.len <= self.capacity_bytes,
-            "HostPinnedRegion out of bounds: offset={offset} len={} cap={}",
-            region.len,
-            self.capacity_bytes
-        );
+        let offset = self
+            .validate_live_region(region)
+            .expect("HostPinnedPool as_mut_slice requires a live region");
         unsafe { std::slice::from_raw_parts_mut(self.arena.base_ptr.add(offset), region.len) }
     }
 
     pub fn host_ptr(&self, region: HostPinnedRegion) -> u64 {
-        let offset = region.offset as usize;
-        assert!(
-            offset + region.len <= self.capacity_bytes,
-            "HostPinnedRegion out of bounds"
-        );
+        let offset = self
+            .validate_live_region(region)
+            .expect("HostPinnedPool host_ptr requires a live region");
         (self.arena.base_ptr as usize + offset) as u64
+    }
+
+    fn validate_live_region(&self, region: HostPinnedRegion) -> Result<usize> {
+        let offset = region.offset as usize;
+        let region_end = offset.checked_add(region.len).ok_or_else(|| {
+            anyhow!(
+                "HostPinnedRegion overflow: offset={} len={}",
+                region.offset,
+                region.len
+            )
+        })?;
+        if region_end > self.capacity_bytes {
+            return Err(anyhow!(
+                "HostPinnedRegion out of bounds: offset={} len={} cap={}",
+                region.offset,
+                region.len,
+                self.capacity_bytes
+            ));
+        }
+        if !self.live_regions.contains(&region) {
+            return Err(anyhow!(
+                "HostPinnedRegion is not live in this pool: offset={} len={}",
+                region.offset,
+                region.len
+            ));
+        }
+        Ok(offset)
     }
 }
 
@@ -245,7 +294,7 @@ mod tests {
         let mut pool = HostPinnedPool::new(1024).unwrap();
         let a = pool.reserve(128).unwrap();
         let _b = pool.reserve(128).unwrap();
-        pool.release(a);
+        pool.release(a).unwrap();
         let c = pool.reserve(128).unwrap();
         assert_eq!(c.offset, 0);
         assert_eq!(pool.reserved_bytes(), 256);
@@ -255,7 +304,7 @@ mod tests {
     fn release_splits_larger_free_hole_on_reuse() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
         let a = pool.reserve(256).unwrap();
-        pool.release(a);
+        pool.release(a).unwrap();
         let b = pool.reserve(64).unwrap();
         assert_eq!(b.offset, 0);
         assert_eq!(b.len, 64);
@@ -275,9 +324,9 @@ mod tests {
     fn reset_rewinds_allocator_and_clears_free_list() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
         let a = pool.reserve(128).unwrap();
-        pool.release(a);
+        pool.release(a).unwrap();
         pool.reserve(64).unwrap();
-        pool.reset();
+        pool.reset().unwrap();
         let region = pool.reserve(128).unwrap();
         assert_eq!(region.offset, 0);
         assert_eq!(pool.reserved_bytes(), 128);
@@ -299,5 +348,39 @@ mod tests {
         let _b = pool.reserve(128).unwrap();
         let ptr_after = pool.host_ptr(a);
         assert_eq!(ptr_before, ptr_after);
+    }
+
+    #[test]
+    fn release_rejects_double_free() {
+        let mut pool = HostPinnedPool::new(256).unwrap();
+        let region = pool.reserve(64).unwrap();
+        pool.release(region).unwrap();
+
+        let err = pool.release(region).unwrap_err();
+        assert!(err.to_string().contains("not live"));
+    }
+
+    #[test]
+    fn reset_invalidates_old_regions() {
+        let mut pool = HostPinnedPool::new(256).unwrap();
+        let region = pool.reserve(64).unwrap();
+        pool.reset().unwrap();
+
+        let err = pool.release(region).unwrap_err();
+        assert!(err.to_string().contains("not live"));
+    }
+
+    #[test]
+    fn shared_pool_read_rejects_released_region() {
+        let shared = SharedHostPinnedPool::new(HostPinnedPool::new(256).unwrap());
+        let region = {
+            let mut pool = shared.lock().unwrap();
+            let region = pool.reserve(64).unwrap();
+            pool.release(region).unwrap();
+            region
+        };
+
+        let err = shared.read_region(region).unwrap_err();
+        assert!(err.to_string().contains("not live"));
     }
 }
