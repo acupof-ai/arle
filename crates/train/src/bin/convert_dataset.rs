@@ -14,11 +14,18 @@ use std::{path::PathBuf, process::ExitCode};
 use train::data_adapter::{InputFormat, convert_file};
 
 fn main() -> ExitCode {
+    dispatch_from_args(std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+pub(crate) fn dispatch_from_args<I>(args: I) -> ExitCode
+where
+    I: IntoIterator<Item = String>,
+{
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut format: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--input" => input = args.next().map(PathBuf::from),

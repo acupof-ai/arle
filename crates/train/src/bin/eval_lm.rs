@@ -127,6 +127,18 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), CliError> {
     let args = parse_args()?;
+    run_with_args(args)
+}
+
+pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let parsed = parse_args_from(args.into_iter()).map_err(|err| err.to_string())?;
+    run_with_args(parsed).map_err(|err| err.to_string())
+}
+
+fn run_with_args(args: CliArgs) -> Result<(), CliError> {
     validate_args(&args)?;
 
     let config_path = args.model_path.join("config.json");
@@ -225,8 +237,14 @@ fn run_with_family<F: EvalFamily>(args: &CliArgs, config_path: &Path) -> Result<
 }
 
 fn parse_args() -> Result<CliArgs, CliError> {
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from<I>(mut iter: I) -> Result<CliArgs, CliError>
+where
+    I: Iterator<Item = String>,
+{
     let mut args = CliArgs::default();
-    let mut iter = env::args().skip(1);
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--model-family" => {

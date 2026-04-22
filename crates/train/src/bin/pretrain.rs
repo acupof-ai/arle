@@ -482,18 +482,28 @@ fn main() -> Result<(), CliError> {
 
 fn run() -> Result<(), CliError> {
     let mut args = parse_args()?;
-    validate_args(&args)?;
+    run_with_args(&mut args)
+}
+
+pub(crate) fn dispatch_from_args<I>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut parsed = parse_args_from(args.into_iter()).map_err(|err| err.to_string())?;
+    run_with_args(&mut parsed).map_err(|err| err.to_string())
+}
+
+fn run_with_args(args: &mut CliArgs) -> Result<(), CliError> {
+    validate_args(args)?;
     let tokenizer = ChatTokenizer::from_file(&args.tokenizer)?;
-    let special_tokens = resolve_special_token_ids(&args, &tokenizer)?;
+    let special_tokens = resolve_special_token_ids(args, &tokenizer)?;
     args.bos_token_id = Some(special_tokens.bos.id);
     args.eos_token_id = Some(special_tokens.eos.id);
     let vocab_size = args.vocab_size.unwrap_or_else(|| tokenizer.vocab_size());
 
     match resolve_pretrain_family(args.model_family) {
-        PretrainModelFamily::Qwen3 => run_with_family::<Qwen3Family>(&args, tokenizer, vocab_size),
-        PretrainModelFamily::Qwen35 => {
-            run_with_family::<Qwen35Family>(&args, tokenizer, vocab_size)
-        }
+        PretrainModelFamily::Qwen3 => run_with_family::<Qwen3Family>(args, tokenizer, vocab_size),
+        PretrainModelFamily::Qwen35 => run_with_family::<Qwen35Family>(args, tokenizer, vocab_size),
     }
 }
 
