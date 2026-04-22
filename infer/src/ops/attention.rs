@@ -12,7 +12,7 @@
 //! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV
 //! attention + online softmax + merge in one kernel launch.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
@@ -428,35 +428,7 @@ impl<'a> PagedPrefillForward<'a> {
         num_kv_heads: usize,
         page_size: usize,
     ) -> Result<Self> {
-        Self::new_inner(
-            ctx,
-            plan,
-            sequences,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-            128,
-        )
-    }
-
-    /// Plan and upload indptrs ONCE for the whole forward. HD256 flavour.
-    pub(crate) fn new_hd256(
-        ctx: &DeviceContext,
-        plan: &'a mut BatchPrefillPagedPlan,
-        sequences: &[PagedPrefillSequence],
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        page_size: usize,
-    ) -> Result<Self> {
-        Self::new_inner(
-            ctx,
-            plan,
-            sequences,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-            256,
-        )
+        Self::new_inner(ctx, plan, sequences, num_q_heads, num_kv_heads, page_size)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -467,7 +439,6 @@ impl<'a> PagedPrefillForward<'a> {
         num_q_heads: usize,
         num_kv_heads: usize,
         page_size: usize,
-        head_dim: usize,
     ) -> Result<Self> {
         ensure!(
             !sequences.is_empty(),
@@ -516,27 +487,15 @@ impl<'a> PagedPrefillForward<'a> {
         // Single plan call for the whole forward. All layers share the same
         // (batch_size, qo_len, kv_len, page_size, num_heads) shape, so one
         // plan covers them all.
-        if head_dim == 128 {
-            plan.plan_hd128(
-                ctx,
-                &qo_indptr,
-                &kv_indptr,
-                sequences.len(),
-                num_q_heads,
-                num_kv_heads,
-                page_size,
-            )?;
-        } else {
-            plan.plan_hd256(
-                ctx,
-                &qo_indptr,
-                &kv_indptr,
-                sequences.len(),
-                num_q_heads,
-                num_kv_heads,
-                page_size,
-            )?;
-        }
+        plan.plan_hd128(
+            ctx,
+            &qo_indptr,
+            &kv_indptr,
+            sequences.len(),
+            num_q_heads,
+            num_kv_heads,
+            page_size,
+        )?;
 
         let qo_indptr_dev: CudaSlice<i32> = ctx
             .stream
@@ -686,156 +645,6 @@ pub(crate) fn prefill_attention_paged_batch(
         num_kv_heads,
         page_size,
     )?;
-
-    Ok(())
-}
-
-/// Qwen3.5 HD256 paged prefill with q-gate — per-layer kernels only.
-///
-/// Same structural contract as `prefill_attention_paged_batch`: plan is
-/// called ONCE per forward via `PagedPrefillForward::new_hd256`, not
-/// per layer. This function only runs:
-///  1. HD256 fused prep kernel (QK norm + partial RoPE + paged K/V write).
-///  2. FlashInfer `BatchPrefillWithPagedKVCacheDispatched<HD=256>` `_run`.
-///  3. q-gate multiply on output.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prefill_attention_hd256_paged_batch(
-    ctx: &DeviceContext,
-    q_full_batch: &HiddenStates,
-    k_batch: &HiddenStates,
-    v_batch: &HiddenStates,
-    nrp: &NormRopeParams,
-    meta: &PagedPrefillMeta,
-    fwd: &mut PagedPrefillForward,
-    q_prepped: &mut HiddenStates,
-    output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    rotary_dim: usize,
-) -> Result<()> {
-    let seq_len = q_full_batch.seq_len;
-    let q_dim = num_q_heads * 256;
-    let kv_dim = num_kv_heads * 256;
-    assert_eq!(
-        q_full_batch.hidden_dim,
-        q_dim * 2,
-        "HD256 prefill expects q_full with gate",
-    );
-    assert_eq!(k_batch.hidden_dim, kv_dim);
-    assert_eq!(v_batch.hidden_dim, kv_dim);
-    assert_eq!(output.hidden_dim, q_dim);
-    assert_eq!(q_prepped.hidden_dim, q_dim);
-    assert_eq!(seq_len, fwd.total_qo_rows, "fwd.total_qo_rows mismatch");
-    assert_eq!(meta.page_size, fwd.page_size, "fwd.page_size mismatch");
-    assert_eq!(
-        meta.sequences.len(),
-        fwd.batch_size,
-        "fwd.batch_size mismatch"
-    );
-
-    let page_size = meta.page_size;
-
-    // Step 1: HD256 fused prep kernel. Like the HD128 path above, this kernel
-    // still consumes one sequence at a time, so the packed forward launches it
-    // per sequence and then runs one batched FlashInfer attention pass.
-    unsafe {
-        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
-        let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
-        let (k_ptr, _gk) = k_batch.data.device_ptr(&ctx.stream);
-        let (v_ptr, _gv) = v_batch.data.device_ptr(&ctx.stream);
-        let (qn_ptr, _gqn) = nrp.q_norm.data.device_ptr(&ctx.stream);
-        let (kn_ptr, _gkn) = nrp.k_norm.data.device_ptr(&ctx.stream);
-        let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&ctx.stream);
-        let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&ctx.stream);
-        let (pt_ptr, _gpt) = meta.page_indices.device_ptr(&ctx.stream);
-        let kp_ptr = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
-        let vp_ptr = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
-
-        let q_full_stride = q_full_batch.hidden_dim;
-        let q_stride = q_prepped.hidden_dim;
-        let kv_stride = k_batch.hidden_dim;
-        let half_size = std::mem::size_of::<ffi::Half>();
-        let i32_size = std::mem::size_of::<i32>();
-
-        for seq in meta.sequences {
-            let qf_ptr_offset = (qf_ptr as usize + seq.token_offset * q_full_stride * half_size)
-                as *const ffi::Half;
-            let qp_ptr_offset =
-                (qp_ptr as usize + seq.token_offset * q_stride * half_size) as *mut ffi::Half;
-            let k_ptr_offset =
-                (k_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
-            let v_ptr_offset =
-                (v_ptr as usize + seq.token_offset * kv_stride * half_size) as *const ffi::Half;
-            let pt_ptr_offset = (pt_ptr as usize + seq.page_table_offset * i32_size) as *const i32;
-
-            ffi::prefill_attention_paged_prep_hd256_cuda(
-                qf_ptr_offset,
-                qp_ptr_offset,
-                k_ptr_offset,
-                v_ptr_offset,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                pt_ptr_offset,
-                page_size as i32,
-                kp_ptr as *mut ffi::Half,
-                vp_ptr as *mut ffi::Half,
-                num_q_heads as i32,
-                num_kv_heads as i32,
-                seq.seq_len as i32,
-                seq.start_pos as i32,
-                rotary_dim as i32,
-                nrp.rms_eps,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
-
-    // Step 2: run FlashInfer paged prefill HD256. Plan was done ONCE
-    // outside the layer loop.
-    {
-        let (q_u64, _gq) = q_prepped.data.device_ptr(&ctx.stream);
-        let (o_u64, _go) = output.data.device_ptr_mut(&ctx.stream);
-        let kp_u64 = meta.pool.k_ptr(meta.layer_idx, &ctx.stream);
-        let vp_u64 = meta.pool.v_ptr(meta.layer_idx, &ctx.stream);
-        let (qoi_u64, _gqoi) = fwd.qo_indptr_dev.device_ptr(&ctx.stream);
-        let (kvi_u64, _gkvi) = fwd.kv_indptr_dev.device_ptr(&ctx.stream);
-        let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
-        let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
-
-        fwd.plan.run_hd256(
-            ctx,
-            q_u64,
-            qoi_u64,
-            kp_u64,
-            vp_u64,
-            kvi_u64,
-            kvidx_u64,
-            kvlpl_u64,
-            o_u64,
-            /* lse_ptr */ None,
-            fwd.batch_size,
-            num_q_heads,
-            num_kv_heads,
-            page_size,
-        )?;
-    }
-
-    // Step 3: q-gate (reuse the same kernel the contiguous HD256 path uses).
-    unsafe {
-        let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-        ffi::attention_gate_batch_hd256_cuda(
-            qf_ptr as *const ffi::Half,
-            o_ptr as *mut ffi::Half,
-            num_q_heads as i32,
-            fwd.total_qo_rows as i32,
-            ctx.stream.cu_stream(),
-        )
-        .result()?;
-    }
 
     Ok(())
 }
