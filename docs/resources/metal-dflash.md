@@ -104,9 +104,13 @@ metal scheduler runtime:
 - Prefill:
   Qwen3.5/Qwen3.6 DFlash prefill runs through the compiled C++ target model.
   Both the single-request path and the scheduler path now share
-  `qwen35.rs::with_qwen35_capture_layers` for the capture-layer setup/reset,
-  then `capture_qwen35_hidden_from_cpp_outputs` builds the layer-hidden bundle
-  that seeds the first draft block.
+  `qwen35.rs::with_qwen35_capture_layers` for the capture-layer setup/reset.
+  Captured hidden chunks are reshaped by
+  `capture_qwen35_hidden_from_cpp_outputs` and accumulated across prefill
+  into one rank-2 `[ctx_len, n_capture_layers * hidden]` bundle before the
+  first speculative block. The direct path uses one compiled `prefill(...)`
+  over the whole prompt; the scheduler path appends one captured chunk per
+  prefill slice instead of keeping only the terminal token/chunk.
 - Verify:
   `qwen35_dflash_speculative_block` and
   `qwen35_dflash_speculative_block_batched` now diverge deliberately:
@@ -134,15 +138,17 @@ metal scheduler runtime:
   `[B, T] -> [B]` `prefix_match_len_i32_batched` kernel on GPU, gathers the
   emitted posterior token with one `[B, T] + [B] -> [B]`
   `gather_axis1_i32` pass, and only materializes those two `[B]` vectors back
-  to Rust. On the compiled full-attention sublayers, the packed path may use the verify-only
-  `batched_sdpa_2pass` kernel when the verify block is mask-free, truly
-  batched (`B > 1`), and `block_size == 16`; otherwise it falls back to stock
-  MLX SDPA. For single-row `B=1, S=16` verify, the compiled Qwen3.5/Qwen3.6
-  target model now threads one `prefer_verify_m16` bit from `ForwardContext`
-  down through full-attention, GDR, MLP, MoE, and final logits, so eligible
-  verify sublayers reshape `[1, 16, H] -> [16, H]` once and stay on one
-  canonical `quantized_matmul` / `qwen35_moe_block_forward_cpp` path instead
-  of bouncing through per-layer special cases. Both paths return the same
+  to Rust. On the compiled full-attention sublayers, exact `batched_sdpa_2pass`
+  is now available to both verify hot paths whenever the block is mask-free
+  and `block_size == 16`:
+  packed verify stops constructing an additive mask when `left_padding` is
+  all zero, and single-row `verify_block_summary(cache_pos)` can also take the
+  same 2-pass kernel without re-entering the old packed `B=1` path. The
+  existing `prefer_verify_m16` bit still threads through full-attention, GDR,
+  MLP, MoE, and final logits so eligible verify sublayers reshape
+  `[1, 16, H] -> [16, H]` once and stay on one canonical
+  `quantized_matmul` / `qwen35_moe_block_forward_cpp` path instead of
+  bouncing through per-layer special cases. Both paths return the same
   accepted-token contract and updated target hidden state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
