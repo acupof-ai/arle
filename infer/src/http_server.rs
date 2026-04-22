@@ -14,7 +14,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Method, header},
     middleware,
     routing::{get, post},
@@ -33,6 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 /// Maximum wall-clock time allowed for a non-streaming request to complete.
 /// Streaming responses have natural per-chunk flow control and are not capped here.
 const RESPONSE_TIMEOUT: Duration = Duration::from_mins(5);
+pub(super) const HTTP_REQUEST_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 use crate::error::ApiError;
 use crate::metrics::ServerMetrics;
@@ -1240,6 +1241,7 @@ where
     router
         .method_not_allowed_fallback(method_not_allowed_handler)
         .fallback(route_not_found_handler)
+        .layer(DefaultBodyLimit::max(HTTP_REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -1512,7 +1514,7 @@ mod tests {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let oversized_body = format!(
             r#"{{"prompt":"{}","max_tokens":1}}"#,
-            "x".repeat(3 * 1024 * 1024)
+            "x".repeat(17 * 1024 * 1024)
         );
         let request = Request::builder()
             .method("POST")
@@ -1532,6 +1534,24 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["error"]["type"], "invalid_request_error");
         assert_eq!(payload["error"]["code"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_large_body_within_explicit_limit() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let large_body = format!(
+            r#"{{"model":"qwen3-4b","prompt":"{}","max_tokens":1}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(large_body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
