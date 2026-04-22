@@ -175,6 +175,10 @@ changes.
 - **Always commit and push from the current branch in the current workspace.**
   Do not create a separate worktree or alternate checkout to prepare or ship
   code changes.
+- **Commit small tranches immediately.** Each small, self-contained change
+  should land as its own commit. Run the relevant verification after that
+  commit; if verification finds issues, fix them in a follow-up commit instead
+  of folding multiple micro-changes into one opaque diff.
 - **Never use `git stash` to move unrelated user changes out of the way.**
   Leave other people's dirty paths in place, work around them, and commit only
   your own files by explicit path.
