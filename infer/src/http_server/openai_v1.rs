@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::ApiError;
 use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
 use crate::types::SessionId;
 use chat::{OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls};
@@ -13,6 +14,164 @@ fn normalize_session_id(raw: Option<&str>) -> Option<SessionId> {
         None
     } else {
         Some(SessionId::new(trimmed.to_string()))
+    }
+}
+
+fn invalid_parameter(field: &'static str, detail: impl Into<String>) -> ApiError {
+    ApiError::bad_request(
+        format!("Invalid `{field}`: {}", detail.into()),
+        "invalid_parameter",
+    )
+}
+
+fn validate_max_tokens(value: Option<usize>, field: &'static str) -> Result<(), ApiError> {
+    if matches!(value, Some(0)) {
+        return Err(invalid_parameter(field, "must be at least 1"));
+    }
+    Ok(())
+}
+
+fn validate_single_choice(value: Option<usize>, field: &'static str) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        if value == 0 {
+            return Err(invalid_parameter(field, "must be at least 1"));
+        }
+        if value != 1 {
+            return Err(invalid_parameter(field, "only `1` is currently supported"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_negative_finite(value: Option<f32>, field: &'static str) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        if !value.is_finite() {
+            return Err(invalid_parameter(field, "must be finite"));
+        }
+        if value < 0.0 {
+            return Err(invalid_parameter(field, "must be >= 0.0"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_percentage_like(
+    value: Option<f32>,
+    field: &'static str,
+    min: f32,
+    max: f32,
+    include_zero: bool,
+) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        if !value.is_finite() {
+            return Err(invalid_parameter(field, "must be finite"));
+        }
+        let lower_ok = if include_zero {
+            value >= min
+        } else {
+            value > min
+        };
+        if !lower_ok || value > max {
+            let lower = if include_zero {
+                format!(">= {min}")
+            } else {
+                format!("> {min}")
+            };
+            return Err(invalid_parameter(
+                field,
+                format!("must be {lower} and <= {max}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_top_k(value: Option<i32>) -> Result<(), ApiError> {
+    if let Some(value) = value
+        && value != -1
+        && value < 1
+    {
+        return Err(invalid_parameter("top_k", "must be -1 (disabled) or >= 1"));
+    }
+    Ok(())
+}
+
+fn validate_penalty(value: Option<f32>, field: &'static str) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        if !value.is_finite() {
+            return Err(invalid_parameter(field, "must be finite"));
+        }
+        if !(-2.0..=2.0).contains(&value) {
+            return Err(invalid_parameter(field, "must be between -2.0 and 2.0"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_repetition_penalty(value: Option<f32>) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        if !value.is_finite() {
+            return Err(invalid_parameter("repetition_penalty", "must be finite"));
+        }
+        if value <= 0.0 {
+            return Err(invalid_parameter("repetition_penalty", "must be > 0.0"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stream_options(
+    stream: Option<bool>,
+    stream_options: Option<&StreamOptions>,
+) -> Result<(), ApiError> {
+    if stream_options.is_some() && !stream.unwrap_or(false) {
+        return Err(invalid_parameter(
+            "stream_options",
+            "requires `stream=true`",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_logprobs(value: Option<u32>) -> Result<(), ApiError> {
+    if matches!(value, Some(value) if value > 0) {
+        return Err(invalid_parameter(
+            "logprobs",
+            "is not supported on this server yet",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_common_sampling_fields(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+) -> Result<(), ApiError> {
+    validate_non_negative_finite(temperature, "temperature")?;
+    validate_percentage_like(top_p, "top_p", 0.0, 1.0, false)?;
+    validate_top_k(top_k)?;
+    validate_percentage_like(min_p, "min_p", 0.0, 1.0, true)?;
+    validate_repetition_penalty(repetition_penalty)?;
+    validate_penalty(frequency_penalty, "frequency_penalty")?;
+    validate_penalty(presence_penalty, "presence_penalty")?;
+    Ok(())
+}
+
+fn sanitize_logprobs(values: &[f32]) -> Option<LogprobsResult> {
+    let token_logprobs: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if token_logprobs.is_empty() {
+        None
+    } else {
+        Some(LogprobsResult { token_logprobs })
     }
 }
 
@@ -125,6 +284,23 @@ pub(super) struct StreamOptions {
 }
 
 impl CompletionRequest {
+    pub(super) fn validate(&self) -> Result<(), ApiError> {
+        validate_max_tokens(self.max_tokens, "max_tokens")?;
+        validate_single_choice(self.n, "n")?;
+        validate_stream_options(self.stream, self.stream_options.as_ref())?;
+        validate_logprobs(self.logprobs)?;
+        validate_common_sampling_fields(
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn max_tokens_or_default(&self) -> usize {
         self.max_tokens.unwrap_or(16)
     }
@@ -188,6 +364,7 @@ impl From<crate::server_engine::TokenUsage> for Usage {
 
 impl CompletionResponse {
     pub(super) fn from_output(model: String, created: u64, output: CompletionOutput) -> Self {
+        let logprobs = sanitize_logprobs(&output.token_logprobs);
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4()),
             object: "text_completion",
@@ -196,13 +373,7 @@ impl CompletionResponse {
             choices: vec![Choice {
                 text: output.text,
                 index: 0,
-                logprobs: if output.token_logprobs.is_empty() {
-                    None
-                } else {
-                    Some(LogprobsResult {
-                        token_logprobs: output.token_logprobs,
-                    })
-                },
+                logprobs,
                 finish_reason: output.finish_reason.as_openai_str().to_string(),
             }],
             usage: output.usage.into(),
@@ -235,6 +406,12 @@ impl StreamChunk {
         model: &str,
         delta: CompletionStreamDelta,
     ) -> Self {
+        let logprobs = delta
+            .logprob
+            .filter(|value| value.is_finite())
+            .map(|lp| LogprobsResult {
+                token_logprobs: vec![lp],
+            });
         Self {
             id: request_id.to_string(),
             object: "text_completion",
@@ -243,9 +420,7 @@ impl StreamChunk {
             choices: vec![StreamChoice {
                 text: delta.text_delta,
                 index: 0,
-                logprobs: delta.logprob.map(|lp| LogprobsResult {
-                    token_logprobs: vec![lp],
-                }),
+                logprobs,
                 finish_reason: delta
                     .finish_reason
                     .map(|reason| reason.as_openai_str().to_string()),
@@ -317,6 +492,21 @@ pub(super) struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
+    pub(super) fn validate(&self) -> Result<(), ApiError> {
+        validate_max_tokens(self.max_tokens, "max_tokens")?;
+        validate_stream_options(self.stream, self.stream_options.as_ref())?;
+        validate_common_sampling_fields(
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn max_tokens_or_default(&self) -> usize {
         self.max_tokens.unwrap_or(16)
     }
@@ -552,6 +742,9 @@ pub(super) struct ResponsesRequest {
     pub(super) model: Option<String>,
     pub(super) input: ResponsesInput,
     pub(super) instructions: Option<String>,
+    /// OpenAI Responses uses `max_output_tokens`, but some existing
+    /// compatibility clients still send `max_tokens`.
+    #[serde(default, alias = "max_tokens")]
     pub(super) max_output_tokens: Option<usize>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
@@ -572,6 +765,20 @@ pub(super) struct ResponsesRequest {
 }
 
 impl ResponsesRequest {
+    pub(super) fn validate(&self) -> Result<(), ApiError> {
+        validate_max_tokens(self.max_output_tokens, "max_output_tokens")?;
+        validate_common_sampling_fields(
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.min_p,
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn max_output_tokens_or_default(&self) -> usize {
         self.max_output_tokens.unwrap_or(16)
     }
@@ -806,6 +1013,13 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_accepts_max_tokens_alias() {
+        let raw = r#"{"input":"hi","max_tokens":23}"#;
+        let req: ResponsesRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.max_output_tokens_or_default(), 23);
+    }
+
+    #[test]
     fn responses_response_exposes_output_text_and_function_calls() {
         let response = ResponsesResponse::from_output(
             "Qwen3-4B".to_string(),
@@ -830,5 +1044,76 @@ mod tests {
             payload["output"][1]["type"],
             serde_json::Value::String("function_call".to_string())
         );
+    }
+
+    #[test]
+    fn completion_request_rejects_zero_max_tokens() {
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"prompt":"hi","max_tokens":0}"#).unwrap();
+        let err = req.validate().expect_err("zero max_tokens should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("max_tokens"));
+    }
+
+    #[test]
+    fn completion_request_rejects_multi_choice_n() {
+        let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"hi","n":2}"#).unwrap();
+        let err = req.validate().expect_err("n > 1 should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("only `1`"));
+    }
+
+    #[test]
+    fn completion_request_rejects_logprobs_request() {
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"prompt":"hi","logprobs":1}"#).unwrap();
+        let err = req.validate().expect_err("logprobs should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("logprobs"));
+    }
+
+    #[test]
+    fn chat_request_rejects_stream_options_without_stream() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"user","content":"hi"}],
+                "stream_options":{"include_usage":true}
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("stream_options without stream should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("stream_options"));
+    }
+
+    #[test]
+    fn responses_request_rejects_invalid_top_p() {
+        let req: ResponsesRequest = serde_json::from_str(r#"{"input":"hi","top_p":1.5}"#).unwrap();
+        let err = req.validate().expect_err("top_p > 1 should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("top_p"));
+    }
+
+    #[test]
+    fn completion_response_drops_non_finite_logprobs() {
+        let response = CompletionResponse::from_output(
+            "Qwen3-4B".to_string(),
+            1,
+            CompletionOutput {
+                text: "hello".to_string(),
+                finish_reason: crate::server_engine::FinishReason::Stop,
+                usage: crate::server_engine::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                token_logprobs: vec![f32::NAN, f32::NEG_INFINITY],
+            },
+        );
+
+        let payload = serde_json::to_value(response).unwrap();
+        assert!(payload["choices"][0]["logprobs"].is_null());
     }
 }

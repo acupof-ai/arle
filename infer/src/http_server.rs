@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::Request as AxumRequest;
+use axum::extract::rejection::JsonRejection;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -364,6 +365,26 @@ async fn collect_buffered_response(
         })
 }
 
+fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    payload.map(|Json(value)| value).map_err(|err| match err {
+        JsonRejection::MissingJsonContentType(_) => {
+            ApiError::bad_request("Expected `Content-Type: application/json`", "invalid_json")
+        }
+        JsonRejection::JsonSyntaxError(inner) => ApiError::bad_request(
+            format!("Malformed JSON request body: {inner}"),
+            "invalid_json",
+        ),
+        JsonRejection::JsonDataError(inner) => ApiError::bad_request(
+            format!("Invalid JSON request body: {inner}"),
+            "invalid_json",
+        ),
+        other => ApiError::bad_request(
+            format!("Failed to decode JSON request body: {other}"),
+            "invalid_json",
+        ),
+    })
+}
+
 fn submit_request(
     state: &AppState,
     options: RequestExecutionOptions,
@@ -663,8 +684,9 @@ fn responses_sse_stream(
 async fn completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<OpenAiCompletionRequest>,
+    payload: Result<Json<OpenAiCompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let req = parse_json_request(payload)?;
     let options = RequestExecutionOptions::from_completion(&req);
     let http_span = http_request_span(
         "/v1/completions",
@@ -676,6 +698,7 @@ async fn completions(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
+        req.validate()?;
         let max_tokens = options.max_tokens;
         let stream = options.stream;
         let include_usage = options.include_usage;
@@ -745,8 +768,9 @@ async fn completions(
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let req = parse_json_request(payload)?;
     let options = RequestExecutionOptions::from_chat(&req);
     let http_span = http_request_span(
         "/v1/chat/completions",
@@ -758,6 +782,7 @@ async fn chat_completions(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
+        req.validate()?;
         if req.messages.is_empty() {
             warn!("Rejecting empty messages request");
             return Err(ApiError::bad_request(
@@ -855,7 +880,10 @@ async fn models_handler(
             enabled: true,
             draft: status.draft_model.clone(),
             speculative_tokens: status.speculative_tokens,
-            acceptance_rate: state.metrics.dflash_acceptance_rate_opt(),
+            acceptance_rate: state
+                .metrics
+                .dflash_acceptance_rate_opt()
+                .filter(|rate| rate.is_finite()),
         });
     let response = ModelsListResponse::single(state.identity.model_id.as_str(), now_secs(), dflash);
     Ok(Json(response).into_response())
@@ -864,8 +892,9 @@ async fn models_handler(
 async fn responses_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<ResponsesRequest>,
+    payload: Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let req = parse_json_request(payload)?;
     let options = RequestExecutionOptions::from_responses(&req);
     let http_span = http_request_span(
         "/v1/responses",
@@ -877,6 +906,7 @@ async fn responses_handler(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
+        req.validate()?;
         let prompt = build_responses_prompt(&req)?;
         let max_tokens = options.max_tokens;
         let stream = options.stream;
@@ -1393,6 +1423,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn completion_rejects_malformed_json_with_openai_error_body() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"prompt":"hello","max_tokens":"oops"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert_eq!(payload["error"]["code"], "invalid_json");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Invalid JSON request body")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_zero_max_tokens_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"prompt":"hello","max_tokens":0}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("max_tokens")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // /v1/chat/completions tests
     // -----------------------------------------------------------------------
@@ -1442,6 +1525,32 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_rejects_stream_options_without_stream() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stream_options")
+        );
     }
 
     #[tokio::test]
@@ -2014,6 +2123,30 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("hello")),
             "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_invalid_sampling_knob() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"hello","top_p":1.5}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("top_p")
         );
     }
 
