@@ -2655,30 +2655,42 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
             && posterior_shape[1] == block_size_i32,
         "Qwen3.5 DFlash batched sampled verify tokens unexpected shape {posterior_shape:?}"
     );
-    eval(&[&posterior_tokens]);
-    let posterior_tokens = posterior_tokens.as_slice_i32();
 
     let mut accepted_inputs: Vec<i32> = Vec::with_capacity(batch);
     let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
     for b in 0..batch_i32 {
-        let row_offset = (b as usize) * runtime.block_size;
-        let row_block = &packed_block_tokens[row_offset..row_offset + runtime.block_size];
-        let posterior: Vec<u32> = posterior_tokens[row_offset..row_offset + runtime.block_size]
-            .iter()
-            .map(|&tok| tok as u32)
-            .collect();
+        let row_tokens = slice(
+            &tokens_arr,
+            &[b, 0],
+            &[b + 1, block_size_i32],
+            &[1, 1],
+        );
+        let row_tokens = reshape(&row_tokens, &[block_size_i32]);
+        let drafted_prefix = slice(&row_tokens, &[1], &[block_size_i32], &[1]);
 
-        let matched = row_block
-            .iter()
-            .skip(1)
-            .zip(posterior.iter())
-            .take(runtime.block_size.saturating_sub(1))
-            .take_while(|(draft, target)| (**draft as u32) == **target)
-            .count();
+        let row_posterior = slice(
+            &posterior_tokens,
+            &[b, 0],
+            &[b + 1, block_size_i32],
+            &[1, 1],
+        );
+        let row_posterior = reshape(&row_posterior, &[block_size_i32]);
+        let posterior_prefix = slice(&row_posterior, &[0], &[draft_suffix_len], &[1]);
+        let matched = prefix_match_len_tokens(&drafted_prefix, &posterior_prefix)?;
         let accepted = (matched + 1) as i32;
-        let posterior_token = *posterior.get(matched).ok_or_else(|| {
-            anyhow!("Qwen3.5 DFlash batched verifier produced too few tokens for row {b}")
-        })?;
+        let matched_i32 =
+            i32::try_from(matched).context("Qwen3.5 DFlash batched matched prefix overflow")?;
+        let posterior_token = slice(
+            &row_posterior,
+            &[matched_i32],
+            &[matched_i32 + 1],
+            &[1],
+        );
+        let posterior_token = materialize_token_array(&posterior_token)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Qwen3.5 DFlash batched posterior token row {b} was empty"))?;
+
         accepted_inputs.push(accepted);
         posterior_token_per_row.push(posterior_token);
     }
