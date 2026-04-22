@@ -8,14 +8,41 @@ pub fn sample_categorical(
     rng: &mut LcgRng,
 ) -> (Vec<usize>, Vec<f32>) {
     let rows = batch_shape.0 * batch_shape.1;
+    let mut sampled_ids = Vec::with_capacity(rows);
+    let mut chosen_log_probs = Vec::with_capacity(rows);
+    sample_categorical_into(
+        &mut sampled_ids,
+        &mut chosen_log_probs,
+        logits_data,
+        batch_shape,
+        vocab,
+        temperature,
+        rng,
+    );
+
+    (sampled_ids, chosen_log_probs)
+}
+
+pub fn sample_categorical_into(
+    sampled_ids: &mut Vec<usize>,
+    chosen_log_probs: &mut Vec<f32>,
+    logits_data: &[f32],
+    batch_shape: (usize, usize),
+    vocab: usize,
+    temperature: f32,
+    rng: &mut LcgRng,
+) {
+    let rows = batch_shape.0 * batch_shape.1;
     assert_eq!(
         logits_data.len(),
         rows * vocab,
         "categorical sampler expects logits shaped as [B, S, V]",
     );
 
-    let mut sampled_ids = Vec::with_capacity(rows);
-    let mut chosen_log_probs = Vec::with_capacity(rows);
+    sampled_ids.clear();
+    chosen_log_probs.clear();
+    sampled_ids.reserve(rows.saturating_sub(sampled_ids.capacity()));
+    chosen_log_probs.reserve(rows.saturating_sub(chosen_log_probs.capacity()));
     for row in 0..rows {
         let base = row * vocab;
         let slice = &logits_data[base..base + vocab];
@@ -29,8 +56,6 @@ pub fn sample_categorical(
         sampled_ids.push(index);
         chosen_log_probs.push(log_prob);
     }
-
-    (sampled_ids, chosen_log_probs)
 }
 
 pub(crate) fn log_prob_at_index(logits: &[f32], temperature: f32, index: usize) -> f32 {
