@@ -571,7 +571,7 @@ async fn authorize_session_request(
     Ok(next.run(request).await)
 }
 
-fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
+fn build_responses_prompt(req: &ResponsesRequest) -> String {
     let mut messages = Vec::new();
     if let Some(instructions) = req.instructions.as_deref() {
         if !instructions.trim().is_empty() {
@@ -587,12 +587,6 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
 
     match &req.input {
         ResponsesInput::Text(text) => {
-            if text.trim().is_empty() {
-                return Err(ApiError::bad_request(
-                    "Input must not be empty",
-                    "empty_input",
-                ));
-            }
             messages.push(chat::OpenAiChatMessage {
                 role: "user".into(),
                 content: Some(text.clone().into()),
@@ -602,18 +596,10 @@ fn build_responses_prompt(req: &ResponsesRequest) -> Result<String, ApiError> {
             });
         }
         ResponsesInput::Message(message) => messages.push(message.clone()),
-        ResponsesInput::Messages(items) => {
-            if items.is_empty() {
-                return Err(ApiError::bad_request(
-                    "Input messages must not be empty",
-                    "empty_input",
-                ));
-            }
-            messages.extend(items.iter().cloned());
-        }
+        ResponsesInput::Messages(items) => messages.extend(items.iter().cloned()),
     }
 
-    Ok(chat_messages_to_prompt(&messages, &req.tools))
+    chat_messages_to_prompt(&messages, &req.tools)
 }
 
 /// Build the SSE event(s) for a single [`CompletionStreamDelta`].
@@ -818,14 +804,6 @@ async fn completions(
         let include_usage = options.include_usage;
         let model_id = state.identity.model_id.clone();
 
-        if req.prompt.trim().is_empty() {
-            warn!("Rejecting empty prompt request");
-            return Err(ApiError::bad_request(
-                "Prompt must not be empty",
-                "empty_prompt",
-            ));
-        }
-
         info!(
             "Received request: prompt_len={}, max_tokens={}, stream={}",
             req.prompt.len(),
@@ -897,13 +875,6 @@ async fn chat_completions(
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
         req.validate()?;
-        if req.messages.is_empty() {
-            warn!("Rejecting empty messages request");
-            return Err(ApiError::bad_request(
-                "Messages array must not be empty",
-                "empty_messages",
-            ));
-        }
 
         let max_tokens = options.max_tokens;
         let do_stream = options.stream;
@@ -1021,7 +992,7 @@ async fn responses_handler(
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
         req.validate()?;
-        let prompt = build_responses_prompt(&req)?;
+        let prompt = build_responses_prompt(&req);
         let max_tokens = options.max_tokens;
         let stream = options.stream;
         let model_id = state.identity.model_id.clone();
@@ -1620,6 +1591,16 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("prompt")),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -1908,6 +1889,16 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("messages")),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -2671,6 +2662,30 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("top_p")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_empty_input_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input":"   "}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("input")),
+            "payload={payload}"
         );
     }
 

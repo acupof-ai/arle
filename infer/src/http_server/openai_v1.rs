@@ -35,6 +35,13 @@ fn validate_max_tokens(value: Option<usize>, field: &'static str) -> Result<(), 
     Ok(())
 }
 
+fn validate_non_empty_trimmed_string(value: &str, field: &str) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(invalid_parameter(field, "must not be empty"));
+    }
+    Ok(())
+}
+
 fn validate_single_choice(value: Option<usize>, field: &'static str) -> Result<(), ApiError> {
     if let Some(value) = value {
         if value == 0 {
@@ -456,6 +463,7 @@ pub(super) struct StreamOptions {
 
 impl CompletionRequest {
     pub(super) fn validate(&self) -> Result<(), ApiError> {
+        validate_non_empty_trimmed_string(&self.prompt, "prompt")?;
         validate_max_tokens(self.max_tokens, "max_tokens")?;
         validate_single_choice(self.n, "n")?;
         validate_stream_options(self.stream, self.stream_options.as_ref())?;
@@ -665,6 +673,12 @@ pub(super) struct ChatCompletionRequest {
 
 impl ChatCompletionRequest {
     pub(super) fn validate(&self) -> Result<(), ApiError> {
+        if self.messages.is_empty() {
+            return Err(invalid_parameter(
+                "messages",
+                "must contain at least one message",
+            ));
+        }
         validate_max_tokens(self.max_tokens, "max_tokens")?;
         validate_stream_options(self.stream, self.stream_options.as_ref())?;
         validate_common_sampling_fields(
@@ -952,11 +966,19 @@ impl ResponsesRequest {
         )?;
         validate_supported_tool_definitions(&self.tools, "tools")?;
         match &self.input {
-            ResponsesInput::Text(_) => {}
+            ResponsesInput::Text(text) => validate_non_empty_trimmed_string(text, "input")?,
             ResponsesInput::Message(message) => {
                 validate_supported_messages(std::slice::from_ref(message), "input")?;
             }
-            ResponsesInput::Messages(messages) => validate_supported_messages(messages, "input")?,
+            ResponsesInput::Messages(messages) => {
+                if messages.is_empty() {
+                    return Err(invalid_parameter(
+                        "input",
+                        "must contain at least one message",
+                    ));
+                }
+                validate_supported_messages(messages, "input")?;
+            }
         }
         Ok(())
     }
@@ -1238,6 +1260,14 @@ mod tests {
     }
 
     #[test]
+    fn completion_request_rejects_empty_prompt() {
+        let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"   "}"#).unwrap();
+        let err = req.validate().expect_err("empty prompt should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("prompt"));
+    }
+
+    #[test]
     fn completion_request_rejects_multi_choice_n() {
         let req: CompletionRequest = serde_json::from_str(r#"{"prompt":"hi","n":2}"#).unwrap();
         let err = req.validate().expect_err("n > 1 should fail");
@@ -1302,6 +1332,14 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_rejects_empty_messages() {
+        let req: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        let err = req.validate().expect_err("empty messages should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("messages"));
+    }
+
+    #[test]
     fn chat_request_rejects_non_function_tools() {
         let req: ChatCompletionRequest = serde_json::from_str(
             r#"{
@@ -1355,6 +1393,14 @@ mod tests {
             .expect_err("tool messages without tool_call_id should fail");
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("input[0].tool_call_id"));
+    }
+
+    #[test]
+    fn responses_request_rejects_empty_input() {
+        let req: ResponsesRequest = serde_json::from_str(r#"{"input":"   "}"#).unwrap();
+        let err = req.validate().expect_err("empty input should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("input"));
     }
 
     #[test]
