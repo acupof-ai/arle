@@ -45,8 +45,14 @@ struct SortedSwitchInputs {
 // internals.
 array qmm(const array& x, const array& w, const array& scales,
           const array& biases, int group_size, int bits) {
-    return mlx::core::quantized_matmul(x, w, scales, biases,
-                                       /*transpose=*/true, group_size, bits);
+    return verify_quantized_matmul_cpp(
+        x,
+        w,
+        scales,
+        biases,
+        group_size,
+        bits,
+        /*transpose=*/true);
 }
 
 // Fused quantized-SwiGLU: down(silu(gate(x)) * up(x)) with three 4-bit proj.
