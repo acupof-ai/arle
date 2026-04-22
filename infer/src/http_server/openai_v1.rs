@@ -4,7 +4,9 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
 use crate::types::SessionId;
-use chat::{OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls};
+use chat::{
+    OpenAiChatContent, OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls,
+};
 
 /// Normalize a raw string session hint from a client request. Empty / whitespace
 /// ids are dropped so that "" and `null` behave identically.
@@ -139,6 +141,54 @@ fn validate_logprobs(value: Option<u32>) -> Result<(), ApiError> {
             "logprobs",
             "is not supported on this server yet",
         ));
+    }
+    Ok(())
+}
+
+fn validate_text_only_content(
+    content: &OpenAiChatContent,
+    field: &'static str,
+) -> Result<(), ApiError> {
+    let OpenAiChatContent::Parts(parts) = content else {
+        return Ok(());
+    };
+
+    for part in parts {
+        let Some(part_type) = part.get("type").and_then(serde_json::Value::as_str) else {
+            return Err(invalid_parameter(
+                field,
+                "content parts must include a string `type`",
+            ));
+        };
+        if part_type != "text" {
+            return Err(invalid_parameter(
+                field,
+                format!("content part type `{part_type}` is not supported on this server yet"),
+            ));
+        }
+        if part
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(invalid_parameter(
+                field,
+                "text content parts must include a string `text`",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_text_only_messages(
+    messages: &[OpenAiChatMessage],
+    field: &'static str,
+) -> Result<(), ApiError> {
+    for message in messages {
+        if let Some(content) = &message.content {
+            validate_text_only_content(content, field)?;
+        }
     }
     Ok(())
 }
@@ -507,6 +557,7 @@ impl ChatCompletionRequest {
             self.frequency_penalty,
             self.presence_penalty,
         )?;
+        validate_text_only_messages(&self.messages, "messages")?;
         Ok(())
     }
 
@@ -780,6 +831,13 @@ impl ResponsesRequest {
             self.frequency_penalty,
             self.presence_penalty,
         )?;
+        match &self.input {
+            ResponsesInput::Text(_) => {}
+            ResponsesInput::Message(message) => {
+                validate_text_only_messages(std::slice::from_ref(message), "input")?;
+            }
+            ResponsesInput::Messages(messages) => validate_text_only_messages(messages, "input")?,
+        }
         Ok(())
     }
 
@@ -1093,11 +1151,41 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_rejects_non_text_content_parts() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("non-text message parts should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("image_url"));
+    }
+
+    #[test]
     fn responses_request_rejects_invalid_top_p() {
         let req: ResponsesRequest = serde_json::from_str(r#"{"input":"hi","top_p":1.5}"#).unwrap();
         let err = req.validate().expect_err("top_p > 1 should fail");
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("top_p"));
+    }
+
+    #[test]
+    fn responses_request_rejects_non_text_message_parts() {
+        let req: ResponsesRequest = serde_json::from_str(
+            r#"{
+                "input":[{"role":"user","content":[{"type":"input_audio","audio":{"data":"...","format":"wav"}}]}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("non-text responses input parts should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("input_audio"));
     }
 
     #[test]
