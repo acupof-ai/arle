@@ -16,7 +16,7 @@ use super::{
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
     mlx::{
         Dtype, MlxArray, as_dtype, async_eval, concatenate_axis, eval, gather_axis1_i32,
-        prefix_match_len_i32, prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
+        prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
     },
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params},
@@ -1713,25 +1713,11 @@ fn materialize_token_array(tokens: &MlxArray) -> Vec<u32> {
         .collect()
 }
 
-fn prefix_match_len_tokens(lhs: &MlxArray, rhs: &MlxArray) -> Result<usize> {
-    let lhs_i32 = if lhs.dtype() == Dtype::Int32 {
-        lhs.clone()
-    } else {
-        as_dtype(lhs, Dtype::Int32)
-    };
-    let rhs_i32 = if rhs.dtype() == Dtype::Int32 {
-        rhs.clone()
-    } else {
-        as_dtype(rhs, Dtype::Int32)
-    };
-    let matched = prefix_match_len_i32(&lhs_i32, &rhs_i32);
-    eval(&[&matched]);
-    let matched = matched.item_i32();
-    ensure!(
-        matched >= 0,
-        "mlx_prefix_match_len_i32 returned a negative prefix length: {matched}"
-    );
-    Ok(matched as usize)
+fn prefix_match_len_host(lhs: &[u32], rhs: &[u32]) -> usize {
+    lhs.iter()
+        .zip(rhs.iter())
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count()
 }
 
 fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
@@ -1746,39 +1732,6 @@ fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
         as_dtype(rhs, Dtype::Int32)
     };
     prefix_match_len_i32_batched(&lhs_i32, &rhs_i32)
-}
-
-fn build_accepted_tokens_from_arrays(
-    drafted_suffix: &MlxArray,
-    posterior_tokens: &MlxArray,
-    matched: usize,
-) -> Result<Vec<u32>> {
-    let matched_i32 =
-        i32::try_from(matched).context("accepted draft prefix length does not fit i32")?;
-    let posterior_shape = posterior_tokens.shape();
-    let total = *posterior_shape
-        .first()
-        .ok_or_else(|| anyhow!("posterior_tokens must be rank-1"))?;
-    ensure!(
-        matched_i32 < total,
-        "posterior token index {matched_i32} out of range for total={total}"
-    );
-
-    let posterior_token = slice(posterior_tokens, &[matched_i32], &[matched_i32 + 1], &[1]);
-    let accepted = if matched == 0 {
-        posterior_token
-    } else {
-        let accepted_draft = slice(drafted_suffix, &[0], &[matched_i32], &[1]);
-        concatenate_axis(&[accepted_draft, posterior_token], 0)
-    };
-    let accepted_tokens = materialize_token_array(&accepted);
-    ensure!(
-        accepted_tokens.len() == matched + 1,
-        "accepted token count mismatch: expected {}, got {}",
-        matched + 1,
-        accepted_tokens.len()
-    );
-    Ok(accepted_tokens)
 }
 
 #[derive(Clone)]
@@ -2232,14 +2185,37 @@ pub(crate) fn qwen35_dflash_speculative_block(
         posterior_tokens.shape(),
         runtime.block_size
     );
+    let posterior_tokens_i32 = if posterior_tokens.dtype() == Dtype::Int32 {
+        posterior_tokens.clone()
+    } else {
+        as_dtype(&posterior_tokens, Dtype::Int32)
+    };
     let drafted_prefix = slice(&block_tokens, &[1], &[block_size_i32], &[1]);
-    let posterior_prefix = slice(&posterior_tokens, &[0], &[block_size_i32 - 1], &[1]);
-    let matched = prefix_match_len_tokens(&drafted_prefix, &posterior_prefix)?;
+    eval(&[&drafted_prefix, &posterior_tokens_i32]);
+    let drafted_vals = drafted_prefix
+        .as_slice_i32()
+        .into_iter()
+        .map(|token| token as u32)
+        .collect::<Vec<_>>();
+    let posterior_vals = posterior_tokens_i32
+        .as_slice_i32()
+        .into_iter()
+        .map(|token| token as u32)
+        .collect::<Vec<_>>();
+    ensure!(
+        drafted_vals.len() == runtime.block_size.saturating_sub(1)
+            && posterior_vals.len() == runtime.block_size,
+        "Qwen3.5 DFlash sampled verify materialized drafted={} posterior={} tokens for block_size={}",
+        drafted_vals.len(),
+        posterior_vals.len(),
+        runtime.block_size
+    );
+    let matched = prefix_match_len_host(&drafted_vals, &posterior_vals[..drafted_vals.len()]);
     if profile {
-        let drafted_vals = materialize_token_array(&drafted_prefix);
-        let posterior_vals = materialize_token_array(&posterior_prefix);
-        for (offset, (&draft, &target)) in
-            drafted_vals.iter().zip(posterior_vals.iter()).enumerate()
+        for (offset, (&draft, &target)) in drafted_vals
+            .iter()
+            .zip(posterior_vals.iter().take(drafted_vals.len()))
+            .enumerate()
         {
             per_pos_match[offset] = draft == target;
         }
@@ -2257,8 +2233,8 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_verify = t_start.elapsed();
     let t_sample = t_verify;
 
-    let accepted_tokens_out =
-        build_accepted_tokens_from_arrays(&drafted_prefix, &posterior_tokens, matched)?;
+    let mut accepted_tokens_out = drafted_vals[..matched].to_vec();
+    accepted_tokens_out.push(posterior_vals[matched]);
 
     log::debug!(
         "qwen35_dflash: accepted={}/{} matched_prefix={}",

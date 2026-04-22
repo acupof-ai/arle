@@ -44,33 +44,57 @@ fn mlx_array_from_raw_or_panic(raw: *mut mlx_sys::mlx_array, op: &str) -> MlxArr
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
+    Bool,
     Uint8,
+    Uint16,
     Uint32,
+    Uint64,
+    Int8,
+    Int16,
     Int32,
+    Int64,
     Float16,
     Float32,
+    Float64,
     Bfloat16,
+    Complex64,
 }
 
 impl Dtype {
     pub fn to_raw(self) -> i32 {
         match self {
+            Dtype::Bool => mlx_sys::MLX_BOOL,
             Dtype::Uint8 => mlx_sys::MLX_UINT8,
+            Dtype::Uint16 => mlx_sys::MLX_UINT16,
             Dtype::Uint32 => mlx_sys::MLX_UINT32,
+            Dtype::Uint64 => mlx_sys::MLX_UINT64,
+            Dtype::Int8 => mlx_sys::MLX_INT8,
+            Dtype::Int16 => mlx_sys::MLX_INT16,
             Dtype::Int32 => mlx_sys::MLX_INT32,
+            Dtype::Int64 => mlx_sys::MLX_INT64,
             Dtype::Float16 => mlx_sys::MLX_FLOAT16,
             Dtype::Float32 => mlx_sys::MLX_FLOAT32,
+            Dtype::Float64 => mlx_sys::MLX_FLOAT64,
             Dtype::Bfloat16 => mlx_sys::MLX_BFLOAT16,
+            Dtype::Complex64 => mlx_sys::MLX_COMPLEX64,
         }
     }
     pub fn from_raw(raw: i32) -> Option<Self> {
         match raw {
+            x if x == mlx_sys::MLX_BOOL => Some(Dtype::Bool),
             x if x == mlx_sys::MLX_UINT8 => Some(Dtype::Uint8),
+            x if x == mlx_sys::MLX_UINT16 => Some(Dtype::Uint16),
             x if x == mlx_sys::MLX_UINT32 => Some(Dtype::Uint32),
+            x if x == mlx_sys::MLX_UINT64 => Some(Dtype::Uint64),
+            x if x == mlx_sys::MLX_INT8 => Some(Dtype::Int8),
+            x if x == mlx_sys::MLX_INT16 => Some(Dtype::Int16),
             x if x == mlx_sys::MLX_INT32 => Some(Dtype::Int32),
+            x if x == mlx_sys::MLX_INT64 => Some(Dtype::Int64),
             x if x == mlx_sys::MLX_FLOAT16 => Some(Dtype::Float16),
             x if x == mlx_sys::MLX_FLOAT32 => Some(Dtype::Float32),
+            x if x == mlx_sys::MLX_FLOAT64 => Some(Dtype::Float64),
             x if x == mlx_sys::MLX_BFLOAT16 => Some(Dtype::Bfloat16),
+            x if x == mlx_sys::MLX_COMPLEX64 => Some(Dtype::Complex64),
             _ => None,
         }
     }
@@ -966,6 +990,14 @@ mod tests {
         let matched = prefix_match_len_i32(&lhs, &rhs);
         eval(&[&matched]);
         assert_eq!(matched.item_i32(), 2);
+    }
+
+    #[test]
+    fn dtype_supports_int64_roundtrip() {
+        let _guard = metal_test_guard();
+        let ints = MlxArray::from_slice_i32(&[1, 2, 3], &[3]);
+        let ints64 = as_dtype(&ints, Dtype::Int64);
+        assert_eq!(ints64.dtype(), Dtype::Int64);
     }
 
     #[test]
