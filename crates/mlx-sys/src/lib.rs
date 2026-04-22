@@ -18,12 +18,14 @@ pub const MLX_BOOL: i32 = 0;
 pub const MLX_UINT8: i32 = 1;
 pub const MLX_UINT16: i32 = 2;
 pub const MLX_UINT32: i32 = 3;
+pub const MLX_UINT64: i32 = 4;
 pub const MLX_INT8: i32 = 5;
 pub const MLX_INT16: i32 = 6;
 pub const MLX_INT32: i32 = 7;
 pub const MLX_INT64: i32 = 8;
 pub const MLX_FLOAT16: i32 = 9;
 pub const MLX_FLOAT32: i32 = 10;
+pub const MLX_FLOAT64: i32 = 11;
 pub const MLX_BFLOAT16: i32 = 12;
 pub const MLX_COMPLEX64: i32 = 13;
 
