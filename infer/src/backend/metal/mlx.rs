@@ -334,6 +334,13 @@ pub fn prefix_match_len_i32(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
     )
 }
 
+pub fn prefix_match_len_i32_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_prefix_match_len_i32_batched(lhs.0, rhs.0) },
+        "mlx_prefix_match_len_i32_batched",
+    )
+}
+
 pub fn concatenate_axis(arrays: &[MlxArray], axis: i32) -> MlxArray {
     let p: Vec<*mut mlx_sys::mlx_array> = arrays.iter().map(|a| a.0).collect();
     mlx_array_from_raw_or_panic(
@@ -952,6 +959,16 @@ mod tests {
         let matched = prefix_match_len_i32(&lhs, &rhs);
         eval(&[&matched]);
         assert_eq!(matched.item_i32(), 2);
+    }
+
+    #[test]
+    fn prefix_match_len_i32_batched_counts_each_row_prefix() {
+        let _guard = metal_test_guard();
+        let lhs = MlxArray::from_slice_i32(&[11, 12, 13, 14, 21, 22, 23, 24], &[2, 4]);
+        let rhs = MlxArray::from_slice_i32(&[11, 12, 99, 14, 21, 22, 23, 24], &[2, 4]);
+        let matched = prefix_match_len_i32_batched(&lhs, &rhs);
+        eval(&[&matched]);
+        assert_eq!(matched.as_slice_i32(), vec![2, 4]);
     }
 
     #[test]

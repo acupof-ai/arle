@@ -16,7 +16,7 @@ use super::{
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
     mlx::{
         Dtype, MlxArray, as_dtype, async_eval, concatenate_axis, eval, prefix_match_len_i32,
-        rms_norm, slice, take_axis, zeros,
+        prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
     },
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params},
@@ -1734,6 +1734,27 @@ fn prefix_match_len_tokens(lhs: &MlxArray, rhs: &MlxArray) -> Result<usize> {
     Ok(matched as usize)
 }
 
+fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> Result<Vec<i32>> {
+    let lhs_i32 = if lhs.dtype() == Dtype::Int32 {
+        lhs.clone()
+    } else {
+        as_dtype(lhs, Dtype::Int32)
+    };
+    let rhs_i32 = if rhs.dtype() == Dtype::Int32 {
+        rhs.clone()
+    } else {
+        as_dtype(rhs, Dtype::Int32)
+    };
+    let matched = prefix_match_len_i32_batched(&lhs_i32, &rhs_i32);
+    eval(&[&matched]);
+    let matched = matched.as_slice_i32();
+    ensure!(
+        matched.iter().all(|&value| value >= 0),
+        "mlx_prefix_match_len_i32_batched returned a negative prefix length: {matched:?}"
+    );
+    Ok(matched)
+}
+
 fn build_accepted_tokens_from_arrays(
     drafted_suffix: &MlxArray,
     posterior_tokens: &MlxArray,
@@ -2656,25 +2677,28 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         "Qwen3.5 DFlash batched sampled verify tokens unexpected shape {posterior_shape:?}"
     );
 
+    let drafted_prefix = slice(&tokens_arr, &[0, 1], &[batch_i32, block_size_i32], &[1, 1]);
+    let posterior_prefix = slice(
+        &posterior_tokens,
+        &[0, 0],
+        &[batch_i32, draft_suffix_len],
+        &[1, 1],
+    );
+    let matched_per_row = prefix_match_len_tokens_batched(&drafted_prefix, &posterior_prefix)?;
+
     let mut accepted_inputs: Vec<i32> = Vec::with_capacity(batch);
     let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
-    for b in 0..batch_i32 {
-        let row_tokens = slice(&tokens_arr, &[b, 0], &[b + 1, block_size_i32], &[1, 1]);
-        let row_tokens = reshape(&row_tokens, &[block_size_i32]);
-        let drafted_prefix = slice(&row_tokens, &[1], &[block_size_i32], &[1]);
-
+    for (b, &matched) in matched_per_row.iter().enumerate() {
+        let b_i32 = b as i32;
         let row_posterior = slice(
             &posterior_tokens,
-            &[b, 0],
-            &[b + 1, block_size_i32],
+            &[b_i32, 0],
+            &[b_i32 + 1, block_size_i32],
             &[1, 1],
         );
         let row_posterior = reshape(&row_posterior, &[block_size_i32]);
-        let posterior_prefix = slice(&row_posterior, &[0], &[draft_suffix_len], &[1]);
-        let matched = prefix_match_len_tokens(&drafted_prefix, &posterior_prefix)?;
-        let accepted = (matched + 1) as i32;
-        let matched_i32 =
-            i32::try_from(matched).context("Qwen3.5 DFlash batched matched prefix overflow")?;
+        let accepted = matched + 1;
+        let matched_i32 = matched;
         let posterior_token = slice(&row_posterior, &[matched_i32], &[matched_i32 + 1], &[1]);
         let posterior_token = materialize_token_array(&posterior_token)
             .into_iter()
