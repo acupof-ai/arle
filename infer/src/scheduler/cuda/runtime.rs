@@ -1,9 +1,9 @@
+use super::core::{is_full_sealed_prefix, sealed_block_token_count};
 use super::{
     ActiveRequest, CompletionStreamDelta, FinishReason, ModelForward, Ordering, Phase,
     STATS_LOG_INTERVAL, Scheduler, TokenUsage, error, info, warn,
 };
 use crate::kv_tier::{ReadmissionSource, RequestChunkState};
-use crate::prefix_cache::BlockMetadataUpdate;
 use crate::scheduler::types::RequestLengthContract;
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ struct PrefixAdmissionPlan {
     lookup: crate::kv_tier::LookupOutcome,
     reusable: Option<(usize, usize, usize)>,
     direct_gpu_attach: bool,
-    gpu_ready_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
+    gpu_ready_sealed_blocks: Vec<crate::prefix_cache::BlockId>,
     attached_prefix_blocks: Vec<crate::prefix_cache::BlockId>,
     staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
 }
@@ -160,6 +160,13 @@ pub(super) fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock])
         .iter()
         .filter(|block| !matches!(block.hit_kind, crate::kv_tier::HitKind::Miss))
         .all(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
+}
+
+fn matched_sealed_lookup_blocks(blocks: &[crate::kv_tier::LookupBlock]) -> usize {
+    blocks
+        .iter()
+        .filter(|block| !matches!(block.hit_kind, crate::kv_tier::HitKind::Miss))
+        .count()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +340,7 @@ impl<M: ModelForward> Scheduler<M> {
         prompt_tokens: &[u32],
         free_slots: &[usize],
     ) -> PrefixAdmissionPlan {
+        let block_size = self.prefix_cache.block_size();
         let lookup = self
             .prefix_cache
             .lookup_or_stage(prompt_tokens, crate::kv_tier::LookupHeuristics::default());
@@ -341,14 +349,27 @@ impl<M: ModelForward> Scheduler<M> {
             .iter()
             .filter_map(|block| block.block_id)
             .collect();
-        let ready_on_gpu = lookup_blocks_ready_on_gpu(&lookup.blocks);
-        let gpu_ready_prefix_blocks: Vec<_> = lookup
+        let matched_sealed_block_count = matched_sealed_lookup_blocks(&lookup.blocks);
+        let lookup_is_full_sealed = lookup.matched_len == 0
+            || is_full_sealed_prefix(lookup.matched_len, block_size, matched_sealed_block_count);
+        debug_assert!(
+            lookup_is_full_sealed,
+            "lookup_or_stage must classify sealed full blocks only: matched={} blocks={} block_size={}",
+            lookup.matched_len, matched_sealed_block_count, block_size,
+        );
+        let ready_on_gpu = lookup_is_full_sealed && lookup_blocks_ready_on_gpu(&lookup.blocks);
+        let gpu_ready_sealed_blocks: Vec<_> = lookup
             .blocks
             .iter()
             .take_while(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
             .filter_map(|block| block.block_id)
             .collect();
+        let gpu_ready_sealed_tokens =
+            sealed_block_token_count(block_size, gpu_ready_sealed_blocks.len());
+        let fully_addressable_gpu_hit =
+            ready_on_gpu && gpu_ready_sealed_tokens == lookup.matched_len;
         let staged_prefix_plan = if self.model.prefill_uses_paged_pool()
+            && lookup_is_full_sealed
             && !lookup.recompute_advised
             && !ready_on_gpu
             && lookup.blocks.iter().any(|block| {
@@ -363,19 +384,20 @@ impl<M: ModelForward> Scheduler<M> {
             None
         };
         let direct_gpu_attach = self.model.prefill_uses_paged_pool()
+            && lookup_is_full_sealed
             && !lookup.recompute_advised
-            && !gpu_ready_prefix_blocks.is_empty()
-            && ready_on_gpu
+            && !gpu_ready_sealed_blocks.is_empty()
+            && fully_addressable_gpu_hit
             && staged_prefix_plan.is_none();
         let reusable_gpu_prefix = if direct_gpu_attach || staged_prefix_plan.is_some() {
             None
-        } else if ready_on_gpu && !lookup.recompute_advised {
+        } else if fully_addressable_gpu_hit && !lookup.recompute_advised {
             best_reusable_slot_for_radix_hit(
-                &gpu_ready_prefix_blocks,
+                &gpu_ready_sealed_blocks,
                 free_slots,
                 &self.block_owner_slots,
                 &self.slot_materialized_prompt_lens,
-                self.prefix_cache.block_size(),
+                block_size,
             )
         } else {
             None
@@ -386,9 +408,9 @@ impl<M: ModelForward> Scheduler<M> {
             lookup,
             reusable: reusable_gpu_prefix,
             direct_gpu_attach,
-            gpu_ready_prefix_blocks: gpu_ready_prefix_blocks.clone(),
+            gpu_ready_sealed_blocks: gpu_ready_sealed_blocks.clone(),
             attached_prefix_blocks: if direct_gpu_attach {
-                gpu_ready_prefix_blocks
+                gpu_ready_sealed_blocks
             } else {
                 Vec::new()
             },
@@ -477,7 +499,7 @@ impl<M: ModelForward> Scheduler<M> {
             let bytes_not_on_gpu =
                 plan.lookup.matched_len > 0 && (!ready_on_gpu || plan.lookup.recompute_advised);
             let no_reusable_free_slot = plan.lookup.matched_len > 0
-                && !plan.gpu_ready_prefix_blocks.is_empty()
+                && !plan.gpu_ready_sealed_blocks.is_empty()
                 && plan.reusable.is_none();
             if bytes_not_on_gpu || no_reusable_free_slot {
                 info!(
@@ -671,6 +693,80 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
+    fn validate_staged_sealed_prefix(
+        &self,
+        request_id: u64,
+        prompt_tokens: &[u32],
+        staged_prefix: &crate::kv_tier::ReadmissionPlan,
+    ) -> anyhow::Result<()> {
+        if staged_prefix.blocks.is_empty() {
+            return Ok(());
+        }
+        let block_size = self.prefix_cache.block_size();
+        let sealed_tokens = sealed_block_token_count(block_size, staged_prefix.blocks.len());
+        if staged_prefix.matched_len > prompt_tokens.len()
+            || !is_full_sealed_prefix(
+                staged_prefix.matched_len,
+                block_size,
+                staged_prefix.blocks.len(),
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "invalid staged sealed prefix shape for request {} (matched={} blocks={} prompt={})",
+                request_id,
+                staged_prefix.matched_len,
+                staged_prefix.blocks.len(),
+                prompt_tokens.len()
+            ));
+        }
+        debug_assert_eq!(
+            staged_prefix.matched_len, sealed_tokens,
+            "staged readmission plans must only cover full sealed radix blocks"
+        );
+        Ok(())
+    }
+
+    fn gpu_ready_staged_prefix_plan(
+        &mut self,
+        request_id: u64,
+        prompt_tokens: &[u32],
+        staged_prefix: &crate::kv_tier::ReadmissionPlan,
+    ) -> anyhow::Result<crate::kv_tier::ReadmissionPlan> {
+        self.validate_staged_sealed_prefix(request_id, prompt_tokens, staged_prefix)?;
+        let final_lookup = self.prefix_cache.lookup_or_stage(
+            &prompt_tokens[..staged_prefix.matched_len],
+            crate::kv_tier::LookupHeuristics::default(),
+        );
+        if !lookup_blocks_ready_on_gpu(&final_lookup.blocks) {
+            return Err(anyhow::anyhow!(
+                "staged sealed prefix promotion did not become GPU-runnable (matched={} expected={})",
+                final_lookup.matched_len,
+                staged_prefix.matched_len
+            ));
+        }
+        let final_plan = self
+            .build_staged_prefix_plan(&final_lookup)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "staged sealed prefix promotion lost full-block shape (matched={} expected={})",
+                    final_lookup.matched_len,
+                    staged_prefix.matched_len
+                )
+            })?;
+        if final_plan.matched_len != staged_prefix.matched_len {
+            return Err(anyhow::anyhow!(
+                "staged sealed prefix promotion matched {} tokens, expected {}",
+                final_plan.matched_len,
+                staged_prefix.matched_len
+            ));
+        }
+        debug_assert!(
+            final_plan.blocks.iter().all(|block| block.source.is_none()),
+            "GPU-ready staged prefix plans should not retain staging sources"
+        );
+        Ok(final_plan)
+    }
+
     fn promote_fetched_prefix(
         &mut self,
         waiter: &FetchWaiter,
@@ -684,6 +780,8 @@ impl<M: ModelForward> Scheduler<M> {
         if staged_prefix.blocks.is_empty() {
             return Ok(());
         }
+        let block_size = self.prefix_cache.block_size();
+        self.validate_staged_sealed_prefix(request_id, prompt_tokens, &staged_prefix)?;
         let fetched_by_id: std::collections::HashMap<
             crate::prefix_cache::BlockId,
             &crate::kv_tier::FetchedBlock,
@@ -692,11 +790,7 @@ impl<M: ModelForward> Scheduler<M> {
             .map(|block| (block.block_id, block))
             .collect();
 
-        let pages_per_block = self
-            .prefix_cache
-            .block_size()
-            .div_ceil(self.paged_kv_pool.page_size)
-            .max(1);
+        let pages_per_block = block_size.div_ceil(self.paged_kv_pool.page_size).max(1);
         let mut promoted_pages: Vec<(
             crate::prefix_cache::BlockId,
             crate::prefix_cache::BlockId,
@@ -739,23 +833,6 @@ impl<M: ModelForward> Scheduler<M> {
             }
         }
 
-        if staged_prefix.matched_len == 0
-            || staged_prefix.matched_len > prompt_tokens.len()
-            || staged_prefix.matched_len
-                != staged_prefix.blocks.len() * self.prefix_cache.block_size()
-        {
-            for (_, _, pages) in promoted_pages {
-                let _ = self.paged_kv_pool.release_pages(&pages);
-            }
-            return Err(anyhow::anyhow!(
-                "invalid staged prefix shape for request {} (matched={} blocks={} prompt={})",
-                request_id,
-                staged_prefix.matched_len,
-                staged_prefix.blocks.len(),
-                prompt_tokens.len()
-            ));
-        }
-
         let prefix_tokens = &prompt_tokens[..staged_prefix.matched_len];
         let inserted = self.prefix_cache.insert_with_fingerprints(
             prefix_tokens,
@@ -780,34 +857,23 @@ impl<M: ModelForward> Scheduler<M> {
             ));
         }
 
-        let block_byte_len = self
-            .paged_kv_pool
-            .storage_bytes_for_tokens(self.prefix_cache.block_size())
-            .min(u32::MAX as usize) as u32;
-        let keepalive_deadline = session_id.as_ref().map(|_| {
-            self.prefix_cache
-                .logical_clock()
-                .saturating_add(self.config.prefix_cache_keepalive_ticks)
-        });
-        for (old_block_id, new_block_id, pages) in promoted_pages {
-            self.block_owner_slots.remove(&old_block_id);
-            self.block_to_pages.insert(new_block_id, pages);
-            let _ = self.prefix_cache.update_block_metadata(
-                new_block_id,
-                BlockMetadataUpdate {
-                    location: Some(crate::kv_tier::BlockLocation::Gpu {
-                        slot: slot_idx as u32,
-                    }),
-                    byte_len: Some(block_byte_len),
-                    session_id: Some(session_id.clone()),
-                    soft_pin_until: Some(keepalive_deadline),
-                    ..BlockMetadataUpdate::default()
-                },
-            );
-        }
+        let promoted_blocks = promoted_pages
+            .into_iter()
+            .map(|(old_block_id, new_block_id, pages)| {
+                self.block_owner_slots.remove(&old_block_id);
+                (new_block_id, pages)
+            })
+            .collect::<Vec<_>>();
+        self.record_sealed_gpu_blocks(
+            slot_idx,
+            promoted_blocks,
+            session_id.as_ref(),
+            self.config.prefix_cache_keepalive_ticks,
+            false,
+        );
 
         info!(
-            "Request {}: staged prefix ready, promoted {}/{} tokens into T0",
+            "Request {}: staged sealed prefix ready, promoted {}/{} tokens into T0",
             request_id,
             staged_prefix.matched_len,
             prompt_tokens.len()
@@ -823,26 +889,9 @@ impl<M: ModelForward> Scheduler<M> {
         if staged_prefix.blocks.is_empty() {
             return Ok(false);
         }
-
-        let final_lookup = self.prefix_cache.lookup_or_stage(
-            &prompt_tokens[..staged_prefix.matched_len],
-            crate::kv_tier::LookupHeuristics::default(),
-        );
-        if final_lookup.matched_len != staged_prefix.matched_len
-            || !lookup_blocks_ready_on_gpu(&final_lookup.blocks)
-        {
-            return Err(anyhow::anyhow!(
-                "staged prefix promotion did not become GPU-runnable (matched={} expected={})",
-                final_lookup.matched_len,
-                staged_prefix.matched_len
-            ));
-        }
-
-        let attached_prefix_blocks: Vec<_> = final_lookup
-            .blocks
-            .iter()
-            .filter_map(|block| block.block_id)
-            .collect();
+        let final_plan =
+            self.gpu_ready_staged_prefix_plan(request_id, prompt_tokens, &staged_prefix)?;
+        let attached_prefix_blocks = final_plan.block_ids();
         if let Some(req) = self.request_mut(slot_idx) {
             if req.id != request_id {
                 return Ok(false);
@@ -1427,9 +1476,11 @@ impl<M: ModelForward> Scheduler<M> {
 mod tests {
     use super::{
         AdmissionPageBudget, WaitingInsertBias, best_reusable_slot_for_radix_hit,
-        finish_rejected_request, insert_waiting_request_by_priority,
+        finish_rejected_request, insert_waiting_request_by_priority, lookup_blocks_ready_on_gpu,
+        matched_sealed_lookup_blocks,
     };
     use crate::prefix_cache::BlockId;
+    use crate::scheduler::cuda::core::is_full_sealed_prefix;
     use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
     use std::collections::{HashMap, VecDeque};
@@ -1592,5 +1643,31 @@ mod tests {
             "later admissions must respect full-request headroom held by active slots",
         );
         assert!(budget.can_fit(1, 4, 0, 0));
+    }
+
+    #[test]
+    fn matched_sealed_lookup_blocks_ignore_trailing_tombstone() {
+        let blocks = vec![
+            crate::kv_tier::LookupBlock {
+                block_id: Some(crate::prefix_cache::BlockId(10)),
+                hit_kind: crate::kv_tier::HitKind::ReadyOnGpu,
+            },
+            crate::kv_tier::LookupBlock {
+                block_id: Some(crate::prefix_cache::BlockId(20)),
+                hit_kind: crate::kv_tier::HitKind::ReadyOnGpu,
+            },
+            crate::kv_tier::LookupBlock {
+                block_id: None,
+                hit_kind: crate::kv_tier::HitKind::Miss,
+            },
+        ];
+
+        assert_eq!(matched_sealed_lookup_blocks(&blocks), 2);
+        assert!(lookup_blocks_ready_on_gpu(&blocks));
+        assert!(is_full_sealed_prefix(
+            8,
+            4,
+            matched_sealed_lookup_blocks(&blocks)
+        ));
     }
 }

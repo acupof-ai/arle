@@ -189,6 +189,50 @@ impl TokenKVPool {
         self.storage_bytes_for_tokens(self.page_size)
     }
 
+    fn slot_hot_tail_len(&self, slot: usize) -> usize {
+        self.seq_lens[slot] % self.page_size
+    }
+
+    fn slot_last_page_len(&self, slot: usize) -> usize {
+        let seq_len = self.seq_lens[slot];
+        if seq_len == 0 {
+            0
+        } else {
+            let hot_tail_len = self.slot_hot_tail_len(slot);
+            if hot_tail_len == 0 {
+                self.page_size
+            } else {
+                hot_tail_len
+            }
+        }
+    }
+
+    fn slot_hot_tail_page(&self, slot: usize) -> Option<u32> {
+        if self.slot_hot_tail_len(slot) == 0 {
+            None
+        } else {
+            self.page_indices[slot].last().copied()
+        }
+    }
+
+    fn page_is_shared_read_only(&self, page: u32) -> bool {
+        let page_idx = page as usize;
+        self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1
+    }
+
+    fn slot_shared_hot_tail_page(&self, slot: usize) -> Option<u32> {
+        let hot_tail_page = self.slot_hot_tail_page(slot)?;
+        self.page_is_shared_read_only(hot_tail_page)
+            .then_some(hot_tail_page)
+    }
+
+    fn recycle_page_if_unreferenced(&mut self, page: u32) {
+        let page_idx = page as usize;
+        if self.page_attach_count[page_idx] == 0 && self.page_ref_count[page_idx] == 0 {
+            self.free_pages.push(page);
+        }
+    }
+
     /// Create a new token-level KV pool.
     ///
     /// `budget_bytes` controls how much GPU memory to allocate for the pool.
@@ -430,11 +474,11 @@ impl TokenKVPool {
             return Ok(Vec::new());
         }
 
-        let used_in_last_page = self.seq_lens[slot] % self.page_size;
-        let available_in_last_page = if used_in_last_page == 0 {
+        let hot_tail_len = self.slot_hot_tail_len(slot);
+        let available_in_last_page = if hot_tail_len == 0 {
             0
         } else {
-            self.page_size - used_in_last_page
+            self.page_size - hot_tail_len
         };
         let remaining_after_fill = count.saturating_sub(available_in_last_page);
         let new_page_count = remaining_after_fill.div_ceil(self.page_size);
@@ -495,6 +539,11 @@ impl TokenKVPool {
     /// Used by the CUDA scheduler's GPU-prefix admission path: the radix owns
     /// the retained pages, and a fresh slot borrows them as its prefix KV
     /// table before suffix prefill / decode appends new tokens.
+    ///
+    /// Borrowed full pages are sealed shared prefix blocks. If `token_count`
+    /// leaves the final page partial, that borrowed frontier is a read-only hot
+    /// tail and the caller must pass through
+    /// [`Self::cow_tail_page_for_append`] before mutating it.
     pub fn attach_pages(&mut self, slot: usize, pages: &[u32], token_count: usize) -> Result<()> {
         if !self.page_indices[slot].is_empty() || self.seq_lens[slot] != 0 {
             return Err(anyhow!(
@@ -823,10 +872,53 @@ impl TokenKVPool {
         Ok(())
     }
 
-    /// Clone the partially-filled tail page when the current slot would
-    /// otherwise append into a shared prefix page.
+    #[cfg(feature = "cuda")]
+    fn detach_shared_hot_tail_page_for_append(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        shared_tail_page: u32,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            self.slot_shared_hot_tail_page(slot),
+            Some(shared_tail_page),
+            "detach_shared_hot_tail_page_for_append requires the live shared hot tail",
+        );
+
+        let new_page = self
+            .free_pages
+            .pop()
+            .ok_or_else(|| anyhow!("TokenKVPool::cow_tail_page_for_append out of free pages"))?;
+        self.page_attach_count[new_page as usize] = 1;
+        self.copy_page_device_to_device(ctx, shared_tail_page, new_page)?;
+
+        let old_tail_page = {
+            let tail_slot_page = self.page_indices[slot]
+                .last_mut()
+                .expect("slot with shared hot tail must have a tail page");
+            let old_tail_page = *tail_slot_page;
+            *tail_slot_page = new_page;
+            old_tail_page
+        };
+        let old_tail_idx = old_tail_page as usize;
+
+        debug_assert!(
+            self.page_attach_count[old_tail_idx] > 0,
+            "detach_shared_hot_tail_page_for_append: detached page had zero slot refs"
+        );
+        self.page_attach_count[old_tail_idx] -= 1;
+        self.recycle_page_if_unreferenced(old_tail_page);
+        Ok(())
+    }
+
+    /// Detach the shared hot tail before append.
     ///
-    /// Returns `true` only when a copy-on-write clone was performed.
+    /// Sealed full pages stay shared and read-only. The only mutable
+    /// shared-prefix write path is detaching a partially-filled shared hot tail
+    /// page immediately before append. Once that tail fills, the next append
+    /// allocates a fresh page instead of mutating the sealed prefix in place.
+    ///
+    /// Returns `true` only when a shared hot tail was detached.
     pub fn cow_tail_page_for_append(&mut self, ctx: &DeviceContext, slot: usize) -> Result<bool> {
         #[cfg(not(feature = "cuda"))]
         {
@@ -837,40 +929,11 @@ impl TokenKVPool {
 
         #[cfg(feature = "cuda")]
         {
-            let seq_len = self.seq_lens[slot];
-            if seq_len == 0 || seq_len % self.page_size == 0 {
-                return Ok(false);
-            }
-
-            let Some(last_page) = self.page_indices[slot].last().copied() else {
+            let Some(shared_tail_page) = self.slot_shared_hot_tail_page(slot) else {
                 return Ok(false);
             };
-            let last_idx = last_page as usize;
-            let shared = self.page_ref_count[last_idx] > 0 || self.page_attach_count[last_idx] > 1;
-            if !shared {
-                return Ok(false);
-            }
 
-            let new_page = self.free_pages.pop().ok_or_else(|| {
-                anyhow!("TokenKVPool::cow_tail_page_for_append out of free pages")
-            })?;
-            self.page_attach_count[new_page as usize] = 1;
-            self.copy_page_device_to_device(ctx, last_page, new_page)?;
-
-            let last_slot_page = self.page_indices[slot]
-                .last_mut()
-                .expect("slot with seq_len>0 must have a tail page");
-            *last_slot_page = new_page;
-
-            debug_assert!(
-                self.page_attach_count[last_idx] > 0,
-                "cow_tail_page_for_append: detached page had zero slot refs"
-            );
-            self.page_attach_count[last_idx] -= 1;
-            if self.page_attach_count[last_idx] == 0 && self.page_ref_count[last_idx] == 0 {
-                self.free_pages.push(last_page);
-            }
-
+            self.detach_shared_hot_tail_page_for_append(ctx, slot, shared_tail_page)?;
             Ok(true)
         }
     }
@@ -894,21 +957,19 @@ impl TokenKVPool {
     /// so decode metadata invalidation logic stays correct even when
     /// pages are retained in limbo.
     pub fn free_slot(&mut self, slot: usize) {
-        if !self.page_indices[slot].is_empty() {
+        let slot_pages = std::mem::take(&mut self.page_indices[slot]);
+        if !slot_pages.is_empty() {
             self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
         }
-        for &idx in &self.page_indices[slot] {
+        for idx in slot_pages {
             let usize_idx = idx as usize;
             debug_assert!(
                 self.page_attach_count[usize_idx] > 0,
                 "free_slot: page {idx} had zero slot refs"
             );
             self.page_attach_count[usize_idx] = self.page_attach_count[usize_idx].saturating_sub(1);
-            if self.page_attach_count[usize_idx] == 0 && self.page_ref_count[usize_idx] == 0 {
-                self.free_pages.push(idx);
-            }
+            self.recycle_page_if_unreferenced(idx);
         }
-        self.page_indices[slot].clear();
         self.seq_lens[slot] = 0;
     }
 
@@ -958,8 +1019,8 @@ impl TokenKVPool {
             );
             let next = cur.saturating_sub(1);
             self.page_ref_count[usize_idx] = next;
-            if next == 0 && self.page_attach_count[usize_idx] == 0 {
-                self.free_pages.push(idx);
+            if next == 0 {
+                self.recycle_page_if_unreferenced(idx);
                 newly_freed.push(idx);
             }
         }
@@ -999,9 +1060,14 @@ impl TokenKVPool {
         let partial_capacity = self
             .seq_lens
             .iter()
-            .map(|&len| {
-                let used = len % self.page_size;
-                if used == 0 { 0 } else { self.page_size - used }
+            .enumerate()
+            .map(|(slot, _)| {
+                let hot_tail_len = self.slot_hot_tail_len(slot);
+                if hot_tail_len == 0 {
+                    0
+                } else {
+                    self.page_size - hot_tail_len
+                }
             })
             .sum::<usize>();
         self.free_pages.len() * self.page_size + partial_capacity
@@ -1175,11 +1241,7 @@ impl TokenKVPool {
                 .last()
                 .expect("invariant: indptr always has at least one element (initialized with 0)");
             indptr.push(prev + pages.len() as i32);
-            last_page_len.push(if self.seq_lens[slot] == 0 {
-                0
-            } else {
-                ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
-            });
+            last_page_len.push(self.slot_last_page_len(slot) as i32);
         }
 
         FlashInferMeta {
@@ -1239,13 +1301,7 @@ impl TokenKVPool {
     pub fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
         slots
             .iter()
-            .map(|&slot| {
-                if self.seq_lens[slot] == 0 {
-                    0
-                } else {
-                    ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
-                }
-            })
+            .map(|&slot| self.slot_last_page_len(slot) as i32)
             .collect()
     }
 
@@ -1675,12 +1731,56 @@ mod tests {
             }
         }
 
-        fn alloc_tokens(&mut self, slot: usize, count: usize) -> Vec<u32> {
-            let used_in_last_page = self.seq_lens[slot] % self.page_size;
-            let available_in_last_page = if used_in_last_page == 0 {
+        fn slot_hot_tail_len(&self, slot: usize) -> usize {
+            self.seq_lens[slot] % self.page_size
+        }
+
+        fn slot_last_page_len(&self, slot: usize) -> usize {
+            let seq_len = self.seq_lens[slot];
+            if seq_len == 0 {
                 0
             } else {
-                self.page_size - used_in_last_page
+                let hot_tail_len = self.slot_hot_tail_len(slot);
+                if hot_tail_len == 0 {
+                    self.page_size
+                } else {
+                    hot_tail_len
+                }
+            }
+        }
+
+        fn slot_hot_tail_page(&self, slot: usize) -> Option<u32> {
+            if self.slot_hot_tail_len(slot) == 0 {
+                None
+            } else {
+                self.page_indices[slot].last().copied()
+            }
+        }
+
+        fn page_is_shared_read_only(&self, page: u32) -> bool {
+            let page_idx = page as usize;
+            self.page_ref_count[page_idx] > 0 || self.page_attach_count[page_idx] > 1
+        }
+
+        fn slot_shared_hot_tail_page(&self, slot: usize) -> Option<u32> {
+            let hot_tail_page = self.slot_hot_tail_page(slot)?;
+            self.page_is_shared_read_only(hot_tail_page)
+                .then_some(hot_tail_page)
+        }
+
+        fn recycle_page_if_unreferenced(&mut self, page: u32) {
+            let page_idx = page as usize;
+            if self.page_ref_count[page_idx] == 0 && self.page_attach_count[page_idx] == 0 {
+                self.free_pages.push(page);
+            }
+        }
+
+        fn alloc_tokens(&mut self, slot: usize, count: usize) -> Vec<u32> {
+            let hot_tail_len = self.slot_hot_tail_len(slot);
+            let available_in_last_page = if hot_tail_len == 0 {
+                0
+            } else {
+                self.page_size - hot_tail_len
             };
             let remaining_after_fill = count.saturating_sub(available_in_last_page);
             let new_page_count = remaining_after_fill.div_ceil(self.page_size);
@@ -1733,8 +1833,8 @@ mod tests {
                 let pu = p as usize;
                 let cur = self.page_ref_count[pu];
                 self.page_ref_count[pu] = cur.saturating_sub(1);
-                if self.page_ref_count[pu] == 0 && self.page_attach_count[pu] == 0 {
-                    self.free_pages.push(p);
+                if self.page_ref_count[pu] == 0 {
+                    self.recycle_page_if_unreferenced(p);
                     freed.push(p);
                 }
             }
@@ -1742,40 +1842,43 @@ mod tests {
         }
 
         fn free_slot(&mut self, slot: usize) {
-            if !self.page_indices[slot].is_empty() {
+            let slot_pages = std::mem::take(&mut self.page_indices[slot]);
+            if !slot_pages.is_empty() {
                 self.slot_epochs[slot] = self.slot_epochs[slot].saturating_add(1);
             }
-            for &idx in &self.page_indices[slot] {
+            for idx in slot_pages {
                 self.page_attach_count[idx as usize] =
                     self.page_attach_count[idx as usize].saturating_sub(1);
-                if self.page_ref_count[idx as usize] == 0
-                    && self.page_attach_count[idx as usize] == 0
-                {
-                    self.free_pages.push(idx);
-                }
+                self.recycle_page_if_unreferenced(idx);
             }
-            self.page_indices[slot].clear();
             self.seq_lens[slot] = 0;
         }
 
-        fn cow_tail_page_for_append(&mut self, slot: usize) -> bool {
-            let seq_len = self.seq_lens[slot];
-            if seq_len == 0 || seq_len % self.page_size == 0 {
-                return false;
-            }
-            let last_page = *self.page_indices[slot].last().unwrap();
-            let last_idx = last_page as usize;
-            let shared = self.page_ref_count[last_idx] > 0 || self.page_attach_count[last_idx] > 1;
-            if !shared {
-                return false;
-            }
+        fn detach_shared_hot_tail_page_for_append(&mut self, slot: usize, shared_tail_page: u32) {
+            debug_assert_eq!(
+                self.slot_shared_hot_tail_page(slot),
+                Some(shared_tail_page),
+                "detach_shared_hot_tail_page_for_append requires the live shared hot tail",
+            );
+
             let new_page = self.free_pages.pop().unwrap();
             self.page_attach_count[new_page as usize] = 1;
-            *self.page_indices[slot].last_mut().unwrap() = new_page;
-            self.page_attach_count[last_idx] -= 1;
-            if self.page_attach_count[last_idx] == 0 && self.page_ref_count[last_idx] == 0 {
-                self.free_pages.push(last_page);
-            }
+
+            let old_tail_page = {
+                let tail_slot_page = self.page_indices[slot].last_mut().unwrap();
+                let old_tail_page = *tail_slot_page;
+                *tail_slot_page = new_page;
+                old_tail_page
+            };
+            self.page_attach_count[old_tail_page as usize] -= 1;
+            self.recycle_page_if_unreferenced(old_tail_page);
+        }
+
+        fn cow_tail_page_for_append(&mut self, slot: usize) -> bool {
+            let Some(shared_tail_page) = self.slot_shared_hot_tail_page(slot) else {
+                return false;
+            };
+            self.detach_shared_hot_tail_page_for_append(slot, shared_tail_page);
             true
         }
 
@@ -1787,9 +1890,14 @@ mod tests {
             let partial_capacity = self
                 .seq_lens
                 .iter()
-                .map(|&len| {
-                    let used = len % self.page_size;
-                    if used == 0 { 0 } else { self.page_size - used }
+                .enumerate()
+                .map(|(slot, _)| {
+                    let hot_tail_len = self.slot_hot_tail_len(slot);
+                    if hot_tail_len == 0 {
+                        0
+                    } else {
+                        self.page_size - hot_tail_len
+                    }
                 })
                 .sum::<usize>();
             self.free_pages.len() * self.page_size + partial_capacity
@@ -1845,13 +1953,7 @@ mod tests {
         fn build_last_page_lens(&self, slots: &[usize]) -> Vec<i32> {
             slots
                 .iter()
-                .map(|&slot| {
-                    if self.seq_lens[slot] == 0 {
-                        0
-                    } else {
-                        ((self.seq_lens[slot] - 1) % self.page_size + 1) as i32
-                    }
-                })
+                .map(|&slot| self.slot_last_page_len(slot) as i32)
                 .collect()
         }
 
@@ -2058,7 +2160,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_pages_keeps_prefix_live_across_multiple_slots() {
+    fn direct_attach_of_full_shared_prefix_keeps_sealed_page_shared() {
         let mut pool = MockPool::new(4, 2, 16);
         let pages = pool.alloc_tokens(0, 16);
         pool.retain(&pages);
@@ -2066,19 +2168,59 @@ mod tests {
 
         pool.attach_pages(1, &pages, 16);
         assert_eq!(pool.page_indices[1], pages);
+        assert!(!pool.cow_tail_page_for_append(1));
         assert_eq!(pool.page_attach_count[pages[0] as usize], 1);
         assert_eq!(pool.page_ref_count[pages[0] as usize], 1);
+
+        let new_hot_tail = pool.alloc_tokens(1, 1);
+        assert_eq!(new_hot_tail.len(), 1);
+        assert_eq!(pool.page_indices[1][0], pages[0]);
+        assert_ne!(pool.page_indices[1][1], pages[0]);
+        assert_eq!(pool.seq_lens[1], 17);
     }
 
     #[test]
-    fn cow_tail_page_clones_when_appending_into_shared_prefix() {
+    fn private_hot_tail_append_does_not_detach() {
+        let mut pool = MockPool::new(2, 1, 16);
+        let pages = pool.alloc_tokens(0, 15);
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pool.slot_hot_tail_page(0), Some(pages[0]));
+        assert_eq!(pool.slot_shared_hot_tail_page(0), None);
+        assert!(!pool.cow_tail_page_for_append(0));
+        assert_eq!(pool.page_indices[0], pages);
+        assert_eq!(pool.page_attach_count[pages[0] as usize], 1);
+        assert_eq!(pool.page_ref_count[pages[0] as usize], 0);
+    }
+
+    #[test]
+    fn shared_hot_tail_detaches_before_append_and_full_page_transition_stays_private() {
         let mut pool = MockPool::new(4, 2, 16);
         let detached = pool.alloc_detached_pages(1);
         pool.attach_pages(0, &detached, 15);
 
+        assert_eq!(pool.slot_hot_tail_page(0), Some(detached[0]));
+        assert_eq!(pool.slot_shared_hot_tail_page(0), Some(detached[0]));
         assert!(pool.cow_tail_page_for_append(0));
-        assert_ne!(pool.page_indices[0][0], detached[0]);
+        let private_tail = pool.page_indices[0][0];
+        assert_ne!(private_tail, detached[0]);
         assert_eq!(pool.page_attach_count[detached[0] as usize], 0);
         assert_eq!(pool.page_ref_count[detached[0] as usize], 1);
+        assert_eq!(pool.page_attach_count[private_tail as usize], 1);
+        assert_eq!(pool.page_ref_count[private_tail as usize], 0);
+        assert_eq!(pool.slot_shared_hot_tail_page(0), None);
+
+        let filled = pool.alloc_tokens(0, 1);
+        assert!(
+            filled.is_empty(),
+            "detached private tail should fill in place"
+        );
+        assert_eq!(pool.seq_lens[0], 16);
+        assert_eq!(pool.page_indices[0], vec![private_tail]);
+        assert!(!pool.cow_tail_page_for_append(0));
+
+        let next_hot_tail = pool.alloc_tokens(0, 1);
+        assert_eq!(next_hot_tail.len(), 1);
+        assert_eq!(pool.page_indices[0], vec![private_tail, next_hot_tail[0]]);
     }
 }

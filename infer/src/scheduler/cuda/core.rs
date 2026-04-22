@@ -55,6 +55,18 @@ fn full_request_pages(prompt_tokens: usize, max_tokens: usize, page_size: usize)
         .div_ceil(page_size.max(1))
 }
 
+pub(super) fn sealed_block_token_count(block_size: usize, block_count: usize) -> usize {
+    block_size.saturating_mul(block_count)
+}
+
+pub(super) fn is_full_sealed_prefix(
+    matched_len: usize,
+    block_size: usize,
+    block_count: usize,
+) -> bool {
+    block_count > 0 && matched_len == sealed_block_token_count(block_size, block_count)
+}
+
 fn waiting_admission_shortage_pages<I>(
     free_pages: usize,
     page_size: usize,
@@ -480,6 +492,87 @@ impl<M: ModelForward> Scheduler<M> {
         self.prefix_cache.block_metadata(block_id)
     }
 
+    fn block_id_for_pages(pages: &[u32]) -> BlockId {
+        BlockId(
+            *pages
+                .first()
+                .expect("full sealed block must map to at least one physical page"),
+        )
+    }
+
+    fn sealed_block_byte_len(&self) -> u32 {
+        self.paged_kv_pool
+            .storage_bytes_for_tokens(self.prefix_cache.block_size())
+            .min(u32::MAX as usize) as u32
+    }
+
+    fn block_keepalive_deadline(
+        &self,
+        session_id: Option<&crate::types::SessionId>,
+        keepalive_ticks: u64,
+    ) -> Option<u64> {
+        session_id.map(|_| {
+            self.prefix_cache
+                .logical_clock()
+                .saturating_add(keepalive_ticks)
+        })
+    }
+
+    fn slot_sealed_block_pages(&self, slot_idx: usize, block_count: usize) -> Vec<Vec<u32>> {
+        let block_size = self.prefix_cache.block_size();
+        (0..block_count)
+            .map(|block_i| {
+                self.paged_kv_pool
+                    .page_indices_for_token_range(slot_idx, block_i * block_size, block_size)
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn flattened_pages_for_blocks(&self, blocks: &[BlockId]) -> Result<Vec<u32>> {
+        let mut pages = Vec::new();
+        for &block_id in blocks {
+            let block_pages = self.block_to_pages.get(&block_id).ok_or_else(|| {
+                anyhow::anyhow!("missing page span for sealed radix block {:?}", block_id)
+            })?;
+            pages.extend_from_slice(block_pages);
+        }
+        Ok(pages)
+    }
+
+    pub(super) fn record_sealed_gpu_blocks<I>(
+        &mut self,
+        slot_idx: usize,
+        blocks: I,
+        session_id: Option<&crate::types::SessionId>,
+        keepalive_ticks: u64,
+        track_slot_owner: bool,
+    ) where
+        I: IntoIterator<Item = (BlockId, Vec<u32>)>,
+    {
+        let block_byte_len = self.sealed_block_byte_len();
+        let keepalive_deadline = self.block_keepalive_deadline(session_id, keepalive_ticks);
+        for (block_id, pages) in blocks {
+            self.block_to_pages.entry(block_id).or_insert(pages);
+            if track_slot_owner {
+                self.block_owner_slots.insert(block_id, slot_idx);
+                self.slot_owned_blocks[slot_idx].push(block_id);
+            }
+            let _ = self.prefix_cache.update_block_metadata(
+                block_id,
+                BlockMetadataUpdate {
+                    location: Some(BlockLocation::Gpu {
+                        slot: slot_idx as u32,
+                    }),
+                    byte_len: Some(block_byte_len),
+                    session_id: Some(session_id.cloned()),
+                    soft_pin_until: Some(keepalive_deadline),
+                    entry_state: None,
+                },
+            );
+        }
+    }
+
     fn host_region_from_metadata(
         metadata: &BlockMetadata,
     ) -> Option<crate::kv_tier::HostPinnedRegion> {
@@ -496,6 +589,7 @@ impl<M: ModelForward> Scheduler<M> {
         &self,
         lookup: &crate::kv_tier::LookupOutcome,
     ) -> Option<ReadmissionPlan> {
+        let block_size = self.prefix_cache.block_size();
         let mut blocks = Vec::new();
         for block in &lookup.blocks {
             if matches!(block.hit_kind, crate::kv_tier::HitKind::Miss) {
@@ -531,7 +625,7 @@ impl<M: ModelForward> Scheduler<M> {
                 source,
             });
         }
-        if blocks.is_empty() {
+        if !is_full_sealed_prefix(lookup.matched_len, block_size, blocks.len()) {
             return None;
         }
         Some(ReadmissionPlan::new(lookup.matched_len, blocks))
@@ -624,15 +718,20 @@ impl<M: ModelForward> Scheduler<M> {
         if blocks.is_empty() || token_count == 0 {
             return Ok(());
         }
-
-        let mut pages = Vec::new();
-        for &block_id in blocks {
-            let block_pages = self.block_to_pages.get(&block_id).ok_or_else(|| {
-                anyhow::anyhow!("missing page span for radix block {:?}", block_id)
-            })?;
-            pages.extend_from_slice(block_pages);
+        let sealed_prefix_tokens =
+            sealed_block_token_count(self.prefix_cache.block_size(), blocks.len());
+        if token_count > sealed_prefix_tokens {
+            return Err(anyhow::anyhow!(
+                "attached prefix overran sealed blocks: tokens={} sealed_tokens={} blocks={}",
+                token_count,
+                sealed_prefix_tokens,
+                blocks.len()
+            ));
         }
-
+        // `blocks` are always full sealed radix blocks. `token_count` may stop
+        // inside the last attached block so the slot keeps a private hot tail
+        // and reaches the only COW boundary at append time.
+        let pages = self.flattened_pages_for_blocks(blocks)?;
         self.paged_kv_pool
             .attach_pages(slot_idx, &pages, token_count)
     }
@@ -1212,19 +1311,16 @@ impl<M: ModelForward> Scheduler<M> {
         // sequences.
         let slot_tokens_now = self.paged_kv_pool.seq_len(slot_idx);
         let publishable_tokens = prompt_tokens.len().min(slot_tokens_now);
-        let num_blocks = publishable_tokens / block_size;
-        if num_blocks == 0 {
+        let sealed_block_count = publishable_tokens / block_size;
+        if sealed_block_count == 0 {
             return;
         }
-        let required_tokens = num_blocks * block_size;
-        let block_pages: Vec<Vec<u32>> = (0..num_blocks)
-            .map(|block_i| {
-                self.paged_kv_pool
-                    .page_indices_for_token_range(slot_idx, block_i * block_size, block_size)
-                    .to_vec()
-            })
-            .collect();
-        let required_pages = block_pages.iter().map(std::vec::Vec::len).sum::<usize>();
+        let sealed_token_count = sealed_block_token_count(block_size, sealed_block_count);
+        let sealed_block_pages = self.slot_sealed_block_pages(slot_idx, sealed_block_count);
+        let required_pages = sealed_block_pages
+            .iter()
+            .map(std::vec::Vec::len)
+            .sum::<usize>();
         let retained_pages = self.paged_kv_pool.retained_count();
         let total_pages = self.paged_kv_pool.max_total_pages;
         let retain_cap_fraction = self.config.prefix_cache_retain_hard_cap;
@@ -1246,15 +1342,9 @@ impl<M: ModelForward> Scheduler<M> {
             return;
         }
 
-        let blocks: Vec<BlockId> = block_pages
+        let blocks: Vec<BlockId> = sealed_block_pages
             .iter()
-            .map(|pages| {
-                BlockId(
-                    *pages
-                        .first()
-                        .expect("full radix block must map to at least one physical page"),
-                )
-            })
+            .map(|pages| Self::block_id_for_pages(pages))
             .collect();
         // M4 review A4: `stable_tag()` is now `Option<u8>`. If the
         // live pool format has no assigned tag (a future
@@ -1278,8 +1368,8 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
         let mut parent_fingerprint: Option<BlockFingerprint> = None;
-        let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(num_blocks);
-        for i in 0..num_blocks {
+        let mut block_fingerprints: Vec<BlockFingerprint> = Vec::with_capacity(sealed_block_count);
+        for i in 0..sealed_block_count {
             let fp = BlockFingerprint::compute(
                 KvContentContext {
                     model_fingerprint: &self.model_fingerprint,
@@ -1292,24 +1382,22 @@ impl<M: ModelForward> Scheduler<M> {
             parent_fingerprint = Some(fp);
         }
 
-        // Slice prompt_tokens to the actually-publishable prefix so the
-        // radix insert walks only the blocks we have fingerprints for.
-        // Without this, when `slot_tokens_now < prompt_tokens.len()` the
-        // insert path would try to traverse blocks past `num_blocks` and
-        // mismatch its own internal block count.
-        let publishable_prompt = &prompt_tokens[..required_tokens];
+        // Publish only sealed full blocks. Any decode-time hot tail stays
+        // request-private until it fills and later becomes its own sealed
+        // block on a subsequent publish.
+        let publishable_prompt = &prompt_tokens[..sealed_token_count];
         let inserted = self.prefix_cache.insert_with_fingerprints(
             publishable_prompt,
             &blocks,
             &block_fingerprints,
         );
-        if inserted != required_tokens {
+        if inserted != sealed_token_count {
             warn!(
                 "prefix_cache.insert: expected {} tokens, got {} (slot={}, num_blocks={}, prompt={})",
-                required_tokens,
+                sealed_token_count,
                 inserted,
                 slot_idx,
-                num_blocks,
+                sealed_block_count,
                 prompt_tokens.len(),
             );
             return;
@@ -1319,48 +1407,22 @@ impl<M: ModelForward> Scheduler<M> {
         // The radix refs a "block" as a unit, and the *entire*
         // `block_size`-wide span must survive `free_slot` so the
         // reuse path can read the full KV state back out.
-        let slot_pages: Vec<u32> = block_pages
+        let slot_pages: Vec<u32> = sealed_block_pages
             .iter()
             .flat_map(|pages| pages.iter().copied())
             .collect();
         self.paged_kv_pool.retain_pages(&slot_pages);
-        self.slot_owned_blocks[slot_idx].clear();
-        let block_byte_len = self
-            .paged_kv_pool
-            .storage_bytes_for_tokens(block_size)
-            .min(u32::MAX as usize) as u32;
-        let keepalive_deadline = session_id.as_ref().map(|_| {
-            self.prefix_cache
-                .logical_clock()
-                .saturating_add(self.config.prefix_cache_keepalive_ticks)
-        });
-        for (block_i, &bid) in blocks.iter().enumerate() {
-            let pages_for_block = block_pages[block_i].clone();
-            // If a prior publish already registered this BlockId
-            // (same pool page as first-of-block), the existing entry
-            // is authoritative — don't clobber it. The `retain_pages`
-            // call above bumped the refcount a second time, so the
-            // first `release_pages` will leave the entry with
-            // refcount > 0 and the eviction path will correctly
-            // short-circuit on the second release.
-            self.block_to_pages
-                .entry(bid)
-                .or_insert_with(|| pages_for_block);
-            self.block_owner_slots.insert(bid, slot_idx);
-            self.slot_owned_blocks[slot_idx].push(bid);
-            let _ = self.prefix_cache.update_block_metadata(
-                bid,
-                BlockMetadataUpdate {
-                    location: Some(BlockLocation::Gpu {
-                        slot: slot_idx as u32,
-                    }),
-                    byte_len: Some(block_byte_len),
-                    session_id: Some(session_id.cloned()),
-                    soft_pin_until: Some(keepalive_deadline),
-                    entry_state: None,
-                },
-            );
-        }
+        debug_assert!(
+            self.slot_owned_blocks[slot_idx].is_empty(),
+            "publish_to_prefix_cache must start from an unowned slot frontier"
+        );
+        self.record_sealed_gpu_blocks(
+            slot_idx,
+            blocks.into_iter().zip(sealed_block_pages),
+            session_id,
+            self.config.prefix_cache_keepalive_ticks,
+            true,
+        );
     }
 
     /// Remove the transient "this free slot still owns a materialized prompt
@@ -2093,8 +2155,9 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_publish_prefix_pages, prefix_cache_reclaim_goal_pages,
-        prefix_cache_retain_hard_cap_pages, waiting_admission_shortage_pages,
+        can_publish_prefix_pages, is_full_sealed_prefix, prefix_cache_reclaim_goal_pages,
+        prefix_cache_retain_hard_cap_pages, sealed_block_token_count,
+        waiting_admission_shortage_pages,
     };
     use crate::kv_tier::{CoordinatorQueueStats, QueueControlStats};
 
@@ -2112,6 +2175,14 @@ mod tests {
         assert!(can_publish_prefix_pages(80, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(81, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(90, 100, 1, HARD_CAP));
+    }
+
+    #[test]
+    fn sealed_prefix_helpers_require_full_blocks() {
+        assert_eq!(sealed_block_token_count(16, 3), 48);
+        assert!(is_full_sealed_prefix(48, 16, 3));
+        assert!(!is_full_sealed_prefix(47, 16, 3));
+        assert!(!is_full_sealed_prefix(0, 16, 0));
     }
 
     #[test]
