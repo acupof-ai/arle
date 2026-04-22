@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{
+        DefaultBodyLimit, Path, State,
+        rejection::{BytesRejection, JsonRejection},
+    },
     http::StatusCode,
     routing::{delete, get, post},
 };
@@ -310,7 +313,33 @@ pub struct ErrorBody {
     pub got: Option<u8>,
 }
 
-fn snapshot_error_to_response(err: &SessionSnapshotError) -> (StatusCode, Json<ErrorBody>) {
+type SessionRouteError = (StatusCode, Json<ErrorBody>);
+
+fn error_body(
+    error: impl Into<String>,
+    kind: &'static str,
+    expected: Option<u8>,
+    got: Option<u8>,
+) -> Json<ErrorBody> {
+    Json(ErrorBody {
+        error: error.into(),
+        kind,
+        expected,
+        got,
+    })
+}
+
+fn session_error(
+    status: StatusCode,
+    error: impl Into<String>,
+    kind: &'static str,
+    expected: Option<u8>,
+    got: Option<u8>,
+) -> SessionRouteError {
+    (status, error_body(error, kind, expected, got))
+}
+
+fn snapshot_error_to_response(err: &SessionSnapshotError) -> SessionRouteError {
     let (status, kind, expected, got) = match err {
         SessionSnapshotError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io", None, None),
         SessionSnapshotError::SerializeRadix(_) | SessionSnapshotError::SerializeManifest(_) => {
@@ -343,34 +372,76 @@ fn snapshot_error_to_response(err: &SessionSnapshotError) -> (StatusCode, Json<E
         }
     };
 
-    (
-        status,
-        Json(ErrorBody {
-            error: err.to_string(),
-            kind,
-            expected,
-            got,
-        }),
+    session_error(status, err.to_string(), kind, expected, got)
+}
+
+fn unsupported_response(message: impl Into<String>) -> SessionRouteError {
+    session_error(
+        StatusCode::NOT_IMPLEMENTED,
+        message.into(),
+        "unsupported",
+        None,
+        None,
     )
 }
 
-fn unsupported_response(message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorBody {
-            error: message.into(),
-            kind: "unsupported",
-            expected: None,
-            got: None,
-        }),
-    )
+fn bytes_rejection_to_response(err: &BytesRejection) -> SessionRouteError {
+    let status = err.status();
+    let body_text = err.body_text();
+    let kind = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        "payload_too_large"
+    } else {
+        "invalid_body"
+    };
+    session_error(status, body_text, kind, None, None)
+}
+
+fn json_rejection_to_response(err: JsonRejection) -> SessionRouteError {
+    match err {
+        JsonRejection::MissingJsonContentType(_) => session_error(
+            StatusCode::BAD_REQUEST,
+            "Expected `Content-Type: application/json`",
+            "invalid_json",
+            None,
+            None,
+        ),
+        JsonRejection::JsonSyntaxError(inner) => session_error(
+            StatusCode::BAD_REQUEST,
+            format!("Malformed JSON request body: {inner}"),
+            "invalid_json",
+            None,
+            None,
+        ),
+        JsonRejection::JsonDataError(inner) => session_error(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON request body: {inner}"),
+            "invalid_json",
+            None,
+            None,
+        ),
+        JsonRejection::BytesRejection(inner) => bytes_rejection_to_response(&inner),
+        other => session_error(
+            StatusCode::BAD_REQUEST,
+            format!("Failed to decode JSON request body: {other}"),
+            "invalid_json",
+            None,
+            None,
+        ),
+    }
+}
+
+fn parse_json_payload<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, SessionRouteError> {
+    payload
+        .map(|Json(value)| value)
+        .map_err(json_rejection_to_response)
 }
 
 async fn handle_save<E: SessionPersistence>(
     Path(session_id): Path<String>,
     State(engine): State<Arc<RwLock<E>>>,
-    Json(req): Json<SaveRequestBody>,
-) -> Result<Json<SessionSnapshot>, (StatusCode, Json<ErrorBody>)> {
+    payload: Result<Json<SaveRequestBody>, JsonRejection>,
+) -> Result<Json<SessionSnapshot>, SessionRouteError> {
+    let req = parse_json_payload(payload)?;
     let engine = engine.read().await;
     let fingerprints = if req.fingerprints.is_empty() {
         None
@@ -392,8 +463,9 @@ async fn handle_save<E: SessionPersistence>(
 
 async fn handle_load<E: SessionPersistence>(
     State(engine): State<Arc<RwLock<E>>>,
-    Json(snapshot): Json<SessionSnapshot>,
-) -> Result<Json<LoadResponseBody>, (StatusCode, Json<ErrorBody>)> {
+    payload: Result<Json<SessionSnapshot>, JsonRejection>,
+) -> Result<Json<LoadResponseBody>, SessionRouteError> {
+    let snapshot = parse_json_payload(payload)?;
     let mut engine = engine.write().await;
     let loaded = engine
         .load_session_snapshot(&snapshot)
@@ -402,13 +474,13 @@ async fn handle_load<E: SessionPersistence>(
     Ok(Json(loaded))
 }
 
-async fn handle_manifest(Path(_session_id): Path<String>) -> (StatusCode, Json<ErrorBody>) {
+async fn handle_manifest(Path(_session_id): Path<String>) -> SessionRouteError {
     // TODO(2026-04-16): persist session manifests so GET /manifest can replay
     // the last saved snapshot for this session id.
     unsupported_response("session manifest persistence is not implemented yet")
 }
 
-async fn handle_delete(Path(_session_id): Path<String>) -> (StatusCode, Json<ErrorBody>) {
+async fn handle_delete(Path(_session_id): Path<String>) -> SessionRouteError {
     // TODO(2026-04-16): delete persisted session manifests and backing blocks
     // once the manifest storage path is wired.
     unsupported_response("session deletion is not implemented yet")
@@ -833,5 +905,52 @@ mod tests {
             .expect("body-limit response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "payload_too_large");
+    }
+
+    #[tokio::test]
+    async fn load_route_rejects_malformed_json_with_structured_error() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-bad/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"version":"oops"}"#))
+                    .expect("build malformed request"),
+            )
+            .await
+            .expect("malformed-json response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "invalid_json");
+    }
+
+    #[tokio::test]
+    async fn save_route_requires_json_content_type() {
+        let dir = tempdir().expect("tempdir");
+        let app = mounted_session_app(mock_engine(&dir, 1));
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/session-save/save")
+                    .body(Body::from("{}"))
+                    .expect("build missing-content-type request"),
+            )
+            .await
+            .expect("missing-content-type response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response_json(response).await;
+        assert_eq!(body["kind"], "invalid_json");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Content-Type")),
+            "body={body}"
+        );
     }
 }
