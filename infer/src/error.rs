@@ -76,6 +76,18 @@ impl ApiError {
         }
     }
 
+    /// 405 Method Not Allowed — route exists but doesn't accept this method.
+    pub fn method_not_allowed(message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error",
+                code,
+            },
+        }
+    }
+
     /// 504 Gateway Timeout — request took too long.
     pub fn timeout(elapsed_secs: u64) -> Self {
         Self {
