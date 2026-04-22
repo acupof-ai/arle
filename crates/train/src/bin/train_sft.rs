@@ -9,7 +9,7 @@ use std::{
 
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
-    ops::{gather_last_dim, log_softmax, mul, mul_scalar, sum},
+    ops::{gather_last_dim, log_softmax, matmul, mean, mul, mul_scalar, sum},
     optim::AdamW,
 };
 use thiserror::Error;
@@ -347,10 +347,10 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
 
     // --- Trainer setup (Wave 3 migration) ---
     let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
-    // `--grad-accum-steps` overrides `--batch` when passed; otherwise the
-    // pre-migration semantics ("batch folds grads into a single optim step")
-    // hold. max(1) to keep the zero-check above happy even if a user passes 0.
-    let grad_accum = args.grad_accum_steps.unwrap_or(args.batch).max(1) as u64;
+    // `--batch` is the true per-forward batch size; `--grad-accum-steps`
+    // layers extra accumulation on top only when explicitly requested.
+    let batch_size = args.batch.max(1);
+    let grad_accum = args.grad_accum_steps.unwrap_or(1).max(1) as u64;
     let schedule: Box<dyn autograd::LrSchedule> = autograd::parse_lr_schedule(
         &args.lr_schedule,
         args.lr,
@@ -398,6 +398,7 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     }
     let run_start_scalars = [
         ("total_steps", args.steps as f64),
+        ("batch_size", batch_size as f64),
         ("grad_accum_steps", grad_accum as f64),
         ("seq_len", args.seq_len as f64),
     ];
@@ -499,27 +500,41 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     let model_ref = &model;
     let dataset_ref = &dataset;
     let step_fn = |ctx: &mut train::StepCtx<'_>| -> autograd::Result<StepOutcome> {
-        let example_index =
-            sample_index(seed, dataset_len, ctx.step as usize, ctx.micro_idx as usize);
-        let example = &dataset_ref[example_index];
-        let input_len = example.input_ids.len() - 1;
-        let position_ids = (0..input_len).map(|index| index as u32).collect::<Vec<_>>();
-        let logits = model_ref.forward_with_positions(
+        let mut batch_examples = Vec::with_capacity(batch_size);
+        for row in 0..batch_size {
+            let example_index = sample_index(
+                seed,
+                dataset_len,
+                ctx.step as usize,
+                (ctx.micro_idx as usize * batch_size) + row,
+            );
+            batch_examples.push(&dataset_ref[example_index]);
+        }
+        let collated = collate_tokenized_batch(&batch_examples);
+        let input_ids = collated
+            .input_ids
+            .iter()
+            .map(|&token_id| token_id as usize)
+            .collect::<Vec<_>>();
+        let logits = model_ref.forward_batch_tokens(
+            &input_ids,
+            batch_examples.len(),
+            collated.seq_len,
             ctx.store,
             ctx.tape,
-            &example.input_ids[..input_len],
-            &position_ids,
         )?;
-        let loss_id = assistant_masked_causal_loss(
+        let loss_id = assistant_masked_causal_loss_batch(
             logits,
-            &example.labels[1..],
+            &collated.labels,
+            batch_examples.len(),
+            collated.seq_len,
             ctx.store,
             ctx.tape,
             model_ref.config().vocab_size(),
         )?;
         Ok(StepOutcome {
             loss_id,
-            token_count: input_len as u64,
+            token_count: collated.token_count,
         })
     };
 
@@ -721,6 +736,40 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+struct BatchedTokenizedSft {
+    input_ids: Vec<u32>,
+    labels: Vec<i32>,
+    seq_len: usize,
+    token_count: u64,
+}
+
+fn collate_tokenized_batch(examples: &[&TokenizedSft]) -> BatchedTokenizedSft {
+    let seq_len = examples
+        .iter()
+        .map(|example| example.input_ids.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let mut input_ids = vec![0u32; examples.len() * seq_len];
+    let mut labels = vec![-100i32; examples.len() * seq_len];
+    let mut token_count = 0_u64;
+
+    for (row, example) in examples.iter().enumerate() {
+        let input_len = example.input_ids.len().saturating_sub(1);
+        let base = row * seq_len;
+        input_ids[base..base + input_len].copy_from_slice(&example.input_ids[..input_len]);
+        labels[base..base + input_len].copy_from_slice(&example.labels[1..1 + input_len]);
+        token_count += input_len as u64;
+    }
+
+    BatchedTokenizedSft {
+        input_ids,
+        labels,
+        seq_len,
+        token_count,
+    }
+}
+
 fn assistant_masked_causal_loss(
     logits: TensorId,
     labels: &[i32],
@@ -781,6 +830,65 @@ fn assistant_masked_causal_loss(
     let masked = mul(target_log_probs, mask, store, tape)?;
     let total = sum(masked, store, tape)?;
     mul_scalar(total, -1.0 / valid_count as f32, store, tape)
+}
+
+fn assistant_masked_causal_loss_batch(
+    logits: TensorId,
+    labels: &[i32],
+    batch: usize,
+    seq_len: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    vocab_size: usize,
+) -> autograd::Result<TensorId> {
+    if batch == 1 {
+        return assistant_masked_causal_loss(logits, labels, store, tape, vocab_size);
+    }
+
+    if labels.len() != batch * seq_len {
+        return Err(leak_autograd_err(format!(
+            "train_sft: batched label count {} does not match batch*seq {}",
+            labels.len(),
+            batch * seq_len
+        )));
+    }
+
+    let mut gather_indices = Vec::with_capacity(labels.len());
+    let mut mask_values = Vec::with_capacity(labels.len());
+    let mut inv_counts = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let row_labels = &labels[row * seq_len..(row + 1) * seq_len];
+        let valid_count = row_labels.iter().filter(|&&label| label >= 0).count();
+        if valid_count == 0 {
+            return Err(AutogradError::TapeInvariant(
+                "train_sft: batched example has no supervised assistant tokens after shifting",
+            ));
+        }
+        inv_counts.push(-1.0 / valid_count as f32);
+        for &label in row_labels {
+            let idx = match usize::try_from(label) {
+                Ok(index) if index < vocab_size => index,
+                Ok(index) => {
+                    return Err(leak_autograd_err(format!(
+                        "train_sft: label {index} is outside vocab size {vocab_size}",
+                    )));
+                }
+                Err(_) => 0,
+            };
+            gather_indices.push(idx);
+            mask_values.push(if label >= 0 { 1.0 } else { 0.0 });
+        }
+    }
+
+    let log_probs = log_softmax(logits, store, tape)?;
+    let target_log_probs = gather_last_dim(log_probs, &gather_indices, store, tape)?;
+    let mask = store.from_slice(&mask_values, &[batch, seq_len])?;
+    let masked = mul(target_log_probs, mask, store, tape)?;
+    let ones = store.from_slice(&vec![1.0f32; seq_len], &[seq_len, 1])?;
+    let row_sums = matmul(masked, ones, store, tape)?;
+    let inv_counts = store.from_slice(&inv_counts, &[batch, 1])?;
+    let per_example_loss = mul(row_sums, inv_counts, store, tape)?;
+    mean(per_example_loss, store, tape)
 }
 
 /// Leak a `String` into a `&'static str` for `AutogradError::TapeInvariant`.
@@ -1468,6 +1576,44 @@ mod tests {
                 "{\"messages\":[{\"role\":\"user\",\"content\":\"bye\"},{\"role\":\"assistant\",\"content\":\"later\"}]}\n",
             ),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn batched_assistant_loss_matches_single_example_mean() -> TestResult {
+        let logits_data = vec![
+            4.0f32, 1.0, 0.0, -1.0, 0.5, 3.0, 0.0, -2.0, // example 0
+            2.0, 0.0, 1.0, -1.0, -0.5, 0.0, 4.0, 1.0, // example 1
+        ];
+
+        let mut batch_store = TensorStore::default();
+        let mut batch_tape = Tape::new();
+        let batch_logits = batch_store.from_slice(&logits_data, &[2, 2, 4])?;
+        let batch_loss = assistant_masked_causal_loss_batch(
+            batch_logits,
+            &[1, 1, 0, -100],
+            2,
+            2,
+            &mut batch_store,
+            &mut batch_tape,
+            4,
+        )?;
+        let batch_value = batch_store.to_host(batch_loss)?[0];
+
+        let mut single_values = Vec::new();
+        for (row, labels) in [vec![1, 1], vec![0, -100]].into_iter().enumerate() {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            let start = row * 8;
+            let logits = store.from_slice(&logits_data[start..start + 8], &[1, 2, 4])?;
+            let loss = assistant_masked_causal_loss(logits, &labels, &mut store, &mut tape, 4)?;
+            single_values.push(store.to_host(loss)?[0]);
+        }
+        let expected = single_values.iter().sum::<f32>() / single_values.len() as f32;
+        assert!(
+            (batch_value - expected).abs() < 1.0e-5,
+            "batched loss {batch_value} != single-example mean {expected}"
+        );
         Ok(())
     }
 
