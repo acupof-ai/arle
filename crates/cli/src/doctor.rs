@@ -10,6 +10,8 @@ use crate::hardware::{self, GpuInfo};
 use crate::hub_discovery;
 use crate::model_catalog;
 
+const INSPECTION_SCHEMA_VERSION: u32 = 1;
+
 struct DoctorSnapshot {
     info: hardware::SystemInfo,
     tty: TtyState,
@@ -207,7 +209,9 @@ fn collect_snapshot(args: &Args) -> DoctorSnapshot {
 
 #[derive(Debug, Serialize)]
 struct DoctorJsonReport {
+    schema_version: u32,
     mode: &'static str,
+    status: &'static str,
     version: &'static str,
     compiled_backend: String,
     supports_inference: bool,
@@ -224,7 +228,9 @@ struct DoctorJsonReport {
 
 #[derive(Debug, Serialize)]
 struct ModelsJsonReport {
+    schema_version: u32,
     mode: &'static str,
+    status: &'static str,
     version: &'static str,
     compiled_backend: String,
     resolution: ResolutionReport,
@@ -263,7 +269,9 @@ struct InputsReport {
 
 #[derive(Debug, Serialize)]
 struct ResolutionReport {
+    status: &'static str,
     selected: Option<SelectedModelReport>,
+    error_code: Option<&'static str>,
     error: Option<String>,
 }
 
@@ -303,6 +311,7 @@ struct ModelRecommendationReport {
 
 #[derive(Debug, Serialize)]
 struct CheckReport {
+    code: &'static str,
     name: &'static str,
     status: &'static str,
     message: String,
@@ -314,8 +323,11 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn doctor_report(snapshot: &DoctorSnapshot) -> DoctorJsonReport {
+    let checks = checks_report(snapshot);
     DoctorJsonReport {
+        schema_version: INSPECTION_SCHEMA_VERSION,
         mode: "doctor",
+        status: overall_check_status(&checks),
         version: env!("CARGO_PKG_VERSION"),
         compiled_backend: snapshot.info.compiled_backend.name().to_string(),
         supports_inference: snapshot.info.compiled_backend.supports_inference(),
@@ -341,16 +353,19 @@ fn doctor_report(snapshot: &DoctorSnapshot) -> DoctorJsonReport {
         resolution: resolution_report(&snapshot.selected),
         discovery: discovery_report(snapshot),
         recommendations: recommendation_reports(snapshot),
-        checks: checks_report(snapshot),
+        checks,
     }
 }
 
 fn models_report(snapshot: &DoctorSnapshot) -> ModelsJsonReport {
+    let resolution = resolution_report(&snapshot.selected);
     ModelsJsonReport {
+        schema_version: INSPECTION_SCHEMA_VERSION,
         mode: "list_models",
+        status: resolution.status,
         version: env!("CARGO_PKG_VERSION"),
         compiled_backend: snapshot.info.compiled_backend.name().to_string(),
-        resolution: resolution_report(&snapshot.selected),
+        resolution,
         discovery: discovery_report(snapshot),
         recommendations: recommendation_reports(snapshot),
     }
@@ -382,17 +397,29 @@ fn gpu_report(gpu: &GpuInfo) -> GpuReport {
 fn resolution_report(selected: &Result<SelectedModelSource>) -> ResolutionReport {
     match selected {
         Ok(source) => ResolutionReport {
+            status: "ok",
             selected: Some(SelectedModelReport {
                 origin: source.origin_key(),
                 value: source.value().to_string(),
                 local_path: source.local_path().map(|path| path.display().to_string()),
             }),
+            error_code: None,
             error: None,
         },
         Err(err) => ResolutionReport {
+            status: "warn",
             selected: None,
+            error_code: Some(resolution_error_code(err)),
             error: Some(format!("{err:#}")),
         },
+    }
+}
+
+fn resolution_error_code(err: &anyhow::Error) -> &'static str {
+    if err.to_string().starts_with("no model selected;") {
+        "no_model_selected"
+    } else {
+        "resolution_failed"
     }
 }
 
@@ -434,6 +461,7 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
     let supports_inference = snapshot.info.compiled_backend.supports_inference();
     if supports_inference {
         checks.push(CheckReport {
+            code: "backend_available",
             name: "backend",
             status: "ok",
             message: format!(
@@ -443,6 +471,7 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
         });
     } else {
         checks.push(CheckReport {
+            code: "backend_missing",
             name: "backend",
             status: "warn",
             message: "rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` to run inference"
@@ -451,6 +480,7 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
     }
     if !supports_inference {
         checks.push(CheckReport {
+            code: "catalog_backendless",
             name: "catalog",
             status: "warn",
             message:
@@ -459,12 +489,14 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
         });
     } else if snapshot.recommendations.is_empty() {
         checks.push(CheckReport {
+            code: "catalog_no_fit",
             name: "catalog",
             status: "warn",
             message: "detected memory does not fit any curated model for this backend".to_string(),
         });
     } else {
         checks.push(CheckReport {
+            code: "catalog_available",
             name: "catalog",
             status: "ok",
             message: format!(
@@ -475,12 +507,14 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
     }
     if snapshot.selected.is_ok() {
         checks.push(CheckReport {
+            code: "resolution_resolved",
             name: "resolution",
             status: "ok",
             message: "resolved a model source".to_string(),
         });
     } else {
         checks.push(CheckReport {
+            code: "resolution_missing",
             name: "resolution",
             status: "warn",
             message: "set `--model-path`, `AGENT_INFER_MODEL`, or cache a supported local model"
@@ -488,6 +522,14 @@ fn checks_report(snapshot: &DoctorSnapshot) -> Vec<CheckReport> {
         });
     }
     checks
+}
+
+fn overall_check_status(checks: &[CheckReport]) -> &'static str {
+    if checks.iter().any(|check| check.status != "ok") {
+        "warn"
+    } else {
+        "ok"
+    }
 }
 
 fn print_discovery_section(snapshot: &DoctorSnapshot) {
@@ -725,11 +767,21 @@ mod tests {
         )));
         let value = serde_json::to_value(doctor_report(&snapshot)).expect("serialize doctor json");
 
+        assert_eq!(value["schema_version"], 1);
         assert_eq!(value["mode"], "doctor");
+        assert_eq!(
+            value["status"],
+            if snapshot.info.compiled_backend.supports_inference() {
+                "ok"
+            } else {
+                "warn"
+            }
+        );
         assert_eq!(
             value["compiled_backend"],
             snapshot.info.compiled_backend.name()
         );
+        assert_eq!(value["resolution"]["status"], "ok");
         assert_eq!(value["resolution"]["selected"]["origin"], "env_model");
         assert_eq!(value["inputs"]["hf_cache_root"], "/tmp/hf-cache");
         assert_eq!(
@@ -738,6 +790,14 @@ mod tests {
                 .expect("snapshot list")
                 .len(),
             6
+        );
+        assert_eq!(
+            value["checks"][0]["code"],
+            if snapshot.info.compiled_backend.supports_inference() {
+                "backend_available"
+            } else {
+                "backend_missing"
+            }
         );
         assert_eq!(value["checks"][0]["name"], "backend");
         assert_eq!(
@@ -755,9 +815,13 @@ mod tests {
         let snapshot = test_snapshot(Err(anyhow::anyhow!("no model selected")));
         let value = serde_json::to_value(models_report(&snapshot)).expect("serialize models json");
 
+        assert_eq!(value["schema_version"], 1);
         assert_eq!(value["mode"], "list_models");
+        assert_eq!(value["status"], "warn");
         assert!(value.get("checks").is_none());
+        assert_eq!(value["resolution"]["status"], "warn");
         assert!(value["resolution"]["selected"].is_null());
+        assert_eq!(value["resolution"]["error_code"], "resolution_failed");
         assert_eq!(value["resolution"]["error"], "no model selected");
     }
 }
