@@ -610,7 +610,55 @@ fn decode_wal_records(bytes: &[u8]) -> io::Result<Vec<KvWalRecord>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
     use tempfile::tempdir;
+
+    struct TestHostArena {
+        handle: *mut KvHostArenaHandle,
+        base_ptr: *mut u8,
+    }
+
+    impl TestHostArena {
+        fn new(capacity_bytes: usize) -> Self {
+            let (handle, base_ptr) = host_arena_create(capacity_bytes).unwrap();
+            assert!(!handle.is_null());
+            assert!(!base_ptr.is_null());
+            Self { handle, base_ptr }
+        }
+
+        fn reserve(&self, len: usize) -> KvHostArenaRegion {
+            unsafe { host_arena_reserve(self.handle, len) }
+                .unwrap()
+                .unwrap()
+        }
+
+        fn release(&self, region: KvHostArenaRegion) {
+            unsafe {
+                host_arena_release(self.handle, region).unwrap();
+            }
+        }
+
+        fn reset(&self) {
+            unsafe {
+                host_arena_reset(self.handle).unwrap();
+            }
+        }
+
+        fn reserved_bytes(&self) -> usize {
+            unsafe { host_arena_reserved_bytes(self.handle.cast_const()) }.unwrap()
+        }
+    }
+
+    impl Drop for TestHostArena {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe {
+                    host_arena_destroy(self.handle).unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn block_path_is_hex_named() {
@@ -708,41 +756,94 @@ mod tests {
 
     #[test]
     fn host_arena_reuses_released_regions() {
-        let (handle, base_ptr) = host_arena_create(256).unwrap();
-        assert!(!handle.is_null());
-        assert!(!base_ptr.is_null());
+        let arena = TestHostArena::new(256);
+        assert!(!arena.base_ptr.is_null());
 
-        let a = unsafe { host_arena_reserve(handle, 64) }.unwrap().unwrap();
-        let b = unsafe { host_arena_reserve(handle, 32) }.unwrap().unwrap();
+        let a = arena.reserve(64);
+        let b = arena.reserve(32);
         assert_eq!(a.offset, 0);
         assert_eq!(b.offset, 64);
-        assert_eq!(
-            unsafe { host_arena_reserved_bytes(handle.cast_const()) }.unwrap(),
-            96
-        );
+        assert_eq!(arena.reserved_bytes(), 96);
 
-        unsafe {
-            host_arena_release(handle, a).unwrap();
-        }
-        let c = unsafe { host_arena_reserve(handle, 64) }.unwrap().unwrap();
+        arena.release(a);
+        let c = arena.reserve(64);
         assert_eq!(c.offset, 0);
-
-        unsafe {
-            host_arena_destroy(handle).unwrap();
-        }
+        assert_eq!(arena.reserved_bytes(), 96);
     }
 
     #[test]
     fn host_arena_reset_rewinds_allocator() {
-        let (handle, _base_ptr) = host_arena_create(128).unwrap();
-        let _ = unsafe { host_arena_reserve(handle, 96) }.unwrap().unwrap();
-        unsafe {
-            host_arena_reset(handle).unwrap();
-        }
-        let region = unsafe { host_arena_reserve(handle, 96) }.unwrap().unwrap();
+        let arena = TestHostArena::new(128);
+        let _ = arena.reserve(96);
+        arena.reset();
+        let region = arena.reserve(96);
         assert_eq!(region.offset, 0);
-        unsafe {
-            host_arena_destroy(handle).unwrap();
+        assert_eq!(arena.reserved_bytes(), 96);
+    }
+
+    #[test]
+    fn host_arena_reverse_release_rewinds_tail_capacity() {
+        let arena = TestHostArena::new(192);
+        let a = arena.reserve(64);
+        let b = arena.reserve(64);
+        let c = arena.reserve(64);
+        assert_eq!(a.offset, 0);
+        assert_eq!(b.offset, 64);
+        assert_eq!(c.offset, 128);
+        assert_eq!(arena.reserved_bytes(), 192);
+
+        arena.release(c);
+        assert_eq!(arena.reserved_bytes(), 128);
+        arena.release(b);
+        assert_eq!(arena.reserved_bytes(), 64);
+        arena.release(a);
+        assert_eq!(arena.reserved_bytes(), 0);
+
+        let whole = arena.reserve(192);
+        assert_eq!(whole.offset, 0);
+        assert_eq!(whole.len, 192);
+        assert_eq!(arena.reserved_bytes(), 192);
+    }
+
+    #[test]
+    #[ignore = "microbench: cargo test -p kv-native-sys host_arena_bench --release -- --ignored --nocapture"]
+    fn host_arena_bench_reserved_bytes_fragmented() {
+        const REGION_LEN: usize = 64;
+        const REGIONS: usize = 8_192;
+        const QUERIES: usize = 5_000_000;
+        const WARMUP_QUERIES: usize = 100_000;
+
+        let arena = TestHostArena::new(REGION_LEN * REGIONS);
+        let mut regions = Vec::with_capacity(REGIONS);
+        for _ in 0..REGIONS {
+            regions.push(arena.reserve(REGION_LEN));
         }
+        for region in regions.iter().step_by(2) {
+            arena.release(*region);
+        }
+
+        let expected_reserved = REGION_LEN * (REGIONS / 2);
+        let mut checksum = 0usize;
+        for _ in 0..WARMUP_QUERIES {
+            let reserved = arena.reserved_bytes();
+            assert_eq!(reserved, expected_reserved);
+            checksum = checksum.wrapping_add(black_box(reserved));
+        }
+
+        let start = Instant::now();
+        for _ in 0..QUERIES {
+            let reserved = arena.reserved_bytes();
+            assert_eq!(reserved, expected_reserved);
+            checksum = checksum.wrapping_add(black_box(reserved));
+        }
+        let elapsed = start.elapsed();
+        let ns_per_query = elapsed.as_secs_f64() * 1_000_000_000.0 / QUERIES as f64;
+
+        eprintln!(
+            "host_arena_bench_reserved_bytes_fragmented regions={REGIONS} holes={} expected_reserved={} queries={QUERIES} total_ns={} ns_per_query={ns_per_query:.2} checksum={checksum}",
+            REGIONS / 2,
+            expected_reserved,
+            elapsed.as_nanos(),
+        );
     }
 }

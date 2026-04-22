@@ -57,6 +57,7 @@ const KvHostArena = struct {
     mapping: ?*anyopaque,
     capacity_bytes: usize,
     next_offset: usize,
+    reserved_bytes: usize,
     free_list: std.ArrayListUnmanaged(KvHostArenaRegion),
 };
 
@@ -545,6 +546,27 @@ fn hostArenaFromHandle(handle: ?*KvHostArena) ?*KvHostArena {
     return handle;
 }
 
+fn hostArenaRegionEnd(region: KvHostArenaRegion) ?usize {
+    return std.math.add(usize, @intCast(region.offset), region.len) catch null;
+}
+
+fn hostArenaRewindTail(arena: *KvHostArena) void {
+    while (true) {
+        var idx: usize = 0;
+        while (idx < arena.free_list.items.len) : (idx += 1) {
+            const free_region = arena.free_list.items[idx];
+            const free_region_end = hostArenaRegionEnd(free_region) orelse continue;
+            if (free_region_end != arena.next_offset) continue;
+
+            arena.next_offset = @intCast(free_region.offset);
+            _ = arena.free_list.swapRemove(idx);
+            break;
+        } else {
+            return;
+        }
+    }
+}
+
 fn hostArenaCreateInternal(
     capacity_bytes: usize,
     out_handle: *?*KvHostArena,
@@ -568,6 +590,7 @@ fn hostArenaCreateInternal(
         .mapping = mapping,
         .capacity_bytes = capacity_bytes,
         .next_offset = 0,
+        .reserved_bytes = 0,
         .free_list = std.ArrayListUnmanaged(KvHostArenaRegion).empty,
     };
 
@@ -586,11 +609,7 @@ fn hostArenaDestroyInternal(handle: ?*KvHostArena) KvStatus {
 
 fn hostArenaReservedBytesInternal(handle: ?*const KvHostArena, out_reserved_bytes: *usize) KvStatus {
     const arena = handle orelse return .invalid_input;
-    var free_bytes: usize = 0;
-    for (arena.free_list.items) |region| {
-        free_bytes += region.len;
-    }
-    out_reserved_bytes.* = arena.next_offset -| free_bytes;
+    out_reserved_bytes.* = arena.reserved_bytes;
     return .ok;
 }
 
@@ -621,6 +640,7 @@ fn hostArenaReserveInternal(
             .offset = free_region.offset,
             .len = len,
         };
+        arena.reserved_bytes = std.math.add(usize, arena.reserved_bytes, len) catch return .oom;
         return .ok;
     }
 
@@ -630,22 +650,35 @@ fn hostArenaReserveInternal(
         .len = len,
     };
     arena.next_offset += len;
+    arena.reserved_bytes = std.math.add(usize, arena.reserved_bytes, len) catch return .oom;
     return .ok;
 }
 
 fn hostArenaReleaseInternal(handle: ?*KvHostArena, region: KvHostArenaRegion) KvStatus {
     const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
-    const region_end = std.math.add(usize, @intCast(region.offset), region.len) catch {
+    const region_end = hostArenaRegionEnd(region) orelse return .invalid_input;
+    if (region.len == 0 or region_end > arena.capacity_bytes) return .invalid_input;
+    arena.reserved_bytes = std.math.sub(usize, arena.reserved_bytes, region.len) catch {
         return .invalid_input;
     };
-    if (region.len == 0 or region_end > arena.capacity_bytes) return .invalid_input;
-    arena.free_list.append(std.heap.c_allocator, region) catch return .oom;
+    if (region_end == arena.next_offset) {
+        arena.next_offset = @intCast(region.offset);
+        hostArenaRewindTail(arena);
+        return .ok;
+    }
+    arena.free_list.append(std.heap.c_allocator, region) catch {
+        arena.reserved_bytes = std.math.add(usize, arena.reserved_bytes, region.len) catch {
+            return .oom;
+        };
+        return .oom;
+    };
     return .ok;
 }
 
 fn hostArenaResetInternal(handle: ?*KvHostArena) KvStatus {
     const arena = hostArenaFromHandle(handle) orelse return .invalid_input;
     arena.next_offset = 0;
+    arena.reserved_bytes = 0;
     arena.free_list.clearRetainingCapacity();
     return .ok;
 }
