@@ -77,6 +77,15 @@ metal_request / metal_bench / metal_serve
                  -> qwen35_compiled_step prefill for prompt
                  -> capture_qwen35_hidden_from_cpp_outputs
                  -> dflash.rs::qwen35_dflash_speculative_block
+
+metal scheduler runtime:
+  metal_serve -> runtime.rs::run_metal_scheduler_runtime
+    -> request_state.rs::Qwen35StepDriver::{prefill_token,prefill_tokens,decode_token}
+      -> qwen35.rs::with_qwen35_capture_layers
+      -> ensure_dflash_target_hidden_for_terminal_prefill
+      -> qwen35_dflash_speculative_block
+      -> fallback to standard decode when target_hidden is still missing
+         or the request is on the Rust step path
 ```
 
 ## Trigger, routing, fallback
@@ -94,6 +103,11 @@ metal_request / metal_bench / metal_serve
   that seeds the first draft block.
 - Verify:
   Each speculative block uses `qwen35_dflash_speculative_block`, which runs one target verify over the whole block, accepts the longest greedy prefix, rolls back rejected GDR state, and returns the updated target hidden state.
+- Scheduler fallback:
+  `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
+  terminal prefill did not seed `target_hidden` yet, or the request is on the
+  Rust step path instead of the compiled C++ path, Metal falls through to the
+  standard target decode path for that token instead of aborting the request.
 - Fallback:
   `metal/dflash.rs::check_compatibility` refuses only true shape mismatches now. For Qwen3.6, rebucketed draft heads are accepted when `q_proj_width` and `kv_proj_width` match the target. Any compatibility failure logs a warning and falls back to standard Metal generation instead of aborting startup.
 
