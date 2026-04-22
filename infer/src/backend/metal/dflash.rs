@@ -3605,7 +3605,7 @@ mod tests {
         let target = synthetic_target_config();
         let mut draft = synthetic_draft_config();
         draft.num_attention_heads = 32;
-        draft.num_key_value_heads = 4;
+        draft.num_key_value_heads = 16;
         draft.head_dim = 64;
         super::check_compatibility(&target, &draft, "synthetic/draft")
             .expect("same q/kv projection widths should be accepted");
