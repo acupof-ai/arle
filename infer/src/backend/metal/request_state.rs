@@ -3583,11 +3583,11 @@ impl<'a> Qwen35StepDriver<'a> {
     ) -> Result<Vec<Qwen35PrefixSnapshot>> {
         ensure!(
             block_size > 0,
-            "Qwen3.5 prefix snapshot block size must be > 0"
+            "Qwen3.5/Qwen3.6 prefix snapshot block size must be > 0"
         );
         ensure!(
             prompt_tokens.len().is_multiple_of(block_size),
-            "Qwen3.5 prefix snapshot build requires a block-aligned prompt"
+            "Qwen3.5/Qwen3.6 prefix snapshot build requires a block-aligned prompt"
         );
         if !matches!(self.mode, Qwen35StepMode::Cpp(_)) || prompt_tokens.is_empty() {
             return Ok(Vec::new());
@@ -3611,18 +3611,18 @@ impl<'a> Qwen35StepDriver<'a> {
             1,
             None,
         )
-        .context("build replay driver for Qwen3.5 prefix snapshots")?;
+        .context("build replay driver for Qwen3.5/Qwen3.6 prefix snapshots")?;
         let mut snapshots = Vec::with_capacity(prompt_tokens.len() / block_size);
 
         for chunk in prompt_tokens.chunks(block_size) {
             replay
                 .prefill_tokens(chunk, false)
-                .context("replay Qwen3.5 prompt chunk for prefix snapshot")?;
+                .context("replay Qwen3.5/Qwen3.6 prompt chunk for prefix snapshot")?;
             let materialized = replay.cache_len as usize;
             snapshots.push(
                 replay
                     .export_current_cpp_snapshot(prompt_tokens[..materialized].to_vec())
-                    .context("export replayed Qwen3.5 prefix snapshot")?,
+                    .context("export replayed Qwen3.5/Qwen3.6 prefix snapshot")?,
             );
         }
 
@@ -3643,7 +3643,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 self.weights
                     .cpp_model
                     .as_ref()
-                    .context("Qwen3.5 DFlash requires C++ compiled model")?
+                    .context("Qwen3.5/Qwen3.6 DFlash requires C++ compiled model")?
                     .as_raw(),
             )
         } else {
@@ -3713,7 +3713,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .weights
                     .cpp_model
                     .as_ref()
-                    .context("Qwen3.5 C++ prefill path missing compiled model")?;
+                    .context("Qwen3.5/Qwen3.6 C++ prefill path missing compiled model")?;
                 state.ensure_session_active(cpp_model)?;
                 let logits = if let Some(ref dflash) = self.dflash {
                     super::qwen35::with_qwen35_capture_layers(
@@ -3789,7 +3789,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
             self.pending_sampled = None;
         }
 
-        // ── DFlash speculative path (Qwen3.5) ────────────────────────────
+        // ── DFlash speculative path (Qwen3.5/Qwen3.6) ─────────────────────
         // 1. Drain buffer first — cheap, no GPU work, short-lived borrow.
         if let Some(dflash) = self.dflash.as_mut()
             && let Some(buffered) = dflash.token_buffer.pop_front()
@@ -3805,8 +3805,8 @@ impl StepDriver for Qwen35StepDriver<'_> {
         //    produces a malformed slice_update and the forward dies with
         //    "Shapes (1,4,16,256) and (1,4,N,256) cannot be broadcast".
         if let Some(block_size) = self.dflash.as_ref().map(|d| d.runtime.block_size()) {
-            let block_size_i32 =
-                i32::try_from(block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
+            let block_size_i32 = i32::try_from(block_size)
+                .context("Qwen3.5/Qwen3.6 DFlash block_size does not fit i32")?;
             let needed_cap = self.cache_len + block_size_i32;
             if needed_cap > self.kv_capacity {
                 self.ensure_capacity(needed_cap)?;
@@ -3828,7 +3828,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     .weights
                     .cpp_model
                     .as_ref()
-                    .context("Qwen3.5 DFlash requires C++ compiled model")?;
+                    .context("Qwen3.5/Qwen3.6 DFlash requires C++ compiled model")?;
                 cpp_state.ensure_caches_drained(cpp_model)?;
 
                 let block = dflash::qwen35_dflash_speculative_block(
@@ -3855,7 +3855,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 return dflash
                     .token_buffer
                     .pop_front()
-                    .context("Qwen3.5 DFlash block produced zero tokens");
+                    .context("Qwen3.5/Qwen3.6 DFlash block produced zero tokens");
             }
             // Rust mode fallback: fall through to standard decode
         }
