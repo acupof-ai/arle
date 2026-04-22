@@ -55,14 +55,6 @@ pub struct Qwen3Model {
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
-    /// Shared paged-prefill plan for `process_all_layers_batch_paged`. Stores
-    /// `(max_total_qo_rows, plan)` so larger packed multi-request forwards can
-    /// grow the FlashInfer workspace on demand without reallocating every call.
-    /// The plan is still reused across subsequent prefills once capacity is
-    /// sufficient, matching sglang's `workspace_buffer` pattern and avoiding
-    /// the async-free pressure that caused foreign C++ exceptions under load.
-    pub(super) paged_prefill_plan:
-        std::sync::Mutex<Option<(usize, cuda_kernels::flashinfer::BatchPrefillPagedPlan)>>,
     /// Optional PEFT LoRA bundle. `None` = no adapter, forward uses base
     /// weights verbatim. When `Some`, every projection site in prefill /
     /// decode / batch_decode checks `lora.layers[layer_idx].<module>` and
@@ -241,7 +233,6 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
-            paged_prefill_plan: std::sync::Mutex::new(None),
             lora: None,
         };
 
@@ -462,7 +453,6 @@ impl Qwen3Model {
             cos_cache,
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
-            paged_prefill_plan: std::sync::Mutex::new(None),
             lora: None,
         };
 

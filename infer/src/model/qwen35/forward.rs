@@ -169,6 +169,7 @@ impl GenerationState for Qwen35State {
 impl ModelForward for Qwen35Model {
     type State = Qwen35State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers35;
+    type PrefillContext = ();
 
     fn create_state(&self) -> Result<Self::State> {
         let single_token_bufs = SingleTokenBuffers::new(&self.ctx, &self.config)?;
@@ -217,6 +218,15 @@ impl ModelForward for Qwen35Model {
             max_pages,
             num_linear_layers,
         )
+    }
+
+    fn create_prefill_context(
+        &self,
+        _max_batch_size: usize,
+        _prefill_budget_tokens: usize,
+        _pool: &PagedKVPool,
+    ) -> Result<Self::PrefillContext> {
+        Ok(())
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {

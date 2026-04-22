@@ -1,3 +1,4 @@
+use super::core::{PendingPrefill, PendingPrefillRow};
 use super::{FinishReason, GenerationState, ModelForward, Phase, Scheduler, error, info, warn};
 use crate::model::PrefillBatchRequest;
 use crate::sampler::SamplingParams;
@@ -38,6 +39,29 @@ enum PrefillCompletionAction {
     Stop,
     FinishLength,
     MoveToDecode,
+}
+
+struct PreparedPrefillBatch {
+    rows: Vec<PendingPrefillRow>,
+    chunk_tokens: Vec<(usize, Vec<u32>)>,
+    uses_paged: bool,
+    prefill_spans: Vec<(usize, fastrace::Span)>,
+}
+
+impl PreparedPrefillBatch {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn requests(&self) -> Vec<PrefillBatchRequest<'_>> {
+        self.chunk_tokens
+            .iter()
+            .map(|(slot_idx, tokens)| PrefillBatchRequest {
+                slot_idx: *slot_idx,
+                tokens,
+            })
+            .collect()
+    }
 }
 
 fn prefill_completion_action(
@@ -416,13 +440,9 @@ impl<M: ModelForward> Scheduler<M> {
         }
     }
 
-    /// Process one scheduler-planned prefill batch. Single-request prefill is
-    /// just the batch_size=1 case.
-    pub(super) fn step_prefill_batch(&mut self, candidates: &[PrefillCandidate]) {
+    fn prepare_prefill_batch(&mut self, candidates: &[PrefillCandidate]) -> PreparedPrefillBatch {
+        let mut rows = Vec::with_capacity(candidates.len());
         let mut chunk_tokens = Vec::with_capacity(candidates.len());
-        let mut totals = Vec::with_capacity(candidates.len());
-        let mut new_progress = Vec::with_capacity(candidates.len());
-
         for candidate in candidates {
             let slot_idx = candidate.slot_idx;
             let Some(req) = self.request(slot_idx) else {
@@ -451,13 +471,13 @@ impl<M: ModelForward> Scheduler<M> {
             if tokens.is_empty() {
                 continue;
             }
-            new_progress.push(progress + tokens.len());
-            totals.push(total);
+            self.dequeue_prefill(slot_idx);
+            rows.push(PendingPrefillRow {
+                slot_idx,
+                total_tokens: total,
+                next_progress: progress + tokens.len(),
+            });
             chunk_tokens.push((slot_idx, tokens));
-        }
-
-        if chunk_tokens.is_empty() {
-            return;
         }
 
         let uses_paged = self.model.prefill_uses_paged_pool() && self.paged_kv_pool.is_active();
@@ -481,36 +501,16 @@ impl<M: ModelForward> Scheduler<M> {
                 })
             })
             .collect();
-        let requests: Vec<PrefillBatchRequest<'_>> = chunk_tokens
-            .iter()
-            .map(|(slot_idx, tokens)| PrefillBatchRequest {
-                slot_idx: *slot_idx,
-                tokens,
-            })
-            .collect();
-
-        let forward_result = self
-            .model
-            .forward_prefill_batch(
-                &requests,
-                &mut self.states,
-                uses_paged.then_some(&mut self.paged_kv_pool),
-            )
-            .map(|()| true);
-
-        if let Err(e) = forward_result {
-            for (slot_idx, _) in &chunk_tokens {
-                let req_id = self
-                    .request(*slot_idx)
-                    .map(|req| req.id)
-                    .unwrap_or_default();
-                error!("Request {}: prefill batch failed: {}", req_id, e);
-                self.finish_slot(*slot_idx);
-            }
-            return;
+        PreparedPrefillBatch {
+            rows,
+            chunk_tokens,
+            uses_paged,
+            prefill_spans,
         }
+    }
 
-        for (slot_idx, span) in &prefill_spans {
+    fn finish_prefill_batch(&mut self, pending: PendingPrefill) {
+        for (slot_idx, span) in &pending.prefill_spans {
             if let Some(req) = self.request_mut(*slot_idx) {
                 req.update_trace_context(Some(span));
             }
@@ -518,30 +518,37 @@ impl<M: ModelForward> Scheduler<M> {
 
         let mut completed_slots = Vec::new();
         let mut completed_sampling = Vec::new();
-        for (((slot_idx, _tokens), total), progress) in
-            chunk_tokens.iter().zip(totals).zip(new_progress)
-        {
-            let req_id = self
-                .request(*slot_idx)
-                .map(|req| req.id)
-                .unwrap_or_default();
-            if progress < total {
-                if let Some(req) = self.request_mut(*slot_idx)
-                    && let Phase::Prefilling {
-                        progress: state_progress,
-                        ..
-                    } = &mut req.phase
+        for row in pending.rows {
+            let slot_idx = row.slot_idx;
+            let Some(req) = self.request(slot_idx) else {
+                continue;
+            };
+            if req.delta_tx.is_closed() || matches!(req.phase, Phase::Finished) {
+                self.finish_slot(slot_idx);
+                continue;
+            }
+
+            if row.next_progress < row.total_tokens {
+                let req_id = req.id;
+                if let Some(req) = self.request_mut(slot_idx)
+                    && let Phase::Prefilling { progress, .. } = &mut req.phase
                 {
-                    *state_progress = progress;
+                    *progress = row.next_progress;
+                    self.queue_prefill(slot_idx);
                 }
                 info!(
                     "Request {}: prefill chunk {}/{} tokens",
-                    req_id, progress, total
+                    req_id, row.next_progress, row.total_tokens
                 );
                 continue;
             }
-            completed_slots.push(*slot_idx);
-            completed_sampling.push(self.prepare_prefill_completion(*slot_idx, total, uses_paged));
+
+            completed_slots.push(slot_idx);
+            completed_sampling.push(self.prepare_prefill_completion(
+                slot_idx,
+                row.total_tokens,
+                pending.uses_paged,
+            ));
         }
 
         if completed_slots.is_empty() {
@@ -570,6 +577,111 @@ impl<M: ModelForward> Scheduler<M> {
                     self.finish_slot(slot_idx);
                 }
             }
+        }
+    }
+
+    fn finish_prefill_batch_error(&mut self, rows: &[PendingPrefillRow], err: &anyhow::Error) {
+        for row in rows {
+            let req_id = self
+                .request(row.slot_idx)
+                .map(|req| req.id)
+                .unwrap_or_default();
+            error!("Request {}: prefill batch failed: {}", req_id, err);
+            self.finish_slot(row.slot_idx);
+        }
+    }
+
+    fn step_prefill_batch_sync(&mut self, batch: PreparedPrefillBatch) {
+        let requests = batch.requests();
+        let forward_result = self.model.forward_prefill_batch(
+            &requests,
+            &mut self.states,
+            batch.uses_paged.then_some(&mut self.paged_kv_pool),
+        );
+        if let Err(e) = forward_result {
+            self.finish_prefill_batch_error(&batch.rows, &e);
+            return;
+        }
+        self.finish_prefill_batch(PendingPrefill {
+            rows: batch.rows,
+            uses_paged: batch.uses_paged,
+            prefill_spans: batch.prefill_spans,
+        });
+    }
+
+    fn step_prefill_batch_async(&mut self, batch: PreparedPrefillBatch) {
+        if self.prefill_ctx.is_none() {
+            match self.model.create_prefill_context(
+                self.states.len(),
+                self.config.max_prefill_tokens,
+                &self.paged_kv_pool,
+            ) {
+                Ok(prefill_ctx) => self.prefill_ctx = Some(prefill_ctx),
+                Err(e) => {
+                    self.finish_prefill_batch_error(&batch.rows, &e);
+                    return;
+                }
+            }
+        }
+
+        let requests = batch.requests();
+        let prefill_ctx = self
+            .prefill_ctx
+            .as_mut()
+            .expect("prefill context must exist before async launch");
+        let forward_result = self.model.launch_prefill_batch(
+            &requests,
+            &mut self.states,
+            batch.uses_paged.then_some(&mut self.paged_kv_pool),
+            prefill_ctx,
+        );
+        if let Err(e) = forward_result {
+            self.finish_prefill_batch_error(&batch.rows, &e);
+            return;
+        }
+
+        self.pending_prefill = Some(PendingPrefill {
+            rows: batch.rows,
+            uses_paged: batch.uses_paged,
+            prefill_spans: batch.prefill_spans,
+        });
+    }
+
+    pub(super) fn step_prefill_readback(&mut self) {
+        let Some(pending) = self.pending_prefill.take() else {
+            return;
+        };
+        let Some(prefill_ctx) = self.prefill_ctx.as_mut() else {
+            self.finish_prefill_batch_error(
+                &pending.rows,
+                &anyhow::anyhow!("missing prefill context for async completion"),
+            );
+            return;
+        };
+
+        if let Err(e) = self
+            .model
+            .complete_prefill_batch(&mut self.states, prefill_ctx)
+        {
+            self.finish_prefill_batch_error(&pending.rows, &e);
+            return;
+        }
+
+        self.finish_prefill_batch(pending);
+    }
+
+    /// Process one scheduler-planned prefill batch. Single-request prefill is
+    /// just the batch_size=1 case.
+    pub(super) fn step_prefill_batch(&mut self, candidates: &[PrefillCandidate]) {
+        let batch = self.prepare_prefill_batch(candidates);
+        if batch.is_empty() {
+            return;
+        }
+
+        if self.model.supports_async_prefill_batch() {
+            self.step_prefill_batch_async(batch);
+        } else {
+            self.step_prefill_batch_sync(batch);
         }
     }
 }

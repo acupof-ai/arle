@@ -3,7 +3,7 @@ use rand::RngExt;
 use rand::rngs::StdRng;
 
 use super::decode_buffers::DecodeBuffers;
-use super::prefill::Qwen3PagedPrefillRequest;
+use super::prefill::{Qwen3PagedPrefillRequest, Qwen3PrefillContext};
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
 use crate::model::{
@@ -82,6 +82,7 @@ impl GenerationState for Qwen3State {
 impl ModelForward for Qwen3Model {
     type State = Qwen3State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers;
+    type PrefillContext = Qwen3PrefillContext;
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(Qwen3State {
@@ -115,6 +116,15 @@ impl ModelForward for Qwen3Model {
             num_heads,
             max_pages,
         )
+    }
+
+    fn create_prefill_context(
+        &self,
+        _max_batch_size: usize,
+        _prefill_budget_tokens: usize,
+        _pool: &PagedKVPool,
+    ) -> Result<Self::PrefillContext> {
+        Ok(Qwen3PrefillContext::new())
     }
 
     fn scheduler_runtime_workspace_bytes(
@@ -212,10 +222,12 @@ impl ModelForward for Qwen3Model {
         slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        let request = [Qwen3PagedPrefillRequest { tokens, slot }];
-        let mut logits = self.forward_prefill_paged_batch(&request, pool)?;
-        state.base.prefill_logits = Some(logits.pop().expect("single paged prefill result"));
-        Ok(())
+        let request = [Qwen3PagedPrefillRequest {
+            tokens,
+            slot,
+            state_idx: 0,
+        }];
+        self.run_prefill_paged_batch_sync(&request, std::slice::from_mut(state), pool)
     }
 
     fn forward_prefill_batch_with_pool(
@@ -233,17 +245,53 @@ impl ModelForward for Qwen3Model {
             .map(|request| Qwen3PagedPrefillRequest {
                 tokens: request.tokens,
                 slot: request.slot_idx,
+                state_idx: request.slot_idx,
             })
             .collect();
-        let logits = self.forward_prefill_paged_batch(&paged_requests, pool)?;
-        for (request, request_logits) in requests.iter().zip(logits) {
-            states[request.slot_idx].base.prefill_logits = Some(request_logits);
-        }
+        self.run_prefill_paged_batch_sync(&paged_requests, states, pool)?;
         Ok(true)
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
         true
+    }
+
+    fn supports_async_prefill_batch(&self) -> bool {
+        true
+    }
+
+    fn launch_prefill_batch(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        prefill_ctx: &mut Self::PrefillContext,
+    ) -> Result<()> {
+        match paged_kv_pool {
+            Some(pool) if self.prefill_uses_paged_pool() && pool.is_active() => {
+                if !prepare_paged_prefill_batch(requests, pool)? {
+                    return Ok(());
+                }
+                let paged_requests: Vec<Qwen3PagedPrefillRequest<'_>> = requests
+                    .iter()
+                    .map(|request| Qwen3PagedPrefillRequest {
+                        tokens: request.tokens,
+                        slot: request.slot_idx,
+                        state_idx: request.slot_idx,
+                    })
+                    .collect();
+                self.launch_prefill_paged_batch(&paged_requests, states, pool, prefill_ctx)
+            }
+            _ => self.forward_prefill_batch(requests, states, paged_kv_pool),
+        }
+    }
+
+    fn complete_prefill_batch(
+        &self,
+        _states: &mut [Self::State],
+        prefill_ctx: &mut Self::PrefillContext,
+    ) -> Result<()> {
+        prefill_ctx.complete(&self.ctx)
     }
 
     fn select_token(

@@ -239,15 +239,23 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn step(&mut self) {
         let num = self.active_len();
-        if num == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
+        if num == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
             self.metrics.set_scheduler_step(0, 0, 0, 0, 0, 0);
             return;
         }
 
-        // Read back the previous iteration's decode first. This keeps
-        // `pending_decode` live across loop turns so `run()` can overlap the
-        // next round of intake/admission work with GPU compute instead of
-        // launching and synchronizing in the same iteration.
+        let prefill_readback_us = if self.pending_prefill.is_some() {
+            let t = std::time::Instant::now();
+            self.step_prefill_readback();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+
+        // Read back the previous iteration's in-flight GPU work first.
+        // `pending_prefill` / `pending_decode` live across loop turns so
+        // `run()` can overlap the next round of intake/admission work with GPU
+        // compute instead of launching and synchronizing in the same iteration.
         let readback_us = if self.pending_decode.is_some() {
             let t = std::time::Instant::now();
             self.step_decode_readback();
@@ -272,6 +280,10 @@ impl<M: ModelForward> Scheduler<M> {
             self.pending_decode.is_none(),
             "pending decode must be cleared before the next launch"
         );
+        assert!(
+            self.pending_prefill.is_none(),
+            "pending prefill must be cleared before the next launch"
+        );
 
         let prefill_t = std::time::Instant::now();
         if !plan.prefill.is_empty() {
@@ -295,7 +307,7 @@ impl<M: ModelForward> Scheduler<M> {
         let decode_us = decode_launch_us + readback_us;
         let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
 
-        let total_us = decode_us + emit_us + admission_us + prefill_us;
+        let total_us = decode_us + emit_us + admission_us + prefill_readback_us + prefill_us;
         self.metrics.set_scheduler_step(
             scheduled_rows,
             scheduled_decode_rows,
@@ -317,7 +329,10 @@ impl<M: ModelForward> Scheduler<M> {
         };
         update_ema(&mut self.step_timing_decode_us, decode_us);
         update_ema(&mut self.step_timing_emit_us, emit_us);
-        update_ema(&mut self.step_timing_prefill_us, prefill_us);
+        update_ema(
+            &mut self.step_timing_prefill_us,
+            prefill_readback_us + prefill_us,
+        );
         update_ema(&mut self.step_timing_total_us, total_us);
 
         if total_us > 100_000 && !plan.is_idle() {
@@ -327,7 +342,7 @@ impl<M: ModelForward> Scheduler<M> {
                 admission_us,
                 decode_us,
                 emit_us,
-                prefill_us,
+                prefill_readback_us + prefill_us,
                 total_us,
                 num
             );
