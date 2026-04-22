@@ -2,22 +2,22 @@ use super::{ModelForward, Phase, Scheduler, info};
 use crate::model::kv_cache::KVFormat;
 
 #[derive(Clone, Copy, Debug)]
-struct PrefillReservation {
-    prefill_tokens: usize,
-    page_reserve: SlotPageReserve,
+pub(super) struct PrefillReservation {
+    pub prefill_tokens: usize,
+    pub page_reserve: SlotPageReserve,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SlotPageReserve {
-    slot_idx: usize,
-    prefill_pool_tokens: usize,
-    decode_headroom_tokens: usize,
+pub(super) struct SlotPageReserve {
+    pub slot_idx: usize,
+    pub prefill_pool_tokens: usize,
+    pub decode_headroom_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PrefillCandidate {
-    slot_idx: usize,
-    reservation: PrefillReservation,
+pub(super) struct PrefillCandidate {
+    pub slot_idx: usize,
+    pub reservation: PrefillReservation,
 }
 
 #[derive(Clone, Debug)]
@@ -303,10 +303,7 @@ impl<M: ModelForward> Scheduler<M> {
 
         let prefill_t = std::time::Instant::now();
         if let StepPlan::PrefillOnly(candidates) = &plan {
-            for candidate in candidates {
-                let _ = self
-                    .step_prefill_chunk(candidate.slot_idx, candidate.reservation.prefill_tokens);
-            }
+            self.step_prefill_batch(candidates);
         }
         let prefill_us = prefill_t.elapsed().as_micros();
         let decode_us = decode_launch_us + readback_us;
