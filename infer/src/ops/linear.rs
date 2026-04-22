@@ -379,6 +379,58 @@ pub fn gemm(ctx: &DeviceContext, weight: &DeviceMatrix, x: &HiddenStates) -> Res
     Ok(out)
 }
 
+/// Graph-safe BF16 GEMM for captured batched prefill kernels.
+///
+/// This path is intentionally narrow: it only accepts plain BF16 weights and
+/// always uses the workspace-free cuBLAS handle so CUDA Graph capture can span
+/// multi-token prefill projections. Non-BF16 formats stay on `gemm_into`.
+pub(crate) fn gemm_graphsafe_batched_into(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    assert_eq!(
+        weight.cols, x.hidden_dim,
+        "weight cols {} != hidden_dim {}",
+        weight.cols, x.hidden_dim
+    );
+    assert_eq!(
+        out.hidden_dim, weight.rows,
+        "out hidden_dim {} != weight rows {}",
+        out.hidden_dim, weight.rows
+    );
+    assert_eq!(
+        out.seq_len, x.seq_len,
+        "out seq_len {} != x seq_len {}",
+        out.seq_len, x.seq_len
+    );
+    anyhow::ensure!(
+        !weight.is_quantized() && !weight.has_marlin() && !weight.has_tq(),
+        "graph-safe batched GEMM requires plain BF16 weights"
+    );
+
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gemm_graphsafe_cuda(
+            w_ptr as *const ffi::Half,
+            x_ptr as *const ffi::Half,
+            y_ptr as *mut ffi::Half,
+            weight.rows as i32,
+            x.seq_len as i32,
+            weight.cols as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()
+        .map_err(|e| anyhow::anyhow!("gemm_graphsafe_cuda failed: {e}"))?;
+    }
+
+    Ok(())
+}
+
 /// GEMM into pre-allocated output buffer (zero allocation).
 /// For seq_len=1, uses the graph-safe cuBLAS handle (no workspace) for lower
 /// latency while preserving numerical parity with the prefill path.

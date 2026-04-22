@@ -59,6 +59,24 @@ impl Qwen35State {
         self.clear_prefill_logits();
         self.paged_prefill = None;
     }
+
+    fn ensure_paged_prefill(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &super::config::Config35,
+        seq_len: usize,
+        page_size: usize,
+    ) -> Result<()> {
+        let needs_realloc = self
+            .paged_prefill
+            .as_ref()
+            .map(|bufs| !bufs.matches_shape(seq_len, page_size))
+            .unwrap_or(true);
+        if needs_realloc {
+            self.paged_prefill = Some(PagedPrefillBuffers35::new(ctx, config, seq_len, page_size)?);
+        }
+        Ok(())
+    }
 }
 
 impl GenerationState for Qwen35State {
@@ -224,24 +242,13 @@ impl ModelForward for Qwen35Model {
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
         state.clear_prefill_logits();
-        let needs_realloc = state
-            .paged_prefill
-            .as_ref()
-            .map(|bufs| !bufs.matches_shape(tokens.len(), pool.page_size))
-            .unwrap_or(true);
-        if needs_realloc {
-            state.paged_prefill = Some(PagedPrefillBuffers35::new(
-                &self.ctx,
-                &self.config,
-                tokens.len(),
-                pool.page_size,
-            )?);
-        }
+        state.ensure_paged_prefill(&self.ctx, &self.config, tokens.len(), pool.page_size)?;
+        let recurrent = &mut state.recurrent_state;
         let prefill_bufs = state
             .paged_prefill
             .as_mut()
             .expect("paged prefill buffers initialized");
-        self.prefill_forward_paged(tokens, pool, slot, &mut state.recurrent_state, prefill_bufs)?;
+        self.prefill_forward_paged(tokens, pool, slot, recurrent, prefill_bufs)?;
         Ok(())
     }
 
