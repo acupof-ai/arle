@@ -975,7 +975,7 @@ impl RadixCache {
             if node.ref_count != 0 {
                 continue;
             }
-            if self.selection_pin_active(node, tier_filter, intent, now) {
+            if Self::selection_pin_active(node, tier_filter, intent, now) {
                 continue;
             }
             if node.entry_state != IndexEntryState::Ready {
@@ -1021,7 +1021,6 @@ impl RadixCache {
     }
 
     fn selection_pin_active(
-        &self,
         node: &Node,
         tier_filter: Option<Tier>,
         intent: BlockSelectionIntent,
