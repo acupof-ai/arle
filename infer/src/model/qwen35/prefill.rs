@@ -284,9 +284,10 @@ impl Qwen35Model {
         let start_pos = self.prepare_paged_prefill(token_ids, pool, slot, bufs)?;
         bufs.clear_logits();
 
-        // Capture/replay is shape-based, not "first chunk only". The page-table
-        // metadata and FlashInfer plan are refreshed before launch, and graph
-        // state is invalidated whenever the page-index buffer needs to grow.
+        // Replay is only safe while the captured launch scalars still match.
+        // Page-table metadata and FlashInfer planning are refreshed before each
+        // launch, but `start_pos` is still baked into the prep kernel params,
+        // so a changed chunk offset forces recapture.
         let use_graph = self.supports_paged_prefill_graph();
         if use_graph {
             let mut graph_state = std::mem::replace(&mut bufs.graph_state, CudaGraphState::new());
@@ -294,6 +295,7 @@ impl Qwen35Model {
                 self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, true)
             })?;
             bufs.graph_state = graph_state;
+            bufs.mark_graph_start_pos(start_pos);
         } else {
             self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, false)?;
         }
@@ -379,6 +381,7 @@ impl Qwen35Model {
         if page_indices_reallocated {
             bufs.invalidate_graph();
         }
+        bufs.invalidate_graph_if_start_pos_changed(start_pos);
 
         let qo_indptr = [0_i32, seq_len as i32];
         let kv_indptr = [0_i32, num_pages as i32];
