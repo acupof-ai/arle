@@ -622,8 +622,13 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn release_host_region(&self, region: crate::kv_tier::HostPinnedRegion) {
-        if let Ok(mut pool) = self.host_pinned_pool.lock() {
-            pool.release(region);
+        if let Err(err) = self.host_pinned_pool.release_region(region) {
+            log::warn!(
+                "failed to release host pinned region offset={} len={}: {}",
+                region.offset,
+                region.len,
+                err
+            );
         }
     }
 

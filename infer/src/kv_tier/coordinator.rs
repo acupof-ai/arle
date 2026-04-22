@@ -702,8 +702,13 @@ impl Coordinator {
         )],
     ) {
         for (pool, region) in regions {
-            if let Ok(mut pool) = pool.lock() {
-                pool.release(*region);
+            if let Err(err) = pool.release_region(*region) {
+                log::warn!(
+                    "coordinator failed to release allocated host region offset={} len={}: {}",
+                    region.offset,
+                    region.len,
+                    err
+                );
             }
         }
     }
@@ -1418,7 +1423,7 @@ mod tests {
                     host_pool.read_region(blocks[0].host_region).unwrap(),
                     b"disk-bytes"
                 );
-                host_pool.lock().unwrap().release(blocks[0].host_region);
+                host_pool.release_region(blocks[0].host_region).unwrap();
             }
             other => panic!("unexpected fetch event: {other:?}"),
         }
@@ -1842,7 +1847,7 @@ mod tests {
                     host_pool.read_region(blocks[0].host_region).unwrap(),
                     b"remote-bytes"
                 );
-                host_pool.lock().unwrap().release(blocks[0].host_region);
+                host_pool.release_region(blocks[0].host_region).unwrap();
             }
             other => panic!("unexpected remote fetch event: {other:?}"),
         }
