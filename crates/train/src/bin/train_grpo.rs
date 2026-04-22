@@ -1492,6 +1492,7 @@ mod tests {
             &args,
             &cfg,
             &resumed_policy,
+            Arc::new(CpuBackend),
             &mut resumed_store,
             lora,
         )?;
@@ -1608,6 +1609,7 @@ mod tests {
             &args,
             &cfg,
             &resumed_policy,
+            Arc::new(CpuBackend),
             &mut resumed_store,
             lora,
         )?;
