@@ -12,7 +12,7 @@
 //! Single-token decode uses Triton AOT kernel: fused QK-norm + RoPE + split-KV
 //! attention + online softmax + merge in one kernel launch.
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use cuda_kernels::ffi;
