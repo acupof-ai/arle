@@ -636,6 +636,7 @@ impl<M: ModelForward> Scheduler<M> {
             reusable_prefix_len: direct_gpu_attach_len.unwrap_or(reusable_prefix_len),
             reusable_cached_prompt_len,
             attached_prefix_blocks,
+            staged_prefix: None,
         });
         self.step_new(slot_idx);
         if matches!(
