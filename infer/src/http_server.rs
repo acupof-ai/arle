@@ -1857,6 +1857,20 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()["www-authenticate"],
+            r#"Bearer realm="agent-infer""#
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "unauthorized");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Missing Authorization")),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -1901,6 +1915,43 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()["www-authenticate"],
+            r#"Bearer realm="agent-infer""#
+        );
+    }
+
+    #[tokio::test]
+    async fn completions_reject_invalid_api_key_with_bearer_challenge() {
+        let app = build_app_with_config(
+            mock_scheduler("Qwen3-4B"),
+            ServerMetrics::new(""),
+            HttpServerConfig {
+                api_key: Some(Arc::<str>::from("secret-token")),
+                ..Default::default()
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()["www-authenticate"],
+            r#"Bearer realm="agent-infer""#
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "unauthorized");
+        assert_eq!(payload["error"]["message"], "Invalid API key");
     }
 
     #[tokio::test]
