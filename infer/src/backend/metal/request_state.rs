@@ -2351,6 +2351,7 @@ fn try_decode_qwen35_dflash_speculative_batch<'a>(
         let dflash_state = state.driver.dflash.as_mut().expect("validated above");
         dflash_state.acceptance_lengths.push(block.accepted_inputs);
         dflash_state.target_hidden = Some(block.updated_target_hidden);
+        dflash_state.prefetched_draft = None;
         for t in block.accepted_tokens {
             dflash_state.token_buffer.push_back(t);
         }
@@ -3168,6 +3169,9 @@ struct Qwen35DFlashState {
     draft_state: dflash::ContiguousKvState,
     /// Target-layer hidden states for the next draft block.
     target_hidden: Option<MlxArray>,
+    /// Optional next-block draft block tokens, launched asynchronously after
+    /// verify/accept and consumed when the next single-row speculative block starts.
+    prefetched_draft: Option<dflash::Qwen35PrefetchedDraft>,
     /// Multi-token buffer from speculative acceptance.
     token_buffer: VecDeque<u32>,
     /// Which target-model layers to capture hidden states from.
@@ -3316,6 +3320,7 @@ impl<'a> Qwen35StepDriver<'a> {
                     total_tokens_needed,
                 ),
                 target_hidden: None,
+                prefetched_draft: None,
                 token_buffer: VecDeque::new(),
                 target_layer_ids: runtime.target_layer_ids().to_vec(),
                 acceptance_lengths: Vec::new(),
@@ -3354,6 +3359,7 @@ impl<'a> Qwen35StepDriver<'a> {
                 raw,
                 dflash.target_layer_ids.len(),
             )?;
+            dflash.prefetched_draft = None;
         }
         if dflash.target_hidden.is_some() {
             return Ok(());
@@ -3389,6 +3395,7 @@ impl<'a> Qwen35StepDriver<'a> {
         );
         eval(&[&th]);
         dflash.target_hidden = Some(th);
+        dflash.prefetched_draft = None;
         Ok(())
     }
 
@@ -3848,10 +3855,12 @@ impl StepDriver for Qwen35StepDriver<'_> {
                     &mut cpp_state.gdr_flat,
                     &mut self.cache_len,
                     &mut dflash.draft_state,
+                    dflash.prefetched_draft.take(),
                 )?;
 
                 dflash.acceptance_lengths.push(block.accepted_inputs);
                 dflash.target_hidden = Some(block.updated_target_hidden);
+                dflash.prefetched_draft = block.prefetched_next_draft;
 
                 for &t in &block.accepted_tokens {
                     dflash.token_buffer.push_back(t);
@@ -3929,6 +3938,9 @@ impl StepDriver for Qwen35StepDriver<'_> {
 
     fn cleanup(&mut self) -> Result<()> {
         self.pending_sampled = None;
+        if let Some(dflash) = self.dflash.as_mut() {
+            dflash.prefetched_draft = None;
+        }
         self.ensure_cpp_session_drained()
     }
 }

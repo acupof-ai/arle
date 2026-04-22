@@ -85,9 +85,9 @@ metal scheduler runtime:
       -> ensure_dflash_target_hidden_for_terminal_prefill
       -> qwen35_dflash_speculative_block
          single-row: sampled full-block verify via
-         `verify_block_sampled(cache_pos)` + one host-side 15-token prefix
-         compare over the sampled posterior block
-         + GDR rollback on rejection
+         `verify_block_summary(cache_pos)` + accepted-prefix slice from
+         the staged block tokens + GDR rollback on rejection
+         + token-only next-block prefetch
       -> qwen35_dflash_speculative_block_batched
          multi-row: packed full-block verify over `[B, block_size]`
       -> fallback to standard decode when target_hidden is still missing
@@ -111,10 +111,13 @@ metal scheduler runtime:
   `qwen35_dflash_speculative_block` and
   `qwen35_dflash_speculative_block_batched` now diverge deliberately:
   single-row DFlash uses the native scalar-cache sampled verify entrypoint,
-  `CppQwen35Model::verify_block_sampled`, then materializes the sampled
-  posterior block once and computes the 15-token accepted prefix on the host.
-  That keeps the single-row control path simple and avoids a separate MLX
-  prefix-match kernel just to compare one short block before rollback.
+  `CppQwen35Model::verify_block_summary`, which samples inside C++ and returns
+  only `(matched_prefix_len, next_token)` plus updated KV/GDR state. Rust then
+  slices the accepted prefix directly out of the staged block tokens. That
+  keeps the single-row control path simple, avoids the old posterior-block
+  readback, and matches the `dflash-mlx` shape more closely: prefetch keeps
+  only `seed_token + block_tokens`, while the live draft cache stays in the
+  canonical `draft_state` instead of cloning a second cache snapshot.
   Batched DFlash still verifies the whole packed block in one forward and
   applies the same rollback rule row-wise. The packed route now also samples the draft
   suffix in one `linear + sample_rows_array` pass over the flattened

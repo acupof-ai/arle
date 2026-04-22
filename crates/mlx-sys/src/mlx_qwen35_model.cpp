@@ -2056,7 +2056,7 @@ int32_t qwen35_compiled_verify_block(
     }
 }
 
-int32_t qwen35_compiled_verify_block_sampled(
+int32_t qwen35_compiled_verify_block_summary(
     void* model,
     mlx_array* token_ids,    // int32 [block_size]
     int32_t block_size,
@@ -2065,13 +2065,33 @@ int32_t qwen35_compiled_verify_block_sampled(
     mlx_array** gdr_states, int32_t n_gdr,
     float temperature,
     bool greedy,
-    mlx_array** out_sampled,  // [block_size]
+    int32_t* out_matched_prefix_len,
+    int32_t* out_next_token,
     mlx_array** out_kv_caches,
     mlx_array** out_gdr_states
 ) {
     auto* m = static_cast<Qwen35CompiledModel*>(model);
     try {
         mlx_clear_error();
+
+        if (out_matched_prefix_len == nullptr || out_next_token == nullptr) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_summary requires non-null summary outputs");
+        }
+        if (block_size <= 0) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_summary requires block_size > 0");
+        }
+
+        auto tokens = *to_arr(token_ids);
+        if (tokens.dtype() != int32) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_summary requires int32 token_ids");
+        }
+        if (tokens.ndim() != 1 || tokens.shape(0) != block_size) {
+            throw std::runtime_error(
+                "qwen35_compiled_verify_block_summary requires token_ids shape [block_size]");
+        }
 
         m->current_cache_pos = cache_pos;
         m->current_batch_size = 1;
@@ -2094,8 +2114,20 @@ int32_t qwen35_compiled_verify_block_sampled(
             ? argmax(logits, -1, false)
             : random::categorical(logits * array(1.0f / temperature), -1);
         sampled = reshape(sampled, {block_size});
+        eval(sampled);
+        eval(tokens);
+        const int32_t* sampled_data = sampled.data<int32_t>();
+        const int32_t* token_data = tokens.data<int32_t>();
 
-        *out_sampled = from_arr(std::move(sampled));
+        int32_t matched_prefix_len = 0;
+        int32_t drafted_len = block_size - 1;
+        while (matched_prefix_len < drafted_len &&
+               sampled_data[matched_prefix_len] == token_data[matched_prefix_len + 1]) {
+            matched_prefix_len += 1;
+        }
+        *out_matched_prefix_len = matched_prefix_len;
+        *out_next_token = sampled_data[matched_prefix_len];
+
         for (int i = 0; i < n_kv; ++i) {
             out_kv_caches[i] = from_arr(std::move(outputs[1 + i]));
         }
