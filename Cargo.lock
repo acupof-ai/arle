@@ -490,6 +490,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "anyhow",
+ "autograd",
  "chat",
  "clap",
  "console 0.16.3",
@@ -500,13 +501,18 @@ dependencies = [
  "infer",
  "log",
  "nucleo-matcher",
+ "qwen3-spec",
+ "qwen35-spec",
  "reqwest",
  "rustyline",
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tools",
+ "train",
 ]
 
 [[package]]

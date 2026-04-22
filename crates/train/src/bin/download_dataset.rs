@@ -17,10 +17,17 @@ use std::process::ExitCode;
 use train::hub_dataset::download_dataset_file;
 
 fn main() -> ExitCode {
+    dispatch_from_args(std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+pub(crate) fn dispatch_from_args<I>(args: I) -> ExitCode
+where
+    I: IntoIterator<Item = String>,
+{
     let mut repo: Option<String> = None;
     let mut file: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--repo" => repo = args.next(),

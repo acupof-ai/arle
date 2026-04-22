@@ -5,10 +5,10 @@ edition = "2024"
 
 [features]
 default = ["cuda"]
-cuda = ["infer/cuda"]
-no-cuda = ["infer/no-cuda"]
+cuda = ["infer/cuda", "train/cuda", "autograd/cuda"]
+no-cuda = ["infer/no-cuda", "train/no-cuda", "autograd/no-cuda"]
 cpu = ["infer/cpu"]
-metal = ["infer/metal"]
+metal = ["infer/metal", "train/metal", "autograd/metal"]
 
 [dependencies]
 anyhow = "1.0"
@@ -19,8 +19,13 @@ dialoguer = "0.11"
 hf-hub = { version = "0.5", features = ["tokio"] }
 indicatif = "0.18"
 agent = { path = "../agent" }
+autograd = { path = "../autograd", default-features = false }
 chat = { path = "../chat" }
 infer = { path = "../../infer", default-features = false }
+qwen3-spec = { path = "../qwen3-spec" }
+qwen35-spec = { path = "../qwen35-spec" }
+thiserror = { workspace = true }
+train = { path = "../train", default-features = false }
 tools = { path = "../tools" }
 log = "0.4"
 nucleo-matcher = "0.3"
@@ -30,6 +35,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.35"
 tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
