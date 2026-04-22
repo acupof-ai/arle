@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rand::RngExt;
 use rand::rngs::StdRng;
+use rand::RngExt;
 
 use super::decode_buffers::DecodeBuffers;
 use super::weights::GLM4Model;
@@ -8,7 +8,6 @@ use crate::model::generation_state::GenerationStateBase;
 use crate::model::{GenerationState, ModelForward};
 use crate::ops;
 use crate::sampler::SamplingParams;
-use cuda_kernels::TokenKVPool;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
 
 /// Per-request mutable state for GLM-4.
@@ -161,33 +160,6 @@ impl ModelForward for GLM4Model {
 
     fn supports_cuda_graph_decode(&self) -> bool {
         self.enable_cuda_graph
-    }
-
-    fn forward_prefill_with_pool(
-        &self,
-        tokens: &[u32],
-        state: &mut Self::State,
-        pool: &TokenKVPool,
-        _slot: usize,
-        new_token_indices: &cudarc::driver::CudaSlice<i32>,
-    ) -> Result<()> {
-        if tokens.len() == 1 {
-            self.forward_decode(tokens[0], state)?;
-        } else {
-            let start_pos = state.base.kv_cache.len();
-            let hidden = self.get_embeddings_batch(tokens)?;
-            let hidden = self.process_all_layers_batch_with_pool(
-                hidden,
-                start_pos,
-                &mut state.base.kv_cache,
-                pool,
-                new_token_indices,
-            )?;
-            let logits = self.compute_logits_batch(&hidden)?;
-            state.base.prefill_logits = Some(logits);
-        }
-
-        Ok(())
     }
 
     fn select_token(
