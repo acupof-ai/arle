@@ -175,13 +175,15 @@ pub fn evaluate_examples<M: CausalLm>(
 
     for example in examples {
         let input_len = example.input_ids.len() - 1;
+        let position_ids = (0..input_len).collect::<Vec<_>>();
         let input_ids = example.input_ids[..input_len]
             .iter()
             .map(|&id| id as usize)
             .collect::<Vec<_>>();
         tape.entries.clear();
         tape.set_enabled(true);
-        let logits = model.forward_batch_tokens(&input_ids, 1, input_len, store, tape)?;
+        let logits =
+            model.forward_batch_tokens_with_positions(&input_ids, &position_ids, 1, store, tape)?;
         let (loss_id, token_count) =
             masked_causal_loss(logits, &example.labels[1..], store, tape, vocab_size)?;
         let loss_value = store.to_host(loss_id).map_err(EvalLmError::Autograd)?[0] as f64;
