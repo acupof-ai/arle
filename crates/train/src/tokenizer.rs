@@ -20,6 +20,12 @@ const CHATML_SPECIAL_TOKENS: [&str; 4] = [
 ];
 const UNK_TOKEN: &str = "[UNK]";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpecialToken {
+    pub id: u32,
+    pub token: String,
+}
+
 pub struct ChatTokenizer {
     inner: Tokenizer,
 }
@@ -63,6 +69,58 @@ impl ChatTokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
+    }
+
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    pub fn resolve_special_token(
+        &self,
+        name: &str,
+        explicit_id: Option<u32>,
+        explicit_token: Option<&str>,
+        inferred_tokens: &[&str],
+    ) -> Result<Option<ResolvedSpecialToken>> {
+        if let Some(token) = explicit_token {
+            let id = self.token_to_id(token).ok_or_else(|| {
+                tokenizer_message(&format!("tokenizer is missing {name} token {token:?}"))
+            })?;
+            if let Some(explicit_id) = explicit_id {
+                if explicit_id != id {
+                    return Err(tokenizer_message(&format!(
+                        "{name} token/id mismatch: token {token:?} maps to {id}, not {explicit_id}"
+                    )));
+                }
+            }
+            return Ok(Some(ResolvedSpecialToken {
+                id,
+                token: token.to_string(),
+            }));
+        }
+
+        if let Some(explicit_id) = explicit_id {
+            let token = self.id_to_token(explicit_id).ok_or_else(|| {
+                tokenizer_message(&format!(
+                    "tokenizer is missing {name} token id {explicit_id}"
+                ))
+            })?;
+            return Ok(Some(ResolvedSpecialToken {
+                id: explicit_id,
+                token,
+            }));
+        }
+
+        Ok(inferred_tokens.iter().find_map(|token| {
+            self.token_to_id(token).map(|id| ResolvedSpecialToken {
+                id,
+                token: (*token).to_string(),
+            })
+        }))
     }
 }
 
@@ -163,5 +221,41 @@ mod tests {
             tok.decode(&ids, true).expect("decode").trim(),
             "hello world"
         );
+    }
+
+    #[test]
+    fn resolve_special_token_prefers_explicit_token_and_checks_id_match() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        write_wordlevel_tokenizer(&path, ["hello"], ["<eos>", "<bos>"]).expect("write");
+        let tok = ChatTokenizer::from_file(&path).expect("load tokenizer");
+        let eos_id = tok.token_to_id("<eos>").expect("eos id");
+        let resolved = tok
+            .resolve_special_token("eos", Some(eos_id), Some("<eos>"), &["</s>"])
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.id, eos_id);
+        assert_eq!(resolved.token, "<eos>");
+
+        let err = tok
+            .resolve_special_token("eos", Some(eos_id + 1), Some("<eos>"), &["</s>"])
+            .expect_err("mismatch should fail");
+        assert!(
+            err.to_string().contains("mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_special_token_can_infer_common_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("tokenizer.json");
+        write_wordlevel_tokenizer(&path, ["hello"], ["<|endoftext|>"]).expect("write");
+        let tok = ChatTokenizer::from_file(&path).expect("load tokenizer");
+        let resolved = tok
+            .resolve_special_token("bos", None, None, &["<s>", "<|endoftext|>"])
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.token, "<|endoftext|>");
     }
 }
