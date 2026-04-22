@@ -151,6 +151,38 @@ auto& tape_replay_kernel() {
     return kernel;
 }
 
+auto& prefix_match_len_i32_kernel() {
+    static auto kernel = fast::metal_kernel(
+        "prefix_match_len_i32",
+        {"lhs", "rhs", "T"},
+        {"out"},
+        R"(
+        uint tid = thread_position_in_threadgroup.x;
+        threadgroup int flags[256];
+
+        if (tid < T) {
+            flags[tid] = (lhs[tid] == rhs[tid]) ? 1 : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            int count = 0;
+            for (int i = 0; i < T; ++i) {
+                if (flags[i] != 0) {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            out[0] = count;
+        }
+        )",
+        "",
+        true,
+        false);
+    return kernel;
+}
+
 auto& tape_replay_varlen_kernel() {
     static auto kernel = fast::metal_kernel(
         "tape_replay_varlen",
@@ -486,6 +518,39 @@ mlx_array* mlx_matmul(mlx_array* a, mlx_array* b) {
 
 mlx_array* mlx_greater(mlx_array* a, mlx_array* b) {
     MLX_TRY_RETURN(from_arr(greater(*to_arr(a), *to_arr(b))));
+}
+
+mlx_array* mlx_prefix_match_len_i32(mlx_array* lhs, mlx_array* rhs) {
+    MLX_TRY_RETURN([&]() {
+        auto lhs_arr = contiguous(*to_arr(lhs));
+        auto rhs_arr = contiguous(*to_arr(rhs));
+        require_rank(lhs_arr, 1, "lhs");
+        require_rank(rhs_arr, 1, "rhs");
+        require_dtype(lhs_arr, int32, "lhs");
+        require_dtype(rhs_arr, int32, "rhs");
+        if (lhs_arr.shape(0) != rhs_arr.shape(0)) {
+            throw std::invalid_argument("mlx_prefix_match_len_i32 requires equal-length inputs");
+        }
+        int T = lhs_arr.shape(0);
+        if (T <= 0) {
+            return from_arr(array(int32_t{0}));
+        }
+        if (T > 256) {
+            throw std::invalid_argument("mlx_prefix_match_len_i32 supports at most 256 elements");
+        }
+
+        auto result = prefix_match_len_i32_kernel()(
+            {lhs_arr, rhs_arr, array(T)},
+            {{1}},
+            {int32},
+            std::make_tuple(256, 1, 1),
+            std::make_tuple(256, 1, 1),
+            {},
+            std::nullopt,
+            false,
+            {});
+        return from_arr(std::move(result[0]));
+    }());
 }
 
 // === Unary ops ===
