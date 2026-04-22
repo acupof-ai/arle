@@ -756,6 +756,12 @@ impl ChatCompletionRequest {
             self.presence_penalty,
         )?;
         validate_supported_messages_and_tools(&self.messages, "messages", &self.tools, "tools")?;
+        if self.stream_or_default() && !self.tools.is_empty() {
+            return Err(invalid_parameter(
+                "stream",
+                "stream=true is not supported when tools are present; use non-streaming chat completions for tool calls",
+            ));
+        }
         Ok(())
     }
 
@@ -1481,6 +1487,24 @@ mod tests {
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("tools[0].type"));
         assert!(err.body.message.contains("web_search"));
+    }
+
+    #[test]
+    fn chat_request_rejects_streaming_tools() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"user","content":"hi"}],
+                "stream":true,
+                "tools":[{"type":"function","function":{"name":"shell"}}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("streaming chat tools should fail until delta.tool_calls exist");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("stream=true"));
+        assert!(err.body.message.contains("tool calls"));
     }
 
     #[test]
