@@ -43,6 +43,7 @@ where
     let was_enabled = tape.enabled;
     let trajectories = (|| {
         tape.set_enabled(false);
+        let keep = retained_ids(&[policy, ref_model], store);
 
         let mut trajectories = Vec::with_capacity(prompts.len() * group_size);
         for prompt in prompts {
@@ -102,7 +103,6 @@ where
                 trajectory.old_log_probs[position] = sampled_log_prob;
             }
 
-            let keep = retained_ids(&[policy, ref_model], store);
             store.retain_ids(&keep);
         }
 

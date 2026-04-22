@@ -137,6 +137,7 @@ where
     let was_enabled = tape.enabled;
     let rollout_result = (|| {
         tape.set_enabled(false);
+        let keep = retained_ids(&[policy, ref_model], store);
 
         let mut cursor = initial_prompt.len();
         for turn in turns {
@@ -169,7 +170,6 @@ where
                 old_log_probs[position] = sampled_log_probs[0];
                 response_mask[position] = true;
 
-                let keep = retained_ids(&[policy, ref_model], store);
                 store.retain_ids(&keep);
             }
             turn_boundaries.push((agent_start, agent_end));
