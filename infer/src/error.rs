@@ -88,6 +88,18 @@ impl ApiError {
         }
     }
 
+    /// 413 Payload Too Large — request body exceeded the accepted limit.
+    pub fn payload_too_large(message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error",
+                code,
+            },
+        }
+    }
+
     /// 504 Gateway Timeout — request took too long.
     pub fn timeout(elapsed_secs: u64) -> Self {
         Self {

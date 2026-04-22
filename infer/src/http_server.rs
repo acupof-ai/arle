@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::Request as AxumRequest;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -378,11 +378,22 @@ fn parse_json_request<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, A
             format!("Invalid JSON request body: {inner}"),
             "invalid_json",
         ),
+        JsonRejection::BytesRejection(inner) => bytes_rejection_to_api_error(&inner),
         other => ApiError::bad_request(
             format!("Failed to decode JSON request body: {other}"),
             "invalid_json",
         ),
     })
+}
+
+fn bytes_rejection_to_api_error(err: &BytesRejection) -> ApiError {
+    let status = err.status();
+    let body_text = err.body_text();
+    if status == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large(body_text, "payload_too_large")
+    } else {
+        ApiError::bad_request(body_text, "invalid_body")
+    }
 }
 
 fn route_not_found_error(path: &str) -> ApiError {
@@ -1471,6 +1482,56 @@ mod tests {
                 .is_some_and(|message| message.contains("Invalid JSON request body")),
             "payload={payload}"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_requires_json_content_type() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .body(Body::from(r#"{"prompt":"hello","max_tokens":1}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_json");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Content-Type")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_rejects_payload_too_large_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let oversized_body = format!(
+            r#"{{"prompt":"{}","max_tokens":1}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(oversized_body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert_eq!(payload["error"]["code"], "payload_too_large");
     }
 
     #[tokio::test]
