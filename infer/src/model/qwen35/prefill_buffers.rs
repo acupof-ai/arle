@@ -250,6 +250,7 @@ pub(super) struct PagedPrefillBuffers35 {
     pub metadata: PagedPrefillMetadata35,
     pub plan: BatchPrefillPagedPlan,
     pub graph_state: CudaGraphState,
+    captured_start_pos: Option<usize>,
 }
 
 impl PagedPrefillBuffers35 {
@@ -304,6 +305,7 @@ impl PagedPrefillBuffers35 {
                 config.num_attention_heads,
             )?,
             graph_state: CudaGraphState::new(),
+            captured_start_pos: None,
         })
     }
 
@@ -313,6 +315,20 @@ impl PagedPrefillBuffers35 {
 
     pub(super) fn invalidate_graph(&mut self) {
         self.graph_state = CudaGraphState::new();
+        self.captured_start_pos = None;
+    }
+
+    pub(super) fn invalidate_graph_if_start_pos_changed(&mut self, start_pos: usize) {
+        if self
+            .captured_start_pos
+            .is_some_and(|captured| captured != start_pos)
+        {
+            self.invalidate_graph();
+        }
+    }
+
+    pub(super) fn mark_graph_start_pos(&mut self, start_pos: usize) {
+        self.captured_start_pos = Some(start_pos);
     }
 
     pub(super) fn clear_logits(&mut self) {
