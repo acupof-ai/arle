@@ -11,7 +11,7 @@ use infer::http_server::{HttpServerConfig, TrainControlTarget, build_app_with_co
 use infer::logging;
 use infer::model::{KVCacheDtype, KVFormat};
 use infer::scheduler::SchedulerConfig;
-use infer::trace_reporter::FileReporter;
+use infer::trace_reporter::{TraceStartupConfig, configure_global_tracing};
 use log::info;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/Qwen3-4B");
@@ -37,6 +37,38 @@ struct Args {
     /// Enable request tracing and write trace JSON files to this directory
     #[arg(long)]
     trace_output_path: Option<PathBuf>,
+
+    /// Request tracing level: `off`, `basic`, or `verbose`
+    #[arg(long)]
+    trace_level: Option<String>,
+
+    /// Fraction of requests to trace, between 0.0 and 1.0
+    #[arg(long)]
+    trace_sample_rate: Option<f64>,
+
+    /// Flush interval for trace exporters in milliseconds
+    #[arg(long)]
+    trace_report_interval_ms: Option<u64>,
+
+    /// Promote slow requests above this latency threshold (ms) when the caller opts in
+    #[arg(long)]
+    trace_slow_request_ms: Option<u64>,
+
+    /// OTLP traces endpoint, e.g. `http://127.0.0.1:4318`
+    #[arg(long)]
+    otlp_traces_endpoint: Option<String>,
+
+    /// Service name to attach to exported traces
+    #[arg(long)]
+    trace_service_name: Option<String>,
+
+    /// Additional OTLP headers as `k=v,k2=v2`
+    #[arg(long)]
+    trace_otlp_headers: Option<String>,
+
+    /// OTLP export timeout in milliseconds
+    #[arg(long)]
+    trace_otlp_timeout_ms: Option<u64>,
 
     /// Number of concurrent request slots (each gets its own KV cache).
     /// If unset, auto-computed from available GPU memory.
@@ -101,14 +133,21 @@ async fn main() {
     logging::init_default();
 
     let args = Args::parse();
+    let tracing = configure_global_tracing(TraceStartupConfig {
+        level: args.trace_level.clone(),
+        sample_rate: args.trace_sample_rate,
+        report_interval_ms: args.trace_report_interval_ms,
+        slow_request_ms: args.trace_slow_request_ms,
+        file_output: args.trace_output_path.clone(),
+        otlp_endpoint: args.otlp_traces_endpoint.clone(),
+        otlp_headers: args.trace_otlp_headers.clone(),
+        otlp_timeout_ms: args.trace_otlp_timeout_ms,
+        service_name: args.trace_service_name.clone(),
+    })
+    .unwrap_or_else(|err| panic!("invalid tracing config: {err}"));
 
-    if let Some(ref trace_path) = args.trace_output_path {
-        std::fs::create_dir_all(trace_path).expect("Failed to create trace output directory");
-        fastrace::set_reporter(
-            FileReporter::new(trace_path.clone()),
-            fastrace::collector::Config::default(),
-        );
-        info!("Tracing enabled: output_dir={}", trace_path.display());
+    if tracing.reporter_installed() {
+        info!("Tracing configured: {}", tracing.config().summary());
     }
 
     let model_path = args
@@ -256,7 +295,7 @@ async fn main() {
     drop(handle);
     scheduler_runtime.wait();
 
-    if args.trace_output_path.is_some() {
+    if tracing.reporter_installed() {
         info!("Flushing pending traces...");
         fastrace::flush();
     }

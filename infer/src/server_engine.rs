@@ -1122,6 +1122,7 @@ impl<H: RequestHandle> RequestHandleInferenceEngine<H> {
                 priority: RequestPriority::Normal,
                 session_id: None,
                 delta_tx,
+                trace_context: None,
             })
             .map_err(|err| anyhow::anyhow!("request submission failed: {err}"))
     }

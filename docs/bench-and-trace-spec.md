@@ -49,7 +49,14 @@ reran this?" from §3+§4 alone, the entry is incomplete.
 
 - **`scripts/bench_guidellm.sh <label>`** — canonical throughput / latency sweep wrapper. Params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3; changing them is a deliberate commit. Wrapper enforces one-at-a-time (serial) runs and captures `/v1/stats` service trace before/during/after each run.
 - **`scripts/bench_throughput.py`** — legacy helper for narrower synthetic / diagnostic checks; keep it for historical reproducibility only. `bench_kv_cache*.py` remains component-level / internal-only.
-- **`nsys profile` / `ncu --set full`** — CUDA trace → `.nsys-rep` / `.ncu-rep`.
+- **`scripts/profile_nsys_guidellm.sh <label>`** — preferred infer-side
+  `Nsight Systems` wrapper; attaches to a running server, drives a short
+  bench-anchored load, and exports `.nsys-rep` + `.sqlite` + stats + summary.
+- **`scripts/profile_ncu_guidellm.sh <label> --family <name>`** — preferred
+  infer-side `Nsight Compute` wrapper; attaches to a running server, drives a
+  bench-anchored load, and exports `.ncu-rep` + summary.
+- **`nsys profile` / `ncu --set full`** — raw CUDA profiler CLIs; still valid
+  for one-off work, but repo-owned captures should prefer the wrappers above.
 - **Xcode Metal capture / MLX instruments** — Metal trace → `.gputrace`.
 
 ---
@@ -153,7 +160,9 @@ agent-infer/
 │       └── errors/                  ← bench that surfaced a bug
 ├── bench-output/                    ← gitignored; raw .json/.csv/.html/.nsys-rep/.gputrace
 ├── benchmarks/                      ← committed baseline JSONs (small)
-├── scripts/bench_guidellm.sh        ← canonical throughput / latency wrapper
+├── scripts/bench_guidellm.sh         ← canonical throughput / latency wrapper
+├── scripts/profile_nsys_guidellm.sh  ← canonical infer Nsight Systems wrapper
+├── scripts/profile_ncu_guidellm.sh   ← canonical infer Nsight Compute wrapper
 └── scripts/bench_throughput.py       ← legacy helper / deprecation banner
 ```
 

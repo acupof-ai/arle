@@ -513,6 +513,7 @@ impl<M: ModelForward> Scheduler<M> {
             sampling: incoming.sampling,
             stop: incoming.stop,
             session_id: incoming.session_id,
+            trace_context: incoming.trace_context,
             delta_tx: incoming.delta_tx,
             emit_cursor: super::request::EmitCursor::default(),
             phase: if plan.staged_prefix_plan.is_some() {
@@ -525,6 +526,7 @@ impl<M: ModelForward> Scheduler<M> {
             },
             cacheable_prompt_len: 0,
             latest_logprob: None,
+            pending_finish_reason: None,
             reusable_prefix_len: if plan.direct_gpu_attach {
                 plan.lookup.matched_len
             } else {
@@ -1057,9 +1059,15 @@ impl<M: ModelForward> Scheduler<M> {
                 }
                 if finished {
                     if let Some(req) = self.request_mut(slot_idx) {
+                        req.pending_finish_reason = None;
                         req.phase = Phase::Finished;
                     }
                     self.finish_slot(slot_idx);
+                } else if let Some(reason) = self
+                    .request_mut(slot_idx)
+                    .and_then(|req| req.pending_finish_reason.take())
+                {
+                    self.finish_request(slot_idx, reason);
                 }
             }
         }
@@ -1071,8 +1079,7 @@ impl<M: ModelForward> Scheduler<M> {
                 Ok(event) => self.handle_emit_event(event),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    error!("Emit event channel disconnected");
-                    break;
+                    panic!("emit event channel disconnected");
                 }
             }
         }
@@ -1105,10 +1112,7 @@ impl<M: ModelForward> Scheduler<M> {
                 recv(self.emit_events) -> event => {
                     match event {
                         Ok(event) => self.handle_emit_event(event),
-                        Err(_) => {
-                            error!("Emit event channel disconnected");
-                            break;
-                        }
+                        Err(_) => panic!("emit event channel disconnected"),
                     }
                 }
                 recv(self.coordinator_events) -> event => {
@@ -1487,6 +1491,7 @@ mod tests {
             priority,
             session_id: None,
             delta_tx: tx,
+            trace_context: None,
         }
     }
 

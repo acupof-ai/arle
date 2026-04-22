@@ -13,12 +13,20 @@
 //! | `infer_requests_waiting` | gauge | Requests waiting in queue |
 //! | `infer_scheduler_running_batch` | gauge | Requests currently in the decode-running batch |
 //! | `infer_scheduler_prefill_queue` | gauge | Requests currently queued for prefill continuation |
+//! | `infer_scheduler_scheduled_rows` | gauge | Rows scheduled in the most recent scheduler tick |
+//! | `infer_scheduler_scheduled_decode_rows` | gauge | Decode rows scheduled in the most recent scheduler tick |
+//! | `infer_scheduler_scheduled_prefill_rows` | gauge | Prefill rows scheduled in the most recent scheduler tick |
+//! | `infer_scheduler_decode_tokens` | gauge | Decode tokens advanced in the most recent scheduler tick |
+//! | `infer_scheduler_prefill_tokens` | gauge | Prefill tokens advanced in the most recent scheduler tick |
+//! | `infer_scheduler_batch_width` | gauge | Total GPU batch width in the most recent scheduler tick |
 //! | `infer_kv_coordinator_queue_capacity` | gauge | Coordinator queue capacity |
 //! | `infer_kv_fetch_queue_depth` | gauge | In-flight staged KV fetch tickets |
 //! | `infer_kv_fetch_waiters` | gauge | Requests waiting on staged KV fetches |
 //! | `infer_kv_store_queue_depth` | gauge | In-flight staged KV spill/store tickets |
 //! | `infer_kv_fetch_backpressure` | gauge | Staged KV fetch queue backpressure flag (0/1) |
 //! | `infer_kv_store_backpressure` | gauge | Staged KV store queue backpressure flag (0/1) |
+//! | `infer_tier_fetch_wait_seconds` | gauge | Oldest outstanding staged fetch wait |
+//! | `infer_tier_store_wait_seconds` | gauge | Oldest outstanding staged store wait |
 //! | `infer_tokens_generated_total` | counter | Total output tokens generated |
 //! | `infer_tokens_prompt_total` | counter | Total prompt tokens processed |
 //! | `infer_queue_wait_seconds` | histogram | Submit-to-admit queueing latency |
@@ -27,6 +35,7 @@
 //! | `infer_ttft_seconds` | histogram | Time-to-first-token latency |
 //! | `infer_tpot_seconds` | histogram | Time-per-output-token latency |
 //! | `infer_e2e_seconds` | histogram | End-to-end request latency |
+//! | `infer_scheduler_step_seconds` | histogram | End-to-end scheduler tick latency |
 //! | `infer_kv_gpu_utilization` | gauge | GPU KV cache utilization (0–1) |
 //! | `infer_kv_gpu_blocks_free` | gauge | Free GPU KV blocks |
 //! | `infer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
@@ -62,6 +71,14 @@ pub const LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.002, 0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.050, 0.075, 0.100,
     0.150, 0.200, 0.300, 0.500, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
 ];
+
+fn secs_to_micros(secs: f64) -> u64 {
+    (secs.max(0.0) * 1_000_000.0).round() as u64
+}
+
+fn micros_to_secs(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
 
 impl Histogram {
     /// Create a new histogram with the given bucket boundaries (in seconds).
@@ -146,6 +163,7 @@ pub struct HistogramSet {
     pub ttft: Histogram,
     pub tpot: Histogram,
     pub e2e: Histogram,
+    pub scheduler_step: Histogram,
 }
 
 impl HistogramSet {
@@ -158,6 +176,7 @@ impl HistogramSet {
             ttft: Histogram::new(LATENCY_BUCKETS),
             tpot: Histogram::new(LATENCY_BUCKETS),
             e2e: Histogram::new(LATENCY_BUCKETS),
+            scheduler_step: Histogram::new(LATENCY_BUCKETS),
         }
     }
 }
@@ -197,12 +216,21 @@ struct MetricsInner {
     pub requests_waiting: AtomicU64,
     pub scheduler_running_batch: AtomicU64,
     pub scheduler_prefill_queue: AtomicU64,
+    pub scheduler_scheduled_rows: AtomicU64,
+    pub scheduler_scheduled_decode_rows: AtomicU64,
+    pub scheduler_scheduled_prefill_rows: AtomicU64,
+    pub scheduler_decode_tokens: AtomicU64,
+    pub scheduler_prefill_tokens: AtomicU64,
+    pub scheduler_batch_width: AtomicU64,
+    pub scheduler_step_last_us: AtomicU64,
     pub kv_coordinator_queue_capacity: AtomicU64,
     pub kv_fetch_queue_depth: AtomicU64,
     pub kv_fetch_waiters: AtomicU64,
     pub kv_store_queue_depth: AtomicU64,
     pub kv_fetch_backpressure: AtomicU64,
     pub kv_store_backpressure: AtomicU64,
+    pub tier_fetch_wait_us: AtomicU64,
+    pub tier_store_wait_us: AtomicU64,
     pub kv_gpu_blocks_free: AtomicU64,
     pub kv_gpu_blocks_total: AtomicU64,
     pub memory_active_bytes: AtomicU64,
@@ -233,12 +261,21 @@ impl ServerMetrics {
                 requests_waiting: AtomicU64::new(0),
                 scheduler_running_batch: AtomicU64::new(0),
                 scheduler_prefill_queue: AtomicU64::new(0),
+                scheduler_scheduled_rows: AtomicU64::new(0),
+                scheduler_scheduled_decode_rows: AtomicU64::new(0),
+                scheduler_scheduled_prefill_rows: AtomicU64::new(0),
+                scheduler_decode_tokens: AtomicU64::new(0),
+                scheduler_prefill_tokens: AtomicU64::new(0),
+                scheduler_batch_width: AtomicU64::new(0),
+                scheduler_step_last_us: AtomicU64::new(0),
                 kv_coordinator_queue_capacity: AtomicU64::new(0),
                 kv_fetch_queue_depth: AtomicU64::new(0),
                 kv_fetch_waiters: AtomicU64::new(0),
                 kv_store_queue_depth: AtomicU64::new(0),
                 kv_fetch_backpressure: AtomicU64::new(0),
                 kv_store_backpressure: AtomicU64::new(0),
+                tier_fetch_wait_us: AtomicU64::new(0),
+                tier_store_wait_us: AtomicU64::new(0),
                 kv_gpu_blocks_free: AtomicU64::new(0),
                 kv_gpu_blocks_total: AtomicU64::new(0),
                 memory_active_bytes: AtomicU64::new(0),
@@ -342,6 +379,46 @@ impl ServerMetrics {
             .store(prefill_queue, Ordering::Relaxed);
     }
 
+    /// Update per-tick scheduler gauges.
+    pub fn set_scheduler_step(
+        &self,
+        scheduled_rows: u64,
+        scheduled_decode_rows: u64,
+        scheduled_prefill_rows: u64,
+        decode_tokens: u64,
+        prefill_tokens: u64,
+        batch_width: u64,
+    ) {
+        self.inner
+            .scheduler_scheduled_rows
+            .store(scheduled_rows, Ordering::Relaxed);
+        self.inner
+            .scheduler_scheduled_decode_rows
+            .store(scheduled_decode_rows, Ordering::Relaxed);
+        self.inner
+            .scheduler_scheduled_prefill_rows
+            .store(scheduled_prefill_rows, Ordering::Relaxed);
+        self.inner
+            .scheduler_decode_tokens
+            .store(decode_tokens, Ordering::Relaxed);
+        self.inner
+            .scheduler_prefill_tokens
+            .store(prefill_tokens, Ordering::Relaxed);
+        self.inner
+            .scheduler_batch_width
+            .store(batch_width, Ordering::Relaxed);
+    }
+
+    /// Record end-to-end scheduler tick latency.
+    pub fn observe_scheduler_step(&self, step_s: f64) {
+        self.inner
+            .scheduler_step_last_us
+            .store(secs_to_micros(step_s), Ordering::Relaxed);
+        if let Ok(mut h) = self.inner.histograms.lock() {
+            h.scheduler_step.observe(step_s.max(0.0));
+        }
+    }
+
     /// Update the staged KV coordinator queue gauges.
     pub fn set_kv_coordinator(
         &self,
@@ -370,6 +447,16 @@ impl ServerMetrics {
         self.inner
             .kv_store_backpressure
             .store(u64::from(store_backpressure), Ordering::Relaxed);
+    }
+
+    /// Update oldest outstanding tier wait gauges.
+    pub fn set_tier_wait_seconds(&self, fetch_wait_s: f64, store_wait_s: f64) {
+        self.inner
+            .tier_fetch_wait_us
+            .store(secs_to_micros(fetch_wait_s), Ordering::Relaxed);
+        self.inner
+            .tier_store_wait_us
+            .store(secs_to_micros(store_wait_s), Ordering::Relaxed);
     }
 
     /// Update the GPU KV block gauges.
@@ -423,6 +510,38 @@ impl ServerMetrics {
         self.inner.scheduler_prefill_queue.load(Ordering::Relaxed)
     }
 
+    pub fn scheduler_scheduled_rows(&self) -> u64 {
+        self.inner.scheduler_scheduled_rows.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_scheduled_decode_rows(&self) -> u64 {
+        self.inner
+            .scheduler_scheduled_decode_rows
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_scheduled_prefill_rows(&self) -> u64 {
+        self.inner
+            .scheduler_scheduled_prefill_rows
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_decode_tokens(&self) -> u64 {
+        self.inner.scheduler_decode_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_prefill_tokens(&self) -> u64 {
+        self.inner.scheduler_prefill_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_batch_width(&self) -> u64 {
+        self.inner.scheduler_batch_width.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_step_last_seconds(&self) -> f64 {
+        micros_to_secs(self.inner.scheduler_step_last_us.load(Ordering::Relaxed))
+    }
+
     pub fn kv_coordinator_queue_capacity(&self) -> u64 {
         self.inner
             .kv_coordinator_queue_capacity
@@ -447,6 +566,14 @@ impl ServerMetrics {
 
     pub fn kv_store_backpressure(&self) -> bool {
         self.inner.kv_store_backpressure.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn tier_fetch_wait_seconds(&self) -> f64 {
+        micros_to_secs(self.inner.tier_fetch_wait_us.load(Ordering::Relaxed))
+    }
+
+    pub fn tier_store_wait_seconds(&self) -> f64 {
+        micros_to_secs(self.inner.tier_store_wait_us.load(Ordering::Relaxed))
     }
 
     pub fn kv_gpu_utilization(&self) -> f64 {
@@ -689,6 +816,87 @@ impl ServerMetrics {
         )
         .unwrap();
 
+        out.push_str(
+            "# HELP infer_scheduler_scheduled_rows Rows scheduled in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_scheduled_rows gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_scheduled_rows{{{labels}}} {}",
+            self.inner.scheduler_scheduled_rows.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_scheduled_decode_rows Decode rows scheduled in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_scheduled_decode_rows gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_scheduled_decode_rows{{{labels}}} {}",
+            self.inner
+                .scheduler_scheduled_decode_rows
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_scheduled_prefill_rows Prefill rows scheduled in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_scheduled_prefill_rows gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_scheduled_prefill_rows{{{labels}}} {}",
+            self.inner
+                .scheduler_scheduled_prefill_rows
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_decode_tokens Decode tokens advanced in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_decode_tokens gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_decode_tokens{{{labels}}} {}",
+            self.inner.scheduler_decode_tokens.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_prefill_tokens Prefill tokens advanced in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_prefill_tokens gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_prefill_tokens{{{labels}}} {}",
+            self.inner.scheduler_prefill_tokens.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_batch_width Total GPU batch width in the most recent scheduler tick.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_batch_width gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_batch_width{{{labels}}} {}",
+            self.inner.scheduler_batch_width.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_scheduler_step_last_seconds Most recent end-to-end scheduler tick latency.\n",
+        );
+        out.push_str("# TYPE infer_scheduler_step_last_seconds gauge\n");
+        writeln!(
+            out,
+            "infer_scheduler_step_last_seconds{{{labels}}} {:.6}",
+            self.scheduler_step_last_seconds()
+        )
+        .unwrap();
+
         out.push_str("# HELP infer_kv_coordinator_queue_capacity Coordinator queue capacity shared by staged KV fetch/store work.\n");
         out.push_str("# TYPE infer_kv_coordinator_queue_capacity gauge\n");
         writeln!(
@@ -744,6 +952,28 @@ impl ServerMetrics {
             out,
             "infer_kv_store_backpressure{{{labels}}} {}",
             self.inner.kv_store_backpressure.load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_wait_seconds Oldest outstanding staged KV fetch wait.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_wait_seconds gauge\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_wait_seconds{{{labels}}} {:.6}",
+            self.tier_fetch_wait_seconds()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_store_wait_seconds Oldest outstanding staged KV store wait.\n",
+        );
+        out.push_str("# TYPE infer_tier_store_wait_seconds gauge\n");
+        writeln!(
+            out,
+            "infer_tier_store_wait_seconds{{{labels}}} {:.6}",
+            self.tier_store_wait_seconds()
         )
         .unwrap();
 
@@ -819,6 +1049,15 @@ impl ServerMetrics {
             out.push_str("# HELP infer_e2e_seconds End-to-end request latency.\n");
             out.push_str("# TYPE infer_e2e_seconds histogram\n");
             out.push_str(&h.e2e.render("infer_e2e_seconds", &labels));
+
+            out.push_str(
+                "# HELP infer_scheduler_step_seconds End-to-end scheduler tick latency.\n",
+            );
+            out.push_str("# TYPE infer_scheduler_step_seconds histogram\n");
+            out.push_str(
+                &h.scheduler_step
+                    .render("infer_scheduler_step_seconds", &labels),
+            );
         }
 
         out
@@ -846,6 +1085,10 @@ impl ServerMetrics {
         let tpot_p50 = histograms
             .as_ref()
             .and_then(|h| h.tpot.percentile(0.50))
+            .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
+        let step_p50 = histograms
+            .as_ref()
+            .and_then(|h| h.scheduler_step.percentile(0.50))
             .map_or_else(|| "—".to_string(), |v| format!("{:.1}ms", v * 1000.0));
         let service_p50 = histograms
             .as_ref()
@@ -886,13 +1129,23 @@ impl ServerMetrics {
         };
 
         format!(
-            "requests={} active={} waiting={} running_batch={} prefill_queue={} tokens_out={} kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
+            self.scheduler_scheduled_rows(),
+            self.scheduler_scheduled_decode_rows(),
+            self.scheduler_scheduled_prefill_rows(),
             self.scheduler_running_batch(),
             self.scheduler_prefill_queue(),
+            self.scheduler_batch_width(),
+            self.scheduler_decode_tokens(),
+            self.scheduler_prefill_tokens(),
             self.tokens_generated_total(),
+            self.scheduler_step_last_seconds() * 1000.0,
+            step_p50,
+            self.tier_fetch_wait_seconds() * 1000.0,
+            self.tier_store_wait_seconds() * 1000.0,
             self.kv_gpu_utilization() * 100.0,
             self.prefix_hit_rate() * 100.0,
             active_mb,
@@ -947,7 +1200,10 @@ mod tests {
         m.set_active(2);
         m.set_waiting(5);
         m.set_scheduler_occupancy(3, 4);
+        m.set_scheduler_step(4, 3, 1, 3, 128, 4);
+        m.observe_scheduler_step(0.012);
         m.set_kv_coordinator(16, 3, 5, 2, true, false);
+        m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
         m.record_prefix_lookup(true);
         m.set_memory_bytes(1234, 5678, 42);
@@ -959,12 +1215,20 @@ mod tests {
         assert!(rendered.contains("infer_requests_waiting{model=\"Qwen3-4B\",} 5"));
         assert!(rendered.contains("infer_scheduler_running_batch{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_scheduler_prefill_queue{model=\"Qwen3-4B\",} 4"));
+        assert!(rendered.contains("infer_scheduler_scheduled_rows{model=\"Qwen3-4B\",} 4"));
+        assert!(rendered.contains("infer_scheduler_scheduled_decode_rows{model=\"Qwen3-4B\",} 3"));
+        assert!(rendered.contains("infer_scheduler_scheduled_prefill_rows{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_scheduler_decode_tokens{model=\"Qwen3-4B\",} 3"));
+        assert!(rendered.contains("infer_scheduler_prefill_tokens{model=\"Qwen3-4B\",} 128"));
+        assert!(rendered.contains("infer_scheduler_batch_width{model=\"Qwen3-4B\",} 4"));
         assert!(rendered.contains("infer_kv_coordinator_queue_capacity{model=\"Qwen3-4B\",} 16"));
         assert!(rendered.contains("infer_kv_fetch_queue_depth{model=\"Qwen3-4B\",} 3"));
         assert!(rendered.contains("infer_kv_fetch_waiters{model=\"Qwen3-4B\",} 5"));
         assert!(rendered.contains("infer_kv_store_queue_depth{model=\"Qwen3-4B\",} 2"));
         assert!(rendered.contains("infer_kv_fetch_backpressure{model=\"Qwen3-4B\",} 1"));
         assert!(rendered.contains("infer_kv_store_backpressure{model=\"Qwen3-4B\",} 0"));
+        assert!(rendered.contains("infer_tier_fetch_wait_seconds{model=\"Qwen3-4B\",} 0.250000"));
+        assert!(rendered.contains("infer_tier_store_wait_seconds{model=\"Qwen3-4B\",} 0.500000"));
         assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));
@@ -973,6 +1237,7 @@ mod tests {
         assert!(rendered.contains("infer_tpot_seconds_count"));
         assert!(rendered.contains("infer_service_seconds_count"));
         assert!(rendered.contains("infer_e2e_seconds_count"));
+        assert!(rendered.contains("infer_scheduler_step_seconds_count"));
         assert!(rendered.contains("infer_kv_gpu_blocks_free{model=\"Qwen3-4B\",} 100"));
         assert!(rendered.contains("infer_kv_gpu_blocks_total{model=\"Qwen3-4B\",} 200"));
     }
@@ -983,6 +1248,7 @@ mod tests {
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
+        assert!(s.contains("scheduled=0"));
         assert!(s.contains("queue_p50="));
         assert!(s.contains("prefix_hit_rate=0.0%"));
     }

@@ -96,6 +96,7 @@ impl<M: ModelForward> Scheduler<M> {
                 stop: victim.stop.take(),
                 priority: victim.priority,
                 session_id: victim.session_id.clone(),
+                trace_context: victim.trace_context,
                 delta_tx: victim.delta_tx.clone(),
             };
             victim.phase = Phase::Finished;
@@ -274,10 +275,31 @@ impl<M: ModelForward> Scheduler<M> {
             false
         };
 
+        let batch_size = decode_indices.len();
+        let decode_spans = decode_indices
+            .iter()
+            .filter_map(|&slot_idx| {
+                self.request(slot_idx).and_then(|req| {
+                    req.begin_trace_span("decode_loop").map(|span| {
+                        (
+                            slot_idx,
+                            span.with_properties(|| {
+                                [
+                                    ("slot_idx", slot_idx.to_string()),
+                                    ("batch_size", batch_size.to_string()),
+                                ]
+                            }),
+                        )
+                    })
+                })
+            })
+            .collect();
+
         self.pending_decode = Some(PendingDecode {
             decode_indices,
             slot_indices,
             greedy_launched,
+            decode_spans,
         });
     }
 
@@ -325,6 +347,17 @@ impl<M: ModelForward> Scheduler<M> {
         let Some(pending) = self.pending_decode.take() else {
             return;
         };
+        let decode_trace_contexts: std::collections::HashMap<
+            usize,
+            fastrace::collector::SpanContext,
+        > = pending
+            .decode_spans
+            .iter()
+            .filter_map(|(slot_idx, span)| {
+                fastrace::collector::SpanContext::from_span(span)
+                    .map(|context| (*slot_idx, context))
+            })
+            .collect();
         let sampling_params: Vec<crate::sampler::SamplingParams> = pending
             .decode_indices
             .iter()
@@ -369,6 +402,12 @@ impl<M: ModelForward> Scheduler<M> {
         match sampled_result {
             Ok(sampled_tokens) => {
                 for (j, &slot_idx) in pending.decode_indices.iter().enumerate() {
+                    if let Some(req) = self.request_mut(slot_idx) {
+                        req.trace_context = decode_trace_contexts
+                            .get(&slot_idx)
+                            .copied()
+                            .or(req.trace_context);
+                    }
                     let token = sampled_tokens[j];
                     if let Some(req) = self.request_mut(slot_idx) {
                         req.latest_logprob =
@@ -395,7 +434,9 @@ impl<M: ModelForward> Scheduler<M> {
                         .request(slot_idx)
                         .is_some_and(|req| req.generated_tokens.len() >= req.max_tokens);
                     if reached_max {
-                        self.finish_request(slot_idx, FinishReason::Length);
+                        if !self.defer_finish_until_emit_gate(slot_idx, FinishReason::Length) {
+                            self.finish_request(slot_idx, FinishReason::Length);
+                        }
                     }
                 }
             }

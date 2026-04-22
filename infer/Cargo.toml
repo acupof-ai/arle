@@ -49,6 +49,10 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 comfy-table = "7.2"
 crossbeam-channel = "0.5"
+pollster = "0.4"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 chat = { path = "../crates/chat" }
 cuda-kernels = { path = "../crates/cuda-kernels", default-features = false }
 qwen3-spec = { path = "../crates/qwen3-spec" }
