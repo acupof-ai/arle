@@ -93,7 +93,6 @@ impl<M: ModelForward> Scheduler<M> {
             );
             if let Some(req) = self.request_mut(slot_idx) {
                 req.phase = Phase::Prefilling {
-                    materialized_prefix_len: attach_prefix_len,
                     effective_tokens: effective,
                     progress: 0,
                 };
@@ -286,7 +285,6 @@ impl<M: ModelForward> Scheduler<M> {
 
         if let Some(req) = self.request_mut(slot_idx) {
             req.phase = Phase::Prefilling {
-                materialized_prefix_len: pool_prefix_len,
                 effective_tokens: effective,
                 progress: 0,
             };
@@ -409,7 +407,6 @@ impl<M: ModelForward> Scheduler<M> {
 
             let (tokens, progress, total) = match &req.phase {
                 Phase::Prefilling {
-                    materialized_prefix_len: _,
                     effective_tokens,
                     progress,
                 } => {

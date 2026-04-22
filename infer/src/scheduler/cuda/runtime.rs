@@ -474,7 +474,6 @@ impl<M: ModelForward> Scheduler<M> {
                 Phase::WaitingFetch
             } else {
                 Phase::Prefilling {
-                    materialized_prefix_len: 0,
                     effective_tokens: Vec::new(),
                     progress: 0,
                 }
@@ -603,7 +602,6 @@ impl<M: ModelForward> Scheduler<M> {
             req.reusable_cached_prompt_len = 0;
             req.attached_prefix_blocks.clear();
             req.phase = Phase::Prefilling {
-                materialized_prefix_len: 0,
                 effective_tokens: Vec::new(),
                 progress: 0,
             };
@@ -810,7 +808,6 @@ impl<M: ModelForward> Scheduler<M> {
             req.reusable_prefix_len = staged_prefix.matched_len;
             req.reusable_cached_prompt_len = staged_prefix.matched_len;
             req.phase = Phase::Prefilling {
-                materialized_prefix_len: 0,
                 effective_tokens: Vec::new(),
                 progress: 0,
             };
