@@ -41,13 +41,19 @@ pub struct Qwen35State {
 unsafe impl Send for Qwen35State {}
 
 impl Qwen35State {
-    fn prefill_logits(&self) -> Option<&DeviceVec> {
-        self.base.prefill_logits.as_ref().or_else(|| {
-            self.paged_prefill
-                .as_ref()
+    fn prefill_logits_from_parts<'a>(
+        base: &'a GenerationStateBase,
+        paged_prefill: Option<&'a PagedPrefillBuffers35>,
+    ) -> Option<&'a DeviceVec> {
+        base.prefill_logits.as_ref().or_else(|| {
+            paged_prefill
                 .filter(|bufs| bufs.logits_valid)
                 .map(|bufs| &bufs.logits)
         })
+    }
+
+    fn prefill_logits(&self) -> Option<&DeviceVec> {
+        Self::prefill_logits_from_parts(&self.base, self.paged_prefill.as_ref())
     }
 
     fn clear_prefill_logits(&mut self) {
@@ -80,7 +86,7 @@ impl Qwen35State {
         Ok(())
     }
 
-    fn prepare_paged_prefill(
+    pub(super) fn prepare_paged_prefill(
         &mut self,
         ctx: &DeviceContext,
         config: &super::config::Config35,
@@ -261,6 +267,15 @@ impl ModelForward for Qwen35Model {
             .as_mut()
             .expect("paged prefill buffers initialized");
         self.prefill_forward_paged(tokens, pool, slot, recurrent, prefill_bufs)?;
+        state.base.prefill_logits = Some(DeviceVec {
+            data: self
+                .ctx
+                .stream
+                .clone_dtod(&prefill_bufs.logits.data)
+                .map_err(|e| anyhow::anyhow!("clone paged prefill logits D2D failed: {e}"))?,
+            len: prefill_bufs.logits.len,
+            label: "qwen35_paged_prefill_logits",
+        });
         Ok(())
     }
 
@@ -275,29 +290,17 @@ impl ModelForward for Qwen35Model {
         }
 
         for request in requests {
-            states[request.slot_idx].prepare_paged_prefill(
-                &self.ctx,
-                &self.config,
-                request.tokens.len(),
-                pool.page_size,
-            )?;
+            states[request.slot_idx].drop_paged_prefill();
         }
 
-        for request in requests {
-            let state = &mut states[request.slot_idx];
-            let recurrent = &mut state.recurrent_state;
-            let prefill_bufs = state
-                .paged_prefill
-                .as_mut()
-                .expect("paged prefill buffers initialized");
-            self.prefill_forward_paged(
-                request.tokens,
-                pool,
-                request.slot_idx,
-                recurrent,
-                prefill_bufs,
-            )?;
-        }
+        let paged_requests: Vec<super::prefill::Qwen35PagedPrefillRequest<'_>> = requests
+            .iter()
+            .map(|request| super::prefill::Qwen35PagedPrefillRequest {
+                tokens: request.tokens,
+                slot: request.slot_idx,
+            })
+            .collect();
+        self.prefill_forward_paged_batch(&paged_requests, states, pool)?;
 
         Ok(true)
     }
@@ -340,7 +343,7 @@ impl ModelForward for Qwen35Model {
             base,
             ..
         } = state;
-        if let Some(logits) = base.prefill_logits.as_ref() {
+        if let Some(logits) = Qwen35State::prefill_logits_from_parts(base, paged_prefill.as_ref()) {
             ops::gpu_sample_into(
                 &self.ctx,
                 logits,
@@ -349,28 +352,6 @@ impl ModelForward for Qwen35Model {
                 params,
                 random_val,
             )
-        } else if let Some(prefill) = paged_prefill.as_ref() {
-            if prefill.logits_valid {
-                ops::gpu_sample_into(
-                    &self.ctx,
-                    &prefill.logits,
-                    &mut decode_bufs.sample_probs,
-                    &mut decode_bufs.sample_out,
-                    params,
-                    random_val,
-                )
-            } else {
-                let (logits, sample_probs, sample_out) =
-                    decode_bufs.current_logits_and_sampling_bufs(&single_token_bufs.logits);
-                ops::gpu_sample_into(
-                    &self.ctx,
-                    logits,
-                    sample_probs,
-                    sample_out,
-                    params,
-                    random_val,
-                )
-            }
         } else {
             let (logits, sample_probs, sample_out) =
                 decode_bufs.current_logits_and_sampling_bufs(&single_token_bufs.logits);
@@ -399,26 +380,15 @@ impl ModelForward for Qwen35Model {
             ..
         } = state;
         if params.is_greedy() {
-            let (token, logprob) = if let Some(logits) = base.prefill_logits.as_ref() {
+            let (token, logprob) = if let Some(logits) =
+                Qwen35State::prefill_logits_from_parts(base, paged_prefill.as_ref())
+            {
                 ops::argmax_with_logprob(
                     &self.ctx,
                     logits,
                     &mut decode_bufs.sample_out,
                     &mut decode_bufs.sample_probs,
                 )?
-            } else if let Some(prefill) = paged_prefill.as_ref() {
-                if prefill.logits_valid {
-                    ops::argmax_with_logprob(
-                        &self.ctx,
-                        &prefill.logits,
-                        &mut decode_bufs.sample_out,
-                        &mut decode_bufs.sample_probs,
-                    )?
-                } else {
-                    let (logits, sample_probs, sample_out) =
-                        decode_bufs.current_logits_and_sampling_bufs(&single_token_bufs.logits);
-                    ops::argmax_with_logprob(&self.ctx, logits, sample_out, sample_probs)?
-                }
             } else {
                 let (logits, sample_probs, sample_out) =
                     decode_bufs.current_logits_and_sampling_bufs(&single_token_bufs.logits);
@@ -597,7 +567,9 @@ impl ModelForward for Qwen35Model {
                 base,
                 ..
             } = state;
-            if let Some(logits) = base.prefill_logits.as_ref() {
+            if let Some(logits) =
+                Qwen35State::prefill_logits_from_parts(base, paged_prefill.as_ref())
+            {
                 crate::ops::gpu_sample_launch(
                     &self.ctx,
                     logits,
@@ -606,28 +578,6 @@ impl ModelForward for Qwen35Model {
                     params[i],
                     random_val,
                 )?;
-            } else if let Some(prefill) = paged_prefill.as_ref() {
-                if prefill.logits_valid {
-                    crate::ops::gpu_sample_launch(
-                        &self.ctx,
-                        &prefill.logits,
-                        &mut decode_bufs.sample_probs,
-                        &mut decode_bufs.sample_out,
-                        params[i],
-                        random_val,
-                    )?;
-                } else {
-                    let ptrs = &decode_bufs.ptrs;
-                    crate::ops::gpu_sample_launch_raw(
-                        &self.ctx,
-                        ptrs.logits_ptr,
-                        ptrs.logits_len,
-                        ptrs.sample_probs_ptr,
-                        ptrs.sample_out_ptr,
-                        params[i],
-                        random_val,
-                    )?;
-                }
             } else {
                 let ptrs = &decode_bufs.ptrs;
                 crate::ops::gpu_sample_launch_raw(

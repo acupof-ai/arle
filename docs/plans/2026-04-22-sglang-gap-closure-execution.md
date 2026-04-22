@@ -53,12 +53,13 @@ That pointed at one bottleneck cluster:
   - MixedBatch scheduling no longer forks by model family
 - Model-side prefill execution is **not fully unified** yet:
   - `Qwen3` has a real packed batched paged-prefill path
-  - `Qwen3.5` now overrides `forward_prefill_batch_with_pool()` and no longer
-    falls back to the trait default, but the current override still allocates
-    pages for the batch and then iterates requests one by one through
-    `prefill_forward_paged(...)`
-  - so `Qwen3.5` is shipped on paged prefill, but it is **not yet** the same
-    packed varlen batched prefill shape as `Qwen3`
+  - `Qwen3.5` now also has a true packed multi-request paged-prefill path:
+    the scheduler-visible batch override builds one packed token/page-table
+    layout, runs one packed layer loop, and uses packed recurrent-state
+    launches for the hybrid linear-attention layers
+  - model-side batching is still not perfectly identical between `Qwen3` and
+    `Qwen3.5` because `Qwen3.5` remains hybrid and therefore retains its real
+    `supports_partial_prefix() == false` capability difference
 - `Qwen3.5` also remains a real capability outlier because it is hybrid:
   `supports_partial_prefix() == false` is a model constraint, not just an
   implementation gap.
@@ -100,9 +101,11 @@ That pointed at one bottleneck cluster:
   prefill path
 - graph replay is invalidated only when a pointer-stable prerequisite such as
   the page-index buffer storage changes
-- this track does **not** by itself claim parity with `Qwen3`'s packed batched
-  paged-prefill implementation; the current `Qwen3.5` batch override is still
-  model-local sequential replay over a batched allocation
+- `Qwen3.5` batch prefill now uses one packed multi-request paged-prefill path
+  instead of sequentially replaying `prefill_forward_paged(...)` per request
+- the remaining difference versus `Qwen3` is model capability shape
+  (hybrid recurrent layers / no partial-prefix restore), not an extra
+  scheduler-visible batch prefill fallback
 
 **Primary files**
 
@@ -176,12 +179,15 @@ That pointed at one bottleneck cluster:
 - `5dfde31` `fix(qwen35): guard paged-prefill graph start-pos reuse`
 - `0c49fca` `fix(qwen35): make paged-prefill graph start-pos device-backed`
 - `b76c4bf` `feat(qwen35): override paged prefill batch path`
+- `fd3b27b` `feat(qwen35): add packed conv1d prefill surface`
 - `94c7df6` `refactor(scheduler): keep waiting queue incrementally ordered`
 - `a01a124` `refactor(scheduler): pretokenize cuda http admissions`
 - `14b4db6` `feat(scheduler): offload stopless streaming emit`
 - `d2e29bd` `fix(scheduler): align admission with active headroom`
 - latest local tranche: unify all streaming emit behind one worker and consume
   stop-sensitive gate results on the scheduler side before the next decode launch
+- latest local tranche: finish `Qwen3.5` packed multi-request paged-prefill on
+  the canonical model path and unify paged-prefill logits postconditions
 
 ## Parallelization shape used
 
@@ -203,6 +209,9 @@ Integration pass resolves the shared seam between:
 
 - `Qwen3.5` shipped path reports `prefill_uses_paged_pool() == true`
 - `Qwen3.5` no longer falls back to the trait-default paged-prefill batch path
+- `Qwen3.5` batch prefill no longer sequentially replays per-request paged
+  prefill over a batched page allocation; it runs one packed multi-request
+  model-side paged-prefill path
 - no shipped path uses `step_decode_launch_mixed`
 - no shipped path uses the legacy dual-write helper for mixed prefill+decode
 - scheduler keeps one canonical launch/prepare/readback flow

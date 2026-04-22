@@ -6,6 +6,7 @@ use half::bf16;
 
 use super::config::Config35;
 use crate::model::cuda_graph::CudaGraphState;
+use crate::ops::PagedPrefillSequence;
 use cuda_kernels::flashinfer::BatchPrefillPagedPlan;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 
@@ -113,6 +114,42 @@ impl GdrChunkwiseScratch35 {
     }
 }
 
+pub(super) struct PackedGdrLaunch35 {
+    pub conv_state_ptrs: Vec<u64>,
+    pub state_ptrs: Vec<u64>,
+    pub q_ptrs: Vec<u64>,
+    pub k_ptrs: Vec<u64>,
+    pub v_ptrs: Vec<u64>,
+    pub g_cumsum_ptrs: Vec<u64>,
+    pub beta_ptrs: Vec<u64>,
+    pub a_tril_ptrs: Vec<u64>,
+    pub a_inv_ptrs: Vec<u64>,
+    pub w_ptrs: Vec<u64>,
+    pub u_ptrs: Vec<u64>,
+    pub chunk_state_ptrs: Vec<u64>,
+    pub v_new_ptrs: Vec<u64>,
+}
+
+impl PackedGdrLaunch35 {
+    fn new(batch_size: usize) -> Self {
+        Self {
+            conv_state_ptrs: vec![0; batch_size],
+            state_ptrs: vec![0; batch_size],
+            q_ptrs: vec![0; batch_size],
+            k_ptrs: vec![0; batch_size],
+            v_ptrs: vec![0; batch_size],
+            g_cumsum_ptrs: vec![0; batch_size],
+            beta_ptrs: vec![0; batch_size],
+            a_tril_ptrs: vec![0; batch_size],
+            a_inv_ptrs: vec![0; batch_size],
+            w_ptrs: vec![0; batch_size],
+            u_ptrs: vec![0; batch_size],
+            chunk_state_ptrs: vec![0; batch_size],
+            v_new_ptrs: vec![0; batch_size],
+        }
+    }
+}
+
 pub(super) struct PagedPrefillMetadata35 {
     pub token_ids_gpu: CudaSlice<i32>,
     pub page_indices_gpu: CudaSlice<i32>,
@@ -121,8 +158,13 @@ pub(super) struct PagedPrefillMetadata35 {
     pub kv_last_page_len_gpu: CudaSlice<i32>,
     pub start_pos_gpu: CudaSlice<i32>,
     pub num_pages: usize,
+    pub batch_size: usize,
     token_ids_host: Vec<i32>,
     page_indices_host: Vec<i32>,
+    pub(super) qo_indptr_host: Vec<i32>,
+    pub(super) kv_indptr_host: Vec<i32>,
+    pub(super) kv_last_page_len_host: Vec<i32>,
+    pub(super) start_pos_host: Vec<i32>,
 }
 
 impl PagedPrefillMetadata35 {
@@ -160,8 +202,13 @@ impl PagedPrefillMetadata35 {
             kv_last_page_len_gpu,
             start_pos_gpu,
             num_pages: 0,
+            batch_size: 1,
             token_ids_host: vec![0; seq_len],
             page_indices_host: Vec::with_capacity(initial_pages.max(1)),
+            qo_indptr_host: vec![0; 2],
+            kv_indptr_host: vec![0; 2],
+            kv_last_page_len_host: vec![0; 1],
+            start_pos_host: vec![0; 1],
         })
     }
 
@@ -169,14 +216,24 @@ impl PagedPrefillMetadata35 {
         &mut self,
         ctx: &DeviceContext,
         token_ids: &[u32],
-        page_indices: &[u32],
-        seq_len: usize,
+        page_indices: &[i32],
+        sequences: &[PagedPrefillSequence],
         page_size: usize,
-        start_pos: usize,
     ) -> Result<bool> {
-        debug_assert_eq!(token_ids.len(), seq_len);
+        anyhow::ensure!(
+            !sequences.is_empty(),
+            "paged prefill metadata requires at least one sequence"
+        );
 
-        for (dst, &token) in self.token_ids_host.iter_mut().zip(token_ids) {
+        if self.token_ids_host.len() != token_ids.len() {
+            self.token_ids_host.resize(token_ids.len(), 0);
+            self.token_ids_gpu = ctx
+                .stream
+                .alloc_zeros(token_ids.len().max(1))
+                .map_err(|e| anyhow::anyhow!("Realloc token_ids failed: {e}"))?;
+        }
+
+        for (dst, &token) in self.token_ids_host.iter_mut().zip(token_ids.iter()) {
             *dst = token as i32;
         }
         ctx.stream
@@ -195,36 +252,92 @@ impl PagedPrefillMetadata35 {
         }
 
         self.page_indices_host.clear();
-        self.page_indices_host
-            .extend(page_indices.iter().map(|&page| page as i32));
+        self.page_indices_host.extend_from_slice(page_indices);
         let mut page_indices_view = self.page_indices_gpu.slice_mut(..num_pages);
         ctx.stream
             .memcpy_htod(&self.page_indices_host, &mut page_indices_view)
             .map_err(|e| anyhow::anyhow!("page_indices H2D failed: {e}"))?;
 
-        let qo_indptr = [0_i32, seq_len as i32];
-        let kv_indptr = [0_i32, num_pages as i32];
-        let kv_last_page_len = [if seq_len == 0 {
-            0
-        } else {
-            ((start_pos + seq_len - 1) % page_size + 1) as i32
-        }];
-        let start_pos = [start_pos as i32];
+        let batch_size = sequences.len();
+        let metadata_reallocated = self.qo_indptr_gpu.len() != batch_size + 1
+            || self.kv_indptr_gpu.len() != batch_size + 1
+            || self.kv_last_page_len_gpu.len() != batch_size
+            || self.start_pos_gpu.len() != batch_size;
+        if metadata_reallocated {
+            self.qo_indptr_gpu = ctx
+                .stream
+                .alloc_zeros(batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Realloc qo_indptr failed: {e}"))?;
+            self.kv_indptr_gpu = ctx
+                .stream
+                .alloc_zeros(batch_size + 1)
+                .map_err(|e| anyhow::anyhow!("Realloc kv_indptr failed: {e}"))?;
+            self.kv_last_page_len_gpu = ctx
+                .stream
+                .alloc_zeros(batch_size.max(1))
+                .map_err(|e| anyhow::anyhow!("Realloc kv_last_page_len failed: {e}"))?;
+            self.start_pos_gpu = ctx
+                .stream
+                .alloc_zeros(batch_size.max(1))
+                .map_err(|e| anyhow::anyhow!("Realloc start_pos failed: {e}"))?;
+            self.qo_indptr_host.resize(batch_size + 1, 0);
+            self.kv_indptr_host.resize(batch_size + 1, 0);
+            self.kv_last_page_len_host.resize(batch_size, 0);
+            self.start_pos_host.resize(batch_size, 0);
+        }
+
+        let mut total_qo_rows = 0usize;
+        let mut total_pages = 0usize;
+        self.qo_indptr_host[0] = 0;
+        self.kv_indptr_host[0] = 0;
+        for (batch_idx, seq) in sequences.iter().enumerate() {
+            anyhow::ensure!(seq.seq_len > 0, "paged prefill sequence must not be empty");
+            anyhow::ensure!(
+                seq.token_offset == total_qo_rows,
+                "paged prefill token packing gap/overlap: expected offset {}, got {}",
+                total_qo_rows,
+                seq.token_offset
+            );
+            anyhow::ensure!(
+                seq.page_table_offset == total_pages,
+                "paged prefill page-table packing gap/overlap: expected offset {}, got {}",
+                total_pages,
+                seq.page_table_offset
+            );
+            total_qo_rows += seq.seq_len;
+            total_pages += seq.num_pages;
+            self.qo_indptr_host[batch_idx + 1] = total_qo_rows as i32;
+            self.kv_indptr_host[batch_idx + 1] = total_pages as i32;
+            self.kv_last_page_len_host[batch_idx] =
+                ((seq.start_pos + seq.seq_len - 1) % page_size + 1) as i32;
+            self.start_pos_host[batch_idx] = seq.start_pos as i32;
+        }
+        anyhow::ensure!(
+            total_qo_rows == token_ids.len(),
+            "paged prefill token packing covers {total_qo_rows} rows, expected {}",
+            token_ids.len()
+        );
+        anyhow::ensure!(
+            total_pages == num_pages,
+            "paged prefill page-table packing covers {total_pages} pages, expected {num_pages}"
+        );
+
         ctx.stream
-            .memcpy_htod(&qo_indptr, &mut self.qo_indptr_gpu)
+            .memcpy_htod(&self.qo_indptr_host, &mut self.qo_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("qo_indptr H2D failed: {e}"))?;
         ctx.stream
-            .memcpy_htod(&kv_indptr, &mut self.kv_indptr_gpu)
+            .memcpy_htod(&self.kv_indptr_host, &mut self.kv_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("kv_indptr H2D failed: {e}"))?;
         ctx.stream
-            .memcpy_htod(&kv_last_page_len, &mut self.kv_last_page_len_gpu)
+            .memcpy_htod(&self.kv_last_page_len_host, &mut self.kv_last_page_len_gpu)
             .map_err(|e| anyhow::anyhow!("kv_last_page_len H2D failed: {e}"))?;
         ctx.stream
-            .memcpy_htod(&start_pos, &mut self.start_pos_gpu)
+            .memcpy_htod(&self.start_pos_host, &mut self.start_pos_gpu)
             .map_err(|e| anyhow::anyhow!("start_pos H2D failed: {e}"))?;
         self.num_pages = num_pages;
+        self.batch_size = batch_size;
 
-        Ok(page_indices_reallocated)
+        Ok(page_indices_reallocated || metadata_reallocated)
     }
 }
 
@@ -257,6 +370,9 @@ pub(super) struct PagedPrefillBuffers35 {
     pub logits: DeviceVec,
     pub logits_valid: bool,
     pub gdr_chunkwise_scratch: GdrChunkwiseScratch35,
+    pub gdr_batch_scratch: Vec<GdrChunkwiseScratch35>,
+    pub gdr_batch_seq_lens: Vec<usize>,
+    pub gdr_launch: PackedGdrLaunch35,
     pub metadata: PagedPrefillMetadata35,
     pub plan: BatchPrefillPagedPlan,
     pub graph_state: CudaGraphState,
@@ -307,6 +423,9 @@ impl PagedPrefillBuffers35 {
             logits: DeviceVec::zeros(ctx, config.vocab_size)?,
             logits_valid: false,
             gdr_chunkwise_scratch: GdrChunkwiseScratch35::new(ctx, config, seq_len)?,
+            gdr_batch_scratch: Vec::new(),
+            gdr_batch_seq_lens: Vec::new(),
+            gdr_launch: PackedGdrLaunch35::new(0),
             metadata: PagedPrefillMetadata35::new(ctx, seq_len, num_pages)?,
             plan: BatchPrefillPagedPlan::new_hd256(
                 ctx,
@@ -327,5 +446,29 @@ impl PagedPrefillBuffers35 {
 
     pub(super) fn clear_logits(&mut self) {
         self.logits_valid = false;
+    }
+
+    pub(super) fn ensure_batch_gdr_scratch(
+        &mut self,
+        ctx: &DeviceContext,
+        config: &Config35,
+        request_lens: &[usize],
+    ) -> Result<()> {
+        if self.gdr_batch_seq_lens != request_lens {
+            self.gdr_batch_scratch.clear();
+            self.gdr_batch_scratch.reserve(request_lens.len());
+            for &seq_len in request_lens {
+                self.gdr_batch_scratch
+                    .push(GdrChunkwiseScratch35::new(ctx, config, seq_len)?);
+            }
+            self.gdr_batch_seq_lens.clear();
+            self.gdr_batch_seq_lens.extend_from_slice(request_lens);
+        }
+
+        if self.gdr_launch.state_ptrs.len() != request_lens.len() {
+            self.gdr_launch = PackedGdrLaunch35::new(request_lens.len());
+        }
+
+        Ok(())
     }
 }

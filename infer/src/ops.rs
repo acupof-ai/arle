@@ -65,8 +65,9 @@ pub(crate) use norm::{
     rms_norm_batch_f32_in_into, rms_norm_batch_into, rms_norm_gated_batch_into,
 };
 pub(crate) use recurrent::{
-    conv1d_decode_batch_into, conv1d_prefill_batch_into, gated_delta_rule_decode_into,
-    gdr_decode_batch_into,
+    Conv1dPrefillBatchLaunch, GdrPrefillBatchLaunch, conv1d_decode_batch_into,
+    conv1d_prefill_batch_into, conv1d_prefill_packed_batch_into, gated_delta_rule_decode_into,
+    gated_delta_rule_prefill_chunkwise_batch_into, gdr_decode_batch_into,
 };
 pub(crate) use sampling::{
     argmax_batch_launch, argmax_batch_logprob_launch, argmax_batch_readback_into,
