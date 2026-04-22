@@ -152,18 +152,21 @@ impl HostPinnedPool {
         self.capacity_bytes
     }
 
-    pub fn reserved_bytes(&self) -> usize {
+    pub fn reserved_bytes(&self) -> Result<usize> {
         unsafe { kv_native_sys::host_arena_reserved_bytes(self.arena.handle.cast_const()) }
-            .expect("HostPinnedPool reserved_bytes native query must succeed")
+            .map_err(|err| anyhow!("HostPinnedPool reserved_bytes native query failed: {err}"))
     }
 
-    pub fn remaining_bytes(&self) -> usize {
-        self.capacity_bytes.saturating_sub(self.reserved_bytes())
+    pub fn remaining_bytes(&self) -> Result<usize> {
+        Ok(self.capacity_bytes.saturating_sub(self.reserved_bytes()?))
     }
 
-    pub fn reserve(&mut self, len: usize) -> Option<HostPinnedRegion> {
+    pub fn reserve(&mut self, len: usize) -> Result<Option<HostPinnedRegion>> {
         let region = unsafe { kv_native_sys::host_arena_reserve(self.arena.handle, len) }
-            .expect("HostPinnedPool reserve native query must succeed")?;
+            .map_err(|err| anyhow!("HostPinnedPool reserve native query failed: {err}"))?;
+        let Some(region) = region else {
+            return Ok(None);
+        };
         let region = HostPinnedRegion {
             offset: region.offset,
             len: region.len,
@@ -174,7 +177,7 @@ impl HostPinnedPool {
             region.offset,
             region.len
         );
-        Some(region)
+        Ok(Some(region))
     }
 
     pub fn release(&mut self, region: HostPinnedRegion) -> Result<()> {
@@ -280,35 +283,35 @@ mod tests {
     #[test]
     fn reserve_advances_offset_without_reallocating() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
-        let a = pool.reserve(128).unwrap();
-        let b = pool.reserve(256).unwrap();
+        let a = pool.reserve(128).unwrap().unwrap();
+        let b = pool.reserve(256).unwrap().unwrap();
         assert_eq!(a.offset, 0);
         assert_eq!(a.len, 128);
         assert_eq!(b.offset, 128);
         assert_eq!(b.len, 256);
-        assert_eq!(pool.reserved_bytes(), 384);
+        assert_eq!(pool.reserved_bytes().unwrap(), 384);
     }
 
     #[test]
     fn release_and_reuse_via_free_list_first_fit() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
-        let a = pool.reserve(128).unwrap();
-        let _b = pool.reserve(128).unwrap();
+        let a = pool.reserve(128).unwrap().unwrap();
+        let _b = pool.reserve(128).unwrap().unwrap();
         pool.release(a).unwrap();
-        let c = pool.reserve(128).unwrap();
+        let c = pool.reserve(128).unwrap().unwrap();
         assert_eq!(c.offset, 0);
-        assert_eq!(pool.reserved_bytes(), 256);
+        assert_eq!(pool.reserved_bytes().unwrap(), 256);
     }
 
     #[test]
     fn release_splits_larger_free_hole_on_reuse() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
-        let a = pool.reserve(256).unwrap();
+        let a = pool.reserve(256).unwrap().unwrap();
         pool.release(a).unwrap();
-        let b = pool.reserve(64).unwrap();
+        let b = pool.reserve(64).unwrap().unwrap();
         assert_eq!(b.offset, 0);
         assert_eq!(b.len, 64);
-        let c = pool.reserve(192).unwrap();
+        let c = pool.reserve(192).unwrap().unwrap();
         assert_eq!(c.offset, 64);
         assert_eq!(c.len, 192);
     }
@@ -316,26 +319,26 @@ mod tests {
     #[test]
     fn reserve_returns_none_on_exhaustion() {
         let mut pool = HostPinnedPool::new(128).unwrap();
-        assert!(pool.reserve(128).is_some());
-        assert!(pool.reserve(1).is_none());
+        assert!(pool.reserve(128).unwrap().is_some());
+        assert!(pool.reserve(1).unwrap().is_none());
     }
 
     #[test]
     fn reset_rewinds_allocator_and_clears_free_list() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
-        let a = pool.reserve(128).unwrap();
+        let a = pool.reserve(128).unwrap().unwrap();
         pool.release(a).unwrap();
-        pool.reserve(64).unwrap();
+        pool.reserve(64).unwrap().unwrap();
         pool.reset().unwrap();
-        let region = pool.reserve(128).unwrap();
+        let region = pool.reserve(128).unwrap().unwrap();
         assert_eq!(region.offset, 0);
-        assert_eq!(pool.reserved_bytes(), 128);
+        assert_eq!(pool.reserved_bytes().unwrap(), 128);
     }
 
     #[test]
     fn as_slice_round_trips_bytes_via_mut_write() {
         let mut pool = HostPinnedPool::new(64).unwrap();
-        let region = pool.reserve(32).unwrap();
+        let region = pool.reserve(32).unwrap().unwrap();
         pool.as_mut_slice(region).copy_from_slice(&[7u8; 32]);
         assert_eq!(pool.as_slice(region), &[7u8; 32]);
     }
@@ -343,9 +346,9 @@ mod tests {
     #[test]
     fn host_ptr_stays_stable_across_subsequent_reservations() {
         let mut pool = HostPinnedPool::new(1024).unwrap();
-        let a = pool.reserve(128).unwrap();
+        let a = pool.reserve(128).unwrap().unwrap();
         let ptr_before = pool.host_ptr(a);
-        let _b = pool.reserve(128).unwrap();
+        let _b = pool.reserve(128).unwrap().unwrap();
         let ptr_after = pool.host_ptr(a);
         assert_eq!(ptr_before, ptr_after);
     }
@@ -353,7 +356,7 @@ mod tests {
     #[test]
     fn release_rejects_double_free() {
         let mut pool = HostPinnedPool::new(256).unwrap();
-        let region = pool.reserve(64).unwrap();
+        let region = pool.reserve(64).unwrap().unwrap();
         pool.release(region).unwrap();
 
         let err = pool.release(region).unwrap_err();
@@ -363,7 +366,7 @@ mod tests {
     #[test]
     fn reset_invalidates_old_regions() {
         let mut pool = HostPinnedPool::new(256).unwrap();
-        let region = pool.reserve(64).unwrap();
+        let region = pool.reserve(64).unwrap().unwrap();
         pool.reset().unwrap();
 
         let err = pool.release(region).unwrap_err();
@@ -375,7 +378,7 @@ mod tests {
         let shared = SharedHostPinnedPool::new(HostPinnedPool::new(256).unwrap());
         let region = {
             let mut pool = shared.lock().unwrap();
-            let region = pool.reserve(64).unwrap();
+            let region = pool.reserve(64).unwrap().unwrap();
             pool.release(region).unwrap();
             region
         };
