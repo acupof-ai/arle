@@ -146,41 +146,11 @@ where
     trajectories
 }
 
-fn batch_full_ids(trajectories: &[Trajectory]) -> Vec<usize> {
-    let total = trajectories
-        .iter()
-        .map(|trajectory| trajectory.full_ids.len())
-        .sum();
-    let mut batch_ids = Vec::with_capacity(total);
-    fill_batch_full_ids(&mut batch_ids, trajectories);
-    batch_ids
-}
-
 fn fill_batch_full_ids(out: &mut Vec<usize>, trajectories: &[Trajectory]) {
     out.clear();
     for trajectory in trajectories {
         out.extend_from_slice(&trajectory.full_ids);
     }
-}
-
-fn batch_position_logits(
-    logits: &[f32],
-    batch: usize,
-    seq_len: usize,
-    position: usize,
-    vocab_size: usize,
-) -> Vec<f32> {
-    let row_stride = seq_len * vocab_size;
-    let mut position_logits = Vec::with_capacity(batch * vocab_size);
-    fill_batch_position_logits(
-        &mut position_logits,
-        logits,
-        batch,
-        seq_len,
-        position,
-        vocab_size,
-    );
-    position_logits
 }
 
 fn fill_batch_position_logits(
