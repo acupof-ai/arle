@@ -368,7 +368,8 @@ impl<M: ModelForward> Scheduler<M> {
             sealed_block_token_count(block_size, gpu_ready_sealed_blocks.len());
         let fully_addressable_gpu_hit =
             ready_on_gpu && gpu_ready_sealed_tokens == lookup.matched_len;
-        let staged_prefix_plan = if self.model.prefill_uses_paged_pool()
+        let supports_cross_slot_prefix_attach = self.model.supports_cross_slot_prefix_attach();
+        let staged_prefix_plan = if supports_cross_slot_prefix_attach
             && lookup_is_full_sealed
             && !lookup.recompute_advised
             && !ready_on_gpu
@@ -383,7 +384,7 @@ impl<M: ModelForward> Scheduler<M> {
         } else {
             None
         };
-        let direct_gpu_attach = self.model.prefill_uses_paged_pool()
+        let direct_gpu_attach = supports_cross_slot_prefix_attach
             && lookup_is_full_sealed
             && !lookup.recompute_advised
             && !gpu_ready_sealed_blocks.is_empty()
