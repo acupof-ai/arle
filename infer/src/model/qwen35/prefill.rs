@@ -284,7 +284,10 @@ impl Qwen35Model {
         let start_pos = self.prepare_paged_prefill(token_ids, pool, slot, bufs)?;
         bufs.clear_logits();
 
-        let use_graph = self.supports_paged_prefill_graph() && start_pos == 0;
+        // Capture/replay is shape-based, not "first chunk only". The page-table
+        // metadata and FlashInfer plan are refreshed before launch, and graph
+        // state is invalidated whenever the page-index buffer needs to grow.
+        let use_graph = self.supports_paged_prefill_graph();
         if use_graph {
             let mut graph_state = std::mem::replace(&mut bufs.graph_state, CudaGraphState::new());
             graph_state.run_or_capture(&self.ctx, || {
