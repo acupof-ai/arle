@@ -138,4 +138,32 @@ unsafe extern "C" {
         scale: f32,
         stream: CUstream,
     ) -> CUresult;
+
+    pub fn gated_delta_rule_prefill_chunkwise_batch_cuda(
+        qkv_batch: *const Half,
+        b_proj_batch: *const Half,
+        a_proj_batch: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        state_ptrs: *const u64,
+        q_ptrs: *const u64,
+        k_ptrs: *const u64,
+        v_ptrs: *const u64,
+        g_cumsum_ptrs: *const u64,
+        beta_ptrs: *const u64,
+        a_tril_ptrs: *const u64,
+        a_inv_ptrs: *const u64,
+        w_ptrs: *const u64,
+        u_ptrs: *const u64,
+        chunk_state_ptrs: *const u64,
+        v_new_ptrs: *const u64,
+        seq_indptr: *const i32,
+        output_batch: *mut Half,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
