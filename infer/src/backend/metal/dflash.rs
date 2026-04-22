@@ -2114,14 +2114,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // full block verify wastes the target pass. Verify only until the first
     // mismatch (inclusive): every executed step is accepted, so we avoid both
     // over-verification and GDR rollback.
-    super::qwen35::with_qwen35_capture_layers(
+    cpp_model.begin_session(target_kv_flat, target_gdr_flat)?;
+    let verify_result = super::qwen35::with_qwen35_capture_layers(
         cpp_model.as_raw(),
         &runtime.target_layer_ids,
         || {
             for step_idx in 0..runtime.block_size {
                 let token = MlxArray::from_slice_i32(&[block_tokens[step_idx] as i32], &[1]);
-                let logits =
-                    cpp_model.step(&token, *target_cache_len, target_kv_flat, target_gdr_flat)?;
+                let logits = cpp_model.step_session(&token, *target_cache_len)?;
                 let posterior = sample_last_token(&logits, params)?;
                 let captured = drain_captured_hidden(cpp_model)?;
                 ensure!(
@@ -2149,7 +2149,18 @@ pub(crate) fn qwen35_dflash_speculative_block(
             }
             Ok(())
         },
-    )?;
+    );
+    let (session_kv, session_gdr) =
+        cpp_model.end_session(target_kv_flat.len(), target_gdr_flat.len())?;
+    for (dst, src) in target_kv_flat.iter_mut().zip(session_kv) {
+        let old = std::mem::replace(dst, src);
+        drop(old);
+    }
+    for (dst, src) in target_gdr_flat.iter_mut().zip(session_gdr) {
+        let old = std::mem::replace(dst, src);
+        drop(old);
+    }
+    verify_result?;
     let t_verify = t_start.elapsed();
     let t_sample = t_verify;
 
