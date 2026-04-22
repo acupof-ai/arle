@@ -26,7 +26,7 @@ use fastrace::future::FutureExt;
 use fastrace::local::LocalSpan;
 use futures_util::{StreamExt, stream};
 use log::{error, info, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -150,6 +150,32 @@ struct TrainEventsQuery {
 struct ProxiedTrainResponse {
     status: axum::http::StatusCode,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct HealthResponse {
+    status: String,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+impl HealthResponse {
+    fn live() -> Self {
+        Self {
+            status: "ok".to_string(),
+            service: "agent-infer".to_string(),
+            model: None,
+        }
+    }
+
+    fn ready(model_id: &str) -> Self {
+        Self {
+            status: "ready".to_string(),
+            service: "agent-infer".to_string(),
+            model: Some(model_id.to_string()),
+        }
+    }
 }
 
 struct RequestExecutionOptions {
@@ -409,9 +435,8 @@ fn allow_header_value_for_path(path: &str) -> Option<axum::http::HeaderValue> {
         | "/v1/responses"
         | "/v1/train/stop"
         | "/v1/train/save" => "POST",
-        "/v1/models" | "/metrics" | "/v1/stats" | "/v1/train/status" | "/v1/train/events" => {
-            "GET, HEAD"
-        }
+        "/v1/models" | "/metrics" | "/v1/stats" | "/v1/train/status" | "/v1/train/events"
+        | "/healthz" | "/readyz" => "GET, HEAD",
         _ => return None,
     };
     Some(axum::http::HeaderValue::from_static(allow))
@@ -1032,6 +1057,14 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     )
 }
 
+async fn healthz_handler() -> Json<HealthResponse> {
+    Json(HealthResponse::live())
+}
+
+async fn readyz_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    Json(HealthResponse::ready(&state.identity.model_id))
+}
+
 async fn stats_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(err) = authorize_v1_request(&headers, state.as_ref()) {
         return err.into_response();
@@ -1260,6 +1293,8 @@ where
     // `sessions::session_router(engine)`, so we apply the auth middleware
     // via `.layer(...)` and mount the whole subtree as a service.
     let mut router: Router<Arc<AppState>> = Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_handler))
@@ -1910,6 +1945,44 @@ mod tests {
         assert!(
             payload.contains("infer_requests_active"),
             "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_endpoint_returns_json_status() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HealthResponse>(&body).unwrap(),
+            HealthResponse::live()
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_endpoint_returns_model_identity() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HealthResponse>(&body).unwrap(),
+            HealthResponse::ready("Qwen3-4B")
         );
     }
 
