@@ -408,8 +408,7 @@ fn paged_prefill_last_page_len(kv_len: usize, page_size: usize) -> i32 {
 /// per layer) and under bench stream backlog this race reliably corrupts
 /// the CUDA context. sglang avoids it by calling plan once per forward and
 /// we do the same now.
-pub(crate) struct PagedPrefillForward<'a> {
-    pub plan: &'a mut BatchPrefillPagedPlan,
+pub(crate) struct PagedPrefillForward {
     pub qo_indptr_dev: CudaSlice<i32>,
     pub kv_indptr_dev: CudaSlice<i32>,
     pub kv_last_page_len_dev: CudaSlice<i32>,
@@ -418,11 +417,11 @@ pub(crate) struct PagedPrefillForward<'a> {
     pub page_size: usize,
 }
 
-impl<'a> PagedPrefillForward<'a> {
+impl PagedPrefillForward {
     /// Plan and upload indptrs ONCE for the whole forward. HD128 flavour.
     pub(crate) fn new_hd128(
         ctx: &DeviceContext,
-        plan: &'a mut BatchPrefillPagedPlan,
+        plan: &mut BatchPrefillPagedPlan,
         sequences: &[PagedPrefillSequence],
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -434,7 +433,7 @@ impl<'a> PagedPrefillForward<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new_inner(
         ctx: &DeviceContext,
-        plan: &'a mut BatchPrefillPagedPlan,
+        plan: &mut BatchPrefillPagedPlan,
         sequences: &[PagedPrefillSequence],
         num_q_heads: usize,
         num_kv_heads: usize,
@@ -511,7 +510,6 @@ impl<'a> PagedPrefillForward<'a> {
             .map_err(|e| anyhow!("kv_last_page_len H2D failed: {e}"))?;
 
         Ok(Self {
-            plan,
             qo_indptr_dev,
             kv_indptr_dev,
             kv_last_page_len_dev,
@@ -546,6 +544,7 @@ pub(crate) fn prefill_attention_paged_batch(
     v_batch: &HiddenStates,
     nrp: &NormRopeParams,
     meta: &PagedPrefillMeta,
+    plan: &mut BatchPrefillPagedPlan,
     fwd: &mut PagedPrefillForward,
     output: &mut HiddenStates,
     heads: &HeadConfig,
@@ -629,7 +628,7 @@ pub(crate) fn prefill_attention_paged_batch(
     let (kvidx_u64, _gkvidx) = meta.page_indices.device_ptr(&ctx.stream);
     let (kvlpl_u64, _gkvlpl) = fwd.kv_last_page_len_dev.device_ptr(&ctx.stream);
 
-    fwd.plan.run_hd128(
+    plan.run_hd128(
         ctx,
         q_u64,
         qoi_u64,

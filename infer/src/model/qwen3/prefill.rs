@@ -1,6 +1,7 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 
+use super::forward::Qwen3State;
 use super::weights::{Qwen3Model, TransformerBlock};
 use crate::model::kv_cache::KVCache;
 use crate::ops;
@@ -33,6 +34,8 @@ struct PrefillBuffers {
     up_out: HiddenStates,      // inter_dim × seq_len
     act_out: HiddenStates,     // inter_dim × seq_len
     attn_output: HiddenStates, // q_dim × seq_len
+    last_hidden: DeviceVec,    // hidden_dim
+    last_normed: DeviceVec,    // hidden_dim
 }
 
 impl PrefillBuffers {
@@ -65,6 +68,8 @@ impl PrefillBuffers {
             up_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             act_out: HiddenStates::zeros(ctx, inter_dim, seq_len)?,
             attn_output: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            last_hidden: DeviceVec::zeros(ctx, hidden_dim)?,
+            last_normed: DeviceVec::zeros(ctx, hidden_dim)?,
         })
     }
 }
@@ -72,6 +77,61 @@ impl PrefillBuffers {
 pub(super) struct Qwen3PagedPrefillRequest<'a> {
     pub tokens: &'a [u32],
     pub slot: usize,
+    pub state_idx: usize,
+}
+
+struct PendingPagedPrefill {
+    _hidden: HiddenStates,
+    _bufs: PrefillBuffers,
+    _page_indices_dev: CudaSlice<i32>,
+    _fwd: crate::ops::PagedPrefillForward,
+}
+
+pub struct Qwen3PrefillContext {
+    plan_capacity_rows: usize,
+    plan: Option<BatchPrefillPagedPlan>,
+    pending: Option<PendingPagedPrefill>,
+}
+
+impl Qwen3PrefillContext {
+    pub(super) fn new() -> Self {
+        Self {
+            plan_capacity_rows: 0,
+            plan: None,
+            pending: None,
+        }
+    }
+
+    fn plan_mut(
+        &mut self,
+        ctx: &DeviceContext,
+        required_rows: usize,
+        num_heads: usize,
+    ) -> Result<&mut BatchPrefillPagedPlan> {
+        if self.plan_capacity_rows < required_rows || self.plan.is_none() {
+            self.plan = Some(BatchPrefillPagedPlan::new(ctx, required_rows, num_heads)?);
+            self.plan_capacity_rows = required_rows;
+        }
+        Ok(self.plan.as_mut().expect("prefill plan initialized"))
+    }
+
+    fn set_pending(&mut self, pending: PendingPagedPrefill) -> Result<()> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "qwen3 prefill context already has a pending batch"
+        );
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    pub(super) fn complete(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        ctx.sync()?;
+        self.pending = None;
+        Ok(())
+    }
 }
 
 impl Qwen3Model {
@@ -93,22 +153,7 @@ impl Qwen3Model {
         kv_cache: &mut KVCache,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        // Allocate all intermediates once — eliminates ~11k cuMemAllocAsync calls.
-        let mut bufs = PrefillBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            seq_len,
-        )?;
+        let mut bufs = self.prefill_buffers(seq_len)?;
 
         // If fp32 residual shadow is enabled, seed it from the bf16 embedding.
         if let Some(ref mut r) = bufs.residual_f32 {
@@ -138,6 +183,22 @@ impl Qwen3Model {
         }
 
         Ok(hidden)
+    }
+
+    fn prefill_buffers(&self, seq_len: usize) -> Result<PrefillBuffers> {
+        let num_heads = self.config.num_attention_heads;
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        PrefillBuffers::new(
+            &self.ctx,
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            self.config.intermediate_size,
+            seq_len,
+        )
     }
 
     pub(super) fn build_paged_prefill_sequences(
@@ -197,29 +258,68 @@ impl Qwen3Model {
     fn compute_logits_batch_packed(
         &self,
         hidden: &HiddenStates,
+        requests: &[Qwen3PagedPrefillRequest<'_>],
+        states: &mut [Qwen3State],
         sequences: &[ops::PagedPrefillSequence],
-    ) -> Result<Vec<DeviceVec>> {
-        let mut logits = Vec::with_capacity(sequences.len());
-        for seq in sequences {
+        bufs: &mut PrefillBuffers,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            requests.len() == sequences.len(),
+            "paged prefill request/sequence count mismatch: requests={} sequences={}",
+            requests.len(),
+            sequences.len()
+        );
+        for (request, seq) in requests.iter().zip(sequences) {
             let last_token = seq.token_offset + seq.seq_len - 1;
-            let last_hidden = ops::extract_vec(&self.ctx, hidden, last_token)?;
-            let normed = ops::rms_norm(
+            ops::extract_vec_into(&self.ctx, hidden, last_token, &mut bufs.last_hidden)?;
+            ops::rms_norm_into(
                 &self.ctx,
-                &last_hidden,
+                &bufs.last_hidden,
                 &self.norm,
                 self.config.rms_norm_eps,
+                &mut bufs.last_normed,
             )?;
-            logits.push(ops::linear(&self.ctx, &normed, self.output_projection())?);
+            let state = states.get_mut(request.state_idx).ok_or_else(|| {
+                anyhow::anyhow!("invalid paged prefill state {}", request.state_idx)
+            })?;
+            let needs_alloc = state
+                .base
+                .prefill_logits
+                .as_ref()
+                .is_none_or(|logits| logits.len != self.config.vocab_size);
+            if needs_alloc {
+                state.base.prefill_logits = Some(
+                    DeviceVec::zeros(&self.ctx, self.config.vocab_size)?
+                        .with_label("qwen3_paged_prefill_logits"),
+                );
+            }
+            let seq_logits = state
+                .base
+                .prefill_logits
+                .as_mut()
+                .expect("prefill logits allocated");
+            ops::gemv(
+                &self.ctx,
+                self.output_projection(),
+                &bufs.last_normed,
+                seq_logits,
+            )?;
         }
-        Ok(logits)
+        Ok(())
     }
 
-    #[fastrace::trace(name = "forward_prefill_paged_batch")]
-    pub(super) fn forward_prefill_paged_batch(
+    #[fastrace::trace(name = "launch_prefill_paged_batch")]
+    pub(super) fn launch_prefill_paged_batch(
         &self,
         requests: &[Qwen3PagedPrefillRequest<'_>],
+        states: &mut [Qwen3State],
         pool: &TokenKVPool,
-    ) -> Result<Vec<DeviceVec>> {
+        prefill_ctx: &mut Qwen3PrefillContext,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
         let total_tokens = requests.iter().map(|req| req.tokens.len()).sum();
         let mut packed_tokens = Vec::with_capacity(total_tokens);
         for req in requests {
@@ -227,15 +327,74 @@ impl Qwen3Model {
         }
 
         let (sequences, page_indices) = self.build_paged_prefill_sequences(requests, pool)?;
+        let mut bufs = self.prefill_buffers(packed_tokens.len())?;
         let page_indices_dev: CudaSlice<i32> = self
             .ctx
             .stream
             .clone_htod(&page_indices)
             .map_err(|e| anyhow::anyhow!("page_indices H2D failed: {e}"))?;
+        let mut fwd = {
+            let plan = prefill_ctx.plan_mut(
+                &self.ctx,
+                packed_tokens.len(),
+                self.config.num_attention_heads,
+            )?;
+            crate::ops::PagedPrefillForward::new_hd128(
+                &self.ctx,
+                plan,
+                &sequences,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                pool.page_size,
+            )?
+        };
         let hidden = self.get_embeddings_batch(&packed_tokens)?;
-        let hidden =
-            self.process_all_layers_batch_paged(hidden, pool, &sequences, &page_indices_dev)?;
-        self.compute_logits_batch_packed(&hidden, &sequences)
+        let hidden = match {
+            let plan = prefill_ctx.plan_mut(
+                &self.ctx,
+                packed_tokens.len(),
+                self.config.num_attention_heads,
+            )?;
+            self.process_all_layers_batch_paged(
+                hidden,
+                &mut bufs,
+                pool,
+                &sequences,
+                &page_indices_dev,
+                plan,
+                &mut fwd,
+            )
+        } {
+            Ok(hidden) => hidden,
+            Err(err) => {
+                self.ctx.sync()?;
+                return Err(err);
+            }
+        };
+        if let Err(err) =
+            self.compute_logits_batch_packed(&hidden, requests, states, &sequences, &mut bufs)
+        {
+            self.ctx.sync()?;
+            return Err(err);
+        }
+        prefill_ctx.set_pending(PendingPagedPrefill {
+            _hidden: hidden,
+            _bufs: bufs,
+            _page_indices_dev: page_indices_dev,
+            _fwd: fwd,
+        })?;
+        Ok(())
+    }
+
+    pub(super) fn run_prefill_paged_batch_sync(
+        &self,
+        requests: &[Qwen3PagedPrefillRequest<'_>],
+        states: &mut [Qwen3State],
+        pool: &TokenKVPool,
+    ) -> Result<()> {
+        let mut prefill_ctx = Qwen3PrefillContext::new();
+        self.launch_prefill_paged_batch(requests, states, pool, &mut prefill_ctx)?;
+        prefill_ctx.complete(&self.ctx)
     }
 
     /// Paged-KV prefill over one or more packed requests. Writes K/V directly
@@ -244,29 +403,17 @@ impl Qwen3Model {
     /// batch. No contiguous KV cache is touched; the scheduler must skip
     /// `migrate_kv_range_to_paged` for this forward.
     #[fastrace::trace(name = "process_all_layers_batch_paged")]
-    pub(super) fn process_all_layers_batch_paged(
+    fn process_all_layers_batch_paged(
         &self,
         mut hidden: HiddenStates,
+        bufs: &mut PrefillBuffers,
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        plan: &mut BatchPrefillPagedPlan,
+        fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<HiddenStates> {
         let seq_len = hidden.seq_len;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let inter_dim = self.config.intermediate_size;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        let mut bufs = PrefillBuffers::new(
-            &self.ctx,
-            self.config.hidden_size,
-            q_dim,
-            kv_dim,
-            inter_dim,
-            seq_len,
-        )?;
 
         anyhow::ensure!(
             !sequences.is_empty(),
@@ -280,64 +427,19 @@ impl Qwen3Model {
             "paged prefill token packing does not cover all hidden rows"
         );
 
-        // Lazy-init the shared paged-prefill plan on first call and reuse
-        // across all subsequent prefills. Allocating a fresh 264MB
-        // FlashInferWorkspace per forward caused async-free backlog →
-        // foreign C++ exception under concurrent load. Matches sglang's
-        // single `workspace_buffer` pattern (`flashinfer_backend.py:260-292`).
-        let mut plan_guard = self
-            .paged_prefill_plan
-            .lock()
-            .map_err(|_| anyhow::anyhow!("paged_prefill_plan mutex poisoned"))?;
-        let required_rows = seq_len.max(4096);
-        let needs_realloc = plan_guard
-            .as_ref()
-            .map(|(max_rows, _)| *max_rows < required_rows)
-            .unwrap_or(true);
-        if needs_realloc {
-            *plan_guard = Some((
-                required_rows,
-                BatchPrefillPagedPlan::new(&self.ctx, required_rows, num_heads)?,
-            ));
-        }
-        let (_, plan) = plan_guard.as_mut().expect("just initialized");
-
-        // Structural invariant: plan ONCE per forward, not per layer.
-        // All 36 layers share the same packed (batch_size, qo_indptr, kv_indptr,
-        // num_heads, page_size) shape, so one plan call covers them all.
-        // Calling plan per layer overwrites `page_locked_workspace`
-        // (host pinned) while a prior layer's `cudaMemcpyAsync` is still
-        // queued on the compute stream — classic async-memcpy data race
-        // that corrupts FlashInfer's `int_workspace` and poisons the
-        // CUDA context under bench concurrency.
-        let mut fwd = crate::ops::PagedPrefillForward::new_hd128(
-            &self.ctx,
-            plan,
-            sequences,
-            num_heads,
-            num_kv_heads,
-            pool.page_size,
-        )?;
-
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_layer_batch_paged(
                 layer_idx,
                 layer,
                 &mut hidden,
-                &mut bufs,
+                bufs,
                 pool,
                 sequences,
                 page_indices,
-                &mut fwd,
+                plan,
+                fwd,
             )?;
         }
-
-        // This forward owns both the shared FlashInfer plan workspace and
-        // per-forward GPU metadata buffers (`page_indices`, qo/kv indptrs).
-        // Keep them alive until the compute stream drains; otherwise the next
-        // chunk can re-plan into the same host/device workspace while kernels
-        // from the prior chunk still consume it.
-        self.ctx.sync()?;
 
         Ok(hidden)
     }
@@ -358,6 +460,7 @@ impl Qwen3Model {
         pool: &TokenKVPool,
         sequences: &[ops::PagedPrefillSequence],
         page_indices: &CudaSlice<i32>,
+        plan: &mut BatchPrefillPagedPlan,
         fwd: &mut crate::ops::PagedPrefillForward,
     ) -> Result<()> {
         let num_heads = self.config.num_attention_heads;
@@ -438,6 +541,7 @@ impl Qwen3Model {
             &bufs.v_batch,
             &nrp,
             &meta,
+            plan,
             fwd,
             &mut bufs.attn_output,
             &heads,

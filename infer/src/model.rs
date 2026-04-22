@@ -195,6 +195,11 @@ pub trait ModelForward: Send {
     /// Must implement `DecodeContextOps` so the scheduler can perform
     /// model-agnostic pre/post work (H2D copies, FlashInfer metadata).
     type DecodeContext: DecodeContextOps + Send;
+    /// Pre-allocated buffers for batched prefill that must outlive queued GPU
+    /// work when the scheduler keeps a prefill batch pending across loop turns.
+    ///
+    /// Models that do not support async batched prefill use `()`.
+    type PrefillContext: Send;
 
     fn create_state(&self) -> Result<Self::State>;
 
@@ -204,6 +209,15 @@ pub trait ModelForward: Send {
         max_batch_size: usize,
         pool: &PagedKVPool,
     ) -> Result<Self::DecodeContext>;
+
+    /// Create prefill context for async batched prefill. The scheduler owns
+    /// one context for the lifetime of the run, mirroring `DecodeContext`.
+    fn create_prefill_context(
+        &self,
+        _max_batch_size: usize,
+        _prefill_budget_tokens: usize,
+        _pool: &PagedKVPool,
+    ) -> Result<Self::PrefillContext>;
 
     /// KV cache memory cost per token in bytes (across all layers, K+V, bf16).
     fn kv_cache_bytes_per_token(&self) -> usize;
@@ -326,6 +340,37 @@ pub trait ModelForward: Send {
             }
         }
 
+        Ok(())
+    }
+
+    /// Whether this model can keep a batched prefill launch pending across
+    /// scheduler loop turns and complete it later via `complete_prefill_batch`.
+    fn supports_async_prefill_batch(&self) -> bool {
+        false
+    }
+
+    /// Launch a batched prefill without synchronizing the device.
+    ///
+    /// The default path keeps behavior correct by falling back to the
+    /// synchronous `forward_prefill_batch`.
+    fn launch_prefill_batch(
+        &self,
+        requests: &[PrefillBatchRequest<'_>],
+        states: &mut [Self::State],
+        paged_kv_pool: Option<&mut PagedKVPool>,
+        _prefill_ctx: &mut Self::PrefillContext,
+    ) -> Result<()> {
+        self.forward_prefill_batch(requests, states, paged_kv_pool)
+    }
+
+    /// Complete a previously launched async batched prefill and release any
+    /// temporary buffers that had to stay alive until the queued GPU work
+    /// finished.
+    fn complete_prefill_batch(
+        &self,
+        _states: &mut [Self::State],
+        _prefill_ctx: &mut Self::PrefillContext,
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -1229,7 +1229,7 @@ impl<M: ModelForward> Scheduler<M> {
             return self.wait_for_fetch_or_request();
         }
 
-        if self.active_len() == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
+        if self.active_len() == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
             if !self.wakeup_live {
                 info!("Scheduler shutting down: all handles dropped");
                 return false;
@@ -1264,10 +1264,10 @@ impl<M: ModelForward> Scheduler<M> {
             let assign_us = step_start.elapsed().as_micros();
 
             let step_t = std::time::Instant::now();
-            // `step()` keeps decode readback pending across loop turns so this
-            // iteration's intake/admission work can overlap the previous
-            // iteration's GPU compute. The remaining sync point is
-            // `sample_batch_greedy_readback()`.
+            // `step()` keeps decode/prefill readback pending across loop turns
+            // so this iteration's intake/admission work can overlap the
+            // previous iteration's GPU compute. The sync points live in the
+            // corresponding readback/completion calls.
             self.step();
             let step_us = step_t.elapsed().as_micros();
 
@@ -1434,6 +1434,9 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn cleanup(&mut self) {
         for slot_idx in 0..self.active.len() {
+            if self.slot_has_pending_gpu_work(slot_idx) {
+                continue;
+            }
             let finished = matches!(
                 self.request(slot_idx).map(|req| &req.phase),
                 Some(Phase::Finished)

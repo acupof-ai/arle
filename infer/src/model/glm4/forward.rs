@@ -78,6 +78,7 @@ impl GenerationState for GLM4State {
 impl ModelForward for GLM4Model {
     type State = GLM4State;
     type DecodeContext = super::batch_decode::BatchDecodeBuffers;
+    type PrefillContext = ();
 
     fn create_state(&self) -> Result<Self::State> {
         Ok(GLM4State {
@@ -112,6 +113,15 @@ impl ModelForward for GLM4Model {
             num_heads,
             max_pages,
         )
+    }
+
+    fn create_prefill_context(
+        &self,
+        _max_batch_size: usize,
+        _prefill_budget_tokens: usize,
+        _pool: &PagedKVPool,
+    ) -> Result<Self::PrefillContext> {
+        Ok(())
     }
 
     fn kv_cache_bytes_per_token(&self) -> usize {

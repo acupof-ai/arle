@@ -73,6 +73,18 @@ pub(super) struct PendingDecode {
     pub decode_spans: Vec<(usize, Span)>,
 }
 
+pub(super) struct PendingPrefillRow {
+    pub slot_idx: usize,
+    pub total_tokens: usize,
+    pub next_progress: usize,
+}
+
+pub(super) struct PendingPrefill {
+    pub rows: Vec<PendingPrefillRow>,
+    pub uses_paged: bool,
+    pub prefill_spans: Vec<(usize, Span)>,
+}
+
 enum EmitCommand {
     Append {
         request_id: u64,
@@ -336,6 +348,9 @@ pub struct Scheduler<M: ModelForward> {
     /// Pre-allocated buffers for batched decode (reused across steps).
     /// Typed via `M::DecodeContext` — no downcasting needed.
     pub(super) decode_bufs: Option<M::DecodeContext>,
+    /// Pre-allocated buffers for batched prefill that may hold GPU resources
+    /// across loop turns when async prefill overlap is enabled.
+    pub(super) prefill_ctx: Option<M::PrefillContext>,
     /// Lifetime stats.
     pub(super) total_completed: u64,
     pub(super) total_generated_tokens: u64,
@@ -349,6 +364,8 @@ pub struct Scheduler<M: ModelForward> {
     pub(super) peak_mem_bytes: u64,
     /// Pending decode state for GPU/CPU overlap.
     pub(super) pending_decode: Option<PendingDecode>,
+    /// Pending prefill state for GPU/CPU overlap.
+    pub(super) pending_prefill: Option<PendingPrefill>,
 }
 
 impl<M: ModelForward> Scheduler<M> {
@@ -940,6 +957,7 @@ impl<M: ModelForward> Scheduler<M> {
             rng: StdRng::seed_from_u64(seed),
             paged_kv_pool,
             decode_bufs: None,
+            prefill_ctx: None,
             total_completed: 0,
             total_generated_tokens: 0,
             step_timing_decode_us: 0.0,
@@ -949,6 +967,7 @@ impl<M: ModelForward> Scheduler<M> {
             last_mem_query: std::time::Instant::now(),
             peak_mem_bytes: 0,
             pending_decode: None,
+            pending_prefill: None,
         };
 
         let handle = SchedulerHandle::with_shared_waiting_count_and_wakeup(
@@ -979,6 +998,7 @@ impl<M: ModelForward> Scheduler<M> {
     pub(super) fn is_fetch_wait_bound(&self) -> bool {
         self.active_len() > 0
             && self.pending_decode.is_none()
+            && self.pending_prefill.is_none()
             && self.prefill_queue.is_empty()
             && !self.has_decode_work()
             && self
@@ -986,6 +1006,20 @@ impl<M: ModelForward> Scheduler<M> {
                 .iter()
                 .flatten()
                 .all(|req| matches!(req.phase, Phase::WaitingFetch))
+    }
+
+    pub(super) fn has_pending_gpu_work(&self) -> bool {
+        self.pending_decode.is_some() || self.pending_prefill.is_some()
+    }
+
+    pub(super) fn slot_has_pending_gpu_work(&self, slot_idx: usize) -> bool {
+        self.pending_decode
+            .as_ref()
+            .is_some_and(|pending| pending.decode_indices.contains(&slot_idx))
+            || self
+                .pending_prefill
+                .as_ref()
+                .is_some_and(|pending| pending.rows.iter().any(|row| row.slot_idx == slot_idx))
     }
 
     pub(super) fn request(&self, slot_idx: usize) -> Option<&ActiveRequest> {
