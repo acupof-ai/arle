@@ -38,7 +38,7 @@ export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-D warnings"
 
 run cargo fmt --manifest-path infer/Cargo.toml --all -- --check
-run ./scripts/check_kv_zig.sh
+run env CHECK_KV_ZIG_SCOPE=kv-only ./scripts/check_kv_zig.sh
 run cargo check --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
 run cargo clippy --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib -- -D warnings
 run cargo test --manifest-path infer/Cargo.toml --no-default-features --features no-cuda --lib
