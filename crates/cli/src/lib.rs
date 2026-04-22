@@ -32,7 +32,13 @@ use clap::Parser;
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
 
 pub fn run() -> ExitCode {
-    match run_impl() {
+    let args = Args::parse();
+
+    if let Some(command) = args.command {
+        return train_cli::run(command);
+    }
+
+    match run_impl(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[agent-infer] error: {err:#}");
@@ -41,9 +47,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_impl() -> Result<()> {
-    let args = Args::parse();
-
+fn run_impl(args: Args) -> Result<()> {
     if args.doctor {
         doctor::run(&args)?;
         return Ok(());
@@ -51,11 +55,6 @@ fn run_impl() -> Result<()> {
 
     if args.list_models {
         doctor::list_models(&args)?;
-        return Ok(());
-    }
-
-    if let Some(command) = args.command {
-        train_cli::run(command)?;
         return Ok(());
     }
 
