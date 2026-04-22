@@ -15,7 +15,7 @@
 //! | T0   | GPU HBM            | ~0 (kernel)   | owned by `TokenKVPool` in `backend/cuda/paged_kv.rs`, not represented here |
 //! | T1   | Host pinned DRAM   | ~10 µs PCIe   | live on the CUDA lane via Zig-backed `HostPinnedPool`; staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
 //! | T2   | NVMe SSD           | 10–100 µs     | `transport/disk.rs` backs coordinator store / persist and local staged readmission (`disk -> host -> T0`) |
-//! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` stub exists behind `rdma-nixl` feature |
+//! | T3   | Remote (NIXL/RDMA) | 1–50 µs       | `transport/nixl.rs` builds under `rdma-nixl` (stub) or `rdma-nixl-real` |
 //!
 //! The earlier project-doc draft used T0/T2/T3/T4 with T1 intentionally
 //! cut; the 2026-04-15 revision renamed to T0/T1/T2/T3 for alignment
@@ -103,8 +103,9 @@
 //!   [`TransportId`], [`MemKind`].
 //! - [`transport`] — [`KVTransport`] trait, [`TransferOp`],
 //!   [`TransportError`]. `DiskStore` is implemented in
-//!   `transport::disk`; `NixlTransport` is a stub in `transport::nixl`
-//!   behind `rdma-nixl`.
+//!   `transport::disk`; `NixlTransport` is the remote-tier surface in
+//!   `transport::nixl`, compiled via `rdma-nixl` (stub) or
+//!   `rdma-nixl-real`.
 //!
 //! The former `directory` submodule was deleted in M1; its fields
 //! (`ref_count`, `last_access`, `session_id`, `pin_until`, `tier`,

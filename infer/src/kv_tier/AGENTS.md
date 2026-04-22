@@ -26,7 +26,7 @@ Load this file before editing anything under `kv_tier/`, and re-read
 | T0   | GPU HBM           | kernel   | **Not here.** Owned by `TokenKVPool` in `crates/cuda-kernels/src/paged_kv.rs`. |
 | T1   | Host pinned DRAM  | ~10 µs   | live on CUDA: scheduler demotes GPU blocks into Zig-backed `host_pool.rs`, and staged host hits promote back into T0 through `ReadmissionPlan + FetchTicket + WaitingFetch` |
 | T2   | NVMe SSD          | 10–100 µs| `transport/disk.rs` is wired into coordinator spill/persist, session restore plumbing, and local staged readmission (`disk -> host -> T0`) |
-| T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` stub behind `rdma-nixl` feature. |
+| T3   | Remote (NIXL)     | 1–50 µs  | `transport/nixl.rs` via `rdma-nixl` (stub) or `rdma-nixl-real`. |
 
 **Apple Silicon skips T1.** MLX unified memory makes host↔GPU a self-memcpy.
 Metal joins at M4 for T2 disk (bounded wired-memory KV pool).
@@ -45,7 +45,7 @@ kv_tier/host_pool.rs    — HostPinnedPool, HostPinnedRegion (thin Rust wrapper 
 kv_tier/transport.rs    — KVTransport trait + TransferOp + TransportError
 kv_tier/transport/disk.rs       — DiskStore (Rust adapter over kv-native-sys Zig object store + future descriptor substrate)
 kv_tier/transport/local_cuda.rs — LocalCudaTransport (local-lane plumbing)
-kv_tier/transport/nixl.rs       — NixlTransport stub, #[cfg(feature = "rdma-nixl")]
+kv_tier/transport/nixl.rs       — NixlTransport remote-tier surface, compiled via `rdma-nixl` (stub) or `rdma-nixl-real`
 kv_tier/coordinator.rs  — Coordinator, command/event channel for plan/fetch/store queues on the local spill/readmission path; queue stats/cancellation/backpressure and shared-fs remote fetch/store live here
 ```
 

@@ -16,20 +16,20 @@
 //!   cross-platform (macOS tests run on `tokio::fs`-free paths). The
 //!   coordinator now routes spill/stage byte paths through it, but it is
 //!   still not a `KVTransport` impl.
-//! - `nixl` (feature `rdma-nixl`) — `NixlTransport` stub for the T4 remote tier.
-//!   Only compiled under `#[cfg(feature = "rdma-nixl")]`; references
-//!   `nixl-sys` types so a `cargo check --features rdma-nixl` on macOS
-//!   proves the trait shape is forward-compatible with real NIXL.
+//! - `nixl` (features `rdma-nixl` or `rdma-nixl-real`) — `NixlTransport`
+//!   remote-tier surface. `rdma-nixl` compiles against the stub API on
+//!   macOS/dev CI; `rdma-nixl-real` compiles against the real native link
+//!   surface on CUDA hosts.
 
 pub mod disk;
 pub mod local_cuda;
-#[cfg(feature = "rdma-nixl")]
+#[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 pub mod nixl;
 pub mod shared_fs;
 
 pub use disk::DiskStore;
 pub use local_cuda::LocalCudaTransport;
-#[cfg(feature = "rdma-nixl")]
+#[cfg(any(feature = "rdma-nixl", feature = "rdma-nixl-real"))]
 pub use nixl::NixlTransport;
 pub use shared_fs::SharedFsStore;
 
