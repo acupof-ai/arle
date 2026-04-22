@@ -316,12 +316,12 @@ impl MetalQwen35PrefixRuntime {
     ) -> Result<()> {
         let prompt_tokens = &request.prompt_tokens;
         if prompt_tokens.len() < self.block_size {
-            metrics.record_prefix_lookup(false);
+            metrics.record_prefix_lookup(0, prompt_tokens.len());
             return Ok(());
         }
 
         let Some(prefix_key) = self.lookup_longest_prefix(prompt_tokens) else {
-            metrics.record_prefix_lookup(false);
+            metrics.record_prefix_lookup(0, prompt_tokens.len());
             return Ok(());
         };
 
@@ -335,7 +335,8 @@ impl MetalQwen35PrefixRuntime {
                 false
             };
 
-        metrics.record_prefix_lookup(imported);
+        let reused_tokens = if imported { prefix_key.len() } else { 0 };
+        metrics.record_prefix_lookup(reused_tokens, prompt_tokens.len());
         if !imported {
             return Ok(());
         }

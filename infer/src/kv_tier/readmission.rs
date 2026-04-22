@@ -159,6 +159,21 @@ impl ReadmissionPlan {
     pub fn mark_consumed(&mut self) {
         self.state = RequestChunkState::Consumed;
     }
+
+    pub fn source_counts(&self) -> (usize, usize, usize) {
+        let mut host = 0usize;
+        let mut disk = 0usize;
+        let mut remote = 0usize;
+        for block in &self.blocks {
+            match block.source {
+                Some(ReadmissionSource::HostPinned { .. }) => host += 1,
+                Some(ReadmissionSource::Disk { .. }) => disk += 1,
+                Some(ReadmissionSource::Remote { .. }) => remote += 1,
+                None => {}
+            }
+        }
+        (host, disk, remote)
+    }
 }
 
 #[cfg(test)]

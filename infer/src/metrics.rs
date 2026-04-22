@@ -45,6 +45,15 @@
 //! | `infer_kv_gpu_blocks_total` | gauge | Total GPU KV blocks |
 //! | `infer_prefix_hits_total` | counter | Prefix-cache lookup hits |
 //! | `infer_prefix_lookups_total` | counter | Prefix-cache lookups |
+//! | `infer_prefix_reused_tokens_total` | counter | Prefix tokens skipped by reuse |
+//! | `infer_prefix_lookup_prompt_tokens_total` | counter | Prompt tokens seen by prefix lookup |
+//! | `infer_prefix_skip_rate` | gauge | Fraction of prompt tokens skipped by prefix reuse |
+//! | `infer_tier_fetch_staged_host_blocks_total` | counter | Request-weighted staged blocks found in T1 |
+//! | `infer_tier_fetch_staged_disk_blocks_total` | counter | Request-weighted staged blocks found in T2 |
+//! | `infer_tier_fetch_staged_remote_blocks_total` | counter | Request-weighted staged blocks found in T3 |
+//! | `infer_tier_fetch_promoted_blocks_total` | counter | Staged blocks promoted back into T0 |
+//! | `infer_tier_fetch_fallback_total` | counter | Staged-prefix fallbacks back to cold prefill |
+//! | `infer_tier_fetch_recall_rate` | gauge | Promoted staged blocks / staged blocks |
 //! | `infer_memory_active_bytes` | gauge | Active MLX allocator memory |
 //! | `infer_memory_peak_bytes` | gauge | Peak MLX allocator memory |
 //! | `infer_memory_cache_bytes` | gauge | Cached MLX allocator memory |
@@ -209,6 +218,13 @@ struct MetricsInner {
     pub requests_failed_total: AtomicU64,
     pub prefix_hits_total: AtomicU64,
     pub prefix_lookups_total: AtomicU64,
+    pub prefix_reused_tokens_total: AtomicU64,
+    pub prefix_lookup_prompt_tokens_total: AtomicU64,
+    pub tier_fetch_staged_host_blocks_total: AtomicU64,
+    pub tier_fetch_staged_disk_blocks_total: AtomicU64,
+    pub tier_fetch_staged_remote_blocks_total: AtomicU64,
+    pub tier_fetch_promoted_blocks_total: AtomicU64,
+    pub tier_fetch_fallback_total: AtomicU64,
 
     // DFlash speculative decode counters.
     pub dflash_blocks_total: AtomicU64,
@@ -262,6 +278,13 @@ impl ServerMetrics {
                 requests_failed_total: AtomicU64::new(0),
                 prefix_hits_total: AtomicU64::new(0),
                 prefix_lookups_total: AtomicU64::new(0),
+                prefix_reused_tokens_total: AtomicU64::new(0),
+                prefix_lookup_prompt_tokens_total: AtomicU64::new(0),
+                tier_fetch_staged_host_blocks_total: AtomicU64::new(0),
+                tier_fetch_staged_disk_blocks_total: AtomicU64::new(0),
+                tier_fetch_staged_remote_blocks_total: AtomicU64::new(0),
+                tier_fetch_promoted_blocks_total: AtomicU64::new(0),
+                tier_fetch_fallback_total: AtomicU64::new(0),
                 dflash_blocks_total: AtomicU64::new(0),
                 dflash_accepted_tokens_total: AtomicU64::new(0),
                 dflash_draft_tokens_total: AtomicU64::new(0),
@@ -361,14 +384,52 @@ impl ServerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one prefix-cache lookup and whether it hit a reusable prefix.
-    pub fn record_prefix_lookup(&self, hit: bool) {
+    /// Record one prefix-cache lookup plus how many prompt tokens it skipped.
+    pub fn record_prefix_lookup(&self, reused_tokens: usize, prompt_tokens: usize) {
         self.inner
             .prefix_lookups_total
             .fetch_add(1, Ordering::Relaxed);
-        if hit {
+        self.inner
+            .prefix_reused_tokens_total
+            .fetch_add(reused_tokens as u64, Ordering::Relaxed);
+        self.inner
+            .prefix_lookup_prompt_tokens_total
+            .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+        if reused_tokens > 0 {
             self.inner.prefix_hits_total.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record request-weighted staged fetch blocks by slower-tier source.
+    pub fn record_tier_fetch_plan(
+        &self,
+        host_blocks: usize,
+        disk_blocks: usize,
+        remote_blocks: usize,
+    ) {
+        self.inner
+            .tier_fetch_staged_host_blocks_total
+            .fetch_add(host_blocks as u64, Ordering::Relaxed);
+        self.inner
+            .tier_fetch_staged_disk_blocks_total
+            .fetch_add(disk_blocks as u64, Ordering::Relaxed);
+        self.inner
+            .tier_fetch_staged_remote_blocks_total
+            .fetch_add(remote_blocks as u64, Ordering::Relaxed);
+    }
+
+    /// Record staged blocks successfully promoted back into T0.
+    pub fn record_tier_fetch_promoted(&self, promoted_blocks: usize) {
+        self.inner
+            .tier_fetch_promoted_blocks_total
+            .fetch_add(promoted_blocks as u64, Ordering::Relaxed);
+    }
+
+    /// Record one staged-prefix fallback back to cold prefill.
+    pub fn record_tier_fetch_fallback(&self) {
+        self.inner
+            .tier_fetch_fallback_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set the number of currently-active requests.
@@ -637,6 +698,62 @@ impl ServerMetrics {
         self.inner.prefix_hits_total.load(Ordering::Relaxed) as f64 / lookups as f64
     }
 
+    pub fn prefix_skip_rate(&self) -> f64 {
+        let prompt_tokens = self
+            .inner
+            .prefix_lookup_prompt_tokens_total
+            .load(Ordering::Relaxed);
+        if prompt_tokens == 0 {
+            return 0.0;
+        }
+        self.inner
+            .prefix_reused_tokens_total
+            .load(Ordering::Relaxed) as f64
+            / prompt_tokens as f64
+    }
+
+    pub fn tier_fetch_staged_host_blocks_total(&self) -> u64 {
+        self.inner
+            .tier_fetch_staged_host_blocks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_staged_disk_blocks_total(&self) -> u64 {
+        self.inner
+            .tier_fetch_staged_disk_blocks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_staged_remote_blocks_total(&self) -> u64 {
+        self.inner
+            .tier_fetch_staged_remote_blocks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_promoted_blocks_total(&self) -> u64 {
+        self.inner
+            .tier_fetch_promoted_blocks_total
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_fallback_total(&self) -> u64 {
+        self.inner.tier_fetch_fallback_total.load(Ordering::Relaxed)
+    }
+
+    pub fn tier_fetch_staged_blocks_total(&self) -> u64 {
+        self.tier_fetch_staged_host_blocks_total()
+            + self.tier_fetch_staged_disk_blocks_total()
+            + self.tier_fetch_staged_remote_blocks_total()
+    }
+
+    pub fn tier_fetch_recall_rate(&self) -> f64 {
+        let staged_blocks = self.tier_fetch_staged_blocks_total();
+        if staged_blocks == 0 {
+            return 0.0;
+        }
+        self.tier_fetch_promoted_blocks_total() as f64 / staged_blocks as f64
+    }
+
     /// Record one DFlash speculative block execution.
     pub fn record_dflash_block(&self, accepted_inputs: usize, block_size: usize) {
         self.inner
@@ -771,6 +888,107 @@ impl ServerMetrics {
             out,
             "infer_prefix_hit_rate{{{labels}}} {:.4}",
             self.prefix_hit_rate()
+        )
+        .unwrap();
+
+        out.push_str("# HELP infer_prefix_reused_tokens_total Prefix tokens skipped by reuse.\n");
+        out.push_str("# TYPE infer_prefix_reused_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_prefix_reused_tokens_total{{{labels}}} {}",
+            self.inner
+                .prefix_reused_tokens_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_prefix_lookup_prompt_tokens_total Prompt tokens seen by prefix lookup.\n",
+        );
+        out.push_str("# TYPE infer_prefix_lookup_prompt_tokens_total counter\n");
+        writeln!(
+            out,
+            "infer_prefix_lookup_prompt_tokens_total{{{labels}}} {}",
+            self.inner
+                .prefix_lookup_prompt_tokens_total
+                .load(Ordering::Relaxed)
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_prefix_skip_rate Fraction of prompt tokens skipped by prefix reuse [0,1].\n",
+        );
+        out.push_str("# TYPE infer_prefix_skip_rate gauge\n");
+        writeln!(
+            out,
+            "infer_prefix_skip_rate{{{labels}}} {:.4}",
+            self.prefix_skip_rate()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_staged_host_blocks_total Request-weighted staged blocks found in T1.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_staged_host_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_staged_host_blocks_total{{{labels}}} {}",
+            self.tier_fetch_staged_host_blocks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_staged_disk_blocks_total Request-weighted staged blocks found in T2.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_staged_disk_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_staged_disk_blocks_total{{{labels}}} {}",
+            self.tier_fetch_staged_disk_blocks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_staged_remote_blocks_total Request-weighted staged blocks found in T3.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_staged_remote_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_staged_remote_blocks_total{{{labels}}} {}",
+            self.tier_fetch_staged_remote_blocks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_promoted_blocks_total Staged blocks promoted back into T0.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_promoted_blocks_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_promoted_blocks_total{{{labels}}} {}",
+            self.tier_fetch_promoted_blocks_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_fallback_total Staged-prefix fallbacks back to cold prefill.\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_fallback_total counter\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_fallback_total{{{labels}}} {}",
+            self.tier_fetch_fallback_total()
+        )
+        .unwrap();
+
+        out.push_str(
+            "# HELP infer_tier_fetch_recall_rate Promoted staged blocks divided by staged blocks [0,1].\n",
+        );
+        out.push_str("# TYPE infer_tier_fetch_recall_rate gauge\n");
+        writeln!(
+            out,
+            "infer_tier_fetch_recall_rate{{{labels}}} {:.4}",
+            self.tier_fetch_recall_rate()
         )
         .unwrap();
 
@@ -1213,9 +1431,24 @@ impl ServerMetrics {
         } else {
             String::new()
         };
+        let staged_blocks = self.tier_fetch_staged_blocks_total();
+        let tier_suffix = if staged_blocks > 0 || self.tier_fetch_fallback_total() > 0 {
+            format!(
+                " prefix_skip_rate={:.1}% tier_recall={:.1}% tier_src=h:{}/d:{}/r:{} tier_promoted={} tier_fallback={}",
+                self.prefix_skip_rate() * 100.0,
+                self.tier_fetch_recall_rate() * 100.0,
+                self.tier_fetch_staged_host_blocks_total(),
+                self.tier_fetch_staged_disk_blocks_total(),
+                self.tier_fetch_staged_remote_blocks_total(),
+                self.tier_fetch_promoted_blocks_total(),
+                self.tier_fetch_fallback_total(),
+            )
+        } else {
+            format!(" prefix_skip_rate={:.1}%", self.prefix_skip_rate() * 100.0)
+        };
 
         format!(
-            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}",
+            "requests={} active={} waiting={} scheduled={} decode_rows={} prefill_rows={} running_batch={} prefill_queue={} batch_width={} decode_tokens={} prefill_tokens={} tokens_out={} step_last={:.1}ms step_p50={} tier_fetch_wait={:.1}ms tier_store_wait={:.1}ms kv_util={:.1}% prefix_hit_rate={:.1}% active_mem={:.1}MB peak_mem={:.1}MB cache_mem={:.1}MB queue_p50={} active_ttft_p50={} ttft_p50={} ttft_p99={} service_p50={} tpot_p50={}{}{}{}",
             self.requests_total(),
             self.requests_active(),
             self.requests_waiting(),
@@ -1244,6 +1477,7 @@ impl ServerMetrics {
             service_p50,
             tpot_p50,
             dflash_suffix,
+            tier_suffix,
             coordinator_suffix,
         )
     }
@@ -1291,7 +1525,10 @@ mod tests {
         m.set_kv_coordinator(16, 3, 5, 2, true, false, 7, 5, 1, 2);
         m.set_tier_wait_seconds(0.25, 0.5);
         m.set_kv_gpu_blocks(100, 200);
-        m.record_prefix_lookup(true);
+        m.record_prefix_lookup(64, 128);
+        m.record_tier_fetch_plan(2, 3, 4);
+        m.record_tier_fetch_promoted(6);
+        m.record_tier_fetch_fallback();
         m.set_memory_bytes(1234, 5678, 42);
 
         let rendered = m.render_prometheus();
@@ -1320,6 +1557,23 @@ mod tests {
         assert!(rendered.contains("infer_tier_fetch_wait_seconds{model=\"Qwen3-4B\",} 0.250000"));
         assert!(rendered.contains("infer_tier_store_wait_seconds{model=\"Qwen3-4B\",} 0.500000"));
         assert!(rendered.contains("infer_prefix_hit_rate{model=\"Qwen3-4B\",} 1.0000"));
+        assert!(rendered.contains("infer_prefix_reused_tokens_total{model=\"Qwen3-4B\",} 64"));
+        assert!(
+            rendered.contains("infer_prefix_lookup_prompt_tokens_total{model=\"Qwen3-4B\",} 128")
+        );
+        assert!(rendered.contains("infer_prefix_skip_rate{model=\"Qwen3-4B\",} 0.5000"));
+        assert!(
+            rendered.contains("infer_tier_fetch_staged_host_blocks_total{model=\"Qwen3-4B\",} 2")
+        );
+        assert!(
+            rendered.contains("infer_tier_fetch_staged_disk_blocks_total{model=\"Qwen3-4B\",} 3")
+        );
+        assert!(
+            rendered.contains("infer_tier_fetch_staged_remote_blocks_total{model=\"Qwen3-4B\",} 4")
+        );
+        assert!(rendered.contains("infer_tier_fetch_promoted_blocks_total{model=\"Qwen3-4B\",} 6"));
+        assert!(rendered.contains("infer_tier_fetch_fallback_total{model=\"Qwen3-4B\",} 1"));
+        assert!(rendered.contains("infer_tier_fetch_recall_rate{model=\"Qwen3-4B\",} 0.6667"));
         assert!(rendered.contains("infer_memory_active_bytes{model=\"Qwen3-4B\",} 1234"));
         assert!(rendered.contains("infer_queue_wait_seconds_count"));
         assert!(rendered.contains("infer_active_ttft_seconds_count"));
@@ -1336,12 +1590,21 @@ mod tests {
     fn server_metrics_render_summary() {
         let m = ServerMetrics::new("Qwen3-8B");
         m.set_kv_coordinator(16, 0, 0, 0, false, false, 3, 2, 1, 4);
+        m.record_prefix_lookup(32, 128);
+        m.record_tier_fetch_plan(1, 2, 0);
+        m.record_tier_fetch_promoted(2);
+        m.record_tier_fetch_fallback();
         let s = m.render_summary();
         assert!(s.contains("requests=0"));
         assert!(s.contains("active=0"));
         assert!(s.contains("scheduled=0"));
         assert!(s.contains("queue_p50="));
-        assert!(s.contains("prefix_hit_rate=0.0%"));
+        assert!(s.contains("prefix_hit_rate=100.0%"));
+        assert!(s.contains("prefix_skip_rate=25.0%"));
+        assert!(s.contains("tier_recall=66.7%"));
+        assert!(s.contains("tier_src=h:1/d:2/r:0"));
+        assert!(s.contains("tier_promoted=2"));
+        assert!(s.contains("tier_fallback=1"));
         assert!(s.contains("kv_store=sub:3,done:2,fail:1,rej:4"));
     }
 
