@@ -250,3 +250,9 @@ External follow-up remains mandatory:
 - delta table vs SGLang for `c1/c2/c4/c8/c16`
 - fix any review findings or remote-regression findings that the CUDA run
   surfaces
+- latest local rerun on pulled `39152ac`:
+  `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c4-c8-c16-39152ac-localfix.md`
+- latest `c16` end-to-end bottleneck trace on the same local tree:
+  `docs/experience/wins/2026-04-22-profile-cuda-qwen3-4b-c16-end-to-end-bottleneck-39152ac-localfix.md`
+- latest waiting-aware reclaim bench on the same local tree:
+  `docs/experience/wins/2026-04-22-bench-guidellm-qwen3-4b-l4-c8-c16-39152ac-waiting-reclaim.md`
