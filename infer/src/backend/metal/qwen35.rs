@@ -171,6 +171,21 @@ pub(crate) fn capture_qwen35_hidden_from_cpp_outputs(
     Ok(Some(concatenate_axis(&squeezed, 1)))
 }
 
+pub(crate) fn append_qwen35_captured_hidden_chunk(
+    accumulated: &mut Option<MlxArray>,
+    captured_chunk: Option<MlxArray>,
+) {
+    let Some(chunk) = captured_chunk else {
+        return;
+    };
+    let combined = if let Some(existing) = accumulated.take() {
+        concatenate_axis(&[existing, chunk], 0)
+    } else {
+        chunk
+    };
+    *accumulated = Some(combined);
+}
+
 pub(crate) fn with_qwen35_capture_layers<T>(
     cpp_model_raw: *mut std::ffi::c_void,
     target_layer_ids: &[usize],
@@ -820,7 +835,6 @@ impl CppQwen35Model {
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
-    #[cfg(test)]
     pub(super) fn prefill(
         &self,
         tokens: &MlxArray,
@@ -1686,9 +1700,6 @@ fn metal_generate_qwen35_dflash(
     let mut kv_capacity = cache_shape[2];
     let mut recurrent = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
     let mut cache_len = 0i32;
-    let mut logits = None;
-    let mut target_hidden = None;
-
     let mut kv_flat: Vec<MlxArray> = k_caches
         .iter()
         .zip(v_caches.iter())
@@ -1701,34 +1712,24 @@ fn metal_generate_qwen35_dflash(
         .flat_map(|(s, c)| [s.clone(), c.clone()])
         .collect();
 
-    for (idx, &token) in input_ids.iter().enumerate() {
-        let token_arr = MlxArray::from_slice_i32(&[token as i32], &[1]);
-        let step_logits = if idx + 1 == input_ids.len() {
-            with_qwen35_capture_layers(cpp_model.as_raw(), runtime.target_layer_ids(), || {
-                cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)
-            })?
-        } else {
-            cpp_model.step(&token_arr, cache_len, &mut kv_flat, &mut gdr_flat)?
-        };
-        if idx + 1 == input_ids.len() {
-            target_hidden = capture_qwen35_hidden_from_cpp_outputs(
-                cpp_model.as_raw(),
-                runtime.target_layer_ids().len(),
-            )?;
-        } else {
-            let mut outputs: Vec<&MlxArray> =
-                Vec::with_capacity(1 + kv_flat.len() + gdr_flat.len());
-            outputs.push(&step_logits);
-            outputs.extend(kv_flat.iter());
-            outputs.extend(gdr_flat.iter());
-            super::mlx::eval(&outputs);
-        }
-        logits = Some(step_logits);
-        cache_len += 1;
-        recurrent.seq_len = cache_len as usize;
-    }
-
-    let logits = logits.context("Qwen3.5 prompt produced no logits")?;
+    let prompt_values: Vec<i32> = input_ids.iter().map(|&token| token as i32).collect();
+    let prompt_arr = MlxArray::from_slice_i32(&prompt_values, &[input_ids.len() as i32]);
+    let logits =
+        with_qwen35_capture_layers(cpp_model.as_raw(), runtime.target_layer_ids(), || {
+            cpp_model.prefill(
+                &prompt_arr,
+                input_ids.len() as i32,
+                cache_len,
+                &mut kv_flat,
+                &mut gdr_flat,
+            )
+        })?;
+    let target_hidden = capture_qwen35_hidden_from_cpp_outputs(
+        cpp_model.as_raw(),
+        runtime.target_layer_ids().len(),
+    )?;
+    cache_len += input_ids.len() as i32;
+    recurrent.seq_len = cache_len as usize;
     let mut current_token =
         dflash::sample_last_token_suppress(&logits, params, Some(runtime.mask_token_id()))?;
     let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -2575,6 +2576,26 @@ mod tests {
         start[0] = row;
         end[0] = row + 1;
         slice(array, &start, &end, &strides)
+    }
+
+    #[test]
+    fn append_qwen35_captured_hidden_chunk_concatenates_context_rows() {
+        let _guard = metal_test_guard();
+        let mut accumulated = None;
+        append_qwen35_captured_hidden_chunk(
+            &mut accumulated,
+            Some(MlxArray::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])),
+        );
+        append_qwen35_captured_hidden_chunk(
+            &mut accumulated,
+            Some(MlxArray::from_slice_f32(&[5.0, 6.0], &[1, 2])),
+        );
+
+        let combined = accumulated.expect("captured hidden");
+        let combined = as_dtype(&combined, Dtype::Float32);
+        eval(&[&combined]);
+        assert_eq!(combined.shape(), &[3, 2]);
+        assert_eq!(combined.as_slice_f32(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     fn left_pad_kv_cache_row_for_test(

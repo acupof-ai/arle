@@ -615,7 +615,11 @@ struct Qwen35CompiledModel {
         if (!ctx.is_verify || ctx.has_attn_mask || ctx.seq_len != 16) {
             return false;
         }
-        if (!ctx.has_cache_pos_arr || ctx.batch_size <= 1) {
+        // Valid for both mask-free packed verify and the native single-row
+        // verify-summary path. We intentionally do not require cache_pos_arr:
+        // B=1 summary keeps the scalar cache contract and should still take
+        // the exact 2-pass kernel when the shapes line up.
+        if (ctx.batch_size <= 0) {
             return false;
         }
         if ((hd != 128 && hd != 256) || nkv <= 0 || (nh % nkv) != 0) {

@@ -1826,6 +1826,10 @@ fn prefix_match_len_tokens_batched(lhs: &MlxArray, rhs: &MlxArray) -> MlxArray {
     prefix_match_len_i32_batched(&lhs_i32, &rhs_i32)
 }
 
+fn packed_verify_needs_attn_mask(left_padding: &[i32]) -> bool {
+    left_padding.iter().any(|&padding| padding != 0)
+}
+
 #[derive(Clone)]
 struct Qwen35GdrTape {
     innovation_tape: MlxArray,
@@ -2722,8 +2726,18 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     // ── 7. Build packed verify inputs and call verify_block_batched. ──
     let tokens_arr = MlxArray::from_slice_i32(&packed_block_tokens, &[batch_i32, block_size_i32]);
     let rope_offsets = MlxArray::from_slice_i32(target_cache_lens, &[batch_i32]);
-    let attn_mask =
-        super::mlx::build_varlen_verify_mask(left_padding, block_size_i32, batch_cache_len);
+    // When every row shares the same physical cache cursor there is no
+    // left-padding to hide, so we can skip the additive mask and let the C++
+    // verify path take its exact 2-pass SDPA fast path.
+    let attn_mask = if packed_verify_needs_attn_mask(left_padding) {
+        Some(super::mlx::build_varlen_verify_mask(
+            left_padding,
+            block_size_i32,
+            batch_cache_len,
+        ))
+    } else {
+        None
+    };
 
     let n_capture_layers = runtime.target_layer_ids.len();
     let expected_tape_count = packed_target_gdr_flat.len() / 2;
@@ -2735,7 +2749,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         target_cache_lens,
         packed_target_kv_flat,
         packed_target_gdr_flat,
-        Some(&attn_mask),
+        attn_mask.as_ref(),
         &rope_offsets,
         &params_per_row[0],
         Some(runtime.mask_token_id()),
@@ -3809,5 +3823,15 @@ mod tests {
         options
             .validate()
             .expect_err("empty draft model must be rejected before load");
+    }
+
+    #[test]
+    fn packed_verify_needs_attn_mask_skips_zero_left_padding() {
+        assert!(!super::packed_verify_needs_attn_mask(&[0, 0, 0]));
+    }
+
+    #[test]
+    fn packed_verify_needs_attn_mask_detects_varlen_rows() {
+        assert!(super::packed_verify_needs_attn_mask(&[0, 2, 0]));
     }
 }

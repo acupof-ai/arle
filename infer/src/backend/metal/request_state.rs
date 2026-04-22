@@ -11,7 +11,9 @@ use super::gdr::MetalRecurrentState;
 use super::kv_pool::MetalKVPool;
 use super::mlx::{MlxArray, async_eval, concatenate_axis, eval, slice, take_axis, zeros};
 use super::ops::{clear_metal_cache, extend_kv_cache};
-use super::qwen35::{CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step};
+use super::qwen35::{
+    CppQwen35Model, Qwen35MetalWeights, qwen35_forward_step, qwen35_forward_with_hidden_states,
+};
 use super::sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params};
 use super::weights::{MetalWeights, StandardMetalWeights};
 use crate::sampler::SamplingParams;
@@ -3344,58 +3346,33 @@ impl<'a> Qwen35StepDriver<'a> {
         })
     }
 
-    fn ensure_dflash_target_hidden_for_terminal_prefill(
+    fn append_dflash_target_hidden_chunk(&mut self, captured: Option<MlxArray>) {
+        let reset_prefetch = captured.is_some();
+        let Some(dflash) = self.dflash.as_mut() else {
+            return;
+        };
+        super::qwen35::append_qwen35_captured_hidden_chunk(&mut dflash.target_hidden, captured);
+        if reset_prefetch {
+            dflash.prefetched_draft = None;
+        }
+    }
+
+    fn append_dflash_target_hidden_from_cpp_outputs(
         &mut self,
-        last_prompt_token: u32,
-        cpp_model_raw: Option<*mut std::ffi::c_void>,
+        cpp_model_raw: *mut std::ffi::c_void,
     ) -> Result<()> {
         let Some(dflash) = self.dflash.as_mut() else {
             return Ok(());
         };
-        if dflash.target_hidden.is_none()
-            && let Some(raw) = cpp_model_raw
-        {
-            dflash.target_hidden = super::qwen35::capture_qwen35_hidden_from_cpp_outputs(
-                raw,
-                dflash.target_layer_ids.len(),
-            )?;
+        let captured = super::qwen35::capture_qwen35_hidden_from_cpp_outputs(
+            cpp_model_raw,
+            dflash.target_layer_ids.len(),
+        )?;
+        let reset_prefetch = captured.is_some();
+        super::qwen35::append_qwen35_captured_hidden_chunk(&mut dflash.target_hidden, captured);
+        if reset_prefetch {
             dflash.prefetched_draft = None;
         }
-        if dflash.target_hidden.is_some() {
-            return Ok(());
-        }
-
-        let MetalModelArch::Qwen35(arch) = &self.config.arch else {
-            return Ok(());
-        };
-        let num_full = arch.num_full_attention_layers();
-        let cache_shape = [
-            1i32,
-            self.config.num_key_value_heads as i32,
-            KV_CACHE_CHUNK,
-            self.config.head_dim as i32,
-        ];
-        let mut tk: Vec<MlxArray> = (0..num_full)
-            .map(|_| zeros(&cache_shape, super::mlx::Dtype::Bfloat16))
-            .collect();
-        let mut tv: Vec<MlxArray> = (0..num_full)
-            .map(|_| zeros(&cache_shape, super::mlx::Dtype::Bfloat16))
-            .collect();
-        let mut tr = MetalRecurrentState::new(arch.num_linear_attention_layers(), &arch.linear);
-        let (_, th) = super::qwen35::qwen35_forward_with_hidden_states(
-            &[last_prompt_token],
-            self.weights,
-            self.config,
-            arch,
-            &mut tk,
-            &mut tv,
-            &mut tr,
-            self.cache_len - 1,
-            &dflash.target_layer_ids,
-        );
-        eval(&[&th]);
-        dflash.target_hidden = Some(th);
-        dflash.prefetched_draft = None;
         Ok(())
     }
 
@@ -3489,6 +3466,45 @@ impl<'a> Qwen35StepDriver<'a> {
 
         state.recurrent.seq_len = (cache_len + 1) as usize;
         logits
+    }
+
+    fn run_rust_prefill_hidden_chunk(
+        weights: &Qwen35MetalWeights,
+        config: &MetalModelConfig,
+        arch: &super::config::MetalQwen35ArchConfig,
+        cache_len: i32,
+        state: &mut Qwen35RustState,
+        tokens: &[u32],
+        target_layer_ids: &[usize],
+    ) -> (MlxArray, MlxArray) {
+        let (logits, target_hidden) = qwen35_forward_with_hidden_states(
+            tokens,
+            weights,
+            config,
+            arch,
+            &mut state.k_caches,
+            &mut state.v_caches,
+            &mut state.recurrent,
+            cache_len,
+            target_layer_ids,
+        );
+
+        let next_cache_len = cache_len + tokens.len() as i32;
+        let mut step_outputs: Vec<&MlxArray> = Vec::with_capacity(
+            1 + state.k_caches.len()
+                + state.v_caches.len()
+                + state.recurrent.states.len()
+                + state.recurrent.conv_states.len(),
+        );
+        step_outputs.push(&logits);
+        step_outputs.extend(state.k_caches.iter());
+        step_outputs.extend(state.v_caches.iter());
+        step_outputs.extend(state.recurrent.states.iter());
+        step_outputs.extend(state.recurrent.conv_states.iter());
+        async_eval(&step_outputs);
+
+        state.recurrent.seq_len = next_cache_len as usize;
+        (logits, target_hidden)
     }
 
     fn ensure_capacity(&mut self, needed_tokens: i32) -> Result<()> {
@@ -3643,12 +3659,39 @@ impl<'a> Qwen35StepDriver<'a> {
 
 impl StepDriver for Qwen35StepDriver<'_> {
     fn prefill_token(&mut self, token: u32, terminal_prompt: bool) -> Result<Option<u32>> {
-        let capture_cpp_hidden = terminal_prompt
-            && self
-                .dflash
+        let rust_hidden_target_layers = if matches!(self.mode, Qwen35StepMode::Rust(_)) {
+            self.dflash
                 .as_ref()
-                .is_some_and(|dflash| dflash.target_hidden.is_none())
-            && matches!(self.mode, Qwen35StepMode::Cpp(_));
+                .map(|dflash| dflash.target_layer_ids.clone())
+        } else {
+            None
+        };
+        if let Some(target_layer_ids) = rust_hidden_target_layers.as_deref() {
+            self.ensure_capacity(self.cache_len + 1)?;
+            let (logits, captured) = match &mut self.mode {
+                Qwen35StepMode::Rust(state) => Self::run_rust_prefill_hidden_chunk(
+                    self.weights,
+                    self.config,
+                    self.arch,
+                    self.cache_len,
+                    state,
+                    std::slice::from_ref(&token),
+                    target_layer_ids,
+                ),
+                Qwen35StepMode::Cpp(_) => unreachable!("rust hidden prefill selected cpp mode"),
+            };
+            self.cache_len += 1;
+            self.append_dflash_target_hidden_chunk(Some(captured));
+            if terminal_prompt {
+                let sampled = gpu_sample_token(&logits, &self.params);
+                eval(&[&sampled]);
+                return Ok(Some(sampled.item_i32() as u32));
+            }
+            return Ok(None);
+        }
+
+        let capture_cpp_hidden =
+            self.dflash.is_some() && matches!(self.mode, Qwen35StepMode::Cpp(_));
         let cpp_model_raw = if capture_cpp_hidden {
             Some(
                 self.weights
@@ -3676,8 +3719,10 @@ impl StepDriver for Qwen35StepDriver<'_> {
         } else {
             self.run_step(token)?
         };
+        if let Some(raw) = cpp_model_raw {
+            self.append_dflash_target_hidden_from_cpp_outputs(raw)?;
+        }
         if terminal_prompt {
-            self.ensure_dflash_target_hidden_for_terminal_prefill(token, cpp_model_raw)?;
             let sampled = gpu_sample_token(&logits, &self.params);
             eval(&[&sampled]);
             Ok(Some(sampled.item_i32() as u32))
@@ -3695,10 +3740,20 @@ impl StepDriver for Qwen35StepDriver<'_> {
         let started = trace.then(Instant::now);
         let cache_len_before = self.cache_len;
 
+        let rust_hidden_target_layers = if matches!(self.mode, Qwen35StepMode::Rust(_)) {
+            self.dflash
+                .as_ref()
+                .map(|dflash| dflash.target_layer_ids.clone())
+        } else {
+            None
+        };
         let use_cpp_batch_prefill = matches!(self.mode, Qwen35StepMode::Cpp(_)) && tokens.len() > 1;
+        let use_rust_hidden_prefill = rust_hidden_target_layers.is_some() && tokens.len() > 1;
         if trace {
             let mode = if use_cpp_batch_prefill {
                 "cpp_batch_prefill"
+            } else if use_rust_hidden_prefill {
+                "rust_hidden_prefill"
             } else if matches!(self.mode, Qwen35StepMode::Cpp(_)) {
                 "cpp_scalar_prefill"
             } else {
@@ -3712,7 +3767,7 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 cache_len_before,
             );
         }
-        if use_cpp_batch_prefill {
+        if use_cpp_batch_prefill || use_rust_hidden_prefill {
             self.ensure_capacity(self.cache_len + tokens.len() as i32)?;
         }
 
@@ -3743,14 +3798,42 @@ impl StepDriver for Qwen35StepDriver<'_> {
                 };
                 async_eval(&[&logits]);
                 self.cache_len += tokens.len() as i32;
+                if let Some(dflash) = self.dflash.as_mut() {
+                    let captured = super::qwen35::capture_qwen35_hidden_from_cpp_outputs(
+                        cpp_model.as_raw(),
+                        dflash.target_layer_ids.len(),
+                    )?;
+                    super::qwen35::append_qwen35_captured_hidden_chunk(
+                        &mut dflash.target_hidden,
+                        captured,
+                    );
+                    dflash.prefetched_draft = None;
+                }
 
                 if terminal_prompt {
-                    self.ensure_dflash_target_hidden_for_terminal_prefill(
-                        *tokens
-                            .last()
-                            .context("terminal prefill missing last token")?,
-                        Some(cpp_model.as_raw()),
-                    )?;
+                    let sampled = gpu_sample_token(&logits, &self.params);
+                    eval(&[&sampled]);
+                    Ok(Some(sampled.item_i32() as u32))
+                } else {
+                    Ok(None)
+                }
+            }
+            Qwen35StepMode::Rust(state) if use_rust_hidden_prefill => {
+                let target_layer_ids = rust_hidden_target_layers
+                    .as_deref()
+                    .context("Qwen3.5/Qwen3.6 rust hidden prefill missing target layers")?;
+                let (logits, captured) = Self::run_rust_prefill_hidden_chunk(
+                    self.weights,
+                    self.config,
+                    self.arch,
+                    self.cache_len,
+                    state,
+                    tokens,
+                    target_layer_ids,
+                );
+                self.cache_len += tokens.len() as i32;
+                self.append_dflash_target_hidden_chunk(Some(captured));
+                if terminal_prompt {
                     let sampled = gpu_sample_token(&logits, &self.params);
                     eval(&[&sampled]);
                     Ok(Some(sampled.item_i32() as u32))
@@ -3776,6 +3859,8 @@ impl StepDriver for Qwen35StepDriver<'_> {
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             let mode = if use_cpp_batch_prefill {
                 "cpp_batch_prefill"
+            } else if use_rust_hidden_prefill {
+                "rust_hidden_prefill"
             } else if matches!(self.mode, Qwen35StepMode::Cpp(_)) {
                 "cpp_scalar_prefill"
             } else {
