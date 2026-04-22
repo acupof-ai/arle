@@ -118,6 +118,10 @@ metal scheduler runtime:
   readback, and matches the `dflash-mlx` shape more closely: prefetch keeps
   only `seed_token + block_tokens`, while the live draft cache stays in the
   canonical `draft_state` instead of cloning a second cache snapshot.
+  Draft sampling, the prefill `staged_first` token, scalar verify summary, and
+  packed sampled verify now all suppress the draft runtime's `mask_token_id`
+  before argmax/categorical sampling, matching the reference's
+  `greedy_tokens_with_mask(..., suppress_token_mask)` contract.
   Batched DFlash still verifies the whole packed block in one forward and
   applies the same rollback rule row-wise. The packed route now also samples the draft
   suffix in one `linear + sample_rows_array` pass over the flattened
