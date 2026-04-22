@@ -4,7 +4,7 @@ use crate::{
     dataset::LcgRng,
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::retained_ids,
-    sampling::{log_prob_at_index, sample_categorical},
+    sampling::{log_prob_at_index, sample_categorical_into},
 };
 
 #[derive(Debug, Clone)]
@@ -64,6 +64,8 @@ where
             .sum();
         let mut batch_ids = Vec::with_capacity(total_tokens);
         let mut position_logits = Vec::with_capacity(trajectories.len() * config.vocab_size());
+        let mut sampled_ids = Vec::with_capacity(trajectories.len());
+        let mut sampled_log_probs = Vec::with_capacity(trajectories.len());
 
         for (position, masked) in response_mask.iter().enumerate() {
             if !*masked {
@@ -87,7 +89,9 @@ where
                 position,
                 config.vocab_size(),
             );
-            let (sampled_ids, sampled_log_probs) = sample_categorical(
+            sample_categorical_into(
+                &mut sampled_ids,
+                &mut sampled_log_probs,
                 &position_logits,
                 (trajectories.len(), 1),
                 config.vocab_size(),
@@ -95,10 +99,12 @@ where
                 rng,
             );
 
-            for (trajectory, (sampled_id, sampled_log_prob)) in trajectories
-                .iter_mut()
-                .zip(sampled_ids.into_iter().zip(sampled_log_probs))
-            {
+            for (trajectory, (sampled_id, sampled_log_prob)) in trajectories.iter_mut().zip(
+                sampled_ids
+                    .iter()
+                    .copied()
+                    .zip(sampled_log_probs.iter().copied()),
+            ) {
                 trajectory.full_ids[position] = sampled_id;
                 trajectory.old_log_probs[position] = sampled_log_prob;
             }

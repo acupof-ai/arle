@@ -17,7 +17,7 @@ use crate::{
     policy::{GrpoPolicy, GrpoPolicyConfig},
     policy_support::retained_ids,
     rollout::Trajectory,
-    sampling::{log_prob_at_index, sample_categorical},
+    sampling::{log_prob_at_index, sample_categorical_into},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +138,8 @@ where
     let rollout_result = (|| {
         tape.set_enabled(false);
         let keep = retained_ids(&[policy, ref_model], store);
+        let mut sampled_ids = Vec::with_capacity(1);
+        let mut sampled_log_probs = Vec::with_capacity(1);
 
         let mut cursor = initial_prompt.len();
         for turn in turns {
@@ -164,9 +166,16 @@ where
                 let logits = store.to_host(logits_id)?;
                 let logits_base = (position - 1) * vocab_size;
                 let slice = &logits[logits_base..logits_base + vocab_size];
-                let (sampled, sampled_log_probs) =
-                    sample_categorical(slice, (1, 1), vocab_size, temperature, rng);
-                full_ids[position] = sampled[0];
+                sample_categorical_into(
+                    &mut sampled_ids,
+                    &mut sampled_log_probs,
+                    slice,
+                    (1, 1),
+                    vocab_size,
+                    temperature,
+                    rng,
+                );
+                full_ids[position] = sampled_ids[0];
                 old_log_probs[position] = sampled_log_probs[0];
                 response_mask[position] = true;
 
