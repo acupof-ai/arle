@@ -587,7 +587,11 @@ impl<M: ModelForward> Scheduler<M> {
         if pool.capacity_bytes() == 0 {
             return 0.0;
         }
-        pool.reserved_bytes() as f64 / pool.capacity_bytes() as f64
+        let Ok(reserved_bytes) = pool.reserved_bytes() else {
+            log::warn!("failed to query host pool reserved bytes for usage fraction");
+            return 1.0;
+        };
+        reserved_bytes as f64 / pool.capacity_bytes() as f64
     }
 
     fn host_pool_demote_headroom_bytes(&self) -> usize {
@@ -599,7 +603,11 @@ impl<M: ModelForward> Scheduler<M> {
             return 0;
         }
         let demote_high_water = (capacity as f64 * self.config.t1_host_pinned_high_water) as usize;
-        demote_high_water.saturating_sub(pool.reserved_bytes())
+        let Ok(reserved_bytes) = pool.reserved_bytes() else {
+            log::warn!("failed to query host pool reserved bytes for demote headroom");
+            return 0;
+        };
+        demote_high_water.saturating_sub(reserved_bytes)
     }
 
     fn demote_block_budget(&self, candidates: &[BlockId]) -> usize {
@@ -1402,7 +1410,7 @@ impl<M: ModelForward> Scheduler<M> {
             .copy_pages_to_host(self.model.device_context(), &pages)?;
         let region = {
             let mut pool = self.host_pinned_pool.lock()?;
-            pool.reserve(payload.len()).ok_or_else(|| {
+            pool.reserve(payload.len())?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "host pinned pool exhausted while demoting block {:?} ({} bytes)",
                     block_id,
@@ -1491,7 +1499,15 @@ impl<M: ModelForward> Scheduler<M> {
 
         let (reserved_bytes, target_reserved_bytes) = match self.host_pinned_pool.lock() {
             Ok(pool) => (
-                pool.reserved_bytes(),
+                match pool.reserved_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        log::warn!(
+                            "failed to query host pool reserved bytes for spill target: {err}"
+                        );
+                        return 0;
+                    }
+                },
                 (pool.capacity_bytes() as f64 * self.config.t1_host_pinned_low_water) as usize,
             ),
             Err(_) => return 0,

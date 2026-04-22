@@ -1015,13 +1015,20 @@ impl Coordinator {
                                 return self.fetch_failed(ticket, block.block_id, err.to_string());
                             }
                         };
-                        let Some(region) = pool.reserve(payload.len()) else {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(
-                                ticket,
-                                block.block_id,
-                                "host pinned pool exhausted",
-                            );
+                        let region = match pool.reserve(payload.len()) {
+                            Ok(Some(region)) => region,
+                            Ok(None) => {
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(
+                                    ticket,
+                                    block.block_id,
+                                    "host pinned pool exhausted",
+                                );
+                            }
+                            Err(err) => {
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(ticket, block.block_id, err.to_string());
+                            }
                         };
                         pool.as_mut_slice(region).copy_from_slice(&payload);
                         region
@@ -1090,13 +1097,20 @@ impl Coordinator {
                                 return self.fetch_failed(ticket, block.block_id, err.to_string());
                             }
                         };
-                        let Some(region) = pool.reserve(payload.len()) else {
-                            Self::release_allocated_regions(&allocated_regions);
-                            return self.fetch_failed(
-                                ticket,
-                                block.block_id,
-                                "host pinned pool exhausted",
-                            );
+                        let region = match pool.reserve(payload.len()) {
+                            Ok(Some(region)) => region,
+                            Ok(None) => {
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(
+                                    ticket,
+                                    block.block_id,
+                                    "host pinned pool exhausted",
+                                );
+                            }
+                            Err(err) => {
+                                Self::release_allocated_regions(&allocated_regions);
+                                return self.fetch_failed(ticket, block.block_id, err.to_string());
+                            }
                         };
                         pool.as_mut_slice(region)
                             .copy_from_slice(payload.as_slice());
@@ -1229,7 +1243,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(6).unwrap();
+            let region = pool.reserve(6).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"abcdef");
             region
         };
@@ -1290,7 +1304,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(4).unwrap();
+            let region = pool.reserve(4).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"test");
             region
         };
@@ -1335,7 +1349,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(5).unwrap();
+            let region = pool.reserve(5).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"hello");
             region
         };
@@ -1474,7 +1488,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(4).unwrap();
+            let region = pool.reserve(4).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"test");
             region
         };
@@ -1508,7 +1522,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(4).unwrap();
+            let region = pool.reserve(4).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"test");
             region
         };
@@ -1553,7 +1567,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(5).unwrap();
+            let region = pool.reserve(5).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"hello");
             region
         };
@@ -1690,7 +1704,7 @@ mod tests {
         );
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(4).unwrap();
+            let region = pool.reserve(4).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"test");
             region
         };
@@ -1745,7 +1759,7 @@ mod tests {
         let fingerprint = BlockFingerprint([0x31; 16]);
         let region = {
             let mut pool = host_pool.lock().unwrap();
-            let region = pool.reserve(12).unwrap();
+            let region = pool.reserve(12).unwrap().unwrap();
             pool.as_mut_slice(region).copy_from_slice(b"remote-bytes");
             region
         };
