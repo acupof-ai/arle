@@ -28,6 +28,8 @@ pub(crate) enum CompiledBackend {
     Cuda,
     Metal,
     Cpu,
+    #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+    None,
 }
 
 impl CompiledBackend {
@@ -47,7 +49,7 @@ impl CompiledBackend {
         }
         #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
         {
-            Self::Cpu
+            Self::None
         }
     }
 
@@ -56,6 +58,20 @@ impl CompiledBackend {
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Cpu => "cpu",
+            #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+            Self::None => "none",
+        }
+    }
+
+    pub(crate) fn supports_inference(self) -> bool {
+        let _ = self;
+        #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
+        {
+            true
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        {
+            false
         }
     }
 }
@@ -118,6 +134,8 @@ fn detect_gpu(backend: CompiledBackend, total_ram_gb: f64) -> GpuInfo {
         CompiledBackend::Cuda => detect_nvidia_gpu(),
         CompiledBackend::Metal => detect_apple_gpu(total_ram_gb),
         CompiledBackend::Cpu => GpuInfo::None,
+        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "cpu")))]
+        CompiledBackend::None => GpuInfo::None,
     }
 }
 

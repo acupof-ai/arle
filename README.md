@@ -293,6 +293,19 @@ Current package boundary for agent mode:
 
 If `--model-path` is omitted, the CLI first checks `AGENT_INFER_MODEL`, then auto-detects a local model from common directories and the local HuggingFace cache.
 
+Use `--doctor` to print a self-check report for the current CLI build without
+loading a model. It shows the compiled backend, detected hardware, TTY state,
+HuggingFace cache root, model-resolution source, and curated model
+recommendations.
+
+```bash
+cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,cli -- \
+  --doctor
+```
+
+Invalid `--max-turns`, `--max-tokens`, and `--temperature` values fail during
+argument parsing instead of surfacing later at runtime.
+
 Tools: `python` (execute Python snippets), `shell` (execute bash commands). The
 KV prefix cache reuses the full prior-turn KV in place for every subsequent
 turn of a session — only the new user message (and any tool-result content)
