@@ -49,6 +49,61 @@ fn can_publish_prefix_pages(
         <= prefix_cache_retain_hard_cap_pages(total_pages, cap_fraction)
 }
 
+fn full_request_pages(prompt_tokens: usize, max_tokens: usize, page_size: usize) -> usize {
+    prompt_tokens
+        .saturating_add(max_tokens)
+        .div_ceil(page_size.max(1))
+}
+
+fn waiting_admission_shortage_pages<I>(
+    free_pages: usize,
+    page_size: usize,
+    free_slots: usize,
+    waiting_requests: usize,
+    waiting: I,
+) -> usize
+where
+    I: IntoIterator<Item = (Option<usize>, usize)>,
+{
+    if free_slots == 0 && waiting_requests == 0 {
+        return 0;
+    }
+    let mut requested_pages = 0usize;
+    let mut considered = 0usize;
+    let admission_window = free_slots.max(waiting_requests);
+    for (prompt_tokens, max_tokens) in waiting {
+        let Some(prompt_tokens) = prompt_tokens else {
+            continue;
+        };
+        requested_pages = requested_pages.saturating_add(full_request_pages(
+            prompt_tokens,
+            max_tokens,
+            page_size,
+        ));
+        considered += 1;
+        if considered >= admission_window {
+            break;
+        }
+    }
+    requested_pages.saturating_sub(free_pages)
+}
+
+fn prefix_cache_reclaim_goal_pages(
+    retained_pages: usize,
+    high_water_pages: usize,
+    low_water_pages: usize,
+    waiting_shortage_pages: usize,
+) -> usize {
+    let watermark_goal = if retained_pages > high_water_pages {
+        retained_pages.saturating_sub(low_water_pages)
+    } else {
+        0
+    };
+    watermark_goal
+        .max(waiting_shortage_pages)
+        .min(retained_pages)
+}
+
 pub(super) struct PendingDecode {
     pub decode_indices: Vec<usize>,
     pub slot_indices: Vec<usize>,
@@ -345,6 +400,21 @@ impl<M: ModelForward> Scheduler<M> {
         let high = (total as f64 * self.config.prefix_cache_high_water) as usize;
         let low = (total as f64 * self.config.prefix_cache_low_water) as usize;
         (high, low)
+    }
+
+    fn waiting_admission_shortage_pages(&self) -> usize {
+        waiting_admission_shortage_pages(
+            self.pool_free_pages(),
+            self.paged_kv_pool.page_size.max(1),
+            self.active.iter().filter(|req| req.is_none()).count(),
+            self.waiting.len(),
+            self.waiting.iter().map(|incoming| {
+                (
+                    incoming.prompt_tokens.as_ref().map(std::vec::Vec::len),
+                    incoming.max_tokens,
+                )
+            }),
+        )
     }
 
     pub fn session_fingerprints(&self, session_id: &str) -> Vec<BlockFingerprint> {
@@ -1485,13 +1555,19 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     /// Release radix-held pool pages back to the free list once the
-    /// pool's retained fraction exceeds the high-water mark.
+    /// pool crosses the retention watermark or queued admissions need
+    /// more GPU headroom than the free list currently provides.
     ///
-    /// Policy: when `retained / total > PREFIX_CACHE_HIGH_WATER`,
-    /// evict LRU radix blocks until `retained / total ≤
-    /// PREFIX_CACHE_LOW_WATER`. The gap between high and low marks
-    /// prevents thrash where every completed request immediately
-    /// evicts the block it just inserted.
+    /// Policy: reclaim enough pages to satisfy the larger of:
+    ///
+    /// - the usual watermark gap (`retained > high_water`, reclaim down to
+    ///   `low_water`)
+    /// - the next wave of queued admissions that can fill the currently free
+    ///   slots, based on their cached prompt token lengths + `max_tokens`
+    ///
+    /// This keeps a single eviction policy/ranking path while allowing
+    /// `cleanup()` to restore steady-state active-set occupancy under long
+    /// prompts instead of parking half the pool in radix-retained pages.
     ///
     /// Each evicted `BlockId` is looked up in `block_to_pages` and
     /// the full per-block page span is released via
@@ -1511,10 +1587,11 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let retained = self.paged_kv_pool.retained_count();
         let (high, target) = self.prefix_cache_watermarks_pages();
-        if retained <= high {
+        let waiting_shortage = self.waiting_admission_shortage_pages();
+        let want_free = prefix_cache_reclaim_goal_pages(retained, high, target, waiting_shortage);
+        if want_free == 0 {
             return 0;
         }
-        let want_free = retained.saturating_sub(target);
         let pages_per_block = self
             .prefix_cache
             .block_size()
@@ -2015,7 +2092,10 @@ impl<M: ModelForward> Drop for Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_publish_prefix_pages, prefix_cache_retain_hard_cap_pages};
+    use super::{
+        can_publish_prefix_pages, prefix_cache_reclaim_goal_pages,
+        prefix_cache_retain_hard_cap_pages, waiting_admission_shortage_pages,
+    };
     use crate::kv_tier::{CoordinatorQueueStats, QueueControlStats};
 
     const HARD_CAP: f64 = 0.90;
@@ -2032,6 +2112,48 @@ mod tests {
         assert!(can_publish_prefix_pages(80, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(81, 100, 10, HARD_CAP));
         assert!(!can_publish_prefix_pages(90, 100, 1, HARD_CAP));
+    }
+
+    #[test]
+    fn waiting_admission_shortage_expands_beyond_free_slots_for_backlog() {
+        let waiting = std::iter::repeat_n((Some(4_097usize), 256usize), 11);
+        assert_eq!(
+            waiting_admission_shortage_pages(1_385, 16, 5, 11, waiting),
+            1_618
+        );
+    }
+
+    #[test]
+    fn waiting_admission_shortage_reclaims_even_when_no_slots_are_free() {
+        let waiting = vec![(Some(4_097usize), 256usize)];
+        assert_eq!(waiting_admission_shortage_pages(0, 16, 0, 1, waiting), 273);
+    }
+
+    #[test]
+    fn waiting_admission_shortage_skips_untokenized_entries() {
+        let waiting = vec![
+            (None, 256usize),
+            (Some(4_097usize), 256usize),
+            (Some(2_048usize), 128usize),
+        ];
+        assert_eq!(waiting_admission_shortage_pages(0, 16, 2, 3, waiting), 409);
+    }
+
+    #[test]
+    fn reclaim_goal_can_trigger_below_watermark_when_waiting_needs_headroom() {
+        assert_eq!(prefix_cache_reclaim_goal_pages(1_384, 2_076, 1_384, 0), 0);
+        assert_eq!(
+            prefix_cache_reclaim_goal_pages(1_384, 2_076, 1_384, 1_345),
+            1_345
+        );
+        assert_eq!(
+            prefix_cache_reclaim_goal_pages(2_408, 2_076, 1_384, 1_345),
+            1_345
+        );
+        assert_eq!(
+            prefix_cache_reclaim_goal_pages(2_408, 2_076, 1_384, 2_369),
+            2_369
+        );
     }
 
     #[test]
