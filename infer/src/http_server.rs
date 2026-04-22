@@ -798,11 +798,11 @@ async fn completions(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
-        req.validate()?;
+        let model_id = state.identity.model_id.clone();
+        req.validate_for_model(&model_id)?;
         let max_tokens = options.max_tokens;
         let stream = options.stream;
         let include_usage = options.include_usage;
-        let model_id = state.identity.model_id.clone();
 
         info!(
             "Received request: prompt_len={}, max_tokens={}, stream={}",
@@ -874,12 +874,12 @@ async fn chat_completions(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
-        req.validate()?;
+        let model_id = state.identity.model_id.clone();
+        req.validate_for_model(&model_id)?;
 
         let max_tokens = options.max_tokens;
         let do_stream = options.stream;
         let include_usage = options.include_usage;
-        let model_id = state.identity.model_id.clone();
 
         // Convert messages → ChatML prompt.
         let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
@@ -991,11 +991,11 @@ async fn responses_handler(
 
     async move {
         authorize_v1_request(&headers, state.as_ref())?;
-        req.validate()?;
+        let model_id = state.identity.model_id.clone();
+        req.validate_for_model(&model_id)?;
         let prompt = build_responses_prompt(&req);
         let max_tokens = options.max_tokens;
         let stream = options.stream;
-        let model_id = state.identity.model_id.clone();
 
         info!(
             "responses: prompt_len={}, max_output_tokens={}",
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_response_uses_loaded_model_id() {
+    async fn completion_rejects_unavailable_model_with_structured_error() {
         let app = build_app(mock_scheduler("Qwen3-4B"));
         let request = Request::builder()
             .method("POST")
@@ -1473,13 +1473,18 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(payload["model"], "Qwen3-4B");
-        assert_eq!(payload["choices"][0]["text"], "ok:hello");
+        assert_eq!(payload["error"]["code"], "model_not_found");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("qwen3-8b")),
+            "payload={payload}"
+        );
     }
 
     #[tokio::test]
@@ -1531,7 +1536,7 @@ mod tests {
             .uri("/v1/completions")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1,"stream":true}"#,
+                r#"{"model":"qwen3-8b","prompt":"hello","max_tokens":1,"stream":true}"#,
             ))
             .unwrap();
 
@@ -1975,6 +1980,32 @@ mod tests {
             payload["error"]["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("messages[0].role")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_rejects_unavailable_model_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "model_not_found");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("qwen3-8b")),
             "payload={payload}"
         );
     }
@@ -2685,6 +2716,32 @@ mod tests {
             payload["error"]["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("input")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_unavailable_model_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-8b","input":"hello","max_output_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "model_not_found");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("qwen3-8b")),
             "payload={payload}"
         );
     }

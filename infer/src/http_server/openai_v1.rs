@@ -28,6 +28,42 @@ fn invalid_parameter(field: impl AsRef<str>, detail: impl Into<String>) -> ApiEr
     )
 }
 
+fn canonical_model_id(model: &str) -> &str {
+    let trimmed = model.trim();
+    trimmed
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed)
+}
+
+fn validate_requested_model(
+    requested_model: Option<&str>,
+    served_model_id: &str,
+) -> Result<(), ApiError> {
+    let Some(requested_model) = requested_model else {
+        return Ok(());
+    };
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        return Err(invalid_parameter("model", "must not be empty"));
+    }
+
+    let served_key = canonical_model_id(served_model_id);
+    let requested_key = canonical_model_id(requested_model);
+    if requested_model.eq_ignore_ascii_case(served_model_id)
+        || requested_key.eq_ignore_ascii_case(served_key)
+    {
+        return Ok(());
+    }
+
+    Err(ApiError::not_found(
+        format!(
+            "Model `{requested_model}` is not available on this server; loaded model is `{served_model_id}`"
+        ),
+        "model_not_found",
+    ))
+}
+
 fn validate_max_tokens(value: Option<usize>, field: &'static str) -> Result<(), ApiError> {
     if matches!(value, Some(0)) {
         return Err(invalid_parameter(field, "must be at least 1"));
@@ -462,6 +498,11 @@ pub(super) struct StreamOptions {
 }
 
 impl CompletionRequest {
+    pub(super) fn validate_for_model(&self, served_model_id: &str) -> Result<(), ApiError> {
+        validate_requested_model(self.model.as_deref(), served_model_id)?;
+        self.validate()
+    }
+
     pub(super) fn validate(&self) -> Result<(), ApiError> {
         validate_non_empty_trimmed_string(&self.prompt, "prompt")?;
         validate_max_tokens(self.max_tokens, "max_tokens")?;
@@ -672,6 +713,11 @@ pub(super) struct ChatCompletionRequest {
 }
 
 impl ChatCompletionRequest {
+    pub(super) fn validate_for_model(&self, served_model_id: &str) -> Result<(), ApiError> {
+        validate_requested_model(self.model.as_deref(), served_model_id)?;
+        self.validate()
+    }
+
     pub(super) fn validate(&self) -> Result<(), ApiError> {
         if self.messages.is_empty() {
             return Err(invalid_parameter(
@@ -953,6 +999,11 @@ pub(super) struct ResponsesRequest {
 }
 
 impl ResponsesRequest {
+    pub(super) fn validate_for_model(&self, served_model_id: &str) -> Result<(), ApiError> {
+        validate_requested_model(self.model.as_deref(), served_model_id)?;
+        self.validate()
+    }
+
     pub(super) fn validate(&self) -> Result<(), ApiError> {
         validate_max_tokens(self.max_output_tokens, "max_output_tokens")?;
         validate_common_sampling_fields(
@@ -1199,6 +1250,25 @@ mod tests {
         let raw = r#"{"prompt":"hi","user":"client-9"}"#;
         let req: CompletionRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(req.session_id_parsed().unwrap().as_str(), "client-9");
+    }
+
+    #[test]
+    fn completion_request_accepts_model_alias_by_final_segment() {
+        let raw = r#"{"model":"Qwen/Qwen3-4B","prompt":"hi"}"#;
+        let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+        req.validate_for_model("qwen3-4b").unwrap();
+    }
+
+    #[test]
+    fn completion_request_rejects_unavailable_model() {
+        let raw = r#"{"model":"qwen3-8b","prompt":"hi"}"#;
+        let req: CompletionRequest = serde_json::from_str(raw).unwrap();
+        let err = req
+            .validate_for_model("Qwen3-4B")
+            .expect_err("unexpected model should fail");
+        assert_eq!(err.body.code, "model_not_found");
+        assert!(err.body.message.contains("qwen3-8b"));
+        assert!(err.body.message.contains("Qwen3-4B"));
     }
 
     #[test]
