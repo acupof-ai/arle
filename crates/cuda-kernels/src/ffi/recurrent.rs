@@ -55,6 +55,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn conv1d_prefill_packed_batch_cuda(
+        x_batch: *const Half,
+        conv_weight: *const Half,
+        conv_state_ptrs: *const u64,
+        seq_indptr: *const i32,
+        out_batch: *mut Half,
+        num_channels: i32,
+        kernel_size: i32,
+        batch_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
