@@ -8,9 +8,6 @@ pub(crate) enum Phase {
     WaitingFetch,
     /// Prefilling in chunks. Decode takes priority between chunks.
     Prefilling {
-        /// Tokens already materialized in the paged pool before
-        /// `effective_tokens[0]` starts. This is zero for cold prefills.
-        materialized_prefix_len: usize,
         effective_tokens: Vec<u32>,
         /// Progress within `effective_tokens`, not total slot seq_len.
         progress: usize,
