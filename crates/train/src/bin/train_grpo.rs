@@ -25,7 +25,7 @@ use train::{
     checkpoint::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
-    cli_args::{ArgError, next_value, parse_value},
+    cli_args::{ArgError, adamw_for_backend, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -490,7 +490,7 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
         })
         .transpose()?;
     let backend = build_backend(args.backend)?;
-    let mut store = TensorStore::with_backend(backend);
+    let mut store = TensorStore::with_backend(Arc::clone(&backend));
     let mut tape = Tape::new();
     let policy = F::build_model(&config, lora, &mut store)?;
     let params = trainable_param_ids(&policy, &store);
@@ -552,8 +552,15 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
 
     let (ref_model, mut optimizer, resume, completed_sft_steps) =
         if let Some(resume_dir) = resume_dir.as_deref() {
-            let resumed =
-                resume_grpo_checkpoint::<F>(resume_dir, args, &config, &policy, &mut store, lora)?;
+            let resumed = resume_grpo_checkpoint::<F>(
+                resume_dir,
+                args,
+                &config,
+                &policy,
+                Arc::clone(&backend),
+                &mut store,
+                lora,
+            )?;
             (resumed.0, resumed.1, resumed.2, args.sft_steps)
         } else {
             // ---- SFT warm-up phase (migrated onto Trainer) ----
@@ -575,12 +582,14 @@ fn run_with_family<F: SyntheticGrpoFamily>(args: &CliArgs) -> Result<(), CliErro
                 &policy,
                 &params,
                 keep_extra.clone(),
+                Arc::clone(&backend),
                 &mut store,
                 &mut tape,
             )?;
 
             let ref_model = policy.clone_frozen(&mut store);
-            let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+            let mut optimizer =
+                adamw_for_backend(args.lr, (0.9, 0.999), 1.0e-8, 0.0, Arc::clone(&backend));
             let param_names = trainable_param_name_map(&policy, &store);
             optimizer
                 .import_state(&sft.optim_state, &param_names)
@@ -857,13 +866,14 @@ fn run_sft_phase<P>(
     policy: &P,
     params: &[TensorId],
     keep_extra: HashSet<TensorId>,
+    backend: Arc<dyn Backend>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<SftPhaseResult, CliError>
 where
     P: GrpoPolicy + CausalLm,
 {
-    let optim = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let optim = adamw_for_backend(args.lr, (0.9, 0.999), 1.0e-8, 0.0, backend);
     // Mirror pretrain.rs: `--grad-clip 0/NaN/inf` warns and falls through
     // to NoClip instead of panicking in `GlobalNorm::new`.
     let clip = match args.grad_clip {
@@ -982,6 +992,7 @@ fn resume_grpo_checkpoint<F: SyntheticGrpoFamily>(
     args: &CliArgs,
     cfg: &F::Config,
     policy: &F::Model,
+    backend: Arc<dyn Backend>,
     store: &mut TensorStore,
     lora: LoraConfig,
 ) -> Result<(F::Model, AdamW, ResumeState), CliError> {
@@ -1076,7 +1087,7 @@ fn resume_grpo_checkpoint<F: SyntheticGrpoFamily>(
         )));
     }
 
-    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let mut optimizer = adamw_for_backend(args.lr, (0.9, 0.999), 1.0e-8, 0.0, backend);
     let param_names = trainable_param_name_map(policy, store);
     let restored = optimizer
         .import_state(&optim_state, &param_names)

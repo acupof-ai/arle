@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 
-use autograd::{Backend, CpuBackend};
+use autograd::{Backend, CpuBackend, Device, optim::AdamW};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -111,6 +111,22 @@ impl FromStr for BackendChoice {
             "cuda" => Ok(Self::Cuda),
             _ => Err(format!("unknown backend: {value}")),
         }
+    }
+}
+
+/// Use the device-backed AdamW path only on Metal, where `Backend::adamw_step`
+/// is overridden to stay device-resident. CPU keeps the host path, and CUDA
+/// also stays host-backed until it has a real device-side AdamW override.
+pub fn adamw_for_backend(
+    lr: f32,
+    betas: (f32, f32),
+    eps: f32,
+    wd: f32,
+    backend: Arc<dyn Backend>,
+) -> AdamW {
+    match backend.device() {
+        Device::Metal => AdamW::new_with_device(lr, betas, eps, wd, backend),
+        Device::Cpu | Device::Cuda => AdamW::new(lr, betas, eps, wd),
     }
 }
 
@@ -223,5 +239,30 @@ mod tests {
     fn save_dtype_parser_accepts_supported_values() {
         assert_eq!("f32".parse::<SaveDtype>().unwrap(), SaveDtype::F32);
         assert_eq!("bf16".parse::<SaveDtype>().unwrap(), SaveDtype::Bf16);
+    }
+
+    #[test]
+    fn adamw_for_backend_keeps_cpu_host_backed() {
+        let optim = adamw_for_backend(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0, Arc::new(CpuBackend));
+        assert!(
+            format!("{optim:?}").contains("device_backed: false"),
+            "cpu helper must keep host AdamW: {optim:?}"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn adamw_for_backend_uses_device_path_on_metal() {
+        let optim = adamw_for_backend(
+            1.0e-3,
+            (0.9, 0.999),
+            1.0e-8,
+            0.0,
+            Arc::new(autograd::backend_metal::MetalBackend),
+        );
+        assert!(
+            format!("{optim:?}").contains("device_backed: true"),
+            "metal helper must enable device-backed AdamW: {optim:?}"
+        );
     }
 }

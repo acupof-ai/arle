@@ -24,7 +24,7 @@ use train::{
     checkpoint::{
         TRAINER_STATE_CODEC_VERSION, TrainerStateDoc, load_trainer_state_v2, save_trainer_state_v2,
     },
-    cli_args::{ArgError, BackendChoice, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, adamw_for_backend, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -296,11 +296,11 @@ fn run() -> Result<(), CliError> {
             })
         })
         .transpose()?;
-    let mut store = TensorStore::with_backend(backend);
+    let mut store = TensorStore::with_backend(Arc::clone(&backend));
     let mut tape = Tape::new();
     let policy = Qwen35Model::new_with_lora(&config, Some(lora), &mut store)?;
     let params = trainable_param_ids(&policy, &store);
-    let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    let mut optimizer = adamw_for_backend(args.lr, (0.9, 0.999), 1.0e-8, 0.0, Arc::clone(&backend));
     let resume = if let Some(resume_dir) = resume_dir.as_deref() {
         resume_multi_turn_checkpoint(
             resume_dir,
