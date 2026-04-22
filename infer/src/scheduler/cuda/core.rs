@@ -970,7 +970,7 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn queue_emit_finish(&mut self, slot_idx: usize, reason: FinishReason) {
-        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, stops, trace_context)) =
+        let Some((request_id, prompt_tokens, completion_tokens, delta_tx, trace_context)) =
             self.request(slot_idx).map(|req| {
                 (
                     req.id,

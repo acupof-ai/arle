@@ -6,7 +6,9 @@ use super::decode_buffers::DecodeBuffers;
 use super::prefill::Qwen3PagedPrefillRequest;
 use super::weights::Qwen3Model;
 use crate::model::generation_state::GenerationStateBase;
-use crate::model::{GenerationState, ModelForward, PrefillBatchRequest};
+use crate::model::{
+    GenerationState, ModelForward, PrefillBatchRequest, prepare_paged_prefill_batch,
+};
 use crate::ops;
 use crate::sampler::SamplingParams;
 use cuda_kernels::TokenKVPool;
@@ -222,20 +224,8 @@ impl ModelForward for Qwen3Model {
         states: &mut [Self::State],
         pool: &mut PagedKVPool,
     ) -> Result<bool> {
-        if requests.is_empty() {
+        if !prepare_paged_prefill_batch(requests, pool)? {
             return Ok(false);
-        }
-
-        let mut seen_slots = Vec::with_capacity(requests.len());
-        for request in requests {
-            if request.tokens.is_empty() || seen_slots.contains(&request.slot_idx) {
-                return Ok(false);
-            }
-            seen_slots.push(request.slot_idx);
-        }
-
-        for request in requests {
-            pool.alloc_tokens(request.slot_idx, request.tokens.len())?;
         }
 
         let paged_requests: Vec<Qwen3PagedPrefillRequest<'_>> = requests
