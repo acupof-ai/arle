@@ -73,6 +73,7 @@ metal_request / metal_bench / metal_serve
           -> Qwen3.5/Qwen3.6 target:
              qwen35.rs::metal_generate_qwen35
                -> metal_generate_qwen35_dflash
+                 -> qwen35.rs::with_qwen35_capture_layers
                  -> qwen35_compiled_step prefill for prompt
                  -> capture_qwen35_hidden_from_cpp_outputs
                  -> dflash.rs::qwen35_dflash_speculative_block
@@ -86,7 +87,11 @@ metal_request / metal_bench / metal_serve
   `MetalBackend::generate_from_token_ids_with_callback` dispatches by loaded weight family.
   `MetalWeights::Qwen3` goes to the Qwen3 draft path; `MetalWeights::Qwen35` covers both dense Qwen3.5 and Qwen3.6-MoE.
 - Prefill:
-  Qwen3.5/Qwen3.6 DFlash prefill runs through the compiled C++ target model, then captures the layer-hidden bundle that seeds the first draft block.
+  Qwen3.5/Qwen3.6 DFlash prefill runs through the compiled C++ target model.
+  Both the single-request path and the scheduler path now share
+  `qwen35.rs::with_qwen35_capture_layers` for the capture-layer setup/reset,
+  then `capture_qwen35_hidden_from_cpp_outputs` builds the layer-hidden bundle
+  that seeds the first draft block.
 - Verify:
   Each speculative block uses `qwen35_dflash_speculative_block`, which runs one target verify over the whole block, accepts the longest greedy prefix, rolls back rejected GDR state, and returns the updated target hidden state.
 - Fallback:
