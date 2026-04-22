@@ -182,6 +182,7 @@ struct RequestExecutionOptions {
     max_tokens: usize,
     stream: bool,
     include_usage: bool,
+    continuous_usage_stats: bool,
     sampling: SamplingParams,
     stop: Option<Vec<String>>,
     session_id: Option<crate::types::SessionId>,
@@ -193,6 +194,7 @@ impl RequestExecutionOptions {
             max_tokens: req.max_tokens_or_default(),
             stream: req.stream_or_default(),
             include_usage: req.include_usage_or_default(),
+            continuous_usage_stats: req.continuous_usage_stats_or_default(),
             sampling: sampling_params_from_request(
                 req.temperature,
                 req.top_p,
@@ -215,6 +217,7 @@ impl RequestExecutionOptions {
             max_tokens: req.max_tokens_or_default(),
             stream: req.stream_or_default(),
             include_usage: req.include_usage_or_default(),
+            continuous_usage_stats: req.continuous_usage_stats_or_default(),
             sampling: sampling_params_from_request(
                 req.temperature,
                 req.top_p,
@@ -237,6 +240,7 @@ impl RequestExecutionOptions {
             max_tokens: req.max_output_tokens_or_default(),
             stream: req.stream_or_default(),
             include_usage: false,
+            continuous_usage_stats: false,
             sampling: sampling_params_from_request(
                 req.temperature,
                 req.top_p,
@@ -613,6 +617,7 @@ fn build_responses_prompt(req: &ResponsesRequest) -> String {
 fn delta_sse_events<C, U>(
     delta: crate::server_engine::CompletionStreamDelta,
     include_usage: bool,
+    continuous_usage_stats: bool,
     make_chunk: impl FnOnce(crate::server_engine::CompletionStreamDelta) -> C,
     make_usage: impl FnOnce(crate::server_engine::TokenUsage) -> U,
 ) -> Vec<Result<Event, Infallible>>
@@ -627,7 +632,8 @@ where
         Event::default().data(serde_json::to_string(&chunk).expect("chunk serialization"))
     )];
 
-    if include_usage && is_terminal {
+    let emit_usage = include_usage && (is_terminal || continuous_usage_stats);
+    if emit_usage {
         if let Some(u) = usage {
             let usage_chunk = make_usage(u);
             events.push(Ok(Event::default().data(
@@ -803,6 +809,7 @@ async fn completions(
         let max_tokens = options.max_tokens;
         let stream = options.stream;
         let include_usage = options.include_usage;
+        let continuous_usage_stats = options.continuous_usage_stats;
 
         info!(
             "Received request: prompt_len={}, max_tokens={}, stream={}",
@@ -821,6 +828,7 @@ async fn completions(
                 stream::iter(delta_sse_events(
                     delta,
                     include_usage,
+                    continuous_usage_stats,
                     |d| StreamChunk::from_delta(&request_id, created, &model_id, d),
                     |u| StreamUsageChunk::from_usage(&request_id, created, &model_id, u),
                 ))
@@ -880,6 +888,7 @@ async fn chat_completions(
         let max_tokens = options.max_tokens;
         let do_stream = options.stream;
         let include_usage = options.include_usage;
+        let continuous_usage_stats = options.continuous_usage_stats;
 
         // Convert messages → ChatML prompt.
         let prompt = chat_messages_to_prompt(&req.messages, &req.tools);
@@ -912,6 +921,7 @@ async fn chat_completions(
                 stream::iter(delta_sse_events(
                     delta,
                     include_usage,
+                    continuous_usage_stats,
                     |d| ChatStreamChunk::content_chunk(&req_id, created, &mid, d),
                     |u| ChatStreamUsageChunk::from_usage(&req_id, created, &mid, u),
                 ))
@@ -1580,6 +1590,36 @@ mod tests {
                 .contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#),
             "payload={payload}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_response_accepts_continuous_usage_stats_probe_shape() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"qwen3-4b","prompt":"hello","max_tokens":1,"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true}}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            payload.contains(r#""text":"ok:hello""#),
+            "payload={payload}"
+        );
+        assert!(
+            payload
+                .contains(r#""usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}"#),
+            "payload={payload}"
+        );
+        assert!(payload.contains("[DONE]"), "payload={payload}");
     }
 
     #[tokio::test]

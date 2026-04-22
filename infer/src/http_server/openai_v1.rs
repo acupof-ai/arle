@@ -171,10 +171,21 @@ fn validate_stream_options(
     stream: Option<bool>,
     stream_options: Option<&StreamOptions>,
 ) -> Result<(), ApiError> {
-    if stream_options.is_some() && !stream.unwrap_or(false) {
+    let Some(stream_options) = stream_options else {
+        return Ok(());
+    };
+    if !stream.unwrap_or(false) {
         return Err(invalid_parameter(
             "stream_options",
             "requires `stream=true`",
+        ));
+    }
+    if stream_options.continuous_usage_stats.unwrap_or(false)
+        && !stream_options.include_usage.unwrap_or(false)
+    {
+        return Err(invalid_parameter(
+            "stream_options.continuous_usage_stats",
+            "requires `stream_options.include_usage=true`",
         ));
     }
     Ok(())
@@ -495,6 +506,7 @@ pub(super) struct CompletionRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct StreamOptions {
     pub(super) include_usage: Option<bool>,
+    pub(super) continuous_usage_stats: Option<bool>,
 }
 
 impl CompletionRequest {
@@ -533,6 +545,13 @@ impl CompletionRequest {
         self.stream_options
             .as_ref()
             .and_then(|options| options.include_usage)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn continuous_usage_stats_or_default(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|options| options.continuous_usage_stats)
             .unwrap_or(false)
     }
 
@@ -752,6 +771,13 @@ impl ChatCompletionRequest {
         self.stream_options
             .as_ref()
             .and_then(|o| o.include_usage)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn continuous_usage_stats_or_default(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .and_then(|options| options.continuous_usage_stats)
             .unwrap_or(false)
     }
 
@@ -1368,6 +1394,39 @@ mod tests {
             .expect_err("stream_options without stream should fail");
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("stream_options"));
+    }
+
+    #[test]
+    fn completion_request_accepts_continuous_usage_stats_with_include_usage() {
+        let req: CompletionRequest = serde_json::from_str(
+            r#"{
+                "prompt":"hi",
+                "stream":true,
+                "stream_options":{"include_usage":true,"continuous_usage_stats":true}
+            }"#,
+        )
+        .unwrap();
+        req.validate()
+            .expect("continuous_usage_stats should be accepted");
+        assert!(req.include_usage_or_default());
+        assert!(req.continuous_usage_stats_or_default());
+    }
+
+    #[test]
+    fn completion_request_rejects_continuous_usage_stats_without_include_usage() {
+        let req: CompletionRequest = serde_json::from_str(
+            r#"{
+                "prompt":"hi",
+                "stream":true,
+                "stream_options":{"continuous_usage_stats":true}
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("continuous_usage_stats without include_usage should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("continuous_usage_stats"));
     }
 
     #[test]
