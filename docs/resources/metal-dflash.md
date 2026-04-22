@@ -147,9 +147,12 @@ metal scheduler runtime:
   existing `prefer_verify_m16` bit still threads through full-attention, GDR,
   MLP, MoE, and final logits so eligible verify sublayers reshape
   `[1, 16, H] -> [16, H]` once and stay on one canonical
-  `quantized_matmul` / `qwen35_moe_block_forward_cpp` path instead of
-  bouncing through per-layer special cases. Both paths return the same
-  accepted-token contract and updated target hidden state.
+  `verify_quantized_matmul_cpp` / `qwen35_moe_block_forward_cpp` path instead
+  of bouncing through per-layer special cases. The bridge now ships one
+  stable `M=16` verify-qmm Metal kernel (`mma2big`) for that path; the failed
+  pipelined variant was deleted instead of kept as a dormant branch. Both
+  paths return the same accepted-token contract and updated target hidden
+  state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
   terminal prefill did not seed `target_hidden` yet, or the request is on the

@@ -101,6 +101,18 @@ array batched_sdpa_2pass_cpp(
     float scale,
     int32_t gqa_factor);
 
+// Fixed-M=16 quantized matmul specialization shared between the compiled
+// Qwen3.5/Qwen3.6 verify path and the standalone MoE helper. Falls back to
+// stock `quantized_matmul` when the shape or dtype is not eligible.
+array verify_quantized_matmul_cpp(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    int32_t group_size,
+    int32_t bits,
+    bool transpose = true);
+
 extern "C" mlx_array* qwen35_moe_block_forward(
     mlx_array* hidden,
     mlx_array* router_w,

@@ -406,10 +406,8 @@ struct QWeight {
         if (is_dense) {
             return matmul(x, w);  // w is already transposed at load time
         }
-        if (prefer_verify_m16 && x.ndim() == 3 && x.shape(0) == 1 && x.shape(1) == 16) {
-            auto x_2d = reshape(x, {16, x.shape(2)});
-            auto out_2d = quantized_matmul(x_2d, w, scales, biases, true, group_size, bits);
-            return reshape(out_2d, {1, 16, out_2d.shape(1)});
+        if (prefer_verify_m16) {
+            return verify_quantized_matmul_cpp(x, w, scales, biases, group_size, bits);
         }
         return quantized_matmul(x, w, scales, biases, true, group_size, bits);
     }
