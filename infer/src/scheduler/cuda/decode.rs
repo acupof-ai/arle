@@ -56,17 +56,9 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     pub(super) fn finish_request(&mut self, slot_idx: usize, reason: FinishReason) {
-        if self.queue_async_finish(slot_idx, reason) {
-            if let Some(req) = self.request_mut(slot_idx) {
-                req.phase = Phase::Finished;
-            }
-        } else {
-            let Self {
-                active, tokenizer, ..
-            } = self;
-            if let Some(req) = active[slot_idx].as_mut() {
-                req.finish(reason, tokenizer);
-            }
+        self.queue_emit_finish(slot_idx, reason);
+        if let Some(req) = self.request_mut(slot_idx) {
+            req.phase = Phase::Finished;
         }
         self.finish_slot(slot_idx);
     }

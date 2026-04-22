@@ -210,32 +210,16 @@ fn select_prefill_candidates(
 }
 
 impl<M: ModelForward> Scheduler<M> {
-    fn emit_decode_deltas(&mut self, require_prelaunch_gate: bool) -> u128 {
+    fn dispatch_decode_emits(&mut self) -> u128 {
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
-        let mut async_emit_slots = Vec::new();
-        {
-            let Self {
-                active, tokenizer, ..
-            } = self;
-            for slot_idx in decode_slots {
-                let Some(req) = active[slot_idx].as_mut() else {
-                    continue;
-                };
-                if !req.has_pending_emit()
-                    || req.requires_prelaunch_emit_gate() != require_prelaunch_gate
-                {
-                    continue;
-                }
-                if !require_prelaunch_gate && req.uses_async_emit() {
-                    async_emit_slots.push(slot_idx);
-                } else {
-                    req.emit_delta(tokenizer);
-                }
+        for slot_idx in decode_slots {
+            let has_pending_emit = self
+                .request(slot_idx)
+                .is_some_and(|req| req.has_pending_emit());
+            if has_pending_emit {
+                self.dispatch_emit(slot_idx);
             }
-        }
-        for slot_idx in async_emit_slots {
-            self.dispatch_async_emit(slot_idx);
         }
         emit_t.elapsed().as_micros()
     }
@@ -349,11 +333,7 @@ impl<M: ModelForward> Scheduler<M> {
             0
         };
 
-        // Textual stop-sequence detection remains pre-launch because it can
-        // finish requests and must gate whether the next decode launch should
-        // include that row. Pure streaming/detokenize work moves after launch
-        // so it overlaps the current step's GPU decode.
-        let prelaunch_emit_us = self.emit_decode_deltas(true);
+        let emit_gate_wait_us = self.wait_for_emit_gates();
 
         let plan_t = std::time::Instant::now();
         let plan = self.plan_step();
@@ -387,8 +367,8 @@ impl<M: ModelForward> Scheduler<M> {
             .pending_decode
             .as_ref()
             .map_or(0, |pending| pending.decode_indices.len() as u64);
-        let postlaunch_emit_us = self.emit_decode_deltas(false);
-        let emit_us = prelaunch_emit_us + postlaunch_emit_us;
+        let emit_dispatch_us = self.dispatch_decode_emits();
+        let emit_us = emit_gate_wait_us + emit_dispatch_us;
         let decode_us = decode_launch_us + readback_us;
         let scheduled_rows = scheduled_decode_rows + scheduled_prefill_rows;
 
@@ -471,7 +451,6 @@ mod tests {
             (
                 0,
                 PrefillReservation {
-                    slot_idx: 0,
                     prefill_tokens: 8,
                     page_reserve: SlotPageReserve {
                         slot_idx: 0,
@@ -483,7 +462,6 @@ mod tests {
             (
                 1,
                 PrefillReservation {
-                    slot_idx: 1,
                     prefill_tokens: 4,
                     page_reserve: SlotPageReserve {
                         slot_idx: 1,
@@ -495,7 +473,6 @@ mod tests {
             (
                 2,
                 PrefillReservation {
-                    slot_idx: 2,
                     prefill_tokens: 2,
                     page_reserve: SlotPageReserve {
                         slot_idx: 2,
@@ -525,7 +502,6 @@ mod tests {
             (
                 0,
                 PrefillReservation {
-                    slot_idx: 0,
                     prefill_tokens: 5,
                     page_reserve: SlotPageReserve {
                         slot_idx: 0,
@@ -537,7 +513,6 @@ mod tests {
             (
                 1,
                 PrefillReservation {
-                    slot_idx: 1,
                     prefill_tokens: 1,
                     page_reserve: SlotPageReserve {
                         slot_idx: 1,
@@ -561,7 +536,6 @@ mod tests {
             page_budget: PrefillPageBudget::new(1, vec![4], 4),
         };
         let reservation = PrefillReservation {
-            slot_idx: 0,
             prefill_tokens: 4,
             page_reserve: SlotPageReserve {
                 slot_idx: 0,
@@ -598,7 +572,6 @@ mod tests {
             (
                 0,
                 PrefillReservation {
-                    slot_idx: 0,
                     prefill_tokens: 4,
                     page_reserve: SlotPageReserve {
                         slot_idx: 0,
@@ -610,7 +583,6 @@ mod tests {
             (
                 1,
                 PrefillReservation {
-                    slot_idx: 1,
                     prefill_tokens: 2,
                     page_reserve: SlotPageReserve {
                         slot_idx: 1,
