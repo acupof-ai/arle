@@ -140,11 +140,28 @@ pub(super) fn lookup_blocks_ready_on_gpu(blocks: &[crate::kv_tier::LookupBlock])
         .all(|block| matches!(block.hit_kind, crate::kv_tier::HitKind::ReadyOnGpu))
 }
 
-pub(super) fn sort_waiting_queue_by_priority(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaitingInsertBias {
+    BeforeEqual,
+    AfterEqual,
+}
+
+fn insert_waiting_request_by_priority(
     waiting: &mut std::collections::VecDeque<super::IncomingRequest>,
+    incoming: super::IncomingRequest,
+    bias: WaitingInsertBias,
 ) {
-    let waiting = waiting.make_contiguous();
-    waiting.sort_by(|lhs, rhs| rhs.priority.cmp(&lhs.priority));
+    let insert_at = match bias {
+        WaitingInsertBias::BeforeEqual => waiting
+            .iter()
+            .position(|queued| incoming.priority >= queued.priority)
+            .unwrap_or(waiting.len()),
+        WaitingInsertBias::AfterEqual => waiting
+            .iter()
+            .position(|queued| incoming.priority > queued.priority)
+            .unwrap_or(waiting.len()),
+    };
+    waiting.insert(insert_at, incoming);
 }
 
 fn finish_rejected_request(
@@ -165,6 +182,14 @@ fn finish_rejected_request(
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    pub(super) fn enqueue_waiting_request(
+        &mut self,
+        incoming: super::IncomingRequest,
+        bias: WaitingInsertBias,
+    ) {
+        insert_waiting_request_by_priority(&mut self.waiting, incoming, bias);
+    }
+
     fn full_isl_reserved_tokens(
         &self,
         plan: &PrefixAdmissionPlan,
@@ -258,12 +283,12 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn defer_waiting_request(
-        deferred: &mut std::collections::VecDeque<super::IncomingRequest>,
+        &mut self,
         mut incoming: super::IncomingRequest,
         prompt_tokens: Vec<u32>,
     ) {
         incoming.prompt_tokens = Some(prompt_tokens);
-        deferred.push_back(incoming);
+        self.enqueue_waiting_request(incoming, WaitingInsertBias::BeforeEqual);
     }
 
     /// Canonical admission decision for one incoming prompt.
@@ -993,7 +1018,7 @@ impl<M: ModelForward> Scheduler<M> {
     fn drain_request_rx(&mut self) {
         while let Ok(req) = self.request_rx.try_recv() {
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
-            self.waiting.push_back(req);
+            self.enqueue_waiting_request(req, WaitingInsertBias::AfterEqual);
         }
     }
 
@@ -1141,7 +1166,6 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn assign_slots(&mut self) {
-        sort_waiting_queue_by_priority(&mut self.waiting);
         let length_contract = RequestLengthContract::derive(
             self.paged_kv_pool.max_total_tokens,
             self.effective_max_seq_len,
@@ -1154,17 +1178,12 @@ impl<M: ModelForward> Scheduler<M> {
 
         let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
         let mut admission_budget = AdmissionPageBudget::from_scheduler(self);
-        let mut deferred = std::collections::VecDeque::new();
         for candidate in candidates {
             let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
                 self.choose_admission_slot(&candidate.plan, &available_free_slots)
             else {
                 self.release_admission_plan(&candidate.plan);
-                Self::defer_waiting_request(
-                    &mut deferred,
-                    candidate.incoming,
-                    candidate.prompt_tokens,
-                );
+                self.defer_waiting_request(candidate.incoming, candidate.prompt_tokens);
                 continue;
             };
             let reserved_prefix_tokens =
@@ -1177,11 +1196,7 @@ impl<M: ModelForward> Scheduler<M> {
                 reserved_prefix_tokens,
             ) {
                 self.release_admission_plan(&candidate.plan);
-                Self::defer_waiting_request(
-                    &mut deferred,
-                    candidate.incoming,
-                    candidate.prompt_tokens,
-                );
+                self.defer_waiting_request(candidate.incoming, candidate.prompt_tokens);
                 continue;
             }
             if candidate.plan.attached_prefix_blocks.is_empty()
@@ -1209,9 +1224,6 @@ impl<M: ModelForward> Scheduler<M> {
                 reusable_prefix_len,
                 reusable_cached_prompt_len,
             );
-        }
-        while let Some(req) = deferred.pop_back() {
-            self.waiting.push_front(req);
         }
     }
 
@@ -1301,10 +1313,14 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdmissionPageBudget, best_reusable_slot_for_radix_hit, finish_rejected_request};
+    use super::{
+        AdmissionPageBudget, WaitingInsertBias, best_reusable_slot_for_radix_hit,
+        finish_rejected_request, insert_waiting_request_by_priority,
+    };
     use crate::prefix_cache::BlockId;
+    use crate::scheduler::{IncomingRequest, RequestPriority};
     use crate::server_engine::FinishReason;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use tokio::sync::mpsc;
 
     #[test]
@@ -1350,6 +1366,64 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 17);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    fn queued_request(label: &str, priority: RequestPriority) -> IncomingRequest {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        IncomingRequest {
+            prompt: label.to_string(),
+            prompt_tokens: None,
+            max_tokens: 1,
+            sampling: crate::sampler::SamplingParams::default(),
+            stop: None,
+            priority,
+            session_id: None,
+            delta_tx: tx,
+        }
+    }
+
+    #[test]
+    fn waiting_insert_after_equal_preserves_fifo_for_same_priority() {
+        let mut waiting = VecDeque::from(vec![
+            queued_request("high", RequestPriority::High),
+            queued_request("first-normal", RequestPriority::Normal),
+        ]);
+
+        insert_waiting_request_by_priority(
+            &mut waiting,
+            queued_request("second-normal", RequestPriority::Normal),
+            WaitingInsertBias::AfterEqual,
+        );
+
+        assert_eq!(
+            waiting
+                .into_iter()
+                .map(|req| req.prompt)
+                .collect::<Vec<_>>(),
+            vec!["high", "first-normal", "second-normal"]
+        );
+    }
+
+    #[test]
+    fn waiting_insert_before_equal_gives_requeues_equal_priority_preference() {
+        let mut waiting = VecDeque::from(vec![
+            queued_request("high", RequestPriority::High),
+            queued_request("queued-normal", RequestPriority::Normal),
+        ]);
+
+        insert_waiting_request_by_priority(
+            &mut waiting,
+            queued_request("requeued-normal", RequestPriority::Normal),
+            WaitingInsertBias::BeforeEqual,
+        );
+
+        assert_eq!(
+            waiting
+                .into_iter()
+                .map(|req| req.prompt)
+                .collect::<Vec<_>>(),
+            vec!["high", "requeued-normal", "queued-normal"]
+        );
     }
 
     #[test]

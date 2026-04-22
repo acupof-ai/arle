@@ -2,6 +2,7 @@ use super::{
     FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
 use crate::scheduler::cuda::core::PendingDecode;
+use crate::scheduler::cuda::runtime::WaitingInsertBias;
 
 fn retract_victim_score(
     generated_tokens: usize,
@@ -121,7 +122,7 @@ impl<M: ModelForward> Scheduler<M> {
         self.slot_materialized_prompt_lens[slot_idx] = 0;
         self.clear_slot_prefix_ownership(slot_idx);
         self.finish_slot(slot_idx);
-        self.waiting.push_front(requeue);
+        self.enqueue_waiting_request(requeue, WaitingInsertBias::BeforeEqual);
     }
 
     fn launch_decode_batch_from_tokens(

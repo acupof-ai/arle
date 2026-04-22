@@ -53,6 +53,8 @@ That pointed at one bottleneck cluster:
 - CUDA scheduler overlap now has:
   - cross-iteration `pending_decode` launch/readback split
   - event-driven fetch-wait sleep instead of `recv_timeout(2ms)` polling
+  - incrementally priority-ordered waiting queue, so `assign_slots()` no
+    longer sorts the whole queue every tick
 - Deterministic admission now has:
   - full-ISL reservation in `assign_slots()`
   - explicit prefill planner `score -> fit` structure
@@ -145,7 +147,8 @@ That pointed at one bottleneck cluster:
 - `e99be66` `feat(scheduler): make fetch waits event-driven`
 - `50ab021` `refactor(scheduler): canonicalize prefill planner budget`
 - `5dfde31` `fix(qwen35): guard paged-prefill graph start-pos reuse`
-- `pending` `fix(qwen35): make paged-prefill graph start-pos device-backed`
+- `0c49fca` `fix(qwen35): make paged-prefill graph start-pos device-backed`
+- `pending` `refactor(scheduler): keep waiting queue incrementally ordered`
 
 ## Parallelization shape used
 
