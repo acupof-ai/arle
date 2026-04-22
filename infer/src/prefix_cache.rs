@@ -26,9 +26,11 @@
 //!
 //! # Block granularity
 //!
-//! Tokens are grouped into fixed-size blocks (e.g. 16 tokens). A node's block
-//! is only valid when the node holds exactly `block_size` tokens. Fractional
-//! trailing blocks are not cached — the final partial block must be re-prefilled.
+//! Tokens are grouped into fixed-size blocks (e.g. 16 tokens). A node may carry
+//! a block only when the cumulative path length to that node ends on a
+//! `block_size` boundary. In a compressed radix that node's own edge may be
+//! shorter than `block_size` after a split. Fractional trailing blocks are not
+//! cached — the final partial block must be re-prefilled.
 //!
 //! # Eviction
 //!
@@ -99,8 +101,8 @@ pub struct ReconcileReport {
 struct Node {
     /// Token sequence stored on this edge (from parent to this node).
     tokens: Vec<u32>,
-    /// GPU block ID cached for this node. `None` if tokens < block_size or
-    /// if this node has not yet been committed to the GPU.
+    /// GPU block ID cached for the sealed block ending at this node's path.
+    /// `None` if the node is off-boundary or has not been committed yet.
     block_id: Option<BlockId>,
     /// Number of in-flight requests currently pinning this node.
     /// Runtime-only: in-flight pins do not survive a snapshot boundary.
@@ -191,8 +193,9 @@ pub struct RadixCache {
     free_nodes: Vec<usize>,
     /// Index 0 is always the virtual root (empty token sequence).
     // root index is always 0
-    /// Block size: a node gets a block_id only when it holds exactly
-    /// `block_size` tokens. Must match the paged KV block size.
+    /// Block size: a node gets a block_id only when its cumulative path length
+    /// ends on a `block_size` boundary. The edge itself may be shorter after a
+    /// compressed-radix split. Must match the paged KV block size.
     block_size: usize,
     /// Monotonically increasing clock for LRU tracking.
     /// Runtime-only: snapshots keep structure/metadata, then restart the
@@ -307,6 +310,40 @@ impl RadixCache {
         }
     }
 
+    fn edge_match_len(edge: &[u32], remaining: &[u32]) -> usize {
+        edge.iter()
+            .zip(remaining.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    fn child_edge_match(&self, child_idx: usize, remaining: &[u32]) -> (usize, usize) {
+        let edge = &self.nodes[child_idx].tokens;
+        (Self::edge_match_len(edge, remaining), edge.len())
+    }
+
+    fn next_block_boundary(&self, block_idx: usize) -> usize {
+        (block_idx + 1) * self.block_size
+    }
+
+    fn full_block_end(&self, block_idx: usize, total_tokens: usize) -> Option<usize> {
+        let boundary = self.next_block_boundary(block_idx);
+        (boundary <= total_tokens).then_some(boundary)
+    }
+
+    fn truncated_block_end(&self, block_idx: usize, total_tokens: usize) -> usize {
+        self.next_block_boundary(block_idx).min(total_tokens)
+    }
+
+    fn path_is_block_aligned(&self, path_len: usize) -> bool {
+        path_len != 0 && path_len.is_multiple_of(self.block_size)
+    }
+
+    fn rounded_prefix_len(&self, walked_tokens: usize, matched_blocks: usize) -> usize {
+        let matched_len = (matched_blocks * self.block_size).min(walked_tokens);
+        (matched_len / self.block_size) * self.block_size
+    }
+
     fn find_block_node_mut(&mut self, block: BlockId) -> Option<&mut Node> {
         let idx = *self.block_index.get(&block)?;
         self.nodes.get_mut(idx)
@@ -345,16 +382,10 @@ impl RadixCache {
                 break;
             };
 
-            // Check how many tokens of the child's edge match.
-            let child_tokens = self.nodes[child_idx].tokens.clone();
             let remaining = &tokens[pos..];
-            let match_len = child_tokens
-                .iter()
-                .zip(remaining.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
+            let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
 
-            if match_len < child_tokens.len() {
+            if match_len < edge_len {
                 // Partial match — stop here. We cannot use a partially-matched node.
                 break;
             }
@@ -378,8 +409,7 @@ impl RadixCache {
         }
 
         // Round down matched_len to block boundary.
-        let matched_len = (matched_blocks.len() * self.block_size).min(pos);
-        let rounded = (matched_len / self.block_size) * self.block_size;
+        let rounded = self.rounded_prefix_len(pos, matched_blocks.len());
         // Trim blocks if we exceeded rounded boundary (shouldn't happen, but be safe).
         let block_count = rounded / self.block_size;
         if matched_blocks.len() > block_count {
@@ -417,15 +447,10 @@ impl RadixCache {
                 break;
             };
 
-            let child_tokens = self.nodes[child_idx].tokens.clone();
             let remaining = &tokens[pos..];
-            let match_len = child_tokens
-                .iter()
-                .zip(remaining.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
+            let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
 
-            if match_len < child_tokens.len() {
+            if match_len < edge_len {
                 break;
             }
 
@@ -480,7 +505,7 @@ impl RadixCache {
             .iter()
             .filter(|block| !matches!(block.hit_kind, HitKind::Miss))
             .count();
-        let matched_len = (matched_blocks * self.block_size).min(pos);
+        let matched_len = self.rounded_prefix_len(pos, matched_blocks);
         LookupOutcome::new(matched_len, blocks, recompute_advised)
     }
 
@@ -525,32 +550,27 @@ impl RadixCache {
             let next_token = tokens[pos];
 
             if let Some(&child_idx) = self.nodes[node_idx].children.get(&next_token) {
-                let child_tokens = self.nodes[child_idx].tokens.clone();
                 let remaining = &tokens[pos..];
-                let match_len = child_tokens
-                    .iter()
-                    .zip(remaining.iter())
-                    .take_while(|(a, b)| a == b)
-                    .count();
+                let (match_len, edge_len) = self.child_edge_match(child_idx, remaining);
 
-                if match_len == child_tokens.len() {
+                if match_len == edge_len {
                     // Full edge match — descend.
                     self.nodes[child_idx].last_access = now;
-                    pos += match_len;
+                    pos += edge_len;
 
-                    // Advance block_idx when walking through a block-bearing
-                    // node — regardless of this edge's token length.
+                    // Advance block_idx when walking through a block-bearing node.
                     //
-                    // Block-bearing nodes may carry a short edge when the
-                    // node was created under an edge split: the block_id
-                    // represents block_size tokens on the path *through* the
-                    // node from the last block boundary, not the node's own
-                    // edge length. The older guard (`child_tokens.len() ==
-                    // block_size`) under-counted those walks and reused the
-                    // caller's `blocks[0]` for downstream blocks, corrupting
-                    // `block_index`. Checking block_id presence covers both
-                    // full-size and post-split short-edge block-bearing nodes.
+                    // The invariant is on cumulative path length, not edge
+                    // length: a compressed-radix split may leave this node with
+                    // a short edge while its path still ends exactly on the next
+                    // sealed block boundary. So block progress is keyed off
+                    // `block_id` presence plus the walked path, not `edge_len`.
                     if self.nodes[child_idx].block_id.is_some() && block_idx < blocks.len() {
+                        debug_assert!(
+                            self.path_is_block_aligned(pos),
+                            "block-bearing node must end on a block boundary: child_idx={child_idx}, pos={pos}, block_size={}",
+                            self.block_size,
+                        );
                         let new_bid = blocks[block_idx];
                         if let Some(old_bid) = self.nodes[child_idx].block_id
                             && old_bid != new_bid
@@ -567,11 +587,12 @@ impl RadixCache {
                 } else {
                     // Partial match — split the existing edge.
                     let split_point = match_len;
-                    let old_suffix = child_tokens[split_point..].to_vec();
                     let old_block = self.nodes[child_idx].block_id;
                     let old_ref_count = self.nodes[child_idx].ref_count;
                     let old_children: HashMap<u32, usize> =
                         std::mem::take(&mut self.nodes[child_idx].children);
+                    let mut shared_tokens = std::mem::take(&mut self.nodes[child_idx].tokens);
+                    let old_suffix = shared_tokens.split_off(split_point);
 
                     // Create an intermediate node for the shared prefix.
                     //
@@ -584,7 +605,6 @@ impl RadixCache {
                     // garbage-collection pass that prunes orphaned non-block
                     // intermediates could remove a shared parent that is
                     // structurally part of an in-flight request.
-                    let shared_tokens = child_tokens[..split_point].to_vec();
                     let mut shared_node = Node::new(shared_tokens, None, now);
                     shared_node.ref_count = old_ref_count;
                     let shared_idx = self.alloc_node(shared_node);
@@ -604,21 +624,14 @@ impl RadixCache {
                     self.nodes[node_idx].children.insert(next_token, shared_idx);
 
                     // Place the caller's current block as a NEW sibling under
-                    // shared_idx, completing the current block window at the
-                    // next block boundary. The sibling covers
-                    // tokens[pos+match_len .. (block_idx+1)*block_size].
-                    // Computing the end from (block_idx+1)*block_size — not
-                    // pos+block_size — is load-bearing: when the walk passed
-                    // through an outer shared intermediate (no block_id), pos
-                    // can be mid-block while block_idx still points at the
-                    // block that window should register. Path-from-last-
-                    // boundary to this new node sums to block_size, so the
-                    // block-id alignment invariant holds. The new sibling's
-                    // first token differs from first_old by construction
-                    // (that's why match_len stopped short).
-                    let rest_end = (block_idx + 1) * self.block_size;
-                    if block_idx < blocks.len() && rest_end <= tokens.len() {
-                        let new_block_tokens = tokens[pos + match_len..rest_end].to_vec();
+                    // shared_idx, completing the current sealed block window
+                    // on the path. The edge ends at the next block boundary
+                    // tracked by `block_idx`, not at `pos + block_size`: after
+                    // descending through non-block shared intermediates `pos`
+                    // can already be mid-block, but the aligned path boundary
+                    // still lives at `next_block_boundary(block_idx)`.
+                    if let Some(block_end) = self.full_block_end(block_idx, tokens.len()) {
+                        let new_block_tokens = tokens[pos + match_len..block_end].to_vec();
                         let new_bid = blocks[block_idx];
                         let new_fp = fps[block_idx];
                         let mut new_node = Node::new(new_block_tokens, Some(new_bid), now);
@@ -627,7 +640,7 @@ impl RadixCache {
                         self.block_index.insert(new_bid, new_idx);
                         let first_new = self.nodes[new_idx].tokens[0];
                         self.nodes[shared_idx].children.insert(first_new, new_idx);
-                        pos = rest_end;
+                        pos = block_end;
                         block_idx += 1;
                         node_idx = new_idx;
                         continue;
@@ -646,8 +659,8 @@ impl RadixCache {
                 // current block (len < block_size, path-from-last-boundary
                 // still sums to block_size so it takes the caller's block_id).
                 while pos < tokens.len() && block_idx < blocks.len() {
-                    let next_boundary = (block_idx + 1) * self.block_size;
-                    let end = next_boundary.min(tokens.len());
+                    let next_boundary = self.next_block_boundary(block_idx);
+                    let end = self.truncated_block_end(block_idx, tokens.len());
                     let edge_tokens = tokens[pos..end].to_vec();
                     let is_full_block = end == next_boundary;
                     let (block_id, fingerprint) = if is_full_block {
@@ -659,14 +672,19 @@ impl RadixCache {
                         (None, None)
                     };
 
-                    let mut new_node = Node::new(edge_tokens.clone(), block_id, now);
+                    let first_tok = edge_tokens[0];
+                    let mut new_node = Node::new(edge_tokens, block_id, now);
                     new_node.fingerprint = fingerprint;
                     let new_idx = self.alloc_node(new_node);
                     if let Some(bid) = block_id {
+                        debug_assert!(
+                            self.path_is_block_aligned(end),
+                            "new block-bearing node must end on a block boundary: end={end}, block_size={}",
+                            self.block_size,
+                        );
                         self.block_index.insert(bid, new_idx);
                     }
 
-                    let first_tok = edge_tokens[0];
                     self.nodes[node_idx].children.insert(first_tok, new_idx);
 
                     pos = end;
@@ -1260,6 +1278,26 @@ mod tests {
         ids.iter().map(|&id| BlockId(id)).collect()
     }
 
+    fn assert_block_path_alignment(cache: &RadixCache) {
+        fn walk(cache: &RadixCache, node_idx: usize, parent_path_len: usize) {
+            let node = &cache.nodes[node_idx];
+            let path_len = parent_path_len + node.tokens.len();
+            if let Some(block_id) = node.block_id {
+                assert!(
+                    cache.path_is_block_aligned(path_len),
+                    "block-bearing node {block_id:?} ended at non-boundary path len {path_len}",
+                );
+            }
+            for &child_idx in node.children.values() {
+                walk(cache, child_idx, path_len);
+            }
+        }
+
+        for &child_idx in cache.nodes[RadixCache::root()].children.values() {
+            walk(cache, child_idx, 0);
+        }
+    }
+
     #[test]
     fn empty_cache_returns_no_match() {
         let mut cache = RadixCache::new(4);
@@ -1578,6 +1616,7 @@ mod tests {
             "after split on first token, the full 2 blocks should be registered \
              (would return 0 before the fix)",
         );
+        assert_block_path_alignment(&cache);
 
         // Both requests remain reachable.
         let (len_a, blocks_a) = cache.lookup(&[1, 2, 3, 4]);
@@ -1605,6 +1644,7 @@ mod tests {
             "after split on block 2, both blocks should be registered \
              (would return 4 before the fix)",
         );
+        assert_block_path_alignment(&cache);
 
         // Original request still reachable.
         let (len_orig, blocks_orig) = cache.lookup(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1631,10 +1671,40 @@ mod tests {
 
         let inserted = cache.insert(&[1, 5, 6, 7, 12, 13, 14, 15], &bids(&[100, 300]));
         assert_eq!(inserted, 8);
+        assert_block_path_alignment(&cache);
 
         let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 12, 13, 14, 15]);
         assert_eq!(len, 8);
         assert_eq!(blocks, bids(&[100, 300]));
+    }
+
+    #[test]
+    fn split_can_leave_short_edge_block_bearing_node_when_path_is_aligned() {
+        let mut cache = RadixCache::new(4);
+        cache.insert(&[1, 2, 3, 4], &bids(&[10]));
+        cache.insert(&[1, 5, 6, 7, 8, 9, 10, 11], &bids(&[100, 200]));
+
+        assert_block_path_alignment(&cache);
+
+        let shared_idx = *cache.nodes[RadixCache::root()]
+            .children
+            .get(&1)
+            .expect("root should point at the shared split node");
+        let shared = &cache.nodes[shared_idx];
+        assert_eq!(shared.tokens, vec![1]);
+        assert!(shared.block_id.is_none());
+
+        let short_edge_idx = *shared
+            .children
+            .get(&5)
+            .expect("shared split node should have the divergent block child");
+        let short_edge = &cache.nodes[short_edge_idx];
+        assert_eq!(short_edge.tokens, vec![5, 6, 7]);
+        assert_eq!(short_edge.block_id, Some(BlockId(100)));
+        assert!(
+            short_edge.tokens.len() < cache.block_size(),
+            "edge itself should stay compressed after the split",
+        );
     }
 
     #[test]
@@ -1655,6 +1725,7 @@ mod tests {
         // split at match_len=1. rest_end must be 8, not 9 (8+1+4).
         let inserted = cache.insert(&[1, 5, 6, 7, 8, 9, 20, 21], &bids(&[100, 400]));
         assert_eq!(inserted, 8);
+        assert_block_path_alignment(&cache);
 
         let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 8, 9, 20, 21]);
         assert_eq!(len, 8);
@@ -1681,6 +1752,7 @@ mod tests {
         // block 2 with tokens[5..8] and take blocks[1].
         let inserted = cache.insert(&[1, 5, 6, 7, 8, 16, 17, 18], &bids(&[100, 500]));
         assert_eq!(inserted, 8);
+        assert_block_path_alignment(&cache);
 
         let (len, blocks) = cache.lookup(&[1, 5, 6, 7, 8, 16, 17, 18]);
         assert_eq!(len, 8);
@@ -1697,6 +1769,7 @@ mod tests {
         // Shares only token [1], diverges, has exactly one block of tokens.
         let inserted = cache.insert(&[1, 5, 6, 7], &bids(&[100]));
         assert_eq!(inserted, 4);
+        assert_block_path_alignment(&cache);
 
         let (len, blocks) = cache.lookup(&[1, 5, 6, 7]);
         assert_eq!(len, 4);
