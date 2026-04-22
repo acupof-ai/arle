@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use crate::model::qwen35::prefill_buffers::GdrChunkwiseScratch35;
@@ -17,6 +17,77 @@ pub struct GdrHeadConfig {
     pub num_value_heads: usize,
     pub key_dim: usize,
     pub val_dim: usize,
+}
+
+/// Host-side launch metadata for packed multi-request GDR prefill.
+///
+/// The packed `qkv`/`b_proj`/`a_proj`/`output` tensors stay contiguous on the
+/// device. Per-request recurrent state and chunkwise scratch remain
+/// request-private, so launch metadata is a set of host pointer arrays plus a
+/// packed `seq_indptr`.
+#[allow(dead_code)]
+pub(crate) struct GdrPrefillBatchLaunch<'a> {
+    pub state_ptrs: &'a [u64],
+    pub q_ptrs: &'a [u64],
+    pub k_ptrs: &'a [u64],
+    pub v_ptrs: &'a [u64],
+    pub g_cumsum_ptrs: &'a [u64],
+    pub beta_ptrs: &'a [u64],
+    pub a_tril_ptrs: &'a [u64],
+    pub a_inv_ptrs: &'a [u64],
+    pub w_ptrs: &'a [u64],
+    pub u_ptrs: &'a [u64],
+    pub chunk_state_ptrs: &'a [u64],
+    pub v_new_ptrs: &'a [u64],
+    /// Prefix sums over packed token rows. Length must be `batch_size + 1`.
+    pub seq_indptr: &'a [i32],
+}
+
+#[allow(dead_code)]
+impl<'a> GdrPrefillBatchLaunch<'a> {
+    fn batch_size(&self) -> usize {
+        self.state_ptrs.len()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let batch_size = self.batch_size();
+        ensure!(
+            batch_size > 0,
+            "gdr packed prefill launch requires at least one request"
+        );
+        ensure!(
+            self.q_ptrs.len() == batch_size
+                && self.k_ptrs.len() == batch_size
+                && self.v_ptrs.len() == batch_size
+                && self.g_cumsum_ptrs.len() == batch_size
+                && self.beta_ptrs.len() == batch_size
+                && self.a_tril_ptrs.len() == batch_size
+                && self.a_inv_ptrs.len() == batch_size
+                && self.w_ptrs.len() == batch_size
+                && self.u_ptrs.len() == batch_size
+                && self.chunk_state_ptrs.len() == batch_size
+                && self.v_new_ptrs.len() == batch_size,
+            "gdr packed prefill launch pointer arrays must all match batch size {}",
+            batch_size
+        );
+        ensure!(
+            self.seq_indptr.len() == batch_size + 1,
+            "gdr packed prefill launch seq_indptr len {} must equal batch size {} + 1",
+            self.seq_indptr.len(),
+            batch_size
+        );
+        ensure!(
+            self.seq_indptr.first().copied() == Some(0),
+            "gdr packed prefill launch seq_indptr must start at 0"
+        );
+        for window in self.seq_indptr.windows(2) {
+            ensure!(
+                window[1] > window[0],
+                "gdr packed prefill launch seq_indptr must be strictly increasing"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Gated delta rule recurrent decode (single step, seq_len=1).
@@ -545,4 +616,77 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         num_value_heads,
         1.0 / (key_dim as f32).sqrt(),
     )
+}
+
+/// Packed multi-request chunkwise GDR prefill.
+///
+/// This is the minimum stable ABI for future Qwen3.5 packed paged-prefill
+/// wiring: packed activations stay contiguous, while per-request recurrent
+/// state and scratch remain request-private and are addressed through host
+/// pointer arrays plus `seq_indptr`.
+#[allow(dead_code)]
+pub(crate) fn gated_delta_rule_prefill_chunkwise_batch_into(
+    ctx: &DeviceContext,
+    qkv_batch: &HiddenStates,
+    b_proj_batch: &HiddenStates,
+    a_proj_batch: &HiddenStates,
+    weights: &GdrWeights<'_>,
+    launch: &GdrPrefillBatchLaunch<'_>,
+    output_batch: &mut HiddenStates,
+    heads: &GdrHeadConfig,
+) -> Result<()> {
+    launch.validate()?;
+
+    ensure!(
+        qkv_batch.seq_len == output_batch.seq_len
+            && b_proj_batch.seq_len == output_batch.seq_len
+            && a_proj_batch.seq_len == output_batch.seq_len,
+        "gdr packed prefill tensors must share the same packed seq_len"
+    );
+    ensure!(
+        launch.seq_indptr.last().copied() == Some(output_batch.seq_len as i32),
+        "gdr packed prefill seq_indptr last {} must equal packed seq_len {}",
+        launch.seq_indptr.last().copied().unwrap_or_default(),
+        output_batch.seq_len
+    );
+
+    let (qkv_ptr, _gqkv) = qkv_batch.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b_proj_batch.data.device_ptr(&ctx.stream);
+    let (a_ptr, _ga) = a_proj_batch.data.device_ptr(&ctx.stream);
+    let (dt_ptr, _gdt) = weights.dt_bias.data.device_ptr(&ctx.stream);
+    let (alog_ptr, _gal) = weights.a_log.device_ptr(&ctx.stream);
+    let (o_ptr, _go) = output_batch.data.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::gated_delta_rule_prefill_chunkwise_batch_cuda(
+            qkv_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            a_ptr as *const ffi::Half,
+            dt_ptr as *const ffi::Half,
+            alog_ptr as *const f32,
+            launch.state_ptrs.as_ptr(),
+            launch.q_ptrs.as_ptr(),
+            launch.k_ptrs.as_ptr(),
+            launch.v_ptrs.as_ptr(),
+            launch.g_cumsum_ptrs.as_ptr(),
+            launch.beta_ptrs.as_ptr(),
+            launch.a_tril_ptrs.as_ptr(),
+            launch.a_inv_ptrs.as_ptr(),
+            launch.w_ptrs.as_ptr(),
+            launch.u_ptrs.as_ptr(),
+            launch.chunk_state_ptrs.as_ptr(),
+            launch.v_new_ptrs.as_ptr(),
+            launch.seq_indptr.as_ptr(),
+            o_ptr as *mut ffi::Half,
+            heads.num_key_heads as i32,
+            heads.num_value_heads as i32,
+            heads.key_dim as i32,
+            heads.val_dim as i32,
+            launch.batch_size() as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+
+    Ok(())
 }
