@@ -396,9 +396,19 @@ impl MetalDflashRuntime {
             .map_err(LoadError::Fatal)?;
         let draft_cpp_model = DFlashDraftCppModel::build(&draft_weights, &draft_config);
         let default_block_size = draft_config.block_size.max(1);
+        let tuned_default_block_size =
+            autotuned_default_block_size_for_draft_model(&options.draft_model, default_block_size);
+        if options.speculative_tokens.is_none() && tuned_default_block_size != default_block_size {
+            log::info!(
+                "Metal DFlash auto-tuning block_size for '{}': draft default {} -> {}",
+                options.draft_model,
+                default_block_size,
+                tuned_default_block_size,
+            );
+        }
         let requested_block_size = options
             .speculative_tokens
-            .unwrap_or(default_block_size)
+            .unwrap_or(tuned_default_block_size)
             .max(1);
         if let Some(requested) = options.speculative_tokens {
             if requested < default_block_size {
@@ -500,6 +510,17 @@ impl MetalDflashRuntime {
             && self.draft_cpp_model.is_some()
             && self.draft_attention_mask != "causal"
     }
+}
+
+fn autotuned_default_block_size_for_draft_model(
+    draft_model: &str,
+    default_block_size: usize,
+) -> usize {
+    let lower = draft_model.to_lowercase();
+    if lower.contains("qwen3.6-35b-a3b-dflash") || lower.contains("qwen3.5-35b-a3b-dflash") {
+        return default_block_size.min(2).max(1);
+    }
+    default_block_size.max(1)
 }
 
 #[derive(Clone, Debug)]
@@ -3640,5 +3661,29 @@ mod tests {
         options
             .validate()
             .expect_err("empty draft model must be rejected before load");
+    }
+
+    #[test]
+    fn autotuned_default_block_size_for_a3b_draft_is_two() {
+        assert_eq!(
+            super::autotuned_default_block_size_for_draft_model("z-lab/Qwen3.6-35B-A3B-DFlash", 16,),
+            2
+        );
+        assert_eq!(
+            super::autotuned_default_block_size_for_draft_model("z-lab/Qwen3.5-35B-A3B-DFlash", 16,),
+            2
+        );
+    }
+
+    #[test]
+    fn autotuned_default_block_size_leaves_other_drafts_unchanged() {
+        assert_eq!(
+            super::autotuned_default_block_size_for_draft_model("z-lab/Qwen3.5-4B-DFlash", 16),
+            16
+        );
+        assert_eq!(
+            super::autotuned_default_block_size_for_draft_model("z-lab/Qwen3.6-35B-A3B-DFlash", 1,),
+            1
+        );
     }
 }

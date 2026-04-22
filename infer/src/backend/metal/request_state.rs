@@ -107,6 +107,14 @@ pub enum MetalRequestPhase {
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DflashRequestMetrics {
+    pub block_count: usize,
+    pub block_size: usize,
+    pub avg_accepted_inputs: f64,
+    pub acceptance_rate: f64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefillChunkResult {
     pub processed_tokens: usize,
@@ -946,32 +954,28 @@ impl<'a> MetalRequestState<'a> {
         }
     }
 
-    /// DFlash acceptance rate for this request: fraction of generated tokens
-    /// that came from draft predictions (matches reference metric).
-    /// Returns None if not DFlash-enabled or no blocks executed yet.
-    #[allow(dead_code)]
-    pub(crate) fn dflash_acceptance_rate(&self) -> Option<f64> {
-        match &self.inner {
-            MetalRequestStateInner::Qwen3(state) => {
-                let d = state.driver.dflash.as_ref()?;
-                if d.acceptance_lengths.is_empty() {
-                    return None;
-                }
-                let total_accepted: usize = d.acceptance_lengths.iter().sum();
-                if total_accepted == 0 {
-                    return Some(0.0);
-                }
-                let blocks = d.acceptance_lengths.len();
-                let from_draft = total_accepted.saturating_sub(blocks);
-                Some(from_draft as f64 / total_accepted as f64)
-            }
-            MetalRequestStateInner::Qwen35(_) => None,
-        }
+    /// DFlash aggregate acceptance metrics for this request.
+    /// Returns `None` if DFlash is disabled or no speculative block executed.
+    pub fn dflash_metrics(&self) -> Option<DflashRequestMetrics> {
+        let (block_count, acceptance_lengths, block_size) = self.dflash_block_stats()?;
+        let total_accepted: usize = acceptance_lengths.iter().copied().sum();
+        let avg_accepted_inputs = total_accepted as f64 / block_count as f64;
+        let acceptance_rate = if total_accepted > 0 {
+            total_accepted.saturating_sub(block_count) as f64 / total_accepted as f64
+        } else {
+            0.0
+        };
+        Some(DflashRequestMetrics {
+            block_count,
+            block_size,
+            avg_accepted_inputs,
+            acceptance_rate,
+        })
     }
 
-    /// DFlash per-block acceptance lengths + block size for metrics flush.
-    /// Returns `(block_count, acceptance_lengths, block_size)` or `None` if
-    /// not a DFlash request.
+    /// DFlash per-block acceptance lengths + block size for runtime metrics
+    /// flush. Returns `(block_count, acceptance_lengths, block_size)` or
+    /// `None` if not a DFlash request.
     pub(crate) fn dflash_block_stats(&self) -> Option<(usize, &[usize], usize)> {
         match &self.inner {
             MetalRequestStateInner::Qwen3(state) => {

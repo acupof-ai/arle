@@ -281,10 +281,15 @@ impl MetalBackend {
         input_ids: &[u32],
         params: &SamplingParams,
     ) -> Result<request_state::MetalRequestState<'_>> {
-        // DFlash runtime is not threaded here — only the scheduler runtime
-        // (which has a 'static backend ref) can pass it. The legacy serial
-        // runtime never calls create_request_state for DFlash.
-        self.create_request_state_with_dflash(input_ids, params, None)
+        let dflash_runtime =
+            if let (Some(rt), Some(cfg)) = (self.dflash.as_ref(), self.config.as_ref()) {
+                // SAFETY: the returned request state also borrows `self`, so it
+                // cannot outlive the backend-owned runtime/config these refs point to.
+                unsafe { Some((&*std::ptr::from_ref(rt), &*std::ptr::from_ref(cfg))) }
+            } else {
+                None
+            };
+        self.create_request_state_with_dflash(input_ids, params, dflash_runtime)
     }
 
     /// Like `create_request_state` but accepts an explicit DFlash runtime

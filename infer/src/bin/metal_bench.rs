@@ -43,7 +43,8 @@ struct Cli {
     #[arg(long, visible_alias = "max-tokens", default_value_t = 256)]
     generation_tokens: usize,
 
-    /// Drive decode via Qwen35StepDriver per-step FFI path (matches HTTP server) instead of cpp_model.generate. Qwen3.5 only.
+    /// Drive decode via Qwen35StepDriver per-step FFI path (matches HTTP server)
+    /// instead of cpp_model.generate. Qwen3.5/Qwen3.6 only.
     #[arg(long, default_value_t = false)]
     use_step_driver: bool,
 
@@ -177,6 +178,10 @@ struct Run {
     generation_tps: f64,
     ttft_ms: f64,
     e2e_tps: f64,
+    dflash_block_count: Option<usize>,
+    dflash_block_size: Option<usize>,
+    dflash_avg_accepted_inputs: Option<f64>,
+    dflash_acceptance_rate: Option<f64>,
 }
 
 /// A single metric stat in a baseline file (only mean is required).
@@ -432,7 +437,7 @@ fn run_bench() -> Result<()> {
         );
         let request_state = backend.create_request_state(&prompt_ids, &params)?;
         if !request_state.is_qwen35() {
-            bail!("--use-step-driver requires Qwen3.5 model");
+            bail!("--use-step-driver requires Qwen3.5/Qwen3.6 model");
         }
     }
 
@@ -495,6 +500,10 @@ fn run_bench() -> Result<()> {
                 generation_tps: result.generation_tps,
                 ttft_ms: result.ttft_ms,
                 e2e_tps,
+                dflash_block_count: None,
+                dflash_block_size: None,
+                dflash_avg_accepted_inputs: None,
+                dflash_acceptance_rate: None,
             }
         };
 
@@ -515,6 +524,20 @@ fn run_bench() -> Result<()> {
                     "    [step-driver] decode tok/s = {} / {:.3}s = {:.1}",
                     run.tokens, run.decode_elapsed_s, run.generation_tps,
                 );
+                if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+                    run.dflash_block_count,
+                    run.dflash_block_size,
+                    run.dflash_avg_accepted_inputs,
+                    run.dflash_acceptance_rate,
+                ) {
+                    eprintln!(
+                        "    [dflash] blocks={} block_size={} avg_inputs/block={:.2} acceptance={:.1}%",
+                        blocks,
+                        block_size,
+                        avg_inputs,
+                        acceptance_rate * 100.0,
+                    );
+                }
             }
         }
 
@@ -546,6 +569,26 @@ fn run_bench() -> Result<()> {
     let mean_ttft_ms = ttft_sorted.iter().sum::<f64>() / ttft_sorted.len() as f64;
     let p50_ttft_ms = percentile(&ttft_sorted, 50.0);
     let p99_ttft_ms = percentile(&ttft_sorted, 99.0);
+    let dflash_acceptance: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| r.dflash_acceptance_rate)
+        .collect();
+    let mean_dflash_acceptance = if dflash_acceptance.is_empty() {
+        None
+    } else {
+        Some(dflash_acceptance.iter().sum::<f64>() / dflash_acceptance.len() as f64)
+    };
+    let dflash_avg_inputs: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| r.dflash_avg_accepted_inputs)
+        .collect();
+    let mean_dflash_avg_inputs = if dflash_avg_inputs.is_empty() {
+        None
+    } else {
+        Some(dflash_avg_inputs.iter().sum::<f64>() / dflash_avg_inputs.len() as f64)
+    };
+    let dflash_block_size = runs.iter().find_map(|r| r.dflash_block_size);
+    let dflash_blocks = runs.iter().find_map(|r| r.dflash_block_count);
 
     let avg_tokens = runs.iter().map(|r| r.tokens).sum::<usize>() / runs.len().max(1);
     let prompt_tokens = runs.first().map_or(0, |r| r.prompt_tokens);
@@ -580,6 +623,19 @@ fn run_bench() -> Result<()> {
         if cli.use_step_driver {
             payload["mode"] = serde_json::Value::String("step-driver".to_string());
         }
+        if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+            dflash_blocks,
+            dflash_block_size,
+            mean_dflash_avg_inputs,
+            mean_dflash_acceptance,
+        ) {
+            payload["dflash"] = serde_json::json!({
+                "blocks": blocks,
+                "block_size": block_size,
+                "avg_accepted_inputs": avg_inputs,
+                "acceptance_rate": acceptance_rate,
+            });
+        }
         println!("{payload}");
     } else {
         println!();
@@ -594,6 +650,17 @@ fn run_bench() -> Result<()> {
             println!(
                 "  [step-driver] Generation: {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
             );
+            if let (Some(blocks), Some(block_size), Some(avg_inputs), Some(acceptance_rate)) = (
+                dflash_blocks,
+                dflash_block_size,
+                mean_dflash_avg_inputs,
+                mean_dflash_acceptance,
+            ) {
+                println!(
+                    "  [dflash] blocks={blocks}  block_size={block_size}  avg_inputs/block={avg_inputs:.2}  acceptance={:.1}%",
+                    acceptance_rate * 100.0,
+                );
+            }
         } else {
             println!(
                 "  Generation      : {mean_generation_tps:.1} tok/s mean  |  {p50_generation_tps:.1} p50  |  {p99_generation_tps:.1} p99"
@@ -724,7 +791,7 @@ fn run_step_driver_once(
 
     let mut request_state = backend.create_request_state(prompt_ids, params)?;
     if !request_state.is_qwen35() {
-        bail!("--use-step-driver requires Qwen3.5 model");
+        bail!("--use-step-driver requires Qwen3.5/Qwen3.6 model");
     }
     anyhow::ensure!(
         request_state.phase() == expected_prefill_phase,
@@ -795,6 +862,17 @@ fn run_step_driver_once(
     } else {
         0.0
     };
+    let (dflash_block_count, dflash_block_size, dflash_avg_accepted_inputs, dflash_acceptance_rate) =
+        if let Some(metrics) = request_state.dflash_metrics() {
+            (
+                Some(metrics.block_count),
+                Some(metrics.block_size),
+                Some(metrics.avg_accepted_inputs),
+                Some(metrics.acceptance_rate),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     Ok(Run {
         total_time_ms,
@@ -805,6 +883,10 @@ fn run_step_driver_once(
         generation_tps,
         ttft_ms,
         e2e_tps,
+        dflash_block_count,
+        dflash_block_size,
+        dflash_avg_accepted_inputs,
+        dflash_acceptance_rate,
     })
 }
 
