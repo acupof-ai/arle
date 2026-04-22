@@ -316,6 +316,15 @@ cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,
   --doctor
 ```
 
+Use `--list-models` for the lighter-weight discovery view when you only want
+the resolved model source, supported local hub snapshots, and curated
+recommendations without the full environment report.
+
+```bash
+cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+  --list-models
+```
+
 Invalid `--max-turns`, `--max-tokens`, and `--temperature` values fail during
 argument parsing instead of surfacing later at runtime.
 
