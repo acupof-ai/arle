@@ -240,6 +240,7 @@ HTTP boundary guarantees:
 - JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
 - Unsupported top-level parameters on `/v1/completions`, `/v1/chat/completions`, and `/v1/responses` return structured `invalid_parameter` errors instead of being silently ignored.
 - Blank `prompt`, empty `messages`, and blank `input` are validated through the same structured `invalid_parameter` path instead of route-specific error codes.
+- `model` is optional on request bodies, but when present it must match the currently served model reported by `GET /v1/models` (case-insensitive, final path segment match allowed); mismatches return `404 model_not_found`.
 - Chat / responses message validation is explicit: supported roles are `system`, `user`, `assistant`, and `tool`; `content` part arrays must be text-only; tool definitions must use `type=function`; malformed assistant `tool_calls` and tool messages without `tool_call_id` are rejected with structured `invalid_parameter` errors.
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
