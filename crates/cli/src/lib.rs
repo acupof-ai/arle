@@ -13,11 +13,11 @@ mod model_catalog;
 mod model_picker;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod repl;
-mod train_cli;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod tps;
+mod train_cli;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
 
