@@ -57,13 +57,19 @@ where
                 });
             }
         }
+        let total_tokens: usize = trajectories
+            .iter()
+            .map(|trajectory| trajectory.full_ids.len())
+            .sum();
+        let mut batch_ids = Vec::with_capacity(total_tokens);
+        let mut position_logits = Vec::with_capacity(trajectories.len() * config.vocab_size());
 
         for (position, masked) in response_mask.iter().enumerate() {
             if !*masked {
                 continue;
             }
 
-            let batch_ids = batch_full_ids(&trajectories);
+            fill_batch_full_ids(&mut batch_ids, &trajectories);
             let logits_id = policy.forward_batch_tokens_with_positions(
                 &batch_ids,
                 &position_ids,
@@ -72,7 +78,8 @@ where
                 tape,
             )?;
             let logits = store.to_host(logits_id)?;
-            let position_logits = batch_position_logits(
+            fill_batch_position_logits(
+                &mut position_logits,
                 &logits,
                 trajectories.len(),
                 seq_len,
@@ -99,7 +106,7 @@ where
             store.retain_ids(&keep);
         }
 
-        let batch_ids = batch_full_ids(&trajectories);
+        fill_batch_full_ids(&mut batch_ids, &trajectories);
         let ref_logits_id = ref_model.forward_batch_tokens_with_positions(
             &batch_ids,
             &position_ids,
@@ -145,10 +152,15 @@ fn batch_full_ids(trajectories: &[Trajectory]) -> Vec<usize> {
         .map(|trajectory| trajectory.full_ids.len())
         .sum();
     let mut batch_ids = Vec::with_capacity(total);
-    for trajectory in trajectories {
-        batch_ids.extend_from_slice(&trajectory.full_ids);
-    }
+    fill_batch_full_ids(&mut batch_ids, trajectories);
     batch_ids
+}
+
+fn fill_batch_full_ids(out: &mut Vec<usize>, trajectories: &[Trajectory]) {
+    out.clear();
+    for trajectory in trajectories {
+        out.extend_from_slice(&trajectory.full_ids);
+    }
 }
 
 fn batch_position_logits(
@@ -160,11 +172,31 @@ fn batch_position_logits(
 ) -> Vec<f32> {
     let row_stride = seq_len * vocab_size;
     let mut position_logits = Vec::with_capacity(batch * vocab_size);
+    fill_batch_position_logits(
+        &mut position_logits,
+        logits,
+        batch,
+        seq_len,
+        position,
+        vocab_size,
+    );
+    position_logits
+}
+
+fn fill_batch_position_logits(
+    out: &mut Vec<f32>,
+    logits: &[f32],
+    batch: usize,
+    seq_len: usize,
+    position: usize,
+    vocab_size: usize,
+) {
+    let row_stride = seq_len * vocab_size;
+    out.clear();
     for row in 0..batch {
         let base = (row * row_stride) + position.saturating_sub(1) * vocab_size;
-        position_logits.extend_from_slice(&logits[base..base + vocab_size]);
+        out.extend_from_slice(&logits[base..base + vocab_size]);
     }
-    position_logits
 }
 
 fn validate_prompt_batch(prompts: &[Vec<usize>], seq_len: usize, max_seq_len: usize) -> Result<()> {
