@@ -17,7 +17,6 @@ mod repl;
 mod startup;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod tps;
-mod train_cli;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
 
@@ -51,11 +50,6 @@ fn run_impl() -> Result<()> {
 
     if args.list_models {
         doctor::list_models(&args)?;
-        return Ok(());
-    }
-
-    if let Some(command) = args.command {
-        train_cli::run(command)?;
         return Ok(());
     }
 
