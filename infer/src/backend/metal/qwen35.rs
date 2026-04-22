@@ -1,6 +1,6 @@
 use std::{path::Path, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use super::mlx::{
     Dtype, MlxArray, add, as_dtype, concatenate_axis, multiply, reshape, rms_norm, rope,
@@ -1049,7 +1049,7 @@ impl CppQwen35Model {
     ///
     /// Shapes:
     /// - `tokens`: int32 `[B, block_size]`.
-    /// - `cache_pos_arr`: int32 `[B]` — per-row physical KV write start.
+    /// - `cache_pos_arr`: host int32 `[B]` — per-row physical KV write start.
     /// - `rope_offsets`: int32 `[B]` — per-row RoPE base offset (typically
     ///   equal to `cache_pos_arr[b]` when left-padding is not used).
     /// - `attn_mask`: optional additive `[B, 1, block_size, key_len]`. Pass
@@ -1070,12 +1070,18 @@ impl CppQwen35Model {
         tokens: &MlxArray,
         batch_size: i32,
         block_size: i32,
-        cache_pos_arr: &MlxArray,
+        cache_pos_arr: &[i32],
         packed_kv_caches: &mut [MlxArray],
         packed_gdr_states: &mut [MlxArray],
         attn_mask: Option<&MlxArray>,
         rope_offsets: &MlxArray,
     ) -> Result<MlxArray> {
+        ensure!(
+            cache_pos_arr.len() == batch_size as usize,
+            "verify_block_batched cache_pos_arr len {} != batch_size {}",
+            cache_pos_arr.len(),
+            batch_size
+        );
         let n_kv = packed_kv_caches.len() as i32;
         let n_gdr = packed_gdr_states.len() as i32;
 
@@ -1094,7 +1100,7 @@ impl CppQwen35Model {
                 tokens.as_raw(),
                 batch_size,
                 block_size,
-                cache_pos_arr.as_raw(),
+                cache_pos_arr.as_ptr(),
                 kv_ptrs.as_mut_ptr(),
                 n_kv,
                 gdr_ptrs.as_mut_ptr(),
@@ -1135,13 +1141,19 @@ impl CppQwen35Model {
         tokens: &MlxArray,
         batch_size: i32,
         block_size: i32,
-        cache_pos_arr: &MlxArray,
+        cache_pos_arr: &[i32],
         packed_kv_caches: &mut [MlxArray],
         packed_gdr_states: &mut [MlxArray],
         attn_mask: Option<&MlxArray>,
         rope_offsets: &MlxArray,
         params: &SamplingParams,
     ) -> Result<MlxArray> {
+        ensure!(
+            cache_pos_arr.len() == batch_size as usize,
+            "verify_block_batched_sampled cache_pos_arr len {} != batch_size {}",
+            cache_pos_arr.len(),
+            batch_size
+        );
         let n_kv = packed_kv_caches.len() as i32;
         let n_gdr = packed_gdr_states.len() as i32;
         let greedy = params.temperature <= 1e-6 || params.top_k == 1;
@@ -1161,7 +1173,7 @@ impl CppQwen35Model {
                 tokens.as_raw(),
                 batch_size,
                 block_size,
-                cache_pos_arr.as_raw(),
+                cache_pos_arr.as_ptr(),
                 kv_ptrs.as_mut_ptr(),
                 n_kv,
                 gdr_ptrs.as_mut_ptr(),
@@ -2896,13 +2908,12 @@ mod tests {
         let mut batched_kv = kv_flat.clone();
         let mut batched_gdr = gdr_flat.clone();
         let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
-        let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let batched_logits = cpp_model.verify_block_batched(
             &batched_tokens,
             1,
             block_size,
-            &cache_pos_arr,
+            &[cache_pos],
             &mut batched_kv,
             &mut batched_gdr,
             None,
@@ -3008,13 +3019,12 @@ mod tests {
         let mut batched_kv = kv_flat.clone();
         let mut batched_gdr = gdr_flat.clone();
         let batched_tokens = MlxArray::from_slice_i32(&block_tokens, &[1, block_size]);
-        let cache_pos_arr = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let rope_offsets = MlxArray::from_slice_i32(&[cache_pos], &[1]);
         let batched_sampled = cpp_model.verify_block_batched_sampled(
             &batched_tokens,
             1,
             block_size,
-            &cache_pos_arr,
+            &[cache_pos],
             &mut batched_kv,
             &mut batched_gdr,
             None,
@@ -3156,14 +3166,13 @@ mod tests {
 
         let batched_block_tokens: Vec<i32> = row_blocks.iter().flatten().copied().collect();
         let batched_tokens = MlxArray::from_slice_i32(&batched_block_tokens, &[2, block_size]);
-        let cache_pos_arr = MlxArray::from_slice_i32(&[prompt_len, prompt_len], &[2]);
         let rope_offsets = MlxArray::from_slice_i32(&[prompt_len, prompt_len], &[2]);
 
         let batched_logits = cpp_model.verify_block_batched(
             &batched_tokens,
             2,
             block_size,
-            &cache_pos_arr,
+            &[prompt_len, prompt_len],
             &mut packed_kv,
             &mut packed_gdr,
             None,
