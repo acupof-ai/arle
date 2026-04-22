@@ -26,6 +26,77 @@ struct PrefixAdmissionPlan {
     staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
 }
 
+#[derive(Debug)]
+struct AdmissionPageBudget {
+    remaining_free_pages: usize,
+    planned_seq_lens: Vec<usize>,
+    page_size: usize,
+    active: bool,
+}
+
+impl AdmissionPageBudget {
+    fn from_scheduler<M: ModelForward>(scheduler: &Scheduler<M>) -> Self {
+        Self {
+            remaining_free_pages: scheduler.pool_free_pages(),
+            planned_seq_lens: (0..scheduler.states.len())
+                .map(|slot_idx| scheduler.paged_kv_pool.seq_len(slot_idx))
+                .collect(),
+            page_size: scheduler.paged_kv_pool.page_size.max(1),
+            active: scheduler.paged_kv_pool.is_active(),
+        }
+    }
+
+    fn additional_pages_needed(
+        &self,
+        slot_idx: usize,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        reserved_prefix_tokens: usize,
+    ) -> usize {
+        if !self.active {
+            return 0;
+        }
+        let current_seq = self.planned_seq_lens[slot_idx].max(reserved_prefix_tokens);
+        let target_seq = prompt_tokens.saturating_add(max_tokens);
+        if target_seq <= current_seq {
+            return 0;
+        }
+        let current_pages = current_seq.div_ceil(self.page_size);
+        let target_pages = target_seq.div_ceil(self.page_size);
+        target_pages.saturating_sub(current_pages)
+    }
+
+    fn can_fit(
+        &self,
+        slot_idx: usize,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        reserved_prefix_tokens: usize,
+    ) -> bool {
+        self.additional_pages_needed(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens)
+            <= self.remaining_free_pages
+    }
+
+    fn reserve(
+        &mut self,
+        slot_idx: usize,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        reserved_prefix_tokens: usize,
+    ) {
+        if !self.active {
+            return;
+        }
+        let new_pages =
+            self.additional_pages_needed(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens);
+        self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
+        let target_seq = prompt_tokens
+            .saturating_add(max_tokens)
+            .max(reserved_prefix_tokens);
+        self.planned_seq_lens[slot_idx] = self.planned_seq_lens[slot_idx].max(target_seq);
+    }
+}
+
 pub(super) fn best_reusable_slot_for_radix_hit(
     matched_blocks: &[crate::prefix_cache::BlockId],
     free_slots: &[usize],
@@ -84,6 +155,31 @@ fn finish_rejected_request(
 }
 
 impl<M: ModelForward> Scheduler<M> {
+    fn full_isl_reserved_tokens(
+        &self,
+        plan: &PrefixAdmissionPlan,
+        reusable_prefix_len: usize,
+    ) -> usize {
+        if plan.direct_gpu_attach {
+            plan.lookup.matched_len
+        } else if reusable_prefix_len > 0 {
+            reusable_prefix_len
+        } else {
+            0
+        }
+    }
+
+    fn can_reserve_full_isl(
+        &self,
+        budget: &AdmissionPageBudget,
+        slot_idx: usize,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        reserved_prefix_tokens: usize,
+    ) -> bool {
+        budget.can_fit(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens)
+    }
+
     /// Canonical admission decision for one incoming prompt.
     ///
     /// Order matters and is intentionally centralized here so the runtime and
@@ -456,10 +552,13 @@ impl<M: ModelForward> Scheduler<M> {
                     self.store_dedupe.remove(&key);
                 }
                 if let Some(waiters) = self.store_waiting.remove(&ticket) {
-                    let canonical_location = locations.first().map(|(_, location)| location.clone());
+                    let canonical_location =
+                        locations.first().map(|(_, location)| location.clone());
                     for (block_id, region) in waiters {
                         if let Some(location) = canonical_location.clone() {
-                            let _ = self.prefix_cache.mark_block_stored(block_id, Some(location));
+                            let _ = self
+                                .prefix_cache
+                                .mark_block_stored(block_id, Some(location));
                         } else {
                             let _ = self.prefix_cache.mark_block_store_failed(block_id);
                         }
@@ -552,7 +651,10 @@ impl<M: ModelForward> Scheduler<M> {
                     self.fetch_dedupe.remove(&key);
                 }
                 for (slot_idx, request_id) in waiters {
-                    if self.request(slot_idx).is_some_and(|req| req.id == request_id) {
+                    if self
+                        .request(slot_idx)
+                        .is_some_and(|req| req.id == request_id)
+                    {
                         self.fallback_to_cold_prefill(slot_idx);
                     }
                 }
@@ -694,7 +796,11 @@ impl<M: ModelForward> Scheduler<M> {
             self.paged_kv_pool.max_total_tokens,
             self.effective_max_seq_len,
         );
-        while !self.waiting.is_empty() {
+        let mut admission_budget = AdmissionPageBudget::from_scheduler(self);
+        let mut deferred = std::collections::VecDeque::new();
+        let mut remaining_scans = self.waiting.len();
+        while remaining_scans > 0 && !self.waiting.is_empty() {
+            remaining_scans = remaining_scans.saturating_sub(1);
             let _ = self.evict_prefix_cache_if_pressured();
             let free_slots = self.free_slots();
             if free_slots.is_empty() {
@@ -744,9 +850,28 @@ impl<M: ModelForward> Scheduler<M> {
             };
             let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
                 plan.reusable.unwrap_or((free_slots[0], 0, 0));
+            let reserved_prefix_tokens =
+                self.full_isl_reserved_tokens(&plan, reusable_prefix_len);
+            if !self.can_reserve_full_isl(
+                &admission_budget,
+                slot_idx,
+                prompt_tokens.len(),
+                incoming.max_tokens,
+                reserved_prefix_tokens,
+            ) {
+                self.prefix_cache.release(&plan.radix_blocks);
+                deferred.push_back(incoming);
+                continue;
+            }
             if plan.attached_prefix_blocks.is_empty() && plan.staged_prefix_plan.is_none() {
                 self.prefix_cache.release(&plan.radix_blocks);
             }
+            admission_budget.reserve(
+                slot_idx,
+                prompt_tokens.len(),
+                incoming.max_tokens,
+                reserved_prefix_tokens,
+            );
 
             let id = self.next_id;
             self.next_id += 1;
@@ -947,6 +1072,9 @@ impl<M: ModelForward> Scheduler<M> {
                 }
             }
         }
+        while let Some(req) = deferred.pop_back() {
+            self.waiting.push_front(req);
+        }
     }
 
     /// Find all free slot indices.
@@ -1035,7 +1163,7 @@ impl<M: ModelForward> Scheduler<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::{best_reusable_slot_for_radix_hit, finish_rejected_request};
+    use super::{AdmissionPageBudget, best_reusable_slot_for_radix_hit, finish_rejected_request};
     use crate::prefix_cache::BlockId;
     use crate::server_engine::FinishReason;
     use std::collections::HashMap;
@@ -1084,5 +1212,38 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 17);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn admission_budget_accounts_for_prior_reservations_in_same_pass() {
+        let mut budget = AdmissionPageBudget {
+            remaining_free_pages: 3,
+            planned_seq_lens: vec![0, 0],
+            page_size: 4,
+            active: true,
+        };
+
+        assert!(budget.can_fit(0, 8, 4, 0));
+        budget.reserve(0, 8, 4, 0);
+
+        assert!(
+            !budget.can_fit(1, 8, 8, 0),
+            "later admissions must see pages reserved by earlier ones in the same assign pass",
+        );
+    }
+
+    #[test]
+    fn admission_budget_honors_attached_prefix_as_existing_seq() {
+        let mut budget = AdmissionPageBudget {
+            remaining_free_pages: 1,
+            planned_seq_lens: vec![0],
+            page_size: 4,
+            active: true,
+        };
+
+        assert!(budget.can_fit(0, 4, 4, 4));
+        budget.reserve(0, 4, 4, 4);
+        assert_eq!(budget.remaining_free_pages, 0);
+        assert_eq!(budget.planned_seq_lens[0], 8);
     }
 }

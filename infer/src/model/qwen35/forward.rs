@@ -194,32 +194,13 @@ impl ModelForward for Qwen35Model {
         slot: usize,
         _new_token_indices: &cudarc::driver::CudaSlice<i32>,
     ) -> Result<()> {
-        if tokens.len() == 1 {
-            // Single-token: fall back to decode fast-path (CUDA Graph).
-            // The decode path uses kv_cache, not the pool, so the caller must
-            // have routed through batch decode for paged correctness. This
-            // mirrors Qwen3's behavior.
-            self.forward_decode(tokens[0], state)?;
-            return Ok(());
-        }
-
         let logits = self.prefill_forward_paged(tokens, pool, slot, &mut state.recurrent_state)?;
         state.base.prefill_logits = Some(logits);
         Ok(())
     }
 
     fn prefill_uses_paged_pool(&self) -> bool {
-        // Phase 1A (commit 859c3d2) wired the paged HD256 prefill path but it
-        // crashes the CUDA context on the second prefill chunk when the slot
-        // is reused with a partial radix hit (Qwen3.5 is
-        // `supports_partial_prefix=false`, so the scheduler falls back to
-        // full recompute but the pool/plan state carries over from the prior
-        // request). The HD256 FlashInfer workspace + total_num_rows fixes in
-        // commits 3702434 and 7a5a962 removed the single-request crashes, but
-        // the slot-reuse path still issues OOB kernels. Revert to the
-        // contiguous+scatter path until the scheduler-level fix lands.
-        // Tracking: `docs/plans/p99-unified-mixed-batch.md` §Phase 1C.
-        false
+        true
     }
 
     fn forward_decode(&self, token: u32, state: &mut Self::State) -> Result<()> {
