@@ -706,22 +706,24 @@ impl<M: ModelForward> Scheduler<M> {
 
     pub(super) fn step(&mut self) {
         let num = self.active_len();
-        if num == 0 && self.waiting.is_empty() {
+        if num == 0 && self.waiting.is_empty() && self.pending_decode.is_none() {
             return;
         }
         self.decode_retracted_this_step = false;
-
-        let plan_t = std::time::Instant::now();
-        let schedule_batch = self.plan_schedule_batch();
-        let forward_batch = self.lower_schedule_batch(schedule_batch);
-        let admission_us = plan_t.elapsed().as_micros();
-
-        assert!(
-            self.pending_decode.is_none(),
-            "pending decode must be cleared before scheduler step"
-        );
-
-        let decode_launch_us = self.launch_forward_batch(&forward_batch);
+        // Read back the previous iteration's decode first. This keeps
+        // `pending_decode` live across loop turns so `run()` can overlap the
+        // next round of intake/admission work with GPU compute instead of
+        // launching and synchronizing in the same iteration.
+        let readback_us = if self.pending_decode.is_some() {
+            let t = std::time::Instant::now();
+            self.step_decode_readback();
+            t.elapsed().as_micros()
+        } else {
+            0
+        };
+        if readback_us > 0 {
+            self.decay_prefill_decode_reserve_ratio_if_stable();
+        }
 
         let emit_t = std::time::Instant::now();
         let decode_slots: Vec<usize> = self.running_batch.iter().copied().collect();
@@ -742,20 +744,21 @@ impl<M: ModelForward> Scheduler<M> {
         }
         let emit_us = emit_t.elapsed().as_micros();
 
+        let plan_t = std::time::Instant::now();
+        let schedule_batch = self.plan_schedule_batch();
+        let forward_batch = self.lower_schedule_batch(schedule_batch);
+        let admission_us = plan_t.elapsed().as_micros();
+
+        assert!(
+            self.pending_decode.is_none(),
+            "pending decode must be cleared before the next launch"
+        );
+
+        let decode_launch_us = self.launch_forward_batch(&forward_batch);
+
         let prefill_t = std::time::Instant::now();
         self.execute_prefill_forward_batch(&forward_batch);
         let prefill_us = prefill_t.elapsed().as_micros();
-
-        let readback_us = if self.pending_decode.is_some() {
-            let t = std::time::Instant::now();
-            self.step_decode_readback();
-            t.elapsed().as_micros()
-        } else {
-            0
-        };
-        if readback_us > 0 {
-            self.decay_prefill_decode_reserve_ratio_if_stable();
-        }
         let decode_us = decode_launch_us + readback_us;
 
         let total_us = decode_us + emit_us + admission_us + prefill_us;
