@@ -304,7 +304,7 @@ runtime.
 
 ---
 
-## Agent Mode
+## Agent CLI
 
 Built-in agent runtime with tool calling:
 
@@ -315,7 +315,10 @@ Built-in agent runtime with tool calling:
 
 The root CLI binary is behind the `cli` feature. Without `--features cli`, `agent-infer` is not built.
 
-Current package boundary for agent mode:
+The CLI is agent-first: there is no separate chat mode and no `--tools`
+switch. Tool calling is the default runtime.
+
+Current package boundary for the CLI:
 
 - `agent-infer` -> thin binary wrapper
 - `cli` -> REPL and slash commands
@@ -331,7 +334,8 @@ HuggingFace cache root, model-resolution source, and curated model
 recommendations. Add `--json` for machine-readable output in scripts and CI;
 inspection JSON now includes a `schema_version`, top-level `status`, and
 stable per-check / resolution codes so callers do not need to infer health
-from prose.
+from prose. Add `--strict` when you want `--doctor` to exit non-zero on
+warnings.
 
 ```bash
 cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,cli -- \
@@ -339,6 +343,9 @@ cargo run -p agent-infer --release --no-default-features --features cpu,no-cuda,
 
 cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
   --doctor --json
+
+cargo run -p agent-infer --release --no-default-features --features cli,no-cuda -- \
+  --doctor --json --strict
 ```
 
 Use `--list-models` for the lighter-weight discovery view when you only want
@@ -372,13 +379,16 @@ cargo run --release --no-default-features --features metal,no-cuda,cli -- \
   --model-path mlx-community/Qwen3-0.6B-4bit
 ```
 
-The CLI keeps conversation history across turns, stores line history in `~/.agent-infer-history`, and supports slash commands:
+The CLI keeps conversation history across turns, stores line history in
+`~/.agent-infer-history`, and supports slash commands:
 
 - `/help` for command help
 - `/reset` or `/clear` to clear the current conversation
 - `/tools` to inspect built-in tools
 - `/model` and `/stats` to inspect the loaded runtime
+- `/models [N]` to list local models and restart hints
 - `/save <path>` and `/load <path>` to persist or resume a session as JSON
+- `/export [path]` to dump the conversation as markdown
 
 ---
 
