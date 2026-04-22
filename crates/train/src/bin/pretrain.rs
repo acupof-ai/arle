@@ -21,14 +21,14 @@ use std::{
 
 use autograd::{
     AutogradError, ConstantLr, Result as AutogradResult, SafetensorsRegistry, Tape, TensorId,
-    TensorStore, optim::AdamW,
+    TensorStore,
 };
 use qwen3_spec::Qwen3Config;
 use thiserror::Error;
 use train::{
     EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig,
     causal_lm::{build_registry, live_tensor_ids, trainable_param_name_map, trainable_params},
-    cli_args::{ArgError, BackendChoice, SaveDtype, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, SaveDtype, adamw_for_backend, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -491,7 +491,7 @@ fn run_with_family<F: PretrainFamily>(
     println!("family={}", F::family_name());
     println!("config: {}", F::describe_config(&cfg));
 
-    let mut store = TensorStore::with_backend(backend);
+    let mut store = TensorStore::with_backend(Arc::clone(&backend));
     let mut tape = Tape::new();
     let model = F::build_model(&cfg, &mut store)?;
     let mut registry = build_registry(&model);
@@ -586,7 +586,13 @@ fn run_with_family<F: PretrainFamily>(
         param_count as f64 / 1_000_000.0
     );
 
-    let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    let optim = adamw_for_backend(
+        args.lr,
+        DEFAULT_BETAS,
+        DEFAULT_EPS,
+        DEFAULT_WEIGHT_DECAY,
+        backend,
+    );
     let clip = match args.grad_clip {
         Some(max_norm) if max_norm > 0.0 && max_norm.is_finite() => {
             PretrainClip::Norm(GlobalNorm::new(max_norm))

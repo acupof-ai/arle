@@ -12,7 +12,6 @@ use autograd::ops::{mul_scalar, sum};
 use autograd::{
     AutogradError, Tape, TensorId, TensorStore,
     ops::{gather_last_dim, log_softmax, matmul, mean, mul},
-    optim::AdamW,
 };
 use thiserror::Error;
 use train::{
@@ -21,7 +20,7 @@ use train::{
         build_adapter_registry, build_registry, live_tensor_ids, save_materialized_registry,
         trainable_params,
     },
-    cli_args::{ArgError, BackendChoice, SaveDtype, next_value, parse_value},
+    cli_args::{ArgError, BackendChoice, SaveDtype, adamw_for_backend, next_value, parse_value},
     control::{
         TrainingController, emit_run_end, emit_run_start, open_run_metrics, serve_if_requested,
         sync_status,
@@ -308,7 +307,8 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
 
     let cfg = F::load_config(config_path)?;
     let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
-    let mut store = TensorStore::with_backend(args.backend.build_backend_or_cpu("train_sft")?);
+    let backend = args.backend.build_backend_or_cpu("train_sft")?;
+    let mut store = TensorStore::with_backend(Arc::clone(&backend));
     let model = F::build_model(&cfg, lora, &mut store)?;
     let mut registry = build_registry(&model);
     registry.load_into(&mut store, &weights_path)?;
@@ -350,7 +350,13 @@ fn run_with_family<F: SftFamily>(args: &CliArgs, config_path: &Path) -> Result<(
     }
 
     // --- Trainer setup (Wave 3 migration) ---
-    let optim = AdamW::new(args.lr, DEFAULT_BETAS, DEFAULT_EPS, DEFAULT_WEIGHT_DECAY);
+    let optim = adamw_for_backend(
+        args.lr,
+        DEFAULT_BETAS,
+        DEFAULT_EPS,
+        DEFAULT_WEIGHT_DECAY,
+        backend,
+    );
     // `--batch` is the true per-forward batch size; `--grad-accum-steps`
     // layers extra accumulation on top only when explicitly requested.
     let batch_size = args.batch.max(1);
