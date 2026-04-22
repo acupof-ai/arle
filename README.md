@@ -224,6 +224,8 @@ OpenAI-compatible. Current HTTP surface:
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `GET /v1/models`
+- `GET /healthz`
+- `GET /readyz`
 - `POST /v1/responses` for the current non-streaming subset
 - `POST /v1/sessions/{session_id}/save`
 - `POST /v1/sessions/{session_id}/load`
@@ -239,6 +241,7 @@ HTTP boundary guarantees:
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
 - Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
+- `GET /healthz` and `GET /readyz` are lightweight unauthenticated JSON probes; `readyz` includes the boot-time model identity snapshot without probing the backend again.
 - `405 Method Not Allowed` responses keep structured JSON bodies and now also include the standard `Allow` header on both top-level and session routes.
 
 ```bash
@@ -280,9 +283,10 @@ curl http://localhost:8000/v1/responses \
 
 </details>
 
-Additional endpoints: `GET /metrics` (Prometheus), `GET /v1/stats`
-(human-readable). On Metal, these expose live queue / latency / MLX memory
-stats from the running runtime.
+Additional endpoints: `GET /healthz`, `GET /readyz`, `GET /metrics`
+(Prometheus), `GET /v1/stats` (human-readable). On Metal, `/metrics` and
+`/v1/stats` expose live queue / latency / MLX memory stats from the running
+runtime.
 
 ---
 
@@ -418,8 +422,8 @@ Detailed runtime ownership graph:
 `agent-infer` uses explicit stability tiers:
 
 - **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
-  `GET /v1/models`), `GET /metrics`, `GET /v1/stats`, and the main documented
-  build/test workflows.
+  `GET /v1/models`, `GET /healthz`, `GET /readyz`), `GET /metrics`,
+  `GET /v1/stats`, and the main documented build/test workflows.
 - **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
   behavior, Metal serving path, GGUF loading, benchmark tooling.
 - **Experimental**: fast-moving quantization paths, tensor-parallel
