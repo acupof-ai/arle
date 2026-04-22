@@ -1193,7 +1193,7 @@ impl<M: ModelForward> Scheduler<M> {
         wait_t.elapsed().as_micros()
     }
 
-    fn wait_for_fetch_or_request(&mut self) -> bool {
+    fn wait_for_coordinator_or_request(&mut self) -> bool {
         if !self.wakeup_live {
             if let Ok(event) = self.coordinator_events.recv() {
                 self.handle_coordinator_event(event);
@@ -1226,10 +1226,13 @@ impl<M: ModelForward> Scheduler<M> {
 
     fn wait_for_wakeup(&mut self) -> bool {
         if self.is_fetch_wait_bound() {
-            return self.wait_for_fetch_or_request();
+            return self.wait_for_coordinator_or_request();
         }
 
         if self.active_len() == 0 && self.waiting.is_empty() && !self.has_pending_gpu_work() {
+            if self.trigger_background_store_drain() {
+                return self.wait_for_coordinator_or_request();
+            }
             if !self.wakeup_live {
                 info!("Scheduler shutting down: all handles dropped");
                 return false;
@@ -1288,6 +1291,9 @@ impl<M: ModelForward> Scheduler<M> {
                 coordinator_stats.store_queue_depth() as u64,
                 coordinator_stats.fetch_backpressured(),
                 coordinator_stats.store_backpressured(),
+                coordinator_stats.store.submitted,
+                coordinator_stats.store.completed,
+                coordinator_stats.store.failed,
             );
             let (fetch_wait_s, store_wait_s) = self.current_tier_wait_seconds();
             self.metrics
