@@ -170,9 +170,10 @@ __global__ void prefill_attention_paged_hd256_kernel(
     int num_qo_heads,
     int num_kv_heads,
     int seq_len,
-    int start_pos,
+    const int* __restrict__ start_pos_ptr,
     int rotary_dim,
     float rms_eps) {
+  int start_pos = *start_pos_ptr;
   int kv_head_idx = blockIdx.x;
   int token = blockIdx.y;
   int tid = threadIdx.x;
@@ -301,7 +302,7 @@ cudaError_t prefill_attention_paged_prep_hd256_cuda(
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
-    int start_pos,
+    const int* start_pos_ptr,
     int rotary_dim,
     float rms_eps,
     cudaStream_t stream) {
@@ -322,7 +323,7 @@ cudaError_t prefill_attention_paged_prep_hd256_cuda(
       num_q_heads,
       num_kv_heads,
       seq_len,
-      start_pos,
+      start_pos_ptr,
       rotary_dim,
       rms_eps);
   return cudaGetLastError();

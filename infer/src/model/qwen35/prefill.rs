@@ -281,23 +281,22 @@ impl Qwen35Model {
             pool.page_size
         );
 
-        let start_pos = self.prepare_paged_prefill(token_ids, pool, slot, bufs)?;
+        self.prepare_paged_prefill(token_ids, pool, slot, bufs)?;
         bufs.clear_logits();
 
-        // Replay is only safe while the captured launch scalars still match.
-        // Page-table metadata and FlashInfer planning are refreshed before each
-        // launch, but `start_pos` is still baked into the prep kernel params,
-        // so a changed chunk offset forces recapture.
+        // Replay is shape-based on the canonical paged-prefill path. Metadata,
+        // including device-backed `start_pos`, and FlashInfer planning are
+        // refreshed before each launch; only pointer-changing reallocations
+        // force recapture.
         let use_graph = self.supports_paged_prefill_graph();
         if use_graph {
             let mut graph_state = std::mem::replace(&mut bufs.graph_state, CudaGraphState::new());
             graph_state.run_or_capture(&self.ctx, || {
-                self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, true)
+                self.prefill_forward_paged_kernels(pool, recurrent, bufs, true)
             })?;
             bufs.graph_state = graph_state;
-            bufs.mark_graph_start_pos(start_pos);
         } else {
-            self.prefill_forward_paged_kernels(pool, start_pos, recurrent, bufs, false)?;
+            self.prefill_forward_paged_kernels(pool, recurrent, bufs, false)?;
         }
 
         recurrent.seq_len += seq_len;
@@ -355,7 +354,7 @@ impl Qwen35Model {
         pool: &TokenKVPool,
         slot: usize,
         bufs: &mut PagedPrefillBuffers35,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         let seq_len = token_ids.len();
         let pool_seq_len = pool.seq_len(slot);
         anyhow::ensure!(
@@ -381,7 +380,6 @@ impl Qwen35Model {
         if page_indices_reallocated {
             bufs.invalidate_graph();
         }
-        bufs.invalidate_graph_if_start_pos_changed(start_pos);
 
         let qo_indptr = [0_i32, seq_len as i32];
         let kv_indptr = [0_i32, num_pages as i32];
@@ -394,13 +392,12 @@ impl Qwen35Model {
             self.config.num_key_value_heads,
             pool.page_size,
         )?;
-        Ok(start_pos)
+        Ok(())
     }
 
     fn prefill_forward_paged_kernels(
         &self,
         pool: &TokenKVPool,
-        start_pos: usize,
         recurrent: &mut RecurrentState,
         bufs: &mut PagedPrefillBuffers35,
         graphsafe: bool,
@@ -420,7 +417,6 @@ impl Qwen35Model {
                 &mut linear_idx,
                 &mut full_idx,
                 pool,
-                start_pos,
                 recurrent,
                 bufs,
                 graphsafe,
@@ -456,7 +452,6 @@ impl Qwen35Model {
         linear_idx: &mut usize,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        start_pos: usize,
         recurrent: &mut RecurrentState,
         bufs: &mut PagedPrefillBuffers35,
         graphsafe: bool,
@@ -474,7 +469,7 @@ impl Qwen35Model {
 
         match &layer.attn {
             LayerKind::FullAttention(attn) => {
-                self.prefill_full_attention_paged(attn, full_idx, pool, start_pos, bufs, graphsafe)?
+                self.prefill_full_attention_paged(attn, full_idx, pool, bufs, graphsafe)?
             }
             LayerKind::LinearAttention(attn) => {
                 self.prefill_linear_attention_paged(attn, linear_idx, recurrent, bufs, graphsafe)?
@@ -530,7 +525,6 @@ impl Qwen35Model {
         attn: &FullAttentionLayer,
         full_idx: &mut usize,
         pool: &TokenKVPool,
-        start_pos: usize,
         bufs: &mut PagedPrefillBuffers35,
         graphsafe: bool,
     ) -> Result<()> {
@@ -558,6 +552,7 @@ impl Qwen35Model {
             let (cos_ptr, _gc) = nrp.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _gs) = nrp.sin_cache.data.device_ptr(&self.ctx.stream);
             let (pt_ptr, _gpt) = bufs.metadata.page_indices_gpu.device_ptr(&self.ctx.stream);
+            let (sp_ptr, _gsp) = bufs.metadata.start_pos_gpu.device_ptr(&self.ctx.stream);
             let kp_ptr = pool.k_ptr(*full_idx, &self.ctx.stream);
             let vp_ptr = pool.v_ptr(*full_idx, &self.ctx.stream);
 
@@ -577,7 +572,7 @@ impl Qwen35Model {
                 c.num_attention_heads as i32,
                 c.num_key_value_heads as i32,
                 bufs.seq_len as i32,
-                start_pos as i32,
+                sp_ptr as *const i32,
                 c.rotary_dim as i32,
                 nrp.rms_eps,
                 self.ctx.stream.cu_stream(),

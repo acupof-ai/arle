@@ -125,7 +125,7 @@ unsafe extern "C" {
         num_q_heads: i32,
         num_kv_heads: i32,
         seq_len: i32,
-        start_pos: i32,
+        start_pos_ptr: *const i32,
         rotary_dim: i32,
         rms_eps: f32,
         stream: CUstream,
