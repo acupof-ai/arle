@@ -14,7 +14,7 @@ use super::{
     forward::rust_transformer_layer,
     generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
+    mlx::{MlxArray, concatenate_axis, eval, reshape, rms_norm, slice, take_axis, zeros},
     ops::{extend_kv_cache, linear},
     sampling::{gpu_sample_token, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
@@ -2064,7 +2064,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // Draft model state
     draft_state: &mut ContiguousKvState,
 ) -> Result<DFlashBlockResult> {
-    use super::mlx::{MlxArray as Arr, eval};
+    use super::mlx::{MlxArray as Arr, eval, reshape};
 
     let profile = std::env::var("QWEN35_DFLASH_PROFILE").is_ok();
     let t_start = std::time::Instant::now();
@@ -2125,18 +2125,21 @@ pub(crate) fn qwen35_dflash_speculative_block(
 
     let n_capture_layers = runtime.target_layer_ids.len();
     let expected_tape_count = target_gdr_flat.len() / 2;
-    // 3a. Single parallel verify forward. Returns logits [1, block_size, vocab].
+    // 3a. Single parallel verify forward. Returns sampled posterior tokens
+    //     [1, block_size], so Rust no longer materializes `[block_size, vocab]`
+    //     just to sample it immediately afterwards.
     let block_tokens_i32: Vec<i32> = block_tokens.iter().map(|&tok| tok as i32).collect();
     let tokens_arr = MlxArray::from_slice_i32(&block_tokens_i32, &[block_size_i32]);
-    let block_logits = cpp_model.verify_block(
+    let posterior_tokens = cpp_model.verify_block_sampled(
         &tokens_arr,
         block_size_i32,
         *target_cache_len,
         target_kv_flat,
         target_gdr_flat,
+        params,
     )?;
     if profile {
-        eval(&[&block_logits]);
+        eval(&[&posterior_tokens]);
     }
     let t_verify = t_start.elapsed();
 
@@ -2147,14 +2150,21 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let captured_hiddens = drain_captured_hidden(cpp_model)?;
 
-    // 3c. Sample posterior token at every position (logits [1, S, V] → [S, V]).
-    let logits_shape = block_logits.shape();
+    // 3c. Read sampled posterior tokens [1, S] → [S].
+    let posterior_shape = posterior_tokens.shape();
     ensure!(
-        logits_shape.len() == 3 && logits_shape[0] == 1 && logits_shape[1] == block_size_i32,
-        "Qwen3.5 DFlash verify logits unexpected shape {logits_shape:?}"
+        posterior_shape.len() == 2
+            && posterior_shape[0] == 1
+            && posterior_shape[1] == block_size_i32,
+        "Qwen3.5 DFlash sampled verify tokens unexpected shape {posterior_shape:?}"
     );
-    let block_logits_2d = super::mlx::reshape(&block_logits, &[block_size_i32, logits_shape[2]]);
-    let posterior_tokens = sample_rows(&block_logits_2d, params)?;
+    let posterior_tokens = reshape(&posterior_tokens, &[block_size_i32]);
+    eval(&[&posterior_tokens]);
+    let posterior_tokens: Vec<u32> = posterior_tokens
+        .as_slice_i32()
+        .into_iter()
+        .map(|tok| tok as u32)
+        .collect();
     let t_sample = t_start.elapsed();
 
     // ── 4. Token matching ──
@@ -2322,6 +2332,21 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
             && batch == draft_states.len(),
         "Qwen3.5 DFlash batched block: per-row slice length mismatch (B={batch})"
     );
+    if let Some((first, rest)) = params_per_row.split_first() {
+        ensure!(
+            rest.iter().all(|params| {
+                params.temperature == first.temperature
+                    && params.top_k == first.top_k
+                    && params.top_p == first.top_p
+                    && params.min_p == first.min_p
+                    && params.repetition_penalty == first.repetition_penalty
+                    && params.frequency_penalty == first.frequency_penalty
+                    && params.presence_penalty == first.presence_penalty
+                    && params.seed == first.seed
+            }),
+            "Qwen3.5 DFlash batched block requires identical sampling params per row"
+        );
+    }
     let batch_i32 = i32::try_from(batch).context("Qwen3.5 DFlash batch does not fit i32")?;
 
     let block_size_i32 =
@@ -2568,7 +2593,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     let n_capture_layers = runtime.target_layer_ids.len();
     let expected_tape_count = packed_target_gdr_flat.len() / 2;
 
-    let block_logits = cpp_model.verify_block_batched(
+    let posterior_tokens = cpp_model.verify_block_batched_sampled(
         &tokens_arr,
         batch_i32,
         block_size_i32,
@@ -2577,32 +2602,31 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         packed_target_gdr_flat,
         Some(&attn_mask),
         &rope_offsets,
+        &params_per_row[0],
     )?;
 
     // ── 8. Drain tapes + captured hidden, per-row matching. ──
     let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let captured_hiddens = drain_captured_hidden(cpp_model)?;
 
-    let logits_shape = block_logits.shape();
+    let posterior_shape = posterior_tokens.shape();
     ensure!(
-        logits_shape.len() == 3
-            && logits_shape[0] == batch_i32
-            && logits_shape[1] == block_size_i32,
-        "Qwen3.5 DFlash batched verify logits unexpected shape {logits_shape:?}"
+        posterior_shape.len() == 2
+            && posterior_shape[0] == batch_i32
+            && posterior_shape[1] == block_size_i32,
+        "Qwen3.5 DFlash batched sampled verify tokens unexpected shape {posterior_shape:?}"
     );
-    let vocab = logits_shape[2];
+    eval(&[&posterior_tokens]);
+    let posterior_tokens = posterior_tokens.as_slice_i32();
 
     let mut accepted_inputs: Vec<i32> = Vec::with_capacity(batch);
     let mut posterior_token_per_row: Vec<u32> = Vec::with_capacity(batch);
     for b in 0..batch_i32 {
-        let row_logits = slice(
-            &block_logits,
-            &[b, 0, 0],
-            &[b + 1, block_size_i32, vocab],
-            &[1, 1, 1],
-        );
-        let row_logits_2d = reshape(&row_logits, &[block_size_i32, vocab]);
-        let posterior = sample_rows(&row_logits_2d, &params_per_row[b as usize])?;
+        let row_offset = (b as usize) * runtime.block_size;
+        let posterior: Vec<u32> = posterior_tokens[row_offset..row_offset + runtime.block_size]
+            .iter()
+            .map(|&tok| tok as u32)
+            .collect();
 
         let row_block = &per_row_block_tokens[b as usize];
         let matched = row_block
