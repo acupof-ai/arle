@@ -209,7 +209,12 @@ fn print_discovery_section(snapshot: &DoctorSnapshot) {
 
 fn print_recommendations_section(snapshot: &DoctorSnapshot) {
     println!("{}", style("Recommendations").bold());
-    if snapshot.recommendations.is_empty() {
+    if !snapshot.info.compiled_backend.supports_inference() {
+        println!(
+            "{} rebuild with `cuda`, `metal,no-cuda`, or `cpu,no-cuda` for backend-specific recommendations",
+            style("catalog").dim()
+        );
+    } else if snapshot.recommendations.is_empty() {
         println!("{} <none fit this machine>", style("catalog").dim());
     } else {
         for entry in snapshot.recommendations.iter().take(5) {
