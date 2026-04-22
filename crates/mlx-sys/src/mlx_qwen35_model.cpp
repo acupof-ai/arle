@@ -111,6 +111,27 @@ bool use_qwen35_cpp_qk_norm_helper() {
     return !(env && std::string(env) == "0");
 }
 
+array suppress_last_axis_token(const array& logits, int32_t suppress_token_id) {
+    if (suppress_token_id < 0 || logits.ndim() == 0) {
+        return logits;
+    }
+    int axis = logits.ndim() - 1;
+    int vocab = logits.shape(axis);
+    if (suppress_token_id >= vocab) {
+        return logits;
+    }
+
+    auto update_shape = logits.shape();
+    update_shape[axis] = 1;
+    auto floor = astype(zeros(update_shape, float32) + array(-1.0e9f), logits.dtype());
+    auto start = logits.shape();
+    auto stop = logits.shape();
+    std::fill(start.begin(), start.end(), 0);
+    start[axis] = suppress_token_id;
+    stop[axis] = suppress_token_id + 1;
+    return slice_update(logits, floor, start, stop);
+}
+
 int qwen35_cpp_gdr_threadgroup_y(int seq_len) {
     int fallback = parse_env_int("AGENT_INFER_QWEN35_CPP_GDR_TG_Y", 4);
     if (seq_len > 1) {
@@ -2065,6 +2086,7 @@ int32_t qwen35_compiled_verify_block_summary(
     mlx_array** gdr_states, int32_t n_gdr,
     float temperature,
     bool greedy,
+    int32_t suppress_token_id,
     int32_t* out_matched_prefix_len,
     int32_t* out_next_token,
     mlx_array** out_kv_caches,
@@ -2110,6 +2132,7 @@ int32_t qwen35_compiled_verify_block_summary(
         auto& outputs = m->prev_outputs;
 
         auto logits = outputs[0];
+        logits = suppress_last_axis_token(logits, suppress_token_id);
         auto sampled = greedy
             ? argmax(logits, -1, false)
             : random::categorical(logits * array(1.0f / temperature), -1);
@@ -2250,6 +2273,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
     mlx_array* rope_offsets,        // int32 [B] per-row RoPE base offset
     float temperature,
     bool greedy,
+    int32_t suppress_token_id,
     mlx_array** out_sampled,        // [B, block_size]
     mlx_array** out_packed_kv_caches,
     mlx_array** out_packed_gdr_states
@@ -2301,6 +2325,7 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
         auto& outputs = m->prev_outputs;
 
         auto logits = outputs[0];
+        logits = suppress_last_axis_token(logits, suppress_token_id);
         auto sampled = greedy
             ? argmax(logits, -1, false)
             : random::categorical(logits * array(1.0f / temperature), -1);

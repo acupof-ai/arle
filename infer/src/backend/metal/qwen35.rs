@@ -999,6 +999,7 @@ impl CppQwen35Model {
         kv_caches: &mut [MlxArray],
         gdr_states: &mut [MlxArray],
         params: &SamplingParams,
+        suppress_token_id: Option<u32>,
     ) -> Result<Qwen35VerifySummary> {
         let n_kv = kv_caches.len() as i32;
         let n_gdr = gdr_states.len() as i32;
@@ -1026,6 +1027,7 @@ impl CppQwen35Model {
                 n_gdr,
                 params.temperature,
                 greedy,
+                suppress_token_id.map_or(-1, |token_id| token_id as i32),
                 &raw mut matched_prefix_len,
                 &raw mut next_token,
                 out_kv.as_mut_ptr(),
@@ -1166,6 +1168,7 @@ impl CppQwen35Model {
         attn_mask: Option<&MlxArray>,
         rope_offsets: &MlxArray,
         params: &SamplingParams,
+        suppress_token_id: Option<u32>,
     ) -> Result<MlxArray> {
         ensure!(
             cache_pos_arr.len() == batch_size as usize,
@@ -1201,6 +1204,7 @@ impl CppQwen35Model {
                 rope_offsets.as_raw(),
                 params.temperature,
                 greedy,
+                suppress_token_id.map_or(-1, |token_id| token_id as i32),
                 &raw mut out_sampled,
                 out_kv.as_mut_ptr(),
                 out_gdr.as_mut_ptr(),
@@ -1725,7 +1729,8 @@ fn metal_generate_qwen35_dflash(
     }
 
     let logits = logits.context("Qwen3.5 prompt produced no logits")?;
-    let mut current_token = gpu_sample_token(&logits, params).item_i32() as u32;
+    let mut current_token =
+        dflash::sample_last_token_suppress(&logits, params, Some(runtime.mask_token_id()))?;
     let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let mut generated = vec![current_token];
     on_token(current_token)?;
@@ -3036,6 +3041,7 @@ mod tests {
             &mut scalar_kv,
             &mut scalar_gdr,
             &params,
+            None,
         )?;
 
         let mut batched_kv = kv_flat.clone();
@@ -3052,6 +3058,7 @@ mod tests {
             None,
             &rope_offsets,
             &params,
+            None,
         )?;
         let batched_sampled = reshape(&batched_sampled, &[block_size]);
 

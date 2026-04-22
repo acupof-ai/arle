@@ -19,7 +19,9 @@ use super::{
         prefix_match_len_i32_batched, rms_norm, slice, take_axis, zeros,
     },
     ops::{extend_kv_cache, linear},
-    sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params},
+    sampling::{
+        gpu_sample_token_batched_masked, gpu_sample_token_masked, validate_metal_sampling_params,
+    },
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
 };
 use crate::backend::is_stream_stop_matched;
@@ -488,6 +490,10 @@ impl MetalDflashRuntime {
 impl MetalDflashRuntime {
     pub(crate) fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    pub(crate) fn mask_token_id(&self) -> u32 {
+        self.mask_token_id
     }
 
     /// Whether the Phase 2B batched DFlash speculative path can legitimately
@@ -1141,7 +1147,8 @@ pub(crate) fn metal_generate_dflash_qwen3(
         &mut target_state,
     )?;
     let prompt_logits = linear(&prompt_norm_hidden, &weights.lm_head);
-    let first_token = sample_last_token(&prompt_logits, params)?;
+    let first_token =
+        sample_last_token_suppress(&prompt_logits, params, Some(runtime.mask_token_id()))?;
     let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut generated = vec![first_token];
@@ -1190,7 +1197,8 @@ pub(crate) fn metal_generate_dflash_qwen3(
             &[1, 1],
         );
         let draft_logits = linear(&block_hidden, &weights.lm_head);
-        let drafted_suffix = sample_rows_array(&draft_logits, params)?;
+        let drafted_suffix =
+            sample_rows_array_suppress(&draft_logits, params, Some(runtime.mask_token_id()))?;
         let drafted_suffix = materialize_token_array(&drafted_suffix);
         draft_state.trim(runtime.block_size);
         draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
@@ -1206,7 +1214,8 @@ pub(crate) fn metal_generate_dflash_qwen3(
             &mut target_state,
         )?;
         let verifier_logits = linear(&verifier_norm_hidden, &weights.lm_head);
-        let posterior = sample_rows_array(&verifier_logits, params)?;
+        let posterior =
+            sample_rows_array_suppress(&verifier_logits, params, Some(runtime.mask_token_id()))?;
         let posterior = materialize_token_array(&posterior);
         let matched = block_tokens
             .iter()
@@ -1361,7 +1370,8 @@ fn qwen35_prepare_draft_block(
         &[1, 1],
     );
     let draft_logits = linear(&draft_block_hidden, lm_head);
-    let drafted_suffix = sample_rows_array(&draft_logits, params)?;
+    let drafted_suffix =
+        sample_rows_array_suppress(&draft_logits, params, Some(runtime.mask_token_id()))?;
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
     Ok(qwen35_build_block_tokens(current_token, &drafted_suffix))
@@ -1427,7 +1437,8 @@ pub(crate) fn dflash_speculative_block(
         &[1, 1],
     );
     let draft_logits = linear(&block_hidden, &weights.lm_head);
-    let drafted_suffix = sample_rows_array(&draft_logits, params)?;
+    let drafted_suffix =
+        sample_rows_array_suppress(&draft_logits, params, Some(runtime.mask_token_id()))?;
     let drafted_suffix = materialize_token_array(&drafted_suffix);
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
@@ -1442,7 +1453,8 @@ pub(crate) fn dflash_speculative_block(
         target_state,
     )?;
     let verifier_logits = linear(&verifier_norm_hidden, &weights.lm_head);
-    let posterior = sample_rows_array(&verifier_logits, params)?;
+    let posterior =
+        sample_rows_array_suppress(&verifier_logits, params, Some(runtime.mask_token_id()))?;
     let posterior = materialize_token_array(&posterior);
     let matched = block_tokens
         .iter()
@@ -1751,7 +1763,11 @@ fn embed_tokens(embed_table: &MlxArray, input_ids: &[u32]) -> MlxArray {
     take_axis(embed_table, &indices, 0)
 }
 
-fn sample_last_token(logits: &MlxArray, params: &SamplingParams) -> Result<u32> {
+pub(crate) fn sample_last_token_suppress(
+    logits: &MlxArray,
+    params: &SamplingParams,
+    suppress_token_id: Option<u32>,
+) -> Result<u32> {
     let shape = logits.shape();
     let last_row = match shape {
         [rows, vocab] => slice(logits, &[rows - 1, 0], &[*rows, *vocab], &[1, 1]),
@@ -1761,19 +1777,23 @@ fn sample_last_token(logits: &MlxArray, params: &SamplingParams) -> Result<u32> 
         }
         _ => anyhow::bail!("expected rank-2 logits or [1, T, vocab], got shape {shape:?}"),
     };
-    let token = gpu_sample_token(&last_row, params);
+    let token = gpu_sample_token_masked(&last_row, params, suppress_token_id);
     eval(&[&token]);
     Ok(token.item_i32() as u32)
 }
 
-fn sample_rows_array(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
+fn sample_rows_array_suppress(
+    logits: &MlxArray,
+    params: &SamplingParams,
+    suppress_token_id: Option<u32>,
+) -> Result<MlxArray> {
     let shape = logits.shape();
     ensure!(
         shape.len() == 2,
         "expected rank-2 logits, got shape {shape:?}"
     );
     Ok(as_dtype(
-        &gpu_sample_token_batched(logits, params),
+        &gpu_sample_token_batched_masked(logits, params, suppress_token_id),
         Dtype::Int32,
     ))
 }
@@ -2250,6 +2270,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
         target_kv_flat,
         target_gdr_flat,
         params,
+        Some(runtime.mask_token_id()),
     )?;
     let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let captured_hiddens = drain_captured_hidden(cpp_model)?;
@@ -2645,7 +2666,11 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         &[batch_i32 * draft_suffix_len, hidden_size_i32],
     );
     let suffix_logits = linear(&suffix_hidden_2d, lm_head);
-    let drafted_suffix = sample_rows_array(&suffix_logits, &params_per_row[0])?;
+    let drafted_suffix = sample_rows_array_suppress(
+        &suffix_logits,
+        &params_per_row[0],
+        Some(runtime.mask_token_id()),
+    )?;
     let drafted_suffix = materialize_token_array(&drafted_suffix);
     ensure!(
         drafted_suffix.len() == batch * runtime.block_size.saturating_sub(1),
@@ -2713,6 +2738,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         Some(&attn_mask),
         &rope_offsets,
         &params_per_row[0],
+        Some(runtime.mask_token_id()),
     )?;
 
     // ── 8. Drain tapes + captured hidden, per-row matching. ──
