@@ -654,6 +654,18 @@ pub fn scaled_dot_product_attention_masked(
         "mlx_fast_sdpa_masked",
     )
 }
+pub fn batched_sdpa_2pass(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    gqa_factor: i32,
+) -> MlxArray {
+    mlx_array_from_raw_or_panic(
+        unsafe { mlx_sys::mlx_batched_sdpa_2pass(q.0, k.0, v.0, scale, gqa_factor) },
+        "mlx_batched_sdpa_2pass",
+    )
+}
 pub fn categorical(logits: &MlxArray) -> MlxArray {
     mlx_array_from_raw_or_panic(
         unsafe { mlx_sys::mlx_random_categorical(logits.0, -1) },
@@ -940,6 +952,60 @@ mod tests {
         let matched = prefix_match_len_i32(&lhs, &rhs);
         eval(&[&matched]);
         assert_eq!(matched.item_i32(), 2);
+    }
+
+    #[test]
+    fn batched_sdpa_2pass_matches_causal_sdpa_for_m16() {
+        let _guard = metal_test_guard();
+
+        let b = 1_i32;
+        let h = 2_i32;
+        let q_len = 16_i32;
+        let kv_len = 32_i32;
+        let d = 128_i32;
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let q_f32: Vec<f32> = (0..(b * h * q_len * d))
+            .map(|i| (((i % 97) as f32) / 97.0 - 0.5) * 0.125)
+            .collect();
+        let k_f32: Vec<f32> = (0..(b * h * kv_len * d))
+            .map(|i| (((i % 89) as f32) / 89.0 - 0.5) * 0.125)
+            .collect();
+        let v_f32: Vec<f32> = (0..(b * h * kv_len * d))
+            .map(|i| (((i % 83) as f32) / 83.0 - 0.5) * 0.125)
+            .collect();
+
+        let q = as_dtype(
+            &MlxArray::from_slice_f32(&q_f32, &[b, h, q_len, d]),
+            Dtype::Bfloat16,
+        );
+        let k = as_dtype(
+            &MlxArray::from_slice_f32(&k_f32, &[b, h, kv_len, d]),
+            Dtype::Bfloat16,
+        );
+        let v = as_dtype(
+            &MlxArray::from_slice_f32(&v_f32, &[b, h, kv_len, d]),
+            Dtype::Bfloat16,
+        );
+
+        let fast = scaled_dot_product_attention(&q, &k, &v, scale, Some("causal"));
+        let twopass = batched_sdpa_2pass(&q, &k, &v, scale, 1);
+        let fast_f32 = as_dtype(&fast, Dtype::Float32);
+        let twopass_f32 = as_dtype(&twopass, Dtype::Float32);
+        eval(&[&fast_f32, &twopass_f32]);
+
+        let mut max_abs_delta = 0.0_f32;
+        for (lhs, rhs) in fast_f32
+            .as_slice_f32()
+            .iter()
+            .zip(twopass_f32.as_slice_f32().iter())
+        {
+            max_abs_delta = max_abs_delta.max((lhs - rhs).abs());
+        }
+        assert!(
+            max_abs_delta < 2e-2,
+            "batched_sdpa_2pass max abs delta too large: {max_abs_delta}"
+        );
     }
 
     // MLX 0.31.1: `fast::rope(..., int offset)` on a `[B, H, S=1, D]` tensor

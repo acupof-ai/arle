@@ -92,6 +92,15 @@ array qwen35_moe_block_forward_cpp(
     int32_t top_k,
     bool norm_topk_prob);
 
+// Fixed-M=16 causal SDPA specialization shared between the bridge FFI and the
+// compiled Qwen3.5/Qwen3.6 verify path.
+array batched_sdpa_2pass_cpp(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    float scale,
+    int32_t gqa_factor);
+
 extern "C" mlx_array* qwen35_moe_block_forward(
     mlx_array* hidden,
     mlx_array* router_w,

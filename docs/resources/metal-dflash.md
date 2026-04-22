@@ -117,8 +117,11 @@ metal scheduler runtime:
   longest accepted prefix on GPU, and Rust materializes only the accepted
   output slice that has to be emitted back to the request state. Batched
   DFlash still verifies the whole packed block in one forward and applies the
-  same rollback rule row-wise. Both return the same accepted-token contract
-  and updated target hidden state.
+  same rollback rule row-wise. On the compiled full-attention sublayers, the
+  packed path may use the verify-only `batched_sdpa_2pass` kernel when the
+  verify block is mask-free, truly batched (`B > 1`), and `block_size == 16`;
+  otherwise it falls back to stock MLX SDPA. Both paths return the same
+  accepted-token contract and updated target hidden state.
 - Scheduler fallback:
   `Qwen35StepDriver::decode_token` keeps one canonical escape hatch: if
   terminal prefill did not seed `target_hidden` yet, or the request is on the
