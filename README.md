@@ -226,18 +226,19 @@ OpenAI-compatible. Current HTTP surface:
 - `GET /v1/models`
 - `GET /healthz`
 - `GET /readyz`
-- `POST /v1/responses` for the current non-streaming subset
+- `POST /v1/responses` for the current text/tool-call subset
 - `POST /v1/sessions/{session_id}/save`
 - `POST /v1/sessions/{session_id}/load`
 - `GET /v1/sessions/{session_id}/manifest`
 - `DELETE /v1/sessions/{session_id}`
 
-Streaming today remains on `/v1/chat/completions`; `/v1/responses` returns a
-clear `400` when `stream=true`.
+Streaming today is available on both `/v1/chat/completions` and
+`/v1/responses`.
 
 HTTP boundary guarantees:
 
 - JSON routes require `Content-Type: application/json`; malformed JSON, missing content type, and oversized bodies return structured JSON errors instead of framework default text.
+- Unsupported top-level parameters on `/v1/completions`, `/v1/chat/completions`, and `/v1/responses` return structured `invalid_parameter` errors instead of being silently ignored.
 - Request body limit for JSON routes is an explicit `16 MiB`.
 - Optional auth uses `Authorization: Bearer <token>`; `401` responses include `WWW-Authenticate: Bearer realm="agent-infer"`.
 - Every HTTP response includes `X-Request-Id`; a client-supplied value is preserved when valid, otherwise the server generates one.
@@ -258,10 +259,15 @@ curl http://localhost:8000/v1/completions \
 # Model discovery
 curl http://localhost:8000/v1/models
 
-# Responses API (non-streaming subset)
+# Responses API
 curl http://localhost:8000/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"input":"Summarize radix prefix caching in one sentence.","max_output_tokens":32}'
+
+# Responses API streaming
+curl -N http://localhost:8000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Summarize radix prefix caching in one sentence.","max_output_tokens":32,"stream":true}'
 ```
 
 <details>
@@ -431,7 +437,7 @@ Detailed runtime ownership graph:
 - **Stable**: documented HTTP endpoints (`/v1/completions`, `/v1/chat/completions`,
   `GET /v1/models`, `GET /healthz`, `GET /readyz`), `GET /metrics`,
   `GET /v1/stats`, and the main documented build/test workflows.
-- **Beta**: `POST /v1/responses` (current non-streaming subset), CLI agent
+- **Beta**: `POST /v1/responses` (current text/tool-call subset), CLI agent
   behavior, Metal serving path, GGUF loading, benchmark tooling.
 - **Experimental**: fast-moving quantization paths, tensor-parallel
   scaffolding, and undocumented flags or environment variables.
