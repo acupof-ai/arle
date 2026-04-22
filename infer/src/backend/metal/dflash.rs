@@ -14,9 +14,12 @@ use super::{
     forward::rust_transformer_layer,
     generate::{KV_CACHE_CHUNK, MetalGenerateOutput},
     loader::{load_proj_from_tensors, load_tensor_map, tensor_get},
-    mlx::{MlxArray, async_eval, concatenate_axis, eval, rms_norm, slice, take_axis, zeros},
+    mlx::{
+        Dtype, MlxArray, as_dtype, async_eval, concatenate_axis, eval, prefix_match_len_i32,
+        rms_norm, slice, take_axis, zeros,
+    },
     ops::{extend_kv_cache, linear},
-    sampling::{gpu_sample_token, validate_metal_sampling_params},
+    sampling::{gpu_sample_token, gpu_sample_token_batched, validate_metal_sampling_params},
     weights::{MlpInputProjection, StandardMetalWeights, WeightTensor},
 };
 use crate::backend::is_stream_stop_matched;
@@ -1186,7 +1189,8 @@ pub(crate) fn metal_generate_dflash_qwen3(
             &[1, 1],
         );
         let draft_logits = linear(&block_hidden, &weights.lm_head);
-        let drafted_suffix = sample_rows(&draft_logits, params)?;
+        let drafted_suffix = sample_rows_array(&draft_logits, params)?;
+        let drafted_suffix = materialize_token_array(&drafted_suffix);
         draft_state.trim(runtime.block_size);
         draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
         for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
@@ -1201,7 +1205,8 @@ pub(crate) fn metal_generate_dflash_qwen3(
             &mut target_state,
         )?;
         let verifier_logits = linear(&verifier_norm_hidden, &weights.lm_head);
-        let posterior = sample_rows(&verifier_logits, params)?;
+        let posterior = sample_rows_array(&verifier_logits, params)?;
+        let posterior = materialize_token_array(&posterior);
         let matched = block_tokens
             .iter()
             .skip(1)
@@ -1344,7 +1349,8 @@ pub(crate) fn dflash_speculative_block(
         &[1, 1],
     );
     let draft_logits = linear(&block_hidden, &weights.lm_head);
-    let drafted_suffix = sample_rows(&draft_logits, params)?;
+    let drafted_suffix = sample_rows_array(&draft_logits, params)?;
+    let drafted_suffix = materialize_token_array(&drafted_suffix);
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
     for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
@@ -1358,7 +1364,8 @@ pub(crate) fn dflash_speculative_block(
         target_state,
     )?;
     let verifier_logits = linear(&verifier_norm_hidden, &weights.lm_head);
-    let posterior = sample_rows(&verifier_logits, params)?;
+    let posterior = sample_rows_array(&verifier_logits, params)?;
+    let posterior = materialize_token_array(&posterior);
     let matched = block_tokens
         .iter()
         .skip(1)
@@ -1680,32 +1687,84 @@ fn sample_last_token(logits: &MlxArray, params: &SamplingParams) -> Result<u32> 
     Ok(token.item_i32() as u32)
 }
 
-fn sample_rows(logits: &MlxArray, params: &SamplingParams) -> Result<Vec<u32>> {
+fn sample_rows_array(logits: &MlxArray, params: &SamplingParams) -> Result<MlxArray> {
     let shape = logits.shape();
     ensure!(
         shape.len() == 2,
         "expected rank-2 logits, got shape {shape:?}"
     );
-    // Fast path: greedy (temperature ≤ ε) — single batched argmax, one eval,
-    // one GPU→CPU transfer via .tolist() instead of N separate .item() calls.
-    if params.temperature <= 1e-6 || params.top_k == 1 {
-        let tokens = super::mlx::argmax_axis(logits, -1);
-        eval(&[&tokens]);
-        let flat: Vec<i32> = tokens.as_slice_i32();
-        return Ok(flat.iter().map(|&t| t as u32).collect());
-    }
-    // Slow path: temperature sampling (per-row, unavoidable for different random draws).
-    let mut row_tokens = Vec::with_capacity(shape[0] as usize);
-    for row in 0..shape[0] {
-        let row_logits = slice(logits, &[row, 0], &[row + 1, shape[1]], &[1, 1]);
-        row_tokens.push(gpu_sample_token(&row_logits, params));
-    }
-    let refs: Vec<_> = row_tokens.iter().collect();
-    eval(&refs);
-    Ok(row_tokens
-        .iter()
-        .map(|token| token.item_i32() as u32)
-        .collect())
+    Ok(as_dtype(
+        &gpu_sample_token_batched(logits, params),
+        Dtype::Int32,
+    ))
+}
+
+fn materialize_token_array(tokens: &MlxArray) -> Vec<u32> {
+    let tokens_i32 = if tokens.dtype() == Dtype::Int32 {
+        tokens.clone()
+    } else {
+        as_dtype(tokens, Dtype::Int32)
+    };
+    eval(&[&tokens_i32]);
+    tokens_i32
+        .as_slice_i32()
+        .into_iter()
+        .map(|token| token as u32)
+        .collect()
+}
+
+fn prefix_match_len_tokens(lhs: &MlxArray, rhs: &MlxArray) -> Result<usize> {
+    let lhs_i32 = if lhs.dtype() == Dtype::Int32 {
+        lhs.clone()
+    } else {
+        as_dtype(lhs, Dtype::Int32)
+    };
+    let rhs_i32 = if rhs.dtype() == Dtype::Int32 {
+        rhs.clone()
+    } else {
+        as_dtype(rhs, Dtype::Int32)
+    };
+    let matched = prefix_match_len_i32(&lhs_i32, &rhs_i32);
+    eval(&[&matched]);
+    let matched = matched.item_i32();
+    ensure!(
+        matched >= 0,
+        "mlx_prefix_match_len_i32 returned a negative prefix length: {matched}"
+    );
+    Ok(matched as usize)
+}
+
+fn build_accepted_tokens_from_arrays(
+    drafted_suffix: &MlxArray,
+    posterior_tokens: &MlxArray,
+    matched: usize,
+) -> Result<Vec<u32>> {
+    let matched_i32 =
+        i32::try_from(matched).context("accepted draft prefix length does not fit i32")?;
+    let posterior_shape = posterior_tokens.shape();
+    let total = *posterior_shape
+        .first()
+        .ok_or_else(|| anyhow!("posterior_tokens must be rank-1"))?;
+    ensure!(
+        matched_i32 < total,
+        "posterior token index {matched_i32} out of range for total={total}"
+    );
+
+    let posterior_token = slice(posterior_tokens, &[matched_i32], &[matched_i32 + 1], &[1]);
+    let accepted = if matched == 0 {
+        posterior_token
+    } else {
+        let accepted_draft = slice(drafted_suffix, &[0], &[matched_i32], &[1]);
+        concatenate_axis(&[accepted_draft, posterior_token], 0)
+    };
+    let accepted_tokens = materialize_token_array(&accepted);
+    ensure!(
+        accepted_tokens.len() == matched + 1,
+        "accepted token count mismatch: expected {}, got {}",
+        matched + 1,
+        accepted_tokens.len()
+    );
+    Ok(accepted_tokens)
 }
 
 #[derive(Clone)]
@@ -2092,9 +2151,9 @@ pub(crate) fn qwen35_dflash_speculative_block(
     // ── 1. Draft forward (same as Qwen3 — draft model is pure transformer) ──
     let block_size_i32 =
         i32::try_from(runtime.block_size).context("Qwen3.5 DFlash block_size does not fit i32")?;
-    let mut block_tokens = vec![runtime.mask_token_id; runtime.block_size];
-    block_tokens[0] = current_token;
-    let noise_embedding = embed_tokens(embed_table, &block_tokens);
+    let mut draft_input_tokens = vec![runtime.mask_token_id; runtime.block_size];
+    draft_input_tokens[0] = current_token;
+    let noise_embedding = embed_tokens(embed_table, &draft_input_tokens);
     let draft_hidden = dflash_draft_forward(runtime, &noise_embedding, target_hidden, draft_state)?;
     let draft_block_hidden = slice(
         &draft_hidden,
@@ -2106,12 +2165,11 @@ pub(crate) fn qwen35_dflash_speculative_block(
         &[1, 1],
     );
     let draft_logits = linear(&draft_block_hidden, lm_head);
-    let drafted_suffix = sample_rows(&draft_logits, params)?;
+    let drafted_suffix = sample_rows_array(&draft_logits, params)?;
     draft_state.trim(runtime.block_size);
     draft_state.apply_window(DRAFT_CACHE_SINK_SIZE, DRAFT_CACHE_WINDOW_SIZE);
-    for (dst, src) in block_tokens.iter_mut().skip(1).zip(drafted_suffix.iter()) {
-        *dst = *src;
-    }
+    let current_token_arr = MlxArray::from_slice_i32(&[current_token as i32], &[1]);
+    let block_tokens = concatenate_axis(&[current_token_arr, drafted_suffix], 0);
     let t_draft = t_start.elapsed();
 
     let n_capture_layers = runtime.target_layer_ids.len();
@@ -2143,8 +2201,7 @@ pub(crate) fn qwen35_dflash_speculative_block(
         raw: cpp_model.as_raw(),
     };
 
-    let block_tokens_i32: Vec<i32> = block_tokens.iter().map(|&token| token as i32).collect();
-    let tokens_arr = MlxArray::from_slice_i32(&block_tokens_i32, &[1, block_size_i32]);
+    let tokens_arr = super::mlx::reshape(&block_tokens, &[1, block_size_i32]);
     let cache_pos_arr = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
     let rope_offsets = MlxArray::from_slice_i32(&[*target_cache_len], &[1]);
     let posterior_tokens = cpp_model.verify_block_batched_sampled(
@@ -2160,31 +2217,25 @@ pub(crate) fn qwen35_dflash_speculative_block(
     )?;
     let tapes = drain_current_qwen35_gdr_tapes(cpp_model, expected_tape_count)?;
     let captured_hiddens = drain_captured_hidden(cpp_model)?;
-    eval(&[&posterior_tokens]);
-    let posterior_tokens = posterior_tokens.as_slice_i32();
+    let posterior_tokens = super::mlx::reshape(&posterior_tokens, &[block_size_i32]);
     ensure!(
-        posterior_tokens.len() == runtime.block_size,
-        "Qwen3.5 DFlash sampled verify returned {} tokens for block_size={}",
-        posterior_tokens.len(),
+        posterior_tokens.shape() == [block_size_i32],
+        "Qwen3.5 DFlash sampled verify returned shape {:?} for block_size={}",
+        posterior_tokens.shape(),
         runtime.block_size
     );
-    let posterior: Vec<u32> = posterior_tokens.iter().map(|&tok| tok as u32).collect();
-
-    for (offset, (&target, &draft)) in posterior
-        .iter()
-        .zip(block_tokens.iter().skip(1))
-        .take(runtime.block_size.saturating_sub(1))
-        .enumerate()
-    {
-        per_pos_match[offset] = target == draft;
+    let drafted_prefix = slice(&block_tokens, &[1], &[block_size_i32], &[1]);
+    let posterior_prefix = slice(&posterior_tokens, &[0], &[block_size_i32 - 1], &[1]);
+    let matched = prefix_match_len_tokens(&drafted_prefix, &posterior_prefix)?;
+    if profile {
+        let drafted_vals = materialize_token_array(&drafted_prefix);
+        let posterior_vals = materialize_token_array(&posterior_prefix);
+        for (offset, (&draft, &target)) in
+            drafted_vals.iter().zip(posterior_vals.iter()).enumerate()
+        {
+            per_pos_match[offset] = draft == target;
+        }
     }
-
-    let matched = posterior
-        .iter()
-        .zip(block_tokens.iter().skip(1))
-        .take(runtime.block_size.saturating_sub(1))
-        .take_while(|(target, draft)| target == draft)
-        .count();
     let accepted_inputs = matched + 1;
     if accepted_inputs < runtime.block_size {
         qwen35_rollback_to_accepted_varlen(
@@ -2198,25 +2249,14 @@ pub(crate) fn qwen35_dflash_speculative_block(
     let t_verify = t_start.elapsed();
     let t_sample = t_verify;
 
-    let posterior_token = *posterior
-        .get(matched)
-        .ok_or_else(|| anyhow!("Qwen3.5 DFlash sampled verify produced too few tokens"))?;
-    let mut accepted_tokens_out = Vec::with_capacity(accepted_inputs);
-    accepted_tokens_out.extend(
-        block_tokens
-            .iter()
-            .skip(1)
-            .take(accepted_inputs.saturating_sub(1))
-            .copied(),
-    );
-    accepted_tokens_out.push(posterior_token);
+    let accepted_tokens_out =
+        build_accepted_tokens_from_arrays(&drafted_prefix, &posterior_tokens, matched)?;
 
     log::debug!(
-        "qwen35_dflash: accepted={}/{} draft={:?} posterior={:?}",
+        "qwen35_dflash: accepted={}/{} matched_prefix={}",
         accepted_inputs,
         runtime.block_size,
-        &block_tokens[1..(matched + 2).min(block_tokens.len())],
-        &accepted_tokens_out[..accepted_inputs.min(accepted_tokens_out.len())]
+        matched
     );
 
     // ── 3. Build updated_target_hidden from accepted verify positions. ──
@@ -2537,7 +2577,8 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
         );
         let row_hidden_2d = reshape(&row_hidden, &[draft_suffix_len, hidden_size_i32]);
         let row_logits = linear(&row_hidden_2d, lm_head);
-        let drafted_suffix = sample_rows(&row_logits, &params_per_row[b as usize])?;
+        let drafted_suffix = sample_rows_array(&row_logits, &params_per_row[b as usize])?;
+        let drafted_suffix = materialize_token_array(&drafted_suffix);
         let row_block = &mut per_row_block_tokens[b as usize];
         for (dst, src) in row_block.iter_mut().skip(1).zip(drafted_suffix.iter()) {
             *dst = *src;
@@ -2689,7 +2730,7 @@ pub(super) fn qwen35_dflash_speculative_block_batched(
     // KV/GDR arrays are sliced per-row (lazy view ops) and re-stashed. No
     // caller issues a host-side read (`.item()` / `.as_slice()`) on these
     // handles before the next DFlash block's own sync, so deferring is
-    // safe. The next block's prefix-match scan in `sample_rows()`
+    // safe. The next block's prefix-match scan in the sampled-row helper
     // (`dflash.rs:1505` → `.item_i32()`) or any subsequent `eval` call
     // will flush this queue.
     {
