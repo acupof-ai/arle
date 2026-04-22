@@ -22,6 +22,7 @@ mod tps;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod welcome;
 
+use std::process::ExitCode;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use std::time::Instant;
 
@@ -33,7 +34,17 @@ use clap::Parser;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 use infer::server_engine::{InferenceEngine, LoadedInferenceEngine};
 
-pub fn run() -> Result<()> {
+pub fn run() -> ExitCode {
+    match run_impl() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("[agent-infer] error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_impl() -> Result<()> {
     #[cfg(all(not(feature = "cuda"), not(feature = "metal"), not(feature = "cpu")))]
     {
         anyhow::bail!(
@@ -83,16 +94,12 @@ pub fn run() -> Result<()> {
         let mut engine = match LoadedInferenceEngine::load(&model_source, !args.no_cuda_graph) {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("{err:#}");
-                eprintln!();
-                eprintln!(
-                    "Hint: verify --model-path points to a model directory with config.json,"
-                );
-                eprintln!("or try: ./scripts/run_dflash.sh serve  (Metal, Apple Silicon)");
-                eprintln!(
-                    "         cargo run --release -p infer --bin metal_bench -- --model <path>"
-                );
-                return Err(err);
+                return Err(anyhow::anyhow!(
+                    "failed to load model from `{model_source}`: {err:#}\n\
+                     Hint: verify --model-path points to a model directory with config.json.\n\
+                     Hint: for Apple Silicon, try `./scripts/run_dflash.sh serve`.\n\
+                     Hint: direct Metal smoke: `cargo run --release -p infer --bin metal_bench -- --model <path>`."
+                ));
             }
         };
         let backend_name = engine.backend_name().to_string();
