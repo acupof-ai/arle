@@ -1,6 +1,5 @@
 use super::{
-    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, info,
-    warn,
+    FinishReason, GenerationState, IncomingRequest, ModelForward, Phase, Scheduler, error, warn,
 };
 use crate::scheduler::cuda::core::PendingDecode;
 

@@ -31,9 +31,20 @@ pub struct SchedulerConfig {
     /// Maximum number of tokens advanced for one prefilling request in a
     /// single scheduler tick.
     pub chunked_prefill_size: usize,
+    /// Maximum total tokens scheduled across one CUDA scheduler tick. Decode
+    /// rows consume one token each; prefill rows consume their admitted chunk.
+    ///
+    /// Mirrors the vLLM/SGLang-style "whole step" token budget rather than a
+    /// prefill-only cap.
+    pub max_num_batched_tokens: usize,
     /// Maximum total prefill tokens admitted across the whole scheduler tick.
     /// Multiple requests share this budget.
     pub max_prefill_tokens: usize,
+    /// Per-request prefill cap once decode rows are active in the same step.
+    ///
+    /// This keeps decode-active ticks from letting one long prefill monopolize
+    /// the whole step even when `chunked_prefill_size` is larger.
+    pub long_prefill_token_threshold: usize,
     /// Maximum number of prefilling requests to advance in one scheduler step.
     /// `None` means no explicit request-count cap.
     pub prefill_max_requests: Option<usize>,
@@ -95,7 +106,9 @@ impl Default for SchedulerConfig {
         Self {
             max_slots: 4,
             chunked_prefill_size: 512,
+            max_num_batched_tokens: 16384,
             max_prefill_tokens: 16384,
+            long_prefill_token_threshold: 512,
             prefill_max_requests: None,
             enable_mixed_chunk: false,
             max_waiting_requests: 256,
@@ -135,6 +148,8 @@ impl SchedulerConfig {
         Self {
             max_slots,
             chunked_prefill_size: 4096,
+            max_num_batched_tokens: 16384,
+            long_prefill_token_threshold: 4096,
             enable_mixed_chunk: true,
             ..Self::default()
         }
@@ -147,8 +162,14 @@ impl SchedulerConfig {
         if self.chunked_prefill_size == 0 {
             anyhow::bail!("chunked_prefill_size must be ≥ 1");
         }
+        if self.max_num_batched_tokens == 0 {
+            anyhow::bail!("max_num_batched_tokens must be ≥ 1");
+        }
         if self.max_prefill_tokens == 0 {
             anyhow::bail!("max_prefill_tokens must be ≥ 1");
+        }
+        if self.long_prefill_token_threshold == 0 {
+            anyhow::bail!("long_prefill_token_threshold must be ≥ 1");
         }
         if matches!(self.prefill_max_requests, Some(0)) {
             anyhow::bail!("prefill_max_requests must be ≥ 1 when provided");
@@ -418,7 +439,9 @@ mod tests {
         let cfg = SchedulerConfig::runtime_defaults(8);
         assert_eq!(cfg.max_slots, 8);
         assert_eq!(cfg.chunked_prefill_size, 4096);
+        assert_eq!(cfg.max_num_batched_tokens, 16384);
         assert_eq!(cfg.max_prefill_tokens, 16384);
+        assert_eq!(cfg.long_prefill_token_threshold, 4096);
         assert_eq!(cfg.prefill_max_requests, None);
         assert!(cfg.enable_mixed_chunk);
         assert_eq!(cfg.prefix_cache_high_water, 0.75);
@@ -459,6 +482,20 @@ mod tests {
         let mut cfg = SchedulerConfig::runtime_defaults(4);
         cfg.max_prefill_tokens = cfg.chunked_prefill_size - 1;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_step_token_budget() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.max_num_batched_tokens = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn scheduler_config_rejects_zero_long_prefill_threshold() {
+        let mut cfg = SchedulerConfig::runtime_defaults(4);
+        cfg.long_prefill_token_threshold = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
