@@ -587,6 +587,9 @@ impl<M: ModelForward> Scheduler<M> {
                     self.fallback_to_cold_prefill(slot_idx);
                 }
                 Some(fetch_key) => {
+                    let (host_blocks, disk_blocks, remote_blocks) = staged_prefix.source_counts();
+                    self.metrics
+                        .record_tier_fetch_plan(host_blocks, disk_blocks, remote_blocks);
                     if let Some(ticket) = self.fetch_dedupe.get(&fetch_key).copied() {
                         if let Some(req) = self.request_mut(slot_idx)
                             && let Some(plan) = req.staged_prefix.as_mut()
@@ -662,6 +665,16 @@ impl<M: ModelForward> Scheduler<M> {
     }
 
     fn fallback_to_cold_prefill_inner(&mut self, slot_idx: usize, release_held_blocks: bool) {
+        if let Some((host_blocks, disk_blocks, remote_blocks)) =
+            self.request(slot_idx).and_then(|req| {
+                req.staged_prefix
+                    .as_ref()
+                    .map(crate::kv_tier::ReadmissionPlan::source_counts)
+            })
+            && host_blocks + disk_blocks + remote_blocks > 0
+        {
+            self.metrics.record_tier_fetch_fallback();
+        }
         let held_blocks = self
             .request(slot_idx)
             .and_then(|req| {
@@ -880,6 +893,9 @@ impl<M: ModelForward> Scheduler<M> {
             self.config.prefix_cache_keepalive_ticks,
             false,
         );
+        let (host_blocks, disk_blocks, remote_blocks) = staged_prefix.source_counts();
+        self.metrics
+            .record_tier_fetch_promoted(host_blocks + disk_blocks + remote_blocks);
 
         info!(
             "Request {}: staged sealed prefix ready, promoted {}/{} tokens into T0",

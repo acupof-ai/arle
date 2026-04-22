@@ -307,8 +307,8 @@ impl<M: ModelForward> Scheduler<M> {
 
             (effective, pool_prefix_len)
         };
-        let prefix_hit = effective.len() < prompt_len;
-        self.metrics.record_prefix_lookup(prefix_hit);
+        let reused_tokens = prompt_len.saturating_sub(effective.len());
+        self.metrics.record_prefix_lookup(reused_tokens, prompt_len);
 
         if pool_prefix_len > 0 && self.paged_kv_pool.is_active() {
             match self.alloc_pool_tokens_with_retry(si, pool_prefix_len) {
