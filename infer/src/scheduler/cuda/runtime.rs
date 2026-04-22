@@ -26,6 +26,12 @@ struct PrefixAdmissionPlan {
     staged_prefix_plan: Option<crate::kv_tier::ReadmissionPlan>,
 }
 
+struct QueuedAdmissionCandidate {
+    incoming: super::IncomingRequest,
+    prompt_tokens: Vec<u32>,
+    plan: PrefixAdmissionPlan,
+}
+
 #[derive(Debug)]
 struct AdmissionPageBudget {
     remaining_free_pages: usize,
@@ -87,8 +93,12 @@ impl AdmissionPageBudget {
         if !self.active {
             return;
         }
-        let new_pages =
-            self.additional_pages_needed(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens);
+        let new_pages = self.additional_pages_needed(
+            slot_idx,
+            prompt_tokens,
+            max_tokens,
+            reserved_prefix_tokens,
+        );
         self.remaining_free_pages = self.remaining_free_pages.saturating_sub(new_pages);
         let target_seq = prompt_tokens
             .saturating_add(max_tokens)
@@ -180,6 +190,82 @@ impl<M: ModelForward> Scheduler<M> {
         budget.can_fit(slot_idx, prompt_tokens, max_tokens, reserved_prefix_tokens)
     }
 
+    fn normalize_waiting_request(
+        &mut self,
+        mut incoming: super::IncomingRequest,
+        length_contract: RequestLengthContract,
+    ) -> Option<(super::IncomingRequest, Vec<u32>)> {
+        if incoming.delta_tx.is_closed() {
+            return None;
+        }
+
+        let prompt_tokens = match incoming.prompt_tokens.take() {
+            Some(tokens) if !tokens.is_empty() => tokens,
+            Some(_) => {
+                error!("Empty cached prompt tokenization, skipping");
+                finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
+                return None;
+            }
+            None => match self.tokenizer.encode(&incoming.prompt) {
+                Ok(tokens) if !tokens.is_empty() => tokens,
+                Ok(_) => {
+                    error!("Empty prompt after tokenization, skipping");
+                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
+                    return None;
+                }
+                Err(e) => {
+                    error!("Tokenization error: {}", e);
+                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
+                    return None;
+                }
+            },
+        };
+
+        if !length_contract.admits_prompt_len(prompt_tokens.len()) {
+            warn!(
+                "Rejecting prompt with {} tokens: scheduler max_input={} max_request={}",
+                prompt_tokens.len(),
+                length_contract.max_request_input_len(),
+                length_contract.max_request_len(),
+            );
+            finish_rejected_request(
+                &incoming.delta_tx,
+                FinishReason::Length,
+                prompt_tokens.len(),
+            );
+            return None;
+        }
+
+        incoming.max_tokens =
+            length_contract.clamp_max_tokens(prompt_tokens.len(), incoming.max_tokens);
+        Some((incoming, prompt_tokens))
+    }
+
+    fn choose_admission_slot(
+        &self,
+        plan: &PrefixAdmissionPlan,
+        free_slots: &[usize],
+    ) -> Option<(usize, usize, usize)> {
+        if free_slots.is_empty() {
+            return None;
+        }
+        if let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) = plan.reusable
+            && free_slots.contains(&slot_idx)
+        {
+            return Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len));
+        }
+        Some((free_slots[0], 0, 0))
+    }
+
+    fn defer_waiting_request(
+        deferred: &mut std::collections::VecDeque<super::IncomingRequest>,
+        mut incoming: super::IncomingRequest,
+        prompt_tokens: Vec<u32>,
+    ) {
+        incoming.prompt_tokens = Some(prompt_tokens);
+        deferred.push_back(incoming);
+    }
+
     /// Canonical admission decision for one incoming prompt.
     ///
     /// Order matters and is intentionally centralized here so the runtime and
@@ -260,6 +346,238 @@ impl<M: ModelForward> Scheduler<M> {
                 Vec::new()
             },
             staged_prefix_plan,
+        }
+    }
+
+    fn collect_admission_candidates(
+        &mut self,
+        free_slots: &[usize],
+        length_contract: RequestLengthContract,
+    ) -> Vec<QueuedAdmissionCandidate> {
+        let mut candidates = Vec::new();
+        let scan_len = self.waiting.len();
+        for _ in 0..scan_len {
+            let Some(incoming) = self.waiting.pop_front() else {
+                break;
+            };
+            let Some((incoming, prompt_tokens)) =
+                self.normalize_waiting_request(incoming, length_contract)
+            else {
+                continue;
+            };
+            let plan = self.build_prefix_admission_plan(&prompt_tokens, free_slots);
+            candidates.push(QueuedAdmissionCandidate {
+                incoming,
+                prompt_tokens,
+                plan,
+            });
+        }
+        candidates
+    }
+
+    fn release_admission_plan(&mut self, plan: &PrefixAdmissionPlan) {
+        self.prefix_cache.release(&plan.radix_blocks);
+    }
+
+    fn admit_waiting_candidate(
+        &mut self,
+        incoming: super::IncomingRequest,
+        prompt_tokens: Vec<u32>,
+        plan: PrefixAdmissionPlan,
+        slot_idx: usize,
+        reusable_prefix_len: usize,
+        reusable_cached_prompt_len: usize,
+    ) {
+        let ready_on_gpu = lookup_blocks_ready_on_gpu(&plan.lookup.blocks);
+        let radix_hit_len = if ready_on_gpu && !plan.lookup.recompute_advised {
+            plan.lookup.matched_len
+        } else {
+            0
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+
+        if let Some(staged) = plan.staged_prefix_plan.as_ref() {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, staged_prefix={}, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                staged.matched_len,
+                self.waiting.len()
+            );
+        } else if plan.direct_gpu_attach {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, radix_gpu_attach={}, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                plan.lookup.matched_len,
+                self.waiting.len()
+            );
+        } else if reusable_prefix_len > 0 {
+            info!(
+                "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
+                id,
+                slot_idx,
+                prompt_tokens.len(),
+                radix_hit_len,
+                reusable_prefix_len,
+                reusable_cached_prompt_len,
+                self.waiting.len()
+            );
+        } else {
+            let bytes_not_on_gpu =
+                plan.lookup.matched_len > 0 && (!ready_on_gpu || plan.lookup.recompute_advised);
+            let no_reusable_free_slot = plan.lookup.matched_len > 0
+                && !plan.gpu_ready_prefix_blocks.is_empty()
+                && plan.reusable.is_none();
+            if bytes_not_on_gpu || no_reusable_free_slot {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    plan.lookup.matched_len,
+                    bytes_not_on_gpu,
+                    no_reusable_free_slot,
+                    self.waiting.len()
+                );
+            } else {
+                info!(
+                    "Request {} → slot {} (prompt={} tokens, queue={})",
+                    id,
+                    slot_idx,
+                    prompt_tokens.len(),
+                    self.waiting.len()
+                );
+            }
+        }
+
+        self.active[slot_idx] = Some(ActiveRequest {
+            id,
+            admitted_at: std::time::Instant::now(),
+            first_token_at: None,
+            prompt: incoming.prompt,
+            prompt_tokens,
+            generated_tokens: Vec::new(),
+            priority: incoming.priority,
+            max_tokens: incoming.max_tokens,
+            sampling: incoming.sampling,
+            stop: incoming.stop,
+            session_id: incoming.session_id,
+            delta_tx: incoming.delta_tx,
+            full_decoded: String::new(),
+            decoded_token_count: 0,
+            sent_len: 0,
+            phase: if plan.staged_prefix_plan.is_some() {
+                Phase::WaitingFetch
+            } else {
+                Phase::Prefilling {
+                    materialized_prefix_len: 0,
+                    effective_tokens: Vec::new(),
+                    progress: 0,
+                }
+            },
+            cacheable_prompt_len: 0,
+            prefix_byte_len: 0,
+            latest_logprob: None,
+            reusable_prefix_len: if plan.direct_gpu_attach {
+                plan.lookup.matched_len
+            } else {
+                reusable_prefix_len
+            },
+            reusable_cached_prompt_len,
+            attached_prefix_blocks: plan.attached_prefix_blocks.clone(),
+            staged_prefix: plan.staged_prefix_plan.clone(),
+        });
+        if incoming.max_tokens == 0 {
+            self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
+            return;
+        }
+        if matches!(
+            self.request(slot_idx).map(|req| &req.phase),
+            Some(Phase::WaitingFetch)
+        ) {
+            let Some(staged_prefix) = self
+                .request(slot_idx)
+                .and_then(|req| req.staged_prefix.as_ref())
+                .cloned()
+            else {
+                self.fallback_to_cold_prefill(slot_idx);
+                return;
+            };
+
+            match staged_prefix.fetch_key() {
+                None => {
+                    warn!(
+                        "Request {}: invalid staged prefix plan, falling back to cold prefill",
+                        id
+                    );
+                    self.fallback_to_cold_prefill(slot_idx);
+                }
+                Some(fetch_key) => {
+                    if let Some(ticket) = self.fetch_dedupe.get(&fetch_key).copied() {
+                        if let Some(req) = self.request_mut(slot_idx)
+                            && let Some(plan) = req.staged_prefix.as_mut()
+                        {
+                            plan.mark_fetching();
+                        }
+                        self.fetch_waiting
+                            .entry(ticket)
+                            .or_default()
+                            .push((slot_idx, id));
+                    } else if self.coordinator_queue_stats().fetch_backpressured() {
+                        let coordinator_stats = self.coordinator_queue_stats();
+                        warn!(
+                            "Request {}: staged fetch backpressured (fetch_q={}/{} waiters={}), falling back to cold prefill",
+                            id,
+                            coordinator_stats.fetch_queue_depth(),
+                            coordinator_stats.queue_capacity(),
+                            coordinator_stats.fetch_waiters,
+                        );
+                        self.fallback_to_cold_prefill(slot_idx);
+                    } else if let Some(fetch_requests) =
+                        staged_prefix.fetch_requests(&self.host_pinned_pool)
+                    {
+                        if let Some(req) = self.request_mut(slot_idx)
+                            && let Some(plan) = req.staged_prefix.as_mut()
+                        {
+                            debug_assert_eq!(plan.state, RequestChunkState::Planned);
+                            plan.mark_fetching();
+                        }
+                        if let Some(ticket) = self.coordinator_handle.submit_fetch(fetch_requests) {
+                            self.fetch_dedupe.insert(fetch_key.clone(), ticket);
+                            self.fetch_ticket_keys.insert(ticket, fetch_key);
+                            self.fetch_waiting.insert(ticket, vec![(slot_idx, id)]);
+                        } else {
+                            let coordinator_stats = self.coordinator_queue_stats();
+                            warn!(
+                                "Request {}: fetch queue full after submit attempt (fetch_q={}/{} waiters={}), falling back to cold prefill",
+                                id,
+                                coordinator_stats.fetch_queue_depth(),
+                                coordinator_stats.queue_capacity(),
+                                coordinator_stats.fetch_waiters,
+                            );
+                            self.fallback_to_cold_prefill(slot_idx);
+                        }
+                    } else {
+                        warn!(
+                            "Request {}: invalid staged prefix fetch request, falling back to cold prefill",
+                            id
+                        );
+                        self.fallback_to_cold_prefill(slot_idx);
+                    }
+                }
+            }
+        } else {
+            self.step_new(slot_idx);
+            if matches!(
+                self.request(slot_idx).map(|req| &req.phase),
+                Some(Phase::Prefilling { .. })
+            ) {
+                self.queue_prefill(slot_idx);
+            }
         }
     }
 
@@ -796,281 +1114,69 @@ impl<M: ModelForward> Scheduler<M> {
             self.paged_kv_pool.max_total_tokens,
             self.effective_max_seq_len,
         );
+        let _ = self.evict_prefix_cache_if_pressured();
+        let mut available_free_slots = self.free_slots();
+        if available_free_slots.is_empty() {
+            return;
+        }
+
+        let candidates = self.collect_admission_candidates(&available_free_slots, length_contract);
         let mut admission_budget = AdmissionPageBudget::from_scheduler(self);
         let mut deferred = std::collections::VecDeque::new();
-        let mut remaining_scans = self.waiting.len();
-        while remaining_scans > 0 && !self.waiting.is_empty() {
-            remaining_scans = remaining_scans.saturating_sub(1);
-            let _ = self.evict_prefix_cache_if_pressured();
-            let free_slots = self.free_slots();
-            if free_slots.is_empty() {
-                break;
-            }
-
-            let mut incoming = self.waiting.pop_front().expect("checked non-empty above");
-            if incoming.delta_tx.is_closed() {
-                continue;
-            }
-            let prompt_tokens = match self.tokenizer.encode(&incoming.prompt) {
-                Ok(tokens) if !tokens.is_empty() => tokens,
-                Ok(_) => {
-                    error!("Empty prompt after tokenization, skipping");
-                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
-                    continue;
-                }
-                Err(e) => {
-                    error!("Tokenization error: {}", e);
-                    finish_rejected_request(&incoming.delta_tx, FinishReason::Length, 0);
-                    continue;
-                }
-            };
-            if !length_contract.admits_prompt_len(prompt_tokens.len()) {
-                warn!(
-                    "Rejecting prompt with {} tokens: scheduler max_input={} max_request={}",
-                    prompt_tokens.len(),
-                    length_contract.max_request_input_len(),
-                    length_contract.max_request_len(),
-                );
-                finish_rejected_request(
-                    &incoming.delta_tx,
-                    FinishReason::Length,
-                    prompt_tokens.len(),
+        for candidate in candidates {
+            let Some((slot_idx, reusable_prefix_len, reusable_cached_prompt_len)) =
+                self.choose_admission_slot(&candidate.plan, &available_free_slots)
+            else {
+                self.release_admission_plan(&candidate.plan);
+                Self::defer_waiting_request(
+                    &mut deferred,
+                    candidate.incoming,
+                    candidate.prompt_tokens,
                 );
                 continue;
-            }
-            incoming.max_tokens =
-                length_contract.clamp_max_tokens(prompt_tokens.len(), incoming.max_tokens);
-
-            let plan = self.build_prefix_admission_plan(&prompt_tokens, &free_slots);
-            let ready_on_gpu = lookup_blocks_ready_on_gpu(&plan.lookup.blocks);
-            let radix_hit_len = if ready_on_gpu && !plan.lookup.recompute_advised {
-                plan.lookup.matched_len
-            } else {
-                0
             };
-            let (slot_idx, reusable_prefix_len, reusable_cached_prompt_len) =
-                plan.reusable.unwrap_or((free_slots[0], 0, 0));
             let reserved_prefix_tokens =
-                self.full_isl_reserved_tokens(&plan, reusable_prefix_len);
+                self.full_isl_reserved_tokens(&candidate.plan, reusable_prefix_len);
             if !self.can_reserve_full_isl(
                 &admission_budget,
                 slot_idx,
-                prompt_tokens.len(),
-                incoming.max_tokens,
+                candidate.prompt_tokens.len(),
+                candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
             ) {
-                self.prefix_cache.release(&plan.radix_blocks);
-                deferred.push_back(incoming);
+                self.release_admission_plan(&candidate.plan);
+                Self::defer_waiting_request(
+                    &mut deferred,
+                    candidate.incoming,
+                    candidate.prompt_tokens,
+                );
                 continue;
             }
-            if plan.attached_prefix_blocks.is_empty() && plan.staged_prefix_plan.is_none() {
-                self.prefix_cache.release(&plan.radix_blocks);
+            if candidate.plan.attached_prefix_blocks.is_empty()
+                && candidate.plan.staged_prefix_plan.is_none()
+            {
+                self.release_admission_plan(&candidate.plan);
             }
             admission_budget.reserve(
                 slot_idx,
-                prompt_tokens.len(),
-                incoming.max_tokens,
+                candidate.prompt_tokens.len(),
+                candidate.incoming.max_tokens,
                 reserved_prefix_tokens,
             );
-
-            let id = self.next_id;
-            self.next_id += 1;
-
-            if let Some(staged) = plan.staged_prefix_plan.as_ref() {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, staged_prefix={}, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    staged.matched_len,
-                    self.waiting.len()
-                );
-            } else if plan.direct_gpu_attach {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, radix_gpu_attach={}, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    plan.lookup.matched_len,
-                    self.waiting.len()
-                );
-            } else if reusable_prefix_len > 0 {
-                info!(
-                    "Request {} → slot {} (prompt={} tokens, radix_hit={}, reusable_prefix={}, cached_len={}, queue={})",
-                    id,
-                    slot_idx,
-                    prompt_tokens.len(),
-                    radix_hit_len,
-                    reusable_prefix_len,
-                    reusable_cached_prompt_len,
-                    self.waiting.len()
-                );
-            } else {
-                let bytes_not_on_gpu =
-                    plan.lookup.matched_len > 0 && (!ready_on_gpu || plan.lookup.recompute_advised);
-                let no_reusable_free_slot = plan.lookup.matched_len > 0
-                    && !plan.gpu_ready_prefix_blocks.is_empty()
-                    && plan.reusable.is_none();
-                // A radix match is only reusable when the bytes already live in
-                // T0 and a free slot still materializes that prefix. When
-                // either precondition fails we degrade to cold prefill, but we
-                // keep both blockers in the log so admission debugging does not
-                // lose the "no reusable free slot" signal behind a staging miss.
-                if bytes_not_on_gpu || no_reusable_free_slot {
-                    info!(
-                        "Request {} → slot {} (prompt={} tokens, radix_hit={} not reusable: bytes_not_on_gpu={}, no_free_slot={}, queue={})",
-                        id,
-                        slot_idx,
-                        prompt_tokens.len(),
-                        plan.lookup.matched_len,
-                        bytes_not_on_gpu,
-                        no_reusable_free_slot,
-                        self.waiting.len()
-                    );
-                } else {
-                    info!(
-                        "Request {} → slot {} (prompt={} tokens, queue={})",
-                        id,
-                        slot_idx,
-                        prompt_tokens.len(),
-                        self.waiting.len()
-                    );
-                }
+            if let Some(pos) = available_free_slots
+                .iter()
+                .position(|&slot| slot == slot_idx)
+            {
+                available_free_slots.remove(pos);
             }
-
-            self.active[slot_idx] = Some(ActiveRequest {
-                id,
-                admitted_at: std::time::Instant::now(),
-                first_token_at: None,
-                prompt: incoming.prompt,
-                prompt_tokens,
-                generated_tokens: Vec::new(),
-                priority: incoming.priority,
-                max_tokens: incoming.max_tokens,
-                sampling: incoming.sampling,
-                stop: incoming.stop,
-                session_id: incoming.session_id,
-                delta_tx: incoming.delta_tx,
-                full_decoded: String::new(),
-                decoded_token_count: 0,
-                sent_len: 0,
-                phase: if plan.staged_prefix_plan.is_some() {
-                    // WaitingFetch is the only parked state left in the CUDA
-                    // scheduler. It exists solely for staged KV readmission and
-                    // always resolves to either:
-                    // 1. `FetchCompleted` -> promote into T0 -> Prefilling
-                    // 2. `FetchFailed` / queue saturation / invalid plan ->
-                    //    cold Prefilling fallback
-                    Phase::WaitingFetch
-                } else {
-                    Phase::Prefilling {
-                        materialized_prefix_len: 0,
-                        effective_tokens: Vec::new(),
-                        progress: 0,
-                    }
-                },
-                cacheable_prompt_len: 0,
-                prefix_byte_len: 0,
-                latest_logprob: None,
-                reusable_prefix_len: if plan.direct_gpu_attach {
-                    plan.lookup.matched_len
-                } else {
-                    reusable_prefix_len
-                },
+            self.admit_waiting_candidate(
+                candidate.incoming,
+                candidate.prompt_tokens,
+                candidate.plan,
+                slot_idx,
+                reusable_prefix_len,
                 reusable_cached_prompt_len,
-                attached_prefix_blocks: plan.attached_prefix_blocks.clone(),
-                staged_prefix: plan.staged_prefix_plan.clone(),
-            });
-            if incoming.max_tokens == 0 {
-                self.finish_request(slot_idx, crate::server_engine::FinishReason::Length);
-                continue;
-            }
-            if matches!(
-                self.request(slot_idx).map(|req| &req.phase),
-                Some(Phase::WaitingFetch)
-            ) {
-                let Some(staged_prefix) = self
-                    .request(slot_idx)
-                    .and_then(|req| req.staged_prefix.as_ref())
-                    .cloned()
-                else {
-                    self.fallback_to_cold_prefill(slot_idx);
-                    continue;
-                };
-
-                match staged_prefix.fetch_key() {
-                    None => {
-                        warn!(
-                            "Request {}: invalid staged prefix plan, falling back to cold prefill",
-                            id
-                        );
-                        self.fallback_to_cold_prefill(slot_idx);
-                    }
-                    Some(fetch_key) => {
-                        if let Some(ticket) = self.fetch_dedupe.get(&fetch_key).copied() {
-                            if let Some(req) = self.request_mut(slot_idx) {
-                                if let Some(plan) = req.staged_prefix.as_mut() {
-                                    plan.mark_fetching();
-                                }
-                            }
-                            self.fetch_waiting
-                                .entry(ticket)
-                                .or_default()
-                                .push((slot_idx, id));
-                        } else if self.coordinator_queue_stats().fetch_backpressured() {
-                            let coordinator_stats = self.coordinator_queue_stats();
-                            warn!(
-                                "Request {}: staged fetch backpressured (fetch_q={}/{} waiters={}), falling back to cold prefill",
-                                id,
-                                coordinator_stats.fetch_queue_depth(),
-                                coordinator_stats.queue_capacity(),
-                                coordinator_stats.fetch_waiters,
-                            );
-                            self.fallback_to_cold_prefill(slot_idx);
-                        } else if let Some(fetch_requests) =
-                            staged_prefix.fetch_requests(&self.host_pinned_pool)
-                        {
-                            if let Some(req) = self.request_mut(slot_idx) {
-                                if let Some(plan) = req.staged_prefix.as_mut() {
-                                    debug_assert_eq!(plan.state, RequestChunkState::Planned);
-                                    plan.mark_fetching();
-                                }
-                            }
-                            if let Some(ticket) =
-                                self.coordinator_handle.submit_fetch(fetch_requests)
-                            {
-                                self.fetch_dedupe.insert(fetch_key.clone(), ticket);
-                                self.fetch_ticket_keys.insert(ticket, fetch_key);
-                                self.fetch_waiting.insert(ticket, vec![(slot_idx, id)]);
-                            } else {
-                                let coordinator_stats = self.coordinator_queue_stats();
-                                warn!(
-                                    "Request {}: fetch queue full after submit attempt (fetch_q={}/{} waiters={}), falling back to cold prefill",
-                                    id,
-                                    coordinator_stats.fetch_queue_depth(),
-                                    coordinator_stats.queue_capacity(),
-                                    coordinator_stats.fetch_waiters,
-                                );
-                                self.fallback_to_cold_prefill(slot_idx);
-                            }
-                        } else {
-                            warn!(
-                                "Request {}: invalid staged prefix fetch request, falling back to cold prefill",
-                                id
-                            );
-                            self.fallback_to_cold_prefill(slot_idx);
-                        }
-                    }
-                }
-            } else {
-                self.step_new(slot_idx);
-                if matches!(
-                    self.request(slot_idx).map(|req| &req.phase),
-                    Some(Phase::Prefilling { .. })
-                ) {
-                    self.queue_prefill(slot_idx);
-                }
-            }
+            );
         }
         while let Some(req) = deferred.pop_back() {
             self.waiting.push_front(req);
