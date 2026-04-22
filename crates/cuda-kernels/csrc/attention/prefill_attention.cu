@@ -109,49 +109,6 @@ __global__ void prefill_kv_cache_write_kernel(
 }
 
 // ============================================================================
-// Kernel 3: Batch write K and V to both contiguous KV cache and paged KV pool
-//
-// Grid: (num_kv_heads, seq_len), Block: head_dim
-// K is already normed+RoPE'd, V is raw.
-// ============================================================================
-__global__ void prefill_kv_cache_dual_write_kernel(
-    const __nv_bfloat16* __restrict__ k,   // [kv_dim, seq_len] normed+RoPE'd
-    const __nv_bfloat16* __restrict__ v,   // [kv_dim, seq_len]
-    __nv_bfloat16* __restrict__ k_cache,   // [num_kv_heads * max_seq * head_dim]
-    __nv_bfloat16* __restrict__ v_cache,
-    int head_dim, int kv_dim, int max_seq_len, int start_pos,
-    const int* __restrict__ page_table,
-    int page_size,
-    __nv_bfloat16* __restrict__ k_pool,
-    __nv_bfloat16* __restrict__ v_pool
-) {
-    int kv_head = blockIdx.x;
-    int token = blockIdx.y;
-    int d = threadIdx.x;
-
-    int src_offset = kv_head * head_dim + d + token * kv_dim;
-    int dst_offset = kv_head * max_seq_len * head_dim + (start_pos + token) * head_dim + d;
-
-    __nv_bfloat16 k_val = k[src_offset];
-    __nv_bfloat16 v_val = v[src_offset];
-    k_cache[dst_offset] = k_val;
-    v_cache[dst_offset] = v_val;
-
-    if (page_table != nullptr) {
-        int logical_tok = start_pos + token;
-        int pg = page_table[logical_tok / page_size];
-        int off = logical_tok % page_size;
-        int pool_off = pg * (gridDim.x * page_size * head_dim)
-                     + kv_head * page_size * head_dim
-                     + off * head_dim
-                     + d;
-        k_pool[pool_off] = k_val;
-        v_pool[pool_off] = v_val;
-    }
-}
-
-
-// ============================================================================
 // C API: Prefill attention preparation (QK norm + RoPE + KV cache write)
 //
 // Steps 1-2 of the prefill attention pipeline:
@@ -200,51 +157,6 @@ cudaError_t prefill_attention_prep_cuda(
     prefill_kv_cache_write_kernel<<<cache_grid, head_dim, 0, stream>>>(
         k_batch, v_batch, k_cache, v_cache,
         head_dim, kv_dim, max_seq_len, start_pos
-    );
-    return cudaGetLastError();
-}
-
-cudaError_t prefill_attention_prep_dual_write_cuda(
-    __nv_bfloat16* q_batch,          // [q_dim, seq_len] modified in-place (normed+RoPE'd)
-    __nv_bfloat16* k_batch,          // [kv_dim, seq_len] modified in-place (normed+RoPE'd)
-    const __nv_bfloat16* v_batch,    // [kv_dim, seq_len]
-    const __nv_bfloat16* q_norm_weight,
-    const __nv_bfloat16* k_norm_weight,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    __nv_bfloat16* k_cache,          // [num_kv_heads * max_seq * head_dim]
-    __nv_bfloat16* v_cache,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int seq_len,
-    int start_pos,
-    int max_seq_len,
-    float rms_eps,
-    cudaStream_t stream,
-    const int* page_table,
-    int page_size,
-    __nv_bfloat16* k_pool,
-    __nv_bfloat16* v_pool
-) {
-    int q_dim = num_q_heads * head_dim;
-    int kv_dim = num_kv_heads * head_dim;
-
-    // Step 1: QK norm + RoPE (in-place)
-    dim3 norm_grid(num_q_heads + num_kv_heads, seq_len);
-    prefill_qk_norm_rope_kernel<<<norm_grid, head_dim, 0, stream>>>(
-        q_batch, k_batch, q_norm_weight, k_norm_weight,
-        cos_cache, sin_cache,
-        num_q_heads, num_kv_heads, head_dim,
-        seq_len, q_dim, kv_dim, start_pos, rms_eps
-    );
-
-    // Step 2: Write K, V to contiguous cache and paged pool
-    dim3 cache_grid(num_kv_heads, seq_len);
-    prefill_kv_cache_dual_write_kernel<<<cache_grid, head_dim, 0, stream>>>(
-        k_batch, v_batch, k_cache, v_cache,
-        head_dim, kv_dim, max_seq_len, start_pos,
-        page_table, page_size, k_pool, v_pool
     );
     return cudaGetLastError();
 }

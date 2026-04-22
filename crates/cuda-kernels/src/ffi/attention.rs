@@ -22,30 +22,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn prefill_attention_prep_dual_write_cuda(
-        q_batch: *mut Half,
-        k_batch: *mut Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        k_cache: *mut Half,
-        v_cache: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        start_pos: i32,
-        max_seq_len: i32,
-        rms_eps: f32,
-        stream: CUstream,
-        page_table: *const i32,
-        page_size: i32,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-    ) -> CUresult;
-
     pub fn prefill_attention_paged_prep_cuda(
         q_batch: *mut Half,
         k_batch: *mut Half,
