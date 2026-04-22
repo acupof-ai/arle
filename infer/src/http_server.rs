@@ -1963,6 +1963,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completion_rejects_unsupported_message_role_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"developer","content":"hi"}],"max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("messages[0].role")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_completion_streaming() {
         let app = build_app(mock_scheduler("Qwen3-8B"));
         let request = Request::builder()
@@ -2670,6 +2696,36 @@ mod tests {
             payload["error"]["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("parallel_tool_calls")),
+            "payload={payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_rejects_non_function_tools_with_structured_error() {
+        let app = build_app(mock_scheduler("Qwen3-4B"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "input":"hello",
+                    "max_output_tokens":1,
+                    "tools":[{"type":"web_search","function":{"name":"search"}}]
+                }"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_parameter");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("tools[0].type")),
             "payload={payload}"
         );
     }

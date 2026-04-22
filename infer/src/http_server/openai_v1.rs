@@ -5,7 +5,8 @@ use crate::error::ApiError;
 use crate::server_engine::{CompletionOutput, CompletionStreamDelta};
 use crate::types::SessionId;
 use chat::{
-    OpenAiChatContent, OpenAiChatMessage, OpenAiToolDefinition, ToolCall, openai_parse_tool_calls,
+    OpenAiChatContent, OpenAiChatMessage, OpenAiToolCall, OpenAiToolDefinition, ToolCall,
+    openai_parse_tool_calls,
 };
 
 /// Normalize a raw string session hint from a client request. Empty / whitespace
@@ -19,7 +20,8 @@ fn normalize_session_id(raw: Option<&str>) -> Option<SessionId> {
     }
 }
 
-fn invalid_parameter(field: &'static str, detail: impl Into<String>) -> ApiError {
+fn invalid_parameter(field: impl AsRef<str>, detail: impl Into<String>) -> ApiError {
+    let field = field.as_ref();
     ApiError::bad_request(
         format!("Invalid `{field}`: {}", detail.into()),
         "invalid_parameter",
@@ -145,24 +147,22 @@ fn validate_logprobs(value: Option<u32>) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_text_only_content(
-    content: &OpenAiChatContent,
-    field: &'static str,
-) -> Result<(), ApiError> {
+fn validate_text_only_content(content: &OpenAiChatContent, field: &str) -> Result<(), ApiError> {
     let OpenAiChatContent::Parts(parts) = content else {
         return Ok(());
     };
 
-    for part in parts {
+    for (index, part) in parts.iter().enumerate() {
+        let part_field = format!("{field}[{index}]");
         let Some(part_type) = part.get("type").and_then(serde_json::Value::as_str) else {
             return Err(invalid_parameter(
-                field,
+                format!("{part_field}.type"),
                 "content parts must include a string `type`",
             ));
         };
         if part_type != "text" {
             return Err(invalid_parameter(
-                field,
+                format!("{part_field}.type"),
                 format!("content part type `{part_type}` is not supported on this server yet"),
             ));
         }
@@ -172,7 +172,7 @@ fn validate_text_only_content(
             .is_none()
         {
             return Err(invalid_parameter(
-                field,
+                format!("{part_field}.text"),
                 "text content parts must include a string `text`",
             ));
         }
@@ -181,15 +181,134 @@ fn validate_text_only_content(
     Ok(())
 }
 
-fn validate_text_only_messages(
-    messages: &[OpenAiChatMessage],
-    field: &'static str,
-) -> Result<(), ApiError> {
-    for message in messages {
-        if let Some(content) = &message.content {
-            validate_text_only_content(content, field)?;
+fn validate_tool_call(tool_call: &OpenAiToolCall, field: &str) -> Result<(), ApiError> {
+    if tool_call.call_type != "function" {
+        return Err(invalid_parameter(
+            format!("{field}.type"),
+            format!(
+                "tool call type `{}` is not supported on this server yet",
+                tool_call.call_type
+            ),
+        ));
+    }
+    if tool_call.function.name.trim().is_empty() {
+        return Err(invalid_parameter(
+            format!("{field}.function.name"),
+            "must be a non-empty string",
+        ));
+    }
+    if serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments).is_err() {
+        return Err(invalid_parameter(
+            format!("{field}.function.arguments"),
+            "must be a valid JSON-encoded string",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_supported_message(message: &OpenAiChatMessage, field: &str) -> Result<(), ApiError> {
+    match message.role.as_str() {
+        "system" | "user" | "assistant" | "tool" => {}
+        other => {
+            return Err(invalid_parameter(
+                format!("{field}.role"),
+                format!(
+                    "role `{other}` is not supported on this server yet; expected system, user, assistant, or tool"
+                ),
+            ));
         }
     }
+
+    if let Some(content) = &message.content {
+        validate_text_only_content(content, &format!("{field}.content"))?;
+    }
+
+    if message.role == "assistant" {
+        for (index, tool_call) in message.tool_calls.iter().enumerate() {
+            validate_tool_call(tool_call, &format!("{field}.tool_calls[{index}]"))?;
+        }
+    } else if !message.tool_calls.is_empty() {
+        return Err(invalid_parameter(
+            format!("{field}.tool_calls"),
+            "is only supported on assistant messages",
+        ));
+    }
+
+    if message.role == "tool" {
+        if message
+            .tool_call_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(invalid_parameter(
+                format!("{field}.tool_call_id"),
+                "is required on tool messages",
+            ));
+        }
+    } else if message.tool_call_id.is_some() {
+        return Err(invalid_parameter(
+            format!("{field}.tool_call_id"),
+            "is only supported on tool messages",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_supported_messages(
+    messages: &[OpenAiChatMessage],
+    field: &str,
+) -> Result<(), ApiError> {
+    for (index, message) in messages.iter().enumerate() {
+        validate_supported_message(message, &format!("{field}[{index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_supported_tool_definitions(
+    tools: &[OpenAiToolDefinition],
+    field: &str,
+) -> Result<(), ApiError> {
+    for (index, tool) in tools.iter().enumerate() {
+        let tool_field = format!("{field}[{index}]");
+        if tool.tool_type != "function" {
+            return Err(invalid_parameter(
+                format!("{tool_field}.type"),
+                format!(
+                    "tool type `{}` is not supported on this server yet",
+                    tool.tool_type
+                ),
+            ));
+        }
+        if tool.function.name.trim().is_empty() {
+            return Err(invalid_parameter(
+                format!("{tool_field}.function.name"),
+                "must be a non-empty string",
+            ));
+        }
+        if tool
+            .function
+            .parameters
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid_parameter(
+                format!("{tool_field}.function.parameters"),
+                "must be a JSON object when provided",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_supported_messages_and_tools(
+    messages: &[OpenAiChatMessage],
+    message_field: &str,
+    tools: &[OpenAiToolDefinition],
+    tools_field: &str,
+) -> Result<(), ApiError> {
+    validate_supported_messages(messages, message_field)?;
+    validate_supported_tool_definitions(tools, tools_field)?;
     Ok(())
 }
 
@@ -557,7 +676,7 @@ impl ChatCompletionRequest {
             self.frequency_penalty,
             self.presence_penalty,
         )?;
-        validate_text_only_messages(&self.messages, "messages")?;
+        validate_supported_messages_and_tools(&self.messages, "messages", &self.tools, "tools")?;
         Ok(())
     }
 
@@ -831,12 +950,13 @@ impl ResponsesRequest {
             self.frequency_penalty,
             self.presence_penalty,
         )?;
+        validate_supported_tool_definitions(&self.tools, "tools")?;
         match &self.input {
             ResponsesInput::Text(_) => {}
             ResponsesInput::Message(message) => {
-                validate_text_only_messages(std::slice::from_ref(message), "input")?;
+                validate_supported_messages(std::slice::from_ref(message), "input")?;
             }
-            ResponsesInput::Messages(messages) => validate_text_only_messages(messages, "input")?,
+            ResponsesInput::Messages(messages) => validate_supported_messages(messages, "input")?,
         }
         Ok(())
     }
@@ -1163,6 +1283,78 @@ mod tests {
             .expect_err("non-text message parts should fail");
         assert_eq!(err.body.code, "invalid_parameter");
         assert!(err.body.message.contains("image_url"));
+    }
+
+    #[test]
+    fn chat_request_rejects_unknown_message_role() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"developer","content":"hi"}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("unsupported message roles should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("messages[0].role"));
+        assert!(err.body.message.contains("developer"));
+    }
+
+    #[test]
+    fn chat_request_rejects_non_function_tools() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"web_search","function":{"name":"search"}}]
+            }"#,
+        )
+        .unwrap();
+        let err = req.validate().expect_err("non-function tools should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("tools[0].type"));
+        assert!(err.body.message.contains("web_search"));
+    }
+
+    #[test]
+    fn chat_request_rejects_invalid_assistant_tool_call_arguments() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages":[{
+                    "role":"assistant",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"shell","arguments":"not-json"}
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("invalid assistant tool_call arguments should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(
+            err.body
+                .message
+                .contains("messages[0].tool_calls[0].function.arguments")
+        );
+    }
+
+    #[test]
+    fn responses_request_rejects_tool_message_without_tool_call_id() {
+        let req: ResponsesRequest = serde_json::from_str(
+            r#"{
+                "input":[{"role":"tool","content":"done"}]
+            }"#,
+        )
+        .unwrap();
+        let err = req
+            .validate()
+            .expect_err("tool messages without tool_call_id should fail");
+        assert_eq!(err.body.code, "invalid_parameter");
+        assert!(err.body.message.contains("input[0].tool_call_id"));
     }
 
     #[test]
