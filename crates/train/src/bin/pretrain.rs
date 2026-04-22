@@ -47,18 +47,39 @@ use train::{
         GenerationConfigSource as Qwen35GenerationConfigSource, Qwen35CheckpointError,
         Qwen35StepCheckpoint, save_step_checkpoint as save_qwen35_step_checkpoint,
     },
-    tokenizer::ChatTokenizer,
+    tokenizer::{ChatTokenizer, ResolvedSpecialToken},
     trainer::cross_entropy_loss,
 };
-
-// Qwen3 tokenizer defaults — infer/Config requires both fields.
-const DEFAULT_BOS_TOKEN_ID: u32 = 151_643;
-const DEFAULT_EOS_TOKEN_ID: u32 = 151_645;
 
 const DEFAULT_BETAS: (f32, f32) = (0.9, 0.999);
 const DEFAULT_EPS: f32 = 1.0e-8;
 const DEFAULT_WEIGHT_DECAY: f32 = 0.01;
 const STOP_REQUESTED_ERR: &str = "pretrain: operator stop requested";
+const DEFAULT_BOS_TOKEN_CANDIDATES: &[&str] = &[
+    "<|begin_of_text|>",
+    "<s>",
+    "<|endoftext|>",
+    "<bos>",
+    "<|bos|>",
+    "[BOS]",
+    "<|im_start|>",
+];
+const DEFAULT_EOS_TOKEN_CANDIDATES: &[&str] = &[
+    "<|im_end|>",
+    "</s>",
+    "<|endoftext|>",
+    "<eos>",
+    "<|eos|>",
+    "[EOS]",
+];
+const RESOLVED_SPECIAL_TOKEN_IDS_ERR: &str =
+    "pretrain: special token ids must be resolved before building config";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSpecialTokenIds {
+    bos: ResolvedSpecialToken,
+    eos: ResolvedSpecialToken,
+}
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -94,8 +115,10 @@ struct CliArgs {
     rope_theta: f32,
     tie_word_embeddings: bool,
     linear_attn_every: usize,
-    bos_token_id: u32,
-    eos_token_id: u32,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+    bos_token_id: Option<u32>,
+    eos_token_id: Option<u32>,
     metrics_jsonl: Option<PathBuf>,
     serve: Option<u16>,
 }
@@ -134,11 +157,23 @@ impl Default for CliArgs {
             rope_theta: 1_000_000.0,
             tie_word_embeddings: true,
             linear_attn_every: 0,
-            bos_token_id: DEFAULT_BOS_TOKEN_ID,
-            eos_token_id: DEFAULT_EOS_TOKEN_ID,
+            bos_token: None,
+            eos_token: None,
+            bos_token_id: None,
+            eos_token_id: None,
             metrics_jsonl: None,
             serve: None,
         }
+    }
+}
+
+impl CliArgs {
+    fn resolved_bos_token_id(&self) -> u32 {
+        self.bos_token_id.expect(RESOLVED_SPECIAL_TOKEN_IDS_ERR)
+    }
+
+    fn resolved_eos_token_id(&self) -> u32 {
+        self.eos_token_id.expect(RESOLVED_SPECIAL_TOKEN_IDS_ERR)
     }
 }
 
@@ -339,9 +374,9 @@ impl PretrainFamily for Qwen35Family {
             num_hidden_layers: args.num_hidden_layers,
             vocab_size,
             rms_norm_eps: args.rms_norm_eps,
-            stop_token_ids: vec![args.eos_token_id],
-            bos_token_id: Some(args.bos_token_id),
-            eos_token_id: args.eos_token_id,
+            stop_token_ids: vec![args.resolved_eos_token_id()],
+            bos_token_id: Some(args.resolved_bos_token_id()),
+            eos_token_id: args.resolved_eos_token_id(),
             tie_word_embeddings: args.tie_word_embeddings,
             num_attention_heads: args.num_attention_heads,
             num_key_value_heads: args.num_kv_heads.max(1),
@@ -446,9 +481,12 @@ fn main() -> Result<(), CliError> {
 }
 
 fn run() -> Result<(), CliError> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     validate_args(&args)?;
     let tokenizer = ChatTokenizer::from_file(&args.tokenizer)?;
+    let special_tokens = resolve_special_token_ids(&args, &tokenizer)?;
+    args.bos_token_id = Some(special_tokens.bos.id);
+    args.eos_token_id = Some(special_tokens.eos.id);
     let vocab_size = args.vocab_size.unwrap_or_else(|| tokenizer.vocab_size());
 
     match resolve_pretrain_family(args.model_family) {
@@ -492,6 +530,13 @@ fn run_with_family<F: PretrainFamily>(
     println!("backend: {:?}", backend.device());
     println!("family={}", F::family_name());
     println!("config: {}", F::describe_config(&cfg));
+    println!(
+        "[pretrain] tokenizer special tokens: bos={} ({:?}), eos={} ({:?})",
+        args.resolved_bos_token_id(),
+        tokenizer.id_to_token(args.resolved_bos_token_id()),
+        args.resolved_eos_token_id(),
+        tokenizer.id_to_token(args.resolved_eos_token_id()),
+    );
 
     let mut store = TensorStore::with_backend(Arc::clone(&backend));
     let mut tape = Tape::new();
@@ -629,6 +674,14 @@ fn run_with_family<F: PretrainFamily>(
         ("backend", backend_name),
         ("out", out_dir_string.as_str()),
     ];
+    let bos_token_string = tokenizer
+        .id_to_token(args.resolved_bos_token_id())
+        .unwrap_or_else(|| format!("<id:{}>", args.resolved_bos_token_id()));
+    let eos_token_string = tokenizer
+        .id_to_token(args.resolved_eos_token_id())
+        .unwrap_or_else(|| format!("<id:{}>", args.resolved_eos_token_id()));
+    run_start_strings.push(("bos_token", bos_token_string.as_str()));
+    run_start_strings.push(("eos_token", eos_token_string.as_str()));
     if let Some(path) = resume_dir_string.as_deref() {
         run_start_strings.push(("resume_from", path));
     }
@@ -637,6 +690,8 @@ fn run_with_family<F: PretrainFamily>(
         ("batch_size", batch_size as f64),
         ("grad_accum_steps", grad_accum as f64),
         ("seq", args.seq as f64),
+        ("bos_token_id", args.resolved_bos_token_id() as f64),
+        ("eos_token_id", args.resolved_eos_token_id() as f64),
     ];
     let run_start_bools = [("resumed", resume_dir_canonical.is_some())];
     emit_run_start(
@@ -792,8 +847,8 @@ fn run_with_family<F: PretrainFamily>(
     let out_dir = args.out.clone();
     let tokenizer_path = args.tokenizer.clone();
     let save_dtype = args.save_dtype;
-    let bos_token_id = args.bos_token_id;
-    let eos_token_id = args.eos_token_id;
+    let bos_token_id = args.resolved_bos_token_id();
+    let eos_token_id = args.resolved_eos_token_id();
     let cfg_ref = cfg.clone();
     let metrics_for_hooks = metrics.clone();
     let controller_for_hooks = Arc::clone(&controller);
@@ -1026,11 +1081,13 @@ where
             "--linear-attn-every" => {
                 args.linear_attn_every = parse_value(&flag, next_value(&mut iter, &flag)?)?;
             }
+            "--bos-token" => args.bos_token = Some(next_value(&mut iter, &flag)?),
+            "--eos-token" => args.eos_token = Some(next_value(&mut iter, &flag)?),
             "--bos-token-id" => {
-                args.bos_token_id = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+                args.bos_token_id = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
             "--eos-token-id" => {
-                args.eos_token_id = parse_value(&flag, next_value(&mut iter, &flag)?)?;
+                args.eos_token_id = Some(parse_value(&flag, next_value(&mut iter, &flag)?)?);
             }
             "--metrics-jsonl" => {
                 args.metrics_jsonl = Some(PathBuf::from(next_value(&mut iter, &flag)?));
@@ -1101,6 +1158,37 @@ fn validate_args(args: &CliArgs) -> Result<(), CliError> {
         ));
     }
     Ok(())
+}
+
+fn resolve_special_token_ids(
+    args: &CliArgs,
+    tokenizer: &ChatTokenizer,
+) -> Result<ResolvedSpecialTokenIds, CliError> {
+    let eos = tokenizer
+        .resolve_special_token(
+            "eos",
+            args.eos_token_id,
+            args.eos_token.as_deref(),
+            DEFAULT_EOS_TOKEN_CANDIDATES,
+        )?
+        .ok_or_else(|| {
+            CliError::Custom(format!(
+                "unable to infer EOS token from tokenizer {}; pass --eos-token or --eos-token-id",
+                args.tokenizer.display()
+            ))
+        })?;
+    let bos = tokenizer
+        .resolve_special_token(
+            "bos",
+            args.bos_token_id,
+            args.bos_token.as_deref(),
+            DEFAULT_BOS_TOKEN_CANDIDATES,
+        )?
+        .unwrap_or_else(|| ResolvedSpecialToken {
+            id: eos.id,
+            token: eos.token.clone(),
+        });
+    Ok(ResolvedSpecialTokenIds { bos, eos })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1176,8 +1264,8 @@ fn save_qwen35_checkpoint(
             tokenizer_path: Some(tokenizer_path),
             config_json: Qwen35ConfigJsonSource::Synthesize { cfg, torch_dtype },
             generation_config: Qwen35GenerationConfigSource::Synthesize {
-                bos_token_id: Some(bos_token_id).or(cfg.bos_token_id),
-                eos_token_id: eos_token_id.max(cfg.eos_token_id),
+                bos_token_id: Some(bos_token_id),
+                eos_token_id,
             },
         },
         |weights_path| {
@@ -1248,8 +1336,10 @@ mod tests {
             rope_theta: 10_000.0,
             tie_word_embeddings: true,
             linear_attn_every: 0,
-            bos_token_id: 1,
-            eos_token_id: 2,
+            bos_token: None,
+            eos_token: None,
+            bos_token_id: Some(1),
+            eos_token_id: Some(2),
             metrics_jsonl: None,
             serve: None,
         }
@@ -1307,8 +1397,8 @@ mod tests {
         );
         assert_eq!(cfg.num_experts, 0);
         assert_eq!(cfg.rope_cache_len_hint, Some(args.max_position_embeddings));
-        assert_eq!(cfg.bos_token_id, Some(args.bos_token_id));
-        assert_eq!(cfg.eos_token_id, args.eos_token_id);
+        assert_eq!(cfg.bos_token_id, args.bos_token_id);
+        assert_eq!(cfg.eos_token_id, args.eos_token_id.expect("resolved eos"));
         Ok(())
     }
 
@@ -1387,6 +1477,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_special_token_overrides() {
+        let args = parse_args_from(
+            vec![
+                "--corpus",
+                "corpus.txt",
+                "--tokenizer",
+                "tok.json",
+                "--out",
+                "ckpt",
+                "--bos-token",
+                "<s>",
+                "--eos-token",
+                "</s>",
+                "--bos-token-id",
+                "1",
+                "--eos-token-id",
+                "2",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("parse special token overrides");
+        assert_eq!(args.bos_token.as_deref(), Some("<s>"));
+        assert_eq!(args.eos_token.as_deref(), Some("</s>"));
+        assert_eq!(args.bos_token_id, Some(1));
+        assert_eq!(args.eos_token_id, Some(2));
+    }
+
+    #[test]
     fn validate_args_rejects_zero_grad_accum_steps() {
         let mut args = tiny_args();
         args.corpus = PathBuf::from("corpus.txt");
@@ -1399,6 +1518,28 @@ mod tests {
             CliError::Arg(ArgError::InvalidValue { flag, value })
                 if flag == "--grad-accum-steps" && value == "0"
         ));
+    }
+
+    #[test]
+    fn resolve_special_token_ids_falls_back_to_single_endoftext_token() -> Result<(), CliError> {
+        let dir = tempdir().expect("tempdir");
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        train::tokenizer::write_wordlevel_tokenizer(
+            &tokenizer_path,
+            ["hello", "world"],
+            ["<|endoftext|>"],
+        )?;
+        let tokenizer = ChatTokenizer::from_file(&tokenizer_path)?;
+        let mut args = tiny_args();
+        args.corpus = PathBuf::from("corpus.txt");
+        args.tokenizer = tokenizer_path;
+        args.out = PathBuf::from("out");
+        args.bos_token_id = None;
+        args.eos_token_id = None;
+        let resolved = resolve_special_token_ids(&args, &tokenizer)?;
+        assert_eq!(resolved.bos.id, resolved.eos.id);
+        assert_eq!(resolved.bos.token, "<|endoftext|>");
+        Ok(())
     }
 
     #[test]
@@ -1474,8 +1615,8 @@ mod tests {
             &mut store,
             &cfg,
             &tokenizer_path,
-            args.bos_token_id,
-            args.eos_token_id,
+            args.resolved_bos_token_id(),
+            args.resolved_eos_token_id(),
             SaveDtype::F32,
         )?;
 
@@ -1559,8 +1700,8 @@ mod tests {
             &mut store,
             &cfg,
             &tokenizer_path,
-            args.bos_token_id,
-            args.eos_token_id,
+            args.resolved_bos_token_id(),
+            args.resolved_eos_token_id(),
             SaveDtype::F32,
         )?;
 
