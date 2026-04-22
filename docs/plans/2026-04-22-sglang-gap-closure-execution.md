@@ -57,10 +57,9 @@ That pointed at one bottleneck cluster:
   - full-ISL reservation in `assign_slots()`
   - explicit prefill planner `score -> fit` structure
   - one canonical mutable prefill token budget
-- Qwen3.5 paged-prefill full-forward graph is on the canonical path, with one
-  remaining correctness guard: replay is invalidated when the captured
-  `start_pos` changes because that scalar is still baked into the prep-kernel
-  launch parameters.
+- Qwen3.5 paged-prefill full-forward graph now reuses safely across chunk
+  offsets because `start_pos` is uploaded through stable device-backed metadata
+  instead of being baked into the prep-kernel launch parameters.
 
 ## Landed tracks
 
@@ -73,8 +72,8 @@ That pointed at one bottleneck cluster:
 - the contiguous prefill fallback is no longer the default path
 - paged-prefill full-forward graph capture/replay is wired onto the canonical
   prefill path
-- graph replay is invalidated when the page-index buffer reallocates or the
-  captured `start_pos` changes
+- graph replay is invalidated only when a pointer-stable prerequisite such as
+  the page-index buffer storage changes
 
 **Primary files**
 
@@ -146,6 +145,7 @@ That pointed at one bottleneck cluster:
 - `e99be66` `feat(scheduler): make fetch waits event-driven`
 - `50ab021` `refactor(scheduler): canonicalize prefill planner budget`
 - `5dfde31` `fix(qwen35): guard paged-prefill graph start-pos reuse`
+- `pending` `fix(qwen35): make paged-prefill graph start-pos device-backed`
 
 ## Parallelization shape used
 

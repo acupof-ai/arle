@@ -119,6 +119,7 @@ pub(super) struct PagedPrefillMetadata35 {
     pub qo_indptr_gpu: CudaSlice<i32>,
     pub kv_indptr_gpu: CudaSlice<i32>,
     pub kv_last_page_len_gpu: CudaSlice<i32>,
+    pub start_pos_gpu: CudaSlice<i32>,
     pub num_pages: usize,
     token_ids_host: Vec<i32>,
     page_indices_host: Vec<i32>,
@@ -146,6 +147,10 @@ impl PagedPrefillMetadata35 {
             .stream
             .alloc_zeros(1)
             .map_err(|e| anyhow::anyhow!("Alloc kv_last_page_len failed: {e}"))?;
+        let start_pos_gpu = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(|e| anyhow::anyhow!("Alloc start_pos failed: {e}"))?;
 
         Ok(Self {
             token_ids_gpu,
@@ -153,6 +158,7 @@ impl PagedPrefillMetadata35 {
             qo_indptr_gpu,
             kv_indptr_gpu,
             kv_last_page_len_gpu,
+            start_pos_gpu,
             num_pages: 0,
             token_ids_host: vec![0; seq_len],
             page_indices_host: Vec::with_capacity(initial_pages.max(1)),
@@ -203,6 +209,7 @@ impl PagedPrefillMetadata35 {
         } else {
             ((start_pos + seq_len - 1) % page_size + 1) as i32
         }];
+        let start_pos = [start_pos as i32];
         ctx.stream
             .memcpy_htod(&qo_indptr, &mut self.qo_indptr_gpu)
             .map_err(|e| anyhow::anyhow!("qo_indptr H2D failed: {e}"))?;
@@ -212,6 +219,9 @@ impl PagedPrefillMetadata35 {
         ctx.stream
             .memcpy_htod(&kv_last_page_len, &mut self.kv_last_page_len_gpu)
             .map_err(|e| anyhow::anyhow!("kv_last_page_len H2D failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&start_pos, &mut self.start_pos_gpu)
+            .map_err(|e| anyhow::anyhow!("start_pos H2D failed: {e}"))?;
         self.num_pages = num_pages;
 
         Ok(page_indices_reallocated)
@@ -250,7 +260,6 @@ pub(super) struct PagedPrefillBuffers35 {
     pub metadata: PagedPrefillMetadata35,
     pub plan: BatchPrefillPagedPlan,
     pub graph_state: CudaGraphState,
-    captured_start_pos: Option<usize>,
 }
 
 impl PagedPrefillBuffers35 {
@@ -305,7 +314,6 @@ impl PagedPrefillBuffers35 {
                 config.num_attention_heads,
             )?,
             graph_state: CudaGraphState::new(),
-            captured_start_pos: None,
         })
     }
 
@@ -315,20 +323,6 @@ impl PagedPrefillBuffers35 {
 
     pub(super) fn invalidate_graph(&mut self) {
         self.graph_state = CudaGraphState::new();
-        self.captured_start_pos = None;
-    }
-
-    pub(super) fn invalidate_graph_if_start_pos_changed(&mut self, start_pos: usize) {
-        if self
-            .captured_start_pos
-            .is_some_and(|captured| captured != start_pos)
-        {
-            self.invalidate_graph();
-        }
-    }
-
-    pub(super) fn mark_graph_start_pos(&mut self, start_pos: usize) {
-        self.captured_start_pos = Some(start_pos);
     }
 
     pub(super) fn clear_logits(&mut self) {
